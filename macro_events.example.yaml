@@ -1,0 +1,27 @@
+# Optional event blackout calendar for 0DTE options mode.
+#
+# Supported fields per event:
+#   label: free text shown in logs / reason strings
+#   enabled: true|false
+#   date: YYYY-MM-DD            # exact-date event
+#   weekday: MON|TUE|WED|THU|FRI|SAT|SUN   # recurring weekly event
+#   start: "HH:MM"
+#   end: "HH:MM"
+#   block_new_entries: true|false
+#   force_flatten: true|false
+#
+# Keep this file updated from official calendars if you want hard macro blackouts.
+events:
+  - label: cpi_release_window
+    date: 2026-04-10
+    start: "08:25"
+    end: "10:00"
+    block_new_entries: true
+    force_flatten: false
+
+  - label: fomc_statement_window
+    date: 2026-05-06
+    start: "13:55"
+    end: "14:45"
+    block_new_entries: true
+    force_flatten: true

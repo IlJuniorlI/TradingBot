@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "name": "pairs_residual",
+  "type": "stock",
+  "strategy_module": "intraday_tv_schwab_bot._strategies.pairs_residual.strategy",
+  "strategy_class": "PairsResidualStrategy",
+  "screener_module": "intraday_tv_schwab_bot._strategies.pairs_residual.screener",
+  "screener_class": "PairsResidualScreener",
+  "entry_windows": [
+    [
+      "10:10",
+      "14:10"
+    ]
+  ],
+  "management_windows": [
+    [
+      "09:55",
+      "15:20"
+    ]
+  ],
+  "screener_windows": [
+    [
+      "09:55",
+      "14:10"
+    ]
+  ],
+  "params": {
+    "zscore_entry": 1.25,
+    "max_zscore_entry": 2.1,
+    "lookback_bars": 90,
+    "min_rvol": 1.8,
+    "min_day_strength": 3.0,
+    "entry_exhaustion_filter_enabled": true,
+    "max_entry_vwap_extension_atr": 0.95,
+    "max_entry_ema9_extension_atr": 0.82,
+    "max_entry_bar_range_atr": 1.65,
+    "max_entry_upper_wick_frac": 0.3,
+    "max_entry_lower_wick_frac": 0.3,
+    "entry_wick_close_position_guard": 0.62,
+    "htf_fvg_entry_weight": 0.28,
+    "one_minute_fvg_entry_weight": 0.16,
+    "opposing_fvg_entry_penalty_mult": 0.95,
+    "fvg_runner_rr_bonus": 0.1,
+    "adaptive_breakeven_rr": 0.86,
+    "adaptive_profit_lock_rr": 1.08,
+    "adaptive_profit_lock_stop_rr": 0.22,
+    "adaptive_runner_trigger_rr": 1.1,
+    "force_flatten": {
+      "long": true,
+      "short": true
+    }
+  },
+  "capabilities": {
+    "dashboard": {
+      "tradable_symbols_source": "pairs.symbols"
+    },
+    "startup_restore": {
+      "eligible_symbols_source": "dashboard_tradable_symbols",
+      "require_hybrid_metadata": true
+    },
+    "watchlist": {
+      "active_sources": [
+        "candidates",
+        "positions.underlyings_or_symbols",
+        "positions.reference_symbols",
+        "pairs.symbols",
+        "pairs.references"
+      ]
+    }
+  }
+}

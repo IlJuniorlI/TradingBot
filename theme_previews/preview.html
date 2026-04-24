@@ -1,0 +1,962 @@
+<!doctype html>
+<html lang="en" data-theme="nexus">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=1600" />
+<title>Theme Preview — Nexus</title>
+<style>
+/* ========================================
+   THEMES
+   ======================================== */
+[data-theme="nexus"] {
+  --bg: #050806;
+  --bg-2: #070c09;
+  --panel: #0c1210;
+  --panel-raised: #0f1613;
+  --panel-bright: #131a17;
+  --line: rgba(255,255,255,0.05);
+  --line-strong: rgba(255,255,255,0.09);
+  --text: #f5faf7;
+  --text-dim: #b8c4bd;
+  --muted: #6d7a73;
+  --soft: #434b46;
+  --accent: #3de0a0;
+  --accent-bright: #5fffbc;
+  --accent-ink: #03201a;
+  --accent-glow: rgba(61, 224, 160, 0.45);
+  --accent-glow-soft: rgba(61, 224, 160, 0.14);
+  --accent-wash: rgba(61, 224, 160, 0.09);
+  --good: #3de0a0;
+  --bad: #ff5582;
+  --bad-wash: rgba(255, 85, 130, 0.10);
+  --bad-glow: rgba(255, 85, 130, 0.35);
+  --warn: #ffc165;
+  --grid: rgba(61, 224, 160, 0.05);
+}
+[data-theme="solstice"] {
+  --bg: #0a0806;
+  --bg-2: #0c0a08;
+  --panel: #121010;
+  --panel-raised: #161313;
+  --panel-bright: #1a1716;
+  --line: rgba(255,255,255,0.05);
+  --line-strong: rgba(255,255,255,0.09);
+  --text: #fbf5ef;
+  --text-dim: #c8bdb3;
+  --muted: #7a7269;
+  --soft: #4b4540;
+  --accent: #ff9a4d;
+  --accent-bright: #ffb674;
+  --accent-ink: #1f0a02;
+  --accent-glow: rgba(255, 154, 77, 0.40);
+  --accent-glow-soft: rgba(255, 154, 77, 0.14);
+  --accent-wash: rgba(255, 154, 77, 0.09);
+  --good: #3de0a0;
+  --bad: #ff5582;
+  --bad-wash: rgba(255, 85, 130, 0.10);
+  --bad-glow: rgba(255, 85, 130, 0.35);
+  --warn: #ffc165;
+  --grid: rgba(255, 154, 77, 0.05);
+}
+[data-theme="nebula"] {
+  --bg: #07060a;
+  --bg-2: #0a080e;
+  --panel: #110f15;
+  --panel-raised: #15121a;
+  --panel-bright: #19161f;
+  --line: rgba(255,255,255,0.05);
+  --line-strong: rgba(255,255,255,0.09);
+  --text: #f5f0fa;
+  --text-dim: #c0b8c8;
+  --muted: #787080;
+  --soft: #48434f;
+  --accent: #b779ff;
+  --accent-bright: #d099ff;
+  --accent-ink: #100523;
+  --accent-glow: rgba(183, 121, 255, 0.40);
+  --accent-glow-soft: rgba(183, 121, 255, 0.14);
+  --accent-wash: rgba(183, 121, 255, 0.09);
+  --good: #3de0a0;
+  --bad: #ff5582;
+  --bad-wash: rgba(255, 85, 130, 0.10);
+  --bad-glow: rgba(255, 85, 130, 0.35);
+  --warn: #ffc165;
+  --grid: rgba(183, 121, 255, 0.05);
+}
+
+/* ========================================
+   BASE
+   ======================================== */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  letter-spacing: -0.005em;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+  min-height: 100vh;
+  position: relative;
+}
+
+/* soft ambient glows */
+body::before {
+  content: "";
+  position: fixed; inset: 0;
+  background:
+    radial-gradient(900px 600px at 15% -5%, var(--accent-glow-soft), transparent 55%),
+    radial-gradient(700px 500px at 95% 40%, var(--accent-glow-soft), transparent 60%),
+    radial-gradient(500px 400px at 40% 105%, var(--accent-glow-soft), transparent 60%);
+  pointer-events: none; z-index: 0;
+}
+
+/* subtle grid */
+body::after {
+  content: "";
+  position: fixed; inset: 0;
+  background:
+    linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 100% 52px,
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 52px 100%;
+  pointer-events: none; z-index: 0;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-height: 100vh;
+  padding: 20px;
+  gap: 18px;
+  position: relative;
+  z-index: 1;
+}
+
+/* ========================================
+   TOPBAR
+   ======================================== */
+.topbar {
+  display: grid;
+  grid-template-columns: minmax(260px, 320px) 1fr auto;
+  gap: 22px;
+  align-items: center;
+  padding: 18px 24px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  box-shadow:
+    0 20px 60px rgba(0,0,0,0.45),
+    0 0 40px var(--accent-glow-soft);
+}
+.brand { display: flex; gap: 14px; align-items: center; }
+.brand-badge {
+  width: 46px; height: 46px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, var(--accent-bright), var(--accent));
+  color: var(--accent-ink);
+  display: grid; place-items: center;
+  font-weight: 800; font-size: 16px;
+  box-shadow: 0 10px 28px var(--accent-glow);
+}
+.brand-title { font-weight: 700; font-size: 18px; letter-spacing: -0.02em; }
+.brand-sub {
+  font-size: 12px; color: var(--text-dim); margin-top: 3px;
+  display: flex; align-items: center; gap: 8px; font-weight: 500;
+}
+.status-dot {
+  display: inline-block; width: 7px; height: 7px;
+  background: var(--accent); border-radius: 50%;
+  box-shadow: 0 0 10px var(--accent), 0 0 20px var(--accent-glow);
+}
+.status-strip { display: flex; gap: 24px; flex-wrap: wrap; justify-content: center; align-items: center;}
+.metric-pill { min-width: 78px; }
+.metric-pill .label {
+  font-size: 11px; color: var(--muted);
+  margin-bottom: 4px; font-weight: 500;
+}
+.metric-pill .value {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-weight: 600; font-size: 17px; letter-spacing: -0.01em;
+}
+.metric-pill .value.chip-wrap { font-family: inherit; }
+.pill-badge {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 5px 12px; border-radius: 999px;
+  font-size: 12px; font-weight: 600;
+  background: var(--accent-wash);
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
+}
+.pill-btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 10px 18px; border-radius: 999px;
+  background: var(--accent); color: var(--accent-ink);
+  font-weight: 700; font-size: 13px;
+  border: 0; cursor: pointer;
+  box-shadow: 0 10px 30px var(--accent-glow);
+}
+.pill-btn .ic {
+  width: 20px; height: 20px; border-radius: 50%;
+  background: var(--accent-ink); display: grid; place-items: center;
+  color: var(--accent);
+}
+.toolbar { display: flex; gap: 12px; align-items: center;}
+
+/* ========================================
+   WORKSPACE
+   ======================================== */
+.workspace {
+  display: grid;
+  grid-template-columns: 340px 1fr 360px;
+  gap: 18px;
+  min-height: 0;
+}
+.rail, .right-rail { display: grid; gap: 18px; align-content: start; }
+.center-stage { display: grid; grid-template-rows: 1fr auto; gap: 18px; min-height: 0; }
+
+/* ========================================
+   PANEL
+   ======================================== */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  box-shadow:
+    0 24px 60px rgba(0,0,0,0.4),
+    inset 0 1px 0 rgba(255,255,255,0.03);
+  position: relative;
+  overflow: hidden;
+}
+.panel::before {
+  content: "";
+  position: absolute; inset: 0;
+  background: radial-gradient(700px 200px at 50% -20%, var(--accent-glow-soft), transparent 60%);
+  pointer-events: none; z-index: 0;
+}
+.panel-inner { padding: 22px 24px; position: relative; z-index: 1; }
+.panel-head {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  margin-bottom: 18px;
+}
+.panel-title { font-weight: 700; font-size: 15px; letter-spacing: -0.02em; }
+.panel-meta { font-size: 12px; color: var(--muted); margin-top: 4px; font-weight: 500;}
+
+/* ========================================
+   WATCHLIST — hero cards with sparklines
+   ======================================== */
+.watchlist-tools { display: flex; gap: 2px; background: var(--bg-2); border-radius: 12px; padding: 3px; border: 1px solid var(--line);}
+.toggle-btn {
+  background: transparent; border: 0;
+  color: var(--muted);
+  padding: 6px 14px;
+  border-radius: 9px;
+  font-size: 12px; cursor: pointer; font-weight: 600;
+  font-family: inherit;
+}
+.toggle-btn.active { background: var(--accent); color: var(--accent-ink); }
+.card-list { display: grid; gap: 8px; }
+.wl-row {
+  display: grid;
+  grid-template-columns: 44px 1fr 90px auto;
+  align-items: center;
+  padding: 12px 14px;
+  background: var(--panel-raised);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  gap: 12px;
+  position: relative;
+}
+.wl-row.active {
+  background: linear-gradient(135deg, var(--accent-wash), transparent 70%), var(--panel-bright);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent) 25%, transparent),
+    0 8px 28px var(--accent-glow),
+    inset 0 0 30px var(--accent-glow-soft);
+}
+.wl-icon {
+  width: 36px; height: 36px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, var(--accent-wash), var(--panel-bright));
+  border: 1px solid var(--line);
+  display: grid; place-items: center;
+  font-weight: 800; font-size: 11px; letter-spacing: -0.02em;
+  color: var(--accent);
+}
+.wl-row.active .wl-icon {
+  background: linear-gradient(135deg, var(--accent-bright), var(--accent));
+  color: var(--accent-ink);
+  box-shadow: 0 4px 14px var(--accent-glow);
+  border: 0;
+}
+.wl-main { min-width: 0; }
+.wl-sym { font-weight: 700; font-size: 14px; letter-spacing: -0.02em; }
+.wl-meta { font-size: 11px; color: var(--muted); margin-top: 3px; font-weight: 500;}
+.wl-spark { width: 90px; height: 30px; }
+.wl-price-wrap { text-align: right; }
+.wl-price {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 13px; font-weight: 600;
+}
+.wl-chg {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px; margin-top: 3px; font-weight: 600;
+}
+.pos { color: var(--good); }
+.neg { color: var(--bad); }
+
+/* ========================================
+   CANDIDATES
+   ======================================== */
+.candidate-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.cand-chip {
+  background: var(--panel-raised);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 14px 8px 12px;
+  text-align: center;
+}
+.cand-sym { font-weight: 700; font-size: 12.5px; letter-spacing: -0.02em; }
+.cand-score {
+  font-size: 26px; font-weight: 700; margin-top: 6px;
+  letter-spacing: -0.03em;
+  color: var(--text);
+}
+.cand-bias { font-size: 10.5px; color: var(--muted); margin-top: 4px; font-weight: 500; }
+
+/* ========================================
+   HERO CHART PANEL
+   ======================================== */
+.chart-panel { min-height: 0; }
+.chart-panel > .panel-inner {
+  display: grid; grid-template-rows: auto auto 1fr auto auto; gap: 18px; height: 100%;
+}
+.chart-head { display: flex; justify-content: space-between; align-items: flex-start; }
+.symbol-focus-title { display: flex; gap: 14px; align-items: center; }
+.sym-icon {
+  width: 48px; height: 48px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, var(--accent-bright), var(--accent));
+  color: var(--accent-ink);
+  display: grid; place-items: center;
+  font-weight: 800; font-size: 14px;
+  box-shadow: 0 10px 28px var(--accent-glow);
+}
+.sym-info .sym-label { font-size: 11.5px; color: var(--muted); font-weight: 500; letter-spacing: 0.02em; margin-bottom: 2px;}
+.sym-info .sym-name {
+  font-weight: 700; font-size: 20px; letter-spacing: -0.02em;
+  display: flex; gap: 8px; align-items: center;
+}
+.icon-badge {
+  width: 22px; height: 22px;
+  border-radius: 7px;
+  background: var(--accent-wash); color: var(--accent);
+  display: grid; place-items: center;
+  font-size: 11px; font-weight: 800;
+}
+.icon-badge.good { background: color-mix(in srgb, var(--good) 14%, transparent); color: var(--good);}
+
+/* Big price block */
+.hero-price {
+  display: flex; gap: 32px; align-items: flex-end;
+  padding: 4px 0 4px;
+}
+.hero-price .price-label {
+  font-size: 12px; color: var(--muted);
+  font-weight: 500; margin-bottom: 6px;
+}
+.hero-price .price-big {
+  font-size: 54px; font-weight: 700;
+  letter-spacing: -0.035em;
+  line-height: 1;
+  color: var(--text);
+}
+.hero-price .price-chg {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 12px 5px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--good) 16%, transparent);
+  color: var(--good);
+  font-size: 12.5px; font-weight: 700;
+  margin-left: 10px; margin-bottom: 10px;
+}
+.hero-price .price-chg .arrow {
+  width: 16px; height: 16px; border-radius: 50%;
+  background: var(--good); color: #042017;
+  display: grid; place-items: center; font-size: 10px;
+}
+.hero-price .mini-stat { margin-left: auto; display: flex; gap: 18px; padding-bottom: 10px;}
+.hero-price .mini-stat .kv .k { font-size: 11px; color: var(--muted); font-weight: 500;}
+.hero-price .mini-stat .kv .v {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 14px; font-weight: 600; margin-top: 4px;
+}
+
+.chart-wrap {
+  position: relative;
+  background:
+    radial-gradient(700px 240px at 50% 0%, var(--accent-glow-soft), transparent 70%),
+    var(--panel-raised);
+  border-radius: 20px;
+  overflow: hidden;
+  min-height: 280px;
+  border: 1px solid var(--line);
+}
+.chart-wrap svg { width: 100%; height: 100%; display: block; }
+.timeframe-toggle {
+  position: absolute; top: 14px; right: 14px;
+  display: flex; gap: 2px;
+  background: rgba(0,0,0,0.5);
+  border: 1px solid var(--line);
+  border-radius: 11px; padding: 3px;
+}
+.tf-btn {
+  background: transparent; border: 0; color: var(--muted);
+  font-size: 11px; padding: 5px 11px; cursor: pointer;
+  font-weight: 600; border-radius: 8px; font-family: inherit;
+}
+.tf-btn.active { background: var(--accent); color: var(--accent-ink);}
+
+.bottom-strip { display: flex; justify-content: space-between; gap: 14px; flex-wrap: wrap; align-items: center;}
+.chip-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.structure-chip {
+  font-size: 11.5px;
+  padding: 6px 13px;
+  border-radius: 999px;
+  background: var(--accent-wash);
+  color: var(--accent);
+  font-weight: 600;
+  border: 1px solid color-mix(in srgb, var(--accent) 15%, transparent);
+}
+.level-group { display: flex; gap: 16px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: var(--muted);}
+.level-group b { color: var(--text); font-weight: 600; }
+
+.detail-grid { display: grid; grid-template-columns: 1.1fr 1fr 1fr; gap: 12px; }
+.detail-card, .mini-panel {
+  background: var(--panel-raised);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 16px 18px;
+}
+.detail-top { display: flex; justify-content: space-between; align-items: center; }
+.tiny-label { font-size: 11.5px; color: var(--muted); margin-bottom: 6px; font-weight: 500; }
+.value-big { font-size: 34px; font-weight: 700; letter-spacing: -0.03em; line-height: 1;}
+.score-ring {
+  width: 58px; height: 58px; border-radius: 50%;
+  background: conic-gradient(var(--accent) 0 var(--ring-pct, 75%), var(--line) var(--ring-pct, 75%) 100%);
+  display: grid; place-items: center; position: relative;
+  box-shadow: 0 0 28px var(--accent-glow-soft);
+}
+.score-ring::before {
+  content: ""; position: absolute; inset: 6px;
+  background: var(--panel-raised); border-radius: 50%;
+}
+.score-ring span { position: relative; font-weight: 700; font-size: 13px; color: var(--accent);}
+.score-ring.good { background: conic-gradient(var(--good) 0 var(--ring-pct, 75%), var(--line) var(--ring-pct, 75%) 100%);}
+.score-ring.warn { background: conic-gradient(var(--warn) 0 var(--ring-pct, 75%), var(--line) var(--ring-pct, 75%) 100%);}
+.score-ring.warn span { color: var(--warn);}
+.subline { font-size: 11.5px; color: var(--muted); margin-top: 12px; line-height: 1.45; font-weight: 400;}
+.metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 14px; }
+.kv .tiny-label { margin-bottom: 3px; }
+.kv .v { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13.5px; font-weight: 600;}
+.bar-track { background: var(--line); border-radius: 999px; height: 4px; overflow: hidden; }
+.bar-fill {
+  background: linear-gradient(90deg, var(--accent), var(--accent-bright));
+  height: 100%; border-radius: 999px;
+  box-shadow: 0 0 10px var(--accent-glow);
+}
+.bar-fill.warn { background: var(--warn);}
+
+/* ========================================
+   DOCK
+   ======================================== */
+.dock {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  box-shadow: 0 24px 60px rgba(0,0,0,0.4);
+  min-height: 210px; max-height: 240px;
+  overflow: hidden; position: relative;
+}
+.dock > .panel-inner { height: 100%; display: grid; grid-template-rows: auto 1fr; gap: 10px; padding-top: 18px; padding-bottom: 8px;}
+.dock-tools { display: flex; gap: 0; background: var(--bg-2); border-radius: 12px; padding: 3px; border: 1px solid var(--line);}
+.tab-btn {
+  background: transparent; border: 0;
+  color: var(--muted);
+  padding: 7px 18px;
+  border-radius: 9px;
+  font-size: 12px; cursor: pointer; font-weight: 600;
+  font-family: inherit;
+}
+.tab-btn.active { background: var(--accent); color: var(--accent-ink);}
+.dock-body { overflow: hidden; min-height: 0; }
+.event-list { display: grid; gap: 2px; }
+.event-row {
+  display: grid;
+  grid-template-columns: 80px 60px 1fr auto;
+  gap: 16px; padding: 9px 12px;
+  font-size: 12.5px; border-radius: 10px;
+}
+.event-row:nth-child(odd) { background: var(--panel-raised); }
+.event-time { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--muted); font-weight: 500;}
+.event-sym { font-weight: 700; letter-spacing: -0.01em; }
+.event-desc { color: var(--text-dim); font-weight: 400;}
+.event-value { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--muted); text-align: right; font-weight: 600; }
+.event-value.pos { color: var(--good); }
+.event-value.neg { color: var(--bad); }
+
+/* ========================================
+   RIGHT RAIL — KPI, Risk, Positions
+   ======================================== */
+.kpi-panel { position: relative; }
+.kpi-hero { padding: 6px 0 0; }
+.kpi-hero .ttl { font-size: 12px; color: var(--muted); font-weight: 500; margin-bottom: 6px;}
+.kpi-hero .big {
+  font-size: 38px; font-weight: 700; letter-spacing: -0.03em; line-height: 1;
+}
+.kpi-hero .chg {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: color-mix(in srgb, var(--good) 14%, transparent);
+  color: var(--good);
+  font-size: 12px; font-weight: 700;
+  padding: 3px 10px 3px 8px; border-radius: 999px;
+  margin-top: 10px;
+}
+.kpi-hero .chg .arrow {
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--good); color: #042017;
+  display: grid; place-items: center; font-size: 9px;
+}
+.kpi-spark { margin-top: 10px; width: 100%; height: 58px; display: block;}
+.kpi-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 14px; }
+.kpi-mini { padding: 12px 14px; background: var(--panel-raised); border: 1px solid var(--line); border-radius: 14px;}
+.kpi-mini .k { font-size: 11.5px; color: var(--muted); font-weight: 500;}
+.kpi-mini .v { font-size: 18px; font-weight: 700; letter-spacing: -0.02em; margin-top: 4px;}
+
+.gauge-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+.gauge-card { display: grid; gap: 10px; justify-items: center; }
+.gauge-ring {
+  width: 72px; height: 72px; border-radius: 50%;
+  background: conic-gradient(var(--accent) 0 var(--gauge-pct, 42%), var(--line) var(--gauge-pct, 42%) 100%);
+  display: grid; place-items: center; position: relative;
+  box-shadow: 0 0 28px var(--accent-glow-soft);
+}
+.gauge-ring.good { background: conic-gradient(var(--good) 0 var(--gauge-pct, 42%), var(--line) var(--gauge-pct, 42%) 100%);}
+.gauge-ring.warn { background: conic-gradient(var(--warn) 0 var(--gauge-pct, 42%), var(--line) var(--gauge-pct, 42%) 100%);}
+.gauge-ring::before { content: ""; position: absolute; inset: 8px; background: var(--panel); border-radius: 50%;}
+.gauge-ring span { position: relative; font-weight: 700; font-size: 13px; color: var(--accent);}
+.gauge-ring.good span { color: var(--good);}
+.gauge-ring.warn span { color: var(--warn);}
+
+.position-grid { display: grid; gap: 10px; }
+.pos-row {
+  background: var(--panel-raised);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 14px 16px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  position: relative;
+}
+.pos-row.active {
+  background: linear-gradient(135deg, var(--accent-wash), transparent 70%), var(--panel-bright);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  box-shadow: 0 8px 24px var(--accent-glow), inset 0 0 20px var(--accent-glow-soft);
+}
+.pos-head { display: flex; gap: 8px; align-items: center; font-weight: 700; font-size: 13.5px; letter-spacing: -0.01em;}
+.pos-tag {
+  font-size: 10.5px; padding: 3px 10px; border-radius: 999px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--good) 14%, transparent); color: var(--good);
+}
+.pos-meta { font-size: 11px; color: var(--muted); margin-top: 4px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+.pos-pnl {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-weight: 700; font-size: 15px;
+  text-align: right; align-self: center;
+}
+
+/* ========================================
+   SWITCHER
+   ======================================== */
+.switcher {
+  position: fixed; top: 14px; right: 16px;
+  display: flex; gap: 4px;
+  background: rgba(0,0,0,0.7); padding: 6px; border-radius: 14px;
+  z-index: 100;
+  border: 1px solid rgba(255,255,255,0.1);
+}
+.switcher button {
+  background: transparent; color: #fff; border: 0;
+  border-radius: 9px; padding: 7px 14px;
+  font-size: 12px; cursor: pointer; font-weight: 600;
+  font-family: inherit;
+}
+.switcher button.active { background: #fff; color: #000;}
+body.no-switch .switcher { display: none; }
+</style>
+</head>
+<body>
+
+<div class="switcher">
+  <button data-t="nexus" class="active">Nexus</button>
+  <button data-t="solstice">Solstice</button>
+  <button data-t="nebula">Nebula</button>
+</div>
+
+<div class="app-shell">
+
+  <!-- TOPBAR -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-badge">SB</div>
+      <div class="brand-copy">
+        <div class="brand-title">Schwab Bot</div>
+        <div class="brand-sub"><span class="status-dot"></span> Live · top_tier_adaptive</div>
+      </div>
+    </div>
+    <div class="status-strip">
+      <div class="metric-pill"><div class="label">Status</div><div class="value"><span class="pill-badge"><span class="status-dot"></span>Trading</span></div></div>
+      <div class="metric-pill"><div class="label">Day PnL</div><div class="value pos">+$1,247</div></div>
+      <div class="metric-pill"><div class="label">Profit Factor</div><div class="value">2.14</div></div>
+      <div class="metric-pill"><div class="label">Trades</div><div class="value">18</div></div>
+      <div class="metric-pill"><div class="label">Win Rate</div><div class="value">61.1%</div></div>
+    </div>
+    <div class="toolbar">
+      <div class="metric-pill"><div class="label">API / Min</div><div class="value" style="font-size:14px;">47 / 120</div></div>
+      <button class="pill-btn"><span class="ic">▶</span>Deploy</button>
+    </div>
+  </header>
+
+  <!-- WORKSPACE -->
+  <div class="workspace">
+
+    <!-- LEFT RAIL -->
+    <aside class="rail">
+      <section class="panel">
+        <div class="panel-inner">
+          <div class="panel-head">
+            <div><div class="panel-title">Watchlist</div><div class="panel-meta">23 tracked · 8 armed</div></div>
+            <div class="watchlist-tools">
+              <button class="toggle-btn active">All</button>
+              <button class="toggle-btn">Long</button>
+              <button class="toggle-btn">Short</button>
+            </div>
+          </div>
+          <div class="card-list">
+
+            <div class="wl-row active">
+              <div class="wl-icon">NV</div>
+              <div class="wl-main"><div class="wl-sym">NVDA</div><div class="wl-meta">Armed · pullback</div></div>
+              <svg class="wl-spark" viewBox="0 0 90 30" preserveAspectRatio="none">
+                <defs><linearGradient id="g1a" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity="0.45"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>
+                <path d="M0,22 L15,20 L30,18 L45,14 L60,10 L75,8 L90,4 L90,30 L0,30 Z" fill="url(#g1a)"/>
+                <path d="M0,22 L15,20 L30,18 L45,14 L60,10 L75,8 L90,4" fill="none" stroke="var(--accent)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <div class="wl-price-wrap"><div class="wl-price">925.17</div><div class="wl-chg pos">+2.34%</div></div>
+            </div>
+
+            <div class="wl-row">
+              <div class="wl-icon">TS</div>
+              <div class="wl-main"><div class="wl-sym">TSLA</div><div class="wl-meta">Active · ATR 8.1</div></div>
+              <svg class="wl-spark" viewBox="0 0 90 30" preserveAspectRatio="none">
+                <path d="M0,20 L15,22 L30,16 L45,18 L60,12 L75,6 L90,4" fill="none" stroke="var(--good)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <div class="wl-price-wrap"><div class="wl-price">242.91</div><div class="wl-chg pos">+3.12%</div></div>
+            </div>
+
+            <div class="wl-row">
+              <div class="wl-icon">AA</div>
+              <div class="wl-main"><div class="wl-sym">AAPL</div><div class="wl-meta">Watching · ATR 3.4</div></div>
+              <svg class="wl-spark" viewBox="0 0 90 30" preserveAspectRatio="none">
+                <path d="M0,18 L15,20 L30,16 L45,14 L60,16 L75,12 L90,10" fill="none" stroke="var(--good)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <div class="wl-price-wrap"><div class="wl-price">187.42</div><div class="wl-chg pos">+1.24%</div></div>
+            </div>
+
+            <div class="wl-row">
+              <div class="wl-icon">MS</div>
+              <div class="wl-main"><div class="wl-sym">MSFT</div><div class="wl-meta">Watching · ATR 5.2</div></div>
+              <svg class="wl-spark" viewBox="0 0 90 30" preserveAspectRatio="none">
+                <path d="M0,16 L15,14 L30,18 L45,12 L60,14 L75,10 L90,12" fill="none" stroke="var(--good)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <div class="wl-price-wrap"><div class="wl-price">421.88</div><div class="wl-chg pos">+0.67%</div></div>
+            </div>
+
+            <div class="wl-row">
+              <div class="wl-icon">AM</div>
+              <div class="wl-main"><div class="wl-sym">AMZN</div><div class="wl-meta">Pullback · ATR 4.1</div></div>
+              <svg class="wl-spark" viewBox="0 0 90 30" preserveAspectRatio="none">
+                <path d="M0,10 L15,12 L30,16 L45,14 L60,18 L75,22 L90,20" fill="none" stroke="var(--bad)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <div class="wl-price-wrap"><div class="wl-price">178.33</div><div class="wl-chg neg">-0.42%</div></div>
+            </div>
+
+            <div class="wl-row">
+              <div class="wl-icon">ME</div>
+              <div class="wl-main"><div class="wl-sym">META</div><div class="wl-meta">Watching · ATR 6.8</div></div>
+              <svg class="wl-spark" viewBox="0 0 90 30" preserveAspectRatio="none">
+                <path d="M0,20 L15,18 L30,20 L45,14 L60,16 L75,10 L90,8" fill="none" stroke="var(--good)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <div class="wl-price-wrap"><div class="wl-price">531.22</div><div class="wl-chg pos">+0.89%</div></div>
+            </div>
+
+            <div class="wl-row">
+              <div class="wl-icon">SP</div>
+              <div class="wl-main"><div class="wl-sym">SPY</div><div class="wl-meta">Neutral · ATR 2.1</div></div>
+              <svg class="wl-spark" viewBox="0 0 90 30" preserveAspectRatio="none">
+                <path d="M0,14 L15,14 L30,12 L45,16 L60,14 L75,12 L90,10" fill="none" stroke="var(--good)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <div class="wl-price-wrap"><div class="wl-price">512.44</div><div class="wl-chg pos">+0.18%</div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-inner">
+          <div class="panel-head">
+            <div><div class="panel-title">Candidates</div><div class="panel-meta">Top ranked screener names</div></div>
+          </div>
+          <div class="candidate-grid">
+            <div class="cand-chip"><div class="cand-sym">NVDA</div><div class="cand-score">94</div><div class="cand-bias">Long</div></div>
+            <div class="cand-chip"><div class="cand-sym">TSLA</div><div class="cand-score">87</div><div class="cand-bias">Long</div></div>
+            <div class="cand-chip"><div class="cand-sym">AAPL</div><div class="cand-score">82</div><div class="cand-bias">Long</div></div>
+          </div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- CENTER -->
+    <main class="center-stage">
+      <section class="panel chart-panel">
+        <div class="panel-inner">
+
+          <div class="chart-head">
+            <div class="symbol-focus-title">
+              <div class="sym-icon">NV</div>
+              <div class="sym-info">
+                <div class="sym-label">NVIDIA Corp · Trend regime</div>
+                <div class="sym-name">
+                  NVDA
+                  <div class="icon-badge good">▲</div>
+                  <div class="icon-badge">HH</div>
+                </div>
+              </div>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <span class="pill-badge"><span class="status-dot"></span>Armed</span>
+              <button class="pill-btn"><span class="ic">+</span>Open Trade</button>
+            </div>
+          </div>
+
+          <div class="hero-price">
+            <div>
+              <div class="price-label">Last price</div>
+              <div style="display:flex; align-items:flex-end;">
+                <div class="price-big">$925.17</div>
+                <div class="price-chg"><span class="arrow">▲</span>2.34%</div>
+              </div>
+            </div>
+            <div class="mini-stat">
+              <div class="kv"><div class="k">Spread</div><div class="v">0.02</div></div>
+              <div class="kv"><div class="k">Volume</div><div class="v">28.4M</div></div>
+              <div class="kv"><div class="k">ATR</div><div class="v">14.2</div></div>
+            </div>
+          </div>
+
+          <div class="chart-wrap">
+            <div class="timeframe-toggle">
+              <button class="tf-btn active">1M</button>
+              <button class="tf-btn">5M</button>
+              <button class="tf-btn">HTF</button>
+            </div>
+            <svg viewBox="0 0 800 320" preserveAspectRatio="none">
+              <defs>
+                <linearGradient id="heroArea" x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.45"/>
+                  <stop offset="50%" stop-color="var(--accent)" stop-opacity="0.12"/>
+                  <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
+                </linearGradient>
+              </defs>
+              <!-- dashed ref lines -->
+              <line x1="0" y1="240" x2="800" y2="240" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 8" opacity="0.4"/>
+              <line x1="0" y1="80"  x2="800" y2="80"  stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 8" opacity="0.4"/>
+
+              <!-- area + line -->
+              <path d="M0,210 C60,200 100,220 160,190 C220,164 260,172 320,156 C380,138 420,142 480,120 C540,100 580,112 640,94 C700,76 740,80 800,64 L800,320 L0,320 Z"
+                    fill="url(#heroArea)"/>
+              <path d="M0,210 C60,200 100,220 160,190 C220,164 260,172 320,156 C380,138 420,142 480,120 C540,100 580,112 640,94 C700,76 740,80 800,64"
+                    stroke="var(--accent)" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+              <!-- glow duplicate -->
+              <path d="M0,210 C60,200 100,220 160,190 C220,164 260,172 320,156 C380,138 420,142 480,120 C540,100 580,112 640,94 C700,76 740,80 800,64"
+                    stroke="var(--accent)" stroke-width="8" fill="none" stroke-linecap="round" stroke-linejoin="round" opacity="0.18"/>
+
+              <!-- price bubble -->
+              <g>
+                <rect x="660" y="30" width="128" height="34" rx="17" fill="var(--accent)"/>
+                <text x="724" y="52" fill="var(--accent-ink)" font-size="13" font-weight="700" text-anchor="middle" font-family="system-ui, sans-serif">$925.17</text>
+                <line x1="724" y1="64" x2="760" y2="64" stroke="var(--accent)" stroke-width="2" opacity="0.5"/>
+                <circle cx="760" cy="64" r="7" fill="var(--accent)" opacity="0.28"/>
+                <circle cx="760" cy="64" r="4" fill="var(--accent)"/>
+                <circle cx="760" cy="64" r="2" fill="var(--panel)"/>
+              </g>
+
+              <!-- earlier marker -->
+              <g>
+                <circle cx="280" cy="164" r="5" fill="var(--bad)" opacity="0.8"/>
+                <circle cx="280" cy="164" r="2" fill="var(--panel)"/>
+                <text x="290" y="160" fill="var(--bad)" font-size="10" font-weight="600" font-family="ui-monospace, monospace">Exit 918.40</text>
+              </g>
+            </svg>
+          </div>
+
+          <div class="bottom-strip">
+            <div class="chip-row">
+              <div class="structure-chip">Higher High</div>
+              <div class="structure-chip">Pullback</div>
+              <div class="structure-chip">EMA9 hold</div>
+              <div class="structure-chip">RVOL 1.84</div>
+            </div>
+            <div class="level-group">
+              <span>S <b>918.40</b></span>
+              <span>R <b>932.10</b></span>
+              <span>VWAP <b>921.55</b></span>
+            </div>
+          </div>
+
+          <div class="detail-grid">
+            <div class="detail-card">
+              <div class="detail-top">
+                <div>
+                  <div class="tiny-label">Candidate score</div>
+                  <div class="value-big">94</div>
+                </div>
+                <div class="score-ring good" style="--ring-pct:94%;"><span>A+</span></div>
+              </div>
+              <div class="subline">Strategy screener ranking for selected symbol</div>
+              <div class="metric-grid">
+                <div class="kv"><div class="tiny-label">Bias</div><div class="v pos">Long</div></div>
+                <div class="kv"><div class="tiny-label">State</div><div class="v">Armed</div></div>
+                <div class="kv"><div class="tiny-label">Regime</div><div class="v">Trend</div></div>
+              </div>
+            </div>
+            <div class="mini-panel">
+              <div class="tiny-label">Price / Levels</div>
+              <div class="metric-grid" style="grid-template-columns: repeat(2, 1fr); margin-top: 10px;">
+                <div class="kv"><div class="tiny-label">Support</div><div class="v">918.40</div></div>
+                <div class="kv"><div class="tiny-label">Resistance</div><div class="v">932.10</div></div>
+                <div class="kv"><div class="tiny-label">VWAP</div><div class="v">921.55</div></div>
+                <div class="kv"><div class="tiny-label">Bias score</div><div class="v pos">+8.2</div></div>
+              </div>
+              <div class="bar-track" style="margin-top: 14px;"><div class="bar-fill" style="width: 48%;"></div></div>
+            </div>
+            <div class="mini-panel">
+              <div class="tiny-label">Moving Averages</div>
+              <div class="metric-grid" style="grid-template-columns: repeat(2, 1fr); margin-top: 10px;">
+                <div class="kv"><div class="tiny-label">EMA9</div><div class="v">923.18</div></div>
+                <div class="kv"><div class="tiny-label">EMA20</div><div class="v">920.45</div></div>
+                <div class="kv"><div class="tiny-label">Bid</div><div class="v">925.16</div></div>
+                <div class="kv"><div class="tiny-label">Ask</div><div class="v">925.18</div></div>
+              </div>
+              <div class="bar-track" style="margin-top: 14px;"><div class="bar-fill" style="width: 72%;"></div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="dock">
+        <div class="panel-inner">
+          <div class="panel-head">
+            <div><div class="panel-title">Activity</div><div class="panel-meta">Context, trades, and diagnostics</div></div>
+            <div class="dock-tools">
+              <button class="tab-btn active">Events</button>
+              <button class="tab-btn">Trades</button>
+              <button class="tab-btn">Diagnostics</button>
+            </div>
+          </div>
+          <div class="dock-body">
+            <div class="event-list">
+              <div class="event-row"><span class="event-time">14:32:12</span><span class="event-sym">NVDA</span><span class="event-desc">Entry long · 1 contract 930C @ 4.32 · stop 920.80</span><span class="event-value">925.17</span></div>
+              <div class="event-row"><span class="event-time">14:28:04</span><span class="event-sym">TSLA</span><span class="event-desc">Exit · target 1 hit · trail runner on remainder</span><span class="event-value pos">+$412.50</span></div>
+              <div class="event-row"><span class="event-time">14:21:33</span><span class="event-sym">AAPL</span><span class="event-desc">Screener pick · score 82 · setup forming on pullback</span><span class="event-value">score 82</span></div>
+              <div class="event-row"><span class="event-time">14:15:07</span><span class="event-sym">SPY</span><span class="event-desc">Hedge closed · micro drawdown inside tolerance</span><span class="event-value neg">-$38.20</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- RIGHT RAIL -->
+    <aside class="right-rail">
+      <section class="panel kpi-panel">
+        <div class="panel-inner">
+          <div class="panel-head"><div><div class="panel-title">Equity</div><div class="panel-meta">Paper ledger · live state</div></div></div>
+          <div class="kpi-hero">
+            <div class="ttl">Total capital</div>
+            <div class="big">$48,772</div>
+            <div class="chg"><span class="arrow">▲</span>+2.63% today</div>
+          </div>
+          <svg class="kpi-spark" viewBox="0 0 320 58" preserveAspectRatio="none">
+            <defs><linearGradient id="kpiA" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity="0.35"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>
+            <path d="M0,40 C30,38 60,42 100,34 C140,26 170,32 210,22 C250,14 280,18 320,10 L320,58 L0,58 Z" fill="url(#kpiA)"/>
+            <path d="M0,40 C30,38 60,42 100,34 C140,26 170,32 210,22 C250,14 280,18 320,10" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          <div class="kpi-row">
+            <div class="kpi-mini"><div class="k">Realized</div><div class="v pos">+$1,247</div></div>
+            <div class="kpi-mini"><div class="k">Unrealized</div><div class="v pos">+$384</div></div>
+            <div class="kpi-mini"><div class="k">Drawdown</div><div class="v neg">-$213</div></div>
+            <div class="kpi-mini"><div class="k">Win Rate</div><div class="v">61.1%</div></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-inner">
+          <div class="panel-head"><div><div class="panel-title">Risk</div><div class="panel-meta">Fast visual guardrails</div></div></div>
+          <div class="gauge-grid">
+            <div class="gauge-card"><div class="tiny-label">Exposure</div><div class="gauge-ring" style="--gauge-pct:42%;"><span>42%</span></div></div>
+            <div class="gauge-card"><div class="tiny-label">Max Risk</div><div class="gauge-ring good" style="--gauge-pct:18%;"><span>1.8%</span></div></div>
+            <div class="gauge-card"><div class="tiny-label">Max DD</div><div class="gauge-ring warn" style="--gauge-pct:32%;"><span>3.2%</span></div></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-inner">
+          <div class="panel-head"><div><div class="panel-title">Open Positions</div><div class="panel-meta">2 active</div></div></div>
+          <div class="position-grid">
+            <div class="pos-row active">
+              <div>
+                <div class="pos-head">NVDA <span class="pos-tag">Long · Call</span></div>
+                <div class="pos-meta">930C @ 4.32 · stop 920.80 · 14:32</div>
+              </div>
+              <div class="pos-pnl pos">+$384</div>
+            </div>
+            <div class="pos-row">
+              <div>
+                <div class="pos-head">AAPL <span class="pos-tag">Long</span></div>
+                <div class="pos-meta">100 sh @ 187.40 · 14:18</div>
+              </div>
+              <div class="pos-pnl pos">+$22</div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </aside>
+
+  </div>
+</div>
+
+<script>
+  document.querySelector('.switcher').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-t]');
+    if (!btn) return;
+    document.documentElement.dataset.theme = btn.dataset.t;
+    document.querySelectorAll('.switcher button').forEach(b => b.classList.toggle('active', b === btn));
+  });
+</script>
+
+</body>
+</html>

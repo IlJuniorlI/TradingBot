@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "name": "zero_dte_etf_long_options",
+  "type": "option",
+  "strategy_module": "intraday_tv_schwab_bot._strategies.zero_dte_etf_long_options.strategy",
+  "strategy_class": "ZeroDteEtfLongOptionsStrategy",
+  "screener_module": "intraday_tv_schwab_bot._strategies.zero_dte_etf_long_options.screener",
+  "screener_class": "ZeroDteEtfLongOptionsScreener",
+  "entry_windows": [
+    [
+      "09:40",
+      "14:10"
+    ]
+  ],
+  "management_windows": [
+    [
+      "09:30",
+      "15:20"
+    ]
+  ],
+  "screener_windows": [
+    [
+      "09:35",
+      "14:10"
+    ]
+  ],
+  "params": {
+    "orb_end_time": "10:05",
+    "trend_start_time": "10:05",
+    "trend_end_time": "13:30",
+    "no_new_entries_after": "13:45",
+    "min_bars": 90,
+    "min_confirm_bars": 30,
+    "trend_vwap_lookback": 10,
+    "flip_lookback": 14,
+    "range_lookback": 25,
+    "min_candidate_rvol": 1.15,
+    "trend_rvol": 1.25,
+    "credit_min_rvol": 0.88,
+    "credit_max_rvol": 1.9,
+    "trend_vwap_distance_pct": 0.0014,
+    "trend_ema_gap_pct": 0.0007,
+    "trend_above_vwap_frac": 0.74,
+    "trend_min_ret5": 0.0006,
+    "trend_min_ret15": 0.0013,
+    "range_vwap_distance_pct": 0.0018,
+    "range_ema_gap_pct": 0.0007,
+    "range_max_intraday_move_pct": 0.009,
+    "credit_max_day_move_pct": 0.008,
+    "credit_max_vix_change_pct": 0.01,
+    "chop_flip_min": 4,
+    "chop_flip_max_for_trend": 3,
+    "chaos_intraday_range_pct": 0.016,
+    "min_trend_score": 5.1,
+    "min_range_score": 4.6,
+    "min_score_gap": 1.6,
+    "long_option_min_trend_score": 5.0,
+    "long_option_min_score_gap": 1.5,
+    "long_option_max_vwap_extension_pct": 0.0026,
+    "long_option_max_ema_gap_pct": 0.0015,
+    "long_option_max_ret5": 0.002,
+    "long_option_max_ret15": 0.0044,
+    "orb_breakout_buffer_pct": 0.0008,
+    "require_index_confirmation": true,
+    "candle_weight": 0.5,
+    "candle_sr_weight": 0.35,
+    "candle_trend_follow_weight": 0.25,
+    "candle_range_penalty": 0.3,
+    "candle_mixed_penalty": 0.18,
+    "use_htf_trend_confirmation": true,
+    "require_htf_alignment": true,
+    "htf_timeframe_minutes": 15,
+    "htf_lookback_days": 60,
+    "htf_refresh_seconds": 180,
+    "htf_min_bars": 20,
+    "htf_vwap_distance_pct": 0.0009,
+    "htf_ema_gap_pct": 0.0007,
+    "htf_min_ret3": 0.0009,
+    "htf_range_vwap_distance_pct": 0.002,
+    "htf_range_ema_gap_pct": 0.001,
+    "htf_score_bonus": 0.65,
+    "htf_score_penalty": 0.65,
+    "fvg_context_weight_scale": 0.9
+  },
+  "capabilities": {
+    "dashboard": {
+      "tradable_symbols_source": "options.underlyings"
+    },
+    "startup_restore": {
+      "eligible_symbols_source": "dashboard_tradable_symbols",
+      "require_hybrid_metadata": false
+    },
+    "watchlist": {
+      "active_sources": [
+        "candidates",
+        "options.underlyings",
+        "options.confirmation_symbols",
+        "options.volatility_symbol",
+        {
+          "source": "positions.metadata",
+          "key": "underlying",
+          "strategy_names": [
+            "zero_dte_etf_options",
+            "zero_dte_etf_long_options"
+          ]
+        },
+        {
+          "source": "positions.metadata",
+          "key": "confirm_index",
+          "strategy_names": [
+            "zero_dte_etf_options",
+            "zero_dte_etf_long_options"
+          ]
+        }
+      ],
+      "quote_sources": [
+        "options.volatility_symbol",
+        "options.confirmation_symbols",
+        {
+          "source": "positions.metadata_list",
+          "key": "valuation_legs",
+          "strategy_names": [
+            "zero_dte_etf_options",
+            "zero_dte_etf_long_options"
+          ]
+        }
+      ]
+    }
+  }
+}

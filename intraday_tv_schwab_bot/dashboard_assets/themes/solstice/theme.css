@@ -1,0 +1,27 @@
+[data-theme="solstice"] {
+  --bg: #0a0806;
+  --bg2: #0e0c0a;
+  --panel: #131110;
+  --panel2: #1a1716;
+  --panel3: #100e0d;
+  --line: rgba(255, 255, 255, 0.05);
+  --line-strong: rgba(255, 255, 255, 0.10);
+  --text: #fbf5ef;
+  --muted: #9a928d;
+  --soft: #5f5854;
+  --good: #3de0a0;
+  --bad: #ff5f7e;
+  --warn: #ffc165;
+  --accent: #ff9a4d;
+  --accent-2: #ffb674;
+  --chip: rgba(255, 154, 77, 0.06);
+  --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+  --body-bg: #0a0806;
+  --body-glow-1: radial-gradient(1100px 700px at 15% -5%, rgba(255, 154, 77, 0.10), transparent 55%);
+  --body-glow-2: radial-gradient(900px 600px at 85% 110%, rgba(255, 154, 77, 0.06), transparent 55%);
+  --panel-bg: linear-gradient(180deg, rgba(19, 17, 16, 0.96), rgba(14, 12, 11, 0.96));
+  --panel-glow: radial-gradient(700px 180px at 50% 0%, rgba(255, 154, 77, 0.08), transparent 60%);
+  --chart-bg: linear-gradient(180deg, rgba(12, 10, 9, 0.96), rgba(17, 14, 13, 0.98));
+  --chart-grid: linear-gradient(transparent 95%, rgba(255, 255, 255, 0.05) 96%), linear-gradient(90deg, transparent 95%, rgba(255, 255, 255, 0.04) 96%);
+  --gauge-inner: #100e0d;
+}

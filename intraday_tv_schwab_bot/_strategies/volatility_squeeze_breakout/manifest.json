@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "name": "volatility_squeeze_breakout",
+  "type": "stock",
+  "strategy_module": "intraday_tv_schwab_bot._strategies.volatility_squeeze_breakout.strategy",
+  "strategy_class": "VolatilitySqueezeBreakoutStrategy",
+  "screener_module": "intraday_tv_schwab_bot._strategies.volatility_squeeze_breakout.screener",
+  "screener_class": "VolatilitySqueezeBreakoutScreener",
+  "entry_windows": [
+    [
+      "09:48",
+      "15:38"
+    ]
+  ],
+  "management_windows": [
+    [
+      "09:33",
+      "15:58"
+    ]
+  ],
+  "screener_windows": [
+    [
+      "09:33",
+      "15:38"
+    ]
+  ],
+  "params": {
+    "min_change_from_open": 0.9,
+    "max_change_from_open": 7.5,
+    "min_rvol": 1.35,
+    "min_bars": 60,
+    "squeeze_lookback_bars": 16,
+    "squeeze_baseline_bars": 22,
+    "max_squeeze_range_pct": 0.011,
+    "max_squeeze_range_atr": 2.2,
+    "max_squeeze_width_pct": 0.05,
+    "max_squeeze_width_ratio": 0.74,
+    "breakout_buffer_pct": 0.0008,
+    "min_bar_close_position": 0.63,
+    "min_breakout_volume_ratio": 1.12,
+    "min_atr_expansion_mult": 1.0,
+    "min_pressure_drift_pct": 0.0011,
+    "require_vwap_alignment": true,
+    "require_avwap_alignment": true,
+    "prefer_bollinger_squeeze_flag": true,
+    "target_rr": 2.05,
+    "runner_enabled": true,
+    "runner_target_rr": 2.4,
+    "entry_exhaustion_filter_enabled": true,
+    "max_entry_vwap_extension_atr": 0.88,
+    "max_entry_ema9_extension_atr": 0.68,
+    "max_entry_bar_range_atr": 1.42,
+    "max_entry_upper_wick_frac": 0.25,
+    "max_entry_lower_wick_frac": 0.25,
+    "entry_wick_close_position_guard": 0.66,
+    "anti_chase_fvg_retest_enabled": true,
+    "anti_chase_fvg_retest_lookback_bars": 5,
+    "anti_chase_fvg_retest_max_gap_distance_pct": 0.0028,
+    "anti_chase_fvg_retest_max_opposing_distance_pct": 0.0018,
+    "anti_chase_fvg_retest_min_close_position": 0.66,
+    "anti_chase_fvg_retest_stop_buffer_gap_frac": 0.14,
+    "htf_fvg_entry_weight": 0.44,
+    "one_minute_fvg_entry_weight": 0.24,
+    "opposing_fvg_entry_penalty_mult": 1.0,
+    "fvg_runner_rr_bonus": 0.16,
+    "adaptive_breakeven_rr": 0.9,
+    "adaptive_profit_lock_rr": 1.2,
+    "adaptive_profit_lock_stop_rr": 0.26,
+    "adaptive_runner_trigger_rr": 1.08,
+    "force_flatten": {
+      "long": true,
+      "short": true
+    }
+  }
+}

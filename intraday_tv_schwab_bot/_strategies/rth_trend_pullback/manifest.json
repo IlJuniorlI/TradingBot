@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "name": "rth_trend_pullback",
+  "type": "stock",
+  "strategy_module": "intraday_tv_schwab_bot._strategies.rth_trend_pullback.strategy",
+  "strategy_class": "RTHTrendPullbackStrategy",
+  "screener_module": "intraday_tv_schwab_bot._strategies.rth_trend_pullback.screener",
+  "screener_class": "RTHTrendPullbackScreener",
+  "entry_windows": [
+    [
+      "09:38",
+      "15:45"
+    ]
+  ],
+  "management_windows": [
+    [
+      "09:33",
+      "15:58"
+    ]
+  ],
+  "screener_windows": [
+    [
+      "09:33",
+      "15:45"
+    ]
+  ],
+  "params": {
+    "min_change_from_open": 1.8,
+    "max_change_from_open": 22.0,
+    "min_rvol": 1.5,
+    "min_bars": 35,
+    "support_lookback_bars": 10,
+    "trigger_lookback_bars": 4,
+    "support_hold_pct": 0.012,
+    "max_extension_from_vwap_pct": 0.018,
+    "min_bar_close_position": 0.6,
+    "trend_min_ret5": 0.0002,
+    "trend_min_ret15": 0.0004,
+    "target_rr": 2.0,
+    "entry_exhaustion_filter_enabled": true,
+    "max_entry_vwap_extension_atr": 0.95,
+    "max_entry_ema9_extension_atr": 0.78,
+    "max_entry_bar_range_atr": 1.65,
+    "max_entry_upper_wick_frac": 0.3,
+    "max_entry_lower_wick_frac": 0.3,
+    "entry_wick_close_position_guard": 0.62,
+    "anti_chase_fvg_retest_enabled": true,
+    "anti_chase_fvg_retest_lookback_bars": 5,
+    "anti_chase_fvg_retest_max_gap_distance_pct": 0.003,
+    "anti_chase_fvg_retest_max_opposing_distance_pct": 0.0021,
+    "anti_chase_fvg_retest_min_close_position": 0.62,
+    "anti_chase_fvg_retest_stop_buffer_gap_frac": 0.15,
+    "strong_trend_runner_enabled": true,
+    "strong_trend_target_rr": 2.35,
+    "htf_fvg_entry_weight": 0.52,
+    "one_minute_fvg_entry_weight": 0.32,
+    "opposing_fvg_entry_penalty_mult": 1.0,
+    "fvg_runner_rr_bonus": 0.24,
+    "adaptive_breakeven_rr": 0.95,
+    "adaptive_profit_lock_rr": 1.28,
+    "adaptive_profit_lock_stop_rr": 0.28,
+    "adaptive_runner_trigger_rr": 1.14,
+    "force_flatten": {
+      "long": true,
+      "short": true
+    }
+  }
+}

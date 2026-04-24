@@ -1,0 +1,27 @@
+[data-theme="dark"] {
+  --bg: #000000;
+  --bg2: #080808;
+  --panel: #0e0e0e;
+  --panel2: #111111;
+  --panel3: #0a0a0a;
+  --line: rgba(255,255,255,0.08);
+  --line-strong: rgba(255,255,255,0.14);
+  --text: #eaeaef;
+  --muted: #8a8d9a;
+  --soft: #565866;
+  --good: #4cd990;
+  --bad: #f4516c;
+  --warn: #f0a030;
+  --accent: #4db8ff;
+  --accent-2: #6ad4ff;
+  --chip: rgba(255,255,255,0.05);
+  --shadow: 0 20px 50px rgba(0, 0, 0, 0.7);
+  --body-bg: #000000;
+  --body-glow-1: none;
+  --body-glow-2: none;
+  --panel-bg: linear-gradient(180deg, #0e0e0e, #0a0a0a);
+  --panel-glow: radial-gradient(600px 140px at 50% 0%, rgba(255,255,255,0.03), transparent 60%);
+  --chart-bg: #000000;
+  --chart-grid: linear-gradient(transparent 95%, rgba(255,255,255,.07) 96%), linear-gradient(90deg, transparent 95%, rgba(255,255,255,.06) 96%);
+  --gauge-inner: #0a0a0a;
+}

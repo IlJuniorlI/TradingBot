@@ -1,0 +1,543 @@
+# Canonical full-config template for this package.
+# Copy this file to configs/config.yaml for a working starting point, or use a shipped
+# strategy preset like configs/config.<strategy>.yaml. The scaffold script also clones
+# this file when creating a new full runnable strategy preset.
+
+# Active strategy preset to run.
+strategy: peer_confirmed_htf_pivots
+
+# Schwab API credentials, token storage, and account selection.
+# NOTE: app_key, app_secret, account_hash, and encryption are supplied via
+# the .env file at the repo root (SCHWAB_APP_KEY, SCHWAB_APP_SECRET,
+# SCHWAB_ACCOUNT_HASH, SCHWAB_ENCRYPTION_KEY). See .env.example for the
+# template. You can still set them here if you prefer — a real yaml value
+# wins over .env — but keeping them out of this file avoids accidentally
+# committing credentials.
+schwab:
+  callback_url: https://127.0.0.1
+  tokens_db: .schwabdev/tokens.db
+  timeout: 10
+  dry_run: true
+
+# TradingView and screener inputs used to source candidates.
+# NOTE: sessionid is supplied via the .env file (TRADINGVIEW_SESSIONID).
+# Leave it unset here unless you want the yaml value to override .env.
+tradingview:
+  market: america
+  max_candidates: 10
+  screener_refresh_seconds: 60
+  min_market_cap: 30000000
+  max_market_cap: 2000000000
+  min_volume: 550000
+  min_value_traded_1m: 100000.0
+  min_volume_1m: 8000
+
+# Paper-account starting state and retained history settings.
+paper:
+  starting_equity: 25000.0
+  max_equity_points: 2000
+  max_trade_history: 200
+
+# Position sizing, exposure caps, and trade-management defaults.
+risk:
+  max_positions: 2
+  risk_per_trade_frac_of_notional: 0.004
+  max_notional_per_trade: 4000.0
+  max_total_notional: 8000.0
+  max_daily_loss: 400.0
+  default_stop_pct: 0.018
+  default_target_pct: 0.038
+  trailing_stop_pct: 0.014
+  trade_management_mode: adaptive
+  allow_short: true
+  cooldown_minutes: 2
+  reentry_policy: cooldown
+  # Direction-aware cooldown: a LONG exit only blocks same-direction
+  # re-entries; SHORTs remain available to capture genuine reversals.
+  cooldown_direction_aware: true
+  # Same-level retry block: after a losing exit, same-direction re-entry
+  # on the same symbol is blocked within same_level_block_atr_mult * ATR
+  # of the prior fill for same_level_block_minutes minutes. A fib-pullback
+  # entry (retrace to 0.5-0.786 of the swing) overrides the block.
+  same_level_block_minutes: 30
+  same_level_block_atr_mult: 0.3
+  # Time-stop: positions held >= time_stop_minutes with |return_pct| below
+  # time_stop_min_return_pct are scratched to free a slot. 0 = disabled.
+  time_stop_minutes: 45
+  time_stop_min_return_pct: 0.003
+  # Peak-giveback floor: once max_favorable_r since entry crosses
+  # peak_giveback_min_r (default 1.0), exit when current_r retraces below
+  # a tiered fraction of the peak — 50% at 1R-2R, 40% at 2R-3R, 30% at 3R+.
+  # Protects 1R+ winners from becoming losers (AMZN +$62→-$13, INTC
+  # +$95→-$3 on 2026-04-17 are exactly this failure mode).
+  peak_giveback_enabled: true
+  peak_giveback_min_r: 1.0
+
+# Runtime cadence, streaming, reconciliation, and logging controls.
+runtime:
+  timezone: America/New_York
+  loop_sleep_seconds: 2.0
+  history_poll_seconds: 90
+  quote_poll_seconds: 6
+  quote_cache_seconds: 6
+  quote_batch_size: 20
+  history_lookback_minutes: 780
+  use_extended_hours_history: true
+  use_rth_session_indicators: true
+  warmup_minutes: 150
+  prewarm_before_windows_minutes: 15
+  log_dir: .logs
+  # Schwab CHART_EQUITY stream field indices: 0=symbol, 1=ts, 2=open,
+  # 3=high, 4=low, 5=close, 6=volume, 7=seq, 8=chart_time.
+  stream_fields: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+  stream_connect_timeout_seconds: 20
+  stream_fallback_poll_seconds: 25
+  stream_stale_fallback_seconds: 60
+  stream_health_log_seconds: 90
+  # Auto-exit: shut down cleanly when market closes and no positions are open
+  auto_exit_after_session: true
+  cycle_precompute_workers: 4
+  reconcile_on_startup: true
+  startup_reconcile_mode: block
+  startup_order_lookback_days: 2
+  startup_reconcile_ignore_symbols: []
+  startup_reconcile_metadata_db_path: .logs/startup_reconcile_metadata.sqlite
+
+# Execution buffers, repricing, and exit handling behavior.
+execution:
+  entry_limit_min_buffer: 0.03
+  entry_limit_max_buffer: 0.05
+  entry_limit_spread_frac: 0.1
+  entry_live_fill_timeout_seconds: 2.0
+  entry_live_poll_seconds: 0.25
+  entry_live_reprice_attempts: 2
+  entry_live_reprice_step_frac: 0.33
+  extended_hours_enabled: true
+  market_exit_regular_hours: false
+
+# Candle-pattern inputs used by strategies that support them.
+candles:
+  bullish_patterns:
+    - bullish_1c
+    - bullish_2c
+    - bullish_3c
+  bearish_patterns:
+    - bearish_1c
+    - bearish_2c
+    - bearish_3c
+# Higher-level chart-pattern detection and entry filters.
+chart_patterns:
+  enabled: true
+  lookback_bars: 32
+  bullish_patterns:
+    - bullish_double_bottom
+    - bullish_inverse_head_and_shoulders
+    - bullish_falling_wedge
+    - bullish_broadening_bottom
+    - bullish_triple_bottom
+    - bullish_flag
+    - bullish_pennant
+    - bullish_ascending_triangle
+    - bullish_symmetrical_triangle
+  bearish_patterns:
+    - bearish_double_top
+    - bearish_head_and_shoulders
+    - bearish_rising_wedge
+    - bearish_broadening_top
+    - bearish_triple_top
+    - bearish_flag
+    - bearish_pennant
+    - bearish_descending_triangle
+    - bearish_symmetrical_triangle
+
+# Local dashboard server settings and chart display options.
+dashboard:
+  enabled: true
+  host: 127.0.0.1
+  port: 8765
+  refresh_ms: 1500
+  state_path: .logs/dashboard_state.json
+  # Theme: default, dark, light, nexus (mint), solstice (amber), nebula (violet). See intraday_tv_schwab_bot/dashboard_assets/README.md for the full catalog.
+  theme: default
+  # HTTPS: set to true and provide cert/key paths to serve over HTTPS
+  https: false
+  ssl_certfile: ""
+  ssl_keyfile: ""
+  charting:
+    compact_chart_timeframe: ltf
+    compact:
+      max_bars: 90
+      show_volume: false
+      show_moving_averages: true
+      show_vwap: true
+      show_support_resistance: true
+      show_next_support_resistance: true
+      show_full_support_resistance_ladder: false
+      show_key_level_zones: true
+      show_key_level_zone_labels: true
+      show_bollinger_bands: false
+      show_anchored_vwap: false
+      show_fib_extensions: false
+      show_channel: false
+      show_trendlines: false
+      show_htf_fair_value_gaps: false
+      show_1m_fair_value_gaps: false
+      show_trade_markers: true
+      tooltip_show_returns: true
+      tooltip_show_support_resistance: true
+      tooltip_show_structure: true
+      tooltip_show_volatility: true
+      tooltip_show_orderflow: true
+      tooltip_show_patterns: true
+    expanded:
+      max_bars: 360
+      show_volume: true
+      show_moving_averages: true
+      show_vwap: true
+      show_support_resistance: true
+      show_next_support_resistance: true
+      show_full_support_resistance_ladder: true
+      show_key_level_zones: true
+      show_key_level_zone_labels: true
+      show_bollinger_bands: true
+      show_anchored_vwap: true
+      show_fib_extensions: true
+      show_channel: false
+      show_trendlines: false
+      show_htf_fair_value_gaps: false
+      show_1m_fair_value_gaps: false
+      show_trade_markers: true
+      tooltip_show_returns: true
+      tooltip_show_support_resistance: true
+      tooltip_show_structure: true
+      tooltip_show_volatility: true
+      tooltip_show_orderflow: true
+      tooltip_show_patterns: true
+
+# Higher-timeframe support, resistance, and structure settings.
+support_resistance:
+  enabled: true
+  timeframe_minutes: 15
+  lookback_days: 10
+  refresh_seconds: 480
+  pivot_span: 2
+  max_levels_per_side: 4
+  atr_tolerance_mult: 0.6
+  pct_tolerance: 0.003
+  same_side_min_gap_atr_mult: 0.1
+  same_side_min_gap_pct: 0.0015
+  fallback_reference_max_drift_atr_mult: 1.0
+  fallback_reference_max_drift_pct: 0.01
+  proximity_atr_mult: 0.7
+  breakout_atr_mult: 0.3
+  breakout_buffer_pct: 0.0012
+  stop_buffer_atr_mult: 0.25
+  entry_min_clearance_atr: 0.72
+  entry_min_clearance_pct: 0.0025
+  entry_proximity_scoring_enabled: true
+  entry_bias_score_weight: 0.5
+  entry_favorable_proximity_bonus: 0.3
+  entry_opposing_proximity_penalty: 0.3
+  use_prior_day_high_low: true
+  use_prior_week_high_low: true
+  htf_fair_value_gaps_enabled: true
+  htf_fair_value_gap_max_per_side: 3
+  htf_fair_value_gap_min_atr_mult: 0.06
+  htf_fair_value_gap_min_pct: 0.0006
+  one_minute_fair_value_gaps_enabled: true
+  one_minute_fair_value_gap_max_per_side: 3
+  one_minute_fair_value_gap_min_atr_mult: 0.06
+  one_minute_fair_value_gap_min_pct: 0.0006
+  dashboard_flip_confirmation_1m_bars: 1
+  trading_flip_confirmation_1m_bars: 2
+  trading_flip_confirmation_5m_bars: 1
+  flip_stop_buffer_atr_mult: 0.25
+  flip_target_requires_momentum_confirm: true
+  regime_weight: 0.7
+  structure_enabled: true
+  structure_1m_pivot_span: 2
+  structure_eq_atr_mult: 0.25
+  structure_1m_weight: 0.65
+  structure_htf_weight: 0.95
+  structure_event_lookback_bars: 8
+  # Grace window suppressing bias-based structure exits (EQL/LL/HL/HH/LH)
+  # in the first N minutes after entry AND until at least M new 1m pivots
+  # have formed. CHoCH exits still fire — those are true reversal signals
+  # rather than minor noise pivots.
+  structure_exit_grace_minutes: 10
+  structure_exit_min_post_entry_pivots: 2
+  # Additional grace for positions entered during the ORB window
+  # (09:35 to strategy.orb_end_time). Pullbacks early in ORB trades often
+  # present as bearish-structure / bearish-chart-pattern signals but
+  # continue higher after the opening flush resolves. Suppresses both
+  # chart_pattern_exit AND structure_bearish/bullish_exit for the first
+  # N minutes of ORB-entered positions. CHoCH exits still fire. 0 = off.
+  orb_entry_exit_grace_minutes: 20
+
+# Technical indicator-derived levels and overlay settings.
+technical_levels:
+  enabled: true
+  fib_enabled: true
+  fib_lookback_bars: 120
+  fib_min_impulse_atr: 1.25
+  fib_near_extension_pct: 0.0055
+  channel_enabled: false
+  channel_lookback_bars: 120
+  channel_min_touches: 3
+  channel_atr_tolerance_mult: 0.35
+  channel_parallel_slope_frac: 0.12
+  channel_min_gap_atr_mult: 0.8
+  channel_min_gap_pct: 0.0025
+  channel_near_edge_pct: 0.16
+  trendline_enabled: false
+  trendline_lookback_bars: 120
+  trendline_min_touches: 3
+  trendline_atr_tolerance_mult: 0.35
+  trendline_breakout_buffer_atr_mult: 0.15
+  adx_enabled: true
+  adx_length: 14
+  adx_min_strength: 18.0
+  adx_entry_bonus: 0.2
+  adx_rising_bonus: 0.08
+  adx_weak_penalty: 0.12
+  anchored_vwap_enabled: false
+  anchored_vwap_entry_bonus: 0.2
+  anchored_vwap_entry_penalty: 0.18
+  atr_context_enabled: true
+  atr_expansion_lookback: 5
+  atr_expansion_min_mult: 0.8
+  atr_expansion_bonus: 0.12
+  atr_stretch_penalty_mult: 2.6
+  atr_stretch_penalty: 0.2
+  obv_enabled: true
+  obv_ema_length: 20
+  obv_entry_bonus: 0.1
+  obv_entry_penalty: 0.08
+  divergence_enabled: true
+  divergence_rsi_length: 14
+  divergence_rsi_min_delta: 2.5
+  divergence_obv_min_volume_frac: 0.65
+  divergence_counter_rsi_penalty: 0.12
+  divergence_counter_obv_penalty: 0.1
+  divergence_block_dual_counter: true
+  bollinger_enabled: true
+  bollinger_length: 20
+  bollinger_std_mult: 2.0
+  bollinger_squeeze_width_pct: 0.06
+  bollinger_entry_bonus_midband: 0.16
+  bollinger_entry_penalty_outer_band: 0.22
+  target_use_bollinger: false
+  target_use_fib: true
+  target_use_channel: true
+  target_use_trendline: true
+  stop_use_trendline: true
+  entry_bonus_channel_alignment: 0.2
+  entry_bonus_trendline_respect: 0.2
+  entry_penalty_near_extension: 0.4
+
+# Shared entry filters and scoring knobs used across strategies.
+shared_entry:
+  use_fvg_context: true
+  use_divergence_filter: true
+  use_technical_entry_adjustment: true
+  use_technical_stop_target_refinement: true
+  use_structure_filter: true
+  use_sr_filter: true
+  use_sr_stop_target_refinement: true
+  use_opposing_chart_filter: true
+  # Minimum risk-to-reward floor enforced by the SR/technical target
+  # refinement pipeline. When a refine pass would cap the target so close
+  # to entry that R:R drops below this value, the cap is rejected and
+  # the strategy's original target is kept instead. Prevents the bot from
+  # entering with collapsed R:R when a nearby level happens to sit right
+  # above (for longs) or below (for shorts) the entry price.
+  min_target_rr: 1.0
+
+# Shared exit and management settings used across strategies.
+  use_opposing_candle_filter: false
+shared_exit:
+  use_technical_exit: true
+  use_trendline_break: true
+  use_channel_break: true
+  use_bollinger_reject: false
+  use_anchored_vwap_loss: true
+  use_chart_pattern_exit: false
+  use_structure_exit: true
+  use_sr_loss_exit: true
+  confirm_with_ema9: true
+  confirm_with_ema20: true
+  confirm_with_vwap: true
+  confirm_with_close_position: true
+  bullish_close_position_max: 0.46
+  bearish_close_position_min: 0.54
+  bullish_close_position_loose_max: 0.38
+  bearish_close_position_loose_min: 0.62
+
+# Options-mode filters, pricing, and contract-selection controls.
+  use_candle_pattern_exit: false
+options:
+  enabled: true
+  underlyings:
+    - SPY
+    - QQQ
+  confirmation_symbols:
+    SPY: "$SPX"
+    QQQ: "$COMPX"
+    IWM: "$RUT"
+  volatility_symbol: VIX
+  styles:
+    - orb_debit_spread
+    - trend_debit_spread
+    - midday_credit_spread
+    - orb_long_option
+    - trend_long_option
+  min_underlying_price: 100.0
+  min_option_volume: 300
+  min_open_interest: 600
+  max_bid_ask_spread_pct: 0.1
+  max_leg_spread_dollars: 0.08
+  max_net_spread_pct: 0.2
+  max_net_spread_price: 2.8
+  min_net_mid_price: 0.25
+  target_long_delta: 0.38
+  target_short_delta: 0.23
+  target_single_delta: 0.28
+  max_single_option_price: 2.25
+  option_limit_mode: mid
+  strike_width_by_symbol:
+    SPY: 2.0
+    QQQ: 2.0
+    IWM: 1.0
+  max_contracts_per_trade: 1
+  max_loss_per_trade: 200.0
+  debit_stop_frac: 0.45
+  debit_target_mult: 1.45
+  credit_stop_mult: 1.65
+  credit_target_frac: 0.32
+  single_stop_frac: 0.38
+  single_target_mult: 1.5
+  force_flatten_time: "15:18"
+  max_vix: 22.5
+  vix_spike_pct: 0.011
+  vertical_limit_mode: mid
+  quote_stability_checks: 3
+  quote_stability_pause_ms: 500
+  max_mid_drift_pct: 0.06
+  max_quote_age_seconds: 6
+  dry_run_replace_attempts: 2
+  dry_run_step_frac: 0.25
+  event_blackout_file: ./macro_events.auto.yaml
+  event_blackouts: []
+  option_chain_cache_seconds: 6
+  option_chain_cache_max_entries: 24
+
+# Strategy-specific windows and tuned parameters.
+strategies:
+  peer_confirmed_htf_pivots:
+    entry_windows:
+      - ["09:35", "11:15"]
+      - ["13:00", "14:45"]
+    management_windows:
+      - ["09:01", "15:55"]
+    screener_windows:
+      - ["09:01", "11:25"]
+      - ["12:45", "15:55"]
+    params:
+      peers:
+        - QQQ
+        - AVGO
+        - TSM
+      activity_score_weight: 0.1
+      adaptive_breakeven_rr: 0.9
+      adaptive_profit_lock_rr: 1.18
+      adaptive_profit_lock_stop_rr: 0.32
+      adaptive_runner_trigger_rr: 1.1
+      bond_symbol: TLT
+      dollar_symbol: NYICDX
+      enable_macro_confirmation: true
+      entry_exhaustion_filter_enabled: true
+      entry_family: auto
+      force_flatten:
+        long: true
+        short: true
+      fvg_runner_rr_bonus: 0.1
+      htf_atr_tolerance_mult: 0.35
+      htf_ema_fast_span: 34
+      htf_ema_slow_span: 200
+      htf_fvg_entry_weight: 0.28
+      htf_lookback_days: 60
+      htf_max_levels_per_side: 6
+      htf_pct_tolerance: 0.003
+      htf_pivot_span: 2
+      htf_refresh_seconds: 120
+      htf_stop_buffer_atr_mult: 0.25
+      htf_timeframe_minutes: 60
+      macro_bonus: 0.75
+      macro_miss_penalty: 0.28
+      max_continuation_distance_from_pivot_atr: 1.35
+      max_entry_bar_range_atr: 1.65
+      max_entry_ema9_extension_atr: 0.85
+      max_entry_lower_wick_frac: 0.3
+      max_entry_upper_wick_frac: 0.3
+      max_entry_vwap_extension_atr: 1.05
+      max_reclaim_distance_from_pivot_atr: 0.9
+      max_rejection_distance_from_pivot_atr: 0.82
+      min_adx14: 12.5
+      min_bars: 90
+      min_peer_agreement: 2
+      min_peer_score: 2
+      min_regime_score: 4
+      min_rr: 1.65
+      min_total_score: 5
+      min_trigger_bars: 20
+      min_trigger_close_position: 0.6
+      min_trigger_score: 2.5
+      min_trigger_volume_ratio: 1.0
+      one_minute_fvg_entry_weight: 0.14
+      opposing_fvg_entry_penalty_mult: 1.0
+      pivot_battleground_max_distance_atr: 1.1
+      pivot_confirmed_flip_zone_bonus: 0.55
+      pivot_continuation_breakout_buffer_pct: 0.0009
+      pivot_continuation_family_bonus: -0.12
+      pivot_continuation_interaction_lookback_bars: 9
+      pivot_continuation_max_distance_atr: 1.45
+      pivot_invalidated_zone_penalty: 1.0
+      pivot_original_zone_hold_bonus: 0.18
+      pivot_pending_flip_zone_penalty: 0.5
+      pivot_reclaim_buffer_pct: 0.00045
+      pivot_reclaim_family_bonus: 0.25
+      pivot_reclaim_zone_frac: 0.09
+      pivot_rejection_allows_neutral_ltf_structure: true
+      pivot_rejection_family_bonus: 0.12
+      pivot_rejection_min_wick_frac: 0.24
+      pivot_target_min_clearance_atr: 1.1
+      pivot_zone_atr_mult: 0.24
+      pivot_zone_pct: 0.0018
+      require_macro_agreement_count: 1
+      runner_target_rr: 2.45
+      # FVG scoring penalty applied when a same-direction fair-value gap has
+      # been filled/invalidated. Defaults to opposing_fvg_active_penalty * 0.85
+      # when omitted. A filled continuation gap is a weaker directional signal
+      # than an untouched one, so the penalty reduces the continuation-side
+      # bias without vetoing the setup. Lower = more tolerant of filled gaps.
+      same_direction_fvg_invalidated_penalty: 0.102
+      screener_activity_move_cap_pct: 2.4
+      screener_activity_move_sweet_spot_pct: 1.0
+      screener_contrarian_bias_threshold_pct: 1.25
+      screener_relative_volume_cap: 2.2
+      stop_buffer_atr_mult: 0.5
+      strong_setup_runner_enabled: true
+      target_rr: 1.95
+      tradable:
+        - AAPL
+        - NVDA
+        - GOOG
+        - AMD
+        - INTC
+        - MU
+      trigger_timeframe_minutes: 5
+      use_sr_veto: false
+      volatility_symbol: VIX
+
+# Pair definitions used by the pairs_residual strategy.
+pairs: []

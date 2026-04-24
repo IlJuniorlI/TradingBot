@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "name": "momentum_close",
+  "type": "stock",
+  "strategy_module": "intraday_tv_schwab_bot._strategies.momentum_close.strategy",
+  "strategy_class": "MomentumIntoCloseStrategy",
+  "screener_module": "intraday_tv_schwab_bot._strategies.momentum_close.screener",
+  "screener_class": "MomentumIntoCloseScreener",
+  "entry_windows": [
+    [
+      "13:45",
+      "15:39"
+    ]
+  ],
+  "management_windows": [
+    [
+      "13:30",
+      "15:54"
+    ]
+  ],
+  "screener_windows": [
+    [
+      "10:30",
+      "11:20"
+    ],
+    [
+      "13:30",
+      "15:25"
+    ]
+  ],
+  "params": {
+    "min_change_from_open": 4.0,
+    "max_change_from_open": 14.0,
+    "min_rvol": 2.4,
+    "breakout_lookback_bars": 6,
+    "entry_exhaustion_filter_enabled": true,
+    "max_entry_vwap_extension_atr": 0.85,
+    "max_entry_ema9_extension_atr": 0.68,
+    "max_entry_bar_range_atr": 1.55,
+    "max_entry_upper_wick_frac": 0.27,
+    "max_entry_lower_wick_frac": 0.27,
+    "entry_wick_close_position_guard": 0.66,
+    "anti_chase_fvg_retest_enabled": true,
+    "anti_chase_fvg_retest_lookback_bars": 5,
+    "anti_chase_fvg_retest_max_gap_distance_pct": 0.0028,
+    "anti_chase_fvg_retest_max_opposing_distance_pct": 0.002,
+    "anti_chase_fvg_retest_min_close_position": 0.64,
+    "anti_chase_fvg_retest_stop_buffer_gap_frac": 0.15,
+    "htf_fvg_entry_weight": 0.46,
+    "one_minute_fvg_entry_weight": 0.28,
+    "opposing_fvg_entry_penalty_mult": 1.0,
+    "fvg_runner_rr_bonus": 0.2,
+    "adaptive_breakeven_rr": 0.88,
+    "adaptive_profit_lock_rr": 1.22,
+    "adaptive_profit_lock_stop_rr": 0.26,
+    "adaptive_runner_trigger_rr": 1.15,
+    "force_flatten": {
+      "long": true,
+      "short": true
+    }
+  }
+}

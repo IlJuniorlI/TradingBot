@@ -1,0 +1,55 @@
+<!doctype html>
+<!--
+  example_custom — starter template for a fully custom dashboard.
+
+  When themes/<name>/index.html exists, the server serves it INSTEAD of the
+  base dashboard.html. You own the whole page. You still get:
+    - /api/state       → JSON snapshot (same schema the base dashboard uses)
+    - /api/chart?symbol=XYZ&bars=120&timeframe=1m|htf
+    - /health          → {"ok": true}
+    - /themes/<name>/theme.css, /theme.js, /assets/*   (self-hosted)
+  Template substitutions applied to this file at serve time:
+    __REFRESH_MS__    (int — the configured poll interval)
+    __IMAGES__        (JSON object — brand images etc.)
+    __BRAND_BADGE__   (data: URI for the brand badge)
+    __THEME__         (this theme's folder name)
+-->
+<html lang="en" data-theme="__THEME__">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Example Custom Dashboard</title>
+  <link rel="stylesheet" href="/themes/__THEME__/theme.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="bar">
+      <div class="brand">
+        <img src="__BRAND_BADGE__" alt="" class="brand-badge" />
+        <div>
+          <div class="brand-title">Example Custom Dashboard</div>
+          <div class="brand-sub" id="updated">Connecting…</div>
+        </div>
+      </div>
+      <div class="pills">
+        <div class="pill"><span class="k">Status</span><span class="v" id="status">—</span></div>
+        <div class="pill"><span class="k">Day PnL</span><span class="v" id="daypnl">—</span></div>
+        <div class="pill"><span class="k">Trades</span><span class="v" id="trades">—</span></div>
+      </div>
+    </header>
+
+    <section class="card">
+      <div class="card-title">Watchlist (raw from /api/state)</div>
+      <pre id="watchlist-dump">loading…</pre>
+    </section>
+  </main>
+
+  <script>
+    window.DASHBOARD_CONFIG = {
+      refreshMs: __REFRESH_MS__,
+      images: __IMAGES__,
+    };
+  </script>
+  <script src="/themes/__THEME__/theme.js" defer onerror="this.remove()"></script>
+</body>
+</html>

@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Schwab tokens (contains OAuth access/refresh tokens)
+.schwabdev/
+
+# Bot logs and runtime state
+.logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test/coverage — tests live in E:\ source only, never in prod or beta.
+# The /tests/ rule blocks accidental commits if a test dir ever lands in the
+# repo; .pytest_cache/.hypothesis are per-developer caches anyway.
+/tests/
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# User configs with real credentials (keep example/presets)
+configs/config.yaml
+
+# Auto-generated macro-events cache from scripts/sync_macro_events.py
+# (keep macro_events.example.yaml as the template)
+macro_events.auto.yaml
+
+# Environment file with Schwab/TradingView secrets (keep .env.example)
+.env
+.env.local
+.env.*.local
+
+# SQLite databases
+*.sqlite
+*.db
+!.schwabdev/  # already ignored above, but explicit

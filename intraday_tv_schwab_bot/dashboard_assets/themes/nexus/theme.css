@@ -1,0 +1,27 @@
+[data-theme="nexus"] {
+  --bg: #050806;
+  --bg2: #0a0f0c;
+  --panel: #0d1311;
+  --panel2: #111916;
+  --panel3: #0a0f0c;
+  --line: rgba(255, 255, 255, 0.05);
+  --line-strong: rgba(255, 255, 255, 0.10);
+  --text: #f5faf7;
+  --muted: #8d9a92;
+  --soft: #545f58;
+  --good: #3de0a0;
+  --bad: #ff5f7e;
+  --warn: #ffc165;
+  --accent: #3de0a0;
+  --accent-2: #5fffbc;
+  --chip: rgba(61, 224, 160, 0.06);
+  --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+  --body-bg: #050806;
+  --body-glow-1: radial-gradient(1100px 700px at 15% -5%, rgba(61, 224, 160, 0.10), transparent 55%);
+  --body-glow-2: radial-gradient(900px 600px at 85% 110%, rgba(61, 224, 160, 0.06), transparent 55%);
+  --panel-bg: linear-gradient(180deg, rgba(13, 19, 17, 0.96), rgba(10, 14, 12, 0.96));
+  --panel-glow: radial-gradient(700px 180px at 50% 0%, rgba(61, 224, 160, 0.08), transparent 60%);
+  --chart-bg: linear-gradient(180deg, rgba(8, 12, 10, 0.96), rgba(12, 17, 14, 0.98));
+  --chart-grid: linear-gradient(transparent 95%, rgba(255, 255, 255, 0.05) 96%), linear-gradient(90deg, transparent 95%, rgba(255, 255, 255, 0.04) 96%);
+  --gauge-inner: #0a100d;
+}

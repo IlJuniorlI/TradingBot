@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en" data-theme="__THEME__">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>Schwab Bot · Mobile</title>
+  <!-- Reuse the desktop stylesheet so every card inherits the active theme. -->
+  <link rel="stylesheet" href="/assets/dashboard.css" />
+  <link rel="stylesheet" href="/themes/__THEME__/theme.css" />
+  <link rel="stylesheet" href="/assets/mobile.css" />
+</head>
+<body>
+  <div class="m-shell">
+
+    <!-- Top bar — same markup/IDs as desktop so the same formatters fill it. -->
+    <header class="topbar m-topbar">
+      <div class="brand">
+        <div class="brand-badge"><img src="__BRAND_BADGE__" alt="Brand" /></div>
+        <div class="brand-copy">
+          <div class="brand-title">Schwab Bot</div>
+          <div class="brand-sub" id="top-subline">Loading live bot state…</div>
+        </div>
+      </div>
+      <div class="status-strip">
+        <div class="metric-pill status-metric">
+          <div class="label">Status</div>
+          <div class="value" id="status-badge-wrap"><span class="status-chip status-idle">Starting</span></div>
+        </div>
+        <div class="metric-pill"><div class="label">Day PnL</div><div class="value" id="metric-daypnl">—</div></div>
+        <div class="metric-pill"><div class="label">Profit Factor</div><div class="value" id="metric-pf">—</div></div>
+        <div class="metric-pill"><div class="label">Total Trades</div><div class="value" id="metric-trades">—</div></div>
+        <div class="metric-pill"><div class="label">Wins / Losses</div><div class="value" id="metric-wl">—</div></div>
+        <div class="metric-pill"><div class="label">Win Rate</div><div class="value" id="metric-winrate">—</div></div>
+        <div class="metric-pill"><div class="label">Ready</div><div class="value" id="metric-warmup">—</div></div>
+      </div>
+      <div class="toolbar">
+        <div class="metric-pill" id="metric-updated-wrap">
+          <div class="label">Updated</div>
+          <div class="value" style="font-size:14px;" id="metric-updated">—</div>
+        </div>
+      </div>
+    </header>
+
+    <!-- KPI -->
+    <section class="panel">
+      <div class="panel-inner">
+        <div class="panel-head"><div class="panel-title">KPI</div><div class="panel-meta" id="kpi-meta">Paper ledger and live state</div></div>
+        <div class="kpi-grid">
+          <div class="kpi-tile"><div class="tiny-label" id="kpi-netliq-label">Capital</div><div class="value-main" id="kpi-netliq">—</div></div>
+          <div class="kpi-tile"><div class="tiny-label">Realized</div><div class="value-main" id="kpi-realized">—</div></div>
+          <div class="kpi-tile"><div class="tiny-label">Unrealized</div><div class="value-main" id="kpi-unrealized">—</div></div>
+          <div class="kpi-tile"><div class="tiny-label">Drawdown</div><div class="value-main" id="kpi-drawdown">—</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Risk / Utilization -->
+    <section class="panel">
+      <div class="panel-inner">
+        <div class="panel-head"><div class="panel-title">Risk / Utilization</div><div class="panel-meta">Fast visual guardrails</div></div>
+        <div class="gauge-grid">
+          <div class="gauge-card">
+            <div class="tiny-label" style="text-align:center;">Gross Exposure</div>
+            <div class="gauge-ring" id="gauge-exposure-ring"><span id="gauge-exposure-text">—</span></div>
+            <div class="bar-track"><div class="bar-fill" id="gauge-exposure-fill" style="width:0%;"></div></div>
+          </div>
+          <div class="gauge-card">
+            <div class="tiny-label" style="text-align:center;">Max Risk</div>
+            <div class="gauge-ring good" id="gauge-win-ring"><span id="gauge-win-text">—</span></div>
+            <div class="bar-track"><div class="bar-fill" id="gauge-win-fill" style="width:0%;"></div></div>
+          </div>
+          <div class="gauge-card">
+            <div class="tiny-label" style="text-align:center;">Max Drawdown</div>
+            <div class="gauge-ring warn" id="gauge-dd-ring"><span id="gauge-dd-text">—</span></div>
+            <div class="bar-track"><div class="bar-fill warn" id="gauge-dd-fill" style="width:0%;"></div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Open Positions -->
+    <section class="panel positions-panel">
+      <div class="panel-inner">
+        <div class="panel-head"><div class="panel-title">Open Positions</div><div class="panel-meta" id="positions-meta">—</div></div>
+        <div class="positions-scroll"><div class="position-grid" id="positions-cards"></div></div>
+      </div>
+    </section>
+
+  </div>
+
+  <script>
+    window.DASHBOARD_CONFIG = { refreshMs: __REFRESH_MS__ };
+  </script>
+  <script src="/assets/mobile.js"></script>
+  <script src="/themes/__THEME__/theme.js" defer onerror="this.remove()"></script>
+</body>
+</html>

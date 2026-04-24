@@ -1,0 +1,9 @@
+# Runtime dependencies, strictly pinned. Last verified on Python 3.11.2.
+# Bumping any of these requires a full pytest pass + a dry-run on beta
+# before promoting to prod.
+schwabdev==3.0.3
+tradingview-screener==3.1.0
+pandas==2.3.3
+numpy==2.4.4
+PyYAML==6.0.3
+TA-Lib==0.6.8

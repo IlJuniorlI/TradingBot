@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "name": "opening_range_breakout",
+  "type": "stock",
+  "strategy_module": "intraday_tv_schwab_bot._strategies.opening_range_breakout.strategy",
+  "strategy_class": "ORBStrategy",
+  "screener_module": "intraday_tv_schwab_bot._strategies.opening_range_breakout.screener",
+  "screener_class": "ORBScreener",
+  "entry_windows": [
+    [
+      "09:37",
+      "10:05"
+    ]
+  ],
+  "management_windows": [
+    [
+      "09:30",
+      "10:50"
+    ]
+  ],
+  "screener_windows": [
+    [
+      "08:10",
+      "09:29"
+    ]
+  ],
+  "params": {
+    "min_bars": 30,
+    "orb_watchlist_mode": "premarket",
+    "watchlist_min_change": 5.5,
+    "watchlist_min_volume": 800000,
+    "opening_range_minutes": 5,
+    "min_breakout_buffer_pct": 0.0011,
+    "entry_exhaustion_filter_enabled": true,
+    "max_entry_vwap_extension_atr": 0.85,
+    "max_entry_ema9_extension_atr": 0.68,
+    "max_entry_bar_range_atr": 1.45,
+    "max_entry_upper_wick_frac": 0.25,
+    "max_entry_lower_wick_frac": 0.25,
+    "entry_wick_close_position_guard": 0.68,
+    "anti_chase_fvg_retest_enabled": true,
+    "anti_chase_fvg_retest_lookback_bars": 4,
+    "anti_chase_fvg_retest_max_gap_distance_pct": 0.0028,
+    "anti_chase_fvg_retest_max_opposing_distance_pct": 0.0019,
+    "anti_chase_fvg_retest_min_close_position": 0.66,
+    "anti_chase_fvg_retest_stop_buffer_gap_frac": 0.15,
+    "htf_fvg_entry_weight": 0.46,
+    "one_minute_fvg_entry_weight": 0.28,
+    "opposing_fvg_entry_penalty_mult": 1.0,
+    "fvg_runner_rr_bonus": 0.2,
+    "adaptive_breakeven_rr": 0.86,
+    "adaptive_profit_lock_rr": 1.18,
+    "adaptive_profit_lock_stop_rr": 0.26,
+    "adaptive_runner_trigger_rr": 1.1,
+    "force_flatten": {
+      "long": true,
+      "short": true
+    }
+  }
+}

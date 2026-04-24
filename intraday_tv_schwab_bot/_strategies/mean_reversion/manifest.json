@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "name": "mean_reversion",
+  "type": "stock",
+  "strategy_module": "intraday_tv_schwab_bot._strategies.mean_reversion.strategy",
+  "strategy_class": "MeanReversionStrategy",
+  "screener_module": "intraday_tv_schwab_bot._strategies.mean_reversion.screener",
+  "screener_class": "MeanReversionScreener",
+  "entry_windows": [
+    [
+      "09:39",
+      "10:55"
+    ],
+    [
+      "13:07",
+      "14:45"
+    ]
+  ],
+  "management_windows": [
+    [
+      "09:34",
+      "15:10"
+    ]
+  ],
+  "screener_windows": [
+    [
+      "09:39",
+      "10:55"
+    ],
+    [
+      "13:07",
+      "14:45"
+    ]
+  ],
+  "params": {
+    "min_day_strength": 5.2,
+    "max_day_strength": 15.5,
+    "min_rvol": 2.4,
+    "max_pullback_from_high": 0.027,
+    "min_reversal_close_position": 0.58,
+    "require_positive_reversal_ret5": true,
+    "htf_fvg_entry_weight": 0.34,
+    "one_minute_fvg_entry_weight": 0.2,
+    "opposing_fvg_entry_penalty_mult": 0.88,
+    "fvg_runner_rr_bonus": 0.12,
+    "adaptive_breakeven_rr": 0.72,
+    "adaptive_profit_lock_rr": 0.96,
+    "adaptive_profit_lock_stop_rr": 0.15,
+    "force_flatten": {
+      "long": true,
+      "short": true
+    }
+  }
+}

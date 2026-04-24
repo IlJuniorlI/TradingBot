@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en" data-theme="__THEME__">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Intraday TV + Schwab Bot</title>
+    <link rel="stylesheet" href="/assets/dashboard.css" />
+    <link rel="stylesheet" href="/themes/__THEME__/theme.css" />
+
+</head>
+<body>
+  <div class="app-shell" id="app-root">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-badge"><img src="__BRAND_BADGE__" alt="Brand" /></div>
+        <div class="brand-copy">
+          <div class="brand-title">Schwab Bot</div>
+          <div class="brand-sub" id="top-subline">Loading live bot state…</div>
+        </div>
+      </div>
+      <div class="status-strip">
+        <div class="metric-pill status-metric">
+          <div class="label">Status</div>
+          <div class="value" id="status-badge-wrap"><span class="status-chip status-idle">Starting</span></div>
+        </div>
+        <div class="metric-pill"><div class="label">Day PnL</div><div class="value" id="metric-daypnl">—</div></div>
+        <div class="metric-pill"><div class="label">Profit Factor</div><div class="value" id="metric-pf">—</div></div>
+        <div class="metric-pill"><div class="label">Total Trades</div><div class="value" id="metric-trades">—</div></div>
+        <div class="metric-pill"><div class="label">Wins / Losses</div><div class="value" id="metric-wl">—</div></div>
+        <div class="metric-pill"><div class="label">Win Rate</div><div class="value" id="metric-winrate">—</div></div>
+        <div class="metric-pill"><div class="label">Ready</div><div class="value" id="metric-warmup">—</div></div>
+      </div>
+      <div class="toolbar">
+        <div class="metric-pill" id="metric-api-wrap">
+          <div class="label">Schwabdev Calls / Min</div>
+          <div class="value" style="font-size:16px;" id="metric-api-cpm">—</div>
+        </div>
+        <div class="metric-pill" id="metric-updated-wrap">
+          <div class="label">Updated</div>
+          <div class="value" style="font-size:14px;" id="metric-updated">—</div>
+        </div>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="rail">
+        <section class="panel watchlist-panel">
+          <div class="panel-inner">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">Watchlist</div>
+                <div class="panel-meta" id="watchlist-meta">—</div>
+              </div>
+              <div class="watchlist-tools">
+                <button class="toggle-btn active" data-filter="all" type="button">All</button>
+                <button class="toggle-btn" data-filter="long" type="button">Long</button>
+                <button class="toggle-btn" data-filter="short" type="button">Short</button>
+              </div>
+            </div>
+            <div class="watchlist-scroll">
+              <div class="card-list" id="watchlist-list"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel candidates-panel">
+          <div class="panel-inner">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">Candidates</div>
+                <div class="panel-meta" id="candidate-meta">Top ranked screener names</div>
+              </div>
+            </div>
+            <div class="candidate-scroll">
+              <div class="candidate-grid" id="candidate-grid"></div>
+            </div>
+          </div>
+        </section>
+      </aside>
+
+      <main class="center-stage">
+        <section class="panel main-panel chart-panel">
+          <div class="panel-inner">
+            <div class="chart-head">
+              <div>
+                <div class="symbol-focus-title">
+                  <div class="symbol-name" id="selected-symbol">—</div>
+                  <div class="icon-badge" id="selected-trend-icon"></div>
+                  <div class="icon-badge" id="selected-structure-icon"></div>
+                </div>
+                <div class="focus-meta" id="selected-description">Waiting for symbol data…</div>
+              </div>
+              <div class="focus-stack">
+                <div class="focus-right">
+                <span class="tiny-chip tone-accent" id="selected-price">Last —</span>
+                <span class="tiny-chip tone-neutral" id="selected-change">Change —</span>
+                <span class="tiny-chip tone-neutral" id="selected-spread">Spread —</span>
+                <span class="tiny-chip tone-neutral" id="selected-volume">Vol —</span>
+                <div class="chart-timeframe-toggle" id="chart-timeframe-toggle" aria-label="Expanded chart timeframe">
+                  <button type="button" class="chart-timeframe-btn" data-timeframe-mode="1m">1M LTF</button>
+                  <button type="button" class="chart-timeframe-btn" data-timeframe-mode="htf">HTF</button>
+                </div>
+                <a class="tv-link tv-link-icon" id="selected-link" target="_blank" rel="noopener noreferrer" aria-label="Open symbol in TradingView"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAwnpUWHRSYXcgcHJvZmlsZSB0eXBlIGV4aWYAAHjabVDbEcMgDPtnio4AiJfHIW161w06fgV2cqGt7pCNBcLY7e/X090GYkgu5dqKlOKJJEliZ9K8ok8OPk2eOCTul7o7hcgSGGEXip0/6uE00NCZ5avR3YRtFSSZf/syihowOhr5w4zEjBBVCGbQ9Vu+SKvXL2y7X9F0uUGprW3/7Cun98h8BzHuCPBkoGkDGKs4dCYgs8CDAXnmlZwhZsaB/JvTAfcB7LJZJI/lI+kAAAGEaUNDUElDQyBwcm9maWxlAAB4nH2Rv0vDQBzFX1OlIhWHZhDrkKE62UVFHEsVi2ChtBVadTC59Bc0aUlSXBwF14KDPxarDi7Oujq4CoLgDxD/AHFSdJESv5cUWsR4cNyHd/ced+8AoVVlmtkXAzTdMtKJuJTLr0qBV/ghIoQwwjIz68nMYhae4+sePr7eRXmW97k/x5BaMBngk4hjrG5YxBvEs5tWnfM+scjKskp8Tjxp0AWJH7muuPzGueSwwDNFI5ueJxaJpVIPKz3MyoZGPEMcUTWd8oWcyyrnLc5atcE69+QvDBb0lQzXaY4hgSUkkYIEBQ1UUIWFKK06KSbStB/38I86/hS5FHJVwMixgBo0yI4f/A9+d2sWp6fcpGAc6H+x7Y9xILALtJu2/X1s2+0TwP8MXOldf60FzH2S3uxqkSNgeBu4uO5qyh5wuQOMPNVlQ3YkP02hWATez+ib8kDoFhhcc3vr7OP0AchSV8s3wMEhMFGi7HWPdw/09vbvmU5/P7K8csCDeNKrAAANdmlUWHRYTUw6Y29tLmFkb2JlLnhtcAAAAAAAPD94cGFja2V0IGJlZ2luPSLvu78iIGlkPSJXNU0wTXBDZWhpSHpyZVN6TlRjemtjOWQiPz4KPHg6eG1wbWV0YSB4bWxuczp4PSJhZG9iZTpuczptZXRhLyIgeDp4bXB0az0iWE1QIENvcmUgNC40LjAtRXhpdjIiPgogPHJkZjpSREYgeG1sbnM6cmRmPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5LzAyLzIyLXJkZi1zeW50YXgtbnMjIj4KICA8cmRmOkRlc2NyaXB0aW9uIHJkZjphYm91dD0iIgogICAgeG1sbnM6eG1wTU09Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC9tbS8iCiAgICB4bWxuczpzdEV2dD0iaHR0cDovL25zLmFkb2JlLmNvbS94YXAvMS4wL3NUeXBlL1Jlc291cmNlRXZlbnQjIgogICAgeG1sbnM6ZGM9Imh0dHA6Ly9wdXJsLm9yZy9kYy9lbGVtZW50cy8xLjEvIgogICAgeG1sbnM6R0lNUD0iaHR0cDovL3d3dy5naW1wLm9yZy94bXAvIgogICAgeG1sbnM6dGlmZj0iaHR0cDovL25zLmFkb2JlLmNvbS90aWZmLzEuMC8iCiAgICB4bWxuczp4bXA9Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC8iCiAgIHhtcE1NOkRvY3VtZW50SUQ9ImdpbXA6ZG9jaWQ6Z2ltcDo5N2U4MjNiZi05ZjRhLTQ3MDgtOTVmMy1jZGVhZjU3Y2Y3Y2YiCiAgIHhtcE1NOkluc3RhbmNlSUQ9InhtcC5paWQ6ZmYxMDgzNjItZTA2My00OTgyLThiYmEtZjM5YWRhNWIxZTcwIgogICB4bXBNTTpPcmlnaW5hbERvY3VtZW50SUQ9InhtcC5kaWQ6YWU4MTJlN2YtNDRhYy00NGI5LTlmOTAtODUyZTg1MzczNzQxIgogICBkYzpGb3JtYXQ9ImltYWdlL3BuZyIKICAgR0lNUDpBUEk9IjIuMCIKICAgR0lNUDpQbGF0Zm9ybT0iV2luZG93cyIKICAgR0lNUDpUaW1lU3RhbXA9IjE3NzQwMzQ4ODE2NTM3NzciCiAgIEdJTVA6VmVyc2lvbj0iMi4xMC4zOCIKICAgdGlmZjpPcmllbnRhdGlvbj0iMSIKICAgeG1wOkNyZWF0b3JUb29sPSJHSU1QIDIuMTAiCiAgIHhtcDpNZXRhZGF0YURhdGU9IjIwMjY6MDM6MjBUMTU6Mjc6NTktMDQ6MDAiCiAgIHhtcDpNb2RpZnlEYXRlPSIyMDI2OjAzOjIwVDE1OjI3OjU5LTA0OjAwIj4KICAgPHhtcE1NOkhpc3Rvcnk+CiAgICA8cmRmOlNlcT4KICAgICA8cmRmOmxpCiAgICAgIHN0RXZ0OmFjdGlvbj0ic2F2ZWQiCiAgICAgIHN0RXZ0OmNoYW5nZWQ9Ii8iCiAgICAgIHN0RXZ0Omluc3RhbmNlSUQ9InhtcC5paWQ6MjI4MmU5MmItMGNkOS00MzY2LWIxMWMtZmM3MzZkN2FiNDE0IgogICAgICBzdEV2dDpzb2Z0d2FyZUFnZW50PSJHaW1wIDIuMTAgKFdpbmRvd3MpIgogICAgICBzdEV2dDp3aGVuPSIyMDI2LTAzLTIwVDE1OjI4OjAxIi8+CiAgICA8L3JkZjpTZXE+CiAgIDwveG1wTU06SGlzdG9yeT4KICA8L3JkZjpEZXNjcmlwdGlvbj4KIDwvcmRmOlJERj4KPC94OnhtcG1ldGE+CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAKPD94cGFja2V0IGVuZD0idyI/Prb3GMoAAAAGYktHRAAKABwAQNATuFoAAAAJcEhZcwAACxMAAAsTAQCanBgAAAAHdElNRQfqAxQTHAFswFi+AAAGdklEQVR42u2cX0hTbRzHv2fTaek2bCNnBlGgpMHwoj9UF4FiFJTkjcYWyjyIEURedOG1IEFXedUfKy8miuKKIq/E7EKCoghE+wMplBboIsZWy7HtnPfiRWmvZvvzbDu++35gFztnz7PnOedznvM8v+c5RzKbzSpIzqLjIaAAhAIQCkAoAKEAhAIQCkAoAKEAhAIQCkAoAKEAhAIQCkAoAKEAhAIQCkAoAKEAhAIQCkAoAKEAhAIQCkAoAKEAhAIQCkAoAKEAhAIQCkAoAKEAhAIQCkAoAKEARAPk8RD8i9FohMVigclkQjAYhNfrhd/vh6qqFCAVent7UV1dnbUK+nw+OBwOhMPhdfsURUFdXR1kWYbdbkd5eTkkSQIALC8vY2ZmBm63Gx6PB3l58R0qp9MJl8slRJynT5/i2rVrW1uA6upqHDp0KGsCfPv2DXq9fp0AkiShu7sbLpcLZrN5XTqbzQabzYajR4+ivr4eV69excrKyqb/pdfr4XA4cPDgwZTLHQqFcOfOHd4C0sX169fR1tYGvV6/6e+KiorgdDpRXFyM9vb2DVuSVWpqaoScfACYm5uD2+1GYWEhO4GikWUZLS0tfz35v7cWDQ0N6Orq+uNvIpEIrly5goKCgpTLp6oqHj9+nPaTn5MC6HQ6uFyuhE+UTqeD0+mE1WrdcH9VVRWOHDkipIxerxf37t3jMDAdNDU1obKyMqm0paWl6Ojo2HBfc3MzSktLhZRxfHwcXq+XAqQDu90Og8GQVFpJkmC32xGJRGK2FxQU4MyZM0LKFwgEMDg4mLkWMdcE2LNnT0rprVYrfv36FbPt3LlzqKioEFK+6elpTExMUIB09gFSTf/7GD8UCiXUodyMaDSKoaGhjHT+claAubm5lNIvLS1h+/bta99ra2tht9uFlG1+fh4ejyezF0SuCTA7O7vpWP5vw7O3b9/GRAUdDgeMRqOQsj169Gjd7YUCCObBgwf4+PFj0lf/3bt3177v2LEDtbW1Qsq1tLSE4eHhzN8Sc02AUCiE/v5+hEKhhNIpioLR0VF8/fp1bVt7eztsNpuQcr18+RLv3r2jAJmgr68Pw8PDiEajcTf9T548QU9PT4xIZ8+eXZs8SlXKmzdvxj3hRAFSRFVVdHZ24vbt2wgEApv+dmVlBSMjI+jo6Ii5P1+4cEHY0O/Nmzd48eJFVo5Fzk4GKYqCrq4ujI+PQ5Zl1NTUoKysbO2K/v79O2ZnZzE4OAi32x0TPJIkCc3NzULi/tFoFA8fPoy7NdpyAkxPT6+LnCVCSUkJ9u/fn7aYwOTkJCYnJ2E0GlFeXg6LxQK/34/FxUX4fD6oqrouclhRUYHDhw8LKcOnT58wMDCQtQsh7QJcvnw5JQG6u7s3nYUTRSAQwPv37+O6fVy6dAkmk0nI/05MTODHjx9C+hKaFMBgMCQde19tbrWEyWQSNvTz+Xzo7e3Nah25KDRBWltbsXv3biF5TU1N4cuXL1mtDwVIgPz8fDQ2NqY8n7A6uhgdHc36olMKkAAnTpwQFvf/8OEDhoaGsl4nChAn4XAYsiwjPz9fSBzC4/Fg27ZtFGCrUFVVJWzot7CwgP7+fk3UiwLEiSzLsFgswoZ+f4tAUgANUVxcjJMnTwrJy+/3Y2RkRDN1owBx0NTUhH379gnJ6/Xr13j27BkF2CoEg0GcP39eSLBGURT09fUJmUOgABmioaEBBw4cEJLXzMxMRhd8UgABOJ1OFBUVCbn6x8bGEl6IQgGyyK5du3Ds2DEheS0vL2uq80cB4uDixYvYuXOnkLympqZSXpFMATJIJBLBqVOnhHT+fv78iRs3bgiZQ6AAGaKtrQ179+4VkterV6+ysuCTAiSJXq9HY2OjkLh/OBzO6pIvCpAEIuP+nz9/xv379zVbVwqwwXCts7NTyNBPVVWMjY1p8t5PAf5AWVkZjh8/Lmzod+vWLU3XlwL8h5aWFmEvenj+/HnMk0RaRPPPBaiquvZJtkmPF4PBgNOnTyecbiOCwWBWnvVLFMlsNmv6TYiFhYUoKSlJWoBoNJrQ61asVquQR7QURYHX69X8iyY1LwBhH4BQAEIBCAUgFIBQAEIBCAUgFIBQAEIBCAUgFIBQAEIBCAUgFIBQAEIBCAUgFIBQAEIBCAUgFIBQAEIBCAUgFIBQAEIBCAWgAIQCEApAKAChAIQCEApAKAChAIQCkP8//wAzmguaRboomwAAAABJRU5ErkJggg==" alt="TradingView" /></a>
+                </div>
+                <div class="chart-overlay" id="chart-legend"></div>
+              </div>
+            </div>
+
+            <div class="chart-wrap">
+              <canvas id="market-chart"></canvas>
+              <div class="chart-loading" id="chart-loading" aria-live="polite" aria-hidden="true">
+                <div class="chart-loading-spinner"></div>
+                <div class="chart-loading-text">Loading chart…</div>
+              </div>
+              <div class="chart-tooltip" id="chart-tooltip"></div>
+            </div>
+
+            <div class="bottom-strip">
+              <div class="chip-row" id="selected-structure-strip"></div>
+              <div class="level-group" id="selected-level-strip"></div>
+            </div>
+
+            <div class="detail-grid">
+              <div class="detail-card setup-score-card">
+                <div class="detail-top">
+                  <div>
+                    <div class="tiny-label" id="detail-score-label">Candidate Score</div>
+                    <div class="value-big" id="detail-score">—</div>
+                  </div>
+                  <div class="score-ring" id="detail-score-ring"><span>—</span></div>
+                </div>
+                <div class="subline" id="detail-score-sub">Strategy screener ranking for the selected symbol</div>
+                <div class="metric-grid">
+                  <div class="kv"><div class="tiny-label">Bias</div><div class="v" id="detail-bias">—</div></div>
+                  <div class="kv"><div class="tiny-label">State</div><div class="v" id="detail-state">—</div></div>
+                  <div class="kv"><div class="tiny-label">Regime</div><div class="v" id="detail-regime">—</div></div>
+                </div>
+              </div>
+
+              <div class="mini-panel">
+                <div class="panel-title">Price / Levels</div>
+                <div class="metric-grid" style="grid-template-columns: repeat(2, minmax(0, 1fr));">
+                  <div class="kv"><div class="tiny-label">Support</div><div class="v" id="detail-support">—</div></div>
+                  <div class="kv"><div class="tiny-label">Resistance</div><div class="v" id="detail-resistance">—</div></div>
+                  <div class="kv"><div class="tiny-label">VWAP</div><div class="v" id="detail-vwap">—</div></div>
+                  <div class="kv"><div class="tiny-label">Bias Score</div><div class="v" id="detail-bias-score">—</div></div>
+                </div>
+                <div style="margin-top: 12px;" class="bar-track"><div class="bar-fill" id="detail-range-fill" style="width:0%;"></div></div>
+                <div class="subline" id="detail-range-text">Distance within current support / resistance range</div>
+              </div>
+
+              <div class="mini-panel">
+                <div class="panel-title">Moving Averages</div>
+                <div class="metric-grid" style="grid-template-columns: repeat(2, minmax(0, 1fr));">
+                  <div class="kv"><div class="tiny-label">EMA9</div><div class="v" id="detail-ema9">—</div></div>
+                  <div class="kv"><div class="tiny-label">EMA20</div><div class="v" id="detail-ema20">—</div></div>
+                  <div class="kv"><div class="tiny-label" id="detail-quote-left-label">Bid</div><div class="v" id="detail-bid">—</div></div>
+                  <div class="kv"><div class="tiny-label" id="detail-quote-right-label">Ask</div><div class="v" id="detail-ask">—</div></div>
+                </div>
+                <div style="margin-top: 12px;" class="bar-track"><div class="bar-fill" id="detail-momentum-fill" style="width:0%;"></div></div>
+                <div class="subline" id="detail-momentum-text">Momentum and extension snapshot</div>
+              </div>
+            </div>
+          </div>
+        </section>
+        <section class="dock">
+          <div class="panel-inner">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">Bottom Dock</div>
+                <div class="panel-meta" id="dock-meta">Context, trades, and diagnostics</div>
+              </div>
+              <div class="dock-tools">
+                <button class="tab-btn active" data-tab="events" type="button">Events</button>
+                <button class="tab-btn" data-tab="trades" type="button">Trades</button>
+                <button class="tab-btn" data-tab="diagnostics" type="button">Diagnostics</button>
+              </div>
+            </div>
+            <div class="dock-body">
+              <div class="dock-pane active" data-page="events">
+                <div class="dock-scroll" tabindex="0"><div class="event-list" id="events-list"></div></div>
+              </div>
+              <div class="dock-pane" data-page="trades">
+                <div class="table-scroll" tabindex="0">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Exit Time</th>
+                        <th>Symbol</th>
+                        <th>Strategy</th>
+                        <th>Side</th>
+                        <th title="Quantity">Qty</th>
+                        <th>Entry</th>
+                        <th>Exit</th>
+                        <th>Realized</th>
+                        <th title="Return Percent">Rtn %</th>
+                        <th title="Hold Minutes">Hold Min</th>
+                        <th>Reason</th>
+                      </tr>
+                    </thead>
+                    <tbody id="trades-table-body"></tbody>
+                  </table>
+                </div>
+              </div>
+              <div class="dock-pane" data-page="diagnostics">
+                <div class="dock-scroll" tabindex="0"><div class="diag-grid" id="diagnostics-grid"></div></div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <aside class="right-rail">
+        <section class="panel">
+          <div class="panel-inner">
+            <div class="panel-head"><div class="panel-title">KPI</div><div class="panel-meta" id="kpi-meta">Paper ledger and live state</div></div>
+            <div class="kpi-grid">
+              <div class="kpi-tile"><div class="tiny-label" id="kpi-netliq-label">Capital</div><div class="value-main" id="kpi-netliq">—</div></div>
+              <div class="kpi-tile"><div class="tiny-label">Realized</div><div class="value-main" id="kpi-realized">—</div></div>
+              <div class="kpi-tile"><div class="tiny-label">Unrealized</div><div class="value-main" id="kpi-unrealized">—</div></div>
+              <div class="kpi-tile"><div class="tiny-label">Drawdown</div><div class="value-main" id="kpi-drawdown">—</div></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-inner">
+            <div class="panel-head"><div class="panel-title">Risk / Utilization</div><div class="panel-meta">Fast visual guardrails</div></div>
+            <div class="gauge-grid">
+              <div class="gauge-card">
+                <div class="tiny-label" style="text-align:center;">Gross Exposure</div>
+                <div class="gauge-ring" id="gauge-exposure-ring"><span id="gauge-exposure-text">—</span></div>
+                <div class="bar-track"><div class="bar-fill" id="gauge-exposure-fill" style="width:0%;"></div></div>
+              </div>
+              <div class="gauge-card">
+                <div class="tiny-label" style="text-align:center;">Max Risk</div>
+                <div class="gauge-ring good" id="gauge-win-ring"><span id="gauge-win-text">—</span></div>
+                <div class="bar-track"><div class="bar-fill" id="gauge-win-fill" style="width:0%;"></div></div>
+              </div>
+              <div class="gauge-card">
+                <div class="tiny-label" style="text-align:center;">Max Drawdown</div>
+                <div class="gauge-ring warn" id="gauge-dd-ring"><span id="gauge-dd-text">—</span></div>
+                <div class="bar-track"><div class="bar-fill warn" id="gauge-dd-fill" style="width:0%;"></div></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="positions-slot" style="min-height:0;">
+          <section class="panel positions-panel" style="min-height:0;">
+            <div class="panel-inner" style="height:100%; display:grid; grid-template-rows:auto minmax(0,1fr);">
+              <div class="panel-head"><div class="panel-title">Open Positions</div><div class="panel-meta" id="positions-meta">—</div></div>
+              <div class="positions-scroll"><div class="position-grid" id="positions-cards"></div></div>
+            </div>
+          </section>
+        </section>
+      </aside>
+    </div>
+  </div>
+
+  <script>
+    window.DASHBOARD_CONFIG = {
+      refreshMs: __REFRESH_MS__,
+      images: __IMAGES__,
+    };
+  </script>
+  <script src="/assets/dashboard.js"></script>
+  <script src="/themes/__THEME__/theme.js" defer onerror="this.remove()"></script>
+
+</body>
+</html>

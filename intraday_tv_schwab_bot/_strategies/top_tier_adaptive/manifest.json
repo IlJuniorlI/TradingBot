@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "name": "top_tier_adaptive",
+  "type": "stock",
+  "strategy_module": "intraday_tv_schwab_bot._strategies.top_tier_adaptive.strategy",
+  "strategy_class": "TopTierAdaptiveStrategy",
+  "screener_module": "intraday_tv_schwab_bot._strategies.top_tier_adaptive.screener",
+  "screener_class": "TopTierAdaptiveScreener",
+  "entry_windows": [
+    ["09:35", "15:00"]
+  ],
+  "management_windows": [
+    ["09:30", "15:55"]
+  ],
+  "screener_windows": [
+    ["09:30", "15:00"]
+  ],
+  "params": {
+    "tradable": ["AAPL", "MSFT", "NVDA", "INTC", "AMD", "AVGO", "TSM", "CRM", "AMZN", "TSLA", "HD", "LOW", "UBER", "COST", "GOOG", "META", "NFLX", "RBLX", "TMUS", "JPM", "GS", "V", "LLY"],
+    "index_symbols": ["SPY", "QQQ"],
+    "min_bars": 90,
+    "trigger_timeframe_minutes": 5,
+    "htf_timeframe_minutes": 15,
+    "min_trigger_bars": 15,
+    "min_trend_score": 3.5,
+    "min_pullback_score": 3.5,
+    "min_pullback_trend_score": 3.0,
+    "min_range_score": 3.5,
+    "min_score_gap": 1.2,
+    "min_adx14": 15.0,
+    "pullback_ema_touch_atr_mult": 0.35,
+    "pullback_hold_atr_mult": 0.40,
+    "pullback_lookback_bars": 5,
+    "range_max_vwap_dist_pct": 0.0020,
+    "range_max_ema_gap_pct": 0.0008,
+    "range_min_flip_count": 3,
+    "range_lookback_bars": 20,
+    "trend_target_rr": 2.0,
+    "pullback_target_rr": 2.0,
+    "range_target_rr": 1.5,
+    "stop_buffer_atr_mult": 0.25,
+    "require_index_confirmation": true,
+    "orb_bypass_htf_bias": true,
+    "orb_bypass_exhaustion": true,
+    "orb_bypass_index_confirmation": true,
+    "orb_bypass_structure_entry": true,
+    "orb_bypass_sr_entry": true,
+    "respect_screener_bias": true,
+    "orb_bypass_screener_bias": true,
+    "reject_stretched_entries": true,
+    "stretched_percent_b_max": 0.80,
+    "stretched_atr_mult_max": 1.1,
+    "orb_bypass_stretched_filter": false,
+    "reject_tech_bias_contradiction": true,
+    "orb_bypass_tech_bias_contradiction": true,
+    "require_htf_pivot_alignment_trend": true,
+    "afternoon_include_range": true,
+    "reject_entry_near_broken_level": true,
+    "broken_level_min_clearance_pct": 0.0025,
+    "broken_level_min_clearance_atr": 0.72,
+    "reject_target_beyond_sr": true,
+    "target_max_sr_ratio": 0.8,
+    "reject_range_during_squeeze": true,
+    "orb_opposing_sr_atr_mult": 0.5,
+    "orb_require_5m_followthrough": true,
+    "orb_end_time": "10:05",
+    "midday_start_time": "11:30",
+    "midday_end_time": "13:00",
+    "afternoon_start_time": "13:00",
+    "no_new_entries_after": "15:00",
+    "entry_exhaustion_filter_enabled": true,
+    "max_entry_vwap_extension_atr": 1.50,
+    "max_entry_ema9_extension_atr": 1.20,
+    "max_entry_bar_range_atr": 1.80,
+    "max_entry_upper_wick_frac": 0.30,
+    "max_entry_lower_wick_frac": 0.30,
+    "htf_fvg_entry_weight": 0.30,
+    "one_minute_fvg_entry_weight": 0.18,
+    "opposing_fvg_entry_penalty_mult": 1.0,
+    "fvg_runner_rr_bonus": 0.15,
+    "adaptive_breakeven_rr": 1.00,
+    "adaptive_partial_breakeven_rr": 0.5,
+    "adaptive_partial_breakeven_offset_r": 0.0,
+    "adaptive_profit_lock_rr": 1.30,
+    "adaptive_profit_lock_stop_rr": 0.35,
+    "adaptive_runner_trigger_rr": 1.15,
+    "sector_groups": {
+      "tech": ["AAPL", "MSFT", "NVDA", "INTC", "AMD", "AVGO", "TSM", "CRM"],
+      "consumer_discretionary": ["AMZN", "TSLA", "HD", "LOW", "UBER"],
+      "communication": ["GOOG", "META", "NFLX", "RBLX", "TMUS"],
+      "financials": ["JPM", "GS", "V"],
+      "healthcare": ["LLY"],
+      "industrials": [],
+      "energy": [],
+      "consumer_staples": ["COST"],
+      "materials": [],
+      "real_estate": [],
+      "utilities": []
+    },
+    "max_same_sector_same_direction": 2,
+    "force_flatten": {
+      "long": true,
+      "short": true
+    }
+  },
+  "capabilities": {
+    "dashboard": {
+      "tradable_symbols_source": "params.tradable",
+      "candidate_limit_mode": "tradable_count",
+      "allow_generic_level_fallback": true
+    },
+    "startup_restore": {
+      "eligible_symbols_source": "dashboard_tradable_symbols",
+      "require_hybrid_metadata": false
+    },
+    "watchlist": {
+      "active_sources": [
+        "candidates",
+        "positions.underlyings_or_symbols",
+        "positions.reference_symbols",
+        "dashboard_tradable_symbols"
+      ]
+    },
+    "history": {
+      "required_bars": 90
+    }
+  }
+}

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "intraday-tv-schwab-bot"
+dynamic = ["version"]
+description = "Intraday trading bot combining TradingView screener candidates with Schwab execution."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "IlJuniorlI" },
+]
+requires-python = ">=3.11"
+dependencies = [
+    "schwabdev==3.0.3",
+    "tradingview-screener==3.1.0",
+    "pandas==2.3.3",
+    "numpy==2.4.4",
+    "PyYAML==6.0.3",
+    "TA-Lib==0.6.8",
+]
+
+[project.scripts]
+intraday-tv-schwab-bot = "main:main"
+
+[tool.setuptools.dynamic]
+version = { file = "version.txt" }
+
+[tool.setuptools.packages.find]
+include = ["intraday_tv_schwab_bot*"]
+exclude = ["tests*", "scripts*", "theme_previews*"]
+
+[tool.setuptools.package-data]
+intraday_tv_schwab_bot = [
+    "_strategies/*/manifest.json",
+    "_strategies/*/README.md",
+    "dashboard_assets/*",
+    "dashboard_assets/**/*",
+]

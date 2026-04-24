@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "name": "closing_reversal",
+  "type": "stock",
+  "strategy_module": "intraday_tv_schwab_bot._strategies.closing_reversal.strategy",
+  "strategy_class": "ClosingReversalStrategy",
+  "screener_module": "intraday_tv_schwab_bot._strategies.closing_reversal.screener",
+  "screener_class": "ClosingReversalScreener",
+  "entry_windows": [
+    [
+      "15:33",
+      "15:54"
+    ]
+  ],
+  "management_windows": [
+    [
+      "15:10",
+      "15:57"
+    ]
+  ],
+  "screener_windows": [
+    [
+      "15:10",
+      "15:52"
+    ]
+  ],
+  "params": {
+    "min_day_strength": 6.0,
+    "max_day_strength": 16.5,
+    "min_rvol": 2.5,
+    "max_pullback_from_high": 0.05,
+    "min_reversal_close_position": 0.6,
+    "require_positive_reversal_ret5": true,
+    "htf_fvg_entry_weight": 0.38,
+    "one_minute_fvg_entry_weight": 0.24,
+    "opposing_fvg_entry_penalty_mult": 0.88,
+    "fvg_runner_rr_bonus": 0.12,
+    "adaptive_breakeven_rr": 0.72,
+    "adaptive_profit_lock_rr": 0.98,
+    "adaptive_profit_lock_stop_rr": 0.15,
+    "force_flatten": {
+      "long": true,
+      "short": true
+    }
+  }
+}

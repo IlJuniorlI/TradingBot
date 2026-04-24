@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "name": "peer_confirmed_htf_pivots",
+  "type": "stock",
+  "strategy_module": "intraday_tv_schwab_bot._strategies.peer_confirmed_htf_pivots.strategy",
+  "strategy_class": "PeerConfirmedHTFPivotsStrategy",
+  "screener_module": "intraday_tv_schwab_bot._strategies.peer_confirmed_htf_pivots.screener",
+  "screener_class": "PeerConfirmedHTFPivotsScreener",
+  "entry_windows": [
+    [
+      "09:35",
+      "11:15"
+    ],
+    [
+      "13:00",
+      "14:45"
+    ]
+  ],
+  "management_windows": [
+    [
+      "09:01",
+      "15:55"
+    ]
+  ],
+  "screener_windows": [
+    [
+      "09:01",
+      "11:25"
+    ],
+    [
+      "12:45",
+      "15:55"
+    ]
+  ],
+  "params": {
+    "tradable": [
+      "AAPL",
+      "NVDA",
+      "GOOG",
+      "AMD",
+      "INTC",
+      "MU"
+    ],
+    "peers": [
+      "QQQ",
+      "AVGO",
+      "TSM"
+    ],
+    "trigger_timeframe_minutes": 5,
+    "min_bars": 90,
+    "min_trigger_bars": 20,
+    "htf_timeframe_minutes": 60,
+    "htf_lookback_days": 60,
+    "htf_refresh_seconds": 120,
+    "htf_pivot_span": 2,
+    "htf_max_levels_per_side": 6,
+    "htf_atr_tolerance_mult": 0.35,
+    "htf_pct_tolerance": 0.003,
+    "htf_stop_buffer_atr_mult": 0.25,
+    "htf_ema_fast_span": 34,
+    "htf_ema_slow_span": 200,
+    "entry_family": "auto",
+    "min_regime_score": 4,
+    "min_trigger_score": 2.5,
+    "min_total_score": 5,
+    "min_peer_agreement": 2,
+    "min_peer_score": 2,
+    "enable_macro_confirmation": true,
+    "require_macro_agreement_count": 1,
+    "use_sr_veto": false,
+    "dollar_symbol": "NYICDX",
+    "bond_symbol": "TLT",
+    "volatility_symbol": "VIX",
+    "pivot_zone_atr_mult": 0.24,
+    "pivot_zone_pct": 0.0018,
+    "pivot_battleground_max_distance_atr": 1.1,
+    "pivot_target_min_clearance_atr": 1.1,
+    "pivot_confirmed_flip_zone_bonus": 0.55,
+    "pivot_original_zone_hold_bonus": 0.18,
+    "pivot_pending_flip_zone_penalty": 0.5,
+    "pivot_invalidated_zone_penalty": 1.0,
+    "pivot_reclaim_buffer_pct": 0.00045,
+    "pivot_reclaim_zone_frac": 0.09,
+    "pivot_rejection_min_wick_frac": 0.24,
+    "pivot_rejection_allows_neutral_ltf_structure": true,
+    "pivot_continuation_breakout_buffer_pct": 0.0009,
+    "pivot_continuation_interaction_lookback_bars": 9,
+    "pivot_continuation_max_distance_atr": 1.45,
+    "min_trigger_close_position": 0.6,
+    "min_trigger_volume_ratio": 1.0,
+    "min_adx14": 12.5,
+    "max_reclaim_distance_from_pivot_atr": 0.9,
+    "max_rejection_distance_from_pivot_atr": 0.82,
+    "max_continuation_distance_from_pivot_atr": 1.35,
+    "entry_exhaustion_filter_enabled": true,
+    "max_entry_vwap_extension_atr": 1.05,
+    "max_entry_ema9_extension_atr": 0.85,
+    "max_entry_bar_range_atr": 1.65,
+    "max_entry_upper_wick_frac": 0.3,
+    "max_entry_lower_wick_frac": 0.3,
+    "min_rr": 1.65,
+    "target_rr": 1.95,
+    "runner_target_rr": 2.45,
+    "stop_buffer_atr_mult": 0.5,
+    "strong_setup_runner_enabled": true,
+    "adaptive_breakeven_rr": 0.9,
+    "adaptive_profit_lock_rr": 1.18,
+    "adaptive_profit_lock_stop_rr": 0.32,
+    "adaptive_runner_trigger_rr": 1.1,
+    "htf_fvg_entry_weight": 0.28,
+    "one_minute_fvg_entry_weight": 0.14,
+    "pivot_reclaim_family_bonus": 0.25,
+    "pivot_rejection_family_bonus": 0.12,
+    "pivot_continuation_family_bonus": -0.12,
+    "screener_contrarian_bias_threshold_pct": 1.25,
+    "screener_activity_move_sweet_spot_pct": 1.0,
+    "screener_activity_move_cap_pct": 2.4,
+    "screener_relative_volume_cap": 2.2,
+    "opposing_fvg_entry_penalty_mult": 1.0,
+    "fvg_runner_rr_bonus": 0.1,
+    "activity_score_weight": 0.1,
+    "macro_bonus": 0.75,
+    "macro_miss_penalty": 0.28,
+    "force_flatten": {
+      "long": true,
+      "short": true
+    }
+  },
+  "capabilities": {
+    "dashboard": {
+      "tradable_symbols_source": "params.tradable",
+      "candidate_limit_mode": "tradable_count",
+      "allow_generic_level_fallback": true,
+      "candidate_labels": {
+        "bullish_htf_pivot_support": "HP",
+        "bearish_htf_pivot_resistance": "HP"
+      },
+      "candidate_sources": {
+        "bullish_htf_pivot_support": [
+          "htf_pivot"
+        ],
+        "bearish_htf_pivot_resistance": [
+          "htf_pivot"
+        ]
+      },
+      "zone_width": {
+        "mode": "max_of",
+        "atr_mult": 0.22,
+        "pct_of_price": 0.0016,
+        "min_width": 0.01
+      }
+    },
+    "startup_restore": {
+      "eligible_symbols_source": "dashboard_tradable_symbols",
+      "require_hybrid_metadata": false
+    },
+    "signal_priority": {
+      "metadata_fields": [
+        "trigger_score",
+        "regime_score",
+        "directional_peer_score",
+        "directional_vote_edge",
+        "runner_quality_score",
+        "execution_headroom_score",
+        "source_quality_score",
+        "selection_quality_score"
+      ]
+    },
+    "watchlist": {
+      "active_sources": [
+        "candidates",
+        "positions.underlyings_or_symbols",
+        "positions.reference_symbols",
+        "dashboard_tradable_symbols",
+        "params.peers",
+        {
+          "source": "params.keys_if_true",
+          "flag": "enable_macro_confirmation",
+          "keys": [
+            "dollar_symbol",
+            "bond_symbol",
+            "volatility_symbol"
+          ]
+        }
+      ]
+    }
+  }
+}

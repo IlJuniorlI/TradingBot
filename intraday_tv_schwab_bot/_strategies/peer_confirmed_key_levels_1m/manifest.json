@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "name": "peer_confirmed_key_levels_1m",
+  "type": "stock",
+  "strategy_module": "intraday_tv_schwab_bot._strategies.peer_confirmed_key_levels_1m.strategy",
+  "strategy_class": "PeerConfirmedKeyLevels1MStrategy",
+  "screener_module": "intraday_tv_schwab_bot._strategies.peer_confirmed_key_levels_1m.screener",
+  "screener_class": "PeerConfirmedKeyLevels1MScreener",
+  "entry_windows": [
+    [
+      "07:05",
+      "15:20"
+    ]
+  ],
+  "management_windows": [
+    [
+      "07:00",
+      "15:58"
+    ]
+  ],
+  "screener_windows": [
+    [
+      "07:00",
+      "15:40"
+    ]
+  ],
+  "params": {
+    "tradable": [
+      "AAPL",
+      "NVDA",
+      "GOOG",
+      "AMD",
+      "INTC"
+    ],
+    "peers": [
+      "QQQ",
+      "AVGO",
+      "MU",
+      "TSM"
+    ],
+    "htf_timeframe_minutes": 60,
+    "htf_lookback_days": 60,
+    "htf_refresh_seconds": 120,
+    "htf_pivot_span": 2,
+    "htf_max_levels_per_side": 6,
+    "htf_atr_tolerance_mult": 0.35,
+    "htf_pct_tolerance": 0.003,
+    "htf_stop_buffer_atr_mult": 0.25,
+    "htf_ema_fast_span": 34,
+    "htf_ema_slow_span": 200,
+    "trigger_timeframe_minutes": 1,
+    "min_bars": 100,
+    "min_trigger_bars": 55,
+    "zone_atr_mult": 0.17,
+    "zone_pct": 0.0013,
+    "min_level_score": 2.5,
+    "level_score_raw_htf_weight": 0.65,
+    "min_trigger_score": 2.4,
+    "trigger_quality_bonus_enabled": true,
+    "trigger_quality_max_bonus": 2.0,
+    "trigger_reclaim_quality_bonus_cap": 0.8,
+    "trigger_zone_interaction_bonus_cap": 0.5,
+    "trigger_candle_quality_bonus_cap": 0.5,
+    "trigger_volume_quality_bonus_cap": 0.4,
+    "trigger_range_expansion_bonus_cap": 0.4,
+    "min_rr": 1.6,
+    "stop_buffer_atr_mult": 0.56,
+    "min_peer_agreement": 2,
+    "min_peer_score": 2,
+    "enable_macro_confirmation": true,
+    "require_macro_agreement_count": 1,
+    "require_macro_net_bias": true,
+    "require_hourly_bias_alignment": true,
+    "dollar_symbol": "NYICDX",
+    "bond_symbol": "TLT",
+    "volatility_symbol": "VIX",
+    "level_round_number_tolerance_pct": 0.002,
+    "strong_setup_runner_enabled": true,
+    "strong_setup_min_trigger_score": 3.0,
+    "strong_setup_min_level_score": 3.0,
+    "strong_setup_min_peer_score": 2,
+    "strong_setup_min_hourly_vote_edge": 1,
+    "strong_setup_target_level_offset": 1,
+    "activity_score_weight": 0.12,
+    "htf_fvg_entry_weight": 0.32,
+    "one_minute_fvg_entry_weight": 0.26,
+    "opposing_fvg_entry_penalty_mult": 1.0,
+    "fvg_runner_rr_bonus": 0.14,
+    "adaptive_breakeven_rr": 0.82,
+    "adaptive_profit_lock_rr": 1.08,
+    "adaptive_profit_lock_stop_rr": 0.28,
+    "adaptive_runner_trigger_rr": 1.02,
+    "force_flatten": {
+      "long": true,
+      "short": true
+    }
+  },
+  "capabilities": {
+    "dashboard": {
+      "tradable_symbols_source": "params.tradable",
+      "candidate_limit_mode": "tradable_count",
+      "allow_generic_level_fallback": true
+    },
+    "startup_restore": {
+      "eligible_symbols_source": "dashboard_tradable_symbols",
+      "require_hybrid_metadata": false
+    },
+    "signal_priority": {
+      "metadata_fields": [
+        "trigger_score",
+        "regime_score",
+        "directional_peer_score",
+        "directional_vote_edge",
+        "runner_quality_score",
+        "execution_headroom_score",
+        "source_quality_score",
+        "selection_quality_score"
+      ]
+    },
+    "watchlist": {
+      "active_sources": [
+        "candidates",
+        "positions.underlyings_or_symbols",
+        "positions.reference_symbols",
+        "dashboard_tradable_symbols",
+        "params.peers",
+        {
+          "source": "params.keys_if_true",
+          "flag": "enable_macro_confirmation",
+          "keys": [
+            "dollar_symbol",
+            "bond_symbol",
+            "volatility_symbol"
+          ]
+        }
+      ]
+    }
+  }
+}
