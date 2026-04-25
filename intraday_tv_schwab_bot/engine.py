@@ -398,29 +398,67 @@ class IntradayBot:
                 watchlist_trace = self.strategy.watchlist_trace("active", self.last_candidates, self.positions)
                 self.audit.log_watchlist_trace("active", watchlist_trace)
 
+            # Per-symbol history fetch decisions are made serially (they read
+            # warmup_tracker state and are cheap), but the actual HTTP fetches
+            # run in parallel — the bot was previously paying ~watchlist_size
+            # network round-trips serially during refresh cycles.
+            #
+            # Keys are normalized to the same uppercase+strip form that
+            # _parallel_symbol_map applies before dispatching, so the lambda's
+            # dict lookup is guaranteed to match the symbol it receives.
+            history_fetch_targets: dict[str, int] = {}
             for symbol in self.last_watchlist:
+                normalized = str(symbol or "").upper().strip()
+                if not normalized:
+                    continue
                 should_fetch, required_bars = self.warmup_tracker.should_fetch_symbol_history(
                     symbol,
                     context_refresh_active=gate_state.context_refresh_active,
                     streaming_active=gate_state.streaming_active,
                 )
                 if should_fetch:
-                    self.data.fetch_history(
-                        symbol,
-                        lookback_minutes=self.warmup_tracker.history_fetch_lookback_minutes(
-                            now,
-                            streaming_active=gate_state.streaming_active,
-                            required_bars=self.warmup_tracker.desired_history_bars(symbol),
-                        ),
+                    history_fetch_targets[normalized] = self.warmup_tracker.history_fetch_lookback_minutes(
+                        now,
+                        streaming_active=gate_state.streaming_active,
+                        required_bars=self.warmup_tracker.desired_history_bars(symbol),
                     )
+            if history_fetch_targets:
+                self._parallel_symbol_map(
+                    list(history_fetch_targets),
+                    lambda symbol: self.data.fetch_history(
+                        symbol,
+                        lookback_minutes=history_fetch_targets[symbol],
+                    ),
+                    label="History fetch",
+                )
 
             if gate_state.context_refresh_active and getattr(self.config, "support_resistance", None) is not None and bool(self.config.support_resistance.enabled):
+                sr_tf = self.position_manager.active_sr_timeframe_minutes()
+                sr_refresh = self.position_manager.active_sr_refresh_seconds()
+                sr_lookback = self.position_manager.active_sr_lookback_days()
+                # Pre-normalize so the should_refresh check and the threaded
+                # fetch agree on cache keys (data_feed._symbol_key applies the
+                # same upper().strip()).
+                sr_fetch_targets: list[str] = []
                 for symbol in self.last_watchlist:
-                    if self.data.should_refresh_support_resistance(symbol, timeframe_minutes=self.position_manager.active_sr_timeframe_minutes(), refresh_seconds=self.position_manager.active_sr_refresh_seconds()):
-                        try:
-                            self.data.fetch_support_resistance(symbol, timeframe_minutes=self.position_manager.active_sr_timeframe_minutes(), lookback_days=self.position_manager.active_sr_lookback_days(), refresh_seconds=self.position_manager.active_sr_refresh_seconds())
-                        except Exception as exc:
-                            LOG.warning("Support/resistance refresh failed for %s: %s", symbol, exc)
+                    normalized = str(symbol or "").upper().strip()
+                    if not normalized:
+                        continue
+                    if self.data.should_refresh_support_resistance(
+                        normalized, timeframe_minutes=sr_tf, refresh_seconds=sr_refresh
+                    ):
+                        sr_fetch_targets.append(normalized)
+                if sr_fetch_targets:
+                    self._parallel_symbol_map(
+                        sr_fetch_targets,
+                        lambda symbol: self.data.fetch_support_resistance(
+                            symbol,
+                            timeframe_minutes=sr_tf,
+                            lookback_days=sr_lookback,
+                            refresh_seconds=sr_refresh,
+                        ),
+                        label="Support/resistance fetch",
+                    )
 
             if gate_state.streaming_active and self.last_watchlist:
                 self.data.start_streaming(self.last_watchlist)

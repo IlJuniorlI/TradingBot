@@ -7,6 +7,7 @@ import logging
 import re
 import math
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from threading import RLock
@@ -1089,6 +1090,41 @@ class MarketDataStore:
         batch_size = max(1, int(self.config.runtime.quote_batch_size))
         return [symbols[idx: idx + batch_size] for idx in range(0, len(symbols), batch_size)]
 
+    def _parallel_quote_fetch(self, symbols: list[str]) -> tuple[dict[str, dict], list[str]]:
+        """Run `_fetch_single_quote_with_aliases` across symbols in parallel.
+
+        Cache writes inside the worker are guarded by `self._lock`, so multiple
+        workers can refresh distinct symbols safely. Returns the per-symbol
+        normalized payloads on success, plus the list of symbols that raised.
+        """
+        fetched: dict[str, dict] = {}
+        failed: list[str] = []
+        if not symbols:
+            return fetched, failed
+        try:
+            configured = int(getattr(self.config.runtime, "cycle_precompute_workers", 4) or 4)
+        except Exception:
+            configured = 4
+        workers = min(max(1, configured), len(symbols))
+        if workers < 2:
+            for sym in symbols:
+                try:
+                    fetched[sym] = self._fetch_single_quote_with_aliases(sym)
+                except Exception as exc:
+                    LOG.warning("Quote fetch failed for %s: %s", sym, exc)
+                    failed.append(sym)
+            return fetched, failed
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bot-quote-fetch") as executor:
+            futures = {executor.submit(self._fetch_single_quote_with_aliases, sym): sym for sym in symbols}
+            for future in as_completed(futures):
+                sym = futures[future]
+                try:
+                    fetched[sym] = future.result()
+                except Exception as exc:
+                    LOG.warning("Quote fetch failed for %s: %s", sym, exc)
+                    failed.append(sym)
+        return fetched, failed
+
     @staticmethod
     def _quote_aliases(symbol: str) -> list[str]:
         sym = str(symbol).strip()
@@ -1315,28 +1351,9 @@ class MarketDataStore:
                     self.last_quote_refresh[symbol] = fetched_at
                 out[symbol] = normalized
                 batch_hits += 1
-            for symbol in chunk:
-                if symbol in fetched:
-                    continue
-                try:
-                    normalized = self._fetch_single_quote_with_aliases(symbol)
-                    fetched_at = now_et()
-                    normalized["fetched_at"] = fetched_at
-                    with self._lock:
-                        self.quote_cache[symbol] = normalized
-                        self.last_quote_refresh[symbol] = fetched_at
-                    out[symbol] = normalized
-                    fallback_hits += 1
-                except Exception as exc:
-                    failures += 1
-                    LOG.warning("Quote fetch failed for %s: %s", symbol, exc)
-                    cached = self.quote_cache.get(symbol)
-                    if cached is not None:
-                        out[symbol] = cached
-
-        for symbol in alias_pending:
-            try:
-                normalized = self._fetch_single_quote_with_aliases(symbol)
+            fallback_targets = [symbol for symbol in chunk if symbol not in fetched]
+            fallback_results, fallback_failed = self._parallel_quote_fetch(fallback_targets)
+            for symbol, normalized in fallback_results.items():
                 fetched_at = now_et()
                 normalized["fetched_at"] = fetched_at
                 with self._lock:
@@ -1344,12 +1361,26 @@ class MarketDataStore:
                     self.last_quote_refresh[symbol] = fetched_at
                 out[symbol] = normalized
                 fallback_hits += 1
-            except Exception as exc:
+            for symbol in fallback_failed:
                 failures += 1
-                LOG.warning("Quote fetch failed for %s: %s", symbol, exc)
                 cached = self.quote_cache.get(symbol)
                 if cached is not None:
                     out[symbol] = cached
+
+        alias_results, alias_failed = self._parallel_quote_fetch(alias_pending)
+        for symbol, normalized in alias_results.items():
+            fetched_at = now_et()
+            normalized["fetched_at"] = fetched_at
+            with self._lock:
+                self.quote_cache[symbol] = normalized
+                self.last_quote_refresh[symbol] = fetched_at
+            out[symbol] = normalized
+            fallback_hits += 1
+        for symbol in alias_failed:
+            failures += 1
+            cached = self.quote_cache.get(symbol)
+            if cached is not None:
+                out[symbol] = cached
 
         if requested:
             mode = "all_cached" if not pending and not failures and cached_hits == len(requested) else "refresh"
