@@ -56,6 +56,28 @@ def _manifest(name: str, class_stem: str, plugin_type: str) -> str:
                 "symbols": ["SPY", "QQQ"],
                 "min_bars": 40,
                 "min_rvol": 1.5,
+                # FVG entry-adjustment surface — declared explicitly so any
+                # later customization that calls _fvg_entry_adjustment_components
+                # (directly, or via _build_bullish_reversal_signal) reads
+                # documented manifest values instead of strategy_base hardcoded
+                # fallbacks. Defaults mirror BaseStrategy._fvg_entry_adjustment_components
+                # at strategy_base.py:2527-2539.
+                "htf_fvg_entry_weight": 0.55,
+                "one_minute_fvg_entry_weight": 0.35,
+                "opposing_fvg_entry_penalty_mult": 1.0,
+                "fvg_runner_rr_bonus": 0.12,
+                "same_direction_fvg_validated_bonus": 0.15,
+                "same_direction_fvg_active_bonus": 0.12,
+                "opposing_fvg_validated_penalty": 0.15,
+                "opposing_fvg_active_penalty": 0.12,
+                "invalidated_opposing_fvg_bonus": 0.10,
+                "same_direction_fvg_invalidated_penalty": 0.102,
+                # End-of-window force-flatten policy. Read by
+                # _configurable_stock_force_flatten (called from the
+                # scaffolded should_force_flatten override). Both directions
+                # default on so positions don't survive past the management
+                # window without explicit opt-out.
+                "force_flatten": {"long": True, "short": True},
             },
             "capabilities": {
                 "dashboard": {
@@ -86,6 +108,7 @@ def _manifest(name: str, class_stem: str, plugin_type: str) -> str:
 def _strategy_py(name: str, class_stem: str) -> str:
     return dedent(
         f'''
+        # SPDX-License-Identifier: MIT
         from ..shared import Candidate, Position, Signal, Side, pd
         from ..strategy_base import BaseStrategy
 
@@ -181,6 +204,7 @@ def _strategy_py(name: str, class_stem: str) -> str:
 def _screener_py(name: str, class_stem: str) -> str:
     return dedent(
         f'''
+        # SPDX-License-Identifier: MIT
         from ..shared import Candidate, Side
         from ..screener_base import BaseStrategyScreener
 
@@ -260,7 +284,9 @@ def scaffold_plugin(name: str, class_stem: str | None, plugin_type: str, *, forc
         raise FileExistsError(f"{target} already exists; pass --force to overwrite")
     target.mkdir(parents=True, exist_ok=True)
     files = {
-        "__init__.py": "",
+        # SPDX header + docstring matches the convention used by all 14
+        # existing strategies' __init__.py files. Don't emit empty files.
+        "__init__.py": '# SPDX-License-Identifier: MIT\n"""Strategy plugin package."""\n',
         "manifest.json": _manifest(plugin_name, class_name, plugin_type),
         "strategy.py": _strategy_py(plugin_name, class_name),
         "screener.py": _screener_py(plugin_name, class_name),
