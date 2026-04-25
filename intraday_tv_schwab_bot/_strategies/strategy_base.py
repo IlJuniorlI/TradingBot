@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Iterable, cast
+from threading import RLock
+from typing import TYPE_CHECKING, ClassVar, Iterable, cast
 
 from .rvol import effective_relative_volume, relative_volume_gate_threshold
 from .shared import (
@@ -49,6 +50,21 @@ class BaseStrategy:
     # "adaptive_ladder" and this flag is False, the engine logs a one-time
     # warning at startup so the user knows ladder mechanics are inactive.
     supports_adaptive_ladder: bool = True
+
+    # Auto-detected set of context-builder calls the strategy has made over
+    # its lifetime. Each entry is a tuple `(name, *args)` — e.g. `("chart",)`,
+    # `("structure", "1m")`, `("technical",)`. Populated lazily on first
+    # invocation of each builder. The engine reads this set every cycle
+    # (after _prime_cycle_support_cache) to drive _prime_cycle_context_cache,
+    # which pre-warms the observed contexts in parallel via
+    # _parallel_symbol_map. Cycle 1 is lazy (set is empty); cycles 2+ benefit.
+    # __init_subclass__ gives each subclass its own set so different strategy
+    # classes don't cross-contaminate.
+    _observed_contexts: ClassVar[set[tuple]] = set()
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        cls._observed_contexts = set()
 
     @classmethod
     def normalize_params(cls, params: dict[str, Any]) -> dict[str, Any]:
@@ -127,6 +143,14 @@ class BaseStrategy:
         self._technical_context_cache: dict[tuple[Any, ...], Any] = {}
         self._structure_context_cache: dict[tuple[Any, ...], Any] = {}
         self._chart_context_cache: dict[tuple[Any, ...], Any] = {}
+        # Locks protect the 3 context dicts when the engine pre-warms them
+        # in parallel via _parallel_symbol_map. Different worker threads
+        # write distinct cache_keys, but the dict mutations themselves still
+        # need protection. Compute happens outside the locks, so threads
+        # never wait on each other for the heavy work.
+        self._chart_context_lock = RLock()
+        self._structure_context_lock = RLock()
+        self._technical_context_lock = RLock()
 
     def strategy_logic_default(self, section: str, key: str, default: Any) -> Any:
         return default
@@ -721,12 +745,54 @@ class BaseStrategy:
         return all(conditions) if conditions else True
 
     def _reset_entry_decisions(self) -> None:
+        # Per-cycle decision tracking. Called at the start of every strategy's
+        # entry_signals(). Does NOT touch the chart/structure/technical context
+        # caches anymore — those are pre-warmed by the engine before
+        # entry_signals runs and would be wiped here. The engine resets them
+        # via reset_context_caches() inside _prime_cycle_context_cache, on
+        # the cycle boundary instead of the entry_signals boundary.
         self._entry_decisions = {}
         self._build_failures = {}
         self._candle_context_cache = {}
-        self._technical_context_cache = {}
-        self._structure_context_cache = {}
-        self._chart_context_cache = {}
+
+    def reset_context_caches(self) -> None:
+        """Cycle-boundary cache cleanup for the three pre-warmed context caches.
+
+        Public API for the engine. Called inside `_prime_cycle_context_cache`
+        before the parallel dispatch populates caches for the new cycle's
+        frames. Without this reset the caches would grow unboundedly across
+        the session (one entry per (symbol, timeframe) per cycle). Frame-id
+        cache keys would never falsely collide, but memory would.
+        """
+        with self._chart_context_lock:
+            self._chart_context_cache = {}
+        with self._structure_context_lock:
+            self._structure_context_cache = {}
+        with self._technical_context_lock:
+            self._technical_context_cache = {}
+
+    def prime_cycle_contexts(self, frame: pd.DataFrame, observed: Iterable[tuple]) -> None:
+        """Pre-warm the strategy's context caches for one symbol's frame.
+
+        Public API for the engine. Replays each entry in `observed` against
+        the per-symbol frame, hitting the appropriate internal builder
+        (`_chart_context`, `_structure_context`, `_technical_context`).
+        Each builder is self-caching under its own RLock, so this is safe
+        to call from worker threads in parallel across watchlist symbols.
+        """
+        if frame is None or frame.empty:
+            return
+        for entry in observed:
+            if not entry:
+                continue
+            name = entry[0]
+            if name == "chart":
+                self._chart_context(frame)
+            elif name == "structure":
+                timeframe = entry[1] if len(entry) > 1 else "1m"
+                self._structure_context(frame, timeframe)
+            elif name == "technical":
+                self._technical_context(frame)
 
     def _entry_side_context(self, preferred_sides: list[Side]) -> tuple[list[Side], list[str]]:
         allow_short = bool(self.config.risk.allow_short)
@@ -829,13 +895,18 @@ class BaseStrategy:
     def _chart_context(self, frame: pd.DataFrame):
         # Per-cycle cache keyed like _technical_context — id(frame) separates
         # symbols; length+last-bar markers guard against id-reuse after GC.
+        # Records the call signature in _observed_contexts so the engine can
+        # pre-warm this context in parallel for next cycle's watchlist.
+        type(self)._observed_contexts.add(("chart",))
         cache_key = self._technical_context_cache_key(frame)
-        cached = self._chart_context_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        with self._chart_context_lock:
+            cached = self._chart_context_cache.get(cache_key)
+            if cached is not None:
+                return cached
         if not bool(self._chart_pattern_setting("enabled", True)):
             ctx = analyze_chart_pattern_context(frame, bullish_allowed=[], bearish_allowed=[], lookback_bars=0)
-            self._chart_context_cache[cache_key] = ctx
+            with self._chart_context_lock:
+                self._chart_context_cache[cache_key] = ctx
             return ctx
         cfg = getattr(self.config, "chart_patterns", None)
         bullish_allowed = list(getattr(cfg, "bullish_patterns", []))
@@ -847,7 +918,8 @@ class BaseStrategy:
             bearish_allowed=bearish_allowed,
             lookback_bars=lookback_bars,
         )
-        self._chart_context_cache[cache_key] = ctx
+        with self._chart_context_lock:
+            self._chart_context_cache[cache_key] = ctx
         return ctx
 
     @staticmethod
@@ -1650,17 +1722,23 @@ class BaseStrategy:
     def _structure_context(self, frame: pd.DataFrame | None, timeframe: str = "1m"):
         # Per-cycle cache. Timeframe goes in the key because the pivot_span /
         # pct_tolerance branches below differ by timeframe token.
+        # Records (name, timeframe) so the engine pre-warms the right
+        # variant — peer_confirmed strategies use "ltf" while most others
+        # use "1m"; both can co-exist in a single observed set.
+        timeframe_token = str(timeframe).lower()
+        type(self)._observed_contexts.add(("structure", timeframe_token))
         frame_key = self._technical_context_cache_key(frame)
-        cache_key = (frame_key, str(timeframe).lower())
-        cached = self._structure_context_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        cache_key = (frame_key, timeframe_token)
+        with self._structure_context_lock:
+            cached = self._structure_context_cache.get(cache_key)
+            if cached is not None:
+                return cached
         current_price = self._safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
         if frame is None or frame.empty or not bool(self._support_resistance_setting("structure_enabled", True)):
             empty_ctx = empty_market_structure_context(current_price)
-            self._structure_context_cache[cache_key] = empty_ctx
+            with self._structure_context_lock:
+                self._structure_context_cache[cache_key] = empty_ctx
             return empty_ctx
-        timeframe_token = str(timeframe).lower()
         pivot_span = int(self._support_resistance_setting("pivot_span", 2) or 2)
         if timeframe_token in {"1m", "1min", "minute", "execution"}:
             pivot_span = int(self._support_resistance_setting("structure_1m_pivot_span", max(2, pivot_span)) or max(2, pivot_span))
@@ -1678,7 +1756,8 @@ class BaseStrategy:
             breakout_buffer_pct=float(self._support_resistance_setting("breakout_buffer_pct", 0.0015) or 0.0015),
             structure_event_max_age_bars=structure_event_max_age_bars,
         )
-        self._structure_context_cache[cache_key] = ctx
+        with self._structure_context_lock:
+            self._structure_context_cache[cache_key] = ctx
         return ctx
 
     @staticmethod
@@ -1724,16 +1803,19 @@ class BaseStrategy:
         return id(frame), len(frame), last_marker
 
     def _technical_context(self, frame: pd.DataFrame | None) -> TechnicalLevelsContext:
+        type(self)._observed_contexts.add(("technical",))
         cache_key = self._technical_context_cache_key(frame)
-        cached = self._technical_context_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        with self._technical_context_lock:
+            cached = self._technical_context_cache.get(cache_key)
+            if cached is not None:
+                return cached
         current_price = self._safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
         cfg = getattr(self.config, "technical_levels", None)
         sr_cfg = getattr(self.config, "support_resistance", None)
         if frame is None or frame.empty or not bool(self._technical_level_setting("enabled", True)):
             empty_ctx = empty_technical_levels_context(current_price)
-            self._technical_context_cache[cache_key] = empty_ctx
+            with self._technical_context_lock:
+                self._technical_context_cache[cache_key] = empty_ctx
             return empty_ctx
         pivot_span = int(self._support_resistance_setting("structure_1m_pivot_span", self._support_resistance_setting("pivot_span", 2)) or 2) if sr_cfg is not None else 2
         ctx = build_technical_levels_context(
@@ -1774,7 +1856,8 @@ class BaseStrategy:
             divergence_enabled=bool(self._technical_level_setting("divergence_enabled", True)),
             bollinger_enabled=bool(self._technical_level_setting("bollinger_enabled", True)),
         )
-        self._technical_context_cache[cache_key] = ctx
+        with self._technical_context_lock:
+            self._technical_context_cache[cache_key] = ctx
         return ctx
 
     def _technical_lists(self, ctx, prefix: str = "tech") -> dict[str, Any]:

@@ -385,7 +385,26 @@ class IntradayBot:
                     interval=45.0,
                 )
             watchlist = self.strategy.active_watchlist(self.last_candidates, self.positions)
-            self.last_watchlist = [] if gate_state.idle_closed_market else sorted(watchlist)
+            # Normalize symbols to upper().strip() at the source so every
+            # downstream consumer (parallel maps, bars.setdefault fallback,
+            # warmup tracker, API state) sees the same canonical form.
+            # Without this, a non-uppercase symbol from a strategy could
+            # produce two bars dict entries — one keyed uppercase from
+            # _parallel_symbol_map, one keyed original-case from
+            # bars.setdefault — with different frame ids and so different
+            # context-cache keys, causing pre-warm hits to miss in
+            # entry_signals' per-candidate loop.
+            if gate_state.idle_closed_market:
+                self.last_watchlist = []
+            else:
+                normalized: list[str] = []
+                seen: set[str] = set()
+                for sym in watchlist:
+                    key = str(sym or "").upper().strip()
+                    if key and key not in seen:
+                        seen.add(key)
+                        normalized.append(key)
+                self.last_watchlist = sorted(normalized)
             if gate_state.idle_closed_market:
                 self.audit.log_cycle(
                     f"watchlist_idle:{self.config.strategy}",
@@ -408,8 +427,8 @@ class IntradayBot:
             # dict lookup is guaranteed to match the symbol it receives.
             history_fetch_targets: dict[str, int] = {}
             for symbol in self.last_watchlist:
-                normalized = str(symbol or "").upper().strip()
-                if not normalized:
+                symbol_key = str(symbol or "").upper().strip()
+                if not symbol_key:
                     continue
                 should_fetch, required_bars = self.warmup_tracker.should_fetch_symbol_history(
                     symbol,
@@ -417,7 +436,7 @@ class IntradayBot:
                     streaming_active=gate_state.streaming_active,
                 )
                 if should_fetch:
-                    history_fetch_targets[normalized] = self.warmup_tracker.history_fetch_lookback_minutes(
+                    history_fetch_targets[symbol_key] = self.warmup_tracker.history_fetch_lookback_minutes(
                         now,
                         streaming_active=gate_state.streaming_active,
                         required_bars=self.warmup_tracker.desired_history_bars(symbol),
@@ -441,13 +460,13 @@ class IntradayBot:
                 # same upper().strip()).
                 sr_fetch_targets: list[str] = []
                 for symbol in self.last_watchlist:
-                    normalized = str(symbol or "").upper().strip()
-                    if not normalized:
+                    symbol_key = str(symbol or "").upper().strip()
+                    if not symbol_key:
                         continue
                     if self.data.should_refresh_support_resistance(
-                        normalized, timeframe_minutes=sr_tf, refresh_seconds=sr_refresh
+                        symbol_key, timeframe_minutes=sr_tf, refresh_seconds=sr_refresh
                     ):
-                        sr_fetch_targets.append(normalized)
+                        sr_fetch_targets.append(symbol_key)
                 if sr_fetch_targets:
                     self._parallel_symbol_map(
                         sr_fetch_targets,
@@ -473,6 +492,7 @@ class IntradayBot:
             for symbol in self.last_watchlist:
                 bars.setdefault(symbol, self.data.get_merged(symbol, with_indicators=True))
             self._prime_cycle_support_cache(bars, allow_refresh=False)
+            self._prime_cycle_context_cache(bars)
             warmup_summary = self.warmup_tracker.warmup_summary(self.last_watchlist, bars=bars)
             self.warmup_tracker.log_warmup_summary(warmup_summary)
 
@@ -639,6 +659,59 @@ class IntradayBot:
             )
 
         self._parallel_symbol_map(symbols, _compute, label="Support/resistance precompute")
+
+    def _prime_cycle_context_cache(self, bars: dict[str, pd.DataFrame]) -> None:
+        """Pre-warm strategy chart/structure/technical caches in parallel.
+
+        Strategies populate three per-symbol context caches lazily inside
+        their per-candidate entry_signals loop. Each context build does
+        non-trivial GIL-releasing work — TA-Lib chart-pattern detection,
+        pivot/ATR market-structure analysis, and the
+        Fibonacci/trendline/channel/Bollinger technical-levels stack —
+        and the per-candidate frame is a fresh `.copy()` from
+        get_merged() so different candidates always cache-miss. Running
+        the builders in parallel across the watchlist before
+        entry_signals starts amortizes that work across cycle_precompute
+        workers instead of paying it serially in the entry-window
+        critical path.
+
+        Auto-detect: each context builder records its call signature in
+        `BaseStrategy._observed_contexts` (a class-level set of tuples like
+        `("structure", "1m")`). On cycle 1 the set is empty and this method
+        is a no-op — the strategy runs lazy. From cycle 2 onward, only the
+        contexts the strategy actually invokes are pre-warmed, in parallel
+        across the watchlist via `_parallel_symbol_map`. New code paths
+        that hit a previously-unseen context register on first invocation
+        and join the pre-warm set thereafter (self-healing).
+
+        Cache writes inside each builder are guarded by per-cache RLocks,
+        so distinct workers writing distinct keys don't race.
+        """
+        # Snapshot the observed set so workers iterating it can't trip on
+        # a concurrent mutation if a builder happens to record a previously-
+        # unseen tuple mid-cycle. In practice, pre-warm only replays known
+        # entries (idempotent set.add → no size change), but a frozenset
+        # eliminates any race-window doubt for the cost of one shallow copy.
+        observed = frozenset(getattr(type(self.strategy), "_observed_contexts", ()))
+        if not observed:
+            return
+        symbols = [symbol for symbol, frame in bars.items() if frame is not None and not frame.empty]
+        if not symbols:
+            return
+        # Cycle-boundary reset — owned by the engine now, NOT by entry_signals.
+        # Strategies still call _reset_entry_decisions() at the top of
+        # entry_signals(), but that method no longer touches the 3 context
+        # caches the engine just (or is about to) pre-warm.
+        self.strategy.reset_context_caches()
+
+        def _warm(symbol: str) -> Any:
+            frame = bars.get(symbol)
+            if frame is None or frame.empty:
+                return None
+            self.strategy.prime_cycle_contexts(frame, observed)
+            return None
+
+        self._parallel_symbol_map(symbols, _warm, label="Strategy context precompute")
 
     def _publish_state(self, now: datetime, screening_active: bool, streaming_active: bool, management_active: bool, message: str, context_refresh_active: bool = False, gate_state: CycleGateState | None = None, warmup_summary: dict[str, Any] | None = None) -> None:
         performance = self.account.snapshot_copy(self.positions)
