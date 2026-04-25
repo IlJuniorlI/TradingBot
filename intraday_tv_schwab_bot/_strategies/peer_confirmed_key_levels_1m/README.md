@@ -38,5 +38,8 @@ unchanged.
 - Trigger quality bonus: enabled, capped at `+2.0` total
 - Minimum R:R: `1.6`
 - Minimum peer agreement: `2`
+- `level_score_raw_htf_weight: 0.65` (clamped to a 0.60 floor — same as base)
+
+For the full parameter table — adaptive trade management knobs, FVG weights, force-flatten defaults, etc. — see [`../peer_confirmed_key_levels/README.md`](../peer_confirmed_key_levels/README.md). Anything not listed under "What changes vs the base strategy" inherits the base default.
 
 Use `configs/config.peer_confirmed_key_levels_1m.yaml` for the shipped full runtime preset.

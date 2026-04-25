@@ -7,17 +7,53 @@
   "screener_module": "intraday_tv_schwab_bot._strategies.top_tier_adaptive.screener",
   "screener_class": "TopTierAdaptiveScreener",
   "entry_windows": [
-    ["09:35", "15:00"]
+    [
+      "09:35",
+      "15:00"
+    ]
   ],
   "management_windows": [
-    ["09:30", "15:55"]
+    [
+      "09:30",
+      "15:55"
+    ]
   ],
   "screener_windows": [
-    ["09:30", "15:00"]
+    [
+      "09:30",
+      "15:00"
+    ]
   ],
   "params": {
-    "tradable": ["AAPL", "MSFT", "NVDA", "INTC", "AMD", "AVGO", "TSM", "CRM", "AMZN", "TSLA", "HD", "LOW", "UBER", "COST", "GOOG", "META", "NFLX", "RBLX", "TMUS", "JPM", "GS", "V", "LLY"],
-    "index_symbols": ["SPY", "QQQ"],
+    "tradable": [
+      "AAPL",
+      "MSFT",
+      "NVDA",
+      "INTC",
+      "AMD",
+      "AVGO",
+      "TSM",
+      "CRM",
+      "AMZN",
+      "TSLA",
+      "HD",
+      "LOW",
+      "UBER",
+      "COST",
+      "GOOG",
+      "META",
+      "NFLX",
+      "RBLX",
+      "TMUS",
+      "JPM",
+      "GS",
+      "V",
+      "LLY"
+    ],
+    "index_symbols": [
+      "SPY",
+      "QQQ"
+    ],
     "min_bars": 90,
     "trigger_timeframe_minutes": 5,
     "htf_timeframe_minutes": 15,
@@ -29,9 +65,9 @@
     "min_score_gap": 1.2,
     "min_adx14": 15.0,
     "pullback_ema_touch_atr_mult": 0.35,
-    "pullback_hold_atr_mult": 0.40,
+    "pullback_hold_atr_mult": 0.4,
     "pullback_lookback_bars": 5,
-    "range_max_vwap_dist_pct": 0.0020,
+    "range_max_vwap_dist_pct": 0.002,
     "range_max_ema_gap_pct": 0.0008,
     "range_min_flip_count": 3,
     "range_lookback_bars": 20,
@@ -48,7 +84,7 @@
     "respect_screener_bias": true,
     "orb_bypass_screener_bias": true,
     "reject_stretched_entries": true,
-    "stretched_percent_b_max": 0.80,
+    "stretched_percent_b_max": 0.8,
     "stretched_atr_mult_max": 1.1,
     "orb_bypass_stretched_filter": false,
     "reject_tech_bias_contradiction": true,
@@ -69,30 +105,65 @@
     "afternoon_start_time": "13:00",
     "no_new_entries_after": "15:00",
     "entry_exhaustion_filter_enabled": true,
-    "max_entry_vwap_extension_atr": 1.50,
-    "max_entry_ema9_extension_atr": 1.20,
-    "max_entry_bar_range_atr": 1.80,
-    "max_entry_upper_wick_frac": 0.30,
-    "max_entry_lower_wick_frac": 0.30,
-    "htf_fvg_entry_weight": 0.30,
+    "max_entry_vwap_extension_atr": 1.5,
+    "max_entry_ema9_extension_atr": 1.2,
+    "max_entry_bar_range_atr": 1.8,
+    "max_entry_upper_wick_frac": 0.3,
+    "max_entry_lower_wick_frac": 0.3,
+    "htf_fvg_entry_weight": 0.3,
     "one_minute_fvg_entry_weight": 0.18,
     "opposing_fvg_entry_penalty_mult": 1.0,
     "fvg_runner_rr_bonus": 0.15,
-    "adaptive_breakeven_rr": 1.00,
+    "same_direction_fvg_validated_bonus": 0.15,
+    "same_direction_fvg_active_bonus": 0.12,
+    "opposing_fvg_validated_penalty": 0.15,
+    "opposing_fvg_active_penalty": 0.12,
+    "invalidated_opposing_fvg_bonus": 0.1,
+    "same_direction_fvg_invalidated_penalty": 0.102,
+    "adaptive_breakeven_rr": 1.0,
     "adaptive_partial_breakeven_rr": 0.5,
     "adaptive_partial_breakeven_offset_r": 0.0,
-    "adaptive_profit_lock_rr": 1.30,
+    "adaptive_profit_lock_rr": 1.3,
     "adaptive_profit_lock_stop_rr": 0.35,
     "adaptive_runner_trigger_rr": 1.15,
     "sector_groups": {
-      "tech": ["AAPL", "MSFT", "NVDA", "INTC", "AMD", "AVGO", "TSM", "CRM"],
-      "consumer_discretionary": ["AMZN", "TSLA", "HD", "LOW", "UBER"],
-      "communication": ["GOOG", "META", "NFLX", "RBLX", "TMUS"],
-      "financials": ["JPM", "GS", "V"],
-      "healthcare": ["LLY"],
+      "tech": [
+        "AAPL",
+        "MSFT",
+        "NVDA",
+        "INTC",
+        "AMD",
+        "AVGO",
+        "TSM",
+        "CRM"
+      ],
+      "consumer_discretionary": [
+        "AMZN",
+        "TSLA",
+        "HD",
+        "LOW",
+        "UBER"
+      ],
+      "communication": [
+        "GOOG",
+        "META",
+        "NFLX",
+        "RBLX",
+        "TMUS"
+      ],
+      "financials": [
+        "JPM",
+        "GS",
+        "V"
+      ],
+      "healthcare": [
+        "LLY"
+      ],
       "industrials": [],
       "energy": [],
-      "consumer_staples": ["COST"],
+      "consumer_staples": [
+        "COST"
+      ],
       "materials": [],
       "real_estate": [],
       "utilities": []

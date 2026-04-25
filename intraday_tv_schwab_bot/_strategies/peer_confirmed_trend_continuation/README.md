@@ -181,7 +181,10 @@ Current package defaults:
 | `macro_miss_penalty`              | `0.3`                                     |
 | `extension_penalty_per_atr`       | `0.72`                                    |
 | `extension_hard_cap_mult`         | `1.45`                                    |
-| `force_flatten`                   | `{'long': False, 'short': False}`         |
+| `force_flatten`                   | `{'long': True, 'short': True}`           |
+
+`force_flatten` is the default end-of-window flatten policy — both directions auto-flatten when the management window closes.
+
 ## Files in this folder
 
 - `manifest.json` defines the plugin registration metadata.

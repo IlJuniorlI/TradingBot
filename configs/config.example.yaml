@@ -97,6 +97,11 @@ runtime:
   # Auto-exit: shut down cleanly when market closes and no positions are open
   auto_exit_after_session: true
   cycle_precompute_workers: 4
+  # Per-day debug archive: on session shutdown, write
+  # {log_dir}/sessions/{YYYY-MM-DD}/ with bars/{SYMBOL}.csv (RTH+indicators),
+  # trades.csv for the day, and manifest.json. Disable to save disk if not
+  # using dashboard/post-session analysis tooling.
+  export_session_archive: true
   reconcile_on_startup: true
   startup_reconcile_mode: block
   startup_order_lookback_days: 2
@@ -430,6 +435,41 @@ options:
   event_blackouts: []
   option_chain_cache_seconds: 6
   option_chain_cache_max_entries: 24
+  # Premium ratchet — post-entry stop tightening for option positions.
+  # Disabled by default; enable per-strategy when you want protective
+  # ratchets active. Marks/stops are multiples of entry premium.
+  options_breakeven_enabled: false
+  options_breakeven_mark_mult: 1.25
+  options_breakeven_stop_mult: 1.05
+  options_profit_lock_enabled: false
+  options_profit_lock_mark_mult: 1.40
+  options_profit_lock_stop_mult: 1.15
+  # Time-decay-aware target/stop scaling — narrow targets and widen stops
+  # as theta accelerates. Window times are HH:MM in runtime.timezone.
+  debit_target_time_decay_enabled: false
+  debit_target_time_decay_start: "10:30"
+  debit_target_time_decay_end: "14:00"
+  debit_target_time_decay_min_scale: 0.70
+  debit_stop_time_decay_widen_factor: 0.30
+  # Time-aware delta — shift deeper ITM as the session progresses to
+  # offset theta on long-leg fills.
+  delta_time_shift_enabled: false
+  delta_time_shift_per_hour: 0.025
+  delta_time_shift_max: 0.15
+  delta_time_shift_start: "10:00"
+  # Trend momentum filter — require ATR expansion + volume confirmation
+  # before trend-style option entries fire.
+  trend_momentum_filter_enabled: false
+  trend_min_atr_expansion: 0.85
+  trend_min_volume_ratio: 0.90
+  # Credit distance gate — reject credit spreads when the short strike
+  # sits closer than min_credit_distance_atr * ATR to the underlying.
+  credit_distance_gate_enabled: false
+  min_credit_distance_atr: 1.8
+  # Adaptive strike width — scale strike_width_by_symbol with VIX up to
+  # adaptive_width_max_scale.
+  adaptive_width_enabled: false
+  adaptive_width_max_scale: 1.5
 
 # Strategy-specific windows and tuned parameters.
 strategies:

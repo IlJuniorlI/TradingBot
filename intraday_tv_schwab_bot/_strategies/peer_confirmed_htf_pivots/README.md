@@ -145,9 +145,14 @@ Strategy-specific knobs:
   - `strong_setup_runner_enabled`, `adaptive_breakeven_rr`, `adaptive_profit_lock_rr`, `adaptive_profit_lock_stop_rr`, `adaptive_runner_trigger_rr`
 - Screener shaping:
   - `screener_contrarian_bias_threshold_pct`, `screener_activity_move_sweet_spot_pct`, `screener_activity_move_cap_pct`, `screener_relative_volume_cap`
-- Context overlays:
-  - `htf_fvg_entry_weight`, `one_minute_fvg_entry_weight`, `opposing_fvg_entry_penalty_mult`, `fvg_runner_rr_bonus`
-  - `same_direction_fvg_invalidated_penalty` — penalty applied when a same-direction FVG has been filled/invalidated. Defaults to `opposing_fvg_active_penalty * 0.85` when omitted. Lower values are more tolerant of filled continuation gaps. See `configs/config.example.yaml` for the exposed default (`0.102`).
+- Context overlays — fair-value-gap (FVG) entry adjustment knobs (read by `strategy_base._fvg_entry_adjustment_components`, gated by `shared_entry.use_fvg_context`). All shipped per-strategy in this strategy's `manifest.json`:
+  - `htf_fvg_entry_weight`, `one_minute_fvg_entry_weight` — multipliers applied to the HTF and 1-minute FVG bull/bear scores when computing the entry adjustment.
+  - `opposing_fvg_entry_penalty_mult` — multiplier on the opposing-direction FVG penalty (1.0 = full penalty; lower = more tolerant of trades against an active gap).
+  - `fvg_runner_rr_bonus` — extra R:R credit when the trade direction aligns with a same-direction continuation FVG.
+  - `same_direction_fvg_validated_bonus`, `same_direction_fvg_active_bonus` — entry-score bonuses when a same-direction gap has been validated (price interacted) or is still active (untouched).
+  - `opposing_fvg_validated_penalty`, `opposing_fvg_active_penalty` — entry-score penalties when an opposing-direction gap has been validated or is still active.
+  - `invalidated_opposing_fvg_bonus` — bonus when the opposing-direction gap has been filled (cleared the bias).
+  - `same_direction_fvg_invalidated_penalty` — penalty when the same-direction gap has been filled. Manifest default `0.102`, which equals the historical `opposing_fvg_active_penalty * 0.85` derivation; tune independently per strategy.
 
 Also uses these shared stock groups:
 

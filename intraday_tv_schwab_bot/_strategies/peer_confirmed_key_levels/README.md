@@ -180,7 +180,11 @@ Current package defaults:
 | `adaptive_profit_lock_rr`            | `1.25`                                    |
 | `adaptive_profit_lock_stop_rr`       | `0.32`                                    |
 | `adaptive_runner_trigger_rr`         | `1.12`                                    |
-| `force_flatten`                      | `{'long': False, 'short': False}`         |
+| `level_score_raw_htf_weight`         | `0.65`                                    |
+| `force_flatten`                      | `{'long': True, 'short': True}`           |
+
+`level_score_raw_htf_weight` (clamped to a 0.60 floor in code) controls how much the raw HTF S/R level strength contributes to the level-quality score. Lower values blend more peer-confirmation context into the score; higher values let HTF magnitude dominate. `force_flatten` is the default end-of-window flatten policy — both directions auto-flatten when the management window closes.
+
 ## Files in this folder
 
 - `manifest.json` defines the plugin registration metadata.

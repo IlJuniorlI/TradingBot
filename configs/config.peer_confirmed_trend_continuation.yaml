@@ -43,6 +43,24 @@ risk:
   allow_short: true
   cooldown_minutes: 2
   reentry_policy: cooldown
+  # Direction-aware cooldown: a LONG exit only blocks same-direction
+  # re-entries; SHORTs remain available to capture genuine reversals.
+  cooldown_direction_aware: true
+  # Same-level retry block: after a losing exit, same-direction re-entry
+  # on the same symbol is blocked within same_level_block_atr_mult * ATR
+  # of the prior fill for same_level_block_minutes minutes. A fib-pullback
+  # entry (retrace to 0.5-0.786 of the swing) overrides the block.
+  same_level_block_minutes: 30
+  same_level_block_atr_mult: 0.3
+  # Time-stop: positions held >= time_stop_minutes with |return_pct| below
+  # time_stop_min_return_pct are scratched to free a slot. 0 = disabled.
+  time_stop_minutes: 45
+  time_stop_min_return_pct: 0.003
+  # Peak-giveback floor: once max_favorable_r since entry crosses
+  # peak_giveback_min_r (default 1.0), exit when current_r retraces below
+  # a tiered fraction of the peak — 50% at 1R-2R, 40% at 2R-3R, 30% at 3R+.
+  peak_giveback_enabled: true
+  peak_giveback_min_r: 1.0
 
 # Runtime cadence, streaming, reconciliation, and logging controls.
 runtime:
@@ -75,6 +93,11 @@ runtime:
   # Auto-exit: shut down cleanly when market closes and no positions are open
   auto_exit_after_session: true
   cycle_precompute_workers: 4
+  # Per-day debug archive: on session shutdown, write
+  # {log_dir}/sessions/{YYYY-MM-DD}/ with bars/{SYMBOL}.csv (RTH+indicators),
+  # trades.csv for the day, and manifest.json. Disable to save disk if not
+  # using dashboard/post-session analysis tooling.
+  export_session_archive: true
   reconcile_on_startup: true
   startup_reconcile_mode: ignore
   startup_order_lookback_days: 2

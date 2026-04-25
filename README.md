@@ -218,6 +218,13 @@ This block controls shared position sizing, daily guardrails, re-entry behavior,
 | `allow_short`                     | `false`           |
 | `cooldown_minutes`                | `20`              |
 | `reentry_policy`                  | `cooldown`        |
+| `cooldown_direction_aware`        | `true`            |
+| `same_level_block_minutes`        | `30`              |
+| `same_level_block_atr_mult`       | `0.3`             |
+| `time_stop_minutes`               | `45`              |
+| `time_stop_min_return_pct`        | `0.003`           |
+| `peak_giveback_enabled`           | `true`            |
+| `peak_giveback_min_r`             | `1.0`             |
 
 Behavior and valid values:
 
@@ -239,6 +246,13 @@ Behavior and valid values:
   - `cooldown`: block re-entry for `cooldown_minutes` after exit.
   - `immediate`: allow same-symbol re-entry immediately.
   - `rest_of_day`: block re-entry until the next trading day.
+- `cooldown_direction_aware`: when `true` (the recommended default), the cooldown is keyed by `(symbol, side)` — a LONG exit on `NVDA` only blocks LONG re-entries on `NVDA`; a SHORT can still fire immediately if a genuine bearish setup develops. When `false`, the cooldown blocks both directions on the symbol for the full `cooldown_minutes` window. Has no effect under `reentry_policy: immediate` or `rest_of_day`.
+- `same_level_block_minutes`: after a stop-out, block **same-direction** re-entry on the same symbol for this many minutes. Targets the breakout-chase pattern where the bot enters → stops → re-enters at the same level → stops again. Set to `0` to disable. Independent of `cooldown_minutes`; both blocks apply.
+- `same_level_block_atr_mult`: the same-level block only fires when the new entry sits within `same_level_block_atr_mult × ATR` of the prior stop price. Lower values block a tighter price band around the prior stop; higher values widen it. Fib-pullback entries (where the new entry sits in the [0.5, 0.786] retracement zone of a tagged anchor) override the block.
+- `time_stop_minutes`: scratch-exit a trade held this long with `|return_pct| < time_stop_min_return_pct`. Targets dead-capital trades that aren't moving. Set to `0` to disable.
+- `time_stop_min_return_pct`: the absolute return threshold under which the time-stop fires (e.g. `0.003` = 0.3%). Trades outside this band aren't time-stopped regardless of duration.
+- `peak_giveback_enabled`: when `true`, fires `peak_giveback:peakXR_floorYR` once `max_favorable_r` crosses `peak_giveback_min_r` and `current_r` retraces past a tiered floor (50% at 1R peak, 40% at 2R, 30% at 3R+). Complements the protective-BE logic at +0.5R: BE catches 0.5–1R winners, peak-giveback catches 1R+ runners that give back too much.
+- `peak_giveback_min_r`: minimum peak R-multiple before the peak-giveback floor activates. Set to `0` together with `peak_giveback_enabled: false` to disable entirely.
 
 ### `runtime`
 
@@ -269,6 +283,8 @@ This block controls loop timing, quote/history refresh cadence, stream fallback 
 | `startup_reconcile_ignore_symbols`   | `[]`                                      |
 | `startup_reconcile_metadata_db_path` | `.logs/startup_reconcile_metadata.sqlite` |
 | `auto_exit_after_session`            | `false`                                   |
+| `cycle_precompute_workers`           | `4`                                       |
+| `export_session_archive`             | `true`                                    |
 
 Behavior and valid values:
 
@@ -303,6 +319,8 @@ Behavior and valid values:
 - `startup_reconcile_ignore_symbols`: symbol list ignored during startup reconcile. Ignored open symbols are still blocked from new entries.
 - `startup_reconcile_metadata_db_path`: SQLite metadata path used by hybrid restore.
 - `auto_exit_after_session`: when `true`, the bot shuts down cleanly after the trading session ends and all positions are closed. Exits after the latest of RTH close and any configured strategy window end. On non-trading days (weekends/holidays), exits immediately. Designed for use with Windows Task Scheduler or cron to start the bot daily.
+- `cycle_precompute_workers`: thread-pool size used to precompute per-symbol indicator/structure context in parallel each engine cycle. Higher values reduce per-cycle latency on wide watchlists at the cost of CPU; lower values trade latency for less contention.
+- `export_session_archive`: when `true`, on session shutdown the engine writes a per-day archive to `{log_dir}/sessions/{YYYY-MM-DD}/` containing `bars/{SYMBOL}.csv` for every active watchlist symbol (RTH only, with indicators), `trades.csv` filtered to the day, and `manifest.json` with strategy + summary stats. Useful for trade audits and post-session analysis. Disable to save disk space if running without dashboard/analysis needs.
 
 ### Session report
 
@@ -776,49 +794,71 @@ Behavior:
 
 Shared 0DTE ETF option-engine settings. Both option strategies use this block.
 
-| Option                           | Code default                                                                                                 |
-|----------------------------------|--------------------------------------------------------------------------------------------------------------|
-| `enabled`                        | `true`                                                                                                       |
-| `underlyings`                    | `['SPY', 'QQQ']`                                                                                             |
-| `confirmation_symbols`           | `{'SPY': '$SPX', 'QQQ': '$COMPX', 'IWM': '$RUT'}`                                                            |
-| `volatility_symbol`              | `VIX`                                                                                                        |
-| `styles`                         | `['orb_debit_spread', 'trend_debit_spread', 'midday_credit_spread', 'orb_long_option', 'trend_long_option']` |
-| `min_underlying_price`           | `100.0`                                                                                                      |
-| `min_option_volume`              | `300`                                                                                                        |
-| `min_open_interest`              | `600`                                                                                                        |
-| `max_bid_ask_spread_pct`         | `0.1`                                                                                                        |
-| `max_leg_spread_dollars`         | `0.08`                                                                                                       |
-| `max_net_spread_pct`             | `0.2`                                                                                                        |
-| `max_net_spread_price`           | `2.8`                                                                                                        |
-| `min_net_mid_price`              | `0.25`                                                                                                       |
-| `target_long_delta`              | `0.38`                                                                                                       |
-| `target_short_delta`             | `0.23`                                                                                                       |
-| `target_single_delta`            | `0.28`                                                                                                       |
-| `max_single_option_price`        | `2.25`                                                                                                       |
-| `option_limit_mode`              | `mid`                                                                                                        |
-| `strike_width_by_symbol`         | `{'SPY': 2.0, 'QQQ': 2.0, 'IWM': 1.0}`                                                                       |
-| `max_contracts_per_trade`        | `1`                                                                                                          |
-| `max_loss_per_trade`             | `200.0`                                                                                                      |
-| `debit_stop_frac`                | `0.45`                                                                                                       |
-| `debit_target_mult`              | `1.45`                                                                                                       |
-| `credit_stop_mult`               | `1.65`                                                                                                       |
-| `credit_target_frac`             | `0.32`                                                                                                       |
-| `single_stop_frac`               | `0.38`                                                                                                       |
-| `single_target_mult`             | `1.5`                                                                                                        |
-| `force_flatten_time`             | `15:18`                                                                                                      |
-| `max_vix`                        | `22.5`                                                                                                       |
-| `vix_spike_pct`                  | `0.011`                                                                                                      |
-| `vertical_limit_mode`            | `mid`                                                                                                        |
-| `quote_stability_checks`         | `3`                                                                                                          |
-| `quote_stability_pause_ms`       | `500`                                                                                                        |
-| `max_mid_drift_pct`              | `0.06`                                                                                                       |
-| `max_quote_age_seconds`          | `6`                                                                                                          |
-| `dry_run_replace_attempts`       | `2`                                                                                                          |
-| `dry_run_step_frac`              | `0.25`                                                                                                       |
-| `event_blackout_file`            | `./macro_events.auto.yaml`                                                                                   |
-| `event_blackouts`                | `[]`                                                                                                         |
-| `option_chain_cache_seconds`     | `6`                                                                                                          |
-| `option_chain_cache_max_entries` | `24`                                                                                                         |
+| Option                               | Code default                                                                                                 |
+|--------------------------------------|--------------------------------------------------------------------------------------------------------------|
+| `enabled`                            | `true`                                                                                                       |
+| `underlyings`                        | `['SPY', 'QQQ']`                                                                                             |
+| `confirmation_symbols`               | `{'SPY': '$SPX', 'QQQ': '$COMPX', 'IWM': '$RUT'}`                                                            |
+| `volatility_symbol`                  | `VIX`                                                                                                        |
+| `styles`                             | `['orb_debit_spread', 'trend_debit_spread', 'midday_credit_spread', 'orb_long_option', 'trend_long_option']` |
+| `min_underlying_price`               | `100.0`                                                                                                      |
+| `min_option_volume`                  | `300`                                                                                                        |
+| `min_open_interest`                  | `600`                                                                                                        |
+| `max_bid_ask_spread_pct`             | `0.1`                                                                                                        |
+| `max_leg_spread_dollars`             | `0.08`                                                                                                       |
+| `max_net_spread_pct`                 | `0.2`                                                                                                        |
+| `max_net_spread_price`               | `2.8`                                                                                                        |
+| `min_net_mid_price`                  | `0.25`                                                                                                       |
+| `target_long_delta`                  | `0.38`                                                                                                       |
+| `target_short_delta`                 | `0.23`                                                                                                       |
+| `target_single_delta`                | `0.28`                                                                                                       |
+| `max_single_option_price`            | `2.25`                                                                                                       |
+| `option_limit_mode`                  | `mid`                                                                                                        |
+| `strike_width_by_symbol`             | `{'SPY': 2.0, 'QQQ': 2.0, 'IWM': 1.0}`                                                                       |
+| `max_contracts_per_trade`            | `1`                                                                                                          |
+| `max_loss_per_trade`                 | `200.0`                                                                                                      |
+| `debit_stop_frac`                    | `0.45`                                                                                                       |
+| `debit_target_mult`                  | `1.45`                                                                                                       |
+| `credit_stop_mult`                   | `1.65`                                                                                                       |
+| `credit_target_frac`                 | `0.32`                                                                                                       |
+| `single_stop_frac`                   | `0.38`                                                                                                       |
+| `single_target_mult`                 | `1.5`                                                                                                        |
+| `force_flatten_time`                 | `15:18`                                                                                                      |
+| `max_vix`                            | `22.5`                                                                                                       |
+| `vix_spike_pct`                      | `0.011`                                                                                                      |
+| `vertical_limit_mode`                | `mid`                                                                                                        |
+| `quote_stability_checks`             | `3`                                                                                                          |
+| `quote_stability_pause_ms`           | `500`                                                                                                        |
+| `max_mid_drift_pct`                  | `0.06`                                                                                                       |
+| `max_quote_age_seconds`              | `6`                                                                                                          |
+| `dry_run_replace_attempts`           | `2`                                                                                                          |
+| `dry_run_step_frac`                  | `0.25`                                                                                                       |
+| `event_blackout_file`                | `./macro_events.auto.yaml`                                                                                   |
+| `event_blackouts`                    | `[]`                                                                                                         |
+| `option_chain_cache_seconds`         | `6`                                                                                                          |
+| `option_chain_cache_max_entries`     | `24`                                                                                                         |
+| `options_breakeven_enabled`          | `false`                                                                                                      |
+| `options_breakeven_mark_mult`        | `1.25`                                                                                                       |
+| `options_breakeven_stop_mult`        | `1.05`                                                                                                       |
+| `options_profit_lock_enabled`        | `false`                                                                                                      |
+| `options_profit_lock_mark_mult`      | `1.40`                                                                                                       |
+| `options_profit_lock_stop_mult`      | `1.15`                                                                                                       |
+| `debit_target_time_decay_enabled`    | `false`                                                                                                      |
+| `debit_target_time_decay_start`      | `10:30`                                                                                                      |
+| `debit_target_time_decay_end`        | `14:00`                                                                                                      |
+| `debit_target_time_decay_min_scale`  | `0.70`                                                                                                       |
+| `debit_stop_time_decay_widen_factor` | `0.30`                                                                                                       |
+| `delta_time_shift_enabled`           | `false`                                                                                                      |
+| `delta_time_shift_per_hour`          | `0.025`                                                                                                      |
+| `delta_time_shift_max`               | `0.15`                                                                                                       |
+| `delta_time_shift_start`             | `10:00`                                                                                                      |
+| `trend_momentum_filter_enabled`      | `false`                                                                                                      |
+| `trend_min_atr_expansion`            | `0.85`                                                                                                       |
+| `trend_min_volume_ratio`             | `0.90`                                                                                                       |
+| `credit_distance_gate_enabled`       | `false`                                                                                                      |
+| `min_credit_distance_atr`            | `1.8`                                                                                                        |
+| `adaptive_width_enabled`             | `false`                                                                                                      |
+| `adaptive_width_max_scale`           | `1.5`                                                                                                        |
 
 Behavior and valid values:
 
@@ -859,6 +899,29 @@ Behavior and valid values:
   - Each blackout row can use: `enabled`, `label`, `date`, `weekday`, `start`, `end`, `block_new_entries`, `force_flatten`.
 - Chain cache:
   - `option_chain_cache_seconds`, `option_chain_cache_max_entries`
+- Premium ratchet (post-entry stop management). All four premium-ratchet families are off by default; enable the ones you want active.
+  - `options_breakeven_enabled` / `options_breakeven_mark_mult` / `options_breakeven_stop_mult`: when the option mark crosses `entry × options_breakeven_mark_mult`, ratchet the stop up to `entry × options_breakeven_stop_mult`. Locks a small protective gain on debit trades that go through their first push.
+  - `options_profit_lock_enabled` / `options_profit_lock_mark_mult` / `options_profit_lock_stop_mult`: a second, looser ratchet that activates at a higher mark multiple and locks a larger fraction of the move. Stacks with `options_breakeven_*`.
+- Time-decay-aware stop/target scaling for debit trades:
+  - `debit_target_time_decay_enabled`: master toggle. When `true`, the debit target shrinks linearly between `debit_target_time_decay_start` and `debit_target_time_decay_end` (HH:MM in `runtime.timezone`), and the debit stop widens proportionally so theta-decayed trades aren't stopped on noise.
+  - `debit_target_time_decay_start` / `debit_target_time_decay_end`: scaling window. Outside this window, the standard `debit_target_mult` and `debit_stop_frac` apply unchanged.
+  - `debit_target_time_decay_min_scale`: lower bound on the target scale at the end of the window (e.g. `0.70` = target collapses to 70% of `debit_target_mult` by `debit_target_time_decay_end`).
+  - `debit_stop_time_decay_widen_factor`: how much the stop widens at the end of the window relative to the target shrink (e.g. `0.30` = stop loosens by 30% × the target shrink).
+- Time-aware delta selection (long-leg side of debit verticals and singles):
+  - `delta_time_shift_enabled`: master toggle. When `true`, after `delta_time_shift_start` the bot adds `delta_time_shift_per_hour × hours_elapsed` to `target_long_delta` / `target_single_delta`, capped at `delta_time_shift_max`. Picks deeper-ITM strikes later in the day to fight theta.
+  - `delta_time_shift_per_hour`: shift-per-hour added to the target delta after `delta_time_shift_start`.
+  - `delta_time_shift_max`: hard cap on cumulative delta shift.
+  - `delta_time_shift_start`: HH:MM at which the shift begins accumulating.
+- Trend entry momentum filter (applies to `trend_*` styles):
+  - `trend_momentum_filter_enabled`: when `true`, requires both ATR expansion and volume confirmation before a trend entry fires.
+  - `trend_min_atr_expansion`: minimum recent-ATR / baseline-ATR ratio required.
+  - `trend_min_volume_ratio`: minimum recent-volume / baseline-volume ratio required.
+- Credit strike distance gate (applies to `midday_credit_spread`):
+  - `credit_distance_gate_enabled`: when `true`, requires the short strike to sit at least `min_credit_distance_atr × ATR` from the current underlying price before a credit spread is allowed.
+  - `min_credit_distance_atr`: ATR multiple defining the minimum strike-to-spot distance.
+- VIX-adaptive strike width:
+  - `adaptive_width_enabled`: when `true`, scales `strike_width_by_symbol` up by a VIX-driven factor capped at `adaptive_width_max_scale`. Wider verticals when VIX is elevated, baseline width when VIX is normal.
+  - `adaptive_width_max_scale`: hard upper bound on the per-symbol width multiplier.
 
 ## `strategies.<name>` block reference
 
@@ -2023,3 +2086,35 @@ The shipped `configs/config.pairs_residual.yaml` preset now includes two editabl
 ## Strategy-specific top-level presets
 
 Prebuilt top-level presets are included under `configs/config.<strategy>.yaml` for every strategy. Each preset is intended to be the complete runtime source of truth for that strategy, while manifests remain the built-in fallback defaults.
+
+Shipped preset files:
+
+| Preset                                                  | Strategy                            |
+|---------------------------------------------------------|-------------------------------------|
+| `configs/config.momentum_close.yaml`                    | `momentum_close`                    |
+| `configs/config.mean_reversion.yaml`                    | `mean_reversion`                    |
+| `configs/config.closing_reversal.yaml`                  | `closing_reversal`                  |
+| `configs/config.rth_trend_pullback.yaml`                | `rth_trend_pullback`                |
+| `configs/config.volatility_squeeze_breakout.yaml`       | `volatility_squeeze_breakout`       |
+| `configs/config.pairs_residual.yaml`                    | `pairs_residual`                    |
+| `configs/config.opening_range_breakout.yaml`            | `opening_range_breakout`            |
+| `configs/config.peer_confirmed_key_levels.yaml`         | `peer_confirmed_key_levels`         |
+| `configs/config.peer_confirmed_key_levels_1m.yaml`      | `peer_confirmed_key_levels_1m`      |
+| `configs/config.peer_confirmed_trend_continuation.yaml` | `peer_confirmed_trend_continuation` |
+| `configs/config.peer_confirmed_htf_pivots.yaml`         | `peer_confirmed_htf_pivots`         |
+| `configs/config.top_tier_adaptive.yaml`                 | `top_tier_adaptive`                 |
+| `configs/config.zero_dte_etf_options.yaml`              | `zero_dte_etf_options`              |
+| `configs/config.zero_dte_etf_long_options.yaml`         | `zero_dte_etf_long_options`         |
+
+Plus two non-strategy files:
+
+- `configs/config.example.yaml` — canonical full-config template, used as the scaffold base by `scripts/scaffold_strategy_plugin.py`.
+- `configs/config.yaml` — the default file `main.py` loads when `--config` is omitted.
+
+To run a shipped preset:
+
+```bash
+python main.py --config configs/config.<strategy>.yaml --strategy <strategy>
+```
+
+For per-strategy parameter tuning see [Strategy-by-strategy reference](#strategy-by-strategy-reference). For preset-directory conventions see [`configs/README_PRESETS.md`](configs/README_PRESETS.md).
