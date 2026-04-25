@@ -10,9 +10,8 @@ from __future__ import annotations
 
 from collections import deque
 
-from ..shared import Candidate, Position, Signal, Side, pd
+from ..shared import Candidate, Position, Signal, Side, now_et, parse_hhmm, pd
 from ..strategy_base import BaseStrategy
-from ...utils import now_et, parse_hhmm
 
 
 class TopTierAdaptiveStrategy(BaseStrategy):
