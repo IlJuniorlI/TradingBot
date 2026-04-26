@@ -83,6 +83,81 @@
   --warn: #ffc165;
   --grid: rgba(183, 121, 255, 0.05);
 }
+[data-theme="default"] {
+  --bg: #05070c;
+  --bg-2: #0b1020;
+  --panel: #0d111f;
+  --panel-raised: #111728;
+  --panel-bright: #161e34;
+  --line: rgba(255,255,255,0.08);
+  --line-strong: rgba(255,255,255,0.14);
+  --text: #e9edf7;
+  --text-dim: #b9c2d4;
+  --muted: #92a0bf;
+  --soft: #65718b;
+  --accent: #55c2ff;
+  --accent-bright: #76e3ff;
+  --accent-ink: #021a2e;
+  --accent-glow: rgba(85, 194, 255, 0.45);
+  --accent-glow-soft: rgba(85, 194, 255, 0.14);
+  --accent-wash: rgba(85, 194, 255, 0.09);
+  --good: #6ce3a2;
+  --bad: #ff6b82;
+  --bad-wash: rgba(255, 107, 130, 0.10);
+  --bad-glow: rgba(255, 107, 130, 0.35);
+  --warn: #ffbd63;
+  --grid: rgba(85, 194, 255, 0.05);
+}
+[data-theme="dark"] {
+  --bg: #000000;
+  --bg-2: #080808;
+  --panel: #0e0e0e;
+  --panel-raised: #131313;
+  --panel-bright: #181818;
+  --line: rgba(255,255,255,0.08);
+  --line-strong: rgba(255,255,255,0.14);
+  --text: #eaeaef;
+  --text-dim: #b8bcc6;
+  --muted: #8a8d9a;
+  --soft: #565866;
+  --accent: #4db8ff;
+  --accent-bright: #6ad4ff;
+  --accent-ink: #021824;
+  --accent-glow: rgba(77, 184, 255, 0.45);
+  --accent-glow-soft: rgba(77, 184, 255, 0.14);
+  --accent-wash: rgba(77, 184, 255, 0.09);
+  --good: #4cd990;
+  --bad: #f4516c;
+  --bad-wash: rgba(244, 81, 108, 0.10);
+  --bad-glow: rgba(244, 81, 108, 0.35);
+  --warn: #f0a030;
+  --grid: rgba(255, 255, 255, 0.04);
+}
+[data-theme="light"] {
+  --bg: #ffffff;
+  --bg-2: #f4f5f8;
+  --panel: #f8f9fc;
+  --panel-raised: #f1f3f7;
+  --panel-bright: #eaecf2;
+  --line: rgba(0,0,0,0.08);
+  --line-strong: rgba(0,0,0,0.14);
+  --text: #1a1d26;
+  --text-dim: #424652;
+  --muted: #5a6275;
+  --soft: #8590a6;
+  --accent: #1a8bd6;
+  --accent-bright: #0e7ac2;
+  --accent-ink: #ffffff;
+  --accent-glow: rgba(26, 139, 214, 0.30);
+  --accent-glow-soft: rgba(26, 139, 214, 0.10);
+  --accent-wash: rgba(26, 139, 214, 0.06);
+  --good: #1a9956;
+  --bad: #d42e47;
+  --bad-wash: rgba(212, 46, 71, 0.06);
+  --bad-glow: rgba(212, 46, 71, 0.20);
+  --warn: #c57a00;
+  --grid: rgba(0, 0, 0, 0.05);
+}
 
 /* ========================================
    BASE
@@ -603,6 +678,9 @@ body.no-switch .switcher { display: none; }
   <button data-t="nexus" class="active">Nexus</button>
   <button data-t="solstice">Solstice</button>
   <button data-t="nebula">Nebula</button>
+  <button data-t="default">Default</button>
+  <button data-t="dark">Dark</button>
+  <button data-t="light">Light</button>
 </div>
 
 <div class="app-shell">
