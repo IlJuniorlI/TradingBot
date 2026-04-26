@@ -4,10 +4,11 @@ Version: see [`version.txt`](version.txt) · Changelog: [`CHANGELOG.md`](CHANGEL
 
 This README documents the **live config surface that the bot actually loads today** from `intraday_tv_schwab_bot/config.py`, plus the shipped top-level presets under `configs/` and plugin manifests under `intraday_tv_schwab_bot/_strategies/`.
 
-Two important notes up front:
+Three important notes up front:
 
 1. **Top-level block tables below show code defaults**. The strategy-by-strategy sections later in this file reflect the shipped top-level `configs/config.<strategy>.yaml` presets and matching manifest defaults that tune each bundled strategy.
 2. Strategy params are split between **strategy-specific knobs** and **shared reusable groups** like anti-chase, FVG confluence, and adaptive trade management.
+3. **Dashboard zoom on 1080p and lower displays**: the dashboard is laid out for 1440p+. On 1080p (or smaller), set browser zoom to **75%** so all panels fit without scrolling and chart overlays render at the intended scale. Chrome/Edge: `Ctrl + -` twice from default. Firefox: `Ctrl + -` twice, then per-domain zoom is remembered.
 
 See also:
 
