@@ -360,6 +360,15 @@ class RuntimeConfig:
     startup_reconcile_metadata_db_path: str = ".logs/startup_reconcile_metadata.sqlite"
     auto_exit_after_session: bool = False
     cycle_precompute_workers: int = 4
+    # Per-symbol quote-fetch failure threshold. When a symbol fails this
+    # many consecutive quote fetches (typically Schwab 401/403/404), it
+    # is blacklisted from quote refresh for the remainder of the session.
+    # Recovers on bot restart. Counter resets on any successful fetch.
+    # Set to 0 to disable (always retry — pre-2026-04-29 behavior). The
+    # default 5 catches symbol-specific permission errors (e.g. restricted
+    # securities like KNRX 2026-04-29: 457 wasted 401 retries) without
+    # blacklisting on transient hiccups.
+    max_consecutive_quote_failures: int = 5
     # When True, on session shutdown the engine writes a per-day archive
     # to {log_dir}/sessions/{YYYY-MM-DD}/ containing: bars/{SYMBOL}.csv for
     # every active watchlist symbol (RTH only, with indicators), trades.csv

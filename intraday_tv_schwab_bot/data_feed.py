@@ -98,6 +98,13 @@ class MarketDataStore:
         self.htf_cache: dict[tuple, HTFContext] = {}
         self.last_htf_refresh: dict[tuple[str, int], datetime] = {}
         self.last_quote_refresh: dict[str, datetime] = {}
+        # Per-symbol quote-failure tracking. Counter increments on each
+        # quote-fetch failure, resets on success. Blacklist captures the
+        # session-time when a symbol crossed the
+        # `runtime.max_consecutive_quote_failures` threshold and silences
+        # further fetch attempts for that symbol until bot restart.
+        self._consecutive_quote_failures: dict[str, int] = {}
+        self._quote_blacklist: dict[str, datetime] = {}
         self.merge_stats: dict[str, MergeStats] = defaultdict(MergeStats)
         self.last_history_refresh: dict[str, datetime] = {}
         self.last_stream_update: dict[str, datetime] = {}
@@ -1101,6 +1108,39 @@ class MarketDataStore:
         failed: list[str] = []
         if not symbols:
             return fetched, failed
+
+        # Per-symbol blacklist gate. After a symbol exceeds
+        # `runtime.max_consecutive_quote_failures` consecutive quote-fetch
+        # failures (typically symbol-specific Schwab 401/403/404 such as
+        # restricted-security responses), skip it silently for the rest
+        # of the session. Recovers on bot restart.
+        try:
+            failure_threshold = max(0, int(getattr(self.config.runtime, "max_consecutive_quote_failures", 5) or 0))
+        except Exception:
+            failure_threshold = 5
+        if failure_threshold > 0 and self._quote_blacklist:
+            symbols = [s for s in symbols if s not in self._quote_blacklist]
+            if not symbols:
+                return fetched, failed
+
+        def _record_success(sym: str) -> None:
+            if failure_threshold > 0:
+                self._consecutive_quote_failures.pop(sym, None)
+
+        def _record_failure(sym: str, exc: Exception) -> None:
+            LOG.warning("Quote fetch failed for %s: %s", sym, exc)
+            failed.append(sym)
+            if failure_threshold <= 0:
+                return
+            count = self._consecutive_quote_failures.get(sym, 0) + 1
+            self._consecutive_quote_failures[sym] = count
+            if count >= failure_threshold and sym not in self._quote_blacklist:
+                self._quote_blacklist[sym] = now_et()
+                LOG.warning(
+                    "Blacklisting %s from quote refresh after %d consecutive failures (last: %s); will retry on bot restart",
+                    sym, failure_threshold, exc,
+                )
+
         try:
             configured = int(getattr(self.config.runtime, "cycle_precompute_workers", 4) or 4)
         except Exception:
@@ -1110,9 +1150,9 @@ class MarketDataStore:
             for sym in symbols:
                 try:
                     fetched[sym] = self._fetch_single_quote_with_aliases(sym)
+                    _record_success(sym)
                 except Exception as exc:
-                    LOG.warning("Quote fetch failed for %s: %s", sym, exc)
-                    failed.append(sym)
+                    _record_failure(sym, exc)
             return fetched, failed
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bot-quote-fetch") as executor:
             futures = {executor.submit(self._fetch_single_quote_with_aliases, sym): sym for sym in symbols}
@@ -1120,9 +1160,9 @@ class MarketDataStore:
                 sym = futures[future]
                 try:
                     fetched[sym] = future.result()
+                    _record_success(sym)
                 except Exception as exc:
-                    LOG.warning("Quote fetch failed for %s: %s", sym, exc)
-                    failed.append(sym)
+                    _record_failure(sym, exc)
         return fetched, failed
 
     @staticmethod

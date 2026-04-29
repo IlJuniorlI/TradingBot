@@ -86,6 +86,7 @@ runtime:
   # Auto-exit: shut down cleanly when market closes and no positions are open
   auto_exit_after_session: true
   cycle_precompute_workers: 4
+  max_consecutive_quote_failures: 5
   # Per-day debug archive: on session shutdown, write
   # {log_dir}/sessions/{YYYY-MM-DD}/ with bars/{SYMBOL}.csv (RTH+indicators),
   # trades.csv for the day, and manifest.json. Disable to save disk if not
