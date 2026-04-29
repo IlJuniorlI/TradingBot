@@ -57,11 +57,19 @@ class ORBScreener(BaseStrategyScreener):
             q = q.order_by(self._order_field("change_from_open"), ascending=False)
         df = self._execute(q)
         if mode == "none":
+            # Score = rvol × volume_in_millions. Dividing raw volume by 1M
+            # keeps the ranking identical to the prior rvol×volume formula
+            # but produces single/double-digit magnitudes (matching the
+            # premarket/early_session branch below) instead of 6-7 digit
+            # values that polluted logs and dashboard rendering.
             return self._candidate_rows(
                 df,
                 self.strategy_name,
                 directional_bias_fn=lambda row: Side.LONG,
-                activity_score_fn=lambda row: float(row.get("relative_volume_10d_calc", 1.0) or 1.0) * float(row.get("volume", 0.0) or 0.0),
+                activity_score_fn=lambda row: (
+                    float(row.get("relative_volume_10d_calc", 1.0) or 1.0)
+                    * float(row.get("volume", 0.0) or 0.0) / 1_000_000.0
+                ),
             )
         # Score by change_from_open weighted by RVOL — a 6% premarket mover
         # with 3x RVOL is a better ORB candidate than a 10% mover with 0.8x.
