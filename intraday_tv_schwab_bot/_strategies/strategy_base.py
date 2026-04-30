@@ -19,6 +19,11 @@ from .helpers import (
     _reason_with_values,
     _safe_float,
 )
+from ..order_blocks import (
+    OrderBlockContext,
+    build_order_block_context,
+    empty_order_block_context,
+)
 from .rvol import effective_relative_volume, relative_volume_gate_threshold
 from .shared import (
     Any,
@@ -1222,6 +1227,183 @@ class BaseStrategy:
         out["metadata"]["anti_chase_fvg_retest_status"] = out["status"]
         return out
 
+    def _continuation_ob_retest_plan(
+        self,
+        side: Side,
+        symbol: str,
+        frame: pd.DataFrame | None,
+        data=None,
+        *,
+        trigger_level: float,
+        breakout_active: bool,
+        close: float,
+        vwap: float,
+        ema9: float,
+    ) -> dict[str, Any]:
+        """Order-block retest plan, parallel to `_continuation_fvg_retest_plan`.
+
+        Returns the same {status, reason, metadata, stop_anchor} dict shape so
+        it composes with `_apply_continuation_zone_retest_plans`. Reuses the
+        same `anti_chase_fvg_retest_*` knobs for confirmation thresholds — the
+        user-stated convention is "same rules for confirm" between FVG and OB.
+        Disabled by default; opt in via `support_resistance.one_minute_order_blocks_enabled`.
+        """
+        out: dict[str, Any] = {"status": "none", "reason": None, "metadata": {}, "stop_anchor": None}
+        if frame is None or frame.empty:
+            return out
+        if not bool(self._support_resistance_setting("one_minute_order_blocks_enabled", False)):
+            return out
+        close = float(close or 0.0)
+        if close <= 0:
+            return out
+        ob_ctx = self._one_minute_order_block_context(symbol, frame, data)
+        same_ob = getattr(ob_ctx, "nearest_bullish_ob", None) if side == Side.LONG else getattr(ob_ctx, "nearest_bearish_ob", None)
+        opposing_ob = getattr(ob_ctx, "nearest_bearish_ob", None) if side == Side.LONG else getattr(ob_ctx, "nearest_bullish_ob", None)
+        same_info = self._fvg_gap_state(same_ob, close)
+        opposing_info = self._fvg_gap_state(opposing_ob, close)
+        same_state = str(same_info.get("state", "none") or "none").strip().lower()
+        opposing_state = str(opposing_info.get("state", "none") or "none").strip().lower()
+        lower = _optional_float(same_info.get("lower"))
+        upper = _optional_float(same_info.get("upper"))
+        midpoint = _optional_float(same_info.get("midpoint"))
+        size = max(1e-8, float(_optional_float(same_info.get("size"), 0.0) or 0.0))
+        same_distance_pct = _optional_float(same_info.get("distance_pct"), 1.0)
+        opposing_distance_pct = _optional_float(opposing_info.get("distance_pct"))
+        max_gap_distance_pct = max(0.0002, float(self.params.get("anti_chase_fvg_retest_max_gap_distance_pct", 0.0030)))
+        max_opposing_distance_pct = max(0.0002, float(self.params.get("anti_chase_fvg_retest_max_opposing_distance_pct", 0.0020)))
+        lookback_bars = max(2, int(self.params.get("anti_chase_fvg_retest_lookback_bars", 5)))
+        min_close_pos_raw = self.params.get("anti_chase_fvg_retest_min_close_position")
+        if min_close_pos_raw is None:
+            min_close_pos_raw = self.params.get("min_bar_close_position", 0.60)
+        min_close_pos = min(0.95, max(0.05, float(min_close_pos_raw)))
+        stop_buffer_gap_frac = max(0.0, float(self.params.get("anti_chase_fvg_retest_stop_buffer_gap_frac", 0.14)))
+        trigger_tolerance_pct = max(0.0, float(self.params.get("anti_chase_fvg_retest_trigger_tolerance_pct", 0.0012)))
+        touch_tolerance = max(size * 0.20, abs(close) * max_gap_distance_pct * 0.25, 1e-8)
+        invalidation_tolerance = max(size * 0.18, abs(close) * 1e-6, 1e-8)
+        edge_tolerance = max(0.0, abs(close) * float(self.params.get("anti_chase_fvg_edge_tolerance_pct", 0.0) or 0.0))
+        skip_trend_reclaim = bool(self.params.get("anti_chase_fvg_retest_skip_vwap_ema9_reclaim", False))
+        direction_label = "bullish" if side == Side.LONG else "bearish"
+        out["metadata"].update(
+            {
+                "anti_chase_ob_retest_side": direction_label,
+                "anti_chase_ob_retest_same_state": same_state,
+                "anti_chase_ob_retest_opposing_state": opposing_state,
+                "anti_chase_ob_retest_same_midpoint": midpoint,
+                "anti_chase_ob_retest_same_lower": lower,
+                "anti_chase_ob_retest_same_upper": upper,
+                "anti_chase_ob_retest_same_distance_pct": same_distance_pct,
+                "anti_chase_ob_retest_opposing_distance_pct": opposing_distance_pct,
+                "anti_chase_ob_retest_trigger_level": float(trigger_level or 0.0),
+                "anti_chase_ob_retest_mode": str(getattr(ob_ctx, "mode", "loose") or "loose"),
+            }
+        )
+        if lower is None or upper is None or midpoint is None or same_state not in {"active", "validated"}:
+            if same_state == "invalidated":
+                out["status"] = "reject"
+                out["reason"] = f"{direction_label}_ob_retest_rejected({_detail_fields(detail='same_direction_block_invalidated', midpoint=midpoint or 0.0)})"
+                out["metadata"]["anti_chase_ob_retest_status"] = out["status"]
+            return out
+        in_zone = lower - touch_tolerance <= close <= upper + touch_tolerance
+        if not in_zone and (same_distance_pct is None or float(same_distance_pct) > max_gap_distance_pct):
+            return out
+        recent = frame.tail(lookback_bars + 1)
+        prior = recent.iloc[:-1]
+        if side == Side.LONG:
+            impulse_seen = bool(breakout_active)
+            if not impulse_seen and trigger_level > 0 and not prior.empty:
+                impulse_seen = float(prior["close"].max()) >= (float(trigger_level) * (1.0 - trigger_tolerance_pct))
+        else:
+            impulse_seen = bool(breakout_active)
+            if not impulse_seen and trigger_level > 0 and not prior.empty:
+                impulse_seen = float(prior["close"].min()) <= (float(trigger_level) * (1.0 + trigger_tolerance_pct))
+        if not impulse_seen:
+            return out
+        opposing_blocked = bool(opposing_state in {"active", "validated"} and opposing_distance_pct is not None and float(opposing_distance_pct) <= max_opposing_distance_pct)
+        if opposing_blocked:
+            out["status"] = "reject"
+            out["reason"] = f"{direction_label}_ob_retest_rejected({_detail_fields(detail='opposing_block_too_close', opposing_distance_pct=opposing_distance_pct or 0.0)})"
+            out["metadata"]["anti_chase_ob_retest_status"] = out["status"]
+            return out
+        last = frame.iloc[-1]
+        bar_low = _safe_float(last.get("low"), close)
+        bar_high = _safe_float(last.get("high"), close)
+        close_pos = _bar_close_position(frame)
+        touched_zone = bar_low <= (upper + touch_tolerance + edge_tolerance) and bar_high >= (lower - touch_tolerance - edge_tolerance)
+        if side == Side.LONG:
+            respected_zone = bar_low >= (lower - invalidation_tolerance)
+            reclaimed = close >= (midpoint - touch_tolerance)
+            if not skip_trend_reclaim:
+                reclaimed = reclaimed and close >= min(float(vwap or close), float(ema9 or close))
+            bar_confirm = close_pos >= min_close_pos
+            stop_anchor = max(0.01, lower - (size * stop_buffer_gap_frac))
+        else:
+            respected_zone = bar_high <= (upper + invalidation_tolerance)
+            reclaimed = close <= (midpoint + touch_tolerance)
+            if not skip_trend_reclaim:
+                reclaimed = reclaimed and close <= max(float(vwap or close), float(ema9 or close))
+            bar_confirm = close_pos <= (1.0 - min_close_pos)
+            stop_anchor = upper + (size * stop_buffer_gap_frac)
+        out["metadata"]["anti_chase_ob_retest_recent_impulse"] = bool(impulse_seen)
+        out["metadata"]["anti_chase_ob_retest_touched_zone"] = bool(touched_zone)
+        out["metadata"]["anti_chase_ob_retest_respected_zone"] = bool(respected_zone)
+        out["metadata"]["anti_chase_ob_retest_bar_confirm"] = bool(bar_confirm)
+        if touched_zone and respected_zone and reclaimed and bar_confirm:
+            out["status"] = "allow"
+            out["stop_anchor"] = float(stop_anchor)
+            out["metadata"].update(
+                {
+                    "anti_chase_ob_retest_status": "allow",
+                    "anti_chase_ob_retest_confirmed": True,
+                    "anti_chase_ob_retest_stop_anchor": float(stop_anchor),
+                }
+            )
+            return out
+        out["status"] = "wait"
+        out["reason"] = f"wait_for_{direction_label}_ob_retest({_detail_fields(state=same_state, midpoint=midpoint, trigger=trigger_level, distance_pct=same_distance_pct or 0.0)})"
+        out["metadata"]["anti_chase_ob_retest_status"] = out["status"]
+        return out
+
+    @staticmethod
+    def _apply_continuation_zone_retest_plans(
+        reasons: list[str],
+        plans: list[dict[str, Any] | None],
+        *,
+        deferrable_prefixes: set[str],
+    ) -> list[str]:
+        """Combine multiple retest plans (e.g. FVG + OB) with OR logic.
+
+        - If ANY plan returns ``status="allow"`` and all current reasons are
+          deferrable, clear the reasons (entry can fire).
+        - Otherwise prefer "wait" reasons over "reject" reasons (waiting
+          could still resolve in a later bar).
+        - Plans with ``status="none"`` (no zone available) are ignored.
+        - Mirrors ``_apply_continuation_fvg_retest_plan`` semantics for the
+          single-plan case.
+        """
+        if not reasons or not plans:
+            return reasons
+        engaged = [
+            (p, str(p.get("status", "none") or "none").strip().lower())
+            for p in plans
+            if p
+        ]
+        engaged = [(p, s) for p, s in engaged if s != "none"]
+        if not engaged:
+            return reasons
+        deferred = [reason for reason in reasons if _reason_prefix(reason) in deferrable_prefixes]
+        other = [reason for reason in reasons if _reason_prefix(reason) not in deferrable_prefixes]
+        if not deferred or other:
+            return reasons
+        if any(s == "allow" for _p, s in engaged):
+            return []
+        wait_plans = [p for p, s in engaged if s == "wait" and (str(p.get("reason") or "").strip())]
+        if wait_plans:
+            return [str(wait_plans[0]["reason"]).strip()]
+        reject_plans = [p for p, s in engaged if s == "reject" and (str(p.get("reason") or "").strip())]
+        if reject_plans:
+            return [str(reject_plans[0]["reason"]).strip()]
+        return reasons
+
     @staticmethod
     def _blocks_bullish_entry(ctx) -> bool:
         return bool(
@@ -1416,6 +1598,30 @@ class BaseStrategy:
             max_per_side=max_per_side,
             min_gap_atr_mult=min_gap_atr_mult,
             min_gap_pct=min_gap_pct,
+        )
+
+    def _one_minute_order_block_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> OrderBlockContext:
+        current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
+        mode = str(self._support_resistance_setting("one_minute_order_block_mode", "loose") or "loose").strip().lower() or "loose"
+        if not bool(self._support_resistance_setting("one_minute_order_blocks_enabled", False)):
+            return empty_order_block_context(current_price, timeframe_minutes=1, mode=mode)
+        max_per_side = int(self._support_resistance_setting("one_minute_order_block_max_per_side", 4) or 4)
+        min_atr_mult = float(self._support_resistance_setting("one_minute_order_block_min_atr_mult", 0.05) or 0.05)
+        min_pct = float(self._support_resistance_setting("one_minute_order_block_min_pct", 0.0005) or 0.0005)
+        pivot_span = int(self._support_resistance_setting("one_minute_order_block_pivot_span", 2) or 2)
+        new_high_lookback = int(self._support_resistance_setting("one_minute_order_block_new_high_lookback", 8) or 8)
+        if frame is None or frame.empty:
+            return empty_order_block_context(current_price, timeframe_minutes=1, mode=mode)
+        return build_order_block_context(
+            frame,
+            timeframe_minutes=1,
+            current_price=current_price,
+            mode=mode,
+            max_per_side=max_per_side,
+            min_block_atr_mult=min_atr_mult,
+            min_block_pct=min_pct,
+            pivot_span=pivot_span,
+            new_high_lookback=new_high_lookback,
         )
 
     @staticmethod
