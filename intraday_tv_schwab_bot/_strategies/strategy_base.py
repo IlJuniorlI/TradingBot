@@ -175,7 +175,6 @@ class BaseStrategy:
     def _relative_volume_gate_threshold(symbol: str, base_threshold: object, params: dict[str, Any] | None = None) -> float:
         return relative_volume_gate_threshold(symbol, base_threshold, params or {})
 
-
     def _watchlist_capability_sources(self, kind: str) -> list[object] | None:
         raw = self._capability(f"watchlist.{kind}_sources", None)
         return raw if isinstance(raw, list) else None
@@ -488,7 +487,6 @@ class BaseStrategy:
             if isinstance(override, dict):
                 policy = override
         return policy if isinstance(policy, dict) else None
-
 
     def dashboard_zone_width_for_level(
         self,
@@ -814,7 +812,6 @@ class BaseStrategy:
             return {str(k): v for k, v in payload.items()}
         return {"primary_reason": str(payload), "reasons": [str(payload)]}
 
-
     def _chart_context(self, frame: pd.DataFrame):
         # Per-cycle cache keyed like _technical_context — id(frame) separates
         # symbols; length+last-bar markers guard against id-reuse after GC.
@@ -915,8 +912,6 @@ class BaseStrategy:
             return "bearish"
         return "bullish" if position.side == Side.LONG else "bearish"
 
-
-
     def _build_bullish_reversal_signal(
         self,
         *,
@@ -982,8 +977,6 @@ class BaseStrategy:
             metadata=metadata,
         )
 
-
-
     def _bullish_sr_block_reason(self, sr_ctx) -> str:
         return _reason_with_values(
             "too_close_to_htf_resistance",
@@ -1007,9 +1000,6 @@ class BaseStrategy:
                 "clearance_atr": (sr_ctx.support_distance_atr, ">", float(self._support_resistance_setting("entry_min_clearance_atr", 0.85))),
             },
         )
-
-
-
 
     def _entry_exhaustion_reasons(self, side: Side, frame: pd.DataFrame | None, *, close: float, vwap: float, ema9: float) -> list[str]:
         if frame is None or frame.empty:
@@ -1050,8 +1040,6 @@ class BaseStrategy:
             if (bar_range / atr) > max_bar_range_atr and (vwap_ext_atr > max_vwap_ext_atr * 0.75 or ema9_ext_atr > max_ema9_ext_atr * 0.75):
                 reasons.append(_reason_with_values("expansion_bar_too_large", current=(bar_range / atr), required=max_bar_range_atr, op="<=", digits=4))
         return reasons
-
-
 
     @staticmethod
     def _apply_continuation_fvg_retest_plan(reasons: list[str], plan: dict[str, Any] | None, *, deferrable_prefixes: set[str]) -> list[str]:
@@ -1439,7 +1427,6 @@ class BaseStrategy:
             return ensure_standard_indicator_frame(frame.copy())
         out = resample_bars(frame, f"{tf}min")
         return ensure_standard_indicator_frame(out)
-
 
     def _structure_context(self, frame: pd.DataFrame | None, timeframe: str = "1m"):
         # Per-cycle cache. Timeframe goes in the key because the pivot_span /
@@ -2796,7 +2783,6 @@ class BaseStrategy:
         )
         return bool(too_close and not actively_below)
 
-
     def _refine_bullish_sr_levels(self, close: float, stop: float, target: float | None, sr_ctx):
         if not self._shared_entry_enabled("use_sr_stop_target_refinement", True):
             return float(stop), (None if target is None else float(target))
@@ -3037,7 +3023,6 @@ class BaseStrategy:
             if position.reference_symbol:
                 symbols.add(position.reference_symbol)
         return symbols
-
 
     def quote_watchlist(self, candidates: list[Candidate], positions: dict[str, Position], bars: dict[str, pd.DataFrame]) -> set[str]:
         configured = self._watchlist_symbols_from_capabilities(
