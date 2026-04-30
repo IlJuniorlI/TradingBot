@@ -6,7 +6,14 @@ from ..shared import (
     Position,
     Side,
     Signal,
+    _bar_close_position,
+    _bar_wick_fractions,
     _discrete_score_threshold,
+    insufficient_bars_reason,
+    _optional_float,
+    _safe_float,
+    _session_open_price,
+    _side_prefixed_reasons,
     pd,
 )
 from ..strategy_base import BaseStrategy
@@ -92,10 +99,10 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         metadata = position.metadata if isinstance(position.metadata, dict) else {}
         if not bool(metadata.get("ladder_management_enabled")):
             return False, "hold"
-        defense_price = self._optional_float(metadata.get("ladder_defense_price"))
+        defense_price = _optional_float(metadata.get("ladder_defense_price"))
         if defense_price is None or defense_price <= 0:
             return False, "hold"
-        defense_zone_width = max(0.0, self._optional_float(metadata.get("ladder_defense_zone_width"), 0.0) or 0.0)
+        defense_zone_width = max(0.0, _optional_float(metadata.get("ladder_defense_zone_width"), 0.0) or 0.0)
         symbol = str(metadata.get("underlying") or position.symbol)
         sr_ctx = None
         if data is not None and hasattr(data, "get_support_resistance"):
@@ -165,11 +172,12 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
     def _level_score_raw_htf_weight(self) -> float:
         return self._clamp_weight(self.params.get("level_score_raw_htf_weight", 0.65), 0.60)
 
-    def _hourly_bias(self, htf: HTFContext, close: float) -> tuple[str, int, int]:
+    @staticmethod
+    def _hourly_bias(htf: HTFContext, close: float) -> tuple[str, int, int]:
         bull = 0
         bear = 0
-        ema_fast = self._optional_float(getattr(htf, "ema_fast", None))
-        ema_slow = self._optional_float(getattr(htf, "ema_slow", None))
+        ema_fast = _optional_float(getattr(htf, "ema_fast", None))
+        ema_slow = _optional_float(getattr(htf, "ema_slow", None))
         if ema_fast is not None:
             if close > ema_fast:
                 bull += 1
@@ -210,7 +218,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             if frame is None or frame.empty:
                 details[peer] = "missing"
                 continue
-            close = self._safe_float(frame.iloc[-1]["close"])
+            close = _safe_float(frame.iloc[-1]["close"])
             ltf = self._resampled_frame(frame, int(self.params.get("trigger_timeframe_minutes", 5)), symbol=peer, data=data)
             htf = self._htf_context(
                 peer,
@@ -231,7 +239,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             )
             bull_votes = 0
             bear_votes = 0
-            ema_fast = self._optional_float(getattr(htf, "ema_fast", None))
+            ema_fast = _optional_float(getattr(htf, "ema_fast", None))
             if ema_fast is not None:
                 if close > ema_fast:
                     bull_votes += 1
@@ -239,15 +247,15 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                     bear_votes += 1
             if ltf is not None and not ltf.empty:
                 last = ltf.iloc[-1]
-                ltf_close = self._safe_float(last["close"], close)
-                ltf_vwap = self._safe_float(last.get("vwap"), ltf_close)
-                ema9 = self._safe_float(last.get("ema9"), ltf_close)
-                ema20 = self._safe_float(last.get("ema20"), ltf_close)
+                ltf_close = _safe_float(last["close"], close)
+                ltf_vwap = _safe_float(last.get("vwap"), ltf_close)
+                ema9 = _safe_float(last.get("ema9"), ltf_close)
+                ema20 = _safe_float(last.get("ema20"), ltf_close)
                 if ltf_close > ltf_vwap and ema9 >= ema20:
                     bull_votes += 1
                 elif ltf_close < ltf_vwap and ema9 <= ema20:
                     bear_votes += 1
-            session_open = self._session_open_price(frame)
+            session_open = _session_open_price(frame)
             if session_open is not None:
                 if close > session_open:
                     bull_votes += 1
@@ -285,12 +293,12 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 details[key] = "missing"
                 continue
             last = macro.iloc[-1]
-            close = self._safe_float(last["close"])
-            vwap = self._optional_float(last.get("vwap"))
-            volume = self._optional_float(last.get("volume"))
-            ema9 = self._safe_float(last.get("ema9"), close)
-            ema20 = self._safe_float(last.get("ema20"), close)
-            ret5 = self._safe_float(last.get("ret5"), 0.0)
+            close = _safe_float(last["close"])
+            vwap = _optional_float(last.get("vwap"))
+            volume = _optional_float(last.get("volume"))
+            ema9 = _safe_float(last.get("ema9"), close)
+            ema20 = _safe_float(last.get("ema20"), close)
+            ret5 = _safe_float(last.get("ret5"), 0.0)
             use_vwap = vwap is not None and volume is not None and volume > 0.0
             if use_vwap:
                 up = close > float(vwap) and ema9 >= ema20 and ret5 >= 0.0
@@ -306,11 +314,11 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                             session_slice = macro.loc[session_mask]
                 except Exception:
                     session_slice = macro
-                session_open = self._safe_float(session_slice.iloc[0].get("open"), close) if session_slice is not None and not session_slice.empty else close
+                session_open = _safe_float(session_slice.iloc[0].get("open"), close) if session_slice is not None and not session_slice.empty else close
                 recent_window = macro.tail(6)
                 prior_bars = recent_window.iloc[:-1] if len(recent_window) > 1 else recent_window.iloc[0:0]
-                recent_5bar_high = self._safe_float(prior_bars["high"].max(), close) if not prior_bars.empty and "high" in prior_bars.columns else close
-                recent_5bar_low = self._safe_float(prior_bars["low"].min(), close) if not prior_bars.empty and "low" in prior_bars.columns else close
+                recent_5bar_high = _safe_float(prior_bars["high"].max(), close) if not prior_bars.empty and "high" in prior_bars.columns else close
+                recent_5bar_low = _safe_float(prior_bars["low"].min(), close) if not prior_bars.empty and "low" in prior_bars.columns else close
                 bull_votes = 0
                 bear_votes = 0
                 if ema9 > ema20:
@@ -363,7 +371,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
     def _collapse_peer_levels(self, candidates: list[dict[str, Any]], close: float, htf: HTFContext) -> list[dict[str, Any]]:
         if not candidates:
             return []
-        atr = self._optional_float(getattr(htf, "atr14", None)) or max(float(close) * 0.0015, 0.01)
+        atr = _optional_float(getattr(htf, "atr14", None)) or max(float(close) * 0.0015, 0.01)
         tolerance = max(
             float(atr) * float(self.params.get("htf_atr_tolerance_mult", 0.35)),
             float(close) * float(self.params.get("htf_pct_tolerance", 0.0030)),
@@ -435,8 +443,8 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 local_confluence_score += 1.0
             if self._round_number_hit(float(price), tolerance_pct):
                 local_confluence_score += 1.0
-            ema_fast = self._optional_float(getattr(htf, "ema_fast", None))
-            ema_slow = self._optional_float(getattr(htf, "ema_slow", None))
+            ema_fast = _optional_float(getattr(htf, "ema_fast", None))
+            ema_slow = _optional_float(getattr(htf, "ema_slow", None))
             if ema_fast is not None and abs(float(price) - ema_fast) <= max(float(close) * tolerance_pct, float(getattr(htf, "atr14", 0.0) or 0.0) * 0.25):
                 local_confluence_score += 1.0
             if ema_slow is not None and abs(float(price) - ema_slow) <= max(float(close) * tolerance_pct, float(getattr(htf, "atr14", 0.0) or 0.0) * 0.25):
@@ -469,10 +477,10 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             source_priority = float(getattr(level_obj, "source_priority", self._peer_level_source_priority(kind)) or self._peer_level_source_priority(kind))
             _append(
                 kind,
-                self._optional_float(getattr(level_obj, "price", None)),
+                _optional_float(getattr(level_obj, "price", None)),
                 touches=int(getattr(level_obj, "touches", 1) or 1),
                 base_score=max(1.5, source_priority),
-                raw_htf_score=self._optional_float(getattr(level_obj, "score", None)),
+                raw_htf_score=_optional_float(getattr(level_obj, "score", None)),
                 source_priority=source_priority,
             )
 
@@ -481,9 +489,9 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 _append_level_obj(level_obj, "nearest_htf_support")
             _append_level_obj(getattr(htf, "broken_resistance", None), "broken_htf_resistance")
             for gap in (getattr(htf, "bullish_fvgs", []) or []):
-                lower = self._optional_float(getattr(gap, "lower", None))
-                upper = self._optional_float(getattr(gap, "upper", None))
-                midpoint = self._optional_float(getattr(gap, "midpoint", None))
+                lower = _optional_float(getattr(gap, "lower", None))
+                upper = _optional_float(getattr(gap, "upper", None))
+                midpoint = _optional_float(getattr(gap, "midpoint", None))
                 if lower is None or upper is None or midpoint is None:
                     continue
                 if lower > close and upper > close:
@@ -494,9 +502,9 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 _append_level_obj(level_obj, "nearest_htf_resistance")
             _append_level_obj(getattr(htf, "broken_support", None), "broken_htf_support")
             for gap in (getattr(htf, "bearish_fvgs", []) or []):
-                lower = self._optional_float(getattr(gap, "lower", None))
-                upper = self._optional_float(getattr(gap, "upper", None))
-                midpoint = self._optional_float(getattr(gap, "midpoint", None))
+                lower = _optional_float(getattr(gap, "lower", None))
+                upper = _optional_float(getattr(gap, "upper", None))
+                midpoint = _optional_float(getattr(gap, "midpoint", None))
                 if lower is None or upper is None or midpoint is None:
                     continue
                 if lower < close and upper < close:
@@ -509,8 +517,8 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         zone_floor = float(min_zone)
         zone_width = max(float(self.params.get("zone_atr_mult", 0.21)) * atr, min_zone)
         if isinstance(candidate, dict):
-            zone_lower = self._optional_float(candidate.get("zone_lower"))
-            zone_upper = self._optional_float(candidate.get("zone_upper"))
+            zone_lower = _optional_float(candidate.get("zone_lower"))
+            zone_upper = _optional_float(candidate.get("zone_upper"))
             if zone_lower is not None and zone_upper is not None and zone_upper >= zone_lower:
                 # Use the FVG span to raise the zone FLOOR (so very small FVGs
                 # don't shrink below min_zone), but do NOT let a tall FVG blow
@@ -575,7 +583,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
     def _select_level(self, side: Side, close: float, ltf: pd.DataFrame, htf: HTFContext) -> dict[str, Any] | None:
         if ltf is None or ltf.empty:
             return None
-        atr = self._safe_float(ltf.iloc[-1].get("atr14"), self._optional_float(getattr(htf, "atr14", None)) or max(close * 0.0015, 0.01))
+        atr = _safe_float(ltf.iloc[-1].get("atr14"), _optional_float(getattr(htf, "atr14", None)) or max(close * 0.0015, 0.01))
         recent = ltf.tail(4)
         best: dict[str, Any] | None = None
         for candidate in self._candidate_levels(close, htf, side):
@@ -642,13 +650,13 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         if prior.empty:
             return {"quality_bonus": 0.0, "quality_reasons": [], "quality_breakdown": {}}
 
-        close = self._safe_float(last.get("close"), level_price)
-        open_ = self._safe_float(last.get("open"), close)
-        atr = max(self._safe_float(last.get("atr14"), max(abs(float(close)) * 0.0015, 0.01)), max(abs(float(close)) * 0.0005, 0.01))
-        upper_wick_frac, lower_wick_frac, body_frac, bar_range = self._bar_wick_fractions(ltf)
-        close_pos = self._bar_close_position(ltf)
+        close = _safe_float(last.get("close"), level_price)
+        open_ = _safe_float(last.get("open"), close)
+        atr = max(_safe_float(last.get("atr14"), max(abs(float(close)) * 0.0015, 0.01)), max(abs(float(close)) * 0.0005, 0.01))
+        upper_wick_frac, lower_wick_frac, body_frac, bar_range = _bar_wick_fractions(ltf)
+        close_pos = _bar_close_position(ltf)
         recent_ranges = (prior["high"] - prior["low"]).tail(10) if {"high", "low"}.issubset(prior.columns) else pd.Series(dtype=float)
-        avg_range = self._safe_float(recent_ranges.mean(), bar_range if bar_range > 0 else atr)
+        avg_range = _safe_float(recent_ranges.mean(), bar_range if bar_range > 0 else atr)
         avg_range = max(avg_range, atr * 0.35, 1e-9)
         range_ratio = float(bar_range) / avg_range if avg_range > 0 else 0.0
         zone_scale = max(float(zone_width), atr * 0.15, abs(float(level_price)) * 0.0005, 1e-6)
@@ -684,11 +692,11 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 components["range_expansion_bonus"] = range_bonus
 
         if side == Side.LONG:
-            sweep_extreme = self._safe_float(sweep_window["low"].min(), close) if "low" in sweep_window.columns else close
+            sweep_extreme = _safe_float(sweep_window["low"].min(), close) if "low" in sweep_window.columns else close
             recovery_distance = max(0.0, close - float(level_price))
             penetration_ratio = max(0.0, float(level_price) - float(sweep_extreme)) / zone_scale
         else:
-            sweep_extreme = self._safe_float(sweep_window["high"].max(), close) if "high" in sweep_window.columns else close
+            sweep_extreme = _safe_float(sweep_window["high"].max(), close) if "high" in sweep_window.columns else close
             recovery_distance = max(0.0, float(level_price) - close)
             penetration_ratio = max(0.0, float(sweep_extreme) - float(level_price)) / zone_scale
 
@@ -921,7 +929,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         }
 
     def _build_equity_signal(self, c: Candidate, frame: pd.DataFrame, ltf: pd.DataFrame, htf: HTFContext, side: Side, level: dict[str, Any], peer_ctx: dict[str, Any], macro_ctx: dict[str, Any], data=None) -> Signal | None:
-        close = self._safe_float(frame.iloc[-1]["close"])
+        close = _safe_float(frame.iloc[-1]["close"])
         failure_style = self._failure_style_name(side)
         # Cheap directional gates run BEFORE expensive trigger scoring so that
         # symbols mis-sided against the hourly/peer/macro tape short-circuit out
@@ -982,7 +990,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             self._set_build_failure(c.symbol, failure_style, f"trigger_score_below_min:{trigger_score:.4f}<{trigger_min_score:.4f}")
             return None
         last5 = ltf.iloc[-1]
-        atr = self._safe_float(last5.get("atr14"), self._optional_float(getattr(htf, "atr14", None)) or max(close * 0.0015, 0.01))
+        atr = _safe_float(last5.get("atr14"), _optional_float(getattr(htf, "atr14", None)) or max(close * 0.0015, 0.01))
         target_clearance = self._peer_target_clearance(side, close, htf, atr)
         if self._shared_entry_enabled("use_sr_filter", True) and bool(self._support_resistance_setting("enabled", True)) and target_clearance is not None:
             min_clearance_pct = float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038))
@@ -1164,15 +1172,15 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         if frame is None or frame.empty:
             return False, "hold"
         last = frame.iloc[-1]
-        close = self._safe_float(last["close"])
-        ema9 = self._safe_float(last["ema9"], close) if "ema9" in frame.columns else close
-        ema20 = self._safe_float(last["ema20"], close) if "ema20" in frame.columns else close
-        vwap = self._safe_float(last["vwap"], close) if "vwap" in frame.columns else close
+        close = _safe_float(last["close"])
+        ema9 = _safe_float(last["ema9"], close) if "ema9" in frame.columns else close
+        ema20 = _safe_float(last["ema20"], close) if "ema20" in frame.columns else close
+        vwap = _safe_float(last["vwap"], close) if "vwap" in frame.columns else close
         should_exit, reason = self._ladder_exit_signal(position, frame, close, ema9, ema20, vwap, data=data)
         if should_exit:
             return should_exit, reason
         direction = self._direction_token(position)
-        close_pos = self._bar_close_position(frame)
+        close_pos = _bar_close_position(frame)
         return self._technical_exit_signal(direction, frame, close, ema9, ema20, vwap, close_pos, position)
 
     def entry_signals(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], client=None, data=None) -> list[Signal]:
@@ -1205,13 +1213,13 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 self._record_entry_decision(c.symbol, "skipped", ["already_in_position"])
                 continue
             if frame is None or len(frame) < min_bars:
-                self._record_entry_decision(c.symbol, "skipped", [self._insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)])
+                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)])
                 continue
             ltf = self._resampled_frame(frame, trigger_tf, symbol=c.symbol, data=data)
             if ltf is None or len(ltf) < min_trigger_bars:
-                self._record_entry_decision(c.symbol, "skipped", [self._insufficient_bars_reason("insufficient_trigger_bars", 0 if ltf is None else len(ltf), min_trigger_bars)])
+                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_trigger_bars", 0 if ltf is None else len(ltf), min_trigger_bars)])
                 continue
-            close = self._safe_float(frame.iloc[-1]["close"])
+            close = _safe_float(frame.iloc[-1]["close"])
             htf = self._htf_context(
                 c.symbol,
                 data,
@@ -1258,7 +1266,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                     long_failure = self._consume_build_failure(c.symbol, self._failure_style_name(Side.LONG))
                     short_failure = self._consume_build_failure(c.symbol, self._failure_style_name(Side.SHORT))
                     for side, failure in ((Side.LONG, long_failure), (Side.SHORT, short_failure)):
-                        for token in self._side_prefixed_reasons(side, [failure] if failure else []):
+                        for token in _side_prefixed_reasons(side, [failure] if failure else []):
                             if token and token not in reasons:
                                 reasons.append(token)
                     if not reasons:

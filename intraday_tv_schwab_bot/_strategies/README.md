@@ -213,7 +213,7 @@ class MyNewStrategy(BaseStrategy):
                 self._record_entry_decision(
                     c.symbol,
                     "skipped",
-                    [self._insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)],
+                    [self.insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)],
                 )
                 continue
 

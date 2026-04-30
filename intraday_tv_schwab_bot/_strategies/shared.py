@@ -52,79 +52,76 @@ from ..htf_levels import (
 from ..technical_levels import TechnicalLevelsContext, build_technical_levels_context, empty_technical_levels_context
 from ..utils import call_schwab_client, ensure_standard_indicator_frame, equity_session_state, now_et, parse_hhmm, resample_bars
 
+# Pure helpers live in `helpers.py`. shared.py is the import boundary
+# for the strategies package and re-exports them for convenience.
+# Strategies can `from ..shared import _discrete_score_threshold` etc.
+# without needing to know the helpers.py module exists.
+from .helpers import (
+    _ambiguous_regime_reason,
+    _bar_close_position,
+    _bar_wick_fractions,
+    _bool_token,
+    _clamp_long_premium_levels,
+    _clamp_short_premium_levels,
+    _dashboard_zone_width_from_policy,
+    _detail_fields,
+    _discrete_score_threshold,
+    _fmt_metric,
+    _gate_snapshot,
+    insufficient_bars_reason,
+    _is_scalar_missing,
+    _no_style_trigger_reason,
+    _normalize_symbol_list,
+    _normalize_symbol_list_details,
+    _optional_float,
+    _optional_int,
+    _position_strategy_matches,
+    _positive_quote_value,
+    _reason_prefix,
+    _reason_with_values,
+    _safe_float,
+    _same_day_mask,
+    _session_open_price,
+    _side_prefixed_reason,
+    _side_prefixed_reasons,
+    _style_unavailable_reason,
+    _time_gte_mask,
+)
+
 
 LOG = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Phase 4 helper extractions — pure static functions moved out of
-# BaseStrategy to reduce strategy_base.py and make them usable without
-# inheriting. Each was originally `@staticmethod` on BaseStrategy.
-# ---------------------------------------------------------------------------
-
-def _discrete_score_threshold(
-    value: Any,
-    default: int,
-    *,
-    minimum: int = 0,
-    maximum: int | None = None,
-) -> int:
-    """Coerce ``value`` to an integer threshold, falling back to ``default``
-    on parse failure and clamping to ``[minimum, maximum]`` (maximum optional).
-    Originally BaseStrategy._discrete_score_threshold."""
-    try:
-        raw = float(value)
-    except Exception:
-        raw = float(default)
-    if math.isnan(raw):
-        raw = float(default)
-    threshold = int(math.ceil(raw))
-    threshold = max(int(minimum), threshold)
-    if maximum is not None:
-        threshold = min(int(maximum), threshold)
-    return threshold
-
-
-def _side_prefixed_reason(side: Side, reason: str) -> str:
-    """Ensure ``reason`` starts with ``{side.value.lower()}.`` prefix.
-    Idempotent. Empty reason passes through unchanged.
-    Originally BaseStrategy._side_prefixed_reason."""
-    token = str(reason or "").strip()
-    if not token:
-        return token
-    prefix = f"{side.value.lower()}."
-    return token if token.startswith(prefix) else f"{prefix}{token}"
-
-
-def _gate_snapshot(
-    name: str,
-    *,
-    passed: bool,
-    current: Any = None,
-    required: Any = None,
-    op: str = ">=",
-    note: str | None = None,
-) -> dict[str, Any]:
-    """Build a gate-decision record for structured logging.
-    Originally BaseStrategy._gate_snapshot."""
-    payload: dict[str, Any] = {
-        "name": str(name),
-        "pass": bool(passed),
-        "op": str(op),
-    }
-    if current is not None:
-        payload["current"] = current
-    if required is not None:
-        payload["required"] = required
-    if note:
-        payload["note"] = str(note)
-    return payload
-
-
 __all__ = [
+    '_ambiguous_regime_reason',
+    '_bar_close_position',
+    '_bar_wick_fractions',
+    '_bool_token',
+    '_clamp_long_premium_levels',
+    '_clamp_short_premium_levels',
+    '_dashboard_zone_width_from_policy',
+    '_detail_fields',
     '_discrete_score_threshold',
+    '_fmt_metric',
     '_gate_snapshot',
+    'insufficient_bars_reason',
+    '_is_scalar_missing',
+    '_no_style_trigger_reason',
+    '_normalize_symbol_list',
+    '_normalize_symbol_list_details',
+    '_optional_float',
+    '_optional_int',
+    '_position_strategy_matches',
+    '_positive_quote_value',
+    '_reason_prefix',
+    '_reason_with_values',
+    '_safe_float',
+    '_same_day_mask',
+    '_session_open_price',
     '_side_prefixed_reason',
+    '_side_prefixed_reasons',
+    '_style_unavailable_reason',
+    '_time_gte_mask',
     'ASSET_TYPE_OPTION_SINGLE',
     'ASSET_TYPE_OPTION_VERTICAL',
     'Any',

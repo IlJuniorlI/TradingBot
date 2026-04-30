@@ -3,13 +3,26 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from threading import RLock
-from typing import TYPE_CHECKING, ClassVar, Iterable, cast
+from typing import TYPE_CHECKING, ClassVar, Iterable
 
+from .helpers import (
+    _bar_close_position,
+    _bar_wick_fractions,
+    _dashboard_zone_width_from_policy,
+    _detail_fields,
+    _normalize_symbol_list,
+    _normalize_symbol_list_details,
+    _optional_float,
+    _optional_int,
+    _position_strategy_matches,
+    _reason_prefix,
+    _reason_with_values,
+    _safe_float,
+)
 from .rvol import effective_relative_volume, relative_volume_gate_threshold
 from .shared import (
     Any,
     Candidate,
-    _side_prefixed_reason,
     FairValueGapContext,
     HTFContext,
     LOG,
@@ -22,7 +35,6 @@ from .shared import (
     build_fair_value_gap_context,
     build_technical_levels_context,
     equity_session_state,
-    date,
     detect_candle_context,
     directional_candle_signal,
     ensure_standard_indicator_frame,
@@ -102,26 +114,26 @@ class BaseStrategy:
         if token.startswith("params."):
             key = token.split(".", 1)[1]
             if isinstance(self.params, dict):
-                return self._normalize_symbol_list(self.params.get(key))
+                return _normalize_symbol_list(self.params.get(key))
             return []
         if token.startswith("options."):
             if not self._options_capability_enabled():
                 return []
             optcfg = getattr(self.config, "options", None)
             if token == "options.underlyings":
-                return self._normalize_symbol_list(getattr(optcfg, "underlyings", []))
+                return _normalize_symbol_list(getattr(optcfg, "underlyings", []))
             if token == "options.confirmation_symbols":
                 values = getattr(optcfg, "confirmation_symbols", {})
                 if isinstance(values, dict):
                     values = values.values()
-                return self._normalize_symbol_list(values)
+                return _normalize_symbol_list(values)
             if token == "options.volatility_symbol":
-                return self._normalize_symbol_list([getattr(optcfg, "volatility_symbol", "")])
+                return _normalize_symbol_list([getattr(optcfg, "volatility_symbol", "")])
             return []
         if token == "pairs.symbols":
-            return self._normalize_symbol_list(getattr(pair, "symbol", "") for pair in (getattr(self, "pairs", None) or []))
+            return _normalize_symbol_list(getattr(pair, "symbol", "") for pair in (getattr(self, "pairs", None) or []))
         if token == "pairs.references":
-            return self._normalize_symbol_list(getattr(pair, "reference", "") for pair in (getattr(self, "pairs", None) or []))
+            return _normalize_symbol_list(getattr(pair, "reference", "") for pair in (getattr(self, "pairs", None) or []))
         return []
 
     def __init__(self, config: BotConfig):
@@ -163,50 +175,6 @@ class BaseStrategy:
     def _relative_volume_gate_threshold(symbol: str, base_threshold: object, params: dict[str, Any] | None = None) -> float:
         return relative_volume_gate_threshold(symbol, base_threshold, params or {})
 
-    @staticmethod
-    def _normalize_symbol_list_details(values: object) -> tuple[list[str], list[str]]:
-        if isinstance(values, (str, bytes, dict)) or values is None:
-            raw_values: list[object] = []
-        elif isinstance(values, (list, tuple, set, frozenset)):
-            raw_values = list(values)
-        else:
-            try:
-                iterable_values = cast(Iterable[object], values)
-                raw_values = list(iterable_values)
-            except Exception:
-                raw_values = []
-        out: list[str] = []
-        skipped: list[str] = []
-        seen: set[str] = set()
-        invalid_tokens = {"NONE", "NULL", "NAN"}
-        for raw in raw_values:
-            if raw is None:
-                skipped.append("<NONE>")
-                continue
-            token = str(raw).upper().strip()
-            if not token:
-                skipped.append("<EMPTY>")
-                continue
-            if token in invalid_tokens:
-                skipped.append(token)
-                continue
-            if token in seen:
-                continue
-            seen.add(token)
-            out.append(token)
-        return out, skipped
-
-    @classmethod
-    def _normalize_symbol_list(cls, values: object) -> list[str]:
-        normalized, _skipped = cls._normalize_symbol_list_details(values)
-        return normalized
-
-    @staticmethod
-    def _position_strategy_matches(position: Position, strategy_names: list[str] | None) -> bool:
-        if not strategy_names:
-            return True
-        current = str(getattr(position, "strategy", "") or "").strip().lower()
-        return current in {str(name).strip().lower() for name in strategy_names if str(name).strip()}
 
     def _watchlist_capability_sources(self, kind: str) -> list[object] | None:
         raw = self._capability(f"watchlist.{kind}_sources", None)
@@ -249,7 +217,7 @@ class BaseStrategy:
         for source in sources:
             label = self._watchlist_source_label(source)
             raw_values = self._watchlist_source_values(source, candidates, positions, bars=bars, active_symbols=active_symbols)
-            normalized, skipped = self._normalize_symbol_list_details(raw_values)
+            normalized, skipped = _normalize_symbol_list_details(raw_values)
             trace[label] = {
                 "symbols": normalized,
                 "skipped": skipped,
@@ -321,7 +289,7 @@ class BaseStrategy:
             strategy_names = [str(item).strip().lower() for item in source.get("strategy_names", []) if str(item).strip()]
             values: list[object] = []
             for position in positions.values():
-                if not self._position_strategy_matches(position, strategy_names):
+                if not _position_strategy_matches(position, strategy_names):
                     continue
                 metadata = getattr(position, "metadata", {}) if isinstance(getattr(position, "metadata", {}), dict) else {}
                 raw_value = metadata.get(key)
@@ -345,7 +313,7 @@ class BaseStrategy:
         active_symbols: set[str] | None = None,
     ) -> list[str]:
         raw_values = self._watchlist_source_values(source, candidates, positions, bars=bars, active_symbols=active_symbols)
-        return self._normalize_symbol_list(raw_values)
+        return _normalize_symbol_list(raw_values)
 
     def _watchlist_symbols_from_capabilities(
         self,
@@ -362,7 +330,7 @@ class BaseStrategy:
         symbols: set[str] = set()
         for source in sources:
             symbols.update(self._watchlist_symbols_from_source(source, candidates, positions, bars=bars, active_symbols=active_symbols))
-        return {token for token in self._normalize_symbol_list(symbols)}
+        return {token for token in _normalize_symbol_list(symbols)}
 
     def dashboard_tradable_symbols(self) -> list[str]:
         source = self._capability("dashboard.tradable_symbols_source", None)
@@ -373,7 +341,7 @@ class BaseStrategy:
         raw_symbols = self.params.get("tradable")
         if raw_symbols is None:
             raw_symbols = self.params.get("symbols")
-        return self._normalize_symbol_list(raw_symbols)
+        return _normalize_symbol_list(raw_symbols)
 
     def restore_eligible_symbols(self) -> list[str] | None:
         source = self._capability("startup_restore.eligible_symbols_source", "dashboard_tradable_symbols")
@@ -410,9 +378,9 @@ class BaseStrategy:
                 continue
             fallback = None
             if field == "selection_quality_score":
-                priority_tiebreak = self._optional_float(metadata.get("selection_quality_score"))
+                priority_tiebreak = _optional_float(metadata.get("selection_quality_score"))
                 fallback = priority_tiebreak if priority_tiebreak is not None else strength
-            out.append(float(self._safe_float(metadata.get(field), fallback if fallback is not None else 0.0) or 0.0))
+            out.append(float(_safe_float(metadata.get(field), fallback if fallback is not None else 0.0) or 0.0))
         out.extend((float(strength), float(candidate_activity_score), -float(rank)))
         return tuple(out)
 
@@ -521,43 +489,6 @@ class BaseStrategy:
                 policy = override
         return policy if isinstance(policy, dict) else None
 
-    @staticmethod
-    def _dashboard_zone_width_from_policy(policy: dict[str, Any], close: float, atr: float) -> float | None:
-        mode = str(policy.get("mode") or "").strip().lower()
-        min_width = float(policy.get("min_width", 0.01) or 0.01)
-        computed_width: float | None
-        if mode == "fixed":
-            value = policy.get("value", policy.get("fixed_width"))
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                return None
-            computed_width = float(value)
-        elif mode == "atr_mult":
-            value = policy.get("value", policy.get("atr_mult"))
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                return None
-            computed_width = float(atr) * float(value)
-        elif mode in {"pct_of_price", "price_pct"}:
-            value = policy.get("value", policy.get("pct_of_price", policy.get("price_pct")))
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                return None
-            computed_width = float(close) * float(value)
-        elif mode == "max_of":
-            parts: list[float] = []
-            fixed_width = policy.get("fixed_width")
-            atr_mult = policy.get("atr_mult")
-            pct_of_price = policy.get("pct_of_price", policy.get("price_pct"))
-            if isinstance(fixed_width, (int, float)) and not isinstance(fixed_width, bool):
-                parts.append(float(fixed_width))
-            if isinstance(atr_mult, (int, float)) and not isinstance(atr_mult, bool):
-                parts.append(float(atr) * float(atr_mult))
-            if isinstance(pct_of_price, (int, float)) and not isinstance(pct_of_price, bool):
-                parts.append(float(close) * float(pct_of_price))
-            if not parts:
-                return None
-            computed_width = max(parts)
-        else:
-            return None
-        return max(float(computed_width), float(min_width), 0.01)
 
     def dashboard_zone_width_for_level(
         self,
@@ -570,7 +501,7 @@ class BaseStrategy:
     ) -> float | None:
         policy = self._resolve_dashboard_zone_width_policy(candidate)
         if isinstance(policy, dict):
-            return self._dashboard_zone_width_from_policy(policy, close=float(close), atr=float(atr))
+            return _dashboard_zone_width_from_policy(policy, close=float(close), atr=float(atr))
         return None
 
     def dashboard_overlay_candidates(self, side: Side, close: float, ltf: pd.DataFrame, htf: HTFContext) -> list[dict[str, Any]] | None:
@@ -883,14 +814,6 @@ class BaseStrategy:
             return {str(k): v for k, v in payload.items()}
         return {"primary_reason": str(payload), "reasons": [str(payload)]}
 
-    @staticmethod
-    def _side_prefixed_reasons(side: Side, reasons: list[str] | tuple[str, ...] | None) -> list[str]:
-        out: list[str] = []
-        for item in reasons or []:
-            token = _side_prefixed_reason(side, str(item or '').strip())
-            if token and token not in out:
-                out.append(token)
-        return out
 
     def _chart_context(self, frame: pd.DataFrame):
         # Per-cycle cache keyed like _technical_context — id(frame) separates
@@ -992,57 +915,7 @@ class BaseStrategy:
             return "bearish"
         return "bullish" if position.side == Side.LONG else "bearish"
 
-    @staticmethod
-    def _is_scalar_missing(value: Any) -> bool:
-        if value is None:
-            return True
-        if isinstance(value, str) and not value.strip():
-            return True
-        if isinstance(value, (pd.DataFrame, pd.Series, pd.Index)):
-            return False
-        try:
-            missing = pd.isna(value)
-        except Exception:
-            return False
-        return type(missing).__name__ in {"bool", "bool_"} and bool(missing)
 
-    @staticmethod
-    def _safe_float(value: Any, default: float = 0.0) -> float:
-        try:
-            if BaseStrategy._is_scalar_missing(value):
-                return float(default)
-            return float(value)
-        except Exception:
-            return float(default)
-
-    @staticmethod
-    def _optional_float(value: Any, default: float | None = None) -> float | None:
-        try:
-            if BaseStrategy._is_scalar_missing(value):
-                return default
-            return float(value)
-        except Exception:
-            return default
-
-    @staticmethod
-    def _optional_int(value: Any, default: int | None = None) -> int | None:
-        try:
-            if BaseStrategy._is_scalar_missing(value):
-                return default
-            return int(value)
-        except Exception:
-            return default
-
-    @staticmethod
-    def _fmt_metric(value: Any, digits: int = 4) -> str:
-        try:
-            if BaseStrategy._is_scalar_missing(value):
-                return 'na'
-            if isinstance(value, int) and not isinstance(value, bool):
-                return str(value)
-            return f"{float(value):.{digits}f}"
-        except Exception:
-            return 'na'
 
     def _build_bullish_reversal_signal(
         self,
@@ -1065,7 +938,7 @@ class BaseStrategy:
         extra_priority: float = 0.0,
         management_style: str = "reversal",
     ) -> Signal:
-        last_close = self._safe_float(frame.iloc[-1]["close"])
+        last_close = _safe_float(frame.iloc[-1]["close"])
         adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx)
         fvg_adjustments = self._fvg_entry_adjustment_components(Side.LONG, candidate.symbol, frame, data)
         management = self._adaptive_management_components(
@@ -1110,42 +983,9 @@ class BaseStrategy:
         )
 
 
-    @classmethod
-    def _reason_with_values(cls, name: str, *, current: Any = None, required: Any = None, op: str = '>=', digits: int = 4, extras: dict[str, tuple[Any, str, Any]] | None = None) -> str:
-        parts = [name]
-        if required is not None or current is not None:
-            parts.append(f"required{op}{cls._fmt_metric(required, digits)}")
-            parts.append(f"current={cls._fmt_metric(current, digits)}")
-        for label, payload in (extras or {}).items():
-            extra_current, extra_op, extra_required = payload
-            parts.append(f"{label}_required{extra_op}{cls._fmt_metric(extra_required, digits)}")
-            parts.append(f"{label}_current={cls._fmt_metric(extra_current, digits)}")
-        return f"{name}({','.join(parts[1:])})" if len(parts) > 1 else name
-
-    @classmethod
-    def _detail_fields(cls, **fields: Any) -> str:
-        parts: list[str] = []
-        for key, value in fields.items():
-            if isinstance(value, bool):
-                rendered = cls._bool_token(value)
-            elif isinstance(value, int) and not isinstance(value, bool):
-                rendered = str(value)
-            elif isinstance(value, str):
-                rendered = value
-            else:
-                rendered = cls._fmt_metric(value, 4)
-            parts.append(f"{key}={rendered}")
-        return ",".join(parts)
-
-    @classmethod
-    def _style_unavailable_reason(cls, style: str, detail: str, **fields: Any) -> str:
-        detail = str(detail or '').strip() or 'unknown'
-        extra = cls._detail_fields(**fields)
-        inner = f"{detail},{extra}" if extra else detail
-        return f"{style}_unavailable({inner})"
 
     def _bullish_sr_block_reason(self, sr_ctx) -> str:
-        return self._reason_with_values(
+        return _reason_with_values(
             "too_close_to_htf_resistance",
             current=sr_ctx.resistance_distance_pct,
             required=float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)),
@@ -1157,7 +997,7 @@ class BaseStrategy:
         )
 
     def _bearish_sr_block_reason(self, sr_ctx) -> str:
-        return self._reason_with_values(
+        return _reason_with_values(
             "too_close_to_htf_support",
             current=sr_ctx.support_distance_pct,
             required=float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)),
@@ -1168,140 +1008,15 @@ class BaseStrategy:
             },
         )
 
-    @classmethod
-    def _insufficient_bars_reason(cls, name: str, current: Any, required: Any) -> str:
-        return cls._reason_with_values(name, current=current, required=required, op='>=', digits=0)
 
-    @classmethod
-    def insufficient_bars_reason(cls, name: str, current: Any, required: Any) -> str:
-        return cls._insufficient_bars_reason(name, current, required)
 
-    @classmethod
-    def _ambiguous_regime_reason(
-        cls,
-        *,
-        top_name: str,
-        top_score: Any,
-        second_name: str,
-        second_score: Any,
-        min_top_score: Any,
-        min_score_gap: Any,
-    ) -> str:
-        gap = None
-        try:
-            if not BaseStrategy._is_scalar_missing(top_score) and not BaseStrategy._is_scalar_missing(second_score):
-                gap = float(top_score) - float(second_score)
-        except Exception:
-            gap = None
-        return (
-            "ambiguous_regime("
-            f"top={top_name},"
-            f"top_score={cls._fmt_metric(top_score, 2)},"
-            f"second={second_name},"
-            f"second_score={cls._fmt_metric(second_score, 2)},"
-            f"required_top_score>={cls._fmt_metric(min_top_score, 2)},"
-            f"required_score_gap>={cls._fmt_metric(min_score_gap, 2)},"
-            f"current_score_gap={cls._fmt_metric(gap, 2)}"
-            ")"
-        )
-
-    @staticmethod
-    def _bool_token(value: Any) -> str:
-        return "true" if bool(value) else "false"
-
-    @classmethod
-    def _no_style_trigger_reason(
-        cls,
-        *,
-        regime_name: str,
-        bullish: bool,
-        bearish: bool,
-        rangeish: bool,
-        orb_enabled: bool,
-        orb_window: bool,
-        trend_enabled: bool,
-        trend_window: bool,
-        credit_enabled: bool,
-        credit_window: bool,
-        last_close: Any,
-        last_vwap: Any,
-        last_ret5: Any,
-        trend_min_ret5: Any,
-        or_high: Any,
-        or_low: Any,
-        orb_buffer_pct: Any,
-    ) -> str:
-        bull_trigger = None
-        bear_trigger = None
-        try:
-            if not BaseStrategy._is_scalar_missing(or_high) and not BaseStrategy._is_scalar_missing(orb_buffer_pct):
-                bull_trigger = float(or_high) * (1.0 + float(orb_buffer_pct))
-        except Exception:
-            bull_trigger = None
-        try:
-            if not BaseStrategy._is_scalar_missing(or_low) and not BaseStrategy._is_scalar_missing(orb_buffer_pct):
-                bear_trigger = float(or_low) * (1.0 - float(orb_buffer_pct))
-        except Exception:
-            bear_trigger = None
-        return (
-            "no_style_trigger("
-            f"regime={regime_name},"
-            f"bullish={cls._bool_token(bullish)},"
-            f"bearish={cls._bool_token(bearish)},"
-            f"rangeish={cls._bool_token(rangeish)},"
-            f"orb_enabled={cls._bool_token(orb_enabled)},"
-            f"orb_window={cls._bool_token(orb_window)},"
-            f"trend_enabled={cls._bool_token(trend_enabled)},"
-            f"trend_window={cls._bool_token(trend_window)},"
-            f"credit_enabled={cls._bool_token(credit_enabled)},"
-            f"credit_window={cls._bool_token(credit_window)},"
-            f"close={cls._fmt_metric(last_close, 4)},"
-            f"vwap={cls._fmt_metric(last_vwap, 4)},"
-            f"ret5={cls._fmt_metric(last_ret5, 4)},"
-            f"required_ret5>={cls._fmt_metric(trend_min_ret5, 4)},"
-            f"required_bear_ret5<={cls._fmt_metric(-cls._safe_float(trend_min_ret5, 0.0), 4)},"
-            f"or_high={cls._fmt_metric(or_high, 4)},"
-            f"or_low={cls._fmt_metric(or_low, 4)},"
-            f"orb_bull_trigger>{cls._fmt_metric(bull_trigger, 4)},"
-            f"orb_bear_trigger<{cls._fmt_metric(bear_trigger, 4)},"
-            f"orb_buffer_pct={cls._fmt_metric(orb_buffer_pct, 4)}"
-            ")"
-        )
-
-    @staticmethod
-    def _bar_close_position(frame: pd.DataFrame) -> float:
-        if frame is None or frame.empty:
-            return 0.5
-        last = frame.iloc[-1]
-        low = BaseStrategy._safe_float(last["low"])
-        high = BaseStrategy._safe_float(last["high"])
-        if high <= low:
-            return 0.5
-        return (BaseStrategy._safe_float(last["close"]) - low) / (high - low)
-
-    @staticmethod
-    def _bar_wick_fractions(frame: pd.DataFrame) -> tuple[float, float, float, float]:
-        if frame is None or frame.empty:
-            return 0.0, 0.0, 0.0, 0.0
-        last = frame.iloc[-1]
-        high = BaseStrategy._safe_float(last.get("high"), 0.0)
-        low = BaseStrategy._safe_float(last.get("low"), 0.0)
-        open_ = BaseStrategy._safe_float(last.get("open"), low)
-        close = BaseStrategy._safe_float(last.get("close"), open_)
-        bar_range = max(0.0, high - low)
-        if bar_range <= 0.0:
-            return 0.0, 0.0, 0.0, 0.0
-        upper_wick = max(0.0, high - max(open_, close))
-        lower_wick = max(0.0, min(open_, close) - low)
-        body = abs(close - open_)
-        return upper_wick / bar_range, lower_wick / bar_range, body / bar_range, bar_range
 
     def _entry_exhaustion_reasons(self, side: Side, frame: pd.DataFrame | None, *, close: float, vwap: float, ema9: float) -> list[str]:
         if frame is None or frame.empty:
             return []
         if not bool(self.params.get("entry_exhaustion_filter_enabled", True)):
             return []
-        atr = self._safe_float(frame.iloc[-1].get("atr14"), max(abs(float(close)) * 0.0015, 0.01))
+        atr = _safe_float(frame.iloc[-1].get("atr14"), max(abs(float(close)) * 0.0015, 0.01))
         atr = max(atr, max(abs(float(close)) * 0.0005, 0.01))
         max_vwap_ext_atr = max(0.1, float(self.params.get("max_entry_vwap_extension_atr", 0.95)))
         max_ema9_ext_atr = max(0.1, float(self.params.get("max_entry_ema9_extension_atr", 0.75)))
@@ -1309,46 +1024,44 @@ class BaseStrategy:
         max_upper_wick_frac = min(0.95, max(0.05, float(self.params.get("max_entry_upper_wick_frac", 0.30))))
         max_lower_wick_frac = min(0.95, max(0.05, float(self.params.get("max_entry_lower_wick_frac", 0.30))))
         wick_close_pos_guard = min(0.95, max(0.05, float(self.params.get("entry_wick_close_position_guard", 0.62))))
-        upper_wick_frac, lower_wick_frac, _, bar_range = self._bar_wick_fractions(frame)
-        close_pos = self._bar_close_position(frame)
+        upper_wick_frac, lower_wick_frac, _, bar_range = _bar_wick_fractions(frame)
+        close_pos = _bar_close_position(frame)
         reasons: list[str] = []
         if side == Side.LONG:
             vwap_ext_atr = max(0.0, float(close) - float(vwap)) / atr if float(vwap) > 0 else 0.0
             ema9_ext_atr = max(0.0, float(close) - float(ema9)) / atr if float(ema9) > 0 else 0.0
             if vwap_ext_atr > max_vwap_ext_atr:
-                reasons.append(self._reason_with_values("too_extended_from_vwap_atr", current=vwap_ext_atr, required=max_vwap_ext_atr, op="<=", digits=4))
+                reasons.append(_reason_with_values("too_extended_from_vwap_atr", current=vwap_ext_atr, required=max_vwap_ext_atr, op="<=", digits=4))
             if ema9_ext_atr > max_ema9_ext_atr:
-                reasons.append(self._reason_with_values("too_extended_from_ema9_atr", current=ema9_ext_atr, required=max_ema9_ext_atr, op="<=", digits=4))
+                reasons.append(_reason_with_values("too_extended_from_ema9_atr", current=ema9_ext_atr, required=max_ema9_ext_atr, op="<=", digits=4))
             if upper_wick_frac > max_upper_wick_frac and close_pos < wick_close_pos_guard:
-                reasons.append(self._reason_with_values("upper_wick_rejection", current=upper_wick_frac, required=max_upper_wick_frac, op="<=", digits=4, extras={"close_position": (close_pos, ">=", wick_close_pos_guard)}))
+                reasons.append(_reason_with_values("upper_wick_rejection", current=upper_wick_frac, required=max_upper_wick_frac, op="<=", digits=4, extras={"close_position": (close_pos, ">=", wick_close_pos_guard)}))
             if (bar_range / atr) > max_bar_range_atr and (vwap_ext_atr > max_vwap_ext_atr * 0.75 or ema9_ext_atr > max_ema9_ext_atr * 0.75):
-                reasons.append(self._reason_with_values("expansion_bar_too_large", current=(bar_range / atr), required=max_bar_range_atr, op="<=", digits=4))
+                reasons.append(_reason_with_values("expansion_bar_too_large", current=(bar_range / atr), required=max_bar_range_atr, op="<=", digits=4))
         else:
             vwap_ext_atr = max(0.0, float(vwap) - float(close)) / atr if float(vwap) > 0 else 0.0
             ema9_ext_atr = max(0.0, float(ema9) - float(close)) / atr if float(ema9) > 0 else 0.0
             if vwap_ext_atr > max_vwap_ext_atr:
-                reasons.append(self._reason_with_values("too_extended_from_vwap_atr", current=vwap_ext_atr, required=max_vwap_ext_atr, op="<=", digits=4))
+                reasons.append(_reason_with_values("too_extended_from_vwap_atr", current=vwap_ext_atr, required=max_vwap_ext_atr, op="<=", digits=4))
             if ema9_ext_atr > max_ema9_ext_atr:
-                reasons.append(self._reason_with_values("too_extended_from_ema9_atr", current=ema9_ext_atr, required=max_ema9_ext_atr, op="<=", digits=4))
+                reasons.append(_reason_with_values("too_extended_from_ema9_atr", current=ema9_ext_atr, required=max_ema9_ext_atr, op="<=", digits=4))
             if lower_wick_frac > max_lower_wick_frac and close_pos > (1.0 - wick_close_pos_guard):
-                reasons.append(self._reason_with_values("lower_wick_rejection", current=lower_wick_frac, required=max_lower_wick_frac, op="<=", digits=4, extras={"close_position": (close_pos, "<=", 1.0 - wick_close_pos_guard)}))
+                reasons.append(_reason_with_values("lower_wick_rejection", current=lower_wick_frac, required=max_lower_wick_frac, op="<=", digits=4, extras={"close_position": (close_pos, "<=", 1.0 - wick_close_pos_guard)}))
             if (bar_range / atr) > max_bar_range_atr and (vwap_ext_atr > max_vwap_ext_atr * 0.75 or ema9_ext_atr > max_ema9_ext_atr * 0.75):
-                reasons.append(self._reason_with_values("expansion_bar_too_large", current=(bar_range / atr), required=max_bar_range_atr, op="<=", digits=4))
+                reasons.append(_reason_with_values("expansion_bar_too_large", current=(bar_range / atr), required=max_bar_range_atr, op="<=", digits=4))
         return reasons
 
 
-    @staticmethod
-    def _reason_prefix(reason: str) -> str:
-        return str(reason or "").split("(", 1)[0].strip()
 
-    def _apply_continuation_fvg_retest_plan(self, reasons: list[str], plan: dict[str, Any] | None, *, deferrable_prefixes: set[str]) -> list[str]:
+    @staticmethod
+    def _apply_continuation_fvg_retest_plan(reasons: list[str], plan: dict[str, Any] | None, *, deferrable_prefixes: set[str]) -> list[str]:
         if not reasons or not plan:
             return reasons
         status = str(plan.get("status", "none") or "none").strip().lower()
         if status == "none":
             return reasons
-        deferred = [reason for reason in reasons if self._reason_prefix(reason) in deferrable_prefixes]
-        other = [reason for reason in reasons if self._reason_prefix(reason) not in deferrable_prefixes]
+        deferred = [reason for reason in reasons if _reason_prefix(reason) in deferrable_prefixes]
+        other = [reason for reason in reasons if _reason_prefix(reason) not in deferrable_prefixes]
         if not deferred or other:
             return reasons
         if status == "allow":
@@ -1356,10 +1069,11 @@ class BaseStrategy:
         plan_reason = str(plan.get("reason", "") or "").strip()
         return [plan_reason] if plan_reason else reasons
 
-    def _apply_retest_stop_anchor(self, side: Side, close: float, stop: float, plan: dict[str, Any] | None) -> float:
+    @staticmethod
+    def _apply_retest_stop_anchor(side: Side, close: float, stop: float, plan: dict[str, Any] | None) -> float:
         if not plan or str(plan.get("status", "none") or "none").strip().lower() != "allow":
             return float(stop)
-        anchor = self._optional_float(plan.get("stop_anchor"))
+        anchor = _optional_float(plan.get("stop_anchor"))
         if anchor is None:
             return float(stop)
         if side == Side.LONG:
@@ -1406,12 +1120,12 @@ class BaseStrategy:
         opposing_info = self._fvg_gap_state(opposing_gap, close)
         same_state = str(same_info.get("state", "none") or "none").strip().lower()
         opposing_state = str(opposing_info.get("state", "none") or "none").strip().lower()
-        lower = self._optional_float(same_info.get("lower"))
-        upper = self._optional_float(same_info.get("upper"))
-        midpoint = self._optional_float(same_info.get("midpoint"))
-        size = max(1e-8, float(self._optional_float(same_info.get("size"), 0.0) or 0.0))
-        same_distance_pct = self._optional_float(same_info.get("distance_pct"), 1.0)
-        opposing_distance_pct = self._optional_float(opposing_info.get("distance_pct"))
+        lower = _optional_float(same_info.get("lower"))
+        upper = _optional_float(same_info.get("upper"))
+        midpoint = _optional_float(same_info.get("midpoint"))
+        size = max(1e-8, float(_optional_float(same_info.get("size"), 0.0) or 0.0))
+        same_distance_pct = _optional_float(same_info.get("distance_pct"), 1.0)
+        opposing_distance_pct = _optional_float(opposing_info.get("distance_pct"))
         max_gap_distance_pct = max(0.0002, float(self.params.get("anti_chase_fvg_retest_max_gap_distance_pct", 0.0030)))
         max_opposing_distance_pct = max(0.0002, float(self.params.get("anti_chase_fvg_retest_max_opposing_distance_pct", 0.0020)))
         lookback_bars = max(2, int(self.params.get("anti_chase_fvg_retest_lookback_bars", 5)))
@@ -1423,6 +1137,14 @@ class BaseStrategy:
         trigger_tolerance_pct = max(0.0, float(self.params.get("anti_chase_fvg_retest_trigger_tolerance_pct", 0.0012)))
         touch_tolerance = max(size * 0.20, abs(close) * max_gap_distance_pct * 0.25, 1e-8)
         invalidation_tolerance = max(size * 0.18, abs(close) * 1e-6, 1e-8)
+        # Edge-tolerance lets a bar that bounces *just above* a bullish FVG
+        # upper bound (or just below a bearish FVG lower bound) without
+        # penetrating the zone still qualify as a touch. Some reversals
+        # respect the FVG boundary as support without filling the gap;
+        # historically the strict touched_zone check missed those. Default
+        # 0.0 = preserve existing strict behavior. A value of e.g. 0.003
+        # = 0.3% of close treats near-edge reversals as valid retests.
+        edge_tolerance = max(0.0, abs(close) * float(self.params.get("anti_chase_fvg_edge_tolerance_pct", 0.0) or 0.0))
         direction_label = "bullish" if side == Side.LONG else "bearish"
         out["metadata"].update(
             {
@@ -1440,7 +1162,7 @@ class BaseStrategy:
         if lower is None or upper is None or midpoint is None or same_state not in {"active", "validated"}:
             if same_state == "invalidated":
                 out["status"] = "reject"
-                out["reason"] = f"{direction_label}_fvg_retest_rejected({self._detail_fields(detail='same_direction_gap_invalidated', midpoint=midpoint or 0.0)})"
+                out["reason"] = f"{direction_label}_fvg_retest_rejected({_detail_fields(detail='same_direction_gap_invalidated', midpoint=midpoint or 0.0)})"
                 out["metadata"]["anti_chase_fvg_retest_status"] = out["status"]
             return out
         in_gap = lower - touch_tolerance <= close <= upper + touch_tolerance
@@ -1461,14 +1183,14 @@ class BaseStrategy:
         opposing_blocked = bool(opposing_state in {"active", "validated"} and opposing_distance_pct is not None and float(opposing_distance_pct) <= max_opposing_distance_pct)
         if opposing_blocked:
             out["status"] = "reject"
-            out["reason"] = f"{direction_label}_fvg_retest_rejected({self._detail_fields(detail='opposing_gap_too_close', opposing_distance_pct=opposing_distance_pct or 0.0)})"
+            out["reason"] = f"{direction_label}_fvg_retest_rejected({_detail_fields(detail='opposing_gap_too_close', opposing_distance_pct=opposing_distance_pct or 0.0)})"
             out["metadata"]["anti_chase_fvg_retest_status"] = out["status"]
             return out
         last = frame.iloc[-1]
-        bar_low = self._safe_float(last.get("low"), close)
-        bar_high = self._safe_float(last.get("high"), close)
-        close_pos = self._bar_close_position(frame)
-        touched_zone = bar_low <= (upper + touch_tolerance) and bar_high >= (lower - touch_tolerance)
+        bar_low = _safe_float(last.get("low"), close)
+        bar_high = _safe_float(last.get("high"), close)
+        close_pos = _bar_close_position(frame)
+        touched_zone = bar_low <= (upper + touch_tolerance + edge_tolerance) and bar_high >= (lower - touch_tolerance - edge_tolerance)
         if side == Side.LONG:
             respected_zone = bar_low >= (lower - invalidation_tolerance)
             reclaimed = close >= (midpoint - touch_tolerance) and close >= min(float(vwap or close), float(ema9 or close))
@@ -1495,7 +1217,7 @@ class BaseStrategy:
             )
             return out
         out["status"] = "wait"
-        out["reason"] = f"wait_for_{direction_label}_fvg_retest({self._detail_fields(state=same_state, midpoint=midpoint, trigger=trigger_level, distance_pct=same_distance_pct or 0.0)})"
+        out["reason"] = f"wait_for_{direction_label}_fvg_retest({_detail_fields(state=same_state, midpoint=midpoint, trigger=trigger_level, distance_pct=same_distance_pct or 0.0)})"
         out["metadata"]["anti_chase_fvg_retest_status"] = out["status"]
         return out
 
@@ -1632,41 +1354,41 @@ class BaseStrategy:
             "broken_htf_resistance": float(ctx.broken_resistance.price) if getattr(ctx, "broken_resistance", None) else None,
             "nearest_htf_resistance": float(ctx.nearest_resistance.price) if getattr(ctx, "nearest_resistance", None) else None,
             "broken_htf_support": float(ctx.broken_support.price) if getattr(ctx, "broken_support", None) else None,
-            "prior_day_high": BaseStrategy._optional_float(getattr(ctx, "prior_day_high", None)) if "prior_day_high" in active_sources else None,
-            "prior_day_low": BaseStrategy._optional_float(getattr(ctx, "prior_day_low", None)) if "prior_day_low" in active_sources else None,
-            "prior_week_high": BaseStrategy._optional_float(getattr(ctx, "prior_week_high", None)) if "prior_week_high" in active_sources else None,
-            "prior_week_low": BaseStrategy._optional_float(getattr(ctx, "prior_week_low", None)) if "prior_week_low" in active_sources else None,
-            "htf_ema_fast": BaseStrategy._optional_float(getattr(ctx, "ema_fast", None)),
-            "htf_ema_slow": BaseStrategy._optional_float(getattr(ctx, "ema_slow", None)),
-            "htf_atr14": BaseStrategy._optional_float(getattr(ctx, "atr14", None)),
+            "prior_day_high": _optional_float(getattr(ctx, "prior_day_high", None)) if "prior_day_high" in active_sources else None,
+            "prior_day_low": _optional_float(getattr(ctx, "prior_day_low", None)) if "prior_day_low" in active_sources else None,
+            "prior_week_high": _optional_float(getattr(ctx, "prior_week_high", None)) if "prior_week_high" in active_sources else None,
+            "prior_week_low": _optional_float(getattr(ctx, "prior_week_low", None)) if "prior_week_low" in active_sources else None,
+            "htf_ema_fast": _optional_float(getattr(ctx, "ema_fast", None)),
+            "htf_ema_slow": _optional_float(getattr(ctx, "ema_slow", None)),
+            "htf_atr14": _optional_float(getattr(ctx, "atr14", None)),
             "htf_trend_bias": str(getattr(ctx, "trend_bias", "neutral")),
             "htf_level_buffer": float(getattr(ctx, "level_buffer", 0.0) or 0.0),
             "htf_bullish_fvgs": [
                 {
-                    "lower": BaseStrategy._optional_float(getattr(gap, "lower", None)),
-                    "upper": BaseStrategy._optional_float(getattr(gap, "upper", None)),
-                    "midpoint": BaseStrategy._optional_float(getattr(gap, "midpoint", None)),
-                    "size": BaseStrategy._optional_float(getattr(gap, "size", None)),
-                    "filled_pct": BaseStrategy._optional_float(getattr(gap, "filled_pct", None)),
+                    "lower": _optional_float(getattr(gap, "lower", None)),
+                    "upper": _optional_float(getattr(gap, "upper", None)),
+                    "midpoint": _optional_float(getattr(gap, "midpoint", None)),
+                    "size": _optional_float(getattr(gap, "size", None)),
+                    "filled_pct": _optional_float(getattr(gap, "filled_pct", None)),
                 }
                 for gap in (getattr(ctx, "bullish_fvgs", []) or [])
             ],
             "htf_bearish_fvgs": [
                 {
-                    "lower": BaseStrategy._optional_float(getattr(gap, "lower", None)),
-                    "upper": BaseStrategy._optional_float(getattr(gap, "upper", None)),
-                    "midpoint": BaseStrategy._optional_float(getattr(gap, "midpoint", None)),
-                    "size": BaseStrategy._optional_float(getattr(gap, "size", None)),
-                    "filled_pct": BaseStrategy._optional_float(getattr(gap, "filled_pct", None)),
+                    "lower": _optional_float(getattr(gap, "lower", None)),
+                    "upper": _optional_float(getattr(gap, "upper", None)),
+                    "midpoint": _optional_float(getattr(gap, "midpoint", None)),
+                    "size": _optional_float(getattr(gap, "size", None)),
+                    "filled_pct": _optional_float(getattr(gap, "filled_pct", None)),
                 }
                 for gap in (getattr(ctx, "bearish_fvgs", []) or [])
             ],
-            "nearest_htf_bullish_fvg": BaseStrategy._optional_float(getattr(getattr(ctx, "nearest_bullish_fvg", None), "midpoint", None)),
-            "nearest_htf_bearish_fvg": BaseStrategy._optional_float(getattr(getattr(ctx, "nearest_bearish_fvg", None), "midpoint", None)),
+            "nearest_htf_bullish_fvg": _optional_float(getattr(getattr(ctx, "nearest_bullish_fvg", None), "midpoint", None)),
+            "nearest_htf_bearish_fvg": _optional_float(getattr(getattr(ctx, "nearest_bearish_fvg", None), "midpoint", None)),
         }
 
     def _one_minute_fvg_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> FairValueGapContext:
-        current_price = self._safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
+        current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
         if not bool(self._support_resistance_setting("one_minute_fair_value_gaps_enabled", False)):
             return empty_fvg_context(current_price, timeframe_minutes=1)
         max_per_side = int(self._support_resistance_setting("one_minute_fair_value_gap_max_per_side", 4) or 4)
@@ -1733,7 +1455,7 @@ class BaseStrategy:
             cached = self._structure_context_cache.get(cache_key)
             if cached is not None:
                 return cached
-        current_price = self._safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
+        current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
         if frame is None or frame.empty or not bool(self._support_resistance_setting("structure_enabled", True)):
             empty_ctx = empty_market_structure_context(current_price)
             with self._structure_context_lock:
@@ -1809,7 +1531,7 @@ class BaseStrategy:
             cached = self._technical_context_cache.get(cache_key)
             if cached is not None:
                 return cached
-        current_price = self._safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
+        current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
         cfg = getattr(self.config, "technical_levels", None)
         sr_cfg = getattr(self.config, "support_resistance", None)
         if frame is None or frame.empty or not bool(self._technical_level_setting("enabled", True)):
@@ -1824,9 +1546,9 @@ class BaseStrategy:
             pivot_span=max(1, pivot_span),
             fib_lookback_bars=int(self._technical_level_setting("fib_lookback_bars", 120) or 120),
             fib_min_impulse_atr=float(self._technical_level_setting("fib_min_impulse_atr", 1.25) or 1.25),
-            anchored_vwap_impulse_lookback_bars=self._optional_int(self._technical_level_setting("anchored_vwap_impulse_lookback_bars", None), None),
-            anchored_vwap_min_impulse_atr=self._optional_float(self._technical_level_setting("anchored_vwap_min_impulse_atr", None), None),
-            anchored_vwap_pivot_span=self._optional_int(self._technical_level_setting("anchored_vwap_pivot_span", None), None),
+            anchored_vwap_impulse_lookback_bars=_optional_int(self._technical_level_setting("anchored_vwap_impulse_lookback_bars", None), None),
+            anchored_vwap_min_impulse_atr=_optional_float(self._technical_level_setting("anchored_vwap_min_impulse_atr", None), None),
+            anchored_vwap_pivot_span=_optional_int(self._technical_level_setting("anchored_vwap_pivot_span", None), None),
             trendline_lookback_bars=int(self._technical_level_setting("trendline_lookback_bars", 120) or 120),
             trendline_min_touches=int(self._technical_level_setting("trendline_min_touches", 3) or 3),
             trendline_atr_tolerance_mult=float(self._technical_level_setting("trendline_atr_tolerance_mult", 0.35) or 0.35),
@@ -2097,7 +1819,7 @@ class BaseStrategy:
         bb_lower = getattr(tech_ctx, "bollinger_lower", None)
         bb_pct = getattr(tech_ctx, "bollinger_percent_b", None)
         bb_squeeze = bool(getattr(tech_ctx, "bollinger_squeeze", False))
-        price = self._safe_float(getattr(tech_ctx, "current_price", None), 0.0)
+        price = _safe_float(getattr(tech_ctx, "current_price", None), 0.0)
         adx = getattr(tech_ctx, "adx", None)
         dmi_bias = str(getattr(tech_ctx, "dmi_bias", "neutral") or "neutral")
         adx_rising = bool(getattr(tech_ctx, "adx_rising", False))
@@ -2250,7 +1972,7 @@ class BaseStrategy:
         if sr_ctx is None:
             return out
         try:
-            raw_bias = self._safe_float(getattr(sr_ctx, "bias_score", 0.0), 0.0)
+            raw_bias = _safe_float(getattr(sr_ctx, "bias_score", 0.0), 0.0)
             directional_bias = raw_bias if side == Side.LONG else -raw_bias
             bias_weight = max(0.0, float(self._support_resistance_setting("entry_bias_score_weight", 0.60) or 0.60))
             favorable_bonus = max(0.0, float(self._support_resistance_setting("entry_favorable_proximity_bonus", 0.35) or 0.35))
@@ -2260,14 +1982,14 @@ class BaseStrategy:
 
             if side == Side.LONG:
                 favorable_near = bool(getattr(sr_ctx, "near_support", False)) and not bool(getattr(sr_ctx, "breakdown_below_support", False))
-                favorable_dist = self._optional_float(getattr(sr_ctx, "support_distance_atr", None))
+                favorable_dist = _optional_float(getattr(sr_ctx, "support_distance_atr", None))
                 opposing_near = bool(getattr(sr_ctx, "near_resistance", False)) and not bool(getattr(sr_ctx, "breakout_above_resistance", False))
-                opposing_dist = self._optional_float(getattr(sr_ctx, "resistance_distance_atr", None))
+                opposing_dist = _optional_float(getattr(sr_ctx, "resistance_distance_atr", None))
             else:
                 favorable_near = bool(getattr(sr_ctx, "near_resistance", False)) and not bool(getattr(sr_ctx, "breakout_above_resistance", False))
-                favorable_dist = self._optional_float(getattr(sr_ctx, "resistance_distance_atr", None))
+                favorable_dist = _optional_float(getattr(sr_ctx, "resistance_distance_atr", None))
                 opposing_near = bool(getattr(sr_ctx, "near_support", False)) and not bool(getattr(sr_ctx, "breakdown_below_support", False))
-                opposing_dist = self._optional_float(getattr(sr_ctx, "support_distance_atr", None))
+                opposing_dist = _optional_float(getattr(sr_ctx, "support_distance_atr", None))
 
             def _proximity_score(dist_atr: float | None) -> float:
                 if dist_atr is None:
@@ -2303,10 +2025,10 @@ class BaseStrategy:
             return float(stop), (None if target is None else float(target))
         if not bool(self._technical_level_setting("enabled", True)):
             return float(stop), (None if target is None else float(target))
-        atr = self._safe_float(frame.iloc[-1]["atr14"], close * 0.0015) if frame is not None and not frame.empty and "atr14" in frame.columns else max(close * 0.0015, 0.01)
+        atr = _safe_float(frame.iloc[-1]["atr14"], close * 0.0015) if frame is not None and not frame.empty and "atr14" in frame.columns else max(close * 0.0015, 0.01)
         buffer = max(atr * 0.12, close * 0.0010)
         if bool(self._technical_level_setting("stop_use_trendline", True)) and getattr(tech_ctx, "support_trendline", None) is not None:
-            support_value = self._safe_float(getattr(tech_ctx.support_trendline, "current_value", None), 0.0)
+            support_value = _safe_float(getattr(tech_ctx.support_trendline, "current_value", None), 0.0)
             trend_stop = support_value - buffer
             if 0 < trend_stop < close:
                 stop = max(float(stop), float(trend_stop))
@@ -2337,10 +2059,10 @@ class BaseStrategy:
             return float(stop), (None if target is None else float(target))
         if not bool(self._technical_level_setting("enabled", True)):
             return float(stop), (None if target is None else float(target))
-        atr = self._safe_float(frame.iloc[-1]["atr14"], close * 0.0015) if frame is not None and not frame.empty and "atr14" in frame.columns else max(close * 0.0015, 0.01)
+        atr = _safe_float(frame.iloc[-1]["atr14"], close * 0.0015) if frame is not None and not frame.empty and "atr14" in frame.columns else max(close * 0.0015, 0.01)
         buffer = max(atr * 0.12, close * 0.0010)
         if bool(self._technical_level_setting("stop_use_trendline", True)) and getattr(tech_ctx, "resistance_trendline", None) is not None:
-            resistance_value = self._safe_float(getattr(tech_ctx.resistance_trendline, "current_value", None), 0.0)
+            resistance_value = _safe_float(getattr(tech_ctx.resistance_trendline, "current_value", None), 0.0)
             trend_stop = resistance_value + buffer
             if trend_stop > close:
                 stop = min(float(stop), float(trend_stop))
@@ -2370,12 +2092,12 @@ class BaseStrategy:
         if not bool(self._technical_level_setting("enabled", True)):
             return False, "hold"
         tech_ctx = self._technical_context(frame)
-        atr = self._safe_float(frame.iloc[-1]["atr14"], close * 0.0015) if frame is not None and not frame.empty and "atr14" in frame.columns else max(close * 0.0015, 0.01)
+        atr = _safe_float(frame.iloc[-1]["atr14"], close * 0.0015) if frame is not None and not frame.empty and "atr14" in frame.columns else max(close * 0.0015, 0.01)
         buffer = max(atr * float(self._technical_level_setting("trendline_breakout_buffer_atr_mult", 0.15) or 0.15), close * 0.0010)
         if direction == "bullish":
             weak_tape = self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.48)
             if bool(getattr(tech_ctx, "trendline_break_down", False)) and self._shared_exit_enabled("use_trendline_break", True) and weak_tape:
-                support_value = self._safe_float(getattr(getattr(tech_ctx, "support_trendline", None), "current_value", None), close)
+                support_value = _safe_float(getattr(getattr(tech_ctx, "support_trendline", None), "current_value", None), close)
                 return True, f"trendline_break_exit:{support_value:.4f}"
             channel_ctx = getattr(tech_ctx, "channel", None)
             if bool(getattr(channel_ctx, "valid", False)) and getattr(channel_ctx, "lower", None) is not None and self._shared_exit_enabled("use_channel_break", True):
@@ -2386,11 +2108,11 @@ class BaseStrategy:
             if bool(getattr(tech_ctx, "bollinger_upper_reject", False)) and self._shared_exit_enabled("use_bollinger_reject", True):
                 tape_ok = self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.52)
                 if tape_ok:
-                    upper = self._safe_float(getattr(tech_ctx, "bollinger_upper", None), close)
+                    upper = _safe_float(getattr(tech_ctx, "bollinger_upper", None), close)
                     return True, f"bollinger_upper_reject_exit:{upper:.4f}"
             if self._shared_exit_enabled("use_anchored_vwap_loss", True):
-                open_avwap = self._safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0)
-                bull_avwap = self._safe_float(getattr(tech_ctx, "anchored_vwap_bullish_impulse", None), 0.0)
+                open_avwap = _safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0)
+                bull_avwap = _safe_float(getattr(tech_ctx, "anchored_vwap_bullish_impulse", None), 0.0)
                 avwap_floor = max(open_avwap, bull_avwap)
                 # Armed-guard: the position must have traded at-or-above
                 # avwap_floor + buffer at some point since entry. Without
@@ -2401,7 +2123,7 @@ class BaseStrategy:
                 # how trail_armed requires a favorable move before arming.
                 # Buffer tightens the armed threshold so a one-tick poke
                 # right at the floor doesn't arm the exit prematurely.
-                highest_price = self._safe_float(getattr(position, "highest_price", None), float(position.entry_price))
+                highest_price = _safe_float(getattr(position, "highest_price", None), float(position.entry_price))
                 avwap_armed = avwap_floor > 0 and highest_price >= avwap_floor + buffer
                 tape_ok = self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.48)
                 if avwap_floor > 0 and avwap_armed and close < avwap_floor - buffer and tape_ok:
@@ -2409,7 +2131,7 @@ class BaseStrategy:
         else:
             weak_tape = self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.52)
             if bool(getattr(tech_ctx, "trendline_break_up", False)) and self._shared_exit_enabled("use_trendline_break", True) and weak_tape:
-                resistance_value = self._safe_float(getattr(getattr(tech_ctx, "resistance_trendline", None), "current_value", None), close)
+                resistance_value = _safe_float(getattr(getattr(tech_ctx, "resistance_trendline", None), "current_value", None), close)
                 return True, f"trendline_break_exit:{resistance_value:.4f}"
             channel_ctx = getattr(tech_ctx, "channel", None)
             if bool(getattr(channel_ctx, "valid", False)) and getattr(channel_ctx, "upper", None) is not None and self._shared_exit_enabled("use_channel_break", True):
@@ -2420,11 +2142,11 @@ class BaseStrategy:
             if bool(getattr(tech_ctx, "bollinger_lower_reject", False)) and self._shared_exit_enabled("use_bollinger_reject", True):
                 tape_ok = self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.48)
                 if tape_ok:
-                    lower = self._safe_float(getattr(tech_ctx, "bollinger_lower", None), close)
+                    lower = _safe_float(getattr(tech_ctx, "bollinger_lower", None), close)
                     return True, f"bollinger_lower_reject_exit:{lower:.4f}"
             if self._shared_exit_enabled("use_anchored_vwap_loss", True):
-                open_avwap = self._safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0)
-                bear_avwap = self._safe_float(getattr(tech_ctx, "anchored_vwap_bearish_impulse", None), 0.0)
+                open_avwap = _safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0)
+                bear_avwap = _safe_float(getattr(tech_ctx, "anchored_vwap_bearish_impulse", None), 0.0)
                 avwap_ceiling = min(px for px in [open_avwap, bear_avwap] if px > 0) if any(px > 0 for px in [open_avwap, bear_avwap]) else 0.0
                 # Mirror of the bullish armed-guard. Require the position
                 # to have traded at-or-below avwap_ceiling - buffer at some
@@ -2432,7 +2154,7 @@ class BaseStrategy:
                 # price already near the AVWAP ceiling triggers an instant
                 # reclaim exit on the next tick — observed on META
                 # 2026-04-24 09:35 (55-second exit, -$68.86).
-                lowest_price = self._safe_float(getattr(position, "lowest_price", None), float(position.entry_price))
+                lowest_price = _safe_float(getattr(position, "lowest_price", None), float(position.entry_price))
                 avwap_armed = avwap_ceiling > 0 and lowest_price <= avwap_ceiling - buffer
                 tape_ok = self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.52)
                 if avwap_ceiling > 0 and avwap_armed and close > avwap_ceiling + buffer and tape_ok:
@@ -2448,11 +2170,11 @@ class BaseStrategy:
 
     @staticmethod
     def _fvg_gap_state(gap: Any, current_price: float) -> dict[str, Any]:
-        lower = BaseStrategy._optional_float(getattr(gap, "lower", None))
-        upper = BaseStrategy._optional_float(getattr(gap, "upper", None))
-        midpoint = BaseStrategy._optional_float(getattr(gap, "midpoint", None))
-        size = BaseStrategy._optional_float(getattr(gap, "size", None))
-        filled_pct = max(0.0, min(1.0, BaseStrategy._optional_float(getattr(gap, "filled_pct", None), 0.0) or 0.0))
+        lower = _optional_float(getattr(gap, "lower", None))
+        upper = _optional_float(getattr(gap, "upper", None))
+        midpoint = _optional_float(getattr(gap, "midpoint", None))
+        size = _optional_float(getattr(gap, "size", None))
+        filled_pct = max(0.0, min(1.0, _optional_float(getattr(gap, "filled_pct", None), 0.0) or 0.0))
         direction = str(getattr(gap, "direction", "")).strip().lower()
         if lower is None or upper is None or midpoint is None or size is None or size <= 0:
             return {"state": "none", "direction": direction or "unknown", "distance": None, "distance_pct": None, "filled_pct": filled_pct}
@@ -2515,9 +2237,9 @@ class BaseStrategy:
             info = self._fvg_gap_state(gap, close)
             state = str(info.get("state", "none"))
             direction = str(info.get("direction", "unknown"))
-            size = BaseStrategy._optional_float(info.get("size"), 0.0) or 0.0
-            distance = BaseStrategy._optional_float(info.get("distance"), 0.0) or 0.0
-            fill = max(0.0, min(1.0, BaseStrategy._optional_float(info.get("filled_pct"), 0.0) or 0.0))
+            size = _optional_float(info.get("size"), 0.0) or 0.0
+            distance = _optional_float(info.get("distance"), 0.0) or 0.0
+            fill = max(0.0, min(1.0, _optional_float(info.get("filled_pct"), 0.0) or 0.0))
             if state == "none" or direction not in {"bullish", "bearish"}:
                 return 0.0, 0.0, info
             distance_limit = max(float(size) * 2.5, float(proximity_floor), 1e-8)
@@ -2584,7 +2306,7 @@ class BaseStrategy:
         }
         if frame is None or frame.empty or not bool(self._shared_entry_enabled("use_fvg_context", True)):
             return out
-        close = self._safe_float(frame.iloc[-1].get("close"), 0.0)
+        close = _safe_float(frame.iloc[-1].get("close"), 0.0)
         if close <= 0:
             return out
         htf_ctx = self._htf_context(
@@ -2698,14 +2420,14 @@ class BaseStrategy:
                 "htf_fvg_opposing_state": str(opposing_htf_info.get("state", "none") or "none"),
                 "fvg_1m_same_state": str(same_1m_info.get("state", "none") or "none"),
                 "fvg_1m_opposing_state": str(opposing_1m_info.get("state", "none") or "none"),
-                "htf_fvg_same_midpoint": self._optional_float(same_htf_info.get("midpoint")),
-                "htf_fvg_opposing_midpoint": self._optional_float(opposing_htf_info.get("midpoint")),
-                "fvg_1m_same_midpoint": self._optional_float(same_1m_info.get("midpoint")),
-                "fvg_1m_opposing_midpoint": self._optional_float(opposing_1m_info.get("midpoint")),
-                "htf_fvg_same_distance_pct": self._optional_float(same_htf_info.get("distance_pct")),
-                "htf_fvg_opposing_distance_pct": self._optional_float(opposing_htf_info.get("distance_pct")),
-                "fvg_1m_same_distance_pct": self._optional_float(same_1m_info.get("distance_pct")),
-                "fvg_1m_opposing_distance_pct": self._optional_float(opposing_1m_info.get("distance_pct")),
+                "htf_fvg_same_midpoint": _optional_float(same_htf_info.get("midpoint")),
+                "htf_fvg_opposing_midpoint": _optional_float(opposing_htf_info.get("midpoint")),
+                "fvg_1m_same_midpoint": _optional_float(same_1m_info.get("midpoint")),
+                "fvg_1m_opposing_midpoint": _optional_float(opposing_1m_info.get("midpoint")),
+                "htf_fvg_same_distance_pct": _optional_float(same_htf_info.get("distance_pct")),
+                "htf_fvg_opposing_distance_pct": _optional_float(opposing_htf_info.get("distance_pct")),
+                "fvg_1m_same_distance_pct": _optional_float(same_1m_info.get("distance_pct")),
+                "fvg_1m_opposing_distance_pct": _optional_float(opposing_1m_info.get("distance_pct")),
             }
         )
         return out
@@ -2781,8 +2503,8 @@ class BaseStrategy:
             )
             or max(runner_target_rr_default, current_target_rr + runner_bonus_rr + (continuation_scale * 0.18) + strong_setup_bonus)
         )
-        base_trail_pct = self._optional_float(getattr(self.config.risk, "trailing_stop_pct", None))
-        runner_trail_pct = self._optional_float(self.params.get("adaptive_runner_trail_pct"))
+        base_trail_pct = _optional_float(getattr(self.config.risk, "trailing_stop_pct", None))
+        runner_trail_pct = _optional_float(self.params.get("adaptive_runner_trail_pct"))
         if runner_trail_pct is None and base_trail_pct is not None and base_trail_pct > 0:
             runner_trail_pct = max(0.0005, float(base_trail_pct) * (0.85 if trend_like else 0.90))
         return {
@@ -3074,23 +2796,6 @@ class BaseStrategy:
         )
         return bool(too_close and not actively_below)
 
-    @staticmethod
-    def _clamp_long_premium_levels(entry_value: float, stop_value: float, target_value: float | None) -> tuple[float, float | None]:
-        entry = max(0.01, float(entry_value))
-        stop = max(0.01, min(float(stop_value), entry - 0.01))
-        if target_value is None:
-            return stop, None
-        target = max(entry + 0.01, float(target_value))
-        return stop, target
-
-    @staticmethod
-    def _clamp_short_premium_levels(entry_value: float, stop_value: float, target_value: float | None) -> tuple[float, float | None]:
-        entry = max(0.01, float(entry_value))
-        stop = max(entry + 0.01, float(stop_value))
-        if target_value is None:
-            return stop, None
-        target = max(0.01, min(float(target_value), entry - 0.01))
-        return stop, target
 
     def _refine_bullish_sr_levels(self, close: float, stop: float, target: float | None, sr_ctx):
         if not self._shared_entry_enabled("use_sr_stop_target_refinement", True):
@@ -3148,7 +2853,7 @@ class BaseStrategy:
                 entry = float(position.entry_price) if position.entry_price else 0.0
                 last_close: float | None = None
                 if frame is not None and not frame.empty and "close" in frame.columns:
-                    last_close = self._optional_float(frame.iloc[-1]["close"], None)
+                    last_close = _optional_float(frame.iloc[-1]["close"], None)
                 if entry > 0 and last_close is not None:
                     return_pct = abs((float(last_close) - entry) / entry)
                     min_return_pct = float(getattr(self.config.risk, "time_stop_min_return_pct", 0.003) or 0.0)
@@ -3179,12 +2884,12 @@ class BaseStrategy:
         # Only chart-pattern needs min_bars; other exit paths self-handle short frames.
         min_bars = max(12, int(self._chart_pattern_setting("lookback_bars", 32)) // 2) if chart_enabled else 0
         last = frame.iloc[-1]
-        close = self._safe_float(last["close"])
-        ema9 = self._safe_float(last["ema9"], close) if "ema9" in frame.columns else close
-        ema20 = self._safe_float(last["ema20"], close) if "ema20" in frame.columns else close
-        vwap = self._safe_float(last["vwap"], close) if "vwap" in frame.columns else close
+        close = _safe_float(last["close"])
+        ema9 = _safe_float(last["ema9"], close) if "ema9" in frame.columns else close
+        ema20 = _safe_float(last["ema20"], close) if "ema20" in frame.columns else close
+        vwap = _safe_float(last["vwap"], close) if "vwap" in frame.columns else close
         direction = self._direction_token(position)
-        close_pos = self._bar_close_position(frame)
+        close_pos = _bar_close_position(frame)
 
         if chart_enabled and len(frame) >= min_bars:
             ctx = self._chart_context(frame)
@@ -3333,52 +3038,6 @@ class BaseStrategy:
                 symbols.add(position.reference_symbol)
         return symbols
 
-    @staticmethod
-    def _same_day_mask(frame: pd.DataFrame, day: date) -> pd.Series:
-        return frame.index.to_series().map(lambda ts: ts.date() == day)
-
-    @staticmethod
-    def _time_gte_mask(frame: pd.DataFrame, t: time) -> pd.Series:
-        return frame.index.to_series().map(lambda ts: ts.time() >= t)
-
-    @classmethod
-    def _session_open_price(cls, frame: pd.DataFrame | None, day: date | None = None, *, regular_session_only: bool = True) -> float | None:
-        if frame is None or frame.empty:
-            return None
-        target_day = day or now_et().date()
-        same_day = frame[cls._same_day_mask(frame, target_day)]
-        if same_day.empty:
-            return None
-        if regular_session_only:
-            regular = same_day[same_day.index.to_series().map(lambda ts: ts.time() >= time(9, 30))]
-            if not regular.empty:
-                same_day = regular
-        try:
-            open_value = same_day.iloc[0]["open"]
-        except Exception:
-            return None
-        if cls._is_scalar_missing(open_value):
-            return None
-        try:
-            return float(open_value)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _positive_quote_value(quote: dict[str, Any] | None, *keys: str) -> float | None:
-        if not isinstance(quote, dict):
-            return None
-        for key in keys:
-            try:
-                value = quote.get(key)
-                if value is None:
-                    continue
-                number = float(value)
-            except Exception:
-                continue
-            if number > 0:
-                return number
-        return None
 
     def quote_watchlist(self, candidates: list[Candidate], positions: dict[str, Position], bars: dict[str, pd.DataFrame]) -> set[str]:
         configured = self._watchlist_symbols_from_capabilities(

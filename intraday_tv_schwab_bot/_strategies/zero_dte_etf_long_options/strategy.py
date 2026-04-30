@@ -6,6 +6,12 @@ from ..shared import (
     Position,
     Side,
     Signal,
+    _clamp_long_premium_levels,
+    insufficient_bars_reason,
+    _no_style_trigger_reason,
+    _positive_quote_value,
+    _safe_float,
+    _same_day_mask,
     asdict,
     build_single_option_order,
     build_single_option_position_label,
@@ -63,7 +69,7 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             single_stop_frac = max(0.01, min(0.99, single_stop_frac * (1.0 + (1.0 - time_decay_scale) * widen)))
         stop = entry_value * single_stop_frac
         target = entry_value * single_target_mult
-        stop, target = self._clamp_long_premium_levels(entry_value, stop, target)
+        stop, target = _clamp_long_premium_levels(entry_value, stop, target)
         position_key = build_single_option_position_label(underlying, style, contract)
         breakeven_underlying = float(contract.strike) + entry_limit if bullish else float(contract.strike) - entry_limit
         metadata = {
@@ -120,7 +126,7 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             frame = bars.get(c.symbol)
             min_bars = int(self.params.get("min_bars", 35))
             if frame is None or len(frame) < min_bars:
-                self._record_entry_decision(c.symbol, "skipped", [self._insufficient_bars_reason("insufficient_underlying_bars", 0 if frame is None else len(frame), min_bars)])
+                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_underlying_bars", 0 if frame is None else len(frame), min_bars)])
                 continue
             regime = self._regime_confirm(c, bars, data)
             if not regime.get("ok") or regime.get("no_trade"):
@@ -130,31 +136,31 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
                 continue
             confirm_index = regime.get("confirm_index")
             last = frame.iloc[-1]
-            self._underlying_atr_cache[c.symbol] = self._safe_float(last.get("atr14"), 0.0)
+            self._underlying_atr_cache[c.symbol] = _safe_float(last.get("atr14"), 0.0)
             if "atr14" in frame.columns:
                 atr_series = frame["atr14"].dropna().tail(20)
                 self._underlying_ref_atr_cache[c.symbol] = float(atr_series.median()) if len(atr_series) >= 5 else 0.0
-            opening = frame[self._same_day_mask(frame, now_et().date())].between_time("09:30", "09:34")
+            opening = frame[_same_day_mask(frame, now_et().date())].between_time("09:30", "09:34")
             regime_name = str(regime.get("regime") or "unknown")
             bullish = regime_name == "bullish_trend"
             bearish = regime_name == "bearish_trend"
             rangeish = regime_name == "range"
             attempted_style = False
-            last_close = self._safe_float(last["close"])
-            last_vwap = self._safe_float(last["vwap"], last_close)
-            last_ret5 = self._safe_float(last["ret5"], 0.0)
+            last_close = _safe_float(last["close"])
+            last_vwap = _safe_float(last["vwap"], last_close)
+            last_ret5 = _safe_float(last["ret5"], 0.0)
             orb_enabled = self._long_option_style_enabled("orb_long_option")
             orb_window = self._time_in_range(now_t, "09:35", self.params.get("orb_end_time", "10:05"))
             trend_enabled = self._long_option_style_enabled("trend_long_option")
             trend_window = self._time_in_range(now_t, self.params.get("trend_start_time", "10:05"), self.params.get("trend_end_time", "13:25"))
-            or_high = self._safe_float(opening["high"].max()) if not opening.empty else None
-            or_low = self._safe_float(opening["low"].min()) if not opening.empty else None
+            or_high = _safe_float(opening["high"].max()) if not opening.empty else None
+            or_low = _safe_float(opening["low"].min()) if not opening.empty else None
             buffer_pct = float(self.params.get("orb_breakout_buffer_pct", 0.0008))
             trend_min_ret5 = float(self.params.get("trend_min_ret5", 0.0006))
 
             if orb_enabled and orb_window and (bullish or bearish):
                 if not opening.empty:
-                    if bullish and last_close > self._safe_float(or_high) * (1.0 + buffer_pct) and last_close > last_vwap:
+                    if bullish and last_close > _safe_float(or_high) * (1.0 + buffer_pct) and last_close > last_vwap:
                         attempted_style = True
                         sig = self._build_single_option_signal(c.symbol, True, client, data, last_close, "orb_long_option", confirm_index, regime)
                         if sig:
@@ -162,7 +168,7 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
                             self._record_entry_decision(c.symbol, "signal", [sig.reason])
                             continue
                         reasons.append(self._consume_build_failure(c.symbol, "orb_long_option") or "orb_long_option_unavailable")
-                    if bearish and last_close < self._safe_float(or_low) * (1.0 - buffer_pct) and last_close < last_vwap:
+                    if bearish and last_close < _safe_float(or_low) * (1.0 - buffer_pct) and last_close < last_vwap:
                         attempted_style = True
                         sig = self._build_single_option_signal(c.symbol, False, client, data, last_close, "orb_long_option", confirm_index, regime)
                         if sig:
@@ -174,11 +180,11 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             if trend_enabled and trend_window and (bullish or bearish):
                 momentum_ok = True
                 if getattr(self.optcfg, "trend_momentum_filter_enabled", False):
-                    atr_current = self._safe_float(last.get("atr14"), 0.0)
+                    atr_current = _safe_float(last.get("atr14"), 0.0)
                     atr_tail = frame.tail(20)["atr14"].dropna() if "atr14" in frame.columns else pd.Series(dtype=float)
                     atr_mean = float(atr_tail.mean()) if len(atr_tail) > 0 else 0.0
                     atr_expansion = atr_current / max(atr_mean, 1e-9) if atr_mean > 0 else 0.0
-                    vol_current = self._safe_float(last.get("volume"), 0.0)
+                    vol_current = _safe_float(last.get("volume"), 0.0)
                     vol_tail = frame.tail(10)["volume"].dropna() if "volume" in frame.columns else pd.Series(dtype=float)
                     vol_mean = float(vol_tail.mean()) if len(vol_tail) > 0 else 1.0
                     volume_ratio = vol_current / max(vol_mean, 1.0)
@@ -213,7 +219,7 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
                         reasons.extend(style_reasons)
 
             final_reasons = reasons or ([
-                self._no_style_trigger_reason(
+                _no_style_trigger_reason(
                     regime_name=regime_name,
                     bullish=bullish,
                     bearish=bearish,
@@ -247,7 +253,7 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             return None
         if data is not None and not data.quotes_are_fresh([symbol], self.optcfg.max_quote_age_seconds):
             return None
-        mark = self._positive_quote_value(q, "mid", "mark", "last")
+        mark = _positive_quote_value(q, "mid", "mark", "last")
         if mark is None:
             return None
         return max(0.0, mark * 100.0)

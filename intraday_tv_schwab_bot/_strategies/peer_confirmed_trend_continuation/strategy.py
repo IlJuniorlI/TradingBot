@@ -6,9 +6,14 @@ from ..shared import (
     Position,
     Side,
     Signal,
+    _bar_close_position,
     _discrete_score_threshold,
     _gate_snapshot,
+    insufficient_bars_reason,
+    _reason_with_values,
+    _safe_float,
     _side_prefixed_reason,
+    _side_prefixed_reasons,
     pd,
 )
 from ..peer_confirmed_key_levels.strategy import PeerConfirmedKeyLevelsStrategy
@@ -31,8 +36,8 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             return []
         trend = self._trend_signal(side, ltf, htf)
         trigger = self._pullback_trigger_signal(side, ltf, close=trend["close"], ema9=trend["ema9"], ema20=trend["ema20"], atr=trend["atr"])
-        trigger_level = self._safe_float(trigger.get("trigger_level"), 0.0)
-        pullback_extreme = self._safe_float(trigger.get("pullback_extreme"), 0.0)
+        trigger_level = _safe_float(trigger.get("trigger_level"), 0.0)
+        pullback_extreme = _safe_float(trigger.get("pullback_extreme"), 0.0)
         if trigger_level <= 0 or pullback_extreme <= 0:
             return []
         trigger_score = float(trigger.get("score", 0.0) or 0.0)
@@ -98,12 +103,12 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
 
     def _trend_signal(self, side: Side, ltf: pd.DataFrame, htf: HTFContext) -> dict[str, Any]:
         last = ltf.iloc[-1]
-        close = self._safe_float(last.get("close"), 0.0)
-        vwap = self._safe_float(last.get("vwap"), close)
-        ema9 = self._safe_float(last.get("ema9"), close)
-        ema20 = self._safe_float(last.get("ema20"), close)
-        atr = max(self._safe_float(last.get("atr14"), max(close * 0.0015, 0.01)), max(close * 0.0005, 0.01))
-        adx = self._safe_float(last.get("adx14"), 0.0)
+        close = _safe_float(last.get("close"), 0.0)
+        vwap = _safe_float(last.get("vwap"), close)
+        ema9 = _safe_float(last.get("ema9"), close)
+        ema20 = _safe_float(last.get("ema20"), close)
+        atr = max(_safe_float(last.get("atr14"), max(close * 0.0015, 0.01)), max(close * 0.0005, 0.01))
+        adx = _safe_float(last.get("adx14"), 0.0)
         htf_bias, bull_votes, bear_votes = self._hourly_bias(htf, close)
         min_adx = float(self.params.get("min_adx14", 13.5))
         score = 0.0
@@ -112,15 +117,15 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             if close > vwap:
                 score += 1.0
             else:
-                reasons.append(self._reason_with_values("below_vwap", current=close, required=vwap, op=">", digits=4))
+                reasons.append(_reason_with_values("below_vwap", current=close, required=vwap, op=">", digits=4))
             if ema9 >= ema20:
                 score += 1.0
             else:
-                reasons.append(self._reason_with_values("ema9_below_ema20", current=ema9, required=ema20, op=">=", digits=4))
+                reasons.append(_reason_with_values("ema9_below_ema20", current=ema9, required=ema20, op=">=", digits=4))
             if close >= ema9:
                 score += 1.0
             else:
-                reasons.append(self._reason_with_values("below_ema9", current=close, required=ema9, op=">=", digits=4))
+                reasons.append(_reason_with_values("below_ema9", current=close, required=ema9, op=">=", digits=4))
             if htf_bias == "bullish":
                 score += 1.0 + (0.25 if bull_votes >= max(2, bear_votes + 1) else 0.0)
             else:
@@ -129,15 +134,15 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             if close < vwap:
                 score += 1.0
             else:
-                reasons.append(self._reason_with_values("above_vwap", current=close, required=vwap, op="<", digits=4))
+                reasons.append(_reason_with_values("above_vwap", current=close, required=vwap, op="<", digits=4))
             if ema9 <= ema20:
                 score += 1.0
             else:
-                reasons.append(self._reason_with_values("ema9_above_ema20", current=ema9, required=ema20, op="<=", digits=4))
+                reasons.append(_reason_with_values("ema9_above_ema20", current=ema9, required=ema20, op="<=", digits=4))
             if close <= ema9:
                 score += 1.0
             else:
-                reasons.append(self._reason_with_values("above_ema9", current=close, required=ema9, op="<=", digits=4))
+                reasons.append(_reason_with_values("above_ema9", current=close, required=ema9, op="<=", digits=4))
             if htf_bias == "bearish":
                 score += 1.0 + (0.25 if bear_votes >= max(2, bull_votes + 1) else 0.0)
             else:
@@ -145,7 +150,7 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
         if adx >= min_adx:
             score += 1.0
         else:
-            reasons.append(self._reason_with_values("weak_adx", current=adx, required=min_adx, op=">=", digits=4))
+            reasons.append(_reason_with_values("weak_adx", current=adx, required=min_adx, op=">=", digits=4))
         return {
             "score": float(score),
             "reasons": reasons,
@@ -177,41 +182,41 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             return {"score": 0.0, "reasons": ["no_pullback_context"]}
         pullback = prior.tail(max_pullback_bars)
         trigger_ref = prior.tail(max(min_pullback_bars + 1, 2))
-        close_pos = self._bar_close_position(ltf)
-        last_vol = self._safe_float(ltf.iloc[-1].get("volume"), 0.0)
-        avg_vol = max(self._safe_float(prior["volume"].tail(max(3, max_pullback_bars)).mean(), 0.0), 1.0)
+        close_pos = _bar_close_position(ltf)
+        last_vol = _safe_float(ltf.iloc[-1].get("volume"), 0.0)
+        avg_vol = max(_safe_float(prior["volume"].tail(max(3, max_pullback_bars)).mean(), 0.0), 1.0)
         volume_ratio = last_vol / avg_vol if avg_vol > 0 else 0.0
-        pullback_countertrend_volume_ratio = max(self._safe_float(pullback["volume"].mean(), 0.0), 0.0) / max(self._safe_float(prior["volume"].tail(max(6, max_pullback_bars + 1)).mean(), 0.0), 1.0)
+        pullback_countertrend_volume_ratio = max(_safe_float(pullback["volume"].mean(), 0.0), 0.0) / max(_safe_float(prior["volume"].tail(max(6, max_pullback_bars + 1)).mean(), 0.0), 1.0)
         score = 0.0
         reasons: list[str] = []
         if side == Side.LONG:
-            trigger_level = self._safe_float(trigger_ref["high"].max(), close)
-            pullback_extreme = self._safe_float(pullback["low"].min(), close)
+            trigger_level = _safe_float(trigger_ref["high"].max(), close)
+            pullback_extreme = _safe_float(pullback["low"].min(), close)
             pullback_depth_atr = max(0.0, trigger_level - pullback_extreme) / atr if atr > 0 else 0.0
             if pullback_depth_atr <= max_pullback_depth_atr:
                 score += 1.0
             else:
-                reasons.append(self._reason_with_values("pullback_too_deep_atr", current=pullback_depth_atr, required=max_pullback_depth_atr, op="<=", digits=4))
+                reasons.append(_reason_with_values("pullback_too_deep_atr", current=pullback_depth_atr, required=max_pullback_depth_atr, op="<=", digits=4))
             if pullback_extreme >= (ema20 - (atr * pullback_hold_atr)):
                 score += 1.0
             else:
-                reasons.append(self._reason_with_values("pullback_lost_ema20", current=pullback_extreme, required=ema20 - (atr * pullback_hold_atr), op=">=", digits=4))
+                reasons.append(_reason_with_values("pullback_lost_ema20", current=pullback_extreme, required=ema20 - (atr * pullback_hold_atr), op=">=", digits=4))
             if close > trigger_level * (1.0 + breakout_buffer_pct):
                 score += 1.0
             else:
-                reasons.append(self._reason_with_values("no_reexpansion_trigger", current=close, required=trigger_level * (1.0 + breakout_buffer_pct), op=">", digits=4))
+                reasons.append(_reason_with_values("no_reexpansion_trigger", current=close, required=trigger_level * (1.0 + breakout_buffer_pct), op=">", digits=4))
             if close >= ema9:
                 score += 0.75
             else:
-                reasons.append(self._reason_with_values("failed_ema9_reclaim", current=close, required=ema9, op=">=", digits=4))
-            if self._safe_float(ltf.iloc[-1].get("close"), close) >= self._safe_float(ltf.iloc[-1].get("open"), close):
+                reasons.append(_reason_with_values("failed_ema9_reclaim", current=close, required=ema9, op=">=", digits=4))
+            if _safe_float(ltf.iloc[-1].get("close"), close) >= _safe_float(ltf.iloc[-1].get("open"), close):
                 score += 0.5
             else:
                 reasons.append("trigger_bar_not_bullish")
             if close_pos >= min_close_pos:
                 score += 0.5
             else:
-                reasons.append(self._reason_with_values("weak_bar_close", current=close_pos, required=min_close_pos, op=">=", digits=4))
+                reasons.append(_reason_with_values("weak_bar_close", current=close_pos, required=min_close_pos, op=">=", digits=4))
             candle_summary = self._configured_trigger_candle_summary(side, ltf)
             candle_tier = str(candle_summary.get("confirm_tier", "none") or "none")
             candle_bonus = {
@@ -222,33 +227,33 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             score += candle_bonus
             stop_anchor = pullback_extreme
         else:
-            trigger_level = self._safe_float(trigger_ref["low"].min(), close)
-            pullback_extreme = self._safe_float(pullback["high"].max(), close)
+            trigger_level = _safe_float(trigger_ref["low"].min(), close)
+            pullback_extreme = _safe_float(pullback["high"].max(), close)
             pullback_depth_atr = max(0.0, pullback_extreme - trigger_level) / atr if atr > 0 else 0.0
             if pullback_depth_atr <= max_pullback_depth_atr:
                 score += 1.0
             else:
-                reasons.append(self._reason_with_values("pullback_too_deep_atr", current=pullback_depth_atr, required=max_pullback_depth_atr, op="<=", digits=4))
+                reasons.append(_reason_with_values("pullback_too_deep_atr", current=pullback_depth_atr, required=max_pullback_depth_atr, op="<=", digits=4))
             if pullback_extreme <= (ema20 + (atr * pullback_hold_atr)):
                 score += 1.0
             else:
-                reasons.append(self._reason_with_values("pullback_lost_ema20", current=pullback_extreme, required=ema20 + (atr * pullback_hold_atr), op="<=", digits=4))
+                reasons.append(_reason_with_values("pullback_lost_ema20", current=pullback_extreme, required=ema20 + (atr * pullback_hold_atr), op="<=", digits=4))
             if close < trigger_level * (1.0 - breakout_buffer_pct):
                 score += 1.0
             else:
-                reasons.append(self._reason_with_values("no_reexpansion_trigger", current=close, required=trigger_level * (1.0 - breakout_buffer_pct), op="<", digits=4))
+                reasons.append(_reason_with_values("no_reexpansion_trigger", current=close, required=trigger_level * (1.0 - breakout_buffer_pct), op="<", digits=4))
             if close <= ema9:
                 score += 0.75
             else:
-                reasons.append(self._reason_with_values("failed_ema9_reject", current=close, required=ema9, op="<=", digits=4))
-            if self._safe_float(ltf.iloc[-1].get("close"), close) <= self._safe_float(ltf.iloc[-1].get("open"), close):
+                reasons.append(_reason_with_values("failed_ema9_reject", current=close, required=ema9, op="<=", digits=4))
+            if _safe_float(ltf.iloc[-1].get("close"), close) <= _safe_float(ltf.iloc[-1].get("open"), close):
                 score += 0.5
             else:
                 reasons.append("trigger_bar_not_bearish")
             if close_pos <= (1.0 - min_close_pos):
                 score += 0.5
             else:
-                reasons.append(self._reason_with_values("weak_bar_close", current=close_pos, required=1.0 - min_close_pos, op="<=", digits=4))
+                reasons.append(_reason_with_values("weak_bar_close", current=close_pos, required=1.0 - min_close_pos, op="<=", digits=4))
             candle_summary = self._configured_trigger_candle_summary(side, ltf)
             candle_tier = str(candle_summary.get("confirm_tier", "none") or "none")
             candle_bonus = {
@@ -261,11 +266,11 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
         if volume_ratio >= min_trigger_vol:
             score += 0.5
         else:
-            reasons.append(self._reason_with_values("weak_trigger_volume", current=volume_ratio, required=min_trigger_vol, op=">=", digits=4))
+            reasons.append(_reason_with_values("weak_trigger_volume", current=volume_ratio, required=min_trigger_vol, op=">=", digits=4))
         if pullback_countertrend_volume_ratio <= max_countertrend_vol:
             score += 0.5
         else:
-            reasons.append(self._reason_with_values("heavy_countertrend_volume", current=pullback_countertrend_volume_ratio, required=max_countertrend_vol, op="<=", digits=4))
+            reasons.append(_reason_with_values("heavy_countertrend_volume", current=pullback_countertrend_volume_ratio, required=max_countertrend_vol, op="<=", digits=4))
         return {
             "score": float(score),
             "reasons": reasons,
@@ -288,7 +293,7 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
 
     def _build_continuation_signal(self, c: Candidate, frame: pd.DataFrame, ltf: pd.DataFrame, side: Side, peer_ctx: dict[str, Any], macro_ctx: dict[str, Any], data=None, *, sr_ctx=None, ms_ctx=None, tech_ctx=None) -> Signal | None:
         failure_style = f"peer_confirmed_trend_continuation_{side.value.lower()}"
-        close = self._safe_float(ltf.iloc[-1].get("close"), 0.0)
+        close = _safe_float(ltf.iloc[-1].get("close"), 0.0)
         if close <= 0:
             return None
         htf = self._htf_context(
@@ -330,9 +335,9 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             peer_bonus = min(2.0, 0.5 + (0.35 * peer_agreement))
             total_score += peer_bonus
         else:
-            diagnostics.append(self._reason_with_values("weak_peer_score", current=directional_peer_score, required=min_peer_score, op=">=", digits=2))
+            diagnostics.append(_reason_with_values("weak_peer_score", current=directional_peer_score, required=min_peer_score, op=">=", digits=2))
         if peer_agreement < min_peer_agreement:
-            hard_reasons.append(self._reason_with_values("weak_peer_agreement", current=peer_agreement, required=min_peer_agreement, op=">=", digits=2))
+            hard_reasons.append(_reason_with_values("weak_peer_agreement", current=peer_agreement, required=min_peer_agreement, op=">=", digits=2))
 
         macro_bonus = max(0.0, float(self.params.get("macro_bonus", 0.70)))
         macro_miss_penalty = max(0.0, float(self.params.get("macro_miss_penalty", 0.30)))
@@ -348,7 +353,7 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
         min_total = _discrete_score_threshold(self.params.get("min_total_score", 5.5), 6, minimum=1)
         min_trigger_score = _discrete_score_threshold(self.params.get("min_trigger_score", 2.5), 2, minimum=1)
         if float(trigger.get("score", 0.0) or 0.0) < min_trigger_score:
-            hard_reasons.append(self._reason_with_values("weak_trigger_score", current=float(trigger.get("score", 0.0) or 0.0), required=min_trigger_score, op=">=", digits=4))
+            hard_reasons.append(_reason_with_values("weak_trigger_score", current=float(trigger.get("score", 0.0) or 0.0), required=min_trigger_score, op=">=", digits=4))
 
         hard_reasons.extend(self._entry_exhaustion_reasons(side, ltf, close=trend["close"], vwap=trend["vwap"], ema9=trend["ema9"]))
 
@@ -365,12 +370,12 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             total_score -= extension_penalty
             diagnostics.append(f"extension_penalty:{extension_penalty:.4f}")
         if extension_from_vwap_atr > (max_vwap_ext * extension_hard_cap_mult):
-            hard_reasons.append(self._reason_with_values("too_extended_from_vwap_atr", current=extension_from_vwap_atr, required=max_vwap_ext * extension_hard_cap_mult, op="<=", digits=4))
+            hard_reasons.append(_reason_with_values("too_extended_from_vwap_atr", current=extension_from_vwap_atr, required=max_vwap_ext * extension_hard_cap_mult, op="<=", digits=4))
         if extension_from_ema9_atr > (max_ema9_ext * extension_hard_cap_mult):
-            hard_reasons.append(self._reason_with_values("too_extended_from_ema9_atr", current=extension_from_ema9_atr, required=max_ema9_ext * extension_hard_cap_mult, op="<=", digits=4))
+            hard_reasons.append(_reason_with_values("too_extended_from_ema9_atr", current=extension_from_ema9_atr, required=max_ema9_ext * extension_hard_cap_mult, op="<=", digits=4))
 
         if total_score < min_total:
-            hard_reasons.append(self._reason_with_values("weak_total_score", current=total_score, required=min_total, op=">=", digits=4))
+            hard_reasons.append(_reason_with_values("weak_total_score", current=total_score, required=min_total, op=">=", digits=4))
 
         gate_snapshots = [
             _gate_snapshot("trend_score", passed=float(trend.get("score", 0.0) or 0.0) > 0.0, current=round(float(trend.get("score", 0.0) or 0.0), 4), required=0.0, op=">"),
@@ -538,7 +543,7 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
                 self._record_entry_decision(c.symbol, "skipped", ["already_in_position"])
                 continue
             if frame is None or len(frame) < history_bars:
-                self._record_entry_decision(c.symbol, "skipped", [self._insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), history_bars)])
+                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), history_bars)])
                 continue
             ltf = self._resampled_frame(frame, trigger_tf, symbol=c.symbol, data=data)
             if ltf is None or ltf.empty or len(ltf) < max(10, int(self.params.get("min_trigger_bars", 18)) + 4):
@@ -591,7 +596,7 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
                                 all_blockers.append(token)
                         for key, value in failure_payload.get("details", {}).get("near_miss_blockers", {}).items():
                             near_miss_blockers[f"{side_key}.{key}"] = value
-                    for token in self._side_prefixed_reasons(side, failure_payload.get("reasons") or [failure_payload.get("primary_reason") or f"{side.value.lower()}_setup_not_ready"]):
+                    for token in _side_prefixed_reasons(side, failure_payload.get("reasons") or [failure_payload.get("primary_reason") or f"{side.value.lower()}_setup_not_ready"]):
                         if token not in fail_reasons:
                             fail_reasons.append(token)
                     continue
@@ -599,7 +604,7 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
                     c.symbol,
                     f"peer_confirmed_trend_continuation_{side.value.lower()}",
                 )
-                for token in self._side_prefixed_reasons(side, [failure or f"{side.value.lower()}_setup_not_ready"]):
+                for token in _side_prefixed_reasons(side, [failure or f"{side.value.lower()}_setup_not_ready"]):
                     if token not in fail_reasons:
                         fail_reasons.append(token)
             if valid_signals:

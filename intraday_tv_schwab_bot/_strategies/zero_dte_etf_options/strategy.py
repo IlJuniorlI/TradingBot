@@ -9,6 +9,19 @@ from ..shared import (
     Position,
     Side,
     Signal,
+    _ambiguous_regime_reason,
+    _clamp_long_premium_levels,
+    _clamp_short_premium_levels,
+    _detail_fields,
+    insufficient_bars_reason,
+    _no_style_trigger_reason,
+    _optional_float,
+    _positive_quote_value,
+    _reason_with_values,
+    _safe_float,
+    _same_day_mask,
+    _session_open_price,
+    _style_unavailable_reason,
     asdict,
     build_position_label,
     build_vertical_order,
@@ -284,11 +297,11 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
 
     @staticmethod
     def _safe_pct(value: Any) -> float:
-        pct = BaseStrategy._safe_float(value, 0.0)
+        pct = _safe_float(value, 0.0)
         return pct / 100.0 if abs(pct) > 1.0 else pct
 
     def _bullish_sr_block_reason(self, sr_ctx) -> str:
-        return self._reason_with_values(
+        return _reason_with_values(
             "too_close_to_htf_resistance",
             current=sr_ctx.resistance_distance_pct,
             required=float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)),
@@ -300,7 +313,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         )
 
     def _bearish_sr_block_reason(self, sr_ctx) -> str:
-        return self._reason_with_values(
+        return _reason_with_values(
             "too_close_to_htf_support",
             current=sr_ctx.support_distance_pct,
             required=float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)),
@@ -312,8 +325,8 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         )
 
     @classmethod
-    def _insufficient_bars_reason(cls, name: str, current: Any, required: Any) -> str:
-        return cls._reason_with_values(name, current=current, required=required, op='>=', digits=0)
+    def insufficient_bars_reason(cls, name: str, current: Any, required: Any) -> str:
+        return _reason_with_values(name, current=current, required=required, op='>=', digits=0)
 
     @staticmethod
     def _fraction_relative(frame: pd.DataFrame, column: str, lookback: int, direction: str) -> float:
@@ -346,7 +359,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         recent = frame.tail(max(2, lookback))
         if recent.empty:
             return 0.0
-        ref = BaseStrategy._safe_float(recent.iloc[-1]["close"], 0.0)
+        ref = _safe_float(recent.iloc[-1]["close"], 0.0)
         if ref <= 0:
             return 0.0
         return max(0.0, float(recent["high"].max()) - float(recent["low"].min())) / ref
@@ -377,7 +390,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         )
         if not bool(summary.get("available")):
             bars = 0 if frame is None else len(frame)
-            summary["reason"] = self._insufficient_bars_reason("insufficient_htf_bars", bars, min_bars)
+            summary["reason"] = insufficient_bars_reason("insufficient_htf_bars", bars, min_bars)
         summary["timeframe_minutes"] = htf_tf
         return summary
 
@@ -394,24 +407,24 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return {
                 "ok": False,
                 "no_trade": True,
-                "reason": self._insufficient_bars_reason("insufficient_underlying_bars", 0 if u is None else len(u), min_bars),
+                "reason": insufficient_bars_reason("insufficient_underlying_bars", 0 if u is None else len(u), min_bars),
                 "underlying": underlying,
                 "confirm_index": confirm_symbol,
             }
 
         last_u = u.iloc[-1]
-        u_close = self._safe_float(last_u["close"])
-        u_vwap = self._safe_float(last_u["vwap"], u_close)
-        u_ema9 = self._safe_float(last_u["ema9"], u_close)
-        u_ema20 = self._safe_float(last_u["ema20"], u_close)
+        u_close = _safe_float(last_u["close"])
+        u_vwap = _safe_float(last_u["vwap"], u_close)
+        u_ema9 = _safe_float(last_u["ema9"], u_close)
+        u_ema20 = _safe_float(last_u["ema20"], u_close)
         u_vwap_dist = (u_close - u_vwap) / max(u_close, 1.0)
         u_ema_gap = (u_ema9 - u_ema20) / max(u_close, 1.0)
-        u_ret5 = self._safe_float(last_u["ret5"], 0.0)
-        u_ret15 = self._safe_float(last_u["ret15"], 0.0)
+        u_ret5 = _safe_float(last_u["ret5"], 0.0)
+        u_ret15 = _safe_float(last_u["ret15"], 0.0)
         session_day = now_et().date()
-        u_open = self._session_open_price(u, session_day, regular_session_only=True)
+        u_open = _session_open_price(u, session_day, regular_session_only=True)
         if u_open is None:
-            u_open = self._session_open_price(u, session_day, regular_session_only=False)
+            u_open = _session_open_price(u, session_day, regular_session_only=False)
         u_day_ret = float((u_close / u_open) - 1.0) if u_open else 0.0
         u_above_frac = self._fraction_relative(u, "vwap", int(p.get("trend_vwap_lookback", 8)), "above")
         u_below_frac = self._fraction_relative(u, "vwap", int(p.get("trend_vwap_lookback", 8)), "below")
@@ -426,10 +439,10 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         idx_flip_count = 0
         if idx_available:
             last_i = idx.iloc[-1]
-            i_close = self._safe_float(last_i["close"])
-            i_vwap = self._safe_float(last_i["vwap"], i_close)
-            i_ema9 = self._safe_float(last_i["ema9"], i_close)
-            i_ema20 = self._safe_float(last_i["ema20"], i_close)
+            i_close = _safe_float(last_i["close"])
+            i_vwap = _safe_float(last_i["vwap"], i_close)
+            i_ema9 = _safe_float(last_i["ema9"], i_close)
+            i_ema20 = _safe_float(last_i["ema20"], i_close)
             idx_vwap_dist = (i_close - i_vwap) / max(i_close, 1.0)
             idx_ema_gap = (i_ema9 - i_ema20) / max(i_close, 1.0)
             idx_flip_count = self._flip_count(idx, int(p.get("flip_lookback", 12)))
@@ -445,9 +458,9 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                     q = None
             except Exception:
                 LOG.debug("Failed to validate freshness of volatility quote for %s; using current quote snapshot as-is.", vol_symbol, exc_info=True)
-        vix_last = self._positive_quote_value(q, "last", "mid", "mark")
+        vix_last = _positive_quote_value(q, "last", "mid", "mark")
         vix_pct = self._safe_pct(q.get("percent_change")) if q is not None and q.get("percent_change") is not None else 0.0
-        candidate_rvol = self._safe_float(candidate.metadata.get("relative_volume_10d_calc"), 0.0)
+        candidate_rvol = _safe_float(candidate.metadata.get("relative_volume_10d_calc"), 0.0)
         candidate_effective_rvol = self._effective_relative_volume(underlying, candidate_rvol, p, cap_default=2.5, standard_floor=1.0)
         candidate_rvol_profile = rvol_profile_for_symbol(underlying, p or {})
         candidate_day_move = self._safe_pct(candidate.metadata.get("change_from_open"))
@@ -462,14 +475,14 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
 
         reasons: list[str] = []
         if vix_last is not None and vix_last > max_vix:
-            reasons.append(self._reason_with_values("vix_above_limit", current=vix_last, required=max_vix, op="<=", digits=2))
+            reasons.append(_reason_with_values("vix_above_limit", current=vix_last, required=max_vix, op="<=", digits=2))
         if abs(vix_pct) >= vix_spike_pct:
-            reasons.append(self._reason_with_values("vix_spike", current=abs(vix_pct), required=vix_spike_pct, op="<", digits=4))
+            reasons.append(_reason_with_values("vix_spike", current=abs(vix_pct), required=vix_spike_pct, op="<", digits=4))
         if candidate_rvol < min_candidate_rvol_required:
-            reasons.append(self._reason_with_values("weak_relative_volume", current=candidate_rvol, required=min_candidate_rvol_required, op=">=", digits=2))
+            reasons.append(_reason_with_values("weak_relative_volume", current=candidate_rvol, required=min_candidate_rvol_required, op=">=", digits=2))
         if u_range_pct >= chaos_intraday_range_pct and u_flip_count >= chop_flip_min:
             reasons.append(
-                self._reason_with_values(
+                _reason_with_values(
                     "chaotic_intraday_range",
                     current=u_range_pct,
                     required=chaos_intraday_range_pct,
@@ -481,7 +494,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         require_index_confirmation = bool(p.get("require_index_confirmation", True))
         if require_index_confirmation and confirm_symbol and not idx_available:
             reasons.append(
-                self._insufficient_bars_reason(
+                insufficient_bars_reason(
                     "insufficient_confirm_bars",
                     0 if idx is None else len(idx),
                     min_confirm_bars,
@@ -491,7 +504,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             trend_disagree = (u_vwap_dist > 0 > idx_vwap_dist) or (u_vwap_dist < 0 < idx_vwap_dist)
             if trend_disagree and abs(u_vwap_dist) >= trend_vwap_distance_pct and abs(idx_vwap_dist) >= trend_vwap_distance_pct:
                 reasons.append(
-                    self._reason_with_values(
+                    _reason_with_values(
                         "underlying_index_disagreement",
                         current=abs(u_vwap_dist),
                         required=trend_vwap_distance_pct,
@@ -680,7 +693,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             else:
                 no_trade = True
                 reasons.append(
-                    self._ambiguous_regime_reason(
+                    _ambiguous_regime_reason(
                         top_name=top_name,
                         top_score=top_score,
                         second_name=second_name,
@@ -694,7 +707,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             if regime == "bullish_trend" and not htf_bullish:
                 no_trade = True
                 reasons.append(
-                    self._reason_with_values(
+                    _reason_with_values(
                         "htf_trend_misaligned",
                         current=htf_ctx.get("vwap_dist", 0.0),
                         required=float(p.get("htf_vwap_distance_pct", 0.0009)),
@@ -709,7 +722,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             elif regime == "bearish_trend" and not htf_bearish:
                 no_trade = True
                 reasons.append(
-                    self._reason_with_values(
+                    _reason_with_values(
                         "htf_trend_misaligned",
                         current=abs(float(htf_ctx.get("vwap_dist", 0.0))),
                         required=float(p.get("htf_vwap_distance_pct", 0.0009)),
@@ -804,14 +817,14 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 "htf_fvg_bear_score": float(htf_fvg_score["bear_score"]),
                 "htf_fvg_nearest_bullish_state": str(htf_fvg_score["nearest_bullish"].get("state", "none")),
                 "htf_fvg_nearest_bearish_state": str(htf_fvg_score["nearest_bearish"].get("state", "none")),
-                "htf_fvg_nearest_bullish_midpoint": BaseStrategy._optional_float(htf_fvg_score["nearest_bullish"].get("midpoint")),
-                "htf_fvg_nearest_bearish_midpoint": BaseStrategy._optional_float(htf_fvg_score["nearest_bearish"].get("midpoint")),
+                "htf_fvg_nearest_bullish_midpoint": _optional_float(htf_fvg_score["nearest_bullish"].get("midpoint")),
+                "htf_fvg_nearest_bearish_midpoint": _optional_float(htf_fvg_score["nearest_bearish"].get("midpoint")),
                 "fvg_1m_bull_score": float(fvg1_score["bull_score"]),
                 "fvg_1m_bear_score": float(fvg1_score["bear_score"]),
                 "fvg_1m_nearest_bullish_state": str(fvg1_score["nearest_bullish"].get("state", "none")),
                 "fvg_1m_nearest_bearish_state": str(fvg1_score["nearest_bearish"].get("state", "none")),
-                "fvg_1m_nearest_bullish_midpoint": BaseStrategy._optional_float(fvg1_score["nearest_bullish"].get("midpoint")),
-                "fvg_1m_nearest_bearish_midpoint": BaseStrategy._optional_float(fvg1_score["nearest_bearish"].get("midpoint")),
+                "fvg_1m_nearest_bullish_midpoint": _optional_float(fvg1_score["nearest_bullish"].get("midpoint")),
+                "fvg_1m_nearest_bearish_midpoint": _optional_float(fvg1_score["nearest_bearish"].get("midpoint")),
             },
         }
 
@@ -845,15 +858,15 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         min_net_mid_price = float(self.optcfg.min_net_mid_price)
         max_net_spread_pct = float(self.optcfg.max_net_spread_pct)
         if ask <= 0 or mid <= 0:
-            return self._detail_fields(reason="invalid_spread_market", net_bid=bid, net_ask=ask, net_mid=mid)
+            return _detail_fields(reason="invalid_spread_market", net_bid=bid, net_ask=ask, net_mid=mid)
         if ask > max_net_spread_price:
-            return self._detail_fields(reason="net_ask_too_high", required_max_net_ask=max_net_spread_price, current_net_ask=ask, net_bid=bid, net_mid=mid)
+            return _detail_fields(reason="net_ask_too_high", required_max_net_ask=max_net_spread_price, current_net_ask=ask, net_bid=bid, net_mid=mid)
         if mid < min_net_mid_price:
-            return self._detail_fields(reason="net_mid_too_low", required_min_net_mid=min_net_mid_price, current_net_mid=mid, net_bid=bid, net_ask=ask)
+            return _detail_fields(reason="net_mid_too_low", required_min_net_mid=min_net_mid_price, current_net_mid=mid, net_bid=bid, net_ask=ask)
         spread_pct = (ask - bid) / max(mid, 0.01)
         if spread_pct > max_net_spread_pct:
-            return self._detail_fields(reason="net_spread_pct_too_wide", required_max_net_spread_pct=max_net_spread_pct, current_net_spread_pct=spread_pct, net_bid=bid, net_ask=ask, net_mid=mid)
-        return self._detail_fields(reason="invalid_spread_market", net_bid=bid, net_ask=ask, net_mid=mid)
+            return _detail_fields(reason="net_spread_pct_too_wide", required_max_net_spread_pct=max_net_spread_pct, current_net_spread_pct=spread_pct, net_bid=bid, net_ask=ask, net_mid=mid)
+        return _detail_fields(reason="invalid_spread_market", net_bid=bid, net_ask=ask, net_mid=mid)
 
     def _validate_spread_market(self, first_leg: OptionContract, second_leg: OptionContract) -> tuple[float, float, float] | None:
         bid, ask, mid = vertical_price_bounds(first_leg, second_leg)
@@ -873,12 +886,12 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         if frame is None or frame.empty:
             return ["insufficient_underlying_bars"]
         last = frame.iloc[-1]
-        last_close = self._safe_float(last["close"])
-        last_vwap = self._safe_float(last["vwap"], last_close)
-        last_ema9 = self._safe_float(last["ema9"], last_close)
-        last_ema20 = self._safe_float(last["ema20"], last_close)
-        last_ret5 = self._safe_float(last["ret5"], 0.0)
-        last_ret15 = self._safe_float(last["ret15"], 0.0)
+        last_close = _safe_float(last["close"])
+        last_vwap = _safe_float(last["vwap"], last_close)
+        last_ema9 = _safe_float(last["ema9"], last_close)
+        last_ema20 = _safe_float(last["ema20"], last_close)
+        last_ret5 = _safe_float(last["ret5"], 0.0)
+        last_ret15 = _safe_float(last["ret15"], 0.0)
         vwap_dist = (last_close - last_vwap) / max(last_close, 1.0)
         ema_gap = (last_ema9 - last_ema20) / max(last_close, 1.0)
         scores = regime.get("scores") or {}
@@ -894,9 +907,9 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         max_ret15 = float(p.get("long_option_max_ret15", max(float(p.get("trend_min_ret15", 0.0014)) * 5.0, 0.0055)))
 
         if top_score < min_style_score:
-            reasons.append(self._reason_with_values("trend_long_option_low_conviction", current=top_score, required=min_style_score, op=">=", digits=2))
+            reasons.append(_reason_with_values("trend_long_option_low_conviction", current=top_score, required=min_style_score, op=">=", digits=2))
         if (top_score - second_score) < min_style_gap:
-            reasons.append(self._reason_with_values("trend_long_option_score_gap_too_small", current=top_score - second_score, required=min_style_gap, op=">=", digits=2))
+            reasons.append(_reason_with_values("trend_long_option_score_gap_too_small", current=top_score - second_score, required=min_style_gap, op=">=", digits=2))
 
         sr_ctx = self._sr_context(symbol, frame, data)
         ms_ctx = self._structure_context(frame, "1m")
@@ -906,26 +919,26 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             if self._blocks_bullish_sr_entry(sr_ctx):
                 reasons.append(self._bullish_sr_block_reason(sr_ctx))
             if vwap_dist > max_vwap_extension:
-                reasons.append(self._reason_with_values("trend_long_option_too_extended_from_vwap", current=vwap_dist, required=max_vwap_extension, op="<=", digits=4))
+                reasons.append(_reason_with_values("trend_long_option_too_extended_from_vwap", current=vwap_dist, required=max_vwap_extension, op="<=", digits=4))
             if ema_gap > max_ema_extension:
-                reasons.append(self._reason_with_values("trend_long_option_ema_gap_too_large", current=ema_gap, required=max_ema_extension, op="<=", digits=4))
+                reasons.append(_reason_with_values("trend_long_option_ema_gap_too_large", current=ema_gap, required=max_ema_extension, op="<=", digits=4))
             if last_ret5 > max_ret5:
-                reasons.append(self._reason_with_values("trend_long_option_short_term_spike", current=last_ret5, required=max_ret5, op="<=", digits=4))
+                reasons.append(_reason_with_values("trend_long_option_short_term_spike", current=last_ret5, required=max_ret5, op="<=", digits=4))
             if last_ret15 > max_ret15:
-                reasons.append(self._reason_with_values("trend_long_option_already_extended", current=last_ret15, required=max_ret15, op="<=", digits=4))
+                reasons.append(_reason_with_values("trend_long_option_already_extended", current=last_ret15, required=max_ret15, op="<=", digits=4))
         else:
             if self._blocks_bearish_structure_entry(ms_ctx):
                 reasons.append(self._bearish_structure_block_reason(ms_ctx))
             if self._blocks_bearish_sr_entry(sr_ctx):
                 reasons.append(self._bearish_sr_block_reason(sr_ctx))
             if vwap_dist < -max_vwap_extension:
-                reasons.append(self._reason_with_values("trend_long_option_too_extended_from_vwap", current=abs(vwap_dist), required=max_vwap_extension, op="<=", digits=4))
+                reasons.append(_reason_with_values("trend_long_option_too_extended_from_vwap", current=abs(vwap_dist), required=max_vwap_extension, op="<=", digits=4))
             if ema_gap < -max_ema_extension:
-                reasons.append(self._reason_with_values("trend_long_option_ema_gap_too_large", current=abs(ema_gap), required=max_ema_extension, op="<=", digits=4))
+                reasons.append(_reason_with_values("trend_long_option_ema_gap_too_large", current=abs(ema_gap), required=max_ema_extension, op="<=", digits=4))
             if last_ret5 < -max_ret5:
-                reasons.append(self._reason_with_values("trend_long_option_short_term_spike", current=abs(last_ret5), required=max_ret5, op="<=", digits=4))
+                reasons.append(_reason_with_values("trend_long_option_short_term_spike", current=abs(last_ret5), required=max_ret5, op="<=", digits=4))
             if last_ret15 < -max_ret15:
-                reasons.append(self._reason_with_values("trend_long_option_already_extended", current=abs(last_ret15), required=max_ret15, op="<=", digits=4))
+                reasons.append(_reason_with_values("trend_long_option_already_extended", current=abs(last_ret15), required=max_ret15, op="<=", digits=4))
         return reasons
 
     def _stabilize_spread_quotes_detailed(self, data, metadata_first: OptionContract, metadata_second: OptionContract) -> tuple[tuple[OptionContract, OptionContract] | None, str | None]:
@@ -938,11 +951,11 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         for idx in range(checks):
             data.fetch_quotes(symbols, force=True, min_force_interval_seconds=self._option_quote_stability_force_cooldown_seconds(), source="strategies:option_quote_stability_spread")
             if not data.quotes_are_fresh(symbols, self.optcfg.max_quote_age_seconds):
-                return None, self._detail_fields(reason="quote_not_fresh", required_max_quote_age_seconds=float(self.optcfg.max_quote_age_seconds), completed_checks=idx, symbols="|".join(symbols))
+                return None, _detail_fields(reason="quote_not_fresh", required_max_quote_age_seconds=float(self.optcfg.max_quote_age_seconds), completed_checks=idx, symbols="|".join(symbols))
             q1 = data.get_quote(metadata_first.symbol)
             q2 = data.get_quote(metadata_second.symbol)
             if not q1 or not q2:
-                return None, self._detail_fields(reason="missing_leg_quotes", first_symbol=metadata_first.symbol, second_symbol=metadata_second.symbol, first_quote=bool(q1), second_quote=bool(q2), completed_checks=idx)
+                return None, _detail_fields(reason="missing_leg_quotes", first_symbol=metadata_first.symbol, second_symbol=metadata_second.symbol, first_quote=bool(q1), second_quote=bool(q2), completed_checks=idx)
             first = contract_from_quote(metadata_first.symbol, q1, asdict(metadata_first))
             second = contract_from_quote(metadata_second.symbol, q2, asdict(metadata_second))
             latest_pair = (first, second)
@@ -956,7 +969,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         if mids:
             drift = (max(mids) - min(mids)) / max(mids[-1], 0.01)
             if drift > float(self.optcfg.max_mid_drift_pct):
-                return None, self._detail_fields(reason="mid_drift_too_high", required_max_mid_drift_pct=float(self.optcfg.max_mid_drift_pct), current_mid_drift_pct=drift, checks=checks)
+                return None, _detail_fields(reason="mid_drift_too_high", required_max_mid_drift_pct=float(self.optcfg.max_mid_drift_pct), current_mid_drift_pct=drift, checks=checks)
         return latest_pair, None
 
     def _stabilize_spread_quotes(self, data, metadata_first: OptionContract, metadata_second: OptionContract) -> tuple[OptionContract, OptionContract] | None:
@@ -1002,21 +1015,22 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 return None
         return latest_contract
 
-    def _option_final_priority_score(self, candidate: Candidate, regime: dict[str, Any], *, bullish: bool | None = None, rangeish: bool = False) -> float:
+    @staticmethod
+    def _option_final_priority_score(candidate: Candidate, regime: dict[str, Any], *, bullish: bool | None = None, rangeish: bool = False) -> float:
         scores = regime.get("scores") if isinstance(regime, dict) else None
         if not isinstance(scores, dict):
             scores = {}
         primary_key = "range" if rangeish else ("bullish_trend" if bullish else "bearish_trend")
-        primary = self._safe_float(scores.get(primary_key), 0.0)
+        primary = _safe_float(scores.get(primary_key), 0.0)
         alternatives = [
-            self._safe_float(scores.get("bullish_trend"), 0.0),
-            self._safe_float(scores.get("bearish_trend"), 0.0),
-            self._safe_float(scores.get("range"), 0.0),
+            _safe_float(scores.get("bullish_trend"), 0.0),
+            _safe_float(scores.get("bearish_trend"), 0.0),
+            _safe_float(scores.get("range"), 0.0),
         ]
         alternatives.sort(reverse=True)
         runner_up = alternatives[1] if len(alternatives) > 1 else 0.0
         margin = max(0.0, primary - runner_up)
-        base = self._safe_float(candidate.activity_score, 0.0)
+        base = _safe_float(candidate.activity_score, 0.0)
         return round(base + (primary * 100.0) + (margin * 40.0), 4)
 
     def _attach_option_final_priority_score(self, signal: Signal, candidate: Candidate, regime: dict[str, Any], *, bullish: bool | None = None, rangeish: bool = False) -> Signal:
@@ -1069,7 +1083,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             debit_stop_frac = max(0.01, min(0.99, debit_stop_frac * (1.0 + (1.0 - time_decay_scale) * widen)))
         stop = entry_value * debit_stop_frac
         target = entry_value * debit_target_mult
-        stop, target = self._clamp_long_premium_levels(entry_value, stop, target)
+        stop, target = _clamp_long_premium_levels(entry_value, stop, target)
         position_key = build_position_label(underlying, style, Side.LONG, long_leg, short_leg)
         width_dollars = abs(float(short_leg.strike) - float(long_leg.strike)) * 100.0
         breakeven_underlying = float(long_leg.strike) + entry_limit if bullish else float(long_leg.strike) - entry_limit
@@ -1122,7 +1136,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             self._set_build_failure(
                 underlying,
                 style,
-                self._style_unavailable_reason(
+                _style_unavailable_reason(
                     style,
                     "reason=option_chain_empty",
                     put_call=put_call,
@@ -1140,7 +1154,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             self._set_build_failure(
                 underlying,
                 style,
-                self._style_unavailable_reason(
+                _style_unavailable_reason(
                     style,
                     "reason=no_short_leg",
                     put_call=put_call,
@@ -1159,7 +1173,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 if distance_atr < min_dist:
                     self._set_build_failure(
                         underlying, style,
-                        self._style_unavailable_reason(style, f"reason=short_strike_too_close(distance_atr={distance_atr:.2f}<{min_dist})"))
+                        _style_unavailable_reason(style, f"reason=short_strike_too_close(distance_atr={distance_atr:.2f}<{min_dist})"))
                     return None
         base_width = float(self.optcfg.strike_width_by_symbol.get(underlying, 2.0))
         width = self._adaptive_strike_width(underlying, base_width)
@@ -1170,7 +1184,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             self._set_build_failure(
                 underlying,
                 style,
-                self._style_unavailable_reason(
+                _style_unavailable_reason(
                     style,
                     "reason=no_hedge_leg",
                     short_leg_symbol=short_leg.symbol,
@@ -1186,7 +1200,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             self._set_build_failure(
                 underlying,
                 style,
-                self._style_unavailable_reason(
+                _style_unavailable_reason(
                     style,
                     "reason=non_positive_credit_or_risk",
                     entry_credit=entry_credit,
@@ -1203,7 +1217,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             self._set_build_failure(
                 underlying,
                 style,
-                self._style_unavailable_reason(style, stability_reason or "reason=quote_not_stable"),
+                _style_unavailable_reason(style, stability_reason or "reason=quote_not_stable"),
             )
             return None
         short_leg, long_leg = stable
@@ -1212,7 +1226,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             self._set_build_failure(
                 underlying,
                 style,
-                self._style_unavailable_reason(style, self._spread_market_failure_detail(short_leg, long_leg)),
+                _style_unavailable_reason(style, self._spread_market_failure_detail(short_leg, long_leg)),
             )
             return None
         nat_bid, nat_ask, quoted_mid = market
@@ -1227,7 +1241,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         width_dollars = abs(float(short_leg.strike) - float(long_leg.strike)) * 100.0
         adjusted_max_loss = max(0.0, width_dollars - entry_credit_value)
         stop = min(width_dollars, entry_credit_value * credit_stop_mult)
-        stop, target = self._clamp_short_premium_levels(entry_credit_value, stop, target)
+        stop, target = _clamp_short_premium_levels(entry_credit_value, stop, target)
         breakeven_underlying = float(short_leg.strike) - entry_limit if bullish else float(short_leg.strike) + entry_limit
         metadata = {
             "asset_type": ASSET_TYPE_OPTION_VERTICAL,
@@ -1297,7 +1311,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             frame = bars.get(c.symbol)
             min_bars = int(self.params.get("min_bars", 35))
             if frame is None or len(frame) < min_bars:
-                self._record_entry_decision(c.symbol, "skipped", [self._insufficient_bars_reason("insufficient_underlying_bars", 0 if frame is None else len(frame), min_bars)])
+                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_underlying_bars", 0 if frame is None else len(frame), min_bars)])
                 continue
             regime = self._regime_confirm(c, bars, data)
             if not regime.get("ok") or regime.get("no_trade"):
@@ -1308,33 +1322,33 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             confirm_index = regime.get("confirm_index")
             last = frame.iloc[-1]
             # Populate ATR caches for credit distance gate + adaptive width
-            self._underlying_atr_cache[c.symbol] = self._safe_float(last.get("atr14"), 0.0)
+            self._underlying_atr_cache[c.symbol] = _safe_float(last.get("atr14"), 0.0)
             if "atr14" in frame.columns:
                 atr_series = frame["atr14"].dropna().tail(20)
                 self._underlying_ref_atr_cache[c.symbol] = float(atr_series.median()) if len(atr_series) >= 5 else 0.0
-            opening = frame[self._same_day_mask(frame, now_et().date())].between_time("09:30", "09:34")
+            opening = frame[_same_day_mask(frame, now_et().date())].between_time("09:30", "09:34")
             regime_name = str(regime.get("regime") or "unknown")
             bullish = regime_name == "bullish_trend"
             bearish = regime_name == "bearish_trend"
             rangeish = regime_name == "range"
             attempted_style = False
-            last_close = self._safe_float(last["close"])
-            last_vwap = self._safe_float(last["vwap"], last_close)
-            last_ret5 = self._safe_float(last["ret5"], 0.0)
+            last_close = _safe_float(last["close"])
+            last_vwap = _safe_float(last["vwap"], last_close)
+            last_ret5 = _safe_float(last["ret5"], 0.0)
             orb_enabled = self._style_enabled("orb_debit_spread")
             orb_window = self._time_in_range(now_t, "09:35", self.params.get("orb_end_time", "10:05"))
             trend_enabled = self._style_enabled("trend_debit_spread")
             trend_window = self._time_in_range(now_t, self.params.get("trend_start_time", "10:05"), self.params.get("trend_end_time", "13:40"))
             credit_enabled = self._style_enabled("midday_credit_spread")
             credit_window = self._time_in_range(now_t, self.params.get("credit_start_time", "11:05"), self.params.get("credit_end_time", "13:45"))
-            or_high = self._safe_float(opening["high"].max()) if not opening.empty else None
-            or_low = self._safe_float(opening["low"].min()) if not opening.empty else None
+            or_high = _safe_float(opening["high"].max()) if not opening.empty else None
+            or_low = _safe_float(opening["low"].min()) if not opening.empty else None
             buffer_pct = float(self.params.get("orb_breakout_buffer_pct", 0.0008))
             trend_min_ret5 = float(self.params.get("trend_min_ret5", 0.0007))
 
             if orb_enabled and orb_window and (bullish or bearish):
                 if not opening.empty:
-                    if bullish and last_close > self._safe_float(or_high) * (1.0 + buffer_pct) and last_close > last_vwap:
+                    if bullish and last_close > _safe_float(or_high) * (1.0 + buffer_pct) and last_close > last_vwap:
                         attempted_style = True
                         sig = self._build_debit_spread_signal(c.symbol, True, client, data, last_close, "orb_debit_spread", confirm_index, regime)
                         if sig:
@@ -1342,7 +1356,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                             self._record_entry_decision(c.symbol, "signal", [sig.reason])
                             continue
                         reasons.append(self._consume_build_failure(c.symbol, "orb_debit_spread") or "orb_debit_spread_unavailable")
-                    if bearish and last_close < self._safe_float(or_low) * (1.0 - buffer_pct) and last_close < last_vwap:
+                    if bearish and last_close < _safe_float(or_low) * (1.0 - buffer_pct) and last_close < last_vwap:
                         attempted_style = True
                         sig = self._build_debit_spread_signal(c.symbol, False, client, data, last_close, "orb_debit_spread", confirm_index, regime)
                         if sig:
@@ -1356,11 +1370,11 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 # or volume isn't confirming the move.
                 momentum_ok = True
                 if getattr(self.optcfg, "trend_momentum_filter_enabled", False):
-                    atr_current = self._safe_float(last.get("atr14"), 0.0)
+                    atr_current = _safe_float(last.get("atr14"), 0.0)
                     atr_tail = frame.tail(20)["atr14"].dropna() if "atr14" in frame.columns else pd.Series(dtype=float)
                     atr_mean = float(atr_tail.mean()) if len(atr_tail) > 0 else 0.0
                     atr_expansion = atr_current / max(atr_mean, 1e-9) if atr_mean > 0 else 0.0
-                    vol_current = self._safe_float(last.get("volume"), 0.0)
+                    vol_current = _safe_float(last.get("volume"), 0.0)
                     vol_tail = frame.tail(10)["volume"].dropna() if "volume" in frame.columns else pd.Series(dtype=float)
                     vol_mean = float(vol_tail.mean()) if len(vol_tail) > 0 else 1.0
                     volume_ratio = vol_current / max(vol_mean, 1.0)
@@ -1397,7 +1411,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 reasons.append(self._consume_build_failure(c.symbol, "midday_credit_spread") or "midday_credit_spread_unavailable")
 
             final_reasons = reasons or ([
-                self._no_style_trigger_reason(
+                _no_style_trigger_reason(
                     regime_name=regime_name,
                     bullish=bullish,
                     bearish=bearish,
@@ -1455,8 +1469,8 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return None
         if data is not None and not data.quotes_are_fresh([first_symbol, second_symbol], self.optcfg.max_quote_age_seconds):
             return None
-        p1 = self._positive_quote_value(q1, "mid", "mark", "last")
-        p2 = self._positive_quote_value(q2, "mid", "mark", "last")
+        p1 = _positive_quote_value(q1, "mid", "mark", "last")
+        p2 = _positive_quote_value(q2, "mid", "mark", "last")
         if p1 is None or p2 is None:
             return None
         return max(0.0, (p1 - p2) * 100.0)

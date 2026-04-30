@@ -4,6 +4,10 @@ from ..shared import (
     Position,
     Side,
     Signal,
+    _bar_close_position,
+    insufficient_bars_reason,
+    _reason_with_values,
+    _safe_float,
     math,
     pd,
 )
@@ -62,7 +66,7 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 self._record_entry_decision(c.symbol, "skipped", ["already_in_position"])
                 continue
             if frame is None or len(frame) < history_bars:
-                self._record_entry_decision(c.symbol, "skipped", [self._insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), history_bars)])
+                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), history_bars)])
                 continue
 
             last = frame.iloc[-1]
@@ -70,28 +74,28 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
             box_slice = prior.tail(squeeze_lookback)
             baseline_slice = prior.iloc[-(squeeze_lookback + baseline_bars):-squeeze_lookback] if len(prior) >= (squeeze_lookback + baseline_bars) else prior.head(0)
             if len(box_slice) < squeeze_lookback or len(baseline_slice) < baseline_bars:
-                self._record_entry_decision(c.symbol, "skipped", [self._insufficient_bars_reason("insufficient_squeeze_history", len(prior), squeeze_lookback + baseline_bars)])
+                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_squeeze_history", len(prior), squeeze_lookback + baseline_bars)])
                 continue
 
-            last_close = self._safe_float(last["close"])
-            day_strength = self._safe_float(c.metadata.get("change_from_open"), 0.0)
-            last_vwap = self._safe_float(last.get("vwap"), last_close)
-            last_ema9 = self._safe_float(last.get("ema9"), last_close)
-            last_ema20 = self._safe_float(last.get("ema20"), last_close)
-            atr = max(self._safe_float(last.get("atr14"), last_close * 0.0015), max(last_close * 0.0015, 0.01))
-            close_pos = self._bar_close_position(frame)
-            breakout_high = self._safe_float(box_slice["high"].max(), last_close)
-            breakout_low = self._safe_float(box_slice["low"].min(), last_close)
+            last_close = _safe_float(last["close"])
+            day_strength = _safe_float(c.metadata.get("change_from_open"), 0.0)
+            last_vwap = _safe_float(last.get("vwap"), last_close)
+            last_ema9 = _safe_float(last.get("ema9"), last_close)
+            last_ema20 = _safe_float(last.get("ema20"), last_close)
+            atr = max(_safe_float(last.get("atr14"), last_close * 0.0015), max(last_close * 0.0015, 0.01))
+            close_pos = _bar_close_position(frame)
+            breakout_high = _safe_float(box_slice["high"].max(), last_close)
+            breakout_low = _safe_float(box_slice["low"].min(), last_close)
             box_range = max(0.0, breakout_high - breakout_low)
             box_range_pct = (box_range / last_close) if last_close > 0 else 0.0
             box_range_atr = (box_range / atr) if atr > 0 else math.inf
             volume_baseline = max(1.0, self._safe_series_median(box_slice["volume"], fallback=1.0))
-            breakout_volume_ratio = self._safe_float(last.get("volume"), 0.0) / volume_baseline
+            breakout_volume_ratio = _safe_float(last.get("volume"), 0.0) / volume_baseline
             pressure_split = max(2, squeeze_lookback // 2)
             first_half = box_slice.iloc[:pressure_split]
             second_half = box_slice.iloc[-pressure_split:]
-            rising_lows_ok = self._safe_float(second_half["low"].min(), breakout_low) >= self._safe_float(first_half["low"].min(), breakout_low) * (1.0 + min_pressure_drift_pct)
-            falling_highs_ok = self._safe_float(second_half["high"].max(), breakout_high) <= self._safe_float(first_half["high"].max(), breakout_high) * (1.0 - min_pressure_drift_pct)
+            rising_lows_ok = _safe_float(second_half["low"].min(), breakout_low) >= _safe_float(first_half["low"].min(), breakout_low) * (1.0 + min_pressure_drift_pct)
+            falling_highs_ok = _safe_float(second_half["high"].max(), breakout_high) <= _safe_float(first_half["high"].max(), breakout_high) * (1.0 - min_pressure_drift_pct)
 
             bb_len = int(self._technical_level_setting("bollinger_length", 20) or 20)
             bb_mult = float(self._technical_level_setting("bollinger_std_mult", 2.0) or 2.0)
@@ -140,11 +144,11 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 )
             )
             if not compression_ok:
-                reasons.append(self._reason_with_values("no_valid_squeeze", current=box_range_pct, required=max_range_pct, op="<=", digits=4, extras={"range_atr": (box_range_atr, "<=", max_range_atr), "width_pct": (box_width_pct, "<=", max_width_pct), "width_ratio": (width_ratio, "<=", max_width_ratio)}))
+                reasons.append(_reason_with_values("no_valid_squeeze", current=box_range_pct, required=max_range_pct, op="<=", digits=4, extras={"range_atr": (box_range_atr, "<=", max_range_atr), "width_pct": (box_width_pct, "<=", max_width_pct), "width_ratio": (width_ratio, "<=", max_width_ratio)}))
             if breakout_volume_ratio < min_breakout_volume_ratio:
-                reasons.append(self._reason_with_values("breakout_volume_too_light", current=breakout_volume_ratio, required=min_breakout_volume_ratio, op=">=", digits=4))
-            if self._safe_float(getattr(tech_ctx, "atr_expansion_mult", None), 0.0) < min_atr_expansion_mult:
-                reasons.append(self._reason_with_values("no_atr_expansion", current=self._safe_float(getattr(tech_ctx, "atr_expansion_mult", None), 0.0), required=min_atr_expansion_mult, op=">=", digits=4))
+                reasons.append(_reason_with_values("breakout_volume_too_light", current=breakout_volume_ratio, required=min_breakout_volume_ratio, op=">=", digits=4))
+            if _safe_float(getattr(tech_ctx, "atr_expansion_mult", None), 0.0) < min_atr_expansion_mult:
+                reasons.append(_reason_with_values("no_atr_expansion", current=_safe_float(getattr(tech_ctx, "atr_expansion_mult", None), 0.0), required=min_atr_expansion_mult, op=">=", digits=4))
             if prefer_bollinger_flag and not bool(getattr(tech_ctx, "bollinger_squeeze", False)) and box_width_pct > max_width_pct * 0.90:
                 reasons.append("bollinger_squeeze_not_confirmed")
 
@@ -153,22 +157,22 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
 
             long_reasons = list(shared_reasons)
             bullish_breakout = last_close >= breakout_high * (1.0 + breakout_buffer_pct)
-            bullish_avwap = max(self._safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0), self._safe_float(getattr(tech_ctx, "anchored_vwap_bullish_impulse", None), 0.0))
+            bullish_avwap = max(_safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0), _safe_float(getattr(tech_ctx, "anchored_vwap_bullish_impulse", None), 0.0))
             long_retest_plan = self._continuation_fvg_retest_plan(Side.LONG, c.symbol, frame, data, trigger_level=breakout_high, breakout_active=bool(bullish_breakout), close=last_close, vwap=last_vwap, ema9=last_ema9)
             if day_strength < min_change:
-                long_reasons.append(self._reason_with_values("weak_day_strength", current=day_strength, required=min_change, op=">=", digits=4))
+                long_reasons.append(_reason_with_values("weak_day_strength", current=day_strength, required=min_change, op=">=", digits=4))
             if require_vwap_alignment and last_close <= last_vwap:
-                long_reasons.append(self._reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
+                long_reasons.append(_reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
             if last_ema9 < last_ema20:
-                long_reasons.append(self._reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
+                long_reasons.append(_reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
             if require_avwap_alignment and bullish_avwap > 0 and last_close <= bullish_avwap:
-                long_reasons.append(self._reason_with_values("below_bullish_avwap", current=last_close, required=bullish_avwap, op=">", digits=4))
+                long_reasons.append(_reason_with_values("below_bullish_avwap", current=last_close, required=bullish_avwap, op=">", digits=4))
             if not rising_lows_ok:
                 long_reasons.append("pressure_not_building_up")
             if not bullish_breakout:
-                long_reasons.append(self._reason_with_values("no_squeeze_breakout", current=last_close, required=breakout_high * (1.0 + breakout_buffer_pct), op=">=", digits=4))
+                long_reasons.append(_reason_with_values("no_squeeze_breakout", current=last_close, required=breakout_high * (1.0 + breakout_buffer_pct), op=">=", digits=4))
             if close_pos < min_close_pos:
-                long_reasons.append(self._reason_with_values("weak_bar_close", current=close_pos, required=min_close_pos, op=">=", digits=4))
+                long_reasons.append(_reason_with_values("weak_bar_close", current=close_pos, required=min_close_pos, op=">=", digits=4))
             if not long_reasons and self._shared_entry_enabled("use_opposing_chart_filter", True) and self._blocks_bullish_entry(ctx):
                 long_reasons.append("chart_pattern_opposed")
             long_reasons = self._apply_continuation_fvg_retest_plan(long_reasons, long_retest_plan, deferrable_prefixes={"weak_bar_close", "no_squeeze_breakout", "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large"})
@@ -209,25 +213,25 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
 
             short_reasons = list(shared_reasons)
             bearish_breakout = last_close <= breakout_low * (1.0 - breakout_buffer_pct)
-            bearish_avwap_vals = [v for v in [self._safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0), self._safe_float(getattr(tech_ctx, "anchored_vwap_bearish_impulse", None), 0.0)] if v > 0]
+            bearish_avwap_vals = [v for v in [_safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0), _safe_float(getattr(tech_ctx, "anchored_vwap_bearish_impulse", None), 0.0)] if v > 0]
             bearish_avwap = min(bearish_avwap_vals) if bearish_avwap_vals else 0.0
             short_retest_plan = self._continuation_fvg_retest_plan(Side.SHORT, c.symbol, frame, data, trigger_level=breakout_low, breakout_active=bool(bearish_breakout), close=last_close, vwap=last_vwap, ema9=last_ema9)
             if not allow_short:
                 short_reasons.append("shorts_disabled")
             if day_strength > -min_change:
-                short_reasons.append(self._reason_with_values("weak_day_weakness", current=day_strength, required=-min_change, op="<=", digits=4))
+                short_reasons.append(_reason_with_values("weak_day_weakness", current=day_strength, required=-min_change, op="<=", digits=4))
             if require_vwap_alignment and last_close >= last_vwap:
-                short_reasons.append(self._reason_with_values("above_vwap", current=last_close, required=last_vwap, op="<", digits=4))
+                short_reasons.append(_reason_with_values("above_vwap", current=last_close, required=last_vwap, op="<", digits=4))
             if last_ema9 > last_ema20:
-                short_reasons.append(self._reason_with_values("ema9_above_ema20", current=last_ema9, required=last_ema20, op="<=", digits=4))
+                short_reasons.append(_reason_with_values("ema9_above_ema20", current=last_ema9, required=last_ema20, op="<=", digits=4))
             if require_avwap_alignment and 0 < bearish_avwap <= last_close:
-                short_reasons.append(self._reason_with_values("above_bearish_avwap", current=last_close, required=bearish_avwap, op="<", digits=4))
+                short_reasons.append(_reason_with_values("above_bearish_avwap", current=last_close, required=bearish_avwap, op="<", digits=4))
             if not falling_highs_ok:
                 short_reasons.append("pressure_not_building_down")
             if not bearish_breakout:
-                short_reasons.append(self._reason_with_values("no_squeeze_breakdown", current=last_close, required=breakout_low * (1.0 - breakout_buffer_pct), op="<=", digits=4))
+                short_reasons.append(_reason_with_values("no_squeeze_breakdown", current=last_close, required=breakout_low * (1.0 - breakout_buffer_pct), op="<=", digits=4))
             if close_pos > (1.0 - min_close_pos):
-                short_reasons.append(self._reason_with_values("weak_bar_close", current=1.0 - close_pos, required=min_close_pos, op=">=", digits=4))
+                short_reasons.append(_reason_with_values("weak_bar_close", current=1.0 - close_pos, required=min_close_pos, op=">=", digits=4))
             if not short_reasons and self._shared_entry_enabled("use_opposing_chart_filter", True) and self._blocks_bearish_entry(ctx):
                 short_reasons.append("chart_pattern_opposed")
             short_reasons = self._apply_continuation_fvg_retest_plan(short_reasons, short_retest_plan, deferrable_prefixes={"weak_bar_close", "no_squeeze_breakdown", "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "lower_wick_rejection", "expansion_bar_too_large"})

@@ -37,6 +37,7 @@ from .audit_logger import AuditLogger
 from .config import BotConfig
 from .data_feed import MarketDataStore
 from .models import Position
+from ._strategies.helpers import insufficient_bars_reason
 from ._strategies.strategy_base import BaseStrategy
 from .utils import equity_rth_open_at, is_regular_equity_session, is_weekday_session_day, now_et, previous_regular_close
 
@@ -178,7 +179,7 @@ class WarmupTracker:
         except Exception:
             next_retry_due = None
             retry_delay_seconds = None
-        blocking_reason = None if ready else self.strategy.insufficient_bars_reason("insufficient_bars", merged_rows, required_bars)
+        blocking_reason = None if ready else insufficient_bars_reason("insufficient_bars", merged_rows, required_bars)
         live_entry_state = dict(state.get("live_entry_bar_status") or {})
         return {
             "symbol": key,

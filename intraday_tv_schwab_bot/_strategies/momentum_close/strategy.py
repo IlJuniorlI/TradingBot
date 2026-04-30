@@ -4,6 +4,9 @@ from ..shared import (
     Position,
     Side,
     Signal,
+    insufficient_bars_reason,
+    _reason_with_values,
+    _safe_float,
     pd,
 )
 from ..strategy_base import BaseStrategy
@@ -22,34 +25,34 @@ class MomentumIntoCloseStrategy(BaseStrategy):
                 self._record_entry_decision(c.symbol, "skipped", ["already_in_position"])
                 continue
             if frame is None or len(frame) < 30:
-                self._record_entry_decision(c.symbol, "skipped", [self._insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), 30)])
+                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), 30)])
                 continue
             last = frame.iloc[-1]
             recent = frame.tail(lookback + 1).iloc[:-1]
-            breakout = self._safe_float(last["close"]) > float(recent["high"].max())
-            day_strength = self._safe_float(c.metadata.get("change_from_open"), 0.0)
+            breakout = _safe_float(last["close"]) > float(recent["high"].max())
+            day_strength = _safe_float(c.metadata.get("change_from_open"), 0.0)
             ctx = self._chart_context(frame)
             sr_ctx = self._sr_context(c.symbol, frame, data)
             ms_ctx = self._structure_context(frame, "1m")
             tech_ctx = self._technical_context(frame)
             pattern_ok = bool(ctx.matched_bullish_continuation or ctx.matched_bullish_reversal) or ctx.bias_score >= 0.0
-            last_close = self._safe_float(last["close"])
-            last_vwap = self._safe_float(last["vwap"], last_close)
-            last_ret15 = self._safe_float(last["ret15"], 0.0)
-            last_ema9 = self._safe_float(last["ema9"], last_close)
-            last_ema20 = self._safe_float(last["ema20"], last_close)
+            last_close = _safe_float(last["close"])
+            last_vwap = _safe_float(last["vwap"], last_close)
+            last_ret15 = _safe_float(last["ret15"], 0.0)
+            last_ema9 = _safe_float(last["ema9"], last_close)
+            last_ema20 = _safe_float(last["ema20"], last_close)
             breakout_level = float(recent["high"].max())
             retest_plan = self._continuation_fvg_retest_plan(Side.LONG, c.symbol, frame, data, trigger_level=breakout_level, breakout_active=bool(breakout), close=last_close, vwap=last_vwap, ema9=last_ema9)
             if not breakout:
-                reasons.append(self._reason_with_values("no_breakout", current=last_close, required=breakout_level, op=">", digits=4))
+                reasons.append(_reason_with_values("no_breakout", current=last_close, required=breakout_level, op=">", digits=4))
             if day_strength < min_day_strength:
-                reasons.append(self._reason_with_values("weak_day_strength", current=day_strength, required=min_day_strength, op=">=", digits=4))
+                reasons.append(_reason_with_values("weak_day_strength", current=day_strength, required=min_day_strength, op=">=", digits=4))
             if last_close <= last_vwap:
-                reasons.append(self._reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
+                reasons.append(_reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
             if last_ret15 <= 0:
-                reasons.append(self._reason_with_values("weak_ret15", current=last_ret15, required=0.0, op=">", digits=4))
+                reasons.append(_reason_with_values("weak_ret15", current=last_ret15, required=0.0, op=">", digits=4))
             if last_ema9 < last_ema20:
-                reasons.append(self._reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
+                reasons.append(_reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
             if not pattern_ok:
                 reasons.append("chart_pattern_not_supportive")
             if not reasons and self._shared_entry_enabled("use_opposing_chart_filter", True) and self._blocks_bullish_entry(ctx):
@@ -69,7 +72,7 @@ class MomentumIntoCloseStrategy(BaseStrategy):
                 # default_stop_pct floor so we never risk more than the
                 # configured percentage. Non-restrictive — only LOOSENS the
                 # stop slightly on high-conviction momentum setups.
-                last_atr = self._safe_float(last.get("atr14"), 0.0)
+                last_atr = _safe_float(last.get("atr14"), 0.0)
                 swing_low = float(recent["low"].min())
                 if last_atr > 0:
                     swing_low = swing_low - (last_atr * 0.08)

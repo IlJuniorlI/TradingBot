@@ -4,6 +4,11 @@ from ..shared import (
     Position,
     Side,
     Signal,
+    _bar_close_position,
+    insufficient_bars_reason,
+    _reason_with_values,
+    _safe_float,
+    _same_day_mask,
     now_et,
     pd,
 )
@@ -23,22 +28,22 @@ class MeanReversionStrategy(BaseStrategy):
                 self._record_entry_decision(c.symbol, "skipped", ["already_in_position"])
                 continue
             if frame is None or len(frame) < 20:
-                self._record_entry_decision(c.symbol, "skipped", [self._insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), 20)])
+                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), 20)])
                 continue
             last = frame.iloc[-1]
-            last_close = self._safe_float(last["close"])
-            session_frame = frame[self._same_day_mask(frame, now_et().date())]
+            last_close = _safe_float(last["close"])
+            session_frame = frame[_same_day_mask(frame, now_et().date())]
             recent20 = session_frame.tail(20)
             recent3 = frame.tail(3)
-            day_strength = self._safe_float(c.metadata.get("change_from_open"), 0.0)
+            day_strength = _safe_float(c.metadata.get("change_from_open"), 0.0)
             if day_strength < min_day_strength:
-                reasons.append(self._reason_with_values("weak_day_strength", current=day_strength, required=min_day_strength, op=">=", digits=4))
+                reasons.append(_reason_with_values("weak_day_strength", current=day_strength, required=min_day_strength, op=">=", digits=4))
             high20 = float(recent20["high"].max()) if not recent20.empty else 0.0
             if high20 <= 0:
                 reasons.append("invalid_session_high")
             pullback_pct = (high20 - last_close) / high20 if high20 > 0 else 0.0
             if high20 > 0 and pullback_pct > max_pullback_from_high:
-                reasons.append(self._reason_with_values("pullback_too_deep", current=pullback_pct, required=max_pullback_from_high, op="<=", digits=4))
+                reasons.append(_reason_with_values("pullback_too_deep", current=pullback_pct, required=max_pullback_from_high, op="<=", digits=4))
             candle_signal = self._directional_candle_signal(frame, Side.LONG)
             matched_patterns = set(candle_signal.get("matches", []))
             bullish_candle_net_score = float(candle_signal.get("net_score", 0.0) or 0.0)
@@ -55,17 +60,17 @@ class MeanReversionStrategy(BaseStrategy):
                 reasons.append("no_reversal_pattern")
             if not reversal_support:
                 reasons.append("chart_pattern_not_supportive")
-            ema9 = self._safe_float(last["ema9"], last_close)
-            last_ret5 = self._safe_float(last.get("ret5"), 0.0)
-            close_pos = self._bar_close_position(frame)
+            ema9 = _safe_float(last["ema9"], last_close)
+            last_ret5 = _safe_float(last.get("ret5"), 0.0)
+            close_pos = _bar_close_position(frame)
             min_reversal_close_position = float(self.params.get("min_reversal_close_position", 0.58))
             require_positive_ret5 = bool(self.params.get("require_positive_reversal_ret5", True))
             if last_close <= ema9:
-                reasons.append(self._reason_with_values("below_ema9", current=last_close, required=ema9, op=">", digits=4))
+                reasons.append(_reason_with_values("below_ema9", current=last_close, required=ema9, op=">", digits=4))
             if close_pos < min_reversal_close_position:
-                reasons.append(self._reason_with_values("weak_reversal_close", current=close_pos, required=min_reversal_close_position, op=">=", digits=4))
+                reasons.append(_reason_with_values("weak_reversal_close", current=close_pos, required=min_reversal_close_position, op=">=", digits=4))
             if require_positive_ret5 and last_ret5 <= 0.0:
-                reasons.append(self._reason_with_values("reversal_momentum_not_positive", current=last_ret5, required=0.0, op=">", digits=4))
+                reasons.append(_reason_with_values("reversal_momentum_not_positive", current=last_ret5, required=0.0, op=">", digits=4))
             if not reasons and self._shared_entry_enabled("use_opposing_chart_filter", True) and self._blocks_bullish_entry(ctx):
                 reasons.append("chart_pattern_opposed")
             if not reasons:

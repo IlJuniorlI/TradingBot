@@ -8,6 +8,11 @@ from ..shared import (
     Position,
     Side,
     Signal,
+    insufficient_bars_reason,
+    _reason_with_values,
+    _safe_float,
+    _same_day_mask,
+    _time_gte_mask,
     datetime,
     now_et,
     pd,
@@ -46,25 +51,25 @@ class ORBStrategy(BaseStrategy):
                 self._record_entry_decision(c.symbol, "skipped", ["already_in_position"])
                 continue
             if frame is None or len(frame) < min_bars:
-                self._record_entry_decision(c.symbol, "skipped", [self._insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)])
+                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)])
                 continue
             day = now_et().date()
-            session = frame[self._same_day_mask(frame, day)]
+            session = frame[_same_day_mask(frame, day)]
             if len(session) < opening_range_minutes + 2:
-                self._record_entry_decision(c.symbol, "skipped", [self._insufficient_bars_reason("opening_range_incomplete", len(session), opening_range_minutes + 2)])
+                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("opening_range_incomplete", len(session), opening_range_minutes + 2)])
                 continue
             opening_start_time = time(9, 30)
             after_start_time = (datetime.combine(day, opening_start_time, tzinfo=_ET_ZONE) + timedelta(minutes=max(0, opening_range_minutes))).time()
             times_series = session.index.to_series().map(lambda ts: ts.time())
             opening_mask = (times_series >= opening_start_time) & (times_series < after_start_time)
             opening = session[opening_mask.to_numpy()]
-            after = session[self._time_gte_mask(session, after_start_time)]
+            after = session[_time_gte_mask(session, after_start_time)]
             if opening.empty or after.empty:
                 self._record_entry_decision(
                     c.symbol,
                     "skipped",
                     [
-                        self._reason_with_values(
+                        _reason_with_values(
                             "opening_range_incomplete",
                             current=len(opening),
                             required=1,
@@ -87,17 +92,17 @@ class ORBStrategy(BaseStrategy):
             ms_ctx = self._structure_context(frame, "1m")
             tech_ctx = self._technical_context(frame)
             pattern_ok = bool(ctx.matched_bullish_continuation or ctx.matched_bullish_reversal) or ctx.bias_score >= 0.0
-            last_close = self._safe_float(last["close"])
-            last_vwap = self._safe_float(last["vwap"], last_close)
-            last_ema9 = self._safe_float(last["ema9"], last_close)
-            last_ema20 = self._safe_float(last["ema20"], last_close)
+            last_close = _safe_float(last["close"])
+            last_vwap = _safe_float(last["vwap"], last_close)
+            last_ema9 = _safe_float(last["ema9"], last_close)
+            last_ema20 = _safe_float(last["ema20"], last_close)
             retest_plan = self._continuation_fvg_retest_plan(Side.LONG, c.symbol, frame, data, trigger_level=trigger, breakout_active=bool(last_close > trigger), close=last_close, vwap=last_vwap, ema9=last_ema9)
             if last_close <= trigger:
-                reasons.append(self._reason_with_values("no_orb_breakout", current=last_close, required=trigger, op=">", digits=4))
+                reasons.append(_reason_with_values("no_orb_breakout", current=last_close, required=trigger, op=">", digits=4))
             if last_close <= last_vwap:
-                reasons.append(self._reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
+                reasons.append(_reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
             if last_ema9 < last_ema20:
-                reasons.append(self._reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
+                reasons.append(_reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
             if not pattern_ok:
                 reasons.append("chart_pattern_not_supportive")
             if not reasons and self._shared_entry_enabled("use_opposing_chart_filter", True) and self._blocks_bullish_entry(ctx):

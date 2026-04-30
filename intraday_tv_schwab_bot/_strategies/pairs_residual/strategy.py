@@ -4,6 +4,9 @@ from ..shared import (
     Position,
     Side,
     Signal,
+    insufficient_bars_reason,
+    _reason_with_values,
+    _safe_float,
     pd,
 )
 from ..strategy_base import BaseStrategy
@@ -47,7 +50,7 @@ class PairsResidualStrategy(BaseStrategy):
                     symbol,
                     "skipped",
                     [
-                        self._reason_with_values(
+                        _reason_with_values(
                             "insufficient_pair_bars",
                             current=min(0 if left is None else len(left), 0 if right is None else len(right)),
                             required=lookback,
@@ -63,14 +66,14 @@ class PairsResidualStrategy(BaseStrategy):
                 continue
             merged = pd.DataFrame({"left": left["close"], "right": right["close"]}).dropna().tail(lookback)
             if len(merged) < lookback // 2:
-                self._record_entry_decision(symbol, "skipped", [self._insufficient_bars_reason("insufficient_aligned_pair_bars", len(merged), lookback // 2)])
+                self._record_entry_decision(symbol, "skipped", [insufficient_bars_reason("insufficient_aligned_pair_bars", len(merged), lookback // 2)])
                 continue
             left_ret = merged.left.pct_change().fillna(0)
             right_ret = merged.right.pct_change().fillna(0)
             window = max(10, lookback // 3)
             relative = (left_ret - right_ret).rolling(window, min_periods=window).sum().dropna()
             if len(relative) < 2:
-                self._record_entry_decision(symbol, "skipped", [self._insufficient_bars_reason("insufficient_rolling_window", len(relative), 2)])
+                self._record_entry_decision(symbol, "skipped", [insufficient_bars_reason("insufficient_rolling_window", len(relative), 2)])
                 continue
             rel_std = float(relative.std(ddof=0))
             if rel_std <= 0 or rel_std != rel_std:
@@ -85,15 +88,15 @@ class PairsResidualStrategy(BaseStrategy):
             long_ready = allow_long and z >= entry_z
             short_ready = allow_short and z <= -entry_z
             if abs(z) > max_entry_z:
-                reasons.append(self._reason_with_values("relative_strength_too_extended", current=abs(z), required=max_entry_z, op="<=", digits=4))
+                reasons.append(_reason_with_values("relative_strength_too_extended", current=abs(z), required=max_entry_z, op="<=", digits=4))
             elif not (long_ready or short_ready):
                 if abs(z) < entry_z:
-                    reasons.append(self._reason_with_values("relative_strength_abs_below_threshold", current=abs(z), required=entry_z, op=">=", digits=4))
+                    reasons.append(_reason_with_values("relative_strength_abs_below_threshold", current=abs(z), required=entry_z, op=">=", digits=4))
                 elif z <= -entry_z and not global_allow_short and side_pref in {"both", "short"}:
                     reasons.append("shorts_disabled")
                 else:
                     reasons.append(f"side_preference_blocked({side_pref})")
-            last_close = self._safe_float(last["close"])
+            last_close = _safe_float(last["close"])
             sr_ctx = self._sr_context(symbol, left, data)
             ms_ctx = self._structure_context(left, "1m")
             tech_ctx = self._technical_context(left)
@@ -101,8 +104,8 @@ class PairsResidualStrategy(BaseStrategy):
                 if self._blocks_bullish_structure_entry(ms_ctx):
                     reasons.append(self._bullish_structure_block_reason(ms_ctx))
                 if not reasons:
-                    last_vwap = self._safe_float(last.get("vwap"), last_close)
-                    last_ema9 = self._safe_float(last.get("ema9"), last_close)
+                    last_vwap = _safe_float(last.get("vwap"), last_close)
+                    last_ema9 = _safe_float(last.get("ema9"), last_close)
                     reasons.extend(self._entry_exhaustion_reasons(Side.LONG, left, close=last_close, vwap=last_vwap, ema9=last_ema9))
                 if not reasons:
                     stop = last_close * (1.0 - self.config.risk.default_stop_pct)
@@ -140,8 +143,8 @@ class PairsResidualStrategy(BaseStrategy):
                 if self._blocks_bearish_structure_entry(ms_ctx):
                     reasons.append(self._bearish_structure_block_reason(ms_ctx))
                 if not reasons:
-                    last_vwap = self._safe_float(last.get("vwap"), last_close)
-                    last_ema9 = self._safe_float(last.get("ema9"), last_close)
+                    last_vwap = _safe_float(last.get("vwap"), last_close)
+                    last_ema9 = _safe_float(last.get("ema9"), last_close)
                     reasons.extend(self._entry_exhaustion_reasons(Side.SHORT, left, close=last_close, vwap=last_vwap, ema9=last_ema9))
                 if not reasons:
                     stop = last_close * (1.0 + self.config.risk.default_stop_pct)
