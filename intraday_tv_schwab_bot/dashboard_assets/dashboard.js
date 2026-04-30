@@ -287,6 +287,19 @@ function humanizeDecisionToken(value) {
   return rest.length ? `${humanHead}: ${rest.join(':')}` : humanHead;
 }
 
+// Compact form: drops the parameter detail after the first colon.
+// Used in tight UI spots (e.g. the focus-meta line next to the symbol name)
+// where long ETF-options skip reasons like
+// `option_quote_unstable:bid=1.05 ask=1.20 mid=1.13 stability_pct=14.2`
+// would push the live-price/change/volume chips off the right edge.
+// The full detail still appears in the score-sub line below.
+function humanizeDecisionTokenCompact(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '—';
+  const head = raw.split(':')[0];
+  return head.replace(/_/g, ' ');
+}
+
 function entryDecisionForSnapshot(snapshot) {
   if (!snapshot) return null;
   const direct = snapshot.entry_decision;
@@ -297,6 +310,20 @@ function entryDecisionLabel(decision) {
   if (!decision || typeof decision !== 'object') return '';
   const action = String(decision.action || '').trim().toLowerCase();
   const primary = humanizeDecisionToken(decision.primary_reason || (Array.isArray(decision.reasons) ? decision.reasons[0] : ''));
+  if (!action && !primary) return '';
+  if (!primary || primary === '—') return action || '';
+  if (!action || action === 'signal') return primary;
+  return `${action}: ${primary}`;
+}
+
+// Compact variant for tight UI surfaces. Same shape as
+// entryDecisionLabel() but uses the head-only humanizer so long
+// parameter strings (e.g. option-strategy quote-stability values)
+// don't blow out the focus-meta line layout.
+function entryDecisionLabelCompact(decision) {
+  if (!decision || typeof decision !== 'object') return '';
+  const action = String(decision.action || '').trim().toLowerCase();
+  const primary = humanizeDecisionTokenCompact(decision.primary_reason || (Array.isArray(decision.reasons) ? decision.reasons[0] : ''));
   if (!action && !primary) return '';
   if (!primary || primary === '—') return action || '';
   if (!action || action === 'signal') return primary;
@@ -1560,10 +1587,15 @@ function renderSelectedSymbol() {
 
   document.getElementById('selected-symbol').textContent = snapshot.symbol;
   const decision = entryDecisionForSnapshot(snapshot);
+  // Full label (used in scoreSub below) carries the parameter detail;
+  // compact label (used in focus-meta next to the symbol name) drops it
+  // so long ETF-options skip reasons don't push the live-data chips off
+  // the right edge.
   const decisionLabel = entryDecisionLabel(decision);
+  const decisionLabelCompact = entryDecisionLabelCompact(decision);
   const warmup = snapshot.warmup || null;
   const selectedDescriptionBase = snapshot.description || `${safe(cand.directional_bias || pos.side || sr.regime_hint || 'watchlist')} · ${safe(data?.strategy)}`;
-  const selectedDescription = [selectedDescriptionBase, (!warmup || warmup.ready) ? '' : warmupLabel(warmup), decisionLabel].filter(Boolean).join(' · ');
+  const selectedDescription = [selectedDescriptionBase, (!warmup || warmup.ready) ? '' : warmupLabel(warmup), decisionLabelCompact].filter(Boolean).join(' · ');
   document.getElementById('selected-description').textContent = selectedDescription || selectedDescriptionBase;
   document.getElementById('selected-trend-icon').innerHTML = iconForState(sr.trend_state, sr.trend, 'Trend');
   document.getElementById('selected-structure-icon').innerHTML = iconForState(sr.structure_bias, sr.structure_bias, 'Structure');
