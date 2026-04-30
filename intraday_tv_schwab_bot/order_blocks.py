@@ -105,9 +105,33 @@ def _filled_pct_for_bearish(ob_lower: float, ob_upper: float, max_close_after: f
     return max(0.0, min(1.0, (fill_top - ob_lower) / size))
 
 
+def _earlier(ts_a: str | None, ts_b: str | None) -> str | None:
+    """Pick the chronologically earlier of two ISO timestamps; ``None`` is
+    treated as missing. Used to keep first_seen monotonically oldest under
+    merging that's sorted by price."""
+    if ts_a is None or ts_a == "":
+        return ts_b
+    if ts_b is None or ts_b == "":
+        return ts_a
+    return ts_a if ts_a <= ts_b else ts_b
+
+
+def _later(ts_a: str | None, ts_b: str | None) -> str | None:
+    if ts_a is None or ts_a == "":
+        return ts_b
+    if ts_b is None or ts_b == "":
+        return ts_a
+    return ts_a if ts_a >= ts_b else ts_b
+
+
 def _merge_order_blocks(obs: list[OrderBlock], *, tolerance: float) -> list[OrderBlock]:
-    """Merge OBs whose zones overlap within tolerance, keeping the wider one and the
-    older first_seen / newer last_seen."""
+    """Merge OBs whose zones overlap within tolerance.
+
+    Sort is by price (``lower``), so the merged record's first/last_seen
+    must be reconciled by timestamp comparison rather than sort order —
+    the otherwise-natural ``last.first_seen`` would reflect price ordering,
+    not chronology, and produce misleading metadata.
+    """
     if not obs:
         return []
     obs_sorted = sorted(obs, key=lambda o: o.lower)
@@ -131,8 +155,8 @@ def _merge_order_blocks(obs: list[OrderBlock], *, tolerance: float) -> list[Orde
                 upper=merged_upper,
                 midpoint=(merged_lower + merged_upper) / 2.0,
                 size=merged_size,
-                first_seen=last.first_seen if last.first_seen else ob.first_seen,
-                last_seen=ob.last_seen if ob.last_seen else last.last_seen,
+                first_seen=_earlier(last.first_seen, ob.first_seen),
+                last_seen=_later(last.last_seen, ob.last_seen),
                 filled_pct=max(last.filled_pct, ob.filled_pct),
                 source=last.source,
             )
@@ -181,15 +205,18 @@ def _detect_order_blocks_loose(
                     upper = float(high_arr[k])
                     size = upper - lower
                     if size < min_size:
-                        break
+                        # Tiny doji-ish bearish bar — keep walking back for a
+                        # larger meaningful OB instead of giving up.
+                        continue
                     # Compute filled_pct from CLOSES after k — wicks that
                     # pierce the OB but close back inside are tolerated.
                     after = close_arr[k + 1:]
                     min_close_after = float(after.min()) if after.size else upper
                     filled_pct = _filled_pct_for_bullish(lower, upper, min_close_after)
                     if filled_pct >= 1.0 - 1e-9:
-                        # OB has been completely filled — invalidated, skip
-                        break
+                        # This candidate is invalidated. Keep walking for an
+                        # older still-valid OB.
+                        continue
                     anchor_ts = index_values[k]
                     bullish_raw.append(
                         OrderBlock(
@@ -217,12 +244,12 @@ def _detect_order_blocks_loose(
                     upper = float(high_arr[k])
                     size = upper - lower
                     if size < min_size:
-                        break
+                        continue
                     after = close_arr[k + 1:]
                     max_close_after = float(after.max()) if after.size else lower
                     filled_pct = _filled_pct_for_bearish(lower, upper, max_close_after)
                     if filled_pct >= 1.0 - 1e-9:
-                        break
+                        continue
                     anchor_ts = index_values[k]
                     bearish_raw.append(
                         OrderBlock(
@@ -287,12 +314,12 @@ def _detect_order_blocks_strict(
                 upper = float(high_arr[k])
                 size = upper - lower
                 if size < min_size:
-                    break
+                    continue
                 after = close_arr[k + 1:]
                 min_close_after = float(after.min()) if after.size else upper
                 filled_pct = _filled_pct_for_bullish(lower, upper, min_close_after)
                 if filled_pct >= 1.0 - 1e-9:
-                    break
+                    continue
                 anchor_ts = index_values[k]
                 bullish_raw.append(
                     OrderBlock(
@@ -326,12 +353,12 @@ def _detect_order_blocks_strict(
                 upper = float(high_arr[k])
                 size = upper - lower
                 if size < min_size:
-                    break
+                    continue
                 after = close_arr[k + 1:]
                 max_close_after = float(after.max()) if after.size else lower
                 filled_pct = _filled_pct_for_bearish(lower, upper, max_close_after)
                 if filled_pct >= 1.0 - 1e-9:
-                    break
+                    continue
                 anchor_ts = index_values[k]
                 bearish_raw.append(
                     OrderBlock(
