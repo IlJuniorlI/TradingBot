@@ -97,6 +97,11 @@ runtime:
   # Auto-exit: shut down cleanly when market closes and no positions are open
   auto_exit_after_session: true
   cycle_precompute_workers: 4
+  # Per-symbol quote-fetch failure threshold. After this many consecutive
+  # quote refreshes fail (typically Schwab 401/403/404 on restricted
+  # securities), the symbol is silenced from quote refresh for the rest
+  # of the session. Counter resets on any success; blacklist clears on
+  # bot restart. Set to 0 to disable (always retry).
   max_consecutive_quote_failures: 5
   # Per-day debug archive: on session shutdown, write
   # {log_dir}/sessions/{YYYY-MM-DD}/ with bars/{SYMBOL}.csv (RTH+indicators),

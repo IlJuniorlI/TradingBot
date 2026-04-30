@@ -285,6 +285,7 @@ This block controls loop timing, quote/history refresh cadence, stream fallback 
 | `startup_reconcile_metadata_db_path` | `.logs/startup_reconcile_metadata.sqlite` |
 | `auto_exit_after_session`            | `false`                                   |
 | `cycle_precompute_workers`           | `4`                                       |
+| `max_consecutive_quote_failures`     | `5`                                       |
 | `export_session_archive`             | `true`                                    |
 
 Behavior and valid values:
@@ -321,6 +322,7 @@ Behavior and valid values:
 - `startup_reconcile_metadata_db_path`: SQLite metadata path used by hybrid restore.
 - `auto_exit_after_session`: when `true`, the bot shuts down cleanly after the trading session ends and all positions are closed. Exits after the latest of RTH close and any configured strategy window end. On non-trading days (weekends/holidays), exits immediately. Designed for use with Windows Task Scheduler or cron to start the bot daily.
 - `cycle_precompute_workers`: thread-pool size used to precompute per-symbol indicator/structure context in parallel each engine cycle. Higher values reduce per-cycle latency on wide watchlists at the cost of CPU; lower values trade latency for less contention.
+- `max_consecutive_quote_failures`: per-symbol quote-fetch failure threshold. After a symbol fails this many consecutive quote refreshes (typically symbol-specific Schwab 401/403/404 such as restricted-security responses), it is silenced from quote refresh for the rest of the session. The counter resets on any successful fetch; the blacklist clears on bot restart. Set to `0` to disable (always retry — pre-2026-04-29 behavior). The default `5` catches symbol-specific permission errors without triggering on transient hiccups. Other endpoints (history, stream) for the same symbol are unaffected.
 - `export_session_archive`: when `true`, on session shutdown the engine writes a per-day archive to `{log_dir}/sessions/{YYYY-MM-DD}/` containing `bars/{SYMBOL}.csv` for every active watchlist symbol (RTH only, with indicators), `trades.csv` filtered to the day, and `manifest.json` with strategy + summary stats. Useful for trade audits and post-session analysis. Disable to save disk space if running without dashboard/analysis needs.
 
 ### Session report
