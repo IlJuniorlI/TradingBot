@@ -1133,6 +1133,15 @@ class BaseStrategy:
         # 0.0 = preserve existing strict behavior. A value of e.g. 0.003
         # = 0.3% of close treats near-edge reversals as valid retests.
         edge_tolerance = max(0.0, abs(close) * float(self.params.get("anti_chase_fvg_edge_tolerance_pct", 0.0) or 0.0))
+        # Trend-MA reclaim gate: by default the confirming bar's close must
+        # also be above min(VWAP, EMA9) for longs (or below max for shorts).
+        # On microcap squeeze names that gap 50%+ and pull back hard into
+        # earlier FVGs, VWAP/EMA9 lag well above the retest zone, so the
+        # gate blocks exactly the deep-retest entries the strategy wants.
+        # Setting this to True drops the trend-MA reclaim and keeps only the
+        # FVG-midpoint reclaim + bar_confirm shape check. Default False
+        # preserves prior behavior for every other strategy.
+        skip_trend_reclaim = bool(self.params.get("anti_chase_fvg_retest_skip_vwap_ema9_reclaim", False))
         direction_label = "bullish" if side == Side.LONG else "bearish"
         out["metadata"].update(
             {
@@ -1181,12 +1190,16 @@ class BaseStrategy:
         touched_zone = bar_low <= (upper + touch_tolerance + edge_tolerance) and bar_high >= (lower - touch_tolerance - edge_tolerance)
         if side == Side.LONG:
             respected_zone = bar_low >= (lower - invalidation_tolerance)
-            reclaimed = close >= (midpoint - touch_tolerance) and close >= min(float(vwap or close), float(ema9 or close))
+            reclaimed = close >= (midpoint - touch_tolerance)
+            if not skip_trend_reclaim:
+                reclaimed = reclaimed and close >= min(float(vwap or close), float(ema9 or close))
             bar_confirm = close_pos >= min_close_pos
             stop_anchor = max(0.01, lower - (size * stop_buffer_gap_frac))
         else:
             respected_zone = bar_high <= (upper + invalidation_tolerance)
-            reclaimed = close <= (midpoint + touch_tolerance) and close <= max(float(vwap or close), float(ema9 or close))
+            reclaimed = close <= (midpoint + touch_tolerance)
+            if not skip_trend_reclaim:
+                reclaimed = reclaimed and close <= max(float(vwap or close), float(ema9 or close))
             bar_confirm = close_pos <= (1.0 - min_close_pos)
             stop_anchor = upper + (size * stop_buffer_gap_frac)
         out["metadata"]["anti_chase_fvg_retest_recent_impulse"] = bool(impulse_seen)
