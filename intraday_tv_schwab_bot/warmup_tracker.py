@@ -37,7 +37,7 @@ from .audit_logger import AuditLogger
 from .config import BotConfig
 from .data_feed import MarketDataStore
 from .models import Position
-from ._strategies.helpers import insufficient_bars_reason
+from ._strategies import insufficient_bars_reason
 from ._strategies.strategy_base import BaseStrategy
 from .utils import equity_rth_open_at, is_regular_equity_session, is_weekday_session_day, now_et, previous_regular_close
 
