@@ -87,11 +87,13 @@ def _optional_float(value: Any, default: float | None = None) -> float | None:
 
 def _optional_int(value: Any, default: int | None = None) -> int | None:
     """Coerce ``value`` to ``int | None``. Returns ``default`` on
-    failure or NaN."""
+    failure or NaN. Float-strings like ``"3.7"`` parse to ``3`` (truncate
+    toward zero) to match the wider bot's safe_float→int chain — direct
+    ``int("3.7")`` would otherwise raise and fall through to ``default``."""
     try:
         if _is_scalar_missing(value):
             return default
-        return int(value)
+        return int(float(value))
     except Exception:
         return default
 

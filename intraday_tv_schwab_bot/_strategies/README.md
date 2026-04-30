@@ -178,8 +178,10 @@ Avoid `from ..shared import *`. Import only the names your plugin uses.
 from ..shared import (
     Candidate,
     Position,
-    Signal,
     Side,
+    Signal,
+    _safe_float,
+    insufficient_bars_reason,
     pd,
 )
 from ..strategy_base import BaseStrategy
@@ -213,15 +215,15 @@ class MyNewStrategy(BaseStrategy):
                 self._record_entry_decision(
                     c.symbol,
                     "skipped",
-                    [self.insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)],
+                    [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)],
                 )
                 continue
 
             last = frame.iloc[-1]
-            close = self._safe_float(last.get("close"), 0.0)
-            vwap = self._safe_float(last.get("vwap"), close)
-            day_strength = self._safe_float(c.metadata.get("change_from_open"), 0.0)
-            rvol = self._safe_float(c.metadata.get("relative_volume_10d_calc"), 0.0)
+            close = _safe_float(last.get("close"), 0.0)
+            vwap = _safe_float(last.get("vwap"), close)
+            day_strength = _safe_float(c.metadata.get("change_from_open"), 0.0)
+            rvol = _safe_float(c.metadata.get("relative_volume_10d_calc"), 0.0)
 
             if rvol < min_rvol:
                 self._record_entry_decision(c.symbol, "skipped", ["rvol_too_low"])

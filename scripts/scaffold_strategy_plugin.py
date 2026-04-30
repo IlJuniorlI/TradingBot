@@ -109,7 +109,15 @@ def _strategy_py(name: str, class_stem: str) -> str:
     return dedent(
         f'''
         # SPDX-License-Identifier: MIT
-        from ..shared import Candidate, Position, Signal, Side, pd
+        from ..shared import (
+            Candidate,
+            Position,
+            Side,
+            Signal,
+            _safe_float,
+            insufficient_bars_reason,
+            pd,
+        )
         from ..strategy_base import BaseStrategy
 
 
@@ -140,15 +148,15 @@ def _strategy_py(name: str, class_stem: str) -> str:
                         self._record_entry_decision(
                             candidate.symbol,
                             "skipped",
-                            [self._insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)],
+                            [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)],
                         )
                         continue
 
                     last = frame.iloc[-1]
-                    close = self._safe_float(last.get("close"), 0.0)
-                    vwap = self._safe_float(last.get("vwap"), close)
-                    rvol = self._safe_float(candidate.metadata.get("relative_volume_10d_calc"), 0.0)
-                    day_strength = self._safe_float(candidate.metadata.get("change_from_open"), 0.0)
+                    close = _safe_float(last.get("close"), 0.0)
+                    vwap = _safe_float(last.get("vwap"), close)
+                    rvol = _safe_float(candidate.metadata.get("relative_volume_10d_calc"), 0.0)
+                    day_strength = _safe_float(candidate.metadata.get("change_from_open"), 0.0)
 
                     if rvol < min_rvol:
                         self._record_entry_decision(candidate.symbol, "skipped", ["rvol_too_low"])
