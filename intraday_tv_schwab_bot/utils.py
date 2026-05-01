@@ -945,7 +945,6 @@ class _ETDailyFileHandler(logging.FileHandler):
                     if today != self._current_date:
                         if self.stream is not None:
                             self.stream.close()
-                            self.stream = None
                         self._current_date = today
                         self.baseFilename = str(self._log_dir / f"bot_{today}.log")
                         self.stream = self._open()

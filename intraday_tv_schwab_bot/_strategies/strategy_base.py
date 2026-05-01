@@ -1240,7 +1240,7 @@ class BaseStrategy:
         close = float(close or 0.0)
         if close <= 0:
             return out
-        ob_ctx = self._one_minute_order_block_context(symbol, frame, data)
+        ob_ctx = self._one_minute_order_block_context(frame)
         same_ob = getattr(ob_ctx, "nearest_bullish_ob", None) if side == Side.LONG else getattr(ob_ctx, "nearest_bearish_ob", None)
         opposing_ob = getattr(ob_ctx, "nearest_bearish_ob", None) if side == Side.LONG else getattr(ob_ctx, "nearest_bullish_ob", None)
         same_info = self._fvg_gap_state(same_ob, close)
@@ -1599,7 +1599,11 @@ class BaseStrategy:
             "new_high_lookback": int(self._support_resistance_setting("order_block_new_high_lookback", 8) or 8),
         }
 
-    def _one_minute_order_block_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> OrderBlockContext:
+    def _one_minute_order_block_context(self, frame: pd.DataFrame | None) -> OrderBlockContext:
+        """1m order block context. No symbol/data params — unlike FVG and HTF
+        OB, the 1m OB context is computed inline from the per-symbol frame
+        already in scope and doesn't consult any data-store cache. Add params
+        back if/when MarketDataStore gains a `get_order_block_context` cache."""
         current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
         knobs = self._order_block_tuning_knobs()
         mode = knobs["mode"]
