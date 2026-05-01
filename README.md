@@ -799,71 +799,71 @@ Behavior:
 
 Shared 0DTE ETF option-engine settings. Both option strategies use this block.
 
-| Option                           | Code default                                                                                                 |
-|----------------------------------|--------------------------------------------------------------------------------------------------------------|
-| `enabled`                        | `true`                                                                                                       |
-| `underlyings`                    | `['SPY', 'QQQ']`                                                                                             |
-| `confirmation_symbols`           | `{'SPY': '$SPX', 'QQQ': '$COMPX', 'IWM': '$RUT'}`                                                            |
-| `volatility_symbol`              | `VIX`                                                                                                        |
-| `styles`                         | `['orb_debit_spread', 'trend_debit_spread', 'midday_credit_spread', 'orb_long_option', 'trend_long_option']` |
-| `min_underlying_price`           | `100.0`                                                                                                      |
-| `min_option_volume`              | `300`                                                                                                        |
-| `min_open_interest`              | `600`                                                                                                        |
-| `max_bid_ask_spread_pct`         | `0.1`                                                                                                        |
-| `max_leg_spread_dollars`         | `0.08`                                                                                                       |
-| `max_net_spread_pct`             | `0.2`                                                                                                        |
-| `max_net_spread_price`           | `2.8`                                                                                                        |
-| `min_net_mid_price`              | `0.25`                                                                                                       |
-| `target_long_delta`              | `0.38`                                                                                                       |
-| `target_short_delta`             | `0.23`                                                                                                       |
-| `target_single_delta`            | `0.28`                                                                                                       |
-| `max_single_option_price`        | `2.25`                                                                                                       |
-| `option_limit_mode`              | `mid`                                                                                                        |
-| `strike_width_by_symbol`         | `{'SPY': 2.0, 'QQQ': 2.0, 'IWM': 1.0}`                                                                       |
-| `max_contracts_per_trade`        | `1`                                                                                                          |
-| `max_loss_per_trade`             | `200.0`                                                                                                      |
-| `debit_stop_frac`                | `0.45`                                                                                                       |
-| `debit_target_mult`              | `1.45`                                                                                                       |
-| `credit_stop_mult`               | `1.65`                                                                                                       |
-| `credit_target_frac`             | `0.32`                                                                                                       |
-| `single_stop_frac`               | `0.38`                                                                                                       |
-| `single_target_mult`             | `1.5`                                                                                                        |
-| `force_flatten_time`             | `15:18`                                                                                                      |
-| `max_vix`                        | `22.5`                                                                                                       |
-| `vix_spike_pct`                  | `0.011`                                                                                                      |
-| `vertical_limit_mode`            | `mid`                                                                                                        |
-| `quote_stability_checks`         | `3`                                                                                                          |
-| `quote_stability_pause_ms`       | `500`                                                                                                        |
-| `max_mid_drift_pct`              | `0.06`                                                                                                       |
-| `max_quote_age_seconds`          | `6`                                                                                                          |
-| `dry_run_replace_attempts`       | `2`                                                                                                          |
-| `dry_run_step_frac`              | `0.25`                                                                                                       |
-| `event_blackout_file`            | `./macro_events.auto.yaml`                                                                                   |
-| `event_blackouts`                | `[]`                                                                                                         |
-| `option_chain_cache_seconds`     | `6`                                                                                                          |
-| `option_chain_cache_max_entries` | `24`                                                                                                         |
-| `options_breakeven_enabled`      | `false`                                                                                                      |
-| `options_breakeven_mark_mult`    | `1.25`                                                                                                       |
-| `options_breakeven_stop_mult`    | `1.05`                                                                                                       |
-| `options_profit_lock_enabled`    | `false`                                                                                                      |
-| `options_profit_lock_mark_mult`  | `1.40`                                                                                                       |
-| `options_profit_lock_stop_mult`  | `1.15`                                                                                                       |
-| `debit_target_time_decay_enabled`     | `false`                                                                                                 |
-| `debit_target_time_decay_start`       | `10:30`                                                                                                 |
-| `debit_target_time_decay_end`         | `14:00`                                                                                                 |
-| `debit_target_time_decay_min_scale`   | `0.70`                                                                                                  |
-| `debit_stop_time_decay_widen_factor`  | `0.30`                                                                                                  |
-| `delta_time_shift_enabled`       | `false`                                                                                                      |
-| `delta_time_shift_per_hour`      | `0.025`                                                                                                      |
-| `delta_time_shift_max`           | `0.15`                                                                                                       |
-| `delta_time_shift_start`         | `10:00`                                                                                                      |
-| `trend_momentum_filter_enabled`  | `false`                                                                                                      |
-| `trend_min_atr_expansion`        | `0.85`                                                                                                       |
-| `trend_min_volume_ratio`         | `0.90`                                                                                                       |
-| `credit_distance_gate_enabled`   | `false`                                                                                                      |
-| `min_credit_distance_atr`        | `1.8`                                                                                                        |
-| `adaptive_width_enabled`         | `false`                                                                                                      |
-| `adaptive_width_max_scale`       | `1.5`                                                                                                        |
+| Option                               | Code default                                                                                                 |
+|--------------------------------------|--------------------------------------------------------------------------------------------------------------|
+| `enabled`                            | `true`                                                                                                       |
+| `underlyings`                        | `['SPY', 'QQQ']`                                                                                             |
+| `confirmation_symbols`               | `{'SPY': '$SPX', 'QQQ': '$COMPX', 'IWM': '$RUT'}`                                                            |
+| `volatility_symbol`                  | `VIX`                                                                                                        |
+| `styles`                             | `['orb_debit_spread', 'trend_debit_spread', 'midday_credit_spread', 'orb_long_option', 'trend_long_option']` |
+| `min_underlying_price`               | `100.0`                                                                                                      |
+| `min_option_volume`                  | `300`                                                                                                        |
+| `min_open_interest`                  | `600`                                                                                                        |
+| `max_bid_ask_spread_pct`             | `0.1`                                                                                                        |
+| `max_leg_spread_dollars`             | `0.08`                                                                                                       |
+| `max_net_spread_pct`                 | `0.2`                                                                                                        |
+| `max_net_spread_price`               | `2.8`                                                                                                        |
+| `min_net_mid_price`                  | `0.25`                                                                                                       |
+| `target_long_delta`                  | `0.38`                                                                                                       |
+| `target_short_delta`                 | `0.23`                                                                                                       |
+| `target_single_delta`                | `0.28`                                                                                                       |
+| `max_single_option_price`            | `2.25`                                                                                                       |
+| `option_limit_mode`                  | `mid`                                                                                                        |
+| `strike_width_by_symbol`             | `{'SPY': 2.0, 'QQQ': 2.0, 'IWM': 1.0}`                                                                       |
+| `max_contracts_per_trade`            | `1`                                                                                                          |
+| `max_loss_per_trade`                 | `200.0`                                                                                                      |
+| `debit_stop_frac`                    | `0.45`                                                                                                       |
+| `debit_target_mult`                  | `1.45`                                                                                                       |
+| `credit_stop_mult`                   | `1.65`                                                                                                       |
+| `credit_target_frac`                 | `0.32`                                                                                                       |
+| `single_stop_frac`                   | `0.38`                                                                                                       |
+| `single_target_mult`                 | `1.5`                                                                                                        |
+| `force_flatten_time`                 | `15:18`                                                                                                      |
+| `max_vix`                            | `22.5`                                                                                                       |
+| `vix_spike_pct`                      | `0.011`                                                                                                      |
+| `vertical_limit_mode`                | `mid`                                                                                                        |
+| `quote_stability_checks`             | `3`                                                                                                          |
+| `quote_stability_pause_ms`           | `500`                                                                                                        |
+| `max_mid_drift_pct`                  | `0.06`                                                                                                       |
+| `max_quote_age_seconds`              | `6`                                                                                                          |
+| `dry_run_replace_attempts`           | `2`                                                                                                          |
+| `dry_run_step_frac`                  | `0.25`                                                                                                       |
+| `event_blackout_file`                | `./macro_events.auto.yaml`                                                                                   |
+| `event_blackouts`                    | `[]`                                                                                                         |
+| `option_chain_cache_seconds`         | `6`                                                                                                          |
+| `option_chain_cache_max_entries`     | `24`                                                                                                         |
+| `options_breakeven_enabled`          | `false`                                                                                                      |
+| `options_breakeven_mark_mult`        | `1.25`                                                                                                       |
+| `options_breakeven_stop_mult`        | `1.05`                                                                                                       |
+| `options_profit_lock_enabled`        | `false`                                                                                                      |
+| `options_profit_lock_mark_mult`      | `1.40`                                                                                                       |
+| `options_profit_lock_stop_mult`      | `1.15`                                                                                                       |
+| `debit_target_time_decay_enabled`    | `false`                                                                                                      |
+| `debit_target_time_decay_start`      | `10:30`                                                                                                      |
+| `debit_target_time_decay_end`        | `14:00`                                                                                                      |
+| `debit_target_time_decay_min_scale`  | `0.70`                                                                                                       |
+| `debit_stop_time_decay_widen_factor` | `0.30`                                                                                                       |
+| `delta_time_shift_enabled`           | `false`                                                                                                      |
+| `delta_time_shift_per_hour`          | `0.025`                                                                                                      |
+| `delta_time_shift_max`               | `0.15`                                                                                                       |
+| `delta_time_shift_start`             | `10:00`                                                                                                      |
+| `trend_momentum_filter_enabled`      | `false`                                                                                                      |
+| `trend_min_atr_expansion`            | `0.85`                                                                                                       |
+| `trend_min_volume_ratio`             | `0.90`                                                                                                       |
+| `credit_distance_gate_enabled`       | `false`                                                                                                      |
+| `min_credit_distance_atr`            | `1.8`                                                                                                        |
+| `adaptive_width_enabled`             | `false`                                                                                                      |
+| `adaptive_width_max_scale`           | `1.5`                                                                                                        |
 
 Behavior and valid values:
 
@@ -2094,23 +2094,23 @@ Prebuilt top-level presets are included under `configs/config.<strategy>.yaml` f
 
 Shipped preset files:
 
-| Preset                                          | Strategy                              |
-|-------------------------------------------------|---------------------------------------|
-| `configs/config.momentum_close.yaml`            | `momentum_close`                      |
-| `configs/config.mean_reversion.yaml`            | `mean_reversion`                      |
-| `configs/config.closing_reversal.yaml`          | `closing_reversal`                    |
-| `configs/config.rth_trend_pullback.yaml`        | `rth_trend_pullback`                  |
-| `configs/config.volatility_squeeze_breakout.yaml` | `volatility_squeeze_breakout`       |
-| `configs/config.pairs_residual.yaml`            | `pairs_residual`                      |
-| `configs/config.opening_range_breakout.yaml`    | `opening_range_breakout`              |
-| `configs/config.microcap_gap_orb.yaml`          | `microcap_gap_orb`                    |
-| `configs/config.peer_confirmed_key_levels.yaml` | `peer_confirmed_key_levels`           |
-| `configs/config.peer_confirmed_key_levels_1m.yaml` | `peer_confirmed_key_levels_1m`     |
+| Preset                                                  | Strategy                            |
+|---------------------------------------------------------|-------------------------------------|
+| `configs/config.momentum_close.yaml`                    | `momentum_close`                    |
+| `configs/config.mean_reversion.yaml`                    | `mean_reversion`                    |
+| `configs/config.closing_reversal.yaml`                  | `closing_reversal`                  |
+| `configs/config.rth_trend_pullback.yaml`                | `rth_trend_pullback`                |
+| `configs/config.volatility_squeeze_breakout.yaml`       | `volatility_squeeze_breakout`       |
+| `configs/config.pairs_residual.yaml`                    | `pairs_residual`                    |
+| `configs/config.opening_range_breakout.yaml`            | `opening_range_breakout`            |
+| `configs/config.microcap_gap_orb.yaml`                  | `microcap_gap_orb`                  |
+| `configs/config.peer_confirmed_key_levels.yaml`         | `peer_confirmed_key_levels`         |
+| `configs/config.peer_confirmed_key_levels_1m.yaml`      | `peer_confirmed_key_levels_1m`      |
 | `configs/config.peer_confirmed_trend_continuation.yaml` | `peer_confirmed_trend_continuation` |
-| `configs/config.peer_confirmed_htf_pivots.yaml` | `peer_confirmed_htf_pivots`           |
-| `configs/config.top_tier_adaptive.yaml`         | `top_tier_adaptive`                   |
-| `configs/config.zero_dte_etf_options.yaml`      | `zero_dte_etf_options`                |
-| `configs/config.zero_dte_etf_long_options.yaml` | `zero_dte_etf_long_options`           |
+| `configs/config.peer_confirmed_htf_pivots.yaml`         | `peer_confirmed_htf_pivots`         |
+| `configs/config.top_tier_adaptive.yaml`                 | `top_tier_adaptive`                 |
+| `configs/config.zero_dte_etf_options.yaml`              | `zero_dte_etf_options`              |
+| `configs/config.zero_dte_etf_long_options.yaml`         | `zero_dte_etf_long_options`         |
 
 Plus two non-strategy files:
 
