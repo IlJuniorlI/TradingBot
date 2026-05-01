@@ -245,6 +245,14 @@ support_resistance:
   fair_value_gap_min_atr_mult: 0.06
   fair_value_gap_min_pct: 0.0006
   one_minute_fair_value_gaps_enabled: true
+  one_minute_order_blocks_enabled: false
+  htf_order_blocks_enabled: false
+  order_block_mode: loose
+  order_block_max_per_side: 4
+  order_block_min_atr_mult: 0.05
+  order_block_min_pct: 0.0005
+  order_block_pivot_span: 2
+  order_block_new_high_lookback: 8
   dashboard_flip_confirmation_1m_bars: 1
   trading_flip_confirmation_1m_bars: 2
   trading_flip_confirmation_5m_bars: 1
