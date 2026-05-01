@@ -1600,16 +1600,25 @@ class BaseStrategy:
             min_gap_pct=min_gap_pct,
         )
 
+    def _order_block_tuning_knobs(self) -> dict[str, Any]:
+        """Resolve the six SHARED OB tuning knobs from support_resistance config.
+        Both 1m and HTF OB contexts read the same settings — only the enable
+        flag and the input frame's timeframe differ between them."""
+        return {
+            "mode": str(self._support_resistance_setting("order_block_mode", "loose") or "loose").strip().lower() or "loose",
+            "max_per_side": int(self._support_resistance_setting("order_block_max_per_side", 4) or 4),
+            "min_atr_mult": float(self._support_resistance_setting("order_block_min_atr_mult", 0.05) or 0.05),
+            "min_pct": float(self._support_resistance_setting("order_block_min_pct", 0.0005) or 0.0005),
+            "pivot_span": int(self._support_resistance_setting("order_block_pivot_span", 2) or 2),
+            "new_high_lookback": int(self._support_resistance_setting("order_block_new_high_lookback", 8) or 8),
+        }
+
     def _one_minute_order_block_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> OrderBlockContext:
         current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
-        mode = str(self._support_resistance_setting("one_minute_order_block_mode", "loose") or "loose").strip().lower() or "loose"
+        knobs = self._order_block_tuning_knobs()
+        mode = knobs["mode"]
         if not bool(self._support_resistance_setting("one_minute_order_blocks_enabled", False)):
             return empty_order_block_context(current_price, timeframe_minutes=1, mode=mode)
-        max_per_side = int(self._support_resistance_setting("one_minute_order_block_max_per_side", 4) or 4)
-        min_atr_mult = float(self._support_resistance_setting("one_minute_order_block_min_atr_mult", 0.05) or 0.05)
-        min_pct = float(self._support_resistance_setting("one_minute_order_block_min_pct", 0.0005) or 0.0005)
-        pivot_span = int(self._support_resistance_setting("one_minute_order_block_pivot_span", 2) or 2)
-        new_high_lookback = int(self._support_resistance_setting("one_minute_order_block_new_high_lookback", 8) or 8)
         if frame is None or frame.empty:
             return empty_order_block_context(current_price, timeframe_minutes=1, mode=mode)
         return build_order_block_context(
@@ -1617,11 +1626,40 @@ class BaseStrategy:
             timeframe_minutes=1,
             current_price=current_price,
             mode=mode,
-            max_per_side=max_per_side,
-            min_block_atr_mult=min_atr_mult,
-            min_block_pct=min_pct,
-            pivot_span=pivot_span,
-            new_high_lookback=new_high_lookback,
+            max_per_side=knobs["max_per_side"],
+            min_block_atr_mult=knobs["min_atr_mult"],
+            min_block_pct=knobs["min_pct"],
+            pivot_span=knobs["pivot_span"],
+            new_high_lookback=knobs["new_high_lookback"],
+        )
+
+    def _htf_order_block_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> OrderBlockContext:
+        """HTF order block context. Disabled by default — opt in via
+        `support_resistance.htf_order_blocks_enabled: true`. Uses the same
+        tuning knobs as 1m OBs; the only difference is the input frame is
+        resampled to the HTF timeframe (default 15m via
+        `support_resistance.timeframe_minutes`)."""
+        current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
+        knobs = self._order_block_tuning_knobs()
+        mode = knobs["mode"]
+        htf_minutes = self._sr_timeframe_minutes()
+        if not bool(self._support_resistance_setting("htf_order_blocks_enabled", False)):
+            return empty_order_block_context(current_price, timeframe_minutes=htf_minutes, mode=mode)
+        if frame is None or frame.empty:
+            return empty_order_block_context(current_price, timeframe_minutes=htf_minutes, mode=mode)
+        htf_frame = self._resampled_frame(frame, htf_minutes, symbol=symbol, data=data)
+        if htf_frame is None or htf_frame.empty:
+            return empty_order_block_context(current_price, timeframe_minutes=htf_minutes, mode=mode)
+        return build_order_block_context(
+            htf_frame,
+            timeframe_minutes=htf_minutes,
+            current_price=current_price,
+            mode=mode,
+            max_per_side=knobs["max_per_side"],
+            min_block_atr_mult=knobs["min_atr_mult"],
+            min_block_pct=knobs["min_pct"],
+            pivot_span=knobs["pivot_span"],
+            new_high_lookback=knobs["new_high_lookback"],
         )
 
     @staticmethod

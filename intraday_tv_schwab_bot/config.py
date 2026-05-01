@@ -552,21 +552,29 @@ class SupportResistanceConfig:
     one_minute_fair_value_gap_max_per_side: int = 3
     one_minute_fair_value_gap_min_atr_mult: float = 0.06
     one_minute_fair_value_gap_min_pct: float = 0.0006
-    # 1-minute order block detection. Disabled by default — opt-in via
-    # `one_minute_order_blocks_enabled: true`. When enabled, strategies that
-    # call `_continuation_ob_retest_plan` (e.g. microcap_pm_breakout) get a
-    # parallel retest gate that ORs with the FVG retest plan: entry can fire
-    # on either an FVG retest or an OB retest, both with the same bar-confirm
-    # rules. Mode "loose" finds the last opposite-color candle before any
-    # close that prints a new local high/low; "strict" requires a formal
+    # Order block detection. Two timeframes: 1-minute and HTF (controlled by
+    # `support_resistance.timeframe_minutes`, default 15m). Each timeframe has
+    # its own enable flag; the six tuning knobs below are SHARED — both
+    # timeframes use the same mode / max_per_side / size filters / pivot span.
+    # Disabled by default. When `one_minute_order_blocks_enabled` is true,
+    # strategies that call `_continuation_ob_retest_plan` (e.g.
+    # microcap_pm_breakout) get a parallel retest gate that ORs with the FVG
+    # retest plan. When `htf_order_blocks_enabled` is true, HTF OBs are
+    # detected and exposed via `_htf_order_block_context` for strategies that
+    # consume them (current strategies don't gate entries on HTF OBs; this
+    # mirrors the FVG architecture where HTF FVGs are detected for context
+    # but only 1m FVGs gate retest entries).
+    # Mode "loose" finds the last opposite-color candle before any close
+    # that prints a new local high/low; "strict" requires a formal
     # break-of-structure event using pivot_span swing detection.
     one_minute_order_blocks_enabled: bool = False
-    one_minute_order_block_mode: str = "loose"
-    one_minute_order_block_max_per_side: int = 4
-    one_minute_order_block_min_atr_mult: float = 0.05
-    one_minute_order_block_min_pct: float = 0.0005
-    one_minute_order_block_pivot_span: int = 2
-    one_minute_order_block_new_high_lookback: int = 8
+    htf_order_blocks_enabled: bool = False
+    order_block_mode: str = "loose"
+    order_block_max_per_side: int = 4
+    order_block_min_atr_mult: float = 0.05
+    order_block_min_pct: float = 0.0005
+    order_block_pivot_span: int = 2
+    order_block_new_high_lookback: int = 8
     dashboard_flip_confirmation_1m_bars: int = 1
     trading_flip_confirmation_1m_bars: int = 2
     trading_flip_confirmation_5m_bars: int = 1

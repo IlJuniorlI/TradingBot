@@ -25,20 +25,29 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (20 entries, was 10 hand-curated). Adopts the mechanical
   "no-leading-underscore = public" rule so future additions are
   one-line entries with no judgment call.
-- 1-minute order block detection (`intraday_tv_schwab_bot/order_blocks.py`).
-  Two modes selectable via `support_resistance.one_minute_order_block_mode`:
+- Order block detection at both 1-minute and HTF timeframes
+  (`intraday_tv_schwab_bot/order_blocks.py`). Each timeframe has its
+  own enable flag — `support_resistance.one_minute_order_blocks_enabled`
+  and `support_resistance.htf_order_blocks_enabled` — but both share
+  the six tuning knobs (`order_block_mode`, `order_block_max_per_side`,
+  `order_block_min_atr_mult`, `order_block_min_pct`,
+  `order_block_pivot_span`, `order_block_new_high_lookback`). HTF OBs
+  use `support_resistance.timeframe_minutes` (default 15m) and resample
+  the 1m frame internally. Two detection modes via `order_block_mode`:
   `"loose"` finds the last opposite-color candle before any close that
   prints a new local high/low; `"strict"` requires a formal
   break-of-structure event detected via the same pivot-span swing
-  detector used by support/resistance. Disabled by default; opt in via
-  `support_resistance.one_minute_order_blocks_enabled: true`. Wicks
+  detector used by support/resistance. Disabled by default. Wicks
   below the OB lower (or above OB upper for bearish) are tolerated as
   long as the bar closes back inside the zone — only a close beyond
   the far boundary invalidates the OB. New `BaseStrategy` methods
-  `_one_minute_order_block_context`, `_continuation_ob_retest_plan`,
-  and `_apply_continuation_zone_retest_plans` (the OR-combine helper
-  for FVG + OB plans). Reuses every `anti_chase_fvg_retest_*` knob for
-  bar-confirmation thresholds — same rules as FVG.
+  `_one_minute_order_block_context`, `_htf_order_block_context`,
+  `_continuation_ob_retest_plan` (currently consumes 1m OBs), and
+  `_apply_continuation_zone_retest_plans` (OR-combine helper for FVG
+  + OB plans). Reuses every `anti_chase_fvg_retest_*` knob for
+  bar-confirmation thresholds — same rules as FVG. Mirrors the FVG
+  architecture where HTF FVGs are detected for context but only 1m
+  FVGs gate retest entries.
 - `anti_chase_fvg_retest_skip_vwap_ema9_reclaim` strategy param
   (default `false`). When `true`, drops the trend-MA half of the
   bullish-FVG `reclaimed` clause (and corresponding `<=max(...)` for
