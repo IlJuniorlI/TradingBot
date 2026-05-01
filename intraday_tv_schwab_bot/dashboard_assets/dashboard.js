@@ -10,6 +10,35 @@ const CHART_BADGE_IMAGES = IMAGE_ASSETS;
 // market clock. If the bot ever supports non-US markets, plumb
 // `runtime.timezone` through `DASHBOARD_CONFIG` and read it here.
 const DASHBOARD_TIMEZONE = 'America/New_York';
+// Cached Intl.DateTimeFormat instances. Per-call `toLocaleString({timeZone:...})`
+// is significantly slower than reusing a pre-built formatter — each invocation
+// re-parses options and constructs the underlying ICU resolver. Charts call
+// these per axis tick (10-20× per render), so the cache shaves real time off
+// every chart paint. Day-key formatter uses en-CA's YYYY-MM-DD output so
+// string compare cleanly identifies trading-day rollovers in ET.
+const CHART_TS_FMT = new Intl.DateTimeFormat([], {
+  month: 'short',
+  day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  timeZone: DASHBOARD_TIMEZONE,
+});
+const TIME_AXIS_FMT = new Intl.DateTimeFormat([], {
+  hour: 'numeric',
+  minute: '2-digit',
+  timeZone: DASHBOARD_TIMEZONE,
+});
+const DAY_AXIS_FMT = new Intl.DateTimeFormat('en-US', {
+  month: '2-digit',
+  day: '2-digit',
+  timeZone: DASHBOARD_TIMEZONE,
+});
+const DAY_KEY_FMT = new Intl.DateTimeFormat('en-CA', {
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  timeZone: DASHBOARD_TIMEZONE,
+});
 const EXPANDED_CHART_CACHE_MAX = 6;
 const EXPANDED_CHART_CACHE_TTL_MS = 20 * 60 * 1000;
 const COMPACT_CHART_CACHE_MAX = 8;
@@ -132,13 +161,7 @@ function fmtChartTs(value) {
   if (!value) return '—';
   const dt = new Date(value);
   if (Number.isFinite(dt.getTime())) {
-    return dt.toLocaleString([], {
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      timeZone: DASHBOARD_TIMEZONE,
-    });
+    return CHART_TS_FMT.format(dt);
   }
   return safe(value).replace('T', ' ').slice(0, 16);
 }
@@ -2359,22 +2382,14 @@ function drawSelectedChart(snapshot) {
     if (!value) return '';
     const dt = new Date(value);
     if (!Number.isFinite(dt.getTime())) return '';
-    return dt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZone: DASHBOARD_TIMEZONE });
+    return TIME_AXIS_FMT.format(dt);
   }
 
   function formatDayAxisLabel(value) {
     if (!value) return '';
     const dt = new Date(value);
     if (!Number.isFinite(dt.getTime())) return '';
-    // Use Intl with explicit ET timezone so the date label matches the
-    // bot's session calendar regardless of viewer locale. dt.getMonth()/
-    // dt.getDate() would silently use browser-local time and mislabel
-    // the trading day for any viewer outside ET.
-    return dt.toLocaleDateString('en-US', {
-      month: '2-digit',
-      day: '2-digit',
-      timeZone: DASHBOARD_TIMEZONE,
-    });
+    return DAY_AXIS_FMT.format(dt);
   }
 
   function inferredBarMinutes() {
@@ -2429,8 +2444,13 @@ function drawSelectedChart(snapshot) {
       const prev = new Date(bars[idx - 1]?.ts || '');
       const curr = new Date(bars[idx]?.ts || '');
       if (!Number.isFinite(prev.getTime()) || !Number.isFinite(curr.getTime())) continue;
-      const prevKey = `${prev.getFullYear()}-${prev.getMonth()}-${prev.getDate()}`;
-      const currKey = `${curr.getFullYear()}-${curr.getMonth()}-${curr.getDate()}`;
+      // Day-boundary keys must use the same timezone as the labels —
+      // DAY_AXIS_FMT renders ET, so a browser-local prev.getDate() vs
+      // curr.getDate() comparison would put the rollover marker at the
+      // wrong x for any viewer outside ET. DAY_KEY_FMT yields ISO
+      // YYYY-MM-DD via the en-CA locale, perfect for string equality.
+      const prevKey = DAY_KEY_FMT.format(prev);
+      const currKey = DAY_KEY_FMT.format(curr);
       if (prevKey === currKey || seen.has(currKey)) continue;
       const label = formatDayAxisLabel(bars[idx]?.ts);
       if (!label) continue;
