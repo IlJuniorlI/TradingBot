@@ -25,6 +25,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (20 entries, was 10 hand-curated). Adopts the mechanical
   "no-leading-underscore = public" rule so future additions are
   one-line entries with no judgment call.
+- Dashboard chart support for order block overlays via two new
+  `DashboardChartConfig` fields (per profile):
+  `show_htf_order_blocks` and `show_1m_order_blocks` (both default
+  `false`). When enabled — together with the matching
+  `support_resistance.htf_order_blocks_enabled` /
+  `one_minute_order_blocks_enabled` flag — the chart draws OB zones
+  with a **dashed-line border around a very faint fill**, distinct
+  from FVGs which render as solid-filled rectangles. Same green/red
+  bullish/bearish color semantics so direction is still readable at
+  a glance. Same cross-timeframe protection as FVGs (HTF OBs hidden
+  on 1m charts, 1m OBs hidden on HTF charts). Backend reuses
+  `dashboard_fvg_payload` since `OrderBlock` and `HTFFairValueGap`
+  share the same field shape; payload includes `kind: "ob"` and
+  `mode` (loose / strict) for downstream consumers.
 - Order block detection at both 1-minute and HTF timeframes
   (`intraday_tv_schwab_bot/order_blocks.py`). Each timeframe has its
   own enable flag — `support_resistance.one_minute_order_blocks_enabled`
@@ -54,6 +68,34 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shorts), keeping only the FVG-midpoint reclaim plus `bar_confirm`
   shape. Lets microcap squeeze strategies fire on deep retests where
   VWAP/EMA9 lag well above the FVG zone.
+
+### Changed (continued)
+
+- Removed `BaseStrategy._apply_continuation_fvg_retest_plan` — the
+  single-plan apply helper that predated the OR-combine refactor.
+  All four remaining callers (`momentum_close`, `opening_range_breakout`,
+  `rth_trend_pullback`, `volatility_squeeze_breakout` — 12 call sites)
+  now use the multi-plan `_apply_continuation_zone_retest_plans` with
+  a single-element plan list. Behavior is identical for the
+  single-plan case (verified: any plan `status="allow"` and all
+  reasons deferrable → clear; otherwise prefer wait over reject).
+  Per the project's clean-breaks-over-shims convention.
+- Collapsed the six FVG tuning knobs split across `htf_*` and
+  `one_minute_*` prefixes (`htf_fair_value_gap_max_per_side`,
+  `htf_fair_value_gap_min_atr_mult`, `htf_fair_value_gap_min_pct`,
+  `one_minute_fair_value_gap_max_per_side`,
+  `one_minute_fair_value_gap_min_atr_mult`,
+  `one_minute_fair_value_gap_min_pct`) into three shared knobs:
+  `fair_value_gap_max_per_side`, `fair_value_gap_min_atr_mult`,
+  `fair_value_gap_min_pct`. Both 1m and HTF FVG detection now read
+  from these single fields. The two enable flags
+  (`htf_fair_value_gaps_enabled`, `one_minute_fair_value_gaps_enabled`)
+  remain timeframe-specific. All shipped preset configs had identical
+  values across the htf/one_minute prefixes, so no existing tuning is
+  lost. Per the project's clean-breaks-over-shims convention, the old
+  field names are removed entirely from `SupportResistanceConfig` —
+  any user configs that still reference them will need to be updated.
+  This mirrors the OB knob consolidation (commit 28558f4).
 
 ### Changed
 

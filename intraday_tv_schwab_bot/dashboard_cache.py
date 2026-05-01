@@ -41,6 +41,7 @@ from .chart_patterns import analyze_chart_pattern_context
 from .config import DashboardChartConfig, DashboardChartingConfig
 from .htf_levels import summarize_htf_trend
 from .models import Side
+from .order_blocks import build_order_block_context
 from .support_resistance import build_support_resistance_context, zone_flip_confirmed
 from .technical_levels import build_technical_levels_context
 from .utils import now_et, resample_bars
@@ -868,9 +869,9 @@ class DashboardCache:
                     use_prior_day_high_low=bool(getattr(self.config.support_resistance, "use_prior_day_high_low", True)),
                     use_prior_week_high_low=bool(getattr(self.config.support_resistance, "use_prior_week_high_low", True)),
                     include_fair_value_gaps=include_fair_value_gaps,
-                    fair_value_gap_max_per_side=int(getattr(self.config.support_resistance, "htf_fair_value_gap_max_per_side", 4) or 4),
-                    fair_value_gap_min_atr_mult=float(getattr(self.config.support_resistance, "htf_fair_value_gap_min_atr_mult", 0.05) or 0.05),
-                    fair_value_gap_min_pct=float(getattr(self.config.support_resistance, "htf_fair_value_gap_min_pct", 0.0005) or 0.0005),
+                    fair_value_gap_max_per_side=int(getattr(self.config.support_resistance, "fair_value_gap_max_per_side", 4) or 4),
+                    fair_value_gap_min_atr_mult=float(getattr(self.config.support_resistance, "fair_value_gap_min_atr_mult", 0.05) or 0.05),
+                    fair_value_gap_min_pct=float(getattr(self.config.support_resistance, "fair_value_gap_min_pct", 0.0005) or 0.0005),
                 )
                 if htf_ctx is not None:
                     for gap in list(getattr(htf_ctx, "bullish_fvgs", []) or []) + list(getattr(htf_ctx, "bearish_fvgs", []) or []):
@@ -891,9 +892,9 @@ class DashboardCache:
                     symbol,
                     timeframe_minutes=1,
                     current_price=current_price,
-                    max_per_side=int(getattr(self.config.support_resistance, "one_minute_fair_value_gap_max_per_side", 4) or 4),
-                    min_gap_atr_mult=float(getattr(self.config.support_resistance, "one_minute_fair_value_gap_min_atr_mult", 0.05) or 0.05),
-                    min_gap_pct=float(getattr(self.config.support_resistance, "one_minute_fair_value_gap_min_pct", 0.0005) or 0.0005),
+                    max_per_side=int(getattr(self.config.support_resistance, "fair_value_gap_max_per_side", 4) or 4),
+                    min_gap_atr_mult=float(getattr(self.config.support_resistance, "fair_value_gap_min_atr_mult", 0.05) or 0.05),
+                    min_gap_pct=float(getattr(self.config.support_resistance, "fair_value_gap_min_pct", 0.0005) or 0.0005),
                 )
                 if fvg_ctx is not None:
                     merged_index_frame = frame if frame is not None and not frame.empty else self.data.get_merged(symbol, with_indicators=True)
@@ -905,6 +906,73 @@ class DashboardCache:
                             one_minute_fair_value_gaps.append(payload_fvg)
         except Exception:
             one_minute_fair_value_gaps = []
+
+        # Order blocks. Same payload shape as FVGs (lower/upper/midpoint/size/
+        # direction/filled_pct/first_seen/last_seen) — `dashboard_fvg_payload`
+        # is reused since it's shape-driven, not type-driven. Frontend reads
+        # `htf_order_blocks` and `one_minute_order_blocks` separately and renders
+        # them with dashed-stroke styling vs FVGs' solid-fill styling.
+        htf_order_blocks: list[dict[str, Any]] = []
+        try:
+            sr_cfg = getattr(self.config, "support_resistance", None)
+            include_htf_obs = bool(getattr(sr_cfg, "htf_order_blocks_enabled", False)) if sr_cfg is not None else False
+            chart_wants_htf_obs = bool(compact_chart_profile.show_htf_order_blocks) or bool(expanded_chart_profile.show_htf_order_blocks)
+            if include_htf_obs and chart_wants_htf_obs and self.data is not None:
+                htf_minutes = self._active_sr_timeframe_minutes()
+                htf_frame = self.data.get_merged(symbol, timeframe=f"{int(htf_minutes)}min", with_indicators=True)
+                if htf_frame is not None and not htf_frame.empty:
+                    ob_ctx_htf = build_order_block_context(
+                        htf_frame,
+                        timeframe_minutes=htf_minutes,
+                        current_price=current_price,
+                        mode=str(getattr(sr_cfg, "order_block_mode", "loose") or "loose"),
+                        max_per_side=int(getattr(sr_cfg, "order_block_max_per_side", 4) or 4),
+                        min_block_atr_mult=float(getattr(sr_cfg, "order_block_min_atr_mult", 0.05) or 0.05),
+                        min_block_pct=float(getattr(sr_cfg, "order_block_min_pct", 0.0005) or 0.0005),
+                        pivot_span=int(getattr(sr_cfg, "order_block_pivot_span", 2) or 2),
+                        new_high_lookback=int(getattr(sr_cfg, "order_block_new_high_lookback", 8) or 8),
+                    )
+                    for ob in list(getattr(ob_ctx_htf, "bullish_obs", []) or []) + list(getattr(ob_ctx_htf, "bearish_obs", []) or []):
+                        payload_ob = dashboard_fvg_payload(ob)
+                        if payload_ob is not None:
+                            payload_ob["timeframe"] = f"{int(htf_minutes)}m"
+                            payload_ob["kind"] = "ob"
+                            payload_ob["mode"] = str(getattr(ob_ctx_htf, "mode", "loose") or "loose")
+                            htf_order_blocks.append(payload_ob)
+        except Exception:
+            self.log_component_failure("htf_order_blocks_collect", symbol)
+            htf_order_blocks = []
+
+        one_minute_order_blocks: list[dict[str, Any]] = []
+        try:
+            sr_cfg = getattr(self.config, "support_resistance", None)
+            include_one_minute_obs = bool(getattr(sr_cfg, "one_minute_order_blocks_enabled", False)) if sr_cfg is not None else False
+            chart_wants_one_minute_obs = bool(compact_chart_profile.show_1m_order_blocks) or bool(expanded_chart_profile.show_1m_order_blocks)
+            if include_one_minute_obs and chart_wants_one_minute_obs and self.data is not None:
+                one_minute_frame = frame if frame is not None and not frame.empty else self.data.get_merged(symbol, with_indicators=True)
+                if one_minute_frame is not None and not one_minute_frame.empty:
+                    ob_ctx_1m = build_order_block_context(
+                        one_minute_frame,
+                        timeframe_minutes=1,
+                        current_price=current_price,
+                        mode=str(getattr(sr_cfg, "order_block_mode", "loose") or "loose"),
+                        max_per_side=int(getattr(sr_cfg, "order_block_max_per_side", 4) or 4),
+                        min_block_atr_mult=float(getattr(sr_cfg, "order_block_min_atr_mult", 0.05) or 0.05),
+                        min_block_pct=float(getattr(sr_cfg, "order_block_min_pct", 0.0005) or 0.0005),
+                        pivot_span=int(getattr(sr_cfg, "order_block_pivot_span", 2) or 2),
+                        new_high_lookback=int(getattr(sr_cfg, "order_block_new_high_lookback", 8) or 8),
+                    )
+                    for ob in list(getattr(ob_ctx_1m, "bullish_obs", []) or []) + list(getattr(ob_ctx_1m, "bearish_obs", []) or []):
+                        payload_ob = dashboard_fvg_payload(ob)
+                        if payload_ob is not None:
+                            payload_ob["timeframe"] = "1m"
+                            payload_ob["kind"] = "ob"
+                            payload_ob["mode"] = str(getattr(ob_ctx_1m, "mode", "loose") or "loose")
+                            payload_ob["anchor_abs_index"] = dashboard_fvg_anchor_abs_index(one_minute_frame, payload_ob.get("first_seen"))
+                            one_minute_order_blocks.append(payload_ob)
+        except Exception:
+            self.log_component_failure("one_minute_order_blocks_collect", symbol)
+            one_minute_order_blocks = []
 
         chart_payload = {
             "levels": {
@@ -921,6 +989,8 @@ class DashboardCache:
                 "key_level_zones": key_level_zones,
                 "htf_fair_value_gaps": htf_fair_value_gaps,
                 "one_minute_fair_value_gaps": one_minute_fair_value_gaps,
+                "htf_order_blocks": htf_order_blocks,
+                "one_minute_order_blocks": one_minute_order_blocks,
             },
             "technicals": technical_payload,
             "position_markers": position_markers,
@@ -1027,9 +1097,9 @@ class DashboardCache:
         use_prior_day_high_low = bool(getattr(sr_cfg, "use_prior_day_high_low", True)) if sr_cfg is not None else True
         use_prior_week_high_low = bool(getattr(sr_cfg, "use_prior_week_high_low", True)) if sr_cfg is not None else True
         include_fair_value_gaps = bool(getattr(sr_cfg, "htf_fair_value_gaps_enabled", True)) if sr_cfg is not None else True
-        fair_value_gap_max_per_side = int(getattr(sr_cfg, "htf_fair_value_gap_max_per_side", 4) or 4) if sr_cfg is not None else 4
-        fair_value_gap_min_atr_mult = float(getattr(sr_cfg, "htf_fair_value_gap_min_atr_mult", 0.05) or 0.05) if sr_cfg is not None else 0.05
-        fair_value_gap_min_pct = float(getattr(sr_cfg, "htf_fair_value_gap_min_pct", 0.0005) or 0.0005) if sr_cfg is not None else 0.0005
+        fair_value_gap_max_per_side = int(getattr(sr_cfg, "fair_value_gap_max_per_side", 4) or 4) if sr_cfg is not None else 4
+        fair_value_gap_min_atr_mult = float(getattr(sr_cfg, "fair_value_gap_min_atr_mult", 0.05) or 0.05) if sr_cfg is not None else 0.05
+        fair_value_gap_min_pct = float(getattr(sr_cfg, "fair_value_gap_min_pct", 0.0005) or 0.0005) if sr_cfg is not None else 0.0005
 
         htf = self.data.get_htf_context(
             symbol,
@@ -1489,9 +1559,9 @@ class DashboardCache:
                         use_prior_day_high_low=bool(getattr(sr_cfg, "use_prior_day_high_low", True)),
                         use_prior_week_high_low=bool(getattr(sr_cfg, "use_prior_week_high_low", True)),
                         include_fair_value_gaps=bool(getattr(sr_cfg, "htf_fair_value_gaps_enabled", True)),
-                        fair_value_gap_max_per_side=int(getattr(sr_cfg, "htf_fair_value_gap_max_per_side", 4) or 4),
-                        fair_value_gap_min_atr_mult=float(getattr(sr_cfg, "htf_fair_value_gap_min_atr_mult", 0.05) or 0.05),
-                        fair_value_gap_min_pct=float(getattr(sr_cfg, "htf_fair_value_gap_min_pct", 0.0005) or 0.0005),
+                        fair_value_gap_max_per_side=int(getattr(sr_cfg, "fair_value_gap_max_per_side", 4) or 4),
+                        fair_value_gap_min_atr_mult=float(getattr(sr_cfg, "fair_value_gap_min_atr_mult", 0.05) or 0.05),
+                        fair_value_gap_min_pct=float(getattr(sr_cfg, "fair_value_gap_min_pct", 0.0005) or 0.0005),
                     )
                     htf_trend_bias = str(getattr(htf_ctx, "trend_bias", "neutral") or "neutral").strip().lower()
         except Exception:

@@ -1047,22 +1047,6 @@ class BaseStrategy:
         return reasons
 
     @staticmethod
-    def _apply_continuation_fvg_retest_plan(reasons: list[str], plan: dict[str, Any] | None, *, deferrable_prefixes: set[str]) -> list[str]:
-        if not reasons or not plan:
-            return reasons
-        status = str(plan.get("status", "none") or "none").strip().lower()
-        if status == "none":
-            return reasons
-        deferred = [reason for reason in reasons if _reason_prefix(reason) in deferrable_prefixes]
-        other = [reason for reason in reasons if _reason_prefix(reason) not in deferrable_prefixes]
-        if not deferred or other:
-            return reasons
-        if status == "allow":
-            return []
-        plan_reason = str(plan.get("reason", "") or "").strip()
-        return [plan_reason] if plan_reason else reasons
-
-    @staticmethod
     def _apply_retest_stop_anchor(side: Side, close: float, stop: float, plan: dict[str, Any] | None) -> float:
         if not plan or str(plan.get("status", "none") or "none").strip().lower() != "allow":
             return float(stop)
@@ -1377,8 +1361,10 @@ class BaseStrategy:
         - Otherwise prefer "wait" reasons over "reject" reasons (waiting
           could still resolve in a later bar).
         - Plans with ``status="none"`` (no zone available) are ignored.
-        - Mirrors ``_apply_continuation_fvg_retest_plan`` semantics for the
-          single-plan case.
+        - When called with a single-plan list, behavior matches the prior
+          ``_apply_continuation_fvg_retest_plan`` (now removed) exactly:
+          allow on the only plan clears deferrable reasons; wait/reject
+          replaces with the plan reason; none returns reasons unchanged.
         """
         if not reasons or not plans:
             return reasons
@@ -1509,9 +1495,9 @@ class BaseStrategy:
             use_prior_day_high_low=bool(use_prior_day_high_low),
             use_prior_week_high_low=bool(use_prior_week_high_low),
             include_fair_value_gaps=bool(self._support_resistance_setting("htf_fair_value_gaps_enabled", True)),
-            fair_value_gap_max_per_side=int(self._support_resistance_setting("htf_fair_value_gap_max_per_side", 4) or 4),
-            fair_value_gap_min_atr_mult=float(self._support_resistance_setting("htf_fair_value_gap_min_atr_mult", 0.05) or 0.05),
-            fair_value_gap_min_pct=float(self._support_resistance_setting("htf_fair_value_gap_min_pct", 0.0005) or 0.0005),
+            fair_value_gap_max_per_side=int(self._support_resistance_setting("fair_value_gap_max_per_side", 4) or 4),
+            fair_value_gap_min_atr_mult=float(self._support_resistance_setting("fair_value_gap_min_atr_mult", 0.05) or 0.05),
+            fair_value_gap_min_pct=float(self._support_resistance_setting("fair_value_gap_min_pct", 0.0005) or 0.0005),
         )
         if ctx is None:
             return empty_htf_context(current_price or 0.0, timeframe_minutes=timeframe_minutes)
@@ -1574,9 +1560,9 @@ class BaseStrategy:
         current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
         if not bool(self._support_resistance_setting("one_minute_fair_value_gaps_enabled", False)):
             return empty_fvg_context(current_price, timeframe_minutes=1)
-        max_per_side = int(self._support_resistance_setting("one_minute_fair_value_gap_max_per_side", 4) or 4)
-        min_gap_atr_mult = float(self._support_resistance_setting("one_minute_fair_value_gap_min_atr_mult", 0.05) or 0.05)
-        min_gap_pct = float(self._support_resistance_setting("one_minute_fair_value_gap_min_pct", 0.0005) or 0.0005)
+        max_per_side = int(self._support_resistance_setting("fair_value_gap_max_per_side", 4) or 4)
+        min_gap_atr_mult = float(self._support_resistance_setting("fair_value_gap_min_atr_mult", 0.05) or 0.05)
+        min_gap_pct = float(self._support_resistance_setting("fair_value_gap_min_pct", 0.0005) or 0.0005)
         if data is not None and hasattr(data, "get_fair_value_gap_context") and symbol:
             try:
                 return data.get_fair_value_gap_context(

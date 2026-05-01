@@ -111,10 +111,10 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                     reasons.append(_reason_with_values("weak_bar_close", current=close_pos, required=min_bar_close_position, op=">=", digits=4))
                 if not reasons and self._shared_entry_enabled("use_opposing_chart_filter", True) and self._blocks_bullish_entry(ctx):
                     reasons.append("chart_pattern_opposed")
-                reasons = self._apply_continuation_fvg_retest_plan(reasons, retest_plan, deferrable_prefixes={"too_extended_from_vwap", "no_reexpansion_trigger", "weak_bar_close", "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large"})
+                reasons = self._apply_continuation_zone_retest_plans(reasons, [retest_plan], deferrable_prefixes={"too_extended_from_vwap", "no_reexpansion_trigger", "weak_bar_close", "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large"})
                 if not reasons:
                     reasons.extend(self._entry_exhaustion_reasons(Side.LONG, frame, close=last_close, vwap=last_vwap, ema9=last_ema9))
-                    reasons = self._apply_continuation_fvg_retest_plan(reasons, retest_plan, deferrable_prefixes={"too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large"})
+                    reasons = self._apply_continuation_zone_retest_plans(reasons, [retest_plan], deferrable_prefixes={"too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large"})
                 if not reasons:
                     divergence_reason = self._dual_counter_divergence_reason(Side.LONG, tech_ctx)
                     if divergence_reason:
@@ -184,10 +184,10 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                     reasons.append(_reason_with_values("weak_bar_close", current=close_pos, required=1.0 - min_bar_close_position, op="<=", digits=4))
                 if not reasons and self._shared_entry_enabled("use_opposing_chart_filter", True) and self._blocks_bearish_entry(ctx):
                     reasons.append("chart_pattern_opposed")
-                reasons = self._apply_continuation_fvg_retest_plan(reasons, retest_plan, deferrable_prefixes={"too_extended_from_vwap", "no_reexpansion_trigger", "weak_bar_close", "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "lower_wick_rejection", "expansion_bar_too_large"})
+                reasons = self._apply_continuation_zone_retest_plans(reasons, [retest_plan], deferrable_prefixes={"too_extended_from_vwap", "no_reexpansion_trigger", "weak_bar_close", "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "lower_wick_rejection", "expansion_bar_too_large"})
                 if not reasons:
                     reasons.extend(self._entry_exhaustion_reasons(Side.SHORT, frame, close=last_close, vwap=last_vwap, ema9=last_ema9))
-                    reasons = self._apply_continuation_fvg_retest_plan(reasons, retest_plan, deferrable_prefixes={"too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "lower_wick_rejection", "expansion_bar_too_large"})
+                    reasons = self._apply_continuation_zone_retest_plans(reasons, [retest_plan], deferrable_prefixes={"too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "lower_wick_rejection", "expansion_bar_too_large"})
                 if not reasons:
                     divergence_reason = self._dual_counter_divergence_reason(Side.SHORT, tech_ctx)
                     if divergence_reason:

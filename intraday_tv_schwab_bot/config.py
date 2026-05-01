@@ -413,6 +413,10 @@ class DashboardChartConfig:
     show_trendlines: bool = False
     show_htf_fair_value_gaps: bool = False
     show_1m_fair_value_gaps: bool = False
+    # Order blocks render as dashed-stroke rectangles (vs FVGs' solid fill)
+    # so the two zone types are visually distinguishable on the chart.
+    show_htf_order_blocks: bool = False
+    show_1m_order_blocks: bool = False
     show_trade_markers: bool = True
     tooltip_show_returns: bool = True
     tooltip_show_support_resistance: bool = True
@@ -545,13 +549,14 @@ class SupportResistanceConfig:
     use_prior_day_high_low: bool = True
     use_prior_week_high_low: bool = True
     htf_fair_value_gaps_enabled: bool = True
-    htf_fair_value_gap_max_per_side: int = 3
-    htf_fair_value_gap_min_atr_mult: float = 0.06
-    htf_fair_value_gap_min_pct: float = 0.0006
     one_minute_fair_value_gaps_enabled: bool = True
-    one_minute_fair_value_gap_max_per_side: int = 3
-    one_minute_fair_value_gap_min_atr_mult: float = 0.06
-    one_minute_fair_value_gap_min_pct: float = 0.0006
+    # Shared FVG tuning knobs — both 1m and HTF FVG detection read these.
+    # Each timeframe has its own enable flag above; the size filters and
+    # max-per-side cap are identical across timeframes (matches the OB
+    # convention).
+    fair_value_gap_max_per_side: int = 3
+    fair_value_gap_min_atr_mult: float = 0.06
+    fair_value_gap_min_pct: float = 0.0006
     # Order block detection. Two timeframes: 1-minute and HTF (controlled by
     # `support_resistance.timeframe_minutes`, default 15m). Each timeframe has
     # its own enable flag; the six tuning knobs below are SHARED — both

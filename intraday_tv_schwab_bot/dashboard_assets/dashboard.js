@@ -1711,11 +1711,12 @@ function drawSelectedChart(snapshot) {
   const isOneMinuteChart = chartTimeframeMode === '1m';
   const isHtfChart = chartTimeframeMode === 'htf';
   const show = (key, fallback = true) => {
-    if (isOneMinuteChart && key === 'show_htf_fair_value_gaps') {
+    if (isOneMinuteChart && (key === 'show_htf_fair_value_gaps' || key === 'show_htf_order_blocks')) {
       return false;
     }
     if (isHtfChart && (
       key === 'show_1m_fair_value_gaps'
+      || key === 'show_1m_order_blocks'
       || key === 'show_anchored_vwap'
     )) {
       return false;
@@ -1965,6 +1966,25 @@ function drawSelectedChart(snapshot) {
     const anchorAbsIndex = Number(gap?.anchor_abs_index);
     if (Number.isFinite(anchorAbsIndex)) return anchorAbsIndex >= visibleAbsStart && anchorAbsIndex <= visibleAbsEnd;
     const startMillis = Date.parse(gap?.first_seen || '');
+    const firstBarMillis = Date.parse(bars[0]?.ts || '');
+    const lastBarMillis = Date.parse(bars[bars.length - 1]?.ts || '');
+    if (!Number.isFinite(startMillis)) return false;
+    if (Number.isFinite(firstBarMillis) && startMillis < firstBarMillis) return false;
+    if (Number.isFinite(lastBarMillis) && startMillis > lastBarMillis) return false;
+    return true;
+  });
+  // Order blocks share the FVG payload shape but render with dashed stroke
+  // + minimal fill so they're visually distinguishable from FVGs.
+  const htfOrderBlocks = isOneMinuteChart ? [] : normalizeDashboardFvgs(levels.htf_order_blocks, 1).filter(ob => {
+    const timeframe = String(ob?.timeframe || '').trim().toLowerCase();
+    return !!timeframe && timeframe !== '1m';
+  });
+  const oneMinuteOrderBlocks = isHtfChart ? [] : normalizeDashboardFvgs(levels.one_minute_order_blocks, 1).filter(ob => {
+    const timeframe = String(ob?.timeframe || '').trim().toLowerCase();
+    if (timeframe !== '1m') return false;
+    const anchorAbsIndex = Number(ob?.anchor_abs_index);
+    if (Number.isFinite(anchorAbsIndex)) return anchorAbsIndex >= visibleAbsStart && anchorAbsIndex <= visibleAbsEnd;
+    const startMillis = Date.parse(ob?.first_seen || '');
     const firstBarMillis = Date.parse(bars[0]?.ts || '');
     const lastBarMillis = Date.parse(bars[bars.length - 1]?.ts || '');
     if (!Number.isFinite(startMillis)) return false;
@@ -2437,6 +2457,39 @@ function drawSelectedChart(snapshot) {
     ctx.restore();
   }
 
+  // Order-block rendering helper. Visually distinct from `drawTimedZone`
+  // (which is solid filled) — OBs render with a dashed-line border around
+  // a very faint fill so the two zone types (FVG vs OB) don't collapse
+  // into a single visual at a glance.
+  function drawTimedDashedZone(startIdx, endIdx, upperValue, lowerValue, fillStyle, strokeStyle, lineWidth = 1.2, dashPattern = [5, 4]) {
+    if (numOrNull(upperValue) === null || numOrNull(lowerValue) === null) return;
+    const start = Math.max(0, Math.min(bars.length - 1, Number(startIdx)));
+    const end = Math.max(start, Math.min(bars.length - 1, Number(endIdx)));
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+    const clampedUpper = clamp(Math.max(upperValue, lowerValue), minY, maxY);
+    const clampedLower = clamp(Math.min(upperValue, lowerValue), minY, maxY);
+    const topY = yFor(clampedUpper);
+    const bottomY = yFor(clampedLower);
+    const leftX = xFor(start) - (slotW / 2);
+    const rightX = xFor(end) + (slotW / 2);
+    const zoneLeft = clamp(leftX, pad.left, width - pad.right);
+    const zoneRight = clamp(rightX, pad.left, width - pad.right);
+    if (zoneRight <= zoneLeft) return;
+    ctx.save();
+    if (fillStyle) {
+      ctx.fillStyle = fillStyle;
+      ctx.fillRect(zoneLeft, topY, zoneRight - zoneLeft, bottomY - topY);
+    }
+    if (strokeStyle) {
+      ctx.strokeStyle = strokeStyle;
+      ctx.lineWidth = lineWidth;
+      ctx.setLineDash(dashPattern);
+      ctx.strokeRect(zoneLeft, topY, zoneRight - zoneLeft, bottomY - topY);
+      ctx.setLineDash([]);
+    }
+    ctx.restore();
+  }
+
   function resolveTimedZoneRange(startTs, endTs = null, spanBars = 15, maxSpanBars = null, options = {}) {
     const span = Math.max(1, Number(spanBars) || 15);
     const maxSpan = Math.max(1, Number(maxSpanBars) || span);
@@ -2810,6 +2863,40 @@ function drawSelectedChart(snapshot) {
           : resolveTimedZoneRange(gap?.first_seen, null, 15, 15, { requireVisibleStart: true });
         if (!timedRange) return;
         drawTimedZone(timedRange.startIdx, timedRange.endIdx, upper, lower, fill);
+      });
+    }
+
+    // Order blocks render after FVGs so any overlapping zones show the OB
+    // dashed-border on top, making both visible. Bullish=green / bearish=red
+    // matches the FVG color semantics; the dashed stroke + low fill opacity
+    // is what differentiates OBs from FVGs visually.
+    if (show('show_htf_order_blocks', false)) {
+      htfOrderBlocks.forEach(ob => {
+        const lower = numOrNull(ob?.lower);
+        const upper = numOrNull(ob?.upper);
+        if (lower === null || upper === null) return;
+        const isBullish = String(ob?.direction || '').toLowerCase() === 'bullish';
+        const fill = isBullish ? 'rgba(76, 214, 128, 0.06)' : 'rgba(255, 92, 92, 0.06)';
+        const stroke = isBullish ? 'rgba(76, 214, 128, 0.85)' : 'rgba(255, 92, 92, 0.85)';
+        const timedRange = resolveTimedZoneRange(ob?.first_seen, null, 8, 8);
+        if (!timedRange) return;
+        drawTimedDashedZone(timedRange.startIdx, timedRange.endIdx, upper, lower, fill, stroke, 1.4, [6, 4]);
+      });
+    }
+
+    if (show('show_1m_order_blocks', false)) {
+      oneMinuteOrderBlocks.forEach(ob => {
+        const lower = numOrNull(ob?.lower);
+        const upper = numOrNull(ob?.upper);
+        if (lower === null || upper === null) return;
+        const isBullish = String(ob?.direction || '').toLowerCase() === 'bullish';
+        const fill = isBullish ? 'rgba(76, 214, 128, 0.07)' : 'rgba(255, 92, 92, 0.07)';
+        const stroke = isBullish ? 'rgba(76, 214, 128, 0.90)' : 'rgba(255, 92, 92, 0.90)';
+        const timedRange = Number.isFinite(Number(ob?.anchor_abs_index))
+          ? resolveIndexedZoneRange(ob?.anchor_abs_index, 15, 15)
+          : resolveTimedZoneRange(ob?.first_seen, null, 15, 15, { requireVisibleStart: true });
+        if (!timedRange) return;
+        drawTimedDashedZone(timedRange.startIdx, timedRange.endIdx, upper, lower, fill, stroke, 1.2, [5, 4]);
       });
     }
 
