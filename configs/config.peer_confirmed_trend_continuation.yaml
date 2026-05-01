@@ -184,6 +184,8 @@ dashboard:
       show_trendlines: false
       show_htf_fair_value_gaps: false
       show_1m_fair_value_gaps: true
+      show_htf_order_blocks: false
+      show_1m_order_blocks: false
       show_trade_markers: true
       tooltip_show_returns: true
       tooltip_show_support_resistance: true
@@ -208,6 +210,8 @@ dashboard:
       show_trendlines: false
       show_htf_fair_value_gaps: true
       show_1m_fair_value_gaps: false
+      show_htf_order_blocks: false
+      show_1m_order_blocks: false
       show_trade_markers: true
       tooltip_show_returns: true
       tooltip_show_support_resistance: true
@@ -243,13 +247,10 @@ support_resistance:
   use_prior_day_high_low: true
   use_prior_week_high_low: true
   htf_fair_value_gaps_enabled: true
-  htf_fair_value_gap_max_per_side: 3
-  htf_fair_value_gap_min_atr_mult: 0.06
-  htf_fair_value_gap_min_pct: 0.0006
+  fair_value_gap_max_per_side: 3
+  fair_value_gap_min_atr_mult: 0.06
+  fair_value_gap_min_pct: 0.0006
   one_minute_fair_value_gaps_enabled: true
-  one_minute_fair_value_gap_max_per_side: 3
-  one_minute_fair_value_gap_min_atr_mult: 0.06
-  one_minute_fair_value_gap_min_pct: 0.0006
   dashboard_flip_confirmation_1m_bars: 1
   trading_flip_confirmation_1m_bars: 2
   trading_flip_confirmation_5m_bars: 1
