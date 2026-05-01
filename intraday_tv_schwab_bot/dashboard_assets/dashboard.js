@@ -3,6 +3,13 @@ const DASHBOARD_CONFIG = window.DASHBOARD_CONFIG || {};
 const REFRESH_MS = Number(DASHBOARD_CONFIG.refreshMs || 2000);
 const IMAGE_ASSETS = DASHBOARD_CONFIG.images || {};
 const CHART_BADGE_IMAGES = IMAGE_ASSETS;
+// Hardcoded ET because the bot only trades US equities/options sessions
+// and all server-side bar timestamps are emitted as ET-localized
+// `pd.Timestamp.isoformat()`. Without forcing this, browsers in other
+// timezones would render bar labels in their local TZ, mislabeling the
+// market clock. If the bot ever supports non-US markets, plumb
+// `runtime.timezone` through `DASHBOARD_CONFIG` and read it here.
+const DASHBOARD_TIMEZONE = 'America/New_York';
 const EXPANDED_CHART_CACHE_MAX = 6;
 const EXPANDED_CHART_CACHE_TTL_MS = 20 * 60 * 1000;
 const COMPACT_CHART_CACHE_MAX = 8;
@@ -130,6 +137,7 @@ function fmtChartTs(value) {
       day: 'numeric',
       hour: '2-digit',
       minute: '2-digit',
+      timeZone: DASHBOARD_TIMEZONE,
     });
   }
   return safe(value).replace('T', ' ').slice(0, 16);
@@ -1760,9 +1768,26 @@ function drawSelectedChart(snapshot) {
       ctx.font = '14px sans-serif';
       ctx.fillText(message, 22, 30);
     }
+    // Cancel any pending hover-RAF queued by the previous chart's
+    // pointer handler. Without this, the queued RAF fires after we've
+    // cleared the canvas and detached handlers, calling the stale
+    // closure's paint/updateTooltip and drawing ghost data over the
+    // new chart's blank state. Mirrors clearPointerActivity but runs
+    // even when the cancel didn't come from a leave gesture.
+    if (hoverFrameRequest) {
+      window.cancelAnimationFrame(hoverFrameRequest);
+      hoverFrameRequest = 0;
+    }
+    pendingHoverState = null;
     hideTooltip();
-    canvas.onmousemove = null;
-    canvas.onmouseleave = hideTooltip;
+    // Detach pointer/mouse handlers so a stale chart's idx mapping
+    // doesn't fire while the new chart's bars are still loading.
+    // hideTooltip stays wired on leave so dragging off the canvas
+    // dismisses any lingering tooltip during the transition.
+    canvas.onpointermove = null;
+    canvas.onpointerdown = null;
+    canvas.onpointerleave = hideTooltip;
+    canvas.onpointercancel = hideTooltip;
   }
 
   function prettyLabel(value) {
@@ -2326,16 +2351,22 @@ function drawSelectedChart(snapshot) {
     if (!value) return '';
     const dt = new Date(value);
     if (!Number.isFinite(dt.getTime())) return '';
-    return dt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    return dt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZone: DASHBOARD_TIMEZONE });
   }
 
   function formatDayAxisLabel(value) {
     if (!value) return '';
     const dt = new Date(value);
     if (!Number.isFinite(dt.getTime())) return '';
-    const month = String(dt.getMonth() + 1).padStart(2, '0');
-    const day = String(dt.getDate()).padStart(2, '0');
-    return `${month}/${day}`;
+    // Use Intl with explicit ET timezone so the date label matches the
+    // bot's session calendar regardless of viewer locale. dt.getMonth()/
+    // dt.getDate() would silently use browser-local time and mislabel
+    // the trading day for any viewer outside ET.
+    return dt.toLocaleDateString('en-US', {
+      month: '2-digit',
+      day: '2-digit',
+      timeZone: DASHBOARD_TIMEZONE,
+    });
   }
 
   function inferredBarMinutes() {
@@ -2772,7 +2803,12 @@ function drawSelectedChart(snapshot) {
       bars.forEach((bar, idx) => {
         const x = xFor(idx);
         const rising = Number(bar.close) >= Number(bar.open);
-        const volumeValue = Math.max(Number(bar.volume || 0), 0);
+        // `Number(bar.volume || 0)` would coerce the string "NaN"
+        // (truthy) to NaN, which then propagates through Math.sqrt and
+        // skips the bar silently. Use parseFinite (defined near the top)
+        // to convert non-numeric / null / "NaN" to a safe 0.
+        const rawVolume = parseFinite(bar.volume);
+        const volumeValue = Math.max(rawVolume === null ? 0 : rawVolume, 0);
         const scaledVolume = volumeValue > 0 ? (Math.sqrt(volumeValue) / sqrtVolumeMax) : 0;
         const volH = volumeValue > 0 ? Math.max(1.5, scaledVolume * maxVolumeHeight) : 0;
         ctx.fillStyle = rising ? 'rgba(108,227,162,0.34)' : 'rgba(255,107,130,0.36)';
@@ -3132,8 +3168,16 @@ function drawSelectedChart(snapshot) {
     }
 
     if (activeIndex !== null && activeIndex >= 0 && activeIndex < bars.length) {
-      const hoverBar = bars[hoverIndex];
-      const hoverX = xFor(hoverIndex);
+      // Use activeIndex (resolved from hoverIndex || pinnedIndex above)
+      // for both the bar reference and the x-coordinate. Today
+      // pinnedIndex is declared at line ~2337 but never reassigned, so
+      // activeIndex always equals hoverIndex in practice — but if a
+      // future change wires bar-pinning, paint(null) with a pinned bar
+      // would dereference bars[null]/xFor(null) and crash here. Keep
+      // the references symmetrically on activeIndex so that landmine
+      // is closed before pinning lands.
+      const hoverBar = bars[activeIndex];
+      const hoverX = xFor(activeIndex);
       ctx.setLineDash([4, 4]);
       ctx.strokeStyle = 'rgba(207,232,255,0.28)';
       ctx.lineWidth = 1;
@@ -3345,8 +3389,15 @@ function drawSelectedChart(snapshot) {
   paint(null);
 
   canvas.onclick = null;
-  canvas.onmousemove = (event) => {
-    pendingHoverState = { clientX: event.clientX, clientY: event.clientY };
+  // Unified pointer-driven hover: single handler covers mouse, pen, and
+  // touch. `pointermove` fires on mouse motion AND on dragging-finger;
+  // for taps we also wire `pointerdown` so the tooltip appears
+  // immediately on first contact (instead of only after movement).
+  // `pointerleave` mirrors the legacy mouseleave semantics. Touch events
+  // are gated to events with pointerType === 'touch' so we don't double-
+  // process the synthetic mouse events that follow a tap on some browsers.
+  const handlePointerActivity = (clientX, clientY) => {
+    pendingHoverState = { clientX, clientY };
     if (hoverFrameRequest) return;
     hoverFrameRequest = window.requestAnimationFrame(() => {
       hoverFrameRequest = 0;
@@ -3365,7 +3416,7 @@ function drawSelectedChart(snapshot) {
       updateTooltip(idx, latest.clientX, latest.clientY);
     });
   };
-  canvas.onmouseleave = () => {
+  const clearPointerActivity = () => {
     if (hoverFrameRequest) {
       window.cancelAnimationFrame(hoverFrameRequest);
       hoverFrameRequest = 0;
@@ -3373,6 +3424,29 @@ function drawSelectedChart(snapshot) {
     pendingHoverState = null;
     paint(null);
     hideTooltip();
+  };
+  canvas.onpointermove = (event) => handlePointerActivity(event.clientX, event.clientY);
+  canvas.onpointerdown = (event) => {
+    // Only react to touch/pen down — mouse hover is already covered by
+    // pointermove. This avoids a redundant repaint on every mouse click.
+    if (event.pointerType === 'mouse') return;
+    handlePointerActivity(event.clientX, event.clientY);
+  };
+  canvas.onpointerleave = (event) => {
+    // For touch/pen, lifting the finger fires pointerleave/pointercancel
+    // immediately — clearing the tooltip would create a flash on every
+    // tap. Keep the tooltip visible until the next gesture (which will
+    // either redraw it via pointerdown or move it via pointermove).
+    // Mouse cursors leaving the canvas should still clear immediately.
+    if (event && event.pointerType && event.pointerType !== 'mouse') return;
+    clearPointerActivity();
+  };
+  canvas.onpointercancel = (event) => {
+    // pointercancel fires for touch interrupted by scroll, pinch, or
+    // multi-touch. Apply the same touch-keeps-tooltip rule so a stray
+    // gesture interruption doesn't blank a deliberately tapped bar.
+    if (event && event.pointerType && event.pointerType !== 'mouse') return;
+    clearPointerActivity();
   };
 }
 
@@ -3846,3 +3920,10 @@ syncPositionsViewport();
 renderChartTimeframeToggle();
 refresh();
 setInterval(refresh, REFRESH_MS);
+// Force an immediate refresh when the user returns to a hidden tab.
+// Browsers throttle setInterval to ~1Hz when hidden; without this,
+// users see stale data for up to one full REFRESH_MS cycle on focus.
+// `refreshInFlight` already guards against doubling.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refresh();
+});

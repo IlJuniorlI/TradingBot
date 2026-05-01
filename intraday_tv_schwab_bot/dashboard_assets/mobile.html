@@ -8,7 +8,8 @@
   <title>Schwab Bot · Mobile</title>
   <!-- Reuse the desktop stylesheet so every card inherits the active theme. -->
   <link rel="stylesheet" href="/assets/dashboard.css" />
-  <link rel="stylesheet" href="/themes/__THEME__/theme.css" />
+  <!-- Optional theme override; missing theme.css shouldn't strip styling. -->
+  <link rel="stylesheet" href="/themes/__THEME__/theme.css" onerror="this.remove()" />
   <link rel="stylesheet" href="/assets/mobile.css" />
 </head>
 <body>

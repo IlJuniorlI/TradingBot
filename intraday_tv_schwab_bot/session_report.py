@@ -666,8 +666,9 @@ def export_session_archive(
     - ``config_snapshot.yaml`` — the resolved BotConfig (with secrets
       redacted) so future audits can reproduce decisions even if
       config.yaml has been edited since.
-    - ``account_snapshot.json`` — full PaperAccount snapshot at shutdown:
-      equity curve, realized PnL by symbol, open positions, etc.
+    - ``account_snapshot.json`` — full PaperAccount snapshot at the
+      moment of export (end-of-day daily fire or shutdown): equity
+      curve, realized PnL by symbol, open positions, etc.
     - ``events.jsonl`` — structured events (ENTRY_CONTEXT, EXIT_CONTEXT,
       TRADE_SUMMARY, SKIP_SUMMARY) extracted from the log file as
       one-per-line JSON. Easier to parse with jq/pandas than grepping
@@ -694,8 +695,10 @@ def export_session_archive(
         ``account.realized_pnl`` and ``account.trades`` so closed-position
         symbols are included even if they left the watchlist.
     positions
-        Currently-open positions at shutdown (typically empty after
-        force-flatten).
+        Currently-open positions at the moment of export. On the
+        end-of-day daily fire (8pm ET) this is whatever the bot is
+        holding overnight; on shutdown it's typically empty after
+        force-flatten.
     strategy
         Strategy instance — used for ``strategy.active_watchlist(...)``
         and ``strategy.params`` (to read trigger/HTF timeframes).

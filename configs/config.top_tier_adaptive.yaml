@@ -85,6 +85,9 @@ runtime:
   stream_health_log_seconds: 90
   # Auto-exit: shut down cleanly when market closes and no positions are open
   auto_exit_after_session: true
+  idle_sleep_seconds: 60.0
+  symbol_state_prune_seconds: 1800.0
+  session_reconcile_on_resume: true
   cycle_precompute_workers: 4
   max_consecutive_quote_failures: 5
   # Per-day debug archive: on session shutdown, write

@@ -241,13 +241,38 @@ def dashboard_frame_signature(frame: pd.DataFrame | None) -> tuple[Any, ...]:
 
 def dashboard_recent_trade_markers(account: Any, symbol: str) -> list[dict[str, Any]]:
     """Return up to 12 dashboard-shaped trade rows for ``symbol`` from
-    ``account.trades``. Extracted from IntradayBot as part of Phase 5."""
+    today's ``account.trades`` (filtered by current ET session date).
+
+    Two correctness fixes vs. the original Phase-5 extraction:
+    1. The symbol filter runs BEFORE the slice. The trades deque is
+       LIFO-ordered (newest at index 0); pre-slicing to [:12] would make
+       a fresh fill on a long-quiet symbol invisible if 12 other tickers
+       traded after it.
+    2. Multi-day filter: ``account.trades`` is a multi-day deque
+       (maxlen=200). A naked iteration leaks yesterday's exits onto
+       today's chart. We restrict to trades whose ``exit_time`` falls
+       on the current ET trading date (or, for still-open positions
+       that emit a marker, ``entry_time``).
+    """
     out: list[dict[str, Any]] = []
     key = str(symbol or "").upper().strip()
     if not key:
         return out
-    for trade in list(getattr(account, "trades", []))[:12]:
+    today = now_et().date()
+    for trade in list(getattr(account, "trades", [])):
         if str(getattr(trade, "symbol", "") or "").upper().strip() != key:
+            continue
+        # Today-filter: a trade belongs to today's chart if either side
+        # of the round-trip happened today. Exit-time wins when present;
+        # fall back to entry_time so paper-account entries that haven't
+        # exited yet still surface.
+        exit_time = getattr(trade, "exit_time", None)
+        entry_time = getattr(trade, "entry_time", None)
+        ref_time = exit_time if exit_time is not None else entry_time
+        try:
+            if ref_time is None or ref_time.date() != today:
+                continue
+        except Exception:
             continue
         try:
             out.append({
@@ -256,20 +281,32 @@ def dashboard_recent_trade_markers(account: Any, symbol: str) -> list[dict[str, 
                 "qty": int(getattr(trade, "qty", 0) or 0),
                 "entry_price": dashboard_safe_float(getattr(trade, "entry_price", None)),
                 "exit_price": dashboard_safe_float(getattr(trade, "exit_price", None)),
-                "entry_time": getattr(trade, "entry_time", None).isoformat() if getattr(trade, "entry_time", None) is not None else None,
-                "exit_time": getattr(trade, "exit_time", None).isoformat() if getattr(trade, "exit_time", None) is not None else None,
+                "entry_time": entry_time.isoformat() if entry_time is not None else None,
+                "exit_time": exit_time.isoformat() if exit_time is not None else None,
                 "realized_pnl": dashboard_safe_float(getattr(trade, "realized_pnl", None)),
                 "return_pct": dashboard_safe_float(getattr(trade, "return_pct", None)),
                 "reason": str(getattr(trade, "reason", "") or ""),
             })
         except Exception:
             continue
+        if len(out) >= 12:
+            break
     return out
 
 
 def dashboard_symbol_trade_signature(account: Any, symbol: str) -> tuple[Any, ...]:
     """Build a cache-key signature capturing the last trade state for
-    ``symbol`` on ``account``. Extracted from IntradayBot as part of Phase 5."""
+    ``symbol`` on ``account``.
+
+    Same correctness fix as ``dashboard_recent_trade_markers``: filter
+    by symbol BEFORE slicing. Without this, a fresh fill on a
+    long-quiet symbol won't change the signature when 24 other tickers
+    have traded after it, so the cached snapshot stays stale.
+
+    The signature is intentionally NOT date-filtered — cache invalidation
+    must catch any newly-recorded trade for the symbol regardless of
+    session date, even if the chart payload itself filters to today.
+    """
     key = str(symbol or "").upper().strip()
     if not key:
         return 0, None, None, None
@@ -277,7 +314,8 @@ def dashboard_symbol_trade_signature(account: Any, symbol: str) -> tuple[Any, ..
     latest_exit: str | None = None
     latest_entry: str | None = None
     latest_reason: str | None = None
-    for trade in list(getattr(account, "trades", []))[:24]:
+    matched = 0
+    for trade in list(getattr(account, "trades", [])):
         if str(getattr(trade, "symbol", "") or "").upper().strip() != key:
             continue
         count += 1
@@ -287,6 +325,9 @@ def dashboard_symbol_trade_signature(account: Any, symbol: str) -> tuple[Any, ..
             latest_exit = exit_time.isoformat() if exit_time is not None else None
             latest_entry = entry_time.isoformat() if entry_time is not None else None
             latest_reason = str(getattr(trade, "reason", "") or "")
+        matched += 1
+        if matched >= 24:
+            break
     return count, latest_exit, latest_entry, latest_reason
 
 
@@ -375,6 +416,24 @@ class DashboardCache:
         self.chart_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
         self.lock = RLock()
         self._error_log_times: dict[str, float] = {}
+
+    def prune_inactive_symbols(self, active_symbols: set[str]) -> int:
+        """Drop cached snapshot + chart payloads for symbols no longer in the
+        active set. Mirrors `MarketDataStore.prune_inactive_symbols` on the
+        dashboard side. Each entry is a deep-copied serialized payload —
+        kilobytes each — so a long-running bot with high symbol churn
+        accumulates real memory here too. Returns count evicted."""
+        active = {str(s).upper().strip() for s in (active_symbols or set()) if s}
+        with self.lock:
+            snap_stale = {sym for sym in self.snapshot_cache.keys() if str(sym).upper().strip() not in active}
+            chart_stale = {key for key in self.chart_cache.keys() if str(key[0]).upper().strip() not in active}
+            for sym in snap_stale:
+                self.snapshot_cache.pop(sym, None)
+            for key in chart_stale:
+                self.chart_cache.pop(key, None)
+        # Distinct symbol count, not entry count, so the engine has a
+        # consistent figure to log alongside the data_feed prune count.
+        return len({str(sym).upper().strip() for sym in (snap_stale | {k[0] for k in chart_stale})})
 
     def log_component_failure(self, component: str, message: str, *message_args: Any) -> None:
         """Rate-limited component error logger.
@@ -944,7 +1003,11 @@ class DashboardCache:
                         payload_ob["mode"] = str(getattr(ob_ctx_htf, "mode", "loose") or "loose")
                         htf_order_blocks.append(payload_ob)
         except Exception:
-            self.log_component_failure("htf_order_blocks_collect", symbol)
+            self.log_component_failure(
+                "htf_order_blocks_collect",
+                "Dashboard HTF order blocks collect failed for %s",
+                symbol,
+            )
             htf_order_blocks = []
 
         one_minute_order_blocks: list[dict[str, Any]] = []
@@ -973,7 +1036,11 @@ class DashboardCache:
                         payload_ob["anchor_abs_index"] = dashboard_fvg_anchor_abs_index(one_minute_frame, payload_ob.get("first_seen"))
                         one_minute_order_blocks.append(payload_ob)
         except Exception:
-            self.log_component_failure("one_minute_order_blocks_collect", symbol)
+            self.log_component_failure(
+                "one_minute_order_blocks_collect",
+                "Dashboard 1m order blocks collect failed for %s",
+                symbol,
+            )
             one_minute_order_blocks = []
 
         chart_payload = {
@@ -1968,7 +2035,14 @@ class DashboardCache:
         with self.lock:
             cache_entry = self.chart_cache.get(cache_key)
             if cache_entry is not None and cache_entry.get("signature") == frame_signature:
-                return copy.deepcopy(cache_entry["payload"])
+                # Re-stamp `last_update` on every cache hit so the
+                # frontend's "last update" timestamp doesn't freeze
+                # while the underlying frame_signature is unchanged.
+                # Without this, viewers see a stale wall-clock label
+                # for the entire lifetime of the cached payload.
+                cached_payload = copy.deepcopy(cache_entry["payload"])
+                cached_payload["last_update"] = now_et().isoformat()
+                return cached_payload
         bars = dashboard_bars_from_frame(frame, max_bars=capped_bars)
         pattern_payload = self.current_pattern_payload(frame)
         structure_overlay = self.current_structure_overlay(frame, timeframe_minutes=timeframe_minutes)

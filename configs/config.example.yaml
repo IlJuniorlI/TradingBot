@@ -96,6 +96,20 @@ runtime:
   stream_health_log_seconds: 90
   # Auto-exit: shut down cleanly when market closes and no positions are open
   auto_exit_after_session: true
+  # Always-on idle cadence: outside the 7am-8pm ET stream window the loop
+  # sleeps this long instead of `loop_sleep_seconds`. Cuts overnight CPU
+  # by ~95% (60s vs 2s per cycle). Set <= loop_sleep_seconds to disable.
+  idle_sleep_seconds: 60.0
+  # Cadence at which the engine evicts per-symbol state (history frames,
+  # HTF/SR caches, dashboard payloads) for symbols no longer in the
+  # active set. Long-running multi-day bots otherwise accumulate ~240KB
+  # per dropped 1m frame indefinitely. Set to 0 to disable pruning.
+  symbol_state_prune_seconds: 1800.0
+  # When true, the engine re-runs the startup reconcile on the first
+  # cycle of each new ET trading day after streaming returns. Catches
+  # overnight position changes (manual closes via Schwab app, broker
+  # stop fills) that an always-on bot would otherwise miss.
+  session_reconcile_on_resume: true
   cycle_precompute_workers: 4
   # Per-symbol quote-fetch failure threshold. After this many consecutive
   # quote refreshes fail (typically Schwab 401/403/404 on restricted

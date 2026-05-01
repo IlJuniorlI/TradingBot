@@ -105,3 +105,52 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* Mobile-specific overrides for desktop styles that don't translate well
+   to touch.
+
+   - .position-card carries `cursor: pointer` from dashboard.css:306, but
+     mobile.js never wires a click handler (desktop's parallel is
+     dashboard.js:1544 → setSelectedSymbol). We don't have a per-symbol
+     selected-state on mobile, so the card is informational only — make
+     the cursor reflect that and disable the iOS tap-highlight flash.
+   - The desktop sheet floats `.positions-panel` with `position: fixed`
+     at viewports >1400px (dashboard.css:1113). The 1400px breakpoint
+     happens to neutralize this for mobile, but make the override
+     explicit so the panel positioning doesn't depend on a brittle
+     breakpoint contract.
+   - `panel-meta` ("Day PnL ${...} · cash ${...}", mobile.js:178) can
+     produce 50+ char strings with 7-figure values. Allow wrapping
+     instead of forcing single-line truncation. */
+.m-shell .position-card {
+  cursor: default;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.m-shell .positions-panel {
+  position: relative;
+  left: auto;
+  right: auto;
+  bottom: auto;
+  height: auto;
+  max-height: none;
+}
+
+.m-shell .panel-meta {
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.4;
+}
+
+/* Disable tap-highlight flash on every interactive element on mobile.
+   The default blue/gray flash on tap is jarring at the typical mobile
+   refresh cadence and provides no useful signal that desktop hover
+   doesn't already cover. */
+.m-shell button,
+.m-shell .btn,
+.m-shell [role="button"],
+.m-shell a,
+.m-shell .position-card,
+.m-shell .metric-pill {
+  -webkit-tap-highlight-color: transparent;
+}

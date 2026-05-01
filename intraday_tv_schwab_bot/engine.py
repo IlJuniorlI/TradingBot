@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from schwabdev import Client
@@ -37,7 +37,7 @@ from .warmup_tracker import WarmupTracker
 from ._strategies.registry import build_strategy
 from ._strategies.strategy_base import BaseStrategy
 from .session_report import export_session_archive, write_session_report
-from .utils import TRADEFLOW_LEVEL, SchwabdevApiUsageTracker, equity_session_state, now_et, register_schwab_api_tracker, setup_logging
+from .utils import EQUITY_STREAM_END, TRADEFLOW_LEVEL, SchwabdevApiUsageTracker, equity_session_state, now_et, register_schwab_api_tracker, setup_logging
 
 LOG = logging.getLogger(__name__)
 
@@ -92,7 +92,38 @@ class IntradayBot:
         self.last_watchlist: list[str] = []
         self.last_quote_watchlist: list[str] = []
         self.last_error: str | None = None
+        # Memory-pressure prune cadence. Symbol-keyed state in
+        # MarketDataStore + DashboardCache grows unbounded across cycles
+        # as the screener returns new symbols day to day. Every
+        # `runtime.symbol_state_prune_seconds` we evict per-symbol entries
+        # for symbols no longer in the active set (streaming + watchlist
+        # + held positions). Default: every 30 minutes.
+        self._last_symbol_prune_monotonic: float = 0.0
+        # ET session date of the most recent broker reconcile. The
+        # startup reconcile sets this on first successful run; the
+        # session-boundary reconcile in `_maybe_session_reconcile`
+        # re-runs at the start of each new ET trading day so an
+        # always-on bot catches broker-side state changes that
+        # happened during the 8pm-7am gap (manual position closes
+        # via the Schwab app, server-side stop fills, etc.).
+        self._last_reconcile_session_date: date | None = None
         self._last_reconcile_metadata_signature: str | None = None
+        # ET session date of the most recent daily session-archive
+        # export. `_maybe_export_session_archive` fires once per ET
+        # trading day after the stream window closes (8pm ET) so an
+        # always-on bot writes a per-day archive on a per-day cadence
+        # instead of waiting for shutdown. Shutdown still writes its
+        # own archive (potentially overwriting today's) for the final
+        # state — that path also updates this field for symmetry.
+        self._last_session_archive_date: date | None = None
+        # ET session date last seen by `_maybe_session_rollover_reset`.
+        # Used to clear `entry_gatekeeper.session_skip_counts` when the
+        # ET date rolls. Without this, an always-on bot accumulates
+        # skip-reason counts across days so each daily archive shows
+        # the cumulative tally instead of just that day's. Initialized
+        # to None so the first cycle stamps today's date without
+        # firing a (no-op) reset.
+        self._last_skip_counts_reset_date: date | None = None
         self.entry_gatekeeper = EntryGatekeeper(
             config,
             client=self.client,
@@ -224,6 +255,10 @@ class IntradayBot:
                 LOG.exception("Could not start dashboard on %s:%s: %s", self.config.dashboard.host, self.config.dashboard.port, exc)
                 self.dashboard = None
         self.startup_reconciler.reconcile()
+        # Initial reconcile counts as today's reconcile. The session-
+        # boundary reconcile in `_maybe_session_reconcile` won't fire
+        # again until the ET date rolls over.
+        self._last_reconcile_session_date = now_et().date()
         LOG.info("Starting bot with strategy=%s dry_run=%s", self.config.strategy, self.config.schwab.dry_run)
         risk_budget_dollars = float(
             self.config.risk.max_notional_per_trade * self.config.risk.risk_per_trade_frac_of_notional
@@ -267,17 +302,28 @@ class IntradayBot:
                 self.config.options.volatility_symbol,
             )
         auto_exit = bool(self.config.runtime.auto_exit_after_session)
+        consecutive_errors = 0
         while True:
             try:
                 self.step()
                 self.last_error = None
+                consecutive_errors = 0
             except KeyboardInterrupt:
                 LOG.info("Interrupted, shutting down.")
                 self._shutdown_cleanup()
                 break
             except Exception as exc:
+                consecutive_errors += 1
                 self.last_error = str(exc)
-                LOG.exception("Unhandled engine error: %s", exc)
+                # Throttle log volume during sustained API outages: full
+                # tracebacks for the first few errors and every 10th after,
+                # otherwise a one-line warning. Keeps a single flapping API
+                # from filling the log file overnight.
+                first_line = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+                if consecutive_errors <= 3 or consecutive_errors % 10 == 0:
+                    LOG.exception("Unhandled engine error (consecutive=%d): %s", consecutive_errors, exc)
+                else:
+                    LOG.warning("Engine error (consecutive=%d): %s", consecutive_errors, first_line)
                 now = now_et()
                 gate_state = self.cycle_gate.evaluate(now, self.config.active_strategy.schedule())
                 self._publish_state(
@@ -310,7 +356,256 @@ class IntradayBot:
                     LOG.info("Auto-exit: all windows closed at %s, no open positions — shutting down", exit_after.strftime("%H:%M"))
                     self._shutdown_cleanup()
                     break
-            time.sleep(self.config.runtime.loop_sleep_seconds)
+            self._maybe_session_reconcile()
+            self._maybe_export_session_archive()
+            self._maybe_session_rollover_reset()
+            self._maybe_prune_inactive_symbols()
+            sleep_secs = self._cycle_sleep_seconds()
+            if consecutive_errors > 0:
+                # Exponential backoff: 2× per consecutive error, capped at
+                # 60s. Prevents tight-loop hammering of a flapping API.
+                # Each successful step() resets `consecutive_errors` to 0
+                # above, returning to normal cadence immediately.
+                backoff = min(60.0, sleep_secs * (2.0 ** min(consecutive_errors - 1, 5)))
+                sleep_secs = max(sleep_secs, backoff)
+            time.sleep(sleep_secs)
+
+    def _maybe_session_reconcile(self) -> None:
+        """Re-run startup reconcile when a new ET trading day begins.
+
+        Closes the always-on overnight gap: between 8pm and 7am the bot
+        cannot submit orders or receive streamed ticks, but the user can
+        still close positions via the Schwab app, and (when broker-side
+        stops are wired up later) the broker can fire stops directly.
+        Without this, the bot wakes at 7am still believing those
+        positions are open and tries to manage phantoms.
+
+        Runs at most once per ET trading day, gated on:
+        - It's a trading day (not weekend/holiday)
+        - Stream session is open (i.e., we've actually crossed 7am ET)
+        - Today's date != date of last successful reconcile
+
+        First run is satisfied by the startup `reconcile()` call which
+        sets `_last_reconcile_session_date` immediately. So a fresh
+        bot start at 9am Tuesday won't double-reconcile.
+
+        Disable via `runtime.session_reconcile_on_resume: false`.
+        """
+        if not bool(getattr(self.config.runtime, "session_reconcile_on_resume", True)):
+            return
+        # Honor the same gate the startup reconcile honors.
+        if not self.config.runtime.reconcile_on_startup:
+            return
+        if str(self.config.runtime.startup_reconcile_mode or "ignore").lower() == "ignore":
+            return
+        now = now_et()
+        state = equity_session_state(
+            now,
+            extended_hours_enabled=bool(self.config.execution.extended_hours_enabled),
+        )
+        if not state.is_trading_day:
+            return
+        if not state.stream_available:
+            return
+        today = now.date()
+        if self._last_reconcile_session_date == today:
+            return
+        LOG.info(
+            "Session-boundary reconcile: new ET trading day %s (last=%s) — syncing broker positions/orders",
+            today, self._last_reconcile_session_date,
+        )
+        try:
+            self.startup_reconciler.reconcile()
+            self._last_reconcile_session_date = today
+        except Exception:
+            # If reconcile fails (network blip, Schwab API hiccup), don't
+            # update the date — try again on the next loop iteration via
+            # the same gate. Log full exc only on first failure each
+            # session to avoid spam during a sustained outage.
+            LOG.exception("Session-boundary reconcile failed (will retry next cycle)")
+
+    def _maybe_session_rollover_reset(self) -> None:
+        """Clear per-session counters when the ET trading date rolls.
+
+        Mirrors what ``RiskManager._reset_if_new_session`` does for
+        ``realized_pnl``: an always-on bot otherwise accumulates state
+        across days so each daily archive shows the cumulative tally
+        instead of just that day's. Currently scoped to
+        ``entry_gatekeeper.session_skip_counts`` (the only
+        cross-day-leaky per-session dict that's surfaced into archives
+        + session reports).
+
+        Fires unconditionally — does not depend on
+        ``session_reconcile_on_resume`` since the user can disable
+        reconcile while still wanting per-day count semantics.
+
+        Order in the main loop: placed AFTER ``_maybe_export_session_archive``
+        but the ordering is incidental — the two helpers fire in
+        non-overlapping time windows. The archive only writes when
+        ``now.time() >= EQUITY_STREAM_END`` (8pm) and the rollover only
+        fires when the ET date differs from ``_last_skip_counts_reset_date``,
+        which happens at midnight, ~4 hours later. So in practice
+        archive_for_day_N happens at ~8pm on day N, then rollover_for_day_N+1
+        fires shortly after midnight, and counts collected on day N+1
+        accumulate from zero through to ~8pm day N+1's archive.
+        """
+        today = now_et().date()
+        last = self._last_skip_counts_reset_date
+        if last is None:
+            self._last_skip_counts_reset_date = today
+            return
+        if today == last:
+            return
+        existing = len(self.entry_gatekeeper.session_skip_counts)
+        if existing:
+            LOG.info(
+                "Skip-counts session rollover %s -> %s: resetting %d counters",
+                last, today, existing,
+            )
+        self.entry_gatekeeper.session_skip_counts.clear()
+        self._last_skip_counts_reset_date = today
+
+    def _maybe_export_session_archive(self) -> None:
+        """Write a per-day session archive once the ET trading day ends.
+
+        Closes the always-on archive gap: pre-always-on, the archive
+        only fired on shutdown, so a bot that ran continuously through
+        many sessions never produced per-day archives. This fires once
+        per ET trading day after the stream window closes (8pm ET) so
+        each day gets its own ``{log_dir}/sessions/{YYYY-MM-DD}/``
+        bundle while the bot is still running.
+
+        Trigger conditions:
+        - ``runtime.export_session_archive`` is true (master switch).
+        - It's a trading day (not weekend/holiday).
+        - Current ET time is at or past ``EQUITY_STREAM_END`` (20:00) —
+          i.e. the stream window has closed for the day.
+        - Today's date != ``_last_session_archive_date``.
+
+        On success, ``_last_session_archive_date`` is updated to today
+        so the daily write doesn't fire again until the date rolls.
+        Shutdown still always writes its own archive (potentially
+        overwriting today's bundle with a fresher snapshot) and stamps
+        this field too — so callers that read ``_last_session_archive_date``
+        always see the truth regardless of which path wrote last.
+        """
+        if not bool(self.config.runtime.export_session_archive):
+            return
+        now = now_et()
+        state = equity_session_state(
+            now,
+            extended_hours_enabled=bool(self.config.execution.extended_hours_enabled),
+        )
+        if not state.is_trading_day:
+            return
+        if now.time() < EQUITY_STREAM_END:
+            return
+        today = now.date()
+        if self._last_session_archive_date == today:
+            return
+        LOG.info(
+            "Daily session archive: ET trading day %s ended — exporting bars/trades/manifest",
+            today,
+        )
+        try:
+            self._export_session_archive()
+            self._last_session_archive_date = today
+        except Exception:
+            # Archive export is a debug aid — never let it crash the
+            # main loop. Log full traceback once; a sustained failure
+            # will retry next cycle but won't spam.
+            LOG.exception("Daily session archive failed (will retry next cycle)")
+
+    def _maybe_prune_inactive_symbols(self) -> None:
+        """Evict per-symbol state for symbols no longer in the active set.
+
+        Cadence is gated by `runtime.symbol_state_prune_seconds` (default
+        1800 = 30 min) to keep the per-cycle overhead negligible. The
+        active set is the union of:
+        - currently streamed symbols (live tick consumers)
+        - last cycle's watchlist (anything we'd refresh)
+        - all open-position symbols (must keep history for management)
+
+        A symbol that drops out of all three has no consumer; safe to evict.
+        Re-fetched cleanly on revival via the warmup tracker.
+        """
+        ttl = float(getattr(self.config.runtime, "symbol_state_prune_seconds", 1800.0) or 0.0)
+        if ttl <= 0:
+            return
+        now = time.monotonic()
+        if now - self._last_symbol_prune_monotonic < ttl:
+            return
+        self._last_symbol_prune_monotonic = now
+        # Symbols we still care about — anything that could need state.
+        active: set[str] = set()
+        try:
+            active.update(self.data.stream_symbols)
+        except Exception:
+            pass
+        active.update(self.last_watchlist or [])
+        active.update(self.last_quote_watchlist or [])
+        active.update(self.positions.keys() if self.positions else [])
+        # Pruning hits the data feed (frames + caches) and the dashboard
+        # snapshot/chart caches. Both no-op when active is empty
+        # (would otherwise nuke everything).
+        if not active:
+            return
+        try:
+            n_data = self.data.prune_inactive_symbols(active)
+            n_dash = self.dashboard_cache.prune_inactive_symbols(active)
+            if n_data or n_dash:
+                LOG.info(
+                    "Symbol-state prune evicted data_feed=%d, dashboard=%d (active set: %d symbols)",
+                    n_data, n_dash, len(active),
+                )
+        except Exception:
+            LOG.debug("prune_inactive_symbols failed (non-fatal)", exc_info=True)
+
+    def _cycle_sleep_seconds(self) -> float:
+        """Pick the right sleep interval for the next loop iteration.
+
+        Default is `runtime.loop_sleep_seconds` (2.0). The fast cadence
+        only matters during the equity stream window (7am–8pm ET on
+        trading days), when streamed ticks need prompt processing and
+        the broker accepts orders. Outside that window the bot can do
+        nothing actionable — Schwab won't accept orders before 7am or
+        after 8pm — so the loop should idle at
+        `runtime.idle_sleep_seconds` (60.0 default).
+
+        Two cadences:
+        - **Stream window (7am–8pm ET on trading days)**: fast cycle.
+          Entries fire, management runs, dashboard updates from live
+          ticks.
+        - **Outside the stream window (8pm–7am, weekends, holidays)**:
+          idle. Both streaming and order acceptance are off; even with
+          open positions, `can_close_position_now()` returns False so
+          management is gated off regardless of cycle cadence. Was
+          previously burning 2s cycles overnight.
+
+        Note: every Schwab equity order session (regular_session, AM
+        extended, PM extended) lies entirely inside the 7am–8pm stream
+        window, so "stream off" implies "no order session" — there is
+        no third cadence to handle.
+
+        Set `idle_sleep_seconds <= loop_sleep_seconds` to disable the
+        optimization entirely.
+        """
+        base = float(self.config.runtime.loop_sleep_seconds)
+        idle = float(getattr(self.config.runtime, "idle_sleep_seconds", 60.0) or 60.0)
+        if idle <= base:
+            return base
+        state = equity_session_state(
+            now_et(),
+            extended_hours_enabled=bool(self.config.execution.extended_hours_enabled),
+        )
+        # Stream available: fast cycle — live ticks + order session both
+        # gated by the same 7am-8pm window, so any actionable work
+        # happens here.
+        if state.stream_available:
+            return base
+        # Outside the stream window: nothing actionable. Idle even with
+        # open positions; management is blocked anyway.
+        return idle
 
     def _shutdown_cleanup(self) -> None:
         """Three-step cleanup with per-step isolation so a failure in one
@@ -344,6 +639,13 @@ class IntradayBot:
         if bool(self.config.runtime.export_session_archive):
             try:
                 self._export_session_archive()
+                # Stamp today as archived so a shutdown that happens
+                # after the daily fire (or before it, on a same-day
+                # restart) keeps `_last_session_archive_date` truthful.
+                # An overwrite is fine — the freshest snapshot wins,
+                # and the daily fire on a subsequent trading day still
+                # uses date inequality (today != last) to gate.
+                self._last_session_archive_date = now_et().date()
             except Exception as exc:
                 # Archive export is a debug aid — never let it crash shutdown.
                 LOG.warning("Session archive export failed: %s", exc, exc_info=True)

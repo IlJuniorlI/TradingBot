@@ -589,7 +589,13 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         for candidate in self._candidate_levels(close, htf, side):
             price = float(candidate["price"])
             zone = self._zone_width_for_level(side, close, atr, price, htf, candidate)
-            touched = bool(float(recent["low"].min()) <= price + zone and float(recent["high"].max()) >= price - zone)
+            # Per-bar overlap check: a bar "touches" the zone when its
+            # OWN range covers part of [price-zone, price+zone]. The
+            # window-wide min/max formulation (low.min() AND high.max())
+            # was a false-positive trap — one bar entirely above the
+            # zone AND another entirely below would pass without any
+            # bar actually entering the zone (e.g. fast spike on news).
+            touched = bool(((recent["low"] <= price + zone) & (recent["high"] >= price - zone)).any())
             if not touched:
                 continue
             distance = abs(close - price)

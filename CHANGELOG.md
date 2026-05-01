@@ -9,6 +9,72 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Always-on operation: three new `RuntimeConfig` knobs let the bot
+  run continuously across days instead of exiting at session close.
+  - `runtime.idle_sleep_seconds` (default `60.0`) — outside the 7am-8pm
+    ET equity stream window the main loop sleeps this long instead of
+    `loop_sleep_seconds`. Cuts overnight CPU by ~95% (60s vs 2s per
+    cycle); set ≤ `loop_sleep_seconds` to disable.
+  - `runtime.symbol_state_prune_seconds` (default `1800.0`) — cadence
+    at which the engine evicts per-symbol state (history frames,
+    HTF/SR caches, dashboard snapshot/chart payloads) for symbols no
+    longer in the active set (streamed + watchlist + open positions).
+    Long-running multi-day bots otherwise accumulate ~240KB per
+    dropped 1m frame indefinitely. Set to `0` to disable.
+  - `runtime.session_reconcile_on_resume` (default `true`) — re-runs
+    the startup reconcile on the first cycle of each new ET trading
+    day after streaming returns. Catches positions that closed
+    overnight via the Schwab app or broker-side stops; without this,
+    an always-on bot would wake at 7am still believing those positions
+    are open and try to manage phantoms.
+- Daily session archive: `_maybe_export_session_archive` fires once
+  per ET trading day after the stream window closes (8pm ET) so an
+  always-on bot writes a per-day `{log_dir}/sessions/{YYYY-MM-DD}/`
+  archive on a per-day cadence instead of only on shutdown. Reuses
+  the existing `runtime.export_session_archive` master switch.
+  Shutdown still always writes its own archive (potentially
+  overwriting today's bundle with a fresher snapshot).
+- Engine main-loop resilience: exponential backoff (2× per
+  consecutive `step()` error, capped at 60s) plus log throttling
+  (full traceback for the first 3 errors and every 10th after,
+  one-line warning otherwise) replaces the previous unconditional
+  `LOG.exception` + tight 2s retry. Keeps a flapping API from
+  filling the log file overnight.
+- Memory-pressure pruning: `MarketDataStore.prune_inactive_symbols`
+  and `DashboardCache.prune_inactive_symbols` evict per-symbol
+  entries (history, live, HTF/SR caches, quote tracking, snapshot
+  cache, chart cache) for symbols that are no longer streamed,
+  watchlisted, or held. Engine wires these via
+  `_maybe_prune_inactive_symbols` on the configurable cadence above.
+- Session-rollover counter reset: `_maybe_session_rollover_reset`
+  clears `entry_gatekeeper.session_skip_counts` when the ET trading
+  date changes. Mirrors the per-day reset `RiskManager` already does
+  for `realized_pnl`, so each daily archive's `session_skip_counts`
+  reflects only that day's tally instead of the cumulative total.
+- Dashboard chart touch-input support: chart canvas now uses pointer
+  events (`onpointermove` / `onpointerdown` / `onpointerleave` /
+  `onpointercancel`) so hover/tooltip updates fire for both mouse
+  and touch interactions. Tap shows the tooltip; drag moves it; tap
+  persists until the next gesture (touch flow does not auto-clear).
+  `touch-action: pan-y` on `#market-chart` lets vertical page scroll
+  pass through while capturing horizontal swipes for hover.
+- Dashboard small-phone fallback: new `@media (max-width: 480px)`
+  block in `dashboard.css` collapses topbar/status-strip/grid layouts
+  to a single column, bumps interactive elements to 44×44px tap
+  targets, and allows table cells to wrap. The dedicated `/mobile`
+  route is still the preferred phone experience, but viewers loading
+  `/` on a phone now get a sane single-column layout.
+- Dashboard chart timezone constant: hardcoded `DASHBOARD_TIMEZONE =
+  'America/New_York'` passed to all chart timestamp formatters
+  (`fmtChartTs`, `formatTimeAxisLabel`, `formatDayAxisLabel`) so
+  labels match the bot's session calendar regardless of viewer
+  locale. Without this, browsers in other timezones would render
+  bar labels in their local TZ.
+- Dashboard tab-visibility refresh: both desktop (`dashboard.js`)
+  and mobile (`mobile.js`) now register `visibilitychange`
+  listeners that force an immediate `refresh()` on tab return.
+  Browsers throttle `setInterval` to ~1Hz when hidden; without this,
+  users see stale data for up to one full refresh cycle on focus.
 - `runtime.max_consecutive_quote_failures` (default `5`) — per-symbol
   quote-fetch failure threshold on `MarketDataStore`. After the
   threshold is crossed, the symbol is silenced from quote refresh for
@@ -71,6 +137,49 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `_cycle_sleep_seconds()` now picks between `runtime.loop_sleep_seconds`
+  (fast) inside the 7am-8pm ET stream window and
+  `runtime.idle_sleep_seconds` (idle) outside it. Every Schwab equity
+  order session lies entirely within the stream window, so "stream
+  off" implies "no order session" — no third cadence to handle.
+- `dashboard_recent_trade_markers()` and `dashboard_symbol_trade_signature()`
+  now filter trades by symbol BEFORE slicing, and the marker function
+  also filters to today's ET session date. With the old order, a fresh
+  fill on a long-quiet symbol could be invisible (when 12+ other
+  tickers had traded after it) AND would not change the snapshot
+  signature, leaving the cached snapshot stale. Multi-day deque entries
+  also no longer leak yesterday's exits onto today's chart.
+- Chart payload `last_update` is now re-stamped on every cache hit so
+  the frontend's "last update" timestamp doesn't freeze for the
+  lifetime of a cached payload. Was baked into the deep-copied cache
+  entry and served unchanged.
+- `peer_confirmed_key_levels` preset retuned for always-on operation
+  (`auto_exit_after_session: false`, `startup_reconcile_mode:
+  restore_hybrid` so overnight long holds survive crashes,
+  entry/management/screener windows expanded to `07:00-19:55` ET to
+  span the full Schwab stream window, `time_stop_minutes: 0` so the
+  45-min "scratch if not moving" rule doesn't close runners that
+  cross sessions). The strategy's per-cycle filters (min trigger
+  score, peer agreement, macro net bias) gate low-quality
+  extended-hours candidates organically.
+- All 18 yaml presets now expose the three new always-on knobs
+  (`idle_sleep_seconds`, `symbol_state_prune_seconds`,
+  `session_reconcile_on_resume`). README runtime table + behavior
+  section and `config.example.yaml` updated with explanatory
+  comments.
+- `:hover` rules on `.symbol-card`, `.candidate-tile`,
+  `.position-card`, `.positions-slot`, and `.positions-slot >
+  .positions-panel` now wrap in `@media (hover: hover)` so iOS taps
+  no longer leave cards stuck in the hover-elevated state until the
+  user taps elsewhere. Mouse pointers still get the transitions.
+- Mobile dashboard poll cadence floor raised to 4000ms (vs 2000ms
+  desktop default) — saves cellular radio cycling on phones in a
+  pocket. Server-provided `dashboard.refresh_ms` is honored when
+  it's already slower than the mobile floor.
+- Removed redundant `dashboard_candidate_levels` override in
+  `peer_confirmed_htf_pivots` — it returned `[]` matching the base
+  class default. The HTF strategy's actual dashboard payload flows
+  through `dashboard_overlay_candidates` (unchanged).
 - Removed `BaseStrategy._apply_continuation_fvg_retest_plan` — the
   single-plan apply helper that predated the OR-combine refactor.
   All four remaining callers (`momentum_close`, `opening_range_breakout`,
@@ -155,6 +264,85 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `peer_confirmed_key_levels._select_level` "touched zone" check
+  was a window-wide `low.min() <= price+zone AND high.max() >=
+  price-zone`, which could pass when no individual bar's range
+  actually overlapped the zone — e.g. one bar entirely above + one
+  entirely below the level both contributing their min/max. Replaced
+  with per-bar overlap: `((recent["low"] <= price + zone) &
+  (recent["high"] >= price - zone)).any()`. Trips infrequently in
+  normal markets but can fire during news/fast-spike conditions and
+  cause level selection to pick a zone that wasn't actually tested.
+- `dashboard.js paint()` used `bars[hoverIndex]` / `xFor(hoverIndex)`
+  inside the `activeIndex !== null` block. Today `pinnedIndex` is
+  declared but never reassigned, so the bug doesn't fire — but the
+  moment bar-pinning lands, `paint(null)` with a pinned bar would
+  dereference `bars[null]` and crash the chart. Now uses
+  `activeIndex` consistently for both bar reference and x-coordinate.
+- `dashboard_cache.py log_component_failure` calls in the new OB
+  collection blocks (added with the OB feature) passed the symbol
+  as the printf message instead of as an arg — would log a single
+  unhelpful token and TypeError if a symbol contained `%`. Both call
+  sites now pass `"...failed for %s", symbol` matching the pattern
+  used throughout the file.
+- `data_feed.prune_inactive_symbols` now also evicts the
+  `last_htf_refresh` tuple-keyed dict. Was missed in the original
+  pass — minor leak (one datetime per (symbol, htf_minutes) pair)
+  but unbounded for long multi-day runs.
+- Engine `_cycle_sleep_seconds` collapsed from three branches to two
+  (stream available → fast, else → idle). The third branch — "stream
+  off but order session open" — was unreachable: every Schwab equity
+  order session lies entirely inside the 7am-8pm stream window.
+  Doc-comment narrative referencing a fictional "4am-7am extended-AM"
+  window also rewritten; extended-AM actually starts at
+  `EQUITY_STREAM_START` (7am).
+- Dashboard volume-bar render: `Number(bar.volume || 0)` would coerce
+  the truthy string `"NaN"` to `NaN`, propagate through `Math.sqrt`,
+  and silently skip the bar via the `if (volH > 0)` guard. Now uses
+  `parseFinite(bar.volume)` to convert non-finite inputs to a safe
+  `0`. Cosmetic data loss; no crash.
+- Chart `renderEmpty` now cancels any pending hover-RAF before
+  detaching pointer handlers. Previously a queued
+  `requestAnimationFrame` from the previous chart's hover could fire
+  AFTER the canvas was cleared and handlers reset, drawing ghost
+  data over the new blank state via the stale closure's
+  `paint`/`updateTooltip`.
+- Tap-and-release on touch devices flashed the chart tooltip briefly
+  (pointerdown showed it, pointerleave/pointercancel hid it on finger
+  lift). Both leave/cancel handlers now skip `clearPointerActivity`
+  when `pointerType !== 'mouse'` so the tooltip persists until the
+  next gesture (re-tap or drag). Mouse cursors leaving the canvas
+  still clear immediately.
+- Theme stylesheet `<link>` 404 would unset every CSS variable
+  (`--bg`, `--text`, `--panel-bg`, etc.) and render the page nearly
+  unstyled. Both `dashboard.html` and `mobile.html` now have
+  `onerror="this.remove()"` on the theme stylesheet link so a
+  missing theme.css falls back cleanly to the base styling. Mirrors
+  the existing handling on the optional `theme.js` script tag.
+- Mobile `.position-card` had `cursor: pointer` from the desktop
+  stylesheet but `mobile.js` never wired a click handler — cards
+  looked tappable but did nothing. Added `.m-shell .position-card
+  { cursor: default; -webkit-tap-highlight-color: transparent; }`
+  override, plus `-webkit-tap-highlight-color: transparent` on
+  buttons and metric pills to suppress the iOS tap-flash.
+- Mobile `.panel-meta` (the KPI sub-line "Day PnL ${...} · cash
+  ${...}") wrapped awkwardly with 7-figure equity values. Added
+  `white-space: normal; word-break: break-word; line-height: 1.4`
+  override on `.m-shell .panel-meta`.
+- Mobile `.positions-panel` previously relied on the desktop's
+  `≤1400px` breakpoint to neutralize `position: fixed`. Added
+  explicit `position: relative` override on `.m-shell
+  .positions-panel` so positioning doesn't depend on the desktop's
+  breakpoint contract.
+- Mobile Qty rendering went through `escapeHtml(pos.qty)` which
+  produced literal `"null"` for null qty values. Switched to
+  `fmtInteger(pos.qty)` which renders `—` for null/non-numeric.
+- Chart timestamp formatters (`fmtChartTs`, `formatTimeAxisLabel`,
+  `formatDayAxisLabel`) used implicit browser-local timezone via
+  `toLocaleString`/`toLocaleTimeString`. Server-side bar timestamps
+  are ET-localized; browsers in other timezones rendered chart
+  labels in their local TZ, mislabeling the market clock. All three
+  now pass `timeZone: DASHBOARD_TIMEZONE` ('America/New_York').
 - ORB screener `none`-mode activity score now uses
   `rvol × volume / 1_000_000` (was `rvol × volume`). Ranking is
   mathematically identical, but the rescaled magnitudes match the

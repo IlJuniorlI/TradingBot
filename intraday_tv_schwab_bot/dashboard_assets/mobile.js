@@ -7,10 +7,19 @@
 (function () {
   'use strict';
 
+  // Mobile defaults to a slower cadence than desktop. The desktop value
+  // (typically 2s) is intended for an always-on dashboard window where
+  // freshness matters more than battery; on a phone in a pocket or
+  // briefly checked on the go, the cellular radio cycling every 2s is a
+  // real battery cost. The mobile floor is 4s. The server-provided
+  // refreshMs only takes effect when it's already SLOWER than the mobile
+  // floor — a server value below 4000 will be raised to 4000. Set
+  // dashboard.refresh_ms higher in config to throttle mobile further.
   const DEFAULT_REFRESH_MS = 2000;
-  const MIN_REFRESH_MS = 500;
+  const MOBILE_REFRESH_MS = 4000;
   const cfg = (window.DASHBOARD_CONFIG || {});
-  const refreshMs = Math.max(MIN_REFRESH_MS, Number(cfg.refreshMs) || DEFAULT_REFRESH_MS);
+  const serverRefreshMs = Number(cfg.refreshMs) || DEFAULT_REFRESH_MS;
+  const refreshMs = Math.max(serverRefreshMs, MOBILE_REFRESH_MS);
 
   // ---- formatting helpers (ports of the ones in dashboard.js) ----
 
@@ -249,7 +258,7 @@
         <div class="position-top">
           <div>
             <div class="position-name">${escapeHtml(baseSymbol)}</div>
-            <div class="position-sub">${escapeHtml(fmtSide(pos))} · ${escapeHtml(pos.asset_type || '—')} · Qty ${escapeHtml(pos.qty)}</div>
+            <div class="position-sub">${escapeHtml(fmtSide(pos))} · ${escapeHtml(pos.asset_type || '—')} · Qty ${fmtInteger(pos.qty)}</div>
           </div>
           <div class="price-stack">
             <div class="price-main ${pnlClass(pos.unrealized_pnl)}">${fmtMoney(pos.unrealized_pnl)}</div>
@@ -306,6 +315,14 @@
   function start() {
     fetchState();
     setInterval(fetchState, refreshMs);
+    // Browsers throttle setInterval to ~1Hz when the tab is hidden;
+    // on phones this means re-opening the app shows stale data for
+    // up to one full refreshMs cycle. Force an immediate fetch on
+    // visibility return. The fetch path is idempotent so this is
+    // safe to fire alongside an in-flight interval tick.
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) fetchState();
+    });
   }
 
   if (document.readyState === 'loading') {

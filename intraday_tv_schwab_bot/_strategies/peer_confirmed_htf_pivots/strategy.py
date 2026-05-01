@@ -158,14 +158,6 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
             deduped.append(candidate)
         return deduped
 
-    def dashboard_candidate_levels(
-        self,
-        close: float,
-        htf: HTFContext,
-        side: Side,
-    ) -> list[dict[str, Any]]:
-        return []
-
     def dashboard_select_level(
         self,
         side: Side,

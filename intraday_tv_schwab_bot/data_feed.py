@@ -231,6 +231,58 @@ class MarketDataStore:
     def _htf_key(symbol: str, timeframe_minutes: int) -> tuple[str, int]:
         return str(symbol).upper().strip(), int(timeframe_minutes)
 
+    def prune_inactive_symbols(self, active_symbols: set[str]) -> int:
+        """Drop per-symbol state for symbols not in ``active_symbols``.
+
+        Long-lived multi-day runs accumulate per-symbol entries (history
+        frames, HTF/SR/quote caches) for every symbol the screener has
+        ever returned. Without pruning, RSS grows unbounded as different
+        symbols rotate through the watchlist day to day. The 1m frame
+        alone is ~240KB per symbol at the default 1080-min lookback —
+        500 symbols over a month would be ~120MB just for history.
+
+        Called by the engine after each cycle's watchlist is determined.
+        ``active_symbols`` is the union of streaming symbols + current
+        watchlist + held positions — anything we still care about. A
+        symbol that drops out of all three has no consumer; safe to evict.
+        If it returns to the watchlist later the warmup tracker re-fetches
+        from `price_history` (one round-trip per revival).
+
+        Returns the number of distinct symbols evicted.
+        """
+        active = {self._symbol_key(s) for s in (active_symbols or set()) if s}
+        # Capture victim symbol set from the primary `history` keyspace —
+        # any symbol with state but not active. Then remove it from every
+        # per-symbol dict in one pass so we never leave dangling entries.
+        with self._lock:
+            stale = {sym for sym in self.history.keys() if sym not in active}
+            stale |= {sym for sym in self.live.keys() if sym not in active}
+            stale |= {sym for sym in self.quote_cache.keys() if sym not in active}
+            if not stale:
+                return 0
+            # Single-key dicts
+            for sym in stale:
+                self.history.pop(sym, None)
+                self.live.pop(sym, None)
+                self.quote_cache.pop(sym, None)
+                self.last_history_refresh.pop(sym, None)
+                self.last_quote_refresh.pop(sym, None)
+                self.last_stream_update.pop(sym, None)
+                self.last_stream_bar_time.pop(sym, None)
+                self.last_stream_health_log.pop(sym, None)
+                self.last_empty_history_refresh.pop(sym, None)
+                self._consecutive_quote_failures.pop(sym, None)
+                self._quote_blacklist.pop(sym, None)
+                self._forced_premarket_history_refresh_date.pop(sym, None)
+                self.merge_stats.pop(sym, None)
+                self._stream_seen_symbols.discard(sym)
+            # Tuple-keyed dicts: drop any (sym, *) entry where sym is stale.
+            self.history_htf = {k: v for k, v in self.history_htf.items() if k[0] not in stale}
+            self.htf_cache = {k: v for k, v in self.htf_cache.items() if k[0] not in stale}
+            self.last_htf_refresh = {k: v for k, v in self.last_htf_refresh.items() if k[0] not in stale}
+            self.sr_cache = {k: v for k, v in self.sr_cache.items() if k[0] not in stale}
+        return len(stale)
+
     def begin_cycle(self) -> None:
         with self._lock:
             self._cycle_active = True

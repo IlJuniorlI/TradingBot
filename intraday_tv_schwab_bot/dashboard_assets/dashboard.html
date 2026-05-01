@@ -5,7 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Intraday TV + Schwab Bot</title>
     <link rel="stylesheet" href="/assets/dashboard.css" />
-    <link rel="stylesheet" href="/themes/__THEME__/theme.css" />
+    <!-- Theme stylesheet is optional; if a theme ships without theme.css
+         the link 404s. `onerror` removes the broken <link> so the page
+         keeps the base dashboard.css styling instead of stripping it
+         (which would happen if the browser stalled on the missing
+         resource and skipped paint). Mirrors the theme.js handling on
+         line ~268. -->
+    <link rel="stylesheet" href="/themes/__THEME__/theme.css" onerror="this.remove()" />
 
 </head>
 <body>

@@ -1,6 +1,16 @@
 # Top-level tuned config for peer_confirmed_key_levels.
 # Shipped tuned runtime preset for this strategy.
 # Put SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_ACCOUNT_HASH, SCHWAB_ENCRYPTION_KEY, and TRADINGVIEW_SESSIONID in a .env file at the repo root (see .env.example).
+#
+# TUNING PROFILE: always-on with 7am-8pm trading
+# - runtime.auto_exit_after_session: false  (bot runs across days)
+# - runtime.startup_reconcile_mode: restore_hybrid  (recover overnight holds on restart)
+# - strategies entry/management/screener windows span 07:00-19:55 ET to use
+#   the full Schwab stream + order-acceptance window. The strategy's own
+#   filters (min_trigger_score, peer agreement, macro net bias) gate
+#   low-quality extended-hours candidates.
+# - allow_short: true with force_flatten.long: false / force_flatten.short: true
+#   — longs may be held overnight, shorts are flattened before stream close.
 
 # Active strategy preset to run.
 strategy: peer_confirmed_key_levels
@@ -54,7 +64,10 @@ risk:
   same_level_block_atr_mult: 0.3
   # Time-stop: positions held >= time_stop_minutes with |return_pct| below
   # time_stop_min_return_pct are scratched to free a slot. 0 = disabled.
-  time_stop_minutes: 45
+  # Disabled here because the always-on profile holds longs overnight
+  # (force_flatten.long: false); a 45-min "scratched if not moving"
+  # rule would close runners that just need more time across sessions.
+  time_stop_minutes: 0
   time_stop_min_return_pct: 0.003
   # Peak-giveback floor: once max_favorable_r since entry crosses
   # peak_giveback_min_r (default 1.0), exit when current_r retraces below
@@ -90,8 +103,13 @@ runtime:
   stream_fallback_poll_seconds: 25
   stream_stale_fallback_seconds: 60
   stream_health_log_seconds: 90
-  # Auto-exit: shut down cleanly when market closes and no positions are open
-  auto_exit_after_session: true
+  # Always-on profile: keep the bot running across days so overnight long
+  # holds stay tracked. Set to true if you want the bot to exit cleanly
+  # at session close (and rely on Task Scheduler / cron to restart daily).
+  auto_exit_after_session: false
+  idle_sleep_seconds: 60.0
+  symbol_state_prune_seconds: 1800.0
+  session_reconcile_on_resume: true
   cycle_precompute_workers: 4
   max_consecutive_quote_failures: 5
   # Per-day debug archive: on session shutdown, write
@@ -100,7 +118,12 @@ runtime:
   # using dashboard/post-session analysis tooling.
   export_session_archive: true
   reconcile_on_startup: true
-  startup_reconcile_mode: ignore
+  # restore_hybrid: on startup (and on each new ET trading day via
+  # session_reconcile_on_resume) the bot pulls broker positions and
+  # consults the metadata SQLite store to rebuild stop/target/strategy
+  # context. Required for the always-on profile to survive overnight
+  # crashes — `ignore` would silently drop tracking of held longs.
+  startup_reconcile_mode: restore_hybrid
   startup_order_lookback_days: 2
   startup_reconcile_ignore_symbols: []
   startup_reconcile_metadata_db_path: .logs/startup_reconcile_metadata.sqlite
@@ -423,12 +446,19 @@ options:
 # Strategy-specific windows and tuned parameters.
 strategies:
   peer_confirmed_key_levels:
+    # Schedule windows aligned to the 7am-8pm ET Schwab stream + order
+    # window. End at 19:55 (5 min before 8pm) so the strategy has time
+    # to flatten shorts (`force_flatten.short: true`) before order
+    # acceptance ends at 20:00. Entries and management share the same
+    # window so the strategy can react to extended-hours moves; the
+    # strategy's per-cycle filters (min_trigger_score, peer agreement,
+    # macro net bias) gate low-quality candidates organically.
     entry_windows:
-      - ["09:35", "15:15"]
+      - ["07:00", "19:55"]
     management_windows:
-      - ["09:01", "15:55"]
+      - ["07:00", "19:55"]
     screener_windows:
-      - ["09:01", "15:55"]
+      - ["07:00", "19:55"]
     params:
       tradable:
         - AAPL

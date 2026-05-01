@@ -348,6 +348,24 @@ class RiskConfig:
 class RuntimeConfig:
     timezone: str = "America/New_York"
     loop_sleep_seconds: float = 2.0
+    # When the bot is in "deep idle" (always-on mode with
+    # auto_exit_after_session=false, outside the 7am–8pm ET equity stream
+    # session, and no open positions), the main loop sleeps this long
+    # between cycles instead of `loop_sleep_seconds`. Cuts overnight CPU
+    # waste by ~95% — the loop wakes up every minute to recheck whether
+    # the stream session has started, instead of every 2s. Set to a
+    # value <= loop_sleep_seconds to disable the optimization entirely
+    # (no idle slowdown).
+    idle_sleep_seconds: float = 60.0
+    # How often the engine evicts per-symbol state (history frames, HTF
+    # caches, dashboard snapshot/chart payloads) for symbols that have
+    # dropped out of the active set (streaming + watchlist + open
+    # positions). Long-running multi-day runs accumulate per-symbol
+    # entries — each 1m frame is ~240KB at the default lookback, so 500
+    # symbols seen over a month would be ~120MB just for history.
+    # Pruning runs every cycle on a wall-clock timer so the per-cycle
+    # cost is negligible. Set to 0 to disable pruning entirely.
+    symbol_state_prune_seconds: float = 1800.0
     history_poll_seconds: int = 150
     quote_poll_seconds: int = 6
     quote_cache_seconds: int = 6
@@ -368,6 +386,18 @@ class RuntimeConfig:
     startup_order_lookback_days: int = 2
     startup_reconcile_ignore_symbols: list[str] = field(default_factory=list)
     startup_reconcile_metadata_db_path: str = ".logs/startup_reconcile_metadata.sqlite"
+    # When the bot stays running across ET midnight (always-on operation
+    # with `auto_exit_after_session: false`), re-run the startup reconcile
+    # at the first cycle on each new trading day where streaming is back
+    # online (i.e. the first cycle after 7am ET). Catches positions that
+    # closed overnight via the Schwab app or broker-side stops — without
+    # this, the bot would wake at 7am still believing those positions
+    # are open and try to manage phantoms. Honors the same
+    # `reconcile_on_startup` and `startup_reconcile_mode` knobs as the
+    # startup reconcile (no separate mode). Set to `false` to disable
+    # if you handle reconciliation externally or only run single-day
+    # sessions.
+    session_reconcile_on_resume: bool = True
     auto_exit_after_session: bool = False
     cycle_precompute_workers: int = 4
     # Per-symbol quote-fetch failure threshold. When a symbol fails this
