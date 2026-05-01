@@ -1607,14 +1607,16 @@ function renderSelectedSymbol() {
   const selectedChange = numOrNull(q.percent_change) ?? numOrNull(cand.change_from_open);
   document.getElementById('selected-change').className = `tiny-chip ${pnlClass(selectedChange) === 'good' ? 'tone-good' : (pnlClass(selectedChange) === 'bad' ? 'tone-bad' : 'tone-neutral')}`;
   document.getElementById('selected-change').textContent = `Change ${fmtPct(selectedChange)}`;
+  // Spread pill stays visible across renders to match the sibling pills
+  // (selected-price, selected-change, selected-volume) which always show
+  // their `—` placeholder. Toggling `.hidden` between renders caused the
+  // pill to flicker on/off whenever ask/bid went transiently stale
+  // between stream ticks.
   const spreadEl = document.getElementById('selected-spread');
-  if (spread !== null && Number.isFinite(spread) && spread > 0) {
-    spreadEl.textContent = `Spread ${fmtNum(spread, 3)}`;
-    spreadEl.classList.remove('hidden');
-  } else {
-    spreadEl.textContent = 'Spread —';
-    spreadEl.classList.add('hidden');
-  }
+  spreadEl.classList.remove('hidden');
+  spreadEl.textContent = (spread !== null && Number.isFinite(spread) && spread > 0)
+    ? `Spread ${fmtNum(spread, 3)}`
+    : 'Spread —';
   document.getElementById('selected-volume').textContent = `Vol ${fmtCompact(q.total_volume)}`;
   renderChartTimeframeToggle(data);
   const selectedTvMeta = tradingViewSymbolMeta(snapshot.symbol, exchangeMap, snapshot.exchange);
