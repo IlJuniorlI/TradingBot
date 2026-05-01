@@ -1713,6 +1713,13 @@ function drawSelectedChart(snapshot) {
   }
   let lastTooltipLeft = null;
   let lastTooltipTop = null;
+  // Hoist hover state to the top of drawSelectedChart so renderEmpty
+  // (defined below at ~line 1763) can read/write them on early-return
+  // paths. Previously declared further down — caused a TDZ
+  // ReferenceError when the chart payload had no bars and renderEmpty
+  // ran before the original `let` line was reached.
+  let hoverFrameRequest = 0;
+  let pendingHoverState = null;
   const chartCfg = currentChartProfile(appState.data);
   const isExpandedView = !!appState.mainPanelExpanded;
   const activeViewMode = isExpandedView ? 'expanded' : 'compact';
@@ -2343,8 +2350,9 @@ function drawSelectedChart(snapshot) {
     };
   }
   const tooltipHtmlCache = new Map();
-  let hoverFrameRequest = 0;
-  let pendingHoverState = null;
+  // hoverFrameRequest / pendingHoverState are hoisted to the top of
+  // drawSelectedChart (around line ~1721) so renderEmpty can access
+  // them on early-return paths without hitting the TDZ.
   let pinnedIndex = -1;
 
   function formatTimeAxisLabel(value) {
