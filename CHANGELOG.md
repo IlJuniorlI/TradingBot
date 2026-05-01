@@ -69,7 +69,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shape. Lets microcap squeeze strategies fire on deep retests where
   VWAP/EMA9 lag well above the FVG zone.
 
-### Changed (continued)
+### Changed
 
 - Removed `BaseStrategy._apply_continuation_fvg_retest_plan` — the
   single-plan apply helper that predated the OR-combine refactor.
@@ -95,10 +95,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lost. Per the project's clean-breaks-over-shims convention, the old
   field names are removed entirely from `SupportResistanceConfig` —
   any user configs that still reference them will need to be updated.
-  This mirrors the OB knob consolidation (commit 28558f4).
-
-### Changed
-
+  This mirrors the OB knob consolidation in the same release.
+- Order block context is now cycle-cached on `MarketDataStore` via a
+  new `_cycle_ob_cache` and `get_order_block_context()` method that
+  mirrors the existing FVG cache pattern. Both `BaseStrategy`'s
+  `_one_minute_order_block_context` / `_htf_order_block_context` and
+  `dashboard_cache.py` route through the cache so the same cycle's
+  strategy candidate evaluation and dashboard chart payload share a
+  single OB build per (symbol, timeframe, knob set). Eliminates
+  ~260 redundant `build_order_block_context` calls per minute when
+  strategy + dashboard are both consuming OBs. Cache invalidates on
+  every stream bar (per-symbol) and at cycle boundaries.
 - Engine cycle now threads per-symbol Schwab fetches in parallel.
   History, support/resistance refresh, and quote fallback run via the
   new `_parallel_symbol_map` and `_parallel_quote_fetch` helpers.
@@ -171,6 +178,46 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instead of the obsolete `self._insufficient_bars_reason(...)` /
   `self._safe_float(...)` method calls. Generated plugins from the
   scaffold now match the post-helpers.py-extraction architecture.
+- Order block detection walk-back no longer aborts on the first
+  failed candidate. The `_detect_order_blocks_loose` and
+  `_detect_order_blocks_strict` walk-back loops used `break` when
+  the immediate-prior opposite-color candle failed the size filter
+  or had been invalidated, producing zero detections in cases where
+  a tiny doji-bearish bar sits at idx-1 with a real bearish OB at
+  idx-2+. Replaced with `continue` so the walk-back keeps searching
+  up to `max_distance_back` bars away. Also fixed
+  `_merge_order_blocks` first/last_seen reconciliation: sort is by
+  price (`lower`), so the natural `last.first_seen` reflected
+  price order, not chronology — replaced with explicit
+  `_earlier`/`_later` ISO-timestamp helpers. Cosmetic for
+  metadata; no functional impact on merged zone bounds.
+- Order block knobs were previously defined in
+  `SupportResistanceConfig` but never made it into the shipped
+  yaml files (only the `show_*_order_blocks` chart toggles were
+  added in the OB-rendering commit). The runtime worked via Python
+  field defaults, but anyone reading a preset to discover tunable
+  knobs would not see them. All 14 prod preset yamls + the example
+  yaml now expose the eight OB knobs
+  (`one_minute_order_blocks_enabled`, `htf_order_blocks_enabled`,
+  `order_block_mode`, `order_block_max_per_side`,
+  `order_block_min_atr_mult`, `order_block_min_pct`,
+  `order_block_pivot_span`, `order_block_new_high_lookback`),
+  defaults safe-off.
+- Dashboard `selected-spread` pill no longer flickers between
+  visible and hidden on each refresh. The chip toggled `.hidden`
+  whenever `q.ask` or `q.bid` went transiently stale between
+  stream ticks, causing the surrounding chip strip to jitter.
+  Aligned with the sibling pills (`selected-price`,
+  `selected-change`, `selected-volume`) which always stay visible
+  and show their `—` placeholder when data is missing.
+- Three IDE / type-checker warnings cleaned up: redundant
+  `self.stream = None` between `close()` and reassignment in the
+  date-rolling log handler in `utils.py` (type-checker complaint
+  about `None` for `SupportsWrite[str]`); two unused `symbol` /
+  `data` parameters on `_one_minute_order_block_context` (the 1m
+  OB context now reads from the data store cache when available,
+  so the params are wired through). The HTF sibling
+  `_htf_order_block_context` continues to consume both params.
 
 ## [1.0.0] — 2026-04-24
 
