@@ -1240,7 +1240,7 @@ class BaseStrategy:
         close = float(close or 0.0)
         if close <= 0:
             return out
-        ob_ctx = self._one_minute_order_block_context(frame)
+        ob_ctx = self._one_minute_order_block_context(symbol, frame, data)
         same_ob = getattr(ob_ctx, "nearest_bullish_ob", None) if side == Side.LONG else getattr(ob_ctx, "nearest_bearish_ob", None)
         opposing_ob = getattr(ob_ctx, "nearest_bearish_ob", None) if side == Side.LONG else getattr(ob_ctx, "nearest_bullish_ob", None)
         same_info = self._fvg_gap_state(same_ob, close)
@@ -1599,16 +1599,31 @@ class BaseStrategy:
             "new_high_lookback": int(self._support_resistance_setting("order_block_new_high_lookback", 8) or 8),
         }
 
-    def _one_minute_order_block_context(self, frame: pd.DataFrame | None) -> OrderBlockContext:
-        """1m order block context. No symbol/data params — unlike FVG and HTF
-        OB, the 1m OB context is computed inline from the per-symbol frame
-        already in scope and doesn't consult any data-store cache. Add params
-        back if/when MarketDataStore gains a `get_order_block_context` cache."""
+    def _one_minute_order_block_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> OrderBlockContext:
+        """1m order block context. Routes through `data.get_order_block_context`
+        when available (cycle-cached, avoids redundant builds across multiple
+        candidates per cycle and the dashboard). Falls back to inline
+        `build_order_block_context` when there's no data store available."""
         current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
         knobs = self._order_block_tuning_knobs()
         mode = knobs["mode"]
         if not bool(self._support_resistance_setting("one_minute_order_blocks_enabled", False)):
             return empty_order_block_context(current_price, timeframe_minutes=1, mode=mode)
+        if data is not None and hasattr(data, "get_order_block_context") and symbol:
+            try:
+                return data.get_order_block_context(
+                    symbol,
+                    timeframe_minutes=1,
+                    current_price=current_price,
+                    mode=mode,
+                    max_per_side=knobs["max_per_side"],
+                    min_block_atr_mult=knobs["min_atr_mult"],
+                    min_block_pct=knobs["min_pct"],
+                    pivot_span=knobs["pivot_span"],
+                    new_high_lookback=knobs["new_high_lookback"],
+                )
+            except Exception:
+                LOG.debug("Failed to load cached order block context for %s; recomputing from frame.", symbol, exc_info=True)
         if frame is None or frame.empty:
             return empty_order_block_context(current_price, timeframe_minutes=1, mode=mode)
         return build_order_block_context(
@@ -1628,13 +1643,32 @@ class BaseStrategy:
         `support_resistance.htf_order_blocks_enabled: true`. Uses the same
         tuning knobs as 1m OBs; the only difference is the input frame is
         resampled to the HTF timeframe (default 15m via
-        `support_resistance.timeframe_minutes`)."""
+        `support_resistance.timeframe_minutes`).
+
+        Routes through `data.get_order_block_context` when available so the
+        HTF resample + OB detection is shared with the dashboard via the
+        cycle-scoped cache."""
         current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
         knobs = self._order_block_tuning_knobs()
         mode = knobs["mode"]
         htf_minutes = self._sr_timeframe_minutes()
         if not bool(self._support_resistance_setting("htf_order_blocks_enabled", False)):
             return empty_order_block_context(current_price, timeframe_minutes=htf_minutes, mode=mode)
+        if data is not None and hasattr(data, "get_order_block_context") and symbol:
+            try:
+                return data.get_order_block_context(
+                    symbol,
+                    timeframe_minutes=htf_minutes,
+                    current_price=current_price,
+                    mode=mode,
+                    max_per_side=knobs["max_per_side"],
+                    min_block_atr_mult=knobs["min_atr_mult"],
+                    min_block_pct=knobs["min_pct"],
+                    pivot_span=knobs["pivot_span"],
+                    new_high_lookback=knobs["new_high_lookback"],
+                )
+            except Exception:
+                LOG.debug("Failed to load cached HTF order block context for %s; recomputing from frame.", symbol, exc_info=True)
         if frame is None or frame.empty:
             return empty_order_block_context(current_price, timeframe_minutes=htf_minutes, mode=mode)
         htf_frame = self._resampled_frame(frame, htf_minutes, symbol=symbol, data=data)

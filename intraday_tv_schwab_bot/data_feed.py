@@ -41,6 +41,7 @@ except Exception:  # pragma: no cover - test/import fallback when schwabdev is u
 from .config import BotConfig
 from .support_resistance import SupportResistanceContext, build_support_resistance_context
 from .htf_levels import HTFContext, FairValueGapContext, build_fair_value_gap_context, build_htf_context, empty_fvg_context
+from .order_blocks import OrderBlockContext, build_order_block_context, empty_order_block_context
 from .utils import EQUITY_STREAM_HISTORY_REFRESH_READY, call_schwab_client, ensure_ohlcv_frame, ensure_standard_indicator_frame, floor_minute, get_runtime_timezone_name, is_equity_stream_session, is_regular_equity_session, is_weekday_session_day, now_et, resample_bars
 
 LOG = logging.getLogger(__name__)
@@ -121,6 +122,7 @@ class MarketDataStore:
         self._cycle_merged_cache: dict[tuple[str, str, bool], pd.DataFrame] = {}
         self._cycle_htf_context_cache: dict[tuple, HTFContext | None] = {}
         self._cycle_fvg_cache: dict[tuple, FairValueGapContext] = {}
+        self._cycle_ob_cache: dict[tuple, OrderBlockContext] = {}
         self._cycle_sr_cache: dict[tuple, SupportResistanceContext | None] = {}
 
     @staticmethod
@@ -235,6 +237,7 @@ class MarketDataStore:
             self._cycle_merged_cache.clear()
             self._cycle_htf_context_cache.clear()
             self._cycle_fvg_cache.clear()
+            self._cycle_ob_cache.clear()
             self._cycle_sr_cache.clear()
 
     def end_cycle(self) -> None:
@@ -243,6 +246,7 @@ class MarketDataStore:
             self._cycle_merged_cache.clear()
             self._cycle_htf_context_cache.clear()
             self._cycle_fvg_cache.clear()
+            self._cycle_ob_cache.clear()
             self._cycle_sr_cache.clear()
 
     def _invalidate_cycle_symbol(self, symbol: str) -> None:
@@ -255,6 +259,9 @@ class MarketDataStore:
             fvg_victims = [k for k in self._cycle_fvg_cache if k[0] == cache_key]
             for k in fvg_victims:
                 del self._cycle_fvg_cache[k]
+            ob_victims = [k for k in self._cycle_ob_cache if k[0] == cache_key]
+            for k in ob_victims:
+                del self._cycle_ob_cache[k]
 
     def _invalidate_cycle_htf(self, symbol: str, timeframe_minutes: int | None = None) -> None:
         cache_key = self._symbol_key(symbol)
@@ -667,6 +674,74 @@ class MarketDataStore:
         with self._lock:
             if self._cycle_active:
                 self._cycle_fvg_cache[cache_key] = copy.deepcopy(ctx)
+        return copy.deepcopy(ctx)
+
+    def get_order_block_context(
+        self,
+        symbol: str,
+        *,
+        timeframe_minutes: int = 1,
+        current_price: float | None = None,
+        mode: str = "loose",
+        max_per_side: int = 4,
+        min_block_atr_mult: float = 0.05,
+        min_block_pct: float = 0.0005,
+        pivot_span: int = 2,
+        new_high_lookback: int = 8,
+    ) -> OrderBlockContext:
+        """Cycle-cached order block context — mirror of `get_fair_value_gap_context`.
+
+        For 1m OBs, ``timeframe_minutes=1`` and the merged 1m frame is used.
+        For HTF OBs (e.g. 15m), the merged frame is fetched at that timeframe
+        via ``get_merged(symbol, timeframe=f'{tf}min')``.
+
+        Cache invalidates per-symbol on every new stream bar via
+        ``_invalidate_cycle_symbol`` and on cycle boundaries via
+        ``begin_cycle`` / ``end_cycle``. Identical lifetime to the FVG cache.
+        """
+        cache_key = (
+            self._symbol_key(symbol),
+            int(timeframe_minutes),
+            None if current_price is None else round(float(current_price), 8),
+            str(mode or "loose").strip().lower() or "loose",
+            int(max_per_side),
+            round(float(min_block_atr_mult), 6),
+            round(float(min_block_pct), 6),
+            int(pivot_span),
+            int(new_high_lookback),
+        )
+        with self._lock:
+            if self._cycle_active and cache_key in self._cycle_ob_cache:
+                return copy.deepcopy(self._cycle_ob_cache[cache_key])
+        # Fetch the right frame: 1m via get_merged(no timeframe), HTF via the
+        # explicit timeframe lookup that triggers internal resampling.
+        tf = max(1, int(timeframe_minutes))
+        if tf == 1:
+            merged = self.get_merged(symbol, with_indicators=True)
+        else:
+            merged = self.get_merged(symbol, timeframe=f"{tf}min", with_indicators=True)
+        if merged is None or merged.empty:
+            ctx = empty_order_block_context(
+                float(current_price or 0.0),
+                timeframe_minutes=tf,
+                mode=str(mode or "loose"),
+            )
+        else:
+            close = float(current_price if current_price is not None else merged.iloc[-1].get("close", 0.0) or 0.0)
+            ctx = build_order_block_context(
+                merged,
+                timeframe_minutes=tf,
+                current_price=close,
+                mode=str(mode or "loose"),
+                max_per_side=max(0, int(max_per_side or 0)),
+                min_block_atr_mult=float(min_block_atr_mult),
+                min_block_pct=float(min_block_pct),
+                pivot_span=int(pivot_span),
+                new_high_lookback=int(new_high_lookback),
+            )
+        with self._lock:
+            if self._cycle_active:
+                self._cycle_ob_cache[cache_key] = copy.deepcopy(ctx)
         return copy.deepcopy(ctx)
 
     def get_htf_frame(

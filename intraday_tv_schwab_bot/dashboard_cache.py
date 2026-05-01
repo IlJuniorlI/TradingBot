@@ -41,7 +41,6 @@ from .chart_patterns import analyze_chart_pattern_context
 from .config import DashboardChartConfig, DashboardChartingConfig
 from .htf_levels import summarize_htf_trend
 from .models import Side
-from .order_blocks import build_order_block_context
 from .support_resistance import build_support_resistance_context, zone_flip_confirmed
 from .technical_levels import build_technical_levels_context
 from .utils import now_et, resample_bars
@@ -912,64 +911,67 @@ class DashboardCache:
         # is reused since it's shape-driven, not type-driven. Frontend reads
         # `htf_order_blocks` and `one_minute_order_blocks` separately and renders
         # them with dashed-stroke styling vs FVGs' solid-fill styling.
+        # Pull tuning knobs once for both blocks below.
+        sr_cfg = getattr(self.config, "support_resistance", None)
+        ob_kwargs = dict(
+            mode=str(getattr(sr_cfg, "order_block_mode", "loose") or "loose"),
+            max_per_side=int(getattr(sr_cfg, "order_block_max_per_side", 4) or 4),
+            min_block_atr_mult=float(getattr(sr_cfg, "order_block_min_atr_mult", 0.05) or 0.05),
+            min_block_pct=float(getattr(sr_cfg, "order_block_min_pct", 0.0005) or 0.0005),
+            pivot_span=int(getattr(sr_cfg, "order_block_pivot_span", 2) or 2),
+            new_high_lookback=int(getattr(sr_cfg, "order_block_new_high_lookback", 8) or 8),
+        ) if sr_cfg is not None else None
+
         htf_order_blocks: list[dict[str, Any]] = []
         try:
-            sr_cfg = getattr(self.config, "support_resistance", None)
             include_htf_obs = bool(getattr(sr_cfg, "htf_order_blocks_enabled", False)) if sr_cfg is not None else False
             chart_wants_htf_obs = bool(compact_chart_profile.show_htf_order_blocks) or bool(expanded_chart_profile.show_htf_order_blocks)
-            if include_htf_obs and chart_wants_htf_obs and self.data is not None:
+            if include_htf_obs and chart_wants_htf_obs and self.data is not None and ob_kwargs is not None:
                 htf_minutes = self._active_sr_timeframe_minutes()
-                htf_frame = self.data.get_merged(symbol, timeframe=f"{int(htf_minutes)}min", with_indicators=True)
-                if htf_frame is not None and not htf_frame.empty:
-                    ob_ctx_htf = build_order_block_context(
-                        htf_frame,
-                        timeframe_minutes=htf_minutes,
-                        current_price=current_price,
-                        mode=str(getattr(sr_cfg, "order_block_mode", "loose") or "loose"),
-                        max_per_side=int(getattr(sr_cfg, "order_block_max_per_side", 4) or 4),
-                        min_block_atr_mult=float(getattr(sr_cfg, "order_block_min_atr_mult", 0.05) or 0.05),
-                        min_block_pct=float(getattr(sr_cfg, "order_block_min_pct", 0.0005) or 0.0005),
-                        pivot_span=int(getattr(sr_cfg, "order_block_pivot_span", 2) or 2),
-                        new_high_lookback=int(getattr(sr_cfg, "order_block_new_high_lookback", 8) or 8),
-                    )
-                    for ob in list(getattr(ob_ctx_htf, "bullish_obs", []) or []) + list(getattr(ob_ctx_htf, "bearish_obs", []) or []):
-                        payload_ob = dashboard_fvg_payload(ob)
-                        if payload_ob is not None:
-                            payload_ob["timeframe"] = f"{int(htf_minutes)}m"
-                            payload_ob["kind"] = "ob"
-                            payload_ob["mode"] = str(getattr(ob_ctx_htf, "mode", "loose") or "loose")
-                            htf_order_blocks.append(payload_ob)
+                # Cycle-cached: hits get_order_block_context's cache when the
+                # strategy already computed it earlier in the same cycle.
+                ob_ctx_htf = self.data.get_order_block_context(
+                    symbol,
+                    timeframe_minutes=htf_minutes,
+                    current_price=current_price,
+                    **ob_kwargs,
+                )
+                for ob in list(getattr(ob_ctx_htf, "bullish_obs", []) or []) + list(getattr(ob_ctx_htf, "bearish_obs", []) or []):
+                    payload_ob = dashboard_fvg_payload(ob)
+                    if payload_ob is not None:
+                        payload_ob["timeframe"] = f"{int(htf_minutes)}m"
+                        payload_ob["kind"] = "ob"
+                        payload_ob["mode"] = str(getattr(ob_ctx_htf, "mode", "loose") or "loose")
+                        htf_order_blocks.append(payload_ob)
         except Exception:
             self.log_component_failure("htf_order_blocks_collect", symbol)
             htf_order_blocks = []
 
         one_minute_order_blocks: list[dict[str, Any]] = []
         try:
-            sr_cfg = getattr(self.config, "support_resistance", None)
             include_one_minute_obs = bool(getattr(sr_cfg, "one_minute_order_blocks_enabled", False)) if sr_cfg is not None else False
             chart_wants_one_minute_obs = bool(compact_chart_profile.show_1m_order_blocks) or bool(expanded_chart_profile.show_1m_order_blocks)
-            if include_one_minute_obs and chart_wants_one_minute_obs and self.data is not None:
+            if include_one_minute_obs and chart_wants_one_minute_obs and self.data is not None and ob_kwargs is not None:
+                # Cycle-cached: same cache as the strategy uses when it calls
+                # `_one_minute_order_block_context` during entry evaluation.
+                ob_ctx_1m = self.data.get_order_block_context(
+                    symbol,
+                    timeframe_minutes=1,
+                    current_price=current_price,
+                    **ob_kwargs,
+                )
+                # We still need an in-scope 1m frame for the anchor_abs_index
+                # lookup that drives chart placement; the OB context alone
+                # doesn't carry frame indices.
                 one_minute_frame = frame if frame is not None and not frame.empty else self.data.get_merged(symbol, with_indicators=True)
-                if one_minute_frame is not None and not one_minute_frame.empty:
-                    ob_ctx_1m = build_order_block_context(
-                        one_minute_frame,
-                        timeframe_minutes=1,
-                        current_price=current_price,
-                        mode=str(getattr(sr_cfg, "order_block_mode", "loose") or "loose"),
-                        max_per_side=int(getattr(sr_cfg, "order_block_max_per_side", 4) or 4),
-                        min_block_atr_mult=float(getattr(sr_cfg, "order_block_min_atr_mult", 0.05) or 0.05),
-                        min_block_pct=float(getattr(sr_cfg, "order_block_min_pct", 0.0005) or 0.0005),
-                        pivot_span=int(getattr(sr_cfg, "order_block_pivot_span", 2) or 2),
-                        new_high_lookback=int(getattr(sr_cfg, "order_block_new_high_lookback", 8) or 8),
-                    )
-                    for ob in list(getattr(ob_ctx_1m, "bullish_obs", []) or []) + list(getattr(ob_ctx_1m, "bearish_obs", []) or []):
-                        payload_ob = dashboard_fvg_payload(ob)
-                        if payload_ob is not None:
-                            payload_ob["timeframe"] = "1m"
-                            payload_ob["kind"] = "ob"
-                            payload_ob["mode"] = str(getattr(ob_ctx_1m, "mode", "loose") or "loose")
-                            payload_ob["anchor_abs_index"] = dashboard_fvg_anchor_abs_index(one_minute_frame, payload_ob.get("first_seen"))
-                            one_minute_order_blocks.append(payload_ob)
+                for ob in list(getattr(ob_ctx_1m, "bullish_obs", []) or []) + list(getattr(ob_ctx_1m, "bearish_obs", []) or []):
+                    payload_ob = dashboard_fvg_payload(ob)
+                    if payload_ob is not None:
+                        payload_ob["timeframe"] = "1m"
+                        payload_ob["kind"] = "ob"
+                        payload_ob["mode"] = str(getattr(ob_ctx_1m, "mode", "loose") or "loose")
+                        payload_ob["anchor_abs_index"] = dashboard_fvg_anchor_abs_index(one_minute_frame, payload_ob.get("first_seen"))
+                        one_minute_order_blocks.append(payload_ob)
         except Exception:
             self.log_component_failure("one_minute_order_blocks_collect", symbol)
             one_minute_order_blocks = []
