@@ -680,6 +680,22 @@ function syncExpandedChartFromBaseSnapshot(data = appState.data) {
   if (!mergedBars.length) return false;
   const changed = chartBarsSignature(mergedBars) !== chartBarsSignature(currentBars);
   const mode = expandedChartTimeframeMode();
+  // Preserve patterns/structureOverlay from the existing chart cache
+  // when the state snapshot doesn't carry them. The state-level snapshot
+  // payload (snapshot.chart) NEVER includes `patterns` — that field is
+  // only populated by /api/chart fetches via ensureExpandedChartBars.
+  // Without this fallback, every state poll wipes
+  // appState.expandedChart.patterns to {} for expanded LTF view (this
+  // function only runs for LTF, see line ~664), causing the tooltip
+  // pattern section to render empty until the next /api/chart fetch
+  // re-populates them. Compact version (syncCompactChartFromBaseSnapshot
+  // line ~740) already does this.
+  const existingPatterns = (cached && typeof cached === 'object' ? cached.patterns : null)
+    || appState.expandedChart.patterns
+    || {};
+  const existingStructureOverlay = (cached && typeof cached === 'object' ? cached.structureOverlay : null)
+    || appState.expandedChart.structureOverlay
+    || {};
   const cacheEntry = {
     bars: mergedBars,
     lastBarTs: safe(mergedBars[mergedBars.length - 1]?.ts),
@@ -687,8 +703,8 @@ function syncExpandedChartFromBaseSnapshot(data = appState.data) {
     maxBars,
     timeframeMode: mode,
     timeframeLabel: expandedChartTimeframeLabel(data, mode),
-    patterns: snapshot?.chart?.patterns || {},
-    structureOverlay: snapshot?.chart?.structure_overlay || {},
+    patterns: snapshot?.chart?.patterns || existingPatterns,
+    structureOverlay: snapshot?.chart?.structure_overlay || existingStructureOverlay,
     htfRefreshToken: null,
     stateLastUpdate: safe(data?.last_update),
     updatedAt: Date.now(),
