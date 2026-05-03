@@ -830,21 +830,32 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             },
         }
 
-    def _fetch_filtered_contracts(self, client, symbol: str, put_call: str) -> list[OptionContract]:
+    def _fetch_raw_option_chain(self, client, symbol: str) -> list[OptionContract]:
+        # Return the full unfiltered 0DTE option chain for `symbol`.
+        # Reads from the per-symbol cache when warm; on miss, issues one
+        # Schwab option_chains call, parses, caches, and returns the
+        # result. Pure I/O + cache plumbing — no put/call or
+        # liquidity filter applied. Use _fetch_filtered_contracts when
+        # you need a filtered list; use this when you only want to warm
+        # the cache.
+        cached = self._get_cached_option_chain(symbol)
+        if cached is not None:
+            return cached
         today = now_et().date()
-        contracts = self._get_cached_option_chain(symbol)
-        if contracts is None:
-            response = call_schwab_client(client, "option_chains",
-                symbol=symbol,
-                contractType="ALL",
-                strikeCount=12,
-                includeUnderlyingQuote=True,
-                fromDate=today,
-                toDate=today,
-            )
-            payload = response.json()
-            contracts = parse_option_chain(payload, only_dte=0)
-            self._set_cached_option_chain(symbol, contracts)
+        response = call_schwab_client(client, "option_chains",
+            symbol=symbol,
+            contractType="ALL",
+            strikeCount=12,
+            includeUnderlyingQuote=True,
+            fromDate=today,
+            toDate=today,
+        )
+        contracts = parse_option_chain(response.json(), only_dte=0)
+        self._set_cached_option_chain(symbol, contracts)
+        return contracts
+
+    def _fetch_filtered_contracts(self, client, symbol: str, put_call: str) -> list[OptionContract]:
+        contracts = self._fetch_raw_option_chain(client, symbol)
         filtered = filter_contracts(
             contracts,
             put_call=put_call,
@@ -874,10 +885,10 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
 
         def _warm(sym: str) -> None:
             try:
-                # Any put_call works — _fetch_filtered_contracts populates
-                # the symbol-keyed cache as a side-effect; the filtered
-                # CALL list returned here is discarded.
-                self._fetch_filtered_contracts(client, sym, "CALL")
+                # I/O-only path: populate the symbol-keyed cache without
+                # running the put/call + liquidity filter (those are
+                # parameterised per build call and don't affect the cache).
+                self._fetch_raw_option_chain(client, sym)
             except Exception as exc:
                 LOG.warning("Option chain prefetch failed for %s: %s", sym, exc)
 

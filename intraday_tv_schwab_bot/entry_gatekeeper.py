@@ -279,9 +279,10 @@ class EntryGatekeeper:
     # ------------------------------------------------------------------
     # Broker position-query helpers (wrap schwabdev calls). Exit recovery
     # in PositionManager also uses these — injected as callables there.
-    # All callers within a single engine.step() share one cached snapshot
-    # via _get_cycle_positions(); cache is invalidated at begin_cycle()
-    # and end_cycle().
+    # By default, all callers within a single engine.step() share one
+    # cached snapshot via _get_cycle_positions(); cache is invalidated at
+    # begin_cycle() and end_cycle(). Pass force_refresh=True to bypass
+    # the cache and issue a fresh account_details fetch.
     # ------------------------------------------------------------------
 
     def begin_cycle(self) -> None:
@@ -296,6 +297,18 @@ class EntryGatekeeper:
         self._cycle_positions_cache = None
         self._cycle_positions_failed = False
 
+    def _fetch_broker_positions_uncached(self) -> list[dict[str, Any]] | None:
+        # Issue an unconditional account_details fetch, bypassing the
+        # cycle cache. Used by force_refresh callers and as the underlying
+        # implementation of the cycle-cached path. Returns None on Schwab
+        # failure to match the legacy broker_position_row contract.
+        try:
+            account = call_schwab_client(self.client, "account_details", self.executor.account_hash, fields="positions").json()
+            return extract_broker_positions(account)
+        except Exception as exc:
+            LOG.warning("Could not query broker position snapshot: %s", exc)
+            return None
+
     def _get_cycle_positions(self) -> list[dict[str, Any]] | None:
         # Return the broker positions list for the current cycle, fetching
         # once if not yet cached. Returns None if the fetch failed (caller
@@ -307,21 +320,23 @@ class EntryGatekeeper:
             return None
         if self._cycle_positions_cache is not None:
             return self._cycle_positions_cache
-        try:
-            account = call_schwab_client(self.client, "account_details", self.executor.account_hash, fields="positions").json()
-            rows = extract_broker_positions(account)
-        except Exception as exc:
-            LOG.warning("Could not query broker position snapshot: %s", exc)
+        rows = self._fetch_broker_positions_uncached()
+        if rows is None:
             self._cycle_positions_failed = True
             return None
         self._cycle_positions_cache = rows
         return rows
 
-    def broker_position_row(self, symbol: str) -> dict[str, Any] | None:
+    def broker_position_row(self, symbol: str, *, force_refresh: bool = False) -> dict[str, Any] | None:
+        # Default: returns the row from the cycle-cached snapshot
+        # (account_details fetched at most once per engine.step()).
+        # force_refresh=True bypasses the cache and issues a fresh fetch
+        # — use only when the cycle-start snapshot would be misleading
+        # (e.g., post-place_order verification before the next cycle).
         symbol_upper = str(symbol or "").upper().strip()
         if not symbol_upper:
             return None
-        rows = self._get_cycle_positions()
+        rows = self._fetch_broker_positions_uncached() if force_refresh else self._get_cycle_positions()
         if rows is None:
             return None
         for row in rows:
@@ -330,11 +345,13 @@ class EntryGatekeeper:
                 return row
         return None
 
-    def broker_position_rows(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
+    def broker_position_rows(self, symbols: list[str], *, force_refresh: bool = False) -> dict[str, dict[str, Any]]:
+        # Same snapshot semantics as broker_position_row — see its
+        # docstring for the force_refresh contract.
         wanted = {str(symbol or "").upper().strip() for symbol in (symbols or []) if str(symbol or "").strip()}
         if not wanted:
             return {}
-        rows = self._get_cycle_positions()
+        rows = self._fetch_broker_positions_uncached() if force_refresh else self._get_cycle_positions()
         if rows is None:
             return {}
         out: dict[str, dict[str, Any]] = {}
