@@ -24,7 +24,7 @@ machinery in `BaseStrategy` works on order blocks unchanged.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import logging
 
 import pandas as pd
@@ -77,7 +77,7 @@ def empty_order_block_context(
     )
 
 
-def _ob_strength_score(ob: OrderBlock, atr: float) -> float:
+def _ob_strength_score(ob: OrderBlock, atr: float, *, age_bars: int | None = None) -> float:
     """Composite strength score for ranking. Higher = stronger.
 
     Four factors, each independently floored / capped so no single
@@ -93,6 +93,12 @@ def _ob_strength_score(ob: OrderBlock, atr: float) -> float:
     - **validity** (1 - filled_pct): heavily penalize OBs that are
       mostly filled.
 
+    ``age_bars`` is accepted as an explicit kwarg so the score can be
+    computed BEFORE the OB instance has its ``age_bars`` field
+    populated — useful when constructing a new instance via
+    ``dataclasses.replace`` rather than mutating the existing one.
+    Falls back to ``ob.age_bars`` when not passed.
+
     The sort uses ``-strength_score`` so OBs from genuine large moves
     (high size + high thrust) outrank fresh small OBs (low size + low
     thrust + low age) even when the small ones are closer to current
@@ -102,7 +108,8 @@ def _ob_strength_score(ob: OrderBlock, atr: float) -> float:
     size_atr = ob.size / max(atr, 1e-9)
     size_score = min(2.0, size_atr / 0.5)            # 1.0 at 0.5×ATR, capped at 2.0
     thrust_score = min(2.0, ob.thrust_atr / 0.75) if ob.thrust_atr > 0 else 0.5
-    age_score = min(1.5, max(0.5, ob.age_bars / 20.0))
+    effective_age = int(age_bars) if age_bars is not None else int(ob.age_bars)
+    age_score = min(1.5, max(0.5, effective_age / 20.0))
     validity = max(0.1, 1.0 - ob.filled_pct)
     return float(size_score * thrust_score * age_score * validity)
 
@@ -551,13 +558,32 @@ def build_order_block_context(
     merge_tol = max(min_size * 0.25, ref_close * 0.00025, 1e-8)
     bullish = _merge_order_blocks(bullish_raw, tolerance=merge_tol)
     bearish = _merge_order_blocks(bearish_raw, tolerance=merge_tol)
-    # Compute age + strength for every merged OB. age_bars is
-    # bars-since-anchor-to-end-of-frame; older still-valid OBs score
-    # higher in strength (proven respect over time).
+    # Enrich every merged OB with computed age_bars + strength_score
+    # via dataclasses.replace() rather than in-place attribute
+    # assignment. Reasons:
+    #   - PyCharm's static analyzer flags `ob.age_bars = ...` on a
+    #     slotted dataclass with "Invalid usage of attribute(s) on
+    #     classes with __slots__ definitions" because it can't always
+    #     resolve the auto-generated __slots__ from `slots=True`.
+    #   - More importantly, in-place mutation is fragile design — any
+    #     future refactor that drops these fields from the dataclass
+    #     would silently work in some paths and fail in others.
+    #     `replace()` builds a new instance via the dataclass
+    #     constructor, so missing fields fail loudly at construction.
+    # age_bars is bars-since-anchor-to-end-of-frame; older still-valid
+    # OBs score higher in strength (proven respect over time).
     n = len(base)
-    for ob in bullish + bearish:
-        ob.age_bars = max(0, n - 1 - int(ob.anchor_index))
-        ob.strength_score = _ob_strength_score(ob, atr)
+
+    def _enriched(ob: OrderBlock) -> OrderBlock:
+        age = max(0, n - 1 - int(ob.anchor_index))
+        return replace(
+            ob,
+            age_bars=age,
+            strength_score=_ob_strength_score(ob, atr, age_bars=age),
+        )
+
+    bullish = [_enriched(ob) for ob in bullish]
+    bearish = [_enriched(ob) for ob in bearish]
     # Strength-first sort. Closer-to-price as deterministic tiebreaker
     # so two equally-strong OBs render in distance order.
     bullish.sort(key=lambda ob: (-ob.strength_score, _ob_distance("bullish", ob, ref_close)))
