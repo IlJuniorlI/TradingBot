@@ -178,7 +178,7 @@ cd ~/TradingBot
 # Ctrl+C once tokens are saved.
 
 # Then SCP to the server:
-scp .schwabdev/tokens.db joseph@server:~/TradingBot/.schwabdev/
+scp .schwabdev/tokens.db <user>@<server>:~/TradingBot/.schwabdev/
 
 # Important: the SCHWAB_ENCRYPTION_KEY values must MATCH between machines.
 # Copy the same value into ~/TradingBot/.env on the server.
@@ -320,7 +320,7 @@ to `127.0.0.1:8765`. Don't change this unless you know what you're doing.
 
 From your laptop:
 ```bash
-ssh -L 8765:localhost:8765 joseph@server
+ssh -L 8765:localhost:8765 <user>@<server>
 # then open http://localhost:8765 in your browser
 # (or https://localhost:8765 if dashboard.https is true — see Option C)
 ```
@@ -550,7 +550,7 @@ Common causes:
 - Wrong `WorkingDirectory` — must be the bot's repo root, where
   `configs/config.yaml` is reachable
 - `.env` not readable by your user (check `ls -la ~/TradingBot/.env`,
-  should be `-rw------- joseph joseph`)
+  should be `-rw------- <user> <user>`)
 - `python3.11` install path mismatch — confirm the venv's Python works
   outside systemd: `~/TradingBot/.venv/bin/python -c "print('ok')"`
 - Missing `loginctl enable-linger $USER` — service exits when you log out
