@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from ..shared import (
     ASSET_TYPE_OPTION_VERTICAL,
     Any,
@@ -177,7 +179,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         return str(symbol).upper().strip(), now_et().date().isoformat()
 
     def _get_cached_option_chain(self, symbol: str) -> list[OptionContract] | None:
-        ttl = max(0, int(getattr(self.optcfg, "option_chain_cache_seconds", 8) or 0))
+        ttl = max(0, int(self.optcfg.option_chain_cache_seconds))
         if ttl <= 0:
             return None
         key = self._option_chain_cache_key(symbol)
@@ -191,14 +193,14 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         return list(contracts)
 
     def _set_cached_option_chain(self, symbol: str, contracts: list[OptionContract]) -> None:
-        ttl = max(0, int(getattr(self.optcfg, "option_chain_cache_seconds", 8) or 0))
+        ttl = max(0, int(self.optcfg.option_chain_cache_seconds))
         if ttl <= 0:
             return
         key = self._option_chain_cache_key(symbol)
         if key in self._option_chain_cache:
             self._option_chain_cache.pop(key, None)
         self._option_chain_cache[key] = (now_et(), list(contracts))
-        max_entries = max(1, int(getattr(self.optcfg, "option_chain_cache_max_entries", 24) or 24))
+        max_entries = max(1, int(self.optcfg.option_chain_cache_max_entries))
         while len(self._option_chain_cache) > max_entries:
             oldest = next(iter(self._option_chain_cache))
             self._option_chain_cache.pop(oldest, None)
@@ -852,6 +854,41 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         )
         return [c for c in filtered if (c.ask - c.bid) <= float(self.optcfg.max_leg_spread_dollars)]
 
+    def _prefetch_option_chains(self, symbols: list[str], client) -> None:
+        # Warm the per-symbol option-chain cache in parallel before the
+        # sequential candidate-build loop in entry_signals(). Each candidate
+        # would otherwise hit Schwab serially via _fetch_filtered_contracts;
+        # for N>1 cache-miss candidates that's N * ~150ms of stacked I/O on
+        # the engine thread per cycle. The chain cache is symbol+date keyed
+        # (no put_call), so one fetch per symbol covers both CALL and PUT
+        # build paths. Failures are logged and swallowed — the build path
+        # will retry on its own and emit its own option_chain_empty
+        # decision if the retry also fails.
+        misses = [
+            sym for sym in {str(s or "").upper().strip() for s in symbols}
+            if sym and self._get_cached_option_chain(sym) is None
+        ]
+        if not misses:
+            return
+        max_workers = min(len(misses), 4)
+
+        def _warm(sym: str) -> None:
+            try:
+                # Any put_call works — _fetch_filtered_contracts populates
+                # the symbol-keyed cache as a side-effect; the filtered
+                # CALL list returned here is discarded.
+                self._fetch_filtered_contracts(client, sym, "CALL")
+            except Exception as exc:
+                LOG.warning("Option chain prefetch failed for %s: %s", sym, exc)
+
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="bot-option-chain-prefetch") as executor:
+            futures = [executor.submit(_warm, sym) for sym in misses]
+            for future in as_completed(futures):
+                # _warm swallows its own exceptions; result() here is a
+                # no-op safety check that ensures any unexpected exception
+                # propagates to the caller's outer error handling.
+                future.result()
+
     def _spread_market_failure_detail(self, first_leg: OptionContract, second_leg: OptionContract) -> str:
         bid, ask, mid = vertical_price_bounds(first_leg, second_leg)
         max_net_spread_price = float(self.optcfg.max_net_spread_price)
@@ -1303,6 +1340,23 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             for c in candidates:
                 self._record_entry_decision(c.symbol, "skipped", ["after_entry_cutoff"])
             return out
+        # Pre-warm option-chain cache for candidates that will reach a
+        # spread builder. Cheap pre-filters (already-open, insufficient
+        # bars) match the per-candidate guards below to avoid wasted
+        # Schwab calls on candidates the loop will skip. Regime check is
+        # NOT pre-evaluated here — it's local-only compute, and avoiding
+        # double evaluation matters more than skipping a chain fetch for
+        # a regime-rejected candidate. Worst case: ~1-2 wasted chain
+        # fetches per cycle, well under Schwab's per-minute cap.
+        prefetch_min_bars = int(self.params.get("min_bars", 35))
+        prefetch_symbols = [
+            c.symbol for c in candidates
+            if not self._underlying_already_open(c.symbol, positions)
+            and bars.get(c.symbol) is not None
+            and len(bars.get(c.symbol)) >= prefetch_min_bars
+        ]
+        if prefetch_symbols:
+            self._prefetch_option_chains(prefetch_symbols, client)
         for c in candidates:
             reasons: list[str] = []
             if self._underlying_already_open(c.symbol, positions):

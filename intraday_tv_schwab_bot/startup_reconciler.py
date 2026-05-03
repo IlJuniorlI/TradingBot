@@ -38,6 +38,7 @@ Design notes:
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from typing import Any, Callable
 
@@ -372,22 +373,45 @@ class StartupReconciler:
         if not self.config.runtime.reconcile_on_startup or mode == "ignore":
             return
         try:
-            account = call_schwab_client(self.client, "account_details", self.executor.account_hash, fields="positions").json()
+            # account_details and account_orders are independent reads; fire
+            # both in parallel to halve the boot-time stall that blocks the
+            # engine from entering its first scan cycle. Result objects are
+            # processed sequentially below — same behaviour as before for
+            # 4xx/5xx (status_code branch) and network errors (re-raised by
+            # future.result(), caught by the outer try/except).
+            now = now_et()
+            from_ts = (now - timedelta(days=self.config.runtime.startup_order_lookback_days)).astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            to_ts = now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="bot-startup-reconcile") as executor:
+                # Wrap each call in a lambda so executor.submit sees a
+                # zero-arg callable. Passing positional/keyword args directly
+                # to submit() trips PyCharm's ParamSpec inference against
+                # schwabdev.Client method overloads (e.g. place_order's
+                # dict-typed second arg), producing false positives. The
+                # lambda also keeps from_ts / to_ts bound at definition time
+                # — they're set once above and never mutated, so no late-
+                # binding issue.
+                account_future = executor.submit(
+                    lambda: call_schwab_client(
+                        self.client, "account_details", self.executor.account_hash, fields="positions"
+                    )
+                )
+                orders_future = executor.submit(
+                    lambda: call_schwab_client(
+                        self.client,
+                        "account_orders",
+                        self.executor.account_hash,
+                        fromEnteredTime=from_ts,
+                        toEnteredTime=to_ts,
+                    )
+                )
+                account = account_future.result().json()
+                orders_resp = orders_future.result()
             raw_positions = extract_broker_positions(account)
             ignored_open_position_symbols = sorted(self._ignored_open_position_symbols(raw_positions))
             if ignored_open_position_symbols:
                 self._entry_block_symbols = set(ignored_open_position_symbols)
             positions = self._filter_reconcile_positions(raw_positions)
-            now = now_et()
-            from_ts = (now - timedelta(days=self.config.runtime.startup_order_lookback_days)).astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-            to_ts = now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-            orders_resp = call_schwab_client(
-                self.client,
-                "account_orders",
-                self.executor.account_hash,
-                fromEnteredTime=from_ts,
-                toEnteredTime=to_ts,
-            )
             orders_lookup_failed = False
             if getattr(orders_resp, "status_code", 200) >= 400:
                 orders_lookup_failed = True

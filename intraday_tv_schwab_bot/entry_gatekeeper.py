@@ -112,6 +112,15 @@ class EntryGatekeeper:
         self.session_skip_counts: dict[str, int] = {}
         self._option_entry_retry_until: dict[str, datetime] = {}
         self._option_entry_retry_counts: dict[str, int] = {}
+        # Per-cycle broker-positions cache. Without this, every signal in a
+        # cycle (entry checks + exit recovery) issues its own account_details
+        # call returning identical data; 5 signals = 5 redundant Schwab
+        # fetches. The cache is cleared at begin_cycle() and end_cycle() to
+        # match data_feed.py's lifecycle pattern. _cycle_positions_failed
+        # latches a failed fetch so we don't retry-storm Schwab if the API
+        # is unhealthy mid-cycle.
+        self._cycle_positions_cache: list[dict[str, Any]] | None = None
+        self._cycle_positions_failed: bool = False
 
     @staticmethod
     def _safe_series_last(frame, field: str, default: float | None = None) -> float | None:
@@ -270,17 +279,50 @@ class EntryGatekeeper:
     # ------------------------------------------------------------------
     # Broker position-query helpers (wrap schwabdev calls). Exit recovery
     # in PositionManager also uses these — injected as callables there.
+    # All callers within a single engine.step() share one cached snapshot
+    # via _get_cycle_positions(); cache is invalidated at begin_cycle()
+    # and end_cycle().
     # ------------------------------------------------------------------
+
+    def begin_cycle(self) -> None:
+        # Mirrors data_feed.MarketDataStore.begin_cycle(). Called from
+        # engine.step() so per-cycle caches start fresh each tick.
+        self._cycle_positions_cache = None
+        self._cycle_positions_failed = False
+
+    def end_cycle(self) -> None:
+        # Symmetric clear so a stale snapshot can never leak into the
+        # gap between cycles (defensive — begin_cycle() also clears).
+        self._cycle_positions_cache = None
+        self._cycle_positions_failed = False
+
+    def _get_cycle_positions(self) -> list[dict[str, Any]] | None:
+        # Return the broker positions list for the current cycle, fetching
+        # once if not yet cached. Returns None if the fetch failed (caller
+        # treats as 'no broker data', matching the legacy behaviour where
+        # an exception in broker_position_row returned None). A failed
+        # fetch latches via _cycle_positions_failed so subsequent callers
+        # within the same cycle don't retry-storm Schwab.
+        if self._cycle_positions_failed:
+            return None
+        if self._cycle_positions_cache is not None:
+            return self._cycle_positions_cache
+        try:
+            account = call_schwab_client(self.client, "account_details", self.executor.account_hash, fields="positions").json()
+            rows = extract_broker_positions(account)
+        except Exception as exc:
+            LOG.warning("Could not query broker position snapshot: %s", exc)
+            self._cycle_positions_failed = True
+            return None
+        self._cycle_positions_cache = rows
+        return rows
 
     def broker_position_row(self, symbol: str) -> dict[str, Any] | None:
         symbol_upper = str(symbol or "").upper().strip()
         if not symbol_upper:
             return None
-        try:
-            account = call_schwab_client(self.client, "account_details", self.executor.account_hash, fields="positions").json()
-            rows = extract_broker_positions(account)
-        except Exception as exc:
-            LOG.warning("Could not query broker position snapshot for %s: %s", symbol_upper, exc)
+        rows = self._get_cycle_positions()
+        if rows is None:
             return None
         for row in rows:
             row_symbol = str(row.get("symbol") or "").upper().strip()
@@ -292,11 +334,8 @@ class EntryGatekeeper:
         wanted = {str(symbol or "").upper().strip() for symbol in (symbols or []) if str(symbol or "").strip()}
         if not wanted:
             return {}
-        try:
-            account = call_schwab_client(self.client, "account_details", self.executor.account_hash, fields="positions").json()
-            rows = extract_broker_positions(account)
-        except Exception as exc:
-            LOG.warning("Could not query broker position snapshot for symbols=%s: %s", ",".join(sorted(wanted)), exc)
+        rows = self._get_cycle_positions()
+        if rows is None:
             return {}
         out: dict[str, dict[str, Any]] = {}
         for row in rows:

@@ -322,6 +322,7 @@ From your laptop:
 ```bash
 ssh -L 8765:localhost:8765 joseph@server
 # then open http://localhost:8765 in your browser
+# (or https://localhost:8765 if dashboard.https is true — see Option C)
 ```
 
 Works from anywhere you can SSH from. Mobile too via Termius / Blink Shell.
@@ -337,6 +338,55 @@ dashboard:
   port: 8765
 ```
 
+### Option C — In-bot HTTPS (single-user remote access)
+
+For dashboard access from a single user without an SSH tunnel, the bot
+can terminate TLS itself. Both `ssl_certfile` and `ssl_keyfile` are
+required when `https: true`.
+
+Generate a self-signed cert with `openssl` (one-time, valid ~2 years):
+```bash
+sudo mkdir -p /etc/trading-bot/ssl
+cd /etc/trading-bot/ssl
+openssl req -x509 -newkey rsa:4096 -sha256 -days 825 \
+    -nodes -keyout dashboard.key -out dashboard.crt \
+    -subj "/CN=trading-bot" \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:$(hostname -I | awk '{print $1}')"
+sudo chown joseph:joseph dashboard.*
+sudo chmod 600 dashboard.key
+sudo chmod 644 dashboard.crt
+```
+
+The SAN list MUST include every hostname or IP you'll type into the
+browser bar. The example above covers loopback (`127.0.0.1`) and the
+server's first LAN IP. Add more `IP:<addr>` or `DNS:<name>` entries
+for additional access patterns — the browser rejects the cert if the
+URL doesn't match a SAN entry.
+
+Then in `configs/config.yaml`:
+```yaml
+dashboard:
+  host: 192.168.1.50   # your LAN IP, or 0.0.0.0 for any interface
+  port: 8765
+  https: true
+  ssl_certfile: /etc/trading-bot/ssl/dashboard.crt
+  ssl_keyfile:  /etc/trading-bot/ssl/dashboard.key
+```
+
+The browser warns about the self-signed cert on first visit — click
+Advanced → Proceed. Subsequent loads are warning-free until the cert
+expires.
+
+The dashboard uses HTTP/1.1 keep-alive and offloads TLS handshakes to
+per-request worker threads, so polling and asset fetches share one
+connection and there's no first-load stall under HTTPS.
+
+For real (browser-trusted) certs without warnings, install
+[`mkcert`](https://github.com/FiloSottile/mkcert) on the machine you
+browse from, generate certs there, and `scp` them to the server.
+mkcert installs a local CA into your browser's trust store, so its
+certs are accepted with no warning.
+
 ### Don't do this
 
 ```yaml
@@ -345,9 +395,12 @@ dashboard:
 ```
 
 The dashboard exposes positions, equity, watchlist, trades, and last
-update timestamps. Anyone scanning your IP can read all of that.
-If you really need cross-network access, put nginx + basic auth in
-front, or use Cloudflare Access / Tailscale.
+update timestamps. Anyone scanning your IP can read all of that —
+HTTPS protects the transport but does not authenticate the visitor.
+If you really need cross-network access, use Tailscale (Option B) or
+in-bot HTTPS bound to a private interface (Option C). Public-internet
+exposure requires a real auth layer in front — Caddy or nginx with
+basic auth, Cloudflare Access, or oauth2-proxy.
 
 ---
 

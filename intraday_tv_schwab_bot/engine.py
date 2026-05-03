@@ -673,6 +673,7 @@ class IntradayBot:
     def step(self) -> None:
 
         self.data.begin_cycle()
+        self.entry_gatekeeper.begin_cycle()
         try:
             now = now_et()
             schedule = self.config.active_strategy.schedule()
@@ -875,6 +876,7 @@ class IntradayBot:
             )
         finally:
             self.data.end_cycle()
+            self.entry_gatekeeper.end_cycle()
 
     @staticmethod
     def _extract_last_prices(bars: dict[str, Any]) -> dict[str, float]:

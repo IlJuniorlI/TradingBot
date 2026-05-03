@@ -330,6 +330,7 @@ Behavior and valid values:
 - `symbol_state_prune_seconds`: cadence at which the engine evicts per-symbol state (history frames, HTF/SR caches, dashboard snapshot/chart payloads) for symbols that have dropped out of the active set (streamed symbols + last watchlist + open positions). Long-running multi-day bots otherwise accumulate history dicts (~240KB per 1m frame at default lookback) for every symbol the screener has ever returned. Set to `0` to disable pruning entirely.
 - `session_reconcile_on_resume`: when `true`, the engine re-runs the startup reconcile at the first cycle on each new ET trading day where streaming is back online (i.e., the first cycle past 7am ET). Catches positions that closed overnight via the Schwab app or broker-side stops — without this, an always-on bot would wake at 7am still believing those positions are open and try to manage phantoms. Honors the same `reconcile_on_startup` and `startup_reconcile_mode` knobs as the startup reconcile (no separate mode). Set to `false` to disable if you handle reconciliation externally or only run single-day sessions.
 - `cycle_precompute_workers`: thread-pool size used to precompute per-symbol indicator/structure context in parallel each engine cycle. Higher values reduce per-cycle latency on wide watchlists at the cost of CPU; lower values trade latency for less contention.
+- Cycle-scoped broker positions cache: `account_details` is fetched at most once per `step()` regardless of how many `broker_position_row` / `broker_position_rows` consumers (entry gatekeeper + exit recovery in position manager) run inside the cycle. Eliminates the N-fetches-per-cycle redundancy when many signals or positions overlap; failure latches per-cycle to avoid retry storms during Schwab outages. Mirrors the per-cycle FVG/OB/S-R caches in `data_feed.py`.
 - `max_consecutive_quote_failures`: per-symbol quote-fetch failure threshold. After a symbol fails this many consecutive quote refreshes (typically symbol-specific Schwab 401/403/404 such as restricted-security responses), it is silenced from quote refresh for the rest of the session. The counter resets on any successful fetch; the blacklist clears on bot restart. Set to `0` to disable (always retry — pre-2026-04-29 behavior). The default `5` catches symbol-specific permission errors without triggering on transient hiccups. Other endpoints (history, stream) for the same symbol are unaffected.
 - `export_session_archive`: when `true`, the engine writes a per-day archive to `{log_dir}/sessions/{YYYY-MM-DD}/` containing `bars/{SYMBOL}.csv` for every active watchlist symbol (RTH only, with indicators), `trades.csv` filtered to the day, and `manifest.json` with strategy + summary stats. The archive fires automatically once per ET trading day after the stream window closes (8 PM ET), so an always-on bot produces one archive per session without waiting for shutdown; shutdown still writes its own (potentially overwriting today's bundle with a fresher snapshot). Useful for trade audits and post-session analysis. Disable to save disk space if running without dashboard/analysis needs.
 
@@ -593,6 +594,7 @@ Higher-timeframe support/resistance, prior-day/week levels, FVG mapping, flip ha
 | `order_block_max_per_side`               | `4`          |
 | `order_block_min_atr_mult`               | `0.05`       |
 | `order_block_min_pct`                    | `0.0005`     |
+| `order_block_min_thrust_atr_mult`        | `0.75`       |
 | `order_block_pivot_span`                 | `2`          |
 | `order_block_new_high_lookback`          | `8`          |
 | `dashboard_flip_confirmation_1m_bars`    | `1`          |
@@ -631,6 +633,12 @@ How the groups work:
   - `htf_fair_value_gaps_*` controls HTF FVG generation.
   - `one_minute_fair_value_gaps_*` controls 1-minute FVG generation.
   - Raising the min ATR or min percent thresholds makes FVG detection more selective.
+- Order block detection:
+  - `htf_order_blocks_enabled` and `one_minute_order_blocks_enabled` toggle OB generation per timeframe.
+  - `order_block_mode`: `loose` declares a break-of-structure when price prints a new N-bar high (`order_block_new_high_lookback`); `strict` requires a pivot-confirmed BoS (`order_block_pivot_span`). Strict produces fewer, higher-quality OBs.
+  - `order_block_min_atr_mult` and `order_block_min_pct` set the minimum OB body size (whichever is larger).
+  - `order_block_min_thrust_atr_mult` (default `0.75`) requires the BoS thrust — close-to-close move from the OB candle to the breakout candle — to be at least this fraction of ATR. Filters weak setups where a small candle randomly broke a recent high.
+  - `order_block_max_per_side` caps OBs per side per timeframe. Ranking is strength-based (thrust × size × age × validity), so the strongest OBs survive when the cap clips — small-move noise OBs no longer displace strong OBs from real moves.
 - Level-loss and flip behavior:
   - `dashboard_flip_confirmation_1m_bars`, `trading_flip_confirmation_1m_bars`, `trading_flip_confirmation_5m_bars` tune how many bars confirm a flip for display vs trading.
   - Whether confirmed level-loss breaks trigger an exit is controlled by `shared_exit.use_sr_loss_exit`.
@@ -918,6 +926,7 @@ Behavior and valid values:
   - Each blackout row can use: `enabled`, `label`, `date`, `weekday`, `start`, `end`, `block_new_entries`, `force_flatten`.
 - Chain cache:
   - `option_chain_cache_seconds`, `option_chain_cache_max_entries`
+  - 0DTE strategies (`zero_dte_etf_options`, `zero_dte_etf_long_options`) parallel-prefetch chains for all qualifying candidates at the start of each `entry_signals` pass; the sequential per-candidate build loop then hits the warm cache. Size `option_chain_cache_max_entries` ≥ the number of underlyings you trade so prefetched chains aren't evicted before consumption.
 - Premium ratchet (post-entry stop management). All four premium-ratchet families are off by default; enable the ones you want active.
   - `options_breakeven_enabled` / `options_breakeven_mark_mult` / `options_breakeven_stop_mult`: when the option mark crosses `entry × options_breakeven_mark_mult`, ratchet the stop up to `entry × options_breakeven_stop_mult`. Locks a small protective gain on debit trades that go through their first push.
   - `options_profit_lock_enabled` / `options_profit_lock_mark_mult` / `options_profit_lock_stop_mult`: a second, looser ratchet that activates at a higher mark multiple and locks a larger fraction of the move. Stacks with `options_breakeven_*`.
