@@ -1601,7 +1601,9 @@ class BaseStrategy:
             "max_per_side": int(self._support_resistance_setting("order_block_max_per_side", 4) or 4),
             "min_atr_mult": float(self._support_resistance_setting("order_block_min_atr_mult", 0.05) or 0.05),
             "min_pct": float(self._support_resistance_setting("order_block_min_pct", 0.0005) or 0.0005),
-            "min_thrust_atr_mult": float(self._support_resistance_setting("order_block_min_thrust_atr_mult", 0.75) or 0.75),
+            "min_thrust_atr_mult": float(
+                self._support_resistance_setting("order_block_min_thrust_atr_mult", 0.75) or 0.75
+            ),
             "pivot_span": int(self._support_resistance_setting("order_block_pivot_span", 2) or 2),
             "new_high_lookback": int(self._support_resistance_setting("order_block_new_high_lookback", 8) or 8),
         }

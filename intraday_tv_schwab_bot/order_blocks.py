@@ -504,10 +504,18 @@ def build_order_block_context(
     if mode_norm not in {"loose", "strict"}:
         mode_norm = "loose"
     if frame is None or frame.empty:
-        return empty_order_block_context(float(current_price or 0.0), timeframe_minutes=timeframe_minutes, mode=mode_norm)
+        return empty_order_block_context(
+            float(current_price or 0.0),
+            timeframe_minutes=timeframe_minutes,
+            mode=mode_norm,
+        )
     base = ensure_standard_indicator_frame(ensure_ohlcv_frame(frame.copy()))
     if base.empty or len(base) < 5:
-        return empty_order_block_context(float(current_price or 0.0), timeframe_minutes=timeframe_minutes, mode=mode_norm)
+        return empty_order_block_context(
+            float(current_price or 0.0),
+            timeframe_minutes=timeframe_minutes,
+            mode=mode_norm,
+        )
     if current_price is None or current_price <= 0:
         try:
             current_price = float(base.iloc[-1]["close"])
