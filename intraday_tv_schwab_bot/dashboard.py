@@ -7,7 +7,9 @@ import json
 import logging
 import math
 import re
+import socket
 import ssl
+import sys
 from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -157,6 +159,17 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def handle_error(self, request, client_address):  # type: ignore[override]
+        # Default BaseServer.handle_error prints a full traceback to stderr,
+        # which floods journald whenever a port scanner, broken keep-alive,
+        # or aborted TLS handshake hits the dashboard. Suppress the common
+        # transport-layer noise; let unexpected errors surface as before.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ssl.SSLError, ConnectionError, BrokenPipeError, socket.timeout)):
+            LOG.debug("Dashboard transport error from %s: %s", client_address, exc)
+            return
+        super().handle_error(request, client_address)
+
 
 class DashboardState:
     def __init__(self):
@@ -252,7 +265,15 @@ class DashboardServer:
                 certfile=self.ssl_certfile,
                 keyfile=self.ssl_keyfile or None,
             )
-            self.httpd.socket = ctx.wrap_socket(self.httpd.socket, server_side=True)
+            # do_handshake_on_connect=False defers the TLS handshake out of
+            # accept() so concurrent clients can handshake in parallel on
+            # their worker threads (see Handler.setup below). Without this,
+            # one slow handshake stalls every other incoming connection.
+            self.httpd.socket = ctx.wrap_socket(
+                self.httpd.socket,
+                server_side=True,
+                do_handshake_on_connect=False,
+            )
         self.thread = Thread(target=self.httpd.serve_forever, name="dashboard-server", daemon=True)
         self.thread.start()
         LOG.info("Dashboard listening at %s", self.url)
@@ -295,6 +316,42 @@ class DashboardServer:
         chart_payload_provider = self.chart_payload_provider
 
         class Handler(BaseHTTPRequestHandler):
+            # HTTP/1.1 keeps the TCP+TLS connection open across requests so
+            # the dashboard's polling loop and asset fetches share one
+            # handshake instead of paying for a fresh one per request. All
+            # response paths in this class set Content-Length explicitly,
+            # so keep-alive framing is well-defined.
+            protocol_version = "HTTP/1.1"
+            # Bound idle keep-alive lifetime so abandoned browser tabs don't
+            # hold a worker thread + socket open indefinitely. Active polls
+            # (every refresh_ms) reset the clock; only truly silent
+            # connections get reaped.
+            timeout = 30
+
+            def setup(self) -> None:
+                # Complete the deferred TLS handshake here on the per-request
+                # worker thread. The listening socket is wrapped with
+                # do_handshake_on_connect=False so accept() returns
+                # immediately; without an explicit handshake, the first
+                # rfile.read() would error out on an unhandshaken SSLSocket.
+                connection = self.request
+                if isinstance(connection, ssl.SSLSocket):
+                    try:
+                        connection.settimeout(5.0)
+                        connection.do_handshake()
+                    except (ssl.SSLError, OSError) as exc:
+                        client = self.client_address[0] if self.client_address else "unknown"
+                        LOG.debug("TLS handshake failed for %s: %s", client, exc)
+                        try:
+                            connection.close()
+                        except Exception:
+                            pass
+                        # Re-raise so BaseRequestHandler skips handle()/finish()
+                        # on a dead socket; ReusableThreadingHTTPServer.handle_error
+                        # silences the transport-layer exception.
+                        raise
+                super().setup()
+
             def _security_headers(self) -> None:
                 self.send_header("X-Frame-Options", "DENY")
                 self.send_header("X-Content-Type-Options", "nosniff")
