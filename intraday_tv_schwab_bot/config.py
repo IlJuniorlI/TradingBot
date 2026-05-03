@@ -610,6 +610,14 @@ class SupportResistanceConfig:
     order_block_min_pct: float = 0.0005
     order_block_pivot_span: int = 2
     order_block_new_high_lookback: int = 8
+    # Minimum BoS displacement (in ATR units) required for an OB to count.
+    # The break-of-structure bar's close must be at least this much away
+    # from the OB candle's close. Filters out micro-breakouts that would
+    # otherwise produce a flood of noise OBs near current price. Combined
+    # with the strength-based sort in build_order_block_context, this
+    # ensures strong OBs from real moves outrank fresh weak OBs in the
+    # top-K cap. 0.0 disables the thrust filter.
+    order_block_min_thrust_atr_mult: float = 0.75
     dashboard_flip_confirmation_1m_bars: int = 1
     trading_flip_confirmation_1m_bars: int = 2
     trading_flip_confirmation_5m_bars: int = 1

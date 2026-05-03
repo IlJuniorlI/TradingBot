@@ -738,6 +738,7 @@ class MarketDataStore:
         max_per_side: int = 4,
         min_block_atr_mult: float = 0.05,
         min_block_pct: float = 0.0005,
+        min_thrust_atr_mult: float = 0.75,
         pivot_span: int = 2,
         new_high_lookback: int = 8,
     ) -> OrderBlockContext:
@@ -750,6 +751,10 @@ class MarketDataStore:
         Cache invalidates per-symbol on every new stream bar via
         ``_invalidate_cycle_symbol`` and on cycle boundaries via
         ``begin_cycle`` / ``end_cycle``. Identical lifetime to the FVG cache.
+
+        ``min_thrust_atr_mult`` is part of the cache key — different
+        thrust thresholds produce different OB sets, so callers passing
+        different values get separate cache entries.
         """
         cache_key = (
             self._symbol_key(symbol),
@@ -759,6 +764,7 @@ class MarketDataStore:
             int(max_per_side),
             round(float(min_block_atr_mult), 6),
             round(float(min_block_pct), 6),
+            round(float(min_thrust_atr_mult), 6),
             int(pivot_span),
             int(new_high_lookback),
         )
@@ -788,6 +794,7 @@ class MarketDataStore:
                 max_per_side=max(0, int(max_per_side or 0)),
                 min_block_atr_mult=float(min_block_atr_mult),
                 min_block_pct=float(min_block_pct),
+                min_thrust_atr_mult=float(min_thrust_atr_mult),
                 pivot_span=int(pivot_span),
                 new_high_lookback=int(new_high_lookback),
             )

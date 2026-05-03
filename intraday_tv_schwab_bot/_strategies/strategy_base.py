@@ -1587,14 +1587,21 @@ class BaseStrategy:
         )
 
     def _order_block_tuning_knobs(self) -> dict[str, Any]:
-        """Resolve the six SHARED OB tuning knobs from support_resistance config.
+        """Resolve the SHARED OB tuning knobs from support_resistance config.
         Both 1m and HTF OB contexts read the same settings — only the enable
-        flag and the input frame's timeframe differ between them."""
+        flag and the input frame's timeframe differ between them.
+
+        The ``min_thrust_atr_mult`` knob (added 2026-05) gates BoS
+        displacement to filter micro-breakouts; combined with the
+        strength-based sort in build_order_block_context, this stops
+        weak close-to-price OBs from displacing strong distant ones.
+        """
         return {
             "mode": str(self._support_resistance_setting("order_block_mode", "loose") or "loose").strip().lower() or "loose",
             "max_per_side": int(self._support_resistance_setting("order_block_max_per_side", 4) or 4),
             "min_atr_mult": float(self._support_resistance_setting("order_block_min_atr_mult", 0.05) or 0.05),
             "min_pct": float(self._support_resistance_setting("order_block_min_pct", 0.0005) or 0.0005),
+            "min_thrust_atr_mult": float(self._support_resistance_setting("order_block_min_thrust_atr_mult", 0.75) or 0.75),
             "pivot_span": int(self._support_resistance_setting("order_block_pivot_span", 2) or 2),
             "new_high_lookback": int(self._support_resistance_setting("order_block_new_high_lookback", 8) or 8),
         }
@@ -1619,6 +1626,7 @@ class BaseStrategy:
                     max_per_side=knobs["max_per_side"],
                     min_block_atr_mult=knobs["min_atr_mult"],
                     min_block_pct=knobs["min_pct"],
+                    min_thrust_atr_mult=knobs["min_thrust_atr_mult"],
                     pivot_span=knobs["pivot_span"],
                     new_high_lookback=knobs["new_high_lookback"],
                 )
@@ -1634,6 +1642,7 @@ class BaseStrategy:
             max_per_side=knobs["max_per_side"],
             min_block_atr_mult=knobs["min_atr_mult"],
             min_block_pct=knobs["min_pct"],
+            min_thrust_atr_mult=knobs["min_thrust_atr_mult"],
             pivot_span=knobs["pivot_span"],
             new_high_lookback=knobs["new_high_lookback"],
         )
@@ -1664,6 +1673,7 @@ class BaseStrategy:
                     max_per_side=knobs["max_per_side"],
                     min_block_atr_mult=knobs["min_atr_mult"],
                     min_block_pct=knobs["min_pct"],
+                    min_thrust_atr_mult=knobs["min_thrust_atr_mult"],
                     pivot_span=knobs["pivot_span"],
                     new_high_lookback=knobs["new_high_lookback"],
                 )
@@ -1682,6 +1692,7 @@ class BaseStrategy:
             max_per_side=knobs["max_per_side"],
             min_block_atr_mult=knobs["min_atr_mult"],
             min_block_pct=knobs["min_pct"],
+            min_thrust_atr_mult=knobs["min_thrust_atr_mult"],
             pivot_span=knobs["pivot_span"],
             new_high_lookback=knobs["new_high_lookback"],
         )

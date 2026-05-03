@@ -984,6 +984,7 @@ class DashboardCache:
             max_per_side=int(getattr(sr_cfg, "order_block_max_per_side", 4) or 4),
             min_block_atr_mult=float(getattr(sr_cfg, "order_block_min_atr_mult", 0.05) or 0.05),
             min_block_pct=float(getattr(sr_cfg, "order_block_min_pct", 0.0005) or 0.0005),
+            min_thrust_atr_mult=float(getattr(sr_cfg, "order_block_min_thrust_atr_mult", 0.75) or 0.75),
             pivot_span=int(getattr(sr_cfg, "order_block_pivot_span", 2) or 2),
             new_high_lookback=int(getattr(sr_cfg, "order_block_new_high_lookback", 8) or 8),
         ) if sr_cfg is not None else None

@@ -207,8 +207,8 @@ dashboard:
       show_trendlines: false
       show_htf_fair_value_gaps: false
       show_1m_fair_value_gaps: true
-      show_htf_order_blocks: false
-      show_1m_order_blocks: false
+      show_htf_order_blocks: true
+      show_1m_order_blocks: true
       show_trade_markers: true
       tooltip_show_returns: true
       tooltip_show_support_resistance: true
@@ -233,8 +233,8 @@ dashboard:
       show_trendlines: false
       show_htf_fair_value_gaps: true
       show_1m_fair_value_gaps: true
-      show_htf_order_blocks: false
-      show_1m_order_blocks: false
+      show_htf_order_blocks: true
+      show_1m_order_blocks: true
       show_trade_markers: true
       tooltip_show_returns: true
       tooltip_show_support_resistance: true
@@ -274,14 +274,19 @@ support_resistance:
   fair_value_gap_min_atr_mult: 0.06
   fair_value_gap_min_pct: 0.0006
   one_minute_fair_value_gaps_enabled: true
-  one_minute_order_blocks_enabled: false
-  htf_order_blocks_enabled: false
-  order_block_mode: loose
-  order_block_max_per_side: 4
-  order_block_min_atr_mult: 0.05
-  order_block_min_pct: 0.0005
-  order_block_pivot_span: 2
-  order_block_new_high_lookback: 8
+  # Order blocks: enabled with strict ICT/SMC pivot detection +
+  # tightened size + thrust filters. Strength-based sort means strong
+  # OBs from real BoS moves outrank fresh weak OBs in the top-K. See
+  # order_blocks.py::_ob_strength_score for the ranking math.
+  one_minute_order_blocks_enabled: true
+  htf_order_blocks_enabled: true
+  order_block_mode: strict              # was loose; uses actual swing-pivot BoS
+  order_block_max_per_side: 8           # was 4; keep more so strong distant OBs survive
+  order_block_min_atr_mult: 0.50        # was 0.05; OB candle size >= 50% of ATR
+  order_block_min_pct: 0.0025           # was 0.0005; 0.25% of price floor
+  order_block_min_thrust_atr_mult: 0.75 # NEW; BoS displacement >= 75% of ATR
+  order_block_pivot_span: 3             # was 2; require slightly stronger pivots
+  order_block_new_high_lookback: 30     # was 8; loose-mode BoS over 30 bars (only used if mode=loose)
   dashboard_flip_confirmation_1m_bars: 1
   trading_flip_confirmation_1m_bars: 2
   trading_flip_confirmation_5m_bars: 1

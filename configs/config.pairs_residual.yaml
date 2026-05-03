@@ -254,6 +254,7 @@ support_resistance:
   order_block_max_per_side: 4
   order_block_min_atr_mult: 0.05
   order_block_min_pct: 0.0005
+  order_block_min_thrust_atr_mult: 0.75
   order_block_pivot_span: 2
   order_block_new_high_lookback: 8
   dashboard_flip_confirmation_1m_bars: 1
