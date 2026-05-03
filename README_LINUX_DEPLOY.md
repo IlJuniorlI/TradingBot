@@ -352,7 +352,7 @@ openssl req -x509 -newkey rsa:4096 -sha256 -days 825 \
     -nodes -keyout dashboard.key -out dashboard.crt \
     -subj "/CN=trading-bot" \
     -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:$(hostname -I | awk '{print $1}')"
-sudo chown joseph:joseph dashboard.*
+sudo chown "$USER:$USER" dashboard.*
 sudo chmod 600 dashboard.key
 sudo chmod 644 dashboard.crt
 ```
@@ -366,7 +366,7 @@ URL doesn't match a SAN entry.
 Then in `configs/config.yaml`:
 ```yaml
 dashboard:
-  host: 192.168.1.50   # your LAN IP, or 0.0.0.0 for any interface
+  host: <your-lan-ip>   # e.g. 192.168.x.y, or 0.0.0.0 for any interface
   port: 8765
   https: true
   ssl_certfile: /etc/trading-bot/ssl/dashboard.crt
