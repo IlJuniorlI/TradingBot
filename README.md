@@ -26,7 +26,6 @@ See also:
 - `volatility_squeeze_breakout` — liquid-stock compression breakout strategy
 - `pairs_residual` — relative-value pair divergence strategy
 - `opening_range_breakout` — opening-range breakout strategy
-- `microcap_gap_orb` — long-only opening-range breakout tuned for cheap (≤$20) names that gap 20%+ at the open; subclasses `opening_range_breakout` with a custom screener and a 09:37–13:30 entry window so late-morning gappers still get evaluated
 - `peer_confirmed_key_levels` — peer-confirmed hourly key-level/zone strategy with 5-minute triggers, optional macro confirmation, and ladder-aware post-entry management when `adaptive_ladder` is enabled
 - `peer_confirmed_key_levels_1m` — faster 1-minute peer-confirmed hourly key-level/zone variant tuned as a compromise between aggressive and balanced confirmation
 - `peer_confirmed_trend_continuation` — peer-confirmed trend continuation strategy that trades controlled pullbacks and re-expansion without waiting for key-level touches
@@ -119,7 +118,6 @@ Valid values:
 - `volatility_squeeze_breakout`
 - `pairs_residual`
 - `opening_range_breakout`
-- `microcap_gap_orb`
 - `zero_dte_etf_options`
 - `zero_dte_etf_long_options`
 - `peer_confirmed_key_levels`
@@ -2126,7 +2124,6 @@ Shipped preset files:
 | `configs/config.volatility_squeeze_breakout.yaml` | `volatility_squeeze_breakout`       |
 | `configs/config.pairs_residual.yaml`            | `pairs_residual`                      |
 | `configs/config.opening_range_breakout.yaml`    | `opening_range_breakout`              |
-| `configs/config.microcap_gap_orb.yaml`          | `microcap_gap_orb`                    |
 | `configs/config.peer_confirmed_key_levels.yaml` | `peer_confirmed_key_levels`           |
 | `configs/config.peer_confirmed_key_levels_1m.yaml` | `peer_confirmed_key_levels_1m`     |
 | `configs/config.peer_confirmed_trend_continuation.yaml` | `peer_confirmed_trend_continuation` |

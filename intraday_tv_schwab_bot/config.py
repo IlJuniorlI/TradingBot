@@ -592,9 +592,9 @@ class SupportResistanceConfig:
     # its own enable flag; the six tuning knobs below are SHARED — both
     # timeframes use the same mode / max_per_side / size filters / pivot span.
     # Disabled by default. When `one_minute_order_blocks_enabled` is true,
-    # strategies that call `_continuation_ob_retest_plan` (e.g.
-    # microcap_pm_breakout) get a parallel retest gate that ORs with the FVG
-    # retest plan. When `htf_order_blocks_enabled` is true, HTF OBs are
+    # strategies that call `_continuation_ob_retest_plan` get a parallel
+    # retest gate that ORs with the FVG retest plan. When
+    # `htf_order_blocks_enabled` is true, HTF OBs are
     # detected and exposed via `_htf_order_block_context` for strategies that
     # consume them (current strategies don't gate entries on HTF OBs; this
     # mirrors the FVG architecture where HTF FVGs are detected for context
