@@ -9,6 +9,36 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `support_resistance.order_block_min_thrust_atr_mult` (default `0.75`)
+  — minimum thrust requirement for OB acceptance. The break-of-structure
+  thrust (close-to-close move from the OB candle to the breakout candle)
+  must be at least this fraction of ATR. Filters weak setups where a
+  small candle randomly broke a recent high. Applies to both `loose`
+  and `strict` detection modes, both 1m and HTF timeframes. All 18
+  shipped preset configs expose the knob; existing OB tuning is
+  unaffected.
+- `OrderBlock` dataclass gained four diagnostic fields used for
+  strength-based ranking and dashboard introspection:
+  `anchor_index` (origin bar position for age computation), `age_bars`
+  (how many bars old the OB is), `thrust_atr` (computed thrust
+  magnitude), `strength_score` (composite score for ranking when
+  `order_block_max_per_side` clips). Internal only — not exposed in
+  dashboard payloads, no public API change.
+- `_fetch_raw_option_chain(client, symbol)` on the 0DTE option strategy
+  classes — pure I/O + cache helper that fetches and caches the full
+  unfiltered option chain. `_fetch_filtered_contracts` now delegates to
+  it, and the new `_prefetch_option_chains` warm-up path uses it
+  directly so the parallel prefetch no longer runs the put/call +
+  liquidity filter just to discard the result.
+- `entry_gatekeeper.broker_position_row` and `broker_position_rows`
+  accept a `force_refresh` keyword. Default returns the cycle-cached
+  snapshot (cf. cycle-scoped broker positions cache below);
+  `force_refresh=True` bypasses the cache and issues a fresh
+  `account_details` fetch for callers that need post-`place_order`
+  state without waiting for the next cycle. Backed by a new
+  `_fetch_broker_positions_uncached()` helper that also serves as the
+  single source of truth for the underlying Schwab call shape (the
+  cycle-cache helper now delegates to it).
 - Always-on operation: three new `RuntimeConfig` knobs let the bot
   run continuously across days instead of exiting at session close.
   - `runtime.idle_sleep_seconds` (default `60.0`) — outside the 7am-8pm
@@ -137,6 +167,70 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Order block ranking is now strength-based (thrust × size × age ×
+  validity) instead of nearest-to-current-price. When
+  `order_block_max_per_side` clips, the strongest OBs survive — small-
+  move noise OBs no longer displace strong OBs from real moves, which
+  was the bug that motivated the new `order_block_min_thrust_atr_mult`
+  filter and ranking score. `nearest_bullish_ob` /
+  `nearest_bearish_ob` accessors still resolve to the nearest OB by
+  price for backward compatibility with `_continuation_ob_retest_plan`
+  consumers (whose retest semantics genuinely want "closest to price",
+  not "strongest").
+- `OrderBlock` enrichment (per-cycle `age_bars` + `strength_score`
+  recompute) now uses `dataclasses.replace()` instead of in-place
+  attribute assignment. Eliminates PyCharm `__slots__` warnings on the
+  slotted dataclass and ensures any future stale-bytecode would fail
+  loudly at construction rather than silently dropping new attributes.
+  Merged OBs preserve `min(anchor_index)` and `max(thrust_atr)` across
+  the merge so strength sort doesn't degenerate when adjacent zones
+  collapse.
+- `peer_confirmed_key_levels` preset disables 1m + HTF order block
+  detection (`one_minute_order_blocks_enabled: false`,
+  `htf_order_blocks_enabled: false`) and the matching dashboard
+  `show_*_order_blocks` flags in both compact and expanded layouts.
+  The strategy's custom entry pipeline doesn't consume OBs at all, so
+  detecting and rendering them was wasted compute on every cycle.
+- Dashboard HTTP server now uses HTTP/1.1 keep-alive
+  (`protocol_version = "HTTP/1.1"`) with a 30-second idle timeout
+  (`Handler.timeout = 30`). Polling and asset fetches share one
+  TCP+TLS connection per browser tab instead of opening a fresh pair
+  per request — eliminates the first-load stall under HTTPS where the
+  browser would queue 6 parallel asset fetches behind serial TLS
+  handshakes. TLS handshake is now deferred off the accept thread
+  (`do_handshake_on_connect=False` on the listening socket + an
+  explicit `setup()` override that runs `do_handshake()` with a 5-second
+  timeout on the per-request worker thread) so concurrent clients can
+  handshake in parallel. New `ReusableThreadingHTTPServer.handle_error`
+  override silences common transport-layer exceptions (`ssl.SSLError`,
+  `ConnectionError`, `BrokenPipeError`, `socket.timeout`) at DEBUG
+  level instead of dumping full tracebacks to journald on every
+  port-scanner connection or aborted handshake.
+- `entry_gatekeeper` adds a cycle-scoped broker positions cache:
+  `account_details` is fetched at most once per `engine.step()`
+  regardless of how many `broker_position_row` /
+  `broker_position_rows` consumers run inside the cycle (entry gate +
+  exit recovery via `position_manager`'s injected callable). 5
+  in-cycle signal/position checks = 1 Schwab call instead of 5
+  identical fetches. Failure latches per-cycle (`_cycle_positions_failed`)
+  to avoid retry-storms during Schwab outages. New `begin_cycle()` /
+  `end_cycle()` lifecycle hooks wired into `engine.step()` mirror the
+  per-cycle FVG/OB/S-R caches in `data_feed.py`.
+- 0DTE strategies (`zero_dte_etf_options`, `zero_dte_etf_long_options`)
+  parallel-prefetch option chains for all qualifying candidates at the
+  start of each `entry_signals` pass via a `ThreadPoolExecutor` (up to
+  4 workers, scaled to the miss count). The sequential per-candidate
+  build loop then hits the warm cache. For 3-5 cache-miss candidates
+  this collapses ~450-750ms of stacked serial Schwab `option_chains`
+  calls into one ~150ms parallel batch. Inherited automatically by
+  the long-options subclass.
+- `startup_reconciler.reconcile` parallelizes the `account_details`
+  (positions) and `account_orders` (working orders) Schwab calls via
+  a 2-worker `ThreadPoolExecutor`. Saves ~200-400ms of boot stall
+  before the engine enters its first scan cycle. Both calls wrapped
+  in lambdas to sidestep PyCharm `ParamSpec` false positives that
+  mismatched our args against `schwabdev.Client.place_order`'s
+  dict-typed second arg.
 - `_cycle_sleep_seconds()` now picks between `runtime.loop_sleep_seconds`
   (fast) inside the 7am-8pm ET stream window and
   `runtime.idle_sleep_seconds` (idle) outside it. Every Schwab equity
