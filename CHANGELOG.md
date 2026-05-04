@@ -177,6 +177,25 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **HTF prior-day/week levels now always candidates, not just fallbacks**
+  (`htf_levels.py build_htf_context`). The previous flow only injected
+  `prior_day_low` / `prior_week_low` (and the high counterparts) when
+  pivot detection produced an empty result. In strong directional moves
+  a stock can rally for weeks with no proper pivot lows in the rally
+  portion (each bar's low > the surrounding bars' lows by definition of
+  an uptrend), so pivot-only support detection surfaces only the ancient
+  base. AMD example: rally from $258 → $346 over a week with no pivot
+  lows in the rally; the dashboard showed first support at $254 (a
+  pivot low from the base period weeks earlier) instead of yesterday's
+  $340 low. Both prior-day and prior-week levels now merge into the
+  candidate pool alongside pivot levels via `_extend_unique_levels`,
+  then compete in `_collapse_same_side_levels`. Their `source_priority`
+  of 2.0 (prior_day) / 3.0 (prior_week) outranks pivot's 1.0 in
+  `_level_preference`, so when a prior-day/week level overlaps a
+  same-cluster pivot, the prior-day/week level wins the picker. The
+  second-chance fallback (when filtered candidates are empty) and
+  frame-extreme fallback (when both pivots and prior-day/week are
+  empty) are preserved as-is for fully-empty edge cases.
 - **HTF level scoring now time-aware** (`htf_levels.py _cluster_levels`).
   The previous formula computed `score = touches + min(1.5, 0.15 * touches)`
   — a misleadingly-named "recency_bonus" that was actually a touches

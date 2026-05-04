@@ -749,42 +749,47 @@ def build_htf_context(
     prior_day_high, prior_day_low = _prior_day_levels(frame) if include_prior_day else (None, None)
     prior_week_high, prior_week_low = _prior_week_levels(frame) if include_prior_week else (None, None)
 
+    # Always merge prior_day/week levels into the candidate pool alongside
+    # pivot-derived levels. In strong directional moves a stock can rally
+    # for weeks with no proper pivot lows in the rally portion (each bar's
+    # low > the next bar's low), so pivot detection only surfaces the
+    # ancient base. Without prior_day_low / prior_week_low as always-on
+    # candidates the dashboard would render only stale base levels far
+    # below current price. They carry source_priority 2.0 / 3.0 (vs
+    # pivot's 1.0), so when a prior-day/week level overlaps a same-cluster
+    # pivot, _level_preference picks the prior-day/week level in collapse.
+    prior_supports = _fallback_prior_side_levels(
+        side="support",
+        current_price=close,
+        include_prior_day=include_prior_day,
+        include_prior_week=include_prior_week,
+        prior_day_high=prior_day_high,
+        prior_day_low=prior_day_low,
+        prior_week_high=prior_week_high,
+        prior_week_low=prior_week_low,
+    )
+    prior_resistances = _fallback_prior_side_levels(
+        side="resistance",
+        current_price=close,
+        include_prior_day=include_prior_day,
+        include_prior_week=include_prior_week,
+        prior_day_high=prior_day_high,
+        prior_day_low=prior_day_low,
+        prior_week_high=prior_week_high,
+        prior_week_low=prior_week_low,
+    )
     support_references: list[HTFLevel] = list(pivot_supports)
     resistance_references: list[HTFLevel] = list(pivot_resistances)
+    _extend_unique_levels(support_references, prior_supports)
+    _extend_unique_levels(resistance_references, prior_resistances)
     support_filter_price = close
     resistance_filter_price = close
     if not support_references:
-        support_references = _fallback_prior_side_levels(
-            side="support",
-            current_price=fallback_reference_price,
-            include_prior_day=include_prior_day,
-            include_prior_week=include_prior_week,
-            prior_day_high=prior_day_high,
-            prior_day_low=prior_day_low,
-            prior_week_high=prior_week_high,
-            prior_week_low=prior_week_low,
-        )
-        if support_references:
-            support_filter_price = fallback_reference_price
-        else:
-            min_low_pos = int(frame["low"].astype(float).values.argmin())
-            support_references = _cluster_levels([(pd.Timestamp(frame.index[min_low_pos]), float(frame["low"].iloc[min_low_pos]))], "support", tolerance, int(max_levels_per_side * 2))
+        min_low_pos = int(frame["low"].astype(float).values.argmin())
+        support_references = _cluster_levels([(pd.Timestamp(frame.index[min_low_pos]), float(frame["low"].iloc[min_low_pos]))], "support", tolerance, int(max_levels_per_side * 2))
     if not resistance_references:
-        resistance_references = _fallback_prior_side_levels(
-            side="resistance",
-            current_price=fallback_reference_price,
-            include_prior_day=include_prior_day,
-            include_prior_week=include_prior_week,
-            prior_day_high=prior_day_high,
-            prior_day_low=prior_day_low,
-            prior_week_high=prior_week_high,
-            prior_week_low=prior_week_low,
-        )
-        if resistance_references:
-            resistance_filter_price = fallback_reference_price
-        else:
-            max_high_pos = int(frame["high"].astype(float).values.argmax())
-            resistance_references = _cluster_levels([(pd.Timestamp(frame.index[max_high_pos]), float(frame["high"].iloc[max_high_pos]))], "resistance", tolerance, int(max_levels_per_side * 2))
+        max_high_pos = int(frame["high"].astype(float).values.argmax())
+        resistance_references = _cluster_levels([(pd.Timestamp(frame.index[max_high_pos]), float(frame["high"].iloc[max_high_pos]))], "resistance", tolerance, int(max_levels_per_side * 2))
 
     eps = max(abs(float(close)) * 1e-6, 1e-8)
     flip_bars = max(0, int(flip_confirmation_bars or 0))
