@@ -263,7 +263,7 @@ This block controls loop timing, quote/history refresh cadence, stream fallback 
 |--------------------------------------|-------------------------------------------|
 | `timezone`                           | `America/New_York`                        |
 | `loop_sleep_seconds`                 | `2.0`                                     |
-| `history_poll_seconds`               | `150`                                     |
+| `history_poll_seconds`               | `300`                                     |
 | `quote_poll_seconds`                 | `6`                                       |
 | `quote_cache_seconds`                | `6`                                       |
 | `quote_batch_size`                   | `20`                                      |
@@ -276,8 +276,9 @@ This block controls loop timing, quote/history refresh cadence, stream fallback 
 | `stream_fields`                      | `[0, 1, 2, 3, 4, 5, 6, 7, 8]`             |
 | `stream_connect_timeout_seconds`     | `20`                                      |
 | `stream_fallback_poll_seconds`       | `25`                                      |
-| `stream_stale_fallback_seconds`      | `60`                                      |
+| `stream_stale_fallback_seconds`      | `180`                                     |
 | `stream_health_log_seconds`          | `90`                                      |
+| `htf_audit_refresh_seconds`          | `3600`                                    |
 | `reconcile_on_startup`               | `true`                                    |
 | `startup_reconcile_mode`             | `block`                                   |
 | `startup_order_lookback_days`        | `2`                                       |
@@ -313,6 +314,7 @@ Behavior and valid values:
 - `stream_fallback_poll_seconds`: polling cadence when streaming is unavailable.
 - `stream_stale_fallback_seconds`: base regular-session stale-stream threshold. For 1-minute `CHART_EQUITY`, the live stale check is floored by the stream-health policy (currently about 130 seconds) so healthy minute-close streams do not false-fallback every loop.
 - `stream_health_log_seconds`: throttle interval for stream-health logging.
+- `htf_audit_refresh_seconds`: HTF rebuild audit cadence. `fetch_htf_context` normally rebuilds higher-timeframe bars by resampling the in-memory 1-minute frame (live streamer + initial backfill) — a deterministic microsecond-cost operation that doesn't burn Schwab API quota. Every `htf_audit_refresh_seconds` (default 3600s = 1h) the bot falls back to `price_history` as an authoritative-source audit, catching any drift between the streamer-fed 1m bars and Schwab's record. The Schwab fallback also fires when the cache is empty (initial backfill) or when the 1m frame doesn't cover the incremental overlap window (heal). Setting this to a small value (e.g. 60) effectively disables the in-memory path — every rebuild round-trips Schwab. Setting it very large skips audits entirely.
 - `reconcile_on_startup`: whether to inspect broker positions/orders at startup.
 - `startup_reconcile_mode`: valid values are `ignore`, `block`, `log_only`, `restore_basic`, `restore_hybrid`.
   - `ignore`: skip startup reconciliation entirely.
@@ -1522,7 +1524,7 @@ Current package defaults:
 | `min_trigger_bars`                | `18`                                      |
 | `htf_timeframe_minutes`           | `60`                                      |
 | `htf_lookback_days`               | `60`                                      |
-| `htf_refresh_seconds`             | `120`                                     |
+| `htf_refresh_seconds`             | `600`                                     |
 | `htf_pivot_span`                  | `2`                                       |
 | `htf_max_levels_per_side`         | `6`                                       |
 | `htf_atr_tolerance_mult`          | `0.35`                                    |
@@ -1616,7 +1618,7 @@ Current package defaults:
 | `peers`                              | `['QQQ', 'AVGO', 'MU', 'TSM']`            |
 | `htf_timeframe_minutes`              | `60`                                      |
 | `htf_lookback_days`                  | `60`                                      |
-| `htf_refresh_seconds`                | `120`                                     |
+| `htf_refresh_seconds`                | `600`                                     |
 | `htf_pivot_span`                     | `2`                                       |
 | `htf_max_levels_per_side`            | `6`                                       |
 | `htf_atr_tolerance_mult`             | `0.35`                                    |
@@ -1694,7 +1696,7 @@ Current package defaults:
 | `peers`                              | `['QQQ', 'AVGO', 'MU', 'TSM']`            |
 | `htf_timeframe_minutes`              | `60`                                      |
 | `htf_lookback_days`                  | `60`                                      |
-| `htf_refresh_seconds`                | `120`                                     |
+| `htf_refresh_seconds`                | `600`                                     |
 | `htf_pivot_span`                     | `2`                                       |
 | `htf_max_levels_per_side`            | `6`                                       |
 | `htf_atr_tolerance_mult`             | `0.35`                                    |
@@ -1798,7 +1800,7 @@ Current package defaults:
 | `min_trigger_bars`                             | `20`                                            |
 | `htf_timeframe_minutes`                        | `60`                                            |
 | `htf_lookback_days`                            | `60`                                            |
-| `htf_refresh_seconds`                          | `120`                                           |
+| `htf_refresh_seconds`                          | `600`                                           |
 | `htf_pivot_span`                               | `2`                                             |
 | `htf_max_levels_per_side`                      | `6`                                             |
 | `htf_atr_tolerance_mult`                       | `0.35`                                          |
@@ -1986,7 +1988,7 @@ Current package defaults:
 | `require_htf_alignment`       | `True`                  |
 | `htf_timeframe_minutes`       | `15`                    |
 | `htf_lookback_days`           | `15`                    |
-| `htf_refresh_seconds`         | `300`                   |
+| `htf_refresh_seconds`         | `600`                   |
 | `htf_min_bars`                | `20`                    |
 | `htf_vwap_distance_pct`       | `0.0009`                |
 | `htf_ema_gap_pct`             | `0.0007`                |
@@ -2066,7 +2068,7 @@ Current package defaults:
 | `require_htf_alignment`              | `True`                  |
 | `htf_timeframe_minutes`              | `15`                    |
 | `htf_lookback_days`                  | `60`                    |
-| `htf_refresh_seconds`                | `180`                   |
+| `htf_refresh_seconds`                | `600`                   |
 | `htf_min_bars`                       | `20`                    |
 | `htf_vwap_distance_pct`              | `0.0009`                |
 | `htf_ema_gap_pct`                    | `0.0007`                |

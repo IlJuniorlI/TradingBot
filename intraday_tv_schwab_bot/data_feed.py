@@ -124,6 +124,21 @@ class MarketDataStore:
         self._cycle_fvg_cache: dict[tuple, FairValueGapContext] = {}
         self._cycle_ob_cache: dict[tuple, OrderBlockContext] = {}
         self._cycle_sr_cache: dict[tuple, SupportResistanceContext | None] = {}
+        # Resolved Schwab API alias cache: original_symbol_upper -> resolved_alias.
+        # Populated lazily after the first successful single-symbol fetch
+        # (quote or price_history). Lets the batch quote path substitute
+        # macro symbols (NYICDX, VIX) with their resolved aliases ($NYICDX,
+        # $VIX) so they piggyback on the streamable batch instead of
+        # firing separate per-cycle alias-retry calls.
+        self._resolved_quote_alias: dict[str, str] = {}
+        # HTF audit refresh tracker. fetch_htf_context normally rebuilds the
+        # HTF frame by resampling the in-memory 1m frame (live streamer +
+        # initial backfill). Periodically — every htf_audit_refresh_seconds
+        # (default 3600s) — it falls back to Schwab price_history as an
+        # authoritative-source audit, catching any drift between the
+        # streamer-fed 1m bars and Schwab's record. This dict tracks the
+        # last Schwab-backed refresh per (symbol, timeframe_minutes).
+        self.last_htf_audit_refresh: dict[tuple[str, int], datetime] = {}
 
     @staticmethod
     def is_streamable_equity(symbol: str) -> bool:
@@ -280,6 +295,7 @@ class MarketDataStore:
             self.history_htf = {k: v for k, v in self.history_htf.items() if k[0] not in stale}
             self.htf_cache = {k: v for k, v in self.htf_cache.items() if k[0] not in stale}
             self.last_htf_refresh = {k: v for k, v in self.last_htf_refresh.items() if k[0] not in stale}
+            self.last_htf_audit_refresh = {k: v for k, v in self.last_htf_audit_refresh.items() if k[0] not in stale}
             self.sr_cache = {k: v for k, v in self.sr_cache.items() if k[0] not in stale}
         return len(stale)
 
@@ -376,6 +392,80 @@ class MarketDataStore:
         cfg = getattr(self.config, "support_resistance", None)
         ttl = int(refresh_seconds or getattr(cfg, "refresh_seconds", 180) or 180)
         return (now_et() - last).total_seconds() >= max(30, ttl)
+
+    def _htf_audit_due(self, key: tuple[str, int]) -> bool:
+        # Whether a fresh Schwab-backed audit is due for this (symbol, tf).
+        # Audits run on a longer cadence than regular HTF refreshes — they
+        # catch drift between in-memory 1m bars (streamer-fed) and the
+        # authoritative Schwab price_history record. Default 1 hour.
+        last_audit = self.last_htf_audit_refresh.get(key)
+        if last_audit is None:
+            return True
+        ttl = max(60, int(getattr(self.config.runtime, "htf_audit_refresh_seconds", 3600) or 3600))
+        return (now_et() - last_audit).total_seconds() >= ttl
+
+    def _try_resample_htf_from_live_1m(
+        self,
+        symbol: str,
+        *,
+        cached_frame: pd.DataFrame,
+        timeframe_minutes: int,
+        base_frequency_minutes: int,
+        end: datetime,
+        lookback_days: int,
+    ) -> pd.DataFrame | None:
+        # Rebuild the HTF frame by slicing the in-memory 1m frame to the
+        # incremental overlap window and resampling to tf-minute bars.
+        # Returns the merged HTF frame on success, or None when the 1m
+        # frame is missing / doesn't cover enough history (initial backfill,
+        # cold-start, or after a long stream outage). The Schwab fallback
+        # path in fetch_htf_context handles the None case.
+        cache_key = self._symbol_key(symbol)
+        with self._lock:
+            live_1m = self.history.get(cache_key)
+        if live_1m is None or live_1m.empty:
+            return None
+        try:
+            last_htf_idx = pd.Timestamp(cached_frame.index.max())
+            earliest_1m_idx = pd.Timestamp(live_1m.index.min())
+        except Exception:
+            return None
+        if pd.isna(last_htf_idx) or pd.isna(earliest_1m_idx):
+            return None
+        # Normalize timezones so comparison is well-defined.
+        if last_htf_idx.tzinfo is None:
+            try:
+                last_htf_idx = last_htf_idx.tz_localize(end.tzinfo)
+            except Exception:
+                return None
+        if earliest_1m_idx.tzinfo is None:
+            try:
+                earliest_1m_idx = earliest_1m_idx.tz_localize(end.tzinfo)
+            except Exception:
+                return None
+        # Use the same overlap policy as Schwab incremental refresh — see
+        # _htf_incremental_start: max(base_freq * 4, 240) minutes.
+        overlap_minutes = max(int(base_frequency_minutes) * 4, 240)
+        overlap_cutoff = last_htf_idx.to_pydatetime() - timedelta(minutes=overlap_minutes)
+        if earliest_1m_idx.to_pydatetime() > overlap_cutoff:
+            # 1m frame doesn't cover the overlap window — fall back to Schwab.
+            return None
+        # Slice 1m frame from the cutoff onward and resample to tf-minute bars.
+        try:
+            overlap_1m = live_1m[live_1m.index >= overlap_cutoff]
+        except Exception:
+            return None
+        if overlap_1m.empty:
+            return None
+        rebuilt_htf = resample_bars(overlap_1m, f"{int(timeframe_minutes)}min")
+        if rebuilt_htf is None or rebuilt_htf.empty:
+            return None
+        # Merge with cached HTF — _merge_htf_frames preserves older bars
+        # while letting newer bars override overlapping indices, which is
+        # exactly what we need to refresh the tail without losing history.
+        merged = self._merge_htf_frames(cached_frame, rebuilt_htf)
+        merged = self._trim_frame_to_days(merged, end, int(lookback_days))
+        return merged
 
     @staticmethod
     def _ohlcv_columns(frame: pd.DataFrame | None) -> pd.DataFrame:
@@ -485,37 +575,69 @@ class MarketDataStore:
             cached_frame = self.history_htf.get(key)
         base_freq = self._direct_history_frequency(tf)
         end = now_et()
-        start = self._htf_incremental_start(
-            cached_frame,
-            end=end,
-            lookback_days=int(lookback_days),
-            base_frequency_minutes=base_freq,
-        )
-        incremental_refresh = start is not None
-        if start is None:
-            start = end - timedelta(days=max(5, int(lookback_days)))
-        mode = "incremental" if incremental_refresh else "full"
-        LOG.info("Fetching %sm HTF price_history for %s from %s to %s (base=%sm mode=%s)", tf, symbol, start, end, base_freq, mode)
-        payload, source_symbol = self._fetch_price_history_payload_with_aliases(
-            symbol,
-            frequencyType="minute",
-            frequency=base_freq,
-            startDate=start,
-            endDate=end,
-            needExtendedHoursData=bool(self.config.runtime.use_extended_hours_history),
-            needPreviousClose=True,
-        )
-        if str(source_symbol).upper().strip() != str(symbol).upper().strip():
-            LOG.debug("Resolved HTF price_history alias for %s via %s", symbol, source_symbol)
-        candles = payload.get("candles", [])
-        df = self._history_candles_to_frame(candles)
-        if base_freq != tf and not df.empty:
-            df = resample_bars(df, f"{tf}min")
-        if incremental_refresh and cached_frame is not None and not cached_frame.empty:
-            df = self._merge_htf_frames(cached_frame, df)
-        else:
-            df = self._ohlcv_columns(df)
-        df = self._trim_frame_to_days(df, end, int(lookback_days))
+        # Phase 3: when the HTF cache is warm and an authoritative-source
+        # audit isn't due, rebuild the HTF frame by resampling the
+        # in-memory 1m frame (streamer-fed) instead of fetching a fresh
+        # incremental window from Schwab. The 1m frame is the truth — it
+        # comes from CHART_EQUITY ticks the bot already trusts for entry
+        # decisions — and resampling 1m -> tf is a deterministic
+        # microsecond operation. Audit cadence is htf_audit_refresh_seconds
+        # (default 3600s); the Schwab fallback fires when audit is due,
+        # when the cache is empty (initial backfill), or when the 1m
+        # frame doesn't cover the incremental overlap window.
+        df: pd.DataFrame | None = None
+        if cached_frame is not None and not cached_frame.empty and not self._htf_audit_due(key):
+            rebuilt = self._try_resample_htf_from_live_1m(
+                symbol,
+                cached_frame=cached_frame,
+                timeframe_minutes=tf,
+                base_frequency_minutes=base_freq,
+                end=end,
+                lookback_days=int(lookback_days),
+            )
+            if rebuilt is not None and not rebuilt.empty:
+                df = rebuilt
+                LOG.debug(
+                    "HTF context for %s tf=%sm rebuilt from live 1m frame (skipped Schwab fetch)",
+                    symbol, tf,
+                )
+
+        if df is None:
+            # Audit due / cache cold / 1m frame insufficient — go to Schwab.
+            start = self._htf_incremental_start(
+                cached_frame,
+                end=end,
+                lookback_days=int(lookback_days),
+                base_frequency_minutes=base_freq,
+            )
+            incremental_refresh = start is not None
+            if start is None:
+                start = end - timedelta(days=max(5, int(lookback_days)))
+            mode = "incremental" if incremental_refresh else "full"
+            LOG.info("Fetching %sm HTF price_history for %s from %s to %s (base=%sm mode=%s)", tf, symbol, start, end, base_freq, mode)
+            payload, source_symbol = self._fetch_price_history_payload_with_aliases(
+                symbol,
+                frequencyType="minute",
+                frequency=base_freq,
+                startDate=start,
+                endDate=end,
+                needExtendedHoursData=bool(self.config.runtime.use_extended_hours_history),
+                needPreviousClose=True,
+            )
+            if str(source_symbol).upper().strip() != str(symbol).upper().strip():
+                LOG.debug("Resolved HTF price_history alias for %s via %s", symbol, source_symbol)
+            candles = payload.get("candles", [])
+            df = self._history_candles_to_frame(candles)
+            if base_freq != tf and not df.empty:
+                df = resample_bars(df, f"{tf}min")
+            if incremental_refresh and cached_frame is not None and not cached_frame.empty:
+                df = self._merge_htf_frames(cached_frame, df)
+            else:
+                df = self._ohlcv_columns(df)
+            df = self._trim_frame_to_days(df, end, int(lookback_days))
+            # Mark the audit complete — this Schwab fetch is the
+            # authoritative source we just synced against.
+            self.last_htf_audit_refresh[key] = now_et()
         df = ensure_standard_indicator_frame(df)
         current = None
         merged = self.get_merged(symbol, with_indicators=False)
@@ -1048,6 +1170,19 @@ class MarketDataStore:
                 self.last_empty_history_refresh.pop(cache_key, None)
             self.merge_stats[cache_key].history_rows = len(self.history[cache_key])
         self._invalidate_cycle_symbol(symbol)
+        # Propagate the 1m heal into HTF: invalidate the cross-cycle
+        # refresh throttle and cycle-scoped HTF/SR caches so the next
+        # HTF refresh fires immediately. Phase 3's in-memory resample
+        # path picks up the just-healed 1m bars and produces corrected
+        # HTF without a second Schwab call. Skipped on empty heals
+        # (REST returned no candles) since the 1m frame didn't change
+        # and the existing HTF derivation is still valid.
+        if not df.empty:
+            with self._lock:
+                htf_throttle_keys = [k for k in self.last_htf_refresh.keys() if k[0] == cache_key]
+                for throttle_key in htf_throttle_keys:
+                    self.last_htf_refresh.pop(throttle_key, None)
+            self._invalidate_cycle_htf(symbol)
         if df.empty and not self.is_regular_session(fetched_at):
             LOG.info("price_history returned no candles for %s outside regular session; using slower retry cadence", symbol)
         return self.get_merged(symbol)
@@ -1299,9 +1434,17 @@ class MarketDataStore:
                     _record_failure(sym, exc)
         return fetched, failed
 
-    @staticmethod
-    def _quote_aliases(symbol: str) -> list[str]:
+    def _quote_aliases(self, symbol: str) -> list[str]:
+        # If a previous fetch resolved this symbol to a specific Schwab
+        # alias (e.g. NYICDX -> $NYICDX), short-circuit to a single-element
+        # list so the caller skips the multi-alias retry loop entirely.
+        # The fetcher (quote or price_history) hits the right alias on the
+        # first attempt; the batch quote path also routes the symbol into
+        # batch_pending (since len([cached]) == 1) instead of alias_pending.
         sym = str(symbol).strip()
+        cached = self._resolved_quote_alias.get(sym.upper())
+        if cached:
+            return [cached]
         aliases = QUOTE_SYMBOL_ALIASES.get(sym.upper(), [sym])
         out: list[str] = []
         for item in aliases:
@@ -1312,16 +1455,23 @@ class MarketDataStore:
             out.append(sym)
         return out
 
-    @classmethod
-    def _history_aliases(cls, symbol: str) -> list[str]:
-        return cls._quote_aliases(symbol)
+    def _record_resolved_alias(self, symbol: str, request_symbol: str) -> None:
+        # Cache only when the resolved alias actually differs from the
+        # original — there's nothing to gain from caching identity
+        # resolutions, and skipping them keeps the cache focused on
+        # symbols that genuinely need substitution (NYICDX/VIX, etc.).
+        sym = str(symbol).strip()
+        request = str(request_symbol).strip()
+        if not sym or not request or sym.upper() == request.upper():
+            return
+        self._resolved_quote_alias[sym.upper()] = request
 
     def _fetch_price_history_payload_with_aliases(self, symbol: str, **kwargs) -> tuple[dict, str]:
         last_exc: Exception | None = None
         fallback_payload: dict | None = None
         fallback_symbol = str(symbol)
         saw_success = False
-        aliases = self._history_aliases(symbol)
+        aliases = self._quote_aliases(symbol)
         if len(aliases) > 1:
             LOG.debug("price_history alias attempts for %s: %s", symbol, aliases)
         for request_symbol in aliases:
@@ -1338,6 +1488,7 @@ class MarketDataStore:
                 if candles:
                     if request_symbol != str(symbol):
                         LOG.debug("price_history alias success for %s via %s candles=%d", symbol, request_symbol, len(candles))
+                        self._record_resolved_alias(symbol, request_symbol)
                     return payload, request_symbol
                 if len(aliases) > 1:
                     LOG.info("price_history alias returned no candles for %s via %s", symbol, request_symbol)
@@ -1377,6 +1528,7 @@ class MarketDataStore:
                 normalized["source_symbol"] = request_symbol
                 if request_symbol != str(symbol):
                     LOG.debug("Quote alias success for %s via %s", symbol, request_symbol)
+                    self._record_resolved_alias(symbol, request_symbol)
                 return normalized
             except Exception as exc:
                 last_exc = exc
@@ -1509,13 +1661,38 @@ class MarketDataStore:
                 continue
             pending.append(symbol)
 
+        # Symbols with a multi-alias list AND no cached resolution yet have
+        # to go through the single-quote fetch path so we can discover
+        # which alias actually works. Symbols with a cached alias (or a
+        # 1-element alias list to begin with) can ride the batch path,
+        # with the cached alias substituted into the actual request.
         alias_pending = [symbol for symbol in pending if len(self._quote_aliases(symbol)) > 1]
         batch_pending = [symbol for symbol in pending if symbol not in alias_pending]
 
         for chunk in self._quote_batch_chunks(batch_pending):
+            # Substitute resolved aliases into the request list so macro
+            # symbols (NYICDX -> $NYICDX, VIX -> $VIX, etc.) piggyback on
+            # the streamable batch instead of needing per-cycle single
+            # fetches. request_to_original maps the resolved alias back
+            # to the original cache key for response remapping.
+            request_chunk: list[str] = []
+            request_to_original: dict[str, str] = {}
+            for symbol in chunk:
+                resolved = self._resolved_quote_alias.get(str(symbol).upper(), symbol)
+                request_chunk.append(resolved)
+                if resolved != symbol:
+                    request_to_original[resolved] = symbol
             fetched: dict[str, dict] = {}
-            if len(chunk) > 1:
-                fetched = self._try_batch_quote_request(chunk)
+            if len(request_chunk) > 1:
+                raw_fetched = self._try_batch_quote_request(request_chunk)
+                if request_to_original:
+                    # Schwab returns quotes keyed by request_symbol; remap
+                    # to the original cache key so downstream lookups
+                    # (and the existing fallback `if symbol not in fetched`
+                    # check) see the symbols the rest of the bot uses.
+                    fetched = {request_to_original.get(req, req): payload for req, payload in raw_fetched.items()}
+                else:
+                    fetched = raw_fetched
             fetched_at = now_et()
             for symbol, quote_payload in fetched.items():
                 normalized = self._normalize_quote(symbol, quote_payload)

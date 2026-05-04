@@ -5,6 +5,7 @@ import math
 import os
 import sys
 import time as _monotonic_time
+from collections import deque
 from threading import RLock
 from urllib.parse import urlsplit
 from datetime import date as date_cls, datetime, time, timedelta
@@ -61,32 +62,79 @@ register_tradeflow_logging_level()
 
 
 class SchwabdevApiUsageTracker:
+    # Sliding-window rate tracker. The previous implementation reported a
+    # lifetime average (total_calls / elapsed_since_start), which drifts
+    # toward zero as soon as the bot enters idle hours — for an always-on
+    # bot, ~11 overnight idle hours per day cut the average roughly in
+    # half, even though the actual peak-hour rate hasn't changed. The
+    # rate that matters for Schwab's ~120 req/min cap is "how many calls
+    # right now", not "how many on average since the bot started days
+    # ago". This tracker keeps a deque of recent call timestamps bounded
+    # by the largest reported window (30 min) and reports per-minute
+    # rates over 1m / 5m / 15m / 30m sliding windows.
+    _MAX_WINDOW_SECONDS = 30 * 60
+
     def __init__(self) -> None:
         self.started_at = now_et()
         self.total_calls = 0
         self.last_call_at: Optional[datetime] = None
         self.method_counts: dict[str, int] = {}
+        # Deque of (timestamp, method_name) tuples — pruned to the
+        # _MAX_WINDOW_SECONDS horizon on every record_call/snapshot.
+        # At 20 calls/min sustained, max 600 entries — trivial memory.
+        self._call_times: deque[tuple[datetime, str]] = deque()
         self._lock = RLock()
 
     def record_call(self, method_name: str) -> None:
         name = str(method_name or 'unknown')
+        now = now_et()
         with self._lock:
             self.total_calls += 1
-            self.last_call_at = now_et()
+            self.last_call_at = now
             self.method_counts[name] = int(self.method_counts.get(name, 0)) + 1
+            self._call_times.append((now, name))
+            self._prune(now)
+
+    def _prune(self, now: datetime) -> None:
+        cutoff = now - timedelta(seconds=self._MAX_WINDOW_SECONDS)
+        while self._call_times and self._call_times[0][0] < cutoff:
+            self._call_times.popleft()
+
+    def _calls_in_window(self, now: datetime, seconds: float) -> int:
+        cutoff = now - timedelta(seconds=float(seconds))
+        # Linear scan — deque is bounded at ~600 entries (30min × 20cpm),
+        # so this is sub-microsecond. bisect would be faster but adds
+        # complexity for negligible gain at this size.
+        count = 0
+        for ts, _ in self._call_times:
+            if ts >= cutoff:
+                count += 1
+        return count
 
     def snapshot(self, now: Optional[datetime] = None) -> dict[str, Any]:
         current = now or now_et()
         with self._lock:
+            self._prune(current)
             elapsed_minutes = max(
                 (current - self.started_at).total_seconds() / 60.0,
                 1.0 / 60.0,
             )
-            avg_calls = (
+            lifetime_per_minute = (
                 float(self.total_calls) / elapsed_minutes
                 if self.total_calls > 0
                 else 0.0
             )
+            calls_1m = self._calls_in_window(current, 60.0)
+            calls_5m = self._calls_in_window(current, 300.0)
+            calls_15m = self._calls_in_window(current, 900.0)
+            calls_30m = self._calls_in_window(current, 1800.0)
+            # The dashboard reads `calls_per_minute_5m` — short enough to be
+            # responsive (a 1-minute spike shows up by the second minute) and
+            # smoothed enough not to jitter on every individual call.
+            calls_per_minute_1m = float(calls_1m)               # last 60s
+            calls_per_minute_5m = float(calls_5m) / 5.0         # 5min-avg
+            calls_per_minute_15m = float(calls_15m) / 15.0      # 15min-avg
+            calls_per_minute_30m = float(calls_30m) / 30.0      # 30min-avg
             snapshot = {
                 'started_at': self.started_at.isoformat(),
                 "last_call_at": (
@@ -95,7 +143,15 @@ class SchwabdevApiUsageTracker:
                     else None
                 ),
                 'total_calls': int(self.total_calls),
-                'avg_calls_per_minute': avg_calls,
+                'calls_per_minute_1m': calls_per_minute_1m,
+                'calls_per_minute_5m': calls_per_minute_5m,
+                'calls_per_minute_15m': calls_per_minute_15m,
+                'calls_per_minute_30m': calls_per_minute_30m,
+                'calls_window_1m': int(calls_1m),
+                'calls_window_5m': int(calls_5m),
+                'calls_window_15m': int(calls_15m),
+                'calls_window_30m': int(calls_30m),
+                'lifetime_calls_per_minute': lifetime_per_minute,
                 'method_counts': dict(self.method_counts),
             }
         return snapshot

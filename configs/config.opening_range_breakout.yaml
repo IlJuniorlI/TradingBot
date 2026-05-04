@@ -66,7 +66,7 @@ risk:
 runtime:
   timezone: America/New_York
   loop_sleep_seconds: 2.0
-  history_poll_seconds: 90
+  history_poll_seconds: 300
   quote_poll_seconds: 4
   quote_cache_seconds: 4
   quote_batch_size: 20
@@ -88,8 +88,9 @@ runtime:
     - 8
   stream_connect_timeout_seconds: 20
   stream_fallback_poll_seconds: 25
-  stream_stale_fallback_seconds: 60
+  stream_stale_fallback_seconds: 180
   stream_health_log_seconds: 90
+  htf_audit_refresh_seconds: 3600
   # Auto-exit: shut down cleanly when market closes and no positions are open
   auto_exit_after_session: true
   idle_sleep_seconds: 60.0

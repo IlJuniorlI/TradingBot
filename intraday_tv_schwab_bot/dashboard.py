@@ -47,6 +47,19 @@ def _json_dumps_compact(value: Any) -> str:
     return json.dumps(value, default=str, allow_nan=False, separators=(",", ":"))
 
 
+_API_USAGE_RATE_FIELDS = frozenset({
+    'calls_per_minute_1m',
+    'calls_per_minute_5m',
+    'calls_per_minute_15m',
+    'calls_per_minute_30m',
+    'calls_window_1m',
+    'calls_window_5m',
+    'calls_window_15m',
+    'calls_window_30m',
+    'lifetime_calls_per_minute',
+})
+
+
 def _disk_state_signature(value: Any) -> str:
     def _normalize(node: Any, path: tuple[str, ...] = ()) -> Any:
         if isinstance(node, dict):
@@ -54,7 +67,13 @@ def _disk_state_signature(value: Any) -> str:
             for key in sorted(str(k) for k in node.keys()):
                 if path == () and key == 'last_update':
                     continue
-                if path == ('api_usage',) and key == 'avg_calls_per_minute':
+                # All sliding-window rate / count fields change on every
+                # refresh; excluded from the disk-state signature so the
+                # snapshot file doesn't get rewritten on every cycle just
+                # because the rate ticked. total_calls and last_call_at
+                # are kept in the signature — they only change when an
+                # actual API call happens.
+                if path == ('api_usage',) and key in _API_USAGE_RATE_FIELDS:
                     continue
                 normalized[key] = _normalize(node[key], path + (key,))
             return normalized

@@ -114,7 +114,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                     mode="trading",
                     timeframe_minutes=int(self.params.get("htf_timeframe_minutes", 60)),
                     lookback_days=int(self.params.get("htf_lookback_days", 60)),
-                    refresh_seconds=int(self.params.get("htf_refresh_seconds", 120)),
+                    refresh_seconds=int(self.params.get("htf_refresh_seconds", 600)),
                     use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
                     use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
                     allow_refresh=True,
@@ -206,7 +206,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         stop_atr = float(self.params.get("htf_stop_buffer_atr_mult", 0.25))
         ema_fast_span = int(self.params.get("htf_ema_fast_span", 50))
         ema_slow_span = int(self.params.get("htf_ema_slow_span", 200))
-        refresh_seconds = int(self.params.get("htf_refresh_seconds", 120))
+        refresh_seconds = int(self.params.get("htf_refresh_seconds", 600))
         score = 0
         bullish = 0
         bearish = 0
@@ -1167,7 +1167,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             stop_buffer_atr_mult=float(self.params.get("htf_stop_buffer_atr_mult", 0.25)),
             ema_fast_span=int(self.params.get("htf_ema_fast_span", 50)),
             ema_slow_span=int(self.params.get("htf_ema_slow_span", 200)),
-            refresh_seconds=int(self.params.get("htf_refresh_seconds", 120)),
+            refresh_seconds=int(self.params.get("htf_refresh_seconds", 600)),
             use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
             use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
         )
@@ -1203,7 +1203,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         stop_atr = float(self.params.get("htf_stop_buffer_atr_mult", 0.25))
         ema_fast_span = int(self.params.get("htf_ema_fast_span", 50))
         ema_slow_span = int(self.params.get("htf_ema_slow_span", 200))
-        refresh_seconds = int(self.params.get("htf_refresh_seconds", 120))
+        refresh_seconds = int(self.params.get("htf_refresh_seconds", 600))
         trigger_tf = int(self.params.get("trigger_timeframe_minutes", 5))
         min_bars = int(self.params.get("min_bars", 80))
         min_trigger_bars = int(self.params.get("min_trigger_bars", 18))

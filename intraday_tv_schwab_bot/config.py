@@ -366,7 +366,7 @@ class RuntimeConfig:
     # Pruning runs every cycle on a wall-clock timer so the per-cycle
     # cost is negligible. Set to 0 to disable pruning entirely.
     symbol_state_prune_seconds: float = 1800.0
-    history_poll_seconds: int = 150
+    history_poll_seconds: int = 300
     quote_poll_seconds: int = 6
     quote_cache_seconds: int = 6
     quote_batch_size: int = 20
@@ -379,8 +379,16 @@ class RuntimeConfig:
     stream_fields: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6, 7, 8])
     stream_connect_timeout_seconds: int = 20
     stream_fallback_poll_seconds: int = 25
-    stream_stale_fallback_seconds: int = 60
+    stream_stale_fallback_seconds: int = 180
     stream_health_log_seconds: int = 90
+    # HTF audit cadence. fetch_htf_context normally rebuilds HTF bars by
+    # resampling the in-memory 1m frame (streamer-fed). Every
+    # htf_audit_refresh_seconds (default 3600s = 1h), the bot falls back
+    # to Schwab price_history as an authoritative-source audit, catching
+    # any drift between streamer-fed 1m bars and Schwab's record. Set
+    # to a small value (e.g. 60) to effectively disable the in-memory
+    # path; set to a very large value to skip audits entirely.
+    htf_audit_refresh_seconds: int = 3600
     reconcile_on_startup: bool = True
     startup_reconcile_mode: str = "block"
     startup_order_lookback_days: int = 2
@@ -557,7 +565,7 @@ class SupportResistanceConfig:
     enabled: bool = True
     timeframe_minutes: int = 15
     lookback_days: int = 10
-    refresh_seconds: int = 480
+    refresh_seconds: int = 600
     pivot_span: int = 2
     max_levels_per_side: int = 3
     atr_tolerance_mult: float = 0.60

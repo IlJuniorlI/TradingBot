@@ -1513,7 +1513,7 @@ function renderTopbar(data) {
   if (tradesEl) tradesEl.textContent = fmtInteger(Number.isFinite(totalTrades) ? totalTrades : ((Number(perf.closed_trades) || 0) + openPositions));
   if (wlEl) wlEl.textContent = `${fmtInteger(perf.wins ?? 0)} / ${fmtInteger(perf.losses ?? 0)}`;
   if (winRateEl) winRateEl.textContent = perf.win_rate == null ? '—' : fmtPctFromRatio(perf.win_rate);
-  if (apiCpmEl) apiCpmEl.textContent = fmtNum(data?.api_usage?.avg_calls_per_minute, 1);
+  if (apiCpmEl) apiCpmEl.textContent = fmtNum(data?.api_usage?.calls_per_minute_5m, 1);
   if (updatedEl) updatedEl.textContent = safe(data?.last_update).replace('T', ' ').slice(0, 19);
   const warmup = data?.warmup || {};
   if (warmupEl) warmupEl.textContent = warmup.total ? `${fmtInteger(warmup.ready_count || 0)} / ${fmtInteger(warmup.total || 0)}` : '—';
@@ -3597,7 +3597,7 @@ function renderEventsAndDock() {
     ['History Symbols', safe(data?.data?.history_symbols)],
     ['Stream Symbols', safe((data?.data?.stream_symbols || []).join(', '))],
     ['Quote Symbols', safe((data?.data?.quote_symbols || []).length)],
-    ['Schwabdev Calls / Min', fmtNum(data?.api_usage?.avg_calls_per_minute, 1)],
+    ['Schwabdev Calls / Min (5m)', fmtNum(data?.api_usage?.calls_per_minute_5m, 1)],
     ['Schwabdev Calls Total', safe(data?.api_usage?.total_calls)],
     ['Last Schwabdev Call', safe(data?.api_usage?.last_call_at).replace('T', ' ').slice(0, 19)],
     ['Closed Trades', safe(perf.closed_trades)],

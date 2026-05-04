@@ -77,7 +77,7 @@ risk:
 runtime:
   timezone: America/New_York
   loop_sleep_seconds: 2.0
-  history_poll_seconds: 90
+  history_poll_seconds: 300
   quote_poll_seconds: 6
   quote_cache_seconds: 6
   quote_batch_size: 20
@@ -92,8 +92,15 @@ runtime:
   stream_fields: [0, 1, 2, 3, 4, 5, 6, 7, 8]
   stream_connect_timeout_seconds: 20
   stream_fallback_poll_seconds: 25
-  stream_stale_fallback_seconds: 60
+  stream_stale_fallback_seconds: 180
   stream_health_log_seconds: 90
+  # HTF audit cadence. fetch_htf_context normally rebuilds HTF bars by
+  # resampling the in-memory 1m frame (streamer-fed). Every
+  # htf_audit_refresh_seconds (default 3600s = 1h), the bot falls back to
+  # Schwab price_history as an authoritative-source audit. Set to a small
+  # value (e.g. 60) to effectively disable the in-memory path; set very
+  # large to skip audits entirely.
+  htf_audit_refresh_seconds: 3600
   # Auto-exit: shut down cleanly when market closes and no positions are open
   auto_exit_after_session: true
   # Always-on idle cadence: outside the 7am-8pm ET stream window the loop
@@ -539,7 +546,7 @@ strategies:
       htf_max_levels_per_side: 6
       htf_pct_tolerance: 0.003
       htf_pivot_span: 2
-      htf_refresh_seconds: 120
+      htf_refresh_seconds: 600
       htf_stop_buffer_atr_mult: 0.25
       htf_timeframe_minutes: 60
       macro_bonus: 0.75
