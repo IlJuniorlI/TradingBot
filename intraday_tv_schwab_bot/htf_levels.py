@@ -201,6 +201,12 @@ def _cluster_levels(points: Iterable[tuple[pd.Timestamp, float]], kind: str, tol
     ordered = sorted([(ts, float(price)) for ts, price in points], key=lambda x: x[1])
     if not ordered:
         return []
+    newest_ts = max((ts for ts, _price in ordered), default=None)
+    oldest_ts = min((ts for ts, _price in ordered), default=None)
+    total_window_seconds = max(
+        1.0,
+        float((newest_ts - oldest_ts).total_seconds()) if newest_ts is not None and oldest_ts is not None else 1.0,
+    )
     groups: list[list[tuple[pd.Timestamp, float]]] = []
     for point in ordered:
         if not groups:
@@ -217,16 +223,38 @@ def _cluster_levels(points: Iterable[tuple[pd.Timestamp, float]], kind: str, tol
         grp_sorted = sorted(grp, key=lambda x: x[0])
         prices = [price for _, price in grp_sorted]
         touches = len(grp_sorted)
-        recency_bonus = min(1.5, 0.15 * touches)
-        score = float(touches) + recency_bonus
+        cluster_first_ts = grp_sorted[0][0]
+        cluster_last_ts = grp_sorted[-1][0]
+        active_window_seconds = max(0.0, float((cluster_last_ts - cluster_first_ts).total_seconds()))
+        # Recency factor decays linearly from 1.0 (cluster's last touch is newest)
+        # to a floor of 0.10 (cluster's last touch is at the oldest end of the
+        # window). HTF lookback windows are typically 60 days at 1h tf, so a
+        # base from 30+ days ago must not outrank a swing low from yesterday
+        # just because the old base accumulated more touches during a long
+        # consolidation. The recency multiplier on touches downweights ancient
+        # bases enough that recent close-to-price levels survive top-N
+        # selection. Persistence bonus is additive and rewards levels that
+        # held across a sustained portion of the window (a true multi-month
+        # value area still ranks above a one-tap pivot).
+        recency_factor = 1.0
+        if newest_ts is not None and oldest_ts is not None:
+            age_seconds = max(0.0, float((newest_ts - cluster_last_ts).total_seconds()))
+            recency_factor = max(0.10, 1.0 - (age_seconds / total_window_seconds))
+        persistence_factor = min(1.0, active_window_seconds / total_window_seconds)
+        # Effective touches: recent levels keep full count; old levels get
+        # discounted by recency_factor. A 30-day-old base with 8 touches at
+        # recency 0.5 contributes 4.0 effective touches — comparable to a
+        # fresh 4-touch swing low from this week.
+        effective_touches = float(touches) * recency_factor
+        score = effective_touches + 0.50 * persistence_factor
         levels.append(
             HTFLevel(
                 kind=kind,
                 price=float(sum(prices) / len(prices)),
                 touches=touches,
                 score=score,
-                first_seen=grp_sorted[0][0].isoformat() if grp_sorted else None,
-                last_seen=grp_sorted[-1][0].isoformat() if grp_sorted else None,
+                first_seen=cluster_first_ts.isoformat() if grp_sorted else None,
+                last_seen=cluster_last_ts.isoformat() if grp_sorted else None,
             )
         )
     levels.sort(key=lambda lv: (lv.score, lv.touches), reverse=True)

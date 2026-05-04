@@ -177,6 +177,24 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **HTF level scoring now time-aware** (`htf_levels.py _cluster_levels`).
+  The previous formula computed `score = touches + min(1.5, 0.15 * touches)`
+  — a misleadingly-named "recency_bonus" that was actually a touches
+  multiplier with no time component at all. With a 60-day HTF lookback,
+  ancient base levels with many touches accumulated during long
+  consolidations dominated the top-N selection, evicting recent close-
+  to-price swing lows before they reached `_collapse_same_side_levels`.
+  AMD example: current price $346.50 with first support showing at
+  $257.73 (a 30+-day-old base) instead of the recent $320-$343 swing
+  lows. Replaced with the time-aware formula already used in
+  `support_resistance.py _cluster_levels`: `recency_factor` decays
+  linearly from `1.0` (newest) to `0.10` (oldest) across the cluster
+  window, `effective_touches = touches * recency_factor`, plus a
+  persistence bonus that rewards levels held across a sustained portion
+  of the window. A 30-day-old 8-touch base now contributes ~4 effective
+  touches — comparable to a fresh 4-touch swing low — so both survive
+  top-N selection and the dashboard renders the full ladder of recent
+  + historical levels.
 - **HTF in-memory resample reverted.** An earlier attempt at this release
   added a path that rebuilt HTF bars by resampling the in-memory 1m frame
   with a periodic Schwab audit (`htf_audit_refresh_seconds: 3600`).
