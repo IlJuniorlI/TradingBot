@@ -231,7 +231,7 @@ dashboard:
       show_fib_extensions: false
       show_channel: false
       show_trendlines: false
-      show_htf_fair_value_gaps: true
+      show_htf_fair_value_gaps: false
       show_1m_fair_value_gaps: true
       show_htf_order_blocks: false
       show_1m_order_blocks: false
@@ -269,7 +269,14 @@ support_resistance:
   entry_opposing_proximity_penalty: 0.3
   use_prior_day_high_low: true
   use_prior_week_high_low: true
-  htf_fair_value_gaps_enabled: true
+  # HTF FVGs disabled: peer_confirmed_key_levels' _candidate_levels
+  # builder injects each htf.bullish_fvgs / htf.bearish_fvgs entry as a
+  # key-level zone candidate (with the FVG span as zone bounds). With
+  # detection on, the dashboard's hourly key-level zones get cluttered
+  # with FVG-derived zones that aren't real horizontal S/R. Off by
+  # design for this strategy. 1m FVGs stay on — they're consumed by
+  # the bar-confirmation retest plan, not as hourly zones.
+  htf_fair_value_gaps_enabled: false
   fair_value_gap_max_per_side: 3
   fair_value_gap_min_atr_mult: 0.06
   fair_value_gap_min_pct: 0.0006

@@ -177,6 +177,19 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **LTF S/R prior-day/week levels now always candidates, not just fallbacks**
+  (`support_resistance.py build_support_resistance_context`). The same
+  bug previously fixed in `htf_levels.py` (commit `e4abfb1`) existed in
+  the parallel S/R builder used by the dashboard's "S/R levels" sidebar
+  ladder. INTC example: a clear support at $92 (prior_day_low) was
+  rendered as a key-level zone on the chart but absent from the
+  sidebar's supports list, where the first entry was $86.76 (a recent
+  pivot low). Cause: `if not support_references` only injected
+  prior-day/week levels when pivot detection produced an empty result.
+  Fixed identically — `_extend_unique_levels` merges prior_day_low /
+  prior_day_high / prior_week_low / prior_week_high into the candidate
+  pool alongside pivots, so they compete in the collapse step instead
+  of being invisible whenever pivots existed.
 - **HTF prior-day/week levels now always candidates, not just fallbacks**
   (`htf_levels.py build_htf_context`). The previous flow only injected
   `prior_day_low` / `prior_week_low` (and the high counterparts) when
