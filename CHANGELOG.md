@@ -9,6 +9,43 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **LTF/HTF separation cleanup.** The previous code conflated LTF
+  (lower-timeframe / trigger frame) and HTF (higher-timeframe / SR
+  context) via a silent override pattern: `support_resistance.timeframe_minutes`
+  was treated as LTF in name but routinely used as HTF whenever a
+  strategy declared `params.htf_timeframe_minutes`. This made it
+  impossible to read a config and know what timeframe each block was
+  really driving. Cleanup:
+  - **Strategy params renamed** for clarity: `htf_timeframe_minutes`
+    → `htf_minutes`, `trigger_timeframe_minutes` → `ltf_minutes`. The
+    older names are removed entirely (per project's clean-breaks
+    convention) — manifests, yaml configs, READMEs all migrated. 35
+    files updated.
+  - **`support_resistance.timeframe_minutes` is now the default HTF**
+    used by SR detection, key-level zones, dashboard sidebar S/R list,
+    and engine entry/exit gating. Strategies that operate on a
+    different HTF override per-strategy via `params.htf_minutes`.
+  - **LTF defaults to 1-minute streaming bars** when a strategy doesn't
+    declare `params.ltf_minutes`. Strategies with a distinct intraday
+    trigger candle (e.g. `peer_confirmed_key_levels` uses 5-min
+    triggers) declare it explicitly.
+  - **Helper rename**: `_active_sr_*` / `active_sr_*` / `_sr_*`
+    accessors → `_active_htf_*` / `active_htf_*` / `_htf_*`. Each is
+    explicit about reading HTF; the old names hid that. New parallel
+    `_active_ltf_minutes` / `_ltf_minutes` accessors expose the LTF
+    timeframe. The override fallback pattern (read params first, fall
+    back to support_resistance block) is preserved — only the names
+    are now honest.
+  - **Dashboard chart "ltf" mode** renders at the strategy's LTF
+    instead of hardcoded 1-minute bars. For `peer_confirmed_key_levels`
+    that's 5-min bars; for simpler strategies still 1-min. Mode value
+    `"1m"` is accepted as a back-compat alias for `"ltf"` for one
+    release, then dropped. Frontend `dashboard.js` migrated to the
+    canonical `"ltf"` value.
+  - **No trading behavior change for stops/exits/risk** — these were
+    already getting HTF via the override; now they get HTF explicitly.
+    Streaming responsiveness preserved (flip frame is always 1m,
+    live price for stop trigger is always 1m, regardless of HTF).
 - **Always-on operation.** Bot now runs continuously across days instead of
   exiting at session close. Three new `RuntimeConfig` knobs:
   `idle_sleep_seconds` (default `60.0`, ~95% overnight CPU savings via
@@ -26,17 +63,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   archives reflect that day's tally only.
 - **Order blocks** (`order_blocks.py`). Detection at both 1-minute and HTF
   timeframes with two modes (`loose` / `strict`). Eight knobs in
-  `SupportResistanceConfig`: `{one_minute,htf}_order_blocks_enabled` enable
+  `SupportResistanceConfig`: `{ltf,htf}_order_blocks_enabled` enable
   flags plus shared `order_block_mode`, `order_block_max_per_side`,
   `order_block_min_atr_mult`, `order_block_min_pct`,
   `order_block_min_thrust_atr_mult` (default `0.75` — break-of-structure
   thrust filter), `order_block_pivot_span`, and
   `order_block_new_high_lookback`. Strength-based ranking (thrust × size ×
   age × validity) when `max_per_side` clips. New `BaseStrategy` methods:
-  `_one_minute_order_block_context`, `_htf_order_block_context`,
+  `_ltf_order_block_context`, `_htf_order_block_context`,
   `_continuation_ob_retest_plan`, and `_apply_continuation_zone_retest_plans`
   (OR-combine FVG + OB plans). Dashboard chart overlays (dashed border, faint
-  fill) via per-profile `show_htf_order_blocks` / `show_1m_order_blocks` flags;
+  fill) via per-profile `show_htf_order_blocks` / `show_ltf_order_blocks` flags;
   cross-timeframe protection mirrors FVG behavior. All 18 shipped presets
   expose the eight OB knobs (defaults safe-off); `peer_confirmed_key_levels`
   ships with OB detection disabled since its custom entry pipeline doesn't
@@ -44,7 +81,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Heal-propagation hook** (`data_feed.py fetch_history`). A successful
   1m heal now invalidates `last_htf_refresh` and the cycle-scoped HTF
   cache so the HTF rebuild fires immediately on the healed 1m frame
-  instead of waiting `htf_refresh_seconds`. Skipped on empty heals
+  instead of waiting until the next bar boundary. Skipped on empty heals
   (REST returned no candles) since the existing HTF derivation is still
   valid.
 - **Quote alias caching** (`data_feed.py`). New `_resolved_quote_alias` cache
@@ -78,8 +115,257 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   microcap squeeze entries on deep retests where VWAP/EMA9 lag well above
   the FVG zone.
 
+### Added
+
+- **Fib retracement chart overlays (38.2% / 50% / 61.8% / 78.6%).**
+  Pullback support levels within a bullish impulse range and bounce
+  resistance levels within a bearish impulse range, drawn as dashed
+  horizontal lines. Companion to the existing fib extension overlays
+  (127.2% / 161.8%). New `show_fib_retracements` chart toggle in the
+  `DashboardChartConfig` schema (default `false` compact, `true`
+  expanded — paired with `show_fib_extensions`). 8 new
+  `fib_bullish_382/500/618/786` and `fib_bearish_382/500/618/786`
+  fields on `TechnicalLevelsContext`, computed alongside the
+  existing extensions in `technical_levels.py` (no extra impulse
+  detection — the same `bullish_impulse` / `bearish_impulse`
+  segments drive both extension and retracement levels).
+
 ### Changed
 
+- **Technical-levels overlays now follow the strategy's LTF.** The
+  dashboard's `symbol_snapshot` previously built the technical_levels
+  context (fibs, AVWAP, Bollinger, ADX, channels, trendlines, ATR
+  context, OBV, RSI, divergences) from the 1m streamed frame
+  unconditionally. With LTF/HTF separation done across the rest of
+  the codebase, this was the last pinned-1m surface for derived
+  overlays. Now uses the strategy's `params.ltf_minutes` frame
+  (resampled via `data.get_merged(symbol, timeframe=f"{ltf_min}min")`
+  when LTF != 1, otherwise the 1m streamed frame). For
+  `peer_confirmed_key_levels` (LTF=5m) the chart's fib extensions /
+  retracements / AVWAP / Bollinger / channels / trendlines all align
+  with the 5m bars displayed in LTF chart mode. For default-LTF
+  strategies behavior is unchanged.
+- **`hourly_*` → `htf_*` rename (HTF concept, no shims).** All
+  `hourly_*` strategy params, output keys, methods, and reason codes
+  refer to the HTF context (HTF EMAs, HTF zone votes, HTF bias
+  alignment) — not literally "the 1-hour timeframe". Renamed for
+  consistency with the rest of the codebase's HTF/LTF naming:
+  - **Strategy params (2)**: `require_hourly_bias_alignment` →
+    `require_htf_bias_alignment`, `strong_setup_min_hourly_vote_edge` →
+    `strong_setup_min_htf_vote_edge`.
+  - **Method**: `_hourly_bias` → `_htf_bias`.
+  - **Output keys (5)**: `hourly_bias` → `htf_bias`,
+    `hourly_bull_votes` → `htf_bull_votes`, `hourly_bear_votes` →
+    `htf_bear_votes`, `hourly_vote_edge` → `htf_vote_edge`,
+    `hourly_vote_bonus` → `htf_vote_bonus`.
+  - **Reason codes (5)**: `hourly_bias_bearish` → `htf_bias_bearish`,
+    `hourly_bias_not_bullish` → `htf_bias_not_bullish`,
+    `hourly_bias_bullish` → `htf_bias_bullish`,
+    `hourly_bias_not_bearish` → `htf_bias_not_bearish`,
+    `price_not_in_hourly_zone` → `price_not_in_htf_zone`.
+  - Touched: 2 manifests (peer_confirmed_key_levels,
+    peer_confirmed_key_levels_1m), 2 yaml configs, 3 strategy.py files
+    (peer_confirmed_key_levels, peer_confirmed_trend_continuation,
+    entry_gatekeeper), 2 READMEs.
+- **Dashboard chart: AVWAP renders on HTF charts.** The expanded HTF
+  chart was suppressing `show_anchored_vwap` along with the
+  `show_ltf_*` toggles. AVWAP is a price-level overlay (horizontal
+  line drawn at the anchored-VWAP price) that's valid regardless of
+  chart bar timeframe — no reason to hide it on HTF. Removed
+  `show_anchored_vwap` from the HTF suppression list in
+  `dashboard.js`.
+- **Diagnostics tab: bot uptime added.** The bottom-dock Diagnostics
+  panel now shows "Bot Uptime" (formatted as `Nd HH:MM:SS` for runs ≥1
+  day, `HH:MM:SS` otherwise) and "Started At" (raw ISO timestamp).
+  Both derive from `data.started_at` which the engine has been
+  emitting in the snapshot payload all along; the dashboard just
+  wasn't surfacing it. New `fmtUptime()` helper in `dashboard.js`.
+- **All hardcoded "1-minute" paths now follow the strategy's LTF.** Audit
+  found four classes of stale 1m hardcodes after the LTF/HTF split, all
+  cleaned in one cut:
+  - **Real bugs (8 sites)**:
+    - `dashboard_cache.py` chart-payload code passed
+      `timeframe_minutes=1` and labelled FVGs/OBs `"1m"` even when the
+      strategy's LTF was 5m. Both the FVG path (line 961) and the OB
+      path (line 1033) now read `self._active_ltf_minutes()` and label
+      payloads `f"{ltf_min}m"`.
+    - `BaseStrategy._score_fvg_context` was called with
+      `timeframe_minutes=1` from `strategy_base.py` (line 2634) and
+      `zero_dte_etf_options/strategy.py` (line 577) — both now pass
+      `self._ltf_minutes()`.
+    - `dashboard.js` `ltfVisibilityFilter` rejected items whose
+      `timeframe` label wasn't `'1m'`. With LTF=5m, every LTF FVG/OB
+      had label `"5m"` and got dropped from the chart. Filter now
+      compares against `ltfTimeframeLabel` derived from
+      `chart.timeframe_minutes`. HTF FVG/OB filters likewise switched
+      from `timeframe !== '1m'` to `timeframe !== ltfTimeframeLabel`.
+  - **`_structure_context(frame, "1m")` → `_structure_context(frame, "ltf")`**
+    in 13 strategy files (entry_gatekeeper, strategy_base, mean_reversion,
+    pairs_residual, momentum_close, microcap_pm_breakout, closing_reversal,
+    opening_range_breakout, rth_trend_pullback, top_tier_adaptive,
+    volatility_squeeze_breakout, zero_dte_etf_options ×2). Default value
+    of `_structure_context`'s `timeframe` parameter also flipped from
+    `"1m"` to `"ltf"`. Strategies with LTF=1m get identical behavior;
+    strategies with LTF≠1 (none today, but future-safe) get LTF-aware
+    structure analysis automatically.
+  - **Stale internal vars** renamed for consistency: `fvg1_score` →
+    `fvg_ltf_score` (strategy_base, zero_dte_etf_options),
+    `fvg1_ctx` → `fvg_ltf_ctx`, `ms1_ctx` → `ms_ltf_ctx`, `ms1_weight` →
+    `ms_ltf_weight`, `ms1_fields` → `ms_ltf_fields`. Output keys
+    `fvg_1m_*` → `fvg_ltf_*` (8 keys). Entry-decision metadata key
+    prefix `'ms1m'` → `'msltf'` (used by `_structure_lists(prefix=...)`
+    in 3 strategies + entry_gatekeeper). Test fixtures in
+    `tests/test_bug_regressions.py` migrated to the new
+    `msltf_pivot_count` key.
+  - **Stale comments/docstrings** updated: `data_feed.py`
+    `get_order_block_context` docstring now describes "LTF OBs" instead
+    of "1m OBs"; `engine.py` and `strategy_base.py` example tuples for
+    `_observed_contexts` use `("structure", "ltf")` instead of
+    `("structure", "1m")`.
+  - **Genuinely 1m-specific paths kept** (the literal 1-minute frame is
+    correct in these): Schwab API `frequencyType="minute"` /
+    `frequency=1` for streaming history; `support_resistance.py:563`
+    `now_ts.floor("1min")` for the dual-frame flip cutoff;
+    `utils.py:658` `ts.floor("1min")` utility; back-compat aliases for
+    legacy `"1m"` chart-mode URL parameter (`dashboard.py`,
+    `dashboard_cache.py`, `dashboard.html`); `session_report.py:786`
+    already LTF-aware.
+- **`trigger_*` → `ltf_*` rename (LTF-frame meaning only).** The
+  `trigger_*` prefix was overloaded — sometimes meaning "the entry-trigger
+  event" (verb), sometimes meaning "the LTF candle / trigger frame"
+  (noun). Renamed only the noun-meaning items, with no shims:
+  - **Strategy params (12)**: `trigger_quality_bonus_enabled` →
+    `ltf_quality_bonus_enabled`, `trigger_quality_max_bonus` →
+    `ltf_quality_max_bonus`, `trigger_reclaim_quality_bonus_cap` →
+    `ltf_reclaim_quality_bonus_cap`, `trigger_zone_interaction_bonus_cap` →
+    `ltf_zone_interaction_bonus_cap`, `trigger_candle_quality_bonus_cap` →
+    `ltf_candle_quality_bonus_cap`, `trigger_volume_quality_bonus_cap` →
+    `ltf_volume_quality_bonus_cap`, `trigger_range_expansion_bonus_cap` →
+    `ltf_range_expansion_bonus_cap`, `min_trigger_score` → `min_ltf_score`,
+    `min_trigger_close_position` → `min_ltf_close_position`,
+    `min_trigger_volume_ratio` → `min_ltf_volume_ratio`,
+    `min_trigger_bar_volume` → `min_ltf_bar_volume`,
+    `strong_setup_min_trigger_score` → `strong_setup_min_ltf_score`.
+  - **Entry-decision metadata keys (18)**: `trigger_score` → `ltf_score`,
+    `trigger_base_score` → `ltf_base_score`, `trigger_quality_*` →
+    `ltf_quality_*`, all `trigger_candle_*` (matches / anchor / score /
+    net_score / opposite_score / regime_hint) → `ltf_candle_*`,
+    `trigger_score_required` → `ltf_score_required`, `trigger_reasons` →
+    `ltf_reasons`, `strong_setup_trigger_score_required` →
+    `strong_setup_ltf_score_required`, `selection_trigger_score` →
+    `selection_ltf_score`. **Skip-reason codes** also renamed:
+    `weak_trigger_score` → `weak_ltf_score`, `trigger_score_below_min` →
+    `ltf_score_below_min`, `trigger_bar_volume_below_min` →
+    `ltf_bar_volume_below_min`.
+  - **`BaseStrategy` methods (5)**: `_trigger_score` → `_ltf_score`,
+    `_trigger_quality_bonus` → `_ltf_quality_bonus`, `_trigger_quality_caps`
+    → `_ltf_quality_caps`, `_configured_trigger_candle_summary` →
+    `_configured_ltf_candle_summary`, `_configured_trigger_candle_match`
+    → `_configured_ltf_candle_match`.
+  - **Internal vars** in the renamed methods: `trigger_min_score`,
+    `trigger_window`, `trigger_sweep_window`, `trigger_preview`,
+    `level_selection_trigger_score` → `ltf_*` equivalents.
+  - **Kept (verb meaning)**: `adaptive_runner_trigger_rr`,
+    `exit_trigger_level`, `_pullback_trigger_signal`,
+    `_no_style_trigger_reason`, `trigger_lookback_bars` (rth_trend_pullback
+    re-expansion trigger event), `trigger_high` / `trigger_low`,
+    `trigger_level=` kwarg, locals `trigger_level` / `trigger_broke` /
+    `trigger_kind` / `trigger_ref` / `trigger_slice` / `trigger_lookback`,
+    `anti_chase_fvg_retest_trigger_tolerance_pct`. These all really mean
+    "the thing that triggers entry" (verb), not the LTF frame.
+  - 26 files touched in one cut: 5 manifests, 7 yaml configs, 4 strategy.py
+    files (peer_confirmed_*, microcap_pm_breakout), `strategy_base.py`,
+    `entry_gatekeeper.py`, 7 strategy READMEs + main README, 2 test files,
+    `scripts/scaffold_strategy_plugin.py`. No back-compat aliases — old
+    names removed entirely (per project's clean-breaks rule).
+- **Unified flip-confirmation gate.** The two-mode design
+  (`mode="dashboard"` for snappy 1-bar 1m feedback vs `mode="trading"`
+  for the strict 2-bar-1m / 1-bar-5m dual-frame OR gate) collapses to a
+  single trading-strict gate now that every consumer of the SR context
+  uses the same flip strictness:
+  - **Dashboard chart** zone-flip detection (`dashboard_cache.py` key
+    level zones) switched from `dashboard_flip_confirmation_1m_bars=1` /
+    `5m=0` to the trading values. Chart, sidebar (`sr_row()`), entry
+    gatekeeper, position management, and strategy entries (`peer_confirmed_*`,
+    `top_tier_adaptive`) now all see the same flip status — no path
+    where the chart shows a level as broken before the strategy treats
+    it as broken.
+  - **Entry gatekeeper** (`entry_gatekeeper.py:414`) switched from
+    `mode="dashboard"` to `mode="trading"`. Behaviorally a no-op (the
+    gatekeeper only reads `sr_ctx.market_structure`, which is computed
+    by `analyze_market_structure()` and doesn't depend on flip values),
+    but consolidates the cycle-cache (`_cycle_sr_cache`) so the
+    gatekeeper and `position_manager` share a single SR context build
+    per `(symbol, tf)` instead of two.
+  - **`mode="dashboard"` branch removed** from
+    `MarketDataStore.get_support_resistance` — only `"trading"` and
+    `"default"` modes remain. The `mode` parameter could be retired
+    entirely in a follow-up.
+  - **`SupportResistanceConfig.dashboard_flip_confirmation_1m_bars`
+    removed entirely** (per project's clean-breaks-over-shims rule).
+    The orphaned knob is gone from `config.py`, all 18 yaml configs,
+    and the SR-config table in README.md.
+- **LTF FVG / OB / structure retargeting.** Five SR-config knobs and one
+  strategy param were renamed AND re-targeted from "always 1-minute"
+  to "the strategy's LTF":
+  - `support_resistance.one_minute_fair_value_gaps_enabled` →
+    `ltf_fair_value_gaps_enabled`
+  - `support_resistance.one_minute_order_blocks_enabled` →
+    `ltf_order_blocks_enabled`
+  - `support_resistance.structure_1m_pivot_span` → `structure_ltf_pivot_span`
+  - `support_resistance.structure_1m_weight` → `structure_ltf_weight`
+  - `dashboard.charting.{compact,expanded}.show_1m_fair_value_gaps` →
+    `show_ltf_fair_value_gaps` (companion: `show_1m_order_blocks` →
+    `show_ltf_order_blocks`)
+  - Strategy param `one_minute_fvg_entry_weight` → `ltf_fvg_entry_weight`
+  - **Behavior change**: FVG/OB/structure analysis now runs on the
+    strategy's `params.ltf_minutes` frame (defaults to 1m streaming
+    bars when not declared). For `peer_confirmed_key_levels` (LTF=5m),
+    FVGs and OBs are now detected on 5m bars instead of 1m. For
+    `peer_confirmed_key_levels_1m` and other strategies that default
+    to 1m LTF, behavior is unchanged.
+  - **Method renames**: `BaseStrategy._one_minute_fvg_context` →
+    `_ltf_fvg_context`; `_one_minute_order_block_context` →
+    `_ltf_order_block_context`.
+  - **`MarketDataStore.get_fair_value_gap_context`** previously
+    accepted a `timeframe_minutes` label but only ever computed on the
+    1-minute merged frame. Now it resamples to the requested timeframe
+    before building the FVG context (mirroring `get_order_block_context`).
+  - **Structure-context gate**: `_structure_context` matches against
+    the strategy's LTF via the new `_is_ltf_token()` helper instead of
+    the hardcoded `{"1m","1min","minute","execution"}` set. The
+    `structure_ltf_*` overrides now apply when the strategy is computing
+    structure on its LTF frame regardless of LTF value.
+  - **Dashboard chart payload keys**: `one_minute_fair_value_gaps` →
+    `ltf_fair_value_gaps`; `one_minute_order_blocks` → `ltf_order_blocks`.
+    Frontend `dashboard.js` migrated to read the new keys.
+- **Bar-aligned HTF refresh.** `MarketDataStore.should_refresh_htf_context`
+  no longer uses an elapsed-time throttle; it now refreshes on HTF bar
+  boundaries with a 10-second settle buffer. New HTF data only arrives
+  at HTF bar boundaries — within a single bar window the broker has
+  nothing new to give us. For HTF=60m (base_freq=30m), at the 11:00
+  boundary both 30m constituents of the just-closed 10:00-11:00 60m bar
+  are already complete on the broker side, so a single fetch + resample
+  produces the closed bar (no need for two 30m-aligned fetches). API
+  reduction per symbol per HTF: 5m → 60% fewer fetches/hr; 15m → 87%
+  fewer; 30m → 93% fewer; 60m → 97% fewer; 240m → 99% fewer.
+  - **`htf_refresh_seconds` removed entirely.** Strategy params,
+    manifests, yamls, READMEs, accessors, and the `refresh_seconds`
+    parameter on `data_feed.get_*` / `prefetch_htf_contexts` /
+    `should_refresh_*` all gone (per project's clean-breaks
+    convention). Failure retries work naturally because
+    `last_htf_refresh[key]` is only stamped on successful fetch+merge —
+    a failed fetch leaves the bar window "due" so the next tick retries.
+  - **Cycle-cache key on `get_support_resistance` simplified** —
+    `refresh_seconds` dropped from the cycle key tuple since it no
+    longer parameterizes behavior.
+  - **`current_structure_overlay` no longer rebuilds a full SR context.**
+    Calls `support_resistance.analyze_market_structure(frame, ...)`
+    directly to extract the CHOCH/BOS overlay without re-running pivot
+    detection, S/R clustering, prior-day/week, FVG checks, broken-level
+    reconciliation, or proximity metrics — all the work that the
+    overlay path threw away. Eliminates a duplicate per-render rebuild
+    on every dashboard chart payload.
 - **Engine cycle parallelization.** Per-symbol Schwab fetches (history, S/R
   refresh, quote fallback) now run via `_parallel_symbol_map` and
   `_parallel_quote_fetch`. Strategy context caches (`_chart_context`,
@@ -115,11 +401,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   silences common transport-layer exceptions (`ssl.SSLError`,
   `ConnectionError`, `BrokenPipeError`, `socket.timeout`) at DEBUG level
   instead of dumping full tracebacks to journald.
-- **FVG knob consolidation.** Six `htf_*` / `one_minute_*` FVG knobs
+- **FVG knob consolidation.** Six `htf_*` / `ltf_*` FVG knobs
   collapsed into three shared knobs (`fair_value_gap_max_per_side`,
   `fair_value_gap_min_atr_mult`, `fair_value_gap_min_pct`); both timeframes
   read the same fields. Enable flags
-  (`htf_fair_value_gaps_enabled`, `one_minute_fair_value_gaps_enabled`)
+  (`htf_fair_value_gaps_enabled`, `ltf_fair_value_gaps_enabled`)
   remain timeframe-specific. Per project's clean-breaks-over-shims
   convention, the old field names are removed entirely from
   `SupportResistanceConfig`. Mirrors the OB knob consolidation.
@@ -138,11 +424,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   entry/management/screener windows expanded to `07:00-19:55` ET,
   `time_stop_minutes: 0`. API-cost retune for extended hours:
   `history_poll_seconds: 300`, `stream_stale_fallback_seconds: 180`.
-  `htf_refresh_seconds` stays at `120` since the throttle now controls
-  resample cadence (free) and level-flip detection latency, not Schwab
-  call frequency (which `htf_audit_refresh_seconds: 3600` governs).
-  Strategy quality filters (min trigger score, peer agreement, macro net
-  bias) gate extended-hours candidates organically.
+  HTF refresh is bar-aligned (one Schwab call per HTF bar boundary), so
+  the prior `htf_refresh_seconds` knob is gone — see the bar-aligned
+  HTF refresh note in **Changed**. Strategy quality filters (min trigger
+  score, peer agreement, macro net bias) gate extended-hours candidates
+  organically.
 - **Dashboard render polish.** `dashboard_recent_trade_markers()` and
   `dashboard_symbol_trade_signature()` filter trades by symbol BEFORE
   slicing (a fresh fill on a long-quiet symbol could otherwise be
@@ -177,19 +463,6 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **LTF S/R prior-day/week levels now always candidates, not just fallbacks**
-  (`support_resistance.py build_support_resistance_context`). The same
-  bug previously fixed in `htf_levels.py` (commit `e4abfb1`) existed in
-  the parallel S/R builder used by the dashboard's "S/R levels" sidebar
-  ladder. INTC example: a clear support at $92 (prior_day_low) was
-  rendered as a key-level zone on the chart but absent from the
-  sidebar's supports list, where the first entry was $86.76 (a recent
-  pivot low). Cause: `if not support_references` only injected
-  prior-day/week levels when pivot detection produced an empty result.
-  Fixed identically — `_extend_unique_levels` merges prior_day_low /
-  prior_day_high / prior_week_low / prior_week_high into the candidate
-  pool alongside pivots, so they compete in the collapse step instead
-  of being invisible whenever pivots existed.
 - **HTF prior-day/week levels now always candidates, not just fallbacks**
   (`htf_levels.py build_htf_context`). The previous flow only injected
   `prior_day_low` / `prior_week_low` (and the high counterparts) when
@@ -266,19 +539,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   longer dependent on desktop's `≤1400px` breakpoint). Qty rendering uses
   `fmtInteger()` (was `escapeHtml()` producing literal `"null"`).
 - **Memory + state hygiene.** `data_feed.prune_inactive_symbols` evicts
-  `last_htf_refresh` and `last_htf_audit_refresh` tuple-keyed dicts.
+  the `last_htf_refresh` tuple-keyed dict alongside the rest of the
+  per-symbol state.
 - **Config + manifest hygiene.** All 18 prod presets + `config.example.yaml`
-  expose the eight OB knobs (defaults safe-off), the three always-on knobs
-  (`idle_sleep_seconds`, `symbol_state_prune_seconds`,
-  `session_reconcile_on_resume`), and `htf_audit_refresh_seconds: 3600`.
-  README runtime table + behavior section updated with the new knobs.
+  expose the eight OB knobs (defaults safe-off) and the three always-on
+  knobs (`idle_sleep_seconds`, `symbol_state_prune_seconds`,
+  `session_reconcile_on_resume`). README runtime table + behavior
+  section updated with the new knobs.
 - **Logging + cosmetic.** `dashboard_cache.py log_component_failure` calls
   in OB blocks pass symbol as arg (was printf message). ORB `none`-mode
   activity score rescaled to `rvol × volume / 1_000_000` so log magnitudes
   match other branches. Dashboard `focus-meta` uses compact entry-decision
   label so long ETF skip reasons don't push live-data chips off the card.
   Three IDE / type-checker warnings cleaned up (redundant
-  `self.stream = None`, two unused `_one_minute_order_block_context` params).
+  `self.stream = None`, two unused `_ltf_order_block_context` params).
 
 ## [1.0.0] — 2026-04-24
 

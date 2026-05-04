@@ -97,14 +97,14 @@ Strategy-specific knobs:
 
 - Universe and HTF map:
   - `tradable`, `peers`
-  - `htf_timeframe_minutes`, `htf_lookback_days`, `htf_refresh_seconds`, `htf_pivot_span`, `htf_max_levels_per_side`, `htf_atr_tolerance_mult`, `htf_pct_tolerance`, `htf_stop_buffer_atr_mult`, `htf_ema_fast_span`, `htf_ema_slow_span`
+  - `htf_minutes`, `htf_lookback_days`, `htf_pivot_span`, `htf_max_levels_per_side`, `htf_atr_tolerance_mult`, `htf_pct_tolerance`, `htf_stop_buffer_atr_mult`, `htf_ema_fast_span`, `htf_ema_slow_span`
 - Trigger frame and warmup:
-  - `trigger_timeframe_minutes`, `min_bars`, `min_trigger_bars`
+  - `ltf_minutes`, `min_bars`, `min_ltf_bars`
 - Continuation scoring and pullback quality:
-  - `min_total_score`, `min_trigger_score`, `min_adx14`
+  - `min_total_score`, `min_ltf_score`, `min_adx14`
   - `min_pullback_bars`, `max_pullback_bars`, `max_pullback_depth_atr`, `pullback_hold_atr`, `max_countertrend_volume_ratio`
 - Re-expansion trigger detail:
-  - `breakout_buffer_pct`, `min_trigger_close_position`, `min_trigger_volume_ratio`
+  - `breakout_buffer_pct`, `min_ltf_close_position`, `min_ltf_volume_ratio`
 - Anti-chase / extension controls:
   - `max_extension_from_vwap_atr`, `max_extension_from_ema9_atr`
 - Peer and macro confirmation:
@@ -114,7 +114,7 @@ Strategy-specific knobs:
   - `min_rr`, `target_rr`, `runner_target_rr`, `stop_buffer_atr_mult`
   - `strong_setup_runner_enabled`, `adaptive_breakeven_rr`, `adaptive_profit_lock_rr`, `adaptive_profit_lock_stop_rr`, `adaptive_runner_trigger_rr`
 - Context overlays:
-  - `htf_fvg_entry_weight`, `one_minute_fvg_entry_weight`, `opposing_fvg_entry_penalty_mult`, `fvg_runner_rr_bonus`
+  - `htf_fvg_entry_weight`, `ltf_fvg_entry_weight`, `opposing_fvg_entry_penalty_mult`, `fvg_runner_rr_bonus`
   - `use_sr_veto` (disabled by default so the strategy does not hard-block on S/R proximity)
 
 Also uses these shared stock groups:
@@ -129,12 +129,11 @@ Current package defaults:
 |-----------------------------------|-------------------------------------------|
 | `tradable`                        | `['AAPL', 'NVDA', 'GOOG', 'AMD', 'INTC']` |
 | `peers`                           | `['QQQ', 'AVGO', 'MU', 'TSM']`            |
-| `trigger_timeframe_minutes`       | `5`                                       |
+| `ltf_minutes`       | `5`                                       |
 | `min_bars`                        | `85`                                      |
-| `min_trigger_bars`                | `18`                                      |
-| `htf_timeframe_minutes`           | `60`                                      |
+| `min_ltf_bars`                | `18`                                      |
+| `htf_minutes`           | `60`                                      |
 | `htf_lookback_days`               | `60`                                      |
-| `htf_refresh_seconds`             | `120`                                     |
 | `htf_pivot_span`                  | `2`                                       |
 | `htf_max_levels_per_side`         | `6`                                       |
 | `htf_atr_tolerance_mult`          | `0.35`                                    |
@@ -150,7 +149,7 @@ Current package defaults:
 | `bond_symbol`                     | `TLT`                                     |
 | `volatility_symbol`               | `VIX`                                     |
 | `min_total_score`                 | `5.5`                                     |
-| `min_trigger_score`               | `2.5`                                     |
+| `min_ltf_score`               | `2.5`                                     |
 | `min_adx14`                       | `13.5`                                    |
 | `max_pullback_bars`               | `6`                                       |
 | `min_pullback_bars`               | `2`                                       |
@@ -158,8 +157,8 @@ Current package defaults:
 | `pullback_hold_atr`               | `0.38`                                    |
 | `max_countertrend_volume_ratio`   | `1.28`                                    |
 | `breakout_buffer_pct`             | `0.0007`                                  |
-| `min_trigger_close_position`      | `0.58`                                    |
-| `min_trigger_volume_ratio`        | `1.02`                                    |
+| `min_ltf_close_position`      | `0.58`                                    |
+| `min_ltf_volume_ratio`        | `1.02`                                    |
 | `max_extension_from_vwap_atr`     | `1.05`                                    |
 | `max_extension_from_ema9_atr`     | `0.88`                                    |
 | `min_rr`                          | `1.8`                                     |
@@ -172,7 +171,7 @@ Current package defaults:
 | `adaptive_profit_lock_stop_rr`    | `0.34`                                    |
 | `adaptive_runner_trigger_rr`      | `1.12`                                    |
 | `htf_fvg_entry_weight`            | `0.34`                                    |
-| `one_minute_fvg_entry_weight`     | `0.16`                                    |
+| `ltf_fvg_entry_weight`     | `0.16`                                    |
 | `opposing_fvg_entry_penalty_mult` | `1.0`                                     |
 | `fvg_runner_rr_bonus`             | `0.12`                                    |
 | `use_sr_veto`                     | `false`                                   |

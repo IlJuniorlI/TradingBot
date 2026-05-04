@@ -150,7 +150,7 @@ Current code defaults:
 | `strong_trend_runner_enabled`                     | `true`                          |
 | `strong_trend_target_rr`                          | `2.35`                          |
 | `htf_fvg_entry_weight`                            | `0.52`                          |
-| `one_minute_fvg_entry_weight`                     | `0.32`                          |
+| `ltf_fvg_entry_weight`                     | `0.32`                          |
 | `opposing_fvg_entry_penalty_mult`                 | `1.0`                           |
 | `fvg_runner_rr_bonus`                             | `0.24`                          |
 | `adaptive_breakeven_rr`                           | `0.95`                          |

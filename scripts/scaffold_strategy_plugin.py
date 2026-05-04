@@ -63,7 +63,7 @@ def _manifest(name: str, class_stem: str, plugin_type: str) -> str:
                 # fallbacks. Defaults mirror BaseStrategy._fvg_entry_adjustment_components
                 # at strategy_base.py:2527-2539.
                 "htf_fvg_entry_weight": 0.55,
-                "one_minute_fvg_entry_weight": 0.35,
+                "ltf_fvg_entry_weight": 0.35,
                 "opposing_fvg_entry_penalty_mult": 1.0,
                 "fvg_runner_rr_bonus": 0.12,
                 "same_direction_fvg_validated_bonus": 0.15,
@@ -195,7 +195,7 @@ def _strategy_py(name: str, class_stem: str) -> str:
                             "execution_quality_score": execution_quality_score,
                             "final_priority_score": round(final_priority_score, 4),
                             "selection_quality_score": round(selection_quality_score, 4),
-                            "trigger_score": 1.0,
+                            "ltf_score": 1.0,
                             "regime_score": 1.0,
                         }},
                     )

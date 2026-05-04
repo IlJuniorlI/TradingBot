@@ -120,14 +120,14 @@ Strategy-specific knobs:
 
 - Universe and HTF pivot map:
   - `tradable`, `peers`
-  - `htf_timeframe_minutes`, `htf_lookback_days`, `htf_refresh_seconds`, `htf_pivot_span`, `htf_max_levels_per_side`, `htf_atr_tolerance_mult`, `htf_pct_tolerance`, `htf_stop_buffer_atr_mult`, `htf_ema_fast_span`, `htf_ema_slow_span`
+  - `htf_minutes`, `htf_lookback_days`, `htf_pivot_span`, `htf_max_levels_per_side`, `htf_atr_tolerance_mult`, `htf_pct_tolerance`, `htf_stop_buffer_atr_mult`, `htf_ema_fast_span`, `htf_ema_slow_span`
 - Trigger frame and warmup:
-  - `trigger_timeframe_minutes`, `min_bars`, `min_trigger_bars`
+  - `ltf_minutes`, `min_bars`, `min_ltf_bars`
 - Entry-family selection:
   - `entry_family` with `auto`, `pivot_reclaim`, `pivot_rejection`, and `pivot_continuation`
   - `pivot_reclaim_family_bonus`, `pivot_rejection_family_bonus`, `pivot_continuation_family_bonus` for `auto` family weighting
 - Regime / trigger scoring:
-  - `min_regime_score`, `min_trigger_score`, `min_total_score`, `min_peer_agreement`, `min_peer_score`
+  - `min_regime_score`, `min_ltf_score`, `min_total_score`, `min_peer_agreement`, `min_peer_score`
   - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`
 - Pivot-zone sizing and family detail:
   - `pivot_zone_atr_mult`, `pivot_zone_pct`
@@ -136,7 +136,7 @@ Strategy-specific knobs:
   - `pivot_rejection_min_wick_frac`, `pivot_rejection_allows_neutral_ltf_structure`
   - `pivot_continuation_breakout_buffer_pct`, `pivot_continuation_interaction_lookback_bars`, `pivot_continuation_max_distance_atr`
 - Trigger quality and anti-chase:
-  - `min_trigger_close_position`, `min_trigger_volume_ratio`, `min_adx14`
+  - `min_ltf_close_position`, `min_ltf_volume_ratio`, `min_adx14`
   - `max_reclaim_distance_from_pivot_atr`, `max_rejection_distance_from_pivot_atr`, `max_continuation_distance_from_pivot_atr`
   - `entry_exhaustion_filter_enabled`, `max_entry_vwap_extension_atr`, `max_entry_ema9_extension_atr`, `max_entry_bar_range_atr`, `max_entry_upper_wick_frac`, `max_entry_lower_wick_frac`
   - `use_sr_veto` (disabled by default so the strategy stays anchored to the HTF pivot model rather than generic S/R vetoes)
@@ -146,7 +146,7 @@ Strategy-specific knobs:
 - Screener shaping:
   - `screener_contrarian_bias_threshold_pct`, `screener_activity_move_sweet_spot_pct`, `screener_activity_move_cap_pct`, `screener_relative_volume_cap`
 - Context overlays — fair-value-gap (FVG) entry adjustment knobs (read by `strategy_base._fvg_entry_adjustment_components`, gated by `shared_entry.use_fvg_context`). All shipped per-strategy in this strategy's `manifest.json`:
-  - `htf_fvg_entry_weight`, `one_minute_fvg_entry_weight` — multipliers applied to the HTF and 1-minute FVG bull/bear scores when computing the entry adjustment.
+  - `htf_fvg_entry_weight`, `ltf_fvg_entry_weight` — multipliers applied to the HTF and 1-minute FVG bull/bear scores when computing the entry adjustment.
   - `opposing_fvg_entry_penalty_mult` — multiplier on the opposing-direction FVG penalty (1.0 = full penalty; lower = more tolerant of trades against an active gap).
   - `fvg_runner_rr_bonus` — extra R:R credit when the trade direction aligns with a same-direction continuation FVG.
   - `same_direction_fvg_validated_bonus`, `same_direction_fvg_active_bonus` — entry-score bonuses when a same-direction gap has been validated (price interacted) or is still active (untouched).
@@ -166,12 +166,11 @@ Current package defaults:
 |------------------------------------------------|-------------------------------------------------|
 | `tradable`                                     | `['AAPL', 'NVDA', 'GOOG', 'AMD', 'INTC', 'MU']` |
 | `peers`                                        | `['QQQ', 'AVGO', 'TSM']`                        |
-| `trigger_timeframe_minutes`                    | `5`                                             |
+| `ltf_minutes`                    | `5`                                             |
 | `min_bars`                                     | `90`                                            |
-| `min_trigger_bars`                             | `20`                                            |
-| `htf_timeframe_minutes`                        | `60`                                            |
+| `min_ltf_bars`                             | `20`                                            |
+| `htf_minutes`                        | `60`                                            |
 | `htf_lookback_days`                            | `60`                                            |
-| `htf_refresh_seconds`                          | `120`                                           |
 | `htf_pivot_span`                               | `2`                                             |
 | `htf_max_levels_per_side`                      | `6`                                             |
 | `htf_atr_tolerance_mult`                       | `0.35`                                          |
@@ -181,7 +180,7 @@ Current package defaults:
 | `htf_ema_slow_span`                            | `200`                                           |
 | `entry_family`                                 | `auto`                                          |
 | `min_regime_score`                             | `4`                                             |
-| `min_trigger_score`                            | `2.5`                                           |
+| `min_ltf_score`                            | `2.5`                                           |
 | `min_total_score`                              | `5`                                             |
 | `min_peer_agreement`                           | `2`                                             |
 | `min_peer_score`                               | `2`                                             |
@@ -206,8 +205,8 @@ Current package defaults:
 | `pivot_continuation_breakout_buffer_pct`       | `0.0009`                                        |
 | `pivot_continuation_interaction_lookback_bars` | `9`                                             |
 | `pivot_continuation_max_distance_atr`          | `1.45`                                          |
-| `min_trigger_close_position`                   | `0.6`                                           |
-| `min_trigger_volume_ratio`                     | `1.0`                                           |
+| `min_ltf_close_position`                   | `0.6`                                           |
+| `min_ltf_volume_ratio`                     | `1.0`                                           |
 | `min_adx14`                                    | `12.5`                                          |
 | `max_reclaim_distance_from_pivot_atr`          | `0.9`                                           |
 | `max_rejection_distance_from_pivot_atr`        | `0.82`                                          |
@@ -228,7 +227,7 @@ Current package defaults:
 | `adaptive_profit_lock_stop_rr`                 | `0.32`                                          |
 | `adaptive_runner_trigger_rr`                   | `1.1`                                           |
 | `htf_fvg_entry_weight`                         | `0.28`                                          |
-| `one_minute_fvg_entry_weight`                  | `0.14`                                          |
+| `ltf_fvg_entry_weight`                  | `0.14`                                          |
 | `pivot_reclaim_family_bonus`                   | `0.25`                                          |
 | `pivot_rejection_family_bonus`                 | `0.12`                                          |
 | `pivot_continuation_family_bonus`              | `-0.12`                                         |

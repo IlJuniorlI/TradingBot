@@ -225,13 +225,12 @@ class MarketDataStore:
     def _symbol_key(symbol: str) -> str:
         return str(symbol).upper().strip()
 
-    def should_refresh_support_resistance(self, symbol: str, *, timeframe_minutes: int | None = None, refresh_seconds: int | None = None) -> bool:
+    def should_refresh_support_resistance(self, symbol: str, *, timeframe_minutes: int | None = None) -> bool:
         cfg = getattr(self.config, "support_resistance", None)
         if cfg is None or not bool(cfg.enabled) or not self.is_support_resistance_symbol(symbol):
             return False
         tf = int(timeframe_minutes or getattr(cfg, "timeframe_minutes", 15) or 15)
-        ttl = int(refresh_seconds or getattr(cfg, "refresh_seconds", 120) or 120)
-        return self.should_refresh_htf_context(symbol, tf, ttl)
+        return self.should_refresh_htf_context(symbol, tf)
 
 
     @staticmethod
@@ -375,14 +374,35 @@ class MarketDataStore:
                 return base
         return 1
 
-    def should_refresh_htf_context(self, symbol: str, timeframe_minutes: int, refresh_seconds: int | None = None) -> bool:
+    def should_refresh_htf_context(self, symbol: str, timeframe_minutes: int) -> bool:
+        """Bar-aligned HTF refresh gate.
+
+        New HTF data only arrives at HTF bar boundaries — within a single bar
+        window the broker has nothing new to give us. This replaces the prior
+        time-elapsed throttle (every N seconds regardless of bar timing) with
+        a true "1 fetch per HTF bar" cadence.
+
+        For HTF=60m, the underlying ``price_history`` call is at base
+        frequency 30m and resampled to 60m. At the 60m boundary, both 30m
+        constituents of the just-closed 60m bar are already complete on the
+        broker side, so a single fetch + resample produces the closed bar.
+
+        A 10-second settle buffer is applied so we don't fetch at exactly
+        ``:30:00`` — gives the broker time to aggregate the just-closed bar.
+        """
         key = self._htf_key(symbol, timeframe_minutes)
         last = self.last_htf_refresh.get(key)
         if last is None:
             return True
-        cfg = getattr(self.config, "support_resistance", None)
-        ttl = int(refresh_seconds or getattr(cfg, "refresh_seconds", 180) or 180)
-        return (now_et() - last).total_seconds() >= max(30, ttl)
+        tf_min = max(1, int(timeframe_minutes))
+        bucket = f"{tf_min}min"
+        last_bucket = pd.Timestamp(last).floor(bucket)
+        now = now_et()
+        now_bucket = pd.Timestamp(now).floor(bucket)
+        if now_bucket <= last_bucket:
+            return False
+        settle_buffer = timedelta(seconds=10)
+        return (now - now_bucket) >= settle_buffer
 
     @staticmethod
     def _ohlcv_columns(frame: pd.DataFrame | None) -> pd.DataFrame:
@@ -573,7 +593,6 @@ class MarketDataStore:
         stop_buffer_atr_mult: float = 0.25,
         ema_fast_span: int = 50,
         ema_slow_span: int = 200,
-        refresh_seconds: int | None = None,
         flip_confirmation_bars: int = 1,
         use_prior_day_high_low: bool = True,
         use_prior_week_high_low: bool = True,
@@ -588,7 +607,7 @@ class MarketDataStore:
         stale_symbols = [
             symbol
             for symbol in requested
-            if self.should_refresh_htf_context(symbol, int(timeframe_minutes), refresh_seconds)
+            if self.should_refresh_htf_context(symbol, int(timeframe_minutes))
         ]
         if not stale_symbols:
             return
@@ -630,7 +649,6 @@ class MarketDataStore:
         stop_buffer_atr_mult: float = 0.25,
         ema_fast_span: int = 50,
         ema_slow_span: int = 200,
-        refresh_seconds: int | None = None,
         flip_confirmation_bars: int = 1,
         allow_refresh: bool = True,
         use_prior_day_high_low: bool = True,
@@ -654,7 +672,7 @@ class MarketDataStore:
             if self._cycle_active and cache_key in self._cycle_htf_context_cache:
                 return self._cycle_htf_context_cache[cache_key]
             cached = self.htf_cache.get(cache_key)
-        if cached is not None and (not allow_refresh or not self.should_refresh_htf_context(symbol, timeframe_minutes, refresh_seconds)):
+        if cached is not None and (not allow_refresh or not self.should_refresh_htf_context(symbol, timeframe_minutes)):
             with self._lock:
                 if self._cycle_active:
                     self._cycle_htf_context_cache[cache_key] = cached
@@ -717,14 +735,22 @@ class MarketDataStore:
         with self._lock:
             if self._cycle_active and cache_key in self._cycle_fvg_cache:
                 return copy.deepcopy(self._cycle_fvg_cache[cache_key])
-        merged = self.get_merged(symbol, with_indicators=True)
+        # Fetch the right frame: 1m via get_merged(no timeframe), LTF/HTF via the
+        # explicit timeframe lookup that triggers internal resampling. Mirrors
+        # `get_order_block_context` so a 5m FVG context computes on 5m bars,
+        # not 1m bars labeled "5m".
+        tf = max(1, int(timeframe_minutes))
+        if tf == 1:
+            merged = self.get_merged(symbol, with_indicators=True)
+        else:
+            merged = self.get_merged(symbol, timeframe=f"{tf}min", with_indicators=True)
         if merged is None or merged.empty:
-            ctx = empty_fvg_context(float(current_price or 0.0), timeframe_minutes=timeframe_minutes)
+            ctx = empty_fvg_context(float(current_price or 0.0), timeframe_minutes=tf)
         else:
             close = float(current_price if current_price is not None else merged.iloc[-1].get('close', 0.0) or 0.0)
             ctx = build_fair_value_gap_context(
                 merged,
-                timeframe_minutes=max(1, int(timeframe_minutes)),
+                timeframe_minutes=tf,
                 current_price=close,
                 max_per_side=max(0, int(max_per_side or 0)),
                 min_gap_atr_mult=float(min_gap_atr_mult),
@@ -751,9 +777,10 @@ class MarketDataStore:
     ) -> OrderBlockContext:
         """Cycle-cached order block context — mirror of `get_fair_value_gap_context`.
 
-        For 1m OBs, ``timeframe_minutes=1`` and the merged 1m frame is used.
-        For HTF OBs (e.g. 15m), the merged frame is fetched at that timeframe
-        via ``get_merged(symbol, timeframe=f'{tf}min')``.
+        For LTF OBs (``timeframe_minutes`` matches the strategy's
+        ``params.ltf_minutes``, default 1m), uses the merged frame at that
+        timeframe. For HTF OBs (e.g. 15m), the merged frame is fetched at
+        the HTF timeframe via ``get_merged(symbol, timeframe=f'{tf}min')``.
 
         Cache invalidates per-symbol on every new stream bar via
         ``_invalidate_cycle_symbol`` and on cycle boundaries via
@@ -823,14 +850,13 @@ class MarketDataStore:
         stop_buffer_atr_mult: float = 0.25,
         ema_fast_span: int = 50,
         ema_slow_span: int = 200,
-        refresh_seconds: int | None = None,
         flip_confirmation_bars: int = 1,
         allow_refresh: bool = True,
     ) -> pd.DataFrame | None:
         key = self._htf_key(symbol, timeframe_minutes)
         with self._lock:
             frame = self.history_htf.get(key)
-        if frame is not None and not getattr(frame, "empty", True) and (not allow_refresh or not self.should_refresh_htf_context(symbol, timeframe_minutes, refresh_seconds)):
+        if frame is not None and not getattr(frame, "empty", True) and (not allow_refresh or not self.should_refresh_htf_context(symbol, timeframe_minutes)):
             return frame.copy()
         if not allow_refresh:
             return frame.copy() if frame is not None else None
@@ -845,7 +871,6 @@ class MarketDataStore:
             stop_buffer_atr_mult=stop_buffer_atr_mult,
             ema_fast_span=ema_fast_span,
             ema_slow_span=ema_slow_span,
-            refresh_seconds=refresh_seconds,
             flip_confirmation_bars=flip_confirmation_bars,
             allow_refresh=allow_refresh,
         )
@@ -1055,11 +1080,13 @@ class MarketDataStore:
                 self.last_empty_history_refresh.pop(cache_key, None)
             self.merge_stats[cache_key].history_rows = len(self.history[cache_key])
         self._invalidate_cycle_symbol(symbol)
-        # Propagate the 1m heal into HTF: invalidate the cross-cycle
-        # refresh throttle and cycle-scoped HTF/SR caches so the next
-        # HTF refresh fires immediately on the healed 1m frame. Skipped
-        # on empty heals (REST returned no candles) since the 1m frame
-        # didn't change and the existing HTF derivation is still valid.
+        # Propagate the 1m heal into HTF: clear the bar-aligned refresh
+        # gate (last_htf_refresh tracker) and the cycle-scoped HTF/SR
+        # caches so the next call rebuilds against the healed 1m frame
+        # immediately, instead of waiting for the next HTF bar boundary.
+        # Skipped on empty heals (REST returned no candles) since the 1m
+        # frame didn't change and the existing HTF derivation is still
+        # valid.
         if not df.empty:
             with self._lock:
                 htf_throttle_keys = [k for k in self.last_htf_refresh.keys() if k[0] == cache_key]
@@ -1076,7 +1103,6 @@ class MarketDataStore:
         *,
         timeframe_minutes: int | None = None,
         lookback_days: int | None = None,
-        refresh_seconds: int | None = None,
         use_prior_day_high_low: bool | None = None,
         use_prior_week_high_low: bool | None = None,
         allow_refresh: bool = True,
@@ -1094,7 +1120,6 @@ class MarketDataStore:
             atr_tolerance_mult=float(getattr(cfg, "atr_tolerance_mult", 0.60) or 0.60),
             pct_tolerance=float(getattr(cfg, "pct_tolerance", 0.0030) or 0.0030),
             stop_buffer_atr_mult=float(getattr(cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
-            refresh_seconds=int(refresh_seconds or getattr(cfg, "refresh_seconds", 120) or 120),
             allow_refresh=allow_refresh,
         )
         key = self._htf_key(symbol, tf)
@@ -1154,7 +1179,6 @@ class MarketDataStore:
         mode: str = "default",
         timeframe_minutes: int | None = None,
         lookback_days: int | None = None,
-        refresh_seconds: int | None = None,
         use_prior_day_high_low: bool | None = None,
         use_prior_week_high_low: bool | None = None,
         allow_refresh: bool = True,
@@ -1171,7 +1195,6 @@ class MarketDataStore:
             tf,
             normalized_mode,
             None if lookback_days is None else int(lookback_days),
-            None if refresh_seconds is None else int(refresh_seconds),
             resolved_use_prior_day_high_low,
             resolved_use_prior_week_high_low,
         )
@@ -1188,7 +1211,6 @@ class MarketDataStore:
             atr_tolerance_mult=float(getattr(cfg, "atr_tolerance_mult", 0.60) or 0.60),
             pct_tolerance=float(getattr(cfg, "pct_tolerance", 0.0030) or 0.0030),
             stop_buffer_atr_mult=float(getattr(cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
-            refresh_seconds=int(refresh_seconds or getattr(cfg, "refresh_seconds", 120) or 120),
             allow_refresh=allow_refresh,
         )
         use_cache = use_prior_day_high_low is None and use_prior_week_high_low is None
@@ -1200,16 +1222,14 @@ class MarketDataStore:
                 if self._cycle_active:
                     self._cycle_sr_cache[cycle_key] = result
             return result
-        if use_cache and current_price is None and cached is not None and normalized_mode == "default" and flip_frame is None and not self.should_refresh_support_resistance(symbol, timeframe_minutes=tf, refresh_seconds=refresh_seconds):
+        if use_cache and current_price is None and cached is not None and normalized_mode == "default" and flip_frame is None and not self.should_refresh_support_resistance(symbol, timeframe_minutes=tf):
             with self._lock:
                 if self._cycle_active:
                     self._cycle_sr_cache[cycle_key] = cached
             return cached
         flip_1m = 0
         flip_5m = 0
-        if normalized_mode == "dashboard":
-            flip_1m = max(0, int(getattr(cfg, "dashboard_flip_confirmation_1m_bars", 1) or 1))
-        elif normalized_mode == "trading":
+        if normalized_mode == "trading":
             flip_1m = max(0, int(getattr(cfg, "trading_flip_confirmation_1m_bars", 2) or 2))
             flip_5m = max(0, int(getattr(cfg, "trading_flip_confirmation_5m_bars", 1) or 1))
         ctx = build_support_resistance_context(

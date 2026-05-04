@@ -1,13 +1,299 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import TypeVar
+from collections.abc import Callable, Iterable
+from typing import Literal, TypeVar, overload
 
 import pandas as pd
 
 
 TLevel = TypeVar("TLevel")
+
+
+@overload
+def pivot_points(
+    frame: pd.DataFrame,
+    span: int,
+    *,
+    include_idx: Literal[False] = False,
+) -> tuple[list[tuple[pd.Timestamp, float]], list[tuple[pd.Timestamp, float]]]: ...
+
+
+@overload
+def pivot_points(
+    frame: pd.DataFrame,
+    span: int,
+    *,
+    include_idx: Literal[True],
+) -> tuple[list[tuple[int, pd.Timestamp, float]], list[tuple[int, pd.Timestamp, float]]]: ...
+
+
+def pivot_points(
+    frame: pd.DataFrame,
+    span: int,
+    *,
+    include_idx: bool = False,
+):
+    """Detect local-extreme pivots over a ``2*span+1`` rolling window.
+
+    Returns ``(highs, lows)`` where each entry is ``(timestamp, price)``
+    by default. With ``include_idx=True`` each entry is
+    ``(positional_index, timestamp, price)`` — used by callers that need
+    to anchor levels to the bar index for downstream age computation.
+
+    The strict-equality + uniqueness check (``hi == max(hi_window) and
+    hi_window.count(hi) == 1``) discards plateaus where multiple bars
+    share the extreme — only true pivots count, matching how a trader
+    visually identifies a high/low. Shared by ``htf_levels._pivot_points``
+    and ``support_resistance._pivot_points`` so the pivot-detection
+    semantics can't drift between the two builders (the kind of bug we
+    debugged through the AMD/INTC support-list mismatch).
+    """
+    highs: list = []
+    lows: list = []
+    if frame is None or len(frame) < (span * 2 + 3):
+        return highs, lows
+    span = max(1, int(span))
+    high_col = frame["high"]
+    low_col = frame["low"]
+    highs_arr = (
+        high_col.to_numpy(dtype=float, copy=False).tolist()
+        if high_col.dtype != object
+        else high_col.astype(float).tolist()
+    )
+    lows_arr = (
+        low_col.to_numpy(dtype=float, copy=False).tolist()
+        if low_col.dtype != object
+        else low_col.astype(float).tolist()
+    )
+    idxs = list(frame.index)
+    for i in range(span, len(frame) - span):
+        hi = highs_arr[i]
+        lo = lows_arr[i]
+        hi_window = highs_arr[i - span : i + span + 1]
+        lo_window = lows_arr[i - span : i + span + 1]
+        if hi == max(hi_window) and hi_window.count(hi) == 1:
+            highs.append((i, idxs[i], float(hi)) if include_idx else (idxs[i], float(hi)))
+        if lo == min(lo_window) and lo_window.count(lo) == 1:
+            lows.append((i, idxs[i], float(lo)) if include_idx else (idxs[i], float(lo)))
+    return highs, lows
+
+
+def cluster_levels(
+    points: Iterable[tuple[pd.Timestamp, float]],
+    kind: str,
+    tolerance: float,
+    max_levels: int,
+    *,
+    level_factory: Callable[..., TLevel],
+) -> list[TLevel]:
+    """Cluster pivot points by price proximity and return ranked ``TLevel``s.
+
+    Time-aware recency scoring: each cluster's score is
+    ``effective_touches + persistence_bonus`` where
+    ``effective_touches = touches * recency_factor`` and
+    ``recency_factor`` decays linearly from 1.0 (cluster's last touch is
+    the newest in the pivot set) down to a floor of 0.10 (cluster's last
+    touch is at the oldest end). The persistence bonus rewards clusters
+    that span a sustained portion of the lookback window. Together they
+    keep recent close-to-price levels visible alongside long-standing
+    historical bases.
+
+    ``level_factory`` is the dataclass to construct (HTFLevel /
+    SupportResistanceLevel — both have the same field shape). This is the
+    single source of truth for cluster scoring so a fix landing here
+    propagates to every consumer (HTF and LTF SR contexts).
+    """
+    ordered = sorted([(ts, float(price)) for ts, price in points], key=lambda x: x[1])
+    if not ordered:
+        return []
+    newest_ts = max((ts for ts, _price in ordered), default=None)
+    oldest_ts = min((ts for ts, _price in ordered), default=None)
+    total_window_seconds = max(
+        1.0,
+        float((newest_ts - oldest_ts).total_seconds()) if newest_ts is not None and oldest_ts is not None else 1.0,
+    )
+    groups: list[list[tuple[pd.Timestamp, float]]] = []
+    for point in ordered:
+        if not groups:
+            groups.append([point])
+            continue
+        prior_prices = [p for _, p in groups[-1]]
+        anchor = sum(prior_prices) / len(prior_prices)
+        if abs(point[1] - anchor) <= tolerance:
+            groups[-1].append(point)
+        else:
+            groups.append([point])
+    levels: list[TLevel] = []
+    for grp in groups:
+        grp_sorted = sorted(grp, key=lambda x: x[0])
+        prices = [price for _, price in grp_sorted]
+        touches = len(grp_sorted)
+        cluster_first_ts = grp_sorted[0][0]
+        cluster_last_ts = grp_sorted[-1][0]
+        active_window_seconds = max(0.0, float((cluster_last_ts - cluster_first_ts).total_seconds()))
+        recency_factor = 1.0
+        if newest_ts is not None and oldest_ts is not None:
+            age_seconds = max(0.0, float((newest_ts - cluster_last_ts).total_seconds()))
+            recency_factor = max(0.10, 1.0 - (age_seconds / total_window_seconds))
+        persistence_factor = min(1.0, active_window_seconds / total_window_seconds)
+        effective_touches = float(touches) * recency_factor
+        score = effective_touches + 0.50 * persistence_factor
+        levels.append(
+            level_factory(
+                kind=kind,
+                price=float(sum(prices) / len(prices)),
+                touches=touches,
+                score=score,
+                first_seen=cluster_first_ts.isoformat() if grp_sorted else None,
+                last_seen=cluster_last_ts.isoformat() if grp_sorted else None,
+            )
+        )
+    levels.sort(key=lambda lv: (lv.score, lv.touches), reverse=True)
+    return levels[: max(1, int(max_levels))]
+
+
+def confirm_by_bars(
+    frame: pd.DataFrame,
+    field: str,
+    comparator: str,
+    level_price: float,
+    count: int,
+    eps: float,
+) -> bool:
+    """Whether the last ``count`` bars all satisfy ``frame[field] cmp level``.
+
+    Used by both flip-confirmation paths (htf_levels and support_resistance)
+    to decide whether a level has been broken/reclaimed for ``count``
+    consecutive bars on the given field. Accepts both symbolic
+    (``">"`` / ``"<"`` / ``">="`` / ``"<="``) and English
+    (``"above"`` / ``"below"``) comparators so the htf and sr modules can
+    share a single body without rewriting their direction strings.
+    """
+    if count <= 0 or frame is None or frame.empty or field not in frame.columns:
+        return False
+    series = frame[field].astype(float).tail(int(count))
+    if len(series) < int(count):
+        return False
+    cmp = str(comparator).strip().lower()
+    if cmp in (">", "above"):
+        return bool((series > float(level_price) + eps).all())
+    if cmp in ("<", "below"):
+        return bool((series < float(level_price) - eps).all())
+    if cmp == ">=":
+        return bool((series >= float(level_price) + eps).all())
+    if cmp == "<=":
+        return bool((series <= float(level_price) - eps).all())
+    return False
+
+
+def clone_level(
+    level: TLevel,
+    kind: str,
+    *,
+    level_factory: Callable[..., TLevel],
+    source: str | None = None,
+) -> TLevel:
+    """Re-emit ``level`` as ``kind`` via ``level_factory``.
+
+    When ``source`` is ``None`` (default) the cloned level inherits the
+    original level's ``source``; pass an explicit ``source`` to relabel
+    (e.g. ``"broken_htf_resistance"``). Replaces the per-module
+    ``_clone_level`` helpers that previously duplicated the same body
+    across htf_levels and support_resistance.
+    """
+    inherited_source = str(getattr(level, "source", "pivot") or "pivot")
+    return level_factory(
+        kind=kind,
+        price=float(level.price),
+        touches=int(level.touches),
+        score=float(level.score),
+        first_seen=getattr(level, "first_seen", None),
+        last_seen=getattr(level, "last_seen", None),
+        source=str(source if source is not None else inherited_source),
+        source_priority=float(getattr(level, "source_priority", 1.0) or 1.0),
+    )
+
+
+def extend_unique_levels(dest: list, additions: list) -> None:
+    """Append unseen levels from ``additions`` to ``dest`` in place.
+
+    Uniqueness key is ``(source, round(price, 8), kind)``. Pure duck-typing
+    on the level attributes; no factory required. Replaces the per-module
+    ``_extend_unique_levels`` helpers that previously duplicated the same
+    body across htf_levels and support_resistance.
+    """
+    seen = {
+        (
+            str(getattr(level, "source", "pivot") or "pivot"),
+            round(float(level.price), 8),
+            str(getattr(level, "kind", "support") or "support"),
+        )
+        for level in dest
+    }
+    for level in additions:
+        key = (
+            str(getattr(level, "source", "pivot") or "pivot"),
+            round(float(level.price), 8),
+            str(getattr(level, "kind", "support") or "support"),
+        )
+        if key in seen:
+            continue
+        dest.append(level)
+        seen.add(key)
+
+
+def frame_extreme_side_levels(
+    frame: pd.DataFrame,
+    *,
+    side: str,
+    tolerance: float,
+    max_levels: int,
+    level_factory: Callable[..., TLevel],
+) -> list[TLevel]:
+    """Build a single-cluster fallback level from the frame's extreme bar.
+
+    Returns the cluster_levels output from a single ``(timestamp, price)``
+    point — used by both modules as a last-resort reference when
+    pivot detection and prior-day/week fallbacks all return empty.
+    """
+    if frame is None or frame.empty:
+        return []
+    if str(side).strip().lower() == "support":
+        pos = int(frame["low"].astype(float).values.argmin())
+        point = (pd.Timestamp(frame.index[pos]), float(frame["low"].iloc[pos]))
+        return cluster_levels([point], "support", tolerance, max_levels, level_factory=level_factory)
+    pos = int(frame["high"].astype(float).values.argmax())
+    point = (pd.Timestamp(frame.index[pos]), float(frame["high"].iloc[pos]))
+    return cluster_levels([point], "resistance", tolerance, max_levels, level_factory=level_factory)
+
+
+def cluster_levels_by_tolerance(levels: list[TLevel], tolerance: float) -> list[list[TLevel]]:
+    """Group ``levels`` into price-proximity clusters.
+
+    Each cluster's anchor is its running mean — a level joins the prior
+    cluster when ``abs(level.price - anchor) <= tolerance``, otherwise it
+    starts a new one. Pure grouping with no per-cluster reduction; the
+    caller chooses whether to pick a representative (htf_levels) or
+    merge attributes (support_resistance). Replaces the duplicated
+    grouping loop in both modules' ``_collapse_same_side_levels``.
+    """
+    if not levels:
+        return []
+    ordered = sorted(levels, key=lambda lv: float(lv.price))
+    tol = max(float(tolerance), 1e-9)
+    groups: list[list[TLevel]] = []
+    for level in ordered:
+        if not groups:
+            groups.append([level])
+            continue
+        prior_prices = [float(item.price) for item in groups[-1]]
+        anchor = sum(prior_prices) / len(prior_prices)
+        if abs(float(level.price) - anchor) <= tol:
+            groups[-1].append(level)
+        else:
+            groups.append([level])
+    return groups
 
 
 def build_special_level(

@@ -292,9 +292,8 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return
         data.prefetch_htf_contexts(
             symbols,
-            timeframe_minutes=self._sr_timeframe_minutes(),
-            lookback_days=self._sr_lookback_days(),
-            refresh_seconds=self._sr_refresh_seconds(),
+            timeframe_minutes=self._htf_minutes(),
+            lookback_days=self._htf_lookback_days(),
         )
 
     @staticmethod
@@ -371,14 +370,12 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         sr_cfg = getattr(self.config, "support_resistance", None)
         if data is None or not hasattr(data, "get_htf_frame"):
             return {"available": False, "reason": "no_data_feed"}
-        htf_tf = int(p.get("htf_timeframe_minutes", 15))
+        htf_tf = int(p.get("htf_minutes", 15))
         lookback_days = int(p.get("htf_lookback_days", getattr(sr_cfg, "lookback_days", 10) if sr_cfg is not None else 10))
-        refresh_seconds = int(p.get("htf_refresh_seconds", getattr(sr_cfg, "refresh_seconds", 120) if sr_cfg is not None else 120))
         frame = data.get_htf_frame(
             symbol,
             timeframe_minutes=htf_tf,
             lookback_days=lookback_days,
-            refresh_seconds=refresh_seconds,
         )
         min_bars = int(p.get("htf_min_bars", 20))
         summary = summarize_htf_trend(
@@ -522,10 +519,10 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         bear_candle_signal = self._directional_candle_signal(u, Side.SHORT)
         sr_ctx = self._sr_context(underlying, u, data)
         mshtf_ctx = getattr(sr_ctx, "market_structure", None) or empty_market_structure_context(u_close)
-        ms1_ctx = self._structure_context(u, "1m")
+        ms_ltf_ctx = self._structure_context(u, "ltf")
         sr_weight = float(getattr(sr_cfg, "regime_weight", 0.75) or 0.75)
         mshtf_weight = float(getattr(sr_cfg, "structure_htf_weight", 0.90) or 0.90)
-        ms1_weight = float(getattr(sr_cfg, "structure_1m_weight", 0.70) or 0.70)
+        ms_ltf_weight = float(getattr(sr_cfg, "structure_ltf_weight", 0.70) or 0.70)
         bullish_candle_score = float(bull_candle_signal.get("score", 0.0) or 0.0)
         bearish_candle_score = float(bear_candle_signal.get("score", 0.0) or 0.0)
         bullish_candle_net_score = float(bull_candle_signal.get("net_score", 0.0) or 0.0)
@@ -560,8 +557,8 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         htf_fvg_ctx = self._htf_context(
             underlying,
             data,
-            timeframe_minutes=self._sr_timeframe_minutes(),
-            lookback_days=self._sr_lookback_days(),
+            timeframe_minutes=self._htf_minutes(),
+            lookback_days=self._htf_lookback_days(),
             pivot_span=int(self._support_resistance_setting("pivot_span", 2) or 2),
             max_levels_per_side=int(self._support_resistance_setting("max_levels_per_side", 6) or 6),
             atr_tolerance_mult=float(self._support_resistance_setting("atr_tolerance_mult", 0.35) or 0.35),
@@ -569,16 +566,15 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             stop_buffer_atr_mult=float(self._support_resistance_setting("stop_buffer_atr_mult", 0.25) or 0.25),
             ema_fast_span=int(self._support_resistance_setting("ema_fast_span", 50) or 50),
             ema_slow_span=int(self._support_resistance_setting("ema_slow_span", 200) or 200),
-            refresh_seconds=self._sr_refresh_seconds(),
             current_price=u_close,
             use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
             use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
         )
-        fvg1_ctx = self._one_minute_fvg_context(underlying, u, data)
+        fvg_ltf_ctx = self._ltf_fvg_context(underlying, u, data)
         use_fvg_context = self._shared_entry_enabled("use_fvg_context", True)
         fvg_context_weight_scale = max(0.0, float(p.get("fvg_context_weight_scale", 0.9) or 0.0))
-        htf_fvg_score = self._score_fvg_context(u_close, htf_fvg_ctx, timeframe_minutes=getattr(htf_fvg_ctx, "timeframe_minutes", self._sr_timeframe_minutes())) if use_fvg_context else {"bull_score": 0.0, "bear_score": 0.0, "directional_pressure": 0.0}
-        fvg1_score = self._score_fvg_context(u_close, fvg1_ctx, timeframe_minutes=1) if use_fvg_context else {"bull_score": 0.0, "bear_score": 0.0, "directional_pressure": 0.0}
+        htf_fvg_score = self._score_fvg_context(u_close, htf_fvg_ctx, timeframe_minutes=getattr(htf_fvg_ctx, "timeframe_minutes", self._htf_minutes())) if use_fvg_context else {"bull_score": 0.0, "bear_score": 0.0, "directional_pressure": 0.0}
+        fvg_ltf_score = self._score_fvg_context(u_close, fvg_ltf_ctx, timeframe_minutes=self._ltf_minutes()) if use_fvg_context else {"bull_score": 0.0, "bear_score": 0.0, "directional_pressure": 0.0}
 
         bull_score = 0.0
         bear_score = 0.0
@@ -655,27 +651,27 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         bull_score -= mshtf_weight * 0.60 if mshtf_ctx.bias == "bearish" else 0.0
         bull_score += mshtf_weight * 0.95 if self._active_structure_break(mshtf_ctx.bos_up, mshtf_ctx.bos_up_age_bars) else 0.0
         bull_score -= mshtf_weight * 1.05 if self._active_structure_break(mshtf_ctx.choch_down, mshtf_ctx.choch_down_age_bars) else 0.0
-        bull_score += ms1_weight * 0.70 if ms1_ctx.bias == "bullish" else 0.0
-        bull_score -= ms1_weight * 0.75 if ms1_ctx.bias == "bearish" else 0.0
-        bull_score += ms1_weight if (ms1_ctx.bos_up and self._structure_event_recent(ms1_ctx.bos_up_age_bars)) else 0.0
-        bull_score -= ms1_weight if (ms1_ctx.choch_down and self._structure_event_recent(ms1_ctx.choch_down_age_bars)) else 0.0
+        bull_score += ms_ltf_weight * 0.70 if ms_ltf_ctx.bias == "bullish" else 0.0
+        bull_score -= ms_ltf_weight * 0.75 if ms_ltf_ctx.bias == "bearish" else 0.0
+        bull_score += ms_ltf_weight if (ms_ltf_ctx.bos_up and self._structure_event_recent(ms_ltf_ctx.bos_up_age_bars)) else 0.0
+        bull_score -= ms_ltf_weight if (ms_ltf_ctx.choch_down and self._structure_event_recent(ms_ltf_ctx.choch_down_age_bars)) else 0.0
 
         bear_score += mshtf_weight * 0.60 if mshtf_ctx.bias == "bearish" else 0.0
         bear_score -= mshtf_weight * 0.60 if mshtf_ctx.bias == "bullish" else 0.0
         bear_score += mshtf_weight * 0.95 if self._active_structure_break(mshtf_ctx.bos_down, mshtf_ctx.bos_down_age_bars) else 0.0
         bear_score -= mshtf_weight * 1.05 if self._active_structure_break(mshtf_ctx.choch_up, mshtf_ctx.choch_up_age_bars) else 0.0
-        bear_score += ms1_weight * 0.70 if ms1_ctx.bias == "bearish" else 0.0
-        bear_score -= ms1_weight * 0.75 if ms1_ctx.bias == "bullish" else 0.0
-        bear_score += ms1_weight if (ms1_ctx.bos_down and self._structure_event_recent(ms1_ctx.bos_down_age_bars)) else 0.0
-        bear_score -= ms1_weight if (ms1_ctx.choch_up and self._structure_event_recent(ms1_ctx.choch_up_age_bars)) else 0.0
+        bear_score += ms_ltf_weight * 0.70 if ms_ltf_ctx.bias == "bearish" else 0.0
+        bear_score -= ms_ltf_weight * 0.75 if ms_ltf_ctx.bias == "bullish" else 0.0
+        bear_score += ms_ltf_weight if (ms_ltf_ctx.bos_down and self._structure_event_recent(ms_ltf_ctx.bos_down_age_bars)) else 0.0
+        bear_score -= ms_ltf_weight if (ms_ltf_ctx.choch_up and self._structure_event_recent(ms_ltf_ctx.choch_up_age_bars)) else 0.0
 
-        bull_score += (htf_fvg_score["bull_score"] + fvg1_score["bull_score"]) * fvg_context_weight_scale
-        bear_score += (htf_fvg_score["bear_score"] + fvg1_score["bear_score"]) * fvg_context_weight_scale
+        bull_score += (htf_fvg_score["bull_score"] + fvg_ltf_score["bull_score"]) * fvg_context_weight_scale
+        bear_score += (htf_fvg_score["bear_score"] + fvg_ltf_score["bear_score"]) * fvg_context_weight_scale
 
         range_score += mshtf_weight * 0.35 if mshtf_ctx.bias == "neutral" else 0.0
         range_score -= mshtf_weight * 0.35 if mshtf_ctx.bias in {"bullish", "bearish"} else 0.0
-        range_score += ms1_weight * 0.20 if ms1_ctx.bias == "neutral" else 0.0
-        range_score -= min(0.45, ((htf_fvg_score["directional_pressure"] * 0.35) + (fvg1_score["directional_pressure"] * 0.25)) * fvg_context_weight_scale)
+        range_score += ms_ltf_weight * 0.20 if ms_ltf_ctx.bias == "neutral" else 0.0
+        range_score -= min(0.45, ((htf_fvg_score["directional_pressure"] * 0.35) + (fvg_ltf_score["directional_pressure"] * 0.25)) * fvg_context_weight_scale)
 
         scores = {"bullish_trend": bull_score, "bearish_trend": bear_score, "range": range_score}
         ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
@@ -741,17 +737,17 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             if regime == "bullish_trend":
                 if mshtf_ctx.bias == "bearish":
                     no_trade = True
-                    reasons.append(f"htf_structure_bearish(tf={self._sr_timeframe_minutes()}m,last_high={mshtf_ctx.last_high_label},last_low={mshtf_ctx.last_low_label})")
-                elif self._blocks_bullish_structure_entry(ms1_ctx):
+                    reasons.append(f"htf_structure_bearish(tf={self._htf_minutes()}m,last_high={mshtf_ctx.last_high_label},last_low={mshtf_ctx.last_low_label})")
+                elif self._blocks_bullish_structure_entry(ms_ltf_ctx):
                     no_trade = True
-                    reasons.append(self._bullish_structure_block_reason(ms1_ctx))
+                    reasons.append(self._bullish_structure_block_reason(ms_ltf_ctx))
             elif regime == "bearish_trend":
                 if mshtf_ctx.bias == "bullish":
                     no_trade = True
-                    reasons.append(f"htf_structure_bullish(tf={self._sr_timeframe_minutes()}m,last_high={mshtf_ctx.last_high_label},last_low={mshtf_ctx.last_low_label})")
-                elif self._blocks_bearish_structure_entry(ms1_ctx):
+                    reasons.append(f"htf_structure_bullish(tf={self._htf_minutes()}m,last_high={mshtf_ctx.last_high_label},last_low={mshtf_ctx.last_low_label})")
+                elif self._blocks_bearish_structure_entry(ms_ltf_ctx):
                     no_trade = True
-                    reasons.append(self._bearish_structure_block_reason(ms1_ctx))
+                    reasons.append(self._bearish_structure_block_reason(ms_ltf_ctx))
 
         return {
             "ok": True,
@@ -797,7 +793,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 "bearish_candle_score": round(bearish_candle_score, 4),
                 "bullish_candle_net_score": round(bullish_candle_net_score, 4),
                 "bearish_candle_net_score": round(bearish_candle_net_score, 4),
-                **self._structure_lists(ms1_ctx, prefix="ms1m"),
+                **self._structure_lists(ms_ltf_ctx, prefix="msltf"),
                 **self._structure_lists(mshtf_ctx, prefix="mshtf"),
                 "sr_bias_score": float(sr_ctx.bias_score),
                 "sr_regime_hint": str(sr_ctx.regime_hint),
@@ -821,12 +817,12 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 "htf_fvg_nearest_bearish_state": str(htf_fvg_score["nearest_bearish"].get("state", "none")),
                 "htf_fvg_nearest_bullish_midpoint": _optional_float(htf_fvg_score["nearest_bullish"].get("midpoint")),
                 "htf_fvg_nearest_bearish_midpoint": _optional_float(htf_fvg_score["nearest_bearish"].get("midpoint")),
-                "fvg_1m_bull_score": float(fvg1_score["bull_score"]),
-                "fvg_1m_bear_score": float(fvg1_score["bear_score"]),
-                "fvg_1m_nearest_bullish_state": str(fvg1_score["nearest_bullish"].get("state", "none")),
-                "fvg_1m_nearest_bearish_state": str(fvg1_score["nearest_bearish"].get("state", "none")),
-                "fvg_1m_nearest_bullish_midpoint": _optional_float(fvg1_score["nearest_bullish"].get("midpoint")),
-                "fvg_1m_nearest_bearish_midpoint": _optional_float(fvg1_score["nearest_bearish"].get("midpoint")),
+                "fvg_ltf_bull_score": float(fvg_ltf_score["bull_score"]),
+                "fvg_ltf_bear_score": float(fvg_ltf_score["bear_score"]),
+                "fvg_ltf_nearest_bullish_state": str(fvg_ltf_score["nearest_bullish"].get("state", "none")),
+                "fvg_ltf_nearest_bearish_state": str(fvg_ltf_score["nearest_bearish"].get("state", "none")),
+                "fvg_ltf_nearest_bullish_midpoint": _optional_float(fvg_ltf_score["nearest_bullish"].get("midpoint")),
+                "fvg_ltf_nearest_bearish_midpoint": _optional_float(fvg_ltf_score["nearest_bearish"].get("midpoint")),
             },
         }
 
@@ -960,7 +956,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             reasons.append(_reason_with_values("trend_long_option_score_gap_too_small", current=top_score - second_score, required=min_style_gap, op=">=", digits=2))
 
         sr_ctx = self._sr_context(symbol, frame, data)
-        ms_ctx = self._structure_context(frame, "1m")
+        ms_ctx = self._structure_context(frame, "ltf")
         if bullish:
             if self._blocks_bullish_structure_entry(ms_ctx):
                 reasons.append(self._bullish_structure_block_reason(ms_ctx))

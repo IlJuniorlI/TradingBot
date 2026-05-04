@@ -53,7 +53,7 @@ class ClosingReversalStrategy(BaseStrategy):
             candle_confirmed = bool(candle_signal.get("confirmed"))
             ctx = self._chart_context(frame)
             sr_ctx = self._sr_context(c.symbol, frame, data)
-            ms_ctx = self._structure_context(frame, "1m")
+            ms_ctx = self._structure_context(frame, "ltf")
             tech_ctx = self._technical_context(frame)
             chart_ok = bool(ctx.matched_bullish_reversal or ctx.matched_bullish_continuation) or (candle_confirmed and ctx.bias_score >= 0.0)
             if not momentum_up:

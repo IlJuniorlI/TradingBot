@@ -652,8 +652,8 @@ def export_session_archive(
     - ``bars/{N}m/{SYMBOL}.csv`` — full merged frame (history + live,
       warmup + pre-market + RTH + post-market) with all indicators for
       every active watchlist symbol. One subfolder per timeframe actually
-      used by the strategy: always ``1m`` plus ``trigger_timeframe_minutes``
-      and ``htf_timeframe_minutes`` if they're set and > 1. For
+      used by the strategy: always ``1m`` plus ``ltf_minutes``
+      and ``htf_minutes`` if they're set and > 1. For
       top_tier_adaptive that's ``bars/1m/``, ``bars/5m/``, ``bars/15m/``.
       The full frame is written so debuggers can reconstruct the bot's
       view at any moment in the session — indicators like 15m ema20 need
@@ -755,7 +755,7 @@ def export_session_archive(
     # Skip any timeframe that's effectively 1m (≤1) or duplicates 1m.
     timeframes_min: set[int] = {1}
     strategy_params = getattr(strategy, "params", {}) or {}
-    for key in ("trigger_timeframe_minutes", "htf_timeframe_minutes"):
+    for key in ("ltf_minutes", "htf_minutes"):
         raw = strategy_params.get(key) if isinstance(strategy_params, dict) else None
         try:
             tf = int(raw) if raw is not None else 0

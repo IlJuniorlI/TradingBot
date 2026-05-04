@@ -59,6 +59,18 @@ class TechnicalLevelsContext:
         "fib_bullish_1618",
         "fib_bearish_1272",
         "fib_bearish_1618",
+        # Retracement levels — pullback support/bounce resistance within
+        # the impulse range. Bullish impulse → retracements act as support
+        # for pullbacks; bearish impulse → retracements act as resistance
+        # for bounces. Standard ratios: 0.382 / 0.5 / 0.618 / 0.786.
+        "fib_bullish_382",
+        "fib_bullish_500",
+        "fib_bullish_618",
+        "fib_bullish_786",
+        "fib_bearish_382",
+        "fib_bearish_500",
+        "fib_bearish_618",
+        "fib_bearish_786",
         "nearest_bullish_extension",
         "nearest_bullish_extension_ratio",
         "bullish_extension_distance_pct",
@@ -118,6 +130,14 @@ class TechnicalLevelsContext:
     fib_bullish_1618: float | None
     fib_bearish_1272: float | None
     fib_bearish_1618: float | None
+    fib_bullish_382: float | None
+    fib_bullish_500: float | None
+    fib_bullish_618: float | None
+    fib_bullish_786: float | None
+    fib_bearish_382: float | None
+    fib_bearish_500: float | None
+    fib_bearish_618: float | None
+    fib_bearish_786: float | None
     nearest_bullish_extension: float | None
     nearest_bullish_extension_ratio: float | None
     bullish_extension_distance_pct: float | None
@@ -179,6 +199,14 @@ class TechnicalLevelsContext:
         fib_bullish_1618: float | None = None,
         fib_bearish_1272: float | None = None,
         fib_bearish_1618: float | None = None,
+        fib_bullish_382: float | None = None,
+        fib_bullish_500: float | None = None,
+        fib_bullish_618: float | None = None,
+        fib_bullish_786: float | None = None,
+        fib_bearish_382: float | None = None,
+        fib_bearish_500: float | None = None,
+        fib_bearish_618: float | None = None,
+        fib_bearish_786: float | None = None,
         nearest_bullish_extension: float | None = None,
         nearest_bullish_extension_ratio: float | None = None,
         bullish_extension_distance_pct: float | None = None,
@@ -237,6 +265,14 @@ class TechnicalLevelsContext:
         self.fib_bullish_1618 = fib_bullish_1618
         self.fib_bearish_1272 = fib_bearish_1272
         self.fib_bearish_1618 = fib_bearish_1618
+        self.fib_bullish_382 = fib_bullish_382
+        self.fib_bullish_500 = fib_bullish_500
+        self.fib_bullish_618 = fib_bullish_618
+        self.fib_bullish_786 = fib_bullish_786
+        self.fib_bearish_382 = fib_bearish_382
+        self.fib_bearish_500 = fib_bearish_500
+        self.fib_bearish_618 = fib_bearish_618
+        self.fib_bearish_786 = fib_bearish_786
         self.nearest_bullish_extension = nearest_bullish_extension
         self.nearest_bullish_extension_ratio = nearest_bullish_extension_ratio
         self.bullish_extension_distance_pct = bullish_extension_distance_pct
@@ -1107,6 +1143,12 @@ def build_technical_levels_context(
             if rng > 0:
                 ctx.fib_bullish_1272 = float(high + (rng * 0.272))
                 ctx.fib_bullish_1618 = float(high + (rng * 0.618))
+                # Retracement levels: pullback support points within the
+                # bullish impulse range (high → toward low).
+                ctx.fib_bullish_382 = float(high - (rng * 0.382))
+                ctx.fib_bullish_500 = float(high - (rng * 0.500))
+                ctx.fib_bullish_618 = float(high - (rng * 0.618))
+                ctx.fib_bullish_786 = float(high - (rng * 0.786))
                 bull_candidates = [(1.272, ctx.fib_bullish_1272), (1.618, ctx.fib_bullish_1618)]
                 above = [(ratio, px) for ratio, px in bull_candidates if px is not None and px > close]
                 if above:
@@ -1120,6 +1162,12 @@ def build_technical_levels_context(
             if rng > 0:
                 ctx.fib_bearish_1272 = float(low - (rng * 0.272))
                 ctx.fib_bearish_1618 = float(low - (rng * 0.618))
+                # Retracement levels: bounce resistance points within the
+                # bearish impulse range (low → toward high).
+                ctx.fib_bearish_382 = float(low + (rng * 0.382))
+                ctx.fib_bearish_500 = float(low + (rng * 0.500))
+                ctx.fib_bearish_618 = float(low + (rng * 0.618))
+                ctx.fib_bearish_786 = float(low + (rng * 0.786))
                 bear_candidates = [(1.272, ctx.fib_bearish_1272), (1.618, ctx.fib_bearish_1618)]
                 below = [(ratio, px) for ratio, px in bear_candidates if px is not None and px < close]
                 if below:

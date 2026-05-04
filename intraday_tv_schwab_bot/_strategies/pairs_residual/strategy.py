@@ -98,7 +98,7 @@ class PairsResidualStrategy(BaseStrategy):
                     reasons.append(f"side_preference_blocked({side_pref})")
             last_close = _safe_float(last["close"])
             sr_ctx = self._sr_context(symbol, left, data)
-            ms_ctx = self._structure_context(left, "1m")
+            ms_ctx = self._structure_context(left, "ltf")
             tech_ctx = self._technical_context(left)
             if long_ready:
                 if self._blocks_bullish_structure_entry(ms_ctx):

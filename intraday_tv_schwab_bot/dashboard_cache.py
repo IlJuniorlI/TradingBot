@@ -41,7 +41,7 @@ from .chart_patterns import analyze_chart_pattern_context
 from .config import DashboardChartConfig, DashboardChartingConfig
 from .htf_levels import summarize_htf_trend
 from .models import Side
-from .support_resistance import build_support_resistance_context, zone_flip_confirmed
+from .support_resistance import analyze_market_structure, zone_flip_confirmed
 from .technical_levels import build_technical_levels_context
 from .utils import now_et, resample_bars
 from ._sr_ladder import _collapse_price_ladder, _sr_effective_side_tolerance
@@ -505,35 +505,39 @@ class DashboardCache:
     # Payload builders that need data/strategy/account (Phase 5 Step 5).
     # ---------------------------------------------------------------------
 
-    def _active_sr_timeframe_minutes(self) -> int:
+    def _active_htf_minutes(self) -> int:
+        """HTF (higher timeframe) for SR detection, key level zones, sidebar
+        ladder, engine SR/stops/exits. Strategies with their own HTF concept
+        declare it via `params.htf_minutes`; otherwise inherits the shared
+        default from `support_resistance.timeframe_minutes`."""
         cfg = getattr(self.config, "support_resistance", None)
         fallback = int(getattr(cfg, "timeframe_minutes", 15)) if cfg is not None else 15
         params = getattr(self.strategy, "params", {}) or {}
-        return int(params.get("htf_timeframe_minutes", fallback))
+        return int(params.get("htf_minutes", fallback))
 
-    def _active_sr_lookback_days(self) -> int:
+    def _active_htf_lookback_days(self) -> int:
         cfg = getattr(self.config, "support_resistance", None)
         fallback = int(getattr(cfg, "lookback_days", 10)) if cfg is not None else 10
         params = getattr(self.strategy, "params", {}) or {}
         return int(params.get("htf_lookback_days", fallback))
 
-    def _active_sr_refresh_seconds(self) -> int:
-        cfg = getattr(self.config, "support_resistance", None)
-        fallback = int(getattr(cfg, "refresh_seconds", 120)) if cfg is not None else 120
+    def _active_ltf_minutes(self) -> int:
+        """LTF (lower timeframe / trigger frame). Strategies with a distinct
+        intraday trigger candle declare `params.ltf_minutes` (e.g.
+        peer_confirmed_key_levels uses 5-min trigger candles). Otherwise
+        defaults to 1-minute streamed bars."""
         params = getattr(self.strategy, "params", {}) or {}
-        return int(params.get("htf_refresh_seconds", fallback))
+        return int(params.get("ltf_minutes", 1))
 
     def htf_trend(self, symbol: str, *, allow_refresh: bool = True) -> dict[str, Any]:
-        tf = self._active_sr_timeframe_minutes()
-        lookback_days = self._active_sr_lookback_days()
-        refresh_seconds = self._active_sr_refresh_seconds()
+        tf = self._active_htf_minutes()
+        lookback_days = self._active_htf_lookback_days()
         frame = None
         if self.data is not None and hasattr(self.data, "get_htf_frame"):
             frame = self.data.get_htf_frame(
                 symbol,
                 timeframe_minutes=tf,
                 lookback_days=lookback_days,
-                refresh_seconds=refresh_seconds,
                 allow_refresh=allow_refresh,
             )
         summary = summarize_htf_trend(
@@ -760,8 +764,21 @@ class DashboardCache:
             next_support = support_prices[0] if support_prices else None
             next_resistance = resistance_prices[0] if resistance_prices else None
 
-        if frame is not None and not frame.empty:
-            frame_for_analysis = frame.copy()
+        # Build technical levels (fib extensions/retracements, AVWAP,
+        # Bollinger, ADX, channels, trendlines, etc.) on the strategy's LTF
+        # frame so all overlays render at LTF-derived prices. Strategies
+        # with default LTF=1 keep using the 1m streamed frame; strategies
+        # with non-1m LTF (e.g. peer_confirmed_key_levels at LTF=5m) get
+        # 5m-derived fibs/AVWAP/etc. matching the LTF chart bars.
+        ltf_min_for_tech = self._active_ltf_minutes()
+        if ltf_min_for_tech == 1:
+            tech_frame = frame
+        elif self.data is not None and symbol:
+            tech_frame = self.data.get_merged(symbol, timeframe=f"{ltf_min_for_tech}min", with_indicators=True)
+        else:
+            tech_frame = frame
+        if tech_frame is not None and not tech_frame.empty:
+            frame_for_analysis = tech_frame.copy()
             for col in ("open", "high", "low", "close", "volume"):
                 if col in frame_for_analysis.columns:
                     frame_for_analysis[col] = pd.to_numeric(frame_for_analysis[col], errors="coerce")
@@ -773,7 +790,7 @@ class DashboardCache:
                 tech_ctx = build_technical_levels_context(
                     frame_for_analysis,
                     current_price=current_price,
-                    pivot_span=int(getattr(sr_cfg, "structure_1m_pivot_span", getattr(sr_cfg, "pivot_span", 2)) or 2),
+                    pivot_span=int(getattr(sr_cfg, "structure_ltf_pivot_span", getattr(sr_cfg, "pivot_span", 2)) or 2),
                     fib_lookback_bars=int(getattr(tl_cfg, "fib_lookback_bars", 120) or 120),
                     fib_min_impulse_atr=float(getattr(tl_cfg, "fib_min_impulse_atr", 1.25) or 1.25),
                     anchored_vwap_impulse_lookback_bars=(int(getattr(tl_cfg, "anchored_vwap_impulse_lookback_bars")) if getattr(tl_cfg, "anchored_vwap_impulse_lookback_bars", None) is not None else None),
@@ -822,6 +839,14 @@ class DashboardCache:
                     "fib_bullish_1618": dashboard_safe_float(getattr(tech_ctx, "fib_bullish_1618", None)),
                     "fib_bearish_1272": dashboard_safe_float(getattr(tech_ctx, "fib_bearish_1272", None)),
                     "fib_bearish_1618": dashboard_safe_float(getattr(tech_ctx, "fib_bearish_1618", None)),
+                    "fib_bullish_382": dashboard_safe_float(getattr(tech_ctx, "fib_bullish_382", None)),
+                    "fib_bullish_500": dashboard_safe_float(getattr(tech_ctx, "fib_bullish_500", None)),
+                    "fib_bullish_618": dashboard_safe_float(getattr(tech_ctx, "fib_bullish_618", None)),
+                    "fib_bullish_786": dashboard_safe_float(getattr(tech_ctx, "fib_bullish_786", None)),
+                    "fib_bearish_382": dashboard_safe_float(getattr(tech_ctx, "fib_bearish_382", None)),
+                    "fib_bearish_500": dashboard_safe_float(getattr(tech_ctx, "fib_bearish_500", None)),
+                    "fib_bearish_618": dashboard_safe_float(getattr(tech_ctx, "fib_bearish_618", None)),
+                    "fib_bearish_786": dashboard_safe_float(getattr(tech_ctx, "fib_bearish_786", None)),
                     "anchored_vwap_open": dashboard_safe_float(getattr(tech_ctx, "anchored_vwap_open", None)),
                     "anchored_vwap_bullish_impulse": dashboard_safe_float(getattr(tech_ctx, "anchored_vwap_bullish_impulse", None)),
                     "anchored_vwap_bearish_impulse": dashboard_safe_float(getattr(tech_ctx, "anchored_vwap_bearish_impulse", None)),
@@ -920,8 +945,8 @@ class DashboardCache:
             if include_fair_value_gaps and chart_wants_htf_fvgs and self.data is not None:
                 htf_ctx = self.data.get_htf_context(
                     symbol,
-                    timeframe_minutes=self._active_sr_timeframe_minutes(),
-                    lookback_days=self._active_sr_lookback_days(),
+                    timeframe_minutes=self._active_htf_minutes(),
+                    lookback_days=self._active_htf_lookback_days(),
                     pivot_span=int(getattr(self.config.support_resistance, "pivot_span", 2) or 2),
                     max_levels_per_side=int(getattr(self.config.support_resistance, "max_levels_per_side", 3) or 3),
                     atr_tolerance_mult=float(getattr(self.config.support_resistance, "atr_tolerance_mult", 0.60) or 0.60),
@@ -929,7 +954,6 @@ class DashboardCache:
                     stop_buffer_atr_mult=float(getattr(self.config.support_resistance, "stop_buffer_atr_mult", 0.25) or 0.25),
                     ema_fast_span=50,
                     ema_slow_span=200,
-                    refresh_seconds=self._active_sr_refresh_seconds(),
                     allow_refresh=allow_refresh,
                     use_prior_day_high_low=bool(getattr(self.config.support_resistance, "use_prior_day_high_low", True)),
                     use_prior_week_high_low=bool(getattr(self.config.support_resistance, "use_prior_week_high_low", True)),
@@ -942,40 +966,44 @@ class DashboardCache:
                     for gap in list(getattr(htf_ctx, "bullish_fvgs", []) or []) + list(getattr(htf_ctx, "bearish_fvgs", []) or []):
                         payload_fvg = dashboard_fvg_payload(gap)
                         if payload_fvg is not None:
-                            payload_fvg["timeframe"] = f"{int(getattr(htf_ctx, 'timeframe_minutes', self._active_sr_timeframe_minutes()) or self._active_sr_timeframe_minutes())}m"
+                            payload_fvg["timeframe"] = f"{int(getattr(htf_ctx, 'timeframe_minutes', self._active_htf_minutes()) or self._active_htf_minutes())}m"
                             htf_fair_value_gaps.append(payload_fvg)
         except Exception:
             htf_fair_value_gaps = []
 
-        one_minute_fair_value_gaps: list[dict[str, Any]] = []
+        ltf_fair_value_gaps: list[dict[str, Any]] = []
         try:
             sr_cfg = getattr(self.config, "support_resistance", None)
-            include_one_minute_fvgs = bool(getattr(sr_cfg, "one_minute_fair_value_gaps_enabled", False)) if sr_cfg is not None else False
-            chart_wants_one_minute_fvgs = bool(compact_chart_profile.show_1m_fair_value_gaps) or bool(expanded_chart_profile.show_1m_fair_value_gaps)
-            if include_one_minute_fvgs and chart_wants_one_minute_fvgs and self.data is not None:
+            include_ltf_fvgs = bool(getattr(sr_cfg, "ltf_fair_value_gaps_enabled", False)) if sr_cfg is not None else False
+            chart_wants_ltf_fvgs = bool(compact_chart_profile.show_ltf_fair_value_gaps) or bool(expanded_chart_profile.show_ltf_fair_value_gaps)
+            if include_ltf_fvgs and chart_wants_ltf_fvgs and self.data is not None:
+                ltf_min_for_fvg = self._active_ltf_minutes()
                 fvg_ctx = self.data.get_fair_value_gap_context(
                     symbol,
-                    timeframe_minutes=1,
+                    timeframe_minutes=ltf_min_for_fvg,
                     current_price=current_price,
                     max_per_side=int(getattr(self.config.support_resistance, "fair_value_gap_max_per_side", 4) or 4),
                     min_gap_atr_mult=float(getattr(self.config.support_resistance, "fair_value_gap_min_atr_mult", 0.05) or 0.05),
                     min_gap_pct=float(getattr(self.config.support_resistance, "fair_value_gap_min_pct", 0.0005) or 0.0005),
                 )
                 if fvg_ctx is not None:
-                    merged_index_frame = frame if frame is not None and not frame.empty else self.data.get_merged(symbol, with_indicators=True)
+                    if ltf_min_for_fvg == 1:
+                        anchor_frame = frame if frame is not None and not frame.empty else self.data.get_merged(symbol, with_indicators=True)
+                    else:
+                        anchor_frame = self.data.get_merged(symbol, timeframe=f"{ltf_min_for_fvg}min", with_indicators=True)
                     for gap in list(getattr(fvg_ctx, "bullish_fvgs", []) or []) + list(getattr(fvg_ctx, "bearish_fvgs", []) or []):
                         payload_fvg = dashboard_fvg_payload(gap)
                         if payload_fvg is not None:
-                            payload_fvg["timeframe"] = "1m"
-                            payload_fvg["anchor_abs_index"] = dashboard_fvg_anchor_abs_index(merged_index_frame, payload_fvg.get("first_seen"))
-                            one_minute_fair_value_gaps.append(payload_fvg)
+                            payload_fvg["timeframe"] = f"{ltf_min_for_fvg}m"
+                            payload_fvg["anchor_abs_index"] = dashboard_fvg_anchor_abs_index(anchor_frame, payload_fvg.get("first_seen"))
+                            ltf_fair_value_gaps.append(payload_fvg)
         except Exception:
-            one_minute_fair_value_gaps = []
+            ltf_fair_value_gaps = []
 
         # Order blocks. Same payload shape as FVGs (lower/upper/midpoint/size/
         # direction/filled_pct/first_seen/last_seen) — `dashboard_fvg_payload`
         # is reused since it's shape-driven, not type-driven. Frontend reads
-        # `htf_order_blocks` and `one_minute_order_blocks` separately and renders
+        # `htf_order_blocks` and `ltf_order_blocks` separately and renders
         # them with dashed-stroke styling vs FVGs' solid-fill styling.
         # Pull tuning knobs once for both blocks below.
         sr_cfg = getattr(self.config, "support_resistance", None)
@@ -994,7 +1022,7 @@ class DashboardCache:
             include_htf_obs = bool(getattr(sr_cfg, "htf_order_blocks_enabled", False)) if sr_cfg is not None else False
             chart_wants_htf_obs = bool(compact_chart_profile.show_htf_order_blocks) or bool(expanded_chart_profile.show_htf_order_blocks)
             if include_htf_obs and chart_wants_htf_obs and self.data is not None and ob_kwargs is not None:
-                htf_minutes = self._active_sr_timeframe_minutes()
+                htf_minutes = self._active_htf_minutes()
                 # Cycle-cached: hits get_order_block_context's cache when the
                 # strategy already computed it earlier in the same cycle.
                 ob_ctx_htf = self.data.get_order_block_context(
@@ -1018,38 +1046,42 @@ class DashboardCache:
             )
             htf_order_blocks = []
 
-        one_minute_order_blocks: list[dict[str, Any]] = []
+        ltf_order_blocks: list[dict[str, Any]] = []
         try:
-            include_one_minute_obs = bool(getattr(sr_cfg, "one_minute_order_blocks_enabled", False)) if sr_cfg is not None else False
-            chart_wants_one_minute_obs = bool(compact_chart_profile.show_1m_order_blocks) or bool(expanded_chart_profile.show_1m_order_blocks)
-            if include_one_minute_obs and chart_wants_one_minute_obs and self.data is not None and ob_kwargs is not None:
+            include_ltf_obs = bool(getattr(sr_cfg, "ltf_order_blocks_enabled", False)) if sr_cfg is not None else False
+            chart_wants_ltf_obs = bool(compact_chart_profile.show_ltf_order_blocks) or bool(expanded_chart_profile.show_ltf_order_blocks)
+            if include_ltf_obs and chart_wants_ltf_obs and self.data is not None and ob_kwargs is not None:
                 # Cycle-cached: same cache as the strategy uses when it calls
-                # `_one_minute_order_block_context` during entry evaluation.
-                ob_ctx_1m = self.data.get_order_block_context(
+                # `_ltf_order_block_context` during entry evaluation.
+                ltf_min_for_ob = self._active_ltf_minutes()
+                ob_ctx_ltf = self.data.get_order_block_context(
                     symbol,
-                    timeframe_minutes=1,
+                    timeframe_minutes=ltf_min_for_ob,
                     current_price=current_price,
                     **ob_kwargs,
                 )
-                # We still need an in-scope 1m frame for the anchor_abs_index
+                # We still need an in-scope LTF frame for the anchor_abs_index
                 # lookup that drives chart placement; the OB context alone
                 # doesn't carry frame indices.
-                one_minute_frame = frame if frame is not None and not frame.empty else self.data.get_merged(symbol, with_indicators=True)
-                for ob in list(getattr(ob_ctx_1m, "bullish_obs", []) or []) + list(getattr(ob_ctx_1m, "bearish_obs", []) or []):
+                if ltf_min_for_ob == 1:
+                    ltf_frame = frame if frame is not None and not frame.empty else self.data.get_merged(symbol, with_indicators=True)
+                else:
+                    ltf_frame = self.data.get_merged(symbol, timeframe=f"{ltf_min_for_ob}min", with_indicators=True)
+                for ob in list(getattr(ob_ctx_ltf, "bullish_obs", []) or []) + list(getattr(ob_ctx_ltf, "bearish_obs", []) or []):
                     payload_ob = dashboard_fvg_payload(ob)
                     if payload_ob is not None:
-                        payload_ob["timeframe"] = "1m"
+                        payload_ob["timeframe"] = f"{ltf_min_for_ob}m"
                         payload_ob["kind"] = "ob"
-                        payload_ob["mode"] = str(getattr(ob_ctx_1m, "mode", "loose") or "loose")
-                        payload_ob["anchor_abs_index"] = dashboard_fvg_anchor_abs_index(one_minute_frame, payload_ob.get("first_seen"))
-                        one_minute_order_blocks.append(payload_ob)
+                        payload_ob["mode"] = str(getattr(ob_ctx_ltf, "mode", "loose") or "loose")
+                        payload_ob["anchor_abs_index"] = dashboard_fvg_anchor_abs_index(ltf_frame, payload_ob.get("first_seen"))
+                        ltf_order_blocks.append(payload_ob)
         except Exception:
             self.log_component_failure(
-                "one_minute_order_blocks_collect",
+                "ltf_order_blocks_collect",
                 "Dashboard 1m order blocks collect failed for %s",
                 symbol,
             )
-            one_minute_order_blocks = []
+            ltf_order_blocks = []
 
         chart_payload = {
             "levels": {
@@ -1065,9 +1097,9 @@ class DashboardCache:
                 "broken_resistance": dashboard_safe_float((sr_row or {}).get("broken_resistance")),
                 "key_level_zones": key_level_zones,
                 "htf_fair_value_gaps": htf_fair_value_gaps,
-                "one_minute_fair_value_gaps": one_minute_fair_value_gaps,
+                "ltf_fair_value_gaps": ltf_fair_value_gaps,
                 "htf_order_blocks": htf_order_blocks,
-                "one_minute_order_blocks": one_minute_order_blocks,
+                "ltf_order_blocks": ltf_order_blocks,
             },
             "technicals": technical_payload,
             "position_markers": position_markers,
@@ -1169,7 +1201,6 @@ class DashboardCache:
         stop_atr = float(level_ctx.get("stop_buffer_atr_mult", 0.25) or 0.25)
         ema_fast_span = max(1, int(level_ctx.get("ema_fast_span", 50) or 50))
         ema_slow_span = max(1, int(level_ctx.get("ema_slow_span", 200) or 200))
-        refresh_seconds = max(1, int(level_ctx.get("refresh_seconds", 180) or 180))
         sr_cfg = getattr(self.config, "support_resistance", None)
         use_prior_day_high_low = bool(getattr(sr_cfg, "use_prior_day_high_low", True)) if sr_cfg is not None else True
         use_prior_week_high_low = bool(getattr(sr_cfg, "use_prior_week_high_low", True)) if sr_cfg is not None else True
@@ -1189,7 +1220,6 @@ class DashboardCache:
             stop_buffer_atr_mult=stop_atr,
             ema_fast_span=ema_fast_span,
             ema_slow_span=ema_slow_span,
-            refresh_seconds=refresh_seconds,
             allow_refresh=allow_htf_refresh,
             use_prior_day_high_low=use_prior_day_high_low,
             use_prior_week_high_low=use_prior_week_high_low,
@@ -1201,17 +1231,17 @@ class DashboardCache:
         if htf is None:
             return []
 
-        trigger_tf = max(1, int(level_ctx.get("trigger_timeframe_minutes", 5) or 5))
+        ltf_min = max(1, int(level_ctx.get("ltf_minutes", 5) or 5))
         ltf = None
         try:
             if self.data is not None:
-                timeframe = "1min" if trigger_tf <= 1 else f"{trigger_tf}min"
+                timeframe = "1min" if ltf_min <= 1 else f"{ltf_min}min"
                 ltf = self.data.get_merged(symbol, timeframe=timeframe, with_indicators=True)
             elif frame is not None and not frame.empty:
-                if trigger_tf <= 1:
+                if ltf_min <= 1:
                     ltf = frame.copy()
                 else:
-                    ltf = resample_bars(frame, f"{trigger_tf}min")
+                    ltf = resample_bars(frame, f"{ltf_min}min")
         except Exception:
             ltf = None
 
@@ -1325,8 +1355,16 @@ class DashboardCache:
         support_zones = [zone for zone in (_candidate_zone_payload(Side.LONG, candidate) for candidate in long_candidates) if zone is not None]
         resistance_zones = [zone for zone in (_candidate_zone_payload(Side.SHORT, candidate) for candidate in short_candidates) if zone is not None]
 
-        zone_flip_1m = max(0, int(getattr(sr_cfg, "dashboard_flip_confirmation_1m_bars", 1) or 1)) if sr_cfg is not None else 1
-        zone_flip_5m = 0
+        # Use trading-mode flip confirmation (2 bars 1m OR 1 bar 5m) so the
+        # chart's zone classification matches what position management and
+        # strategy entries see. The previous code used loose dashboard mode
+        # (1m_bars=1, 5m_bars=0) for snappier visual feedback, but that meant
+        # a chart zone could flip color before the strategy itself treated it
+        # as flipped — confusing when the dashboard sidebar (which already
+        # uses trading mode via `sr_row()`) and the chart disagreed about
+        # the same level.
+        zone_flip_1m = max(0, int(getattr(sr_cfg, "trading_flip_confirmation_1m_bars", 2) or 2)) if sr_cfg is not None else 2
+        zone_flip_5m = max(0, int(getattr(sr_cfg, "trading_flip_confirmation_5m_bars", 1) or 1)) if sr_cfg is not None else 1
         fallback_bar = None
         if frame is not None and not frame.empty:
             try:
@@ -1562,14 +1600,21 @@ class DashboardCache:
         if cfg is None or not bool(cfg.enabled):
             return None
         current_price = price if price is not None else self.symbol_price(symbol)
+        # mode="trading" gives the sidebar the same flip-confirmation
+        # strictness (trading_flip_confirmation_1m_bars=2,
+        # trading_flip_confirmation_5m_bars=1) that position management,
+        # the chart's zone-flip detection, and the entry gatekeeper all
+        # use. A single "trading" mode means the sidebar / chart /
+        # gatekeeper / strategy agree on which side of a level price is
+        # currently sitting on — no path where one consumer sees a level
+        # as broken before another does.
         ctx = self.data.get_support_resistance(
             symbol,
             current_price=current_price,
             flip_frame=self.data.get_merged(symbol, with_indicators=False),
-            mode="dashboard",
-            timeframe_minutes=self._active_sr_timeframe_minutes(),
-            lookback_days=self._active_sr_lookback_days(),
-            refresh_seconds=self._active_sr_refresh_seconds(),
+            mode="trading",
+            timeframe_minutes=self._active_htf_minutes(),
+            lookback_days=self._active_htf_lookback_days(),
             allow_refresh=allow_refresh,
         )
         if ctx is None:
@@ -1622,8 +1667,8 @@ class DashboardCache:
                 if sr_cfg is not None:
                     htf_ctx = self.data.get_htf_context(
                         symbol,
-                        timeframe_minutes=self._active_sr_timeframe_minutes(),
-                        lookback_days=self._active_sr_lookback_days(),
+                        timeframe_minutes=self._active_htf_minutes(),
+                        lookback_days=self._active_htf_lookback_days(),
                         pivot_span=int(getattr(sr_cfg, "pivot_span", 2) or 2),
                         max_levels_per_side=int(getattr(sr_cfg, "max_levels_per_side", 3) or 3),
                         atr_tolerance_mult=float(getattr(sr_cfg, "atr_tolerance_mult", 0.60) or 0.60),
@@ -1631,7 +1676,6 @@ class DashboardCache:
                         stop_buffer_atr_mult=float(getattr(sr_cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
                         ema_fast_span=50,
                         ema_slow_span=200,
-                        refresh_seconds=self._active_sr_refresh_seconds(),
                         allow_refresh=allow_refresh,
                         use_prior_day_high_low=bool(getattr(sr_cfg, "use_prior_day_high_low", True)),
                         use_prior_week_high_low=bool(getattr(sr_cfg, "use_prior_week_high_low", True)),
@@ -1742,7 +1786,7 @@ class DashboardCache:
             nearest_support_price = support_prices[0] if support_prices else None
             nearest_resistance_price = resistance_prices[0] if resistance_prices else None
 
-        timeframe_minutes = int(getattr(ctx, "timeframe_minutes", self._active_sr_timeframe_minutes()) or self._active_sr_timeframe_minutes())
+        timeframe_minutes = int(getattr(ctx, "timeframe_minutes", self._active_htf_minutes()) or self._active_htf_minutes())
         symbol_key = str(symbol or "").upper().strip()
         htf_refresh = self.data.last_htf_refresh.get((symbol_key, timeframe_minutes)) if symbol_key else None
 
@@ -1785,11 +1829,10 @@ class DashboardCache:
         if not allow_refresh:
             return False
         try:
-            sr_tf = self._active_sr_timeframe_minutes()
-            sr_refresh = self._active_sr_refresh_seconds()
-            if self.data.should_refresh_support_resistance(symbol, timeframe_minutes=sr_tf, refresh_seconds=sr_refresh):
+            sr_tf = self._active_htf_minutes()
+            if self.data.should_refresh_support_resistance(symbol, timeframe_minutes=sr_tf):
                 return True
-            if self.data.should_refresh_htf_context(symbol, sr_tf, sr_refresh):
+            if self.data.should_refresh_htf_context(symbol, sr_tf):
                 return True
         except Exception:
             return True
@@ -1816,7 +1859,7 @@ class DashboardCache:
         quote_refresh = self.data.last_quote_refresh.get(symbol_key) if symbol_key else None
         history_refresh = self.data.last_history_refresh.get(symbol_key) if symbol_key else None
         stream_refresh = self.data.last_stream_update.get(symbol_key) if symbol_key else None
-        htf_refresh = self.data.last_htf_refresh.get((symbol_key, self._active_sr_timeframe_minutes())) if symbol_key else None
+        htf_refresh = self.data.last_htf_refresh.get((symbol_key, self._active_htf_minutes())) if symbol_key else None
         quote_body = quote or {}
         return (
             dashboard_frame_signature(frame),
@@ -1922,8 +1965,15 @@ class DashboardCache:
 
     def current_structure_overlay(self, frame: pd.DataFrame | None, *, timeframe_minutes: int) -> dict[str, Any]:
         """Build the market-structure overlay payload (CHOCH/BOS event, age,
-        level) from ``frame`` at the given timeframe. Returns neutral payload
-        on any failure (with rate-limited warning via log_component_failure)."""
+        level) from ``frame`` at the given timeframe.
+
+        Calls ``analyze_market_structure`` directly instead of building a
+        full ``SupportResistanceContext`` — the overlay only consumes
+        ``market_structure`` and skipping the surrounding S/R clustering,
+        prior-day/week, FVG checks, broken-level reconciliation, and
+        proximity metrics is roughly an order-of-magnitude speedup per
+        chart render. Returns neutral payload on any failure (with
+        rate-limited warning via log_component_failure)."""
         payload: dict[str, Any] = {
             "event": "—",
             "age_bars": None,
@@ -1945,28 +1995,14 @@ class DashboardCache:
             return payload
         try:
             sr_cfg = self.config.support_resistance
-            sr_ctx = build_support_resistance_context(
+            ms_ctx = analyze_market_structure(
                 frame_for_analysis,
                 current_price=close_val,
-                flip_frame=frame_for_analysis,
-                timeframe_minutes=int(timeframe_minutes or 1),
                 pivot_span=int(getattr(sr_cfg, "pivot_span", 2) or 2),
-                max_levels_per_side=int(getattr(sr_cfg, "max_levels_per_side", 3) or 3),
-                atr_tolerance_mult=float(getattr(sr_cfg, "atr_tolerance_mult", 0.60) or 0.60),
+                eq_atr_mult=float(getattr(sr_cfg, "structure_eq_atr_mult", 0.25) or 0.25),
                 pct_tolerance=float(getattr(sr_cfg, "pct_tolerance", 0.0030) or 0.0030),
-                same_side_min_gap_atr_mult=float(getattr(sr_cfg, "same_side_min_gap_atr_mult", 0.10) or 0.10),
-                same_side_min_gap_pct=float(getattr(sr_cfg, "same_side_min_gap_pct", 0.0015) or 0.0015),
-                fallback_reference_max_drift_atr_mult=float(getattr(sr_cfg, "fallback_reference_max_drift_atr_mult", 1.0) or 1.0),
-                fallback_reference_max_drift_pct=float(getattr(sr_cfg, "fallback_reference_max_drift_pct", 0.01) or 0.01),
-                proximity_atr_mult=float(getattr(sr_cfg, "proximity_atr_mult", 1.0) or 1.0),
                 breakout_atr_mult=float(getattr(sr_cfg, "breakout_atr_mult", 0.35) or 0.35),
                 breakout_buffer_pct=float(getattr(sr_cfg, "breakout_buffer_pct", 0.0015) or 0.0015),
-                stop_buffer_atr_mult=float(getattr(sr_cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
-                use_prior_day_high_low=bool(getattr(sr_cfg, "use_prior_day_high_low", True)),
-                use_prior_week_high_low=bool(getattr(sr_cfg, "use_prior_week_high_low", True)),
-                flip_confirmation_1m_bars=int(getattr(sr_cfg, "flip_confirmation_1m_bars", 2) or 2),
-                flip_confirmation_5m_bars=int(getattr(sr_cfg, "flip_confirmation_5m_bars", 1) or 1),
-                structure_eq_atr_mult=float(getattr(sr_cfg, "structure_eq_atr_mult", 0.25) or 0.25),
                 structure_event_max_age_bars=int(getattr(sr_cfg, "structure_event_lookback_bars", 6) or 6),
             )
         except Exception:
@@ -1975,9 +2011,6 @@ class DashboardCache:
                 "Dashboard structure overlay build failed for timeframe=%sm",
                 int(timeframe_minutes or 1),
             )
-            return payload
-        ms_ctx = getattr(sr_ctx, "market_structure", None)
-        if ms_ctx is None:
             return payload
         event = dashboard_structure_event_label(ms_ctx)
         age = None
@@ -2003,21 +2036,35 @@ class DashboardCache:
         })
         return payload
 
-    def chart_payload(self, symbol: str, *, max_bars: int = 90, timeframe_mode: str = "1m") -> dict[str, Any]:
+    def chart_payload(self, symbol: str, *, max_bars: int = 90, timeframe_mode: str = "ltf") -> dict[str, Any]:
         """Build the dashboard chart payload for ``symbol`` — bars + patterns
         + structure overlay + chart config. This is the callable passed to
-        ``DashboardServer`` as ``chart_payload_provider``."""
+        ``DashboardServer`` as ``chart_payload_provider``.
+
+        ``timeframe_mode``: ``"ltf"`` renders at the strategy's LTF
+        (``params.ltf_minutes``, defaults to 1m streaming bars). ``"htf"``
+        renders at the strategy's HTF (``params.htf_minutes`` or the shared
+        ``support_resistance.timeframe_minutes`` default). Legacy ``"1m"``
+        is accepted as an alias for ``"ltf"``."""
         from dataclasses import asdict
-        resolved_mode = str(timeframe_mode or "1m").strip().lower()
+        resolved_mode = str(timeframe_mode or "ltf").strip().lower()
+        if resolved_mode == "1m":  # back-compat alias
+            resolved_mode = "ltf"
         if resolved_mode != "htf":
-            resolved_mode = "1m"
+            resolved_mode = "ltf"
         symbol_key = str(symbol or "").upper().strip()
         try:
             capped_bars = max(1, min(int(max_bars or 90), 480))
         except (TypeError, ValueError):
             capped_bars = 90
-        timeframe_label = f"{self._active_sr_timeframe_minutes()}m" if resolved_mode == "htf" else "1m"
-        timeframe_minutes = self._active_sr_timeframe_minutes() if resolved_mode == "htf" else 1
+        ltf_min = max(1, self._active_ltf_minutes())
+        htf_min = self._active_htf_minutes()
+        if resolved_mode == "htf":
+            timeframe_minutes = htf_min
+            timeframe_label = f"{htf_min}m"
+        else:
+            timeframe_minutes = ltf_min
+            timeframe_label = f"{ltf_min}m" if ltf_min > 1 else "1m"
         if resolved_mode == "htf" and symbol_key:
             # HTTP handler path: only read cached HTF data, never trigger a
             # Schwab fetch here. Forcing a refresh from the HTTP thread races
@@ -2027,13 +2074,20 @@ class DashboardCache:
             # engine cycle will populate it and the next poll will render.
             frame = self.data.get_htf_frame(
                 symbol_key,
-                timeframe_minutes=self._active_sr_timeframe_minutes(),
-                lookback_days=self._active_sr_lookback_days(),
-                refresh_seconds=self._active_sr_refresh_seconds(),
+                timeframe_minutes=htf_min,
+                lookback_days=self._active_htf_lookback_days(),
                 allow_refresh=False,
             )
+        elif symbol_key:
+            # LTF path: when ltf_min is 1 fetch the streaming 1m frame
+            # directly (no resample); for ltf_min > 1 (e.g. 5-min trigger
+            # candles) get_merged resamples 1m -> ltf via resample_bars.
+            if ltf_min > 1:
+                frame = self.data.get_merged(symbol_key, timeframe=f"{ltf_min}min", with_indicators=True)
+            else:
+                frame = self.data.get_merged(symbol_key, with_indicators=True)
         else:
-            frame = self.data.get_merged(symbol_key, with_indicators=True) if symbol_key else None
+            frame = None
         htf_refresh = self.data.last_htf_refresh.get((symbol_key, timeframe_minutes)) if resolved_mode == "htf" and symbol_key else None
         frame_signature = (
             dashboard_frame_signature(frame),
@@ -2061,6 +2115,36 @@ class DashboardCache:
                 cached_payload["last_update"] = now_et().isoformat()
                 return cached_payload
         bars = dashboard_bars_from_frame(frame, max_bars=capped_bars)
+        # Default EMA spans rendered on the chart (matches what
+        # `ensure_standard_indicator_frame` populates as ema9/ema20 columns).
+        ema_fast_span = 9
+        ema_slow_span = 20
+        # In HTF mode, override the bars' ema9 / ema20 values with the
+        # strategy's configured HTF EMAs (e.g. peer_confirmed_key_levels uses
+        # ema_fast_span=34 / ema_slow_span=200 for HTF trend bias). This
+        # keeps the chart faithful to what the strategy actually evaluates
+        # at the HTF — not a different default-span EMA that the strategy
+        # never looks at. Field names stay `ema9` / `ema20` for renderer
+        # compatibility, but the legend uses the labels in this payload.
+        if resolved_mode == "htf" and frame is not None and not getattr(frame, "empty", True):
+            params = getattr(self.strategy, "params", {}) or {}
+            htf_fast = max(1, int(params.get("htf_ema_fast_span", ema_fast_span) or ema_fast_span))
+            htf_slow = max(1, int(params.get("htf_ema_slow_span", ema_slow_span) or ema_slow_span))
+            if htf_fast != ema_fast_span or htf_slow != ema_slow_span:
+                try:
+                    ema_fast_series = frame["close"].ewm(span=htf_fast, adjust=False).mean()
+                    ema_slow_series = frame["close"].ewm(span=htf_slow, adjust=False).mean()
+                    tail = frame.tail(len(bars))
+                    for bar, (idx, _row) in zip(bars, tail.iterrows()):
+                        try:
+                            bar["ema9"] = float(ema_fast_series.loc[idx])
+                            bar["ema20"] = float(ema_slow_series.loc[idx])
+                        except (KeyError, ValueError, TypeError):
+                            pass
+                    ema_fast_span = htf_fast
+                    ema_slow_span = htf_slow
+                except Exception:
+                    LOG.debug("Failed to compute HTF strategy EMAs for %s; chart falls back to default ema9/ema20.", symbol_key, exc_info=True)
         pattern_payload = self.current_pattern_payload(frame)
         structure_overlay = self.current_structure_overlay(frame, timeframe_minutes=timeframe_minutes)
         chart_config_profile = asdict(self.chart_profile("compact"))
@@ -2072,6 +2156,9 @@ class DashboardCache:
             "max_bars": capped_bars,
             "timeframe_mode": resolved_mode,
             "timeframe_label": timeframe_label,
+            "timeframe_minutes": timeframe_minutes,
+            "ema_fast_span": ema_fast_span,
+            "ema_slow_span": ema_slow_span,
             "htf_refresh_token": htf_refresh.isoformat() if htf_refresh is not None else None,
             "last_bar_ts": str(bars[-1].get("ts")) if bars else None,
             "last_update": now_et().isoformat(),

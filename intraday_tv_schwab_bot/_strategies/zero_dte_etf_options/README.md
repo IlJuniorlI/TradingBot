@@ -138,9 +138,8 @@ Current code defaults:
 | `candle_mixed_penalty`        | `0.18`               |
 | `use_htf_trend_confirmation`  | `true`               |
 | `require_htf_alignment`       | `true`               |
-| `htf_timeframe_minutes`       | `15`                 |
+| `htf_minutes`       | `15`                 |
 | `htf_lookback_days`           | `15`                 |
-| `htf_refresh_seconds`         | `120`                |
 | `htf_min_bars`                | `20`                 |
 | `htf_vwap_distance_pct`       | `0.0009`             |
 | `htf_ema_gap_pct`             | `0.0007`             |
@@ -176,7 +175,7 @@ Common parameter families:
 - Candle / SR / trend-follow weights:
   - `candle_weight`, `candle_sr_weight`, `candle_trend_follow_weight`, `candle_range_penalty`, `candle_mixed_penalty`
 - HTF confirmation:
-  - `use_htf_trend_confirmation`, `require_htf_alignment`, `htf_timeframe_minutes`, `htf_lookback_days`, `htf_refresh_seconds`, `htf_min_bars`, `htf_vwap_distance_pct`, `htf_ema_gap_pct`, `htf_min_ret3`, `htf_range_vwap_distance_pct`, `htf_range_ema_gap_pct`, `htf_score_bonus`, `htf_score_penalty`
+  - `use_htf_trend_confirmation`, `require_htf_alignment`, `htf_minutes`, `htf_lookback_days`, `htf_min_bars`, `htf_vwap_distance_pct`, `htf_ema_gap_pct`, `htf_min_ret3`, `htf_range_vwap_distance_pct`, `htf_range_ema_gap_pct`, `htf_score_bonus`, `htf_score_penalty`
 - FVG contribution:
   - `fvg_context_weight_scale`
 

@@ -755,9 +755,8 @@ class IntradayBot:
                 )
 
             if gate_state.context_refresh_active and getattr(self.config, "support_resistance", None) is not None and bool(self.config.support_resistance.enabled):
-                sr_tf = self.position_manager.active_sr_timeframe_minutes()
-                sr_refresh = self.position_manager.active_sr_refresh_seconds()
-                sr_lookback = self.position_manager.active_sr_lookback_days()
+                sr_tf = self.position_manager.active_htf_minutes()
+                sr_lookback = self.position_manager.active_htf_lookback_days()
                 # Pre-normalize so the should_refresh check and the threaded
                 # fetch agree on cache keys (data_feed._symbol_key applies the
                 # same upper().strip()).
@@ -767,7 +766,7 @@ class IntradayBot:
                     if not symbol_key:
                         continue
                     if self.data.should_refresh_support_resistance(
-                        symbol_key, timeframe_minutes=sr_tf, refresh_seconds=sr_refresh
+                        symbol_key, timeframe_minutes=sr_tf,
                     ):
                         sr_fetch_targets.append(symbol_key)
                 if sr_fetch_targets:
@@ -777,7 +776,6 @@ class IntradayBot:
                             symbol,
                             timeframe_minutes=sr_tf,
                             lookback_days=sr_lookback,
-                            refresh_seconds=sr_refresh,
                         ),
                         label="Support/resistance fetch",
                     )
@@ -954,9 +952,8 @@ class IntradayBot:
                 current_price=current_price,
                 flip_frame=frame,
                 mode="trading",
-                timeframe_minutes=self.position_manager.active_sr_timeframe_minutes(),
-                lookback_days=self.position_manager.active_sr_lookback_days(),
-                refresh_seconds=self.position_manager.active_sr_refresh_seconds(),
+                timeframe_minutes=self.position_manager.active_htf_minutes(),
+                lookback_days=self.position_manager.active_htf_lookback_days(),
                 allow_refresh=allow_refresh,
                 use_prior_day_high_low=bool(getattr(sr_cfg, "use_prior_day_high_low", True)),
                 use_prior_week_high_low=bool(getattr(sr_cfg, "use_prior_week_high_low", True)),
@@ -981,7 +978,7 @@ class IntradayBot:
 
         Auto-detect: each context builder records its call signature in
         `BaseStrategy._observed_contexts` (a class-level set of tuples like
-        `("structure", "1m")`). On cycle 1 the set is empty and this method
+        `("structure", "ltf")`). On cycle 1 the set is empty and this method
         is a no-op — the strategy runs lazy. From cycle 2 onward, only the
         contexts the strategy actually invokes are pre-warmed, in parallel
         across the watchlist via `_parallel_symbol_map`. New code paths

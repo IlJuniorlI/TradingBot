@@ -102,13 +102,13 @@ Strategy-specific knobs:
 
 - Universe and HTF map:
   - `tradable`, `peers`
-  - `htf_timeframe_minutes`, `htf_lookback_days`, `htf_refresh_seconds`, `htf_pivot_span`, `htf_max_levels_per_side`, `htf_atr_tolerance_mult`, `htf_pct_tolerance`, `htf_stop_buffer_atr_mult`, `htf_ema_fast_span`, `htf_ema_slow_span`
+  - `htf_minutes`, `htf_lookback_days`, `htf_pivot_span`, `htf_max_levels_per_side`, `htf_atr_tolerance_mult`, `htf_pct_tolerance`, `htf_stop_buffer_atr_mult`, `htf_ema_fast_span`, `htf_ema_slow_span`
 - Trigger frame and warmup:
-  - `trigger_timeframe_minutes`, `min_bars`, `min_trigger_bars`
+  - `ltf_minutes`, `min_bars`, `min_ltf_bars`
   - Stronger signals are prioritized lexicographically by trigger quality, level quality, peer confirmation, vote edge, and clearance before smaller additive bonuses are allowed to break ties.
 - Zone, score, and R:R:
-  - `zone_atr_mult`, `zone_pct`, `min_level_score`, `min_trigger_score`, `min_rr`, `stop_buffer_atr_mult`
-  - `trigger_quality_bonus_enabled`, `trigger_quality_max_bonus`, `trigger_reclaim_quality_bonus_cap`, `trigger_zone_interaction_bonus_cap`, `trigger_candle_quality_bonus_cap`, `trigger_volume_quality_bonus_cap`, `trigger_range_expansion_bonus_cap`
+  - `zone_atr_mult`, `zone_pct`, `min_level_score`, `min_ltf_score`, `min_rr`, `stop_buffer_atr_mult`
+  - `ltf_quality_bonus_enabled`, `ltf_quality_max_bonus`, `ltf_reclaim_quality_bonus_cap`, `ltf_zone_interaction_bonus_cap`, `ltf_candle_quality_bonus_cap`, `ltf_volume_quality_bonus_cap`, `ltf_range_expansion_bonus_cap`
 - Peer confirmation:
   - `min_peer_agreement`, `min_peer_score`
 - Macro confirmation:
@@ -116,7 +116,7 @@ Strategy-specific knobs:
 - Level scoring detail:
   - `level_round_number_tolerance_pct`
 - Strong-setup runner / ladder logic:
-  - `strong_setup_runner_enabled`, `strong_setup_min_trigger_score`, `strong_setup_min_level_score`, `strong_setup_min_peer_score`, `strong_setup_min_hourly_vote_edge`, `strong_setup_target_level_offset`
+  - `strong_setup_runner_enabled`, `strong_setup_min_ltf_score`, `strong_setup_min_level_score`, `strong_setup_min_peer_score`, `strong_setup_min_htf_vote_edge`, `strong_setup_target_level_offset`
   - When `risk.trade_management_mode: adaptive_ladder` is active, this strategy stores rung metadata at entry and promotes targets one rung at a time while ratcheting stops behind defended S/R levels/zones. Non-ladder strategies safely fall back to adaptive management.
 
 Also uses these shared stock groups:
@@ -131,9 +131,8 @@ Current package defaults:
 |--------------------------------------|-------------------------------------------|
 | `tradable`                           | `['AAPL', 'NVDA', 'GOOG', 'AMD', 'INTC']` |
 | `peers`                              | `['QQQ', 'AVGO', 'MU', 'TSM']`            |
-| `htf_timeframe_minutes`              | `60`                                      |
+| `htf_minutes`              | `60`                                      |
 | `htf_lookback_days`                  | `60`                                      |
-| `htf_refresh_seconds`                | `120`                                     |
 | `htf_pivot_span`                     | `2`                                       |
 | `htf_max_levels_per_side`            | `6`                                       |
 | `htf_atr_tolerance_mult`             | `0.35`                                    |
@@ -141,20 +140,20 @@ Current package defaults:
 | `htf_stop_buffer_atr_mult`           | `0.25`                                    |
 | `htf_ema_fast_span`                  | `34`                                      |
 | `htf_ema_slow_span`                  | `200`                                     |
-| `trigger_timeframe_minutes`          | `5`                                       |
+| `ltf_minutes`          | `5`                                       |
 | `min_bars`                           | `80`                                      |
-| `min_trigger_bars`                   | `18`                                      |
+| `min_ltf_bars`                   | `18`                                      |
 | `zone_atr_mult`                      | `0.22`                                    |
 | `zone_pct`                           | `0.0016`                                  |
 | `min_level_score`                    | `2.9`                                     |
-| `min_trigger_score`                  | `2.5`                                     |
-| `trigger_quality_bonus_enabled`      | `true`                                    |
-| `trigger_quality_max_bonus`          | `2.0`                                     |
-| `trigger_reclaim_quality_bonus_cap`  | `0.8`                                     |
-| `trigger_zone_interaction_bonus_cap` | `0.5`                                     |
-| `trigger_candle_quality_bonus_cap`   | `0.5`                                     |
-| `trigger_volume_quality_bonus_cap`   | `0.4`                                     |
-| `trigger_range_expansion_bonus_cap`  | `0.4`                                     |
+| `min_ltf_score`                  | `2.5`                                     |
+| `ltf_quality_bonus_enabled`      | `true`                                    |
+| `ltf_quality_max_bonus`          | `2.0`                                     |
+| `ltf_reclaim_quality_bonus_cap`  | `0.8`                                     |
+| `ltf_zone_interaction_bonus_cap` | `0.5`                                     |
+| `ltf_candle_quality_bonus_cap`   | `0.5`                                     |
+| `ltf_volume_quality_bonus_cap`   | `0.4`                                     |
+| `ltf_range_expansion_bonus_cap`  | `0.4`                                     |
 | `min_rr`                             | `1.75`                                    |
 | `stop_buffer_atr_mult`               | `0.68`                                    |
 | `min_peer_agreement`                 | `2`                                       |
@@ -166,14 +165,14 @@ Current package defaults:
 | `volatility_symbol`                  | `VIX`                                     |
 | `level_round_number_tolerance_pct`   | `0.002`                                   |
 | `strong_setup_runner_enabled`        | `true`                                    |
-| `strong_setup_min_trigger_score`     | `3.2`                                     |
+| `strong_setup_min_ltf_score`     | `3.2`                                     |
 | `strong_setup_min_level_score`       | `3.4`                                     |
 | `strong_setup_min_peer_score`        | `2`                                       |
-| `strong_setup_min_hourly_vote_edge`  | `1`                                       |
+| `strong_setup_min_htf_vote_edge`  | `1`                                       |
 | `strong_setup_target_level_offset`   | `1`                                       |
 | `activity_score_weight`              | `0.11`                                    |
 | `htf_fvg_entry_weight`               | `0.36`                                    |
-| `one_minute_fvg_entry_weight`        | `0.2`                                     |
+| `ltf_fvg_entry_weight`        | `0.2`                                     |
 | `opposing_fvg_entry_penalty_mult`    | `1.0`                                     |
 | `fvg_runner_rr_bonus`                | `0.14`                                    |
 | `adaptive_breakeven_rr`              | `0.9`                                     |

@@ -439,14 +439,15 @@ class DashboardChartConfig:
     show_bollinger_bands: bool = False
     show_anchored_vwap: bool = False
     show_fib_extensions: bool = False
+    show_fib_retracements: bool = False
     show_channel: bool = False
     show_trendlines: bool = False
     show_htf_fair_value_gaps: bool = False
-    show_1m_fair_value_gaps: bool = False
+    show_ltf_fair_value_gaps: bool = False
     # Order blocks render as dashed-stroke rectangles (vs FVGs' solid fill)
     # so the two zone types are visually distinguishable on the chart.
     show_htf_order_blocks: bool = False
-    show_1m_order_blocks: bool = False
+    show_ltf_order_blocks: bool = False
     show_trade_markers: bool = True
     tooltip_show_returns: bool = True
     tooltip_show_support_resistance: bool = True
@@ -468,6 +469,7 @@ class DashboardChartingConfig:
             show_bollinger_bands=True,
             show_anchored_vwap=True,
             show_fib_extensions=True,
+            show_fib_retracements=True,
         )
     )
 
@@ -557,7 +559,6 @@ class SupportResistanceConfig:
     enabled: bool = True
     timeframe_minutes: int = 15
     lookback_days: int = 10
-    refresh_seconds: int = 120
     pivot_span: int = 2
     max_levels_per_side: int = 3
     atr_tolerance_mult: float = 0.60
@@ -579,30 +580,33 @@ class SupportResistanceConfig:
     use_prior_day_high_low: bool = True
     use_prior_week_high_low: bool = True
     htf_fair_value_gaps_enabled: bool = True
-    one_minute_fair_value_gaps_enabled: bool = True
-    # Shared FVG tuning knobs — both 1m and HTF FVG detection read these.
+    ltf_fair_value_gaps_enabled: bool = True
+    # Shared FVG tuning knobs — both LTF and HTF FVG detection read these.
     # Each timeframe has its own enable flag above; the size filters and
     # max-per-side cap are identical across timeframes (matches the OB
-    # convention).
+    # convention). LTF detection runs on the strategy's `params.ltf_minutes`
+    # frame (defaults to 1-minute streaming bars when not declared).
     fair_value_gap_max_per_side: int = 3
     fair_value_gap_min_atr_mult: float = 0.06
     fair_value_gap_min_pct: float = 0.0006
-    # Order block detection. Two timeframes: 1-minute and HTF (controlled by
-    # `support_resistance.timeframe_minutes`, default 15m). Each timeframe has
-    # its own enable flag; the six tuning knobs below are SHARED — both
-    # timeframes use the same mode / max_per_side / size filters / pivot span.
-    # Disabled by default. When `one_minute_order_blocks_enabled` is true,
+    # Order block detection. Two timeframes: LTF (the strategy's
+    # `params.ltf_minutes` frame, default 1-minute streaming bars) and HTF
+    # (controlled by `support_resistance.timeframe_minutes`, default 15m).
+    # Each timeframe has its own enable flag; the six tuning knobs below
+    # are SHARED — both timeframes use the same mode / max_per_side / size
+    # filters / pivot span.
+    # Disabled by default. When `ltf_order_blocks_enabled` is true,
     # strategies that call `_continuation_ob_retest_plan` get a parallel
     # retest gate that ORs with the FVG retest plan. When
     # `htf_order_blocks_enabled` is true, HTF OBs are
     # detected and exposed via `_htf_order_block_context` for strategies that
     # consume them (current strategies don't gate entries on HTF OBs; this
     # mirrors the FVG architecture where HTF FVGs are detected for context
-    # but only 1m FVGs gate retest entries).
+    # but only LTF FVGs gate retest entries).
     # Mode "loose" finds the last opposite-color candle before any close
     # that prints a new local high/low; "strict" requires a formal
     # break-of-structure event using pivot_span swing detection.
-    one_minute_order_blocks_enabled: bool = False
+    ltf_order_blocks_enabled: bool = False
     htf_order_blocks_enabled: bool = False
     order_block_mode: str = "loose"
     order_block_max_per_side: int = 4
@@ -618,16 +622,15 @@ class SupportResistanceConfig:
     # ensures strong OBs from real moves outrank fresh weak OBs in the
     # top-K cap. 0.0 disables the thrust filter.
     order_block_min_thrust_atr_mult: float = 0.75
-    dashboard_flip_confirmation_1m_bars: int = 1
     trading_flip_confirmation_1m_bars: int = 2
     trading_flip_confirmation_5m_bars: int = 1
     flip_stop_buffer_atr_mult: float = 0.25
     flip_target_requires_momentum_confirm: bool = True
     regime_weight: float = 0.70
     structure_enabled: bool = True
-    structure_1m_pivot_span: int = 2
+    structure_ltf_pivot_span: int = 2
     structure_eq_atr_mult: float = 0.25
-    structure_1m_weight: float = 0.65
+    structure_ltf_weight: float = 0.65
     structure_htf_weight: float = 0.85
     structure_event_lookback_bars: int = 6
     # Grace window post-entry during which 1m structure-based exits
@@ -638,7 +641,7 @@ class SupportResistanceConfig:
     # grace window (those are genuine reversal signals, not minor pivots).
     structure_exit_grace_minutes: int = 10
     # Minimum new 1m pivots formed AFTER entry before structure exits can
-    # fire. If ms1m_pivot_count at exit-check time - at-entry time is
+    # fire. If msltf_pivot_count at exit-check time - at-entry time is
     # below this, exit is suppressed. Complements the time-grace by
     # requiring at least some actual structure to form.
     structure_exit_min_post_entry_pivots: int = 2

@@ -5,11 +5,19 @@ from dataclasses import dataclass, field
 import logging
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 
 from .levels_shared import (
+    clone_level,
+    cluster_levels,
+    cluster_levels_by_tolerance,
+    confirm_by_bars,
     datetime_index as _datetime_index,
+    extend_unique_levels,
     fallback_prior_side_levels,
+    frame_extreme_side_levels as _frame_extreme_side_levels_shared,
+    pivot_points,
     prior_day_levels as _prior_day_levels,
     prior_week_levels as _prior_week_levels,
     safe_reference_price_for_fallback as _safe_reference_price_for_fallback,
@@ -177,117 +185,26 @@ def summarize_htf_trend(
 
 
 def _pivot_points(frame: pd.DataFrame, span: int) -> tuple[list[tuple[pd.Timestamp, float]], list[tuple[pd.Timestamp, float]]]:
-    highs: list[tuple[pd.Timestamp, float]] = []
-    lows: list[tuple[pd.Timestamp, float]] = []
-    if frame is None or len(frame) < (span * 2 + 3):
-        return highs, lows
-    span = max(1, int(span))
-    highs_arr = frame["high"].astype(float).tolist()
-    lows_arr = frame["low"].astype(float).tolist()
-    idxs = list(frame.index)
-    for i in range(span, len(frame) - span):
-        hi = highs_arr[i]
-        lo = lows_arr[i]
-        hi_window = highs_arr[i - span : i + span + 1]
-        lo_window = lows_arr[i - span : i + span + 1]
-        if hi == max(hi_window) and hi_window.count(hi) == 1:
-            highs.append((idxs[i], float(hi)))
-        if lo == min(lo_window) and lo_window.count(lo) == 1:
-            lows.append((idxs[i], float(lo)))
-    return highs, lows
+    # Thin wrapper around the shared `pivot_points` helper so the
+    # detection semantics can't drift between htf_levels and
+    # support_resistance — both modules pivot-detect the same way.
+    return pivot_points(frame, span, include_idx=False)
 
 
 def _cluster_levels(points: Iterable[tuple[pd.Timestamp, float]], kind: str, tolerance: float, max_levels: int) -> list[HTFLevel]:
-    ordered = sorted([(ts, float(price)) for ts, price in points], key=lambda x: x[1])
-    if not ordered:
-        return []
-    newest_ts = max((ts for ts, _price in ordered), default=None)
-    oldest_ts = min((ts for ts, _price in ordered), default=None)
-    total_window_seconds = max(
-        1.0,
-        float((newest_ts - oldest_ts).total_seconds()) if newest_ts is not None and oldest_ts is not None else 1.0,
-    )
-    groups: list[list[tuple[pd.Timestamp, float]]] = []
-    for point in ordered:
-        if not groups:
-            groups.append([point])
-            continue
-        prior_prices = [p for _, p in groups[-1]]
-        anchor = sum(prior_prices) / len(prior_prices)
-        if abs(point[1] - anchor) <= tolerance:
-            groups[-1].append(point)
-        else:
-            groups.append([point])
-    levels: list[HTFLevel] = []
-    for grp in groups:
-        grp_sorted = sorted(grp, key=lambda x: x[0])
-        prices = [price for _, price in grp_sorted]
-        touches = len(grp_sorted)
-        cluster_first_ts = grp_sorted[0][0]
-        cluster_last_ts = grp_sorted[-1][0]
-        active_window_seconds = max(0.0, float((cluster_last_ts - cluster_first_ts).total_seconds()))
-        # Recency factor decays linearly from 1.0 (cluster's last touch is newest)
-        # to a floor of 0.10 (cluster's last touch is at the oldest end of the
-        # window). HTF lookback windows are typically 60 days at 1h tf, so a
-        # base from 30+ days ago must not outrank a swing low from yesterday
-        # just because the old base accumulated more touches during a long
-        # consolidation. The recency multiplier on touches downweights ancient
-        # bases enough that recent close-to-price levels survive top-N
-        # selection. Persistence bonus is additive and rewards levels that
-        # held across a sustained portion of the window (a true multi-month
-        # value area still ranks above a one-tap pivot).
-        recency_factor = 1.0
-        if newest_ts is not None and oldest_ts is not None:
-            age_seconds = max(0.0, float((newest_ts - cluster_last_ts).total_seconds()))
-            recency_factor = max(0.10, 1.0 - (age_seconds / total_window_seconds))
-        persistence_factor = min(1.0, active_window_seconds / total_window_seconds)
-        # Effective touches: recent levels keep full count; old levels get
-        # discounted by recency_factor. A 30-day-old base with 8 touches at
-        # recency 0.5 contributes 4.0 effective touches — comparable to a
-        # fresh 4-touch swing low from this week.
-        effective_touches = float(touches) * recency_factor
-        score = effective_touches + 0.50 * persistence_factor
-        levels.append(
-            HTFLevel(
-                kind=kind,
-                price=float(sum(prices) / len(prices)),
-                touches=touches,
-                score=score,
-                first_seen=cluster_first_ts.isoformat() if grp_sorted else None,
-                last_seen=cluster_last_ts.isoformat() if grp_sorted else None,
-            )
-        )
-    levels.sort(key=lambda lv: (lv.score, lv.touches), reverse=True)
-    return levels[: max(1, int(max_levels))]
+    # Thin wrapper around the shared `cluster_levels` helper. The
+    # time-aware recency scoring (effective_touches = touches *
+    # recency_factor + persistence bonus) lives in levels_shared so it
+    # can't drift between this module and support_resistance.py — when
+    # we improved scoring in the AMD/INTC debug pass, having one source
+    # of truth would have made the fix apply everywhere automatically.
+    return cluster_levels(points, kind, tolerance, max_levels, level_factory=HTFLevel)
 
 def _clone_level(level: HTFLevel, kind: str, *, source: str | None = None) -> HTFLevel:
-    return HTFLevel(
-        kind=kind,
-        price=float(level.price),
-        touches=int(level.touches),
-        score=float(level.score),
-        first_seen=level.first_seen,
-        last_seen=level.last_seen,
-        source=str(source if source is not None else (getattr(level, "source", "pivot") or "pivot")),
-        source_priority=float(getattr(level, "source_priority", 1.0) or 1.0),
-    )
-
-
-def _extend_unique_levels(dest: list[HTFLevel], additions: list[HTFLevel]) -> None:
-    seen = {
-        (str(getattr(level, "source", "pivot") or "pivot"), round(float(level.price), 8), str(getattr(level, "kind", "support") or "support"))
-        for level in dest
-    }
-    for level in additions:
-        key = (
-            str(getattr(level, "source", "pivot") or "pivot"),
-            round(float(level.price), 8),
-            str(getattr(level, "kind", "support") or "support"),
-        )
-        if key in seen:
-            continue
-        dest.append(level)
-        seen.add(key)
+    # Thin factory-binding wrapper around the shared `clone_level` helper.
+    # Same pattern as `_cluster_levels` / `_pivot_points`: keeps call sites
+    # readable without repeating `level_factory=HTFLevel` at every emit.
+    return clone_level(level, kind, level_factory=HTFLevel, source=source)
 
 
 def _frame_extreme_side_levels(
@@ -297,17 +214,14 @@ def _frame_extreme_side_levels(
     tolerance: float,
     max_levels: int,
 ) -> list[HTFLevel]:
-    if frame is None or frame.empty:
-        return []
-    if str(side).strip().lower() == "support":
-        pos = int(frame["low"].astype(float).values.argmin())
-        point = (pd.Timestamp(frame.index[pos]), float(frame["low"].iloc[pos]))
-        return _cluster_levels([point], "support", tolerance, max_levels)
-    pos = int(frame["high"].astype(float).values.argmax())
-    point = (pd.Timestamp(frame.index[pos]), float(frame["high"].iloc[pos]))
-    return _cluster_levels([point], "resistance", tolerance, max_levels)
-
-
+    # Thin factory-binding wrapper around `frame_extreme_side_levels`.
+    return _frame_extreme_side_levels_shared(
+        frame,
+        side=side,
+        tolerance=tolerance,
+        max_levels=max_levels,
+        level_factory=HTFLevel,
+    )
 
 
 def _fallback_prior_side_levels(
@@ -352,20 +266,14 @@ def _collapse_same_side_levels(
     reverse: bool,
     max_levels: int,
 ) -> list[HTFLevel]:
-    if not levels:
+    # HTF picks one representative per cluster (highest source_priority,
+    # then score, touches, distance). support_resistance uses the same
+    # tolerance grouping but merges all attributes — that's why the
+    # grouping lives in levels_shared and the per-cluster reducer stays
+    # local to each module.
+    groups = cluster_levels_by_tolerance(levels, tolerance)
+    if not groups:
         return []
-    ordered = sorted(levels, key=lambda lv: float(lv.price))
-    groups: list[list[HTFLevel]] = []
-    for level in ordered:
-        if not groups:
-            groups.append([level])
-            continue
-        prior_prices = [float(item.price) for item in groups[-1]]
-        anchor = sum(prior_prices) / len(prior_prices)
-        if abs(float(level.price) - anchor) <= max(float(tolerance), 1e-9):
-            groups[-1].append(level)
-        else:
-            groups.append([level])
     selected = [max(group, key=lambda lv: _level_preference(lv, current_price)) for group in groups]
     selected.sort(key=lambda lv: float(lv.price), reverse=bool(reverse))
     return selected[: max(1, int(max_levels))]
@@ -400,16 +308,6 @@ def _completed_htf_frame(frame: pd.DataFrame, timeframe_minutes: int) -> pd.Data
         return frame.iloc[:-1].copy() if len(frame) > 1 else pd.DataFrame(columns=frame.columns)
 
 
-def _confirm_by_bars(frame: pd.DataFrame, field: str, comparator: str, level_price: float, count: int, eps: float) -> bool:
-    count = int(count or 0)
-    if count <= 0 or frame is None or frame.empty or field not in frame.columns or len(frame) < count:
-        return False
-    series = frame[field].astype(float).tail(count)
-    if comparator == "above":
-        return bool((series > float(level_price) + float(eps)).all())
-    return bool((series < float(level_price) - float(eps)).all())
-
-
 def _htf_flip_confirmed(
     frame: pd.DataFrame,
     level_price: float,
@@ -421,8 +319,8 @@ def _htf_flip_confirmed(
 ) -> bool:
     completed = _completed_htf_frame(frame, timeframe_minutes)
     if direction == "reclaim":
-        return _confirm_by_bars(completed, "low", "above", level_price, confirm_bars, eps)
-    return _confirm_by_bars(completed, "high", "below", level_price, confirm_bars, eps)
+        return confirm_by_bars(completed, "low", "above", level_price, int(confirm_bars or 0), float(eps))
+    return confirm_by_bars(completed, "high", "below", level_price, int(confirm_bars or 0), float(eps))
 
 
 def _htf_flip_active(
@@ -568,12 +466,20 @@ def _detect_fair_value_gaps(
     # forward_max_high_after[idx] = max of highs for bars strictly after idx.
     low_col = completed["low"] if "low" in completed.columns else None
     high_col = completed["high"] if "high" in completed.columns else None
-    forward_min_low_after = None
-    forward_max_high_after = None
-    if low_col is not None and n > 0:
-        forward_min_low_after = low_col.iloc[::-1].cummin().iloc[::-1].shift(-1).to_numpy()
-    if high_col is not None and n > 0:
-        forward_max_high_after = high_col.iloc[::-1].cummax().iloc[::-1].shift(-1).to_numpy()
+    # Use empty arrays (instead of None) when the column is missing — keeps the
+    # variables a single non-Optional type so static type narrowing works
+    # cleanly through the indexing checks below.
+    _empty: np.ndarray = np.array([], dtype=float)
+    forward_min_low_after: np.ndarray = (
+        low_col.iloc[::-1].cummin().iloc[::-1].shift(-1).to_numpy()
+        if (low_col is not None and n > 0)
+        else _empty
+    )
+    forward_max_high_after: np.ndarray = (
+        high_col.iloc[::-1].cummax().iloc[::-1].shift(-1).to_numpy()
+        if (high_col is not None and n > 0)
+        else _empty
+    )
     # Cache the raw numpy arrays of high/low for the inner loop to avoid repeated .iloc[].get() calls.
     high_arr = high_col.to_numpy() if high_col is not None else None
     low_arr = low_col.to_numpy() if low_col is not None else None
@@ -593,11 +499,11 @@ def _detect_fair_value_gaps(
             size = upper - lower
             if size >= min_gap_size:
                 # O(1) reverse-cummin lookup instead of O(n-idx) tail().min()
-                if forward_min_low_after is not None and idx < len(forward_min_low_after):
-                    raw = forward_min_low_after[idx]
-                    min_low_after = float(raw) if raw == raw else upper  # NaN guard
-                else:
+                if idx >= len(forward_min_low_after):
                     min_low_after = upper
+                else:
+                    raw = forward_min_low_after[idx]
+                    min_low_after = upper if pd.isna(raw) else float(raw)  # NaN guard
                 if min_low_after > lower + eps:
                     fill_top = min(upper, max(lower, min_low_after))
                     filled_pct = max(0.0, min(1.0, (upper - fill_top) / max(size, 1e-9)))
@@ -619,11 +525,11 @@ def _detect_fair_value_gaps(
             upper = left_low
             size = upper - lower
             if size >= min_gap_size:
-                if forward_max_high_after is not None and idx < len(forward_max_high_after):
-                    raw = forward_max_high_after[idx]
-                    max_high_after = float(raw) if raw == raw else lower  # NaN guard
-                else:
+                if idx >= len(forward_max_high_after):
                     max_high_after = lower
+                else:
+                    raw = forward_max_high_after[idx]
+                    max_high_after = lower if pd.isna(raw) else float(raw)  # NaN guard
                 if max_high_after < upper - eps:
                     fill_top = min(upper, max(lower, max_high_after))
                     filled_pct = max(0.0, min(1.0, (fill_top - lower) / max(size, 1e-9)))
@@ -780,8 +686,8 @@ def build_htf_context(
     )
     support_references: list[HTFLevel] = list(pivot_supports)
     resistance_references: list[HTFLevel] = list(pivot_resistances)
-    _extend_unique_levels(support_references, prior_supports)
-    _extend_unique_levels(resistance_references, prior_resistances)
+    extend_unique_levels(support_references, prior_supports)
+    extend_unique_levels(resistance_references, prior_resistances)
     support_filter_price = close
     resistance_filter_price = close
     if not support_references:
@@ -847,7 +753,7 @@ def build_htf_context(
                 tolerance=tolerance,
                 max_levels=int(max_levels_per_side * 2),
             )
-        _extend_unique_levels(support_references, second_chance_support_refs)
+        extend_unique_levels(support_references, second_chance_support_refs)
         for level in second_chance_support_refs:
             if _htf_flip_active(
                 frame,
@@ -881,7 +787,7 @@ def build_htf_context(
                 tolerance=tolerance,
                 max_levels=int(max_levels_per_side * 2),
             )
-        _extend_unique_levels(resistance_references, second_chance_resistance_refs)
+        extend_unique_levels(resistance_references, second_chance_resistance_refs)
         for level in second_chance_resistance_refs:
             if _htf_flip_active(
                 frame,

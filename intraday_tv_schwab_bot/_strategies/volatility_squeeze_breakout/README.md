@@ -164,7 +164,7 @@ Current code defaults:
 | `anti_chase_fvg_retest_min_close_position`        | `0.66`                          |
 | `anti_chase_fvg_retest_stop_buffer_gap_frac`      | `0.14`                          |
 | `htf_fvg_entry_weight`                            | `0.44`                          |
-| `one_minute_fvg_entry_weight`                     | `0.24`                          |
+| `ltf_fvg_entry_weight`                     | `0.24`                          |
 | `opposing_fvg_entry_penalty_mult`                 | `1.0`                           |
 | `fvg_runner_rr_bonus`                             | `0.16`                          |
 | `adaptive_breakeven_rr`                           | `0.9`                           |

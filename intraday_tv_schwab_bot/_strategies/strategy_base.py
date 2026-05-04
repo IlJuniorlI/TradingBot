@@ -70,7 +70,7 @@ class BaseStrategy:
 
     # Auto-detected set of context-builder calls the strategy has made over
     # its lifetime. Each entry is a tuple `(name, *args)` — e.g. `("chart",)`,
-    # `("structure", "1m")`, `("technical",)`. Populated lazily on first
+    # `("structure", "ltf")`, `("technical",)`. Populated lazily on first
     # invocation of each builder. The engine reads this set every cycle
     # (after _prime_cycle_support_cache) to drive _prime_cycle_context_cache,
     # which pre-warms the observed contexts in parallel via
@@ -406,7 +406,7 @@ class BaseStrategy:
     def dashboard_level_context_spec(self) -> dict[str, Any] | None:
         params = self.params if isinstance(self.params, dict) else {}
         spec = {
-            "timeframe_minutes": max(1, int(params.get("htf_timeframe_minutes", 60) or 60)),
+            "timeframe_minutes": max(1, int(params.get("htf_minutes", 60) or 60)),
             "lookback_days": max(1, int(params.get("htf_lookback_days", 60) or 60)),
             "pivot_span": max(1, int(params.get("htf_pivot_span", 2) or 2)),
             "max_levels_per_side": max(1, int(params.get("htf_max_levels_per_side", 6) or 6)),
@@ -415,8 +415,7 @@ class BaseStrategy:
             "stop_buffer_atr_mult": float(params.get("htf_stop_buffer_atr_mult", 0.25) or 0.25),
             "ema_fast_span": max(1, int(params.get("htf_ema_fast_span", 50) or 50)),
             "ema_slow_span": max(1, int(params.get("htf_ema_slow_span", 200) or 200)),
-            "refresh_seconds": max(1, int(params.get("htf_refresh_seconds", 120) or 120)),
-            "trigger_timeframe_minutes": max(1, int(params.get("trigger_timeframe_minutes", 5) or 5)),
+            "ltf_minutes": max(1, int(params.get("ltf_minutes", 5) or 5)),
             "min_level_score": float(params.get("min_level_score", 4.0) or 4.0),
             "level_round_number_tolerance_pct": float(params.get("level_round_number_tolerance_pct", 0.0020) or 0.0020),
             "base_zone_atr_mult": float(params.get("zone_atr_mult", params.get("pivot_zone_atr_mult", 0.20)) or 0.20),
@@ -723,7 +722,7 @@ class BaseStrategy:
             if name == "chart":
                 self._chart_context(frame)
             elif name == "structure":
-                timeframe = entry[1] if len(entry) > 1 else "1m"
+                timeframe = entry[1] if len(entry) > 1 else "ltf"
                 self._structure_context(frame, timeframe)
             elif name == "technical":
                 self._technical_context(frame)
@@ -1090,7 +1089,7 @@ class BaseStrategy:
         close = float(close or 0.0)
         if close <= 0:
             return out
-        fvg_ctx = self._one_minute_fvg_context(symbol, frame, data)
+        fvg_ctx = self._ltf_fvg_context(symbol, frame, data)
         same_gap = getattr(fvg_ctx, "nearest_bullish_fvg", None) if side == Side.LONG else getattr(fvg_ctx, "nearest_bearish_fvg", None)
         opposing_gap = getattr(fvg_ctx, "nearest_bearish_fvg", None) if side == Side.LONG else getattr(fvg_ctx, "nearest_bullish_fvg", None)
         same_info = self._fvg_gap_state(same_gap, close)
@@ -1230,17 +1229,17 @@ class BaseStrategy:
         it composes with `_apply_continuation_zone_retest_plans`. Reuses the
         same `anti_chase_fvg_retest_*` knobs for confirmation thresholds — the
         user-stated convention is "same rules for confirm" between FVG and OB.
-        Disabled by default; opt in via `support_resistance.one_minute_order_blocks_enabled`.
+        Disabled by default; opt in via `support_resistance.ltf_order_blocks_enabled`.
         """
         out: dict[str, Any] = {"status": "none", "reason": None, "metadata": {}, "stop_anchor": None}
         if frame is None or frame.empty:
             return out
-        if not bool(self._support_resistance_setting("one_minute_order_blocks_enabled", False)):
+        if not bool(self._support_resistance_setting("ltf_order_blocks_enabled", False)):
             return out
         close = float(close or 0.0)
         if close <= 0:
             return out
-        ob_ctx = self._one_minute_order_block_context(symbol, frame, data)
+        ob_ctx = self._ltf_order_block_context(symbol, frame, data)
         same_ob = getattr(ob_ctx, "nearest_bullish_ob", None) if side == Side.LONG else getattr(ob_ctx, "nearest_bearish_ob", None)
         opposing_ob = getattr(ob_ctx, "nearest_bearish_ob", None) if side == Side.LONG else getattr(ob_ctx, "nearest_bullish_ob", None)
         same_info = self._fvg_gap_state(same_ob, close)
@@ -1406,21 +1405,43 @@ class BaseStrategy:
             or (len(ctx.matched_bullish_continuation) >= 2 and not ctx.matched_bearish_continuation)
         )
 
-    def _sr_timeframe_minutes(self) -> int:
+    def _htf_minutes(self) -> int:
+        """HTF (higher timeframe) for SR detection. Strategies declare via
+        `params.htf_minutes`; otherwise inherit
+        `support_resistance.timeframe_minutes`."""
         fallback = int(self._support_resistance_setting("timeframe_minutes", 15))
-        return int(self.params.get("htf_timeframe_minutes", fallback))
+        return int(self.params.get("htf_minutes", fallback))
 
-    def _sr_lookback_days(self) -> int:
+    def _htf_lookback_days(self) -> int:
         fallback = int(self._support_resistance_setting("lookback_days", 10))
         return int(self.params.get("htf_lookback_days", fallback))
 
-    def _sr_refresh_seconds(self) -> int:
-        fallback = int(self._support_resistance_setting("refresh_seconds", 600))
-        return int(self.params.get("htf_refresh_seconds", fallback))
+    def _ltf_minutes(self) -> int:
+        """LTF (lower timeframe / trigger frame). Strategies with a distinct
+        intraday trigger candle declare `params.ltf_minutes` (e.g. peer_confirmed
+        uses 5-min trigger candles). Otherwise defaults to 1-minute streamed bars."""
+        return int(self.params.get("ltf_minutes", 1))
+
+    def _is_ltf_token(self, token: str) -> bool:
+        """Whether ``token`` refers to the strategy's LTF timeframe.
+
+        Accepts the literal ``"ltf"`` token plus the numeric forms
+        (``"1m"`` / ``"1min"`` / ``"minute"`` / ``"execution"`` when
+        ``ltf_minutes == 1``; ``"5m"`` / ``"5min"`` when ``ltf_minutes == 5``,
+        and so on). Used by ``_structure_context`` to decide when to apply
+        the LTF-specific pivot-span and pct-tolerance overrides.
+        """
+        normalized = str(token or "").strip().lower()
+        if normalized == "ltf":
+            return True
+        ltf_min = self._ltf_minutes()
+        if ltf_min == 1:
+            return normalized in {"1m", "1min", "minute", "execution"}
+        return normalized in {f"{ltf_min}m", f"{ltf_min}min"}
 
     def _sr_context(self, symbol: str, frame: pd.DataFrame | None, data):
         current_price = float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
-        timeframe_minutes = self._sr_timeframe_minutes()
+        timeframe_minutes = self._htf_minutes()
         if not bool(self._support_resistance_setting("enabled", True)) or data is None:
             return empty_support_resistance_context(current_price, timeframe_minutes=timeframe_minutes)
         ctx = data.get_support_resistance(
@@ -1429,8 +1450,7 @@ class BaseStrategy:
             flip_frame=frame,
             mode="trading",
             timeframe_minutes=timeframe_minutes,
-            lookback_days=self._sr_lookback_days(),
-            refresh_seconds=self._sr_refresh_seconds(),
+            lookback_days=self._htf_lookback_days(),
             use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
             use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
         )
@@ -1473,7 +1493,6 @@ class BaseStrategy:
         stop_buffer_atr_mult: float,
         ema_fast_span: int,
         ema_slow_span: int,
-        refresh_seconds: int | None = None,
         current_price: float | None = None,
         use_prior_day_high_low: bool = True,
         use_prior_week_high_low: bool = True,
@@ -1491,7 +1510,6 @@ class BaseStrategy:
             stop_buffer_atr_mult=stop_buffer_atr_mult,
             ema_fast_span=ema_fast_span,
             ema_slow_span=ema_slow_span,
-            refresh_seconds=refresh_seconds,
             use_prior_day_high_low=bool(use_prior_day_high_low),
             use_prior_week_high_low=bool(use_prior_week_high_low),
             include_fair_value_gaps=bool(self._support_resistance_setting("htf_fair_value_gaps_enabled", True)),
@@ -1516,7 +1534,7 @@ class BaseStrategy:
             if level is not None
         }
         return {
-            "htf_timeframe_minutes": int(getattr(ctx, "timeframe_minutes", 0) or 0),
+            "htf_minutes": int(getattr(ctx, "timeframe_minutes", 0) or 0),
             "htf_supports": [float(round(lv.price, 4)) for lv in getattr(ctx, "supports", [])],
             "htf_resistances": [float(round(lv.price, 4)) for lv in getattr(ctx, "resistances", [])],
             "nearest_htf_support": float(ctx.nearest_support.price) if getattr(ctx, "nearest_support", None) else None,
@@ -1556,10 +1574,11 @@ class BaseStrategy:
             "nearest_htf_bearish_fvg": _optional_float(getattr(getattr(ctx, "nearest_bearish_fvg", None), "midpoint", None)),
         }
 
-    def _one_minute_fvg_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> FairValueGapContext:
+    def _ltf_fvg_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> FairValueGapContext:
+        ltf_min = self._ltf_minutes()
         current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
-        if not bool(self._support_resistance_setting("one_minute_fair_value_gaps_enabled", False)):
-            return empty_fvg_context(current_price, timeframe_minutes=1)
+        if not bool(self._support_resistance_setting("ltf_fair_value_gaps_enabled", False)):
+            return empty_fvg_context(current_price, timeframe_minutes=ltf_min)
         max_per_side = int(self._support_resistance_setting("fair_value_gap_max_per_side", 4) or 4)
         min_gap_atr_mult = float(self._support_resistance_setting("fair_value_gap_min_atr_mult", 0.05) or 0.05)
         min_gap_pct = float(self._support_resistance_setting("fair_value_gap_min_pct", 0.0005) or 0.0005)
@@ -1567,7 +1586,7 @@ class BaseStrategy:
             try:
                 return data.get_fair_value_gap_context(
                     symbol,
-                    timeframe_minutes=1,
+                    timeframe_minutes=ltf_min,
                     current_price=current_price,
                     max_per_side=max_per_side,
                     min_gap_atr_mult=min_gap_atr_mult,
@@ -1576,10 +1595,10 @@ class BaseStrategy:
             except Exception:
                 LOG.debug("Failed to load cached fair value gap context for %s; recomputing from frame.", symbol, exc_info=True)
         if frame is None or frame.empty:
-            return empty_fvg_context(current_price, timeframe_minutes=1)
+            return empty_fvg_context(current_price, timeframe_minutes=ltf_min)
         return build_fair_value_gap_context(
             frame,
-            timeframe_minutes=1,
+            timeframe_minutes=ltf_min,
             current_price=current_price,
             max_per_side=max_per_side,
             min_gap_atr_mult=min_gap_atr_mult,
@@ -1608,21 +1627,24 @@ class BaseStrategy:
             "new_high_lookback": int(self._support_resistance_setting("order_block_new_high_lookback", 8) or 8),
         }
 
-    def _one_minute_order_block_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> OrderBlockContext:
-        """1m order block context. Routes through `data.get_order_block_context`
+    def _ltf_order_block_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> OrderBlockContext:
+        """LTF order block context. Runs on the strategy's
+        ``params.ltf_minutes`` frame (defaults to 1-minute streaming bars
+        when not declared). Routes through `data.get_order_block_context`
         when available (cycle-cached, avoids redundant builds across multiple
         candidates per cycle and the dashboard). Falls back to inline
         `build_order_block_context` when there's no data store available."""
+        ltf_min = self._ltf_minutes()
         current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
         knobs = self._order_block_tuning_knobs()
         mode = knobs["mode"]
-        if not bool(self._support_resistance_setting("one_minute_order_blocks_enabled", False)):
-            return empty_order_block_context(current_price, timeframe_minutes=1, mode=mode)
+        if not bool(self._support_resistance_setting("ltf_order_blocks_enabled", False)):
+            return empty_order_block_context(current_price, timeframe_minutes=ltf_min, mode=mode)
         if data is not None and hasattr(data, "get_order_block_context") and symbol:
             try:
                 return data.get_order_block_context(
                     symbol,
-                    timeframe_minutes=1,
+                    timeframe_minutes=ltf_min,
                     current_price=current_price,
                     mode=mode,
                     max_per_side=knobs["max_per_side"],
@@ -1635,10 +1657,10 @@ class BaseStrategy:
             except Exception:
                 LOG.debug("Failed to load cached order block context for %s; recomputing from frame.", symbol, exc_info=True)
         if frame is None or frame.empty:
-            return empty_order_block_context(current_price, timeframe_minutes=1, mode=mode)
+            return empty_order_block_context(current_price, timeframe_minutes=ltf_min, mode=mode)
         return build_order_block_context(
             frame,
-            timeframe_minutes=1,
+            timeframe_minutes=ltf_min,
             current_price=current_price,
             mode=mode,
             max_per_side=knobs["max_per_side"],
@@ -1662,7 +1684,7 @@ class BaseStrategy:
         current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
         knobs = self._order_block_tuning_knobs()
         mode = knobs["mode"]
-        htf_minutes = self._sr_timeframe_minutes()
+        htf_minutes = self._htf_minutes()
         if not bool(self._support_resistance_setting("htf_order_blocks_enabled", False)):
             return empty_order_block_context(current_price, timeframe_minutes=htf_minutes, mode=mode)
         if data is not None and hasattr(data, "get_order_block_context") and symbol:
@@ -1722,12 +1744,13 @@ class BaseStrategy:
         out = resample_bars(frame, f"{tf}min")
         return ensure_standard_indicator_frame(out)
 
-    def _structure_context(self, frame: pd.DataFrame | None, timeframe: str = "1m"):
+    def _structure_context(self, frame: pd.DataFrame | None, timeframe: str = "ltf"):
         # Per-cycle cache. Timeframe goes in the key because the pivot_span /
-        # pct_tolerance branches below differ by timeframe token.
-        # Records (name, timeframe) so the engine pre-warms the right
-        # variant — peer_confirmed strategies use "ltf" while most others
-        # use "1m"; both can co-exist in a single observed set.
+        # pct_tolerance branches below differ by timeframe token (LTF gets
+        # the structure_ltf_* overrides via `_is_ltf_token`). All strategy
+        # call sites pass "ltf" so the analysis tracks the strategy's
+        # `params.ltf_minutes` (default 1m). Records (name, timeframe) so
+        # the engine pre-warms the right variant.
         timeframe_token = str(timeframe).lower()
         type(self)._observed_contexts.add(("structure", timeframe_token))
         frame_key = self._technical_context_cache_key(frame)
@@ -1743,10 +1766,11 @@ class BaseStrategy:
                 self._structure_context_cache[cache_key] = empty_ctx
             return empty_ctx
         pivot_span = int(self._support_resistance_setting("pivot_span", 2) or 2)
-        if timeframe_token in {"1m", "1min", "minute", "execution"}:
-            pivot_span = int(self._support_resistance_setting("structure_1m_pivot_span", max(2, pivot_span)) or max(2, pivot_span))
+        is_ltf_analysis = self._is_ltf_token(timeframe_token)
+        if is_ltf_analysis:
+            pivot_span = int(self._support_resistance_setting("structure_ltf_pivot_span", max(2, pivot_span)) or max(2, pivot_span))
         pct_tolerance = float(self._support_resistance_setting("pct_tolerance", 0.0030) or 0.0030)
-        if timeframe_token in {"1m", "1min", "minute", "execution"}:
+        if is_ltf_analysis:
             pct_tolerance *= 0.60
         structure_event_max_age_bars = int(self._support_resistance_setting("structure_event_lookback_bars", 6) or 6)
         ctx = analyze_market_structure(
@@ -1820,7 +1844,7 @@ class BaseStrategy:
             with self._technical_context_lock:
                 self._technical_context_cache[cache_key] = empty_ctx
             return empty_ctx
-        pivot_span = int(self._support_resistance_setting("structure_1m_pivot_span", self._support_resistance_setting("pivot_span", 2)) or 2) if sr_cfg is not None else 2
+        pivot_span = int(self._support_resistance_setting("structure_ltf_pivot_span", self._support_resistance_setting("pivot_span", 2)) or 2) if sr_cfg is not None else 2
         ctx = build_technical_levels_context(
             frame,
             current_price=current_price,
@@ -1993,9 +2017,9 @@ class BaseStrategy:
         score_key: str = "final_priority_score",
         score_round: int = 4,
         # Prefixes passed to the component-list helpers. ``ms_prefix``
-        # defaults to "ms1m" (the de-facto call-site convention) rather
+        # defaults to "msltf" (the de-facto LTF-aware call-site convention) rather
         # than the "ms" default on ``_structure_lists`` itself.
-        ms_prefix: str = "ms1m",
+        ms_prefix: str = "msltf",
         tech_prefix: str = "tech",
         # Caller-supplied leading keys (stamped FIRST — lowest
         # precedence, so shared-block keys overwrite collisions). Use for
@@ -2593,8 +2617,8 @@ class BaseStrategy:
         htf_ctx = self._htf_context(
             symbol,
             data,
-            timeframe_minutes=self._sr_timeframe_minutes(),
-            lookback_days=self._sr_lookback_days(),
+            timeframe_minutes=self._htf_minutes(),
+            lookback_days=self._htf_lookback_days(),
             pivot_span=int(self._support_resistance_setting("pivot_span", 2) or 2),
             max_levels_per_side=int(self._support_resistance_setting("max_levels_per_side", 6) or 6),
             atr_tolerance_mult=float(self._support_resistance_setting("atr_tolerance_mult", 0.35) or 0.35),
@@ -2602,16 +2626,15 @@ class BaseStrategy:
             stop_buffer_atr_mult=float(self._support_resistance_setting("stop_buffer_atr_mult", 0.25) or 0.25),
             ema_fast_span=int(self._support_resistance_setting("ema_fast_span", 50) or 50),
             ema_slow_span=int(self._support_resistance_setting("ema_slow_span", 200) or 200),
-            refresh_seconds=self._sr_refresh_seconds(),
             current_price=close,
             use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
             use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
         )
-        fvg1_ctx = self._one_minute_fvg_context(symbol, frame, data)
-        htf_score = self._score_fvg_context(close, htf_ctx, timeframe_minutes=getattr(htf_ctx, "timeframe_minutes", self._sr_timeframe_minutes()))
-        fvg1_score = self._score_fvg_context(close, fvg1_ctx, timeframe_minutes=1)
+        fvg_ltf_ctx = self._ltf_fvg_context(symbol, frame, data)
+        htf_score = self._score_fvg_context(close, htf_ctx, timeframe_minutes=getattr(htf_ctx, "timeframe_minutes", self._htf_minutes()))
+        fvg_ltf_score = self._score_fvg_context(close, fvg_ltf_ctx, timeframe_minutes=self._ltf_minutes())
         htf_weight = max(0.0, float(self.params.get("htf_fvg_entry_weight", 0.55)))
-        one_minute_weight = max(0.0, float(self.params.get("one_minute_fvg_entry_weight", 0.35)))
+        ltf_fvg_weight = max(0.0, float(self.params.get("ltf_fvg_entry_weight", 0.35)))
         opposing_mult = max(0.50, float(self.params.get("opposing_fvg_entry_penalty_mult", 1.00)))
         same_validated_bonus = float(self.params.get("same_direction_fvg_validated_bonus", 0.15))
         same_active_bonus = float(self.params.get("same_direction_fvg_active_bonus", 0.12))
@@ -2627,24 +2650,24 @@ class BaseStrategy:
         if side == Side.LONG:
             same_htf = float(htf_score.get("bull_score", 0.0) or 0.0)
             opposing_htf = float(htf_score.get("bear_score", 0.0) or 0.0)
-            same_1m = float(fvg1_score.get("bull_score", 0.0) or 0.0)
-            opposing_1m = float(fvg1_score.get("bear_score", 0.0) or 0.0)
+            same_ltf = float(fvg_ltf_score.get("bull_score", 0.0) or 0.0)
+            opposing_ltf = float(fvg_ltf_score.get("bear_score", 0.0) or 0.0)
             same_htf_info = dict(htf_score.get("nearest_bullish", {}) or {})
             opposing_htf_info = dict(htf_score.get("nearest_bearish", {}) or {})
-            same_1m_info = dict(fvg1_score.get("nearest_bullish", {}) or {})
-            opposing_1m_info = dict(fvg1_score.get("nearest_bearish", {}) or {})
+            same_ltf_info = dict(fvg_ltf_score.get("nearest_bullish", {}) or {})
+            opposing_ltf_info = dict(fvg_ltf_score.get("nearest_bearish", {}) or {})
         else:
             same_htf = float(htf_score.get("bear_score", 0.0) or 0.0)
             opposing_htf = float(htf_score.get("bull_score", 0.0) or 0.0)
-            same_1m = float(fvg1_score.get("bear_score", 0.0) or 0.0)
-            opposing_1m = float(fvg1_score.get("bull_score", 0.0) or 0.0)
+            same_ltf = float(fvg_ltf_score.get("bear_score", 0.0) or 0.0)
+            opposing_ltf = float(fvg_ltf_score.get("bull_score", 0.0) or 0.0)
             same_htf_info = dict(htf_score.get("nearest_bearish", {}) or {})
             opposing_htf_info = dict(htf_score.get("nearest_bullish", {}) or {})
-            same_1m_info = dict(fvg1_score.get("nearest_bearish", {}) or {})
-            opposing_1m_info = dict(fvg1_score.get("nearest_bullish", {}) or {})
+            same_ltf_info = dict(fvg_ltf_score.get("nearest_bearish", {}) or {})
+            opposing_ltf_info = dict(fvg_ltf_score.get("nearest_bullish", {}) or {})
 
-        raw_same = (same_htf * htf_weight) + (same_1m * one_minute_weight)
-        raw_opposing = ((opposing_htf * htf_weight) + (opposing_1m * one_minute_weight)) * opposing_mult
+        raw_same = (same_htf * htf_weight) + (same_ltf * ltf_fvg_weight)
+        raw_opposing = ((opposing_htf * htf_weight) + (opposing_ltf * ltf_fvg_weight)) * opposing_mult
         state_bonus = 0.0
         continuation_bias = 0.0
         reversal_bias = 0.0
@@ -2677,9 +2700,9 @@ class BaseStrategy:
                     reversal_bias += 0.18 * weight
 
         _apply_state(same_htf_info, same_direction=True, weight=htf_weight)
-        _apply_state(same_1m_info, same_direction=True, weight=one_minute_weight)
+        _apply_state(same_ltf_info, same_direction=True, weight=ltf_fvg_weight)
         _apply_state(opposing_htf_info, same_direction=False, weight=htf_weight)
-        _apply_state(opposing_1m_info, same_direction=False, weight=one_minute_weight)
+        _apply_state(opposing_ltf_info, same_direction=False, weight=ltf_fvg_weight)
 
         entry_adjustment = round(raw_same - raw_opposing + state_bonus, 4)
         continuation_bias = round(max(0.0, raw_same + continuation_bias + max(0.0, state_bonus)), 4)
@@ -2695,20 +2718,20 @@ class BaseStrategy:
                 "fvg_reversal_bias": reversal_bias,
                 "htf_fvg_bull_score": round(float(htf_score.get("bull_score", 0.0) or 0.0), 4),
                 "htf_fvg_bear_score": round(float(htf_score.get("bear_score", 0.0) or 0.0), 4),
-                "fvg_1m_bull_score": round(float(fvg1_score.get("bull_score", 0.0) or 0.0), 4),
-                "fvg_1m_bear_score": round(float(fvg1_score.get("bear_score", 0.0) or 0.0), 4),
+                "fvg_ltf_bull_score": round(float(fvg_ltf_score.get("bull_score", 0.0) or 0.0), 4),
+                "fvg_ltf_bear_score": round(float(fvg_ltf_score.get("bear_score", 0.0) or 0.0), 4),
                 "htf_fvg_same_state": str(same_htf_info.get("state", "none") or "none"),
                 "htf_fvg_opposing_state": str(opposing_htf_info.get("state", "none") or "none"),
-                "fvg_1m_same_state": str(same_1m_info.get("state", "none") or "none"),
-                "fvg_1m_opposing_state": str(opposing_1m_info.get("state", "none") or "none"),
+                "fvg_ltf_same_state": str(same_ltf_info.get("state", "none") or "none"),
+                "fvg_ltf_opposing_state": str(opposing_ltf_info.get("state", "none") or "none"),
                 "htf_fvg_same_midpoint": _optional_float(same_htf_info.get("midpoint")),
                 "htf_fvg_opposing_midpoint": _optional_float(opposing_htf_info.get("midpoint")),
-                "fvg_1m_same_midpoint": _optional_float(same_1m_info.get("midpoint")),
-                "fvg_1m_opposing_midpoint": _optional_float(opposing_1m_info.get("midpoint")),
+                "fvg_ltf_same_midpoint": _optional_float(same_ltf_info.get("midpoint")),
+                "fvg_ltf_opposing_midpoint": _optional_float(opposing_ltf_info.get("midpoint")),
                 "htf_fvg_same_distance_pct": _optional_float(same_htf_info.get("distance_pct")),
                 "htf_fvg_opposing_distance_pct": _optional_float(opposing_htf_info.get("distance_pct")),
-                "fvg_1m_same_distance_pct": _optional_float(same_1m_info.get("distance_pct")),
-                "fvg_1m_opposing_distance_pct": _optional_float(opposing_1m_info.get("distance_pct")),
+                "fvg_ltf_same_distance_pct": _optional_float(same_ltf_info.get("distance_pct")),
+                "fvg_ltf_opposing_distance_pct": _optional_float(opposing_ltf_info.get("distance_pct")),
             }
         )
         return out
@@ -3236,7 +3259,7 @@ class BaseStrategy:
                 joined = "+".join(sorted(opposing_matches)[:3])
                 return True, f"candle_pattern_exit:{joined}"
 
-        ms_ctx = self._structure_context(frame, "1m")
+        ms_ctx = self._structure_context(frame, "ltf")
         # Grace-window gate: a minor EQL/LL pivot forming in the first few
         # minutes after entry is noise, not reversal — session 2026-04-17
         # was 1W / 12T on structure exits (net -$354). Suppress the bias-
@@ -3253,11 +3276,11 @@ class BaseStrategy:
         min_post_entry_pivots = int(self._support_resistance_setting("structure_exit_min_post_entry_pivots", 2))
         pivot_count_now = int(getattr(ms_ctx, "pivot_count", 0) or 0)
         meta = position.metadata if isinstance(position.metadata, dict) else {}
-        # ms1m_pivot_count is stamped into signal.metadata at entry-signal
-        # build time via _structure_lists(..., prefix="ms1m") and then frozen
+        # msltf_pivot_count is stamped into signal.metadata at entry-signal
+        # build time via _structure_lists(..., prefix="msltf") and then frozen
         # onto position.metadata — it's never overwritten during management,
         # so reading it here yields the entry-time pivot count.
-        pivot_count_at_entry = int(meta.get("ms1m_pivot_count", pivot_count_now) or 0)
+        pivot_count_at_entry = int(meta.get("msltf_pivot_count", pivot_count_now) or 0)
         post_entry_pivots = max(0, pivot_count_now - pivot_count_at_entry)
         # ORB-entry grace extends the suppression of non-CHoCH structure
         # exits for positions entered during the ORB window; OR'd with the

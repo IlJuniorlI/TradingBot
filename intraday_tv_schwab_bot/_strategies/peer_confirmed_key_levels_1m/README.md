@@ -20,7 +20,7 @@ unchanged.
 
 ## What changes vs the base strategy
 
-- `trigger_timeframe_minutes: 1`
+- `ltf_minutes: 1`
 - faster runtime / screener refresh defaults
 - slightly tighter level zones and stop buffers
 - lower minimum R:R and softer peer gate for earlier participation

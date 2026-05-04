@@ -128,7 +128,7 @@ Current code defaults:
 | `max_entry_lower_wick_frac`       | `0.3`                           |
 | `entry_wick_close_position_guard` | `0.62`                          |
 | `htf_fvg_entry_weight`            | `0.28`                          |
-| `one_minute_fvg_entry_weight`     | `0.16`                          |
+| `ltf_fvg_entry_weight`     | `0.16`                          |
 | `opposing_fvg_entry_penalty_mult` | `0.95`                          |
 | `fvg_runner_rr_bonus`             | `0.1`                           |
 | `adaptive_breakeven_rr`           | `0.86`                          |

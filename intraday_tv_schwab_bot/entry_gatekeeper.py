@@ -406,12 +406,12 @@ class EntryGatekeeper:
             structure_lists = getattr(self.strategy, '_structure_lists', None)
             structure_context = getattr(self.strategy, '_structure_context', None)
             if callable(structure_lists) and callable(structure_context):
-                ms1_ctx = structure_context(frame, '1m')
-                ms1_fields = structure_lists(ms1_ctx, prefix='ms1m')
-                if isinstance(ms1_fields, Mapping):
-                    out.update({k: v for k, v in ms1_fields.items() if v is not None})
+                ms_ltf_ctx = structure_context(frame, "ltf")
+                ms_ltf_fields = structure_lists(ms_ltf_ctx, prefix='msltf')
+                if isinstance(ms_ltf_fields, Mapping):
+                    out.update({k: v for k, v in ms_ltf_fields.items() if v is not None})
                 current_price = safe_float(out.get('close'), None)
-                sr_ctx = self.data.get_support_resistance(candidate.symbol, current_price=current_price, flip_frame=frame, mode="dashboard", timeframe_minutes=self.position_manager.active_sr_timeframe_minutes(), lookback_days=self.position_manager.active_sr_lookback_days(), refresh_seconds=self.position_manager.active_sr_refresh_seconds())
+                sr_ctx = self.data.get_support_resistance(candidate.symbol, current_price=current_price, flip_frame=frame, mode="trading", timeframe_minutes=self.position_manager.active_htf_minutes(), lookback_days=self.position_manager.active_htf_lookback_days())
                 mshtf_ctx = getattr(sr_ctx, 'market_structure', None) if sr_ctx is not None else None
                 if mshtf_ctx is not None:
                     mshtf_fields = structure_lists(mshtf_ctx, prefix='mshtf')
@@ -427,16 +427,16 @@ class EntryGatekeeper:
             return {}
         include_keys = {
             'benchmark', 'zscore', 'side_preference', 'runner_target_applied', 'qualifying_target_count',
-            'trigger_score_required', 'min_peer_score_required', 'strong_setup_trigger_score_required', 'strong_setup_peer_score_required',
+            'ltf_score_required', 'min_peer_score_required', 'strong_setup_ltf_score_required', 'strong_setup_peer_score_required',
             'or_high', 'or_low', 'pullback_high', 'pullback_low', 'trigger_high', 'trigger_low',
             'support_low', 'resistance_high', 'extension_from_vwap_pct', 'peer_details', 'macro_details',
             'spread_side', 'spread_style', 'spread_type', 'entry_price_points', 'entry_credit',
             'bought_leg_symbol', 'sold_leg_symbol', 'bought_strike', 'sold_strike',
-            'htf_timeframe_minutes', 'nearest_htf_support', 'nearest_htf_resistance',
+            'htf_minutes', 'nearest_htf_support', 'nearest_htf_resistance',
             'broken_htf_support', 'broken_htf_resistance', 'prior_day_high', 'prior_day_low',
             'prior_week_high', 'prior_week_low', 'htf_ema_fast', 'htf_ema_slow', 'htf_atr14',
             'htf_trend_bias', 'htf_level_buffer', 'nearest_htf_bullish_fvg', 'nearest_htf_bearish_fvg',
-            'source_priority', 'selection_score', 'selection_trigger_score', 'hourly_vote_edge',
+            'source_priority', 'selection_score', 'selection_ltf_score', 'htf_vote_edge',
             'macro_agreement_count', 'selection_quality_score', 'activity_score', 'setup_quality_score',
             'execution_quality_score', 'macro_score', 'entry_family', 'peer_universe', 'side_eval',
             'family_eval', 'evaluated_sides', 'primary_blocker', 'all_blockers', 'near_miss_blockers',
@@ -444,7 +444,7 @@ class EntryGatekeeper:
         }
         include_prefixes = (
             'fvg_', 'htf_fvg_', 'adaptive_', 'anti_chase_fvg_retest_',
-            'ms1m_', 'mshtf_', 'sr_', 'tech_', 'matched_', 'chart_pattern_',
+            'msltf_', 'mshtf_', 'sr_', 'tech_', 'matched_', 'chart_pattern_',
             'decision_', 'gate_', 'peak_giveback_', 'orb_',
         )
         exclude_keys = {
@@ -525,11 +525,11 @@ class EntryGatekeeper:
             'level_kind': meta.get('level_kind'),
             'level_price': safe_float(meta.get('level_price'), None),
             'level_score': safe_float(meta.get('level_score'), None),
-            'trigger_score': safe_float(meta.get('trigger_score'), None),
-            'trigger_reasons': meta.get('trigger_reasons'),
-            'hourly_bias': meta.get('hourly_bias'),
-            'hourly_bull_votes': safe_float(meta.get('hourly_bull_votes'), None),
-            'hourly_bear_votes': safe_float(meta.get('hourly_bear_votes'), None),
+            'ltf_score': safe_float(meta.get('ltf_score'), None),
+            'ltf_reasons': meta.get('ltf_reasons'),
+            'htf_bias': meta.get('htf_bias'),
+            'htf_bull_votes': safe_float(meta.get('htf_bull_votes'), None),
+            'htf_bear_votes': safe_float(meta.get('htf_bear_votes'), None),
             'peer_score': safe_float(meta.get('peer_score'), None),
             'peer_bullish': safe_float(meta.get('peer_bullish'), None),
             'peer_bearish': safe_float(meta.get('peer_bearish'), None),
@@ -623,7 +623,7 @@ class EntryGatekeeper:
             if custom_key is not None:
                 return tuple(float(item) for item in custom_key)
         priority_fields = (
-            "trigger_score",
+            "ltf_score",
             "regime_score",
             "directional_peer_score",
             "peer_score",
@@ -636,7 +636,7 @@ class EntryGatekeeper:
         if any(field in meta for field in priority_fields):
             directional_peer_score = meta.get("directional_peer_score", meta.get("peer_score"))
             return (
-                float(safe_float(meta.get("trigger_score"), 0.0) or 0.0),
+                float(safe_float(meta.get("ltf_score"), 0.0) or 0.0),
                 float(safe_float(meta.get("regime_score"), 0.0) or 0.0),
                 float(safe_float(directional_peer_score, 0.0) or 0.0),
                 float(safe_float(meta.get("directional_vote_edge"), 0.0) or 0.0),

@@ -421,7 +421,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         """Apply shared gates (structure, S/R, exhaustion, chart patterns) and
         build the final Signal with adaptive management metadata."""
         sr_ctx = self._sr_context(c.symbol, frame, data)
-        ms_ctx = self._structure_context(frame, "1m")
+        ms_ctx = self._structure_context(frame, "ltf")
         tech_ctx = self._technical_context(frame)
         ctx = self._chart_context(frame)
 
@@ -901,8 +901,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         self._reset_entry_decisions()
         out: list[Signal] = []
         min_bars = int(self.params.get("min_bars", 60) or 60)
-        trigger_tf = max(1, int(self.params.get("trigger_timeframe_minutes", 5)))
-        min_trigger_bars = int(self.params.get("min_trigger_bars", 15))
+        ltf_min = max(1, int(self.params.get("ltf_minutes", 5)))
+        min_ltf_bars = int(self.params.get("min_ltf_bars", 15))
         allow_short = bool(self.config.risk.allow_short)
         now_t = now_et().time()
         allowed_regimes = self._allowed_regimes(now_t)
@@ -934,8 +934,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)])
                 continue
 
-            ltf = self._resampled_frame(frame, trigger_tf, symbol=c.symbol, data=data)
-            if ltf is None or ltf.empty or len(ltf) < min_trigger_bars:
+            ltf = self._resampled_frame(frame, ltf_min, symbol=c.symbol, data=data)
+            if ltf is None or ltf.empty or len(ltf) < min_ltf_bars:
                 self._record_entry_decision(c.symbol, "skipped", ["missing_ltf_context"])
                 continue
 

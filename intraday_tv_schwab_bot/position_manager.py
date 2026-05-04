@@ -20,10 +20,12 @@ Design notes:
   for live broker queries, and are also used by entry recovery. They're
   injected as callables so exit recovery can reach them without pulling
   the whole broker surface into PositionManager.
-- Config accessors ``_active_sr_*`` moved here (they read ``self.config``
-  and ``self.strategy``). Engine call sites in entry / screening paths
-  dispatch through ``self.position_manager._active_sr_*()`` so the
-  accessors have a single home.
+- Config accessors ``active_htf_*`` (HTF timeframe / lookback) live here
+  so engine call sites in entry / screening paths can dispatch through
+  ``self.position_manager.active_htf_*()`` — the accessors read
+  ``self.config`` and ``self.strategy.params`` and have a single home.
+  HTF refresh cadence is now bar-aligned in ``MarketDataStore.should_refresh_htf_context``
+  so there's no longer a refresh-seconds knob on the strategy side.
 """
 from __future__ import annotations
 
@@ -100,23 +102,20 @@ class PositionManager:
     # SR-config accessors (read config + strategy params).
     # ------------------------------------------------------------------
 
-    def active_sr_timeframe_minutes(self) -> int:
+    def active_htf_minutes(self) -> int:
+        """HTF (higher timeframe) for SR detection — strategies declare via
+        `params.htf_minutes`; otherwise inherit
+        `support_resistance.timeframe_minutes`."""
         cfg = getattr(self.config, "support_resistance", None)
         fallback = int(getattr(cfg, "timeframe_minutes", 15)) if cfg is not None else 15
         params = getattr(getattr(self, "strategy", None), "params", {}) or {}
-        return int(params.get("htf_timeframe_minutes", fallback))
+        return int(params.get("htf_minutes", fallback))
 
-    def active_sr_lookback_days(self) -> int:
+    def active_htf_lookback_days(self) -> int:
         cfg = getattr(self.config, "support_resistance", None)
         fallback = int(getattr(cfg, "lookback_days", 10)) if cfg is not None else 10
         params = getattr(getattr(self, "strategy", None), "params", {}) or {}
         return int(params.get("htf_lookback_days", fallback))
-
-    def active_sr_refresh_seconds(self) -> int:
-        cfg = getattr(self.config, "support_resistance", None)
-        fallback = int(getattr(cfg, "refresh_seconds", 120)) if cfg is not None else 120
-        params = getattr(getattr(self, "strategy", None), "params", {}) or {}
-        return int(params.get("htf_refresh_seconds", fallback))
 
     # ------------------------------------------------------------------
     # Mark-price resolution for open positions.
@@ -504,7 +503,7 @@ class PositionManager:
         if frame is None or frame.empty or last_price <= 0:
             return
         symbol = str(position.metadata.get("underlying") or position.symbol)
-        sr_ctx = self.data.get_support_resistance(symbol, current_price=last_price, flip_frame=frame, mode="trading", timeframe_minutes=self.active_sr_timeframe_minutes(), lookback_days=self.active_sr_lookback_days(), refresh_seconds=self.active_sr_refresh_seconds()) if self.data is not None else None
+        sr_ctx = self.data.get_support_resistance(symbol, current_price=last_price, flip_frame=frame, mode="trading", timeframe_minutes=self.active_htf_minutes(), lookback_days=self.active_htf_lookback_days()) if self.data is not None else None
         if sr_ctx is None:
             return
         last = frame.iloc[-1]
@@ -612,7 +611,7 @@ class PositionManager:
         if rung_price <= 0:
             return
         symbol = str(meta.get("underlying") or position.symbol)
-        sr_ctx = self.data.get_support_resistance(symbol, current_price=last_price, flip_frame=frame, mode="trading", timeframe_minutes=self.active_sr_timeframe_minutes(), lookback_days=self.active_sr_lookback_days(), refresh_seconds=self.active_sr_refresh_seconds(), allow_refresh=True) if self.data is not None else None
+        sr_ctx = self.data.get_support_resistance(symbol, current_price=last_price, flip_frame=frame, mode="trading", timeframe_minutes=self.active_htf_minutes(), lookback_days=self.active_htf_lookback_days(), allow_refresh=True) if self.data is not None else None
         close = safe_float(frame.iloc[-1].get("close"), last_price)
         level_buffer = float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0)
         stop_buffer = max(level_buffer, zone_width * 0.25, close * 0.0005)

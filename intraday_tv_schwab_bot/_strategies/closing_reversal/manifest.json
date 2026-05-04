@@ -32,7 +32,7 @@
     "min_reversal_close_position": 0.6,
     "require_positive_reversal_ret5": true,
     "htf_fvg_entry_weight": 0.38,
-    "one_minute_fvg_entry_weight": 0.24,
+    "ltf_fvg_entry_weight": 0.24,
     "opposing_fvg_entry_penalty_mult": 0.88,
     "fvg_runner_rr_bonus": 0.12,
     "same_direction_fvg_validated_bonus": 0.15,

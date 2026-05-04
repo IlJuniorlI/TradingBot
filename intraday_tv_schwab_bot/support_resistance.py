@@ -8,7 +8,14 @@ from typing import Iterable
 import pandas as pd
 
 from .levels_shared import (
+    clone_level,
+    cluster_levels,
+    cluster_levels_by_tolerance,
+    confirm_by_bars,
+    extend_unique_levels,
     fallback_prior_side_levels,
+    frame_extreme_side_levels as _frame_extreme_side_levels_shared,
+    pivot_points,
     prior_day_levels as _prior_day_levels,
     prior_week_levels as _prior_week_levels,
     safe_reference_price_for_fallback as _safe_reference_price_for_fallback,
@@ -109,81 +116,22 @@ def empty_support_resistance_context(current_price: float = 0.0, *, timeframe_mi
     )
 
 def _pivot_points(frame: pd.DataFrame, span: int) -> tuple[list[tuple[int, pd.Timestamp, float]], list[tuple[int, pd.Timestamp, float]]]:
-    highs: list[tuple[int, pd.Timestamp, float]] = []
-    lows: list[tuple[int, pd.Timestamp, float]] = []
-    if frame is None or len(frame) < (span * 2 + 3):
-        return highs, lows
-    span = max(1, int(span))
-    # Use numpy arrays + tolist() once. Skip astype(float) when column is
-    # already float (common case on indicator frames).
-    high_col = frame["high"]
-    low_col = frame["low"]
-    highs_arr = high_col.to_numpy(dtype=float, copy=False).tolist() if high_col.dtype != object else high_col.astype(float).tolist()
-    lows_arr = low_col.to_numpy(dtype=float, copy=False).tolist() if low_col.dtype != object else low_col.astype(float).tolist()
-    idxs = list(frame.index)
-    for i in range(span, len(frame) - span):
-        hi = highs_arr[i]
-        lo = lows_arr[i]
-        hi_window = highs_arr[i - span : i + span + 1]
-        lo_window = lows_arr[i - span : i + span + 1]
-        if hi == max(hi_window) and hi_window.count(hi) == 1:
-            highs.append((i, idxs[i], float(hi)))
-        if lo == min(lo_window) and lo_window.count(lo) == 1:
-            lows.append((i, idxs[i], float(lo)))
-    return highs, lows
+    # Thin wrapper around the shared `pivot_points` helper. Uses
+    # include_idx=True so structure_event detection downstream can
+    # anchor a pivot to its bar position. htf_levels uses include_idx=False.
+    return pivot_points(frame, span, include_idx=True)
 
 
 def _cluster_levels(points: Iterable[tuple[pd.Timestamp, float]], kind: str, tolerance: float, max_levels: int) -> list[SupportResistanceLevel]:
-    ordered = sorted([(ts, float(price)) for ts, price in points], key=lambda x: x[1])
-    if not ordered:
-        return []
-    newest_ts = max((ts for ts, _price in ordered), default=None)
-    oldest_ts = min((ts for ts, _price in ordered), default=None)
-    total_window_seconds = max(
-        1.0,
-        float((newest_ts - oldest_ts).total_seconds()) if newest_ts is not None and oldest_ts is not None else 1.0,
-    )
-    groups: list[list[tuple[pd.Timestamp, float]]] = []
-    for point in ordered:
-        if not groups:
-            groups.append([point])
-            continue
-        prior_prices = [p for _, p in groups[-1]]
-        anchor = sum(prior_prices) / len(prior_prices)
-        if abs(point[1] - anchor) <= tolerance:
-            groups[-1].append(point)
-        else:
-            groups.append([point])
-    levels: list[SupportResistanceLevel] = []
-    for grp in groups:
-        grp_sorted = sorted(grp, key=lambda x: x[0])
-        prices = [price for _, price in grp_sorted]
-        first_seen = grp_sorted[0][0].isoformat() if grp_sorted else None
-        last_seen = grp_sorted[-1][0].isoformat() if grp_sorted else None
-        touches = len(grp_sorted)
-        cluster_first_ts = grp_sorted[0][0]
-        cluster_last_ts = grp_sorted[-1][0]
-        active_window_seconds = max(0.0, float((cluster_last_ts - cluster_first_ts).total_seconds()))
-        recency_factor = 1.0
-        if newest_ts is not None:
-            age_seconds = max(0.0, float((newest_ts - cluster_last_ts).total_seconds()))
-            recency_factor = max(0.15, 1.0 - (age_seconds / total_window_seconds))
-        persistence_factor = min(1.0, active_window_seconds / total_window_seconds)
-        recency_bonus = 0.60 * recency_factor
-        persistence_bonus = 0.50 * persistence_factor
-        score = (float(touches) * 1.15) + recency_bonus + persistence_bonus
-        levels.append(
-            SupportResistanceLevel(
-                kind=kind,
-                price=float(sum(prices) / len(prices)),
-                touches=touches,
-                score=score,
-                first_seen=first_seen,
-                last_seen=last_seen,
-            )
-        )
-    levels.sort(key=lambda lv: (lv.score, lv.touches), reverse=True)
-    return levels[: max(1, int(max_levels))]
+    # Thin wrapper around the shared `cluster_levels` helper — same
+    # multiplicative-recency formula as htf_levels so the two builders
+    # can't drift in their scoring. The previous module-local version
+    # used an additive recency bonus (touches * 1.15 + 0.60 *
+    # recency_factor) which let ancient high-touch bases dominate
+    # close-to-price recent swings — the bug we found in the AMD/INTC
+    # debug. Effective touches via multiplication keeps the rank
+    # ordering stable while letting recency genuinely weight selection.
+    return cluster_levels(points, kind, tolerance, max_levels, level_factory=SupportResistanceLevel)
 
 
 def _reduced_pivots(frame: pd.DataFrame, span: int) -> list[tuple[str, int, pd.Timestamp, float]]:
@@ -429,33 +377,10 @@ def analyze_market_structure(
 
 
 def _clone_level(level: SupportResistanceLevel, kind: str) -> SupportResistanceLevel:
-    return SupportResistanceLevel(
-        kind=kind,
-        price=float(level.price),
-        touches=int(level.touches),
-        score=float(level.score),
-        first_seen=level.first_seen,
-        last_seen=level.last_seen,
-        source=str(getattr(level, "source", "pivot") or "pivot"),
-        source_priority=float(getattr(level, "source_priority", 1.0) or 1.0),
-    )
-
-
-def _extend_unique_levels(dest: list[SupportResistanceLevel], additions: list[SupportResistanceLevel]) -> None:
-    seen = {
-        (str(getattr(level, "source", "pivot") or "pivot"), round(float(level.price), 8), str(getattr(level, "kind", "support") or "support"))
-        for level in dest
-    }
-    for level in additions:
-        key = (
-            str(getattr(level, "source", "pivot") or "pivot"),
-            round(float(level.price), 8),
-            str(getattr(level, "kind", "support") or "support"),
-        )
-        if key in seen:
-            continue
-        dest.append(level)
-        seen.add(key)
+    # Thin factory-binding wrapper around the shared `clone_level` helper.
+    # SR always preserves the original `source` field (HTF allows override
+    # via a `source=` kwarg, but SR's flip semantics never relabel).
+    return clone_level(level, kind, level_factory=SupportResistanceLevel)
 
 
 def _frame_extreme_side_levels(
@@ -465,15 +390,14 @@ def _frame_extreme_side_levels(
     tolerance: float,
     max_levels: int,
 ) -> list[SupportResistanceLevel]:
-    if frame is None or frame.empty:
-        return []
-    if str(side).strip().lower() == "support":
-        pos = int(frame["low"].astype(float).values.argmin())
-        point = (pd.Timestamp(frame.index[pos]), float(frame["low"].iloc[pos]))
-        return _cluster_levels([point], "support", tolerance, max_levels)
-    pos = int(frame["high"].astype(float).values.argmax())
-    point = (pd.Timestamp(frame.index[pos]), float(frame["high"].iloc[pos]))
-    return _cluster_levels([point], "resistance", tolerance, max_levels)
+    # Thin factory-binding wrapper around `frame_extreme_side_levels`.
+    return _frame_extreme_side_levels_shared(
+        frame,
+        side=side,
+        tolerance=tolerance,
+        max_levels=max_levels,
+        level_factory=SupportResistanceLevel,
+    )
 
 
 def _filter_levels_by_side(
@@ -563,20 +487,13 @@ def _collapse_same_side_levels(
     reverse: bool,
     max_levels: int,
 ) -> list[SupportResistanceLevel]:
-    if not levels:
+    # SR merges every level in a cluster (sums touches, sums score, adds
+    # cross-source bonus). htf_levels uses the same tolerance grouping
+    # but picks a single representative — that's why the grouping lives
+    # in levels_shared and the per-cluster reducer stays local.
+    groups = cluster_levels_by_tolerance(levels, tolerance)
+    if not groups:
         return []
-    ordered = sorted(levels, key=lambda lv: float(lv.price))
-    groups: list[list[SupportResistanceLevel]] = []
-    for level in ordered:
-        if not groups:
-            groups.append([level])
-            continue
-        prior_prices = [float(item.price) for item in groups[-1]]
-        anchor = sum(prior_prices) / len(prior_prices)
-        if abs(float(level.price) - anchor) <= max(float(tolerance), 1e-9):
-            groups[-1].append(level)
-        else:
-            groups.append([level])
     selected = [_merge_level_group(group, current_price) for group in groups]
     selected.sort(key=lambda lv: float(lv.price), reverse=bool(reverse))
     return selected[: max(1, int(max_levels))]
@@ -661,16 +578,6 @@ def _completed_flip_frames(flip_frame: pd.DataFrame | None) -> tuple[pd.DataFram
     return completed_1m, completed_5m
 
 
-def _confirm_by_bars(frame: pd.DataFrame, field: str, comparator: str, level_price: float, count: int, eps: float) -> bool:
-    count = int(count or 0)
-    if count <= 0 or frame is None or frame.empty or field not in frame.columns or len(frame) < count:
-        return False
-    series = frame[field].astype(float).tail(count)
-    if comparator == "above":
-        return bool((series > float(level_price) + float(eps)).all())
-    return bool((series < float(level_price) - float(eps)).all())
-
-
 def _flip_confirmed(
     level_price: float,
     *,
@@ -685,8 +592,8 @@ def _flip_confirmed(
     overlay_requested = flip_frame is not None and (confirm_1m_bars > 0 or confirm_5m_bars > 0)
     if direction == "reclaim":
         confirmed = (
-            _confirm_by_bars(completed_1m, "low", "above", level_price, confirm_1m_bars, eps)
-            or _confirm_by_bars(completed_5m, "low", "above", level_price, confirm_5m_bars, eps)
+            confirm_by_bars(completed_1m, "low", "above", level_price, int(confirm_1m_bars or 0), float(eps))
+            or confirm_by_bars(completed_5m, "low", "above", level_price, int(confirm_5m_bars or 0), float(eps))
         )
         if confirmed:
             return True
@@ -697,8 +604,8 @@ def _flip_confirmed(
         _, fallback_low = fallback_bar
         return float(fallback_low) > float(level_price) + float(eps)
     confirmed = (
-        _confirm_by_bars(completed_1m, "high", "below", level_price, confirm_1m_bars, eps)
-        or _confirm_by_bars(completed_5m, "high", "below", level_price, confirm_5m_bars, eps)
+        confirm_by_bars(completed_1m, "high", "below", level_price, int(confirm_1m_bars or 0), float(eps))
+        or confirm_by_bars(completed_5m, "high", "below", level_price, int(confirm_5m_bars or 0), float(eps))
     )
     if confirmed:
         return True
@@ -1031,57 +938,52 @@ def build_support_resistance_context(
     prior_day_high, prior_day_low = _prior_day_levels(frame) if include_prior_day else (None, None)
     prior_week_high, prior_week_low = _prior_week_levels(frame) if include_prior_week else (None, None)
 
-    # Always merge prior_day/week levels into the candidate pool alongside
-    # pivot-derived levels. In strong directional moves a stock can rally
-    # for many bars with no proper pivot lows in the rally portion (each
-    # bar's low > the surrounding bars' lows by definition of an uptrend),
-    # so pivot-only detection only surfaces the ancient base; recent
-    # prior_day_low / prior_week_low are invisible. They carry
-    # source_priority 2.0 / 3.0 (vs pivot's 1.0) so when they overlap a
-    # same-cluster pivot, _level_preference picks the prior-day/week
-    # level. Mirrors the same fix applied to htf_levels.build_htf_context.
-    prior_supports = _fallback_prior_side_levels(
-        side="support",
-        current_price=close,
-        include_prior_day=include_prior_day,
-        include_prior_week=include_prior_week,
-        prior_day_high=prior_day_high,
-        prior_day_low=prior_day_low,
-        prior_week_high=prior_week_high,
-        prior_week_low=prior_week_low,
-    )
-    prior_resistances = _fallback_prior_side_levels(
-        side="resistance",
-        current_price=close,
-        include_prior_day=include_prior_day,
-        include_prior_week=include_prior_week,
-        prior_day_high=prior_day_high,
-        prior_day_low=prior_day_low,
-        prior_week_high=prior_week_high,
-        prior_week_low=prior_week_low,
-    )
     support_references: list[SupportResistanceLevel] = list(raw_pivot_supports)
     resistance_references: list[SupportResistanceLevel] = list(raw_pivot_resistances)
-    _extend_unique_levels(support_references, prior_supports)
-    _extend_unique_levels(resistance_references, prior_resistances)
     support_filter_price = close
     resistance_filter_price = close
     if not support_references:
-        min_low_pos = int(frame["low"].astype(float).values.argmin())
-        support_references = _cluster_levels(
-            [(pd.Timestamp(frame.index[min_low_pos]), float(frame["low"].iloc[min_low_pos]))],
-            "support",
-            merge_tol,
-            max(max_levels_per_side * 2, 2),
+        support_references = _fallback_prior_side_levels(
+            side="support",
+            current_price=fallback_reference_price,
+            include_prior_day=include_prior_day,
+            include_prior_week=include_prior_week,
+            prior_day_high=prior_day_high,
+            prior_day_low=prior_day_low,
+            prior_week_high=prior_week_high,
+            prior_week_low=prior_week_low,
         )
+        if support_references:
+            support_filter_price = fallback_reference_price
+        else:
+            min_low_pos = int(frame["low"].astype(float).values.argmin())
+            support_references = _cluster_levels(
+                [(pd.Timestamp(frame.index[min_low_pos]), float(frame["low"].iloc[min_low_pos]))],
+                "support",
+                merge_tol,
+                max(max_levels_per_side * 2, 2),
+            )
     if not resistance_references:
-        max_high_pos = int(frame["high"].astype(float).values.argmax())
-        resistance_references = _cluster_levels(
-            [(pd.Timestamp(frame.index[max_high_pos]), float(frame["high"].iloc[max_high_pos]))],
-            "resistance",
-            merge_tol,
-            max(max_levels_per_side * 2, 2),
+        resistance_references = _fallback_prior_side_levels(
+            side="resistance",
+            current_price=fallback_reference_price,
+            include_prior_day=include_prior_day,
+            include_prior_week=include_prior_week,
+            prior_day_high=prior_day_high,
+            prior_day_low=prior_day_low,
+            prior_week_high=prior_week_high,
+            prior_week_low=prior_week_low,
         )
+        if resistance_references:
+            resistance_filter_price = fallback_reference_price
+        else:
+            max_high_pos = int(frame["high"].astype(float).values.argmax())
+            resistance_references = _cluster_levels(
+                [(pd.Timestamp(frame.index[max_high_pos]), float(frame["high"].iloc[max_high_pos]))],
+                "resistance",
+                merge_tol,
+                max(max_levels_per_side * 2, 2),
+            )
 
     last_bar = frame.iloc[-1]
     last_low = float(last_bar.low)
@@ -1122,7 +1024,7 @@ def build_support_resistance_context(
                 tolerance=merge_tol,
                 max_levels=max(max_levels_per_side * 2, 2),
             )
-        _extend_unique_levels(support_references, second_chance_support_refs)
+        extend_unique_levels(support_references, second_chance_support_refs)
         for level in second_chance_support_refs:
             if _flip_confirmed(
                 float(level.price),
@@ -1157,7 +1059,7 @@ def build_support_resistance_context(
                 tolerance=merge_tol,
                 max_levels=max(max_levels_per_side * 2, 2),
             )
-        _extend_unique_levels(resistance_references, second_chance_resistance_refs)
+        extend_unique_levels(resistance_references, second_chance_resistance_refs)
         for level in second_chance_resistance_refs:
             if _flip_confirmed(
                 float(level.price),

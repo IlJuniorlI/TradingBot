@@ -243,7 +243,7 @@ class DashboardServer:
         self.chart_payload_provider = chart_payload_provider
 
     @staticmethod
-    def _call_chart_payload_provider(provider: Callable[..., dict[str, Any]], symbol: str, max_bars: int, timeframe_mode: str = '1m') -> dict[str, Any]:
+    def _call_chart_payload_provider(provider: Callable[..., dict[str, Any]], symbol: str, max_bars: int, timeframe_mode: str = 'ltf') -> dict[str, Any]:
         try:
             signature = inspect.signature(provider)
         except (TypeError, ValueError):
@@ -513,9 +513,12 @@ class DashboardServer:
                         requested_bars = int((params.get("bars") or [90])[0])
                     except Exception:
                         requested_bars = 90
-                    requested_timeframe_mode = str((params.get("timeframe") or ['1m'])[0] or '1m').strip().lower()
+                    requested_timeframe_mode = str((params.get("timeframe") or ['ltf'])[0] or 'ltf').strip().lower()
+                    if requested_timeframe_mode == '1m':
+                        # Back-compat alias: legacy "1m" mode -> "ltf".
+                        requested_timeframe_mode = 'ltf'
                     if requested_timeframe_mode != 'htf':
-                        requested_timeframe_mode = '1m'
+                        requested_timeframe_mode = 'ltf'
                     capped_bars = max(1, min(requested_bars, 480))
                     try:
                         chart_payload = DashboardServer._call_chart_payload_provider(chart_payload_provider, symbol, capped_bars, requested_timeframe_mode)

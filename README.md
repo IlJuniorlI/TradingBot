@@ -526,9 +526,9 @@ Use the same option names under `shared`, `compact`, or `expanded`.
 | `show_channel`                        | `false`      |
 | `show_trendlines`                     | `false`      |
 | `show_htf_fair_value_gaps`            | `false`      |
-| `show_1m_fair_value_gaps`             | `false`      |
+| `show_ltf_fair_value_gaps`             | `false`      |
 | `show_htf_order_blocks`               | `false`      |
-| `show_1m_order_blocks`                | `false`      |
+| `show_ltf_order_blocks`                | `false`      |
 | `show_trade_markers`                  | `true`       |
 | `tooltip_show_returns`                | `true`       |
 | `tooltip_show_support_resistance`     | `true`       |
@@ -545,8 +545,8 @@ How charting options behave:
 - `show_support_resistance`, `show_next_support_resistance`, `show_full_support_resistance_ladder`: how much of the support/resistance map to draw.
 - `show_key_level_zones`, `show_key_level_zone_labels`: peer-confirmed zone overlays.
 - `show_bollinger_bands`, `show_anchored_vwap`, `show_fib_extensions`, `show_channel`, `show_trendlines`: heavier technical overlays.
-- `show_htf_fair_value_gaps`, `show_1m_fair_value_gaps`: higher-timeframe and one-minute FVG overlays. Cross-timeframe protection is enforced automatically, so HTF FVGs do not render on 1m charts and 1m FVGs do not render on HTF charts.
-- `show_htf_order_blocks`, `show_1m_order_blocks`: higher-timeframe and one-minute order block overlays. Render with a dashed-line border around a very faint fill so they are visually distinct from the solid-filled FVG overlays. Same green/red bullish/bearish color semantics. Driven by `support_resistance.htf_order_blocks_enabled` / `one_minute_order_blocks_enabled` and the shared OB tuning knobs (`order_block_mode`, etc.). Cross-timeframe protection is enforced the same way as for FVGs.
+- `show_htf_fair_value_gaps`, `show_ltf_fair_value_gaps`: higher-timeframe and one-minute FVG overlays. Cross-timeframe protection is enforced automatically, so HTF FVGs do not render on 1m charts and 1m FVGs do not render on HTF charts.
+- `show_htf_order_blocks`, `show_ltf_order_blocks`: higher-timeframe and one-minute order block overlays. Render with a dashed-line border around a very faint fill so they are visually distinct from the solid-filled FVG overlays. Same green/red bullish/bearish color semantics. Driven by `support_resistance.htf_order_blocks_enabled` / `ltf_order_blocks_enabled` and the shared OB tuning knobs (`order_block_mode`, etc.). Cross-timeframe protection is enforced the same way as for FVGs.
 - `show_trade_markers`: entry/exit markers on the chart.
 - `tooltip_show_*`: toggle tooltip sections individually.
 - In `compact` and `expanded`, using `null` means “inherit from `shared`.”
@@ -560,7 +560,6 @@ Higher-timeframe support/resistance, prior-day/week levels, FVG mapping, flip ha
 | `enabled`                                | `true`       |
 | `timeframe_minutes`                      | `15`         |
 | `lookback_days`                          | `10`         |
-| `refresh_seconds`                        | `480`        |
 | `pivot_span`                             | `2`          |
 | `max_levels_per_side`                    | `3`          |
 | `atr_tolerance_mult`                     | `0.6`        |
@@ -582,11 +581,11 @@ Higher-timeframe support/resistance, prior-day/week levels, FVG mapping, flip ha
 | `use_prior_day_high_low`                 | `true`       |
 | `use_prior_week_high_low`                | `true`       |
 | `htf_fair_value_gaps_enabled`            | `true`       |
-| `one_minute_fair_value_gaps_enabled`     | `true`       |
+| `ltf_fair_value_gaps_enabled`     | `true`       |
 | `fair_value_gap_max_per_side`            | `3`          |
 | `fair_value_gap_min_atr_mult`            | `0.06`       |
 | `fair_value_gap_min_pct`                 | `0.0006`     |
-| `one_minute_order_blocks_enabled`        | `false`      |
+| `ltf_order_blocks_enabled`        | `false`      |
 | `htf_order_blocks_enabled`               | `false`      |
 | `order_block_mode`                       | `loose`      |
 | `order_block_max_per_side`               | `4`          |
@@ -595,16 +594,15 @@ Higher-timeframe support/resistance, prior-day/week levels, FVG mapping, flip ha
 | `order_block_min_thrust_atr_mult`        | `0.75`       |
 | `order_block_pivot_span`                 | `2`          |
 | `order_block_new_high_lookback`          | `8`          |
-| `dashboard_flip_confirmation_1m_bars`    | `1`          |
 | `trading_flip_confirmation_1m_bars`      | `2`          |
 | `trading_flip_confirmation_5m_bars`      | `1`          |
 | `flip_stop_buffer_atr_mult`              | `0.25`       |
 | `flip_target_requires_momentum_confirm`  | `true`       |
 | `regime_weight`                          | `0.7`        |
 | `structure_enabled`                      | `true`       |
-| `structure_1m_pivot_span`                | `2`          |
+| `structure_ltf_pivot_span`                | `2`          |
 | `structure_eq_atr_mult`                  | `0.25`       |
-| `structure_1m_weight`                    | `0.65`       |
+| `structure_ltf_weight`                    | `0.65`       |
 | `structure_htf_weight`                   | `0.85`       |
 | `structure_event_lookback_bars`          | `6`          |
 | `structure_exit_grace_minutes`           | `10`         |
@@ -614,8 +612,8 @@ Higher-timeframe support/resistance, prior-day/week levels, FVG mapping, flip ha
 How the groups work:
 
 - Core HTF level map:
-  - `enabled`, `timeframe_minutes`, `lookback_days`, `refresh_seconds`, `pivot_span`, `max_levels_per_side`
-  - Use these to decide how the level map is built and refreshed.
+  - `enabled`, `timeframe_minutes`, `lookback_days`, `pivot_span`, `max_levels_per_side`
+  - Use these to decide how the level map is built. HTF refresh cadence is bar-aligned (one Schwab call per HTF bar boundary, plus a 10-second settle buffer) — there's no longer a refresh-seconds knob.
 - Level width and proximity:
   - `atr_tolerance_mult`, `pct_tolerance`, `same_side_min_gap_atr_mult`, `same_side_min_gap_pct`, `fallback_reference_max_drift_atr_mult`, `fallback_reference_max_drift_pct`, `proximity_atr_mult`, `breakout_atr_mult`, `breakout_buffer_pct`, `stop_buffer_atr_mult`
   - Larger values make levels and breakout/stop buffers looser; smaller values make them tighter.
@@ -632,19 +630,19 @@ How the groups work:
   - `one_minute_fair_value_gaps_*` controls 1-minute FVG generation.
   - Raising the min ATR or min percent thresholds makes FVG detection more selective.
 - Order block detection:
-  - `htf_order_blocks_enabled` and `one_minute_order_blocks_enabled` toggle OB generation per timeframe.
+  - `htf_order_blocks_enabled` and `ltf_order_blocks_enabled` toggle OB generation per timeframe.
   - `order_block_mode`: `loose` declares a break-of-structure when price prints a new N-bar high (`order_block_new_high_lookback`); `strict` requires a pivot-confirmed BoS (`order_block_pivot_span`). Strict produces fewer, higher-quality OBs.
   - `order_block_min_atr_mult` and `order_block_min_pct` set the minimum OB body size (whichever is larger).
   - `order_block_min_thrust_atr_mult` (default `0.75`) requires the BoS thrust — close-to-close move from the OB candle to the breakout candle — to be at least this fraction of ATR. Filters weak setups where a small candle randomly broke a recent high.
   - `order_block_max_per_side` caps OBs per side per timeframe. Ranking is strength-based (thrust × size × age × validity), so the strongest OBs survive when the cap clips — small-move noise OBs no longer displace strong OBs from real moves.
 - Level-loss and flip behavior:
-  - `dashboard_flip_confirmation_1m_bars`, `trading_flip_confirmation_1m_bars`, `trading_flip_confirmation_5m_bars` tune how many bars confirm a flip for display vs trading.
+  - `trading_flip_confirmation_1m_bars` and `trading_flip_confirmation_5m_bars` tune how many bars confirm a level flip via the dual-frame OR rule (either gate fires confirms). The dashboard sidebar, dashboard chart zone classification, entry gatekeeper, position manager, and strategy entries all use this same strict gate so every consumer agrees on which side of a level price is sitting on.
   - Whether confirmed level-loss breaks trigger an exit is controlled by `shared_exit.use_sr_loss_exit`.
   - `flip_stop_buffer_atr_mult` controls how far beyond a flipped level the stop is anchored when `risk.trade_management_mode: sr_flip` is active.
   - `flip_target_requires_momentum_confirm` prevents target extension on weak flips.
 - Regime and structure:
   - `regime_weight` controls how strongly the S/R regime influences scoring.
-  - `structure_enabled`, `structure_1m_pivot_span`, `structure_eq_atr_mult`, `structure_1m_weight`, `structure_htf_weight`, `structure_event_lookback_bars` control the mixed-timeframe structure layer. The CHoCH-exit toggle is `shared_exit.use_structure_exit`.
+  - `structure_enabled`, `structure_ltf_pivot_span`, `structure_eq_atr_mult`, `structure_ltf_weight`, `structure_htf_weight`, `structure_event_lookback_bars` control the mixed-timeframe structure layer. The CHoCH-exit toggle is `shared_exit.use_structure_exit`.
 - Structure-exit grace windows:
   - `structure_exit_grace_minutes` (default `10`) suppresses `structure_bearish_exit` / `structure_bullish_exit` for the first N minutes after entry. Prevents a minor EQL/LL pivot forming in the first few minutes from exiting an otherwise-healthy trade. CHoCH exits still fire.
   - `structure_exit_min_post_entry_pivots` (default `2`) requires at least N new 1m pivots to form AFTER entry before structure-based bias exits can fire. Complements the time grace.
@@ -1023,13 +1021,13 @@ Behavior:
 Used by all stock strategies.
 
 - `htf_fvg_entry_weight`
-- `one_minute_fvg_entry_weight`
+- `ltf_fvg_entry_weight`
 - `opposing_fvg_entry_penalty_mult`
 - `fvg_runner_rr_bonus`
 
 Behavior:
 
-- Higher `htf_fvg_entry_weight` or `one_minute_fvg_entry_weight` makes same-direction FVG context matter more.
+- Higher `htf_fvg_entry_weight` or `ltf_fvg_entry_weight` makes same-direction FVG context matter more.
 - Higher `opposing_fvg_entry_penalty_mult` makes nearby opposing FVGs more punitive.
 - `fvg_runner_rr_bonus` adds extra room to stronger trades when FVG continuation context is favorable.
 
@@ -1099,7 +1097,7 @@ Current package defaults:
 | `anti_chase_fvg_retest_min_close_position`        | `0.64`                          |
 | `anti_chase_fvg_retest_stop_buffer_gap_frac`      | `0.15`                          |
 | `htf_fvg_entry_weight`                            | `0.46`                          |
-| `one_minute_fvg_entry_weight`                     | `0.28`                          |
+| `ltf_fvg_entry_weight`                     | `0.28`                          |
 | `opposing_fvg_entry_penalty_mult`                 | `1.0`                           |
 | `fvg_runner_rr_bonus`                             | `0.2`                           |
 | `adaptive_breakeven_rr`                           | `0.88`                          |
@@ -1173,7 +1171,7 @@ Current package defaults:
 | `strong_trend_runner_enabled`                     | `True`                          |
 | `strong_trend_target_rr`                          | `2.35`                          |
 | `htf_fvg_entry_weight`                            | `0.52`                          |
-| `one_minute_fvg_entry_weight`                     | `0.32`                          |
+| `ltf_fvg_entry_weight`                     | `0.32`                          |
 | `opposing_fvg_entry_penalty_mult`                 | `1.0`                           |
 | `fvg_runner_rr_bonus`                             | `0.24`                          |
 | `adaptive_breakeven_rr`                           | `0.95`                          |
@@ -1262,7 +1260,7 @@ Current package defaults:
 | `anti_chase_fvg_retest_min_close_position`        | `0.66`                          |
 | `anti_chase_fvg_retest_stop_buffer_gap_frac`      | `0.14`                          |
 | `htf_fvg_entry_weight`                            | `0.44`                          |
-| `one_minute_fvg_entry_weight`                     | `0.24`                          |
+| `ltf_fvg_entry_weight`                     | `0.24`                          |
 | `opposing_fvg_entry_penalty_mult`                 | `1.0`                           |
 | `fvg_runner_rr_bonus`                             | `0.16`                          |
 | `adaptive_breakeven_rr`                           | `0.9`                           |
@@ -1306,7 +1304,7 @@ Current package defaults:
 | `min_reversal_close_position`     | `0.58`                          |
 | `require_positive_reversal_ret5`  | `True`                          |
 | `htf_fvg_entry_weight`            | `0.34`                          |
-| `one_minute_fvg_entry_weight`     | `0.2`                           |
+| `ltf_fvg_entry_weight`     | `0.2`                           |
 | `opposing_fvg_entry_penalty_mult` | `0.88`                          |
 | `fvg_runner_rr_bonus`             | `0.12`                          |
 | `adaptive_breakeven_rr`           | `0.72`                          |
@@ -1349,7 +1347,7 @@ Current package defaults:
 | `min_reversal_close_position`     | `0.6`                           |
 | `require_positive_reversal_ret5`  | `True`                          |
 | `htf_fvg_entry_weight`            | `0.38`                          |
-| `one_minute_fvg_entry_weight`     | `0.24`                          |
+| `ltf_fvg_entry_weight`     | `0.24`                          |
 | `opposing_fvg_entry_penalty_mult` | `0.88`                          |
 | `fvg_runner_rr_bonus`             | `0.12`                          |
 | `adaptive_breakeven_rr`           | `0.72`                          |
@@ -1399,7 +1397,7 @@ Current package defaults:
 | `max_entry_lower_wick_frac`       | `0.3`                           |
 | `entry_wick_close_position_guard` | `0.62`                          |
 | `htf_fvg_entry_weight`            | `0.28`                          |
-| `one_minute_fvg_entry_weight`     | `0.16`                          |
+| `ltf_fvg_entry_weight`     | `0.16`                          |
 | `opposing_fvg_entry_penalty_mult` | `0.95`                          |
 | `fvg_runner_rr_bonus`             | `0.1`                           |
 | `adaptive_breakeven_rr`           | `0.86`                          |
@@ -1460,7 +1458,7 @@ Current package defaults:
 | `anti_chase_fvg_retest_min_close_position`        | `0.66`                          |
 | `anti_chase_fvg_retest_stop_buffer_gap_frac`      | `0.15`                          |
 | `htf_fvg_entry_weight`                            | `0.46`                          |
-| `one_minute_fvg_entry_weight`                     | `0.28`                          |
+| `ltf_fvg_entry_weight`                     | `0.28`                          |
 | `opposing_fvg_entry_penalty_mult`                 | `1.0`                           |
 | `fvg_runner_rr_bonus`                             | `0.2`                           |
 | `adaptive_breakeven_rr`                           | `0.86`                          |
@@ -1485,14 +1483,14 @@ Strategy-specific knobs:
 
 - Universe and HTF map:
   - `tradable`, `peers`
-  - `htf_timeframe_minutes`, `htf_lookback_days`, `htf_refresh_seconds`, `htf_pivot_span`, `htf_max_levels_per_side`, `htf_atr_tolerance_mult`, `htf_pct_tolerance`, `htf_stop_buffer_atr_mult`, `htf_ema_fast_span`, `htf_ema_slow_span`
+  - `htf_minutes`, `htf_lookback_days`, `htf_pivot_span`, `htf_max_levels_per_side`, `htf_atr_tolerance_mult`, `htf_pct_tolerance`, `htf_stop_buffer_atr_mult`, `htf_ema_fast_span`, `htf_ema_slow_span`
 - Trigger frame and warmup:
-  - `trigger_timeframe_minutes`, `min_bars`, `min_trigger_bars`
+  - `ltf_minutes`, `min_bars`, `min_ltf_bars`
 - Continuation scoring and pullback quality:
-  - `min_total_score`, `min_trigger_score`, `min_adx14`
+  - `min_total_score`, `min_ltf_score`, `min_adx14`
   - `min_pullback_bars`, `max_pullback_bars`, `max_pullback_depth_atr`, `pullback_hold_atr`, `max_countertrend_volume_ratio`
 - Re-expansion trigger detail:
-  - `breakout_buffer_pct`, `min_trigger_close_position`, `min_trigger_volume_ratio`
+  - `breakout_buffer_pct`, `min_ltf_close_position`, `min_ltf_volume_ratio`
 - Anti-chase / extension controls:
   - `max_extension_from_vwap_atr`, `max_extension_from_ema9_atr`
 - Peer and macro confirmation:
@@ -1502,7 +1500,7 @@ Strategy-specific knobs:
   - `min_rr`, `target_rr`, `runner_target_rr`, `stop_buffer_atr_mult`
   - `strong_setup_runner_enabled`, `adaptive_breakeven_rr`, `adaptive_profit_lock_rr`, `adaptive_profit_lock_stop_rr`, `adaptive_runner_trigger_rr`
 - Context overlays:
-  - `htf_fvg_entry_weight`, `one_minute_fvg_entry_weight`, `opposing_fvg_entry_penalty_mult`, `fvg_runner_rr_bonus`
+  - `htf_fvg_entry_weight`, `ltf_fvg_entry_weight`, `opposing_fvg_entry_penalty_mult`, `fvg_runner_rr_bonus`
   - `use_sr_veto` (disabled by default so the strategy does not hard-block on S/R proximity)
 
 Also uses these shared stock groups:
@@ -1517,12 +1515,11 @@ Current package defaults:
 |-----------------------------------|-------------------------------------------|
 | `tradable`                        | `['AAPL', 'NVDA', 'GOOG', 'AMD', 'INTC']` |
 | `peers`                           | `['QQQ', 'AVGO', 'MU', 'TSM']`            |
-| `trigger_timeframe_minutes`       | `5`                                       |
+| `ltf_minutes`       | `5`                                       |
 | `min_bars`                        | `85`                                      |
-| `min_trigger_bars`                | `18`                                      |
-| `htf_timeframe_minutes`           | `60`                                      |
+| `min_ltf_bars`                | `18`                                      |
+| `htf_minutes`           | `60`                                      |
 | `htf_lookback_days`               | `60`                                      |
-| `htf_refresh_seconds`             | `120`                                     |
 | `htf_pivot_span`                  | `2`                                       |
 | `htf_max_levels_per_side`         | `6`                                       |
 | `htf_atr_tolerance_mult`          | `0.35`                                    |
@@ -1538,7 +1535,7 @@ Current package defaults:
 | `bond_symbol`                     | `'TLT'`                                   |
 | `volatility_symbol`               | `'VIX'`                                   |
 | `min_total_score`                 | `5.5`                                     |
-| `min_trigger_score`               | `2.5`                                     |
+| `min_ltf_score`               | `2.5`                                     |
 | `min_adx14`                       | `13.5`                                    |
 | `max_pullback_bars`               | `6`                                       |
 | `min_pullback_bars`               | `2`                                       |
@@ -1546,8 +1543,8 @@ Current package defaults:
 | `pullback_hold_atr`               | `0.38`                                    |
 | `max_countertrend_volume_ratio`   | `1.28`                                    |
 | `breakout_buffer_pct`             | `0.0007`                                  |
-| `min_trigger_close_position`      | `0.58`                                    |
-| `min_trigger_volume_ratio`        | `1.02`                                    |
+| `min_ltf_close_position`      | `0.58`                                    |
+| `min_ltf_volume_ratio`        | `1.02`                                    |
 | `max_extension_from_vwap_atr`     | `1.05`                                    |
 | `max_extension_from_ema9_atr`     | `0.88`                                    |
 | `min_rr`                          | `1.8`                                     |
@@ -1560,7 +1557,7 @@ Current package defaults:
 | `adaptive_profit_lock_stop_rr`    | `0.34`                                    |
 | `adaptive_runner_trigger_rr`      | `1.12`                                    |
 | `htf_fvg_entry_weight`            | `0.34`                                    |
-| `one_minute_fvg_entry_weight`     | `0.16`                                    |
+| `ltf_fvg_entry_weight`     | `0.16`                                    |
 | `opposing_fvg_entry_penalty_mult` | `1.0`                                     |
 | `fvg_runner_rr_bonus`             | `0.12`                                    |
 | `use_sr_veto`                     | `False`                                   |
@@ -1585,13 +1582,13 @@ Strategy-specific knobs:
 
 - Universe and HTF map:
   - `tradable`, `peers`
-  - `htf_timeframe_minutes`, `htf_lookback_days`, `htf_refresh_seconds`, `htf_pivot_span`, `htf_max_levels_per_side`, `htf_atr_tolerance_mult`, `htf_pct_tolerance`, `htf_stop_buffer_atr_mult`, `htf_ema_fast_span`, `htf_ema_slow_span`
+  - `htf_minutes`, `htf_lookback_days`, `htf_pivot_span`, `htf_max_levels_per_side`, `htf_atr_tolerance_mult`, `htf_pct_tolerance`, `htf_stop_buffer_atr_mult`, `htf_ema_fast_span`, `htf_ema_slow_span`
 - Trigger frame and warmup:
-  - `trigger_timeframe_minutes`, `min_bars`, `min_trigger_bars`
+  - `ltf_minutes`, `min_bars`, `min_ltf_bars`
   - Stronger signals are prioritized lexicographically by trigger quality, level quality, peer confirmation, vote edge, and clearance before smaller additive bonuses are allowed to break ties.
 - Zone, score, and R:R:
-  - `zone_atr_mult`, `zone_pct`, `min_level_score`, `min_trigger_score`, `min_rr`, `stop_buffer_atr_mult`
-  - `trigger_quality_bonus_enabled`, `trigger_quality_max_bonus`, `trigger_reclaim_quality_bonus_cap`, `trigger_zone_interaction_bonus_cap`, `trigger_candle_quality_bonus_cap`, `trigger_volume_quality_bonus_cap`, `trigger_range_expansion_bonus_cap`
+  - `zone_atr_mult`, `zone_pct`, `min_level_score`, `min_ltf_score`, `min_rr`, `stop_buffer_atr_mult`
+  - `ltf_quality_bonus_enabled`, `ltf_quality_max_bonus`, `ltf_reclaim_quality_bonus_cap`, `ltf_zone_interaction_bonus_cap`, `ltf_candle_quality_bonus_cap`, `ltf_volume_quality_bonus_cap`, `ltf_range_expansion_bonus_cap`
 - Peer confirmation:
   - `min_peer_agreement`, `min_peer_score`
 - Macro confirmation:
@@ -1599,7 +1596,7 @@ Strategy-specific knobs:
 - Level scoring detail:
   - `level_round_number_tolerance_pct`
 - Strong-setup runner / ladder logic:
-  - `strong_setup_runner_enabled`, `strong_setup_min_trigger_score`, `strong_setup_min_level_score`, `strong_setup_min_peer_score`, `strong_setup_min_hourly_vote_edge`, `strong_setup_target_level_offset`
+  - `strong_setup_runner_enabled`, `strong_setup_min_ltf_score`, `strong_setup_min_level_score`, `strong_setup_min_peer_score`, `strong_setup_min_htf_vote_edge`, `strong_setup_target_level_offset`
   - When `risk.trade_management_mode: adaptive_ladder` is active, this strategy stores rung metadata at entry and promotes targets one rung at a time while ratcheting stops behind defended S/R levels/zones. Non-ladder strategies safely fall back to adaptive management.
 
 Also uses these shared stock groups:
@@ -1614,9 +1611,8 @@ Current package defaults:
 |--------------------------------------|-------------------------------------------|
 | `tradable`                           | `['AAPL', 'NVDA', 'GOOG', 'AMD', 'INTC']` |
 | `peers`                              | `['QQQ', 'AVGO', 'MU', 'TSM']`            |
-| `htf_timeframe_minutes`              | `60`                                      |
+| `htf_minutes`              | `60`                                      |
 | `htf_lookback_days`                  | `60`                                      |
-| `htf_refresh_seconds`                | `120`                                     |
 | `htf_pivot_span`                     | `2`                                       |
 | `htf_max_levels_per_side`            | `6`                                       |
 | `htf_atr_tolerance_mult`             | `0.35`                                    |
@@ -1624,20 +1620,20 @@ Current package defaults:
 | `htf_stop_buffer_atr_mult`           | `0.25`                                    |
 | `htf_ema_fast_span`                  | `34`                                      |
 | `htf_ema_slow_span`                  | `200`                                     |
-| `trigger_timeframe_minutes`          | `5`                                       |
+| `ltf_minutes`          | `5`                                       |
 | `min_bars`                           | `80`                                      |
-| `min_trigger_bars`                   | `18`                                      |
+| `min_ltf_bars`                   | `18`                                      |
 | `zone_atr_mult`                      | `0.22`                                    |
 | `zone_pct`                           | `0.0016`                                  |
 | `min_level_score`                    | `2.9`                                     |
-| `min_trigger_score`                  | `2.5`                                     |
-| `trigger_quality_bonus_enabled`      | `True`                                    |
-| `trigger_quality_max_bonus`          | `2.0`                                     |
-| `trigger_reclaim_quality_bonus_cap`  | `0.8`                                     |
-| `trigger_zone_interaction_bonus_cap` | `0.5`                                     |
-| `trigger_candle_quality_bonus_cap`   | `0.5`                                     |
-| `trigger_volume_quality_bonus_cap`   | `0.4`                                     |
-| `trigger_range_expansion_bonus_cap`  | `0.4`                                     |
+| `min_ltf_score`                  | `2.5`                                     |
+| `ltf_quality_bonus_enabled`      | `True`                                    |
+| `ltf_quality_max_bonus`          | `2.0`                                     |
+| `ltf_reclaim_quality_bonus_cap`  | `0.8`                                     |
+| `ltf_zone_interaction_bonus_cap` | `0.5`                                     |
+| `ltf_candle_quality_bonus_cap`   | `0.5`                                     |
+| `ltf_volume_quality_bonus_cap`   | `0.4`                                     |
+| `ltf_range_expansion_bonus_cap`  | `0.4`                                     |
 | `min_rr`                             | `1.75`                                    |
 | `stop_buffer_atr_mult`               | `0.68`                                    |
 | `min_peer_agreement`                 | `2`                                       |
@@ -1649,14 +1645,14 @@ Current package defaults:
 | `volatility_symbol`                  | `'VIX'`                                   |
 | `level_round_number_tolerance_pct`   | `0.002`                                   |
 | `strong_setup_runner_enabled`        | `True`                                    |
-| `strong_setup_min_trigger_score`     | `3.2`                                     |
+| `strong_setup_min_ltf_score`     | `3.2`                                     |
 | `strong_setup_min_level_score`       | `3.4`                                     |
 | `strong_setup_min_peer_score`        | `2`                                       |
-| `strong_setup_min_hourly_vote_edge`  | `1`                                       |
+| `strong_setup_min_htf_vote_edge`  | `1`                                       |
 | `strong_setup_target_level_offset`   | `1`                                       |
 | `activity_score_weight`              | `0.11`                                    |
 | `htf_fvg_entry_weight`               | `0.36`                                    |
-| `one_minute_fvg_entry_weight`        | `0.2`                                     |
+| `ltf_fvg_entry_weight`        | `0.2`                                     |
 | `opposing_fvg_entry_penalty_mult`    | `1.0`                                     |
 | `fvg_runner_rr_bonus`                | `0.14`                                    |
 | `adaptive_breakeven_rr`              | `0.9`                                     |
@@ -1677,12 +1673,12 @@ Default windows:
 
 Key differences vs the 5-minute base strategy:
 
-- `trigger_timeframe_minutes: 1`
-- deeper trigger warmup with `min_bars: 90` and `min_trigger_bars: 45`
+- `ltf_minutes: 1`
+- deeper trigger warmup with `min_bars: 90` and `min_ltf_bars: 45`
 - compromise 1-minute gates that are still faster than the 5-minute base but no longer use the older aggressive thresholds: `min_level_score: 2.5`, `min_rr: 1.6`, `min_peer_agreement: 2`, `min_peer_score: 2`
 - tighter trigger-zone sizing and slightly faster adaptive management to suit 1-minute execution while keeping confirmation more balanced
 - heavier weighting on one-minute FVG participation while still retaining the hourly map and macro confirmation checks
-- inherits the base strategy's capped trigger-quality bonus layer so clean 1-minute reclaims / rejects can outrank weaker touches without raising `min_trigger_score`
+- inherits the base strategy's capped trigger-quality bonus layer so clean 1-minute reclaims / rejects can outrank weaker touches without raising `min_ltf_score`
 
 Use `configs/config.peer_confirmed_key_levels_1m.yaml` for the shipped full preset.
 
@@ -1692,9 +1688,8 @@ Current package defaults:
 |--------------------------------------|-------------------------------------------|
 | `tradable`                           | `['AAPL', 'NVDA', 'GOOG', 'AMD', 'INTC']` |
 | `peers`                              | `['QQQ', 'AVGO', 'MU', 'TSM']`            |
-| `htf_timeframe_minutes`              | `60`                                      |
+| `htf_minutes`              | `60`                                      |
 | `htf_lookback_days`                  | `60`                                      |
-| `htf_refresh_seconds`                | `120`                                     |
 | `htf_pivot_span`                     | `2`                                       |
 | `htf_max_levels_per_side`            | `6`                                       |
 | `htf_atr_tolerance_mult`             | `0.35`                                    |
@@ -1702,20 +1697,20 @@ Current package defaults:
 | `htf_stop_buffer_atr_mult`           | `0.25`                                    |
 | `htf_ema_fast_span`                  | `34`                                      |
 | `htf_ema_slow_span`                  | `200`                                     |
-| `trigger_timeframe_minutes`          | `1`                                       |
+| `ltf_minutes`          | `1`                                       |
 | `min_bars`                           | `100`                                     |
-| `min_trigger_bars`                   | `55`                                      |
+| `min_ltf_bars`                   | `55`                                      |
 | `zone_atr_mult`                      | `0.17`                                    |
 | `zone_pct`                           | `0.0013`                                  |
 | `min_level_score`                    | `2.5`                                     |
-| `min_trigger_score`                  | `2.4`                                     |
-| `trigger_quality_bonus_enabled`      | `True`                                    |
-| `trigger_quality_max_bonus`          | `2.0`                                     |
-| `trigger_reclaim_quality_bonus_cap`  | `0.8`                                     |
-| `trigger_zone_interaction_bonus_cap` | `0.5`                                     |
-| `trigger_candle_quality_bonus_cap`   | `0.5`                                     |
-| `trigger_volume_quality_bonus_cap`   | `0.4`                                     |
-| `trigger_range_expansion_bonus_cap`  | `0.4`                                     |
+| `min_ltf_score`                  | `2.4`                                     |
+| `ltf_quality_bonus_enabled`      | `True`                                    |
+| `ltf_quality_max_bonus`          | `2.0`                                     |
+| `ltf_reclaim_quality_bonus_cap`  | `0.8`                                     |
+| `ltf_zone_interaction_bonus_cap` | `0.5`                                     |
+| `ltf_candle_quality_bonus_cap`   | `0.5`                                     |
+| `ltf_volume_quality_bonus_cap`   | `0.4`                                     |
+| `ltf_range_expansion_bonus_cap`  | `0.4`                                     |
 | `min_rr`                             | `1.6`                                     |
 | `stop_buffer_atr_mult`               | `0.56`                                    |
 | `min_peer_agreement`                 | `2`                                       |
@@ -1727,14 +1722,14 @@ Current package defaults:
 | `volatility_symbol`                  | `'VIX'`                                   |
 | `level_round_number_tolerance_pct`   | `0.002`                                   |
 | `strong_setup_runner_enabled`        | `True`                                    |
-| `strong_setup_min_trigger_score`     | `3.0`                                     |
+| `strong_setup_min_ltf_score`     | `3.0`                                     |
 | `strong_setup_min_level_score`       | `3.0`                                     |
 | `strong_setup_min_peer_score`        | `2`                                       |
-| `strong_setup_min_hourly_vote_edge`  | `1`                                       |
+| `strong_setup_min_htf_vote_edge`  | `1`                                       |
 | `strong_setup_target_level_offset`   | `1`                                       |
 | `activity_score_weight`              | `0.12`                                    |
 | `htf_fvg_entry_weight`               | `0.32`                                    |
-| `one_minute_fvg_entry_weight`        | `0.26`                                    |
+| `ltf_fvg_entry_weight`        | `0.26`                                    |
 | `opposing_fvg_entry_penalty_mult`    | `1.0`                                     |
 | `fvg_runner_rr_bonus`                | `0.14`                                    |
 | `adaptive_breakeven_rr`              | `0.82`                                    |
@@ -1757,13 +1752,13 @@ Strategy-specific knobs:
 
 - Universe and HTF pivot map:
   - `tradable`, `peers`
-  - `htf_timeframe_minutes`, `htf_lookback_days`, `htf_refresh_seconds`, `htf_pivot_span`, `htf_max_levels_per_side`, `htf_atr_tolerance_mult`, `htf_pct_tolerance`, `htf_stop_buffer_atr_mult`, `htf_ema_fast_span`, `htf_ema_slow_span`
+  - `htf_minutes`, `htf_lookback_days`, `htf_pivot_span`, `htf_max_levels_per_side`, `htf_atr_tolerance_mult`, `htf_pct_tolerance`, `htf_stop_buffer_atr_mult`, `htf_ema_fast_span`, `htf_ema_slow_span`
 - Trigger frame and warmup:
-  - `trigger_timeframe_minutes`, `min_bars`, `min_trigger_bars`
+  - `ltf_minutes`, `min_bars`, `min_ltf_bars`
 - Entry-family selection:
   - `entry_family` with `auto`, `pivot_reclaim`, `pivot_rejection`, and `pivot_continuation`
 - Regime / trigger scoring:
-  - `min_regime_score`, `min_trigger_score`, `min_total_score`, `min_peer_agreement`, `min_peer_score`
+  - `min_regime_score`, `min_ltf_score`, `min_total_score`, `min_peer_agreement`, `min_peer_score`
   - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`
 - Pivot-zone sizing and family detail:
   - `pivot_zone_atr_mult`, `pivot_zone_pct`
@@ -1771,7 +1766,7 @@ Strategy-specific knobs:
   - `pivot_rejection_min_wick_frac`, `pivot_rejection_allows_neutral_ltf_structure`
   - `pivot_continuation_breakout_buffer_pct`, `pivot_continuation_interaction_lookback_bars`, `pivot_continuation_max_distance_atr`
 - Trigger quality and anti-chase:
-  - `min_trigger_close_position`, `min_trigger_volume_ratio`, `min_adx14`
+  - `min_ltf_close_position`, `min_ltf_volume_ratio`, `min_adx14`
   - `max_reclaim_distance_from_pivot_atr`, `max_rejection_distance_from_pivot_atr`, `max_continuation_distance_from_pivot_atr`
   - `entry_exhaustion_filter_enabled`, `max_entry_vwap_extension_atr`, `max_entry_ema9_extension_atr`, `max_entry_bar_range_atr`, `max_entry_upper_wick_frac`, `max_entry_lower_wick_frac`
   - `use_sr_veto` (disabled by default so the strategy stays anchored to the HTF pivot model rather than generic S/R vetoes)
@@ -1779,7 +1774,7 @@ Strategy-specific knobs:
   - `min_rr`, `target_rr`, `runner_target_rr`, `stop_buffer_atr_mult`
   - `strong_setup_runner_enabled`, `adaptive_breakeven_rr`, `adaptive_profit_lock_rr`, `adaptive_profit_lock_stop_rr`, `adaptive_runner_trigger_rr`
 - Context overlays:
-  - `htf_fvg_entry_weight`, `one_minute_fvg_entry_weight`, `opposing_fvg_entry_penalty_mult`, `fvg_runner_rr_bonus`
+  - `htf_fvg_entry_weight`, `ltf_fvg_entry_weight`, `opposing_fvg_entry_penalty_mult`, `fvg_runner_rr_bonus`
 
 Also uses these shared stock groups:
 
@@ -1793,12 +1788,11 @@ Current package defaults:
 |------------------------------------------------|-------------------------------------------------|
 | `tradable`                                     | `['AAPL', 'NVDA', 'GOOG', 'AMD', 'INTC', 'MU']` |
 | `peers`                                        | `['QQQ', 'AVGO', 'TSM']`                        |
-| `trigger_timeframe_minutes`                    | `5`                                             |
+| `ltf_minutes`                    | `5`                                             |
 | `min_bars`                                     | `90`                                            |
-| `min_trigger_bars`                             | `20`                                            |
-| `htf_timeframe_minutes`                        | `60`                                            |
+| `min_ltf_bars`                             | `20`                                            |
+| `htf_minutes`                        | `60`                                            |
 | `htf_lookback_days`                            | `60`                                            |
-| `htf_refresh_seconds`                          | `120`                                           |
 | `htf_pivot_span`                               | `2`                                             |
 | `htf_max_levels_per_side`                      | `6`                                             |
 | `htf_atr_tolerance_mult`                       | `0.35`                                          |
@@ -1808,7 +1802,7 @@ Current package defaults:
 | `htf_ema_slow_span`                            | `200`                                           |
 | `entry_family`                                 | `'auto'`                                        |
 | `min_regime_score`                             | `4`                                             |
-| `min_trigger_score`                            | `2.5`                                           |
+| `min_ltf_score`                            | `2.5`                                           |
 | `min_total_score`                              | `5`                                             |
 | `min_peer_agreement`                           | `2`                                             |
 | `min_peer_score`                               | `2`                                             |
@@ -1827,8 +1821,8 @@ Current package defaults:
 | `pivot_continuation_breakout_buffer_pct`       | `0.0009`                                        |
 | `pivot_continuation_interaction_lookback_bars` | `9`                                             |
 | `pivot_continuation_max_distance_atr`          | `1.45`                                          |
-| `min_trigger_close_position`                   | `0.6`                                           |
-| `min_trigger_volume_ratio`                     | `1.0`                                           |
+| `min_ltf_close_position`                   | `0.6`                                           |
+| `min_ltf_volume_ratio`                     | `1.0`                                           |
 | `min_adx14`                                    | `12.5`                                          |
 | `max_reclaim_distance_from_pivot_atr`          | `0.9`                                           |
 | `max_rejection_distance_from_pivot_atr`        | `0.82`                                          |
@@ -1849,7 +1843,7 @@ Current package defaults:
 | `adaptive_profit_lock_stop_rr`                 | `0.32`                                          |
 | `adaptive_runner_trigger_rr`                   | `1.1`                                           |
 | `htf_fvg_entry_weight`                         | `0.28`                                          |
-| `one_minute_fvg_entry_weight`                  | `0.14`                                          |
+| `ltf_fvg_entry_weight`                  | `0.14`                                          |
 | `opposing_fvg_entry_penalty_mult`              | `1.0`                                           |
 | `fvg_runner_rr_bonus`                          | `0.1`                                           |
 | `activity_score_weight`                        | `0.1`                                           |
@@ -1898,9 +1892,9 @@ Current code defaults:
 | `index_symbols`                   | `SPY, QQQ`                                                                             |
 | `require_index_confirmation`      | `true`                                                                                 |
 | `min_bars`                        | `60`                                                                                   |
-| `trigger_timeframe_minutes`       | `5`                                                                                    |
-| `htf_timeframe_minutes`           | `15`                                                                                   |
-| `min_trigger_bars`                | `15`                                                                                   |
+| `ltf_minutes`       | `5`                                                                                    |
+| `htf_minutes`           | `15`                                                                                   |
+| `min_ltf_bars`                | `15`                                                                                   |
 | `min_trend_score`                 | `3.5`                                                                                  |
 | `min_pullback_score`              | `3.5`                                                                                  |
 | `min_pullback_trend_score`        | `3.0`                                                                                  |
@@ -1984,9 +1978,8 @@ Current package defaults:
 | `candle_mixed_penalty`        | `0.18`                  |
 | `use_htf_trend_confirmation`  | `True`                  |
 | `require_htf_alignment`       | `True`                  |
-| `htf_timeframe_minutes`       | `15`                    |
+| `htf_minutes`       | `15`                    |
 | `htf_lookback_days`           | `15`                    |
-| `htf_refresh_seconds`         | `120`                   |
 | `htf_min_bars`                | `20`                    |
 | `htf_vwap_distance_pct`       | `0.0009`                |
 | `htf_ema_gap_pct`             | `0.0007`                |
@@ -2064,9 +2057,8 @@ Current package defaults:
 | `candle_mixed_penalty`               | `0.18`                  |
 | `use_htf_trend_confirmation`         | `True`                  |
 | `require_htf_alignment`              | `True`                  |
-| `htf_timeframe_minutes`              | `15`                    |
+| `htf_minutes`              | `15`                    |
 | `htf_lookback_days`                  | `60`                    |
-| `htf_refresh_seconds`                | `120`                   |
 | `htf_min_bars`                       | `20`                    |
 | `htf_vwap_distance_pct`              | `0.0009`                |
 | `htf_ema_gap_pct`                    | `0.0007`                |

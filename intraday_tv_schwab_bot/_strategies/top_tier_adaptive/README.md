@@ -235,7 +235,7 @@ The shipped preset (`configs/config.top_tier_adaptive.yaml`) uses moderate risk 
 
 - **Best start time**: 09:20-09:25 ET — gives time for history backfill and SPY/QQQ data before open.
 - **Minimum practical start**: before 09:30 ET — the screener window opens at 09:30.
-- The ORB regime window opens at 09:35, but practical entries begin once `min_bars` (90 one-minute bars) and `min_trigger_bars` (15 five-minute bars) are met from the loaded history. With `required_bars: 90`, both gates clear on cold start from the prior session's data.
+- The ORB regime window opens at 09:35, but practical entries begin once `min_bars` (90 one-minute bars) and `min_ltf_bars` (15 five-minute bars) are met from the loaded history. With `required_bars: 90`, both gates clear on cold start from the prior session's data.
 - With `runtime.auto_exit_after_session: true`, the bot shuts down cleanly after market close once all positions are flat. Designed for Windows Task Scheduler or cron to start the bot daily without manual shutdown.
 
 ## Shipped reference
@@ -305,9 +305,9 @@ Current code defaults:
 | `target_max_sr_ratio`                | `0.8`                                                                                                                         |
 | `reject_range_during_squeeze`        | `true`                                                                                                                        |
 | `min_bars`                           | `90`                                                                                                                          |
-| `trigger_timeframe_minutes`          | `5`                                                                                                                           |
-| `htf_timeframe_minutes`              | `15`                                                                                                                          |
-| `min_trigger_bars`                   | `15`                                                                                                                          |
+| `ltf_minutes`          | `5`                                                                                                                           |
+| `htf_minutes`              | `15`                                                                                                                          |
+| `min_ltf_bars`                   | `15`                                                                                                                          |
 | `min_trend_score`                    | `3.5`                                                                                                                         |
 | `min_pullback_score`                 | `3.5`                                                                                                                         |
 | `min_pullback_trend_score`           | `3.0`                                                                                                                         |
@@ -337,7 +337,7 @@ Current code defaults:
 | `max_entry_upper_wick_frac`          | `0.30`                                                                                                                        |
 | `max_entry_lower_wick_frac`          | `0.30`                                                                                                                        |
 | `htf_fvg_entry_weight`               | `0.30`                                                                                                                        |
-| `one_minute_fvg_entry_weight`        | `0.18`                                                                                                                        |
+| `ltf_fvg_entry_weight`        | `0.18`                                                                                                                        |
 | `opposing_fvg_entry_penalty_mult`    | `1.0`                                                                                                                         |
 | `fvg_runner_rr_bonus`                | `0.15`                                                                                                                        |
 | `activity_score_weight`              | `0.12`                                                                                                                        |

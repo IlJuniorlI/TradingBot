@@ -33,7 +33,7 @@ class MomentumIntoCloseStrategy(BaseStrategy):
             day_strength = _safe_float(c.metadata.get("change_from_open"), 0.0)
             ctx = self._chart_context(frame)
             sr_ctx = self._sr_context(c.symbol, frame, data)
-            ms_ctx = self._structure_context(frame, "1m")
+            ms_ctx = self._structure_context(frame, "ltf")
             tech_ctx = self._technical_context(frame)
             pattern_ok = bool(ctx.matched_bullish_continuation or ctx.matched_bullish_reversal) or ctx.bias_score >= 0.0
             last_close = _safe_float(last["close"])

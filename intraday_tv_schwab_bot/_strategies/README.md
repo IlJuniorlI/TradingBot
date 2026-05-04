@@ -86,7 +86,7 @@ New plugins should use the standardized runtime field names below.
   - `selection_quality_score` — tie-break score when two signals have similar final priority.
   - `activity_score` — copied through from the candidate when useful for dashboards/logs.
   - `setup_quality_score` / `execution_quality_score` — optional decomposition fields for cleaner plugin design.
-  - `trigger_score`, `regime_score`, `directional_peer_score`, `peer_score`, `directional_vote_edge`, `runner_quality_score`, `execution_headroom_score`, `source_quality_score` — optional standardized ranking components. Prefer `directional_peer_score` for final ranking whenever a raw peer score must be interpreted differently for longs vs shorts.
+  - `ltf_score`, `regime_score`, `directional_peer_score`, `peer_score`, `directional_vote_edge`, `runner_quality_score`, `execution_headroom_score`, `source_quality_score` — optional standardized ranking components. Prefer `directional_peer_score` for final ranking whenever a raw peer score must be interpreted differently for longs vs shorts.
 
 The old `score`, `side_bias`, `signal_strength`, and `signal_priority_tiebreak` names are no longer part of the plugin contract.
 
@@ -105,7 +105,7 @@ Example capability block:
   },
   "signal_priority": {
     "metadata_fields": [
-      "trigger_score",
+      "ltf_score",
       "regime_score",
       "directional_peer_score",
       "selection_quality_score"

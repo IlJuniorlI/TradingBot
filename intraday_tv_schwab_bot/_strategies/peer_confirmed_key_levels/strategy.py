@@ -34,9 +34,9 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         if capability_bars is not None:
             return capability_bars
         min_bars = int(self.params.get("min_bars", 80))
-        trigger_tf = max(1, int(self.params.get("trigger_timeframe_minutes", 5)))
-        min_trigger_bars = int(self.params.get("min_trigger_bars", 18))
-        return max(min_bars, trigger_tf * min_trigger_bars)
+        ltf_min = max(1, int(self.params.get("ltf_minutes", 5)))
+        min_ltf_bars = int(self.params.get("min_ltf_bars", 18))
+        return max(min_bars, ltf_min * min_ltf_bars)
 
     @classmethod
     def normalize_params(cls, params: dict[str, Any]) -> dict[str, Any]:
@@ -112,9 +112,8 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                     current_price=close,
                     flip_frame=frame,
                     mode="trading",
-                    timeframe_minutes=int(self.params.get("htf_timeframe_minutes", 60)),
+                    timeframe_minutes=int(self.params.get("htf_minutes", 60)),
                     lookback_days=int(self.params.get("htf_lookback_days", 60)),
-                    refresh_seconds=int(self.params.get("htf_refresh_seconds", 120)),
                     use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
                     use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
                     allow_refresh=True,
@@ -173,7 +172,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         return self._clamp_weight(self.params.get("level_score_raw_htf_weight", 0.65), 0.60)
 
     @staticmethod
-    def _hourly_bias(htf: HTFContext, close: float) -> tuple[str, int, int]:
+    def _htf_bias(htf: HTFContext, close: float) -> tuple[str, int, int]:
         bull = 0
         bear = 0
         ema_fast = _optional_float(getattr(htf, "ema_fast", None))
@@ -197,7 +196,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
 
     def _peer_signal(self, symbol: str, bars: dict[str, pd.DataFrame], data) -> dict[str, Any]:
         universe = self._confirmation_universe()
-        tf = int(self.params.get("htf_timeframe_minutes", 60))
+        tf = int(self.params.get("htf_minutes", 60))
         lookback_days = int(self.params.get("htf_lookback_days", 60))
         pivot_span = int(self.params.get("htf_pivot_span", 2))
         max_lvls = int(self.params.get("htf_max_levels_per_side", 6))
@@ -206,7 +205,6 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         stop_atr = float(self.params.get("htf_stop_buffer_atr_mult", 0.25))
         ema_fast_span = int(self.params.get("htf_ema_fast_span", 50))
         ema_slow_span = int(self.params.get("htf_ema_slow_span", 200))
-        refresh_seconds = int(self.params.get("htf_refresh_seconds", 120))
         score = 0
         bullish = 0
         bearish = 0
@@ -219,7 +217,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 details[peer] = "missing"
                 continue
             close = _safe_float(frame.iloc[-1]["close"])
-            ltf = self._resampled_frame(frame, int(self.params.get("trigger_timeframe_minutes", 5)), symbol=peer, data=data)
+            ltf = self._resampled_frame(frame, int(self.params.get("ltf_minutes", 5)), symbol=peer, data=data)
             htf = self._htf_context(
                 peer,
                 data,
@@ -232,7 +230,6 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 stop_buffer_atr_mult=stop_atr,
                 ema_fast_span=ema_fast_span,
                 ema_slow_span=ema_slow_span,
-                refresh_seconds=refresh_seconds,
                 current_price=close,
                 use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
                 use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
@@ -279,7 +276,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         details: dict[str, str] = {}
         long_agree = 0
         short_agree = 0
-        trigger_tf = int(self.params.get("trigger_timeframe_minutes", 5))
+        ltf_min = int(self.params.get("ltf_minutes", 5))
         for key, bullish_when_up in (("dollar_symbol", False), ("bond_symbol", True), ("volatility_symbol", False)):
             symbol = str(self.params.get(key, "")).upper().strip()
             if not symbol:
@@ -288,7 +285,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             if frame is None or frame.empty:
                 details[key] = "missing"
                 continue
-            macro = self._resampled_frame(frame, trigger_tf, symbol=symbol, data=data)
+            macro = self._resampled_frame(frame, ltf_min, symbol=symbol, data=data)
             if macro is None or macro.empty:
                 details[key] = "missing"
                 continue
@@ -548,17 +545,17 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         level_price = float(candidate.get("price", 0.0) or 0.0)
         zone_width = float(candidate.get("zone_width", 0.0) or 0.0)
         source_priority = float(candidate.get("source_priority", self._peer_level_source_priority(str(candidate.get("kind") or ""))) or 0.0)
-        trigger_preview = float(self._trigger_score(side, ltf, level_price, zone_width).get("score", 0.0) or 0.0)
+        ltf_preview = float(self._ltf_score(side, ltf, level_price, zone_width).get("score", 0.0) or 0.0)
         distance = abs(float(close) - level_price)
         distance_atr = distance / max(float(atr), 1e-9)
         selection_score = (
             float(candidate.get("level_score", 0.0) or 0.0)
-            + (float(trigger_preview) * 0.85)
+            + (float(ltf_preview) * 0.85)
             + (source_priority * 0.45)
             - (min(distance_atr, 2.5) * 0.10)
         )
         return {
-            "selection_trigger_score": float(trigger_preview),
+            "selection_ltf_score": float(ltf_preview),
             "selection_source_priority": source_priority,
             "selection_distance_atr": float(distance_atr),
             "selection_score": float(selection_score),
@@ -570,7 +567,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
     @staticmethod
     def _level_selection_priority_key(payload: dict[str, Any]) -> tuple[float, float, float, float, float]:
         return (
-            float(payload.get("selection_trigger_score", 0.0) or 0.0),
+            float(payload.get("selection_ltf_score", 0.0) or 0.0),
             float(payload.get("level_score", 0.0) or 0.0),
             float(payload.get("selection_source_priority", payload.get("source_priority", 0.0)) or 0.0),
             -float(payload.get("selection_distance_atr", float("inf")) or float("inf")),
@@ -609,7 +606,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 best = payload
         return best
 
-    def _configured_trigger_candle_summary(self, side: Side, ltf: pd.DataFrame) -> dict[str, Any]:
+    def _configured_ltf_candle_summary(self, side: Side, ltf: pd.DataFrame) -> dict[str, Any]:
         # _directional_candle_signal slices internally to CANDLE_CONTEXT_BARS
         # so TA-Lib has enough context — pass the full ltf frame.
         frame = ltf if ltf is not None and not ltf.empty else pd.DataFrame()
@@ -617,24 +614,24 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         summary["matches"] = set(summary.get("matches", []))
         return summary
 
-    def _configured_trigger_candle_match(self, side: Side, ltf: pd.DataFrame) -> bool:
-        return bool(self._configured_trigger_candle_summary(side, ltf).get("confirmed"))
+    def _configured_ltf_candle_match(self, side: Side, ltf: pd.DataFrame) -> bool:
+        return bool(self._configured_ltf_candle_summary(side, ltf).get("confirmed"))
 
     @staticmethod
     def _clamp01(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
 
-    def _trigger_quality_caps(self) -> dict[str, float]:
+    def _ltf_quality_caps(self) -> dict[str, float]:
         return {
-            "reclaim_reject": max(0.0, float(self.params.get("trigger_reclaim_quality_bonus_cap", 0.80))),
-            "zone_interaction": max(0.0, float(self.params.get("trigger_zone_interaction_bonus_cap", 0.50))),
-            "candle_quality": max(0.0, float(self.params.get("trigger_candle_quality_bonus_cap", 0.50))),
-            "volume_quality": max(0.0, float(self.params.get("trigger_volume_quality_bonus_cap", 0.40))),
-            "range_expansion": max(0.0, float(self.params.get("trigger_range_expansion_bonus_cap", 0.40))),
-            "max_total": max(0.0, float(self.params.get("trigger_quality_max_bonus", 2.00))),
+            "reclaim_reject": max(0.0, float(self.params.get("ltf_reclaim_quality_bonus_cap", 0.80))),
+            "zone_interaction": max(0.0, float(self.params.get("ltf_zone_interaction_bonus_cap", 0.50))),
+            "candle_quality": max(0.0, float(self.params.get("ltf_candle_quality_bonus_cap", 0.50))),
+            "volume_quality": max(0.0, float(self.params.get("ltf_volume_quality_bonus_cap", 0.40))),
+            "range_expansion": max(0.0, float(self.params.get("ltf_range_expansion_bonus_cap", 0.40))),
+            "max_total": max(0.0, float(self.params.get("ltf_quality_max_bonus", 2.00))),
         }
 
-    def _trigger_quality_bonus(
+    def _ltf_quality_bonus(
         self,
         side: Side,
         ltf: pd.DataFrame,
@@ -647,7 +644,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         reaction_confirmed: bool,
         sweep: bool,
     ) -> dict[str, Any]:
-        if not bool(self.params.get("trigger_quality_bonus_enabled", True)):
+        if not bool(self.params.get("ltf_quality_bonus_enabled", True)):
             return {"quality_bonus": 0.0, "quality_reasons": [], "quality_breakdown": {}}
         if ltf is None or ltf.empty:
             return {"quality_bonus": 0.0, "quality_reasons": [], "quality_breakdown": {}}
@@ -666,7 +663,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         avg_range = max(avg_range, atr * 0.35, 1e-9)
         range_ratio = float(bar_range) / avg_range if avg_range > 0 else 0.0
         zone_scale = max(float(zone_width), atr * 0.15, abs(float(level_price)) * 0.0005, 1e-6)
-        caps = self._trigger_quality_caps()
+        caps = self._ltf_quality_caps()
         components: dict[str, float] = {}
         sweep_window = ltf.tail(4)
 
@@ -732,7 +729,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             "quality_breakdown": rounded_breakdown,
         }
 
-    def _trigger_score(self, side: Side, ltf: pd.DataFrame, level_price: float, zone_width: float) -> dict[str, Any]:
+    def _ltf_score(self, side: Side, ltf: pd.DataFrame, level_price: float, zone_width: float) -> dict[str, Any]:
         if ltf is None or len(ltf) < 5:
             return {"score": 0.0, "base_score": 0.0, "quality_bonus": 0.0, "reasons": [], "quality_reasons": [], "quality_breakdown": {}}
         last = ltf.iloc[-1]
@@ -752,8 +749,8 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         strong_body = body > max(0.01, float(avg_body) * 1.2)
         reasons: list[str] = []
         base_score = 0.0
-        trigger_sweep_window = ltf.tail(4)
-        pattern_summary = self._configured_trigger_candle_summary(side, ltf)
+        ltf_sweep_window = ltf.tail(4)
+        pattern_summary = self._configured_ltf_candle_summary(side, ltf)
         candle_score = float(pattern_summary.get("score", 0.0) or 0.0)
         candle_net_score = float(pattern_summary.get("net_score", 0.0) or 0.0)
         anchor_bars = int(pattern_summary.get("anchor_bars", 0) or 0)
@@ -762,7 +759,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         if side == Side.LONG:
             choch = float(last["close"]) > float(prev3["high"].max()) if not prev3.empty else False
             reclaim = float(last["close"]) >= float(level_price)
-            sweep = float(trigger_sweep_window["low"].min()) <= float(level_price) + zone_width if "low" in trigger_sweep_window.columns else False
+            sweep = float(ltf_sweep_window["low"].min()) <= float(level_price) + zone_width if "low" in ltf_sweep_window.columns else False
             bullish_body = float(last["close"]) > float(last["open"]) and strong_body
             reaction_confirmed = bool(reclaim and sweep)
             candle_tier = str(pattern_summary.get("confirm_tier", "none") or "none")
@@ -787,7 +784,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         else:
             choch = float(last["close"]) < float(prev3["low"].min()) if not prev3.empty else False
             reject = float(last["close"]) <= float(level_price)
-            sweep = float(trigger_sweep_window["high"].max()) >= float(level_price) - zone_width if "high" in trigger_sweep_window.columns else False
+            sweep = float(ltf_sweep_window["high"].max()) >= float(level_price) - zone_width if "high" in ltf_sweep_window.columns else False
             bearish_body = float(last["close"]) < float(last["open"]) and strong_body
             reaction_confirmed = bool(reject and sweep)
             candle_tier = str(pattern_summary.get("confirm_tier", "none") or "none")
@@ -809,7 +806,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             if reaction_confirmed:
                 base_score += 1.0
                 reasons.append("sweep_reject")
-        quality = self._trigger_quality_bonus(
+        quality = self._ltf_quality_bonus(
             side,
             ltf,
             level_price=float(level_price),
@@ -828,13 +825,13 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             "reasons": reasons,
             "quality_reasons": list(quality.get("quality_reasons", [])),
             "quality_breakdown": dict(quality.get("quality_breakdown", {})),
-            "trigger_candle_matches": sorted(pattern_summary.get("matches", set())),
-            "trigger_candle_anchor_pattern": anchor_pattern,
-            "trigger_candle_anchor_bars": int(anchor_bars),
-            "trigger_candle_score": round(float(candle_score), 4),
-            "trigger_candle_net_score": round(float(candle_net_score), 4),
-            "trigger_candle_opposite_score": round(float(pattern_summary.get("opposite_score", 0.0) or 0.0), 4),
-            "trigger_candle_regime_hint": str(pattern_summary.get("regime_hint", "neutral") or "neutral"),
+            "ltf_candle_matches": sorted(pattern_summary.get("matches", set())),
+            "ltf_candle_anchor_pattern": anchor_pattern,
+            "ltf_candle_anchor_bars": int(anchor_bars),
+            "ltf_candle_score": round(float(candle_score), 4),
+            "ltf_candle_net_score": round(float(candle_net_score), 4),
+            "ltf_candle_opposite_score": round(float(pattern_summary.get("opposite_score", 0.0) or 0.0), 4),
+            "ltf_candle_regime_hint": str(pattern_summary.get("regime_hint", "neutral") or "neutral"),
         }
 
     def _sorted_target_levels(self, side: Side, close: float, htf: HTFContext) -> list[dict[str, Any]]:
@@ -940,22 +937,22 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         # Cheap directional gates run BEFORE expensive trigger scoring so that
         # symbols mis-sided against the hourly/peer/macro tape short-circuit out
         # instead of burning candle-pattern + quality-bonus compute and then
-        # logging a misleading ``trigger_score_below_min:0.0000`` reason.
-        bias, bull_votes, bear_votes = self._hourly_bias(htf, close)
-        require_hourly_alignment = bool(self.params.get("require_hourly_bias_alignment", True))
+        # logging a misleading ``ltf_score_below_min:0.0000`` reason.
+        bias, bull_votes, bear_votes = self._htf_bias(htf, close)
+        require_htf_alignment = bool(self.params.get("require_htf_bias_alignment", True))
         if side == Side.LONG:
             if bias == "bearish":
-                self._set_build_failure(c.symbol, failure_style, "hourly_bias_bearish")
+                self._set_build_failure(c.symbol, failure_style, "htf_bias_bearish")
                 return None
-            if require_hourly_alignment and bias != "bullish":
-                self._set_build_failure(c.symbol, failure_style, f"hourly_bias_not_bullish:{bias}({bull_votes}v{bear_votes})")
+            if require_htf_alignment and bias != "bullish":
+                self._set_build_failure(c.symbol, failure_style, f"htf_bias_not_bullish:{bias}({bull_votes}v{bear_votes})")
                 return None
         if side == Side.SHORT:
             if bias == "bullish":
-                self._set_build_failure(c.symbol, failure_style, "hourly_bias_bullish")
+                self._set_build_failure(c.symbol, failure_style, "htf_bias_bullish")
                 return None
-            if require_hourly_alignment and bias != "bearish":
-                self._set_build_failure(c.symbol, failure_style, f"hourly_bias_not_bearish:{bias}({bull_votes}v{bear_votes})")
+            if require_htf_alignment and bias != "bearish":
+                self._set_build_failure(c.symbol, failure_style, f"htf_bias_not_bearish:{bias}({bull_votes}v{bear_votes})")
                 return None
         peer_score = int(peer_ctx.get("score", 0))
         min_peer_score = _discrete_score_threshold(self.params.get("min_peer_score", 2), 2, minimum=0)
@@ -989,11 +986,11 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                     return None
         # Expensive trigger-score compute (candle patterns + quality bonus).
         # Only runs after the cheap directional gates above have accepted.
-        trigger = self._trigger_score(side, ltf, float(level["price"]), float(level["zone_width"]))
-        trigger_min_score = max(0.0, float(self.params.get("min_trigger_score", 2.5)))
-        trigger_score = float(trigger.get("score", 0.0) or 0.0)
-        if trigger_score < trigger_min_score:
-            self._set_build_failure(c.symbol, failure_style, f"trigger_score_below_min:{trigger_score:.4f}<{trigger_min_score:.4f}")
+        trigger = self._ltf_score(side, ltf, float(level["price"]), float(level["zone_width"]))
+        ltf_min_score = max(0.0, float(self.params.get("min_ltf_score", 2.5)))
+        ltf_score = float(trigger.get("score", 0.0) or 0.0)
+        if ltf_score < ltf_min_score:
+            self._set_build_failure(c.symbol, failure_style, f"ltf_score_below_min:{ltf_score:.4f}<{ltf_min_score:.4f}")
             return None
         last5 = ltf.iloc[-1]
         atr = _safe_float(last5.get("atr14"), _optional_float(getattr(htf, "atr14", None)) or max(close * 0.0015, 0.01))
@@ -1025,9 +1022,9 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         target = float(qualifying_target_levels[target_selection_index]["price"])
         strong_vote_edge = (bull_votes - bear_votes) if side == Side.LONG else (bear_votes - bull_votes)
         directional_peer_score = peer_score if side == Side.LONG else -peer_score
-        strong_setup_trigger_min = max(0.0, float(self.params.get("strong_setup_min_trigger_score", 3.2)))
+        strong_setup_trigger_min = max(0.0, float(self.params.get("strong_setup_min_ltf_score", 3.2)))
         strong_setup_peer_min = _discrete_score_threshold(self.params.get("strong_setup_min_peer_score", 2), 3, minimum=0)
-        strong_setup = bool(self.params.get("strong_setup_runner_enabled", True)) and trigger_score >= strong_setup_trigger_min and float(level["level_score"]) >= float(self.params.get("strong_setup_min_level_score", 3.4)) and abs(peer_score) >= strong_setup_peer_min and strong_vote_edge >= int(self.params.get("strong_setup_min_hourly_vote_edge", 1))
+        strong_setup = bool(self.params.get("strong_setup_runner_enabled", True)) and ltf_score >= strong_setup_trigger_min and float(level["level_score"]) >= float(self.params.get("strong_setup_min_level_score", 3.4)) and abs(peer_score) >= strong_setup_peer_min and strong_vote_edge >= int(self.params.get("strong_setup_min_htf_vote_edge", 1))
         target_offset = max(0, int(self.params.get("strong_setup_target_level_offset", 1)))
         if strong_setup and len(qualifying_target_levels) > target_offset:
             target_selection_index = int(target_offset)
@@ -1038,9 +1035,9 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         macro_agreement_count = long_agree if side == Side.LONG else short_agree
         source_priority = float(level.get("source_priority", self._peer_level_source_priority(str(level.get("kind") or ""))) or 0.0)
         level_selection_score = float(level.get("selection_score", 0.0) or 0.0)
-        level_selection_trigger_score = float(level.get("selection_trigger_score", trigger_score) or trigger_score)
+        level_selection_ltf_score = float(level.get("selection_ltf_score", ltf_score) or ltf_score)
         extra_clearance_atr = 0.0 if target_clearance is None else max(0.0, float(target_clearance.get("clearance_atr", 0.0) or 0.0) - float(self._support_resistance_setting("entry_min_clearance_atr", 0.85)))
-        hourly_vote_bonus = max(0.0, float(strong_vote_edge)) * 0.30
+        htf_vote_bonus = max(0.0, float(strong_vote_edge)) * 0.30
         macro_bonus = (float(macro_agreement_count) * 0.15) if macro_confirmation_enabled else 0.0
         clearance_bonus = min(extra_clearance_atr, 2.5) * 0.20
         source_priority_bonus = source_priority * 0.35
@@ -1059,7 +1056,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             + (abs(peer_score) * 0.25)
             + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
             + source_priority_bonus
-            + hourly_vote_bonus
+            + htf_vote_bonus
             + macro_bonus
             + clearance_bonus
             + strong_setup_bonus
@@ -1083,29 +1080,29 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 "level_score_raw_htf_weight": float(level.get("level_score_raw_htf_weight", self._level_score_raw_htf_weight()) or self._level_score_raw_htf_weight()),
                 "source_priority": source_priority,
                 "selection_score": level_selection_score,
-                "selection_trigger_score": round(float(level_selection_trigger_score), 4),
+                "selection_ltf_score": round(float(level_selection_ltf_score), 4),
                 "selection_distance_atr": float(level.get("selection_distance_atr", 0.0) or 0.0),
-                "trigger_score": round(float(trigger_score), 4),
-                "trigger_base_score": round(float(trigger.get("base_score", trigger_score) or trigger_score), 4),
-                "trigger_quality_bonus": round(float(trigger.get("quality_bonus", 0.0) or 0.0), 4),
-                "trigger_quality_reasons": list(trigger.get("quality_reasons", [])),
-                "trigger_quality_breakdown": dict(trigger.get("quality_breakdown", {})),
-                "trigger_candle_matches": list(trigger.get("trigger_candle_matches", [])),
-                "trigger_candle_anchor_pattern": trigger.get("trigger_candle_anchor_pattern"),
-                "trigger_candle_anchor_bars": int(trigger.get("trigger_candle_anchor_bars", 0) or 0),
-                "trigger_candle_score": float(trigger.get("trigger_candle_score", 0.0) or 0.0),
-                "trigger_candle_net_score": float(trigger.get("trigger_candle_net_score", 0.0) or 0.0),
-                "trigger_candle_opposite_score": float(trigger.get("trigger_candle_opposite_score", 0.0) or 0.0),
-                "trigger_candle_regime_hint": str(trigger.get("trigger_candle_regime_hint", "neutral") or "neutral"),
-                "trigger_score_required": float(trigger_min_score),
-                "trigger_reasons": list(trigger["reasons"]),
+                "ltf_score": round(float(ltf_score), 4),
+                "ltf_base_score": round(float(trigger.get("base_score", ltf_score) or ltf_score), 4),
+                "ltf_quality_bonus": round(float(trigger.get("quality_bonus", 0.0) or 0.0), 4),
+                "ltf_quality_reasons": list(trigger.get("quality_reasons", [])),
+                "ltf_quality_breakdown": dict(trigger.get("quality_breakdown", {})),
+                "ltf_candle_matches": list(trigger.get("ltf_candle_matches", [])),
+                "ltf_candle_anchor_pattern": trigger.get("ltf_candle_anchor_pattern"),
+                "ltf_candle_anchor_bars": int(trigger.get("ltf_candle_anchor_bars", 0) or 0),
+                "ltf_candle_score": float(trigger.get("ltf_candle_score", 0.0) or 0.0),
+                "ltf_candle_net_score": float(trigger.get("ltf_candle_net_score", 0.0) or 0.0),
+                "ltf_candle_opposite_score": float(trigger.get("ltf_candle_opposite_score", 0.0) or 0.0),
+                "ltf_candle_regime_hint": str(trigger.get("ltf_candle_regime_hint", "neutral") or "neutral"),
+                "ltf_score_required": float(ltf_min_score),
+                "ltf_reasons": list(trigger["reasons"]),
                 "min_peer_score_required": min_peer_score,
-                "strong_setup_trigger_score_required": float(strong_setup_trigger_min),
+                "strong_setup_ltf_score_required": float(strong_setup_trigger_min),
                 "strong_setup_peer_score_required": strong_setup_peer_min,
-                "hourly_bias": bias,
-                "hourly_bull_votes": bull_votes,
-                "hourly_bear_votes": bear_votes,
-                "hourly_vote_edge": int(strong_vote_edge),
+                "htf_bias": bias,
+                "htf_bull_votes": bull_votes,
+                "htf_bear_votes": bear_votes,
+                "htf_vote_edge": int(strong_vote_edge),
                 "peer_score": peer_score,
                 "directional_peer_score": directional_peer_score,
                 "peer_bullish": int(peer_ctx.get("bullish", 0)),
@@ -1123,7 +1120,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 "activity_score": float(c.activity_score),
                 "activity_score_weight": float(activity_weight),
                 "setup_quality_score": round(float(level["level_score"]) + float(trigger["score"]) + (abs(peer_score) * 0.25), 4),
-                "execution_quality_score": round(float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0) + source_priority_bonus + hourly_vote_bonus + macro_bonus + clearance_bonus + strong_setup_bonus, 4),
+                "execution_quality_score": round(float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0) + source_priority_bonus + htf_vote_bonus + macro_bonus + clearance_bonus + strong_setup_bonus, 4),
                 "macro_score": round(float(macro_bonus), 4),
                 "selection_quality_score": float(selection_quality_score),
                 "regime_score": float(level["level_score"]),
@@ -1158,7 +1155,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             return
         data.prefetch_htf_contexts(
             universe,
-            timeframe_minutes=int(self.params.get("htf_timeframe_minutes", 60)),
+            timeframe_minutes=int(self.params.get("htf_minutes", 60)),
             lookback_days=int(self.params.get("htf_lookback_days", 60)),
             pivot_span=int(self.params.get("htf_pivot_span", 2)),
             max_levels_per_side=int(self.params.get("htf_max_levels_per_side", 6)),
@@ -1167,7 +1164,6 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             stop_buffer_atr_mult=float(self.params.get("htf_stop_buffer_atr_mult", 0.25)),
             ema_fast_span=int(self.params.get("htf_ema_fast_span", 50)),
             ema_slow_span=int(self.params.get("htf_ema_slow_span", 200)),
-            refresh_seconds=int(self.params.get("htf_refresh_seconds", 120)),
             use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
             use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
         )
@@ -1194,7 +1190,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         out: list[Signal] = []
         min_level_score = float(self.params.get("min_level_score", 2.9))
         allow_short = bool(self.config.risk.allow_short)
-        tf = int(self.params.get("htf_timeframe_minutes", 60))
+        tf = int(self.params.get("htf_minutes", 60))
         lookback_days = int(self.params.get("htf_lookback_days", 60))
         pivot_span = int(self.params.get("htf_pivot_span", 2))
         max_lvls = int(self.params.get("htf_max_levels_per_side", 6))
@@ -1203,10 +1199,9 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         stop_atr = float(self.params.get("htf_stop_buffer_atr_mult", 0.25))
         ema_fast_span = int(self.params.get("htf_ema_fast_span", 50))
         ema_slow_span = int(self.params.get("htf_ema_slow_span", 200))
-        refresh_seconds = int(self.params.get("htf_refresh_seconds", 120))
-        trigger_tf = int(self.params.get("trigger_timeframe_minutes", 5))
+        ltf_min = int(self.params.get("ltf_minutes", 5))
         min_bars = int(self.params.get("min_bars", 80))
-        min_trigger_bars = int(self.params.get("min_trigger_bars", 18))
+        min_ltf_bars = int(self.params.get("min_ltf_bars", 18))
         macro_ctx = self._macro_signal(bars, data=data)
         tradable_symbols = set(self._tradable_symbols())
         for c in candidates:
@@ -1221,9 +1216,9 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             if frame is None or len(frame) < min_bars:
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)])
                 continue
-            ltf = self._resampled_frame(frame, trigger_tf, symbol=c.symbol, data=data)
-            if ltf is None or len(ltf) < min_trigger_bars:
-                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_trigger_bars", 0 if ltf is None else len(ltf), min_trigger_bars)])
+            ltf = self._resampled_frame(frame, ltf_min, symbol=c.symbol, data=data)
+            if ltf is None or len(ltf) < min_ltf_bars:
+                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_ltf_bars", 0 if ltf is None else len(ltf), min_ltf_bars)])
                 continue
             close = _safe_float(frame.iloc[-1]["close"])
             htf = self._htf_context(
@@ -1238,7 +1233,6 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 stop_buffer_atr_mult=stop_atr,
                 ema_fast_span=ema_fast_span,
                 ema_slow_span=ema_slow_span,
-                refresh_seconds=refresh_seconds,
                 current_price=close,
                 use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
                 use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
@@ -1267,7 +1261,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                     reasons.append(f"short_level_score_below_min:{short_level_score:.2f}<{min_level_score:.2f}")
             if not signals:
                 if long_level is None and short_level is None:
-                    reasons.append("price_not_in_hourly_zone")
+                    reasons.append("price_not_in_htf_zone")
                 else:
                     long_failure = self._consume_build_failure(c.symbol, self._failure_style_name(Side.LONG))
                     short_failure = self._consume_build_failure(c.symbol, self._failure_style_name(Side.SHORT))

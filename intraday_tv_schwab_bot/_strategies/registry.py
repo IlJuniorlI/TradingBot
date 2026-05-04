@@ -146,7 +146,7 @@ def _coerce_capabilities(raw: object, *, manifest_path: Path) -> dict[str, objec
             if not isinstance(level_context, dict):
                 raise TypeError(f"{manifest_path}: 'capabilities.dashboard.level_context' must be an object")
             for key, value in level_context.items():
-                if key in {"timeframe_minutes", "lookback_days", "pivot_span", "max_levels_per_side", "ema_fast_span", "ema_slow_span", "refresh_seconds", "trigger_timeframe_minutes"}:
+                if key in {"timeframe_minutes", "lookback_days", "pivot_span", "max_levels_per_side", "ema_fast_span", "ema_slow_span", "ltf_minutes"}:
                     if isinstance(value, bool) or not isinstance(value, int):
                         raise TypeError(f"{manifest_path}: 'capabilities.dashboard.level_context.{key}' must be an integer")
                 elif key in {"atr_tolerance_mult", "pct_tolerance", "stop_buffer_atr_mult", "min_level_score", "level_round_number_tolerance_pct", "base_zone_atr_mult", "base_zone_pct"}:

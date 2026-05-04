@@ -45,12 +45,12 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         if capability_bars is not None:
             return capability_bars
         min_bars = int(self.params.get("min_bars", 90))
-        trigger_tf = max(1, int(self.params.get("trigger_timeframe_minutes", 5)))
-        min_trigger_bars = int(self.params.get("min_trigger_bars", 20))
+        ltf_min = max(1, int(self.params.get("ltf_minutes", 5)))
+        min_ltf_bars = int(self.params.get("min_ltf_bars", 20))
         continuation_lookback = int(
             self.params.get("pivot_continuation_interaction_lookback_bars", 10)
         )
-        return max(min_bars, trigger_tf * (min_trigger_bars + continuation_lookback + 6))
+        return max(min_bars, ltf_min * (min_ltf_bars + continuation_lookback + 6))
 
     def _entry_family(self) -> str:
         raw = str(self.params.get("entry_family", "pivot_reclaim") or "pivot_reclaim")
@@ -620,17 +620,17 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         vwap: float,
         ms_ltf,
     ) -> dict[str, Any]:
-        recent = ltf.tail(max(int(self.params.get("min_trigger_bars", 20)), 6))
+        recent = ltf.tail(max(int(self.params.get("min_ltf_bars", 20)), 6))
         prior = recent.iloc[:-1]
         if prior.empty:
             return {"family": "pivot_reclaim", "score": 0.0, "reasons": ["no_reclaim_context"]}
         close_pos = _bar_close_position(ltf)
-        min_close_pos = min(0.95, max(0.05, float(self.params.get("min_trigger_close_position", 0.60))))
+        min_close_pos = min(0.95, max(0.05, float(self.params.get("min_ltf_close_position", 0.60))))
         reclaim_buffer_pct = max(0.0, float(self.params.get("pivot_reclaim_buffer_pct", 0.0005)))
         zone_frac = max(0.01, float(self.params.get("pivot_reclaim_zone_frac", 0.12)))
         reclaim_offset = max(zone_width * zone_frac, close * reclaim_buffer_pct)
         volume_ratio = self._volume_ratio(ltf)
-        min_volume_ratio = max(0.1, float(self.params.get("min_trigger_volume_ratio", 1.0)))
+        min_volume_ratio = max(0.1, float(self.params.get("min_ltf_volume_ratio", 1.0)))
         reasons: list[str] = []
         score = 0.0
         if side == Side.LONG:
@@ -719,15 +719,15 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         ema9: float,
         ms_ltf,
     ) -> dict[str, Any]:
-        recent = ltf.tail(max(int(self.params.get("min_trigger_bars", 20)), 5))
+        recent = ltf.tail(max(int(self.params.get("min_ltf_bars", 20)), 5))
         prior = recent.iloc[:-1]
         if prior.empty:
             return {"family": "pivot_rejection", "score": 0.0, "reasons": ["no_rejection_context"]}
         close_pos = _bar_close_position(ltf)
-        min_close_pos = min(0.95, max(0.05, float(self.params.get("min_trigger_close_position", 0.60))))
+        min_close_pos = min(0.95, max(0.05, float(self.params.get("min_ltf_close_position", 0.60))))
         min_wick_frac = min(0.95, max(0.05, float(self.params.get("pivot_rejection_min_wick_frac", 0.24))))
         volume_ratio = self._volume_ratio(ltf)
-        min_volume_ratio = max(0.1, float(self.params.get("min_trigger_volume_ratio", 1.0)))
+        min_volume_ratio = max(0.1, float(self.params.get("min_ltf_volume_ratio", 1.0)))
         upper_wick_frac, lower_wick_frac, _, _ = _bar_wick_fractions(ltf)
         allow_neutral = bool(self.params.get("pivot_rejection_allows_neutral_ltf_structure", True))
         reasons: list[str] = []
@@ -735,7 +735,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         if side == Side.LONG:
             touched = _safe_float(prior["low"].min(), close) <= (pivot + zone_width)
             held = close >= pivot
-            reversal_candle = lower_wick_frac >= min_wick_frac or self._configured_trigger_candle_match(side, ltf)
+            reversal_candle = lower_wick_frac >= min_wick_frac or self._configured_ltf_candle_match(side, ltf)
             if touched:
                 score += 1.0
             else:
@@ -760,7 +760,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         else:
             touched = _safe_float(prior["high"].max(), close) >= (pivot - zone_width)
             held = close <= pivot
-            reversal_candle = upper_wick_frac >= min_wick_frac or self._configured_trigger_candle_match(side, ltf)
+            reversal_candle = upper_wick_frac >= min_wick_frac or self._configured_ltf_candle_match(side, ltf)
             if touched:
                 score += 1.0
             else:
@@ -816,16 +816,16 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
             4,
             int(self.params.get("pivot_continuation_interaction_lookback_bars", 10)),
         )
-        recent = ltf.tail(max(int(self.params.get("min_trigger_bars", 20)), interaction_lookback + 3))
+        recent = ltf.tail(max(int(self.params.get("min_ltf_bars", 20)), interaction_lookback + 3))
         prior = recent.iloc[:-1]
         if prior.empty:
             return {"family": "pivot_continuation", "score": 0.0, "reasons": ["no_continuation_context"]}
         close_pos = _bar_close_position(ltf)
-        min_close_pos = min(0.95, max(0.05, float(self.params.get("min_trigger_close_position", 0.60))))
+        min_close_pos = min(0.95, max(0.05, float(self.params.get("min_ltf_close_position", 0.60))))
         breakout_buffer_pct = max(0.0, float(self.params.get("pivot_continuation_breakout_buffer_pct", 0.0009)))
         max_distance_atr = max(0.1, float(self.params.get("pivot_continuation_max_distance_atr", 1.45)))
         volume_ratio = self._volume_ratio(ltf)
-        min_volume_ratio = max(0.1, float(self.params.get("min_trigger_volume_ratio", 1.0)))
+        min_volume_ratio = max(0.1, float(self.params.get("min_ltf_volume_ratio", 1.0)))
         reasons: list[str] = []
         score = 0.0
         interaction_slice = prior.tail(interaction_lookback)
@@ -1057,9 +1057,9 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         hard_reasons: list[str] = []
 
         min_regime_score = _discrete_score_threshold(self.params.get("min_regime_score", 4), 4, minimum=1)
-        min_trigger_score = _discrete_score_threshold(self.params.get("min_trigger_score", 2.5), 3, minimum=1)
+        min_ltf_score = _discrete_score_threshold(self.params.get("min_ltf_score", 2.5), 3, minimum=1)
         regime_score = float(regime.get("score", 0.0) or 0.0)
-        trigger_score = float(family_payload.get("score", 0.0) or 0.0)
+        ltf_score = float(family_payload.get("score", 0.0) or 0.0)
         if regime_score < min_regime_score:
             hard_reasons.append(_reason_with_values("weak_regime_score", current=regime_score, required=min_regime_score, op=">=", digits=4))
         if not selected_family_pass:
@@ -1067,8 +1067,8 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                 hard_reasons.extend(family_diagnostics)
             else:
                 hard_reasons.append("selected_entry_family_failed")
-        if trigger_score < min_trigger_score:
-            hard_reasons.append(_reason_with_values("weak_trigger_score", current=trigger_score, required=min_trigger_score, op=">=", digits=4))
+        if ltf_score < min_ltf_score:
+            hard_reasons.append(_reason_with_values("weak_ltf_score", current=ltf_score, required=min_ltf_score, op=">=", digits=4))
 
         min_peer_agreement = max(0, int(self.params.get("min_peer_agreement", 2)))
         min_peer_score = max(0, int(self.params.get("min_peer_score", 2)))
@@ -1082,7 +1082,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         pivot_flip_candidate = bool(regime.get("pivot_flip_candidate", False))
         family_key = str(family_payload.get("family", self._entry_family()) or self._entry_family())
         family_preference_bonus = float(family_payload.get("family_bonus", 0.0) or 0.0)
-        total_score = regime_score + trigger_score + family_preference_bonus
+        total_score = regime_score + ltf_score + family_preference_bonus
         if peer_agreement >= min_peer_agreement:
             total_score += 1.0
         else:
@@ -1135,7 +1135,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         gate_snapshots = [
             _gate_snapshot("regime_score", passed=regime_score >= min_regime_score, current=round(regime_score, 4), required=min_regime_score, op=">="),
             _gate_snapshot("entry_family_pass", passed=selected_family_pass, current=int(selected_family_pass), required=1, op=">=", note=family_key),
-            _gate_snapshot("trigger_score", passed=trigger_score >= min_trigger_score, current=round(trigger_score, 4), required=min_trigger_score, op=">="),
+            _gate_snapshot("ltf_score", passed=ltf_score >= min_ltf_score, current=round(ltf_score, 4), required=min_ltf_score, op=">="),
             _gate_snapshot("peer_agreement", passed=peer_agreement >= min_peer_agreement, current=int(peer_agreement), required=int(min_peer_agreement), op=">="),
             _gate_snapshot("directional_peer_score", passed=directional_peer_score >= min_peer_score, current=round(float(directional_peer_score), 4), required=int(min_peer_score), op=">="),
             _gate_snapshot("macro_alignment", passed=macro_aligned, current=int(macro_aligned), required=1, op=">=", note="required_for_continuation" if family_key == "pivot_continuation" else None),
@@ -1149,8 +1149,8 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
             near_miss_blockers["regime_score"] = round(min_regime_score - regime_score, 4)
         if not selected_family_pass:
             near_miss_blockers["entry_family_pass"] = 1.0
-        if trigger_score < min_trigger_score:
-            near_miss_blockers["trigger_score"] = round(min_trigger_score - trigger_score, 4)
+        if ltf_score < min_ltf_score:
+            near_miss_blockers["ltf_score"] = round(min_ltf_score - ltf_score, 4)
         if peer_agreement < min_peer_agreement:
             near_miss_blockers["peer_agreement"] = round(float(min_peer_agreement - peer_agreement), 4)
         if directional_peer_score < min_peer_score:
@@ -1267,7 +1267,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                 "macro_score": float(macro_ctx.get("long_agree", 0) or 0) if side == Side.LONG else float(macro_ctx.get("short_agree", 0) or 0),
                 "entry_family": family_key,
                 "regime_score": round(regime_score, 4),
-                "trigger_score": round(trigger_score, 4),
+                "ltf_score": round(ltf_score, 4),
                 "family_preference_bonus": round(family_preference_bonus, 4),
                 "peer_score": float(peer_score),
                 "directional_peer_score": float(directional_peer_score),
@@ -1313,7 +1313,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                 "near_miss_blockers": near_miss_blockers,
                 "selection_components": {
                     "regime_score": round(regime_score, 4),
-                    "trigger_score": round(trigger_score, 4),
+                    "ltf_score": round(ltf_score, 4),
                     "family_preference_bonus": round(family_preference_bonus, 4),
                     "peer_bonus": 1.0 if peer_agreement >= min_peer_agreement else 0.0,
                     "directional_peer_bonus": 0.75 if directional_peer_score >= min_peer_score else 0.0,
@@ -1357,7 +1357,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         self._reset_entry_decisions()
         out: list[Signal] = []
         history_bars = self.required_history_bars()
-        trigger_tf = max(1, int(self.params.get("trigger_timeframe_minutes", 5)))
+        ltf_min = max(1, int(self.params.get("ltf_minutes", 5)))
         allow_short = bool(self.config.risk.allow_short)
         macro_ctx = self._macro_signal(bars, data=data)
         tradable_symbols = set(self._tradable_symbols())
@@ -1382,8 +1382,8 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                     ],
                 )
                 continue
-            ltf = self._resampled_frame(frame, trigger_tf, symbol=candidate.symbol, data=data)
-            if ltf is None or ltf.empty or len(ltf) < max(10, int(self.params.get("min_trigger_bars", 20)) + 3):
+            ltf = self._resampled_frame(frame, ltf_min, symbol=candidate.symbol, data=data)
+            if ltf is None or ltf.empty or len(ltf) < max(10, int(self.params.get("min_ltf_bars", 20)) + 3):
                 self._record_entry_decision(candidate.symbol, "skipped", ["missing_ltf_context"])
                 continue
             peer_ctx = self._peer_signal(candidate.symbol, bars, data)

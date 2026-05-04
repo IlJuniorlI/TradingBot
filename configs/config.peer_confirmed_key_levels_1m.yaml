@@ -183,12 +183,13 @@ dashboard:
       show_bollinger_bands: false
       show_anchored_vwap: false
       show_fib_extensions: false
+      show_fib_retracements: false
       show_channel: false
       show_trendlines: false
       show_htf_fair_value_gaps: false
-      show_1m_fair_value_gaps: true
+      show_ltf_fair_value_gaps: true
       show_htf_order_blocks: false
-      show_1m_order_blocks: false
+      show_ltf_order_blocks: false
       show_trade_markers: true
       tooltip_show_returns: true
       tooltip_show_support_resistance: true
@@ -209,12 +210,13 @@ dashboard:
       show_bollinger_bands: true
       show_anchored_vwap: false
       show_fib_extensions: false
+      show_fib_retracements: false
       show_channel: false
       show_trendlines: false
       show_htf_fair_value_gaps: true
-      show_1m_fair_value_gaps: true
+      show_ltf_fair_value_gaps: true
       show_htf_order_blocks: false
-      show_1m_order_blocks: false
+      show_ltf_order_blocks: false
       show_trade_markers: true
       tooltip_show_returns: true
       tooltip_show_support_resistance: true
@@ -228,7 +230,6 @@ support_resistance:
   enabled: true
   timeframe_minutes: 15
   lookback_days: 10
-  refresh_seconds: 480
   pivot_span: 2
   max_levels_per_side: 4
   atr_tolerance_mult: 0.6
@@ -253,8 +254,8 @@ support_resistance:
   fair_value_gap_max_per_side: 3
   fair_value_gap_min_atr_mult: 0.06
   fair_value_gap_min_pct: 0.0006
-  one_minute_fair_value_gaps_enabled: true
-  one_minute_order_blocks_enabled: false
+  ltf_fair_value_gaps_enabled: true
+  ltf_order_blocks_enabled: false
   htf_order_blocks_enabled: false
   order_block_mode: loose
   order_block_max_per_side: 4
@@ -263,16 +264,15 @@ support_resistance:
   order_block_min_thrust_atr_mult: 0.75
   order_block_pivot_span: 2
   order_block_new_high_lookback: 8
-  dashboard_flip_confirmation_1m_bars: 1
   trading_flip_confirmation_1m_bars: 2
   trading_flip_confirmation_5m_bars: 1
   flip_stop_buffer_atr_mult: 0.25
   flip_target_requires_momentum_confirm: true
   regime_weight: 0.7
   structure_enabled: true
-  structure_1m_pivot_span: 2
+  structure_ltf_pivot_span: 2
   structure_eq_atr_mult: 0.25
-  structure_1m_weight: 0.65
+  structure_ltf_weight: 0.65
   structure_htf_weight: 0.9
   structure_event_lookback_bars: 6
 
@@ -466,9 +466,8 @@ strategies:
       htf_max_levels_per_side: 6
       htf_pct_tolerance: 0.003
       htf_pivot_span: 2
-      htf_refresh_seconds: 120
       htf_stop_buffer_atr_mult: 0.25
-      htf_timeframe_minutes: 60
+      htf_minutes: 60
       level_round_number_tolerance_pct: 0.002
       level_score_raw_htf_weight: 0.65
       min_bars: 100
@@ -476,28 +475,28 @@ strategies:
       min_peer_agreement: 3
       min_peer_score: 2
       min_rr: 1.6
-      min_trigger_bars: 55
-      min_trigger_score: 2.4
-      one_minute_fvg_entry_weight: 0.26
+      min_ltf_bars: 55
+      min_ltf_score: 2.4
+      ltf_fvg_entry_weight: 0.26
       opposing_fvg_entry_penalty_mult: 1.0
       require_macro_agreement_count: 1
       require_macro_net_bias: true
-      require_hourly_bias_alignment: true
+      require_htf_bias_alignment: true
       stop_buffer_atr_mult: 0.56
-      strong_setup_min_hourly_vote_edge: 1
+      strong_setup_min_htf_vote_edge: 1
       strong_setup_min_level_score: 3.0
       strong_setup_min_peer_score: 2
-      strong_setup_min_trigger_score: 3.0
+      strong_setup_min_ltf_score: 3.0
       strong_setup_runner_enabled: true
       strong_setup_target_level_offset: 1
-      trigger_candle_quality_bonus_cap: 0.5
-      trigger_quality_bonus_enabled: true
-      trigger_quality_max_bonus: 2.0
-      trigger_range_expansion_bonus_cap: 0.4
-      trigger_reclaim_quality_bonus_cap: 0.8
-      trigger_timeframe_minutes: 1
-      trigger_volume_quality_bonus_cap: 0.4
-      trigger_zone_interaction_bonus_cap: 0.5
+      ltf_candle_quality_bonus_cap: 0.5
+      ltf_quality_bonus_enabled: true
+      ltf_quality_max_bonus: 2.0
+      ltf_range_expansion_bonus_cap: 0.4
+      ltf_reclaim_quality_bonus_cap: 0.8
+      ltf_minutes: 1
+      ltf_volume_quality_bonus_cap: 0.4
+      ltf_zone_interaction_bonus_cap: 0.5
       volatility_symbol: VIX
       zone_atr_mult: 0.17
       zone_pct: 0.0013

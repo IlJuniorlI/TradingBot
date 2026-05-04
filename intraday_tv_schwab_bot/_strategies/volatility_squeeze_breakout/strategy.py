@@ -121,7 +121,7 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
 
             ctx = self._chart_context(frame)
             sr_ctx = self._sr_context(c.symbol, frame, data)
-            ms_ctx = self._structure_context(frame, "1m")
+            ms_ctx = self._structure_context(frame, "ltf")
             tech_ctx = self._technical_context(frame)
             metadata = {
                 "squeeze_breakout_high": breakout_high,
@@ -135,7 +135,7 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 "compression_rising_lows": bool(rising_lows_ok),
                 "compression_falling_highs": bool(falling_highs_ok),
                 **self._chart_lists(ctx),
-                **self._structure_lists(ms_ctx, prefix="ms1m"),
+                **self._structure_lists(ms_ctx, prefix="msltf"),
                 **self._sr_lists(sr_ctx),
                 **self._technical_lists(tech_ctx),
             }
