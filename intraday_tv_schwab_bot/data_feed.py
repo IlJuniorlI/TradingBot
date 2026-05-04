@@ -238,7 +238,7 @@ class MarketDataStore:
         if cfg is None or not bool(cfg.enabled) or not self.is_support_resistance_symbol(symbol):
             return False
         tf = int(timeframe_minutes or getattr(cfg, "timeframe_minutes", 15) or 15)
-        ttl = int(refresh_seconds or getattr(cfg, "refresh_seconds", 600) or 600)
+        ttl = int(refresh_seconds or getattr(cfg, "refresh_seconds", 120) or 120)
         return self.should_refresh_htf_context(symbol, tf, ttl)
 
 
@@ -1211,7 +1211,7 @@ class MarketDataStore:
             atr_tolerance_mult=float(getattr(cfg, "atr_tolerance_mult", 0.60) or 0.60),
             pct_tolerance=float(getattr(cfg, "pct_tolerance", 0.0030) or 0.0030),
             stop_buffer_atr_mult=float(getattr(cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
-            refresh_seconds=int(refresh_seconds or getattr(cfg, "refresh_seconds", 600) or 600),
+            refresh_seconds=int(refresh_seconds or getattr(cfg, "refresh_seconds", 120) or 120),
             allow_refresh=allow_refresh,
         )
         key = self._htf_key(symbol, tf)
@@ -1305,7 +1305,7 @@ class MarketDataStore:
             atr_tolerance_mult=float(getattr(cfg, "atr_tolerance_mult", 0.60) or 0.60),
             pct_tolerance=float(getattr(cfg, "pct_tolerance", 0.0030) or 0.0030),
             stop_buffer_atr_mult=float(getattr(cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
-            refresh_seconds=int(refresh_seconds or getattr(cfg, "refresh_seconds", 600) or 600),
+            refresh_seconds=int(refresh_seconds or getattr(cfg, "refresh_seconds", 120) or 120),
             allow_refresh=allow_refresh,
         )
         use_cache = use_prior_day_high_low is None and use_prior_week_high_low is None

@@ -415,7 +415,7 @@ class BaseStrategy:
             "stop_buffer_atr_mult": float(params.get("htf_stop_buffer_atr_mult", 0.25) or 0.25),
             "ema_fast_span": max(1, int(params.get("htf_ema_fast_span", 50) or 50)),
             "ema_slow_span": max(1, int(params.get("htf_ema_slow_span", 200) or 200)),
-            "refresh_seconds": max(1, int(params.get("htf_refresh_seconds", 600) or 600)),
+            "refresh_seconds": max(1, int(params.get("htf_refresh_seconds", 120) or 120)),
             "trigger_timeframe_minutes": max(1, int(params.get("trigger_timeframe_minutes", 5) or 5)),
             "min_level_score": float(params.get("min_level_score", 4.0) or 4.0),
             "level_round_number_tolerance_pct": float(params.get("level_round_number_tolerance_pct", 0.0020) or 0.0020),

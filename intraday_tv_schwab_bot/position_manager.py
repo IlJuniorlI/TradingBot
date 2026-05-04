@@ -114,7 +114,7 @@ class PositionManager:
 
     def active_sr_refresh_seconds(self) -> int:
         cfg = getattr(self.config, "support_resistance", None)
-        fallback = int(getattr(cfg, "refresh_seconds", 600)) if cfg is not None else 600
+        fallback = int(getattr(cfg, "refresh_seconds", 120)) if cfg is not None else 120
         params = getattr(getattr(self, "strategy", None), "params", {}) or {}
         return int(params.get("htf_refresh_seconds", fallback))
 

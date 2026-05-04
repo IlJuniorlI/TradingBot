@@ -1524,7 +1524,7 @@ Current package defaults:
 | `min_trigger_bars`                | `18`                                      |
 | `htf_timeframe_minutes`           | `60`                                      |
 | `htf_lookback_days`               | `60`                                      |
-| `htf_refresh_seconds`             | `600`                                     |
+| `htf_refresh_seconds`             | `120`                                     |
 | `htf_pivot_span`                  | `2`                                       |
 | `htf_max_levels_per_side`         | `6`                                       |
 | `htf_atr_tolerance_mult`          | `0.35`                                    |
@@ -1618,7 +1618,7 @@ Current package defaults:
 | `peers`                              | `['QQQ', 'AVGO', 'MU', 'TSM']`            |
 | `htf_timeframe_minutes`              | `60`                                      |
 | `htf_lookback_days`                  | `60`                                      |
-| `htf_refresh_seconds`                | `600`                                     |
+| `htf_refresh_seconds`                | `120`                                     |
 | `htf_pivot_span`                     | `2`                                       |
 | `htf_max_levels_per_side`            | `6`                                       |
 | `htf_atr_tolerance_mult`             | `0.35`                                    |
@@ -1696,7 +1696,7 @@ Current package defaults:
 | `peers`                              | `['QQQ', 'AVGO', 'MU', 'TSM']`            |
 | `htf_timeframe_minutes`              | `60`                                      |
 | `htf_lookback_days`                  | `60`                                      |
-| `htf_refresh_seconds`                | `600`                                     |
+| `htf_refresh_seconds`                | `120`                                     |
 | `htf_pivot_span`                     | `2`                                       |
 | `htf_max_levels_per_side`            | `6`                                       |
 | `htf_atr_tolerance_mult`             | `0.35`                                    |
@@ -1800,7 +1800,7 @@ Current package defaults:
 | `min_trigger_bars`                             | `20`                                            |
 | `htf_timeframe_minutes`                        | `60`                                            |
 | `htf_lookback_days`                            | `60`                                            |
-| `htf_refresh_seconds`                          | `600`                                           |
+| `htf_refresh_seconds`                          | `120`                                           |
 | `htf_pivot_span`                               | `2`                                             |
 | `htf_max_levels_per_side`                      | `6`                                             |
 | `htf_atr_tolerance_mult`                       | `0.35`                                          |
@@ -1988,7 +1988,7 @@ Current package defaults:
 | `require_htf_alignment`       | `True`                  |
 | `htf_timeframe_minutes`       | `15`                    |
 | `htf_lookback_days`           | `15`                    |
-| `htf_refresh_seconds`         | `600`                   |
+| `htf_refresh_seconds`         | `120`                   |
 | `htf_min_bars`                | `20`                    |
 | `htf_vwap_distance_pct`       | `0.0009`                |
 | `htf_ema_gap_pct`             | `0.0007`                |
@@ -2068,7 +2068,7 @@ Current package defaults:
 | `require_htf_alignment`              | `True`                  |
 | `htf_timeframe_minutes`              | `15`                    |
 | `htf_lookback_days`                  | `60`                    |
-| `htf_refresh_seconds`                | `600`                   |
+| `htf_refresh_seconds`                | `120`                   |
 | `htf_min_bars`                       | `20`                    |
 | `htf_vwap_distance_pct`              | `0.0009`                |
 | `htf_ema_gap_pct`                    | `0.0007`                |

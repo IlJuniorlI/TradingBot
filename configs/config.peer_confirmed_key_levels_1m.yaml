@@ -467,7 +467,7 @@ strategies:
       htf_max_levels_per_side: 6
       htf_pct_tolerance: 0.003
       htf_pivot_span: 2
-      htf_refresh_seconds: 600
+      htf_refresh_seconds: 120
       htf_stop_buffer_atr_mult: 0.25
       htf_timeframe_minutes: 60
       level_round_number_tolerance_pct: 0.002

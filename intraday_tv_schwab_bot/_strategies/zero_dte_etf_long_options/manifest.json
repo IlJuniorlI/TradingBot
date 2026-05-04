@@ -71,7 +71,7 @@
     "require_htf_alignment": true,
     "htf_timeframe_minutes": 15,
     "htf_lookback_days": 60,
-    "htf_refresh_seconds": 600,
+    "htf_refresh_seconds": 120,
     "htf_min_bars": 20,
     "htf_vwap_distance_pct": 0.0009,
     "htf_ema_gap_pct": 0.0007,

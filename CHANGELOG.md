@@ -141,9 +141,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `auto_exit_after_session: false`, `startup_reconcile_mode: restore_hybrid`,
   entry/management/screener windows expanded to `07:00-19:55` ET,
   `time_stop_minutes: 0`. API-cost retune for extended hours:
-  `history_poll_seconds: 300`, `stream_stale_fallback_seconds: 180`,
-  `htf_refresh_seconds: 600`. Strategy quality filters (min trigger score,
-  peer agreement, macro net bias) gate extended-hours candidates organically.
+  `history_poll_seconds: 300`, `stream_stale_fallback_seconds: 180`.
+  `htf_refresh_seconds` stays at `120` since the throttle now controls
+  resample cadence (free) and level-flip detection latency, not Schwab
+  call frequency (which `htf_audit_refresh_seconds: 3600` governs).
+  Strategy quality filters (min trigger score, peer agreement, macro net
+  bias) gate extended-hours candidates organically.
 - **Dashboard render polish.** `dashboard_recent_trade_markers()` and
   `dashboard_symbol_trade_signature()` filter trades by symbol BEFORE
   slicing (a fresh fill on a long-quiet symbol could otherwise be

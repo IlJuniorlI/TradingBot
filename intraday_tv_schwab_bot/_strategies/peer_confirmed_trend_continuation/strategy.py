@@ -308,7 +308,7 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             stop_buffer_atr_mult=float(self.params.get("htf_stop_buffer_atr_mult", 0.25)),
             ema_fast_span=int(self.params.get("htf_ema_fast_span", 34)),
             ema_slow_span=int(self.params.get("htf_ema_slow_span", 200)),
-            refresh_seconds=int(self.params.get("htf_refresh_seconds", 600)),
+            refresh_seconds=int(self.params.get("htf_refresh_seconds", 120)),
             current_price=close,
             use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
             use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),

@@ -565,7 +565,7 @@ class SupportResistanceConfig:
     enabled: bool = True
     timeframe_minutes: int = 15
     lookback_days: int = 10
-    refresh_seconds: int = 600
+    refresh_seconds: int = 120
     pivot_span: int = 2
     max_levels_per_side: int = 3
     atr_tolerance_mult: float = 0.60

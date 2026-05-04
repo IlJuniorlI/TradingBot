@@ -373,7 +373,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return {"available": False, "reason": "no_data_feed"}
         htf_tf = int(p.get("htf_timeframe_minutes", 15))
         lookback_days = int(p.get("htf_lookback_days", getattr(sr_cfg, "lookback_days", 10) if sr_cfg is not None else 10))
-        refresh_seconds = int(p.get("htf_refresh_seconds", getattr(sr_cfg, "refresh_seconds", 600) if sr_cfg is not None else 600))
+        refresh_seconds = int(p.get("htf_refresh_seconds", getattr(sr_cfg, "refresh_seconds", 120) if sr_cfg is not None else 120))
         frame = data.get_htf_frame(
             symbol,
             timeframe_minutes=htf_tf,

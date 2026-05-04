@@ -133,7 +133,7 @@ Current package defaults:
 | `peers`                              | `['QQQ', 'AVGO', 'MU', 'TSM']`            |
 | `htf_timeframe_minutes`              | `60`                                      |
 | `htf_lookback_days`                  | `60`                                      |
-| `htf_refresh_seconds`                | `600`                                     |
+| `htf_refresh_seconds`                | `120`                                     |
 | `htf_pivot_span`                     | `2`                                       |
 | `htf_max_levels_per_side`            | `6`                                       |
 | `htf_atr_tolerance_mult`             | `0.35`                                    |
