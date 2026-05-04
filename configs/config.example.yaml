@@ -94,13 +94,6 @@ runtime:
   stream_fallback_poll_seconds: 25
   stream_stale_fallback_seconds: 180
   stream_health_log_seconds: 90
-  # HTF audit cadence. fetch_htf_context normally rebuilds HTF bars by
-  # resampling the in-memory 1m frame (streamer-fed). Every
-  # htf_audit_refresh_seconds (default 3600s = 1h), the bot falls back to
-  # Schwab price_history as an authoritative-source audit. Set to a small
-  # value (e.g. 60) to effectively disable the in-memory path; set very
-  # large to skip audits entirely.
-  htf_audit_refresh_seconds: 3600
   # Auto-exit: shut down cleanly when market closes and no positions are open
   auto_exit_after_session: true
   # Always-on idle cadence: outside the 7am-8pm ET stream window the loop

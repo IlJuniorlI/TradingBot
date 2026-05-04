@@ -83,7 +83,6 @@ runtime:
   stream_fallback_poll_seconds: 25
   stream_stale_fallback_seconds: 180
   stream_health_log_seconds: 90
-  htf_audit_refresh_seconds: 3600
   # Auto-exit: shut down cleanly when market closes and no positions are open
   auto_exit_after_session: true
   idle_sleep_seconds: 60.0

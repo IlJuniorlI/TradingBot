@@ -103,7 +103,6 @@ runtime:
   stream_fallback_poll_seconds: 25
   stream_stale_fallback_seconds: 180
   stream_health_log_seconds: 90
-  htf_audit_refresh_seconds: 3600
   # Always-on profile: keep the bot running across days so overnight long
   # holds stay tracked. Set to true if you want the bot to exit cleanly
   # at session close (and rely on Task Scheduler / cron to restart daily).

@@ -381,14 +381,6 @@ class RuntimeConfig:
     stream_fallback_poll_seconds: int = 25
     stream_stale_fallback_seconds: int = 180
     stream_health_log_seconds: int = 90
-    # HTF audit cadence. fetch_htf_context normally rebuilds HTF bars by
-    # resampling the in-memory 1m frame (streamer-fed). Every
-    # htf_audit_refresh_seconds (default 3600s = 1h), the bot falls back
-    # to Schwab price_history as an authoritative-source audit, catching
-    # any drift between streamer-fed 1m bars and Schwab's record. Set
-    # to a small value (e.g. 60) to effectively disable the in-memory
-    # path; set to a very large value to skip audits entirely.
-    htf_audit_refresh_seconds: int = 3600
     reconcile_on_startup: bool = True
     startup_reconcile_mode: str = "block"
     startup_order_lookback_days: int = 2

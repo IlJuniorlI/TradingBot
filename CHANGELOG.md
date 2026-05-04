@@ -41,16 +41,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   expose the eight OB knobs (defaults safe-off); `peer_confirmed_key_levels`
   ships with OB detection disabled since its custom entry pipeline doesn't
   consume OBs. Reuses every `anti_chase_fvg_retest_*` knob for bar-confirmation.
-- **HTF in-memory resample with hourly Schwab audit** (`data_feed.py`).
-  `fetch_htf_context` now rebuilds higher-timeframe bars by resampling the
-  in-memory 1m frame (streamer-fed) instead of round-tripping `price_history`
-  every cycle. New `runtime.htf_audit_refresh_seconds` knob (default `3600`
-  = 1h) governs Schwab fallback cadence; the fallback also fires on initial
-  backfill and when the 1m frame doesn't cover the incremental window. New
-  heal-propagation hook in `fetch_history` invalidates `last_htf_refresh`
-  after a successful 1m heal so HTF rebuilds next cycle (~5s) instead of
-  waiting `htf_refresh_seconds`. Cuts HTF Schwab calls from `~1` per
-  `htf_refresh_seconds` per symbol to `~1/hour` per `(symbol, timeframe)`.
+- **Heal-propagation hook** (`data_feed.py fetch_history`). A successful
+  1m heal now invalidates `last_htf_refresh` and the cycle-scoped HTF
+  cache so the HTF rebuild fires immediately on the healed 1m frame
+  instead of waiting `htf_refresh_seconds`. Skipped on empty heals
+  (REST returned no candles) since the existing HTF derivation is still
+  valid.
 - **Quote alias caching** (`data_feed.py`). New `_resolved_quote_alias` cache
   resolves index-like symbols (`NYICDX`→`$NYICDX`, `VIX`→`$VIX`) once and
   routes them through batched `fetch_quotes` instead of issuing a per-cycle
@@ -181,6 +177,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **HTF in-memory resample reverted.** An earlier attempt at this release
+  added a path that rebuilt HTF bars by resampling the in-memory 1m frame
+  with a periodic Schwab audit (`htf_audit_refresh_seconds: 3600`).
+  Reverted because the convention mismatch between the in-memory path
+  (1m bars resampled with `closed="right"` → bars represent ~10:01-11:00
+  data) and the Schwab path (30m bars from `price_history` resampled the
+  same way → bars represent 10:30-11:30 data) produced inconsistent OHLC
+  in the merged HTF frame. Pivot detection on the inconsistent frame
+  surfaced wildly stale support/resistance levels (e.g., AMD with current
+  price $346 showing first support at $258 from a 30-day-old base). The
+  audit knob, `_try_resample_htf_from_live_1m`, `_htf_audit_due`, and
+  `last_htf_audit_refresh` tracker are removed entirely. The
+  heal-propagation hook on `fetch_history` is preserved (Added section)
+  since it's useful regardless of the rebuild path.
 - **Strategy correctness.** `peer_confirmed_key_levels._select_level`
   "touched zone" check replaced with per-bar overlap (window-wide
   `low.min()`/`high.max()` could pass when no individual bar's range
