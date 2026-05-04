@@ -50,7 +50,16 @@ from ..htf_levels import (
     summarize_htf_trend,
 )
 from ..technical_levels import TechnicalLevelsContext, build_technical_levels_context, empty_technical_levels_context
-from ..utils import call_schwab_client, ensure_standard_indicator_frame, equity_session_state, now_et, parse_hhmm, resample_bars
+from ..utils import (
+    call_schwab_client,
+    ensure_standard_indicator_frame,
+    equity_session_state,
+    now_et,
+    parse_hhmm,
+    resample_bars,
+    talib_bbands,
+    talib_obv,
+)
 
 # Pure helpers live in `helpers.py`. shared.py is the import boundary
 # for the strategies package and re-exports them for convenience.
@@ -175,6 +184,8 @@ __all__ = [
     'single_option_limit_price',
     'single_option_price_bounds',
     'summarize_htf_trend',
+    'talib_bbands',
+    'talib_obv',
     'time',
     'time_mod',
     'timedelta',

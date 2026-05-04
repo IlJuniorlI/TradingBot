@@ -704,9 +704,56 @@ def _require_talib() -> Any:
     return talib
 
 
-def _talib_ema(series: pd.Series, span: int) -> pd.Series:
+def talib_ema(series: pd.Series, span: int) -> pd.Series:
+    """EMA via TA-Lib. Preserves the input's index on the returned series."""
     ta = _require_talib()
     return _series_from_talib(series.index, ta.EMA(_to_float64_array(series), timeperiod=int(span)))
+
+
+def talib_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """OBV via TA-Lib.
+
+    Numerically identical to ``cumsum(direction × volume)``: each bar adds
+    ``+volume`` when ``close > prior close``, ``-volume`` when
+    ``close < prior close``, and zero on a tie. The index of ``close`` is
+    preserved on the returned series. The caller should fill volume NaNs
+    before calling (TA-Lib treats NaN volume as a propagation source).
+    """
+    ta = _require_talib()
+    return _series_from_talib(
+        close.index,
+        ta.OBV(_to_float64_array(close), _to_float64_array(volume)),
+    )
+
+
+def talib_bbands(
+    close: pd.Series,
+    *,
+    length: int,
+    mult: float,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Bollinger Bands via TA-Lib.
+
+    Returns ``(upper, middle, lower)`` matching TA-Lib's own return order.
+    Uses an SMA basis (``matype=ta.MA_Type.SMA``) so the math matches the
+    bot's manual ``rolling(N).mean() + rolling(N).std(ddof=0)`` fallbacks.
+    Emits NaN until the full ``length`` window is available — same warmup
+    semantics as the strategy-side fallbacks that already use
+    ``min_periods=length``.
+    """
+    ta = _require_talib()
+    upper, middle, lower = ta.BBANDS(
+        _to_float64_array(close),
+        timeperiod=int(length),
+        nbdevup=float(mult),
+        nbdevdn=float(mult),
+        matype=ta.MA_Type.SMA,
+    )
+    return (
+        _series_from_talib(close.index, upper),
+        _series_from_talib(close.index, middle),
+        _series_from_talib(close.index, lower),
+    )
 
 
 def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
@@ -725,8 +772,8 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     cum_vol = volume.groupby(session_keys).cumsum().replace(0, math.nan)
     cum_tpv = tpv.groupby(session_keys).cumsum()
     out["vwap_all"] = cum_tpv / cum_vol
-    out["ema9_all"] = _talib_ema(close, span=9)
-    out["ema20_all"] = _talib_ema(close, span=20)
+    out["ema9_all"] = talib_ema(close, span=9)
+    out["ema20_all"] = talib_ema(close, span=20)
 
     index_dt = pd.DatetimeIndex(out.index)
     rth_mask = pd.Series(
@@ -795,7 +842,7 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     out["adx14"] = _series_from_talib(out.index, ta.ADX(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=14))
 
     out["obv"] = _series_from_talib(out.index, ta.OBV(_to_float64_array(close), _to_float64_array(volume)))
-    out["obv_ema20"] = _talib_ema(out["obv"], span=20)
+    out["obv_ema20"] = talib_ema(out["obv"], span=20)
     out["obv_delta5"] = out["obv"].diff(5)
     out["rsi14"] = _series_from_talib(out.index, ta.RSI(_to_float64_array(close), timeperiod=14))
 
@@ -841,7 +888,7 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
             rth_obv = _series_from_talib(today_rth.index, ta.OBV(_to_float64_array(rth_close), _to_float64_array(rth_volume)))
             _overlay("obv", rth_obv)
             if n_rth >= 20:
-                _overlay("obv_ema20", _talib_ema(rth_obv, span=20))
+                _overlay("obv_ema20", talib_ema(rth_obv, span=20))
             _overlay("obv_delta5", rth_obv.diff(5))
 
             # ATR, DI, RSI — clean from bar 14+; ADX needs ~28

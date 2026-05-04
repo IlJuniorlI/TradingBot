@@ -103,6 +103,13 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
             if use_shared_bb_width:
                 bb_width_pct = pd.Series(pd.to_numeric(frame["bb_width_pct"], errors="coerce"), index=frame.index, copy=False)
             else:
+                # Manual rolling Bollinger fallback when bb_len != 20 or
+                # bb_mult != 2.0 (shipped configs always use 20/2.0 so this
+                # branch is dead code in production). Kept on pandas instead
+                # of talib_bbands because TA-Lib's BBANDS poisons the entire
+                # output once it sees a NaN in close, while pandas rolling
+                # recovers as soon as the window moves past the NaN — same
+                # NaN-tolerance the rest of this strategy assumes.
                 mid = pd.Series(pd.to_numeric(frame["close"], errors="coerce"), index=frame.index, copy=False).rolling(bb_len, min_periods=bb_len).mean()
                 std = pd.Series(pd.to_numeric(frame["close"], errors="coerce"), index=frame.index, copy=False).rolling(bb_len, min_periods=bb_len).std(ddof=0)
                 upper = mid + (bb_mult * std)

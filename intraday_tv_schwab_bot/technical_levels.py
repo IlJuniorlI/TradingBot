@@ -14,6 +14,7 @@ from .utils import (
     ensure_ohlcv_frame,
     ensure_standard_indicator_frame,
     resolve_current_price,
+    talib_obv,
 )
 
 
@@ -948,8 +949,9 @@ def build_technical_levels_context(
         if "obv" in frame.columns:
             obv_series = frame["obv"].astype(float)
         else:
-            direction = frame["close"].diff().fillna(0.0).map(lambda x: 1.0 if x > 0 else (-1.0 if x < 0 else 0.0))
-            obv_series = (direction * frame["volume"].fillna(0.0).astype(float)).cumsum()
+            # talib_obv coerces to float64 internally via _to_float64_array;
+            # explicit fillna keeps NaN volume from propagating into the cumsum.
+            obv_series = talib_obv(frame["close"], frame["volume"].fillna(0.0))
         if obv_enabled:
             if int(obv_ema_length) == 20 and "obv_ema20" in frame.columns:
                 obv_ema_series = frame["obv_ema20"].astype(float)
