@@ -59,7 +59,9 @@ const appState = {
     sourceKey: null,
     requestSeq: 0,
     lastBarTs: null,
-    timeframeLabel: '1M',
+    timeframeLabel: null,
+    emaFastSpan: null,
+    emaSlowSpan: null,
     htfRefreshToken: null,
     pinnedBarId: null,
     refreshRafId: 0,
@@ -76,7 +78,9 @@ const appState = {
     sourceKey: null,
     requestSeq: 0,
     lastBarTs: null,
-    timeframeLabel: '1M',
+    timeframeLabel: null,
+    emaFastSpan: null,
+    emaSlowSpan: null,
     htfRefreshToken: null,
     patterns: {},
     structureOverlay: {},
@@ -564,11 +568,45 @@ function currentHtfRefreshToken(data = appState.data, symbol = appState.selected
   return '';
 }
 
+function currentLtfTimeframeLabel(data = appState.data, symbol = appState.selectedSymbol) {
+  const snapshot = selectedSnapshot(data, symbol);
+  const snapshotLabel = String(snapshot?.support_resistance?.ltf_timeframe || '').trim();
+  if (snapshotLabel) return snapshotLabel;
+  const normalizedSymbol = String(symbol || '').toUpperCase();
+  if (normalizedSymbol) {
+    if (normalizedExpandedChartTimeframeMode(appState.expandedChart?.timeframeMode) === 'ltf'
+      && String(appState.expandedChart?.symbol || '').toUpperCase() === normalizedSymbol) {
+      const expandedLabel = String(appState.expandedChart?.timeframeLabel || '').trim();
+      if (expandedLabel) return expandedLabel;
+    }
+    if (normalizedExpandedChartTimeframeMode(appState.compactChart?.timeframeMode) === 'ltf'
+      && String(appState.compactChart?.symbol || '').toUpperCase() === normalizedSymbol) {
+      const compactLabel = String(appState.compactChart?.timeframeLabel || '').trim();
+      if (compactLabel) return compactLabel;
+    }
+  }
+  return '1m';
+}
+
 function expandedChartTimeframeLabel(data = appState.data, mode = expandedChartTimeframeMode()) {
   if (normalizedExpandedChartTimeframeMode(mode) === 'htf') {
     return currentHtfTimeframeLabel(data);
   }
-  return '1M';
+  return currentLtfTimeframeLabel(data);
+}
+
+function chartLtfIsOneMinute(data = appState.data, symbol = appState.selectedSymbol) {
+  // Single source of truth for "is the LTF chart's bar size literally 1m?".
+  // Snapshot.bars are always 1m streaming bars (dashboard_cache.py:626 reads
+  // get_merged with no timeframe arg). When the active strategy declares
+  // params.ltf_minutes > 1 (e.g. peer_confirmed_key_levels uses 5m), the
+  // /api/chart LTF payload returns 5m bars resampled by data_feed.get_merged.
+  // Merging the 1m snapshot bars into the 5m cache would overwrite the 5m
+  // candles by colliding abs_index keys, "rewinding" the chart to whatever
+  // the 1m streaming window covers. So this gate must return true ONLY when
+  // ltf_minutes == 1.
+  const label = String(currentLtfTimeframeLabel(data, symbol) || '').trim().toLowerCase();
+  return label === '1m';
 }
 
 function chartBarIdentity(bar, fallbackIndex = -1) {
@@ -678,6 +716,10 @@ function syncExpandedChartFromBaseSnapshot(data = appState.data) {
   if (expandedChartTimeframeMode() !== 'ltf') return false;
   const symbol = String(appState.selectedSymbol || '').toUpperCase();
   if (!symbol) return false;
+  // Snapshot.bars are 1m streaming bars. For ltf_minutes > 1 they'd collide
+  // with the resampled chart cache via abs_index — bail out and let the
+  // /api/chart fetch keep the cache fresh instead.
+  if (!chartLtfIsOneMinute(data, symbol)) return false;
   const snapshot = activeSnapshotMap(data).get(symbol) || null;
   const baseBars = Array.isArray(snapshot?.bars) ? snapshot.bars : [];
   if (!baseBars.length) return false;
@@ -743,6 +785,9 @@ function syncCompactChartFromBaseSnapshot(data = appState.data) {
   if (compactChartTimeframeMode(data) !== 'ltf') return false;
   const symbol = String(appState.selectedSymbol || '').toUpperCase();
   if (!symbol) return false;
+  // Same 1m-only gate as the expanded sync above — snapshot.bars are 1m and
+  // would corrupt a resampled (5m / 15m / 30m) compact LTF chart cache.
+  if (!chartLtfIsOneMinute(data, symbol)) return false;
   const snapshot = activeSnapshotMap(data).get(symbol) || null;
   const baseBars = Array.isArray(snapshot?.bars) ? snapshot.bars : [];
   if (!baseBars.length) return false;
@@ -819,22 +864,33 @@ function currentChartBars(snapshot) {
       && compactBars.length;
     const compactMatchesTarget = compactModeMatchesTarget
       && compact.sourceKey === targetSourceKey;
+    // Only merge the snapshot's 1m streaming bars when the LTF chart is
+    // itself 1m-grained — see chartLtfIsOneMinute. For ltf_minutes > 1 the
+    // 1m bars would collide on abs_index and overwrite the resampled
+    // candles.
+    const mergeBaseBarsAllowed = compactMode === 'ltf' && baseBars.length && chartLtfIsOneMinute(appState.data, targetSymbol);
     if (compactMatchesTarget) {
-      if (compactMode !== 'ltf' || !baseBars.length) return compactBars;
+      if (!mergeBaseBarsAllowed) return compactBars;
       return mergeChartBars(compactBars, baseBars, targetMaxBars);
     }
     if (compactModeMatchesTarget) {
-      if (compactMode !== 'ltf' || !baseBars.length) return compactBars;
+      if (!mergeBaseBarsAllowed) return compactBars;
       return mergeChartBars(compactBars, baseBars, targetMaxBars);
     }
     if (cachedCompactBars.length) {
-      if (compactMode !== 'ltf' || !baseBars.length) return cachedCompactBars;
+      if (!mergeBaseBarsAllowed) return cachedCompactBars;
       return mergeChartBars(cachedCompactBars, baseBars, targetMaxBars);
     }
     const loadingSelected = !!compact.isLoading && String(appState.selectedSymbol || '').toUpperCase() === targetSymbol;
     if (loadingSelected && compactMode === 'ltf' && baseBars.length && baseBars.length < targetMaxBars) {
       return [];
     }
+    // Final fallback: snapshot.bars are 1m streaming bars. Returning them as
+    // the chart payload only makes sense when the strategy's LTF is 1m. For
+    // ltf_minutes > 1 the 1m bars would briefly show on a chart labeled as
+    // (e.g.) 5m until the /api/chart fetch lands — visually wrong. Show
+    // empty bars in that case so the loading state takes over instead.
+    if (compactMode === 'ltf' && !chartLtfIsOneMinute(appState.data, targetSymbol)) return [];
     return baseBars;
   }
   const targetSymbol = String(snapshot.symbol || '').toUpperCase();
@@ -852,7 +908,10 @@ function currentChartBars(snapshot) {
   if (!Array.isArray(expanded.bars) || !expanded.bars.length) {
     return cachedExpandedBars.length ? cachedExpandedBars : [];
   }
-  if (targetMode !== 'ltf' || !baseBars.length) return expanded.bars;
+  // Same 1m-only merge gate as the compact branch above. For HTF mode or
+  // an LTF > 1m, the snapshot's 1m bars would collide with the chart's
+  // resampled candles via abs_index and corrupt the visible window.
+  if (targetMode !== 'ltf' || !baseBars.length || !chartLtfIsOneMinute(appState.data, targetSymbol)) return expanded.bars;
   return mergeChartBars(expanded.bars, baseBars, targetMaxBars);
 }
 
@@ -893,7 +952,9 @@ function setExpandedChartTimeframeMode(mode) {
   appState.expandedChart.bars = null;
   appState.expandedChart.sourceKey = null;
   appState.expandedChart.lastBarTs = null;
-  appState.expandedChart.timeframeLabel = '1M';
+  appState.expandedChart.timeframeLabel = null;
+  appState.expandedChart.emaFastSpan = null;
+  appState.expandedChart.emaSlowSpan = null;
   appState.expandedChart.htfRefreshToken = null;
   appState.expandedChart.patterns = {};
   appState.expandedChart.structureOverlay = {};
@@ -918,7 +979,9 @@ function resetExpandedChartCache() {
   appState.expandedChart.bars = null;
   appState.expandedChart.sourceKey = null;
   appState.expandedChart.lastBarTs = null;
-  appState.expandedChart.timeframeLabel = '1M';
+  appState.expandedChart.timeframeLabel = null;
+  appState.expandedChart.emaFastSpan = null;
+  appState.expandedChart.emaSlowSpan = null;
   appState.expandedChart.htfRefreshToken = null;
   appState.expandedChart.patterns = {};
   appState.expandedChart.structureOverlay = {};
@@ -1024,6 +1087,8 @@ async function ensureCompactChartBars(force = false) {
     appState.compactChart.sourceKey = sourceKey;
     appState.compactChart.lastBarTs = cached.lastBarTs;
     appState.compactChart.timeframeLabel = cached.timeframeLabel || expandedChartTimeframeLabel(appState.data, timeframeMode);
+    appState.compactChart.emaFastSpan = cached.emaFastSpan ?? null;
+    appState.compactChart.emaSlowSpan = cached.emaSlowSpan ?? null;
     appState.compactChart.htfRefreshToken = cached.htfRefreshToken || null;
     appState.compactChart.patterns = cached.patterns || {};
     appState.compactChart.structureOverlay = cached.structureOverlay || {};
@@ -1057,6 +1122,11 @@ async function ensureCompactChartBars(force = false) {
     maxBars,
     timeframeMode,
     timeframeLabel: String(payload?.timeframe_label || expandedChartTimeframeLabel(appState.data, timeframeMode)),
+    // Capture EMA spans from the chart payload so the chart legend can render
+    // strategy-specific spans (e.g. EMA34 / EMA200 in HTF mode for
+    // peer_confirmed_key_levels) instead of the universal 9 / 20 fallback.
+    emaFastSpan: Number(payload?.ema_fast_span) || null,
+    emaSlowSpan: Number(payload?.ema_slow_span) || null,
     htfRefreshToken: String(payload?.htf_refresh_token || currentHtfRefreshToken(appState.data, symbol) || '').trim() || null,
     patterns: payload?.patterns || {},
     structureOverlay: payload?.structure_overlay || {},
@@ -1070,6 +1140,8 @@ async function ensureCompactChartBars(force = false) {
   appState.compactChart.sourceKey = sourceKey;
   appState.compactChart.lastBarTs = cacheEntry.lastBarTs;
   appState.compactChart.timeframeLabel = cacheEntry.timeframeLabel;
+  appState.compactChart.emaFastSpan = cacheEntry.emaFastSpan;
+  appState.compactChart.emaSlowSpan = cacheEntry.emaSlowSpan;
   appState.compactChart.htfRefreshToken = cacheEntry.htfRefreshToken;
   appState.compactChart.patterns = cacheEntry.patterns || {};
   appState.compactChart.structureOverlay = cacheEntry.structureOverlay || {};
@@ -1084,7 +1156,9 @@ function resetCompactChartCache() {
   appState.compactChart.bars = null;
   appState.compactChart.sourceKey = null;
   appState.compactChart.lastBarTs = null;
-  appState.compactChart.timeframeLabel = '1M';
+  appState.compactChart.timeframeLabel = null;
+  appState.compactChart.emaFastSpan = null;
+  appState.compactChart.emaSlowSpan = null;
   appState.compactChart.htfRefreshToken = null;
   appState.compactChart.patterns = {};
   appState.compactChart.structureOverlay = {};
@@ -1114,6 +1188,8 @@ async function ensureExpandedChartBars(force = false) {
       appState.expandedChart.sourceKey = sourceKey;
       appState.expandedChart.lastBarTs = cached.lastBarTs;
       appState.expandedChart.timeframeLabel = cached.timeframeLabel || expandedChartTimeframeLabel(appState.data, timeframeMode);
+      appState.expandedChart.emaFastSpan = cached.emaFastSpan ?? null;
+      appState.expandedChart.emaSlowSpan = cached.emaSlowSpan ?? null;
       appState.expandedChart.htfRefreshToken = cached.htfRefreshToken || null;
       appState.expandedChart.patterns = cached.patterns || {};
       appState.expandedChart.structureOverlay = cached.structureOverlay || {};
@@ -1148,6 +1224,11 @@ async function ensureExpandedChartBars(force = false) {
     maxBars,
     timeframeMode,
     timeframeLabel: String(payload?.timeframe_label || expandedChartTimeframeLabel(appState.data, timeframeMode)),
+    // Capture EMA spans from the chart payload so HTF mode renders the
+    // strategy's htf_ema_fast_span / htf_ema_slow_span on legend chips
+    // (e.g. EMA34 / EMA200) instead of the LTF default 9 / 20.
+    emaFastSpan: Number(payload?.ema_fast_span) || null,
+    emaSlowSpan: Number(payload?.ema_slow_span) || null,
     htfRefreshToken: String(payload?.htf_refresh_token || currentHtfRefreshToken(appState.data, symbol) || '').trim() || null,
     patterns: payload?.patterns || {},
     structureOverlay: payload?.structure_overlay || {},
@@ -1161,6 +1242,8 @@ async function ensureExpandedChartBars(force = false) {
   appState.expandedChart.sourceKey = sourceKey;
   appState.expandedChart.lastBarTs = cacheEntry.lastBarTs;
   appState.expandedChart.timeframeLabel = cacheEntry.timeframeLabel;
+  appState.expandedChart.emaFastSpan = cacheEntry.emaFastSpan;
+  appState.expandedChart.emaSlowSpan = cacheEntry.emaSlowSpan;
   appState.expandedChart.htfRefreshToken = cacheEntry.htfRefreshToken;
   appState.expandedChart.patterns = cacheEntry.patterns || {};
   appState.expandedChart.structureOverlay = cacheEntry.structureOverlay || {};
@@ -1735,12 +1818,15 @@ function renderSelectedSymbol() {
   document.getElementById('detail-resistance').textContent = fmtNum(nearestResistance, 2);
   document.getElementById('detail-vwap').textContent = fmtNum(bar.vwap, 2);
   document.getElementById('detail-bias-score').textContent = fmtNum(sr.bias_score, 2);
-  // EMA labels are dynamic — chart payload's ema_fast_span / ema_slow_span
-  // tell us whether we're rendering the strategy's HTF EMAs (e.g. 34/200
-  // for peer_confirmed_key_levels in HTF mode) or the default 9/20.
-  const chartForEma = (snapshot && snapshot.chart) || appState?.compactChart || {};
-  const emaFastSpan = Math.max(1, Number(chartForEma.ema_fast_span) || 9);
-  const emaSlowSpan = Math.max(1, Number(chartForEma.ema_slow_span) || 20);
+  // EMA labels are dynamic — chart-endpoint payload's ema_fast_span /
+  // ema_slow_span tell us whether we're rendering the strategy's HTF EMAs
+  // (e.g. 34/200 for peer_confirmed_key_levels in HTF mode) or the default
+  // 9/20. The spans live on appState.expandedChart / compactChart (captured
+  // when /api/chart payloads arrive); snapshot.chart is the levels meta
+  // payload built in dashboard_cache.py:1086 and never carries them.
+  const activeEmaSource = appState.mainPanelExpanded ? appState.expandedChart : appState.compactChart;
+  const emaFastSpan = Math.max(1, Number(activeEmaSource?.emaFastSpan) || 9);
+  const emaSlowSpan = Math.max(1, Number(activeEmaSource?.emaSlowSpan) || 20);
   const emaFastLabel = `EMA${emaFastSpan}`;
   const emaSlowLabel = `EMA${emaSlowSpan}`;
   document.getElementById('detail-ema-fast-label').textContent = emaFastLabel;
@@ -2058,7 +2144,29 @@ function drawSelectedChart(snapshot) {
   // the 1m anchor space and abs-index filtering rejects valid FVGs/OBs.
   // Use timestamp comparison in that case so 1m micro-structure overlays
   // still render at their correct visual position.
-  const chartTimeframeMinutes = Math.max(1, Number(chart?.timeframe_minutes) || 1);
+  //
+  // Source priority: snapshot.support_resistance.ltf_timeframe is server
+  // -emitted truth ("5m" / "1m"). Fall back to the active chart cache's
+  // timeframeLabel, then the snapshot.bars-implied 1m default. snapshot.chart
+  // is the levels/technicals meta-payload (dashboard_cache.py:1086) and never
+  // carries timeframe_minutes — reading from it would always resolve to 1
+  // and silently drop LTF FVG/OB overlays for non-1m strategies.
+  const chartTimeframeMinutesRaw = (() => {
+    const srLabel = String(snapshot?.support_resistance?.ltf_timeframe || '').trim();
+    if (srLabel) {
+      const parsed = parseInt(srLabel, 10);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    const cacheLabel = String(
+      (isExpandedView ? appState.expandedChart?.timeframeLabel : appState.compactChart?.timeframeLabel) || ''
+    ).trim();
+    if (cacheLabel) {
+      const parsed = parseInt(cacheLabel, 10);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return 1;
+  })();
+  const chartTimeframeMinutes = Math.max(1, chartTimeframeMinutesRaw);
   const useAbsIndexForLtf = chartTimeframeMinutes === 1;
   const ltfTimeframeLabel = `${chartTimeframeMinutes}m`;
   const firstBarMillis = Date.parse(bars[0]?.ts || '');
@@ -2091,20 +2199,29 @@ function drawSelectedChart(snapshot) {
     return !!timeframe && timeframe !== ltfTimeframeLabel;
   });
   const ltfOrderBlocks = isHtfChart ? [] : normalizeDashboardFvgs(levels.ltf_order_blocks, 1).filter(ltfVisibilityFilter);
-  const basePatterns = chart.patterns || {};
-  const compactPatterns = (!isExpandedView
-    && String(appState.compactChart?.symbol || '').toUpperCase() === String(snapshot?.symbol || '').toUpperCase()
-    && normalizedExpandedChartTimeframeMode(appState.compactChart?.timeframeMode) === chartTimeframeMode) ? (appState.compactChart.patterns || {}) : {};
-  const expandedPatterns = (isExpandedView && String(appState.expandedChart?.symbol || '').toUpperCase() === String(snapshot?.symbol || '').toUpperCase()) ? (appState.expandedChart.patterns || {}) : {};
-  const patterns = Object.keys(expandedPatterns || {}).length ? expandedPatterns : (Object.keys(compactPatterns || {}).length ? compactPatterns : basePatterns);
-  const structureOverlayBase = chart.structure_overlay || {};
-  const compactStructureOverlay = (!isExpandedView
-    && String(appState.compactChart?.symbol || '').toUpperCase() === String(snapshot?.symbol || '').toUpperCase()
-    && normalizedExpandedChartTimeframeMode(appState.compactChart?.timeframeMode) === chartTimeframeMode) ? (appState.compactChart.structureOverlay || {}) : {};
-  const expandedStructureOverlay = (isExpandedView && String(appState.expandedChart?.symbol || '').toUpperCase() === String(snapshot?.symbol || '').toUpperCase()) ? (appState.expandedChart.structureOverlay || {}) : {};
-  const activeStructureOverlay = Object.keys(expandedStructureOverlay || {}).length
+  // Patterns + structure overlay only ever come from /api/chart payloads
+  // stored on appState.expandedChart / appState.compactChart. snapshot.chart
+  // is the levels/technicals meta-payload built in dashboard_cache.py:1086
+  // and never carries `patterns` or `structure_overlay` — so falling back to
+  // it would always yield {}. Pick the correct cache for the current view
+  // and require a symbol+mode match to avoid showing stale data after a
+  // symbol or mode flip.
+  const snapshotSymbolUpper = String(snapshot?.symbol || '').toUpperCase();
+  const compactCacheMatchesSnapshot = !isExpandedView
+    && String(appState.compactChart?.symbol || '').toUpperCase() === snapshotSymbolUpper
+    && normalizedExpandedChartTimeframeMode(appState.compactChart?.timeframeMode) === chartTimeframeMode;
+  const expandedCacheMatchesSnapshot = isExpandedView
+    && String(appState.expandedChart?.symbol || '').toUpperCase() === snapshotSymbolUpper;
+  const compactPatterns = compactCacheMatchesSnapshot ? (appState.compactChart.patterns || {}) : {};
+  const expandedPatterns = expandedCacheMatchesSnapshot ? (appState.expandedChart.patterns || {}) : {};
+  const patterns = Object.keys(expandedPatterns).length
+    ? expandedPatterns
+    : (Object.keys(compactPatterns).length ? compactPatterns : {});
+  const compactStructureOverlay = compactCacheMatchesSnapshot ? (appState.compactChart.structureOverlay || {}) : {};
+  const expandedStructureOverlay = expandedCacheMatchesSnapshot ? (appState.expandedChart.structureOverlay || {}) : {};
+  const activeStructureOverlay = Object.keys(expandedStructureOverlay).length
     ? expandedStructureOverlay
-    : (Object.keys(compactStructureOverlay || {}).length ? compactStructureOverlay : structureOverlayBase);
+    : (Object.keys(compactStructureOverlay).length ? compactStructureOverlay : {});
   const positionMarkers = chart.position_markers || {};
   const recentTrades = Array.isArray(chart.recent_trades) ? chart.recent_trades : [];
   const highs = bars.map(bar => Number(bar.high));
@@ -2113,8 +2230,15 @@ function drawSelectedChart(snapshot) {
   // Backend tells us which EMA spans the bars carry. In HTF mode the chart
   // values are the strategy's htf_ema_fast/slow (e.g. 34/200 for
   // peer_confirmed_key_levels); in LTF mode they're the default 9/20.
-  const chartEmaFastSpan = Math.max(1, Number(chart?.ema_fast_span) || 9);
-  const chartEmaSlowSpan = Math.max(1, Number(chart?.ema_slow_span) || 20);
+  // The spans live on the chart-endpoint payload (appState.expandedChart /
+  // compactChart), NOT on snapshot.chart — `snapshot.chart` is the
+  // levels/technicals meta-payload built in dashboard_cache.py:1086 and
+  // never carries ema_fast_span/ema_slow_span. Reading from the active
+  // chart cache is what makes the HTF legend show EMA34 / EMA200 instead
+  // of the LTF default 9 / 20.
+  const activeChartCache = isExpandedView ? appState.expandedChart : appState.compactChart;
+  const chartEmaFastSpan = Math.max(1, Number(activeChartCache?.emaFastSpan) || 9);
+  const chartEmaSlowSpan = Math.max(1, Number(activeChartCache?.emaSlowSpan) || 20);
   const seriesDefs = [];
   if (show('show_moving_averages', true)) {
     seriesDefs.push({ key: 'ema9', label: `EMA${chartEmaFastSpan}`, color: '#44e7ff', width: 2.0 });
@@ -3082,6 +3206,17 @@ function drawSelectedChart(snapshot) {
     });
 
     const legendChips = [`<span class="legend-chip"><span class="swatch" style="background:${appState.mainPanelExpanded ? '#79d4ff' : '#6ce3a2'};"></span>${bars.length} bars</span>`];
+    // Compact chart has no on-canvas timeframe toggle (the expanded chart's
+    // chart-timeframe-toggle covers that), so surface the active timeframe
+    // as a legend chip. expandedChartTimeframeLabel resolves to either the
+    // LTF label (e.g. "5m") or HTF label (e.g. "60m") depending on the
+    // current chart mode.
+    if (!isExpandedView) {
+      const compactTfLabel = String(expandedChartTimeframeLabel(appState.data, chartTimeframeMode) || '').trim();
+      if (compactTfLabel) {
+        legendChips.unshift(`<span class="legend-chip"><span class="swatch" style="background:#9c8cff;"></span>${escapeHtml(compactTfLabel)} ${isHtfChart ? 'HTF' : 'LTF'}</span>`);
+      }
+    }
     const lastBar = bars[bars.length - 1];
 
     seriesDefs.forEach(def => {

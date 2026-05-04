@@ -1789,10 +1789,15 @@ class DashboardCache:
         timeframe_minutes = int(getattr(ctx, "timeframe_minutes", self._active_htf_minutes()) or self._active_htf_minutes())
         symbol_key = str(symbol or "").upper().strip()
         htf_refresh = self.data.last_htf_refresh.get((symbol_key, timeframe_minutes)) if symbol_key else None
+        ltf_min = max(1, self._active_ltf_minutes())
 
         return {
             "symbol": symbol,
             "timeframe": f"{timeframe_minutes}m",
+            # LTF label exposed alongside HTF so the dashboard's expanded-chart
+            # LTF toggle button can render "5m LTF" (or whatever ltf_minutes
+            # resolves to) instead of the hardcoded "1M LTF" fallback.
+            "ltf_timeframe": f"{ltf_min}m",
             "price": display_price,
             "htf_refresh_token": htf_refresh.isoformat() if htf_refresh is not None else None,
             "side_tolerance": dashboard_safe_float(getattr(ctx, "side_tolerance", None)),

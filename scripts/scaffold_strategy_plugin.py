@@ -61,7 +61,8 @@ def _manifest(name: str, class_stem: str, plugin_type: str) -> str:
                 # (directly, or via _build_bullish_reversal_signal) reads
                 # documented manifest values instead of strategy_base hardcoded
                 # fallbacks. Defaults mirror BaseStrategy._fvg_entry_adjustment_components
-                # at strategy_base.py:2527-2539.
+                # in strategy_base.py (search for that method to verify defaults
+                # if you tune them — line numbers drift as the file grows).
                 "htf_fvg_entry_weight": 0.55,
                 "ltf_fvg_entry_weight": 0.35,
                 "opposing_fvg_entry_penalty_mult": 1.0,
