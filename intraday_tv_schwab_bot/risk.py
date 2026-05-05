@@ -31,8 +31,18 @@ class StopoutRecord:
     timestamp: datetime
 
 
-@dataclass(slots=True)
+@dataclass
 class RiskState:
+    """Per-RiskManager mutable state.
+
+    `slots=True` is intentionally OFF here even though the rest of the
+    codebase prefers it. PyCharm's static checker has a known bug where
+    field access on `@dataclass(slots=True)` instances is mis-reported as
+    "object has no attribute '<field>'" for every slot field. RiskState is
+    a singleton (one per RiskManager, one per bot run), so the slots
+    memory benefit is ~50 bytes on a single instance — not worth the IDE
+    noise on every read/write of these fields.
+    """
     realized_pnl: float = 0.0
     # Direction-aware cooldown keyed by (SYMBOL_UPPER, Side). A LONG exit
     # only blocks same-direction re-entry; opposite-direction entries remain
@@ -45,8 +55,10 @@ class RiskState:
     recent_stopouts: list[StopoutRecord] = field(default_factory=list)
     # ET session date that owns the current realized_pnl tally. When the date
     # rolls over, realized_pnl is reset to 0.0 so that max_daily_loss behaves
-    # as a per-day gate (matching README.md:195) rather than a per-lifetime cap.
-    session_date: date | None = None
+    # as a per-day gate rather than a per-lifetime cap. Eager-initialized to
+    # today's ET date so the field has a concrete `date` type and
+    # `_reset_if_new_session` doesn't need a lazy-init branch.
+    session_date: date = field(default_factory=lambda: now_et().date())
 
 
 class RiskManager:
@@ -113,12 +125,11 @@ class RiskManager:
 
         Without this, ``max_daily_loss`` accumulates across days on continuous
         multi-day runs and one losing session blocks all future entries until
-        the process is restarted.
+        the process is restarted. ``session_date`` is eager-initialized in
+        ``RiskState`` to today's ET date, so there is no ``None`` initial
+        state to handle here.
         """
         current_date = now_et().date()
-        if self.state.session_date is None:
-            self.state.session_date = current_date
-            return
         if current_date != self.state.session_date:
             if self.state.realized_pnl != 0.0:
                 LOG.info(
@@ -344,7 +355,13 @@ class RiskManager:
                 value = float(raw)
             except (TypeError, ValueError):
                 continue
-            if 0 < value == value:  # NaN-safe: NaN fails both sides of the chain.
+            # math.isfinite rejects NaN and ±inf in one call. The previous
+            # idiom `0 < value == value` (chained comparison) relied on
+            # `NaN == NaN` being False to filter NaN, but it tripped
+            # PyCharm's "Comparison with self" warning and accepted +inf.
+            # isfinite reads cleanly and is also stricter — +inf is never
+            # a valid entry price either.
+            if math.isfinite(value) and value > 0:
                 return value
         return None
 

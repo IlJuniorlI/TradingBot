@@ -275,7 +275,14 @@ class DashboardServer:
         if self.httpd is not None:
             return
         handler = self._make_handler()
-        self.httpd = ReusableThreadingHTTPServer((self.host, self.port), handler)
+        # type: ignore on the next line — typeshed types `BaseServer.__init__`'s
+        # handler arg as `Callable[[Any, Any, Self], BaseRequestHandler]`, where
+        # `Self` is bound to the concrete server class, and PyCharm won't accept
+        # `type[BaseHTTPRequestHandler]` (the class itself) as a match even
+        # though Python classes are callable. Standard typeshed friction; the
+        # runtime construction is correct (this is exactly how the stdlib
+        # `http.server.HTTPServer` example wires up handlers).
+        self.httpd = ReusableThreadingHTTPServer((self.host, self.port), handler)  # type: ignore[arg-type]
         if self.https:
             if not self.ssl_certfile:
                 raise ValueError("dashboard.https is enabled but dashboard.ssl_certfile is not set")
