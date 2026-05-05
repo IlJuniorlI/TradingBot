@@ -90,17 +90,19 @@ class RiskManager:
     def is_symbol_on_cooldown(self, symbol: str, side: "Side | None" = None) -> bool:
         """Check whether ``symbol`` is on cooldown for ``side``.
 
-        If ``side`` is None (legacy callers, e.g. test fixtures that don't
-        track direction), returns True if EITHER direction is on cooldown —
-        preserves the strictest legacy behavior. When called with a specific
-        side from ``can_open``, only the same-side cooldown blocks.
+        With ``cooldown_direction_aware: true`` (the shipped default), the
+        write side only stamps the direction that just exited, so reads
+        should pass the candidate's intended ``side`` when known to avoid
+        blocking the opposite direction. When ``side`` is None — strategies
+        whose screener doesn't pre-classify direction (e.g.
+        peer_confirmed_key_levels) or test fixtures — this returns True if
+        EITHER direction is on cooldown, the conservative fallback.
         """
         key = self._symbol_key(symbol)
         now = now_et()
         if side is not None:
             until = self.state.cooldown_until.get((key, side))
             return bool(until and now < until)
-        # Legacy: any direction on cooldown
         for (stored_key, _stored_side), until in self.state.cooldown_until.items():
             if stored_key == key and until and now < until:
                 return True

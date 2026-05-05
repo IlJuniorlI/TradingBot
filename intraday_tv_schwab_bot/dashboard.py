@@ -514,9 +514,6 @@ class DashboardServer:
                     except Exception:
                         requested_bars = 90
                     requested_timeframe_mode = str((params.get("timeframe") or ['ltf'])[0] or 'ltf').strip().lower()
-                    if requested_timeframe_mode == '1m':
-                        # Back-compat alias: legacy "1m" mode -> "ltf".
-                        requested_timeframe_mode = 'ltf'
                     if requested_timeframe_mode != 'htf':
                         requested_timeframe_mode = 'ltf'
                     capped_bars = max(1, min(requested_bars, 480))

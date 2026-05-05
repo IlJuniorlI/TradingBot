@@ -26,8 +26,8 @@ See also:
 - `volatility_squeeze_breakout` — liquid-stock compression breakout strategy
 - `pairs_residual` — relative-value pair divergence strategy
 - `opening_range_breakout` — opening-range breakout strategy
-- `peer_confirmed_key_levels` — peer-confirmed hourly key-level/zone strategy with 5-minute triggers, optional macro confirmation, and ladder-aware post-entry management when `adaptive_ladder` is enabled
-- `peer_confirmed_key_levels_1m` — faster 1-minute peer-confirmed hourly key-level/zone variant tuned as a compromise between aggressive and balanced confirmation
+- `peer_confirmed_key_levels` — peer-confirmed HTF key-level/zone strategy with 5-minute LTF triggers, optional macro confirmation, and ladder-aware post-entry management when `adaptive_ladder` is enabled
+- `peer_confirmed_key_levels_1m` — faster 1-minute LTF peer-confirmed HTF key-level/zone variant tuned as a compromise between aggressive and balanced confirmation
 - `peer_confirmed_trend_continuation` — peer-confirmed trend continuation strategy that trades controlled pullbacks and re-expansion without waiting for key-level touches
 - `peer_confirmed_htf_pivots` — peer-confirmed higher-timeframe pivot S/R scalp strategy with switchable reclaim, rejection, and continuation entry families
 - `top_tier_adaptive` — multi-regime adaptive strategy for top-tier liquid stocks across Technology, Consumer Discretionary, and Communication Services with index confirmation and sector concentration guard
@@ -545,8 +545,8 @@ How charting options behave:
 - `show_support_resistance`, `show_next_support_resistance`, `show_full_support_resistance_ladder`: how much of the support/resistance map to draw.
 - `show_key_level_zones`, `show_key_level_zone_labels`: peer-confirmed zone overlays.
 - `show_bollinger_bands`, `show_anchored_vwap`, `show_fib_extensions`, `show_channel`, `show_trendlines`: heavier technical overlays.
-- `show_htf_fair_value_gaps`, `show_ltf_fair_value_gaps`: higher-timeframe and one-minute FVG overlays. Cross-timeframe protection is enforced automatically, so HTF FVGs do not render on 1m charts and 1m FVGs do not render on HTF charts.
-- `show_htf_order_blocks`, `show_ltf_order_blocks`: higher-timeframe and one-minute order block overlays. Render with a dashed-line border around a very faint fill so they are visually distinct from the solid-filled FVG overlays. Same green/red bullish/bearish color semantics. Driven by `support_resistance.htf_order_blocks_enabled` / `ltf_order_blocks_enabled` and the shared OB tuning knobs (`order_block_mode`, etc.). Cross-timeframe protection is enforced the same way as for FVGs.
+- `show_htf_fair_value_gaps`, `show_ltf_fair_value_gaps`: HTF and LTF FVG overlays. Cross-timeframe protection is enforced automatically, so HTF FVGs do not render on the LTF chart and LTF FVGs do not render on the HTF chart.
+- `show_htf_order_blocks`, `show_ltf_order_blocks`: HTF and LTF order block overlays. Render with a dashed-line border around a very faint fill so they are visually distinct from the solid-filled FVG overlays. Same green/red bullish/bearish color semantics. Driven by `support_resistance.htf_order_blocks_enabled` / `ltf_order_blocks_enabled` and the shared OB tuning knobs (`order_block_mode`, etc.). Cross-timeframe protection is enforced the same way as for FVGs.
 - `show_trade_markers`: entry/exit markers on the chart.
 - `tooltip_show_*`: toggle tooltip sections individually.
 - In `compact` and `expanded`, using `null` means “inherit from `shared`.”
@@ -626,8 +626,7 @@ How the groups work:
   - `use_prior_day_high_low`, `use_prior_week_high_low`
   - Allow prior-day / prior-week highs and lows as fallback levels only when a side ends up empty after normal S/R detection and cleanup. Those fallback levels are admitted on the correct side of the guarded fallback reference price, can still participate in normal flip handling, and flow through the normal S/R ladder logic. If no prior-day/week fallback is eligible, the builders can fall back to the frame extreme for that side.
 - FVG detection:
-  - `htf_fair_value_gaps_*` controls HTF FVG generation.
-  - `one_minute_fair_value_gaps_*` controls 1-minute FVG generation.
+  - `htf_fair_value_gaps_enabled` toggles HTF FVG generation; `ltf_fair_value_gaps_enabled` toggles LTF FVG generation. The shared `fair_value_gap_max_per_side`, `fair_value_gap_min_atr_mult`, and `fair_value_gap_min_pct` knobs apply to both timeframes.
   - Raising the min ATR or min percent thresholds makes FVG detection more selective.
 - Order block detection:
   - `htf_order_blocks_enabled` and `ltf_order_blocks_enabled` toggle OB generation per timeframe.
@@ -1011,7 +1010,7 @@ Used by the continuation-style stock strategies.
 
 Behavior:
 
-- When enabled, an overextended continuation entry can shift from **enter now** to **wait for a same-direction 1-minute FVG retest**.
+- When enabled, an overextended continuation entry can shift from **enter now** to **wait for a same-direction LTF FVG retest**.
 - Larger distance thresholds make the bot accept looser FVG retests.
 - Higher `anti_chase_fvg_retest_min_close_position` requires a stronger reclaim candle on the retest.
 - `anti_chase_fvg_retest_stop_buffer_gap_frac` controls how tight the stop anchors around the defended FVG.
@@ -1570,7 +1569,7 @@ Current package defaults:
 
 ### `peer_confirmed_key_levels`
 
-Purpose: trade around hourly key levels/zones only when a tradable symbol, its peer basket, and optional macro symbols agree strongly enough, then ride the cleaned S/R ladder while price action still defends the last reclaimed/broken rung.
+Purpose: trade around HTF key levels/zones only when a tradable symbol, its peer basket, and optional macro symbols agree strongly enough, then ride the cleaned S/R ladder while price action still defends the last reclaimed/broken rung.
 
 Default windows:
 
@@ -1663,7 +1662,7 @@ Current package defaults:
 
 ### `peer_confirmed_key_levels_1m`
 
-Purpose: 1-minute peer-confirmed hourly key-level/zone strategy variant that keeps the same HTF map and peer/macro confirmation framework as `peer_confirmed_key_levels`, but is now tuned as a compromise between aggressive and balanced confirmation so entries can form earlier without using the older looser gates.
+Purpose: 1-minute LTF peer-confirmed HTF key-level/zone strategy variant that keeps the same HTF map and peer/macro confirmation framework as `peer_confirmed_key_levels`, but is now tuned as a compromise between aggressive and balanced confirmation so entries can form earlier without using the older looser gates.
 
 Default windows:
 
@@ -1674,11 +1673,11 @@ Default windows:
 Key differences vs the 5-minute base strategy:
 
 - `ltf_minutes: 1`
-- deeper trigger warmup with `min_bars: 90` and `min_ltf_bars: 45`
-- compromise 1-minute gates that are still faster than the 5-minute base but no longer use the older aggressive thresholds: `min_level_score: 2.5`, `min_rr: 1.6`, `min_peer_agreement: 2`, `min_peer_score: 2`
-- tighter trigger-zone sizing and slightly faster adaptive management to suit 1-minute execution while keeping confirmation more balanced
-- heavier weighting on one-minute FVG participation while still retaining the hourly map and macro confirmation checks
-- inherits the base strategy's capped trigger-quality bonus layer so clean 1-minute reclaims / rejects can outrank weaker touches without raising `min_ltf_score`
+- deeper LTF warmup with `min_bars: 90` and `min_ltf_bars: 45`
+- compromise 1-minute LTF gates that are still faster than the 5-minute base but no longer use the older aggressive thresholds: `min_level_score: 2.5`, `min_rr: 1.6`, `min_peer_agreement: 2`, `min_peer_score: 2`
+- tighter LTF zone sizing and slightly faster adaptive management to suit 1-minute execution while keeping confirmation more balanced
+- heavier weighting on LTF FVG participation while still retaining the HTF map and macro confirmation checks
+- inherits the base strategy's capped LTF-quality bonus layer so clean 1-minute reclaims / rejects can outrank weaker touches without raising `min_ltf_score`
 
 Use `configs/config.peer_confirmed_key_levels_1m.yaml` for the shipped full preset.
 
@@ -1740,7 +1739,7 @@ Current package defaults:
 
 ### `peer_confirmed_htf_pivots`
 
-Purpose: trade around higher-timeframe support/resistance pivot battlegrounds instead of generic hourly key-level votes. The strategy can enter in reclaim, rejection, or continuation mode, but it is now explicitly tuned as an S/R scalp strategy that prefers longs around support, shorts around resistance, and uses the next opposing S/R level as the first target reference.
+Purpose: trade around HTF support/resistance pivot battlegrounds instead of generic HTF key-level votes. The strategy can enter in reclaim, rejection, or continuation mode, but it is now explicitly tuned as an S/R scalp strategy that prefers longs around support, shorts around resistance, and uses the next opposing S/R level as the first target reference.
 
 Default windows:
 

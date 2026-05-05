@@ -963,10 +963,12 @@ class DashboardCache:
                     fair_value_gap_min_pct=float(getattr(self.config.support_resistance, "fair_value_gap_min_pct", 0.0005) or 0.0005),
                 )
                 if htf_ctx is not None:
+                    htf_min = self._active_htf_minutes()
+                    htf_tf_minutes = int(getattr(htf_ctx, "timeframe_minutes", htf_min) or htf_min)
                     for gap in list(getattr(htf_ctx, "bullish_fvgs", []) or []) + list(getattr(htf_ctx, "bearish_fvgs", []) or []):
                         payload_fvg = dashboard_fvg_payload(gap)
                         if payload_fvg is not None:
-                            payload_fvg["timeframe"] = f"{int(getattr(htf_ctx, 'timeframe_minutes', self._active_htf_minutes()) or self._active_htf_minutes())}m"
+                            payload_fvg["timeframe"] = f"{htf_tf_minutes}m"
                             htf_fair_value_gaps.append(payload_fvg)
         except Exception:
             htf_fair_value_gaps = []
@@ -1078,7 +1080,7 @@ class DashboardCache:
         except Exception:
             self.log_component_failure(
                 "ltf_order_blocks_collect",
-                "Dashboard 1m order blocks collect failed for %s",
+                "Dashboard LTF order blocks collect failed for %s",
                 symbol,
             )
             ltf_order_blocks = []
@@ -1786,7 +1788,8 @@ class DashboardCache:
             nearest_support_price = support_prices[0] if support_prices else None
             nearest_resistance_price = resistance_prices[0] if resistance_prices else None
 
-        timeframe_minutes = int(getattr(ctx, "timeframe_minutes", self._active_htf_minutes()) or self._active_htf_minutes())
+        htf_min_active = self._active_htf_minutes()
+        timeframe_minutes = int(getattr(ctx, "timeframe_minutes", htf_min_active) or htf_min_active)
         symbol_key = str(symbol or "").upper().strip()
         htf_refresh = self.data.last_htf_refresh.get((symbol_key, timeframe_minutes)) if symbol_key else None
         ltf_min = max(1, self._active_ltf_minutes())
@@ -2049,12 +2052,10 @@ class DashboardCache:
         ``timeframe_mode``: ``"ltf"`` renders at the strategy's LTF
         (``params.ltf_minutes``, defaults to 1m streaming bars). ``"htf"``
         renders at the strategy's HTF (``params.htf_minutes`` or the shared
-        ``support_resistance.timeframe_minutes`` default). Legacy ``"1m"``
-        is accepted as an alias for ``"ltf"``."""
+        ``support_resistance.timeframe_minutes`` default). Anything other
+        than ``"htf"`` is normalized to ``"ltf"``."""
         from dataclasses import asdict
         resolved_mode = str(timeframe_mode or "ltf").strip().lower()
-        if resolved_mode == "1m":  # back-compat alias
-            resolved_mode = "ltf"
         if resolved_mode != "htf":
             resolved_mode = "ltf"
         symbol_key = str(symbol or "").upper().strip()
@@ -2073,8 +2074,8 @@ class DashboardCache:
         if resolved_mode == "htf" and symbol_key:
             # HTTP handler path: only read cached HTF data, never trigger a
             # Schwab fetch here. Forcing a refresh from the HTTP thread races
-            # with the engine's per-cycle prefetch (data_feed.py:480 runs
-            # under self._lock on the engine thread) and risks rate-limit
+            # with the engine's per-cycle prefetch (data_feed.fetch_htf_context
+            # runs under self._lock on the engine thread) and risks rate-limit
             # hits. If the cache is empty, return an empty chart — the next
             # engine cycle will populate it and the next poll will render.
             frame = self.data.get_htf_frame(

@@ -465,7 +465,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     and pct_b <= (1.0 - pct_b_max) and atr_stretch >= stretch_max
                 ):
                     # atr_stretch_ema20_mult is abs(close-ema20)/atr14 — always
-                    # non-negative (see technical_levels.py:688). The direction
+                    # non-negative (computed in build_technical_levels_context).
+                    # The direction
                     # (above vs below EMA20) is captured by bollinger_percent_b:
                     # pct_b <= 0.15 = near lower band = stretched below. So the
                     # magnitude threshold stretch_max applies symmetrically to

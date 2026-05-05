@@ -1023,7 +1023,16 @@ class EntryGatekeeper:
             if self._is_startup_reconcile_entry_blocked(candidate.symbol):
                 self._log_entry_decision(self.config.strategy, candidate.symbol, "skipped", ["startup_reconcile_ignored_open_position"], context=candidate_context)
                 continue
-            if self.risk.is_symbol_on_cooldown(candidate.symbol):
+            # Honor candidate-level directional_bias when the screener sets it
+            # (peer_confirmed_trend_continuation, peer_confirmed_htf_pivots,
+            # pairs_residual, top_tier_adaptive, microcap_*, zero_dte_*) so a
+            # LONG cooldown does not block a candidate the screener has
+            # already pre-classified as SHORT (and vice-versa) under
+            # cooldown_direction_aware: true. Strategies that defer the
+            # direction decision until entry_signals (peer_confirmed_key_levels)
+            # pass directional_bias=None and fall through to the conservative
+            # "any direction blocked" branch in is_symbol_on_cooldown.
+            if self.risk.is_symbol_on_cooldown(candidate.symbol, candidate.directional_bias):
                 self._log_entry_decision(self.config.strategy, candidate.symbol, "skipped", ["cooldown"], context=candidate_context)
                 continue
             live_entry_status = self.data.live_entry_bar_status(candidate.symbol)
