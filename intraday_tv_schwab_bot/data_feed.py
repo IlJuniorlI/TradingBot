@@ -1080,19 +1080,22 @@ class MarketDataStore:
                 self.last_empty_history_refresh.pop(cache_key, None)
             self.merge_stats[cache_key].history_rows = len(self.history[cache_key])
         self._invalidate_cycle_symbol(symbol)
-        # Propagate the 1m heal into HTF: clear the bar-aligned refresh
-        # gate (last_htf_refresh tracker) and the cycle-scoped HTF/SR
-        # caches so the next call rebuilds against the healed 1m frame
-        # immediately, instead of waiting for the next HTF bar boundary.
-        # Skipped on empty heals (REST returned no candles) since the 1m
-        # frame didn't change and the existing HTF derivation is still
-        # valid.
-        if not df.empty:
-            with self._lock:
-                htf_throttle_keys = [k for k in self.last_htf_refresh.keys() if k[0] == cache_key]
-                for throttle_key in htf_throttle_keys:
-                    self.last_htf_refresh.pop(throttle_key, None)
-            self._invalidate_cycle_htf(symbol)
+        # NOTE: a previous version of this method also popped last_htf_refresh
+        # entries and called _invalidate_cycle_htf when the 1m frame healed,
+        # under the (incorrect) premise that "1m heal -> HTF must rebuild
+        # against the healed 1m frame". HTF data is *not* derived from the
+        # 1m stream — fetch_htf_context calls Schwab REST price_history at
+        # base_freq (5/15/30m for the supported HTFs) and resamples to the
+        # target tf. A 1m stream stale has no bearing on HTF freshness.
+        # Popping last_htf_refresh defeated the bar-aligned gate every time
+        # CHART_EQUITY went stale, which is frequent in low-volume after-
+        # hours windows: production logs showed 135 stream stales -> 575
+        # HTF fetches in a single 18:00 hour even though all of those calls
+        # were inside one 60m HTF bucket. The bar-aligned gate already
+        # handles cross-bucket recovery on its own (now_bucket > last_bucket
+        # triggers a refresh); within the same bucket no new HTF bar exists
+        # to fetch, so the pop only added wasted Schwab API calls without
+        # improving data integrity.
         if df.empty and not self.is_regular_session(fetched_at):
             LOG.info("price_history returned no candles for %s outside regular session; using slower retry cadence", symbol)
         return self.get_merged(symbol)
