@@ -2,7 +2,7 @@
 # Bumping any of these requires a full pytest pass + a dry-run on beta
 # before promoting to prod.
 schwabdev==3.0.4
-tradingview-screener==3.1.0
+tradingview-screener==3.2.0
 pandas==2.3.3
 numpy==2.4.4
 PyYAML==6.0.3
