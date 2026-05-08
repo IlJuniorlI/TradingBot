@@ -194,6 +194,10 @@ dashboard:
       show_ltf_fair_value_gaps: true
       show_htf_order_blocks: false
       show_ltf_order_blocks: false
+      # Divergence trendlines on price chart. RSI on by default; OBV off
+      # to avoid stacking duplicate lines on close pivot pairs.
+      show_rsi_divergence: true
+      show_obv_divergence: false
       show_trade_markers: true
       tooltip_show_returns: true
       tooltip_show_support_resistance: true
@@ -221,6 +225,10 @@ dashboard:
       show_ltf_fair_value_gaps: true
       show_htf_order_blocks: false
       show_ltf_order_blocks: false
+      # Divergence trendlines on price chart. RSI on by default; OBV off
+      # to avoid stacking duplicate lines on close pivot pairs.
+      show_rsi_divergence: true
+      show_obv_divergence: false
       show_trade_markers: true
       tooltip_show_returns: true
       tooltip_show_support_resistance: true
@@ -325,7 +333,19 @@ technical_levels:
   divergence_obv_min_volume_frac: 0.65
   divergence_counter_rsi_penalty: 0.12
   divergence_counter_obv_penalty: 0.1
-  divergence_block_dual_counter: true
+  # Multi-pivot divergence detection (added with the levels_shared.find_divergence
+  # refactor): walk the last N pivots and return the most recent qualifying
+  # pair, gated by max-age in bars so stale divergences don'''t dominate.
+  divergence_pivot_lookback: 4
+  divergence_max_age_bars: 8
+  divergence_min_price_move_pct: 0.0015
+  # Hidden divergence (continuation pattern) — same-direction bonus.
+  divergence_hidden_bonus_rsi: 0.10
+  divergence_hidden_bonus_obv: 0.08
+  # HTF (multi-timeframe) divergence confluence — read from HTFContext.
+  htf_divergence_aligned_bonus_rsi: 0.20
+  htf_divergence_counter_penalty_rsi: 0.25
+  htf_divergence_hidden_bonus_rsi: 0.10
   bollinger_enabled: true
   bollinger_length: 20
   bollinger_std_mult: 2.0
@@ -350,6 +370,17 @@ shared_entry:
   use_structure_filter: true
   use_sr_filter: true
   use_sr_stop_target_refinement: true
+  # HTF divergence multi-timeframe confluence (alongside use_divergence_filter
+  # which gates LTF counter-divergence penalties).
+  use_htf_divergence_filter: true
+  # Divergence as a primary entry trigger (off by default). When enabled,
+  # any strategy can fire a secondary entry signal on a confirmed divergence
+  # at S/R confluence. See _divergence_entry_candidate in strategy_base.py.
+  use_divergence_entry_signal: false
+  divergence_entry_min_age_bars: 0
+  divergence_entry_require_sr_confluence: true
+  divergence_entry_score_floor: 1.5
+  divergence_entry_score_bump: 0.20
   use_opposing_chart_filter: false
 
 # Shared exit and management settings used across strategies.
@@ -363,6 +394,12 @@ shared_exit:
   use_chart_pattern_exit: false
   use_structure_exit: false
   use_sr_loss_exit: true
+  # Counter-direction REGULAR divergence forming on a held position.
+  # Hidden divergence is continuation context and never triggers exit.
+  use_divergence_exit_signal: false
+  divergence_exit_partial_frac: 0.5
+  divergence_exit_min_age_bars: 1
+  divergence_exit_require_in_profit: true
   confirm_with_ema9: true
   confirm_with_ema20: true
   confirm_with_vwap: true

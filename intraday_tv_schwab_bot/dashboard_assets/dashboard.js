@@ -2199,6 +2199,11 @@ function drawSelectedChart(snapshot) {
     return !!timeframe && timeframe !== ltfTimeframeLabel;
   });
   const ltfOrderBlocks = isHtfChart ? [] : normalizeDashboardFvgs(levels.ltf_order_blocks, 1).filter(ltfVisibilityFilter);
+  // Divergence trendlines: LTF lines render only on LTF chart, HTF lines
+  // only on HTF chart. Each line is a {pivot_a, pivot_b, kind, direction,
+  // indicator, age_bars, timeframe} payload from DivergenceMatch.to_payload().
+  const ltfDivergenceLines = isHtfChart ? [] : (Array.isArray(levels.ltf_divergence_lines) ? levels.ltf_divergence_lines : []);
+  const htfDivergenceLines = isLtfChart ? [] : (Array.isArray(levels.htf_divergence_lines) ? levels.htf_divergence_lines : []);
   // Patterns + structure overlay only ever come from /api/chart payloads
   // stored on appState.expandedChart / appState.compactChart. snapshot.chart
   // is the levels/technicals meta-payload built in dashboard_cache.py:1086
@@ -3154,6 +3159,84 @@ function drawSelectedChart(snapshot) {
           : resolveTimedZoneRange(ob?.first_seen, null, 15, 15, { requireVisibleStart: true });
         if (!timedRange) return;
         drawTimedDashedZone(timedRange.startIdx, timedRange.endIdx, upper, lower, fill, stroke, 1.2, [5, 4]);
+      });
+    }
+
+    // RSI / OBV divergence trendlines. Each `line` is a DivergenceMatch
+    // payload: {pivot_a:{ts,price,...}, pivot_b:{ts,price,...}, kind, direction,
+    // indicator, age_bars}. Draw a line connecting pivot_a -> pivot_b on the
+    // price chart, color-coded by direction (green=bullish/red=bearish), with
+    // dashed stroke for hidden divergence vs solid for regular. Small label
+    // at midpoint identifies indicator + kind.
+    function drawDivergenceLine(line, opts = {}) {
+      if (!line || !line.pivot_a || !line.pivot_b) return;
+      const tsA = line.pivot_a.ts;
+      const tsB = line.pivot_b.ts;
+      const priceA = numOrNull(line.pivot_a.price);
+      const priceB = numOrNull(line.pivot_b.price);
+      if (priceA === null || priceB === null) return;
+      const millisA = Date.parse(tsA || '');
+      const millisB = Date.parse(tsB || '');
+      if (!Number.isFinite(millisA) || !Number.isFinite(millisB)) return;
+      // Find bar index for each pivot by walking bars[] and matching ts.
+      // Both pivots must be within the visible window for the line to render
+      // (otherwise the line goes off-screen at one end).
+      let idxA = -1;
+      let idxB = -1;
+      for (let i = 0; i < bars.length; i += 1) {
+        const barTs = Date.parse(bars[i]?.ts || '');
+        if (!Number.isFinite(barTs)) continue;
+        if (idxA < 0 && barTs >= millisA) idxA = i;
+        if (idxB < 0 && barTs >= millisB) { idxB = i; break; }
+      }
+      if (idxA < 0 || idxB < 0) return;
+      const direction = String(line?.direction || '').toLowerCase();
+      const kind = String(line?.kind || '').toLowerCase();
+      const indicator = String(line?.indicator || '').toLowerCase();
+      const isBullish = direction === 'bullish';
+      const isHidden = kind === 'hidden';
+      const baseAlpha = indicator === 'obv' ? 0.65 : 0.95;
+      const stroke = isBullish
+        ? `rgba(76, 214, 128, ${baseAlpha})`
+        : `rgba(255, 92, 92, ${baseAlpha})`;
+      const xA = xFor(idxA);
+      const yA = yFor(clamp(priceA, minY, maxY));
+      const xB = xFor(idxB);
+      const yB = yFor(clamp(priceB, minY, maxY));
+      ctx.save();
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = opts.lineWidth || (indicator === 'obv' ? 1.0 : 1.5);
+      if (isHidden) ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.moveTo(xA, yA);
+      ctx.lineTo(xB, yB);
+      ctx.stroke();
+      if (isHidden) ctx.setLineDash([]);
+      // Label at midpoint, if there's room
+      const midX = (xA + xB) / 2;
+      const midY = (yA + yB) / 2;
+      const labelText = indicator === 'rsi'
+        ? (isHidden ? 'RSI hid' : 'RSI ÷')
+        : (isHidden ? 'OBV hid' : 'OBV ÷');
+      ctx.fillStyle = stroke;
+      ctx.font = '10px ui-sans-serif, system-ui';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      // Tiny offset above the line for bullish (lower-pivot lines), below for bearish
+      const labelOffset = isBullish ? -8 : 8;
+      ctx.fillText(labelText, midX, midY + labelOffset);
+      ctx.restore();
+    }
+
+    if (show('show_rsi_divergence', true) || show('show_obv_divergence', false)) {
+      const showRsi = show('show_rsi_divergence', true);
+      const showObv = show('show_obv_divergence', false);
+      const lines = isHtfChart ? htfDivergenceLines : ltfDivergenceLines;
+      lines.forEach(line => {
+        const ind = String(line?.indicator || '').toLowerCase();
+        if (ind === 'rsi' && !showRsi) return;
+        if (ind === 'obv' && !showObv) return;
+        drawDivergenceLine(line);
       });
     }
 

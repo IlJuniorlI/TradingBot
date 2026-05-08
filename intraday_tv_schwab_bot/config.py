@@ -454,6 +454,12 @@ class DashboardChartConfig:
     # so the two zone types are visually distinguishable on the chart.
     show_htf_order_blocks: bool = False
     show_ltf_order_blocks: bool = False
+    # Divergence trendlines on the price chart. RSI divergences render as
+    # solid (regular) or dashed (hidden) lines connecting the two pivot
+    # points. OBV is off by default to avoid stacking duplicate lines on
+    # nearby pivot pairs — toggle on if you want both indicators visible.
+    show_rsi_divergence: bool = True
+    show_obv_divergence: bool = False
     show_trade_markers: bool = True
     tooltip_show_returns: bool = True
     tooltip_show_support_resistance: bool = True
@@ -711,6 +717,28 @@ class TechnicalLevelsConfig:
     divergence_counter_rsi_penalty: float = 0.12
     divergence_counter_obv_penalty: float = 0.10
     divergence_block_dual_counter: bool = True
+    # Multi-pivot detection (added with the levels_shared.find_divergence
+    # refactor): walk the last N pivots and return the most recent qualifying
+    # pair, gated by max-age in bars so stale divergences don't dominate.
+    divergence_pivot_lookback: int = 4
+    divergence_max_age_bars: int = 8
+    divergence_min_price_move_pct: float = 0.0015
+    # Hidden divergence (continuation pattern) — same-direction bonus on the
+    # entry score. Bullish hidden div on a LONG entry: bonus. Bearish hidden
+    # div on a SHORT entry: bonus. Counter-direction hidden div has no effect
+    # (regular divergence already grades that case).
+    divergence_hidden_bonus_rsi: float = 0.10
+    divergence_hidden_bonus_obv: float = 0.08
+    # HTF (multi-timeframe) divergence confluence — read from
+    # HTFContext.{bullish,bearish}_rsi_divergence by _htf_divergence_adjustment.
+    # _rsi suffix because HTF divergence is RSI-only (OBV is volume-driven
+    # and HTF resampling smears the signal — htf_levels.build_htf_context
+    # intentionally skips HTF OBV computation).
+    # Aligned: HTF div in same direction as the trade. Counter: HTF div
+    # against the trade. Hidden: same-side hidden div (continuation).
+    htf_divergence_aligned_bonus_rsi: float = 0.20
+    htf_divergence_counter_penalty_rsi: float = 0.25
+    htf_divergence_hidden_bonus_rsi: float = 0.10
     bollinger_enabled: bool = True
     bollinger_length: int = 20
     bollinger_std_mult: float = 2.0
@@ -731,6 +759,18 @@ class TechnicalLevelsConfig:
 class SharedEntryLogicConfig:
     use_fvg_context: bool = True
     use_divergence_filter: bool = True
+    use_htf_divergence_filter: bool = True
+    # Divergence as a primary entry trigger (off by default). When enabled,
+    # any strategy can fire a secondary entry signal on a confirmed
+    # divergence at S/R confluence. Primary strategy signal still wins on
+    # conflicts; bonus if both fire same direction. Stops anchor to the
+    # divergence pivot; targets to the nearest opposing S/R level (capped
+    # by min_rr * risk).
+    use_divergence_entry_signal: bool = False
+    divergence_entry_min_age_bars: int = 0
+    divergence_entry_require_sr_confluence: bool = True
+    divergence_entry_score_floor: float = 1.5
+    divergence_entry_score_bump: float = 0.20
     use_technical_entry_adjustment: bool = True
     use_technical_stop_target_refinement: bool = True
     use_structure_filter: bool = True
@@ -767,6 +807,14 @@ class SharedExitLogicConfig:
     use_candle_pattern_exit: bool = False
     use_structure_exit: bool = True
     use_sr_loss_exit: bool = True
+    # Divergence exit (counter-direction REGULAR divergence forms while
+    # holding). LONG + new bearish RSI/OBV div -> consider partial close.
+    # SHORT + new bullish div -> mirror. Hidden divergence is continuation
+    # context and does NOT trigger this exit.
+    use_divergence_exit_signal: bool = False
+    divergence_exit_partial_frac: float = 0.5
+    divergence_exit_min_age_bars: int = 1
+    divergence_exit_require_in_profit: bool = True
     confirm_with_ema9: bool = True
     confirm_with_ema20: bool = True
     confirm_with_vwap: bool = True

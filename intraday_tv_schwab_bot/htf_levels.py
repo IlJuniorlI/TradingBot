@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .levels_shared import (
+    DivergenceMatch,
     clone_level,
     cluster_levels,
     cluster_levels_by_tolerance,
@@ -16,6 +17,7 @@ from .levels_shared import (
     datetime_index as _datetime_index,
     extend_unique_levels,
     fallback_prior_side_levels,
+    find_divergence,
     frame_extreme_side_levels as _frame_extreme_side_levels_shared,
     pivot_points,
     prior_day_levels as _prior_day_levels,
@@ -93,6 +95,13 @@ class HTFContext:
     nearest_bearish_fvg: HTFFairValueGap | None = None
     trend_bias: str = "neutral"
     level_buffer: float = 0.0
+    # HTF RSI divergence — same shared detector as technical_levels, but
+    # walked over HTF pivots so it captures multi-timeframe confluence.
+    # Populated when build_htf_context is called with divergence_enabled.
+    bullish_rsi_divergence: "DivergenceMatch | None" = None
+    bearish_rsi_divergence: "DivergenceMatch | None" = None
+    bullish_hidden_rsi_divergence: "DivergenceMatch | None" = None
+    bearish_hidden_rsi_divergence: "DivergenceMatch | None" = None
 
 
 def empty_htf_context(current_price: float = 0.0, *, timeframe_minutes: int = 60) -> HTFContext:
@@ -616,6 +625,11 @@ def build_htf_context(
     fair_value_gap_max_per_side: int = 4,
     fair_value_gap_min_atr_mult: float = 0.05,
     fair_value_gap_min_pct: float = 0.0005,
+    divergence_enabled: bool = True,
+    divergence_pivot_lookback: int = 4,
+    divergence_max_age_bars: int = 6,
+    divergence_min_price_move_pct: float = 0.0015,
+    divergence_rsi_min_delta: float = 2.5,
 ) -> HTFContext:
     time_label = str(getattr(frame, "attrs", {}).get("time_label", "unknown") or "unknown").lower()
     frame = ensure_standard_indicator_frame(ensure_ohlcv_frame(frame))
@@ -897,6 +911,48 @@ def build_htf_context(
             min_gap_pct=float(fair_value_gap_min_pct),
         )
 
+    # HTF RSI divergence — multi-timeframe confluence signal. Uses
+    # include_idx=True pivots so the shared find_divergence can pull RSI
+    # values at exact pivot positions and tag age in HTF bars. RSI series is
+    # whatever ensure_standard_indicator_frame populated under "rsi14".
+    bullish_rsi_div: DivergenceMatch | None = None
+    bearish_rsi_div: DivergenceMatch | None = None
+    bullish_hidden_rsi_div: DivergenceMatch | None = None
+    bearish_hidden_rsi_div: DivergenceMatch | None = None
+    if divergence_enabled and "rsi14" in frame.columns and len(frame) > 0:
+        rsi_series = frame["rsi14"].astype(float)
+        if not rsi_series.dropna().empty:
+            highs_idx, lows_idx = pivot_points(frame, int(pivot_span), include_idx=True)
+            last_bar_pos = max(0, len(frame) - 1)
+            lookback = max(2, int(divergence_pivot_lookback))
+            max_age = max(0, int(divergence_max_age_bars))
+            move_frac = max(0.0001, float(divergence_min_price_move_pct))
+            rsi_delta = max(0.0, float(divergence_rsi_min_delta))
+            bullish_rsi_div = find_divergence(
+                lows_idx, rsi_series, kind="regular", direction="bullish",
+                indicator_name="rsi", price_move_frac=move_frac,
+                indicator_delta=rsi_delta, pivot_lookback=lookback,
+                max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            )
+            bearish_rsi_div = find_divergence(
+                highs_idx, rsi_series, kind="regular", direction="bearish",
+                indicator_name="rsi", price_move_frac=move_frac,
+                indicator_delta=rsi_delta, pivot_lookback=lookback,
+                max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            )
+            bullish_hidden_rsi_div = find_divergence(
+                lows_idx, rsi_series, kind="hidden", direction="bullish",
+                indicator_name="rsi", price_move_frac=move_frac,
+                indicator_delta=rsi_delta, pivot_lookback=lookback,
+                max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            )
+            bearish_hidden_rsi_div = find_divergence(
+                highs_idx, rsi_series, kind="hidden", direction="bearish",
+                indicator_name="rsi", price_move_frac=move_frac,
+                indicator_delta=rsi_delta, pivot_lookback=lookback,
+                max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            )
+
     return HTFContext(
         timeframe_minutes=int(timeframe_minutes),
         current_price=close,
@@ -919,4 +975,8 @@ def build_htf_context(
         nearest_bearish_fvg=nearest_bearish_fvg,
         trend_bias=trend_bias,
         level_buffer=max(atr * float(stop_buffer_atr_mult), close * 0.0010),
+        bullish_rsi_divergence=bullish_rsi_div,
+        bearish_rsi_divergence=bearish_rsi_div,
+        bullish_hidden_rsi_divergence=bullish_hidden_rsi_div,
+        bearish_hidden_rsi_divergence=bearish_hidden_rsi_div,
     )

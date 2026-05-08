@@ -1873,6 +1873,9 @@ class BaseStrategy:
             divergence_rsi_length=int(self._technical_level_setting("divergence_rsi_length", 14) or 14),
             divergence_rsi_min_delta=float(self._technical_level_setting("divergence_rsi_min_delta", 2.0) or 2.0),
             divergence_obv_min_volume_frac=float(getattr(cfg, "divergence_obv_min_volume_frac", 0.50) or 0.50),
+            divergence_pivot_lookback=int(self._technical_level_setting("divergence_pivot_lookback", 4) or 4),
+            divergence_max_age_bars=int(self._technical_level_setting("divergence_max_age_bars", 8) or 8),
+            divergence_min_price_move_pct=float(self._technical_level_setting("divergence_min_price_move_pct", 0.0015) or 0.0015),
             fib_enabled=bool(self._technical_level_setting("fib_enabled", True)),
             channel_enabled=bool(self._technical_level_setting("channel_enabled", True)),
             trendline_enabled=bool(self._technical_level_setting("trendline_enabled", True)),
@@ -1935,10 +1938,14 @@ class BaseStrategy:
             f"{prefix}_obv_ema": getattr(ctx, "obv_ema", None) if obv_enabled else None,
             f"{prefix}_obv_bias": getattr(ctx, "obv_bias", None) if obv_enabled else "neutral",
             f"{prefix}_rsi14": getattr(ctx, "rsi14", None) if divergence_enabled else None,
-            f"{prefix}_bullish_rsi_divergence": bool(getattr(ctx, "bullish_rsi_divergence", False)) if divergence_enabled else False,
-            f"{prefix}_bearish_rsi_divergence": bool(getattr(ctx, "bearish_rsi_divergence", False)) if divergence_enabled else False,
-            f"{prefix}_bullish_obv_divergence": bool(getattr(ctx, "bullish_obv_divergence", False)) if divergence_enabled else False,
-            f"{prefix}_bearish_obv_divergence": bool(getattr(ctx, "bearish_obv_divergence", False)) if divergence_enabled else False,
+            f"{prefix}_bullish_rsi_divergence": (getattr(ctx, "bullish_rsi_divergence", None) is not None) if divergence_enabled else False,
+            f"{prefix}_bearish_rsi_divergence": (getattr(ctx, "bearish_rsi_divergence", None) is not None) if divergence_enabled else False,
+            f"{prefix}_bullish_obv_divergence": (getattr(ctx, "bullish_obv_divergence", None) is not None) if divergence_enabled else False,
+            f"{prefix}_bearish_obv_divergence": (getattr(ctx, "bearish_obv_divergence", None) is not None) if divergence_enabled else False,
+            f"{prefix}_bullish_hidden_rsi_divergence": (getattr(ctx, "bullish_hidden_rsi_divergence", None) is not None) if divergence_enabled else False,
+            f"{prefix}_bearish_hidden_rsi_divergence": (getattr(ctx, "bearish_hidden_rsi_divergence", None) is not None) if divergence_enabled else False,
+            f"{prefix}_bullish_hidden_obv_divergence": (getattr(ctx, "bullish_hidden_obv_divergence", None) is not None) if divergence_enabled else False,
+            f"{prefix}_bearish_hidden_obv_divergence": (getattr(ctx, "bearish_hidden_obv_divergence", None) is not None) if divergence_enabled else False,
             f"{prefix}_counter_divergence_bias": getattr(ctx, "counter_divergence_bias", None) if divergence_enabled else "neutral",
             f"{prefix}_support_touches": getattr(support_line, "touches", None) if trendline_enabled else None,
             f"{prefix}_support_current": getattr(support_line, "current_value", None) if trendline_enabled else None,
@@ -2098,11 +2105,209 @@ class BaseStrategy:
             return None
         if not bool(self._technical_level_setting("divergence_block_dual_counter", True)):
             return None
-        if side == Side.LONG and bool(getattr(tech_ctx, "bearish_rsi_divergence", False)) and bool(getattr(tech_ctx, "bearish_obv_divergence", False)):
+        if side == Side.LONG and getattr(tech_ctx, "bearish_rsi_divergence", None) is not None and getattr(tech_ctx, "bearish_obv_divergence", None) is not None:
             return "dual_counter_divergence(rsi=bearish,obv=bearish)"
-        if side == Side.SHORT and bool(getattr(tech_ctx, "bullish_rsi_divergence", False)) and bool(getattr(tech_ctx, "bullish_obv_divergence", False)):
+        if side == Side.SHORT and getattr(tech_ctx, "bullish_rsi_divergence", None) is not None and getattr(tech_ctx, "bullish_obv_divergence", None) is not None:
             return "dual_counter_divergence(rsi=bullish,obv=bullish)"
         return None
+
+    def _divergence_entry_candidate(
+        self,
+        side: Side,
+        close: float,
+        ltf: pd.DataFrame | None,
+        sr_ctx,
+        tech_ctx,
+    ) -> dict[str, Any] | None:
+        """Shared opt-in entry candidate driven by RSI divergence at S/R.
+
+        When ``shared_entry.use_divergence_entry_signal`` is ``True``, any
+        strategy can invoke this from its signal pipeline to surface a
+        divergence-driven entry. Returns ``None`` if no valid candidate
+        exists, otherwise a dict with ``trigger_level``, ``stop``, ``target``,
+        ``score``, ``reason``, ``kind``, ``indicator``, ``age_bars``.
+
+        Selection rules:
+        - LONG: regular bullish RSI div at HTF support (or near sr_ctx
+          nearest_support / broken_resistance), OR hidden bullish RSI div
+          when HTF EMA fast > slow (uptrend continuation).
+        - SHORT: mirror.
+        - SR confluence requirement (config-gated): the divergence pivot
+          must be within ``sr_ctx.level_buffer`` of an aligned S/R level.
+        - Score = (ind_delta_normalized) + (recency_bonus where 0 age = full)
+          + (S/R confluence bonus). Returned only if score >=
+          ``divergence_entry_score_floor``.
+
+        Stop: deeper of the divergence pivot price ± atr * stop_buffer or
+        the nearest swing low/high.
+        Target: nearest opposing S/R level, or close + (close - stop) *
+        target_rr (whichever is closer / cheaper risk-wise).
+        """
+        if not self._shared_entry_enabled("use_divergence_entry_signal", False):
+            return None
+        if tech_ctx is None or ltf is None or len(ltf) == 0:
+            return None
+        require_sr = bool(self._shared_entry_value("divergence_entry_require_sr_confluence", True))
+        score_floor = float(self._shared_entry_value("divergence_entry_score_floor", 1.5) or 1.5)
+        min_age = max(0, int(self._shared_entry_value("divergence_entry_min_age_bars", 0) or 0))
+        max_age = max(min_age, int(self._technical_level_setting("divergence_max_age_bars", 8) or 8))
+
+        # Pick the most relevant divergence for the side. Regular divergence
+        # (reversal context) takes priority over hidden (continuation) when
+        # both fire — the strategy author can always disable one via config.
+        if side == Side.LONG:
+            primary = getattr(tech_ctx, "bullish_rsi_divergence", None)
+            hidden = getattr(tech_ctx, "bullish_hidden_rsi_divergence", None)
+        else:
+            primary = getattr(tech_ctx, "bearish_rsi_divergence", None)
+            hidden = getattr(tech_ctx, "bearish_hidden_rsi_divergence", None)
+
+        match = primary or hidden
+        if match is None:
+            return None
+        age = int(getattr(match, "age_bars", 0) or 0)
+        # Reject too-fresh (< min_age, may not have completed forming) or
+        # too-stale (> max_age, signal lost relevance) divergences.
+        if age < min_age or age > max_age:
+            return None
+
+        pivot_price = float(getattr(match, "pivot_b_price", 0.0) or 0.0)
+        if pivot_price <= 0:
+            return None
+
+        # ATR for stop sizing.
+        atr_val = _safe_float(ltf.iloc[-1].get("atr14"), max(close * 0.0015, 0.01))
+        stop_buffer = atr_val * float(self._technical_level_setting("stop_buffer_atr_mult", 0.25) or 0.25)
+
+        # SR confluence check: divergence pivot must be near an aligned level.
+        confluence_bonus = 0.0
+        confluence_level: float | None = None
+        if sr_ctx is not None:
+            buffer = max(float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0), atr_val * 0.30, close * 0.0015)
+            if side == Side.LONG:
+                candidates = []
+                ns = getattr(sr_ctx, "nearest_support", None)
+                if ns is not None and getattr(ns, "price", None):
+                    candidates.append(float(ns.price))
+                br = getattr(sr_ctx, "broken_resistance", None)
+                if br is not None and getattr(br, "price", None):
+                    candidates.append(float(br.price))
+            else:
+                candidates = []
+                nr = getattr(sr_ctx, "nearest_resistance", None)
+                if nr is not None and getattr(nr, "price", None):
+                    candidates.append(float(nr.price))
+                bs = getattr(sr_ctx, "broken_support", None)
+                if bs is not None and getattr(bs, "price", None):
+                    candidates.append(float(bs.price))
+            for level_price in candidates:
+                if abs(pivot_price - level_price) <= buffer:
+                    confluence_bonus += 0.5
+                    confluence_level = level_price
+                    break
+        if require_sr and confluence_level is None:
+            return None
+
+        # Score: indicator delta (normalized) + recency + confluence
+        ind_delta = float(getattr(match, "indicator_delta", 0.0) or 0.0)
+        ind_score = min(1.0, ind_delta / 5.0)  # RSI delta of 5+ saturates
+        age = int(getattr(match, "age_bars", 0) or 0)
+        recency_score = max(0.0, 1.0 - (age / 8.0))
+        kind_str = str(getattr(match, "kind", "regular") or "regular")
+        kind_bonus = 0.5 if kind_str == "regular" else 0.3
+        score = ind_score + recency_score + kind_bonus + confluence_bonus
+        if score < score_floor:
+            return None
+
+        # Stop anchor: pivot price minus a buffer for LONG, plus for SHORT.
+        if side == Side.LONG:
+            stop = pivot_price - stop_buffer
+        else:
+            stop = pivot_price + stop_buffer
+
+        # Target anchor: nearest opposing-side level or RR-floor target.
+        target_rr = float(self._shared_entry_value("min_target_rr", 1.5) or 1.5)
+        risk = abs(close - stop)
+        if risk <= 0:
+            return None
+        rr_target = close + (risk * target_rr) if side == Side.LONG else close - (risk * target_rr)
+        target: float | None = rr_target
+        if sr_ctx is not None:
+            if side == Side.LONG:
+                opp = getattr(sr_ctx, "nearest_resistance", None)
+                if opp is not None and getattr(opp, "price", None):
+                    opp_p = float(opp.price)
+                    if opp_p > close:
+                        target = min(rr_target, opp_p)
+            else:
+                opp = getattr(sr_ctx, "nearest_support", None)
+                if opp is not None and getattr(opp, "price", None):
+                    opp_p = float(opp.price)
+                    if opp_p < close:
+                        target = max(rr_target, opp_p)
+
+        return {
+            "source": "shared_divergence_entry",
+            "trigger_level": float(pivot_price),
+            "stop": float(stop),
+            "target": float(target) if target is not None else None,
+            "score": float(score),
+            "reason": f"divergence_entry({kind_str}_{side.value.lower()}_{getattr(match, 'indicator', 'rsi')}_age{age}b)",
+            "kind": kind_str,
+            "indicator": str(getattr(match, "indicator", "rsi")),
+            "age_bars": age,
+            "confluence_level": confluence_level,
+        }
+
+    def _divergence_exit_signal(
+        self,
+        side: Side,
+        in_profit: bool,
+        tech_ctx,
+    ) -> tuple[str, float] | None:
+        """Shared opt-in exit signal driven by counter-direction REGULAR
+        divergence forming on a held position.
+
+        When ``shared_exit.use_divergence_exit_signal`` is ``True``, any
+        strategy can invoke this from its exit pipeline. Returns
+        ``(reason, partial_frac)`` if a counter divergence has formed and
+        the freshness/profit gates pass, ``None`` otherwise.
+
+        Hidden divergence is continuation context and never triggers exit.
+        Same-side regular divergence likewise doesn't trigger exit (it's
+        confluence, not a warning).
+        """
+        if not self._shared_exit_enabled("use_divergence_exit_signal", False):
+            return None
+        if tech_ctx is None:
+            return None
+        partial = max(0.0, min(1.0, float(self._shared_exit_value("divergence_exit_partial_frac", 0.5) or 0.5)))
+        min_age = max(0, int(self._shared_exit_value("divergence_exit_min_age_bars", 1) or 1))
+        max_age = max(min_age, int(self._technical_level_setting("divergence_max_age_bars", 8) or 8))
+        require_profit = bool(self._shared_exit_value("divergence_exit_require_in_profit", True))
+        if require_profit and not in_profit:
+            return None
+
+        if side == Side.LONG:
+            counter = getattr(tech_ctx, "bearish_rsi_divergence", None)
+            counter_obv = getattr(tech_ctx, "bearish_obv_divergence", None)
+            label = "bearish"
+        else:
+            counter = getattr(tech_ctx, "bullish_rsi_divergence", None)
+            counter_obv = getattr(tech_ctx, "bullish_obv_divergence", None)
+            label = "bullish"
+
+        match = counter or counter_obv
+        if match is None:
+            return None
+        age = int(getattr(match, "age_bars", 0) or 0)
+        # Reject too-fresh (< min_age, premature exit before pivot completes)
+        # or too-stale (> max_age, divergence already played out) divergences.
+        if age < min_age or age > max_age:
+            return None
+
+        indicator = str(getattr(match, "indicator", "rsi"))
+        return f"shared_divergence_exit({label}_{indicator}_age{age}b)", partial
 
     def _technical_entry_adjustment(self, side: Side, tech_ctx) -> float:
         if not self._shared_entry_enabled("use_technical_entry_adjustment", True):
@@ -2149,6 +2354,8 @@ class BaseStrategy:
         obv_penalty = float(self._technical_level_setting("obv_entry_penalty", 0.10) or 0.10)
         div_rsi_penalty = float(self._technical_level_setting("divergence_counter_rsi_penalty", 0.12) or 0.12)
         div_obv_penalty = float(self._technical_level_setting("divergence_counter_obv_penalty", 0.10) or 0.10)
+        div_hidden_rsi_bonus = float(self._technical_level_setting("divergence_hidden_bonus_rsi", 0.10) or 0.10)
+        div_hidden_obv_bonus = float(self._technical_level_setting("divergence_hidden_bonus_obv", 0.08) or 0.08)
         divergence_enabled = bool(self._technical_level_setting("divergence_enabled", True))
         if side == Side.LONG:
             if bool(self._technical_level_setting("trendline_enabled", True)):
@@ -2201,10 +2408,17 @@ class BaseStrategy:
                 elif obv_bias == "bearish":
                     bonus -= obv_penalty
             if divergence_enabled:
-                if bool(getattr(tech_ctx, "bearish_rsi_divergence", False)):
+                # Counter-direction REGULAR divergence -> reversal warning,
+                # penalize a LONG entry. Hidden divergence in same direction
+                # -> continuation, bonus.
+                if getattr(tech_ctx, "bearish_rsi_divergence", None) is not None:
                     bonus -= div_rsi_penalty
-                if bool(getattr(tech_ctx, "bearish_obv_divergence", False)):
+                if getattr(tech_ctx, "bearish_obv_divergence", None) is not None:
                     bonus -= div_obv_penalty
+                if getattr(tech_ctx, "bullish_hidden_rsi_divergence", None) is not None:
+                    bonus += div_hidden_rsi_bonus
+                if getattr(tech_ctx, "bullish_hidden_obv_divergence", None) is not None:
+                    bonus += div_hidden_obv_bonus
         else:
             if bool(self._technical_level_setting("trendline_enabled", True)):
                 if bool(getattr(tech_ctx, "resistance_respected", False)):
@@ -2256,10 +2470,17 @@ class BaseStrategy:
                 elif obv_bias == "bullish":
                     bonus -= obv_penalty
             if divergence_enabled:
-                if bool(getattr(tech_ctx, "bullish_rsi_divergence", False)):
+                # Counter-direction REGULAR divergence -> reversal warning,
+                # penalize a SHORT entry. Hidden divergence in same direction
+                # -> continuation, bonus.
+                if getattr(tech_ctx, "bullish_rsi_divergence", None) is not None:
                     bonus -= div_rsi_penalty
-                if bool(getattr(tech_ctx, "bullish_obv_divergence", False)):
+                if getattr(tech_ctx, "bullish_obv_divergence", None) is not None:
                     bonus -= div_obv_penalty
+                if getattr(tech_ctx, "bearish_hidden_rsi_divergence", None) is not None:
+                    bonus += div_hidden_rsi_bonus
+                if getattr(tech_ctx, "bearish_hidden_obv_divergence", None) is not None:
+                    bonus += div_hidden_obv_bonus
         return float(bonus)
 
     def _sr_entry_adjustment_components(self, side: Side, sr_ctx) -> dict[str, float]:
@@ -2315,15 +2536,51 @@ class BaseStrategy:
             return out
         return out
 
-    def _entry_adjustment_components(self, side: Side, sr_ctx=None, tech_ctx=None) -> dict[str, float]:
+    def _entry_adjustment_components(self, side: Side, sr_ctx=None, tech_ctx=None, htf_ctx=None) -> dict[str, float]:
         sr_fields = self._sr_entry_adjustment_components(side, sr_ctx)
         tech_adjustment = round(self._technical_entry_adjustment(side, tech_ctx), 4) if tech_ctx is not None else 0.0
-        total = round(float(sr_fields.get("sr_entry_adjustment", 0.0)) + tech_adjustment, 4)
+        htf_div_adjustment = round(self._htf_divergence_adjustment(side, htf_ctx), 4) if htf_ctx is not None else 0.0
+        total = round(float(sr_fields.get("sr_entry_adjustment", 0.0)) + tech_adjustment + htf_div_adjustment, 4)
         return {
             **sr_fields,
             "technical_entry_adjustment": tech_adjustment,
+            "htf_divergence_adjustment": htf_div_adjustment,
             "entry_context_adjustment": total,
         }
+
+    def _htf_divergence_adjustment(self, side: Side, htf_ctx) -> float:
+        """Multi-timeframe divergence confluence adjustment.
+
+        HTF same-direction divergence (regular bullish for LONG, regular
+        bearish for SHORT) signals a higher-timeframe reversal aligned with
+        the trade — bonus. Counter-direction HTF divergence (regular bullish
+        for SHORT, regular bearish for LONG) signals a HTF reversal AGAINST
+        the trade — penalty. HTF hidden divergence in trade direction signals
+        HTF continuation aligned with the trade — small bonus.
+        """
+        if not self._shared_entry_enabled("use_htf_divergence_filter", True):
+            return 0.0
+        if htf_ctx is None:
+            return 0.0
+        bonus_aligned = float(self._technical_level_setting("htf_divergence_aligned_bonus_rsi", 0.20) or 0.20)
+        penalty_counter = float(self._technical_level_setting("htf_divergence_counter_penalty_rsi", 0.25) or 0.25)
+        bonus_hidden = float(self._technical_level_setting("htf_divergence_hidden_bonus_rsi", 0.10) or 0.10)
+        bonus = 0.0
+        if side == Side.LONG:
+            if getattr(htf_ctx, "bullish_rsi_divergence", None) is not None:
+                bonus += bonus_aligned
+            if getattr(htf_ctx, "bearish_rsi_divergence", None) is not None:
+                bonus -= penalty_counter
+            if getattr(htf_ctx, "bullish_hidden_rsi_divergence", None) is not None:
+                bonus += bonus_hidden
+        else:
+            if getattr(htf_ctx, "bearish_rsi_divergence", None) is not None:
+                bonus += bonus_aligned
+            if getattr(htf_ctx, "bullish_rsi_divergence", None) is not None:
+                bonus -= penalty_counter
+            if getattr(htf_ctx, "bearish_hidden_rsi_divergence", None) is not None:
+                bonus += bonus_hidden
+        return float(bonus)
 
     def _refine_bullish_technical_levels(self, close: float, stop: float, target: float | None, tech_ctx, frame: pd.DataFrame | None):
         if not self._shared_entry_enabled("use_technical_stop_target_refinement", True):

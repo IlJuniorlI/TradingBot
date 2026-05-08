@@ -703,6 +703,14 @@ Optional technical overlays used as confluence, refinement, and exits.
 | `divergence_counter_rsi_penalty`      | `0.12`                                  |
 | `divergence_counter_obv_penalty`      | `0.1`                                   |
 | `divergence_block_dual_counter`       | `true`                                  |
+| `divergence_pivot_lookback`           | `4`                                     |
+| `divergence_max_age_bars`             | `8`                                     |
+| `divergence_min_price_move_pct`       | `0.0015`                                |
+| `divergence_hidden_bonus_rsi`         | `0.10`                                  |
+| `divergence_hidden_bonus_obv`         | `0.08`                                  |
+| `htf_divergence_aligned_bonus_rsi`    | `0.20`                                  |
+| `htf_divergence_counter_penalty_rsi`  | `0.25`                                  |
+| `htf_divergence_hidden_bonus_rsi`     | `0.10`                                  |
 | `bollinger_enabled`                   | `true`                                  |
 | `bollinger_length`                    | `20`                                    |
 | `bollinger_std_mult`                  | `2.0`                                   |
@@ -738,7 +746,10 @@ How the groups work:
 - OBV / participation:
   - `obv_*` rewards or penalizes order-flow participation.
 - Divergence:
-  - `divergence_*` controls RSI/OBV divergence filters. Higher penalties make countertrend divergence more restrictive.
+  - `divergence_*` controls RSI/OBV divergence detection and the score adjustments derived from it. Detection is multi-pivot (walks the most recent `divergence_pivot_lookback` swing pivots) and age-gated (matches whose newest pivot is more than `divergence_max_age_bars` from the latest bar are dropped). `divergence_min_price_move_pct` is the price-move floor a pivot pair must clear before a divergence can register.
+  - **Two pattern families.** *Regular* divergence (price extends, indicator weakens) signals a likely reversal. *Hidden* divergence (price holds the trend, indicator pulls back) signals continuation. Counter-direction regular divergence on an entry triggers `divergence_counter_*_penalty`; same-direction hidden divergence on an entry triggers `divergence_hidden_bonus_*`.
+  - **Two timeframes.** RSI divergence is computed on both the strategy's primary frame (LTF) and the HTF context. HTF-aligned divergence in the trade direction adds `htf_divergence_aligned_bonus_rsi`; HTF counter-direction divergence subtracts `htf_divergence_counter_penalty_rsi`; HTF same-direction hidden divergence adds `htf_divergence_hidden_bonus_rsi`. The `_rsi` suffix on these HTF knobs is deliberate — HTF OBV divergence is intentionally not computed (volume-driven indicators smear under HTF resampling).
+  - **Visual rendering.** Each detected divergence is drawn on the price chart as a trendline connecting the two pivots, color-coded green (bullish) or red (bearish), solid stroke for regular and dashed stroke for hidden. RSI divergences render at full intensity, OBV at lighter weight. Toggle per chart profile via `dashboard.charting.{compact,expanded}.show_rsi_divergence` (default true) and `show_obv_divergence` (default false).
 - Bollinger context:
   - `bollinger_*` controls band calculation, squeeze detection, entry confluence, optional targeting, and optional exits.
 - Target/stop refinement:
@@ -751,24 +762,32 @@ How the groups work:
 
 Global entry-side helper toggles. These replace the old per-strategy logic-override system.
 
-| Option                                 | Code default |
-|----------------------------------------|--------------|
-| `use_fvg_context`                      | `true`       |
-| `use_divergence_filter`                | `true`       |
-| `use_technical_entry_adjustment`       | `true`       |
-| `use_technical_stop_target_refinement` | `true`       |
-| `use_structure_filter`                 | `true`       |
-| `use_sr_filter`                        | `true`       |
-| `use_sr_stop_target_refinement`        | `true`       |
-| `use_opposing_chart_filter`            | `true`       |
-| `use_opposing_candle_filter`           | `false`      |
-| `min_target_rr`                        | `1.0`        |
+| Option                                       | Code default |
+|----------------------------------------------|--------------|
+| `use_fvg_context`                            | `true`       |
+| `use_divergence_filter`                      | `true`       |
+| `use_htf_divergence_filter`                  | `true`       |
+| `use_divergence_entry_signal`                | `false`      |
+| `divergence_entry_min_age_bars`              | `0`          |
+| `divergence_entry_require_sr_confluence`     | `true`       |
+| `divergence_entry_score_floor`               | `1.5`        |
+| `divergence_entry_score_bump`                | `0.20`       |
+| `use_technical_entry_adjustment`             | `true`       |
+| `use_technical_stop_target_refinement`       | `true`       |
+| `use_structure_filter`                       | `true`       |
+| `use_sr_filter`                              | `true`       |
+| `use_sr_stop_target_refinement`              | `true`       |
+| `use_opposing_chart_filter`                  | `true`       |
+| `use_opposing_candle_filter`                 | `false`      |
+| `min_target_rr`                              | `1.0`        |
 
 Behavior:
 
 - All boolean fields default to `true`. `true` enables that shared entry helper globally; `false` disables it globally.
 - `use_fvg_context`: allow FVG context to adjust entry scoring.
-- `use_divergence_filter`: allow RSI/OBV divergence to penalize or block entries.
+- `use_divergence_filter`: allow LTF RSI/OBV regular divergence to penalize entries against the trade direction. Hidden divergence in trade direction is bonused via `technical_levels.divergence_hidden_bonus_*`.
+- `use_htf_divergence_filter`: allow HTF RSI divergence (computed in `htf_levels.build_htf_context`) to score entries via `technical_levels.htf_divergence_*` bonuses/penalties. Independent gate from the LTF divergence filter — set false to disable HTF-side divergence influence while keeping the LTF filter active.
+- `use_divergence_entry_signal` (off by default): enable the shared opt-in entry helper `_divergence_entry_candidate(side, ...)` in `BaseStrategy`. Strategies that opt in invoke this helper to surface a divergence-driven entry candidate (with stop, target, score, and S/R confluence check). Returns `None` unless: the divergence age is in `[divergence_entry_min_age_bars, technical_levels.divergence_max_age_bars]`, the pivot is within `sr_ctx.level_buffer` of an aligned S/R level (when `divergence_entry_require_sr_confluence` is true), and the computed score clears `divergence_entry_score_floor`. Score blends indicator delta, recency, kind (regular vs hidden), and S/R confluence bonus. The strategy's primary signal still wins on conflicts; if both fire same direction the score gets a `divergence_entry_score_bump`.
 - `use_technical_entry_adjustment`: let `technical_levels` adjust entry quality scoring.
 - `use_technical_stop_target_refinement`: allow `technical_levels` to refine stops/targets.
 - `use_structure_filter`: allow the mixed-timeframe structure layer to help or hurt entries.
@@ -793,6 +812,10 @@ Global exit-side helper toggles and tape-confirmation thresholds.
 | `use_candle_pattern_exit`          | `false`      |
 | `use_structure_exit`               | `true`       |
 | `use_sr_loss_exit`                 | `true`       |
+| `use_divergence_exit_signal`       | `false`      |
+| `divergence_exit_partial_frac`     | `0.5`        |
+| `divergence_exit_min_age_bars`     | `1`          |
+| `divergence_exit_require_in_profit`| `true`       |
 | `confirm_with_ema9`                | `true`       |
 | `confirm_with_ema20`               | `true`       |
 | `confirm_with_vwap`                | `true`       |
@@ -811,6 +834,7 @@ Behavior:
 - `use_candle_pattern_exit`: fire `candle_pattern_exit:<pattern>` when an opposing-direction candle cluster crosses `candles.opposing_net_score_threshold` and the tape confirms (via `confirm_with_*` thresholds below). Reuses cached candle context.
 - `use_structure_exit`: allow CHOCH / structure-loss exits.
 - `use_sr_loss_exit`: allow exits on confirmed loss of important support/resistance.
+- `use_divergence_exit_signal` (off by default): enable the shared opt-in exit helper `_divergence_exit_signal(side, in_profit, tech_ctx)` in `BaseStrategy`. When a counter-direction REGULAR divergence forms on a held position and its age is in `[divergence_exit_min_age_bars, technical_levels.divergence_max_age_bars]`, the helper returns `(reason, partial_frac)` and the strategy can act on it. Hidden divergence (continuation) is never an exit trigger. `divergence_exit_partial_frac` controls partial close size (0.0-1.0; 0.5 closes half, leaving the other half on a trailing stop). `divergence_exit_require_in_profit` (default true) gates the exit so a losing position isn't scratched on noise.
 - `confirm_with_ema9`, `confirm_with_ema20`, `confirm_with_vwap`, `confirm_with_close_position`: tape-confirmation requirements applied before shared exits are accepted.
 - `bullish_close_position_max` / `bearish_close_position_min`: strict candle close-location thresholds used when confirming bearish exits from long trades or bullish exits from short trades.
 - `bullish_close_position_loose_max` / `bearish_close_position_loose_min`: looser fallback thresholds for the same confirmation family.

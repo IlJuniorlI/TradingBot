@@ -465,3 +465,269 @@ def prior_week_levels(frame: pd.DataFrame) -> tuple[float | None, float | None]:
     if prior_frame.empty:
         return None, None
     return float(prior_frame["high"].max()), float(prior_frame["low"].min())
+
+
+# ---------------------------------------------------------------------------
+# Divergence detection (shared by technical_levels.py + htf_levels.py)
+#
+# A divergence is a misalignment between a price pivot pair and the
+# corresponding indicator (RSI, OBV) pivot values:
+#
+#   regular bullish: at pivot lows, price prints LL (price2 < price1 by
+#       price_move_frac) but indicator prints HL (ind2 > ind1 + delta).
+#       Reversal-likely from a downtrend.
+#
+#   regular bearish: at pivot highs, price prints HH but indicator prints
+#       LH. Reversal-likely from an uptrend.
+#
+#   hidden bullish: at pivot lows, price prints HL but indicator prints
+#       LL. Continuation in an uptrend.
+#
+#   hidden bearish: at pivot highs, price prints LH but indicator prints
+#       HH. Continuation in a downtrend.
+#
+# The detector walks pairs (a, b) in the most recent ``pivot_lookback``
+# pivots and returns the most recent qualifying pair (highest j), filtered
+# by ``max_age_bars`` (how many bars old the latest pivot can be).
+# ---------------------------------------------------------------------------
+
+
+_DivergencePoint = tuple[int, "pd.Timestamp", float]
+
+
+class DivergenceMatch:
+    """A confirmed divergence between two pivot points and a momentum
+    indicator series.
+
+    Stored as a small immutable record so consumers (engine score
+    adjustments, dashboard chart overlay, shared entry candidate builder)
+    can read pivot positions, indicator values, and freshness without
+    re-deriving them. ``__slots__`` keeps memory footprint tight when many
+    contexts hold these — typically 8 fields per TechnicalLevelsContext.
+    """
+
+    __slots__ = (
+        "kind",
+        "direction",
+        "indicator",
+        "pivot_a_pos",
+        "pivot_a_ts",
+        "pivot_a_price",
+        "pivot_a_indicator",
+        "pivot_b_pos",
+        "pivot_b_ts",
+        "pivot_b_price",
+        "pivot_b_indicator",
+        "indicator_delta",
+        "age_bars",
+    )
+
+    kind: str
+    direction: str
+    indicator: str
+    pivot_a_pos: int
+    pivot_a_ts: pd.Timestamp
+    pivot_a_price: float
+    pivot_a_indicator: float
+    pivot_b_pos: int
+    pivot_b_ts: pd.Timestamp
+    pivot_b_price: float
+    pivot_b_indicator: float
+    indicator_delta: float
+    age_bars: int
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        direction: str,
+        indicator: str,
+        pivot_a_pos: int,
+        pivot_a_ts: pd.Timestamp,
+        pivot_a_price: float,
+        pivot_a_indicator: float,
+        pivot_b_pos: int,
+        pivot_b_ts: pd.Timestamp,
+        pivot_b_price: float,
+        pivot_b_indicator: float,
+        indicator_delta: float,
+        age_bars: int,
+    ) -> None:
+        self.kind = str(kind)
+        self.direction = str(direction)
+        self.indicator = str(indicator)
+        self.pivot_a_pos = int(pivot_a_pos)
+        self.pivot_a_ts = pivot_a_ts
+        self.pivot_a_price = float(pivot_a_price)
+        self.pivot_a_indicator = float(pivot_a_indicator)
+        self.pivot_b_pos = int(pivot_b_pos)
+        self.pivot_b_ts = pivot_b_ts
+        self.pivot_b_price = float(pivot_b_price)
+        self.pivot_b_indicator = float(pivot_b_indicator)
+        self.indicator_delta = float(indicator_delta)
+        self.age_bars = int(age_bars)
+
+    def __bool__(self) -> bool:
+        # All DivergenceMatch instances are truthy. Lets existing callers
+        # that test ``bool(getattr(ctx, "bullish_rsi_divergence", False))``
+        # keep working — None is falsy, a match is truthy.
+        return True
+
+    def __repr__(self) -> str:
+        return (
+            f"DivergenceMatch({self.kind} {self.direction} {self.indicator} "
+            f"a@{self.pivot_a_ts}={self.pivot_a_price:.4f}/{self.pivot_a_indicator:.4f} "
+            f"b@{self.pivot_b_ts}={self.pivot_b_price:.4f}/{self.pivot_b_indicator:.4f} "
+            f"age={self.age_bars}b delta={self.indicator_delta:.4f})"
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        """Render to a JSON-friendly dict for chart / metadata export."""
+        return {
+            "kind": self.kind,
+            "direction": self.direction,
+            "indicator": self.indicator,
+            "pivot_a": {
+                "pos": int(self.pivot_a_pos),
+                "ts": str(self.pivot_a_ts),
+                "price": float(self.pivot_a_price),
+                "indicator": float(self.pivot_a_indicator),
+            },
+            "pivot_b": {
+                "pos": int(self.pivot_b_pos),
+                "ts": str(self.pivot_b_ts),
+                "price": float(self.pivot_b_price),
+                "indicator": float(self.pivot_b_indicator),
+            },
+            "indicator_delta": float(self.indicator_delta),
+            "age_bars": int(self.age_bars),
+        }
+
+
+def _pivot_indicator_value(indicator: pd.Series, pos: int) -> float | None:
+    if pos < 0 or pos >= len(indicator):
+        return None
+    value = indicator.iloc[pos]
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
+def _qualifies(
+    *,
+    kind: str,
+    direction: str,
+    price_a: float,
+    price_b: float,
+    ind_a: float,
+    ind_b: float,
+    price_move_frac: float,
+    indicator_delta: float,
+) -> tuple[bool, float]:
+    """Return ``(matched, |ind_b - ind_a|)`` for the requested pattern.
+
+    Pattern matrix (all four cases reduce to the same shape):
+
+      regular bullish (lows):  price_b < price_a*(1-frac), ind_b > ind_a + delta
+      regular bearish (highs): price_b > price_a*(1+frac), ind_b < ind_a - delta
+      hidden bullish  (lows):  price_b > price_a*(1+frac), ind_b < ind_a - delta
+      hidden bearish  (highs): price_b < price_a*(1-frac), ind_b > ind_a + delta
+    """
+    if kind == "regular" and direction == "bullish":
+        price_ok = price_b < price_a * (1.0 - price_move_frac)
+        ind_ok = ind_b > ind_a + indicator_delta
+    elif kind == "regular" and direction == "bearish":
+        price_ok = price_b > price_a * (1.0 + price_move_frac)
+        ind_ok = ind_b < ind_a - indicator_delta
+    elif kind == "hidden" and direction == "bullish":
+        price_ok = price_b > price_a * (1.0 + price_move_frac)
+        ind_ok = ind_b < ind_a - indicator_delta
+    elif kind == "hidden" and direction == "bearish":
+        price_ok = price_b < price_a * (1.0 - price_move_frac)
+        ind_ok = ind_b > ind_a + indicator_delta
+    else:
+        return False, 0.0
+    return bool(price_ok and ind_ok), abs(ind_b - ind_a)
+
+
+def find_divergence(
+    points: list[_DivergencePoint],
+    indicator: pd.Series,
+    *,
+    kind: str,
+    direction: str,
+    indicator_name: str,
+    price_move_frac: float,
+    indicator_delta: float,
+    pivot_lookback: int,
+    max_age_bars: int,
+    last_bar_pos: int,
+) -> DivergenceMatch | None:
+    """Walk recent pivots and return the most recent qualifying pair.
+
+    ``points`` is a list of ``(pos, ts, price)`` tuples — pivot lows for
+    bullish patterns, pivot highs for bearish patterns. The caller is
+    responsible for picking the right list per direction.
+
+    Algorithm: take the last ``pivot_lookback`` points (most recent first
+    after slicing). Walk pairs (a, b) where a is older and b is more recent.
+    Return the match with the most recent ``b`` whose ``last_bar_pos -
+    b.pos`` is within ``max_age_bars``.
+
+    Returns None if no pair qualifies, or if the indicator series is missing
+    a value at either pivot position.
+    """
+    if not points or len(points) < 2:
+        return None
+    pivot_lookback = max(2, int(pivot_lookback))
+    max_age_bars = max(0, int(max_age_bars))
+    candidates = points[-pivot_lookback:]
+    if len(candidates) < 2:
+        return None
+    best: DivergenceMatch | None = None
+    # Iterate so most recent b wins; pair each candidate b against every
+    # earlier a in the same window.
+    for j in range(len(candidates) - 1, 0, -1):
+        pos_b, ts_b, price_b = candidates[j]
+        age = max(0, int(last_bar_pos) - int(pos_b))
+        if age > max_age_bars:
+            continue
+        ind_b = _pivot_indicator_value(indicator, pos_b)
+        if ind_b is None:
+            continue
+        for i in range(0, j):
+            pos_a, ts_a, price_a = candidates[i]
+            ind_a = _pivot_indicator_value(indicator, pos_a)
+            if ind_a is None:
+                continue
+            matched, delta = _qualifies(
+                kind=kind,
+                direction=direction,
+                price_a=float(price_a),
+                price_b=float(price_b),
+                ind_a=ind_a,
+                ind_b=ind_b,
+                price_move_frac=float(price_move_frac),
+                indicator_delta=float(indicator_delta),
+            )
+            if not matched:
+                continue
+            best = DivergenceMatch(
+                kind=kind,
+                direction=direction,
+                indicator=indicator_name,
+                pivot_a_pos=int(pos_a),
+                pivot_a_ts=ts_a,
+                pivot_a_price=float(price_a),
+                pivot_a_indicator=float(ind_a),
+                pivot_b_pos=int(pos_b),
+                pivot_b_ts=ts_b,
+                pivot_b_price=float(price_b),
+                pivot_b_indicator=float(ind_b),
+                indicator_delta=float(delta),
+                age_bars=int(age),
+            )
+            break  # Found most recent valid b; stop scanning earlier a's
+        if best is not None:
+            break  # Stop scanning earlier b's
+    return best

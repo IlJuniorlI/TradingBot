@@ -777,6 +777,7 @@ class DashboardCache:
             tech_frame = self.data.get_merged(symbol, timeframe=f"{ltf_min_for_tech}min", with_indicators=True)
         else:
             tech_frame = frame
+        tech_ctx = None  # Stays None when tech_frame is empty (warmup path) or build_technical_levels_context raises; downstream readers (technical_payload, divergence_lines) all guard on `tech_ctx is not None`.
         if tech_frame is not None and not tech_frame.empty:
             frame_for_analysis = tech_frame.copy()
             for col in ("open", "high", "low", "close", "volume"):
@@ -815,6 +816,9 @@ class DashboardCache:
                     divergence_rsi_length=int(getattr(tl_cfg, "divergence_rsi_length", 14) or 14),
                     divergence_rsi_min_delta=float(getattr(tl_cfg, "divergence_rsi_min_delta", 2.0) or 2.0),
                     divergence_obv_min_volume_frac=float(getattr(tl_cfg, "divergence_obv_min_volume_frac", 0.50) or 0.50),
+                    divergence_pivot_lookback=int(getattr(tl_cfg, "divergence_pivot_lookback", 4) or 4),
+                    divergence_max_age_bars=int(getattr(tl_cfg, "divergence_max_age_bars", 8) or 8),
+                    divergence_min_price_move_pct=float(getattr(tl_cfg, "divergence_min_price_move_pct", 0.0015) or 0.0015),
                     fib_enabled=bool(getattr(tl_cfg, "fib_enabled", True)),
                     channel_enabled=bool(getattr(tl_cfg, "channel_enabled", True)),
                     trendline_enabled=bool(getattr(tl_cfg, "trendline_enabled", True)),
@@ -865,10 +869,14 @@ class DashboardCache:
                     "obv_ema": dashboard_safe_float(getattr(tech_ctx, "obv_ema", None)),
                     "obv_bias": str(getattr(tech_ctx, "obv_bias", "neutral") or "neutral"),
                     "rsi14": dashboard_safe_float(getattr(tech_ctx, "rsi14", None)),
-                    "bullish_rsi_divergence": bool(getattr(tech_ctx, "bullish_rsi_divergence", False)),
-                    "bearish_rsi_divergence": bool(getattr(tech_ctx, "bearish_rsi_divergence", False)),
-                    "bullish_obv_divergence": bool(getattr(tech_ctx, "bullish_obv_divergence", False)),
-                    "bearish_obv_divergence": bool(getattr(tech_ctx, "bearish_obv_divergence", False)),
+                    "bullish_rsi_divergence": getattr(tech_ctx, "bullish_rsi_divergence", None) is not None,
+                    "bearish_rsi_divergence": getattr(tech_ctx, "bearish_rsi_divergence", None) is not None,
+                    "bullish_obv_divergence": getattr(tech_ctx, "bullish_obv_divergence", None) is not None,
+                    "bearish_obv_divergence": getattr(tech_ctx, "bearish_obv_divergence", None) is not None,
+                    "bullish_hidden_rsi_divergence": getattr(tech_ctx, "bullish_hidden_rsi_divergence", None) is not None,
+                    "bearish_hidden_rsi_divergence": getattr(tech_ctx, "bearish_hidden_rsi_divergence", None) is not None,
+                    "bullish_hidden_obv_divergence": getattr(tech_ctx, "bullish_hidden_obv_divergence", None) is not None,
+                    "bearish_hidden_obv_divergence": getattr(tech_ctx, "bearish_hidden_obv_divergence", None) is not None,
                     "counter_divergence_bias": str(getattr(tech_ctx, "counter_divergence_bias", "neutral") or "neutral"),
                     "bollinger_mid": dashboard_safe_float(getattr(tech_ctx, "bollinger_mid", None)),
                     "bollinger_upper": dashboard_safe_float(getattr(tech_ctx, "bollinger_upper", None)),
@@ -938,11 +946,17 @@ class DashboardCache:
         htf_fair_value_gaps: list[dict[str, Any]] = []
         compact_chart_profile = self.chart_profile("compact")
         expanded_chart_profile = self.chart_profile("expanded")
+        # Hoisted HTF context — built once if any consumer needs it (FVG
+        # rendering, divergence trendlines). Kept outside the FVG try/except
+        # so the divergence block below can read it without re-fetching.
+        htf_ctx = None
+        chart_wants_rsi_div = bool(compact_chart_profile.show_rsi_divergence) or bool(expanded_chart_profile.show_rsi_divergence)
         try:
             sr_cfg = getattr(self.config, "support_resistance", None)
             include_fair_value_gaps = bool(getattr(sr_cfg, "htf_fair_value_gaps_enabled", True)) if sr_cfg is not None else True
             chart_wants_htf_fvgs = bool(compact_chart_profile.show_htf_fair_value_gaps) or bool(expanded_chart_profile.show_htf_fair_value_gaps)
-            if include_fair_value_gaps and chart_wants_htf_fvgs and self.data is not None:
+            need_htf_ctx = (include_fair_value_gaps and chart_wants_htf_fvgs) or chart_wants_rsi_div
+            if need_htf_ctx and self.data is not None:
                 htf_ctx = self.data.get_htf_context(
                     symbol,
                     timeframe_minutes=self._active_htf_minutes(),
@@ -962,7 +976,7 @@ class DashboardCache:
                     fair_value_gap_min_atr_mult=float(getattr(self.config.support_resistance, "fair_value_gap_min_atr_mult", 0.05) or 0.05),
                     fair_value_gap_min_pct=float(getattr(self.config.support_resistance, "fair_value_gap_min_pct", 0.0005) or 0.0005),
                 )
-                if htf_ctx is not None:
+                if include_fair_value_gaps and chart_wants_htf_fvgs and htf_ctx is not None:
                     htf_min = self._active_htf_minutes()
                     htf_tf_minutes = int(getattr(htf_ctx, "timeframe_minutes", htf_min) or htf_min)
                     for gap in list(getattr(htf_ctx, "bullish_fvgs", []) or []) + list(getattr(htf_ctx, "bearish_fvgs", []) or []):
@@ -972,6 +986,7 @@ class DashboardCache:
                             htf_fair_value_gaps.append(payload_fvg)
         except Exception:
             htf_fair_value_gaps = []
+            htf_ctx = None
 
         ltf_fair_value_gaps: list[dict[str, Any]] = []
         try:
@@ -1085,6 +1100,60 @@ class DashboardCache:
             )
             ltf_order_blocks = []
 
+        # Divergence trendlines (RSI / OBV, regular / hidden, bullish / bearish)
+        # for the price chart. LTF divergences come from tech_ctx (built off
+        # the strategy's primary frame), HTF divergences come from htf_ctx
+        # (hoisted above; populated when divergence rendering or FVG rendering
+        # is enabled). Each entry is a DivergenceMatch.to_payload() dict —
+        # frontend draws a line connecting the two pivot points and color-
+        # codes by direction (green=bullish/red=bearish), kind (solid=regular,
+        # dashed=hidden), indicator (RSI heavier stroke than OBV).
+        ltf_divergence_lines: list[dict[str, Any]] = []
+        htf_divergence_lines: list[dict[str, Any]] = []
+        try:
+            chart_wants_obv_div = bool(compact_chart_profile.show_obv_divergence) or bool(expanded_chart_profile.show_obv_divergence)
+            if tech_ctx is not None and (chart_wants_rsi_div or chart_wants_obv_div):
+                for attr_name in (
+                    "bullish_rsi_divergence", "bearish_rsi_divergence",
+                    "bullish_hidden_rsi_divergence", "bearish_hidden_rsi_divergence",
+                    "bullish_obv_divergence", "bearish_obv_divergence",
+                    "bullish_hidden_obv_divergence", "bearish_hidden_obv_divergence",
+                ):
+                    match = getattr(tech_ctx, attr_name, None)
+                    if match is None:
+                        continue
+                    indicator = getattr(match, "indicator", "rsi")
+                    if indicator == "rsi" and not chart_wants_rsi_div:
+                        continue
+                    if indicator == "obv" and not chart_wants_obv_div:
+                        continue
+                    line = match.to_payload()
+                    line["timeframe"] = "ltf"
+                    ltf_divergence_lines.append(line)
+            # HTF divergence lines — only RSI is computed at HTF level
+            # (build_htf_context populates the four HTF RSI fields; OBV
+            # divergence is intentionally LTF-only since OBV is volume-driven
+            # and HTF resampling smears the signal).
+            if htf_ctx is not None and chart_wants_rsi_div:
+                for attr_name in (
+                    "bullish_rsi_divergence", "bearish_rsi_divergence",
+                    "bullish_hidden_rsi_divergence", "bearish_hidden_rsi_divergence",
+                ):
+                    match = getattr(htf_ctx, attr_name, None)
+                    if match is None:
+                        continue
+                    line = match.to_payload()
+                    line["timeframe"] = "htf"
+                    htf_divergence_lines.append(line)
+        except Exception:
+            self.log_component_failure(
+                "divergence_lines_collect",
+                "Dashboard divergence-line collect failed for %s",
+                symbol,
+            )
+            ltf_divergence_lines = []
+            htf_divergence_lines = []
+
         chart_payload = {
             "levels": {
                 "nearest_support": nearest_support,
@@ -1102,6 +1171,8 @@ class DashboardCache:
                 "ltf_fair_value_gaps": ltf_fair_value_gaps,
                 "htf_order_blocks": htf_order_blocks,
                 "ltf_order_blocks": ltf_order_blocks,
+                "ltf_divergence_lines": ltf_divergence_lines,
+                "htf_divergence_lines": htf_divergence_lines,
             },
             "technicals": technical_payload,
             "position_markers": position_markers,

@@ -9,6 +9,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from .levels_shared import DivergenceMatch, find_divergence
 from .utils import (
     atr_value,
     ensure_ohlcv_frame,
@@ -99,6 +100,10 @@ class TechnicalLevelsContext:
         "bearish_rsi_divergence",
         "bullish_obv_divergence",
         "bearish_obv_divergence",
+        "bullish_hidden_rsi_divergence",
+        "bearish_hidden_rsi_divergence",
+        "bullish_hidden_obv_divergence",
+        "bearish_hidden_obv_divergence",
         "counter_divergence_bias",
         "bollinger_mid",
         "bollinger_upper",
@@ -162,10 +167,14 @@ class TechnicalLevelsContext:
     obv_ema: float | None
     obv_bias: str
     rsi14: float | None
-    bullish_rsi_divergence: bool
-    bearish_rsi_divergence: bool
-    bullish_obv_divergence: bool
-    bearish_obv_divergence: bool
+    bullish_rsi_divergence: "DivergenceMatch | None"
+    bearish_rsi_divergence: "DivergenceMatch | None"
+    bullish_obv_divergence: "DivergenceMatch | None"
+    bearish_obv_divergence: "DivergenceMatch | None"
+    bullish_hidden_rsi_divergence: "DivergenceMatch | None"
+    bearish_hidden_rsi_divergence: "DivergenceMatch | None"
+    bullish_hidden_obv_divergence: "DivergenceMatch | None"
+    bearish_hidden_obv_divergence: "DivergenceMatch | None"
     counter_divergence_bias: str
     bollinger_mid: float | None
     bollinger_upper: float | None
@@ -231,10 +240,14 @@ class TechnicalLevelsContext:
         obv_ema: float | None = None,
         obv_bias: str = "neutral",
         rsi14: float | None = None,
-        bullish_rsi_divergence: bool = False,
-        bearish_rsi_divergence: bool = False,
-        bullish_obv_divergence: bool = False,
-        bearish_obv_divergence: bool = False,
+        bullish_rsi_divergence: "DivergenceMatch | None" = None,
+        bearish_rsi_divergence: "DivergenceMatch | None" = None,
+        bullish_obv_divergence: "DivergenceMatch | None" = None,
+        bearish_obv_divergence: "DivergenceMatch | None" = None,
+        bullish_hidden_rsi_divergence: "DivergenceMatch | None" = None,
+        bearish_hidden_rsi_divergence: "DivergenceMatch | None" = None,
+        bullish_hidden_obv_divergence: "DivergenceMatch | None" = None,
+        bearish_hidden_obv_divergence: "DivergenceMatch | None" = None,
         counter_divergence_bias: str = "neutral",
         bollinger_mid: float | None = None,
         bollinger_upper: float | None = None,
@@ -301,6 +314,10 @@ class TechnicalLevelsContext:
         self.bearish_rsi_divergence = bearish_rsi_divergence
         self.bullish_obv_divergence = bullish_obv_divergence
         self.bearish_obv_divergence = bearish_obv_divergence
+        self.bullish_hidden_rsi_divergence = bullish_hidden_rsi_divergence
+        self.bearish_hidden_rsi_divergence = bearish_hidden_rsi_divergence
+        self.bullish_hidden_obv_divergence = bullish_hidden_obv_divergence
+        self.bearish_hidden_obv_divergence = bearish_hidden_obv_divergence
         self.counter_divergence_bias = counter_divergence_bias
         self.bollinger_mid = bollinger_mid
         self.bollinger_upper = bollinger_upper
@@ -667,41 +684,12 @@ def _anchored_vwap(frame: pd.DataFrame, start_pos: int) -> float | None:
     return float((typical * vol_arr).sum() / vol_sum)
 
 
-def _last_two_pivots(points: list[tuple[int, pd.Timestamp, float]]) -> tuple[tuple[int, pd.Timestamp, float], tuple[int, pd.Timestamp, float]] | None:
-    if len(points) < 2:
-        return None
-    return points[-2], points[-1]
-
-
-def _pivot_series_value(series: pd.Series, pos: int) -> float | None:
-    if pos < 0 or pos >= len(series):
-        return None
-    value = series.iloc[pos]
-    return None if pd.isna(value) else float(value)
-
-
-def _bullish_divergence(points: list[tuple[int, pd.Timestamp, float]], indicator: pd.Series, *, price_move_frac: float, indicator_delta: float) -> bool:
-    pair = _last_two_pivots(points)
-    if pair is None:
-        return False
-    (pos1, _ts1, price1), (pos2, _ts2, price2) = pair
-    ind1 = _pivot_series_value(indicator, pos1)
-    ind2 = _pivot_series_value(indicator, pos2)
-    if ind1 is None or ind2 is None:
-        return False
-    return bool(price2 < price1 * (1.0 - price_move_frac) and ind2 > ind1 + indicator_delta)
-
-
-def _bearish_divergence(points: list[tuple[int, pd.Timestamp, float]], indicator: pd.Series, *, price_move_frac: float, indicator_delta: float) -> bool:
-    pair = _last_two_pivots(points)
-    if pair is None:
-        return False
-    (pos1, _ts1, price1), (pos2, _ts2, price2) = pair
-    ind1 = _pivot_series_value(indicator, pos1)
-    ind2 = _pivot_series_value(indicator, pos2)
-    if ind1 is None or ind2 is None:
-        return False
-    return bool(price2 > price1 * (1.0 + price_move_frac) and ind2 < ind1 - indicator_delta)
+# NOTE: divergence detection moved to ``levels_shared.find_divergence``
+# (DivergenceMatch + multi-pivot + age-cutoff). The old _last_two_pivots /
+# _pivot_series_value / _bullish_divergence / _bearish_divergence helpers
+# only walked the last two pivots and returned booleans; they're superseded
+# by the shared detector which can also detect hidden divergences and is
+# imported by both technical_levels.py and htf_levels.py.
 
 def _populate_atr_context(
     ctx: TechnicalLevelsContext,
@@ -893,6 +881,9 @@ def build_technical_levels_context(
     divergence_rsi_length: int = 14,
     divergence_rsi_min_delta: float = 2.0,
     divergence_obv_min_volume_frac: float = 0.50,
+    divergence_pivot_lookback: int = 4,
+    divergence_max_age_bars: int = 8,
+    divergence_min_price_move_pct: float = 0.0015,
     fib_enabled: bool = True,
     channel_enabled: bool = True,
     trendline_enabled: bool = True,
@@ -1059,16 +1050,75 @@ def build_technical_levels_context(
         )
 
     if divergence_enabled and rsi_series is not None and obv_series is not None:
-        price_move_frac = max(0.0010, 0.0015)
+        price_move_frac = max(0.0001, float(divergence_min_price_move_pct))
         avg_volume = float(frame["volume"].tail(20).fillna(0.0).mean()) if "volume" in frame.columns else 0.0
         obv_delta = max(1.0, avg_volume * max(0.0, float(divergence_obv_min_volume_frac)))
-        ctx.bullish_rsi_divergence = _bullish_divergence(lows, rsi_series, price_move_frac=price_move_frac, indicator_delta=max(0.0, float(divergence_rsi_min_delta)))
-        ctx.bearish_rsi_divergence = _bearish_divergence(highs, rsi_series, price_move_frac=price_move_frac, indicator_delta=max(0.0, float(divergence_rsi_min_delta)))
-        ctx.bullish_obv_divergence = _bullish_divergence(lows, obv_series, price_move_frac=price_move_frac, indicator_delta=obv_delta)
-        ctx.bearish_obv_divergence = _bearish_divergence(highs, obv_series, price_move_frac=price_move_frac, indicator_delta=obv_delta)
-        if ctx.bearish_rsi_divergence or ctx.bearish_obv_divergence:
+        rsi_delta = max(0.0, float(divergence_rsi_min_delta))
+        last_bar_pos = max(0, len(frame) - 1)
+        lookback = max(2, int(divergence_pivot_lookback))
+        max_age = max(0, int(divergence_max_age_bars))
+
+        # Regular divergence: pivot pair where price extends but indicator
+        # weakens. Reversal-likely setup. Lows for bullish, highs for bearish.
+        ctx.bullish_rsi_divergence = find_divergence(
+            lows, rsi_series, kind="regular", direction="bullish",
+            indicator_name="rsi", price_move_frac=price_move_frac,
+            indicator_delta=rsi_delta, pivot_lookback=lookback,
+            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+        )
+        ctx.bearish_rsi_divergence = find_divergence(
+            highs, rsi_series, kind="regular", direction="bearish",
+            indicator_name="rsi", price_move_frac=price_move_frac,
+            indicator_delta=rsi_delta, pivot_lookback=lookback,
+            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+        )
+        ctx.bullish_obv_divergence = find_divergence(
+            lows, obv_series, kind="regular", direction="bullish",
+            indicator_name="obv", price_move_frac=price_move_frac,
+            indicator_delta=obv_delta, pivot_lookback=lookback,
+            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+        )
+        ctx.bearish_obv_divergence = find_divergence(
+            highs, obv_series, kind="regular", direction="bearish",
+            indicator_name="obv", price_move_frac=price_move_frac,
+            indicator_delta=obv_delta, pivot_lookback=lookback,
+            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+        )
+
+        # Hidden divergence: opposite price/indicator alignment to regular.
+        # Continuation-likely setup. Bullish hidden = price prints HL but
+        # indicator prints LL (in an uptrend). Mirror for bearish.
+        ctx.bullish_hidden_rsi_divergence = find_divergence(
+            lows, rsi_series, kind="hidden", direction="bullish",
+            indicator_name="rsi", price_move_frac=price_move_frac,
+            indicator_delta=rsi_delta, pivot_lookback=lookback,
+            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+        )
+        ctx.bearish_hidden_rsi_divergence = find_divergence(
+            highs, rsi_series, kind="hidden", direction="bearish",
+            indicator_name="rsi", price_move_frac=price_move_frac,
+            indicator_delta=rsi_delta, pivot_lookback=lookback,
+            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+        )
+        ctx.bullish_hidden_obv_divergence = find_divergence(
+            lows, obv_series, kind="hidden", direction="bullish",
+            indicator_name="obv", price_move_frac=price_move_frac,
+            indicator_delta=obv_delta, pivot_lookback=lookback,
+            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+        )
+        ctx.bearish_hidden_obv_divergence = find_divergence(
+            highs, obv_series, kind="hidden", direction="bearish",
+            indicator_name="obv", price_move_frac=price_move_frac,
+            indicator_delta=obv_delta, pivot_lookback=lookback,
+            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+        )
+
+        # Counter-divergence bias is the regular-pattern summary (used by
+        # the existing entry filter). Hidden divergences are continuation
+        # signals so they don't enter this summary.
+        if ctx.bearish_rsi_divergence is not None or ctx.bearish_obv_divergence is not None:
             ctx.counter_divergence_bias = "bearish"
-        elif ctx.bullish_rsi_divergence or ctx.bullish_obv_divergence:
+        elif ctx.bullish_rsi_divergence is not None or ctx.bullish_obv_divergence is not None:
             ctx.counter_divergence_bias = "bullish"
         else:
             ctx.counter_divergence_bias = "neutral"
