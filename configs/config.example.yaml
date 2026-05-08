@@ -18,6 +18,10 @@ schwab:
   tokens_db: .schwabdev/tokens.db
   timeout: 10
   dry_run: true
+  # Forwards to schwabdev.Client(open_browser_for_auth=...). When true (default),
+  # the OAuth flow auto-opens a browser tab. Set false on headless deployments
+  # (servers, CI, containers) — schwabdev will log the auth URL to open manually.
+  open_browser_for_auth: true
 
 # TradingView and screener inputs used to source candidates.
 # NOTE: sessionid is supplied via the .env file (TRADINGVIEW_SESSIONID).

@@ -277,6 +277,12 @@ class SchwabConfig:
     timeout: int = 10
     account_hash: str | None = None
     dry_run: bool = True
+    # Forwards to schwabdev.Client(open_browser_for_auth=...) (added in
+    # schwabdev 3.0.4). When True (default), the OAuth flow auto-opens a
+    # browser tab so the user can complete authentication. Set False on
+    # headless deployments (servers, CI, containers without a browser) —
+    # the auth URL will be logged instead so it can be opened manually.
+    open_browser_for_auth: bool = True
 
 
 @dataclass(slots=True)

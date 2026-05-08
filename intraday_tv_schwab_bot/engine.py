@@ -55,6 +55,7 @@ class IntradayBot:
             tokens_db=config.schwab.tokens_db,
             encryption=config.schwab.encryption,
             timeout=config.schwab.timeout,
+            open_browser_for_auth=config.schwab.open_browser_for_auth,
         )
         register_schwab_api_tracker(self.client, self.api_usage)
         self.screener = TradingViewScreenerClient(config)
