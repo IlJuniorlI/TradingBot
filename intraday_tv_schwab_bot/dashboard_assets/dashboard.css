@@ -113,7 +113,7 @@
     .tab-btn {
       border-radius: 16px;
       border: 1px solid var(--line);
-      background: rgba(var(--tint-rgb), 0.03);
+      background: rgba(var(--tint-rgb), 0.05);
       color: var(--text);
     }
     .metric-pill {
@@ -197,8 +197,16 @@
       line-height: 1.1;
       cursor: default;
     }
-    .mode-pill.live { color: #dbfff0; border-color: rgba(108,227,162,.22); background: rgba(108,227,162,.08); }
-    .mode-pill.paper { color: #ffe5bf; border-color: rgba(255,189,99,.22); background: rgba(255,189,99,.08); }
+    .mode-pill.live {
+      color: var(--good);
+      border-color: color-mix(in oklab, var(--good) 32%, transparent);
+      background: color-mix(in oklab, var(--good) 14%, transparent);
+    }
+    .mode-pill.paper {
+      color: var(--warn);
+      border-color: color-mix(in oklab, var(--warn) 45%, transparent);
+      background: color-mix(in oklab, var(--warn) 20%, transparent);
+    }
     .toggle-btn:hover,
     .tab-btn:hover { transform: translateY(-1px); border-color: var(--line-strong); }
     .workspace {
@@ -253,7 +261,7 @@
     .tab-btn.active {
       border-color: rgba(85,194,255,.28);
       background: rgba(85,194,255,.12);
-      color: #e6f8ff;
+      color: var(--text);
       box-shadow: inset 0 0 0 1px rgba(85,194,255,.05);
     }
     .watchlist-scroll,
@@ -631,9 +639,13 @@
     .status-error,
     .tone-bad,
     .event-bearish { color: var(--bad); border-color: rgba(255,107,130,.22); background: rgba(255,107,130,.09); }
-    .tone-warn,
+    .tone-warn { color: var(--warn); border-color: rgba(255,189,99,.22); background: rgba(255,189,99,.09); }
     .status-warning,
-    .status-idle { color: var(--warn); border-color: rgba(255,189,99,.22); background: rgba(255,189,99,.09); }
+    .status-idle {
+      color: var(--warn);
+      border-color: color-mix(in oklab, var(--warn) 45%, transparent);
+      background: color-mix(in oklab, var(--warn) 20%, transparent);
+    }
     .tone-accent { color: var(--accent); border-color: rgba(85,194,255,.22); background: rgba(85,194,255,.10); }
     .tone-neutral,
     .event-neutral { color: var(--muted); }
@@ -1260,7 +1272,11 @@
       border-radius: 10px;
     }
     .hidden { display: none !important; }
-    .status-disconnected .mode-pill { border-color: rgba(255,107,130,.25); background: rgba(255,107,130,.08); color: #ffd5de; }
+    .status-disconnected .mode-pill {
+      color: var(--bad);
+      border-color: color-mix(in oklab, var(--bad) 35%, transparent);
+      background: color-mix(in oklab, var(--bad) 14%, transparent);
+    }
     @media (max-width: 1660px) {
       :root { --left-w: 290px; --right-w: 350px; }
       .topbar { grid-template-columns: 300px minmax(0,1fr) 320px; }
