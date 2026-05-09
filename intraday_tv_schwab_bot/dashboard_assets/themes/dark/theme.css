@@ -24,4 +24,13 @@
   --chart-bg: #000000;
   --chart-grid: linear-gradient(transparent 95%, rgba(255,255,255,.07) 96%), linear-gradient(90deg, transparent 95%, rgba(255,255,255,.06) 96%);
   --gauge-inner: #0a0a0a;
+  /* Translucent overlay background for chart-anchored UI (loading veil,
+     legend chip). Dark themes keep the existing near-black tint; light
+     theme uses a white veil so dark text on the chip stays legible. */
+  --overlay-bg: rgba(6, 10, 18, 0.72);
+  /* RGB triplet used by dashboard.css for theme-aware surface tints
+     (subtle highlights, dividers, hover borders, gauge ring tracks).
+     Dark themes: white tint on dark surfaces. Light theme: slate-tinted
+     dark on light surfaces. Each rgba() call site picks its own opacity. */
+  --tint-rgb: 255, 255, 255;
 }

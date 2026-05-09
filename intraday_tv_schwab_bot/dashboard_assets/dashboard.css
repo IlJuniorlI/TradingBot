@@ -76,9 +76,9 @@
       justify-content: center;
       overflow: hidden;
       flex: 0 0 56px;
-      background: rgba(255,255,255,0.03);
-      border: 1px solid rgba(255,255,255,0.08);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+      background: rgba(var(--tint-rgb), 0.03);
+      border: 1px solid rgba(var(--tint-rgb), 0.08);
+      box-shadow: inset 0 1px 0 rgba(var(--tint-rgb), 0.05);
     }
     .brand-badge img {
       display: block;
@@ -113,7 +113,7 @@
     .tab-btn {
       border-radius: 16px;
       border: 1px solid var(--line);
-      background: rgba(255,255,255,0.03);
+      background: rgba(var(--tint-rgb), 0.03);
       color: var(--text);
     }
     .metric-pill {
@@ -297,9 +297,9 @@
     .kpi-tile,
     .gauge-card {
       border-radius: 18px;
-      border: 1px solid rgba(255,255,255,0.07);
-      background: linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.018));
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
+      border: 1px solid rgba(var(--tint-rgb), 0.07);
+      background: linear-gradient(180deg, rgba(var(--tint-rgb), 0.035), rgba(var(--tint-rgb), 0.018));
+      box-shadow: inset 0 1px 0 rgba(var(--tint-rgb), 0.02);
     }
     .symbol-card,
     .candidate-tile,
@@ -311,7 +311,7 @@
     @media (hover: hover) {
       .symbol-card:hover,
       .candidate-tile:hover,
-      .position-card:hover { transform: translateY(-1px); border-color: rgba(255,255,255,0.14); }
+      .position-card:hover { transform: translateY(-1px); border-color: rgba(var(--tint-rgb), 0.14); }
     }
     .symbol-card.active,
     .candidate-tile.active,
@@ -322,7 +322,7 @@
     }
     .tone-long { box-shadow: inset 3px 0 0 var(--good); }
     .tone-short { box-shadow: inset 3px 0 0 var(--bad); }
-    .tone-neutral { box-shadow: inset 3px 0 0 rgba(255,255,255,.09); }
+    .tone-neutral { box-shadow: inset 3px 0 0 rgba(var(--tint-rgb), .09); }
     .symbol-top,
     .position-top,
     .candidate-top,
@@ -358,7 +358,7 @@
       text-transform: uppercase;
       line-height: 1;
       white-space: nowrap;
-      box-shadow: inset 0 0 0 1px rgba(255,255,255,.03);
+      box-shadow: inset 0 0 0 1px rgba(var(--tint-rgb), .03);
       flex: 0 0 auto;
     }
     .tradeable-chip {
@@ -399,8 +399,8 @@
       min-width: 26px;
       min-height: 26px;
       border-radius: 10px;
-      background: rgba(255,255,255,.04);
-      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(var(--tint-rgb), .04);
+      border: 1px solid rgba(var(--tint-rgb), .08);
       padding: 2px;
     }
     .icon-badge img { display: block; height: 22px; width: auto; }
@@ -428,7 +428,7 @@
       border-radius: 50%;
       display: grid;
       place-items: center;
-      background: conic-gradient(var(--accent) 0 var(--pct, 45%), rgba(255,255,255,.06) var(--pct,45%) 100%);
+      background: conic-gradient(var(--accent) 0 var(--pct, 45%), rgba(var(--tint-rgb), .06) var(--pct,45%) 100%);
       position: relative;
       flex: 0 0 52px;
     }
@@ -566,8 +566,8 @@
       gap: 4px;
       padding: 4px;
       border-radius: 999px;
-      background: rgba(255,255,255,.04);
-      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(var(--tint-rgb), .04);
+      border: 1px solid rgba(var(--tint-rgb), .08);
       flex: 0 0 auto;
     }
     html.main-panel-expanded .chart-timeframe-toggle { display: inline-flex; }
@@ -609,7 +609,7 @@
       letter-spacing: .05em;
       text-transform: uppercase;
       background: var(--chip);
-      border: 1px solid rgba(255,255,255,.08);
+      border: 1px solid rgba(var(--tint-rgb), .08);
       color: var(--text);
       white-space: nowrap;
       line-height: 1.1;
@@ -693,9 +693,9 @@
       width: 100%;
       height: 10px;
       border-radius: 999px;
-      background: rgba(255,255,255,.06);
+      background: rgba(var(--tint-rgb), .06);
       overflow: hidden;
-      border: 1px solid rgba(255,255,255,.05);
+      border: 1px solid rgba(var(--tint-rgb), .05);
     }
     .bar-fill {
       height: 100%;
@@ -713,11 +713,11 @@
       height: 12px;
       border-radius: 999px;
       overflow: hidden;
-      border: 1px solid rgba(255,255,255,.05);
+      border: 1px solid rgba(var(--tint-rgb), .05);
       background:
         linear-gradient(90deg, rgba(255,107,130,.14) 0%, rgba(255,107,130,.10) 50%, rgba(108,227,162,.08) 50%, rgba(108,227,162,.14) 100%),
-        rgba(255,255,255,.04);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,.02);
+        rgba(var(--tint-rgb), .04);
+      box-shadow: inset 0 1px 0 rgba(var(--tint-rgb), .02);
     }
     .trade-range-center {
       position: absolute;
@@ -726,7 +726,7 @@
       left: calc(50% - 1px);
       width: 2px;
       border-radius: 999px;
-      background: rgba(255,255,255,.55);
+      background: rgba(var(--tint-rgb), .55);
       z-index: 2;
     }
     .trade-range-fill {
@@ -824,7 +824,7 @@
       align-items: center;
       justify-content: center;
       gap: 10px;
-      background: rgba(7,10,19,.72);
+      background: var(--overlay-bg);
       backdrop-filter: blur(2px);
       -webkit-backdrop-filter: blur(2px);
       opacity: 0;
@@ -841,10 +841,10 @@
       width: 28px;
       height: 28px;
       border-radius: 999px;
-      border: 3px solid rgba(255,255,255,.14);
+      border: 3px solid rgba(var(--tint-rgb), .14);
       border-top-color: rgba(142,197,255,.92);
       animation: chartSpin .85s linear infinite;
-      box-shadow: 0 0 0 1px rgba(255,255,255,.04);
+      box-shadow: 0 0 0 1px rgba(var(--tint-rgb), .04);
     }
     .chart-loading-text {
       color: rgba(236,243,255,.88);
@@ -885,7 +885,7 @@
       overflow: visible;
       padding: 10px 12px;
       border-radius: 14px;
-      border: 1px solid rgba(255,255,255,.10);
+      border: 1px solid rgba(var(--tint-rgb), .10);
       background: rgba(7, 12, 22, .96);
       box-shadow: 0 18px 48px rgba(0,0,0,.42);
       backdrop-filter: blur(10px);
@@ -934,7 +934,7 @@
     .chart-tooltip .tt-section {
       margin-top: 10px;
       padding-top: 10px;
-      border-top: 1px solid rgba(255,255,255,.08);
+      border-top: 1px solid rgba(var(--tint-rgb), .08);
     }
     .chart-tooltip .tt-section-title {
       margin-bottom: 8px;
@@ -952,7 +952,7 @@
     .chart-tooltip .tt-tag {
       padding: 4px 8px;
       border-radius: 999px;
-      background: rgba(255,255,255,.08);
+      background: rgba(var(--tint-rgb), .08);
       font-size: 10px;
       font-weight: 700;
       line-height: 1;
@@ -965,8 +965,8 @@
       border-radius:999px;
       font-size:11px;
       color: var(--text);
-      background: rgba(6,10,18,.72);
-      border: 1px solid rgba(255,255,255,.08);
+      background: var(--overlay-bg);
+      border: 1px solid rgba(var(--tint-rgb), .08);
       backdrop-filter: blur(8px);
     }
     .legend-chip .swatch { width: 10px; height: 10px; border-radius: 50%; }
@@ -1025,12 +1025,12 @@
       display: grid;
       place-items: center;
       margin: 4px auto 10px;
-      background: conic-gradient(var(--accent) 0 var(--pct, 40%), rgba(255,255,255,.06) var(--pct,40%) 100%);
+      background: conic-gradient(var(--accent) 0 var(--pct, 40%), rgba(var(--tint-rgb), .06) var(--pct,40%) 100%);
       position: relative;
     }
-    .gauge-ring.good { background: conic-gradient(var(--good) 0 var(--pct, 40%), rgba(255,255,255,.06) var(--pct,40%) 100%); }
-    .gauge-ring.bad { background: conic-gradient(var(--bad) 0 var(--pct, 40%), rgba(255,255,255,.06) var(--pct,40%) 100%); }
-    .gauge-ring.warn { background: conic-gradient(var(--warn) 0 var(--pct, 40%), rgba(255,255,255,.06) var(--pct,40%) 100%); }
+    .gauge-ring.good { background: conic-gradient(var(--good) 0 var(--pct, 40%), rgba(var(--tint-rgb), .06) var(--pct,40%) 100%); }
+    .gauge-ring.bad { background: conic-gradient(var(--bad) 0 var(--pct, 40%), rgba(var(--tint-rgb), .06) var(--pct,40%) 100%); }
+    .gauge-ring.warn { background: conic-gradient(var(--warn) 0 var(--pct, 40%), rgba(var(--tint-rgb), .06) var(--pct,40%) 100%); }
     .gauge-ring::after {
       content:'';
       position:absolute;
@@ -1232,8 +1232,8 @@
       color: var(--muted);
       text-align: center;
       border-radius: 18px;
-      border: 1px dashed rgba(255,255,255,.08);
-      background: rgba(255,255,255,.02);
+      border: 1px dashed rgba(var(--tint-rgb), .08);
+      background: rgba(var(--tint-rgb), .02);
       padding: 16px;
     }
     .tv-link,

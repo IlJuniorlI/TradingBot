@@ -1,11 +1,15 @@
 [data-theme="light"] {
-  --bg: #ffffff;
-  --bg2: #f4f5f8;
-  --panel: rgba(255, 255, 255, 0.95);
-  --panel2: rgba(248, 249, 252, 0.96);
-  --panel3: rgba(242, 243, 248, 0.98);
-  --line: rgba(0,0,0,0.08);
-  --line-strong: rgba(0,0,0,0.14);
+  /* Light theme uses a soft gray body so pure-white panels visibly pop
+     above it (the prior pure-white-body / white-panel combo made every
+     panel border invisible). Same variable shape as the dark theme so
+     dashboard.css gets identical structure — just inverted hierarchy. */
+  --bg: #eef1f6;
+  --bg2: #e6eaf0;
+  --panel: #ffffff;
+  --panel2: #fafbfd;
+  --panel3: #f3f5f9;
+  --line: rgba(15, 23, 42, 0.12);
+  --line-strong: rgba(15, 23, 42, 0.22);
   --text: #1a1d26;
   --muted: #5a6275;
   --soft: #8590a6;
@@ -14,14 +18,23 @@
   --warn: #c57a00;
   --accent: #1a8bd6;
   --accent-2: #0e7ac2;
-  --chip: rgba(0,0,0,0.04);
-  --shadow: 0 12px 40px rgba(0, 0, 0, 0.10);
-  --body-bg: #ffffff;
+  --chip: rgba(15, 23, 42, 0.06);
+  --shadow: 0 8px 24px rgba(20, 30, 50, 0.10);
+  --body-bg: #eef1f6;
   --body-glow-1: none;
   --body-glow-2: none;
-  --panel-bg: rgba(255, 255, 255, 0.95);
+  --panel-bg: #ffffff;
   --panel-glow: none;
-  --chart-bg: #f8f9fc;
-  --chart-grid: linear-gradient(transparent 95%, rgba(0,0,0,.07) 96%), linear-gradient(90deg, transparent 95%, rgba(0,0,0,.06) 96%);
-  --gauge-inner: #f0f1f4;
+  --chart-bg: #ffffff;
+  --chart-grid: linear-gradient(transparent 95%, rgba(15,23,42,.10) 96%), linear-gradient(90deg, transparent 95%, rgba(15,23,42,.08) 96%);
+  --gauge-inner: #f0f3f8;
+  /* Translucent overlay background for chart-anchored UI (loading veil,
+     legend chip). Dark themes keep the existing near-black tint; light
+     theme uses a white veil so dark text on the chip stays legible. */
+  --overlay-bg: rgba(255, 255, 255, 0.82);
+  /* RGB triplet used by dashboard.css for theme-aware surface tints
+     (subtle highlights, dividers, hover borders, gauge ring tracks).
+     Dark themes: white tint on dark surfaces. Light theme: slate-tinted
+     dark on light surfaces. Each rgba() call site picks its own opacity. */
+  --tint-rgb: 15, 23, 42;
 }

@@ -7,6 +7,12 @@
   --accent: #7cc3ff;
   --good: #5ed89a;
   --bad: #ff6b82;
+  /* example_custom is a fully-custom dashboard (has its own index.html).
+     The base dashboard.css isn't loaded for this theme, so the values
+     below are inert — defined only for parity with the shipped themes
+     in case a future custom-dashboard variant decides to consume them. */
+  --overlay-bg: rgba(6, 10, 18, 0.72);
+  --tint-rgb: 255, 255, 255;
 }
 
 * { box-sizing: border-box; }

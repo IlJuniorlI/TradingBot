@@ -2994,7 +2994,13 @@ function drawSelectedChart(snapshot) {
     const activeIndex = hoverIndex !== null && hoverIndex !== undefined ? hoverIndex : pinnedIndex;
     pendingHorizontalLabels = [];
     ctx.clearRect(0, 0, width, height);
-    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    // Read the theme-aware --tint-rgb at paint time. Canvas strokeStyle
+    // can't parse `var(...)` directly the way CSS can, so we resolve it
+    // once per paint and template it into rgba() strings below. Falls
+    // back to white tint if the variable isn't set (e.g. when the page
+    // loads before any theme stylesheet attaches).
+    const tintRgb = (getComputedStyle(document.documentElement).getPropertyValue('--tint-rgb') || '255, 255, 255').trim();
+    ctx.strokeStyle = `rgba(${tintRgb}, 0.08)`;
     ctx.lineWidth = 1;
     for (let i = 0; i <= 4; i += 1) {
       const y = pad.top + (plotH / 4) * i;
@@ -3065,7 +3071,7 @@ function drawSelectedChart(snapshot) {
       const labelY = tickY + 8;
       const occupiedRanges = [];
       timeAxisTickData.forEach(tick => {
-        ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+        ctx.strokeStyle = `rgba(${tintRgb}, 0.12)`;
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(tick.x, tickY);
