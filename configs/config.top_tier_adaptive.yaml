@@ -325,8 +325,12 @@ technical_levels:
   divergence_rsi_length: 14
   divergence_rsi_min_delta: 2.5
   divergence_obv_min_volume_frac: 0.65
-  divergence_counter_rsi_penalty: 0.12
-  divergence_counter_obv_penalty: 0.1
+  # Counter-divergence penalty trimmed (0.12 -> 0.10 RSI, 0.10 -> 0.08 OBV)
+  # to compensate for the multi-pivot detector firing strictly more often
+  # than the old last-2-pivot scan it replaced. Keeps the cumulative penalty
+  # mass on counter-trade entries roughly where it was before the upgrade.
+  divergence_counter_rsi_penalty: 0.10
+  divergence_counter_obv_penalty: 0.08
   # Multi-pivot divergence detection (added with the levels_shared.find_divergence
   # refactor): walk the last N pivots and return the most recent qualifying
   # pair, gated by max-age in bars so stale divergences don'''t dominate.
@@ -496,13 +500,19 @@ strategies:
       htf_minutes: 15
       min_ltf_bars: 15
 
-      # Regime scoring thresholds
+      # Regime scoring thresholds. min_score_gap raised 1.2 -> 1.4 because
+      # HTF RSI confluence (htf_divergence_aligned_bonus_rsi=+0.20 vs
+      # htf_divergence_counter_penalty_rsi=-0.25) now spreads aligned vs
+      # counter setups by ~0.45 of score on average — the gap can be tighter
+      # while still picking the right regime decisively. min_adx14 bumped
+      # 15.0 -> 16.0 since HTF momentum filter now rejects weak trends
+      # upstream, so the ADX gate can demand slightly more trend strength.
       min_trend_score: 3.5
       min_pullback_score: 3.5
       min_pullback_trend_score: 3.0
       min_range_score: 3.5
-      min_score_gap: 1.2
-      min_adx14: 15.0
+      min_score_gap: 1.4
+      min_adx14: 16.0
 
       # Pullback detection
       pullback_ema_touch_atr_mult: 0.35
@@ -587,11 +597,14 @@ strategies:
       # Priority scoring
       activity_score_weight: 0.12
 
-      # Adaptive management R:R thresholds
+      # Adaptive management R:R thresholds. runner_trigger lowered 1.15 -> 1.10
+      # because HTF-aligned setups (now boosted by +0.20 score) tend to be
+      # higher quality on average; engage runner mode slightly earlier so
+      # the strategy captures more of the move without trailing-stop drag.
       adaptive_breakeven_rr: 1.00
       adaptive_profit_lock_rr: 1.30
       adaptive_profit_lock_stop_rr: 0.35
-      adaptive_runner_trigger_rr: 1.15
+      adaptive_runner_trigger_rr: 1.10
 
       # Adaptive ladder rung builder (used when risk.trade_management_mode
       # is "adaptive_ladder"). Walks S/R resistances (long) / supports
