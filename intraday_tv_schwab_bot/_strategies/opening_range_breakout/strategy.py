@@ -91,8 +91,9 @@ class ORBStrategy(BaseStrategy):
             sr_ctx = self._sr_context(c.symbol, frame, data)
             ms_ctx = self._structure_context(frame, "ltf")
             tech_ctx = self._technical_context(frame)
-            pattern_ok = bool(ctx.matched_bullish_continuation or ctx.matched_bullish_reversal) or ctx.bias_score >= 0.0
             last_close = _safe_float(last["close"])
+            htf_ctx = self._default_htf_context_for_score(c.symbol, data)
+            pattern_ok = bool(ctx.matched_bullish_continuation or ctx.matched_bullish_reversal) or ctx.bias_score >= 0.0
             last_vwap = _safe_float(last["vwap"], last_close)
             last_ema9 = _safe_float(last["ema9"], last_close)
             last_ema20 = _safe_float(last["ema20"], last_close)
@@ -139,7 +140,7 @@ class ORBStrategy(BaseStrategy):
                     ms_bias = getattr(ms_ctx, "bias", "neutral")
                     structure_bonus = 0.75 if ms_bias == "bullish" else 0.0
                     pattern_bonus = 0.35 if ctx.matched_bullish_continuation else 0.15 if ctx.matched_bullish_reversal else 0.0
-                    adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx)
+                    adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
                     fvg_adjustments = self._fvg_entry_adjustment_components(Side.LONG, c.symbol, frame, data)
                     fvg_continuation_bias = float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0)
                     runner_allowed = bool(fvg_continuation_bias >= 0.35 and (ctx.matched_bullish_continuation or ms_bias == "bullish"))

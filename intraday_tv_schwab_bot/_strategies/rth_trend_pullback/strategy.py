@@ -73,6 +73,7 @@ class RTHTrendPullbackStrategy(BaseStrategy):
             sr_ctx = self._sr_context(c.symbol, frame, data)
             ms_ctx = self._structure_context(frame, "ltf")
             tech_ctx = self._technical_context(frame)
+            htf_ctx = self._default_htf_context_for_score(c.symbol, data)
             metadata = {
                 "trigger_high": trigger_high,
                 "trigger_low": trigger_low,
@@ -139,7 +140,7 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                         if bool(getattr(ms_ctx, "bos_up", False)) and self._structure_event_recent(getattr(ms_ctx, "bos_up_age_bars", None)):
                             structure_bonus += 0.5
                         pattern_bonus = 0.35 if ctx.matched_bullish_continuation else 0.15 if ctx.matched_bullish_reversal else 0.0
-                        adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx)
+                        adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
                         fvg_adjustments = self._fvg_entry_adjustment_components(Side.LONG, c.symbol, frame, data)
                         runner_allowed = bool((effective_target_rr > target_rr or float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0) >= 0.35) and getattr(ms_ctx, "bias", "neutral") == "bullish")
                         management = self._adaptive_management_components(Side.LONG, last_close, stop, target, style="trend", runner_allowed=runner_allowed, continuation_bias=float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0), strong_setup=bool(effective_target_rr > target_rr))
@@ -212,7 +213,7 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                         if bool(getattr(ms_ctx, "bos_down", False)) and self._structure_event_recent(getattr(ms_ctx, "bos_down_age_bars", None)):
                             structure_bonus += 0.5
                         pattern_bonus = 0.35 if ctx.matched_bearish_continuation else 0.15 if ctx.matched_bearish_reversal else 0.0
-                        adjustments = self._entry_adjustment_components(Side.SHORT, sr_ctx=sr_ctx, tech_ctx=tech_ctx)
+                        adjustments = self._entry_adjustment_components(Side.SHORT, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
                         fvg_adjustments = self._fvg_entry_adjustment_components(Side.SHORT, c.symbol, frame, data)
                         runner_allowed = bool((effective_target_rr > target_rr or float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0) >= 0.35) and getattr(ms_ctx, "bias", "neutral") == "bearish")
                         management = self._adaptive_management_components(Side.SHORT, last_close, stop, target, style="trend", runner_allowed=runner_allowed, continuation_bias=float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0), strong_setup=bool(effective_target_rr > target_rr))

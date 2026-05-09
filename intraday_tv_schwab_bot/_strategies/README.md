@@ -79,6 +79,8 @@ Optional manifest capabilities and strategy hooks
   - `_divergence_exit_signal(side, in_profit, tech_ctx)` returns `Optional[(reason, partial_frac)]` when a counter-direction REGULAR divergence forms on a held position. Gated by `shared_exit.use_divergence_exit_signal` (off by default). Hidden divergence is continuation context and is intentionally never an exit trigger.
   - Detection itself runs unconditionally inside `build_technical_levels_context` (LTF) and `build_htf_context` (HTF, RSI only); the shared helpers just wrap those raw `DivergenceMatch` results in entry/exit decision shapes. Score adjustments for non-opt-in strategies still apply via `_technical_entry_adjustment` and `_htf_divergence_adjustment` — those run regardless of whether the strategy uses the shared entry/exit helpers.
 
+- **HTF context plumbing for score adjustments.** `_entry_adjustment_components(side, sr_ctx, tech_ctx, htf_ctx=None)` accepts an optional HTF context. When supplied, `_htf_divergence_adjustment` runs and folds HTF RSI confluence (aligned bonus / counter penalty / hidden bonus) into `entry_context_adjustment`. Strategies that already build a customized HTF context (e.g. `peer_confirmed_*`) should pass that one. Strategies that don't otherwise need a customized HTF context can call `_default_htf_context_for_score(symbol, data, current_price)` — a lightweight wrapper that fetches HTF using the bot's `support_resistance` config defaults and returns `None` on failure (the score path defensively zeros out). All non-options stock strategies are wired to pass `htf_ctx` as of the divergence-stack rollout.
+
 ### Canonical runtime contract for plugins
 
 New plugins should use the standardized runtime field names below.

@@ -936,9 +936,10 @@ class BaseStrategy:
         target: float,
         extra_priority: float = 0.0,
         management_style: str = "reversal",
+        htf_ctx: Any = None,
     ) -> Signal:
         last_close = _safe_float(frame.iloc[-1]["close"])
-        adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx)
+        adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
         fvg_adjustments = self._fvg_entry_adjustment_components(Side.LONG, candidate.symbol, frame, data)
         management = self._adaptive_management_components(
             Side.LONG,
@@ -1478,6 +1479,42 @@ class BaseStrategy:
             "sr_level_buffer": float(ctx.level_buffer or 0.0),
             **BaseStrategy._structure_lists(ms_ctx, prefix="mshtf"),
         }
+
+    def _default_htf_context_for_score(self, symbol: str, data):
+        """Fetch HTF context with the bot's standard support_resistance defaults.
+
+        Used by strategies that don't otherwise need a customized HTF
+        context but want HTF RSI divergence to flow into their entry
+        scoring via _entry_adjustment_components(htf_ctx=...). Strategies
+        that already build a custom HTF context (peer_confirmed_*) should
+        pass that one instead.
+
+        Returns ``None`` if HTF data isn't available — the score path is
+        defensive (None ctx -> zero adjustment).
+        """
+        if data is None or not hasattr(data, "get_htf_context"):
+            return None
+        sr_cfg = getattr(self.config, "support_resistance", None)
+        if sr_cfg is None:
+            return None
+        try:
+            return data.get_htf_context(
+                symbol,
+                timeframe_minutes=int(getattr(sr_cfg, "timeframe_minutes", 60) or 60),
+                lookback_days=int(getattr(sr_cfg, "lookback_days", 60) or 60),
+                pivot_span=int(getattr(sr_cfg, "pivot_span", 2) or 2),
+                max_levels_per_side=int(getattr(sr_cfg, "max_levels_per_side", 6) or 6),
+                atr_tolerance_mult=float(getattr(sr_cfg, "atr_tolerance_mult", 0.35) or 0.35),
+                pct_tolerance=float(getattr(sr_cfg, "pct_tolerance", 0.0030) or 0.0030),
+                stop_buffer_atr_mult=float(getattr(sr_cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
+                ema_fast_span=50,
+                ema_slow_span=200,
+                use_prior_day_high_low=bool(getattr(sr_cfg, "use_prior_day_high_low", True)),
+                use_prior_week_high_low=bool(getattr(sr_cfg, "use_prior_week_high_low", True)),
+                allow_refresh=False,
+            )
+        except Exception:
+            return None
 
     def _htf_context(
             self,

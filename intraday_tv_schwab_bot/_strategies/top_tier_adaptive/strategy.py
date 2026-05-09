@@ -424,6 +424,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         ms_ctx = self._structure_context(frame, "ltf")
         tech_ctx = self._technical_context(frame)
         ctx = self._chart_context(frame)
+        htf_ctx = self._default_htf_context_for_score(c.symbol, data)
 
         # Single ORB-window flag reused by all _finalize_signal ORB-bypasses
         # (Fix D, HTF bias, ORB 5m follow-through, structure entry, SR entry,
@@ -773,7 +774,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             else:
                 candle_bonus = 0.10
 
-        adjustments = self._entry_adjustment_components(side, sr_ctx=sr_ctx, tech_ctx=tech_ctx)
+        adjustments = self._entry_adjustment_components(side, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
         fvg_adjustments = self._fvg_entry_adjustment_components(side, c.symbol, frame, data)
         fvg_cont_bias = float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0)
         runner_allowed = bool(fvg_cont_bias >= 0.35 and structure_bonus >= 0.75)

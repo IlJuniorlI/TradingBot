@@ -100,6 +100,7 @@ class PairsResidualStrategy(BaseStrategy):
             sr_ctx = self._sr_context(symbol, left, data)
             ms_ctx = self._structure_context(left, "ltf")
             tech_ctx = self._technical_context(left)
+            htf_ctx = self._default_htf_context_for_score(symbol, data)
             if long_ready:
                 if self._blocks_bullish_structure_entry(ms_ctx):
                     reasons.append(self._bullish_structure_block_reason(ms_ctx))
@@ -115,7 +116,7 @@ class PairsResidualStrategy(BaseStrategy):
                     structure_bonus = 0.75 if getattr(ms_ctx, "bias", "neutral") == "bullish" else 0.0
                     if bool(getattr(ms_ctx, "bos_up", False)) and self._structure_event_recent(getattr(ms_ctx, "bos_up_age_bars", None)):
                         structure_bonus += 0.5
-                    adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx)
+                    adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
                     fvg_adjustments = self._fvg_entry_adjustment_components(Side.LONG, symbol, left, data)
                     # Slightly widened runner gate: allow runners up to 1.9x
                     # the entry threshold when continuation bias is moderate
@@ -154,7 +155,7 @@ class PairsResidualStrategy(BaseStrategy):
                     structure_bonus = 0.75 if getattr(ms_ctx, "bias", "neutral") == "bearish" else 0.0
                     if bool(getattr(ms_ctx, "bos_down", False)) and self._structure_event_recent(getattr(ms_ctx, "bos_down_age_bars", None)):
                         structure_bonus += 0.5
-                    adjustments = self._entry_adjustment_components(Side.SHORT, sr_ctx=sr_ctx, tech_ctx=tech_ctx)
+                    adjustments = self._entry_adjustment_components(Side.SHORT, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
                     fvg_adjustments = self._fvg_entry_adjustment_components(Side.SHORT, symbol, left, data)
                     # Symmetric SHORT-side runner widening (see LONG branch above).
                     fvg_cont_bias = float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0)

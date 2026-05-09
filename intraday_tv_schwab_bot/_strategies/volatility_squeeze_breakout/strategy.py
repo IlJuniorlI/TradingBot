@@ -123,6 +123,7 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
             sr_ctx = self._sr_context(c.symbol, frame, data)
             ms_ctx = self._structure_context(frame, "ltf")
             tech_ctx = self._technical_context(frame)
+            htf_ctx = self._default_htf_context_for_score(c.symbol, data)
             metadata = {
                 "squeeze_breakout_high": breakout_high,
                 "squeeze_breakout_low": breakout_low,
@@ -210,7 +211,7 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                     stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx)
                     stop, target = self._refine_bullish_technical_levels(last_close, stop, target, tech_ctx, frame)
                     stop = self._apply_retest_stop_anchor(Side.LONG, last_close, stop, long_retest_plan)
-                    adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx)
+                    adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
                     fvg_adjustments = self._fvg_entry_adjustment_components(Side.LONG, c.symbol, frame, data)
                     management = self._adaptive_management_components(Side.LONG, last_close, stop, target, style="trend", runner_allowed=bool(runner_enabled), continuation_bias=float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0))
                     final_priority_score = float(c.activity_score) + (0.45 if bool(getattr(tech_ctx, "bollinger_squeeze", False)) else 0.0) + max(0.0, 1.0 - min(1.0, width_ratio)) + max(0.0, breakout_volume_ratio - 1.0) + (0.35 if bool(getattr(ms_ctx, "bos_up", False)) else 0.0) + adjustments["entry_context_adjustment"] + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
@@ -265,7 +266,7 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                     stop, target = self._refine_bearish_sr_levels(last_close, stop, target, sr_ctx)
                     stop, target = self._refine_bearish_technical_levels(last_close, stop, target, tech_ctx, frame)
                     stop = self._apply_retest_stop_anchor(Side.SHORT, last_close, stop, short_retest_plan)
-                    adjustments = self._entry_adjustment_components(Side.SHORT, sr_ctx=sr_ctx, tech_ctx=tech_ctx)
+                    adjustments = self._entry_adjustment_components(Side.SHORT, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
                     fvg_adjustments = self._fvg_entry_adjustment_components(Side.SHORT, c.symbol, frame, data)
                     management = self._adaptive_management_components(Side.SHORT, last_close, stop, target, style="trend", runner_allowed=bool(runner_enabled), continuation_bias=float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0))
                     final_priority_score = float(c.activity_score) + (0.45 if bool(getattr(tech_ctx, "bollinger_squeeze", False)) else 0.0) + max(0.0, 1.0 - min(1.0, width_ratio)) + max(0.0, breakout_volume_ratio - 1.0) + (0.35 if bool(getattr(ms_ctx, "bos_down", False)) else 0.0) + adjustments["entry_context_adjustment"] + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)

@@ -462,7 +462,7 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             stop, target = self._refine_bearish_sr_levels(trend["close"], stop, target, sr_ctx)
             stop, target = self._refine_bearish_technical_levels(trend["close"], stop, target, tech_ctx, ltf)
 
-        adjustments = self._entry_adjustment_components(side, sr_ctx=sr_ctx, tech_ctx=tech_ctx)
+        adjustments = self._entry_adjustment_components(side, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf)
         fvg_adjustments = self._fvg_entry_adjustment_components(side, c.symbol, ltf, data)
         runner_allowed = bool(self.params.get("strong_setup_runner_enabled", True)) and total_score >= (min_total + 1)
         management = self._adaptive_management_components(

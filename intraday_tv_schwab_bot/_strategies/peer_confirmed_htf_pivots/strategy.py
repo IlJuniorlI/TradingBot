@@ -1250,7 +1250,13 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         )
         activity_weight = max(0.0, float(self.params.get("activity_score_weight", 0.18)))
         execution_quality_score = float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
-        final_priority_score = total_score + execution_quality_score + (float(candidate.activity_score) * activity_weight)
+        # HTF RSI divergence confluence — pull HTF context from the data feed
+        # cache (cheap; bot already builds HTF for this strategy elsewhere)
+        # and fold the multi-timeframe divergence adjustment into the final
+        # score. Gated by shared_entry.use_htf_divergence_filter.
+        htf_for_div = self._default_htf_context_for_score(candidate.symbol, data)
+        htf_divergence_adjustment = self._htf_divergence_adjustment(side, htf_for_div) if htf_for_div is not None else 0.0
+        final_priority_score = total_score + execution_quality_score + htf_divergence_adjustment + (float(candidate.activity_score) * activity_weight)
         source_priority = self._family_preference_source_priority(family_key)
         metadata = self._build_signal_metadata(
             entry_price=float(close),

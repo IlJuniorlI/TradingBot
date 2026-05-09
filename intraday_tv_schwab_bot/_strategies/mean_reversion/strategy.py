@@ -55,6 +55,7 @@ class MeanReversionStrategy(BaseStrategy):
             sr_ctx = self._sr_context(c.symbol, frame, data)
             ms_ctx = self._structure_context(frame, "ltf")
             tech_ctx = self._technical_context(frame)
+            htf_ctx = self._default_htf_context_for_score(c.symbol, data)
             reversal_support = bool(ctx.matched_bullish_reversal or (candle_confirmed and ctx.bias_score >= 0.0))
             if not (candle_confirmed or ctx.matched_bullish_reversal):
                 reasons.append("no_reversal_pattern")
@@ -103,6 +104,7 @@ class MeanReversionStrategy(BaseStrategy):
                             sr_ctx=sr_ctx,
                             ms_ctx=ms_ctx,
                             tech_ctx=tech_ctx,
+                            htf_ctx=htf_ctx,
                             stop=stop,
                             target=target,
                             extra_priority=max(0.0, (1.0 - pullback_pct)) + (0.25 if ctx.matched_bullish_reversal else 0.0),

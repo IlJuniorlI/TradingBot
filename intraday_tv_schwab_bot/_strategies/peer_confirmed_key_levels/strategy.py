@@ -1050,6 +1050,13 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         # we reach this ranking code, abs(peer_score) is equivalent to
         # directional_peer_score for the chosen side — safely monotonic with
         # "how strongly peers agree with this direction".
+        # HTF RSI divergence confluence — folds the HTF-aligned bonus / counter
+        # penalty / hidden bonus into the strategy's score. Gated by
+        # shared_entry.use_htf_divergence_filter and behaves as a no-op when
+        # htf has no divergence detected on either side. Doesn't touch sr_ctx
+        # / tech_ctx — only HTF, since that's what's already in scope here
+        # without paying the build cost for the other contexts.
+        htf_divergence_adjustment = self._htf_divergence_adjustment(side, htf)
         final_priority_score = (
             float(level["level_score"])
             + float(trigger["score"])
@@ -1060,6 +1067,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             + macro_bonus
             + clearance_bonus
             + strong_setup_bonus
+            + htf_divergence_adjustment
             + (float(c.activity_score) * activity_weight)
         )
         selection_quality_score = final_priority_score + (level_selection_score * 0.20)

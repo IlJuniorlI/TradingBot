@@ -55,6 +55,7 @@ class ClosingReversalStrategy(BaseStrategy):
             sr_ctx = self._sr_context(c.symbol, frame, data)
             ms_ctx = self._structure_context(frame, "ltf")
             tech_ctx = self._technical_context(frame)
+            htf_ctx = self._default_htf_context_for_score(c.symbol, data)
             chart_ok = bool(ctx.matched_bullish_reversal or ctx.matched_bullish_continuation) or (candle_confirmed and ctx.bias_score >= 0.0)
             if not momentum_up:
                 reasons.append(_reason_with_values("no_short_term_bounce", current=_safe_float(last3["close"].iloc[-1]), required=_safe_float(last3["close"].iloc[0]), op=">", digits=4))
@@ -104,6 +105,7 @@ class ClosingReversalStrategy(BaseStrategy):
                             sr_ctx=sr_ctx,
                             ms_ctx=ms_ctx,
                             tech_ctx=tech_ctx,
+                            htf_ctx=htf_ctx,
                             stop=stop,
                             target=target,
                             extra_priority=(0.25 if momentum_up else 0.0),
