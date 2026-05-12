@@ -946,14 +946,17 @@
       position:absolute;
       inset:0;
       pointer-events:none;
-      /* Edge-faded grid: 32px-spaced 1px lines at 0.28 (horizontal) / 0.24
+      /* Edge-faded grid: 32px-spaced 1px lines at 0.14 (horizontal) / 0.11
          (vertical) alpha, masked by a soft radial vignette so the lines
          only show through the center 30% at full opacity and fade out to
          the borders by 100%. Theme-tracked via --tint-rgb (white tint on
-         dark themes, slate-dark tint on light). */
+         dark themes, slate-dark tint on light). Alpha halved from
+         0.28/0.24 → 0.14/0.11 — the punchier values made the grid
+         compete visually with chart overlays (SR zones, trendlines,
+         EMA, VWAP). The mask aesthetic survives, overlays read first. */
       background:
-        linear-gradient(0deg,  rgba(var(--tint-rgb), 0.28) 0 1px, transparent 1px),
-        linear-gradient(90deg, rgba(var(--tint-rgb), 0.24) 0 1px, transparent 1px);
+        linear-gradient(0deg,  rgba(var(--tint-rgb), 0.14) 0 1px, transparent 1px),
+        linear-gradient(90deg, rgba(var(--tint-rgb), 0.11) 0 1px, transparent 1px);
       background-size: 100% 32px, 32px 100%;
       mask-image: radial-gradient(80% 80% at 50% 50%, black 30%, transparent 100%);
       -webkit-mask-image: radial-gradient(80% 80% at 50% 50%, black 30%, transparent 100%);
