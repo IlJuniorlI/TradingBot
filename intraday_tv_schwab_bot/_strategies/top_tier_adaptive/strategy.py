@@ -624,12 +624,19 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         """Build a momentum-into-close continuation signal. Stops anchor below
         recent swing low (LONG) / above recent swing high (SHORT) with an
         ATR-cushioned buffer so single-bar wicks during the afternoon's lower
-        volume don't trigger the stop. Target uses momentum_close_target_rr."""
+        volume don't trigger the stop. Target uses momentum_close_target_rr.
+
+        Uses the 1m ``frame`` (NOT the resampled ``ltf``) for the N-bar
+        breakout check so it stays consistent with ``_score_momentum_close``
+        and with the source momentum_close strategy. The ``ltf`` parameter
+        is kept on the signature for symmetry with the other builders but
+        is unused here.
+        """
         lookback = max(3, int(self.params.get("momentum_close_breakout_lookback_bars", 6)))
-        session_ltf = ltf[_same_day_mask(ltf, now_et().date())]
-        recent = session_ltf.tail(lookback + 1).iloc[:-1] if len(session_ltf) > lookback else session_ltf.iloc[:-1]
+        session_frame = frame[_same_day_mask(frame, now_et().date())]
+        recent = session_frame.tail(lookback + 1).iloc[:-1] if len(session_frame) > lookback else session_frame.iloc[:-1]
         if recent.empty:
-            self._set_build_failure(c.symbol, "momentum_close", "insufficient_ltf_history")
+            self._set_build_failure(c.symbol, "momentum_close", "insufficient_session_history")
             return None
 
         # Fresh-breakout gate (matches the source strategy's check)
