@@ -81,7 +81,6 @@ The base `dashboard.css` reads every one of these through `var(--name)`. If your
 | `--bad`                          | Negative PnL, short bias                                                    |
 | `--warn`                         | Warnings, drawdown, near-limit                                              |
 | `--chart-bg`                     | Chart panel background                                                      |
-| `--chart-grid`                   | Layered `background-image` for chart gridlines                              |
 | `--gauge-inner`                  | Interior disc color of the risk gauges                                      |
 | `--tint-rgb`                     | RGB triplet (no alpha) for theme-aware surface tints used across `dashboard.css` (subtle highlights, dividers, hover borders, gauge ring tracks) and the chart canvas grid in `dashboard.js`. Dark themes use `255, 255, 255` (white tint on dark surfaces); light theme uses `15, 23, 42` (slate tint on light surfaces). Each call site picks its own opacity. |
 | `--overlay-bg`                   | Translucent background for chart-anchored UI overlays (chart loading veil, legend chip on chart). Dark themes: near-black at ~72% opacity. Light theme: white veil at ~82% opacity so dark text painted on top stays legible. |
