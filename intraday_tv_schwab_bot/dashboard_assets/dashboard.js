@@ -1439,7 +1439,17 @@ function renderCandidates() {
     const isActive = appState.selectedSymbol === String(row.symbol || '').toUpperCase();
     const warmup = snap?.warmup || null;
     const candidateSub = `Rank #${safe(row.rank)} · ${escapeHtml(row.directional_bias || 'neutral')}${warmup ? ` · ${escapeHtml(warmupLabel(warmup))}` : ''}`;
-    const bottomMeta = `Vol ${fmtCompact(row.volume)}`;
+    // Live-first display: prefer the streamed Schwab quote on the symbol's
+    // snapshot; fall back to the screener-row values only when the live
+    // quote is missing. Screener values are 60s-stale; live quote refreshes
+    // ~6s. This keeps candidate display in sync with the watchlist + focus
+    // card (which already follow this pattern). Screener data still drives
+    // the activity_score / directional_bias / universe filtering above —
+    // only the cosmetic Day%/Price/Volume readouts go live-first.
+    const liveChange = numOrNull(snap?.quote?.percent_change) ?? numOrNull(row.change_from_open);
+    const liveVolume = numOrNull(snap?.quote?.total_volume) ?? numOrNull(row.volume);
+    const liveLast   = numOrNull(snap?.quote?.last) ?? numOrNull(row.close);
+    const bottomMeta = `Vol ${fmtCompact(liveVolume)}`;
     return `<div class="candidate-tile ${tone} ${isActive ? 'active' : ''}" data-symbol="${escapeHtml(row.symbol)}">
       <div class="candidate-top">
         <div>
@@ -1451,7 +1461,7 @@ function renderCandidates() {
       <div class="candidate-score">
         <div>
           <div class="tiny-label">Day % / Price</div>
-          <div class="score ${pnlClass(row.change_from_open)}">${fmtPct(row.change_from_open)} · ${fmtNum(row.close, 2)}</div>
+          <div class="score ${pnlClass(liveChange)}">${fmtPct(liveChange)} · ${fmtNum(liveLast, 2)}</div>
         </div>
         <div class="score-ring ${ringTone}" style="--pct:${ringPctNum.toFixed(1)}%;"><span>${Math.round(ringPctNum)}</span></div>
       </div>
