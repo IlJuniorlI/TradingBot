@@ -94,7 +94,7 @@
       flex-direction: column;
       justify-content: center;
     }
-    .brand-title { font-size: 28px; font-weight: 800; line-height: 1.05; }
+    .brand-title { font-size: 28px; font-weight: 700; line-height: 1.05; letter-spacing: -0.02em; }
     .brand-sub { color: var(--muted); font-size: 12px; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .status-strip {
       position: relative;
@@ -131,8 +131,9 @@
     .tiny-label { color: var(--soft); font-size: 10px; text-transform: uppercase; letter-spacing: .1em; }
     .metric-pill .value {
       font-size: 18px;
-      font-weight: 800;
+      font-weight: 600;
       line-height: 1.15;
+      letter-spacing: -0.01em;
       min-height: 28px;
       display: flex;
       align-items: center;
@@ -148,6 +149,13 @@
     }
     .value.good { color: var(--good); }
     .value.bad { color: var(--bad); }
+    /* Descendant variants: dashboard.js / mobile.js wrap the value text in
+       a <span class="good|bad"> instead of putting the class on the host
+       .value element. Without these descendant rules, the Day PnL pill
+       would silently render in default text color. */
+    .value .good { color: var(--good); }
+    .value .bad { color: var(--bad); }
+    .value .warn { color: var(--warn); }
     .value.warn { color: var(--warn); }
     .toolbar {
       position: relative;
@@ -248,8 +256,8 @@
       gap: 10px;
       margin-bottom: 12px;
     }
-    .panel-title { font-size: 18px; font-weight: 800; }
-    .panel-meta { color: var(--muted); font-size: 12px; }
+    .panel-title { font-size: 15px; font-weight: 700; letter-spacing: -0.02em; }
+    .panel-meta { color: var(--muted); font-size: 12px; font-weight: 500; margin-top: 4px; }
     .watchlist-tools,
     .dock-tools {
       display: flex;
@@ -341,7 +349,7 @@
     }
     .symbol-name,
     .position-name,
-    .candidate-name { font-size: 26px; font-weight: 800; line-height: 1; letter-spacing: .02em; }
+    .candidate-name { font-size: 26px; font-weight: 700; line-height: 1; letter-spacing: -0.02em; }
     .symbol-title-row {
       display: flex;
       align-items: center;
@@ -382,7 +390,7 @@
     .position-sub,
     .candidate-sub { color: var(--muted); font-size: 11px; margin-top: 4px; }
     .price-stack { text-align: right; }
-    .price-main { font-size: 22px; font-weight: 800; }
+    .price-main { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; }
     .price-change.good,
     .score.good { color: var(--good); }
     .price-change.bad,
@@ -447,7 +455,17 @@
       background: var(--gauge-inner);
       border: 1px solid var(--line);
     }
-    .score-ring span { position: relative; z-index: 1; font-size: 12px; font-weight: 800; }
+    .score-ring span { position: relative; z-index: 1; font-size: 12px; font-weight: 700; color: var(--accent); }
+    /* Tone variants — dashboard.js maps the candidate-score % to a tone:
+       >=70 good / >=40 warn / <40 bad. The conic-gradient track keeps using
+       --pct so the ring also reflects the magnitude. Mirrors .gauge-ring's
+       tone-variant pattern. */
+    .score-ring.good { background: conic-gradient(var(--good) 0 var(--pct, 45%), rgba(var(--tint-rgb), .06) var(--pct,45%) 100%); }
+    .score-ring.warn { background: conic-gradient(var(--warn) 0 var(--pct, 45%), rgba(var(--tint-rgb), .06) var(--pct,45%) 100%); }
+    .score-ring.bad  { background: conic-gradient(var(--bad)  0 var(--pct, 45%), rgba(var(--tint-rgb), .06) var(--pct,45%) 100%); }
+    .score-ring.good span { color: var(--good); }
+    .score-ring.warn span { color: var(--warn); }
+    .score-ring.bad  span { color: var(--bad);  }
     .main-panel { min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr) auto; gap: var(--gap); transition: inset .18s ease, width .18s ease, height .18s ease, transform .18s ease, box-shadow .18s ease; will-change: transform, inset, width, height; }
     .main-panel.chart-panel { position: relative; z-index: 6; }
     .main-panel .panel-inner { height: 100%; }
@@ -651,15 +669,16 @@
     .detail-grid,
     .gauge-grid,
     .kpi-grid { display: grid; gap: 14px 18px; }
-    /* Flat kpi tiles (no chrome) so the equity sparkline can dominate
-       the panel vertically. Removed from the shared card-chrome rule
-       above; this gives them just typography. */
+    /* KPI tiles wear pill chrome (matches theme_previews/preview.html's
+       .kpi-mini): subtle raised card with border + rounded corners. The
+       equity sparkline below intentionally has NO chrome so the curve
+       reads as graphic, not boxed. */
     .kpi-tile {
-      padding: 0;
-      background: none;
-      border: 0;
-      box-shadow: none;
-      border-radius: 0;
+      padding: 12px 14px;
+      background: linear-gradient(180deg, rgba(var(--tint-rgb), 0.035), rgba(var(--tint-rgb), 0.018));
+      border: 1px solid rgba(var(--tint-rgb), 0.07);
+      box-shadow: inset 0 1px 0 rgba(var(--tint-rgb), 0.02);
+      border-radius: 14px;
       min-width: 0;
     }
     .kpi-hero { padding: 4px 0 2px; }
@@ -673,9 +692,9 @@
     }
     .kpi-hero-value {
       font-size: 30px;
-      font-weight: 800;
+      font-weight: 700;
       line-height: 1;
-      letter-spacing: -.02em;
+      letter-spacing: -.03em;
       color: var(--text);
     }
     .kpi-hero-chg {
@@ -716,22 +735,16 @@
     .kpi-spark {
       height: 138px;
       margin: 14px 0 16px;
-      background:
-        radial-gradient(60% 70% at 50% 0%, rgba(var(--tint-rgb), 0.07), transparent 75%),
-        linear-gradient(180deg, rgba(var(--tint-rgb), 0.05), rgba(var(--tint-rgb), 0.015));
-      border: 1px solid rgba(var(--tint-rgb), 0.06);
-      border-radius: 14px;
-      overflow: hidden;
     }
     .kpi-spark svg { width: 100%; height: 100%; display: block; }
     .kpi-spark:empty { display: none; }
     .kpi-tile .tiny-label { color: var(--soft); }
     .kpi-tile .value-main {
       font-size: 19px;
-      font-weight: 800;
+      font-weight: 700;
       line-height: 1.1;
       margin-top: 4px;
-      letter-spacing: -.01em;
+      letter-spacing: -.02em;
     }
     /* PnL spans injected by renderKpiAndGauges: <span class="good|bad">$X</span>
        inside .value-main. The existing .value.good / .score.good / .price-change.good
@@ -740,6 +753,10 @@
        values actually pick up the theme good/bad colors. */
     .value-main .good { color: var(--good); }
     .value-main .bad { color: var(--bad); }
+    /* Drawdown tile uses .warn (soft orange) — drawdown is a guardrail
+       magnitude, not a sign-bearing PnL, so .bad would read alarmingly
+       red even on healthy small drawdowns. */
+    .value-main .warn { color: var(--warn); }
     .detail-grid {
       grid-template-columns: 1.3fr 1fr 1fr;
       align-items: stretch;
@@ -776,7 +793,7 @@
       letter-spacing: .1em;
       line-height: 1.4;
     }
-    .detail-card .value-big { font-size: 34px; font-weight: 800; line-height: 1; }
+    .detail-card .value-big { font-size: 34px; font-weight: 700; line-height: 1; letter-spacing: -0.03em; }
     .detail-card .subline { color: var(--muted); font-size: 12px; margin-top: 6px; }
     .setup-score-card {
       display: grid;
@@ -795,7 +812,7 @@
       margin-top: 10px;
     }
     .kv { display: grid; gap: 3px; }
-    .kv .v { font-size: 18px; font-weight: 800; }
+    .kv .v { font-size: 18px; font-weight: 700; letter-spacing: -0.02em; }
     .bar-track {
       width: 100%;
       height: 10px;
@@ -888,7 +905,7 @@
     }
     .trade-range-label .v {
       font-size: 12px;
-      font-weight: 800;
+      font-weight: 700;
       margin-top: 2px;
     }
     .chart-wrap {
@@ -1102,7 +1119,19 @@
     }
     .sr-chip.support { color: var(--good); border-color: rgba(108,227,162,.18); background: rgba(108,227,162,.08); }
     .sr-chip.resistance { color: var(--bad); border-color: rgba(255,107,130,.18); background: rgba(255,107,130,.08); }
-    .mini-panel .panel-title { font-size: 14px; }
+    /* Mini-panel titles render as small-caps labels to match the
+       sibling Candidate Score card (.tiny-label) — those three cards
+       sit side-by-side in the detail panel, so harmonizing the title
+       typography keeps the visual rhythm consistent. The mismatch was
+       most obvious in light mode where the bold dark titles clashed
+       against the soft uppercase Candidate Score label. */
+    .mini-panel .panel-title {
+      font-size: 10px;
+      font-weight: 400;
+      text-transform: uppercase;
+      letter-spacing: .1em;
+      color: var(--soft);
+    }
     .center-stage { grid-template-rows: minmax(0, 1fr) var(--dock-h); }
     .right-rail { grid-template-rows: auto auto minmax(0, 1fr); }
     .rail > .panel,
@@ -1144,12 +1173,15 @@
       background: var(--gauge-inner);
       border: 1px solid var(--line);
     }
-    .gauge-ring span { position: relative; z-index: 1; font-size: 16px; font-weight: 800; }
+    .gauge-ring span { position: relative; z-index: 1; font-size: 16px; font-weight: 800; color: var(--accent); }
+    .gauge-ring.good span { color: var(--good); }
+    .gauge-ring.bad span { color: var(--bad); }
+    .gauge-ring.warn span { color: var(--warn); }
     .position-card .position-name { font-size: 24px; }
     .position-grid { display: grid; gap: 10px; }
     .position-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
     .tiny-kv { display: grid; gap: 2px; }
-    .tiny-kv .v { font-size: 15px; font-weight: 800; }
+    .tiny-kv .v { font-size: 15px; font-weight: 700; letter-spacing: -0.02em; }
     .dock {
       min-height: 0;
       height: var(--dock-h);
@@ -1304,7 +1336,7 @@
     .event-list { display: grid; gap: 10px; padding-bottom: 2px; }
     .event-card { padding: 12px 14px; }
     .event-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-    .event-title { font-size: 14px; font-weight: 800; }
+    .event-title { font-size: 14px; font-weight: 700; letter-spacing: -0.01em; }
     .event-time { color: var(--muted); font-size: 11px; }
     .event-text { color: var(--muted); font-size: 12px; margin-top: 6px; line-height: 1.45; }
     .diag-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }

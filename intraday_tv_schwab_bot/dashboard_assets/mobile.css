@@ -143,6 +143,14 @@ body {
   line-height: 1.4;
 }
 
+/* KPI tile grid: dashboard.css forces single column at <=480px as a
+   fallback for the desktop layout loaded on a phone. The dedicated
+   /mobile route fits 2 columns comfortably, so override to keep the
+   Realized / Unrealized / Drawdown / Win Rate tiles in a 2x2 grid. */
+.m-shell .kpi-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 /* Disable tap-highlight flash on every interactive element on mobile.
    The default blue/gray flash on tap is jarring at the typical mobile
    refresh cadence and provides no useful signal that desktop hover

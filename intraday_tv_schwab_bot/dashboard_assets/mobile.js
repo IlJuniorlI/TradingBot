@@ -46,7 +46,6 @@
     const pfEl = document.getElementById('metric-pf');
     const tradesEl = document.getElementById('metric-trades');
     const wlEl = document.getElementById('metric-wl');
-    const winRateEl = document.getElementById('metric-winrate');
     const warmupEl = document.getElementById('metric-warmup');
     const updatedEl = document.getElementById('metric-updated');
     const sublineEl = document.getElementById('top-subline');
@@ -63,7 +62,6 @@
     const totalTrades = Number(perf.total_trades);
     if (tradesEl) tradesEl.textContent = fmtInteger(Number.isFinite(totalTrades) ? totalTrades : ((Number(perf.closed_trades) || 0) + openPositions));
     if (wlEl) wlEl.textContent = `${fmtInteger(perf.wins ?? 0)} / ${fmtInteger(perf.losses ?? 0)}`;
-    if (winRateEl) winRateEl.textContent = perf.win_rate == null ? '—' : fmtPctFromRatio(perf.win_rate);
 
     const warmup = data?.warmup || {};
     if (warmupEl) warmupEl.textContent = warmup.total ? `${fmtInteger(warmup.ready_count || 0)} / ${fmtInteger(warmup.total || 0)}` : '—';
@@ -102,7 +100,10 @@
     if (kpiNet) kpiNet.textContent = fmtMoney(totalEquity);
     if (kpiReal) kpiReal.innerHTML = `<span class="${pnlClass(perf.realized_pnl)}">${fmtMoney(perf.realized_pnl)}</span>`;
     if (kpiUnreal) kpiUnreal.innerHTML = `<span class="${pnlClass(perf.unrealized_pnl)}">${fmtMoney(perf.unrealized_pnl)}</span>`;
-    if (kpiDraw) kpiDraw.textContent = fmtMoney(perf.drawdown);
+    if (kpiDraw) {
+      const drawdownTone = numOrNull(perf.drawdown) ? 'warn' : '';
+      kpiDraw.innerHTML = `<span class="${drawdownTone}">${fmtMoney(perf.drawdown)}</span>`;
+    }
     const kpiWinrate = document.getElementById('kpi-winrate');
     if (kpiWinrate) kpiWinrate.textContent = perf.win_rate == null ? '—' : fmtPctFromRatio(perf.win_rate);
     if (kpiMeta) kpiMeta.textContent = `Day PnL ${fmtMoney(dayPnl)} · cash ${fmtMoney(perf.cash)}`;

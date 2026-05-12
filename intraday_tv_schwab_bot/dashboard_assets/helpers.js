@@ -121,6 +121,12 @@ function modeBadge(isDryRun) {
   return `<span class="mode-pill inline-mode ${tone}">${escapeHtml(label)}</span>`;
 }
 
+// Module-scoped counter for unique gradient IDs. Multiple sparklines render
+// on the same page (KPI equity curve, watchlist rows, etc.) so each needs a
+// distinct linearGradient id — otherwise stops collide and every spark picks
+// up the last-rendered tone's gradient.
+let _sparklineGradId = 0;
+
 function sparklineSVG(values, tone) {
   const nums = (values || []).map(numOrNull).filter(v => v !== null);
   if (nums.length < 2) return '<svg viewBox="0 0 100 28" preserveAspectRatio="none"></svg>';
@@ -134,10 +140,21 @@ function sparklineSVG(values, tone) {
   }).join(' ');
   const area = `0,28 ${pts} 100,28`;
   const stroke = tone === 'tone-bad' ? '#ff6b82' : (tone === 'tone-good' ? '#6ce3a2' : '#79d4ff');
+  const gradId = `spark-grad-${++_sparklineGradId}`;
   // vector-effect="non-scaling-stroke" keeps the line at 2.4 CSS px regardless of
   // how the viewBox stretches to fit the container. Without it, a 52px tall
   // watchlist sparkline and a 110px tall KPI sparkline would render at totally
   // different visual stroke widths (because preserveAspectRatio="none" stretches
   // strokes along with the coordinate system).
-  return `<svg viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="${stroke}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"></polyline><polygon points="${area}" fill="${stroke}" opacity="0.10"></polygon></svg>`;
+  // The under-curve area uses a top-to-bottom gradient (35% → 0% opacity)
+  // matching theme_previews/preview.html so the fill reads as a soft glow
+  // beneath the stroke rather than a flat tint band.
+  return `<svg viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true">`
+    + `<defs><linearGradient id="${gradId}" x1="0" x2="0" y1="0" y2="1">`
+    +   `<stop offset="0" stop-color="${stroke}" stop-opacity="0.35"/>`
+    +   `<stop offset="1" stop-color="${stroke}" stop-opacity="0"/>`
+    + `</linearGradient></defs>`
+    + `<polygon points="${area}" fill="url(#${gradId})"/>`
+    + `<polyline points="${pts}" fill="none" stroke="${stroke}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>`
+    + `</svg>`;
 }

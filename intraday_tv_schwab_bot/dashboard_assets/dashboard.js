@@ -1428,6 +1428,12 @@ function renderCandidates() {
     const snap = snapshots.get(String(row.symbol || '').toUpperCase());
     const values = (snap?.bars || []).map(bar => numOrNull(bar.close)).filter(v => v !== null);
     const pct = scorePct(row.activity_score);
+    const ringPctNum = pct * 100;
+    // Mirror the detail-score-ring tone logic: only apply a tone class when
+    // we actually have a score; otherwise leave the ring toneless so the
+    // default accent track shows instead of painting missing data red.
+    const hasScore = row.activity_score !== null && row.activity_score !== undefined && Number.isFinite(Number(row.activity_score));
+    const ringTone = hasScore ? (ringPctNum >= 70 ? 'good' : (ringPctNum >= 40 ? 'warn' : 'bad')) : '';
     const bias = String(row.directional_bias || '').toUpperCase();
     const tone = bias === 'SHORT' ? 'tone-short' : (bias === 'LONG' ? 'tone-long' : 'tone-neutral');
     const isActive = appState.selectedSymbol === String(row.symbol || '').toUpperCase();
@@ -1447,7 +1453,7 @@ function renderCandidates() {
           <div class="tiny-label">Day % / Price</div>
           <div class="score ${pnlClass(row.change_from_open)}">${fmtPct(row.change_from_open)} · ${fmtNum(row.close, 2)}</div>
         </div>
-        <div class="score-ring" style="--pct:${(pct * 100).toFixed(1)}%;"><span>${Math.round(pct * 100)}</span></div>
+        <div class="score-ring ${ringTone}" style="--pct:${ringPctNum.toFixed(1)}%;"><span>${Math.round(ringPctNum)}</span></div>
       </div>
       <div class="sparkline-wrap">${sparklineSVG(values, tone === 'tone-short' ? 'tone-bad' : 'tone-good')}</div>
       <div class="card-bottom"><div class="mini-meta">${bottomMeta}</div>${structureEventChip(snap?.support_resistance?.structure_event || '—')}</div>
@@ -1509,7 +1515,8 @@ function renderKpiAndGauges(data) {
   document.getElementById('kpi-netliq').textContent = fmtMoney(totalEquity);
   document.getElementById('kpi-realized').innerHTML = `<span class="${pnlClass(perf.realized_pnl)}">${fmtMoney(perf.realized_pnl)}</span>`;
   document.getElementById('kpi-unrealized').innerHTML = `<span class="${pnlClass(perf.unrealized_pnl)}">${fmtMoney(perf.unrealized_pnl)}</span>`;
-  document.getElementById('kpi-drawdown').textContent = fmtMoney(perf.drawdown);
+  const drawdownTone = numOrNull(perf.drawdown) ? 'warn' : '';
+  document.getElementById('kpi-drawdown').innerHTML = `<span class="${drawdownTone}">${fmtMoney(perf.drawdown)}</span>`;
   const winrateEl = document.getElementById('kpi-winrate');
   if (winrateEl) winrateEl.textContent = perf.win_rate == null ? '—' : fmtPctFromRatio(perf.win_rate);
   document.getElementById('kpi-meta').textContent = `Day PnL ${fmtMoney(dayPnl)} · cash ${fmtMoney(perf.cash)}`;
@@ -1720,8 +1727,18 @@ function renderSelectedSymbol() {
   }
   scoreLabelEl.textContent = scoreLabel;
   document.getElementById('detail-score').textContent = scoreText;
-  document.getElementById('detail-score-ring').style.setProperty('--pct', `${(scorePct(scoreBasis) * 100).toFixed(1)}%`);
-  document.getElementById('detail-score-ring').innerHTML = `<span>${Math.round(scorePct(scoreBasis) * 100)}</span>`;
+  const ringEl = document.getElementById('detail-score-ring');
+  const ringPct = scorePct(scoreBasis) * 100;
+  ringEl.style.setProperty('--pct', `${ringPct.toFixed(1)}%`);
+  // Tone class: clear all three first, then apply one based on the %.
+  // When no score data is available (scoreBasis is null), leave the ring
+  // toneless so the default accent track shows — avoids painting a missing
+  // value red just because scorePct's fallback is 18%.
+  ringEl.classList.remove('good', 'warn', 'bad');
+  if (scoreBasis !== null && scoreBasis !== undefined && Number.isFinite(Number(scoreBasis))) {
+    ringEl.classList.add(ringPct >= 70 ? 'good' : (ringPct >= 40 ? 'warn' : 'bad'));
+  }
+  ringEl.innerHTML = `<span>${Math.round(ringPct)}</span>`;
   document.getElementById('detail-score-sub').textContent = scoreSub;
   document.getElementById('detail-bias').textContent = safe(cand.directional_bias || pos.side || 'neutral');
   document.getElementById('detail-state').textContent = safe(sr.state || 'neutral').replace(/_/g, ' ');
