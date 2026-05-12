@@ -663,12 +663,27 @@ def ensure_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
     frame = df.copy()
     frame = frame.sort_index()
-    frame = frame[~frame.index.duplicated(keep="last")]
     for col in ["open", "high", "low", "close", "volume"]:
         if col not in frame.columns:
             frame[col] = math.nan
         else:
             frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    # Schwab's price_history endpoint can return the same minute twice when
+    # called in dates-mode (explicit startDate/endDate). This is a
+    # dates-mode artifact independent of needPreviousClose: variants
+    # tested {needPC=true, needPC=false} both produced the same duplicate
+    # pattern, while period-mode (periodType+period, no dates) returned
+    # clean unique bars. The dupes are once from the consolidated NMS tape
+    # and once from the full reportable tape — OHLC is identical between
+    # the copies but volume differs by 0-4% (the full tape includes odd-lot
+    # and off-exchange prints). Pick the higher-volume copy so
+    # activity_score, rel_vol gates, and OBV-style indicators all see the
+    # most complete print for each minute, instead of inheriting whichever
+    # copy the original sort happened to land last.
+    if frame.index.has_duplicates:
+        frame = frame.sort_values("volume", ascending=False, kind="stable", na_position="last")
+        frame = frame.sort_index(kind="stable")
+        frame = frame[~frame.index.duplicated(keep="first")]
     frame = frame.dropna(subset=["open", "high", "low", "close"])
     if frame.empty:
         return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
