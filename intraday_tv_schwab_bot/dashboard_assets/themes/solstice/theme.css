@@ -22,7 +22,6 @@
   --panel-bg: linear-gradient(180deg, rgba(19, 17, 16, 0.96), rgba(14, 12, 11, 0.96));
   --panel-glow: radial-gradient(700px 180px at 50% 0%, rgba(255, 154, 77, 0.08), transparent 60%);
   --chart-bg: linear-gradient(180deg, rgba(12, 10, 9, 0.96), rgba(17, 14, 13, 0.98));
-  --chart-grid: linear-gradient(transparent 95%, rgba(255, 255, 255, 0.05) 96%), linear-gradient(90deg, transparent 95%, rgba(255, 255, 255, 0.04) 96%);
   --gauge-inner: #100e0d;
   /* Translucent overlay background for chart-anchored UI (loading veil,
      legend chip). Dark themes keep the existing near-black tint; light
