@@ -20,6 +20,7 @@ from ..shared import (
     _optional_float,
     _safe_float,
     _same_day_mask,
+    _session_open_price,
     now_et,
     parse_hhmm,
     pd,
@@ -231,6 +232,145 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             score += 0.5
         return score
 
+    def _score_vol_squeeze(self, side: Side, close: float, vwap: float, ema9: float,
+                           ema20: float, atr: float, frame: pd.DataFrame, tech_ctx) -> float:
+        """Score the Bollinger-squeeze breakout setup. Looks for compressed-range
+        consolidation followed by a directional break out of the box. Compression
+        comes from a tight box_range + low BB width OR an active BB squeeze flag
+        on tech_ctx; the breakout comes from current close clearing the
+        box-high (LONG) / box-low (SHORT) with a buffer. Volume and bar-close
+        position add confirmation points. Ported (lighter) from
+        volatility_squeeze_breakout/strategy.py."""
+        lookback = max(6, int(self.params.get("vol_squeeze_lookback_bars", 12)))
+        session_frame = frame[_same_day_mask(frame, now_et().date())]
+        if len(session_frame) < lookback + 2:
+            return 0.0
+        # Look at the box (last lookback bars BEFORE the current one)
+        last = session_frame.iloc[-1]
+        prior = session_frame.iloc[:-1]
+        box = prior.tail(lookback)
+        if len(box) < lookback:
+            return 0.0
+        box_high = _safe_float(box["high"].max(), close)
+        box_low = _safe_float(box["low"].min(), close)
+        box_range = max(0.0, box_high - box_low)
+        box_range_pct = (box_range / close) if close > 0 else 0.0
+        box_range_atr = (box_range / atr) if atr > 0 else float("inf")
+        max_range_pct = float(self.params.get("vol_squeeze_max_range_pct", 0.012))
+        max_range_atr = float(self.params.get("vol_squeeze_max_range_atr", 1.8))
+        compression_box_ok = box_range_pct <= max_range_pct and box_range_atr <= max_range_atr
+        bb_squeeze_flag = bool(getattr(tech_ctx, "bollinger_squeeze", False))
+        bb_width_pct = _safe_float(getattr(tech_ctx, "bollinger_width_pct", None), 0.0)
+        max_width_pct = float(self.params.get("vol_squeeze_max_width_pct", 0.05))
+        compression_bb_ok = bb_squeeze_flag or (0.0 < bb_width_pct <= max_width_pct)
+
+        score = 0.0
+        if compression_box_ok:
+            score += 2.0
+        if compression_bb_ok:
+            score += 1.0
+        if compression_box_ok and bb_squeeze_flag:
+            # Both compression signals agreeing — strong setup
+            score += 0.5
+
+        # Breakout detection (side-aware)
+        buffer = float(self.params.get("vol_squeeze_breakout_buffer_pct", 0.0008))
+        if side == Side.LONG:
+            broke_out = _safe_float(last["close"]) >= box_high * (1.0 + buffer)
+        else:
+            broke_out = _safe_float(last["close"]) <= box_low * (1.0 - buffer)
+        if broke_out:
+            score += 1.5
+
+        # Volume confirmation: current bar volume vs box-median
+        try:
+            vol_baseline = max(1.0, float(box["volume"].median()))
+        except Exception:
+            vol_baseline = 1.0
+        cur_vol = _safe_float(last.get("volume"), 0.0)
+        min_vol_ratio = float(self.params.get("vol_squeeze_min_breakout_volume_ratio", 1.12))
+        if cur_vol >= vol_baseline * min_vol_ratio:
+            score += 0.5
+
+        # Bar close position
+        close_pos = _bar_close_position(session_frame)
+        min_close_pos = float(self.params.get("vol_squeeze_min_bar_close_position", 0.63))
+        if side == Side.LONG and close_pos >= min_close_pos:
+            score += 0.5
+        if side == Side.SHORT and close_pos <= (1.0 - min_close_pos):
+            score += 0.5
+
+        # Alignment with VWAP/EMA (cheap continuation confirmation)
+        if side == Side.LONG and close > vwap and ema9 >= ema20:
+            score += 0.5
+        if side == Side.SHORT and close < vwap and ema9 <= ema20:
+            score += 0.5
+        return score
+
+    def _score_momentum_close(self, side: Side, close: float, vwap: float, ema9: float,
+                              ema20: float, ret15: float, frame: pd.DataFrame) -> float:
+        """Score the late-session momentum-into-close setup. The thesis is
+        a stock with strong day-direction breaking out of a recent N-bar
+        high (or low for SHORT), still in a trend-aligned posture, with
+        ret15 confirming acceleration. Uses live frame data to compute
+        day_strength (% from today's open) rather than the screener's
+        stale change_from_open. Ported (lighter) from
+        momentum_close/strategy.py."""
+        # Compute live day_strength from session open + current close
+        today_open = _session_open_price(frame)
+        if today_open is None or today_open <= 0:
+            return 0.0
+        day_strength = (close - today_open) / today_open * 100.0
+        min_day = float(self.params.get("momentum_close_min_day_strength", 1.5))
+
+        # Hard gate: side-correct day strength magnitude
+        if side == Side.LONG and day_strength < min_day:
+            return 0.0
+        if side == Side.SHORT and day_strength > -min_day:
+            return 0.0
+
+        # N-bar breakout (use today's bars only)
+        lookback = max(3, int(self.params.get("momentum_close_breakout_lookback_bars", 6)))
+        session_frame = frame[_same_day_mask(frame, now_et().date())]
+        if len(session_frame) < lookback + 1:
+            return 0.0
+        recent = session_frame.tail(lookback + 1).iloc[:-1]
+        if recent.empty:
+            return 0.0
+
+        score = 0.0
+        # day_strength magnitude scoring (tier-based)
+        ds_abs = abs(day_strength)
+        if ds_abs >= min_day:
+            score += 1.0
+        if ds_abs >= min_day * 2.0:
+            score += 1.0
+        if ds_abs >= min_day * 3.0:
+            score += 0.5
+
+        # Breakout above N-bar high (LONG) / below low (SHORT)
+        if side == Side.LONG:
+            breakout_level = _safe_float(recent["high"].max(), close)
+            if close > breakout_level:
+                score += 1.5
+            if close > vwap:
+                score += 1.0
+            if ema9 >= ema20:
+                score += 0.5
+            if ret15 > 0:
+                score += 0.5
+        else:
+            breakout_level = _safe_float(recent["low"].min(), close)
+            if close < breakout_level:
+                score += 1.5
+            if close < vwap:
+                score += 1.0
+            if ema9 <= ema20:
+                score += 0.5
+            if ret15 < 0:
+                score += 0.5
+        return score
+
     # ------------------------------------------------------------------
     # Time-of-day gating
     # ------------------------------------------------------------------
@@ -239,19 +379,37 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         return parse_hhmm(start) <= now_t <= parse_hhmm(end)
 
     def _allowed_regimes(self, now_t) -> set[str]:
-        """Return which regimes are allowed at the current time."""
+        """Return which regimes are allowed at the current time.
+
+        Two extra regimes added 2026-05-12:
+          - vol_squeeze: Bollinger-squeeze breakout. Allowed in the primary
+            window (orb_end → midday_start) and the afternoon (13:00 → no_new),
+            i.e. anywhere there's enough RTH data for a meaningful box.
+          - momentum_close: ride-the-bell continuation. Restricted to the
+            afternoon window (13:00 → no_new) only — explicit per-user
+            request; pre-1pm momentum is already covered by trend/pullback.
+        Both regimes are gated by their own min_*_score thresholds and
+        compete with trend/pullback/range via the standard score-gap rule.
+        Toggle off via params.disable_vol_squeeze_regime /
+        disable_momentum_close_regime.
+        """
         orb_end = self.params.get("orb_end_time", "10:05")
         midday_start = self.params.get("midday_start_time", "11:30")
         midday_end = self.params.get("midday_end_time", "13:00")
         afternoon_start = self.params.get("afternoon_start_time", "13:00")
         no_new = self.params.get("no_new_entries_after", "15:00")
+        vol_squeeze_enabled = not bool(self.params.get("disable_vol_squeeze_regime", False))
+        momentum_close_enabled = not bool(self.params.get("disable_momentum_close_regime", False))
 
         if now_t > parse_hhmm(no_new):
             return set()
         if self._time_in_range(now_t, "09:35", orb_end):
             return {"trend"}  # ORB window: trend only
         if self._time_in_range(now_t, orb_end, midday_start):
-            return {"trend", "pullback", "range"}  # Primary: all
+            regimes = {"trend", "pullback", "range"}
+            if vol_squeeze_enabled:
+                regimes.add("vol_squeeze")
+            return regimes
         if self._time_in_range(now_t, midday_start, midday_end):
             return {"pullback"}  # Midday: pullbacks only
         if self._time_in_range(now_t, afternoon_start, no_new):
@@ -261,8 +419,14 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # mean-reversion at the extremes. Disable via
             # ``afternoon_include_range: false`` in params.
             if bool(self.params.get("afternoon_include_range", True)):
-                return {"trend", "pullback", "range"}
-            return {"trend", "pullback"}
+                regimes = {"trend", "pullback", "range"}
+            else:
+                regimes = {"trend", "pullback"}
+            if vol_squeeze_enabled:
+                regimes.add("vol_squeeze")
+            if momentum_close_enabled:
+                regimes.add("momentum_close")
+            return regimes
         return set()
 
     # ------------------------------------------------------------------
@@ -414,6 +578,92 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             target = max(0.01, range_low + buffer)
 
         return self._finalize_signal(c, side, close, stop, target, "range", regime_score, frame, data)
+
+    def _build_vol_squeeze_signal(self, c: Candidate, side: Side, close: float, atr: float,
+                                  frame: pd.DataFrame, regime_score: float,
+                                  data=None) -> Signal | None:
+        """Build a Bollinger-squeeze breakout signal. Stops sit just outside
+        the squeeze box (below box_low for LONG / above box_high for SHORT),
+        with an ATR-floored buffer to absorb noise around the breakout. Target
+        is the standard RR multiple. Shared filters (HTF bias, stretched-entry,
+        SR/structure, FVG retest, etc.) run inside ``_finalize_signal``."""
+        lookback = max(6, int(self.params.get("vol_squeeze_lookback_bars", 12)))
+        session_frame = frame[_same_day_mask(frame, now_et().date())]
+        if len(session_frame) < lookback + 2:
+            self._set_build_failure(c.symbol, "vol_squeeze", "insufficient_session_bars")
+            return None
+        prior = session_frame.iloc[:-1]
+        box = prior.tail(lookback)
+        if len(box) < lookback:
+            self._set_build_failure(c.symbol, "vol_squeeze", "insufficient_box_bars")
+            return None
+        box_high = _safe_float(box["high"].max(), close)
+        box_low = _safe_float(box["low"].min(), close)
+        box_range = max(0.0, box_high - box_low)
+        target_rr = float(self.params.get("vol_squeeze_target_rr", 2.05))
+        # Stop buffer scales with box range so tighter squeezes don't get
+        # over-wide ATR-based stops. Mirrors source strategy logic.
+        stop_buffer = max(atr * 0.12, close * 0.0010, box_range * 0.22)
+
+        if side == Side.LONG:
+            stop = box_low - stop_buffer
+            stop = min(stop, close * (1.0 - self.config.risk.default_stop_pct))
+            risk = max(0.01, close - stop)
+            target = close + risk * target_rr
+        else:
+            stop = box_high + stop_buffer
+            stop = max(stop, close * (1.0 + self.config.risk.default_stop_pct))
+            risk = max(0.01, stop - close)
+            target = max(0.01, close - risk * target_rr)
+
+        return self._finalize_signal(c, side, close, stop, target, "vol_squeeze", regime_score, frame, data)
+
+    def _build_momentum_close_signal(self, c: Candidate, side: Side, close: float, atr: float,
+                                     ltf: pd.DataFrame, frame: pd.DataFrame,
+                                     regime_score: float, data=None) -> Signal | None:
+        """Build a momentum-into-close continuation signal. Stops anchor below
+        recent swing low (LONG) / above recent swing high (SHORT) with an
+        ATR-cushioned buffer so single-bar wicks during the afternoon's lower
+        volume don't trigger the stop. Target uses momentum_close_target_rr."""
+        lookback = max(3, int(self.params.get("momentum_close_breakout_lookback_bars", 6)))
+        session_ltf = ltf[_same_day_mask(ltf, now_et().date())]
+        recent = session_ltf.tail(lookback + 1).iloc[:-1] if len(session_ltf) > lookback else session_ltf.iloc[:-1]
+        if recent.empty:
+            self._set_build_failure(c.symbol, "momentum_close", "insufficient_ltf_history")
+            return None
+
+        # Fresh-breakout gate (matches the source strategy's check)
+        if side == Side.LONG:
+            breakout_level = _safe_float(recent["high"].max(), close)
+            if close <= breakout_level:
+                self._set_build_failure(
+                    c.symbol, "momentum_close",
+                    f"no_fresh_breakout(close={close:.4f}<=recent_high={breakout_level:.4f})",
+                )
+                return None
+        else:
+            breakout_level = _safe_float(recent["low"].min(), close)
+            if close >= breakout_level:
+                self._set_build_failure(
+                    c.symbol, "momentum_close",
+                    f"no_fresh_breakdown(close={close:.4f}>=recent_low={breakout_level:.4f})",
+                )
+                return None
+
+        target_rr = float(self.params.get("momentum_close_target_rr", 2.0))
+        # ATR-cushioned swing anchor (mirrors momentum_close/strategy.py:76-79)
+        if side == Side.LONG:
+            swing = _safe_float(recent["low"].min(), close) - (atr * 0.08)
+            stop = max(close * (1.0 - self.config.risk.default_stop_pct), swing)
+            risk = max(0.01, close - stop)
+            target = close + risk * target_rr
+        else:
+            swing = _safe_float(recent["high"].max(), close) + (atr * 0.08)
+            stop = min(close * (1.0 + self.config.risk.default_stop_pct), swing)
+            risk = max(0.01, stop - close)
+            target = max(0.01, close - risk * target_rr)
+
+        return self._finalize_signal(c, side, close, stop, target, "momentum_close", regime_score, frame, data)
 
     def _finalize_signal(self, c: Candidate, side: Side, close: float, stop: float,
                          target: float, regime: str, regime_score: float,
@@ -1036,15 +1286,34 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     self._score_range(close, vwap, ema9, ema20, frame, idx_neutral)
                     if "range" in allowed_regimes else 0.0
                 )
+                # vol_squeeze and momentum_close were added 2026-05-12 as
+                # additional regimes that compete in the same score-gap
+                # auction. Their scoring methods read live frame data —
+                # vol_squeeze derives compression from session bars +
+                # BB-width; momentum_close derives day_strength from the
+                # session open (live), not the screener's stale value.
+                tech_ctx_for_score = self._technical_context(frame) if "vol_squeeze" in allowed_regimes else None
+                vol_squeeze_score = (
+                    self._score_vol_squeeze(side, close, vwap, ema9, ema20, atr, frame, tech_ctx_for_score)
+                    if "vol_squeeze" in allowed_regimes else 0.0
+                )
+                momentum_close_score = (
+                    self._score_momentum_close(side, close, vwap, ema9, ema20, ret15, frame)
+                    if "momentum_close" in allowed_regimes else 0.0
+                )
 
                 scores = {
                     "trend": trend_score,
                     "pullback": pullback_score,
                     "range": range_score,
+                    "vol_squeeze": vol_squeeze_score,
+                    "momentum_close": momentum_close_score,
                 }
                 min_trend = float(self.params.get("min_trend_score", 4.0))
                 min_pullback = float(self.params.get("min_pullback_score", 4.0))
                 min_range = float(self.params.get("min_range_score", 3.5))
+                min_vol_squeeze = float(self.params.get("min_vol_squeeze_score", 4.0))
+                min_momentum_close = float(self.params.get("min_momentum_close_score", 4.0))
                 min_gap = float(self.params.get("min_score_gap", 1.5))
 
                 ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
@@ -1059,6 +1328,10 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     selected = "pullback"
                 elif top_regime == "range" and top_score >= min_range and (top_score - second_score) >= min_gap * 0.67 and "range" in allowed_regimes:
                     selected = "range"
+                elif top_regime == "vol_squeeze" and top_score >= min_vol_squeeze and (top_score - second_score) >= min_gap and "vol_squeeze" in allowed_regimes:
+                    selected = "vol_squeeze"
+                elif top_regime == "momentum_close" and top_score >= min_momentum_close and (top_score - second_score) >= min_gap and "momentum_close" in allowed_regimes:
+                    selected = "momentum_close"
                 # Fallback: the primary selection above enforces the min_gap
                 # ambiguity guard on the TOP regime. If that fails, we fall
                 # through here and try each regime in rank order using ONLY
@@ -1082,14 +1355,27 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                         if regime_name == "range" and regime_score >= min_range:
                             selected = "range"
                             break
+                        if regime_name == "vol_squeeze" and regime_score >= min_vol_squeeze:
+                            selected = "vol_squeeze"
+                            break
+                        if regime_name == "momentum_close" and regime_score >= min_momentum_close:
+                            selected = "momentum_close"
+                            break
 
                 if selected is None:
-                    fail_reasons.append(f"{side.value.lower()}_no_qualifying_regime(trend={trend_score:.1f},pb={pullback_score:.1f},range={range_score:.1f})")
+                    fail_reasons.append(
+                        f"{side.value.lower()}_no_qualifying_regime("
+                        f"trend={trend_score:.1f},pb={pullback_score:.1f},"
+                        f"range={range_score:.1f},squeeze={vol_squeeze_score:.1f},"
+                        f"mom_close={momentum_close_score:.1f})"
+                    )
                     continue
 
-                # Index confirmation for trend/pullback (skipped during ORB
-                # window when orb_bypass_index_confirmation is true).
-                if selected in {"trend", "pullback"} and not index_ok and not orb_index_bypass:
+                # Index confirmation for trend/pullback/vol_squeeze/momentum_close
+                # — these all need a market-aligned tape. Range stays exempt
+                # (mean-reversion thesis). Skipped during ORB window when
+                # orb_bypass_index_confirmation is true.
+                if selected in {"trend", "pullback", "vol_squeeze", "momentum_close"} and not index_ok and not orb_index_bypass:
                     fail_reasons.append(f"{side.value.lower()}_{selected}_index_not_confirmed")
                     continue
 
@@ -1101,6 +1387,10 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     sig = self._build_pullback_signal(c, side, close, atr, ltf, frame, regime_score_val, data)
                 elif selected == "range":
                     sig = self._build_range_signal(c, side, close, atr, frame, regime_score_val, data)
+                elif selected == "vol_squeeze":
+                    sig = self._build_vol_squeeze_signal(c, side, close, atr, frame, regime_score_val, data)
+                elif selected == "momentum_close":
+                    sig = self._build_momentum_close_signal(c, side, close, atr, ltf, frame, regime_score_val, data)
 
                 if sig is not None:
                     best_signal = sig

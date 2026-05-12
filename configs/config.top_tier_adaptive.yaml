@@ -614,6 +614,36 @@ strategies:
       ladder_zone_atr_mult: 0.5     # rung confirmation zone width = 0.5 * ATR
       ladder_max_rungs: 4           # cap on number of rungs per signal
 
+      # ===== vol_squeeze regime (added 2026-05-12) =====
+      # Bollinger-squeeze breakout. Fires when the last N bars form a tight
+      # box (range_pct + bb_width_pct both compressed) AND the current bar
+      # breaks out of the box with confirming volume. Allowed in the
+      # primary window (orb_end -> midday_start) and the afternoon
+      # (13:00 -> no_new). Set `disable_vol_squeeze_regime: true` to opt out.
+      min_vol_squeeze_score: 4.0
+      vol_squeeze_lookback_bars: 12
+      vol_squeeze_max_range_pct: 0.012       # box height vs price (LTF)
+      vol_squeeze_max_range_atr: 1.8          # box height vs ATR
+      vol_squeeze_max_width_pct: 0.05         # bollinger width fraction ceiling
+      vol_squeeze_breakout_buffer_pct: 0.0008
+      vol_squeeze_min_breakout_volume_ratio: 1.12
+      vol_squeeze_min_bar_close_position: 0.63
+      vol_squeeze_target_rr: 2.05
+      disable_vol_squeeze_regime: false
+
+      # ===== momentum_close regime (added 2026-05-12) =====
+      # Ride-the-bell continuation. Restricted to the afternoon window
+      # (13:00 -> no_new) per user spec. day_strength is computed LIVE
+      # from session open + current close (not from the screener's
+      # 60-second-stale change_from_open field), so the threshold
+      # applies to the bot's actual perceived intraday move. Set
+      # `disable_momentum_close_regime: true` to opt out.
+      min_momentum_close_score: 4.0
+      momentum_close_breakout_lookback_bars: 6
+      momentum_close_min_day_strength: 1.5    # % from today's open (live)
+      momentum_close_target_rr: 2.0
+      disable_momentum_close_regime: false
+
       # Sector concentration guard — at most 2 same-direction positions per
       # GICS sector. Prevents 3 correlated longs dying together on one headline.
       sector_groups:
