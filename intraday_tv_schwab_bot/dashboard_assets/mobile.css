@@ -73,11 +73,12 @@ body {
   width: 100%;
 }
 
+/* Bare-stack metric pills (matches desktop) — no padding, no min-height.
+   The 2-col grid already handles spacing + cell sizing, and the strip's
+   parent .topbar.m-topbar provides outer padding. */
 .topbar.m-topbar .status-strip .metric-pill,
 .topbar.m-topbar .status-strip .metric-pill.status-metric {
   min-width: 0;
-  min-height: 52px;
-  padding: 8px 10px;
 }
 
 /* Toolbar (Updated pill) — full-width on mobile. */

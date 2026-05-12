@@ -101,30 +101,33 @@
       z-index: 1;
       display: grid;
       grid-auto-flow: column;
-      grid-auto-columns: minmax(138px, max-content);
+      grid-auto-columns: minmax(110px, max-content);
       justify-content: end;
       justify-self: end;
-      gap: 10px;
+      gap: 28px;
       min-width: 0;
     }
-    .metric-pill,
+    /* Mode-pill keeps its existing pill chrome — it's a stand-alone
+       badge (DRY RUN / LIVE), not a metric. */
     .mode-pill {
       border-radius: 16px;
       border: 1px solid var(--line);
       background: rgba(var(--tint-rgb), 0.05);
       color: var(--text);
     }
+    /* Bare-stack metric layout: no border, no fill, no rounded box.
+       Each metric is just a tiny uppercase label + a value, separated
+       only by the .status-strip's gap. Reads as one editorial cluster
+       instead of seven detached pills. */
     .metric-pill {
-      padding: 11px 12px;
-      min-height: 58px;
       display: flex;
       flex-direction: column;
       justify-content: center;
-      gap: 6px;
+      gap: 4px;
       overflow: visible;
-      min-width: 138px;
+      min-width: 0;
     }
-    .status-strip .metric-pill.status-metric { min-width: 176px; }
+    .status-strip .metric-pill.status-metric { min-width: 0; }
     .metric-pill .label,
     .tiny-label { color: var(--soft); font-size: 10px; text-transform: uppercase; letter-spacing: .1em; }
     .metric-pill .value {
