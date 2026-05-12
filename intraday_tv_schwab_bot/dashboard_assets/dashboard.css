@@ -714,7 +714,7 @@
     }
     .kpi-hero-chg.neutral .arrow { background: rgba(var(--tint-rgb), .18); color: var(--panel); }
     .kpi-spark {
-      height: 110px;
+      height: 138px;
       margin: 14px 0 16px;
       background:
         radial-gradient(60% 70% at 50% 0%, rgba(var(--tint-rgb), 0.07), transparent 75%),
