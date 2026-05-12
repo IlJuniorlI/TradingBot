@@ -455,6 +455,9 @@ class DashboardServer:
                 if parsed.path == "/assets/dashboard.js":
                     self._serve_static("dashboard.js", "application/javascript; charset=utf-8")
                     return
+                if parsed.path == "/assets/helpers.js":
+                    self._serve_static("helpers.js", "application/javascript; charset=utf-8")
+                    return
                 if parsed.path == "/assets/mobile.css":
                     self._serve_static("mobile.css", "text/css; charset=utf-8")
                     return

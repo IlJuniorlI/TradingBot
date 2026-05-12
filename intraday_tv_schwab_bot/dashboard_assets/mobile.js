@@ -21,121 +21,16 @@
   const serverRefreshMs = Number(cfg.refreshMs) || DEFAULT_REFRESH_MS;
   const refreshMs = Math.max(serverRefreshMs, MOBILE_REFRESH_MS);
 
-  // ---- formatting helpers (ports of the ones in dashboard.js) ----
-
-  function numOrNull(value) {
-    if (value === null || value === undefined || value === '') return null;
-    const num = Number(value);
-    return Number.isFinite(num) ? num : null;
-  }
-
+  // Shared utilities (numOrNull, clamp, escapeHtml, fmt*, pnlClass,
+  // sparklineSVG, fmtSide, statusBadge, modeBadge) live in helpers.js —
+  // loaded before this script in mobile.html and referenced as globals.
+  //
+  // mobile-only `safe` returns '' for null/undefined (dashboard.js's
+  // returns '—'); divergent on purpose so empty fallbacks like
+  // `safe(x) || 'fallback'` still trigger when x is missing.
   function safe(value) {
     if (value === null || value === undefined) return '';
     return String(value);
-  }
-
-  function clamp(value, min, max) {
-    return Math.min(Math.max(value, min), max);
-  }
-
-  function escapeHtml(value) {
-    return String(value ?? '').replace(/[&<>"']/g, function (ch) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
-    });
-  }
-
-  function fmtMoney(value) {
-    const num = numOrNull(value);
-    if (num === null) return '—';
-    const sign = num < 0 ? '-' : '';
-    const abs = Math.abs(num);
-    return sign + '$' + abs.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  }
-
-  function fmtNum(value, digits) {
-    const num = numOrNull(value);
-    if (num === null) return '—';
-    return num.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
-  }
-
-  function fmtInteger(value) {
-    const num = numOrNull(value);
-    if (num === null) return '—';
-    return Math.round(num).toLocaleString('en-US');
-  }
-
-  function fmtPctSmart(value) {
-    const num = numOrNull(value);
-    if (num === null) return '—';
-    return num.toFixed(num >= 10 ? 0 : 1) + '%';
-  }
-
-  function fmtPctFromRatio(value) {
-    const num = numOrNull(value);
-    if (num === null) return '—';
-    return (num * 100).toFixed(1) + '%';
-  }
-
-  function fmtPct(value, digits = 2) {
-    const num = numOrNull(value);
-    if (num === null) return '—';
-    return num.toFixed(digits) + '%';
-  }
-
-  function fmtSide(entity) {
-    const side = String(entity?.side || '').trim();
-    if (!side) return '—';
-    const opt = String(entity?.option_type || '').trim().toUpperCase();
-    return opt ? `${side} · ${opt}` : side;
-  }
-
-  function pnlClass(value) {
-    const num = numOrNull(value);
-    if (num === null || num === 0) return '';
-    return num > 0 ? 'good' : 'bad';
-  }
-
-  // Port of dashboard.js sparklineSVG. Returns full <svg> markup for a
-  // 100×28 inline sparkline that stretches to its container. Empty when
-  // fewer than 2 numeric values are supplied.
-  function sparklineSVG(values, tone) {
-    const nums = (values || []).map(numOrNull).filter(v => v !== null);
-    if (nums.length < 2) return '<svg viewBox="0 0 100 28" preserveAspectRatio="none"></svg>';
-    const min = Math.min.apply(null, nums);
-    const max = Math.max.apply(null, nums);
-    const span = Math.max(max - min, 1e-9);
-    const pts = nums.map((v, idx) => {
-      const x = (idx / Math.max(nums.length - 1, 1)) * 100;
-      const y = 26 - ((v - min) / span) * 22;
-      return x.toFixed(2) + ',' + y.toFixed(2);
-    }).join(' ');
-    const area = '0,28 ' + pts + ' 100,28';
-    const stroke = tone === 'tone-bad' ? '#ff6b82' : (tone === 'tone-good' ? '#6ce3a2' : '#79d4ff');
-    // vector-effect="non-scaling-stroke" keeps the line at 2.4 CSS px regardless of
-    // how the viewBox stretches. See dashboard.js sparklineSVG for the full note.
-    return '<svg viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true">'
-      + '<polyline points="' + pts + '" fill="none" stroke="' + stroke + '" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"></polyline>'
-      + '<polygon points="' + area + '" fill="' + stroke + '" opacity="0.10"></polygon>'
-      + '</svg>';
-  }
-
-  // NOTE: these two helpers are ports of dashboard.js's versions. Keep the
-  // class names in sync with dashboard.css — .mode-chip / status-starting
-  // are NOT real classes there, so don't invent them here.
-  function statusBadge(status) {
-    const value = String(status || '').toLowerCase();
-    const tone = value === 'running'
-      ? 'status-running'
-      : (value === 'error' || value === 'stopped' || value === 'disconnected'
-        ? 'status-error'
-        : (value === 'starting' ? 'status-warning' : 'status-idle'));
-    return `<span class="status-chip ${tone}">${escapeHtml(value || 'idle')}</span>`;
-  }
-
-  function modeBadge(isDryRun) {
-    const label = isDryRun ? 'DRY RUN / PAPER' : 'LIVE ORDERS';
-    const tone = isDryRun ? 'paper' : 'live';
-    return `<span class="mode-pill inline-mode ${tone}">${escapeHtml(label)}</span>`;
   }
 
   // ---- renderers (mirror dashboard.js but only for mobile DOM) ----
