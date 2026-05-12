@@ -1,9 +1,16 @@
 # SPDX-License-Identifier: MIT
 """Screener for the top_tier_adaptive strategy.
 
-Since the tradable universe is a fixed list of top top-tier liquid stocks (configured in
-params.tradable), the screener simply fetches those symbols from TradingView
-and ranks them by absolute intraday move × relative volume.
+The tradable universe is a fixed list of mega-cap liquid stocks (configured
+in params.tradable) so the screener just fetches their RTH quotes and ranks
+them by |change| × volume.
+
+Bypasses the TradingViewScreenerClient._CANONICAL_SCREEN_FIELDS mapping that
+session-routes `close`/`change_from_open`/`volume` to `premarket_*` or
+`postmarket_*` variants during 04:00-09:30 and 16:00-20:00. Mega-cap
+pre/postmarket prints aren't useful signal for this strategy — sticking
+with the regular-session `change` / `volume` / `close` keeps the ranking
+stable across all sessions.
 """
 from ..shared import Candidate, Side
 from ..screener_base import BaseStrategyScreener
@@ -18,19 +25,11 @@ class TopTierAdaptiveScreener(BaseStrategyScreener):
         if not tradable:
             return []
         c = self._column
+        # Raw field names (no _select_fields canonical mapping) so the
+        # query never substitutes premarket_*/postmarket_* variants.
         query = (
             self._base_query()
-            .select(
-                *self._select_fields(
-                    "name",
-                    "description",
-                    "close",
-                    "volume",
-                    "market_cap_basic",
-                    "relative_volume_10d_calc",
-                    "change_from_open",
-                ),
-            )
+            .select("name", "close", "volume", "change", "market_cap_basic")
             .where(
                 *self._common_equity_conditions(),
                 c("name").isin(tradable),
@@ -42,11 +41,11 @@ class TopTierAdaptiveScreener(BaseStrategyScreener):
             strategy=self.strategy_name,
             directional_bias_fn=lambda row: (
                 Side.LONG
-                if float(row.get("change_from_open", 0.0) or 0.0) > 0.20
-                else (Side.SHORT if float(row.get("change_from_open", 0.0) or 0.0) < -0.20 else None)
+                if float(row.get("change", 0.0) or 0.0) > 0.20
+                else (Side.SHORT if float(row.get("change", 0.0) or 0.0) < -0.20 else None)
             ),
             activity_score_fn=lambda row: (
-                abs(float(row.get("change_from_open", 0.0) or 0.0))
-                * max(0.5, min(float(row.get("relative_volume_10d_calc", 1.0) or 1.0), 3.0))
+                abs(float(row.get("change", 0.0) or 0.0))
+                * max(0.5, float(row.get("volume", 0.0) or 0.0) / 1_000_000.0)
             ),
         )
