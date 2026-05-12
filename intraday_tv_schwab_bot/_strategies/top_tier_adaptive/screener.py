@@ -36,6 +36,15 @@ class TopTierAdaptiveScreener(BaseStrategyScreener):
             )
         )
         rows = self._execute(query)
+        # Alias `change` to `change_from_open` in the candidate row metadata so
+        # downstream consumers (dashboard candidate cards, watchlist tiles,
+        # selected-symbol meta, dashboard_cache, entry_gatekeeper) that read
+        # `change_from_open` keep working. The value is % from prior close
+        # (what TradingView/Yahoo show as "Change %"), not the strict
+        # "% from today's open" the field name implies — but the dashboard
+        # labels it generically as "Day %" so the display remains accurate.
+        if "change" in rows.columns:
+            rows["change_from_open"] = rows["change"]
         return self._candidate_rows(
             rows,
             strategy=self.strategy_name,
