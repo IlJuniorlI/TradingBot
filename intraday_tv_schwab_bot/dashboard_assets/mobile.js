@@ -91,8 +91,32 @@
 
   function pnlClass(value) {
     const num = numOrNull(value);
-    if (num === null || num === 0) return 'pnl-flat';
-    return num > 0 ? 'pnl-pos' : 'pnl-neg';
+    if (num === null || num === 0) return '';
+    return num > 0 ? 'good' : 'bad';
+  }
+
+  // Port of dashboard.js sparklineSVG. Returns full <svg> markup for a
+  // 100×28 inline sparkline that stretches to its container. Empty when
+  // fewer than 2 numeric values are supplied.
+  function sparklineSVG(values, tone) {
+    const nums = (values || []).map(numOrNull).filter(v => v !== null);
+    if (nums.length < 2) return '<svg viewBox="0 0 100 28" preserveAspectRatio="none"></svg>';
+    const min = Math.min.apply(null, nums);
+    const max = Math.max.apply(null, nums);
+    const span = Math.max(max - min, 1e-9);
+    const pts = nums.map((v, idx) => {
+      const x = (idx / Math.max(nums.length - 1, 1)) * 100;
+      const y = 26 - ((v - min) / span) * 22;
+      return x.toFixed(2) + ',' + y.toFixed(2);
+    }).join(' ');
+    const area = '0,28 ' + pts + ' 100,28';
+    const stroke = tone === 'tone-bad' ? '#ff6b82' : (tone === 'tone-good' ? '#6ce3a2' : '#79d4ff');
+    // vector-effect="non-scaling-stroke" keeps the line at 2.4 CSS px regardless of
+    // how the viewBox stretches. See dashboard.js sparklineSVG for the full note.
+    return '<svg viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true">'
+      + '<polyline points="' + pts + '" fill="none" stroke="' + stroke + '" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"></polyline>'
+      + '<polygon points="' + area + '" fill="' + stroke + '" opacity="0.10"></polygon>'
+      + '</svg>';
   }
 
   // NOTE: these two helpers are ports of dashboard.js's versions. Keep the
@@ -184,14 +208,43 @@
     if (kpiReal) kpiReal.innerHTML = `<span class="${pnlClass(perf.realized_pnl)}">${fmtMoney(perf.realized_pnl)}</span>`;
     if (kpiUnreal) kpiUnreal.innerHTML = `<span class="${pnlClass(perf.unrealized_pnl)}">${fmtMoney(perf.unrealized_pnl)}</span>`;
     if (kpiDraw) kpiDraw.textContent = fmtMoney(perf.drawdown);
+    const kpiWinrate = document.getElementById('kpi-winrate');
+    if (kpiWinrate) kpiWinrate.textContent = perf.win_rate == null ? '—' : fmtPctFromRatio(perf.win_rate);
     if (kpiMeta) kpiMeta.textContent = `Day PnL ${fmtMoney(dayPnl)} · cash ${fmtMoney(perf.cash)}`;
+
+    // Day change pill: percent change from starting equity, color-coded.
+    const chgEl = document.getElementById('kpi-day-chg');
+    const chgText = document.getElementById('kpi-day-chg-text');
+    if (chgEl && chgText) {
+      const dayPct = starting > 0 ? (dayPnl / starting) * 100 : 0;
+      const tone = dayPnl > 0 ? 'good' : (dayPnl < 0 ? 'bad' : 'neutral');
+      const arrow = dayPnl > 0 ? '▲' : (dayPnl < 0 ? '▼' : '—');
+      chgEl.className = `kpi-hero-chg ${tone}`;
+      const arrowEl = chgEl.querySelector('.arrow');
+      if (arrowEl) arrowEl.textContent = arrow;
+      chgText.textContent = starting > 0 ? `${fmtPct(dayPct, 2)} today` : '— today';
+    }
+
+    // Equity curve sparkline: green/red based on net direction; empty wrapper
+    // (CSS :empty rule) collapses the strip until we have ≥2 points.
+    const kpiSpark = document.getElementById('kpi-spark');
+    if (kpiSpark) {
+      const equityValues = (Array.isArray(perf.equity_curve) ? perf.equity_curve : [])
+        .map(point => numOrNull(point?.equity))
+        .filter(v => v !== null);
+      if (equityValues.length < 2) {
+        kpiSpark.innerHTML = '';
+      } else {
+        const first = equityValues[0];
+        const last = equityValues[equityValues.length - 1];
+        const tone = last > first ? 'tone-good' : (last < first ? 'tone-bad' : 'tone-neutral');
+        kpiSpark.innerHTML = sparklineSVG(equityValues, tone);
+      }
+    }
 
     const exposureRing = document.getElementById('gauge-exposure-ring');
     const winRing = document.getElementById('gauge-win-ring');
     const ddRing = document.getElementById('gauge-dd-ring');
-    const exposureFill = document.getElementById('gauge-exposure-fill');
-    const winFill = document.getElementById('gauge-win-fill');
-    const ddFill = document.getElementById('gauge-dd-fill');
     const exposureText = document.getElementById('gauge-exposure-text');
     const winText = document.getElementById('gauge-win-text');
     const ddText = document.getElementById('gauge-dd-text');
@@ -199,9 +252,6 @@
     if (exposureRing) exposureRing.style.setProperty('--pct', `${exposurePct}%`);
     if (winRing) winRing.style.setProperty('--pct', `${riskPct}%`);
     if (ddRing) ddRing.style.setProperty('--pct', `${ddPct}%`);
-    if (exposureFill) exposureFill.style.width = `${exposurePct}%`;
-    if (winFill) winFill.style.width = `${riskPct}%`;
-    if (ddFill) ddFill.style.width = `${ddPct}%`;
     if (exposureText) exposureText.textContent = fmtPctSmart(exposurePct);
     if (winText) winText.textContent = fmtPctSmart(riskPct);
     if (ddText) ddText.textContent = fmtPctSmart(ddPct);

@@ -302,7 +302,6 @@
     .event-card,
     .detail-card,
     .mini-panel,
-    .kpi-tile,
     .gauge-card {
       border-radius: 18px;
       border: 1px solid rgba(var(--tint-rgb), 0.07);
@@ -651,7 +650,96 @@
     .event-neutral { color: var(--muted); }
     .detail-grid,
     .gauge-grid,
-    .kpi-grid { display: grid; gap: 12px; }
+    .kpi-grid { display: grid; gap: 14px 18px; }
+    /* Flat kpi tiles (no chrome) so the equity sparkline can dominate
+       the panel vertically. Removed from the shared card-chrome rule
+       above; this gives them just typography. */
+    .kpi-tile {
+      padding: 0;
+      background: none;
+      border: 0;
+      box-shadow: none;
+      border-radius: 0;
+      min-width: 0;
+    }
+    .kpi-hero { padding: 4px 0 2px; }
+    .kpi-hero-label {
+      font-size: 10px;
+      color: var(--soft);
+      font-weight: 700;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+    .kpi-hero-value {
+      font-size: 30px;
+      font-weight: 800;
+      line-height: 1;
+      letter-spacing: -.02em;
+      color: var(--text);
+    }
+    .kpi-hero-chg {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 11px 4px 6px;
+      border-radius: 999px;
+      font-size: 11.5px;
+      font-weight: 700;
+      margin-top: 10px;
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+    }
+    .kpi-hero-chg .arrow {
+      display: grid;
+      place-items: center;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      font-size: 9px;
+      line-height: 1;
+    }
+    .kpi-hero-chg.good {
+      background: color-mix(in oklab, var(--good) 14%, transparent);
+      color: var(--good);
+    }
+    .kpi-hero-chg.good .arrow { background: var(--good); color: var(--panel); }
+    .kpi-hero-chg.bad {
+      background: color-mix(in oklab, var(--bad) 14%, transparent);
+      color: var(--bad);
+    }
+    .kpi-hero-chg.bad .arrow { background: var(--bad); color: var(--panel); }
+    .kpi-hero-chg.neutral {
+      background: rgba(var(--tint-rgb), .06);
+      color: var(--muted);
+    }
+    .kpi-hero-chg.neutral .arrow { background: rgba(var(--tint-rgb), .18); color: var(--panel); }
+    .kpi-spark {
+      height: 110px;
+      margin: 14px 0 16px;
+      background:
+        radial-gradient(60% 70% at 50% 0%, rgba(var(--tint-rgb), 0.07), transparent 75%),
+        linear-gradient(180deg, rgba(var(--tint-rgb), 0.05), rgba(var(--tint-rgb), 0.015));
+      border: 1px solid rgba(var(--tint-rgb), 0.06);
+      border-radius: 14px;
+      overflow: hidden;
+    }
+    .kpi-spark svg { width: 100%; height: 100%; display: block; }
+    .kpi-spark:empty { display: none; }
+    .kpi-tile .tiny-label { color: var(--soft); }
+    .kpi-tile .value-main {
+      font-size: 19px;
+      font-weight: 800;
+      line-height: 1.1;
+      margin-top: 4px;
+      letter-spacing: -.01em;
+    }
+    /* PnL spans injected by renderKpiAndGauges: <span class="good|bad">$X</span>
+       inside .value-main. The existing .value.good / .score.good / .price-change.good
+       rules don't match here because .value-main isn't .value. Scope a rule to
+       the kpi tile (and any other .value-main usage) so realized/unrealized
+       values actually pick up the theme good/bad colors. */
+    .value-main .good { color: var(--good); }
+    .value-main .bad { color: var(--bad); }
     .detail-grid {
       grid-template-columns: 1.3fr 1fr 1fr;
       align-items: stretch;
@@ -659,13 +747,12 @@
     }
     .detail-card,
     .mini-panel,
-    .gauge-card,
-    .kpi-tile { padding: 14px; }
+    .gauge-card { padding: 14px; }
     .gauge-card {
-      min-height: 174px;
+      min-height: 130px;
       display: grid;
-      grid-template-rows: auto 1fr auto;
-      gap: 12px;
+      grid-template-rows: auto 1fr;
+      gap: 10px;
       align-items: stretch;
     }
     .gauge-card > .tiny-label {
@@ -673,13 +760,8 @@
       margin: 0;
     }
     .gauge-card > .gauge-ring {
-      align-self: end;
+      align-self: center;
       justify-self: center;
-      margin-top: auto;
-    }
-    .gauge-card > .bar-track {
-      align-self: end;
-      margin-top: 0;
     }
     .detail-card .value-big { font-size: 34px; font-weight: 800; line-height: 1; }
     .detail-card .subline { color: var(--muted); font-size: 12px; margin-top: 6px; }
@@ -715,7 +797,6 @@
       background: linear-gradient(90deg, rgba(85,194,255,.75), rgba(108,227,162,.85));
     }
     .bar-fill.bad { background: linear-gradient(90deg, rgba(255,107,130,.85), rgba(255,189,99,.85)); }
-    .bar-fill.warn { background: linear-gradient(90deg, rgba(255,189,99,.85), rgba(255,107,130,.75)); }
     .trade-range {
       margin-top: 12px;
     }
@@ -1028,7 +1109,6 @@
       grid-template-rows: auto minmax(0, 1fr);
     }
     .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .kpi-tile .value-main { font-size: 24px; font-weight: 800; line-height: 1; margin-top: 6px; }
     .gauge-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .gauge-ring {
       width: 78px;

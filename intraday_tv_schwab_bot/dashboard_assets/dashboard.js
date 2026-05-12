@@ -438,7 +438,12 @@ function sparklineSVG(values, tone) {
   }).join(' ');
   const area = `0,28 ${pts} 100,28`;
   const stroke = tone === 'tone-bad' ? '#ff6b82' : (tone === 'tone-good' ? '#6ce3a2' : '#79d4ff');
-  return `<svg viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="${stroke}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"></polyline><polygon points="${area}" fill="${stroke}" opacity="0.10"></polygon></svg>`;
+  // vector-effect="non-scaling-stroke" keeps the line at 2.4 CSS px regardless of
+  // how the viewBox stretches to fit the container. Without it, a 52px tall
+  // watchlist sparkline and a 110px tall KPI sparkline would render at totally
+  // different visual stroke widths (because preserveAspectRatio="none" stretches
+  // strokes along with the coordinate system).
+  return `<svg viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="${stroke}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"></polyline><polygon points="${area}" fill="${stroke}" opacity="0.10"></polygon></svg>`;
 }
 
 function warmupTone(warmup) {
@@ -1637,7 +1642,37 @@ function renderKpiAndGauges(data) {
   document.getElementById('kpi-realized').innerHTML = `<span class="${pnlClass(perf.realized_pnl)}">${fmtMoney(perf.realized_pnl)}</span>`;
   document.getElementById('kpi-unrealized').innerHTML = `<span class="${pnlClass(perf.unrealized_pnl)}">${fmtMoney(perf.unrealized_pnl)}</span>`;
   document.getElementById('kpi-drawdown').textContent = fmtMoney(perf.drawdown);
+  const winrateEl = document.getElementById('kpi-winrate');
+  if (winrateEl) winrateEl.textContent = perf.win_rate == null ? '—' : fmtPctFromRatio(perf.win_rate);
   document.getElementById('kpi-meta').textContent = `Day PnL ${fmtMoney(dayPnl)} · cash ${fmtMoney(perf.cash)}`;
+
+  // Day change pill: percent change from starting equity, color-coded.
+  const chgEl = document.getElementById('kpi-day-chg');
+  const chgText = document.getElementById('kpi-day-chg-text');
+  if (chgEl && chgText) {
+    const dayPct = starting > 0 ? (dayPnl / starting) * 100 : 0;
+    const tone = dayPnl > 0 ? 'good' : (dayPnl < 0 ? 'bad' : 'neutral');
+    const arrow = dayPnl > 0 ? '▲' : (dayPnl < 0 ? '▼' : '—');
+    chgEl.className = `kpi-hero-chg ${tone}`;
+    chgEl.querySelector('.arrow').textContent = arrow;
+    chgText.textContent = starting > 0 ? `${fmtPct(dayPct, 2)} today` : '— today';
+  }
+
+  const kpiSpark = document.getElementById('kpi-spark');
+  if (kpiSpark) {
+    const equityValues = (Array.isArray(perf.equity_curve) ? perf.equity_curve : [])
+      .map(point => numOrNull(point?.equity))
+      .filter(v => v !== null);
+    if (equityValues.length < 2) {
+      // Bot just started or no equity points yet — let :empty CSS rule collapse the strip.
+      kpiSpark.innerHTML = '';
+    } else {
+      const first = equityValues[0];
+      const last = equityValues[equityValues.length - 1];
+      const tone = last > first ? 'tone-good' : (last < first ? 'tone-bad' : 'tone-neutral');
+      kpiSpark.innerHTML = sparklineSVG(equityValues, tone);
+    }
+  }
 
   const exposureRing = document.getElementById('gauge-exposure-ring');
   const winRing = document.getElementById('gauge-win-ring');
@@ -1645,9 +1680,6 @@ function renderKpiAndGauges(data) {
   exposureRing.style.setProperty('--pct', `${exposurePct}%`);
   winRing.style.setProperty('--pct', `${riskPct}%`);
   ddRing.style.setProperty('--pct', `${ddPct}%`);
-  document.getElementById('gauge-exposure-fill').style.width = `${exposurePct}%`;
-  document.getElementById('gauge-win-fill').style.width = `${riskPct}%`;
-  document.getElementById('gauge-dd-fill').style.width = `${ddPct}%`;
   document.getElementById('gauge-exposure-text').textContent = fmtPctSmart(exposurePct);
   document.getElementById('gauge-win-text').textContent = fmtPctSmart(riskPct);
   document.getElementById('gauge-dd-text').textContent = fmtPctSmart(ddPct);
