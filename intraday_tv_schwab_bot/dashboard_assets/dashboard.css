@@ -749,10 +749,10 @@
     .mini-panel,
     .gauge-card { padding: 14px; }
     .gauge-card {
-      min-height: 130px;
+      min-height: 150px;
       display: grid;
-      grid-template-rows: auto 1fr;
-      gap: 10px;
+      grid-template-rows: auto 1fr auto;
+      gap: 8px;
       align-items: stretch;
     }
     .gauge-card > .tiny-label {
@@ -760,8 +760,21 @@
       margin: 0;
     }
     .gauge-card > .gauge-ring {
-      align-self: center;
+      align-self: end;
       justify-self: center;
+    }
+    .gauge-value {
+      align-self: end;
+      text-align: center;
+      padding: 3px 10px;
+      border-radius: 999px;
+      background: rgba(var(--tint-rgb), 0.05);
+      border: 1px solid rgba(var(--tint-rgb), 0.08);
+      color: var(--soft);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: .1em;
+      line-height: 1.4;
     }
     .detail-card .value-big { font-size: 34px; font-weight: 800; line-height: 1; }
     .detail-card .subline { color: var(--muted); font-size: 12px; margin-top: 6px; }

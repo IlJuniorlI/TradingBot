@@ -1683,6 +1683,18 @@ function renderKpiAndGauges(data) {
   document.getElementById('gauge-exposure-text').textContent = fmtPctSmart(exposurePct);
   document.getElementById('gauge-win-text').textContent = fmtPctSmart(riskPct);
   document.getElementById('gauge-dd-text').textContent = fmtPctSmart(ddPct);
+
+  // Dollar values shown under each gauge ring. Tight currency format
+  // (no decimals) so they fit in the narrow gauge-card column.
+  const fmtGauge = (v) => {
+    const n = numOrNull(v);
+    if (n === null) return '—';
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n);
+  };
+  const ddDollars = numOrNull(perf.max_drawdown) || numOrNull(perf.drawdown) || 0;
+  document.getElementById('gauge-exposure-value').textContent = fmtGauge(grossExposure);
+  document.getElementById('gauge-win-value').textContent = fmtGauge(grossMaxRisk);
+  document.getElementById('gauge-dd-value').textContent = fmtGauge(ddDollars);
 }
 
 function renderPositions(data) {

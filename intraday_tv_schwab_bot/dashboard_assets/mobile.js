@@ -255,6 +255,20 @@
     if (exposureText) exposureText.textContent = fmtPctSmart(exposurePct);
     if (winText) winText.textContent = fmtPctSmart(riskPct);
     if (ddText) ddText.textContent = fmtPctSmart(ddPct);
+
+    // Dollar values shown under each gauge ring. Tight currency format
+    // (no decimals) so they fit in the narrow gauge-card column.
+    const fmtGauge = (v) => {
+      const n = numOrNull(v);
+      if (n === null) return '—';
+      return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n);
+    };
+    const expValue = document.getElementById('gauge-exposure-value');
+    const winValue = document.getElementById('gauge-win-value');
+    const ddValueEl = document.getElementById('gauge-dd-value');
+    if (expValue) expValue.textContent = fmtGauge(grossExposure);
+    if (winValue) winValue.textContent = fmtGauge(grossMaxRisk);
+    if (ddValueEl) ddValueEl.textContent = fmtGauge(ddValue);
   }
 
   function positionRangeMarkup(pos) {
