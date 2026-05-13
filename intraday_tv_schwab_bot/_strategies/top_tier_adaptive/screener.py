@@ -2,15 +2,27 @@
 """Screener for the top_tier_adaptive strategy.
 
 The tradable universe is a fixed list of mega-cap liquid stocks (configured
-in params.tradable) so the screener just fetches their RTH quotes and ranks
-them by |change| × volume.
+in params.tradable) so the screener just fetches their RTH quotes and ships
+both ``change`` (prior-close %, dashboard "Day %" display) and
+``change_from_open`` (today-open %, decision metric).
 
-Bypasses the TradingViewScreenerClient._CANONICAL_SCREEN_FIELDS mapping that
-session-routes `close`/`change_from_open`/`volume` to `premarket_*` or
-`postmarket_*` variants during 04:00-09:30 and 16:00-20:00. Mega-cap
-pre/postmarket prints aren't useful signal for this strategy — sticking
-with the regular-session `change` / `volume` / `close` keeps the ranking
-stable across all sessions.
+Two distinct metrics carried alongside each other:
+
+  * ``change`` (prior-close-relative) — TradingView's "Change %". What
+    Yahoo / TradingView / most brokers show by default. Used for the
+    dashboard candidate card's "Day %" display fallback when the live
+    Schwab quote ``percent_change`` is unavailable.
+  * ``change_from_open`` (today-open-relative) — pure intraday move from
+    the session open. The right metric for an intraday strategy's
+    directional bias + activity ranking, because the strategy can only
+    trade the intraday move (the overnight gap already happened).
+    Drives ``directional_bias_fn`` + ``activity_score_fn`` here.
+
+The bias from ``change_from_open`` matches the live ``day_strength``
+computation the strategy does itself via ``_compute_live_directional_bias``
+in ``strategy.py`` — that method is the authoritative bias for entry
+decisions; the screener-emitted bias is what the gatekeeper consults for
+cooldown lookups before the strategy runs.
 """
 from ..shared import Candidate, Side
 from ..screener_base import BaseStrategyScreener
@@ -25,36 +37,33 @@ class TopTierAdaptiveScreener(BaseStrategyScreener):
         if not tradable:
             return []
         c = self._column
-        # Raw field names (no _select_fields canonical mapping) so the
-        # query never substitutes premarket_*/postmarket_* variants.
+        bias_threshold = float(params.get("directional_bias_min_day_strength", 0.20))
+        # Raw field names (no _select_fields canonical mapping). Both
+        # ``change`` and ``change_from_open`` are pulled so display +
+        # decision metrics stay separated. Top_tier's screener_windows
+        # is RTH-only ([09:30, 15:00]) so the canonical pre/post-market
+        # variants for ``change_from_open`` aren't a real concern, but
+        # bypassing keeps the values stable if a cached candidate
+        # survives a session transition.
         query = (
             self._base_query()
-            .select("name", "close", "volume", "change", "market_cap_basic")
+            .select("name", "close", "volume", "change", "change_from_open", "market_cap_basic")
             .where(
                 *self._common_equity_conditions(),
                 c("name").isin(tradable),
             )
         )
         rows = self._execute(query)
-        # Alias `change` to `change_from_open` in the candidate row metadata so
-        # downstream consumers (dashboard candidate cards, watchlist tiles,
-        # selected-symbol meta, dashboard_cache, entry_gatekeeper) that read
-        # `change_from_open` keep working. The value is % from prior close
-        # (what TradingView/Yahoo show as "Change %"), not the strict
-        # "% from today's open" the field name implies — but the dashboard
-        # labels it generically as "Day %" so the display remains accurate.
-        if "change" in rows.columns:
-            rows["change_from_open"] = rows["change"]
         return self._candidate_rows(
             rows,
             strategy=self.strategy_name,
             directional_bias_fn=lambda row: (
                 Side.LONG
-                if float(row.get("change", 0.0) or 0.0) > 0.20
-                else (Side.SHORT if float(row.get("change", 0.0) or 0.0) < -0.20 else None)
+                if float(row.get("change_from_open", 0.0) or 0.0) > bias_threshold
+                else (Side.SHORT if float(row.get("change_from_open", 0.0) or 0.0) < -bias_threshold else None)
             ),
             activity_score_fn=lambda row: (
-                abs(float(row.get("change", 0.0) or 0.0))
+                abs(float(row.get("change_from_open", 0.0) or 0.0))
                 * max(0.5, float(row.get("volume", 0.0) or 0.0) / 1_000_000.0)
             ),
         )

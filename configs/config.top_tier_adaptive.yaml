@@ -644,6 +644,31 @@ strategies:
       momentum_close_target_rr: 2.0
       disable_momentum_close_regime: false
 
+      # ===== Per-regime opt-out knobs (added 2026-05-12) =====
+      # Set any of these to true to globally disable that regime across all
+      # time windows. Useful for narrowing the strategy to a subset (e.g.
+      # trend+pullback only). The afternoon range-regime sub-knob
+      # ``afternoon_include_range`` still works for window-specific exclusion.
+      disable_trend_regime: false
+      disable_pullback_regime: false
+      disable_range_regime: false
+
+      # Whole-window opt-out for the 09:35 -> orb_end_time ORB window. When
+      # true, no entries at all during the ORB window — the strategy starts
+      # taking entries at orb_end_time instead. Distinct from the
+      # ``orb_bypass_*`` family (which loosen filters DURING the ORB window).
+      # Use this on tapes where the opening 30 min are too whippy.
+      disable_orb_window: false
+
+      # Live directional bias threshold (added 2026-05-12). Day_strength is
+      # computed LIVE from session_open + current close in the strategy
+      # (NOT from the screener's stale `change_from_open`). The bias drives
+      # Fix A's side selection (LONG-only / SHORT-only / both) — a value of
+      # 0.20 means day_strength must exceed ±0.20% before locking to a side.
+      # The screener also uses this same threshold for its own bias_fn so
+      # gatekeeper cooldown lookups stay aligned with strategy decisions.
+      directional_bias_min_day_strength: 0.20
+
       # Sector concentration guard — at most 2 same-direction positions per
       # GICS sector. Prevents 3 correlated longs dying together on one headline.
       sector_groups:

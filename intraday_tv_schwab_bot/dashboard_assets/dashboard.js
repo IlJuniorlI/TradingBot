@@ -1386,7 +1386,13 @@ function renderWatchlist() {
     const bars = item.bars || [];
     const values = bars.map(bar => numOrNull(bar.close)).filter(v => v !== null);
     const last = q.last ?? (values.length ? values[values.length - 1] : null);
-    const change = numOrNull(q.percent_change) ?? numOrNull(item?.candidate?.change_from_open);
+    // "Day %" display priority: live Schwab percent_change (prior-close) →
+    // screener `change` (prior-close, emitted by top_tier_adaptive) →
+    // screener `change_from_open` (session-relative, for strategies that
+    // don't emit `change`). Preserves prior-close semantic in the fallback
+    // when both are available; falls through to session-relative as last
+    // resort for strategies that only ship change_from_open.
+    const change = numOrNull(q.percent_change) ?? numOrNull(item?.candidate?.change) ?? numOrNull(item?.candidate?.change_from_open);
     const warmup = item?.warmup || null;
     const lowerBase = item.description || `${safe(item?.candidate?.directional_bias || item?.position?.side || item?.support_resistance?.state || 'watchlist')}`;
     const lower = warmup && !warmup.ready ? `${lowerBase} · ${warmupLabel(warmup)}` : lowerBase;
@@ -1446,7 +1452,7 @@ function renderCandidates() {
     // card (which already follow this pattern). Screener data still drives
     // the activity_score / directional_bias / universe filtering above —
     // only the cosmetic Day%/Price/Volume readouts go live-first.
-    const liveChange = numOrNull(snap?.quote?.percent_change) ?? numOrNull(row.change_from_open);
+    const liveChange = numOrNull(snap?.quote?.percent_change) ?? numOrNull(row.change) ?? numOrNull(row.change_from_open);
     const liveVolume = numOrNull(snap?.quote?.total_volume) ?? numOrNull(row.volume);
     const liveLast   = numOrNull(snap?.quote?.last) ?? numOrNull(row.close);
     const bottomMeta = `Vol ${fmtCompact(liveVolume)}`;
@@ -1677,7 +1683,7 @@ function renderSelectedSymbol() {
   const selectedNetChange = numOrNull(q.net_change) ?? ((selectedLast !== null && selectedClose !== null) ? (selectedLast - selectedClose) : null);
   document.getElementById('selected-price').className = `tiny-chip ${pnlTone(selectedNetChange)}`;
   document.getElementById('selected-price').textContent = `Last ${fmtNum(selectedLast, 2)}`;
-  const selectedChange = numOrNull(q.percent_change) ?? numOrNull(cand.change_from_open);
+  const selectedChange = numOrNull(q.percent_change) ?? numOrNull(cand.change) ?? numOrNull(cand.change_from_open);
   document.getElementById('selected-change').className = `tiny-chip ${pnlClass(selectedChange) === 'good' ? 'tone-good' : (pnlClass(selectedChange) === 'bad' ? 'tone-bad' : 'tone-neutral')}`;
   document.getElementById('selected-change').textContent = `Change ${fmtPct(selectedChange)}`;
   // Spread pill stays visible across renders to match the sibling pills
@@ -2274,8 +2280,16 @@ function drawSelectedChart(snapshot) {
       if (v !== null) horizontalLines.push({ value: v, label: item.label, shortLabel: item.shortLabel, color: item.color, dash: [3, 6], labelMode: 'inline' });
     });
   }
+  // Channels and trendlines are computed against the LTF frame in
+  // dashboard_cache.py (build_technical_levels_context fed by tech_frame
+  // at _active_ltf_minutes). The line.slope/intercept were fit against
+  // LTF abs_index values. On the HTF chart the bars carry HTF abs_index
+  // values, so lineValueAt(line, bars[i].abs_index) projects to garbage
+  // prices — the line ends up "in empty space" detached from the bars.
+  // Gate the rendering to LTF-only (mirrors the divergence-lines
+  // isLtfChart/isHtfChart gating at lines 2144-2145).
   const diagonalLines = [];
-  if (show('show_channel', false) && technicals.channel && technicals.channel.valid) {
+  if (isLtfChart && show('show_channel', false) && technicals.channel && technicals.channel.valid) {
     const lowerLine = technicals.channel.lower_line || null;
     const midLine = technicals.channel.mid_line || null;
     const upperLine = technicals.channel.upper_line || null;
@@ -2283,7 +2297,7 @@ function drawSelectedChart(snapshot) {
     if (midLine) diagonalLines.push({ line: midLine, label: 'Channel Mid', color: 'rgba(74, 155, 255, 0.82)', dash: [5, 6], width: 1.2, useChannelRange: true });
     if (upperLine) diagonalLines.push({ line: upperLine, label: 'Channel High', color: '#4a9bff', dash: [], width: 1.7, useChannelRange: true });
   }
-  if (show('show_trendlines', false)) {
+  if (isLtfChart && show('show_trendlines', false)) {
     const supportLine = technicals.support_trendline || null;
     const resistanceLine = technicals.resistance_trendline || null;
     if (supportLine) diagonalLines.push({ line: supportLine, label: 'Support TL', color: '#69c779', dash: [10, 4, 2, 4] });
@@ -3037,7 +3051,11 @@ function drawSelectedChart(snapshot) {
       drawShadedBand(bbUpperValues, bbLowerValues, 'rgba(184, 109, 255, 0.08)');
     }
 
-    if (show('show_channel', false) && technicals.channel && technicals.channel.valid) {
+    // Channel shaded band — LTF-only for the same reason the diagonal
+    // channel lines are LTF-only (see comment above diagonalLines):
+    // line.slope/intercept were fit against LTF abs_index, so projecting
+    // against HTF bars yields detached/floating render values.
+    if (isLtfChart && show('show_channel', false) && technicals.channel && technicals.channel.valid) {
       if (channelUpperLine && channelLowerLine) {
         drawShadedBand(channelUpperValues, channelLowerValues, 'rgba(74, 155, 255, 0.07)');
       }
@@ -3725,7 +3743,7 @@ function buildEvents(data, snapshot) {
         tone: (() => { const bias = String(snapshot.candidate.directional_bias || '').toUpperCase(); return bias === 'SHORT' ? 'tone-bad' : (bias === 'LONG' ? 'tone-good' : 'tone-neutral'); })(),
         title: `${snapshot.symbol} candidate rank #${safe(snapshot.candidate.rank)}`,
         time: safe(data?.last_update).replace('T', ' ').slice(0, 16),
-        text: `Activity ${fmtNum(snapshot.candidate.activity_score, 2)} · day ${fmtPct(snapshot.quote?.percent_change ?? snapshot.candidate.change_from_open)} · volume ${fmtCompact(snapshot.quote?.total_volume ?? snapshot.candidate.volume)}.`
+        text: `Activity ${fmtNum(snapshot.candidate.activity_score, 2)} · day ${fmtPct(snapshot.quote?.percent_change ?? snapshot.candidate.change ?? snapshot.candidate.change_from_open)} · volume ${fmtCompact(snapshot.quote?.total_volume ?? snapshot.candidate.volume)}.`
       });
     }
     if (sr.structure_event && sr.structure_event !== '—') {

@@ -33,10 +33,12 @@ class TopTierAdaptiveStrategy(BaseStrategy):
 
     def __init__(self, config):
         super().__init__(config)
-        # Per-symbol rolling window of recent candidate_directional_bias
-        # observations. Trailing-bias memory for Fix A (2026-04-23): when
-        # the current bar's bias is None, infer the effective side from
-        # recent observations if one side dominates.
+        # Per-symbol rolling window of recent LIVE directional bias
+        # observations (output of ``_compute_live_directional_bias``).
+        # Trailing-bias memory for Fix A (2026-04-23): when the current
+        # bar's live bias is None (day_strength within the neutral band),
+        # infer the effective side from recent observations if one side
+        # dominates.
         self._recent_directional_bias: dict[str, deque[Side | None]] = {}
 
     # ------------------------------------------------------------------
@@ -372,6 +374,42 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         return score
 
     # ------------------------------------------------------------------
+    # Live directional bias
+    # ------------------------------------------------------------------
+    def _compute_live_directional_bias(self, frame: pd.DataFrame, close: float) -> Side | None:
+        """Compute the candidate's directional bias from LIVE intraday data:
+        ``day_strength = (close - session_open) / session_open * 100``.
+
+        Used by Fix A to decide which side(s) to evaluate. Returns
+        ``Side.LONG`` when day_strength > +threshold, ``Side.SHORT`` when
+        day_strength < -threshold, else ``None`` (no bias, both sides
+        evaluated).
+
+        The threshold matches the screener's ``directional_bias_min_day_strength``
+        param (default 0.20%). Computed live rather than read from the
+        screener's pre-computed ``c.directional_bias`` because:
+
+          * Screener cache is up to ~60 s stale; live close is current
+          * Session open from the LTF frame is authoritative (no risk
+            of pre/post-market session-field substitution)
+          * Same semantic as ``_score_momentum_close``'s day_strength,
+            keeping the strategy's bias logic self-consistent
+        """
+        session_open = _session_open_price(frame)
+        if session_open is None or session_open <= 0:
+            return None
+        try:
+            day_strength = (float(close) - session_open) / session_open * 100.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+        threshold = float(self.params.get("directional_bias_min_day_strength", 0.20))
+        if day_strength > threshold:
+            return Side.LONG
+        if day_strength < -threshold:
+            return Side.SHORT
+        return None
+
+    # ------------------------------------------------------------------
     # Time-of-day gating
     # ------------------------------------------------------------------
     @staticmethod
@@ -381,52 +419,88 @@ class TopTierAdaptiveStrategy(BaseStrategy):
     def _allowed_regimes(self, now_t) -> set[str]:
         """Return which regimes are allowed at the current time.
 
-        Two extra regimes added 2026-05-12:
+        Window cutoffs are param-driven (orb_end_time, midday_start_time,
+        midday_end_time, afternoon_start_time, no_new_entries_after) — no
+        hard-coded times.
+
+        Five regimes:
+          - trend / pullback / range: primary scoring regimes
           - vol_squeeze: Bollinger-squeeze breakout. Allowed in the primary
-            window (orb_end → midday_start) and the afternoon (13:00 → no_new),
-            i.e. anywhere there's enough RTH data for a meaningful box.
+            window (orb_end → midday_start) and the afternoon
+            (afternoon_start → no_new).
           - momentum_close: ride-the-bell continuation. Restricted to the
-            afternoon window (13:00 → no_new) only — explicit per-user
-            request; pre-1pm momentum is already covered by trend/pullback.
-        Both regimes are gated by their own min_*_score thresholds and
-        compete with trend/pullback/range via the standard score-gap rule.
-        Toggle off via params.disable_vol_squeeze_regime /
-        disable_momentum_close_regime.
+            afternoon window (afternoon_start → no_new) only — explicit
+            per-user request; pre-afternoon momentum is already covered by
+            trend/pullback.
+
+        Each regime has its own opt-out knob via params:
+          disable_trend_regime / disable_pullback_regime /
+          disable_range_regime / disable_vol_squeeze_regime /
+          disable_momentum_close_regime.
+
+        The 09:35 → orb_end_time window has a separate whole-window
+        opt-out (``disable_orb_window``) that skips the ORB window entirely
+        — different from ``orb_bypass_*`` flags (which loosen filters
+        within the ORB window). Use this when the opening 30 minutes
+        are too whippy and you'd rather start trading at ``orb_end_time``.
+
+        Score thresholds (min_*_score) gate each regime independently and
+        the score-gap auction picks the winner.
         """
         orb_end = self.params.get("orb_end_time", "10:05")
         midday_start = self.params.get("midday_start_time", "11:30")
         midday_end = self.params.get("midday_end_time", "13:00")
         afternoon_start = self.params.get("afternoon_start_time", "13:00")
         no_new = self.params.get("no_new_entries_after", "15:00")
+        orb_window_enabled = not bool(self.params.get("disable_orb_window", False))
+        trend_enabled = not bool(self.params.get("disable_trend_regime", False))
+        pullback_enabled = not bool(self.params.get("disable_pullback_regime", False))
+        range_enabled = not bool(self.params.get("disable_range_regime", False))
         vol_squeeze_enabled = not bool(self.params.get("disable_vol_squeeze_regime", False))
         momentum_close_enabled = not bool(self.params.get("disable_momentum_close_regime", False))
+
+        def _filter(regimes: set[str]) -> set[str]:
+            """Strip regimes whose disable knob is set."""
+            if not trend_enabled:
+                regimes.discard("trend")
+            if not pullback_enabled:
+                regimes.discard("pullback")
+            if not range_enabled:
+                regimes.discard("range")
+            if not vol_squeeze_enabled:
+                regimes.discard("vol_squeeze")
+            if not momentum_close_enabled:
+                regimes.discard("momentum_close")
+            return regimes
 
         if now_t > parse_hhmm(no_new):
             return set()
         if self._time_in_range(now_t, "09:35", orb_end):
-            return {"trend"}  # ORB window: trend only
+            # Whole-window opt-out: when disable_orb_window is true, the
+            # 09:35 → orb_end window is treated as a no-entry zone. Useful
+            # for tapes where the opening 30 minutes are too whippy to
+            # trade reliably; the bot then starts taking entries at
+            # orb_end_time instead. The orb_bypass_* flags loosen filters
+            # within the ORB window; this flag skips the window entirely.
+            if not orb_window_enabled:
+                return set()
+            return _filter({"trend"})  # ORB window: trend only
         if self._time_in_range(now_t, orb_end, midday_start):
-            regimes = {"trend", "pullback", "range"}
-            if vol_squeeze_enabled:
-                regimes.add("vol_squeeze")
-            return regimes
+            return _filter({"trend", "pullback", "range", "vol_squeeze"})
         if self._time_in_range(now_t, midday_start, midday_end):
-            return {"pullback"}  # Midday: pullbacks only
+            return _filter({"pullback"})  # Midday: pullbacks only
         if self._time_in_range(now_t, afternoon_start, no_new):
-            # Range regime is now included in afternoon by default because
+            # Range regime is included in afternoon by default because
             # afternoon tapes are often range-bound and forcing trend/pullback
             # entries there produces late-in-move longs. Range regime handles
             # mean-reversion at the extremes. Disable via
-            # ``afternoon_include_range: false`` in params.
+            # ``afternoon_include_range: false`` in params (or globally via
+            # ``disable_range_regime: true``).
             if bool(self.params.get("afternoon_include_range", True)):
-                regimes = {"trend", "pullback", "range"}
+                regimes = {"trend", "pullback", "range", "vol_squeeze", "momentum_close"}
             else:
-                regimes = {"trend", "pullback"}
-            if vol_squeeze_enabled:
-                regimes.add("vol_squeeze")
-            if momentum_close_enabled:
-                regimes.add("momentum_close")
-            return regimes
+                regimes = {"trend", "pullback", "vol_squeeze", "momentum_close"}
+            return _filter(regimes)
         return set()
 
     # ------------------------------------------------------------------
@@ -619,18 +693,16 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         return self._finalize_signal(c, side, close, stop, target, "vol_squeeze", regime_score, frame, data)
 
     def _build_momentum_close_signal(self, c: Candidate, side: Side, close: float, atr: float,
-                                     ltf: pd.DataFrame, frame: pd.DataFrame,
+                                     frame: pd.DataFrame,
                                      regime_score: float, data=None) -> Signal | None:
         """Build a momentum-into-close continuation signal. Stops anchor below
         recent swing low (LONG) / above recent swing high (SHORT) with an
         ATR-cushioned buffer so single-bar wicks during the afternoon's lower
         volume don't trigger the stop. Target uses momentum_close_target_rr.
 
-        Uses the 1m ``frame`` (NOT the resampled ``ltf``) for the N-bar
-        breakout check so it stays consistent with ``_score_momentum_close``
-        and with the source momentum_close strategy. The ``ltf`` parameter
-        is kept on the signature for symmetry with the other builders but
-        is unused here.
+        Uses the 1m ``frame`` for the N-bar breakout check so it stays
+        consistent with ``_score_momentum_close`` and with the source
+        momentum_close strategy.
         """
         lookback = max(3, int(self.params.get("momentum_close_breakout_lookback_bars", 6)))
         session_frame = frame[_same_day_mask(frame, now_et().date())]
@@ -1208,25 +1280,37 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             ret15 = _safe_float(last.get("ret15"), 0.0)
             atr = max(_safe_float(last.get("atr14"), close * 0.0015), close * 0.0005, 0.01)
 
-            # Determine preferred side from candidate bias.
+            # Determine preferred side from LIVE directional bias.
             # Fix A: when respect_screener_bias is enabled (default), a
             # directional-biased candidate is evaluated on that side ONLY — no
             # fallthrough to the opposite side. Previously the strategy would
             # evaluate [SHORT, LONG] for a SHORT-tagged candidate and if SHORT
             # scoring failed on a short-term bounce, fall through and take LONG.
             # That pattern produced the 2026-04-20 META/INTC/TSLA losses: all
-            # three had change_from_open deeply negative (screener tagged SHORT)
-            # but the strategy took LONG via fallthrough.
+            # three had day_strength deeply negative but the strategy took
+            # LONG via fallthrough.
+            #
+            # The bias is now computed LIVE from session_open + current close
+            # (``_compute_live_directional_bias``) rather than from the
+            # screener's pre-computed ``c.directional_bias`` field. The
+            # screener's value is up to 60 s stale and used to be derived
+            # from ``change`` (prior-close-relative); it now matches the
+            # live value semantically but the live computation is always
+            # the source of truth for entry decisions. The screener's bias
+            # still drives the gatekeeper's per-side cooldown lookup before
+            # entry_signals runs.
             #
             # ORB-window bypass: during the first 30 min (09:35-orb_end),
-            # change_from_open is dominated by the opening gap — a gap-down
-            # day that reverses (TSLA 2026-04-15 $367→$362→$394) correctly
-            # belongs to the LONG side, but change_from_open still reads
-            # negative and the screener tags SHORT. Fallthrough was the old
-            # escape hatch for this pattern; the bypass preserves it during
-            # ORB while Fix A still applies post-ORB.
+            # day_strength is dominated by the opening gap and chop — a
+            # gap-down day that reverses (TSLA 2026-04-15 $367→$362→$394)
+            # correctly belongs to the LONG side, but day_strength still
+            # reads negative early on. Fallthrough was the old escape hatch
+            # for this pattern; the bypass preserves it during ORB while
+            # Fix A still applies post-ORB.
             orb_screener_bypass = bool(self.params.get("orb_bypass_screener_bias", True)) and in_orb_window
             respect_screener_bias = bool(self.params.get("respect_screener_bias", True)) and not orb_screener_bypass
+
+            live_bias = self._compute_live_directional_bias(frame, close)
 
             # Trailing-bias memory for Fix A. A momentary "neutral" bias on
             # a symbol that's been consistently SHORT (or LONG) for many
@@ -1238,7 +1322,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             trailing_enabled = bool(self.params.get("trailing_bias_enabled", True))
             trailing_lookback = max(3, int(self.params.get("trailing_bias_lookback", 10)))
             trailing_threshold = float(self.params.get("trailing_bias_majority_threshold", 0.7))
-            effective_bias = c.directional_bias
+            effective_bias = live_bias
             if effective_bias is None and trailing_enabled and respect_screener_bias:
                 recent = list(self._recent_directional_bias.get(c.symbol, ()))
                 long_count = sum(1 for b in recent if b == Side.LONG)
@@ -1250,13 +1334,15 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                         effective_bias = Side.SHORT
                     elif long_count / total_directional >= trailing_threshold:
                         effective_bias = Side.LONG
-            # Record the raw (not inferred) bias for future cycles.
+            # Record the raw live bias (not the trailing-inferred fallback)
+            # so the trailing memory reflects what the LIVE day_strength
+            # has actually been doing across recent cycles.
             hist = self._recent_directional_bias.get(c.symbol)
             if hist is None or hist.maxlen != trailing_lookback:
                 existing = list(hist) if hist is not None else []
                 hist = deque(existing[-trailing_lookback:], maxlen=trailing_lookback)
                 self._recent_directional_bias[c.symbol] = hist
-            hist.append(c.directional_bias)
+            hist.append(live_bias)
 
             if effective_bias == Side.LONG:
                 if respect_screener_bias:
@@ -1269,9 +1355,9 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     continue
                 preferred_sides = [Side.SHORT] if respect_screener_bias else [Side.SHORT, Side.LONG]
             else:
-                # Neutral bias (change_from_open in [-0.20%, +0.20%]) with
-                # no strong trailing lean: evaluate both sides — screener
-                # hasn't picked a side and recent history is too mixed.
+                # Neutral bias (live day_strength within
+                # ±directional_bias_min_day_strength) with no strong
+                # trailing lean: evaluate both sides.
                 preferred_sides = [Side.LONG, Side.SHORT] if allow_short else [Side.LONG]
 
             best_signal: Signal | None = None
@@ -1397,7 +1483,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 elif selected == "vol_squeeze":
                     sig = self._build_vol_squeeze_signal(c, side, close, atr, frame, regime_score_val, data)
                 elif selected == "momentum_close":
-                    sig = self._build_momentum_close_signal(c, side, close, atr, ltf, frame, regime_score_val, data)
+                    sig = self._build_momentum_close_signal(c, side, close, atr, frame, regime_score_val, data)
 
                 if sig is not None:
                     best_signal = sig

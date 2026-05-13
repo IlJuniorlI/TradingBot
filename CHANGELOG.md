@@ -7,7 +7,77 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **top_tier_adaptive: directional bias is now computed LIVE in the
+  strategy.** *2026-05-12*
+  - `_compute_live_directional_bias(frame, close)` reads
+    `session_open` from the LTF frame and computes
+    `day_strength = (close − session_open) / session_open * 100`.
+    Returns `Side.LONG` / `Side.SHORT` / `None` based on a configurable
+    threshold (`directional_bias_min_day_strength`, default `0.20%`).
+  - Replaces the previous Fix A flow that read the screener's
+    pre-computed `c.directional_bias`. The screener value was up to
+    ~60s stale and (before this change) was derived from `change`
+    (prior-close-relative), which mis-tagged gap-fade days — a stock
+    that gapped +2% and faded to flat would read LONG by `change`
+    but is actually neutral / SHORT-intent intraday.
+  - Trailing-bias memory now records the live bias (not the screener
+    bias) so the inferred-bias fallback reflects what live day_strength
+    has been doing across recent cycles.
+  - The screener (`top_tier_adaptive/screener.py`) now queries BOTH
+    `change` and `change_from_open` from TradingView. The
+    `directional_bias_fn` and `activity_score_fn` use
+    `change_from_open` (matching the strategy's intraday semantic) so
+    the gatekeeper's per-side cooldown lookup stays aligned with what
+    the strategy will actually evaluate. The previous compat alias
+    `rows["change_from_open"] = rows["change"]` (a clean-break
+    violation flagged in the prior review) is removed.
+  - Dashboard candidate "Day %" continues to display the live Schwab
+    `quote.percent_change` (prior-close-relative); the screener
+    fallback path is rarely hit during RTH live trading.
+
 ### Added
+
+- **top_tier_adaptive: two new regimes (vol_squeeze, momentum_close).** *2026-05-12*
+  - **`vol_squeeze`**: Bollinger-squeeze breakout regime. Detects an
+    N-bar compression box via `vol_squeeze_lookback_bars` (default 12)
+    where `bb_width_pct` and box range are both below configurable
+    ceilings, then scores breakout magnitude, confirming volume ratio,
+    bar-close position within the breakout candle, and VWAP/EMA
+    alignment. Allowed in the primary window (`orb_end_time` →
+    `midday_start_time`) and the afternoon (`afternoon_start_time` →
+    `no_new_entries_after`).
+  - **`momentum_close`**: ride-the-bell continuation regime. Computes
+    `day_strength` LIVE from session open + current close (not from
+    the screener's `change_from_open`), hard-gates on
+    `momentum_close_min_day_strength` (default 1.5%), then scores
+    tier-based magnitude + N-bar breakout (1m frame) + alignment.
+    **Restricted to the afternoon window only** per user spec —
+    pre-afternoon momentum is already covered by trend/pullback.
+  - Both regimes compete with trend/pullback/range via the same
+    score-gap auction. Independent min-score thresholds
+    (`min_vol_squeeze_score: 4.0`, `min_momentum_close_score: 4.0`).
+    Independent R:R targets (`vol_squeeze_target_rr: 2.05`,
+    `momentum_close_target_rr: 2.0`).
+  - **Per-regime opt-out knobs** added for all five regimes:
+    `disable_trend_regime`, `disable_pullback_regime`,
+    `disable_range_regime`, `disable_vol_squeeze_regime`,
+    `disable_momentum_close_regime` (all default `false`). Stripping
+    any one removes it from every time window.
+  - **Whole-window ORB opt-out** added: `disable_orb_window`
+    (default `false`) skips the entire 09:35 → `orb_end_time` window.
+    Distinct from the existing `orb_bypass_*` flags which loosen
+    filters within the ORB window — this one skips it entirely. Useful
+    on tapes where the opening 30 minutes are too whippy and the bot
+    should start taking entries at `orb_end_time` instead.
+  - All time-of-day boundaries are param-driven; no hard-coded times.
+    momentum_close gating reads `afternoon_start_time` and
+    `no_new_entries_after` from params (defaults `13:00` / `15:00`).
+  - 14 new smoke tests in `tests/test_top_tier_adaptive_new_regimes.py`
+    cover regime-window allowance, all five regime disable flags, the
+    ORB-window disable flag, and score method robustness on minimal-bar
+    frames.
 
 - **LTF/HTF separation cleanup.** The previous code conflated LTF
   (lower-timeframe / trigger frame) and HTF (higher-timeframe / SR

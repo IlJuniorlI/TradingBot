@@ -30,7 +30,7 @@ See also:
 - `peer_confirmed_key_levels_1m` — faster 1-minute LTF peer-confirmed HTF key-level/zone variant tuned as a compromise between aggressive and balanced confirmation
 - `peer_confirmed_trend_continuation` — peer-confirmed trend continuation strategy that trades controlled pullbacks and re-expansion without waiting for key-level touches
 - `peer_confirmed_htf_pivots` — peer-confirmed higher-timeframe pivot S/R scalp strategy with switchable reclaim, rejection, and continuation entry families
-- `top_tier_adaptive` — multi-regime adaptive strategy for top-tier liquid stocks across Technology, Consumer Discretionary, and Communication Services with index confirmation and sector concentration guard
+- `top_tier_adaptive` — multi-regime adaptive strategy for top-tier liquid stocks across six Tier 1 GICS sectors with index confirmation and sector concentration guard; five regimes (trend, pullback, range, vol_squeeze, momentum_close) compete in a score-gap auction
 
 ### 0DTE ETF option strategies
 
@@ -1879,7 +1879,7 @@ Current package defaults:
 
 ### `top_tier_adaptive`
 
-Purpose: multi-regime adaptive strategy for a fixed universe of 15 top-tier liquid stocks across Technology (AAPL, MSFT, NVDA, INTC, AMD), Consumer Discretionary (AMZN, TSLA, HD, LOW, UBER), and Communication Services (GOOG, META, NFLX, RBLX, TMUS).
+Purpose: multi-regime adaptive strategy for a fixed universe of 23 top-tier liquid stocks across six Tier 1 GICS sectors: Technology (AAPL, MSFT, NVDA, INTC, AMD, AVGO, TSM, CRM), Consumer Discretionary (AMZN, TSLA, HD, LOW, UBER), Communication Services (GOOG, META, NFLX, RBLX, TMUS), Financials (JPM, GS, V), Healthcare (LLY), Consumer Staples (COST). Five regimes compete in a score-gap auction: trend, pullback, range, vol_squeeze, momentum_close — each independently togglable via `disable_*_regime` knobs.
 
 Default windows:
 
@@ -1891,12 +1891,14 @@ Strategy-specific knobs:
 
 - `tradable`: the fixed list of symbols to trade.
 - `index_symbols`: index ETFs for directional confirmation (default SPY, QQQ).
-- `require_index_confirmation`: gate trend/pullback entries on index agreement.
-- `min_trend_score` / `min_pullback_score` / `min_range_score`: minimum regime score to qualify.
+- `require_index_confirmation`: gate trend/pullback/vol_squeeze/momentum_close entries on index agreement.
+- `min_trend_score` / `min_pullback_score` / `min_range_score` / `min_vol_squeeze_score` / `min_momentum_close_score`: minimum regime score to qualify.
 - `min_pullback_trend_score`: minimum trend score required before pullback scoring begins.
 - `min_score_gap`: minimum gap between the winning and runner-up regime.
-- `trend_target_rr` / `pullback_target_rr` / `range_target_rr`: initial R:R targets per regime.
-- `orb_end_time` / `midday_start_time` / `midday_end_time` / `afternoon_start_time` / `no_new_entries_after`: time-of-day regime window boundaries.
+- `trend_target_rr` / `pullback_target_rr` / `range_target_rr` / `vol_squeeze_target_rr` / `momentum_close_target_rr`: initial R:R targets per regime.
+- `orb_end_time` / `midday_start_time` / `midday_end_time` / `afternoon_start_time` / `no_new_entries_after`: time-of-day regime window boundaries (all five regimes use these — no hard-coded times).
+- `disable_trend_regime` / `disable_pullback_regime` / `disable_range_regime` / `disable_vol_squeeze_regime` / `disable_momentum_close_regime`: per-regime opt-out flags (all default `false`).
+- `disable_orb_window`: whole-window opt-out for the 09:35 → `orb_end_time` ORB window (default `false`). Different from `orb_bypass_*` flags which loosen filters within the window — this skips it entirely.
 - `sector_groups`: GICS sector groupings for the concentration guard.
 - `max_same_sector_same_direction`: max same-direction positions per sector.
 
@@ -1914,7 +1916,7 @@ Current code defaults:
 
 | Option                            | Default                                                                                |
 |-----------------------------------|----------------------------------------------------------------------------------------|
-| `tradable`                        | `AAPL, MSFT, NVDA, INTC, AMD, AMZN, TSLA, HD, LOW, UBER, GOOG, META, NFLX, RBLX, TMUS` |
+| `tradable`                        | `AAPL, MSFT, NVDA, INTC, AMD, AVGO, TSM, CRM, AMZN, TSLA, HD, LOW, UBER, COST, GOOG, META, NFLX, RBLX, TMUS, JPM, GS, V, LLY` |
 | `index_symbols`                   | `SPY, QQQ`                                                                             |
 | `require_index_confirmation`      | `true`                                                                                 |
 | `min_bars`                        | `60`                                                                                   |
@@ -1925,11 +1927,21 @@ Current code defaults:
 | `min_pullback_score`              | `3.5`                                                                                  |
 | `min_pullback_trend_score`        | `3.0`                                                                                  |
 | `min_range_score`                 | `3.5`                                                                                  |
+| `min_vol_squeeze_score`           | `4.0`                                                                                  |
+| `min_momentum_close_score`        | `4.0`                                                                                  |
 | `min_score_gap`                   | `1.2`                                                                                  |
 | `min_adx14`                       | `15.0`                                                                                 |
 | `trend_target_rr`                 | `2.0`                                                                                  |
 | `pullback_target_rr`              | `2.0`                                                                                  |
 | `range_target_rr`                 | `1.5`                                                                                  |
+| `vol_squeeze_target_rr`           | `2.05`                                                                                 |
+| `momentum_close_target_rr`        | `2.0`                                                                                  |
+| `disable_orb_window`              | `false`                                                                                |
+| `disable_trend_regime`            | `false`                                                                                |
+| `disable_pullback_regime`         | `false`                                                                                |
+| `disable_range_regime`            | `false`                                                                                |
+| `disable_vol_squeeze_regime`      | `false`                                                                                |
+| `disable_momentum_close_regime`   | `false`                                                                                |
 | `stop_buffer_atr_mult`            | `0.25`                                                                                 |
 | `orb_end_time`                    | `10:05`                                                                                |
 | `midday_start_time`               | `11:30`                                                                                |

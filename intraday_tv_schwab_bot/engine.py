@@ -1042,6 +1042,14 @@ class IntradayBot:
                 "activity_score": c.activity_score,
                 "exchange": exchange or None,
                 "change_from_open": c.metadata.get("change_from_open"),
+                # ``change`` (prior-close-relative) is shipped alongside
+                # ``change_from_open`` (session-open-relative) for strategies
+                # that emit both (currently: top_tier_adaptive). Dashboard
+                # uses ``change`` for the "Day %" display fallback so the
+                # screener-fallback value matches the prior-close semantic
+                # of the live Schwab ``quote.percent_change`` primary.
+                # Strategies that don't emit ``change`` get None here.
+                "change": c.metadata.get("change"),
                 "close": c.metadata.get("close"),
                 "volume": c.metadata.get("volume"),
                 "directional_bias": c.directional_bias.value if c.directional_bias else None,
