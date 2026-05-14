@@ -2370,3 +2370,28 @@ class DashboardCache:
             if raw_symbols is None:
                 raw_symbols = params.get("symbols")
         return self._normalize_symbol_list(raw_symbols)
+
+    def index_symbols(self) -> list[str]:
+        """Index ETFs used for directional confirmation (top_tier_adaptive's
+        ``index_symbols`` + sector_index_map entries). Surfaced to the
+        dashboard payload so watchlist cards can render an "IX" tag for
+        these symbols (mirrors the "TR"/"NS" tagging for tradable /
+        non-streamable)."""
+        strategy_obj = self.strategy
+        if strategy_obj is not None:
+            try:
+                return self._normalize_symbol_list(strategy_obj.dashboard_index_symbols())
+            except Exception:
+                pass
+        params = getattr(strategy_obj, "params", {}) or {}
+        if not isinstance(params, dict):
+            return []
+        merged: set[str] = set()
+        raw_index = params.get("index_symbols")
+        if raw_index:
+            merged.update(self._normalize_symbol_list(raw_index))
+        sector_map = params.get("sector_index_map")
+        if isinstance(sector_map, dict):
+            for tickers in sector_map.values():
+                merged.update(self._normalize_symbol_list(tickers))
+        return sorted(merged)

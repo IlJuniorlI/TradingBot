@@ -7,6 +7,38 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Dashboard watchlist: "IX" chip on index-confirmation ETF cards.** *2026-05-14*
+  - New blue "IX" chip on watchlist cards for symbols that are streamed
+    purely for directional confirmation (XLK / XLC / XLY / XLE / XLB /
+    GDX / COPX / etc) rather than as tradable entry symbols. Sits
+    alongside the existing green "TR" (Tradeable) and amber "NS"
+    (Non-streamable) chips on `symbol-title-row`.
+  - Implementation:
+    - New `BaseStrategy.dashboard_index_symbols()` method that returns
+      the union of `params.index_symbols` + every ETF referenced under
+      `params.sector_index_map`. Subclasses can override.
+    - New `DashboardCache.index_symbols()` method that delegates to the
+      strategy method with a defensive param-walking fallback (mirrors
+      the existing `tradable_symbols()` pattern).
+    - `engine.py` adds `"index_symbols": dashboard_cache.index_symbols()`
+      to the `data` block of the published payload.
+    - `dashboard.js` adds `getDashboardIndexSymbols(data)` helper and
+      renders the chip in `renderWatchlist()`. The chip is suppressed
+      when the same symbol is ALSO tradable (TR wins).
+    - `dashboard.css` adds `.index-chip` rule joined with the existing
+      `.tradeable-chip` / `.ns-chip` shared sizing block. Color
+      hardcoded to sky-blue (`#6ab7ff`) rather than `var(--accent)` —
+      `--accent` is mint on nexus / amber on solstice / violet on
+      nebula and would visually collide with the green TR or amber NS
+      chips on those themes.
+  - Mobile dashboard unchanged: `mobile.js` doesn't render a per-symbol
+    watchlist (only a count in the subline), so no chip surface area
+    there.
+  - Strategies that don't use index confirmation return `[]` from
+    `dashboard_index_symbols()`, so no chips render for those configs.
+
 ### Changed
 
 - **top_tier_adaptive: materials sector now maps to [XLB, GDX, COPX].** *2026-05-14*

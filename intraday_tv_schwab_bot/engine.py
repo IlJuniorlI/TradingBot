@@ -1189,6 +1189,7 @@ class IntradayBot:
                 **self.data.dashboard_data_snapshot(),
                 "non_streamable_symbols": sorted(NON_STREAMABLE),
                 "tradable_symbols": self.dashboard_cache.tradable_symbols(),
+                "index_symbols": self.dashboard_cache.index_symbols(),
             },
             "warmup": warmup_summary,
             "api_usage": self.api_usage.snapshot(now),

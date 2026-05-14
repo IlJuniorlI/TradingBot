@@ -347,6 +347,27 @@ class BaseStrategy:
             raw_symbols = self.params.get("symbols")
         return _normalize_symbol_list(raw_symbols)
 
+    def dashboard_index_symbols(self) -> list[str]:
+        """Return the union of ETFs used for directional confirmation:
+        ``params.index_symbols`` (the flat streamed list) plus every ETF
+        referenced by ``params.sector_index_map`` (per-sector overrides).
+        Surfaced to the dashboard payload so the watchlist UI can tag
+        these cards with an "IX" chip and the user can distinguish them
+        from tradable entry symbols at a glance. Strategies that don't
+        use index confirmation (either param absent) return an empty
+        list. Subclasses can override to provide a custom source."""
+        if not isinstance(self.params, dict):
+            return []
+        symbols: set[str] = set()
+        raw_index = self.params.get("index_symbols")
+        if raw_index:
+            symbols.update(_normalize_symbol_list(raw_index))
+        sector_map = self.params.get("sector_index_map")
+        if isinstance(sector_map, dict):
+            for tickers in sector_map.values():
+                symbols.update(_normalize_symbol_list(tickers))
+        return sorted(symbols)
+
     def restore_eligible_symbols(self) -> list[str] | None:
         source = self._capability("startup_restore.eligible_symbols_source", "dashboard_tradable_symbols")
         token = str(source or "").strip().lower()

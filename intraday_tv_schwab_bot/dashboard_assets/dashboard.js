@@ -1372,6 +1372,11 @@ function getDashboardTradableSymbols(data) {
   return raw.map(sym => String(sym || '').toUpperCase()).filter(Boolean);
 }
 
+function getDashboardIndexSymbols(data) {
+  const raw = Array.isArray(data?.data?.index_symbols) ? data.data.index_symbols : [];
+  return raw.map(sym => String(sym || '').toUpperCase()).filter(Boolean);
+}
+
 function buildWatchlistRows(data) {
   const snapshotMap = buildSnapshotMap(data);
   const activeOrder = (data?.active_watchlist || []).map(sym => String(sym || '').toUpperCase()).filter(Boolean);
@@ -1393,6 +1398,7 @@ function renderWatchlist() {
   const exchangeMap = data?.symbol_exchanges || {};
   const nonStreamSet = new Set(getDashboardNonStreamableSymbols(data));
   const tradableSet = new Set(getDashboardTradableSymbols(data));
+  const indexSet = new Set(getDashboardIndexSymbols(data));
   const html = rows.length ? rows.map(item => {
     const tone = selectedSymbolTone(item);
     const q = item.quote || {};
@@ -1413,12 +1419,14 @@ function renderWatchlist() {
     const symbolKey = String(item?.symbol || '').toUpperCase();
     const isNonStreamable = nonStreamSet.has(symbolKey);
     const isTradable = tradableSet.has(symbolKey);
+    const isIndexSymbol = indexSet.has(symbolKey);
     const tradableChip = isTradable ? '<span class="tradeable-chip" title="Tradeable: configured as an eligible entry symbol for this strategy">TR</span>' : '';
     const nonStreamChip = isNonStreamable ? '<span class="ns-chip" title="Non-streamable: included in the active watchlist but not in the Schwab equity stream">NS</span>' : '';
+    const indexChip = isIndexSymbol && !isTradable ? '<span class="index-chip" title="Index ETF: used for directional confirmation via sector_index_map / index_symbols (not a tradable entry symbol)">IX</span>' : '';
     return `<div class="symbol-card ${tone} ${isActive ? 'active' : ''}" data-symbol="${escapeHtml(item.symbol)}">
       <div class="symbol-top">
         <div>
-          <div class="symbol-title-row"><div class="symbol-name">${escapeHtml(item.symbol)}</div>${tradableChip}${nonStreamChip}</div>
+          <div class="symbol-title-row"><div class="symbol-name">${escapeHtml(item.symbol)}</div>${tradableChip}${indexChip}${nonStreamChip}</div>
           <div class="symbol-sub">${escapeHtml(lower)}</div>
         </div>
         <div class="price-stack">

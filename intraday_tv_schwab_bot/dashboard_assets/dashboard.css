@@ -385,7 +385,8 @@
       min-width: 0;
     }
     .tradeable-chip,
-    .ns-chip {
+    .ns-chip,
+    .index-chip {
       display: inline-flex;
       align-items: center;
       justify-content: center;
@@ -410,6 +411,16 @@
       color: var(--warn);
       border: 1px solid rgba(255,189,99,.20);
       background: rgba(255,189,99,.10);
+    }
+    /* Index-confirmation ETFs (sector trackers like XLK/XLE/GDX). Sky-blue
+       tint is hardcoded (not ``var(--accent)``) so it stays visually
+       distinct from the green TR and amber NS chips across all themes —
+       on nexus/solstice/nebula the accent color is mint/amber/violet
+       and would collide with one of the existing chips. */
+    .index-chip {
+      color: #6ab7ff;
+      border: 1px solid rgba(106,183,255,.22);
+      background: rgba(106,183,255,.10);
     }
     .symbol-sub,
     .position-sub,
