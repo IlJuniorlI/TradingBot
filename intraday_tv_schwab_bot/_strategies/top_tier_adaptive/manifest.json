@@ -223,7 +223,7 @@
       "industrials": ["XLI"],
       "energy": ["XLE"],
       "consumer_staples": ["XLP"],
-      "materials": ["XLB"],
+      "materials": ["XLB", "GDX", "COPX"],
       "real_estate": ["XLRE"],
       "utilities": ["XLU"]
     },

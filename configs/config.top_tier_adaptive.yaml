@@ -930,7 +930,14 @@ strategies:
         industrials: [XLI]
         energy: [XLE]
         consumer_staples: [XLP]
-        materials: [XLB]
+        # 2026-05-14: materials expanded from [XLB] to include GDX and
+        # COPX. XLB is dominated by chemicals (LIN/SHW/APD/ECL ~50%) so
+        # NEM-style gold miners and FCX-style copper miners correlate
+        # weakly with it. OR semantics: a gold miner LONG confirms when
+        # GDX is bullish even if XLB is flat. Note: if this preset is
+        # used with a tradable universe containing materials symbols,
+        # add GDX and COPX to ``index_symbols`` so the bot streams them.
+        materials: [XLB, GDX, COPX]
         real_estate: [XLRE]
         utilities: [XLU]
       max_same_sector_same_direction: 2

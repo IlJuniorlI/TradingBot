@@ -317,7 +317,7 @@ Current code defaults:
 |--------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
 | `tradable`                           | `AAPL, MSFT, NVDA, INTC, AMD, AVGO, TSM, CRM, AMZN, TSLA, HD, LOW, UBER, COST, GOOG, META, NFLX, RBLX, TMUS, JPM, GS, V, LLY` |
 | `index_symbols`                      | `XLK, XLC, XLY, XLF, XLV, XLP`                                                                                                |
-| `sector_index_map`                   | All 11 GICS sectors mapped to their canonical SPDR Select Sector ETF (XLK, XLC, XLY, XLF, XLV, XLI, XLE, XLP, XLB, XLRE, XLU) |
+| `sector_index_map`                   | All 11 GICS sectors mapped to their canonical SPDR Select Sector ETF (XLK, XLC, XLY, XLF, XLV, XLI, XLE, XLP, XLRE, XLU). Materials maps to `[XLB, GDX, COPX]` (XLB is chemicals-heavy so gold/copper miners need GDX/COPX for proper alignment) |
 | `early_session_stop_widening_enabled`| `true`                                                                                                                        |
 | `early_session_stop_widening_until`  | `10:30`                                                                                                                       |
 | `early_session_stop_widening_mult`   | `1.3`                                                                                                                         |

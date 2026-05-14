@@ -9,6 +9,25 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **top_tier_adaptive: materials sector now maps to [XLB, GDX, COPX].** *2026-05-14*
+  - The `materials` entry in `sector_index_map` was previously `[XLB]`
+    only. XLB is dominated by chemicals (LIN/SHW/APD/ECL ~50% weight),
+    so the pure-miner symbols in the default tradable universe — NEM
+    (gold miner) and FCX (copper miner) — correlate weakly with XLB
+    and would get false `pullback_index_not_confirmed` rejections when
+    gold/copper were aligned with the trade but chemicals were flat.
+  - Now maps to `[XLB, GDX, COPX]` with OR semantics: a NEM LONG
+    confirms when GDX (gold miners) OR XLB OR COPX is bullish on the
+    sector confirmation gate. CTVA / DOW (true chemicals) still
+    confirm via XLB.
+  - `H:\TradingBot\configs\config.top_tier_adaptive.yaml`:
+    `index_symbols` updated from `[XLK, XLC, XLY, XLE, XLB]` to
+    `[XLK, XLC, XLY, XLE, XLB, GDX, COPX]` so the new ETFs are
+    streamed. E: tuned preset's materials map updated for consistency
+    (no `index_symbols` change since E:'s tradable universe has no
+    materials symbols).
+  - Manifest default updated to the multi-ETF mapping.
+
 - **volatility_squeeze_breakout: 3-tier targets + tighter screener.** *2026-05-14*
   - **Three-tier target structure** replaces the prior 2-tier (standard /
     runner) system in `_build_*` of the standalone strategy:
