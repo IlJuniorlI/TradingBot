@@ -92,9 +92,12 @@ body {
    of vertical real-estate vs the 2-col stacked-pill layout. Brand badge
    shrinks slightly. Status pill drops the "Status" label (chip alone is
    self-explanatory). Updated demoted into the same grid as the rest.
-   Padding intentionally NOT overridden here — inherits the 16px from
-   ``.topbar.m-topbar`` so spacing matches the sibling .panel cards. */
+   Side + bottom padding inherit 16px from ``.topbar.m-topbar``. Top
+   padding trimmed to 10px because the ``brand-title`` line-height adds
+   visible whitespace above the "Schwab Bot" cap-height; without the
+   trim, the top of the card looked taller than the bottom. */
 .topbar.m-topbar.m-topbar-compact {
+  padding-top: 10px;
   gap: 8px;
 }
 
