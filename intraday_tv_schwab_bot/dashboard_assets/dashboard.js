@@ -110,8 +110,13 @@ function positiveOrNull(value) {
 
 function positionRangeSpec(pos) {
   const entry = numOrNull(pos?.entry_price);
-  const stop = numOrNull(pos?.stop_price);
-  const target = numOrNull(pos?.target_price);
+  // Use the trade's INITIAL stop/target for span calculations so the bar
+  // layout stays stable through management ratchets (adaptive_breakeven_rr
+  // collapsing stop to entry, final-rung clearing target to None).
+  // Falls back to the live stop/target for legacy positions that didn't
+  // get ``initial_*_price`` stamped on metadata at entry.
+  const stop = numOrNull(pos?.initial_stop_price) ?? numOrNull(pos?.stop_price);
+  const target = numOrNull(pos?.initial_target_price) ?? numOrNull(pos?.target_price);
   const last = numOrNull(pos?.last_price);
   const side = String(pos?.side || '').toUpperCase();
   if (entry === null || stop === null || target === null || last === null) return null;
@@ -165,8 +170,8 @@ function positionRangeMarkup(pos) {
       <div class="tiny-label">${escapeHtml(spec.remainingLabel)}</div>
     </div>
     <div class="trade-range-labels">
-      <div class="trade-range-label left"><div class="tiny-label">Stop</div><div class="v">${fmtNum(pos?.stop_price, 2)}</div></div>
-      <div class="trade-range-label right"><div class="tiny-label">Target</div><div class="v">${fmtNum(pos?.target_price, 2)}</div></div>
+      <div class="trade-range-label left"><div class="tiny-label">Stop</div><div class="v">${fmtNum(pos?.initial_stop_price ?? pos?.stop_price, 2)}</div></div>
+      <div class="trade-range-label right"><div class="tiny-label">Target</div><div class="v">${fmtNum(pos?.initial_target_price ?? pos?.target_price, 2)}</div></div>
     </div>
   </div>`;
 }
@@ -1531,9 +1536,17 @@ function renderKpiAndGauges(data) {
   const starting = numOrNull(perf.starting_equity) || 0;
   const grossExposure = numOrNull(perf.gross_market_value) ?? positions.reduce((acc, pos) => acc + Math.abs(numOrNull(pos?.market_value) || 0), 0);
   const grossMaxRisk = numOrNull(perf.gross_max_risk) ?? positions.reduce((acc, pos) => acc + Math.abs(numOrNull(pos?.max_risk) || 0), 0);
-  const exposurePct = totalEquity > 0 ? clamp((grossExposure / totalEquity) * 100, 0, 100) : 0;
-  const riskPct = totalEquity > 0 ? clamp((grossMaxRisk / totalEquity) * 100, 0, 100) : 0;
-  const ddPct = totalEquity > 0 ? clamp(((numOrNull(perf.max_drawdown) || numOrNull(perf.drawdown) || 0) / totalEquity) * 100, 0, 100) : 0;
+  // ``Pct`` (clamped 0-100) drives the ring's visual fill; ``PctTrue``
+  // (uncapped) drives the text readout so over-leverage (e.g. 128% on a
+  // long+short portfolio) is honestly visible instead of pinned to 100%.
+  // ``warn`` tone fires when the ratio exceeds 100% so the ring colors
+  // up as an alert.
+  const exposurePctTrue = totalEquity > 0 ? (grossExposure / totalEquity) * 100 : 0;
+  const riskPctTrue = totalEquity > 0 ? (grossMaxRisk / totalEquity) * 100 : 0;
+  const ddPctTrue = totalEquity > 0 ? ((numOrNull(perf.max_drawdown) || numOrNull(perf.drawdown) || 0) / totalEquity) * 100 : 0;
+  const exposurePct = clamp(exposurePctTrue, 0, 100);
+  const riskPct = clamp(riskPctTrue, 0, 100);
+  const ddPct = clamp(ddPctTrue, 0, 100);
   const dayPnl = totalEquity - starting;
 
   document.getElementById('kpi-netliq').textContent = fmtMoney(totalEquity);
@@ -1579,9 +1592,15 @@ function renderKpiAndGauges(data) {
   exposureRing.style.setProperty('--pct', `${exposurePct}%`);
   winRing.style.setProperty('--pct', `${riskPct}%`);
   ddRing.style.setProperty('--pct', `${ddPct}%`);
-  document.getElementById('gauge-exposure-text').textContent = fmtPctSmart(exposurePct);
-  document.getElementById('gauge-win-text').textContent = fmtPctSmart(riskPct);
-  document.getElementById('gauge-dd-text').textContent = fmtPctSmart(ddPct);
+  // Warn tone when over 100% — signals over-leverage (mixed long/short
+  // positions inflate gross_market_value without inflating net liq).
+  exposureRing.className = `gauge-ring${exposurePctTrue > 100 ? ' warn' : ''}`;
+  // Show true (unclamped) % in the text so 128% reads as "128%" instead
+  // of "100%". Ring still caps visually at 100% fill — the warn tone
+  // is the over-100% signal.
+  document.getElementById('gauge-exposure-text').textContent = fmtPctSmart(exposurePctTrue);
+  document.getElementById('gauge-win-text').textContent = fmtPctSmart(riskPctTrue);
+  document.getElementById('gauge-dd-text').textContent = fmtPctSmart(ddPctTrue);
 
   // Dollar values shown under each gauge ring. Tight currency format
   // (no decimals) so they fit in the narrow gauge-card column.
@@ -2315,8 +2334,19 @@ function drawSelectedChart(snapshot) {
     const pushMarkerLine = (value, label, shortLabel, color, dash) => {
       const numericValue = positiveOrNull(value);
       if (numericValue === null) return;
-      const duplicate = markerLines.some(existing => approxEqual(existing.value, numericValue));
-      if (duplicate) return;
+      // When this marker lands at the same price as a previously-pushed
+      // line, MERGE its label into the existing marker instead of
+      // dropping it silently. The common case: ``adaptive_breakeven_rr``
+      // ratchets the stop up to the entry price, so Stop and Entry
+      // overlap — dropping Stop made it look like the position had no
+      // stop. Merged form ("Entry / Stop", "E·ST") keeps both readouts
+      // visible on one rendered line.
+      const existing = markerLines.find(m => approxEqual(m.value, numericValue));
+      if (existing) {
+        existing.label = `${existing.label} / ${label}`;
+        existing.shortLabel = `${existing.shortLabel}·${shortLabel}`;
+        return;
+      }
       markerLines.push({ value: numericValue, label, shortLabel, color, dash });
     };
     const entryValue = positionMarkers.show_underlying_lines ? positiveOrNull(positionMarkers.entry) : null;
@@ -3863,7 +3893,7 @@ function renderEventsAndDock() {
     <tr>
       <td>${escapeHtml(safe(trade.exit_time).replace('T',' ').slice(0,16))}</td>
       <td>${tradeSymbolCell(trade, exchangeMap)}</td>
-      <td>${escapeHtml(trade.strategy)}</td>
+      <td>${escapeHtml(safe(trade.regime) || safe(trade.strategy) || '—')}</td>
       <td>${escapeHtml(fmtSide(trade))}</td>
       <td>${escapeHtml(safe(trade.qty))}</td>
       <td>${fmtNum(trade.entry_price, 2)}</td>

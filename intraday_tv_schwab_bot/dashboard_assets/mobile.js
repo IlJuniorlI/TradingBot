@@ -101,10 +101,17 @@
       positions.reduce((acc, pos) => acc + Math.abs(numOrNull(pos?.market_value) || 0), 0);
     const grossMaxRisk = numOrNull(perf.gross_max_risk) ??
       positions.reduce((acc, pos) => acc + Math.abs(numOrNull(pos?.max_risk) || 0), 0);
-    const exposurePct = totalEquity > 0 ? clamp((grossExposure / totalEquity) * 100, 0, 100) : 0;
-    const riskPct = totalEquity > 0 ? clamp((grossMaxRisk / totalEquity) * 100, 0, 100) : 0;
+    // ``Pct`` (clamped 0-100) drives the ring's visual fill; ``PctTrue``
+    // (uncapped) drives the text readout so over-leverage (e.g. 128% on
+    // a long+short portfolio) is honestly visible. Warn tone fires when
+    // ratio > 100% — same pattern as the desktop gauge.
+    const exposurePctTrue = totalEquity > 0 ? (grossExposure / totalEquity) * 100 : 0;
+    const riskPctTrue = totalEquity > 0 ? (grossMaxRisk / totalEquity) * 100 : 0;
     const ddValue = numOrNull(perf.max_drawdown) || numOrNull(perf.drawdown) || 0;
-    const ddPct = totalEquity > 0 ? clamp((ddValue / totalEquity) * 100, 0, 100) : 0;
+    const ddPctTrue = totalEquity > 0 ? (ddValue / totalEquity) * 100 : 0;
+    const exposurePct = clamp(exposurePctTrue, 0, 100);
+    const riskPct = clamp(riskPctTrue, 0, 100);
+    const ddPct = clamp(ddPctTrue, 0, 100);
     const dayPnl = totalEquity - starting;
 
     const kpiNet = document.getElementById('kpi-netliq');
@@ -161,12 +168,18 @@
     const winText = document.getElementById('gauge-win-text');
     const ddText = document.getElementById('gauge-dd-text');
 
-    if (exposureRing) exposureRing.style.setProperty('--pct', `${exposurePct}%`);
+    if (exposureRing) {
+      exposureRing.style.setProperty('--pct', `${exposurePct}%`);
+      // Warn tone when over 100% — over-leverage signal.
+      exposureRing.className = `gauge-ring${exposurePctTrue > 100 ? ' warn' : ''}`;
+    }
     if (winRing) winRing.style.setProperty('--pct', `${riskPct}%`);
     if (ddRing) ddRing.style.setProperty('--pct', `${ddPct}%`);
-    if (exposureText) exposureText.textContent = fmtPctSmart(exposurePct);
-    if (winText) winText.textContent = fmtPctSmart(riskPct);
-    if (ddText) ddText.textContent = fmtPctSmart(ddPct);
+    // Text readouts use the TRUE (unclamped) values so readings >100%
+    // surface honestly. Ring visual stays capped at 100% fill.
+    if (exposureText) exposureText.textContent = fmtPctSmart(exposurePctTrue);
+    if (winText) winText.textContent = fmtPctSmart(riskPctTrue);
+    if (ddText) ddText.textContent = fmtPctSmart(ddPctTrue);
 
     // Dollar values shown under each gauge ring. Tight currency format
     // (no decimals) so they fit in the narrow gauge-card column.

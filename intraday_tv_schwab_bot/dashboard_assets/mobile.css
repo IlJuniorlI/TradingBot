@@ -281,6 +281,21 @@ body {
   max-height: none;
 }
 
+/* Disable the inner scroll container on mobile. The desktop sheet uses
+   ``overflow: auto`` + ``overscroll-behavior: contain`` + ``height: 100%``
+   on .positions-scroll because the desktop panel is ``position: fixed``
+   at >1400px with its own viewport-anchored scroll. On phones the panel
+   just flows in the m-shell column — leaving the inner scroll active
+   means vertical swipes that land on a position card get eaten by the
+   inner container (which has no content to scroll past its own bounds)
+   instead of scrolling the whole page. Same fix as ``.m-list``. */
+.m-shell .positions-scroll {
+  overflow: visible;
+  overscroll-behavior: auto;
+  height: auto;
+  min-height: 0;
+}
+
 .m-shell .panel-meta {
   white-space: normal;
   word-break: break-word;
