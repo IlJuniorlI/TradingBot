@@ -955,8 +955,14 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         resistance_level = getattr(sr_ctx, "nearest_resistance", None)
         support_price = float(getattr(support_level, "price", 0.0) or 0.0) if support_level is not None else 0.0
         resistance_price = float(getattr(resistance_level, "price", 0.0) or 0.0) if resistance_level is not None else 0.0
-        if support_price <= 0.0 or resistance_price <= 0.0:
-            self._set_build_failure(c.symbol, "sr_scalp", "missing_htf_levels")
+        if support_price <= 0.0 and resistance_price <= 0.0:
+            self._set_build_failure(c.symbol, "sr_scalp", "missing_htf_levels_both")
+            return None
+        if support_price <= 0.0:
+            self._set_build_failure(c.symbol, "sr_scalp", "missing_htf_support")
+            return None
+        if resistance_price <= 0.0:
+            self._set_build_failure(c.symbol, "sr_scalp", "missing_htf_resistance")
             return None
         if resistance_price <= support_price:
             self._set_build_failure(c.symbol, "sr_scalp", "inverted_htf_levels")
@@ -1785,6 +1791,16 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # low-scoring LONG pullback even if LONG's top regime had a
             # higher score (because trend's build failed). Truly "regimes
             # don't block each other" — within OR across sides.
+            #
+            # Skip-summary buckets:
+            #   * ``<side>_unqualified_no_qualifying_regime(...)`` — no
+            #     regime cleared its min-score floor for this side. Signal
+            #     was never attempted.
+            #   * ``<side>_build_failed_<regime>_<reason>`` — regime cleared
+            #     its floor and the build method was invoked, but a hard
+            #     gate inside the builder rejected. Signal was attempted.
+            # Differentiating these matters for tuning: the first wants
+            # looser score thresholds; the second wants looser hard gates.
             build_queue: list[tuple[Side, str, float, dict[str, Any]]] = []
             for side, decision in side_decisions:
                 if not decision["build_order"]:
@@ -1793,7 +1809,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                         if decision["bias_penalty"] > 0.0 else ""
                     )
                     fail_reasons.append(
-                        f"{side.value.lower()}_no_qualifying_regime("
+                        f"{side.value.lower()}_unqualified_no_qualifying_regime("
                         f"trend={decision['trend_score']:.1f},"
                         f"pb={decision['pullback_score']:.1f},"
                         f"range={decision['range_score']:.1f},"
@@ -1810,6 +1826,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # built in that order.
             build_queue.sort(key=lambda item: item[2], reverse=True)
 
+            winning_decision: dict[str, Any] | None = None
+            winning_regime: str | None = None
             for side, regime_name, regime_score, decision in build_queue:
                 index_ok = decision["index_ok"]
 
@@ -1821,7 +1839,9 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 # orb_bypass_index_confirmation is true. Index failure on
                 # one regime falls through to the next regime in the queue.
                 if regime_name in {"trend", "pullback", "vol_squeeze", "momentum"} and not index_ok and not orb_index_bypass:
-                    fail_reasons.append(f"{side.value.lower()}_{regime_name}_index_not_confirmed")
+                    fail_reasons.append(
+                        f"{side.value.lower()}_build_failed_{regime_name}_index_not_confirmed"
+                    )
                     continue
 
                 sig = None
@@ -1853,17 +1873,46 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                                 sig.metadata["peak_giveback_min_r_override"] = override_r
                                 sig.metadata["peak_giveback_high_conviction_day_strength"] = round(float(day_strength), 4)
                     # Stamp the volatility widening factor for post-mortem.
-                    if vol_widening > 1.0 and isinstance(sig.metadata, dict):
+                    # Always stamped when Tier 2a is enabled (even when the
+                    # factor is 1.0 — disambiguates "feature disabled" from
+                    # "feature enabled but inactive this cycle").
+                    if bool(self.params.get("atr_aware_stop_enabled", True)) and isinstance(sig.metadata, dict):
                         sig.metadata["vol_widening_factor"] = round(float(vol_widening), 4)
                     best_signal = sig
+                    winning_decision = decision
+                    winning_regime = regime_name
                     break
 
+                # Build attempted but rejected by a hard gate inside the
+                # builder. ``_set_build_failure`` already side-prefixes most
+                # rejection tags (long_/short_); only prefix here when the
+                # tag isn't already side-tagged to avoid stuttered buckets
+                # like ``long_long_below_support_zone`` in the EOD summary.
                 failure = self._consume_build_failure(c.symbol, regime_name) or f"{regime_name}_signal_build_failed"
-                fail_reasons.append(f"{side.value.lower()}_{failure}")
+                side_tag = side.value.lower()
+                if failure.startswith(("long_", "short_")):
+                    fail_reasons.append(f"build_failed_{failure}")
+                else:
+                    fail_reasons.append(f"{side_tag}_build_failed_{failure}")
 
             if best_signal is not None:
                 out.append(best_signal)
-                self._record_entry_decision(c.symbol, "signal", [best_signal.reason])
+                # Stamp the soft-bias penalty value on the success path too
+                # so post-mortem can see whether a winner was nearly killed
+                # by bias drag. Sourced from the winning side's decision.
+                detail_payload: dict[str, Any] = {}
+                if winning_decision is not None:
+                    bp = float(winning_decision.get("bias_penalty", 0.0) or 0.0)
+                    if bp > 0.0:
+                        detail_payload["bias_pen"] = round(bp, 4)
+                    if winning_regime is not None:
+                        detail_payload["regime"] = winning_regime
+                        scores_dict = winning_decision.get("scores") or {}
+                        detail_payload["score"] = round(float(scores_dict.get(winning_regime, 0.0)), 4)
+                self._record_entry_decision(
+                    c.symbol, "signal", [best_signal.reason],
+                    details=detail_payload or None,
+                )
             else:
                 self._record_entry_decision(c.symbol, "skipped", fail_reasons or ["no_setup"])
         return out

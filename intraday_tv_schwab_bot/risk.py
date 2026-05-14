@@ -504,21 +504,34 @@ class RiskManager:
         # winners on trend days aren't cut by normal 50% retracements.
         # Falls back to ``config.risk.peak_giveback_min_r`` when not set.
         meta = position.metadata if isinstance(position.metadata, dict) else {}
-        override = meta.get("peak_giveback_min_r_override") if isinstance(meta, dict) else None
+        default_min_r = float(getattr(self.config.risk, "peak_giveback_min_r", 1.0) or 1.0)
+        override = meta.get("peak_giveback_min_r_override")
+        override_active = False
         if override is not None:
             try:
                 min_r = float(override)
+                override_active = True
             except (TypeError, ValueError):
-                min_r = float(getattr(self.config.risk, "peak_giveback_min_r", 1.0) or 1.0)
+                LOG.warning(
+                    "peak_giveback_min_r_override on %s (id=%s) is malformed (%r); falling back to default %.2fR",
+                    position.symbol, getattr(position, "id", "?"), override, default_min_r,
+                )
+                min_r = default_min_r
         else:
-            min_r = float(getattr(self.config.risk, "peak_giveback_min_r", 1.0) or 1.0)
+            min_r = default_min_r
         peak_r, current_r = self._peak_and_current_r(position, last_price, initial_risk)
         if peak_r < min_r:
             return False
         floor_r = self._peak_giveback_floor_r(peak_r)
         if floor_r is None:
             return False
-        return current_r <= floor_r
+        triggered = current_r <= floor_r
+        if triggered and isinstance(meta, dict):
+            # Stamp which threshold actually tripped so update_position can
+            # emit a differentiated exit reason (default vs high-conviction).
+            meta["_peak_giveback_min_r_used"] = round(float(min_r), 4)
+            meta["_peak_giveback_override_active"] = bool(override_active)
+        return triggered
 
     def update_position(self, position: Position, last_price: float) -> tuple[bool, str]:
         meta = position.metadata if isinstance(position.metadata, dict) else {}
@@ -549,12 +562,26 @@ class RiskManager:
         if peak_giveback_exit:
             peak_r, current_r = self._peak_and_current_r(position, last_price, initial_risk)
             floor_r = self._peak_giveback_floor_r(peak_r)
+            # ``_peak_giveback_triggered`` stamped these markers right before
+            # returning True; read them so we can emit a differentiated exit
+            # reason (default 1.0R floor vs Tier 3b high-conviction override).
+            min_r_used = float(meta.get("_peak_giveback_min_r_used") or 0.0) if isinstance(meta, dict) else 0.0
+            override_active = bool(meta.get("_peak_giveback_override_active")) if isinstance(meta, dict) else False
             if isinstance(meta, dict):
                 meta["peak_giveback_fired"] = True
                 meta["peak_giveback_peak_r"] = round(float(peak_r), 4)
                 meta["peak_giveback_floor_r"] = None if floor_r is None else round(float(floor_r), 4)
                 meta["peak_giveback_current_r"] = round(float(current_r), 4)
-            return True, f"peak_giveback:peak{peak_r:.2f}R_floor{(floor_r or 0.0):.2f}R"
+                meta["peak_giveback_min_r_used"] = round(min_r_used, 4)
+                meta["peak_giveback_override_active"] = override_active
+                # Drop the internal sentinels (we promoted them above).
+                meta.pop("_peak_giveback_min_r_used", None)
+                meta.pop("_peak_giveback_override_active", None)
+            reason_tag = "peak_giveback_high_conviction" if override_active else "peak_giveback"
+            return True, (
+                f"{reason_tag}:peak{peak_r:.2f}R_floor{(floor_r or 0.0):.2f}R"
+                f"_minR{min_r_used:.2f}"
+            )
 
         # --- Options premium ratchet (breakeven + profit lock) ---
         # Options bypass equity adaptive management, but this simpler premium-

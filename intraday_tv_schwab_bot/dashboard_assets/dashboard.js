@@ -2014,32 +2014,23 @@ function drawSelectedChart(snapshot) {
       }
     }
 
-    const trendBias = signedBiasToken(bar.trend_state);
-    const structureBias = signedBiasToken(bar.structure_bias);
+    // Per-bar bias reads. Only ``dmi_bias`` and ``obv_bias`` are emitted by
+    // ``dashboard_bars_from_frame`` per-bar; the other reads (trend_state /
+    // structure_bias / anchored_vwap_bias / breakout_above_resistance /
+    // breakdown_below_support / near_support / near_resistance) were dead
+    // code — those fields live on the snapshot's structure / SR sections,
+    // not on individual bars. Cleaned up 2026-05-13 so the heuristic is
+    // honest about what it actually reads.
     const dmiBias = signedBiasToken(bar.dmi_bias);
     const obvBias = signedBiasToken(bar.obv_bias);
-    const avwapBias = signedBiasToken(bar.anchored_vwap_bias);
 
-    if (trendBias > 0) bullish.push('trend_bullish');
-    if (trendBias < 0) bearish.push('trend_bearish');
-    if (structureBias > 0) bullish.push('structure_bullish');
-    if (structureBias < 0) bearish.push('structure_bearish');
     if (dmiBias > 0) bullish.push('dmi_bullish');
     if (dmiBias < 0) bearish.push('dmi_bearish');
     if (obvBias > 0) bullish.push('obv_bullish');
     if (obvBias < 0) bearish.push('obv_bearish');
-    if (avwapBias > 0) bullish.push('avwap_bullish');
-    if (avwapBias < 0) bearish.push('avwap_bearish');
-    if (bar.breakout_above_resistance) bullish.push('breakout_above_resistance');
-    if (bar.breakdown_below_support) bearish.push('breakdown_below_support');
-    if (bar.near_support) bullish.push('near_support');
-    if (bar.near_resistance) bearish.push('near_resistance');
 
-    score += trendBias * 0.80;
-    score += structureBias * 0.70;
     score += dmiBias * 0.50;
     score += obvBias * 0.35;
-    score += avwapBias * 0.25;
     if (ret15 !== null) score += Math.max(-0.50, Math.min(0.50, Number(ret15) * 20));
 
     let regime = 'neutral';

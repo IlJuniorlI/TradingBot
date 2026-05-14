@@ -782,13 +782,29 @@ class BaseStrategy:
         reasons: list[str] | tuple[str, ...] | None = None,
         details: Mapping[str, Any] | None = None,
     ) -> None:
+        """Record a build failure for ``symbol`` under ``style`` (regime).
+
+        ``reason`` is the primary failure tag (always used for the
+        ``primary_reason`` field). ``reasons`` is an optional fuller list;
+        when omitted, defaults to ``[reason]``. When both are passed, the
+        primary tag is prepended to ``reasons`` if missing, so the primary
+        is always discoverable in the list — prevents the latent mismatch
+        where ``primary_reason`` could differ from every element of
+        ``reasons``.
+        """
         cleaned: list[str] = []
-        for item in reasons or [reason]:
+        # Always seed with the primary reason so it can never be absent
+        # from the reasons list — even if the caller passes a kwarg list
+        # that omits it.
+        primary_token = str(reason or '').strip()
+        if primary_token:
+            cleaned.append(primary_token)
+        for item in reasons or []:
             token = str(item or '').strip()
             if token and token not in cleaned:
                 cleaned.append(token)
         payload: dict[str, Any] = {
-            "primary_reason": str(reason),
+            "primary_reason": primary_token,
             "reasons": cleaned,
         }
         if isinstance(details, Mapping):
@@ -3351,8 +3367,27 @@ class BaseStrategy:
             return False
         if not bool(self._support_resistance_setting("enabled", True)):
             return False
+
+        # Pull common values once so both the breakdown-flag branch and the
+        # too-close-to-resistance branch can use them.
+        nearest_sup = getattr(sr_ctx, "nearest_support", None)
+        nearest_sup_price = float(getattr(nearest_sup, "price", 0.0) or 0.0) if nearest_sup is not None else 0.0
+        nearest_res = getattr(sr_ctx, "nearest_resistance", None)
+        nearest_res_price = float(getattr(nearest_res, "price", 0.0) or 0.0) if nearest_res is not None else 0.0
+        current_price = float(getattr(sr_ctx, "current_price", 0.0) or 0.0)
+
+        # Breakdown-flag branch with reclaim escape hatch (added 2026-05-13).
+        # ``breakdown_below_support`` can linger after support was reclaimed
+        # — the SR engine doesn't always clear it until the next pivot. For
+        # mean-reversion / reclaim setups (e.g. sr_scalp LONG near support
+        # that just got broken and recovered), an unconditional block was
+        # killing legitimate entries. Symmetric with the actively_above
+        # escape in the too-close branch below.
         if bool(sr_ctx.breakdown_below_support):
-            return True
+            actively_above_support = bool(0 < nearest_sup_price < current_price)
+            if not actively_above_support:
+                return True
+
         dist_pct = sr_ctx.resistance_distance_pct
         dist_atr = sr_ctx.resistance_distance_atr
         too_close = False
@@ -3368,9 +3403,6 @@ class BaseStrategy:
         # LONG'd at 0.06-0.5 ATR below their new nearest resistance while
         # ``breakout_above_resistance`` was still True from an earlier
         # break — the entries were approaching the next wall, not riding.
-        nearest_res = getattr(sr_ctx, "nearest_resistance", None)
-        nearest_res_price = float(getattr(nearest_res, "price", 0.0) or 0.0) if nearest_res is not None else 0.0
-        current_price = float(getattr(sr_ctx, "current_price", 0.0) or 0.0)
         actively_above = bool(
             sr_ctx.breakout_above_resistance
             and 0 < nearest_res_price < current_price
@@ -3382,8 +3414,26 @@ class BaseStrategy:
             return False
         if not bool(self._support_resistance_setting("enabled", True)):
             return False
+
+        # Pull common values once so both the breakout-flag branch and the
+        # too-close-to-support branch can use them.
+        nearest_sup = getattr(sr_ctx, "nearest_support", None)
+        nearest_sup_price = float(getattr(nearest_sup, "price", 0.0) or 0.0) if nearest_sup is not None else 0.0
+        nearest_res = getattr(sr_ctx, "nearest_resistance", None)
+        nearest_res_price = float(getattr(nearest_res, "price", 0.0) or 0.0) if nearest_res is not None else 0.0
+        current_price = float(getattr(sr_ctx, "current_price", 0.0) or 0.0)
+
+        # Breakout-flag branch with rejection escape hatch (added 2026-05-13).
+        # ``breakout_above_resistance`` can linger after price was rejected
+        # back below resistance — for failure-of-breakout / fade-the-rip
+        # setups (e.g. sr_scalp SHORT near resistance after a failed
+        # break-and-rejection), an unconditional block was killing
+        # legitimate entries. Symmetric with the breakdown escape above.
         if bool(sr_ctx.breakout_above_resistance):
-            return True
+            actively_below_resistance = bool(0 < current_price < nearest_res_price)
+            if not actively_below_resistance:
+                return True
+
         dist_pct = sr_ctx.support_distance_pct
         dist_atr = sr_ctx.support_distance_atr
         too_close = False
@@ -3395,13 +3445,9 @@ class BaseStrategy:
         # the current nearest support (riding through the broken level),
         # not when a stale breakdown flag lingers after a bounce back
         # above. Symmetric with the bullish path above.
-        nearest_sup = getattr(sr_ctx, "nearest_support", None)
-        nearest_sup_price = float(getattr(nearest_sup, "price", 0.0) or 0.0) if nearest_sup is not None else 0.0
-        current_price = float(getattr(sr_ctx, "current_price", 0.0) or 0.0)
         actively_below = bool(
             sr_ctx.breakdown_below_support
-            and nearest_sup_price > 0
-            and current_price < nearest_sup_price
+            and 0 < current_price < nearest_sup_price
         )
         return bool(too_close and not actively_below)
 

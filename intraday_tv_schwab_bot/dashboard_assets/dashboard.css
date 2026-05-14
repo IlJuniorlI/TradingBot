@@ -1045,8 +1045,13 @@
       padding: 10px 12px;
       border-radius: 14px;
       border: 1px solid rgba(var(--tint-rgb), .10);
-      background: rgba(7, 12, 22, .96);
-      box-shadow: 0 18px 48px rgba(0,0,0,.42);
+      /* Theme-aware background + shadow so the tooltip matches the active
+         theme (default / dark / light / nexus / solstice / nebula). The
+         prior hardcoded rgba(7,12,22,.96) + dark shadow rendered the
+         tooltip as a dark blue card regardless of theme — visible against
+         the light theme's white panels but jarring. */
+      background: var(--panel-bg);
+      box-shadow: var(--shadow);
       backdrop-filter: blur(10px);
       color: var(--text);
       pointer-events: none;
