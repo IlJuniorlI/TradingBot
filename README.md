@@ -1890,7 +1890,8 @@ Default windows:
 Strategy-specific knobs:
 
 - `tradable`: the fixed list of symbols to trade.
-- `index_symbols`: index ETFs for directional confirmation (default SPY, QQQ).
+- `index_symbols`: index ETFs streamed for directional confirmation. The default ships with the canonical SPDR Select Sector ETFs that match the default tradable universe's GICS sectors (XLK / XLC / XLY / XLF / XLV / XLP). Pair with `sector_index_map` (below) to control which ETFs confirm which symbols.
+- `sector_index_map`: per-sector mapping from GICS sector name (matches `sector_groups` keys) → list of index ETFs to consult when confirming trades on symbols in that sector. Default: each sector maps to its canonical SPDR Select Sector ETF (`tech: [XLK]`, `energy: [XLE]`, `materials: [XLB]`, ...). When omitted, the bot falls back to OR-ing across the entire `index_symbols` list (legacy behavior).
 - `require_index_confirmation`: gate trend/pullback/vol_squeeze/momentum entries on index agreement. Range and sr_scalp are exempt (mean-reversion theses).
 - `min_trend_score` / `min_pullback_score` / `min_range_score` / `min_vol_squeeze_score` / `min_momentum_score` / `min_sr_scalp_score`: minimum regime score to qualify.
 - `min_pullback_trend_score`: minimum trend score required before pullback scoring begins.
@@ -1919,7 +1920,8 @@ Current code defaults:
 | Option                            | Default                                                                                |
 |-----------------------------------|----------------------------------------------------------------------------------------|
 | `tradable`                        | `AAPL, MSFT, NVDA, INTC, AMD, AVGO, TSM, CRM, AMZN, TSLA, HD, LOW, UBER, COST, GOOG, META, NFLX, RBLX, TMUS, JPM, GS, V, LLY` |
-| `index_symbols`                   | `SPY, QQQ`                                                                             |
+| `index_symbols`                   | `XLK, XLC, XLY, XLF, XLV, XLP`                                                         |
+| `sector_index_map`                | `{tech: [XLK], consumer_discretionary: [XLY], communication: [XLC], financials: [XLF], healthcare: [XLV], industrials: [XLI], energy: [XLE], consumer_staples: [XLP], materials: [XLB], real_estate: [XLRE], utilities: [XLU]}` |
 | `require_index_confirmation`      | `true`                                                                                 |
 | `min_bars`                        | `60`                                                                                   |
 | `ltf_minutes`       | `5`                                                                                    |

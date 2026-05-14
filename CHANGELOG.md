@@ -7,6 +7,140 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **top_tier_adaptive: per-sector index confirmation map.** *2026-05-14*
+  - New ``sector_index_map`` param routes each candidate to a sector-
+    specific list of index ETFs for entry confirmation, replacing the
+    "OR across all ``index_symbols``" behavior. Prevents e.g. an AAPL
+    LONG from being confirmed by XLE just because energy happened to
+    be bullish-aligned.
+  - Default mapping covers all 11 GICS sectors with the canonical SPDR
+    Select Sector ETFs: ``tech: [XLK]``, ``consumer_discretionary: [XLY]``,
+    ``communication: [XLC]``, ``financials: [XLF]``, ``healthcare: [XLV]``,
+    ``industrials: [XLI]``, ``energy: [XLE]``, ``consumer_staples: [XLP]``,
+    ``materials: [XLB]``, ``real_estate: [XLRE]``, ``utilities: [XLU]``.
+  - New strategy helper ``_indices_for_symbol(symbol)`` walks
+    ``sector_groups`` to find the symbol's sector, then reads
+    ``sector_index_map[sector]``. Falls back to the broad
+    ``index_symbols`` list when no per-sector mapping exists
+    (backward-compat for legacy configs).
+  - ``_index_confirms`` and ``_index_neutral`` now take a ``symbol``
+    parameter; called per-candidate inside ``entry_signals`` (was
+    hoisted to once-per-cycle under the broad SPY/QQQ design).
+  - Default ``index_symbols`` updated to the SPDR Select Sector ETFs
+    covering the default tradable universe's sectors (XLK / XLC / XLY
+    / XLF / XLV / XLP). SPY + QQQ removed — they're no longer in any
+    sector's map entry, so streaming them was wasted quote bandwidth.
+- **top_tier_adaptive: early-session stop widening (Tier 2a companion).**
+  *2026-05-14*
+  - New params: ``early_session_stop_widening_enabled`` (default true),
+    ``early_session_stop_widening_until`` (default ``"10:30"``),
+    ``early_session_stop_widening_mult`` (default 1.3).
+  - ``_volatility_widening_factor`` now combines two orthogonal
+    triggers: (1) the existing ATR-expansion check (RELATIVE), and
+    (2) a time-of-day check (ABSOLUTE) that fires during the
+    post-open high-vol window. Final factor = ``max(expansion_factor,
+    time_factor)`` capped at ``atr_widening_max_factor`` — the two
+    don't compound to avoid over-widening on explosive opens.
+  - Motivation: an AMD 10:10 LONG was stopped out at $444.46 (entry
+    $445.95, $1.49 risk) on a single 1m wick that reversed to $449+
+    five minutes later. Tier 2a's relative-expansion check read
+    "normal" because all the post-open bars were noisy together. With
+    the 1.3x absolute multiplier, the stop would have been ~$444.02 —
+    below the dip — and the trade catches the $3+ recovery.
+- **Adaptive ladder: triple-gate suppress decision** *2026-05-14*.
+  Target-exit suppression in ``position_manager._adaptive_ladder_management``
+  now requires THREE confirmations before holding through the multi-
+  bar zone flip (previously a single intra-bar tick at target was
+  enough to lock the position for 2+ minutes):
+  - **Strength gate** (``_ladder_target_strength_confirmed``): the
+    last FULLY CLOSED bar must close at/past target with a strong
+    directional body (close in the upper/lower 55% of bar range for
+    LONG/SHORT). Filters single-tick wicks that revert.
+  - **Index re-alignment gate** (``_ladder_indices_still_aligned``):
+    re-checks the trade's entry-time ``confirmation_indices`` (newly
+    stamped on signal metadata at entry) and verifies at least one
+    sector ETF is STILL aligned with the trade direction. If the
+    sector tape has flipped since entry, suppress is denied and the
+    target exit fires normally — avoids holding through sector
+    reversals.
+  - **Rung-not-confirmed gate** (existing): the multi-bar zone flip
+    hasn't completed yet.
+  - Suppress fires only when target_reached + breakout_strength +
+    indices_aligned + (NOT rung_confirmed). Any failure → exit at
+    target.
+
+### Changed
+
+- **paper_account: per-trade R/R now uses initial stop/target.**
+  *2026-05-14*
+  - ``_position_to_dict`` reads ``metadata.initial_stop_price`` and
+    ``metadata.initial_target_price`` (stamped at entry by
+    ``entry_gatekeeper.py:677-678/1215-1216``, immutable thereafter)
+    for ``max_risk`` and ``max_reward`` calculation. Falls back to
+    live ``stop_price``/``target_price`` for legacy positions.
+  - Was: max_risk used the live ``position.stop_price``, so when
+    ``adaptive_breakeven_rr`` ratcheted the stop to entry,
+    ``max(0, entry - stop) = 0``, max_risk became 0, and the
+    dashboard's R/R rendered as ``—`` for every winning trade past
+    breakeven (which is most of them).
+  - Same payload now also exposes ``initial_stop_price`` +
+    ``initial_target_price`` as first-class fields so the
+    dashboard's progress bar can keep a stable range as adaptive
+    management ratchets the live stop/target.
+- **Dashboard: position progress bar uses initial stop/target.**
+  *2026-05-14*
+  - ``positionRangeSpec`` in dashboard.js now reads
+    ``pos.initial_stop_price`` / ``pos.initial_target_price`` with
+    fallback to the live values via ``??``. Bar layout stays stable
+    through adaptive ratchets (breakeven trail, final-rung clearing
+    target to None) so the "where's my stop?" gap doesn't appear.
+- **Dashboard: chart marker labels merge on price collision.**
+  *2026-05-14*
+  - ``pushMarkerLine`` merges labels when a new marker lands at the
+    same price as an existing one (e.g. Stop ratchets to entry →
+    "Entry / Stop" / "E·ST" combined label) instead of silently
+    dropping the second line as a duplicate. The dropped-Stop case
+    made it look like the position had no stop on the chart.
+- **Dashboard: trade table column "Strategy" → "Regime".**
+  *2026-05-14*
+  - ``TradeRecord.regime`` (stamped on exit from
+    ``position.metadata.regime``) is now the displayed value, with
+    fallback chain ``trade.regime || trade.strategy || '—'`` for
+    pre-stamp trades. Identifies which of the 6 regimes (trend /
+    pullback / range / vol_squeeze / momentum / sr_scalp) produced
+    each closed trade.
+- **Dashboard: exposure gauge honesty over 100%.** *2026-05-14*
+  - Ring fill stays clamped at 100% (preserves the gauge metaphor)
+    but the text readout now uses the UNCLAMPED ratio, so 128%
+    exposure on a long+short portfolio reads as ``128%`` instead of
+    ``100%``. Ring tone flips to ``warn`` (orange) when ratio > 100%.
+    Same fix applied to desktop dashboard.js + mobile.js.
+- **Mobile dashboard: align topbar with sibling panels + many polish
+  tweaks.** *2026-05-13/14*
+  - Topbar padding (16px) + box-shadow (var(--shadow)) match the
+    ``.panel`` cards below. Inner-pill layout is 3-col grid with
+    inline ``label: value`` chips; status row spans full width with
+    chip + mode badge left-aligned. Trimmed top padding to compensate
+    for ``brand-title`` line-height whitespace.
+  - Subline trimmed: drop redundant ``ready X/Y · loading Z`` (already
+    in READY pill), abbreviate ``streaming N symbols`` → ``N streams``.
+  - New ``API/min`` pill wired to ``data.api_usage.calls_per_minute_5m``.
+  - Added Candidates card + Completed Trades card (mobile-only
+    compact list views).
+  - Removed inner ``overflow-y: auto`` from ``.positions-scroll`` —
+    swipes on position cards now pass through to the page scroll
+    instead of being eaten by the inner scroll container.
+  - Day-% color coding on candidate rows (green/red); trade-row
+    dollar amounts intentionally uncolored per user preference.
+- **Mobile dashboard: tooltip theme matches active theme.**
+  *2026-05-13*
+  - ``.chart-tooltip`` ``background`` and ``box-shadow`` switched
+    from hardcoded dark blue to ``var(--panel-bg)`` and
+    ``var(--shadow)``. Works correctly across all 6 themes
+    (default / dark / light / nexus / solstice / nebula).
+
 ### Changed
 
 - **top_tier_adaptive config: high-volatility retune.** *2026-05-13*

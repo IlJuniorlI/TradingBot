@@ -45,7 +45,7 @@ ORB-window opt-out: set `disable_orb_window: true` (default `false`) to skip the
 
 ### 4. Index confirmation gates directional entries
 
-SPY and QQQ are used as index confirmation. For trend, pullback, vol_squeeze, and momentum entries, at least one index must agree with the trade direction:
+Per-sector index ETFs (via `sector_index_map`) are used for confirmation — each stock is gated by its own sector's tape, not an arbitrary broad-market ETF. For example AAPL is confirmed by XLK; XOM by XLE; FCX by XLB. The default mapping is the canonical SPDR Select Sector ETFs (XLK / XLC / XLY / XLF / XLV / XLI / XLE / XLP / XLB / XLRE / XLU). Symbols whose sector isn't mapped fall back to the universe-wide `index_symbols` list. For trend, pullback, vol_squeeze, and momentum entries, at least one mapped index must agree with the trade direction:
 
 - Long: index close > VWAP and EMA9 >= EMA20
 - Short: index close < VWAP and EMA9 <= EMA20
@@ -70,7 +70,7 @@ Before any signal is emitted, the finalize pipeline applies:
 - **HTF bias alignment (`require_htf_bias_alignment`, default true)**: reject longs when 15m market structure is bearish, and shorts when 15m is bullish. Neutral HTF never blocks. Prevents counter-trend entries that look good on the 1m/5m chart but fight the 15m trend. Set `false` if you want the bot to take setups regardless of the higher timeframe.
 - **ORB HTF bypass (`orb_bypass_htf_bias`, default true)**: skip the HTF bias check during the ORB window (09:35 to `orb_end_time`). At the open, the 15m chart has zero or one completed bars from today — the structure is stale (yesterday's pivots). The trend regime's own fresh-breakout gate proves direction. After the ORB window, the filter resumes with 2-3 closed 15m bars.
 - **ORB exhaustion bypass (`orb_bypass_exhaustion`, default true)**: skip the VWAP/EMA extension filters during the ORB window. After an opening dump, VWAP is artificially depressed and recoveries look "extended" when they're really the trend establishing itself. After the ORB window, VWAP reflects today's action and the filter becomes meaningful.
-- **ORB index-confirmation bypass (`orb_bypass_index_confirmation`, default true)**: skip the hard index (SPY/QQQ) confirmation block during the ORB window. The 5m index VWAP is dragged by the opening candle's volume and EMAs are mostly yesterday's values; the hard block can skip valid ORB trend entries when the index is briefly below its own VWAP. Scoring still uses index state (the +1.0 trend-score bonus from index confirmation is not affected); only the hard skip is bypassed.
+- **ORB index-confirmation bypass (`orb_bypass_index_confirmation`, default true)**: skip the hard index (sector ETF) confirmation block during the ORB window. The 5m sector-ETF VWAP is dragged by the opening candle's volume and EMAs are mostly yesterday's values; the hard block can skip valid ORB trend entries when the sector ETF is briefly below its own VWAP. Scoring still uses index state (the +1.0 trend-score bonus from index confirmation is not affected); only the hard skip is bypassed.
 - **ORB structure-block bypass (`orb_bypass_structure_entry`, default true)**: skip the 1m market-structure block during the ORB window. The opening dump candle registers as CHoCH_down on the 1m chart and blocks LONG entries for several bars even after the recovery. The trend-regime fresh-breakout gate already proves direction. Caveat: more aggressive than HTF bias since the 1m structure is immediate, not stale. Set `false` to respect the 1m bearish signal during ORB.
 - **ORB SR-block bypass (`orb_bypass_sr_entry`, default true)**: skip the S/R `breakdown_below_support` (or `breakout_above_resistance` for shorts) block during the ORB window. An opening dump that breaks yesterday's low flips `breakdown_below_support` true, blocking LONG entries until the reclaim confirmation completes — often several bars after the recovery is already underway. Set `false` to respect the breakdown flag during ORB.
 - **ORB screener-bias bypass (`orb_bypass_screener_bias`, default true)**: restore fallthrough to the opposite side during ORB so Fix A doesn't block gap-reversal trades. `change_from_open` is dominated by the opening gap in the first 30 min — a gap-down day that reverses (TSLA 2026-04-15 $367→$362→$394) correctly belongs to LONG even though the screener tagged SHORT. Post-ORB the screener's directional read is respected. Set `false` to enforce screener bias during ORB too.
@@ -150,7 +150,7 @@ Candle patterns do not block entries — they only boost priority when multiple 
 
 ### 8. Index symbols are automatically added to the watchlist
 
-SPY and QQQ (configured in `index_symbols`) are added to the active watchlist so they receive history fetching, streaming, and appear in the bars dict. Without this, index confirmation would silently fail because `bars.get("SPY")` would return None.
+The sector ETFs configured in `index_symbols` (e.g. XLK, XLC, XLY, XLE, XLB depending on which sectors your universe touches) are added to the active watchlist so they receive history fetching, streaming, and appear in the bars dict. Without this, index confirmation would silently fail because `bars.get("XLK")` would return None for an AAPL trade.
 
 ### 9. Sector concentration guard prevents correlated stacking
 
@@ -162,7 +162,7 @@ All 11 GICS sectors are pre-defined in the manifest so new symbols can be droppe
 
 A strong top-tier adaptive entry usually looks like:
 
-- the stock has clear intraday direction confirmed by SPY/QQQ
+- the stock has clear intraday direction confirmed by its sector ETF (per `sector_index_map`)
 - the regime is unambiguous (score gap above the runner-up)
 - the time of day matches the regime (not trying trend plays in the midday chop)
 - the entry is not overextended from VWAP or EMA9
@@ -249,7 +249,7 @@ The shipped preset (`configs/config.top_tier_adaptive.yaml`) uses moderate risk 
 
 ### 15. When to start the bot
 
-- **Best start time**: 09:20-09:25 ET — gives time for history backfill and SPY/QQQ data before open.
+- **Best start time**: 09:20-09:25 ET — gives time for history backfill and sector-ETF data (XLK / XLE / etc.) before open.
 - **Minimum practical start**: before 09:30 ET — the screener window opens at 09:30.
 - The ORB regime window opens at 09:35, but practical entries begin once `min_bars` (90 one-minute bars) and `min_ltf_bars` (15 five-minute bars) are met from the loaded history. With `required_bars: 90`, both gates clear on cold start from the prior session's data.
 - With `runtime.auto_exit_after_session: true`, the bot shuts down cleanly after market close once all positions are flat. Designed for Windows Task Scheduler or cron to start the bot daily without manual shutdown.
@@ -267,12 +267,13 @@ Default windows:
 Strategy-specific knobs:
 
 - `tradable`: the fixed list of symbols to trade.
-- `index_symbols`: index ETFs used for directional confirmation (default SPY, QQQ).
+- `index_symbols`: index ETFs streamed for directional confirmation. Default is the SPDR Select Sector ETFs that cover the default tradable universe's sectors (XLK / XLC / XLY / XLF / XLV / XLP). Must include every ETF referenced by `sector_index_map` for actively-traded sectors.
+- `sector_index_map`: per-GICS-sector mapping → list of index ETFs to consult for confirming trades on symbols in that sector (default uses the canonical SPDR Select Sector ETFs). Falls back to OR-ing across all `index_symbols` when a sector has no mapping.
 - `require_index_confirmation`: gate trend/pullback/vol_squeeze/momentum entries on index agreement. Range and sr_scalp are exempt (mean-reversion theses).
 - `require_htf_bias_alignment`: reject longs against bearish HTF (15m) structure and shorts against bullish HTF structure. Neutral never blocks. Default `true` — prevents counter-trend entries on days when the higher-timeframe structure is pinned against the trade direction. Set `false` to allow counter-HTF setups (the bot will still score them normally, but won't outright block).
 - `orb_bypass_htf_bias`: skip the HTF bias check during the ORB window (09:35 to `orb_end_time`). Default `true`. Set `false` to enforce HTF bias filtering even at the open.
 - `orb_bypass_exhaustion`: skip the VWAP/EMA extension exhaustion filters during the ORB window. Default `true`. Set `false` to enforce exhaustion filtering even at the open.
-- `orb_bypass_index_confirmation`: skip the hard index (SPY/QQQ) confirmation block during the ORB window. Default `true`. Scoring still reflects index state; only the hard skip is bypassed. Set `false` to enforce full index confirmation even at the open.
+- `orb_bypass_index_confirmation`: skip the hard sector-ETF confirmation block during the ORB window. Default `true`. Scoring still reflects index state; only the hard skip is bypassed. Set `false` to enforce full index confirmation even at the open.
 - `orb_bypass_structure_entry`: skip the 1m market-structure block during the ORB window. Default `true`. Set `false` to respect CHoCH_down / bearish-bias-without-BOS_up signals on the 1m chart during the open.
 - `orb_bypass_sr_entry`: skip the S/R breakdown/breakout block during the ORB window. Default `true`. Set `false` to respect the `breakdown_below_support` flag (or `breakout_above_resistance` for shorts) during the open.
 - `orb_bypass_screener_bias`: restore fallthrough to the opposite side during the ORB window so Fix A (`respect_screener_bias`) doesn't block gap-reversal entries. Default `true`. Set `false` to enforce the screener's directional_bias during ORB too.
@@ -310,7 +311,11 @@ Current code defaults:
 | Option                               | Default                                                                                                                       |
 |--------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
 | `tradable`                           | `AAPL, MSFT, NVDA, INTC, AMD, AVGO, TSM, CRM, AMZN, TSLA, HD, LOW, UBER, COST, GOOG, META, NFLX, RBLX, TMUS, JPM, GS, V, LLY` |
-| `index_symbols`                      | `SPY, QQQ`                                                                                                                    |
+| `index_symbols`                      | `XLK, XLC, XLY, XLF, XLV, XLP`                                                                                                |
+| `sector_index_map`                   | All 11 GICS sectors mapped to their canonical SPDR Select Sector ETF (XLK, XLC, XLY, XLF, XLV, XLI, XLE, XLP, XLB, XLRE, XLU) |
+| `early_session_stop_widening_enabled`| `true`                                                                                                                        |
+| `early_session_stop_widening_until`  | `10:30`                                                                                                                       |
+| `early_session_stop_widening_mult`   | `1.3`                                                                                                                         |
 | `require_index_confirmation`         | `true`                                                                                                                        |
 | `require_htf_bias_alignment`         | `true`                                                                                                                        |
 | `orb_bypass_htf_bias`                | `true`                                                                                                                        |
