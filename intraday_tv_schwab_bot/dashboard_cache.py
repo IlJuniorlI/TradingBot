@@ -2161,6 +2161,7 @@ class DashboardCache:
                 breakout_atr_mult=float(getattr(sr_cfg, "breakout_atr_mult", 0.35) or 0.35),
                 breakout_buffer_pct=float(getattr(sr_cfg, "breakout_buffer_pct", 0.0015) or 0.0015),
                 structure_event_max_age_bars=int(getattr(sr_cfg, "structure_event_lookback_bars", 6) or 6),
+                min_range_atr_mult=float(getattr(sr_cfg, "structure_min_range_atr_mult", 1.5) or 0.0),
             )
         except Exception:
             self.log_component_failure(

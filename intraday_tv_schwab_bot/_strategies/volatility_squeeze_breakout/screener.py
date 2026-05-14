@@ -15,6 +15,15 @@ class VolatilitySqueezeBreakoutScreener(BaseStrategyScreener):
         min_change = float(params.get("min_change_from_open", 0.8))
         max_change = float(params.get("max_change_from_open", 8.0))
         min_rvol = float(params.get("min_rvol", 1.35))
+        # 2026-05-14: tighter screener for higher-probability squeeze setups.
+        #   * min_price floor lifted 8 → 12 (param-tunable now) to filter
+        #     low-float volatility traps where a single 50k-share order
+        #     can move 2%+ on its own.
+        #   * default upper-band of change_from_open clamped further by
+        #     the strategy yaml (4.5% vs prior 7.5%) — stocks already up
+        #     5%+ rarely have clean continuation room out of a squeeze.
+        #   * session-range cap default tightened 2.5% → 1.8% (yaml).
+        screener_min_price = float(params.get("screener_min_price", 12.0))
         # Select 'high' and 'low' so we can compute an intraday-range proxy
         # for compression: tight (high - low) / close = likely squeeze context.
         select_cols = ("name", "description", "exchange", "close", "high", "low", "volume", "market_cap_basic", "relative_volume_10d_calc", "change_from_open")
@@ -29,7 +38,7 @@ class VolatilitySqueezeBreakoutScreener(BaseStrategyScreener):
             self._base_query(limit=query_limit)
             .select(*self._select_fields(*select_cols))
             .where(
-                *self._liquid_equity_conditions(min_price=8.0),
+                *self._liquid_equity_conditions(min_price=screener_min_price),
                 c("change_from_open").between(screener_floor, max_change),
             )
             .order_by(self._order_field("change_from_open"), ascending=False)
@@ -38,7 +47,7 @@ class VolatilitySqueezeBreakoutScreener(BaseStrategyScreener):
             self._base_query(limit=query_limit)
             .select(*self._select_fields(*select_cols))
             .where(
-                *self._liquid_equity_conditions(min_price=8.0),
+                *self._liquid_equity_conditions(min_price=screener_min_price),
                 c("change_from_open").between(-max_change, -screener_floor),
             )
             .order_by(self._order_field("change_from_open"), ascending=True)
@@ -62,7 +71,10 @@ class VolatilitySqueezeBreakoutScreener(BaseStrategyScreener):
         # Post-filter: prefer stocks with tight intraday range (compression proxy).
         # (high - low) / close is a rough measure of session volatility.
         # True squeezes have small intraday ranges relative to price.
-        max_session_range_pct = float(params.get("screener_max_session_range_pct", 0.025))
+        # 2026-05-14: default tightened 2.5% → 1.8%. Stocks already showing
+        # >1.8% intraday range have already used much of the day's energy
+        # — less probable to produce a clean expansion-phase breakout.
+        max_session_range_pct = float(params.get("screener_max_session_range_pct", 0.018))
         if "high" in df.columns and "low" in df.columns and "close" in df.columns:
             session_range_pct = ((df["high"].astype(float) - df["low"].astype(float)) / df["close"].astype(float).clip(lower=0.01)).clip(lower=0.0)
             df = df[session_range_pct <= max_session_range_pct].copy()
@@ -82,7 +94,24 @@ class VolatilitySqueezeBreakoutScreener(BaseStrategyScreener):
         # + tight session range. Tight range stocks get a bonus.
         session_range = ((df["high"].astype(float) - df["low"].astype(float)) / df["close"].astype(float).clip(lower=0.01)).clip(lower=0.0) if "high" in df.columns else pd.Series(0.0, index=df.index)
         range_tightness_bonus = (max_session_range_pct - session_range).clip(lower=0.0) * 50.0
-        df["_squeeze_focus_score"] = (df["_effective_relative_volume"].astype(float) * 2.0) + (max_change - abs_change).clip(lower=0.0) + range_tightness_bonus
+        # 2026-05-14: RVOL tier bonus. The base score uses linear RVOL
+        # weighting (×2.0). Squeeze breakouts tend to fire from
+        # accumulation phases — stocks with strongly elevated RVOL
+        # (≥1.8×) are far more likely to have institutional positioning
+        # building, which is what fuels the post-breakout expansion.
+        # Bonus is +2.0 above the 1.8× threshold scaled by how much
+        # above, capped at +5.0 (= effective_rvol 4.3+).
+        screener_rvol_bonus_threshold = float(params.get("screener_rvol_bonus_threshold", 1.8))
+        screener_rvol_bonus_scale = float(params.get("screener_rvol_bonus_scale", 2.0))
+        screener_rvol_bonus_cap = float(params.get("screener_rvol_bonus_cap", 5.0))
+        rvol_excess = (df["_effective_relative_volume"].astype(float) - screener_rvol_bonus_threshold).clip(lower=0.0)
+        rvol_tier_bonus = (rvol_excess * screener_rvol_bonus_scale).clip(upper=screener_rvol_bonus_cap)
+        df["_squeeze_focus_score"] = (
+            (df["_effective_relative_volume"].astype(float) * 2.0)
+            + (max_change - abs_change).clip(lower=0.0)
+            + range_tightness_bonus
+            + rvol_tier_bonus
+        )
         df = df.sort_values(["_squeeze_focus_score", "_effective_relative_volume", "volume"], ascending=[False, False, False]).head(self.config.tradingview.max_candidates)
         return self._candidate_rows(
             df,

@@ -113,9 +113,17 @@ Strategy-specific knobs:
 - `require_vwap_alignment`: require price to break in the same direction as VWAP bias.
 - `require_avwap_alignment`: require price to agree with anchored VWAP impulse context when available.
 - `prefer_bollinger_squeeze_flag`: when enabled, prefer the built-in Bollinger squeeze flag to agree with the custom compression checks.
-- `target_rr`: initial reward-to-risk target before refinements.
+- `target_rr`: standard-tier reward-to-risk target before refinements (default `1.95`).
 - `runner_enabled`: allow the strongest squeeze breakouts to use the farther target logic.
-- `runner_target_rr`: target RR used for those runner cases.
+- `runner_target_rr`: target RR used for the runner tier (default `2.6`). Fires when ANY of: msltf BoS event in side direction, atr_expansion_mult ≥ `min_atr_expansion_mult + 0.12`, or strong-quality breakout (atr_expansion ≥ `tier_atr_expansion_floor`, volume ratio ≥ `tier_volume_ratio_floor`, bar close_position ≥ `tier_close_position_floor`).
+- `premium_target_rr`: premium-tier target RR (default `3.2`). Fires when strong-quality AND BoS event AND Bollinger squeeze flag — exceptionally aligned setups only.
+- `tiered_targets_enabled`: master switch (default `true`). When `false`, the 2-tier system (standard / runner) operates as before.
+- `tier_atr_expansion_floor`: ATR expansion threshold for strong-quality classification (default `1.25`).
+- `tier_volume_ratio_floor`: breakout-bar volume / box-median volume threshold (default `1.5`).
+- `tier_close_position_floor`: minimum close position for LONG (1.0 - threshold for SHORT) (default `0.78`).
+- `screener_min_price`: minimum price floor used by the screener (default `12.0`). Filters low-float volatility traps.
+- `screener_max_session_range_pct`: maximum same-session range as fraction of price (default `0.018` = 1.8%). Tighter intraday range = more compressed tape = more probable squeeze release.
+- `screener_rvol_bonus_threshold` / `screener_rvol_bonus_scale` / `screener_rvol_bonus_cap`: RVOL-tier bonus added to `_squeeze_focus_score`. Each unit of `_effective_relative_volume` above the threshold (default `1.8`) adds `scale` (default `2.0`) to the score, capped at `cap` (default `5.0`). Pushes strong-accumulation candidates to the top of the ranked list.
 
 Also uses these shared stock groups:
 
@@ -130,7 +138,7 @@ Current code defaults:
 | Option                                            | Current code default            |
 |---------------------------------------------------|---------------------------------|
 | `min_change_from_open`                            | `0.9`                           |
-| `max_change_from_open`                            | `7.5`                           |
+| `max_change_from_open`                            | `4.5`  (was `7.5` pre-2026-05-14) |
 | `min_rvol`                                        | `1.35`                          |
 | `min_bars`                                        | `60`                            |
 | `squeeze_lookback_bars`                           | `16`                            |
@@ -147,9 +155,19 @@ Current code defaults:
 | `require_vwap_alignment`                          | `true`                          |
 | `require_avwap_alignment`                         | `true`                          |
 | `prefer_bollinger_squeeze_flag`                   | `true`                          |
-| `target_rr`                                       | `2.05`                          |
+| `target_rr`                                       | `1.95`  (was `2.05` pre-2026-05-14) |
 | `runner_enabled`                                  | `true`                          |
-| `runner_target_rr`                                | `2.4`                           |
+| `runner_target_rr`                                | `2.6`  (was `2.4` pre-2026-05-14) |
+| `premium_target_rr`                               | `3.2`  (new 2026-05-14)         |
+| `tiered_targets_enabled`                          | `true`  (new 2026-05-14)        |
+| `tier_atr_expansion_floor`                        | `1.25`  (new 2026-05-14)        |
+| `tier_volume_ratio_floor`                         | `1.5`  (new 2026-05-14)         |
+| `tier_close_position_floor`                       | `0.78`  (new 2026-05-14)        |
+| `screener_min_price`                              | `12.0`  (was hardcoded 8.0 pre-2026-05-14) |
+| `screener_max_session_range_pct`                  | `0.018`  (was `0.025` pre-2026-05-14) |
+| `screener_rvol_bonus_threshold`                   | `1.8`  (new 2026-05-14)         |
+| `screener_rvol_bonus_scale`                       | `2.0`  (new 2026-05-14)         |
+| `screener_rvol_bonus_cap`                         | `5.0`  (new 2026-05-14)         |
 | `entry_exhaustion_filter_enabled`                 | `true`                          |
 | `max_entry_vwap_extension_atr`                    | `0.88`                          |
 | `max_entry_ema9_extension_atr`                    | `0.68`                          |

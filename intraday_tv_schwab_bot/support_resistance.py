@@ -70,6 +70,17 @@ class MarketStructureContext:
     structure_age_bars: int | None = None
     event_age_bars: int | None = None
     pivot_count: int = 0
+    # Spread between reference_high and reference_low expressed in ATR units.
+    # 0.0 when one of the reference pivots is missing. Surfaced for visibility
+    # so post-session analysis can correlate exit outcomes with structure
+    # range tightness.
+    structure_range_atr: float = 0.0
+    # True when both EQH and EQL flags are set AND the H-L spread is below
+    # ``structure_min_range_atr_mult``. Signals that bias-derived structure
+    # exits should be suppressed (already enforced in _resolve_structure_bias
+    # which returns "neutral" when this is True). Range / vol_squeeze
+    # entries can still inspect the eqh/eql flags directly.
+    tight_structure_range: bool = False
     reason: str = "insufficient_pivots"
 
 
@@ -213,11 +224,21 @@ def _resolve_structure_bias(
     bos_up_age: int | None,
     bos_down_age: int | None,
     max_event_age_bars: int | None,
+    tight_structure_range: bool = False,
 ) -> str:
     if reference_high is not None and close >= float(reference_high) + breakout_buffer:
         return "bullish"
     if reference_low is not None and close <= float(reference_low) - breakout_buffer:
         return "bearish"
+
+    # Tight EQH+EQL consolidation suppresses the midpoint / pivot / recent-
+    # event bias paths — a 0.3-ATR range produces noise-driven bias flips
+    # (single bar can swing bias bearish→bullish). Genuine BoS through the
+    # reference high/low above already returned bullish/bearish, so we still
+    # catch real breakouts. CHoCH is computed in analyze_market_structure
+    # from bos_up/down + pivot_bias, also unaffected.
+    if tight_structure_range:
+        return "neutral"
 
     midpoint_bias = "neutral"
     if reference_high is not None and reference_low is not None and float(reference_high) > float(reference_low):
@@ -274,6 +295,7 @@ def analyze_market_structure(
     breakout_atr_mult: float = 0.35,
     breakout_buffer_pct: float = 0.0015,
     structure_event_max_age_bars: int | None = 6,
+    min_range_atr_mult: float = 1.5,
 ) -> MarketStructureContext:
     frame = ensure_standard_indicator_frame(frame)
     if frame.empty:
@@ -329,6 +351,30 @@ def analyze_market_structure(
     choch_up = bool(bos_up and pivot_bias == "bearish")
     choch_down = bool(bos_down and pivot_bias == "bullish")
 
+    # Tight EQH+EQL consolidation detector (2026-05-14). When both EQH and
+    # EQL flags are set, check the spread between the most recent reference
+    # high and low. If it's below ``min_range_atr_mult`` ATR, the pivot
+    # range is too tight to produce meaningful structure-derived bias —
+    # midpoint and pivot-bias signals become noise (a single bar can flip
+    # bias bearish→bullish within the consolidation). When tight, the bias
+    # resolver short-circuits to "neutral" so structure_bearish_exit /
+    # structure_bullish_exit don't fire. EQH/EQL labels remain on the
+    # context so range-regime entries (which key on those labels) still
+    # see them.
+    structure_range = 0.0
+    if reference_high is not None and reference_low is not None:
+        structure_range = float(reference_high) - float(reference_low)
+    structure_range_atr = (structure_range / atr) if (atr > 0.0 and structure_range > 0.0) else 0.0
+    tight_structure_range = bool(
+        last_high_label == "EQH"
+        and last_low_label == "EQL"
+        and reference_high is not None
+        and reference_low is not None
+        and atr > 0.0
+        and min_range_atr_mult > 0.0
+        and structure_range_atr < float(min_range_atr_mult)
+    )
+
     bias = _resolve_structure_bias(
         pivot_bias=pivot_bias,
         close=close,
@@ -339,6 +385,7 @@ def analyze_market_structure(
         bos_up_age=bos_up_age,
         bos_down_age=bos_down_age,
         max_event_age_bars=structure_event_max_age_bars,
+        tight_structure_range=tight_structure_range,
     )
 
     event_ages = [
@@ -372,6 +419,8 @@ def analyze_market_structure(
         structure_age_bars=structure_age,
         event_age_bars=min(event_ages) if event_ages else None,
         pivot_count=len(pivots),
+        structure_range_atr=float(structure_range_atr),
+        tight_structure_range=bool(tight_structure_range),
         reason="ok" if (last_high_label is not None or last_low_label is not None) else "insufficient_pivots",
     )
 
@@ -900,6 +949,7 @@ def build_support_resistance_context(
     stop_buffer_atr_mult: float = 0.25,
     structure_eq_atr_mult: float = 0.25,
     structure_event_max_age_bars: int | None = 6,
+    structure_min_range_atr_mult: float = 1.5,
     use_prior_day_high_low: bool = True,
     use_prior_week_high_low: bool = True,
     flip_frame: pd.DataFrame | None = None,
@@ -1153,6 +1203,7 @@ def build_support_resistance_context(
         breakout_atr_mult=float(breakout_atr_mult),
         breakout_buffer_pct=float(breakout_buffer_pct),
         structure_event_max_age_bars=structure_event_max_age_bars,
+        min_range_atr_mult=float(structure_min_range_atr_mult),
     )
     return SupportResistanceContext(
         current_price=close,

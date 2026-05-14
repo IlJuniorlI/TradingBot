@@ -201,7 +201,40 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 stop = breakout_low - stop_buffer
                 stop = min(stop, last_close * (1.0 - self.config.risk.default_stop_pct))
                 risk_per_share = max(0.01, last_close - stop)
-                effective_target_rr = runner_target_rr if runner_enabled and (bool(getattr(ms_ctx, "bos_up", False)) or bool(getattr(tech_ctx, "atr_expansion_mult", 0.0) >= (min_atr_expansion_mult + 0.12))) else target_rr
+                # 3-tier target structure (2026-05-14): standard / runner /
+                # premium. Standard catches the bulk of qualifying setups
+                # at a realistic target. Runner extends when the breakout
+                # passes higher quality thresholds (ATR + volume + bar
+                # body all strong). Premium extends further when ALL of
+                # runner-quality + active BoS-up event + Bollinger squeeze
+                # flag agree — the setup is exceptionally aligned and
+                # deserves more runway. Toggle via `tiered_targets_enabled`.
+                tiered_targets_enabled = bool(self.params.get("tiered_targets_enabled", True)) and runner_enabled
+                tier_atr_floor = float(self.params.get("tier_atr_expansion_floor", 1.25))
+                tier_vol_floor = float(self.params.get("tier_volume_ratio_floor", 1.50))
+                tier_close_floor = float(self.params.get("tier_close_position_floor", 0.78))
+                premium_target_rr_val = max(runner_target_rr, float(self.params.get("premium_target_rr", 3.2)))
+                atr_expansion_mult_val = _safe_float(getattr(tech_ctx, "atr_expansion_mult", None), 0.0)
+                bos_up_active = bool(getattr(ms_ctx, "bos_up", False))
+                bollinger_squeeze_flag = bool(getattr(tech_ctx, "bollinger_squeeze", False))
+                strong_quality = (
+                    atr_expansion_mult_val >= tier_atr_floor
+                    and breakout_volume_ratio >= tier_vol_floor
+                    and close_pos >= tier_close_floor
+                )
+                if tiered_targets_enabled and strong_quality and bos_up_active and bollinger_squeeze_flag:
+                    effective_target_rr = premium_target_rr_val
+                    squeeze_tier_label = "premium"
+                elif runner_enabled and (
+                    bos_up_active
+                    or atr_expansion_mult_val >= (min_atr_expansion_mult + 0.12)
+                    or (tiered_targets_enabled and strong_quality)
+                ):
+                    effective_target_rr = runner_target_rr
+                    squeeze_tier_label = "runner"
+                else:
+                    effective_target_rr = target_rr
+                    squeeze_tier_label = "standard"
                 target = last_close + risk_per_share * effective_target_rr
                 if self._blocks_bullish_structure_entry(ms_ctx):
                     long_reasons.append(self._bullish_structure_block_reason(ms_ctx))
@@ -216,7 +249,13 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                     management = self._adaptive_management_components(Side.LONG, last_close, stop, target, style="trend", runner_allowed=bool(runner_enabled), continuation_bias=float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0))
                     final_priority_score = float(c.activity_score) + (0.45 if bool(getattr(tech_ctx, "bollinger_squeeze", False)) else 0.0) + max(0.0, 1.0 - min(1.0, width_ratio)) + max(0.0, breakout_volume_ratio - 1.0) + (0.35 if bool(getattr(ms_ctx, "bos_up", False)) else 0.0) + adjustments["entry_context_adjustment"] + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
                     reason = "volatility_squeeze_breakout_long"
-                    meta = {**metadata, "final_priority_score": round(final_priority_score, 4), **adjustments, **fvg_adjustments, **management}
+                    meta = {
+                        **metadata,
+                        "final_priority_score": round(final_priority_score, 4),
+                        "squeeze_tier_label": squeeze_tier_label,
+                        "squeeze_effective_target_rr": round(float(effective_target_rr), 4),
+                        **adjustments, **fvg_adjustments, **management,
+                    }
                     signals.append(Signal(symbol=c.symbol, strategy=self.strategy_name, side=Side.LONG, reason=reason, stop_price=float(stop), target_price=float(target), metadata=meta))
 
             short_reasons = list(shared_reasons)
@@ -256,7 +295,36 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 stop = breakout_high + stop_buffer_short
                 stop = max(stop, last_close * (1.0 + self.config.risk.default_stop_pct))
                 risk_per_share = max(0.01, stop - last_close)
-                effective_target_rr = runner_target_rr if runner_enabled and (bool(getattr(ms_ctx, "bos_down", False)) or bool(getattr(tech_ctx, "atr_expansion_mult", 0.0) >= (min_atr_expansion_mult + 0.12))) else target_rr
+                # 3-tier target structure (2026-05-14): mirror of LONG side.
+                # Strong-quality requires close_pos in the LOWER 22% of bar
+                # for SHORT (i.e., 1.0 - tier_close_floor); BoS-down event
+                # + Bollinger squeeze qualify for premium tier.
+                tiered_targets_enabled_s = bool(self.params.get("tiered_targets_enabled", True)) and runner_enabled
+                tier_atr_floor_s = float(self.params.get("tier_atr_expansion_floor", 1.25))
+                tier_vol_floor_s = float(self.params.get("tier_volume_ratio_floor", 1.50))
+                tier_close_floor_s = float(self.params.get("tier_close_position_floor", 0.78))
+                premium_target_rr_short = max(runner_target_rr, float(self.params.get("premium_target_rr", 3.2)))
+                atr_expansion_mult_val_s = _safe_float(getattr(tech_ctx, "atr_expansion_mult", None), 0.0)
+                bos_down_active = bool(getattr(ms_ctx, "bos_down", False))
+                bollinger_squeeze_flag_s = bool(getattr(tech_ctx, "bollinger_squeeze", False))
+                strong_quality_short = (
+                    atr_expansion_mult_val_s >= tier_atr_floor_s
+                    and breakout_volume_ratio >= tier_vol_floor_s
+                    and close_pos <= (1.0 - tier_close_floor_s)  # bar closed near LOW
+                )
+                if tiered_targets_enabled_s and strong_quality_short and bos_down_active and bollinger_squeeze_flag_s:
+                    effective_target_rr = premium_target_rr_short
+                    squeeze_tier_label = "premium"
+                elif runner_enabled and (
+                    bos_down_active
+                    or atr_expansion_mult_val_s >= (min_atr_expansion_mult + 0.12)
+                    or (tiered_targets_enabled_s and strong_quality_short)
+                ):
+                    effective_target_rr = runner_target_rr
+                    squeeze_tier_label = "runner"
+                else:
+                    effective_target_rr = target_rr
+                    squeeze_tier_label = "standard"
                 target = last_close - risk_per_share * effective_target_rr
                 if self._blocks_bearish_structure_entry(ms_ctx):
                     short_reasons.append(self._bearish_structure_block_reason(ms_ctx))
@@ -271,7 +339,13 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                     management = self._adaptive_management_components(Side.SHORT, last_close, stop, target, style="trend", runner_allowed=bool(runner_enabled), continuation_bias=float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0))
                     final_priority_score = float(c.activity_score) + (0.45 if bool(getattr(tech_ctx, "bollinger_squeeze", False)) else 0.0) + max(0.0, 1.0 - min(1.0, width_ratio)) + max(0.0, breakout_volume_ratio - 1.0) + (0.35 if bool(getattr(ms_ctx, "bos_down", False)) else 0.0) + adjustments["entry_context_adjustment"] + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
                     reason = "volatility_squeeze_breakout_short"
-                    meta = {**metadata, "final_priority_score": round(final_priority_score, 4), **adjustments, **fvg_adjustments, **management}
+                    meta = {
+                        **metadata,
+                        "final_priority_score": round(final_priority_score, 4),
+                        "squeeze_tier_label": squeeze_tier_label,
+                        "squeeze_effective_target_rr": round(float(effective_target_rr), 4),
+                        **adjustments, **fvg_adjustments, **management,
+                    }
                     signals.append(Signal(symbol=c.symbol, strategy=self.strategy_name, side=Side.SHORT, reason=reason, stop_price=float(stop), target_price=float(target), metadata=meta))
 
             if not signals:

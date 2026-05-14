@@ -7,8 +7,186 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **volatility_squeeze_breakout: 3-tier targets + tighter screener.** *2026-05-14*
+  - **Three-tier target structure** replaces the prior 2-tier (standard /
+    runner) system in `_build_*` of the standalone strategy:
+    - Standard `target_rr: 2.05 → 1.95` — every qualifying setup
+    - Runner `runner_target_rr: 2.4 → 2.6` — promoted when ANY of: msltf
+      BoS in side direction, atr_expansion ≥ `min_atr_expansion_mult +
+      0.12`, OR strong-quality breakout (ATR exp ≥ 1.25, vol ratio ≥
+      1.5, close_pos ≥ 0.78)
+    - **Premium `premium_target_rr: 3.2`** (NEW) — strong-quality AND
+      msltf BoS event AND `tech_ctx.bollinger_squeeze` flag
+  - New params on the strategy:
+    `premium_target_rr` (default 3.2), `tiered_targets_enabled`
+    (default true), `tier_atr_expansion_floor` (1.25),
+    `tier_volume_ratio_floor` (1.5), `tier_close_position_floor` (0.78).
+    Set `tiered_targets_enabled: false` to revert to 2-tier behavior.
+  - Signal metadata now stamps `squeeze_tier_label` ("standard" /
+    "runner" / "premium") and `squeeze_effective_target_rr` for log
+    visibility — post-session analysis can slice trade outcomes by tier.
+  - **Screener tightening** (more probable symbols, fewer noise traps):
+    - `screener_min_price: 8.0 → 12.0` (now param-tunable, was
+      hardcoded). Filters low-float volatility traps where small flows
+      move the tape disproportionately.
+    - `screener_max_session_range_pct: 0.025 → 0.018`. Stocks already
+      showing >1.8% intraday range have used most of the day's energy.
+    - `max_change_from_open: 7.5 → 4.5`. Stocks already up 5%+ rarely
+      have clean continuation runway out of a squeeze.
+    - New `screener_rvol_bonus_*` (threshold 1.8, scale 2.0, cap 5.0):
+      RVOL-tier bonus added to `_squeeze_focus_score`. Each unit of
+      `_effective_relative_volume` above 1.8 adds 2.0 to the score
+      (capped at +5.0). Strong-accumulation names rise to the top of
+      the ranked candidate list.
+  - Motivation: the strategy was overall restrictive (lots of hard
+    filters) but the targets were uniform across breakout quality —
+    a marginal setup that barely passed all gates was rewarded the
+    same as one with full ATR expansion + BoS + Bollinger squeeze.
+    Tier system creates linear reward for breakout quality. Screener
+    tightening reduces raw candidate count by ~40-50% while focusing
+    on the genuinely compressed, mid-cap-and-up names where squeeze
+    breakouts have the highest historical success rate.
+  - LONG-side and SHORT-side tier logic mirror each other. SHORT
+    strong-quality requires `close_pos <= 1.0 - tier_close_position_
+    floor` (close near bar's LOW) instead of upper-bar close.
+  - `allow_short: false` in the shipped config preserved per user
+    direction — code path unchanged.
+
+- **top_tier_adaptive: vol_squeeze hard gates + setup-quality filters.** *2026-05-14*
+  - Built `_build_vol_squeeze_signal` with two complementary gate types
+    that keep today's known winners (TSLA +$130, COP +$14, XOM +$33)
+    while filtering ~5 of 8 losers identified in the ENTRY_CONTEXT log.
+  - **Hard breakout-quality gates** (toggle via `vol_squeeze_hard_
+    breakout_gates: true`, default `true`) — convert the prior +0.5
+    scoring bonuses into HARD gates. Compression-strong setups (3.5
+    base) + a marginal breakout (+1.5 = 5.0) used to pass
+    `min_vol_squeeze_score: 4.0` even when the post-breakout bar had
+    weak volume / wicky body / barely cleared the box. Now hard-reject:
+    - Volume: `bar_volume / box_volume_median >= 1.25` (was scoring
+      bonus only at 1.20)
+    - Close position: `close_pos >= 0.65` for LONG (mirror for SHORT)
+    - Breakout buffer: `last_close >= box_high * (1 + 0.0012)` for LONG
+  - **Setup-quality gates** (NEW, separate threshold params):
+    - `vol_squeeze_min_sr_bias_alignment` (default `0.20`): rejects
+      LONG when `sr_bias_score < -0.20` (HTF SR favors the opposite
+      side); mirror for SHORT. Today's losers included AMD 10:06
+      (sr_bias −0.75), NFLX 13:35 (−0.60), GOOG 10:08 SHORT (+0.75
+      against a SHORT). All 3 winners had `sr_bias_score >= +0.15`.
+    - `vol_squeeze_min_pct_b_directional` (default `0.50`): LONG
+      requires `tech_bollinger_percent_b >= 0.50` (upper half of BBs
+      at the breakout bar); SHORT requires `<= 0.50`. Today's AMD
+      10:06 LONG had pct_b 0.31 (lower band), AAPL/GOOG SHORTs had
+      0.40/0.44 (mid — not at lower band). All 3 winners had
+      pct_b ≥ 0.60.
+    - Set either threshold to `0.0` to disable that gate.
+  - Skip-reason format surfaces the actual values:
+    - `long_vol_squeeze_weak_breakout_buffer(close=X<required=Y)`
+    - `vol_squeeze_weak_breakout_volume(ratio=X<1.25)`
+    - `long_vol_squeeze_weak_bar_close(pos=X<0.65)`
+    - `long_vol_squeeze_sr_against(bias=−0.75<−0.20)`
+    - `long_vol_squeeze_pct_b_below_mid(pct_b=0.31<0.50)`
+  - Motivation: 2026-05-14 session showed 14 vol_squeeze entries with
+    3W/8L (27% wr), +$9.58 net — without TSLA winner −$120 net. The
+    earlier attempt at raising scoring bonus thresholds was cosmetic
+    because the bonuses only add +0.5; most setups passed `min_score:
+    4.0` on compression + breakout alone, never needing the bonuses.
+    Hard gates close that loophole, AND the new setup-quality gates
+    add data-derived filtering that proved to discriminate winners
+    from losers in the session log.
+  - Earlier "1.40 vol_ratio + 0.75 close_pos" hard gates were aggressive
+    enough to risk blocking the TSLA winner. Softened to 1.25 / 0.65
+    in this iteration — winners likely pass both, the SR + pct_b gates
+    do the heavy lifting on quality filtering.
+  - `disable_vol_squeeze_regime` remains `false` on both E: tuned preset
+    and H: running config. Manifest defaults updated to match.
+
 ### Added
 
+- **Tight EQH+EQL bias suppression (`structure_min_range_atr_mult`).** *2026-05-14*
+  - New `support_resistance` knob `structure_min_range_atr_mult` (default `1.5`).
+    When EQH and EQL flags both fire on `analyze_market_structure` AND the
+    spread between `reference_high` and `reference_low` is below N×ATR, the
+    bias resolver short-circuits to `"neutral"` — preventing the midpoint /
+    pivot-bias / recent-event paths from flipping bias on noise within a
+    tight consolidation. EQL/HH pivot labels remain on the context so
+    range-regime entries (which key on EQ flags for mean-reversion setups)
+    still see them.
+  - Genuine BoS through `reference_high` / `reference_low` (real breakout
+    beyond breakout_buffer) still fires bias bullish/bearish — that check
+    runs BEFORE the tight-range short-circuit. CHoCH exits unaffected.
+  - Two new fields on `MarketStructureContext` surfaced for log analysis:
+    - `structure_range_atr`: spread / ATR (always populated when both
+      reference levels present, regardless of tightness flag).
+    - `tight_structure_range`: bool flag indicating the guard is active.
+  - Both fields auto-surface in `ENTRY_CONTEXT` / `EXIT_CONTEXT` /
+    `SKIP_SUMMARY` JSONs via the `msltf_` / `mshtf_` prefix in
+    `strategy_base._structure_lists`.
+  - Motivation: user observation that "EQL and EQH shouldn't be allowed
+    to happen right next to each other — there has to be a gap between
+    them or they produce false signals." Specifically: AMD 14:36 LONG
+    pullback (2026-05-14) was killed at hold=10.2m via
+    `structure_bearish_exit:EQL` on a chop range where bias was
+    oscillating noisily. With this guard active and `min_range_atr_mult`
+    set to 1.5, the bias resolves to neutral inside the tight range and
+    the exit doesn't fire on midpoint-bias noise.
+  - Threaded through 3 call sites: `strategy_base._structure_context`,
+    `data_feed.build_support_resistance_context` (via SR builder kwarg),
+    and `dashboard_cache.analyze_market_structure`. Tests in
+    `tests/test_bug_regressions.py::TestTightStructureRangeBias2026_05_14`.
+- **top_tier_adaptive: oversized entry bar gate.** *2026-05-14*
+  - New params on `top_tier_adaptive` to reject entries when the latest
+    LTF 5m bar has range or body far above ATR — catches the "5m close
+    lag" chase pattern where the bot waits for a large bar to close and
+    enters near its high/low (a $X move already done):
+    - `reject_oversized_entry_bar` (default `true`): master switch.
+    - `entry_bar_range_max_atr_mult` (default `1.8`): skip when
+      `(high - low) / atr14 >= 1.8`.
+    - `entry_bar_body_max_atr_mult` (default `1.4`): skip when
+      `|close - open| / atr14 >= 1.4`.
+    - `orb_bypass_oversized_entry_bar` (default `true`): opening flush
+      bars are always huge — bypass during ORB window.
+  - Applies to `trend` / `pullback` / `sr_scalp` regimes only. `range`,
+    `vol_squeeze`, and `momentum` are exempt because big bars ARE the
+    setup for those regimes (range = mean-reversion at extremes;
+    squeeze + momentum = expansion-driven).
+  - Independent of `reject_stretched_entries` (which keys on Bollinger
+    %B + ATR-stretch from EMA20). The stretched gate didn't catch
+    AMD-style "big bar but price isn't far from MAs" entries because
+    EMAs follow the move; this gate looks at the bar's OWN size.
+  - Skip-reason format: `long_oversized_entry_bar(range=X.XX>=R.RR,body=Y.YY>=B.BB)`
+    surfaces both metrics so the active condition is identifiable.
+  - Implementation in `_finalize_signal` right before the existing
+    `reject_stretched_entries` block. Tests in
+    `tests/test_bug_regressions.py::TestOversizedEntryBarGate2026_05_14`.
+- **Structure-exit pullback grace + BoS confirmation gate.** *2026-05-14*
+  - Two new ``support_resistance`` knobs that layer onto the existing
+    ``structure_exit_grace_minutes`` / ``structure_exit_min_post_entry_pivots``
+    gates that suppress ``structure_bearish_exit`` / ``structure_bullish_exit``
+    early in a trade's life:
+    - ``structure_exit_grace_minutes_pullback`` (default ``15``): extends
+      the grace specifically for the pullback regime (``position.metadata
+      .regime == "pullback"``). Pullback by design enters into LTF chop —
+      the first EQL/LL pivot 10 minutes in is almost always noise, not
+      reversal. Other regimes still use the global grace (10 min).
+    - ``structure_exit_require_bos_confirmation`` (default ``true``): the
+      bias-flip exit now additionally requires an active BoS event
+      (``bos_down`` for long-exit, ``bos_up`` for short-exit). Without
+      this, bias flips on a single EQL/HH pivot — a noisy, weak signal.
+      With it, the bot waits for actual structural break (price below a
+      prior swing low / above a prior swing high). CHoCH exits remain
+      unaffected — those are already strong signals.
+  - Motivation: AMD 14:36 LONG (pullback regime, 2026-05-14) was killed
+    at hold=10.2m via ``structure_bearish_exit:EQL``. The exit barely
+    cleared both legacy gates (10min/2-pivot); the LTF formed a single
+    EQL pivot, bias flipped bearish, exit fired. Price recovered to
+    ~$452 (past R1 $450.10, toward R2 $454.65) shortly after — a
+    winnable trade aborted on noise.
+  - Per-regime grace is implemented in ``strategy_base.position_exit_signal``
+    by branching on ``position.metadata.regime``. BoS confirmation is
+    applied to both LONG and SHORT bias-flip paths. Tests added in
+    ``tests/test_bug_regressions.py::TestPullbackGraceAndBoSConfirmation2026_05_14``.
 - **top_tier_adaptive: per-sector index confirmation map.** *2026-05-14*
   - New ``sector_index_map`` param routes each candidate to a sector-
     specific list of index ETFs for entry confirmation, replacing the

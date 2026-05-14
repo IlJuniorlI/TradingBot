@@ -423,6 +423,16 @@ class PositionManager:
             'style': meta.get('style'),
             'direction': meta.get('direction'),
             'regime': meta.get('regime'),
+            # Per-sector index ETFs the entry was confirmed against
+            # (stamped by top_tier_adaptive at signal-build time via
+            # ``_indices_for_symbol``). Useful for verifying the
+            # sector_index_map is firing and slicing exit outcomes by
+            # which sector was confirming the trade.
+            'confirmation_indices': meta.get('confirmation_indices'),
+            # Volatility widening factor applied to the structural stop
+            # at entry (Tier 2a ATR-expansion + early-session widening).
+            # 1.0 = no widening applied.
+            'vol_widening_factor': safe_float(meta.get('vol_widening_factor'), None),
             'final_priority_score': safe_float(meta.get('final_priority_score'), None),
             'selection_quality_score': safe_float(meta.get('selection_quality_score'), None),
             'activity_score': safe_float(meta.get('activity_score'), None),

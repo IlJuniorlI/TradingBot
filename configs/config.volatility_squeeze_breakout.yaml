@@ -487,7 +487,7 @@ strategies:
         short: true
       fvg_runner_rr_bonus: 0.16
       htf_fvg_entry_weight: 0.44
-      max_change_from_open: 7.5
+      max_change_from_open: 4.5                # 2026-05-14: tightened 7.5 → 4.5; stocks already up 5%+ rarely produce clean continuation breakouts
       max_entry_bar_range_atr: 1.42
       max_entry_ema9_extension_atr: 0.68
       max_entry_lower_wick_frac: 0.25
@@ -510,10 +510,37 @@ strategies:
       require_avwap_alignment: true
       require_vwap_alignment: true
       runner_enabled: true
-      runner_target_rr: 2.4
       squeeze_baseline_bars: 22
       squeeze_lookback_bars: 16
-      target_rr: 2.05
+      # 3-tier target structure (2026-05-14). All setups that pass the
+      # entry filters get at minimum target_rr (1.95). The single-tier
+      # promotion to runner (2.6) fires when ANY of:
+      #   * msltf BoS event in the side direction
+      #   * atr_expansion_mult >= min_atr_expansion_mult + 0.12 (1.12+)
+      #   * strong-quality: ATR exp >= 1.25 AND vol ratio >= 1.5 AND
+      #     close_pos >= 0.78 (LONG; mirror for SHORT)
+      # Premium (3.2) requires strong-quality AND BoS event AND
+      # Bollinger squeeze flag — exceptionally aligned setups only.
+      # Disable via tiered_targets_enabled: false (falls back to the
+      # 2-tier system: standard / runner).
+      target_rr: 1.95
+      runner_target_rr: 2.6
+      premium_target_rr: 3.2
+      tiered_targets_enabled: true
+      tier_atr_expansion_floor: 1.25
+      tier_volume_ratio_floor: 1.5
+      tier_close_position_floor: 0.78
+      # Screener tuning (2026-05-14): more probable symbols by filtering
+      # low-float volatility traps and stocks already overextended.
+      # screener_min_price: 12 (was hardcoded 8). screener_max_session_
+      # range_pct: 0.018 (was 0.025). RVOL bonus tier: extra +2.0 for
+      # each unit of effective_rvol above 1.8, capped at +5.0 — pushes
+      # strong-accumulation names to the top of the candidate list.
+      screener_min_price: 12.0
+      screener_max_session_range_pct: 0.018
+      screener_rvol_bonus_threshold: 1.8
+      screener_rvol_bonus_scale: 2.0
+      screener_rvol_bonus_cap: 5.0
 
 # Pair definitions used by the pairs_residual strategy.
 pairs: []

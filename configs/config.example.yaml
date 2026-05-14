@@ -319,12 +319,33 @@ support_resistance:
   structure_ltf_weight: 0.65
   structure_htf_weight: 0.95
   structure_event_lookback_bars: 8
+  # Tight-range detector (2026-05-14): when EQH and EQL coexist within
+  # < N×ATR of each other, structure-derived bias resolves to "neutral"
+  # so structure_bearish/bullish_exit doesn't fire on a noisy tight chop
+  # range. EQH/EQL flags remain set so range-regime entries can still
+  # see them. Set 0.0 to disable. CHoCH exits unaffected.
+  structure_min_range_atr_mult: 1.5
   # Grace window suppressing bias-based structure exits (EQL/LL/HL/HH/LH)
   # in the first N minutes after entry AND until at least M new 1m pivots
   # have formed. CHoCH exits still fire — those are true reversal signals
   # rather than minor noise pivots.
   structure_exit_grace_minutes: 10
   structure_exit_min_post_entry_pivots: 2
+  # Extended grace specifically for the PULLBACK regime. Pullback entries
+  # are designed to enter into LTF chop (buy the dip on a bullish HTF), so
+  # the first EQL pivot 10 min in is almost always noise, not reversal.
+  # Used only when position.metadata.regime == "pullback"; otherwise the
+  # global structure_exit_grace_minutes applies. Session 2026-05-14 AMD
+  # pullback was killed at 10.2m via structure_bearish_exit:EQL; price
+  # recovered above target shortly after. Set <= global to disable.
+  structure_exit_grace_minutes_pullback: 15
+  # When true, structure_bearish_exit / structure_bullish_exit (the bias-
+  # flip exit, NOT CHoCH) additionally require an active BoS event in the
+  # matching direction (bos_down for long-exit, bos_up for short-exit).
+  # Without this, bias flips on a single EQL/HH pivot — noisy and weak.
+  # With it, the bot waits for an actual structural break (price below a
+  # prior swing low, or above for shorts). CHoCH exits are unaffected.
+  structure_exit_require_bos_confirmation: true
   # Additional grace for positions entered during the ORB window
   # (09:35 to strategy.orb_end_time). Pullbacks early in ORB trades often
   # present as bearish-structure / bearish-chart-pattern signals but

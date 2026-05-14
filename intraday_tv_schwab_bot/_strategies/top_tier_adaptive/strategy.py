@@ -899,6 +899,116 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         box_high = _safe_float(box["high"].max(), close)
         box_low = _safe_float(box["low"].min(), close)
         box_range = max(0.0, box_high - box_low)
+
+        # Hard breakout-quality gates (2026-05-14). Same threshold values
+        # that earn +0.5 scoring bonuses in ``_score_vol_squeeze`` are
+        # also enforced HERE as HARD gates — a trade with weak breakout
+        # volume, weak bar body, or close that didn't clear the box-edge
+        # by enough buffer is rejected outright instead of just losing
+        # the bonus point. Without hard gates, a setup with strong
+        # compression (3.5) + breakout (+1.5) = 5.0 passes
+        # min_vol_squeeze_score (4.0) even on a weak post-breakout bar.
+        #
+        # Augmented 2026-05-14 with two SETUP-quality gates that proved
+        # to separate winners from losers in the session log:
+        #   * SR-alignment: vol_squeeze LONG rejected when sr_bias_score
+        #     < -threshold (HTF SR favors the opposite side). Mirror for
+        #     SHORT. Blocks AMD 10:06 (sr -0.75), NFLX 13:35 (-0.60),
+        #     GOOG 10:08 SHORT (+0.75) — none of the 3 known winners
+        #     would have been blocked (TSLA +0.75, COP +0.15, XOM +0.15).
+        #   * pct_b directional: LONG requires close to be in the upper
+        #     half of Bollinger Bands (pct_b ≥ threshold); SHORT requires
+        #     lower half. AMD 10:06 LONG had pct_b 0.31, AAPL/GOOG SHORTs
+        #     had 0.40/0.44 — all losers. Winners all had pct_b ≥ 0.60.
+        #
+        # Set ``vol_squeeze_hard_breakout_gates`` false to revert to
+        # scoring-only behavior on the volume / close_pos / buffer gates.
+        # The SR-alignment and pct_b gates can be disabled independently
+        # via their own threshold params (set to 0.0 to disable).
+        if bool(self.params.get("vol_squeeze_hard_breakout_gates", True)):
+            last_bar = session_frame.iloc[-1]
+            last_close = _safe_float(last_bar.get("close"), close)
+            buffer_pct = float(self.params.get("vol_squeeze_breakout_buffer_pct", 0.0008))
+            if side == Side.LONG:
+                required_clearance = box_high * (1.0 + buffer_pct)
+                if last_close < required_clearance:
+                    self._set_build_failure(
+                        c.symbol, "vol_squeeze",
+                        f"long_vol_squeeze_weak_breakout_buffer(close={last_close:.4f}<required={required_clearance:.4f})",
+                    )
+                    return None
+            else:
+                required_clearance = box_low * (1.0 - buffer_pct)
+                if last_close > required_clearance:
+                    self._set_build_failure(
+                        c.symbol, "vol_squeeze",
+                        f"short_vol_squeeze_weak_breakout_buffer(close={last_close:.4f}>required={required_clearance:.4f})",
+                    )
+                    return None
+            try:
+                vol_baseline = max(1.0, float(box["volume"].median()))
+            except Exception:
+                vol_baseline = 1.0
+            cur_vol = _safe_float(last_bar.get("volume"), 0.0)
+            min_vol_ratio = float(self.params.get("vol_squeeze_min_breakout_volume_ratio", 1.12))
+            actual_vol_ratio = (cur_vol / vol_baseline) if vol_baseline > 0.0 else 0.0
+            if actual_vol_ratio < min_vol_ratio:
+                self._set_build_failure(
+                    c.symbol, "vol_squeeze",
+                    f"vol_squeeze_weak_breakout_volume(ratio={actual_vol_ratio:.2f}<{min_vol_ratio:.2f})",
+                )
+                return None
+            close_pos = _bar_close_position(session_frame)
+            min_close_pos = float(self.params.get("vol_squeeze_min_bar_close_position", 0.63))
+            if side == Side.LONG and close_pos < min_close_pos:
+                self._set_build_failure(
+                    c.symbol, "vol_squeeze",
+                    f"long_vol_squeeze_weak_bar_close(pos={close_pos:.2f}<{min_close_pos:.2f})",
+                )
+                return None
+            if side == Side.SHORT and close_pos > (1.0 - min_close_pos):
+                self._set_build_failure(
+                    c.symbol, "vol_squeeze",
+                    f"short_vol_squeeze_weak_bar_close(pos={close_pos:.2f}>{1.0 - min_close_pos:.2f})",
+                )
+                return None
+
+        # Setup-quality gates that proved to separate winners from losers
+        # in the 2026-05-14 session. Independent of hard_breakout_gates
+        # switch — set the threshold params to 0.0 to disable each.
+        sr_alignment_threshold = float(self.params.get("vol_squeeze_min_sr_bias_alignment", 0.20))
+        if sr_alignment_threshold > 0.0:
+            sr_ctx = self._sr_context(c.symbol, frame, data)
+            sr_bias_score = _safe_float(getattr(sr_ctx, "bias_score", None), 0.0)
+            if side == Side.LONG and sr_bias_score < -sr_alignment_threshold:
+                self._set_build_failure(
+                    c.symbol, "vol_squeeze",
+                    f"long_vol_squeeze_sr_against(bias={sr_bias_score:+.2f}<{-sr_alignment_threshold:+.2f})",
+                )
+                return None
+            if side == Side.SHORT and sr_bias_score > sr_alignment_threshold:
+                self._set_build_failure(
+                    c.symbol, "vol_squeeze",
+                    f"short_vol_squeeze_sr_against(bias={sr_bias_score:+.2f}>{+sr_alignment_threshold:+.2f})",
+                )
+                return None
+        pct_b_threshold = float(self.params.get("vol_squeeze_min_pct_b_directional", 0.50))
+        if pct_b_threshold > 0.0:
+            tech_ctx = self._technical_context(frame)
+            pct_b = _safe_float(getattr(tech_ctx, "bollinger_percent_b", None), 0.5)
+            if side == Side.LONG and pct_b < pct_b_threshold:
+                self._set_build_failure(
+                    c.symbol, "vol_squeeze",
+                    f"long_vol_squeeze_pct_b_below_mid(pct_b={pct_b:.2f}<{pct_b_threshold:.2f})",
+                )
+                return None
+            if side == Side.SHORT and pct_b > (1.0 - pct_b_threshold):
+                self._set_build_failure(
+                    c.symbol, "vol_squeeze",
+                    f"short_vol_squeeze_pct_b_above_mid(pct_b={pct_b:.2f}>{1.0 - pct_b_threshold:.2f})",
+                )
+                return None
+
         target_rr = float(self.params.get("vol_squeeze_target_rr", 2.05))
         # Stop buffer scales with box range so tighter squeezes don't get
         # over-wide ATR-based stops. Mirrors source strategy logic.
@@ -1145,6 +1255,49 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # normally to prevent late-in-move chases.
         orb_stretched_bypass = bool(self.params.get("orb_bypass_stretched_filter", False)) and in_orb_window
         orb_tech_bias_bypass = bool(self.params.get("orb_bypass_tech_bias_contradiction", True)) and in_orb_window
+        orb_oversized_bar_bypass = bool(self.params.get("orb_bypass_oversized_entry_bar", True)) and in_orb_window
+        # Bar-size gate (2026-05-14) — reject entries when the LTF bar the
+        # signal was built on has a range or body far above ATR. Mitigates
+        # the "5m close lag" pattern where the bot waits for the 5m bar
+        # to close, evaluates against it, and then enters near the bar's
+        # high/low (= a $X chase that's already done). Catches both the
+        # "big total spread / wicky" bar and the "big directional thrust"
+        # bar via separate range/body thresholds. Applies to regimes that
+        # need clean entries (trend / pullback / sr_scalp); range /
+        # vol_squeeze / momentum are exempt because big bars ARE the setup
+        # for those. ORB-bypassed by default — opening flush bars are
+        # always huge and other ORB-stretch gates already handle that
+        # window.
+        if regime in {"trend", "pullback", "sr_scalp"}:
+            if bool(self.params.get("reject_oversized_entry_bar", True)) and not orb_oversized_bar_bypass:
+                atr14 = _optional_float(getattr(tech_ctx, "atr14", None))
+                if frame is not None and not frame.empty and atr14 is not None and atr14 > 0.0:
+                    last_bar = frame.iloc[-1]
+                    bar_high = _optional_float(last_bar.get("high"))
+                    bar_low = _optional_float(last_bar.get("low"))
+                    bar_open = _optional_float(last_bar.get("open"))
+                    bar_close = _optional_float(last_bar.get("close"))
+                    range_atr = (
+                        (bar_high - bar_low) / atr14
+                        if (bar_high is not None and bar_low is not None)
+                        else 0.0
+                    )
+                    body_atr = (
+                        abs(bar_close - bar_open) / atr14
+                        if (bar_close is not None and bar_open is not None)
+                        else 0.0
+                    )
+                    range_max = float(self.params.get("entry_bar_range_max_atr_mult", 1.8))
+                    body_max = float(self.params.get("entry_bar_body_max_atr_mult", 1.4))
+                    range_violated = range_atr >= range_max
+                    body_violated = body_atr >= body_max
+                    if range_violated or body_violated:
+                        side_prefix = "long" if side == Side.LONG else "short"
+                        self._set_build_failure(
+                            c.symbol, regime,
+                            f"{side_prefix}_oversized_entry_bar(range={range_atr:.2f}>={range_max:.2f},body={body_atr:.2f}>={body_max:.2f})",
+                        )
+                        return None
         if regime in {"trend", "pullback"}:
             if bool(self.params.get("reject_stretched_entries", True)) and not orb_stretched_bypass:
                 pct_b = _optional_float(getattr(tech_ctx, "bollinger_percent_b", None))

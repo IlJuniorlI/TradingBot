@@ -441,6 +441,16 @@ class EntryGatekeeper:
             'execution_quality_score', 'macro_score', 'entry_family', 'peer_universe', 'side_eval',
             'family_eval', 'evaluated_sides', 'primary_blocker', 'all_blockers', 'near_miss_blockers',
             'selection_components', 'candidate_reason', 'decision_summary',
+            # Per-sector index confirmation snapshot. Stamped at entry by
+            # top_tier_adaptive.strategy.entry_signals via
+            # ``_indices_for_symbol(symbol)``. Position_manager re-reads it
+            # at adaptive-ladder target-hit time (``_ladder_indices_still_aligned``).
+            # Logged here so post-session analysis can verify which sector
+            # ETFs each entry was confirmed against.
+            'confirmation_indices',
+            # Volatility widening factor stamped by Tier 2a / early-session
+            # widening — useful for slicing trade outcomes by widening tier.
+            'vol_widening_factor',
         }
         include_prefixes = (
             'fvg_', 'htf_fvg_', 'adaptive_', 'anti_chase_fvg_retest_',

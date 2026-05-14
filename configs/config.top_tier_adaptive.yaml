@@ -291,6 +291,24 @@ support_resistance:
   structure_ltf_weight: 0.65
   structure_htf_weight: 0.95
   structure_event_lookback_bars: 8
+  # Tight-range detector (2026-05-14): when EQH and EQL coexist within
+  # < N×ATR of each other, structure-derived bias resolves to "neutral"
+  # so structure_bearish/bullish_exit doesn't fire on noise. Set 0.0 to
+  # disable. AMD 14:36 LONG pullback was killed via structure_bearish_
+  # exit:EQL on a tight chop range.
+  structure_min_range_atr_mult: 1.5
+  # Structure-exit gates. Inherits dataclass defaults (10min global grace,
+  # 2-pivot minimum) plus the 2026-05-14 additions for pullback chop:
+  #   - structure_exit_grace_minutes_pullback (15min) extends grace for
+  #     the pullback regime specifically — pullback by design enters into
+  #     LTF chop, so the first EQL pivot 10min in is noise.
+  #   - structure_exit_require_bos_confirmation requires an active BoS
+  #     event (price actually broke a prior swing low/high) in addition
+  #     to bias=bearish/bullish. CHoCH exits are unaffected.
+  # AMD 14:36 LONG pullback was killed at 10.2m via structure_bearish_exit:
+  # EQL; price recovered above the target shortly after.
+  structure_exit_grace_minutes_pullback: 15
+  structure_exit_require_bos_confirmation: true
 
 # Technical indicator-derived levels and overlay settings.
 technical_levels:
@@ -591,6 +609,19 @@ strategies:
       stretched_atr_mult_max: 1.3              # HIGH_VOL: was 1.1 — bars stretch more from VWAP in high vol
       orb_bypass_stretched_filter: false       # flipped off — bypass let stretched ORB losers through; LLY winner had stretch 0.34
 
+      # Bar-size gate (2026-05-14) — reject entries when the LTF 5m bar
+      # the signal was built on has a range or body far above ATR. Catches
+      # the "5m close lag" chase pattern where the bot waits for the 5m
+      # bar to close and then enters near its high/low (already a $X move).
+      # Applies to trend / pullback / sr_scalp (regimes that need clean
+      # entries); range / vol_squeeze / momentum are exempt because big
+      # bars ARE the setup for those. ORB-bypassed by default — opening
+      # flush bars are always huge and other ORB gates handle that window.
+      reject_oversized_entry_bar: true
+      entry_bar_range_max_atr_mult: 1.8        # skip when (high-low)/atr14 >= this
+      entry_bar_body_max_atr_mult: 1.4         # skip when |close-open|/atr14 >= this
+      orb_bypass_oversized_entry_bar: true     # opening flush bars are always huge
+
       # Tech bias contradiction: reject LONG when DMI/OBV bias is bearish.
       reject_tech_bias_contradiction: true
       orb_bypass_tech_bias_contradiction: true # DMI/OBV reflect stale overnight state during ORB
@@ -661,14 +692,47 @@ strategies:
       # breaks out of the box with confirming volume. Allowed in the
       # primary window (orb_end -> midday_start) and the afternoon
       # (13:00 -> no_new). Set `disable_vol_squeeze_regime: true` to opt out.
+      #
+      # 2026-05-14 tightening: session 14 entries, 3W/8L (27% wr), +$9.58
+      # net. Without the TSLA $130 winner, regime was -$120 net. Cluster
+      # pattern at 10:06-10:18 and 13:35-13:48 (market-wide squeeze
+      # releases that broke and reversed).
+      #
+      # "Happy medium" approach: two complementary gate types in
+      # _build_vol_squeeze_signal:
+      #
+      #   (1) Hard breakout-quality gates (volume + close_pos + buffer).
+      #       Same threshold values as the scoring +0.5 bonuses but
+      #       enforced as HARD gates. Softened from initial 2026-05-14
+      #       tightening (1.40 vol / 0.75 close_pos) to safer 1.25 / 0.65
+      #       to ensure TSLA-class winners pass even when their breakout
+      #       bar isn't perfectly aligned. Toggle off via
+      #       vol_squeeze_hard_breakout_gates: false.
+      #
+      #   (2) NEW setup-quality gates (SR alignment + pct_b directional).
+      #       Derived from comparing today's winners vs losers in the
+      #       ENTRY_CONTEXT log:
+      #         * All 3 winners had sr_bias_score >= +0.15. Losers
+      #           included AMD 10:06 (sr -0.75), NFLX 13:35 (-0.60),
+      #           GOOG 10:08 SHORT (sr +0.75 against a SHORT). Reject
+      #           when sr_bias_score is against the side by more than
+      #           min_sr_bias_alignment.
+      #         * All 3 winners had pct_b >= 0.60. Losers included AMD
+      #           10:06 (0.31), AAPL/GOOG SHORTs (0.40/0.44 — should be
+      #           below mid for SHORT). Reject when pct_b is on the
+      #           wrong side of mid for the trade direction.
+      #       Set either threshold to 0.0 to disable that gate.
       min_vol_squeeze_score: 4.0
       vol_squeeze_lookback_bars: 12
       vol_squeeze_max_range_pct: 0.012       # box height vs price (LTF)
       vol_squeeze_max_range_atr: 1.8          # box height vs ATR
       vol_squeeze_max_width_pct: 0.05         # bollinger width fraction ceiling
-      vol_squeeze_breakout_buffer_pct: 0.0012  # HIGH_VOL: was 0.0008 — need more breakout confirmation; false breakouts common
-      vol_squeeze_min_breakout_volume_ratio: 1.20  # HIGH_VOL: was 1.12 — demand stronger volume confirmation
-      vol_squeeze_min_bar_close_position: 0.63
+      vol_squeeze_breakout_buffer_pct: 0.0012  # HIGH_VOL: was 0.0008 — moderate buffer; TSLA-style breakouts clear ~0.1%
+      vol_squeeze_min_breakout_volume_ratio: 1.25  # 2026-05-14: softened from 1.40 to 1.25 — most real breakouts hit this; HARD gate
+      vol_squeeze_min_bar_close_position: 0.65  # 2026-05-14: softened from 0.75 to 0.65 — close in upper 65% of bar; HARD gate
+      vol_squeeze_hard_breakout_gates: true    # 2026-05-14: convert vol_ratio/close_pos/buffer from +0.5 bonuses to HARD gates
+      vol_squeeze_min_sr_bias_alignment: 0.20  # 2026-05-14: NEW. LONG rejects when sr_bias_score < -0.20 (HTF SR against side). Mirror for SHORT. Set 0.0 to disable.
+      vol_squeeze_min_pct_b_directional: 0.50  # 2026-05-14: NEW. LONG requires pct_b >= 0.50 (upper half of BBs at breakout); SHORT requires <= 0.50. Set 0.0 to disable.
       vol_squeeze_target_rr: 2.05
       disable_vol_squeeze_regime: false
 
@@ -715,8 +779,14 @@ strategies:
       # Index confirmation EXEMPT (mean-reversion thesis, same as range).
       # Disable globally with `disable_sr_scalp_regime: true`.
       min_sr_scalp_score: 4.0                  # HIGH_VOL: was 3.5 — more selective; S/R failures more common in high vol
-      sr_scalp_min_distance_pct: 0.012         # HIGH_VOL: was 0.008 — need wider zones (1.2% of price) to scalp safely
-      sr_scalp_min_distance_atr: 3.0           # HIGH_VOL: was 2.5 — same logic, 3x ATR floor
+      # Distance gates loosened 2026-05-14 after the 05-14 session showed
+      # 559 ``htf_zones_too_close`` rejections (463 LONG, 96 SHORT) and
+      # zero sr_scalp entries on a 16-trade day. The 1.2%/3.0x high-vol
+      # gates were too tight for compressed tape — most stocks' HTF S/R
+      # zones were within those bounds. 0.8%/2.0x lets sr_scalp fire on
+      # tighter zones while still preserving meaningful round-trip room.
+      sr_scalp_min_distance_pct: 0.008         # was 0.012 — 0.8% of price floor
+      sr_scalp_min_distance_atr: 2.0           # was 3.0 — 2x ATR floor
       sr_scalp_max_distance_from_zone_atr: 0.4 # HIGH_VOL: was 0.5 — must be closer to zone inner edge (less mid-range tolerance)
       disable_sr_scalp_regime: false
 

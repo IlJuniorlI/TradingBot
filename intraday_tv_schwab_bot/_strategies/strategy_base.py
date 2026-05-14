@@ -1846,6 +1846,7 @@ class BaseStrategy:
             breakout_atr_mult=float(self._support_resistance_setting("breakout_atr_mult", 0.35) or 0.35),
             breakout_buffer_pct=float(self._support_resistance_setting("breakout_buffer_pct", 0.0015) or 0.0015),
             structure_event_max_age_bars=structure_event_max_age_bars,
+            min_range_atr_mult=float(self._support_resistance_setting("structure_min_range_atr_mult", 1.5) or 0.0),
         )
         with self._structure_context_lock:
             self._structure_context_cache[cache_key] = ctx
@@ -1875,6 +1876,12 @@ class BaseStrategy:
             f"{prefix}_reference_high": getattr(ctx, "reference_high", None),
             f"{prefix}_reference_low": getattr(ctx, "reference_low", None),
             f"{prefix}_pivot_count": int(getattr(ctx, "pivot_count", 0) or 0),
+            # Tight-EQH+EQL detector (2026-05-14): when both EQ flags coexist
+            # within < structure_min_range_atr_mult ATR, bias resolves to
+            # "neutral" to suppress noise-driven structure exits. Surface
+            # both the spread (for tuning) and the boolean trigger.
+            f"{prefix}_structure_range_atr": float(getattr(ctx, "structure_range_atr", 0.0) or 0.0),
+            f"{prefix}_tight_structure_range": bool(getattr(ctx, "tight_structure_range", False)),
             f"{prefix}_reason": str(getattr(ctx, "reason", "unknown") or "unknown"),
         }
 
@@ -3619,14 +3626,36 @@ class BaseStrategy:
         # a minimum number of new pivots have formed post-entry. CHoCH
         # exits (true trend change) still fire — they are genuine reversal
         # signals, not minor pivots.
+        #
+        # Two additional gates layered here (2026-05-14):
+        #   1. Pullback regime gets an extended grace window (default 15m
+        #      vs 10m global) — pullback by design enters into LTF chop,
+        #      so the first EQL is almost always noise. AMD 14:36 LONG was
+        #      killed at hold=10.2m via structure_bearish_exit:EQL; price
+        #      recovered past target shortly after.
+        #   2. BoS confirmation: even after grace expires, the bias-flip
+        #      exit additionally requires an active BoS event in the
+        #      matching direction. EQL/HH alone is just a pivot label;
+        #      BoS-down means price actually broke below a prior swing
+        #      low — a far stronger reversal signal.
         try:
             hold_minutes = max(0.0, (now_et() - position.entry_time).total_seconds() / 60.0)
         except Exception:
             hold_minutes = 0.0
-        grace_minutes = int(self._support_resistance_setting("structure_exit_grace_minutes", 10))
+        meta = position.metadata if isinstance(position.metadata, dict) else {}
+        # Pullback regime gets an extended grace window — the regime is
+        # designed to enter into LTF chop (buy the dip), so the first EQL
+        # pivot is almost always noise. Falls back to the global grace if
+        # the pullback override is <= the global value or not configured.
+        global_grace = int(self._support_resistance_setting("structure_exit_grace_minutes", 10))
+        position_regime = str(meta.get("regime", "") or "")
+        if position_regime == "pullback":
+            pullback_grace = int(self._support_resistance_setting("structure_exit_grace_minutes_pullback", 15))
+            grace_minutes = max(global_grace, pullback_grace)
+        else:
+            grace_minutes = global_grace
         min_post_entry_pivots = int(self._support_resistance_setting("structure_exit_min_post_entry_pivots", 2))
         pivot_count_now = int(getattr(ms_ctx, "pivot_count", 0) or 0)
-        meta = position.metadata if isinstance(position.metadata, dict) else {}
         # msltf_pivot_count is stamped into signal.metadata at entry-signal
         # build time via _structure_lists(..., prefix="msltf") and then frozen
         # onto position.metadata — it's never overwritten during management,
@@ -3637,17 +3666,34 @@ class BaseStrategy:
         # exits for positions entered during the ORB window; OR'd with the
         # existing time/pivot gates so the stricter of the two wins.
         structure_exit_gated = hold_minutes < grace_minutes or post_entry_pivots < min_post_entry_pivots or orb_grace_active
+        # BoS-confirmation gate: when enabled, bias-based structure exits
+        # additionally require an active BoS event (bos_down for long-exit,
+        # bos_up for short-exit). Without this, a single EQL/HH pivot can
+        # flip bias and abort an otherwise-healthy trade. With it, the bot
+        # waits for actual structural break (price below a prior swing low,
+        # or above for shorts). CHoCH exits remain unaffected.
+        require_bos_confirmation = bool(self._support_resistance_setting("structure_exit_require_bos_confirmation", True))
         if self._shared_exit_enabled("use_structure_exit", True) and bool(self._support_resistance_setting("structure_enabled", True)):
             if direction == "bullish":
                 if bool(getattr(ms_ctx, "choch_down", False)) and self._structure_event_recent(getattr(ms_ctx, "choch_down_age_bars", None)) and self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.48):
                     return True, f"structure_choch_down_exit:{getattr(ms_ctx, 'choch_down_age_bars', 'na')}"
                 if not structure_exit_gated and getattr(ms_ctx, "bias", "neutral") == "bearish" and self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.42):
-                    return True, f"structure_bearish_exit:{getattr(ms_ctx, 'last_low_label', 'na')}"
+                    bos_ok = (
+                        not require_bos_confirmation
+                        or (bool(getattr(ms_ctx, "bos_down", False)) and self._structure_event_recent(getattr(ms_ctx, "bos_down_age_bars", None)))
+                    )
+                    if bos_ok:
+                        return True, f"structure_bearish_exit:{getattr(ms_ctx, 'last_low_label', 'na')}"
             else:
                 if bool(getattr(ms_ctx, "choch_up", False)) and self._structure_event_recent(getattr(ms_ctx, "choch_up_age_bars", None)) and self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.52):
                     return True, f"structure_choch_up_exit:{getattr(ms_ctx, 'choch_up_age_bars', 'na')}"
                 if not structure_exit_gated and getattr(ms_ctx, "bias", "neutral") == "bullish" and self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.58):
-                    return True, f"structure_bullish_exit:{getattr(ms_ctx, 'last_high_label', 'na')}"
+                    bos_ok = (
+                        not require_bos_confirmation
+                        or (bool(getattr(ms_ctx, "bos_up", False)) and self._structure_event_recent(getattr(ms_ctx, "bos_up_age_bars", None)))
+                    )
+                    if bos_ok:
+                        return True, f"structure_bullish_exit:{getattr(ms_ctx, 'last_high_label', 'na')}"
 
         triggered, reason = self._technical_exit_signal(direction, frame, close, ema9, ema20, vwap, close_pos, position)
         if triggered:

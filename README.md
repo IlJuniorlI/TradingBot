@@ -608,8 +608,11 @@ Higher-timeframe support/resistance, prior-day/week levels, FVG mapping, flip ha
 | `structure_ltf_weight`                    | `0.65`       |
 | `structure_htf_weight`                   | `0.85`       |
 | `structure_event_lookback_bars`          | `6`          |
+| `structure_min_range_atr_mult`           | `1.5`        |
 | `structure_exit_grace_minutes`           | `10`         |
 | `structure_exit_min_post_entry_pivots`   | `2`          |
+| `structure_exit_grace_minutes_pullback`  | `15`         |
+| `structure_exit_require_bos_confirmation` | `true`      |
 | `orb_entry_exit_grace_minutes`           | `20`         |
 
 How the groups work:
@@ -645,9 +648,12 @@ How the groups work:
 - Regime and structure:
   - `regime_weight` controls how strongly the S/R regime influences scoring.
   - `structure_enabled`, `structure_ltf_pivot_span`, `structure_eq_atr_mult`, `structure_ltf_weight`, `structure_htf_weight`, `structure_event_lookback_bars` control the mixed-timeframe structure layer. The CHoCH-exit toggle is `shared_exit.use_structure_exit`.
+  - `structure_min_range_atr_mult` (default `1.5`) — when both EQH and EQL flags are set AND the spread between `reference_high` and `reference_low` is below this ATR threshold, the structure-derived `bias` resolves to `"neutral"` instead of firing midpoint / pivot / recent-event bias. Prevents bias-based structure exits (`structure_bearish_exit` / `structure_bullish_exit`) from firing inside a tight consolidation where bias would flip on noise. Genuine BoS through `reference_high` / `reference_low` (price actually broke out) still fires bias unchanged — that check runs BEFORE the tight-range short-circuit. `eqh` / `eql` flags remain set so range-regime entries (which key on the EQ labels for mean-reversion setups) still see them. CHoCH exits unaffected. Set `0.0` to disable.
 - Structure-exit grace windows:
   - `structure_exit_grace_minutes` (default `10`) suppresses `structure_bearish_exit` / `structure_bullish_exit` for the first N minutes after entry. Prevents a minor EQL/LL pivot forming in the first few minutes from exiting an otherwise-healthy trade. CHoCH exits still fire.
   - `structure_exit_min_post_entry_pivots` (default `2`) requires at least N new 1m pivots to form AFTER entry before structure-based bias exits can fire. Complements the time grace.
+  - `structure_exit_grace_minutes_pullback` (default `15`) extends the grace specifically for the pullback regime (`position.metadata.regime == "pullback"`). Pullback by design enters into LTF chop, so the first EQL/LL pivot is almost always noise. Falls back to the global grace when set lower. Added 2026-05-14 after AMD 14:36 LONG pullback was killed at hold=10.2m via `structure_bearish_exit:EQL` then recovered above target.
+  - `structure_exit_require_bos_confirmation` (default `true`) additionally requires an active BoS event (`bos_down` for long-exit, `bos_up` for short-exit) — not just a bias flip — before bias-based structure exits fire. EQL/HH alone is noisy; BoS means price actually broke a prior swing low/high. CHoCH exits are unaffected. Set to `false` to revert to bias-only behavior.
   - `orb_entry_exit_grace_minutes` (default `20`) extends the grace specifically for positions entered during the ORB window (09:35 to `orb_end_time`). Suppresses BOTH `structure_bearish/bullish_exit` AND `chart_pattern_exit` for the first N minutes of ORB-entered trades. ORB pullbacks frequently look like bearish structure breaks but continue higher once the opening flush resolves. Set to `0` to disable. CHoCH exits still fire.
 
 ### `technical_levels`

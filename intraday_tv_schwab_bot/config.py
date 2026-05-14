@@ -645,6 +645,18 @@ class SupportResistanceConfig:
     structure_ltf_weight: float = 0.65
     structure_htf_weight: float = 0.85
     structure_event_lookback_bars: int = 6
+    # Minimum spread between the most recent reference_high and reference_low
+    # (in ATR units) for structure-derived bias to be considered meaningful.
+    # When EQH and EQL coexist within a tight range (e.g. 0.3 ATR), the bias
+    # signals derived from the midpoint check or pivot labels are noise — a
+    # single bar can flip bias bearish→bullish multiple times in a narrow
+    # consolidation. AMD 14:36 LONG pullback was killed at 10.2m via
+    # structure_bearish_exit:EQL where the structure was tight chop. With
+    # this gate, ``bias`` defaults to ``neutral`` when range < threshold,
+    # suppressing the noisy bias-flip exits. ``eqh`` / ``eql`` flags remain
+    # set so range-regime entries (which use the EQ labels) still see them.
+    # Set 0.0 to disable. CHoCH still fires from the BoS-event path.
+    structure_min_range_atr_mult: float = 1.5
     # Grace window post-entry during which 1m structure-based exits
     # (structure_bearish_exit:EQL/LL/HL, structure_bullish_exit:HH/LH) are
     # suppressed. An EQL pivot forming in the first few minutes after entry
@@ -657,6 +669,23 @@ class SupportResistanceConfig:
     # below this, exit is suppressed. Complements the time-grace by
     # requiring at least some actual structure to form.
     structure_exit_min_post_entry_pivots: int = 2
+    # Extended grace window for the PULLBACK regime specifically. Pullback
+    # entries are designed to enter into LTF chop (buy the dip on a bullish
+    # HTF) — the first EQL/LL pivot 10 min in is almost always noise, not
+    # a reversal. Session 2026-05-14 AMD pullback was killed at 10.2m via
+    # structure_bearish_exit:EQL; price recovered above the target shortly
+    # after. Applies only when position.metadata.regime == "pullback".
+    # Set to a value <= structure_exit_grace_minutes to disable the override.
+    structure_exit_grace_minutes_pullback: int = 15
+    # When True, structure_bearish_exit / structure_bullish_exit (the bias-
+    # based bias-flip exits, NOT CHoCH) additionally require an active
+    # BoS event in the matching direction (bos_down for long-exit, bos_up
+    # for short-exit). Without this gate, bias flips on a single EQL/HH
+    # pivot — a noisy, weak signal that aborts otherwise-healthy pullback
+    # trades. With BoS confirmation we require price to have actually
+    # broken below a prior swing low (or above for short exits), a far
+    # stronger reversal signal. CHoCH exits are unaffected (already strong).
+    structure_exit_require_bos_confirmation: bool = True
     # Extended grace window for positions opened during the ORB window
     # (09:35-orb_end). ORB pullbacks often look like bearish structure
     # breaks / bearish chart patterns but continue higher afterward.
