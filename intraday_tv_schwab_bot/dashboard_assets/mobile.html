@@ -15,8 +15,11 @@
 <body>
   <div class="m-shell">
 
-    <!-- Top bar — same markup/IDs as desktop so the same formatters fill it. -->
-    <header class="topbar m-topbar">
+    <!-- Top bar — compacted for mobile: inline label/value pills in a 3-col
+         grid, status chip standalone (no "Status" label), Updated demoted
+         to ambient bottom line. Same DOM IDs as desktop so the same
+         formatters fill it. -->
+    <header class="topbar m-topbar m-topbar-compact">
       <div class="brand">
         <div class="brand-badge"><img src="__BRAND_BADGE__" alt="Brand" /></div>
         <div class="brand-copy">
@@ -25,21 +28,22 @@
         </div>
       </div>
       <div class="status-strip">
+        <!-- Row 1: status (chip + mode badge) — spans the full row -->
         <div class="metric-pill status-metric">
-          <div class="label">Status</div>
           <div class="value" id="status-badge-wrap"><span class="status-chip status-idle">Starting</span></div>
         </div>
-        <div class="metric-pill"><div class="label">Day PnL</div><div class="value" id="metric-daypnl">—</div></div>
-        <div class="metric-pill"><div class="label">Profit Factor</div><div class="value" id="metric-pf">—</div></div>
-        <div class="metric-pill"><div class="label">Total Trades</div><div class="value" id="metric-trades">—</div></div>
-        <div class="metric-pill"><div class="label">Wins / Losses</div><div class="value" id="metric-wl">—</div></div>
+        <!-- Rows 2-3: 6 metric pills (3-col grid). Day PnL moved into
+             the last cell of row 3 so the "Updated" full-width footer
+             can sit at the bottom on its own. PnL label trimmed from
+             "Day PnL" to just "PnL" for cell-width parity. -->
+        <div class="metric-pill"><div class="label">PF</div><div class="value" id="metric-pf">—</div></div>
+        <div class="metric-pill"><div class="label">Trades</div><div class="value" id="metric-trades">—</div></div>
+        <div class="metric-pill"><div class="label">W / L</div><div class="value" id="metric-wl">—</div></div>
         <div class="metric-pill"><div class="label">Ready</div><div class="value" id="metric-warmup">—</div></div>
-      </div>
-      <div class="toolbar">
-        <div class="metric-pill" id="metric-updated-wrap">
-          <div class="label">Updated</div>
-          <div class="value" id="metric-updated">—</div>
-        </div>
+        <div class="metric-pill"><div class="label">API/min</div><div class="value" id="metric-api-cpm">—</div></div>
+        <div class="metric-pill"><div class="label">PnL</div><div class="value" id="metric-daypnl">—</div></div>
+        <!-- Footer row: Updated timestamp, full width, with date -->
+        <div class="metric-pill updated-metric"><div class="label">Updated</div><div class="value" id="metric-updated">—</div></div>
       </div>
     </header>
 
@@ -91,6 +95,22 @@
       <div class="panel-inner">
         <div class="panel-head"><div class="panel-title">Open Positions</div><div class="panel-meta" id="positions-meta">—</div></div>
         <div class="positions-scroll"><div class="position-grid" id="positions-cards"></div></div>
+      </div>
+    </section>
+
+    <!-- Candidates (mobile — compact list rows, no sparklines / rings) -->
+    <section class="panel m-candidates-panel">
+      <div class="panel-inner">
+        <div class="panel-head"><div class="panel-title">Candidates</div><div class="panel-meta" id="m-candidates-meta">—</div></div>
+        <div class="m-list" id="m-candidate-list"></div>
+      </div>
+    </section>
+
+    <!-- Completed Trades (mobile — compact list rows of recent closes) -->
+    <section class="panel m-trades-panel">
+      <div class="panel-inner">
+        <div class="panel-head"><div class="panel-title">Completed Trades</div><div class="panel-meta" id="m-trades-meta">—</div></div>
+        <div class="m-list" id="m-trade-list"></div>
       </div>
     </section>
 

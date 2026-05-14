@@ -21,7 +21,7 @@ body {
   min-height: 100vh;
 }
 
-/* Top bar: stack brand, metric pills, and toolbar vertically on mobile. */
+/* Top bar: stack brand + compact pill grid vertically on mobile. */
 .topbar.m-topbar {
   display: flex;
   flex-direction: column;
@@ -81,15 +81,148 @@ body {
   min-width: 0;
 }
 
-/* Toolbar (Updated pill) — full-width on mobile. */
-.topbar.m-topbar .toolbar {
-  display: flex;
-  justify-content: stretch;
+/* ===== Compact mode (m-topbar-compact) =====
+   Pills become inline ``label: value`` rows in a 3-col grid. Saves ~40-60%
+   of vertical real-estate vs the 2-col stacked-pill layout. Brand badge
+   shrinks slightly. Status pill drops the "Status" label (chip alone is
+   self-explanatory). Updated demoted into the same grid as the rest. */
+.topbar.m-topbar.m-topbar-compact {
+  padding: 10px 12px;
+  gap: 8px;
 }
 
-.topbar.m-topbar .toolbar .metric-pill {
-  flex: 1;
+.topbar.m-topbar.m-topbar-compact .brand-badge {
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  border-radius: 10px;
+}
+
+.topbar.m-topbar.m-topbar-compact .brand-title {
+  font-size: 17px;
+}
+
+.topbar.m-topbar.m-topbar-compact .brand-sub {
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.topbar.m-topbar.m-topbar-compact .status-strip {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.topbar.m-topbar.m-topbar-compact .metric-pill {
+  flex-direction: row;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 8px;
+  background: var(--chip, rgba(var(--tint-rgb), .06));
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.topbar.m-topbar.m-topbar-compact .metric-pill .label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  white-space: nowrap;
+  text-transform: uppercase;
+  color: var(--soft);
+  flex: 0 0 auto;
+}
+
+.topbar.m-topbar.m-topbar-compact .metric-pill .value {
+  font-size: 12px;
+  font-weight: 700;
+  min-height: 0;
+  letter-spacing: 0;
+  /* Allow the value to wrap to a second line when it's wider than the
+     cell (e.g. ``$1,234.56`` in the Day PnL pill at 1/3 viewport width).
+     The pill height grows but stays inside the row block — row height
+     is set by the tallest cell, and the status cell (chip + mode badge,
+     which already wraps) is usually the tallest anyway. */
+  white-space: normal;
+  word-break: break-all;
+  overflow: visible;
+  padding-bottom: 0;
+  display: inline-flex;
+  align-items: center;
+  text-align: right;
+  flex: 1 1 auto;
   min-width: 0;
+  justify-content: flex-end;
+}
+
+/* Status row: spans the FULL row but the outer .metric-pill wrapper is
+   stripped — no background, no border, no padding. The two inner chips
+   (status-chip + mode-pill) become the visible elements and are pushed
+   to the row's left and right edges via ``space-between``. The chips
+   carry their own pill styling already; the wrapper was double-bordering.
+   ``display: block`` overrides the .metric-pill's flex layout so the
+   inner .value gets the cell's full width (in flex-row, .value sized to
+   its content even with width:100%, leaving the chips bunched left). */
+.topbar.m-topbar.m-topbar-compact .metric-pill.status-metric {
+  grid-column: 1 / -1;
+  display: block;
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+
+.topbar.m-topbar.m-topbar-compact .metric-pill.status-metric .label {
+  display: none;
+}
+
+.topbar.m-topbar.m-topbar-compact .metric-pill.status-metric .value,
+.topbar.m-topbar.m-topbar-compact #status-badge-wrap {
+  display: flex;
+  align-items: center;
+  /* Left-align both chips (the default ``#status-badge-wrap`` behavior
+     from dashboard.css). The id-included selector here keeps our compact
+     rule at specificity 1-3-0 so other style passes don't drift it. */
+  justify-content: flex-start;
+  gap: 6px;
+  flex-wrap: nowrap;
+  min-height: 0;
+  white-space: nowrap;
+  overflow: visible;
+  text-align: left;
+  font-size: 11px;
+  flex: 1 1 100%;
+  width: 100%;
+}
+
+/* Status chip + mode badge: smaller font + tight padding + drop the
+   30px min-height that dashboard.css enforces. Without the min-height
+   override, the chips render at 30px tall regardless of padding,
+   towering over the 12px-text pills in the rest of the topbar grid. */
+.topbar.m-topbar.m-topbar-compact .metric-pill.status-metric .status-chip,
+.topbar.m-topbar.m-topbar-compact .metric-pill.status-metric .mode-pill,
+.topbar.m-topbar.m-topbar-compact .metric-pill.status-metric .mode-pill.inline-mode {
+  font-size: 10px;
+  letter-spacing: .04em;
+  padding: 2px 8px;
+  line-height: 1.6;
+  font-weight: 700;
+  min-height: 0;
+}
+
+/* Updated pill: also spans the full row, but as a FOOTER below the
+   metric grid. Uses the same inline label+value layout as the rest. */
+.topbar.m-topbar.m-topbar-compact .metric-pill.updated-metric {
+  grid-column: 1 / -1;
+  justify-content: space-between;
+}
+
+/* Below 360px, drop to 2-col so the inline pills don't get cramped. */
+@media (max-width: 360px) {
+  .topbar.m-topbar.m-topbar-compact .status-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 /* Trim the KPI tile value font 1px below desktop so dollar amounts with
@@ -99,11 +232,11 @@ body {
   font-size: 18px;
 }
 
-/* Below 380px, collapse the top-bar pills to a single column so long
-   labels don't clip. KPI / Risk / Open Positions cards flow natively and
-   are intentionally left alone here. */
+/* Below 380px, collapse the legacy (non-compact) top-bar pills to a single
+   column so long labels don't clip. KPI / Risk / Open Positions cards
+   flow natively and are intentionally left alone here. */
 @media (max-width: 380px) {
-  .topbar.m-topbar .status-strip {
+  .topbar.m-topbar:not(.m-topbar-compact) .status-strip {
     grid-template-columns: 1fr;
   }
 }
@@ -152,6 +285,156 @@ body {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+/* ===== Mobile-only list cards (Candidates + Completed Trades) =====
+   Both use the shared ``.m-list`` container so spacing + scroll behavior
+   stay aligned. Compact list-row layout instead of the desktop's
+   tile-grid / table because vertical scrolling is the natural mobile
+   gesture and rows pack the most info per pixel. */
+.m-shell .m-candidates-panel .panel-inner,
+.m-shell .m-trades-panel .panel-inner {
+  /* Same padding shape as the other mobile panels. */
+}
+
+/* No max-height + no internal overflow — let the cards grow with the
+   content and let the PAGE scroll vertically. Nested scroll containers
+   are annoying on phones (the inner panel eats swipe gestures) and
+   typical sessions have <50 closed trades / day so the whole list fits
+   comfortably in a normal page scroll. */
+.m-shell .m-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Candidate row: symbol + bias chip + day% + price + score, single line. */
+.m-shell .m-candidate-row {
+  display: grid;
+  grid-template-columns: minmax(0, 56px) minmax(0, 56px) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 42px);
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--chip, rgba(var(--tint-rgb), .04));
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line);
+  border-radius: 8px;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.m-shell .m-candidate-row.tone-long { border-left-color: var(--good); }
+.m-shell .m-candidate-row.tone-short { border-left-color: var(--bad); }
+.m-shell .m-candidate-row.tone-neutral { border-left-color: var(--soft); }
+
+.m-shell .m-candidate-row .m-sym {
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+
+.m-shell .m-candidate-row .m-bias {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(var(--tint-rgb), .08);
+  text-align: center;
+  justify-self: start;
+}
+
+.m-shell .m-candidate-row.tone-long .m-bias {
+  background: color-mix(in oklab, var(--good) 18%, transparent);
+  color: var(--good);
+}
+
+.m-shell .m-candidate-row.tone-short .m-bias {
+  background: color-mix(in oklab, var(--bad) 18%, transparent);
+  color: var(--bad);
+}
+
+.m-shell .m-candidate-row .m-pct {
+  font-size: 12px;
+  font-weight: 700;
+  text-align: right;
+}
+
+/* Color-code the day % per ``pnlClass()`` (green positive / red negative).
+   dashboard.css's existing ``.good``/``.bad`` rules are scoped to
+   ``.value.good`` / ``.score.good`` etc. — they don't auto-apply to
+   bare ``.m-pct.good``, so we paint them explicitly here. */
+.m-shell .m-candidate-row .m-pct.good { color: var(--good); }
+.m-shell .m-candidate-row .m-pct.bad  { color: var(--bad); }
+
+.m-shell .m-candidate-row .m-price {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  text-align: right;
+}
+
+.m-shell .m-candidate-row .m-score {
+  font-size: 12px;
+  font-weight: 800;
+  text-align: right;
+  color: var(--accent);
+}
+
+/* Trade row: 2-line layout (top: symbol + side + pnl$ + pnl%, bottom:
+   exit-time + strategy + exit-reason). */
+.m-shell .m-trade-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  background: var(--chip, rgba(var(--tint-rgb), .04));
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line);
+  border-radius: 8px;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.m-shell .m-trade-row.tone-long { border-left-color: var(--good); }
+.m-shell .m-trade-row.tone-short { border-left-color: var(--bad); }
+
+.m-shell .m-trade-row .m-trade-top {
+  display: grid;
+  grid-template-columns: minmax(0, 56px) minmax(0, 50px) minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+}
+
+.m-shell .m-trade-row .m-trade-sym {
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+
+.m-shell .m-trade-row .m-trade-side {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--muted);
+}
+
+.m-shell .m-trade-row .m-trade-pnl {
+  font-size: 13px;
+  font-weight: 800;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.m-shell .m-trade-row .m-trade-meta {
+  font-size: 10px;
+  color: var(--muted);
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Disable tap-highlight flash on every interactive element on mobile.
    The default blue/gray flash on tap is jarring at the typical mobile
    refresh cadence and provides no useful signal that desktop hover
@@ -161,6 +444,8 @@ body {
 .m-shell [role="button"],
 .m-shell a,
 .m-shell .position-card,
-.m-shell .metric-pill {
+.m-shell .metric-pill,
+.m-shell .m-candidate-row,
+.m-shell .m-trade-row {
   -webkit-tap-highlight-color: transparent;
 }
