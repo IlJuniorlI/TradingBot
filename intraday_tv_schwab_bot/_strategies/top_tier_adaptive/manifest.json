@@ -51,8 +51,12 @@
       "LLY"
     ],
     "index_symbols": [
-      "SPY",
-      "QQQ"
+      "XLK",
+      "XLC",
+      "XLY",
+      "XLF",
+      "XLV",
+      "XLP"
     ],
     "min_bars": 90,
     "ltf_minutes": 5,
@@ -98,6 +102,9 @@
     "atr_aware_stop_enabled": true,
     "atr_widening_threshold": 1.3,
     "atr_widening_max_factor": 1.5,
+    "early_session_stop_widening_enabled": true,
+    "early_session_stop_widening_until": "10:30",
+    "early_session_stop_widening_mult": 1.3,
     "peak_giveback_high_conviction_day_strength_pct": 2.0,
     "peak_giveback_high_conviction_min_r": 2.0,
     "disable_orb_window": false,
@@ -199,6 +206,19 @@
       "materials": [],
       "real_estate": [],
       "utilities": []
+    },
+    "sector_index_map": {
+      "tech": ["XLK"],
+      "consumer_discretionary": ["XLY"],
+      "communication": ["XLC"],
+      "financials": ["XLF"],
+      "healthcare": ["XLV"],
+      "industrials": ["XLI"],
+      "energy": ["XLE"],
+      "consumer_staples": ["XLP"],
+      "materials": ["XLB"],
+      "real_estate": ["XLRE"],
+      "utilities": ["XLU"]
     },
     "max_same_sector_same_direction": 2,
     "force_flatten": {

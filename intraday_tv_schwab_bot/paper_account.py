@@ -272,31 +272,70 @@ class PaperAccount:
                     breakeven = None
             risk_label = str(metadata.get("option_type") or "long_option").lower()
         else:
+            # Use the TRADE's INITIAL stop/target for max_risk/max_reward so
+            # the dashboard's R/R reflects the planned trade ratio at entry,
+            # not the current managed ratio. Adaptive management (breakeven
+            # ratchet, profit-lock, ladder rung promotion) moves stop_price
+            # and target_price as the trade progresses — using the live
+            # values produced R/R = 0/0 = "—" once stop ratcheted to entry,
+            # which is the most common state for winning trades. The
+            # ``initial_*`` fields are stamped at entry by entry_gatekeeper
+            # (lines 677-678 / 1215-1216) and never mutate after.
+            initial_stop_raw = metadata.get("initial_stop_price")
+            try:
+                initial_stop = float(initial_stop_raw) if initial_stop_raw is not None else float(position.stop_price or position.entry_price)
+            except (TypeError, ValueError):
+                initial_stop = float(position.stop_price or position.entry_price)
             if position.side == Side.LONG:
-                risk_per_share = max(0.0, float(position.entry_price) - float(position.stop_price or position.entry_price))
+                risk_per_share = max(0.0, float(position.entry_price) - initial_stop)
                 _max_risk = risk_per_share * int(position.qty)
                 breakeven = None
                 risk_label = "long_stock"
             else:
-                risk_per_share = max(0.0, float(position.stop_price or position.entry_price) - float(position.entry_price))
+                risk_per_share = max(0.0, initial_stop - float(position.entry_price))
                 _max_risk = risk_per_share * int(position.qty)
                 breakeven = None
                 risk_label = "short_stock"
 
-        if max_reward is None and position.target_price is not None:
+        if max_reward is None:
+            # Prefer initial_target_price (stamped at entry, immutable);
+            # fall back to current position.target_price for legacy
+            # positions or strategies that don't stamp the initial.
+            initial_target_raw = metadata.get("initial_target_price")
             try:
-                target_price = float(position.target_price)
-                entry_price = float(position.entry_price)
-                qty = int(position.qty)
-                if position.side == Side.LONG:
-                    reward_per_unit = max(0.0, target_price - entry_price)
-                else:
-                    reward_per_unit = max(0.0, entry_price - target_price)
-                if reward_per_unit > 0:
-                    max_reward = reward_per_unit * qty
-            except Exception:
-                max_reward = None
+                target_for_reward = float(initial_target_raw) if initial_target_raw is not None else (float(position.target_price) if position.target_price is not None else None)
+            except (TypeError, ValueError):
+                target_for_reward = float(position.target_price) if position.target_price is not None else None
+            if target_for_reward is not None:
+                try:
+                    entry_price = float(position.entry_price)
+                    qty = int(position.qty)
+                    if position.side == Side.LONG:
+                        reward_per_unit = max(0.0, target_for_reward - entry_price)
+                    else:
+                        reward_per_unit = max(0.0, entry_price - target_for_reward)
+                    if reward_per_unit > 0:
+                        max_reward = reward_per_unit * qty
+                except Exception:
+                    max_reward = None
 
+        # Surface the trade's INITIAL stop/target alongside the live ones
+        # so the dashboard's progress bar can use a stable trade range
+        # (entry → initial_target) instead of recomputing the range each
+        # time adaptive management ratchets the live stop/target. Without
+        # this, ``adaptive_breakeven_rr`` collapsing stop to entry made
+        # ``adverseSpan = 0`` and the bar fell back to the left-anchored
+        # P&L view with no Stop/Target labels.
+        initial_stop_payload = metadata.get("initial_stop_price")
+        initial_target_payload = metadata.get("initial_target_price")
+        try:
+            initial_stop_payload = float(initial_stop_payload) if initial_stop_payload is not None else None
+        except (TypeError, ValueError):
+            initial_stop_payload = None
+        try:
+            initial_target_payload = float(initial_target_payload) if initial_target_payload is not None else None
+        except (TypeError, ValueError):
+            initial_target_payload = None
         return {
             "symbol": position.symbol,
             "strategy": position.strategy,
@@ -308,6 +347,8 @@ class PaperAccount:
             "last_price": last_price,
             "stop_price": float(position.stop_price),
             "target_price": float(position.target_price) if position.target_price is not None else None,
+            "initial_stop_price": initial_stop_payload,
+            "initial_target_price": initial_target_payload,
             "market_value": market_value,
             "unrealized_pnl": unrealized,
             "max_risk": _max_risk,

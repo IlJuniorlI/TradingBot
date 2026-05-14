@@ -572,6 +572,107 @@ class PositionManager:
                         position.metadata["sr_flip_target_source"] = float(target_level.price)
                         _append_adjustment(position.metadata,{"manager": "sr_flip", "kind": "target", "reason": "next_support", "from": prior_target, "to": float(candidate_target), "source_level": float(target_level.price), "structural_gap": float(structural_gap)})
 
+    def _ladder_indices_still_aligned(
+        self,
+        indices: list[str] | tuple[str, ...] | None,
+        side: Side,
+    ) -> bool:
+        """Re-check at target-hit time whether at least one of the trade's
+        confirmation indices is STILL aligned with the trade direction.
+
+        Same close>vwap + ema9>=ema20 check (mirror for SHORT) that the
+        entry-side ``_index_confirms`` does — applied again at suppress
+        decision so a sector reversal can short-circuit the adaptive-
+        ladder wait window. If the broader sector tape has flipped
+        against the trade since entry, the trade's apparent strength is
+        divergent and target-exit should fire instead of waiting for the
+        multi-bar zone flip.
+
+        Returns True if no ``indices`` are configured (no extra gate —
+        treats the alignment check as inert for legacy positions /
+        strategies that don't stamp ``confirmation_indices`` at entry).
+        """
+        if not indices:
+            return True
+        if self.data is None:
+            return True
+        for sym in indices:
+            sym_key = str(sym or "").upper().strip()
+            if not sym_key:
+                continue
+            try:
+                frame = self.data.get_merged(sym_key)
+            except Exception:
+                continue
+            if frame is None or len(frame) == 0:
+                continue
+            try:
+                last = frame.iloc[-1]
+                close = float(last.get("close") or 0.0)
+                vwap_raw = last.get("vwap")
+                vwap = float(vwap_raw) if vwap_raw is not None else close
+                ema9_raw = last.get("ema9")
+                ema9 = float(ema9_raw) if ema9_raw is not None else close
+                ema20_raw = last.get("ema20")
+                ema20 = float(ema20_raw) if ema20_raw is not None else close
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if side == Side.LONG and close > vwap and ema9 >= ema20:
+                return True
+            if side == Side.SHORT and close < vwap and ema9 <= ema20:
+                return True
+        return False
+
+    @staticmethod
+    def _ladder_target_strength_confirmed(
+        frame: pd.DataFrame | None,
+        side: Side,
+        target_price: float | None,
+        *,
+        close_pos_min: float = 0.55,
+    ) -> bool:
+        """Return True when the last FULLY CLOSED bar shows a strong push
+        through ``target_price``. Used as a pre-suppress gate so single-tick
+        wicks at the target don't lock the position into a multi-bar
+        zone-flip wait window.
+
+        Strong push:
+          LONG:  close >= target  AND  (close - low) / (high - low) >= ``close_pos_min``
+          SHORT: close <= target  AND  (high - close) / (high - low) >= ``close_pos_min``
+
+        ``close_pos_min`` default 0.55 means the close has to land in the
+        upper 55% of the bar's intra-bar range (for LONG). Doji / wick-top
+        prints don't qualify.
+
+        Returns False on insufficient data — caller treats False as "not
+        strong enough to suppress" and lets the normal target-exit fire.
+        """
+        if target_price is None or frame is None or len(frame) < 2:
+            return False
+        # iloc[-1] is the current FORMING bar; iloc[-2] is the last fully
+        # closed bar. Strength must be evaluated on a closed bar so an
+        # intra-bar tick doesn't get treated as a confirmed breakout.
+        try:
+            bar = frame.iloc[-2]
+            bar_high = float(bar.get("high"))
+            bar_low = float(bar.get("low"))
+            bar_close = float(bar.get("close"))
+            target = float(target_price)
+        except (TypeError, ValueError, KeyError):
+            return False
+        bar_range = bar_high - bar_low
+        if bar_range <= 0:
+            return False
+        if side == Side.LONG:
+            if bar_close < target:
+                return False
+            close_pos = (bar_close - bar_low) / bar_range
+        else:
+            if bar_close > target:
+                return False
+            close_pos = (bar_high - bar_close) / bar_range
+        return close_pos >= close_pos_min
+
     def _adaptive_ladder_management(self, position: Position, frame: pd.DataFrame | None, last_price: float) -> None:
         if isinstance(position.metadata, dict):
             position.metadata.setdefault("management_adjustments", [])
@@ -622,7 +723,22 @@ class PositionManager:
         if position.side == Side.LONG:
             rung_confirmed = zone_flip_confirmed("resistance", lower, upper, flip_frame=frame, confirm_1m_bars=confirm_1m, confirm_5m_bars=confirm_5m, fallback_bar=None, eps=eps)
             target_reached = bool(current_target is not None and last_price >= float(current_target) - max(close * 0.0003, 1e-6))
-            meta["adaptive_ladder_suppress_target_exit"] = bool(target_reached and not rung_confirmed)
+            # Confirmation layer #1: require the last CLOSED bar to show
+            # a strong upper-body push through the target before
+            # suppressing. Filters intra-bar wick-throughs that revert.
+            breakout_strength = self._ladder_target_strength_confirmed(frame, Side.LONG, current_target)
+            # Confirmation layer #2: re-check the trade's entry-time
+            # confirmation indices (stamped on metadata as
+            # ``confirmation_indices``). If the sector ETF has flipped
+            # bearish since entry, the stock's target-tag is divergent
+            # from its peer group — exit at target instead of waiting
+            # for a zone flip that's now structurally less likely.
+            indices_aligned = self._ladder_indices_still_aligned(
+                meta.get("confirmation_indices"), Side.LONG,
+            )
+            meta["adaptive_ladder_suppress_target_exit"] = bool(
+                target_reached and breakout_strength and indices_aligned and not rung_confirmed
+            )
             if not rung_confirmed:
                 return
             candidate_stop = float(lower) - stop_buffer
@@ -656,7 +772,15 @@ class PositionManager:
         else:
             rung_confirmed = zone_flip_confirmed("support", lower, upper, flip_frame=frame, confirm_1m_bars=confirm_1m, confirm_5m_bars=confirm_5m, fallback_bar=None, eps=eps)
             target_reached = bool(current_target is not None and last_price <= float(current_target) + max(close * 0.0003, 1e-6))
-            meta["adaptive_ladder_suppress_target_exit"] = bool(target_reached and not rung_confirmed)
+            # Mirror of the LONG suppress gate: strength check + index
+            # re-alignment check before suppressing the SHORT's target.
+            breakout_strength = self._ladder_target_strength_confirmed(frame, Side.SHORT, current_target)
+            indices_aligned = self._ladder_indices_still_aligned(
+                meta.get("confirmation_indices"), Side.SHORT,
+            )
+            meta["adaptive_ladder_suppress_target_exit"] = bool(
+                target_reached and breakout_strength and indices_aligned and not rung_confirmed
+            )
             if not rung_confirmed:
                 return
             candidate_stop = float(upper) + stop_buffer

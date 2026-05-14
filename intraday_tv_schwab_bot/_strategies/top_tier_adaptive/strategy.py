@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: MIT
 """Multi-regime adaptive intraday strategy for top-tier liquid stocks.
 
-Detects whether each symbol is trending, pulling back, or ranging, then
-applies the appropriate entry style.  Uses SPY/QQQ as index confirmation
-for trend and pullback entries.  Trades both long and short across the
-full RTH session with time-of-day regime gating.
+Detects whether each symbol is trending, pulling back, ranging, breaking
+out of a volatility squeeze, sustaining momentum from the session open,
+or scalping between HTF S/R zones — then applies the appropriate entry
+style. Index confirmation uses a per-sector ETF map (see
+``sector_index_map`` + ``_indices_for_symbol``) so each symbol is gated
+by its actual sector tape, not an arbitrary broad-market ETF. Trades
+both long and short across the full RTH session with time-of-day regime
+gating.
 """
 from __future__ import annotations
 
@@ -44,8 +48,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         self._recent_directional_bias: dict[str, deque[Side | None]] = {}
 
     # ------------------------------------------------------------------
-    # Watchlist — include index confirmation symbols (SPY/QQQ) so they
-    # get history fetching, streaming, and appear in the bars dict.
+    # Watchlist — include all configured index confirmation ETFs so they
+    # get history fetching, streaming, and appear in the bars dict. The
+    # specific ETFs depend on which sectors the active universe touches
+    # (see ``sector_index_map`` in config) — could be sector ETFs
+    # (XLK/XLE/XLB/...) and/or broad-market (SPY/QQQ).
     # ------------------------------------------------------------------
     def active_watchlist(self, candidates: list[Candidate], positions: dict[str, Position]) -> set[str]:
         symbols = super().active_watchlist(candidates, positions)
@@ -81,11 +88,53 @@ class TopTierAdaptiveStrategy(BaseStrategy):
     # ------------------------------------------------------------------
     # Index confirmation
     # ------------------------------------------------------------------
-    def _index_confirms(self, side: Side, bars: dict[str, pd.DataFrame], _data=None) -> bool:
-        """Return True if at least one index symbol agrees with *side*."""
+    def _indices_for_symbol(self, symbol: str) -> list[str]:
+        """Return the index ETFs to consult when confirming trades on
+        *symbol*. Walks ``sector_groups`` to find which sector owns the
+        symbol, then reads ``sector_index_map[sector]`` for the per-sector
+        ETF list.
+
+        Falls back to the universe-wide ``index_symbols`` when the symbol
+        isn't in any sector OR the sector has no per-sector ETF mapping.
+        Backward-compat: dropping ``sector_index_map`` from config = the
+        old "OR across every index_symbols entry" behavior.
+
+        The fallback is intentional, not lazy — it lets a user opt-in
+        sector-by-sector instead of forcing them to map all 11 GICS sectors
+        upfront. Sectors without a map entry retain the broad-market
+        confirmation path.
+        """
+        fallback = [
+            str(s).upper().strip()
+            for s in (self.params.get("index_symbols") or ["SPY", "QQQ"])
+            if str(s).strip()
+        ]
+        sector_groups = self.params.get("sector_groups") or {}
+        sector_index_map = self.params.get("sector_index_map") or {}
+        if not sector_groups or not sector_index_map:
+            return fallback
+        symbol_upper = str(symbol).upper()
+        for sector_name, members in sector_groups.items():
+            if not isinstance(members, (list, tuple)):
+                continue
+            if symbol_upper in {str(m).upper() for m in members if m}:
+                mapped = sector_index_map.get(sector_name)
+                if mapped:
+                    cleaned = [str(s).upper().strip() for s in mapped if str(s).strip()]
+                    if cleaned:
+                        return cleaned
+                break
+        return fallback
+
+    def _index_confirms(self, side: Side, symbol: str, bars: dict[str, pd.DataFrame], _data=None) -> bool:
+        """Return True if at least one index ETF for *symbol*'s sector
+        agrees with *side*. The candidate-aware lookup prevents e.g. an
+        AAPL LONG from being confirmed by XLE (energy ETF) just because
+        XLE happens to be bullish-aligned. See ``_indices_for_symbol`` for
+        the lookup behavior + fallback semantics."""
         if not bool(self.params.get("require_index_confirmation", True)):
             return True
-        index_symbols = [str(s).upper().strip() for s in (self.params.get("index_symbols") or ["SPY", "QQQ"]) if str(s).strip()]
+        index_symbols = self._indices_for_symbol(symbol)
         for sym in index_symbols:
             frame = bars.get(sym)
             if frame is None or frame.empty:
@@ -101,9 +150,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 return True
         return False
 
-    def _index_neutral(self, bars: dict[str, pd.DataFrame]) -> bool:
-        """Return True if indices are not strongly directional (range-friendly)."""
-        index_symbols = [str(s).upper().strip() for s in (self.params.get("index_symbols") or ["SPY", "QQQ"]) if str(s).strip()]
+    def _index_neutral(self, symbol: str, bars: dict[str, pd.DataFrame]) -> bool:
+        """Return True if the per-symbol indices (see ``_indices_for_symbol``)
+        are not strongly directional — i.e. all are within 0.25% of their
+        own VWAP. Used by the range regime's scoring bonus."""
+        index_symbols = self._indices_for_symbol(symbol)
         for sym in index_symbols:
             frame = bars.get(sym)
             if frame is None or frame.empty:
@@ -458,42 +509,63 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         bias, _ = self._compute_live_bias_and_day_strength(frame, close)
         return bias
 
-    def _volatility_widening_factor(self, tech_ctx: Any) -> float:
-        """Stop-buffer widening multiplier for trend-day capture (Tier 2a).
+    def _volatility_widening_factor(self, tech_ctx: Any, current_time: Any = None) -> float:
+        """Stop-buffer widening multiplier — combines TWO orthogonal triggers:
 
-        Returns a float in ``[1.0, atr_widening_max_factor]`` based on the
-        current bar's ATR expansion vs its recent 5-bar average
-        (``tech_ctx.atr_expansion_mult``, populated by
-        ``build_technical_levels_context``). When ATR has expanded past
-        ``atr_widening_threshold`` (default 1.3x), stop buffers scale up
-        linearly to ``atr_widening_max_factor`` (default 1.5x) at 2x the
-        threshold.
+        1. **ATR expansion (Tier 2a, existing)** — when the current bar's
+           ATR is large vs its 5-bar average (``tech_ctx.atr_expansion_mult
+           > atr_widening_threshold``), stops scale up linearly to
+           ``atr_widening_max_factor``. Catches trend-day RELATIVE
+           volatility surges.
 
-        Why widen: in trend-day regimes (think Fed-day rallies, earnings
-        capitulation), per-bar noise expands. A fixed
-        ``stop_buffer_atr_mult * atr`` cushion gets whipsawed even though
-        the underlying trend is intact. Multiplying the cushion by this
-        factor keeps the SAME PER-SHARE RISK semantic (the risk manager
-        downsizes the share count proportionally so dollar risk per trade
-        stays constant) while making the stop more tolerant of trend-day
-        noise. Effect: fewer false stops, more winners captured.
+        2. **Early-session time-of-day widening (new)** — applies an
+           ABSOLUTE multiplier when ``current_time`` is before
+           ``early_session_stop_widening_until``. Catches the post-open
+           high-vol window where ATR may not be "expanding" relative to
+           recent bars (which are all noisy) but absolute vol is high.
+           Without this, a trade taken at 10:10 on AMD got stopped by a
+           single 1m wick that recovered 5 min later — the stop was set
+           by Tier 2a's RELATIVE-expansion logic, which read normal at
+           the time even though absolute volatility was elevated.
+
+        The factor returned is ``max(expansion_factor, time_factor)``,
+        capped at ``atr_widening_max_factor``. Tier 2a + time-of-day
+        don't compound (multiplying both would over-widen on volatile
+        morning opens); the trade gets whichever cushion is larger.
 
         Returns 1.0 when:
-          * ``atr_aware_stop_enabled`` param is False (master toggle)
-          * ``tech_ctx`` is missing or has no ``atr_expansion_mult``
-          * Expansion is below ``atr_widening_threshold`` (normal vol)
+          * ``atr_aware_stop_enabled`` is False (master toggle)
+          * No expansion AND not in early session
+          * ``tech_ctx`` is missing or has no ``atr_expansion_mult`` AND
+            ``current_time`` is unknown
         """
         if not bool(self.params.get("atr_aware_stop_enabled", True)):
             return 1.0
+        max_factor = float(self.params.get("atr_widening_max_factor", 1.5))
+
+        # --- Trigger 1: ATR expansion (Tier 2a) ---
+        expansion_factor = 1.0
         expansion_mult = float(getattr(tech_ctx, "atr_expansion_mult", 1.0) or 1.0) if tech_ctx is not None else 1.0
         threshold = float(self.params.get("atr_widening_threshold", 1.3))
-        if expansion_mult <= threshold:
-            return 1.0
-        max_factor = float(self.params.get("atr_widening_max_factor", 1.5))
-        # Linear scale from 1.0 (at threshold) to max_factor (at 2x threshold)
-        scale_range = max(0.1, threshold)
-        progress = min(1.0, (expansion_mult - threshold) / scale_range)
-        return 1.0 + (max_factor - 1.0) * progress
+        if expansion_mult > threshold:
+            # Linear scale from 1.0 (at threshold) to max_factor (at 2x threshold)
+            scale_range = max(0.1, threshold)
+            progress = min(1.0, (expansion_mult - threshold) / scale_range)
+            expansion_factor = 1.0 + (max_factor - 1.0) * progress
+
+        # --- Trigger 2: Early-session time-of-day widening ---
+        time_factor = 1.0
+        if current_time is not None and bool(self.params.get("early_session_stop_widening_enabled", True)):
+            try:
+                cutoff = parse_hhmm(str(self.params.get("early_session_stop_widening_until", "10:30")))
+                if current_time <= cutoff:
+                    time_factor = float(self.params.get("early_session_stop_widening_mult", 1.3))
+            except Exception:
+                pass
+
+        # Take the LARGER widening (not compound) so morning + ATR
+        # expansion don't double-multiply into an unrealistic stop.
+        return min(max(expansion_factor, time_factor), max_factor)
 
     def _bias_penalty(self, side: Side, day_strength: float | None,
                       effective_bias: Side | None, respect_bias: bool) -> float:
@@ -1545,15 +1617,19 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # Scoring still reflects index state accurately (index_ok is passed
         # to _score_trend); this bypass only prevents the "index not
         # confirmed" hard skip during 09:35-orb_end when the 5m VWAP/EMA
-        # on SPY/QQQ is still equilibrating after the open.
+        # on the sector ETFs (XLK/XLE/etc.) are still equilibrating after
+        # the open.
         orb_end = self.params.get("orb_end_time", "10:05")
         in_orb_window = now_t <= parse_hhmm(orb_end)
         orb_index_bypass = bool(self.params.get("orb_bypass_index_confirmation", True)) and in_orb_window
 
-        # SPY/QQQ bars are cycle-invariant; hoist out of per-candidate loop.
+        # Index ok / neutral are now PER-CANDIDATE because of the
+        # ``sector_index_map``-driven per-sector ETF lookup (see
+        # ``_indices_for_symbol``). An AAPL LONG checks XLK; an XOM LONG
+        # checks XLE; FCX/NEM check XLB; etc. Moved into the per-
+        # candidate loop below since the result varies by ``c.symbol``
+        # even within a single cycle.
         sides_to_evaluate = [Side.LONG, Side.SHORT] if allow_short else [Side.LONG]
-        index_ok_by_side = {side: self._index_confirms(side, bars, data) for side in sides_to_evaluate}
-        idx_neutral = self._index_neutral(bars)
 
         for c in candidates:
             if c.symbol in positions:
@@ -1569,6 +1645,12 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             if ltf is None or ltf.empty or len(ltf) < min_ltf_bars:
                 self._record_entry_decision(c.symbol, "skipped", ["missing_ltf_context"])
                 continue
+
+            # Per-candidate index lookup — uses ``sector_index_map`` to route
+            # AAPL → XLK, XOM → XLE, FCX → XLB, etc. Falls back to
+            # ``index_symbols`` when no sector mapping exists for the symbol.
+            index_ok_by_side = {side: self._index_confirms(side, c.symbol, bars, data) for side in sides_to_evaluate}
+            idx_neutral = self._index_neutral(c.symbol, bars)
 
             last = ltf.iloc[-1]
             close = _safe_float(last["close"])
@@ -1676,7 +1758,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # out of the per-side loop since both sides see the same frame
             # state and the same volatility regime.
             tech_ctx_for_candidate = self._technical_context(frame)
-            vol_widening = self._volatility_widening_factor(tech_ctx_for_candidate)
+            # Pass ``now_t`` so the time-of-day arm of the widening factor
+            # can fire during the early-session high-vol window (typically
+            # 09:35-10:30 ET). Catches absolute volatility that Tier 2a's
+            # relative-expansion check would miss.
+            vol_widening = self._volatility_widening_factor(tech_ctx_for_candidate, current_time=now_t)
 
             # Pass 1 — score each side independently, apply bias penalty,
             # build the per-side ``build_order`` list of qualifying regimes.
@@ -1878,6 +1964,16 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     # "feature enabled but inactive this cycle").
                     if bool(self.params.get("atr_aware_stop_enabled", True)) and isinstance(sig.metadata, dict):
                         sig.metadata["vol_widening_factor"] = round(float(vol_widening), 4)
+                    # Stamp the per-sector confirmation indices used at
+                    # entry. ``position_manager._adaptive_ladder_management``
+                    # re-checks these at target-hit time so a sector ETF
+                    # that has flipped against the trade can short-circuit
+                    # the multi-bar zone-flip wait (target exits at the
+                    # rung price instead of riding through a sector
+                    # reversal). Read in
+                    # ``_ladder_indices_still_aligned``.
+                    if isinstance(sig.metadata, dict):
+                        sig.metadata["confirmation_indices"] = list(self._indices_for_symbol(c.symbol))
                     best_signal = sig
                     winning_decision = decision
                     winning_regime = regime_name
