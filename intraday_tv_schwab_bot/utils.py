@@ -891,6 +891,16 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
         out["ema20"] = out["ema20_all"]
 
     # --- All-hours TA-Lib indicators (always computed) ---
+    # Bollinger Bands: TA-Lib's BBANDS uses a strict 20-bar warmup and
+    # returns NaN for bars 0-18 of the input. On a fresh session (no
+    # carry-over from prior days) that leaves the first 19 minutes of
+    # today's chart without a visible BB line. Fill the leading NaNs
+    # with a min_periods=10 pandas computation — same semantic as the
+    # ``technical_levels.py:813-814`` fallback path used by the strategy
+    # when shared bb_* columns aren't available. After bar 19 the values
+    # match TA-Lib exactly (full 20-bar window); before that they use
+    # whatever bars are available, with the std dev floor at 10 samples
+    # to keep the band statistically meaningful.
     upper, middle, lower_band = ta.BBANDS(
         _to_float64_array(close),
         timeperiod=20,
@@ -901,11 +911,17 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     out["bb_mid"] = _series_from_talib(out.index, middle)
     out["bb_upper"] = _series_from_talib(out.index, upper)
     out["bb_lower"] = _series_from_talib(out.index, lower_band)
+    bb_warmup_mid = close.rolling(20, min_periods=10).mean()
+    bb_warmup_std = close.rolling(20, min_periods=10).std(ddof=0)
+    bb_warmup_upper = bb_warmup_mid + 2.0 * bb_warmup_std
+    bb_warmup_lower = bb_warmup_mid - 2.0 * bb_warmup_std
+    out["bb_mid"] = out["bb_mid"].fillna(bb_warmup_mid)
+    out["bb_upper"] = out["bb_upper"].fillna(bb_warmup_upper)
+    out["bb_lower"] = out["bb_lower"].fillna(bb_warmup_lower)
     out["bb_width"] = out["bb_upper"] - out["bb_lower"]
     out["bb_width_pct"] = out["bb_width"] / out["bb_mid"].replace(0.0, math.nan)
     out["bb_percent_b"] = (close - out["bb_lower"]) / out["bb_width"].replace(0.0, math.nan)
-    rolling_std = close.rolling(20, min_periods=10).std(ddof=0)
-    out["bb_zscore"] = (close - out["bb_mid"]) / rolling_std.replace(0.0, math.nan)
+    out["bb_zscore"] = (close - out["bb_mid"]) / bb_warmup_std.replace(0.0, math.nan)
 
     out["atr14"] = _series_from_talib(out.index, ta.ATR(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=14))
     out["plus_di14"] = _series_from_talib(out.index, ta.PLUS_DI(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=14))

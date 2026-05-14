@@ -495,7 +495,23 @@ class RiskManager:
         return peak_r * 0.7       # 30% giveback 3R+
 
     def _peak_giveback_triggered(self, position: Position, last_price: float, initial_risk: float) -> bool:
-        min_r = float(getattr(self.config.risk, "peak_giveback_min_r", 1.0) or 1.0)
+        # Per-position override (Tier 3b — high-conviction-day loosening).
+        # Strategies that detect a strong directional day at entry (e.g.
+        # top_tier_adaptive when |day_strength| ≥ threshold) stamp
+        # ``peak_giveback_min_r_override`` on the signal metadata, which
+        # carries through to position.metadata. The override raises the
+        # threshold (default 2.0R vs the global default 1.0R) so 2R+
+        # winners on trend days aren't cut by normal 50% retracements.
+        # Falls back to ``config.risk.peak_giveback_min_r`` when not set.
+        meta = position.metadata if isinstance(position.metadata, dict) else {}
+        override = meta.get("peak_giveback_min_r_override") if isinstance(meta, dict) else None
+        if override is not None:
+            try:
+                min_r = float(override)
+            except (TypeError, ValueError):
+                min_r = float(getattr(self.config.risk, "peak_giveback_min_r", 1.0) or 1.0)
+        else:
+            min_r = float(getattr(self.config.risk, "peak_giveback_min_r", 1.0) or 1.0)
         peak_r, current_r = self._peak_and_current_r(position, last_price, initial_risk)
         if peak_r < min_r:
             return False

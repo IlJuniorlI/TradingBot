@@ -9,6 +9,247 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **top_tier_adaptive config: high-volatility retune.** *2026-05-13*
+  - ``configs/config.top_tier_adaptive.yaml`` retuned for elevated-VIX
+    tapes. Manifest (``_strategies/top_tier_adaptive/manifest.json``)
+    LEFT UNTOUCHED — manifest preserves the shipped low/mid-vol defaults
+    so the baseline isn't lost. The yaml is now the deployed high-vol
+    preset.
+  - **Theme**: bars/extensions are larger in high vol, so
+    absolute-distance filters LOOSEN; chop is worse so score gates +
+    sr_scalp distances TIGHTEN; giveback is faster so profit-lock
+    engages SOONER and locks MORE; ATR expansion triggers stop-widening
+    SOONER and goes FURTHER. Soft-bias and high-conviction thresholds
+    re-scaled to the bigger day_strength swings high vol produces.
+  - **Score / selectivity gates**:
+    * ``min_score_gap``: 1.4 → 1.5 (scores noisier; bigger gap for
+      decisive regime selection)
+    * ``min_adx14``: 16.0 → 18.0 (ADX naturally higher in high vol;
+      demand stronger trend reading)
+  - **Buffers (absolute distance — bars are larger)**:
+    * ``stop_buffer_atr_mult``: 0.25 → 0.30 (wider base buffer; Tier 2a
+      scales this further when ATR expands)
+    * ``pullback_ema_touch_atr_mult``: 0.35 → 0.45
+    * ``pullback_hold_atr_mult``: 0.40 → 0.50
+    * ``max_entry_vwap_extension_atr``: 1.50 → 1.80
+    * ``max_entry_ema9_extension_atr``: 1.20 → 1.50
+    * ``max_entry_bar_range_atr``: 1.80 → 2.20
+  - **Stretched filter (bands widen in high vol)**:
+    * ``stretched_percent_b_max``: 0.80 → 0.85
+    * ``stretched_atr_mult_max``: 1.1 → 1.3
+  - **Broken-level clearance (broken levels noisier)**:
+    * ``broken_level_min_clearance_pct``: 0.0025 → 0.0035
+    * ``broken_level_min_clearance_atr``: 0.72 → 0.90
+  - **Target conservatism (SR targets fail more)**:
+    * ``target_max_sr_ratio``: 0.8 → 0.7 (30% head-room vs 20%)
+  - **Adaptive profit protection (giveback faster)**:
+    * ``adaptive_profit_lock_rr``: 1.30 → 1.20 (engage sooner)
+    * ``adaptive_profit_lock_stop_rr``: 0.35 → 0.45 (lock more)
+  - **Vol-squeeze regime (false breakouts more common)**:
+    * ``vol_squeeze_breakout_buffer_pct``: 0.0008 → 0.0012
+    * ``vol_squeeze_min_breakout_volume_ratio``: 1.12 → 1.20
+  - **Momentum regime (1.5% day strength is common in high vol)**:
+    * ``momentum_min_day_strength``: 1.5 → 2.0
+  - **sr_scalp regime (S/R failures more common; zones need to be
+    further apart and closer-to-edge entries only)**:
+    * ``min_sr_scalp_score``: 3.5 → 4.0
+    * ``sr_scalp_min_distance_pct``: 0.008 → 0.012 (1.2% zone gap floor)
+    * ``sr_scalp_min_distance_atr``: 2.5 → 3.0
+    * ``sr_scalp_max_distance_from_zone_atr``: 0.5 → 0.4
+  - **Bias (intraday swings bigger; raise thresholds to match)**:
+    * ``directional_bias_min_day_strength``: 0.20 → 0.30
+    * ``bias_penalty_saturate_at``: 2.0 → 2.5
+  - **Tier 2a — ATR-aware stop widening (ATR expansion the norm)**:
+    * ``atr_widening_threshold``: 1.3 → 1.2 (trigger sooner)
+    * ``atr_widening_max_factor``: 1.5 → 1.8 (more headroom)
+  - **Tier 3b — high-conviction peak-giveback override (2.0% is common
+    in high vol; raise bar; give conviction trades more runway)**:
+    * ``peak_giveback_high_conviction_day_strength_pct``: 2.0 → 2.5
+    * ``peak_giveback_high_conviction_min_r``: 2.0 → 2.5
+  - **Untouched** (deliberately): score floors per regime
+    (``min_trend_score``, ``min_pullback_score``, ``min_range_score``,
+    ``min_vol_squeeze_score``, ``min_momentum_score``); regime time
+    windows; FVG weights; ladder builder; sector concentration cap; all
+    runtime/risk block values (``max_positions``, ``risk_per_trade_*``,
+    ``cooldown_minutes`` — runtime-level changes deferred so they
+    remain explicit user choices not implicit in a strategy preset).
+  - 36 strategy tests still pass. Six tests updated to be insulated
+    from yaml preset retunes (read ``bias_penalty_base/saturate_at`` and
+    ``atr_widening_threshold/max_factor`` from ``strategy.params``
+    dynamically, then verify the formula rather than hardcoded numerical
+    outputs). Two pre-existing stale tests (
+    ``test_midday_window_allows_pullback_and_momentum``,
+    ``test_disable_pullback_removes_it_from_all_windows``) updated to
+    include ``sr_scalp`` in the midday allowed-regime set — sr_scalp's
+    window (orb_end → no_new) legitimately spans midday, the prior
+    expectations predated the 2026-05-12 sr_scalp add.
+
+### Added
+
+- **top_tier_adaptive: new `sr_scalp` regime — HTF S/R mean-reversion
+  scalp.** *2026-05-12*
+  - 6th regime in the auction. Mean-reversion BETWEEN the bot's existing
+    HTF support / resistance zones — NO strategy-local level creation.
+    All inputs come from the same sources the rest of the bot uses:
+    * Level prices: ``sr_ctx.nearest_support`` (HS) and
+      ``sr_ctx.nearest_resistance`` (HR), same fields the dashboard
+      labels HS/HR and ``_refine_*_sr_levels`` consume.
+    * Zone bands: ``zone_atr_mult * atr`` or ``zone_pct * close`` (max),
+      defaulting to the bot-wide 0.20*atr / 0.15%*close. Same formula
+      as the dashboard's ``key_level_zones``.
+    * Stop nudge: ``sr_ctx.level_buffer`` (with ``vol_widening``).
+      Same buffer ``_refine_bullish_sr_levels`` and other S/R code
+      use to nudge stops past structural levels.
+  - **Distance gate**: the INNER gap ``(HR_zone_lower − HS_zone_upper)``
+    must clear BOTH floors (max wins):
+    ``sr_scalp_min_distance_pct * close`` (default 0.8%) AND
+    ``sr_scalp_min_distance_atr * atr`` (default 2.5x). Too-close zones
+    get rejected at build time as ``htf_zones_too_close``; the
+    build-queue fall-through then tries other regimes on the same /
+    opposite side.
+  - **Proximity gate**: close must be inside the entry-side zone OR
+    within ``sr_scalp_max_distance_from_zone_atr * atr`` (default 0.5x)
+    of its inner edge. Mid-range candles don't qualify.
+  - **Permissive scoring**: ``_score_sr_scalp`` rewards bar character
+    (lower-wick rejection for LONG, upper for SHORT), VWAP/EMA
+    neutrality, low ADX. Max score 5.0; ``min_sr_scalp_score`` default
+    3.5. The strict HTF zone check runs at build time, not scoring.
+  - **Index-confirmation exempt** (same as range — mean-reversion).
+  - **Allowed windows**: orb_end → no_new_entries_after. Skipped during
+    ORB to avoid morning level-break chop.
+  - **Stop**: ``HS_zone_lower − level_buffer`` (LONG) /
+    ``HR_zone_upper + level_buffer`` (SHORT).
+  - **Target**: ``HR_zone_lower − level_buffer`` (LONG) /
+    ``HS_zone_upper + level_buffer`` (SHORT) — exits at the inner edge
+    of the opposite zone, matching the bot's structural-exit
+    conventions elsewhere.
+  - 4 new tests in ``TestSRScalpRegime`` (36 total in
+    ``test_top_tier_adaptive_new_regimes.py``).
+
+- **top_tier_adaptive: Tier 2a — volatility-aware stop widening.**
+  *2026-05-12*
+  - On trend-day regimes (when current ATR has expanded past
+    ``atr_widening_threshold`` × its 5-bar average, default 1.3x), all
+    ATR-based stop buffers scale up linearly to ``atr_widening_max_factor``
+    (default 1.5x) at 2x the threshold.
+  - Risk-per-share widens; risk manager downsizes share count so dollar
+    risk per trade stays constant. Effect: fewer false stops from
+    trend-day noise, more winners captured without raising trade risk.
+  - Applies to all five regime builders (trend / pullback / range /
+    vol_squeeze / momentum). Each multiplies its ATR-based buffer
+    and the ``default_stop_pct`` floor by the per-candidate widening
+    factor.
+  - New strategy method: ``_volatility_widening_factor(tech_ctx)``.
+  - New config params: ``atr_aware_stop_enabled`` (default ``true``),
+    ``atr_widening_threshold`` (1.3), ``atr_widening_max_factor`` (1.5).
+  - Stamped on signal metadata as ``vol_widening_factor`` (when >1) for
+    post-mortem debugging.
+
+- **top_tier_adaptive: Tier 3b — high-conviction peak-giveback
+  loosening.** *2026-05-12*
+  - When the candidate's live ``day_strength`` magnitude exceeds
+    ``peak_giveback_high_conviction_day_strength_pct`` (default 2.0%)
+    at entry, the signal is stamped with
+    ``metadata["peak_giveback_min_r_override"] = peak_giveback_high_conviction_min_r``
+    (default 2.0).
+  - ``risk.py:_peak_giveback_triggered`` reads the override from
+    ``position.metadata`` and uses it instead of the global default
+    (``config.risk.peak_giveback_min_r``, typically 1.0).
+  - Effect: a 2R+ runner on a trend day won't get cut by a normal 50%
+    retracement — it has runway to recover and extend. Low-conviction
+    trades retain the conservative 1.0R threshold.
+  - Per-trade stamp (not session-wide), so each candidate gets its own
+    conviction assessment at entry time.
+  - 6 new tests in ``TestVolatilityWideningFactor`` (32 total in
+    ``test_top_tier_adaptive_new_regimes.py``).
+
+### Changed
+
+- **top_tier_adaptive: regime-to-regime fall-through at build time.**
+  *2026-05-12*
+  - Old behavior: each side selected ONE regime (the top-scoring one
+    after primary + fallback selection paths). If that regime's build
+    method failed (e.g. trend's ``no_fresh_breakout``, range's
+    ``bollinger_squeeze`` rejection), the side failed entirely — other
+    qualifying regimes on the same side were silently ignored.
+  - New behavior: each side stores an ordered LIST of qualifying
+    regimes (those meeting their ``min_*_score`` threshold) in
+    post-penalty score-descending order. The build phase iterates this
+    list and tries each regime's build in turn. First successful build
+    wins; build failures fall through to the next qualifying regime
+    on the same side. Across sides, the higher-scored side gets its
+    full build_order tried first.
+  - Effect: a high-scoring trend regime that misses its breakout gate
+    no longer blocks a qualifying pullback or vol_squeeze from firing
+    on the same side. Multiple regimes can coexist on a candidate;
+    they no longer compete winner-takes-all for the single slot.
+  - ``min_score_gap`` config param is now unused — the primary-vs-fallback
+    selection paths it gated are collapsed into the unified
+    build-order iteration. Param retained for backwards compat with
+    existing configs (silently ignored).
+
+- **top_tier_adaptive: Fix A refactored from hard lockout to soft score
+  penalty.** *2026-05-12*
+  - Old behavior: when the candidate's live bias was set (e.g. SHORT),
+    `preferred_sides` was hard-locked to that single side. The strategy
+    never scored or evaluated the opposite side, silently ignoring
+    legitimate counter-bias setups (e.g. a bullish BOS + breakout on a
+    stock with mildly-negative day_strength).
+  - New behavior: both sides are always evaluated. When the side
+    disagrees with the live bias, each regime score for that side is
+    reduced by `bias_penalty_base * min(1.0, |day_strength| /
+    bias_penalty_saturate_at)` before the score-gap auction. Weak
+    counter-bias setups are filtered (penalty drags them below
+    `min_*_score`); strong structural ones still qualify.
+  - Two new params: `bias_penalty_base` (default `1.0`) +
+    `bias_penalty_saturate_at` (default `2.0%`).
+  - Worked example: a stock with `day_strength = -0.5%` (mild SHORT
+    bias) has LONG-side regime scores reduced by 0.25. A trend score of
+    5.0 → 4.75 (still above `min_trend_score: 3.5`, qualifies). A trend
+    score of 4.0 → 3.75 (still qualifies but margin thinner).
+  - 2026-04-20 protection preserved: a stock with `day_strength = -2.0%`
+    applies the full 1.0 penalty to LONG-side regimes, blocking weak
+    LONG bounces. Stocks with `|day_strength| > saturate_at` get the
+    full penalty (no further scaling).
+  - Trailing-bias memory unchanged — still infers the bias from recent
+    cycles when current `live_bias` is None.
+  - `entry_decision` log includes `bias_pen=X.XX` in the failure reason
+    when the penalty contributed to no-qualifying-regime, so
+    post-mortem can distinguish soft-bias filtering from raw-weak
+    scores.
+
+- **top_tier_adaptive: `momentum_close` regime renamed to `momentum`
+  and widened from afternoon-only to post-ORB through close.**
+  *2026-05-12*
+  - Old behavior: regime was restricted to the afternoon window
+    (`afternoon_start_time` → `no_new_entries_after`) — i.e., a
+    ride-the-bell continuation pattern only.
+  - New behavior: regime is allowed in primary
+    (`orb_end_time` → `midday_start_time`), midday
+    (`midday_start_time` → `midday_end_time`), AND afternoon
+    (`afternoon_start_time` → `no_new_entries_after`). The
+    `momentum_min_day_strength` hard gate (default 1.5%) is what
+    filters chop — stocks without enough intraday move score zero,
+    so the time window doesn't need to do the filtering.
+  - Methods renamed: `_score_momentum_close` → `_score_momentum`,
+    `_build_momentum_close_signal` → `_build_momentum_signal`.
+  - Params renamed (clean break, no compat shim):
+    `min_momentum_close_score` → `min_momentum_score`,
+    `momentum_close_breakout_lookback_bars` →
+    `momentum_breakout_lookback_bars`,
+    `momentum_close_min_day_strength` → `momentum_min_day_strength`,
+    `momentum_close_target_rr` → `momentum_target_rr`,
+    `disable_momentum_close_regime` → `disable_momentum_regime`.
+  - Regime string in code/logs: `"momentum_close"` → `"momentum"`.
+  - **Note for H:\\TradingBot users**: the old param names in
+    user-managed configs will silently fall through to defaults
+    after upgrading. Rename the keys when you sync.
+  - Tests in `tests/test_top_tier_adaptive_new_regimes.py` updated
+    for the new name + window.
+  - The standalone `momentum_close` strategy
+    (`_strategies/momentum_close/`) is unchanged — only the
+    top_tier integration was renamed.
+
 - **top_tier_adaptive: directional bias is now computed LIVE in the
   strategy.** *2026-05-12*
   - `_compute_live_directional_bias(frame, close)` reads

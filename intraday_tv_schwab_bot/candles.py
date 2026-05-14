@@ -361,10 +361,34 @@ def _detect_side_patterns_cached(
     allowed: tuple[str, ...],
     bullish: bool,
 ) -> tuple[str, ...]:
+    """Detect matching candle patterns with longest-tier-wins cascade.
+
+    Each pattern fires via ``_evaluate_side_pattern`` using the existing
+    3-bar persistence window (TA-Lib's completion-bar lookback). After
+    detection, results are grouped by pattern length (1/2/3 bars) and
+    only the longest non-empty tier is returned.
+
+    Rationale: a 3-bar Morning Star describes the same 3 candles that
+    also fire 1-bar Marubozu / Belt Hold / Long Line on the 3rd bar. The
+    1-bar readings are redundant noise once the 3-bar story is detected.
+    The cascade reports the structurally meaningful pattern and drops
+    the overlapping shorter ones. When no 3-bar pattern fires, falls
+    back to 2-bar; when no 2-bar fires, falls back to 1-bar. Fixes the
+    user-facing "4 bullish + 3 bearish patterns" noise where a single
+    strong-bodied bar generates a flood of overlapping 1-bar readings.
+    """
     if not frame_key or not allowed:
         return tuple()
-    matches = [name for name in allowed if _evaluate_side_pattern(frame_key, name, bullish=bullish)]
-    return tuple(sorted(matches))
+    matches_by_tier: dict[int, list[str]] = {3: [], 2: [], 1: []}
+    for name in allowed:
+        if _evaluate_side_pattern(frame_key, name, bullish=bullish):
+            tier = pattern_length(name)
+            matches_by_tier.setdefault(tier, []).append(name)
+    for tier_length in (3, 2, 1):
+        tier_matches = matches_by_tier.get(tier_length) or []
+        if tier_matches:
+            return tuple(sorted(tier_matches))
+    return tuple()
 
 
 def summarize_pattern_matches(matches: Iterable[str] | None) -> dict[str, Any]:
@@ -486,6 +510,149 @@ def detect_candle_context(
     bullish = _normalize_allowed_patterns(bullish_allowed, bullish=True)
     bearish = _normalize_allowed_patterns(bearish_allowed, bullish=False)
     return _copy_candle_context(_detect_candle_context_cached(frame_key, bullish, bearish))
+
+
+@lru_cache(maxsize=1024)
+def _talib_pattern_array_from_key(
+    frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...],
+    func_name: str,
+) -> tuple[int, ...]:
+    """Full per-bar TA-Lib output for ``func_name`` against ``frame_key``.
+    Returns a tuple of int signals, one per input bar (length == len(frame_key)).
+    +200/+100 are bullish completions, -200/-100 are bearish, 0 otherwise.
+    Used by ``detect_per_bar_candle_patterns`` for dashboard per-bar tooltip
+    display. The existing latest-snapshot scanner
+    ``_talib_pattern_value_from_key`` is unchanged."""
+    if not frame_key:
+        return tuple()
+    if talib is None:
+        raise RuntimeError("TA-Lib is required for candlestick pattern detection but is not installed")
+    func = getattr(talib, func_name)
+    opens, highs, lows, closes = _ohlc_arrays_from_key(frame_key)
+    values = func(opens, highs, lows, closes)
+    return tuple(int(v) for v in values)
+
+
+def detect_per_bar_candle_patterns(
+    frame: pd.DataFrame,
+    bullish_allowed: Iterable[str] | None = None,
+    bearish_allowed: Iterable[str] | None = None,
+    lookback: int = CANDLE_CONTEXT_BARS,
+) -> dict[Any, dict[str, list[str]]]:
+    """Per-bar candle pattern map keyed by bar timestamp (the DataFrame's
+    index value at the completion bar).
+
+    Each value is ``{"bullish": [names], "bearish": [names]}`` after the
+    longest-tier-wins cascade has been applied PER BAR (3-bar pattern at
+    a bar suppresses overlapping 2-bar/1-bar patterns at the same bar).
+
+    Patterns appear ONLY on their completion bar — the bar where TA-Lib
+    emits the signal. Multi-bar patterns are NOT spread across constituent
+    bars; hover the completion bar to see them.
+
+    ``lookback`` controls how many bars from the tail of ``frame`` are fed
+    to TA-Lib. Defaults to ``CANDLE_CONTEXT_BARS`` (30, sufficient for
+    snapshot-only callers); the dashboard chart payload passes its
+    ``max_bars`` (default 90) so per-bar patterns are available across the
+    full visible chart, not just the last 30 bars. Clamped to a minimum of
+    ``CANDLE_CONTEXT_BARS`` because TA-Lib's pattern functions need at
+    least that much context to initialize their internal body-average /
+    trend state — the first few outputs of a shorter input are unreliable.
+
+    Used by the dashboard chart payload for honest per-bar tooltip display.
+    The existing ``detect_candle_context`` (latest-snapshot semantics) is
+    unchanged and remains the source for the strategy's tech_ctx +
+    candle_pattern_exit gates.
+    """
+    if frame is None or frame.empty:
+        return {}
+    effective_lookback = max(int(lookback), CANDLE_CONTEXT_BARS)
+    # Build the dropna'd subset ONCE and derive both frame_key and timestamps
+    # from it — guarantees positional alignment. Previously frame_key came
+    # from _ohlc_frame_key (which dropna's) but timestamps came from a raw
+    # frame.tail(), so any NaN-OHLC bars in the tail would shift the index
+    # away from the TA-Lib output positions.
+    subset = frame[["open", "high", "low", "close"]].tail(effective_lookback).copy()
+    if subset.empty:
+        return {}
+    for col in ("open", "high", "low", "close"):
+        subset[col] = pd.to_numeric(subset[col], errors="coerce")
+    subset = subset.dropna(subset=["open", "high", "low", "close"])
+    if subset.empty:
+        return {}
+    frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...] = tuple(
+        (
+            _safe_float_token(row[0]),
+            _safe_float_token(row[1]),
+            _safe_float_token(row[2]),
+            _safe_float_token(row[3]),
+        )
+        for row in subset.itertuples(index=False, name=None)
+    )
+    if not frame_key:
+        return {}
+    bullish_allowed_tuple = _normalize_allowed_patterns(bullish_allowed, bullish=True)
+    bearish_allowed_tuple = _normalize_allowed_patterns(bearish_allowed, bullish=False)
+
+    n = len(frame_key)
+    timestamps = list(subset.index)
+    if len(timestamps) != n:
+        # Defensive: the dropna subset and the frame_key derived from it
+        # must always have the same length. If they don't (shouldn't be
+        # possible after the rewrite above), fall back to no per-bar
+        # mapping rather than emitting misaligned data.
+        return {}
+
+    bullish_by_pos: dict[int, list[str]] = {i: [] for i in range(n)}
+    bearish_by_pos: dict[int, list[str]] = {i: [] for i in range(n)}
+
+    for token in bullish_allowed_tuple:
+        if not token:
+            continue
+        if token == "TWEEZER_BOTTOM":
+            # 2-bar custom: completion at position i requires bars (i-1, i).
+            for i in range(1, n):
+                if _tweezer_bottom_from_key(frame_key[:i + 1]):
+                    bullish_by_pos[i].append(token)
+            continue
+        values = _talib_pattern_array_from_key(frame_key, token)
+        for i, v in enumerate(values):
+            if v > 0:
+                bullish_by_pos[i].append(token)
+
+    for token in bearish_allowed_tuple:
+        if not token:
+            continue
+        if token == "TWEEZER_TOP":
+            for i in range(1, n):
+                if _tweezer_top_from_key(frame_key[:i + 1]):
+                    bearish_by_pos[i].append(token)
+            continue
+        values = _talib_pattern_array_from_key(frame_key, token)
+        for i, v in enumerate(values):
+            if v < 0:
+                bearish_by_pos[i].append(token)
+
+    def _apply_tier_cascade(matches: list[str]) -> list[str]:
+        if not matches:
+            return []
+        by_tier: dict[int, list[str]] = {3: [], 2: [], 1: []}
+        for name in matches:
+            by_tier.setdefault(pattern_length(name), []).append(name)
+        for tier_length in (3, 2, 1):
+            tier_matches = by_tier.get(tier_length) or []
+            if tier_matches:
+                return sorted(set(tier_matches))
+        return []
+
+    out: dict[Any, dict[str, list[str]]] = {}
+    for i, ts in enumerate(timestamps):
+        bull = _apply_tier_cascade(bullish_by_pos.get(i, []))
+        bear = _apply_tier_cascade(bearish_by_pos.get(i, []))
+        if not bull and not bear:
+            continue
+        out[ts] = {"bullish": bull, "bearish": bear}
+    return out
 
 
 def directional_candle_signal(candle_ctx: dict[str, Any] | None, *, bullish: bool) -> dict[str, Any]:

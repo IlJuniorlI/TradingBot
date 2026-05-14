@@ -950,7 +950,18 @@ class BaseStrategy:
             runner_allowed=False,
             continuation_bias=float(fvg_adjustments.get("fvg_reversal_bias", 0.0) or 0.0),
         )
-        candle_priority = 0.60 * float(bullish_candle_net_score)
+        # Multiplier bumped 0.60 -> 0.75 (2026-05-12) to compensate for the
+        # candle-pattern tier cascade in candles.py:_detect_side_patterns_cached
+        # which suppresses overlapping shorter-tier patterns (1C marubozus on a
+        # 2C engulfing bar, 1C readings on the 3rd bar of a 3C morning star).
+        # Removing that noise made anchor weights cleaner but cut the typical
+        # ``bullish_candle_net_score`` ceiling by ~0.25 because the corroboration
+        # bonus is now capped within a single tier. 0.60 -> 0.75 restores the
+        # previous max priority contribution (3C anchor: 0.60 * 1.25 = 0.75
+        # pre-cascade -> 0.75 * 1.00 = 0.75 post-cascade) without disturbing
+        # the threshold-based gates (opposing_net_score_threshold, etc.)
+        # which use net_score directly without the 0.75 multiplier.
+        candle_priority = 0.75 * float(bullish_candle_net_score)
         final_priority_score = (
             float(candidate.activity_score)
             + float(extra_priority)

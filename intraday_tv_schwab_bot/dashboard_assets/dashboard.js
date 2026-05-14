@@ -179,10 +179,18 @@ function pnlTone(value) {
 
 function selectedSymbolTone(snapshot) {
   if (!snapshot) return 'tone-neutral';
+  // Explicit bias (candidate directional_bias or open-position side) always
+  // wins. The trend-state fallback only fires when no bias / position is set
+  // — previously the OR-with-trend check could flip a SHORT-tagged card to
+  // tone-long if the HTF trend happened to be bullish, contradicting the
+  // visible "SHORT" subtitle. Bias is the strategy's directional intent for
+  // the symbol; trend is just structural context.
   const bias = String(snapshot?.candidate?.directional_bias || snapshot?.position?.side || '').toUpperCase();
+  if (bias === 'LONG') return 'tone-long';
+  if (bias === 'SHORT') return 'tone-short';
   const trend = String(snapshot?.support_resistance?.trend_state || snapshot?.support_resistance?.structure_bias || '').toLowerCase();
-  if (bias === 'LONG' || trend === 'bullish') return 'tone-long';
-  if (bias === 'SHORT' || trend === 'bearish') return 'tone-short';
+  if (trend === 'bullish') return 'tone-long';
+  if (trend === 'bearish') return 'tone-short';
   return 'tone-neutral';
 }
 
@@ -3485,8 +3493,12 @@ function drawSelectedChart(snapshot) {
     const deltaPct = delta !== null && Number(bar.open) ? (delta / Number(bar.open)) * 100 : null;
     const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
     const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+    // Structure-section values are ALL global snapshot state — the bars
+    // payload doesn't carry per-bar trend_state, so the previous
+    // ``bar.trend_state ??`` fallback was unreachable. Drop it; the section
+    // title is already labeled "(current)" so the global semantic is honest.
     const structureState = sr.state || 'neutral';
-    const structureTrend = bar.trend_state ?? sr.trend ?? sr.trend_state ?? 'neutral';
+    const structureTrend = sr.trend ?? sr.trend_state ?? 'neutral';
     const structureBias = sr.structure_bias || 'neutral';
     const structureEvent = sr.structure_event || '—';
     const sections = [];
@@ -3504,13 +3516,16 @@ function drawSelectedChart(snapshot) {
       `);
     }
     if (show('tooltip_show_support_resistance', true)) {
+      // S/R levels are global snapshot state, not per-bar history. The
+      // ``(current)`` suffix in the section title makes that explicit so
+      // users hovering older bars don't read these as that bar's levels.
       const supportValue = sr.nearest_support;
       const resistanceValue = sr.nearest_resistance;
       const nextSupportValue = levels.next_support;
       const nextResistanceValue = levels.next_resistance;
       sections.push(`
         <div class="tt-section">
-          <div class="tt-section-title">Support / Resistance</div>
+          <div class="tt-section-title">S/R Levels (current)</div>
           <div class="tt-grid">
             <div class="tt-kv"><span>Support</span><strong>${fmtNum(supportValue, 2)}</strong></div>
             <div class="tt-kv"><span>Resistance</span><strong>${fmtNum(resistanceValue, 2)}</strong></div>
@@ -3521,9 +3536,14 @@ function drawSelectedChart(snapshot) {
       `);
     }
     if (show('tooltip_show_structure', true)) {
+      // Structure section: ``state``, ``bias``, ``event`` are global
+      // snapshot values (not bar-indexed). Only ``trend`` is per-bar
+      // when bar.trend_state is populated (currently rare on chart bars
+      // payload), otherwise it falls back to the global snapshot. The
+      // ``(current)`` suffix is explicit about the global nature.
       sections.push(`
         <div class="tt-section">
-          <div class="tt-section-title">Structure</div>
+          <div class="tt-section-title">Structure (current)</div>
           <div class="tt-grid">
             <div class="tt-kv"><span>State</span><strong>${escapeHtml(prettyLabel(structureState || 'neutral'))}</strong></div>
             <div class="tt-kv"><span>Trend</span><strong>${escapeHtml(prettyLabel(structureTrend || 'neutral'))}</strong></div>
@@ -3534,80 +3554,126 @@ function drawSelectedChart(snapshot) {
       `);
     }
     if (show('tooltip_show_volatility', true)) {
+      // Per-bar honest display: no silent fallback to ``technicals.*``
+      // (the latest-snapshot global value). When ``bar.adx`` etc. is
+      // null (e.g. early-session warmup bars, HTF bars without the
+      // column, or a stale frame), the tooltip shows ``—`` instead of
+      // misleadingly reporting the current state as the hovered bar's
+      // state. Bars payload now carries adx/plus_di/minus_di/dmi_bias
+      // per-bar (see dashboard_bars_from_frame), so honest values
+      // appear whenever the data exists.
       sections.push(`
         <div class="tt-section">
           <div class="tt-section-title">Volatility / Trend</div>
           <div class="tt-grid">
             <div class="tt-kv"><span>ATR %</span><strong>${fmtPctFromRatio(bar.atr_pct, 2)}</strong></div>
-            <div class="tt-kv"><span>ADX</span><strong>${fmtNum(bar.adx ?? technicals.adx, 2)}</strong></div>
-            <div class="tt-kv"><span>+DI / -DI</span><strong>${fmtNum(bar.plus_di ?? technicals.plus_di, 1)} / ${fmtNum(bar.minus_di ?? technicals.minus_di, 1)}</strong></div>
-            <div class="tt-kv"><span>DMI Bias</span><strong>${escapeHtml(prettyLabel(bar.dmi_bias || technicals.dmi_bias || 'neutral'))}</strong></div>
-            <div class="tt-kv"><span>BB Width</span><strong>${fmtPctFromRatio(bar.bb_width_pct ?? technicals.bollinger_width_pct, 2)}</strong></div>
-            <div class="tt-kv"><span>%B / Z</span><strong>${fmtNum(bar.bb_percent_b ?? technicals.bollinger_percent_b, 2)} / ${fmtNum(bar.bb_zscore ?? technicals.bollinger_zscore, 2)}</strong></div>
+            <div class="tt-kv"><span>ADX</span><strong>${fmtNum(bar.adx, 2)}</strong></div>
+            <div class="tt-kv"><span>+DI / -DI</span><strong>${fmtNum(bar.plus_di, 1)} / ${fmtNum(bar.minus_di, 1)}</strong></div>
+            <div class="tt-kv"><span>DMI Bias</span><strong>${escapeHtml(prettyLabel(bar.dmi_bias || 'neutral'))}</strong></div>
+            <div class="tt-kv"><span>BB Width</span><strong>${fmtPctFromRatio(bar.bb_width_pct, 2)}</strong></div>
+            <div class="tt-kv"><span>%B / Z</span><strong>${fmtNum(bar.bb_percent_b, 2)} / ${fmtNum(bar.bb_zscore, 2)}</strong></div>
           </div>
         </div>
       `);
     }
     if (show('tooltip_show_orderflow', true)) {
+      // Per-bar honest display: same no-silent-fallback rule as the
+      // Volatility / Trend section above. Bars payload now carries obv,
+      // obv_ema, and the derived obv_bias per-bar. ``anchored_vwap_bias``
+      // is computed in tech_ctx (single-snapshot) and is intentionally
+      // omitted from the bars payload — the tooltip just doesn't show
+      // it anymore rather than silently reporting the global value as
+      // bar-specific.
       sections.push(`
         <div class="tt-section">
           <div class="tt-section-title">Orderflow / Context</div>
           <div class="tt-grid">
-            <div class="tt-kv"><span>OBV Bias</span><strong>${escapeHtml(prettyLabel(bar.obv_bias || technicals.obv_bias || 'neutral'))}</strong></div>
-            <div class="tt-kv"><span>OBV</span><strong>${fmtCompact(bar.obv ?? technicals.obv)}</strong></div>
-            <div class="tt-kv"><span>OBV EMA</span><strong>${fmtCompact(bar.obv_ema ?? technicals.obv_ema)}</strong></div>
-            <div class="tt-kv"><span>AVWAP Bias</span><strong>${escapeHtml(prettyLabel(bar.anchored_vwap_bias || technicals.anchored_vwap_bias || 'neutral'))}</strong></div>
+            <div class="tt-kv"><span>OBV Bias</span><strong>${escapeHtml(prettyLabel(bar.obv_bias || 'neutral'))}</strong></div>
+            <div class="tt-kv"><span>OBV</span><strong>${fmtCompact(bar.obv)}</strong></div>
+            <div class="tt-kv"><span>OBV EMA</span><strong>${fmtCompact(bar.obv_ema)}</strong></div>
           </div>
         </div>
       `);
     }
-    if (show('tooltip_show_patterns', true)) {      const explicitBullishTags = uniqPatternList([
+    if (show('tooltip_show_patterns', true)) {
+      // Patterns are split into two sections:
+      //   1. "Candle Patterns (this bar)" — per-bar from bar.candles_bullish/
+      //      bearish (populated by detect_per_bar_candle_patterns in
+      //      dashboard_cache.py, completion-bar only, with tier cascade).
+      //      Multi-bar patterns appear ONLY on their completion bar.
+      //   2. "Chart Patterns (latest)" — global from patterns.chart_*
+      //      (single detection across the latest 30 bars in the frame).
+      //      Same payload regardless of which bar is hovered.
+      // The candleFallback / chartFallback heuristics are indicator-derived
+      // body-flow / EMA-stack reads (not formal patterns), included
+      // alongside their per-bar / global counterparts to preserve the
+      // previous information density without re-mixing the categories.
+      const barCandlesBullish = Array.isArray(bar.candles_bullish) ? bar.candles_bullish : [];
+      const barCandlesBearish = Array.isArray(bar.candles_bearish) ? bar.candles_bearish : [];
+      const candleFallback = deriveCandleFallback(idx);
+      const chartFallback = deriveChartFallback(idx);
+
+      const candleBullishTags = uniqPatternList([...barCandlesBullish, ...candleFallback.bullish]);
+      const candleBearishTags = uniqPatternList([...barCandlesBearish, ...candleFallback.bearish]);
+      // Per-bar candle regime: derive from the bar's actual matches when
+      // present, otherwise fall back to the body-flow heuristic. Skips
+      // the global ``patterns.candle_regime_hint`` which is latest-only.
+      let candleRegime;
+      let candleBias;
+      if (barCandlesBullish.length && barCandlesBearish.length) {
+        candleRegime = 'mixed';
+        candleBias = 0;
+      } else if (barCandlesBullish.length) {
+        candleRegime = 'bullish_reversal';
+        candleBias = Math.min(1.25, 0.7 + 0.1 * (barCandlesBullish.length - 1));
+      } else if (barCandlesBearish.length) {
+        candleRegime = 'bearish_reversal';
+        candleBias = -Math.min(1.25, 0.7 + 0.1 * (barCandlesBearish.length - 1));
+      } else {
+        candleRegime = candleFallback.regime;
+        candleBias = candleFallback.score;
+      }
+
+      const explicitChartBullish = uniqPatternList([
         ...(patterns.chart_bullish_continuation || []),
         ...(patterns.chart_bullish_reversal || []),
         ...(patterns.chart_bullish || []),
-        ...(patterns.candles_bullish || []),
       ]);
-      const explicitBearishTags = uniqPatternList([
+      const explicitChartBearish = uniqPatternList([
         ...(patterns.chart_bearish_continuation || []),
         ...(patterns.chart_bearish_reversal || []),
         ...(patterns.chart_bearish || []),
-        ...(patterns.candles_bearish || []),
       ]);
-      const chartFallback = deriveChartFallback(idx);
-      const candleFallback = deriveCandleFallback(idx);
       const rawChartRegime = String((patterns.chart_regime_hint) || 'neutral').toLowerCase();
-      const rawCandleRegime = String((patterns.candle_regime_hint) || 'neutral').toLowerCase();
       const rawChartBias = numOrNull(patterns.chart_bias_score);
-      const rawCandleBias = numOrNull(patterns.candle_bias_score);
-      const useExplicitChart = explicitBullishTags.length > 0 || explicitBearishTags.length > 0 || rawChartRegime !== 'neutral' || (rawChartBias !== null && Math.abs(rawChartBias) > 0.0001);
-      const useExplicitCandle = (patterns.candles_bullish || []).length > 0 || (patterns.candles_bearish || []).length > 0 || rawCandleRegime !== 'neutral' || (rawCandleBias !== null && Math.abs(rawCandleBias) > 0.0001);
+      const useExplicitChart = explicitChartBullish.length > 0 || explicitChartBearish.length > 0 || rawChartRegime !== 'neutral' || (rawChartBias !== null && Math.abs(rawChartBias) > 0.0001);
       const chartRegime = useExplicitChart ? ((patterns.chart_regime_hint) || 'neutral') : chartFallback.regime;
       const chartBias = useExplicitChart ? patterns.chart_bias_score : chartFallback.score;
-      const candleRegime = useExplicitCandle ? ((patterns.candle_regime_hint) || 'neutral') : candleFallback.regime;
-      const candleBias = useExplicitCandle ? patterns.candle_bias_score : candleFallback.score;
-      const bullishTags = uniqPatternList([
-        ...explicitBullishTags,
-        ...chartFallback.bullish,
-        ...candleFallback.bullish,
-      ]);
-      const bearishTags = uniqPatternList([
-        ...explicitBearishTags,
-        ...chartFallback.bearish,
-        ...candleFallback.bearish,
-      ]);
+      const chartBullishTags = uniqPatternList([...explicitChartBullish, ...chartFallback.bullish]);
+      const chartBearishTags = uniqPatternList([...explicitChartBearish, ...chartFallback.bearish]);
+
       sections.push(`
         <div class="tt-section">
-          <div class="tt-section-title">Patterns</div>
+          <div class="tt-section-title">Candle Patterns (this bar)</div>
           <div class="tt-grid">
-            <div class="tt-kv"><span>Chart Regime</span><strong>${escapeHtml(prettyLabel(chartRegime || 'neutral'))}</strong></div>
-            <div class="tt-kv"><span>Chart Bias</span><strong>${fmtNum(chartBias, 2)}</strong></div>
             <div class="tt-kv"><span>Candle Regime</span><strong>${escapeHtml(prettyLabel(candleRegime || 'neutral'))}</strong></div>
             <div class="tt-kv"><span>Candle Bias</span><strong>${fmtNum(candleBias, 2)}</strong></div>
           </div>
           <div class="tt-section-title" style="margin-top:8px;">Bullish</div>
-          <div class="tt-tags">${tagHtml(bullishTags, 'good')}</div>
+          <div class="tt-tags">${tagHtml(candleBullishTags, 'good')}</div>
           <div class="tt-section-title" style="margin-top:8px;">Bearish</div>
-          <div class="tt-tags">${tagHtml(bearishTags, 'bad')}</div>
+          <div class="tt-tags">${tagHtml(candleBearishTags, 'bad')}</div>
+        </div>
+        <div class="tt-section">
+          <div class="tt-section-title">Chart Patterns (latest)</div>
+          <div class="tt-grid">
+            <div class="tt-kv"><span>Chart Regime</span><strong>${escapeHtml(prettyLabel(chartRegime || 'neutral'))}</strong></div>
+            <div class="tt-kv"><span>Chart Bias</span><strong>${fmtNum(chartBias, 2)}</strong></div>
+          </div>
+          <div class="tt-section-title" style="margin-top:8px;">Bullish</div>
+          <div class="tt-tags">${tagHtml(chartBullishTags, 'good')}</div>
+          <div class="tt-section-title" style="margin-top:8px;">Bearish</div>
+          <div class="tt-tags">${tagHtml(chartBearishTags, 'bad')}</div>
         </div>
       `);
     }

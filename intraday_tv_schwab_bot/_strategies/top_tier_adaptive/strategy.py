@@ -9,6 +9,7 @@ full RTH session with time-of-day regime gating.
 from __future__ import annotations
 
 from collections import deque
+from typing import Any
 
 from ..shared import (
     Candidate,
@@ -16,6 +17,7 @@ from ..shared import (
     Side,
     Signal,
     _bar_close_position,
+    _bar_wick_fractions,
     insufficient_bars_reason,
     _optional_float,
     _safe_float,
@@ -309,21 +311,24 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             score += 0.5
         return score
 
-    def _score_momentum_close(self, side: Side, close: float, vwap: float, ema9: float,
-                              ema20: float, ret15: float, frame: pd.DataFrame) -> float:
-        """Score the late-session momentum-into-close setup. The thesis is
-        a stock with strong day-direction breaking out of a recent N-bar
-        high (or low for SHORT), still in a trend-aligned posture, with
-        ret15 confirming acceleration. Uses live frame data to compute
-        day_strength (% from today's open) rather than the screener's
-        stale change_from_open. Ported (lighter) from
-        momentum_close/strategy.py."""
+    def _score_momentum(self, side: Side, close: float, vwap: float, ema9: float,
+                        ema20: float, ret15: float, frame: pd.DataFrame) -> float:
+        """Score the momentum-from-open setup. The thesis is a stock with
+        strong day-direction (live ``day_strength`` from session open) that's
+        breaking out of a recent N-bar high (or low for SHORT), still in a
+        trend-aligned posture, with ret15 confirming acceleration. Uses live
+        frame data to compute ``day_strength`` rather than the screener's
+        stale change_from_open. Renamed from ``_score_momentum_close``
+        2026-05-12 when the regime was generalized from afternoon-only to
+        post-ORB through close (skip-ORB) — the day_strength hard gate is
+        what filters out chop, not the time window. Scoring logic ported
+        (lighter) from the standalone ``momentum_close`` strategy."""
         # Compute live day_strength from session open + current close
         today_open = _session_open_price(frame)
         if today_open is None or today_open <= 0:
             return 0.0
         day_strength = (close - today_open) / today_open * 100.0
-        min_day = float(self.params.get("momentum_close_min_day_strength", 1.5))
+        min_day = float(self.params.get("momentum_min_day_strength", 1.5))
 
         # Hard gate: side-correct day strength magnitude
         if side == Side.LONG and day_strength < min_day:
@@ -332,7 +337,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             return 0.0
 
         # N-bar breakout (use today's bars only)
-        lookback = max(3, int(self.params.get("momentum_close_breakout_lookback_bars", 6)))
+        lookback = max(3, int(self.params.get("momentum_breakout_lookback_bars", 6)))
         session_frame = frame[_same_day_mask(frame, now_et().date())]
         if len(session_frame) < lookback + 1:
             return 0.0
@@ -373,41 +378,156 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 score += 0.5
         return score
 
+    @staticmethod
+    def _score_sr_scalp(side: Side, close: float, vwap: float, ema9: float,
+                        ema20: float, atr: float, adx: float,
+                        frame: pd.DataFrame) -> float:
+        """Score the HTF S/R scalp setup. Mean-reversion thesis: price is
+        rotating between two HTF support / resistance levels with enough
+        room between them to scalp. The score is PERMISSIVE — it only
+        checks bar character + neutrality conditions ("does this LOOK
+        like a scalp setup"). The HARD constraint (HTF zone gap +
+        proximity to the entry level) is enforced in
+        ``_build_sr_scalp_signal``; entries with too-close S/R zones get
+        rejected at build time so other regimes can fall through.
+
+        Score components (max 5.0):
+          * +1.5  bar shows a rejection wick on the trade side
+                  (lower wick >= 0.40 of bar range for LONG, upper for SHORT)
+          * +1.0  VWAP-neutral: |close - vwap| <= 0.5 * ATR
+          * +1.0  EMA-neutral:  |ema9 - ema20| / close <= 0.001
+          * +1.0  ADX low (no trend): adx14 <= 18
+          * +0.5  base score (regime is in play)
+        """
+        score = 0.5  # base: regime is in play
+        upper_wick, lower_wick, _body, bar_range = _bar_wick_fractions(frame)
+        if bar_range > 0:
+            wick = lower_wick if side == Side.LONG else upper_wick
+            if wick >= 0.40:
+                score += 1.5
+        if vwap > 0 and atr > 0 and abs(close - vwap) <= 0.5 * atr:
+            score += 1.0
+        if close > 0 and abs(ema9 - ema20) / close <= 0.001:
+            score += 1.0
+        if adx <= 18.0:
+            score += 1.0
+        return score
+
     # ------------------------------------------------------------------
     # Live directional bias
     # ------------------------------------------------------------------
-    def _compute_live_directional_bias(self, frame: pd.DataFrame, close: float) -> Side | None:
-        """Compute the candidate's directional bias from LIVE intraday data:
-        ``day_strength = (close - session_open) / session_open * 100``.
+    def _compute_live_bias_and_day_strength(
+        self, frame: pd.DataFrame, close: float,
+    ) -> tuple[Side | None, float | None]:
+        """Single-source computation: returns ``(bias, day_strength_pct)``.
 
-        Used by Fix A to decide which side(s) to evaluate. Returns
-        ``Side.LONG`` when day_strength > +threshold, ``Side.SHORT`` when
-        day_strength < -threshold, else ``None`` (no bias, both sides
-        evaluated).
+        ``day_strength_pct = (close − session_open) / session_open * 100``.
+        Bias is ``Side.LONG`` when day_strength exceeds
+        ``+directional_bias_min_day_strength`` (default 0.20%), ``Side.SHORT``
+        below the negative threshold, ``None`` within the neutral band.
 
-        The threshold matches the screener's ``directional_bias_min_day_strength``
-        param (default 0.20%). Computed live rather than read from the
-        screener's pre-computed ``c.directional_bias`` because:
+        Both values share one ``_session_open_price`` call so the soft-bias
+        penalty path doesn't repeat the session-open lookup. Used by
+        ``entry_signals`` (needs both bias for side selection AND magnitude
+        for penalty scaling) and by ``_compute_live_directional_bias`` (the
+        single-return wrapper kept for test compatibility).
 
-          * Screener cache is up to ~60 s stale; live close is current
-          * Session open from the LTF frame is authoritative (no risk
-            of pre/post-market session-field substitution)
-          * Same semantic as ``_score_momentum_close``'s day_strength,
-            keeping the strategy's bias logic self-consistent
+        Returns ``(None, None)`` when the session_open is unavailable
+        (warmup frame, missing data, etc.).
         """
         session_open = _session_open_price(frame)
         if session_open is None or session_open <= 0:
-            return None
+            return None, None
         try:
             day_strength = (float(close) - session_open) / session_open * 100.0
         except (TypeError, ValueError, ZeroDivisionError):
-            return None
+            return None, None
         threshold = float(self.params.get("directional_bias_min_day_strength", 0.20))
         if day_strength > threshold:
-            return Side.LONG
+            return Side.LONG, day_strength
         if day_strength < -threshold:
-            return Side.SHORT
-        return None
+            return Side.SHORT, day_strength
+        return None, day_strength
+
+    def _compute_live_directional_bias(self, frame: pd.DataFrame, close: float) -> Side | None:
+        """Bias-only wrapper around ``_compute_live_bias_and_day_strength``.
+        Kept as the public API for tests + any caller that doesn't need
+        the day_strength magnitude. Same semantics as before: returns
+        ``Side.LONG`` / ``Side.SHORT`` / ``None`` based on day_strength
+        vs. ``directional_bias_min_day_strength``."""
+        bias, _ = self._compute_live_bias_and_day_strength(frame, close)
+        return bias
+
+    def _volatility_widening_factor(self, tech_ctx: Any) -> float:
+        """Stop-buffer widening multiplier for trend-day capture (Tier 2a).
+
+        Returns a float in ``[1.0, atr_widening_max_factor]`` based on the
+        current bar's ATR expansion vs its recent 5-bar average
+        (``tech_ctx.atr_expansion_mult``, populated by
+        ``build_technical_levels_context``). When ATR has expanded past
+        ``atr_widening_threshold`` (default 1.3x), stop buffers scale up
+        linearly to ``atr_widening_max_factor`` (default 1.5x) at 2x the
+        threshold.
+
+        Why widen: in trend-day regimes (think Fed-day rallies, earnings
+        capitulation), per-bar noise expands. A fixed
+        ``stop_buffer_atr_mult * atr`` cushion gets whipsawed even though
+        the underlying trend is intact. Multiplying the cushion by this
+        factor keeps the SAME PER-SHARE RISK semantic (the risk manager
+        downsizes the share count proportionally so dollar risk per trade
+        stays constant) while making the stop more tolerant of trend-day
+        noise. Effect: fewer false stops, more winners captured.
+
+        Returns 1.0 when:
+          * ``atr_aware_stop_enabled`` param is False (master toggle)
+          * ``tech_ctx`` is missing or has no ``atr_expansion_mult``
+          * Expansion is below ``atr_widening_threshold`` (normal vol)
+        """
+        if not bool(self.params.get("atr_aware_stop_enabled", True)):
+            return 1.0
+        expansion_mult = float(getattr(tech_ctx, "atr_expansion_mult", 1.0) or 1.0) if tech_ctx is not None else 1.0
+        threshold = float(self.params.get("atr_widening_threshold", 1.3))
+        if expansion_mult <= threshold:
+            return 1.0
+        max_factor = float(self.params.get("atr_widening_max_factor", 1.5))
+        # Linear scale from 1.0 (at threshold) to max_factor (at 2x threshold)
+        scale_range = max(0.1, threshold)
+        progress = min(1.0, (expansion_mult - threshold) / scale_range)
+        return 1.0 + (max_factor - 1.0) * progress
+
+    def _bias_penalty(self, side: Side, day_strength: float | None,
+                      effective_bias: Side | None, respect_bias: bool) -> float:
+        """Soft-bias score adjustment applied to a side's regime scores
+        when the side disagrees with ``effective_bias``.
+
+        Returns 0.0 when:
+          * ``respect_bias`` is False (master toggle off / ORB bypass active)
+          * ``effective_bias`` is None (no bias set)
+          * ``side`` agrees with ``effective_bias``
+
+        Otherwise returns ``bias_penalty_base * magnitude_factor`` where
+        ``magnitude_factor = min(1.0, |day_strength| / bias_penalty_saturate_at)``.
+        Default base 1.0, saturate at 2.0% day_strength — so a −0.5% day with
+        SHORT bias applies only a 0.25 penalty to LONG-side regimes (a strong
+        structural LONG setup can still qualify), while a −3% deep-down day
+        applies the full 1.0 penalty (filters most LONG-side setups).
+
+        Replaces Fix A's previous HARD lockout (``preferred_sides = [Side]``).
+        Both sides are now always evaluated; the penalty filters weak
+        counter-bias setups while letting strong structural ones through.
+        Preserves the 2026-04-20 protection (deep day_strength → full
+        penalty) and the trailing-bias memory (inferred bias still
+        contributes to the penalty).
+        """
+        if not respect_bias:
+            return 0.0
+        if effective_bias is None or effective_bias == side:
+            return 0.0
+        penalty_base = float(self.params.get("bias_penalty_base", 1.0))
+        saturate_at = max(0.1, float(self.params.get("bias_penalty_saturate_at", 2.0)))
+        ds = float(day_strength) if day_strength is not None else 0.0
+        magnitude_factor = min(1.0, abs(ds) / saturate_at)
+        return penalty_base * magnitude_factor
 
     # ------------------------------------------------------------------
     # Time-of-day gating
@@ -423,20 +543,29 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         midday_end_time, afternoon_start_time, no_new_entries_after) — no
         hard-coded times.
 
-        Five regimes:
+        Six regimes:
           - trend / pullback / range: primary scoring regimes
           - vol_squeeze: Bollinger-squeeze breakout. Allowed in the primary
             window (orb_end → midday_start) and the afternoon
             (afternoon_start → no_new).
-          - momentum_close: ride-the-bell continuation. Restricted to the
-            afternoon window (afternoon_start → no_new) only — explicit
-            per-user request; pre-afternoon momentum is already covered by
-            trend/pullback.
+          - momentum: momentum-from-open continuation. Allowed post-ORB
+            through close (orb_end → no_new). Includes midday because the
+            ``momentum_min_day_strength`` hard gate filters out chop —
+            stocks without enough intraday move score zero. Renamed from
+            ``momentum_close`` 2026-05-12 when the window was widened from
+            afternoon-only.
+          - sr_scalp: HTF S/R mean-reversion scalp. Allowed post-ORB
+            through close (orb_end → no_new). Excluded from the ORB
+            window because morning chop near recent levels often breaks
+            through; the build-time distance gate
+            (``sr_scalp_min_distance_pct`` / ``sr_scalp_min_distance_atr``)
+            rejects when the HTF zones are too close to be worth the
+            round-trip.
 
         Each regime has its own opt-out knob via params:
           disable_trend_regime / disable_pullback_regime /
           disable_range_regime / disable_vol_squeeze_regime /
-          disable_momentum_close_regime.
+          disable_momentum_regime / disable_sr_scalp_regime.
 
         The 09:35 → orb_end_time window has a separate whole-window
         opt-out (``disable_orb_window``) that skips the ORB window entirely
@@ -457,7 +586,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         pullback_enabled = not bool(self.params.get("disable_pullback_regime", False))
         range_enabled = not bool(self.params.get("disable_range_regime", False))
         vol_squeeze_enabled = not bool(self.params.get("disable_vol_squeeze_regime", False))
-        momentum_close_enabled = not bool(self.params.get("disable_momentum_close_regime", False))
+        momentum_enabled = not bool(self.params.get("disable_momentum_regime", False))
+        sr_scalp_enabled = not bool(self.params.get("disable_sr_scalp_regime", False))
 
         def _filter(regimes: set[str]) -> set[str]:
             """Strip regimes whose disable knob is set."""
@@ -469,8 +599,10 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 regimes.discard("range")
             if not vol_squeeze_enabled:
                 regimes.discard("vol_squeeze")
-            if not momentum_close_enabled:
-                regimes.discard("momentum_close")
+            if not momentum_enabled:
+                regimes.discard("momentum")
+            if not sr_scalp_enabled:
+                regimes.discard("sr_scalp")
             return regimes
 
         if now_t > parse_hhmm(no_new):
@@ -486,9 +618,19 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 return set()
             return _filter({"trend"})  # ORB window: trend only
         if self._time_in_range(now_t, orb_end, midday_start):
-            return _filter({"trend", "pullback", "range", "vol_squeeze"})
+            # Primary window: full regime mix including momentum + sr_scalp.
+            # The day_strength gate filters momentum; the distance gate
+            # filters sr_scalp (zones must be far enough apart). Neither
+            # blocks the trend / pullback / range / vol_squeeze regimes.
+            return _filter({"trend", "pullback", "range", "vol_squeeze", "momentum", "sr_scalp"})
         if self._time_in_range(now_t, midday_start, midday_end):
-            return _filter({"pullback"})  # Midday: pullbacks only
+            # Midday: pullbacks remain the default fit for top-tier chop,
+            # but momentum is allowed because day_strength >= threshold
+            # implies a stock is genuinely trending despite the lunchtime
+            # tape. sr_scalp is also allowed — midday's low-volatility
+            # chop is often the cleanest scalp environment between HTF
+            # zones (when the gap qualifies).
+            return _filter({"pullback", "momentum", "sr_scalp"})
         if self._time_in_range(now_t, afternoon_start, no_new):
             # Range regime is included in afternoon by default because
             # afternoon tapes are often range-bound and forcing trend/pullback
@@ -497,9 +639,9 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # ``afternoon_include_range: false`` in params (or globally via
             # ``disable_range_regime: true``).
             if bool(self.params.get("afternoon_include_range", True)):
-                regimes = {"trend", "pullback", "range", "vol_squeeze", "momentum_close"}
+                regimes = {"trend", "pullback", "range", "vol_squeeze", "momentum", "sr_scalp"}
             else:
-                regimes = {"trend", "pullback", "vol_squeeze", "momentum_close"}
+                regimes = {"trend", "pullback", "vol_squeeze", "momentum", "sr_scalp"}
             return _filter(regimes)
         return set()
 
@@ -508,14 +650,18 @@ class TopTierAdaptiveStrategy(BaseStrategy):
     # ------------------------------------------------------------------
     def _build_trend_signal(self, c: Candidate, side: Side, close: float, atr: float,
                             ltf: pd.DataFrame, frame: pd.DataFrame, regime_score: float,
-                            data=None) -> Signal | None:
+                            data=None, vol_widening: float = 1.0) -> Signal | None:
         lookback = max(3, int(self.params.get("pullback_lookback_bars", 5)))
         session_ltf = ltf[_same_day_mask(ltf, now_et().date())]
         recent = session_ltf.tail(lookback + 1).iloc[:-1] if len(session_ltf) > lookback else session_ltf.iloc[:-1]
         if recent.empty:
             self._set_build_failure(c.symbol, "trend", "insufficient_ltf_history")
             return None
-        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25))
+        # ATR buffer + default_stop_pct floor both scale with vol_widening
+        # (Tier 2a) — trend-day capture: wider noise tolerance, same dollar
+        # risk per trade (risk manager downsizes share count).
+        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening
+        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening
         target_rr = float(self.params.get("trend_target_rr", 2.0))
 
         if side == Side.LONG:
@@ -527,7 +673,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 )
                 return None
             stop = _safe_float(recent["low"].min(), close) - buffer
-            stop = min(stop, close * (1.0 - self.config.risk.default_stop_pct))
+            stop = min(stop, close * (1.0 - effective_default_stop_pct))
             risk = max(0.01, close - stop)
             target = close + risk * target_rr
         else:
@@ -539,7 +685,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 )
                 return None
             stop = _safe_float(recent["high"].max(), close) + buffer
-            stop = max(stop, close * (1.0 + self.config.risk.default_stop_pct))
+            stop = max(stop, close * (1.0 + effective_default_stop_pct))
             risk = max(0.01, stop - close)
             target = max(0.01, close - risk * target_rr)
 
@@ -547,7 +693,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
 
     def _build_pullback_signal(self, c: Candidate, side: Side, close: float, atr: float,
                                ltf: pd.DataFrame, frame: pd.DataFrame, regime_score: float,
-                               data=None) -> Signal | None:
+                               data=None, vol_widening: float = 1.0) -> Signal | None:
         lookback = max(3, int(self.params.get("pullback_lookback_bars", 5)))
         # ltf is resampled from the full multi-day history frame, so tail(N)
         # crosses session boundary during early RTH. Scope swing/stop lookups
@@ -557,18 +703,20 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         if recent.empty:
             self._set_build_failure(c.symbol, "pullback", "insufficient_ltf_history")
             return None
-        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25))
+        # vol_widening applied to both ATR buffer and default_stop_pct floor (Tier 2a).
+        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening
+        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening
         target_rr = float(self.params.get("pullback_target_rr", 2.0))
 
         if side == Side.LONG:
             stop = _safe_float(recent["low"].min(), close) - buffer
-            stop = min(stop, close * (1.0 - self.config.risk.default_stop_pct))
+            stop = min(stop, close * (1.0 - effective_default_stop_pct))
             risk = max(0.01, close - stop)
             swing_high = _safe_float(session_ltf.tail(20)["high"].max(), close + risk * target_rr)
             target = max(close + risk * target_rr, swing_high)
         else:
             stop = _safe_float(recent["high"].max(), close) + buffer
-            stop = max(stop, close * (1.0 + self.config.risk.default_stop_pct))
+            stop = max(stop, close * (1.0 + effective_default_stop_pct))
             risk = max(0.01, stop - close)
             swing_low = _safe_float(session_ltf.tail(20)["low"].min(), close - risk * target_rr)
             target = max(0.01, min(close - risk * target_rr, swing_low))
@@ -576,7 +724,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         return self._finalize_signal(c, side, close, stop, target, "pullback", regime_score, frame, data)
 
     def _build_range_signal(self, c: Candidate, side: Side, close: float, atr: float,
-                            frame: pd.DataFrame, regime_score: float, data=None) -> Signal | None:
+                            frame: pd.DataFrame, regime_score: float, data=None,
+                            vol_widening: float = 1.0) -> Signal | None:
         lookback = max(8, int(self.params.get("range_lookback_bars", 20)))
         # Scope to today's session so range_high/range_low are not polluted
         # by prior-session bars during early RTH.
@@ -601,7 +750,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 return None
         range_high = _safe_float(recent["high"].max(), close)
         range_low = _safe_float(recent["low"].min(), close)
-        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25))
+        # vol_widening applied (Tier 2a). Note: in range, the buffer also
+        # pulls in the target (target = range_high - buffer for LONG) so
+        # both stop room AND target conservatism scale with volatility,
+        # which is the correct direction (wider noise needs both).
+        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening
         # Previous-bar confirmation — 2026-04-23 red-from-tick-one bucket
         # (AMZN 10:07, COST 11:09/13:02/15:15, LOW 13:08, HD 14:12 SHORT,
         # V 14:14 SHORT) all fired on an in-progress bar whose live tick
@@ -655,7 +808,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
 
     def _build_vol_squeeze_signal(self, c: Candidate, side: Side, close: float, atr: float,
                                   frame: pd.DataFrame, regime_score: float,
-                                  data=None) -> Signal | None:
+                                  data=None, vol_widening: float = 1.0) -> Signal | None:
         """Build a Bollinger-squeeze breakout signal. Stops sit just outside
         the squeeze box (below box_low for LONG / above box_high for SHORT),
         with an ATR-floored buffer to absorb noise around the breakout. Target
@@ -677,38 +830,45 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         target_rr = float(self.params.get("vol_squeeze_target_rr", 2.05))
         # Stop buffer scales with box range so tighter squeezes don't get
         # over-wide ATR-based stops. Mirrors source strategy logic.
-        stop_buffer = max(atr * 0.12, close * 0.0010, box_range * 0.22)
+        # vol_widening (Tier 2a) applies on top of the max() so all three
+        # buffer floors expand together in trend-day regimes.
+        stop_buffer = max(atr * 0.12, close * 0.0010, box_range * 0.22) * vol_widening
+        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening
 
         if side == Side.LONG:
             stop = box_low - stop_buffer
-            stop = min(stop, close * (1.0 - self.config.risk.default_stop_pct))
+            stop = min(stop, close * (1.0 - effective_default_stop_pct))
             risk = max(0.01, close - stop)
             target = close + risk * target_rr
         else:
             stop = box_high + stop_buffer
-            stop = max(stop, close * (1.0 + self.config.risk.default_stop_pct))
+            stop = max(stop, close * (1.0 + effective_default_stop_pct))
             risk = max(0.01, stop - close)
             target = max(0.01, close - risk * target_rr)
 
         return self._finalize_signal(c, side, close, stop, target, "vol_squeeze", regime_score, frame, data)
 
-    def _build_momentum_close_signal(self, c: Candidate, side: Side, close: float, atr: float,
-                                     frame: pd.DataFrame,
-                                     regime_score: float, data=None) -> Signal | None:
-        """Build a momentum-into-close continuation signal. Stops anchor below
+    def _build_momentum_signal(self, c: Candidate, side: Side, close: float, atr: float,
+                               frame: pd.DataFrame,
+                               regime_score: float, data=None,
+                               vol_widening: float = 1.0) -> Signal | None:
+        """Build a momentum-from-open continuation signal. Stops anchor below
         recent swing low (LONG) / above recent swing high (SHORT) with an
-        ATR-cushioned buffer so single-bar wicks during the afternoon's lower
-        volume don't trigger the stop. Target uses momentum_close_target_rr.
+        ATR-cushioned buffer so single-bar wicks (during midday's lower volume
+        or afternoon thin liquidity) don't trigger the stop. Target uses
+        ``momentum_target_rr``.
 
         Uses the 1m ``frame`` for the N-bar breakout check so it stays
-        consistent with ``_score_momentum_close`` and with the source
-        momentum_close strategy.
+        consistent with ``_score_momentum`` and with the source standalone
+        momentum_close strategy. Renamed from ``_build_momentum_close_signal``
+        2026-05-12 when the regime was generalized from afternoon-only to
+        post-ORB through close.
         """
-        lookback = max(3, int(self.params.get("momentum_close_breakout_lookback_bars", 6)))
+        lookback = max(3, int(self.params.get("momentum_breakout_lookback_bars", 6)))
         session_frame = frame[_same_day_mask(frame, now_et().date())]
         recent = session_frame.tail(lookback + 1).iloc[:-1] if len(session_frame) > lookback else session_frame.iloc[:-1]
         if recent.empty:
-            self._set_build_failure(c.symbol, "momentum_close", "insufficient_session_history")
+            self._set_build_failure(c.symbol, "momentum", "insufficient_session_history")
             return None
 
         # Fresh-breakout gate (matches the source strategy's check)
@@ -716,7 +876,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             breakout_level = _safe_float(recent["high"].max(), close)
             if close <= breakout_level:
                 self._set_build_failure(
-                    c.symbol, "momentum_close",
+                    c.symbol, "momentum",
                     f"no_fresh_breakout(close={close:.4f}<=recent_high={breakout_level:.4f})",
                 )
                 return None
@@ -724,25 +884,159 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             breakout_level = _safe_float(recent["low"].min(), close)
             if close >= breakout_level:
                 self._set_build_failure(
-                    c.symbol, "momentum_close",
+                    c.symbol, "momentum",
                     f"no_fresh_breakdown(close={close:.4f}>=recent_low={breakout_level:.4f})",
                 )
                 return None
 
-        target_rr = float(self.params.get("momentum_close_target_rr", 2.0))
-        # ATR-cushioned swing anchor (mirrors momentum_close/strategy.py:76-79)
+        target_rr = float(self.params.get("momentum_target_rr", 2.0))
+        # ATR-cushioned swing anchor (mirrors standalone momentum_close/strategy.py:76-79).
+        # vol_widening (Tier 2a) widens the ATR cushion AND the
+        # default_stop_pct floor so momentum trades on trend days don't
+        # get knocked out by expanded per-bar noise.
+        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening
         if side == Side.LONG:
-            swing = _safe_float(recent["low"].min(), close) - (atr * 0.08)
-            stop = max(close * (1.0 - self.config.risk.default_stop_pct), swing)
+            swing = _safe_float(recent["low"].min(), close) - (atr * 0.08 * vol_widening)
+            stop = max(close * (1.0 - effective_default_stop_pct), swing)
             risk = max(0.01, close - stop)
             target = close + risk * target_rr
         else:
-            swing = _safe_float(recent["high"].max(), close) + (atr * 0.08)
-            stop = min(close * (1.0 + self.config.risk.default_stop_pct), swing)
+            swing = _safe_float(recent["high"].max(), close) + (atr * 0.08 * vol_widening)
+            stop = min(close * (1.0 + effective_default_stop_pct), swing)
             risk = max(0.01, stop - close)
             target = max(0.01, close - risk * target_rr)
 
-        return self._finalize_signal(c, side, close, stop, target, "momentum_close", regime_score, frame, data)
+        return self._finalize_signal(c, side, close, stop, target, "momentum", regime_score, frame, data)
+
+    def _build_sr_scalp_signal(self, c: Candidate, side: Side, close: float, atr: float,
+                               frame: pd.DataFrame, regime_score: float,
+                               data=None, vol_widening: float = 1.0) -> Signal | None:
+        """Build an HTF S/R scalp signal — mean-reversion between the bot's
+        existing HTF support / resistance zones.
+
+        Uses the bot's existing S/R machinery — NO strategy-local level
+        creation. All level prices, zone bands, and stop nudges come from
+        the same sources the rest of the bot uses:
+
+          * Level prices: ``sr_ctx.nearest_support.price`` (HS) and
+            ``sr_ctx.nearest_resistance.price`` (HR). Same fields the
+            dashboard labels "HS" / "HR" and ``_refine_*_sr_levels`` use.
+          * Zone bands: ``zone_atr_mult * atr`` or ``zone_pct * close``
+            (max), defaulting to the bot-wide 0.20*atr / 0.15%*close.
+            Same construction the dashboard's ``key_level_zones`` use.
+          * Stop nudge: ``sr_ctx.level_buffer`` × ``vol_widening``. Same
+            buffer ``_refine_bullish_sr_levels`` / ``_refine_bearish_sr_levels``
+            use to nudge stops past structural levels.
+
+        Strict build-time gates:
+          1. Both ``nearest_support`` (HS) and ``nearest_resistance`` (HR)
+             exist on ``sr_ctx``. No scalp without two-sided zones.
+          2. Inner gap between zones ``(HR_zone_lower − HS_zone_upper)``
+             clears BOTH the % floor (``sr_scalp_min_distance_pct *
+             close``, default 0.8%) AND the ATR floor
+             (``sr_scalp_min_distance_atr * atr``, default 2.5x). Inner
+             gap (not center-to-center) is the conservative measure —
+             wide zones mean the tradeable space between them shrinks.
+          3. Close is inside the entry-side zone OR within
+             ``sr_scalp_max_distance_from_zone_atr * atr`` of its inner
+             edge (default 0.5x). Mid-range candles get rejected.
+          4. Close hasn't broken through the entry-side zone (LONG:
+             ``close > HS_zone_lower``; SHORT: ``close < HR_zone_upper``).
+             Bounces only, not breakdowns.
+
+        Stop = HS_zone_lower − level_buffer (LONG) or HR_zone_upper +
+        level_buffer (SHORT). Target = HR_zone_lower − level_buffer
+        (LONG) or HS_zone_upper + level_buffer (SHORT) — exits at the
+        opposite zone's inner edge, matching the bot's structural-exit
+        conventions everywhere else.
+        """
+        sr_ctx = self._sr_context(c.symbol, frame, data)
+        support_level = getattr(sr_ctx, "nearest_support", None)
+        resistance_level = getattr(sr_ctx, "nearest_resistance", None)
+        support_price = float(getattr(support_level, "price", 0.0) or 0.0) if support_level is not None else 0.0
+        resistance_price = float(getattr(resistance_level, "price", 0.0) or 0.0) if resistance_level is not None else 0.0
+        if support_price <= 0.0 or resistance_price <= 0.0:
+            self._set_build_failure(c.symbol, "sr_scalp", "missing_htf_levels")
+            return None
+        if resistance_price <= support_price:
+            self._set_build_failure(c.symbol, "sr_scalp", "inverted_htf_levels")
+            return None
+
+        # Zone band half-width — bot's existing zone construction (same
+        # formula as dashboard's key_level_zones via
+        # dashboard_level_context_spec). Reads ``zone_atr_mult`` /
+        # ``zone_pct`` from params; defaults match the bot-wide defaults.
+        zone_atr_mult = float(self.params.get("zone_atr_mult", 0.20))
+        zone_pct = float(self.params.get("zone_pct", 0.0015))
+        zone_half_width = max(zone_atr_mult * atr, close * zone_pct, 0.01)
+        support_zone_lower = support_price - zone_half_width
+        support_zone_upper = support_price + zone_half_width
+        resistance_zone_lower = resistance_price - zone_half_width
+        resistance_zone_upper = resistance_price + zone_half_width
+
+        # Inner zone gap = tradeable distance between zone edges. Must
+        # clear both floors (max wins).
+        zone_gap_inner = resistance_zone_lower - support_zone_upper
+        min_gap_pct = float(self.params.get("sr_scalp_min_distance_pct", 0.008))
+        min_gap_atr = float(self.params.get("sr_scalp_min_distance_atr", 2.5))
+        required_gap = max(min_gap_pct * close, min_gap_atr * atr)
+        if zone_gap_inner < required_gap:
+            self._set_build_failure(
+                c.symbol, "sr_scalp",
+                f"htf_zones_too_close(inner_gap={zone_gap_inner:.4f}<{required_gap:.4f},"
+                f"pct_floor={min_gap_pct*close:.4f},atr_floor={min_gap_atr*atr:.4f})",
+            )
+            return None
+
+        # Proximity gate — close must be inside the entry-side zone OR
+        # within ``proximity_buffer`` of its inner edge (toward midrange).
+        proximity_atr_mult = float(self.params.get("sr_scalp_max_distance_from_zone_atr", 0.5))
+        proximity_buffer = proximity_atr_mult * atr
+
+        # Stop nudge — bot's existing ``sr_ctx.level_buffer`` (same buffer
+        # ``_refine_*_sr_levels`` uses everywhere). Scales with
+        # ``vol_widening`` (Tier 2a) on trend-day expansion. Defensive
+        # fallback if sr_ctx didn't supply one.
+        level_buffer = float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0) * vol_widening
+        if level_buffer <= 0.0:
+            level_buffer = max(atr * 0.05, 0.01) * vol_widening
+
+        if side == Side.LONG:
+            # Broken-support guard: a bar trading BELOW the support zone's
+            # lower edge is a breakdown, not a bounce — wrong setup type.
+            if close <= support_zone_lower:
+                self._set_build_failure(
+                    c.symbol, "sr_scalp",
+                    f"long_below_support_zone(close={close:.4f}<=zone_low={support_zone_lower:.4f})",
+                )
+                return None
+            # Proximity: must be inside support zone OR within proximity_buffer
+            # above its upper edge.
+            if close > support_zone_upper + proximity_buffer:
+                self._set_build_failure(
+                    c.symbol, "sr_scalp",
+                    f"long_far_from_support_zone(close={close:.4f}>{support_zone_upper+proximity_buffer:.4f})",
+                )
+                return None
+            stop = support_zone_lower - level_buffer
+            target = resistance_zone_lower - level_buffer
+        else:
+            if close >= resistance_zone_upper:
+                self._set_build_failure(
+                    c.symbol, "sr_scalp",
+                    f"short_above_resistance_zone(close={close:.4f}>=zone_high={resistance_zone_upper:.4f})",
+                )
+                return None
+            if close < resistance_zone_lower - proximity_buffer:
+                self._set_build_failure(
+                    c.symbol, "sr_scalp",
+                    f"short_far_from_resistance_zone(close={close:.4f}<{resistance_zone_lower-proximity_buffer:.4f})",
+                )
+                return None
+            stop = resistance_zone_upper + level_buffer
+            target = support_zone_upper + level_buffer
+
+        return self._finalize_signal(c, side, close, stop, target, "sr_scalp", regime_score, frame, data)
 
     def _finalize_signal(self, c: Candidate, side: Side, close: float, stop: float,
                          target: float, regime: str, regime_score: float,
@@ -1280,50 +1574,54 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             ret15 = _safe_float(last.get("ret15"), 0.0)
             atr = max(_safe_float(last.get("atr14"), close * 0.0015), close * 0.0005, 0.01)
 
-            # Determine preferred side from LIVE directional bias.
-            # Fix A: when respect_screener_bias is enabled (default), a
-            # directional-biased candidate is evaluated on that side ONLY — no
-            # fallthrough to the opposite side. Previously the strategy would
-            # evaluate [SHORT, LONG] for a SHORT-tagged candidate and if SHORT
-            # scoring failed on a short-term bounce, fall through and take LONG.
-            # That pattern produced the 2026-04-20 META/INTC/TSLA losses: all
-            # three had day_strength deeply negative but the strategy took
-            # LONG via fallthrough.
+            # Soft-bias gating (Fix A, refactored 2026-05-12). The original
+            # Fix A hard-locked ``preferred_sides`` to one direction when
+            # ``effective_bias`` was set, fully suppressing the opposite
+            # side. That correctly blocked the 2026-04-20 META/INTC/TSLA
+            # fallthrough losses (deeply-negative day_strength + intraday
+            # bounce), but was too rigid for the opposite case: a stock
+            # with mild bias and a strong structural setup on the opposite
+            # side (fresh BOS↑, breakout above HTF resistance, bullish
+            # structure_bias) had its LONG opportunity silently ignored.
             #
-            # The bias is now computed LIVE from session_open + current close
-            # (``_compute_live_directional_bias``) rather than from the
-            # screener's pre-computed ``c.directional_bias`` field. The
-            # screener's value is up to 60 s stale and used to be derived
-            # from ``change`` (prior-close-relative); it now matches the
-            # live value semantically but the live computation is always
-            # the source of truth for entry decisions. The screener's bias
-            # still drives the gatekeeper's per-side cooldown lookup before
-            # entry_signals runs.
+            # Replaced with a soft score-penalty in ``_bias_penalty``:
+            # both sides are always evaluated, but the side that disagrees
+            # with ``effective_bias`` has each of its regime scores reduced
+            # by ``bias_penalty_base * min(1.0, |day_strength| / saturate_at)``.
+            # A mild −0.5% day applies only ~0.25 penalty (strong setups
+            # still pass min_*_score). A deep −3% day applies the full
+            # 1.0 penalty (filters all but the strongest setups, preserving
+            # the 2026-04-20 protection).
             #
-            # ORB-window bypass: during the first 30 min (09:35-orb_end),
-            # day_strength is dominated by the opening gap and chop — a
-            # gap-down day that reverses (TSLA 2026-04-15 $367→$362→$394)
-            # correctly belongs to the LONG side, but day_strength still
-            # reads negative early on. Fallthrough was the old escape hatch
-            # for this pattern; the bypass preserves it during ORB while
-            # Fix A still applies post-ORB.
+            # The bias is computed LIVE from session_open + current close
+            # (``_compute_live_directional_bias``), authoritative for
+            # decisions; the screener's pre-computed
+            # ``c.directional_bias`` is only used by the gatekeeper's
+            # cooldown lookup before entry_signals runs.
+            #
+            # ORB-window bypass (``orb_bypass_screener_bias``, default
+            # ``true``): during 09:35→orb_end, day_strength is dominated
+            # by the opening gap; the bypass disables the penalty entirely
+            # so gap-fade entries (TSLA 2026-04-15 $367→$362→$394) can
+            # qualify on either side without bias drag.
             orb_screener_bypass = bool(self.params.get("orb_bypass_screener_bias", True)) and in_orb_window
-            respect_screener_bias = bool(self.params.get("respect_screener_bias", True)) and not orb_screener_bypass
+            respect_bias = bool(self.params.get("respect_screener_bias", True)) and not orb_screener_bypass
 
-            live_bias = self._compute_live_directional_bias(frame, close)
+            # Single computation — bias for side selection + day_strength
+            # magnitude for penalty scaling, sharing one _session_open_price
+            # lookup (instead of the two separate calls the prior code did).
+            live_bias, day_strength = self._compute_live_bias_and_day_strength(frame, close)
 
-            # Trailing-bias memory for Fix A. A momentary "neutral" bias on
-            # a symbol that's been consistently SHORT (or LONG) for many
-            # bars should NOT open the door to a counter-direction trade.
-            # 2026-04-23 GOOG 12:51 pullback_long fired with current bias
-            # None after the 10 preceding decisions all had side_pref=SHORT;
-            # lost $22. Infer an effective bias from the trailing window
-            # when current is None and recent was strongly one-sided.
+            # Trailing-bias memory: when current live_bias is None but the
+            # recent window of decisions had a strong one-sided read, infer
+            # that bias for the penalty calculation. Addresses the
+            # 2026-04-23 GOOG 12:51 pullback_long case (current bias None
+            # after 10 SHORT-biased bars, lost $22 to counter-trend).
             trailing_enabled = bool(self.params.get("trailing_bias_enabled", True))
             trailing_lookback = max(3, int(self.params.get("trailing_bias_lookback", 10)))
             trailing_threshold = float(self.params.get("trailing_bias_majority_threshold", 0.7))
             effective_bias = live_bias
-            if effective_bias is None and trailing_enabled and respect_screener_bias:
+            if effective_bias is None and trailing_enabled and respect_bias:
                 recent = list(self._recent_directional_bias.get(c.symbol, ()))
                 long_count = sum(1 for b in recent if b == Side.LONG)
                 short_count = sum(1 for b in recent if b == Side.SHORT)
@@ -1344,25 +1642,44 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 self._recent_directional_bias[c.symbol] = hist
             hist.append(live_bias)
 
-            if effective_bias == Side.LONG:
-                if respect_screener_bias:
-                    preferred_sides = [Side.LONG]
-                else:
-                    preferred_sides = [Side.LONG, Side.SHORT] if allow_short else [Side.LONG]
-            elif effective_bias == Side.SHORT:
-                if not allow_short:
-                    self._record_entry_decision(c.symbol, "skipped", ["shorts_disabled"])
-                    continue
-                preferred_sides = [Side.SHORT] if respect_screener_bias else [Side.SHORT, Side.LONG]
-            else:
-                # Neutral bias (live day_strength within
-                # ±directional_bias_min_day_strength) with no strong
-                # trailing lean: evaluate both sides.
-                preferred_sides = [Side.LONG, Side.SHORT] if allow_short else [Side.LONG]
+            # Both sides are always evaluated under soft bias. The penalty
+            # applied per-side inside the loop below filters out weak
+            # counter-bias setups. Shorts can still be globally disabled
+            # via ``allow_short = False``.
+            preferred_sides = [Side.LONG, Side.SHORT] if allow_short else [Side.LONG]
 
             best_signal: Signal | None = None
             fail_reasons: list[str] = []
 
+            # Score thresholds — read once, used for both sides' qualifier
+            # filtering. ``min_score_gap`` is intentionally NOT read: the
+            # primary-vs-fallback selection paths that used it are collapsed
+            # into the flat score-ordered build_queue, so the gap no longer
+            # gates anything. The param remains in user configs for
+            # backwards compat but is silently ignored.
+            min_trend = float(self.params.get("min_trend_score", 4.0))
+            min_pullback = float(self.params.get("min_pullback_score", 4.0))
+            min_range = float(self.params.get("min_range_score", 3.5))
+            min_vol_squeeze = float(self.params.get("min_vol_squeeze_score", 4.0))
+            min_momentum = float(self.params.get("min_momentum_score", 4.0))
+            min_sr_scalp = float(self.params.get("min_sr_scalp_score", 3.5))
+
+            # tech_ctx is built ONCE per candidate (per-frame @lru_cache makes
+            # repeated calls O(1)). Used by vol_squeeze scoring AND by
+            # _volatility_widening_factor (Tier 2a) for stop widening. Pulled
+            # out of the per-side loop since both sides see the same frame
+            # state and the same volatility regime.
+            tech_ctx_for_candidate = self._technical_context(frame)
+            vol_widening = self._volatility_widening_factor(tech_ctx_for_candidate)
+
+            # Pass 1 — score each side independently, apply bias penalty,
+            # build the per-side ``build_order`` list of qualifying regimes.
+            # No single "winner" is picked here; pass 2 flattens all sides'
+            # build_orders into a cross-side queue sorted by post-penalty
+            # score. The deferred-build design lets the highest-scoring
+            # qualifying (side, regime) pair go first regardless of which
+            # side it's on — no regime blocks another within OR across sides.
+            side_decisions: list[tuple[Side, dict[str, Any]]] = []
             for side in preferred_sides:
                 index_ok = index_ok_by_side.get(side, False)
 
@@ -1379,116 +1696,169 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     self._score_range(close, vwap, ema9, ema20, frame, idx_neutral)
                     if "range" in allowed_regimes else 0.0
                 )
-                # vol_squeeze and momentum_close were added 2026-05-12 as
-                # additional regimes that compete in the same score-gap
-                # auction. Their scoring methods read live frame data —
-                # vol_squeeze derives compression from session bars +
-                # BB-width; momentum_close derives day_strength from the
-                # session open (live), not the screener's stale value.
-                tech_ctx_for_score = self._technical_context(frame) if "vol_squeeze" in allowed_regimes else None
+                # vol_squeeze and momentum: scoring methods read live frame
+                # data — vol_squeeze derives compression from session bars +
+                # BB-width; momentum derives day_strength from the session
+                # open. ``momentum`` was renamed from ``momentum_close`` and
+                # widened from afternoon-only to post-ORB through close.
                 vol_squeeze_score = (
-                    self._score_vol_squeeze(side, close, vwap, ema9, ema20, atr, frame, tech_ctx_for_score)
+                    self._score_vol_squeeze(side, close, vwap, ema9, ema20, atr, frame, tech_ctx_for_candidate)
                     if "vol_squeeze" in allowed_regimes else 0.0
                 )
-                momentum_close_score = (
-                    self._score_momentum_close(side, close, vwap, ema9, ema20, ret15, frame)
-                    if "momentum_close" in allowed_regimes else 0.0
+                momentum_score = (
+                    self._score_momentum(side, close, vwap, ema9, ema20, ret15, frame)
+                    if "momentum" in allowed_regimes else 0.0
                 )
+                # sr_scalp: permissive bar-character scoring. The hard
+                # constraint (HTF zone distance + proximity to entry level)
+                # runs at build time in _build_sr_scalp_signal.
+                sr_scalp_score = (
+                    self._score_sr_scalp(side, close, vwap, ema9, ema20, atr, adx, frame)
+                    if "sr_scalp" in allowed_regimes else 0.0
+                )
+
+                # Soft-bias penalty (Fix A refactored 2026-05-12). See
+                # ``_bias_penalty`` docstring for rationale + worked examples.
+                bias_penalty = self._bias_penalty(side, day_strength, effective_bias, respect_bias)
+                if bias_penalty > 0.0:
+                    trend_score = max(0.0, trend_score - bias_penalty)
+                    pullback_score = max(0.0, pullback_score - bias_penalty)
+                    range_score = max(0.0, range_score - bias_penalty)
+                    vol_squeeze_score = max(0.0, vol_squeeze_score - bias_penalty)
+                    momentum_score = max(0.0, momentum_score - bias_penalty)
+                    sr_scalp_score = max(0.0, sr_scalp_score - bias_penalty)
 
                 scores = {
                     "trend": trend_score,
                     "pullback": pullback_score,
                     "range": range_score,
                     "vol_squeeze": vol_squeeze_score,
-                    "momentum_close": momentum_close_score,
+                    "momentum": momentum_score,
+                    "sr_scalp": sr_scalp_score,
                 }
-                min_trend = float(self.params.get("min_trend_score", 4.0))
-                min_pullback = float(self.params.get("min_pullback_score", 4.0))
-                min_range = float(self.params.get("min_range_score", 3.5))
-                min_vol_squeeze = float(self.params.get("min_vol_squeeze_score", 4.0))
-                min_momentum_close = float(self.params.get("min_momentum_close_score", 4.0))
-                min_gap = float(self.params.get("min_score_gap", 1.5))
 
-                ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-                top_regime, top_score = ranked[0]
-                second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+                # Per-side BUILD ORDER: list of qualifying regimes in score
+                # order. A regime qualifies if it's in allowed_regimes AND
+                # its post-penalty score meets its own min_*_score threshold.
+                # The build phase iterates ACROSS sides AND regimes in
+                # cross-side score order so no regime blocks another (within
+                # OR across sides). Both sides' qualifiers compete in the
+                # same flat queue.
+                #
+                # ``min_score_gap`` config param is silently ignored — the
+                # primary-vs-fallback selection paths it used to gate are
+                # collapsed into the unified score-ordered queue.
+                thresholds = {
+                    "trend": min_trend,
+                    "pullback": min_pullback,
+                    "range": min_range,
+                    "vol_squeeze": min_vol_squeeze,
+                    "momentum": min_momentum,
+                    "sr_scalp": min_sr_scalp,
+                }
+                build_order: list[tuple[str, float]] = []
+                for regime_name, regime_score in sorted(scores.items(), key=lambda kv: kv[1], reverse=True):
+                    if regime_name not in allowed_regimes:
+                        continue
+                    if regime_score >= thresholds.get(regime_name, float("inf")):
+                        build_order.append((regime_name, regime_score))
 
-                # Select regime
-                selected = None
-                if top_regime == "trend" and top_score >= min_trend and (top_score - second_score) >= min_gap and "trend" in allowed_regimes:
-                    selected = "trend"
-                elif top_regime == "pullback" and top_score >= min_pullback and "pullback" in allowed_regimes:
-                    selected = "pullback"
-                elif top_regime == "range" and top_score >= min_range and (top_score - second_score) >= min_gap * 0.67 and "range" in allowed_regimes:
-                    selected = "range"
-                elif top_regime == "vol_squeeze" and top_score >= min_vol_squeeze and (top_score - second_score) >= min_gap and "vol_squeeze" in allowed_regimes:
-                    selected = "vol_squeeze"
-                elif top_regime == "momentum_close" and top_score >= min_momentum_close and (top_score - second_score) >= min_gap and "momentum_close" in allowed_regimes:
-                    selected = "momentum_close"
-                # Fallback: the primary selection above enforces the min_gap
-                # ambiguity guard on the TOP regime. If that fails, we fall
-                # through here and try each regime in rank order using ONLY
-                # its min-score threshold (no gap check). This lets us
-                # recover the TSLA-style case where trend=5.0, pullback=3.0,
-                # range=4.0 failed the primary gap check (gap=1.0 < 1.2)
-                # even though trend clearly dominates; we still attempt the
-                # trend signal build, which has its own fresh-breakout
-                # filter to reject low-quality breakouts. Same for other
-                # regime fallbacks.
-                if selected is None:
-                    for regime_name, regime_score in ranked:
-                        if regime_name not in allowed_regimes:
-                            continue
-                        if regime_name == "trend" and regime_score >= min_trend:
-                            selected = "trend"
-                            break
-                        if regime_name == "pullback" and regime_score >= min_pullback:
-                            selected = "pullback"
-                            break
-                        if regime_name == "range" and regime_score >= min_range:
-                            selected = "range"
-                            break
-                        if regime_name == "vol_squeeze" and regime_score >= min_vol_squeeze:
-                            selected = "vol_squeeze"
-                            break
-                        if regime_name == "momentum_close" and regime_score >= min_momentum_close:
-                            selected = "momentum_close"
-                            break
+                side_decisions.append((side, {
+                    "build_order": build_order,
+                    "scores": scores,
+                    "index_ok": index_ok,
+                    "bias_penalty": bias_penalty,
+                    "trend_score": trend_score,
+                    "pullback_score": pullback_score,
+                    "range_score": range_score,
+                    "vol_squeeze_score": vol_squeeze_score,
+                    "momentum_score": momentum_score,
+                    "sr_scalp_score": sr_scalp_score,
+                }))
 
-                if selected is None:
+            # Pass 2 — record fail reasons for sides with no qualifying
+            # regimes, then flatten the remaining (side, regime) pairs into
+            # a single cross-side build queue sorted by post-penalty score
+            # descending. First successful build wins.
+            #
+            # The flat queue means a high-scoring SHORT range CAN beat a
+            # low-scoring LONG pullback even if LONG's top regime had a
+            # higher score (because trend's build failed). Truly "regimes
+            # don't block each other" — within OR across sides.
+            build_queue: list[tuple[Side, str, float, dict[str, Any]]] = []
+            for side, decision in side_decisions:
+                if not decision["build_order"]:
+                    penalty_suffix = (
+                        f",bias_pen={decision['bias_penalty']:.2f}"
+                        if decision["bias_penalty"] > 0.0 else ""
+                    )
                     fail_reasons.append(
                         f"{side.value.lower()}_no_qualifying_regime("
-                        f"trend={trend_score:.1f},pb={pullback_score:.1f},"
-                        f"range={range_score:.1f},squeeze={vol_squeeze_score:.1f},"
-                        f"mom_close={momentum_close_score:.1f})"
+                        f"trend={decision['trend_score']:.1f},"
+                        f"pb={decision['pullback_score']:.1f},"
+                        f"range={decision['range_score']:.1f},"
+                        f"squeeze={decision['vol_squeeze_score']:.1f},"
+                        f"mom={decision['momentum_score']:.1f},"
+                        f"sr_scalp={decision['sr_scalp_score']:.1f}{penalty_suffix})"
                     )
                     continue
+                for regime_name, regime_score in decision["build_order"]:
+                    build_queue.append((side, regime_name, regime_score, decision))
 
-                # Index confirmation for trend/pullback/vol_squeeze/momentum_close
-                # — these all need a market-aligned tape. Range stays exempt
-                # (mean-reversion thesis). Skipped during ORB window when
-                # orb_bypass_index_confirmation is true.
-                if selected in {"trend", "pullback", "vol_squeeze", "momentum_close"} and not index_ok and not orb_index_bypass:
-                    fail_reasons.append(f"{side.value.lower()}_{selected}_index_not_confirmed")
+            # Stable sort by score desc — ties default to preferred_sides
+            # insertion order (LONG before SHORT) since side_decisions was
+            # built in that order.
+            build_queue.sort(key=lambda item: item[2], reverse=True)
+
+            for side, regime_name, regime_score, decision in build_queue:
+                index_ok = decision["index_ok"]
+
+                # Index confirmation for trend/pullback/vol_squeeze/momentum —
+                # these need a market-aligned tape. Range AND sr_scalp are
+                # exempt — both are mean-reversion theses where a divergent
+                # index reads as "the index doesn't dictate intra-symbol
+                # rotation between levels." Skipped during ORB window when
+                # orb_bypass_index_confirmation is true. Index failure on
+                # one regime falls through to the next regime in the queue.
+                if regime_name in {"trend", "pullback", "vol_squeeze", "momentum"} and not index_ok and not orb_index_bypass:
+                    fail_reasons.append(f"{side.value.lower()}_{regime_name}_index_not_confirmed")
                     continue
 
-                regime_score_val = scores[selected]
                 sig = None
-                if selected == "trend":
-                    sig = self._build_trend_signal(c, side, close, atr, ltf, frame, regime_score_val, data)
-                elif selected == "pullback":
-                    sig = self._build_pullback_signal(c, side, close, atr, ltf, frame, regime_score_val, data)
-                elif selected == "range":
-                    sig = self._build_range_signal(c, side, close, atr, frame, regime_score_val, data)
-                elif selected == "vol_squeeze":
-                    sig = self._build_vol_squeeze_signal(c, side, close, atr, frame, regime_score_val, data)
-                elif selected == "momentum_close":
-                    sig = self._build_momentum_close_signal(c, side, close, atr, frame, regime_score_val, data)
+                if regime_name == "trend":
+                    sig = self._build_trend_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening)
+                elif regime_name == "pullback":
+                    sig = self._build_pullback_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening)
+                elif regime_name == "range":
+                    sig = self._build_range_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening)
+                elif regime_name == "vol_squeeze":
+                    sig = self._build_vol_squeeze_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening)
+                elif regime_name == "momentum":
+                    sig = self._build_momentum_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening)
+                elif regime_name == "sr_scalp":
+                    sig = self._build_sr_scalp_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening)
 
                 if sig is not None:
+                    # Tier 3b: on high-conviction days, loosen the
+                    # peak-giveback threshold so a 2R+ runner doesn't get
+                    # cut by a normal 50% retracement. Override is stamped
+                    # per-trade based on day_strength at ENTRY; risk.py
+                    # reads it from position.metadata at management time.
+                    # Falls back to the global config default when not set.
+                    if day_strength is not None:
+                        conv_threshold = float(self.params.get("peak_giveback_high_conviction_day_strength_pct", 2.0))
+                        if abs(day_strength) >= conv_threshold:
+                            override_r = float(self.params.get("peak_giveback_high_conviction_min_r", 2.0))
+                            if isinstance(sig.metadata, dict):
+                                sig.metadata["peak_giveback_min_r_override"] = override_r
+                                sig.metadata["peak_giveback_high_conviction_day_strength"] = round(float(day_strength), 4)
+                    # Stamp the volatility widening factor for post-mortem.
+                    if vol_widening > 1.0 and isinstance(sig.metadata, dict):
+                        sig.metadata["vol_widening_factor"] = round(float(vol_widening), 4)
                     best_signal = sig
                     break
-                failure = self._consume_build_failure(c.symbol, selected) or f"{selected}_signal_build_failed"
+
+                failure = self._consume_build_failure(c.symbol, regime_name) or f"{regime_name}_signal_build_failed"
                 fail_reasons.append(f"{side.value.lower()}_{failure}")
 
             if best_signal is not None:

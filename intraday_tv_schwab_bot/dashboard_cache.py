@@ -36,7 +36,7 @@ import pandas as pd
 
 import copy
 
-from .candles import detect_candle_context
+from .candles import detect_candle_context, detect_per_bar_candle_patterns
 from .chart_patterns import analyze_chart_pattern_context
 from .config import DashboardChartConfig, DashboardChartingConfig
 from .htf_levels import summarize_htf_trend
@@ -331,19 +331,62 @@ def dashboard_symbol_trade_signature(account: Any, symbol: str) -> tuple[Any, ..
     return count, latest_exit, latest_entry, latest_reason
 
 
-def dashboard_bars_from_frame(frame: pd.DataFrame | None, *, max_bars: int = 90) -> list[dict[str, Any]]:
+def dashboard_bars_from_frame(
+    frame: pd.DataFrame | None,
+    *,
+    max_bars: int = 90,
+    per_bar_candles: dict[Any, dict[str, list[str]]] | None = None,
+) -> list[dict[str, Any]]:
     """Convert the last ``max_bars`` OHLCV rows of ``frame`` into a list of
     JSON-serializable dicts for the dashboard chart payload. Returns [] for
-    None / empty frames. Extracted from IntradayBot as part of Phase 5."""
+    None / empty frames.
+
+    Carries per-bar indicator values so the dashboard tooltip can honestly
+    display the hovered bar's state (instead of silently falling back to a
+    global latest-snapshot value). Per-bar fields:
+      * adx / plus_di / minus_di / dmi_bias (derived from DI lines)
+      * obv / obv_ema / obv_bias (derived from OBV vs OBV-EMA)
+      * candles_bullish / candles_bearish (from ``per_bar_candles`` map,
+        completion-bar only, with tier cascade applied)
+    """
     capped_bars = max(1, min(int(max_bars or 90), 480))
     bars: list[dict[str, Any]] = []
     if frame is None or frame.empty:
         return bars
     tail = frame.tail(capped_bars).copy()
     tail_offset = max(0, len(frame) - len(tail))
+    per_bar_candles = per_bar_candles or {}
     for rel_idx, (idx, row) in enumerate(tail.iterrows()):
         close_val = dashboard_safe_float(row.get("close"))
         atr14 = dashboard_safe_float(row.get("atr14"))
+        plus_di = dashboard_safe_float(row.get("plus_di14"))
+        minus_di = dashboard_safe_float(row.get("minus_di14"))
+        obv = dashboard_safe_float(row.get("obv"))
+        obv_ema = dashboard_safe_float(row.get("obv_ema20"))
+        # DMI bias: bullish if +DI > -DI, bearish if -DI > +DI, else neutral.
+        # None when either reading is unavailable (warmup bars).
+        if plus_di is not None and minus_di is not None:
+            if plus_di > minus_di:
+                dmi_bias = "bullish"
+            elif minus_di > plus_di:
+                dmi_bias = "bearish"
+            else:
+                dmi_bias = "neutral"
+        else:
+            dmi_bias = None
+        # OBV bias: bullish if OBV > OBV-EMA, bearish if below, else neutral.
+        if obv is not None and obv_ema is not None:
+            if obv > obv_ema:
+                obv_bias = "bullish"
+            elif obv < obv_ema:
+                obv_bias = "bearish"
+            else:
+                obv_bias = "neutral"
+        else:
+            obv_bias = None
+        bar_candle_match = per_bar_candles.get(idx, {})
+        candles_bullish = list(bar_candle_match.get("bullish", []))
+        candles_bearish = list(bar_candle_match.get("bearish", []))
         bars.append({
             "ts": idx.isoformat() if hasattr(idx, "isoformat") else str(idx),
             "abs_index": tail_offset + rel_idx,
@@ -366,6 +409,15 @@ def dashboard_bars_from_frame(frame: pd.DataFrame | None, *, max_bars: int = 90)
             "bb_width_pct": dashboard_safe_float(row.get("bb_width_pct")),
             "bb_percent_b": dashboard_safe_float(row.get("bb_percent_b")),
             "bb_zscore": dashboard_safe_float(row.get("bb_zscore")),
+            "adx": dashboard_safe_float(row.get("adx14")),
+            "plus_di": plus_di,
+            "minus_di": minus_di,
+            "dmi_bias": dmi_bias,
+            "obv": obv,
+            "obv_ema": obv_ema,
+            "obv_bias": obv_bias,
+            "candles_bullish": candles_bullish,
+            "candles_bearish": candles_bearish,
         })
     return bars
 
@@ -647,7 +699,33 @@ class DashboardCache:
                 # busy multi-symbol watchlists where dashboard polls
                 # this for every snapshot every refresh cycle.
                 return dict(cached_snapshot["payload"])
-        bars = dashboard_bars_from_frame(frame, max_bars=self.snapshot_max_bars())
+        # Per-bar candle pattern map (completion-bar only, tier cascade).
+        # Drives the tooltip's "Candle Patterns (this bar)" section. Computed
+        # before bars are built so each bar dict can carry its own matched
+        # patterns. lookback passed as snapshot_max_bars() so every visible
+        # bar in the snapshot tooltip has coverage (not just the last 30).
+        snapshot_bars_count = self.snapshot_max_bars()
+        snapshot_per_bar_candles: dict[Any, dict[str, list[str]]] = {}
+        if frame is not None and not frame.empty:
+            try:
+                snapshot_per_bar_candles = detect_per_bar_candle_patterns(
+                    frame,
+                    bullish_allowed=self.config.candles.bullish_patterns,
+                    bearish_allowed=self.config.candles.bearish_patterns,
+                    lookback=snapshot_bars_count,
+                )
+            except Exception:
+                self.log_component_failure(
+                    "per_bar_candles",
+                    "Per-bar candle pattern detection failed for %s",
+                    symbol,
+                )
+                snapshot_per_bar_candles = {}
+        bars = dashboard_bars_from_frame(
+            frame,
+            max_bars=snapshot_bars_count,
+            per_bar_candles=snapshot_per_bar_candles,
+        )
         latest_bar: dict[str, Any] = bars[-1] if bars else {}
         session_total_volume: float | None = None
         if frame is not None and not frame.empty:
@@ -2191,7 +2269,31 @@ class DashboardCache:
                 cached_payload = dict(cache_entry["payload"])
                 cached_payload["last_update"] = now_et().isoformat()
                 return cached_payload
-        bars = dashboard_bars_from_frame(frame, max_bars=capped_bars)
+        # Per-bar candle pattern map for the tooltip's per-bar candle section.
+        # See dashboard_bars_from_frame docstring + detect_per_bar_candle_patterns.
+        # lookback is sized to capped_bars so every visible chart bar gets
+        # pattern coverage (not just the last 30 — the snapshot default).
+        chart_per_bar_candles: dict[Any, dict[str, list[str]]] = {}
+        if frame is not None and not frame.empty:
+            try:
+                chart_per_bar_candles = detect_per_bar_candle_patterns(
+                    frame,
+                    bullish_allowed=self.config.candles.bullish_patterns,
+                    bearish_allowed=self.config.candles.bearish_patterns,
+                    lookback=capped_bars,
+                )
+            except Exception:
+                self.log_component_failure(
+                    "per_bar_candles",
+                    "Per-bar candle pattern detection failed for %s",
+                    symbol_key,
+                )
+                chart_per_bar_candles = {}
+        bars = dashboard_bars_from_frame(
+            frame,
+            max_bars=capped_bars,
+            per_bar_candles=chart_per_bar_candles,
+        )
         # Default EMA spans rendered on the chart (matches what
         # `ensure_standard_indicator_frame` populates as ema9/ema20 columns).
         ema_fast_span = 9

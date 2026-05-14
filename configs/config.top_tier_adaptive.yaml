@@ -475,6 +475,27 @@ strategies:
     screener_windows:
       - ["09:30", "15:00"]
     params:
+      # =================================================================
+      # HIGH-VOLATILITY TUNE (2026-05-13). Tuned for elevated-VIX tapes
+      # where bars stretch wider, %B saturates faster, broken levels are
+      # noisier, and giveback after peaks is faster.
+      #
+      # Theme of the tune:
+      #   * Absolute-distance filters LOOSENED — bars/extensions are
+      #     naturally larger in high vol; ATR-based filters auto-adjust.
+      #   * Selectivity tightened — more chop means more false signals,
+      #     so score gaps + ADX + sr_scalp distance gates are stricter.
+      #   * Profit protection engages EARLIER (1.20R lock vs 1.30R) and
+      #     locks MORE (0.45R vs 0.35R) — giveback is faster.
+      #   * Tier 2a widening triggers SOONER (1.2x vs 1.3x) and goes
+      #     FURTHER (1.8x max vs 1.5x) — ATR expansion is common.
+      #   * Tier 3b conviction threshold raised 2.0% → 2.5% — 2.0% day
+      #     strength is common in high vol; require true trend day.
+      #   * Conviction trades get MORE giveback room (2.5R vs 2.0R).
+      #   * Soft-bias penalty saturates LATER (2.5% vs 2.0%) — high vol
+      #     produces large day_strength swings; don't saturate too fast.
+      # =================================================================
+
       # Universe
       tradable: [AAPL, MSFT, NVDA, INTC, AMD, AVGO, TSM, CRM, AMZN, TSLA, HD, LOW, UBER, COST, GOOG, META, NFLX, RBLX, TMUS, JPM, GS, V, LLY]
       index_symbols: [SPY, QQQ]
@@ -511,12 +532,12 @@ strategies:
       min_pullback_score: 3.5
       min_pullback_trend_score: 3.0
       min_range_score: 3.5
-      min_score_gap: 1.4
-      min_adx14: 16.0
+      min_score_gap: 1.5      # HIGH_VOL: was 1.4 — bigger gap needed in noisier scoring environment
+      min_adx14: 18.0          # HIGH_VOL: was 16.0 — ADX naturally higher in high vol; demand stronger trend
 
       # Pullback detection
-      pullback_ema_touch_atr_mult: 0.35
-      pullback_hold_atr_mult: 0.40
+      pullback_ema_touch_atr_mult: 0.45    # HIGH_VOL: was 0.35 — pullbacks noisier; allow further from EMA
+      pullback_hold_atr_mult: 0.50         # HIGH_VOL: was 0.40 — same logic
       pullback_lookback_bars: 5
 
       # Range detection
@@ -529,7 +550,7 @@ strategies:
       trend_target_rr: 2.0
       pullback_target_rr: 2.0
       range_target_rr: 1.5
-      stop_buffer_atr_mult: 0.25
+      stop_buffer_atr_mult: 0.30          # HIGH_VOL: was 0.25 — wider base buffer (Tier 2a scales this further when ATR expands)
 
       # Time-of-day regime windows
       orb_end_time: "10:05"
@@ -550,8 +571,8 @@ strategies:
       # Stretched entry filter: reject LONG at pct_b ≥ threshold AND
       # atr_stretch ≥ threshold (mirror for SHORT at pct_b ≤ 1-threshold).
       reject_stretched_entries: true
-      stretched_percent_b_max: 0.80            # tightened from 0.85 after 3 ORB trend losers with pct_b 0.83-1.12
-      stretched_atr_mult_max: 1.1              # tightened from 1.2 after COST/INTC/AMD/RBLX breached 1.2 at entry
+      stretched_percent_b_max: 0.85            # HIGH_VOL: was 0.80 — bands widen in high vol; allow %B up to 0.85 for trend continuation
+      stretched_atr_mult_max: 1.3              # HIGH_VOL: was 1.1 — bars stretch more from VWAP in high vol
       orb_bypass_stretched_filter: false       # flipped off — bypass let stretched ORB losers through; LLY winner had stretch 0.34
 
       # Tech bias contradiction: reject LONG when DMI/OBV bias is bearish.
@@ -567,24 +588,27 @@ strategies:
       # Broken-level proximity: reject entries where a broken SR level sits
       # too close on the exit side (it becomes instant resistance/support).
       reject_entry_near_broken_level: true
-      broken_level_min_clearance_pct: 0.0025   # ≥ 0.25% clearance AND
-      broken_level_min_clearance_atr: 0.72     # ≥ 0.72 ATR clearance
+      broken_level_min_clearance_pct: 0.0035   # HIGH_VOL: was 0.0025 — broken levels noisier; require ≥ 0.35% clearance
+      broken_level_min_clearance_atr: 0.90     # HIGH_VOL: was 0.72 — same logic, ≥ 0.90 ATR clearance
 
       # Target-inside-SR (CEILING): reject trend entries whose target
       # projects past nearest opposing SR. Complements entry_min_clearance_atr
       # (FLOOR on SR clearance).
       reject_target_beyond_sr: true
-      target_max_sr_ratio: 0.8                 # target must fit within 80% of SR distance (20% head-room)
+      target_max_sr_ratio: 0.7                 # HIGH_VOL: was 0.8 — more conservative target placement (30% head-room); SR targets fail more in high vol
 
       # Squeeze: skip range regime entries during Bollinger squeeze —
       # squeeze precedes breakout, wrong regime for mean-reversion.
       reject_range_during_squeeze: true
 
-      # Entry exhaustion filters
+      # Entry exhaustion filters (HIGH_VOL: extension/range caps widened —
+      # bars and intra-bar moves are naturally larger when volatility is up,
+      # so the absolute-distance caps need headroom or every valid entry
+      # gets blocked). Wick fractions unchanged (relative shape filter).
       entry_exhaustion_filter_enabled: true
-      max_entry_vwap_extension_atr: 1.50
-      max_entry_ema9_extension_atr: 1.20
-      max_entry_bar_range_atr: 1.80
+      max_entry_vwap_extension_atr: 1.80       # HIGH_VOL: was 1.50
+      max_entry_ema9_extension_atr: 1.50       # HIGH_VOL: was 1.20
+      max_entry_bar_range_atr: 2.20            # HIGH_VOL: was 1.80
       max_entry_upper_wick_frac: 0.30
       max_entry_lower_wick_frac: 0.30
 
@@ -597,13 +621,14 @@ strategies:
       # Priority scoring
       activity_score_weight: 0.12
 
-      # Adaptive management R:R thresholds. runner_trigger lowered 1.15 -> 1.10
-      # because HTF-aligned setups (now boosted by +0.20 score) tend to be
-      # higher quality on average; engage runner mode slightly earlier so
-      # the strategy captures more of the move without trailing-stop drag.
+      # Adaptive management R:R thresholds. HIGH_VOL: profit-lock engages
+      # SOONER (1.20R vs 1.30R) and locks MORE (0.45R stop vs 0.35R) —
+      # giveback is faster in high vol so capture more, lock harder. Tier 3b
+      # high-conviction override (peak_giveback_high_conviction_min_r) still
+      # keeps trend-day winners' runway open via the per-trade metadata stamp.
       adaptive_breakeven_rr: 1.00
-      adaptive_profit_lock_rr: 1.30
-      adaptive_profit_lock_stop_rr: 0.35
+      adaptive_profit_lock_rr: 1.20            # HIGH_VOL: was 1.30 — engage profit-lock sooner
+      adaptive_profit_lock_stop_rr: 0.45       # HIGH_VOL: was 0.35 — lock more profit when triggered
       adaptive_runner_trigger_rr: 1.10
 
       # Adaptive ladder rung builder (used when risk.trade_management_mode
@@ -625,24 +650,59 @@ strategies:
       vol_squeeze_max_range_pct: 0.012       # box height vs price (LTF)
       vol_squeeze_max_range_atr: 1.8          # box height vs ATR
       vol_squeeze_max_width_pct: 0.05         # bollinger width fraction ceiling
-      vol_squeeze_breakout_buffer_pct: 0.0008
-      vol_squeeze_min_breakout_volume_ratio: 1.12
+      vol_squeeze_breakout_buffer_pct: 0.0012  # HIGH_VOL: was 0.0008 — need more breakout confirmation; false breakouts common
+      vol_squeeze_min_breakout_volume_ratio: 1.20  # HIGH_VOL: was 1.12 — demand stronger volume confirmation
       vol_squeeze_min_bar_close_position: 0.63
       vol_squeeze_target_rr: 2.05
       disable_vol_squeeze_regime: false
 
-      # ===== momentum_close regime (added 2026-05-12) =====
-      # Ride-the-bell continuation. Restricted to the afternoon window
-      # (13:00 -> no_new) per user spec. day_strength is computed LIVE
-      # from session open + current close (not from the screener's
-      # 60-second-stale change_from_open field), so the threshold
-      # applies to the bot's actual perceived intraday move. Set
-      # `disable_momentum_close_regime: true` to opt out.
-      min_momentum_close_score: 4.0
-      momentum_close_breakout_lookback_bars: 6
-      momentum_close_min_day_strength: 1.5    # % from today's open (live)
-      momentum_close_target_rr: 2.0
-      disable_momentum_close_regime: false
+      # ===== momentum regime (added 2026-05-12; widened from afternoon-only
+      # and renamed from momentum_close) =====
+      # Momentum-from-open continuation. Allowed post-ORB through close
+      # (orb_end -> no_new_entries_after), including midday — the
+      # ``momentum_min_day_strength`` hard gate (default 1.5%) is what filters
+      # chop, not the time window. day_strength is computed LIVE from session
+      # open + current close (not from the screener's 60-second-stale
+      # change_from_open field), so the threshold applies to the bot's actual
+      # perceived intraday move. Set `disable_momentum_regime: true` to opt out.
+      min_momentum_score: 4.0
+      momentum_breakout_lookback_bars: 6
+      momentum_min_day_strength: 2.0    # HIGH_VOL: was 1.5 — 1.5% is common in high vol; require true trend day (2.0%+)
+      momentum_target_rr: 2.0
+      disable_momentum_regime: false
+
+      # ===== sr_scalp regime (added 2026-05-12) =====
+      # HTF S/R mean-reversion scalp BETWEEN the bot's existing HTF support
+      # (HS = sr_ctx.nearest_support) and HTF resistance (HR =
+      # sr_ctx.nearest_resistance) zones. The strategy does NOT create its
+      # own levels — it uses sr_ctx the same way _refine_*_sr_levels and
+      # the dashboard's key_level_zones do:
+      #   * Level prices come from sr_ctx.nearest_support / nearest_resistance
+      #   * Zone bands use zone_atr_mult * atr (or zone_pct * close, max)
+      #     — same formula as dashboard's key_level_zones
+      #   * Stop nudge uses sr_ctx.level_buffer — same buffer
+      #     _refine_*_sr_levels uses
+      #
+      # Distance gate: the INNER gap between zones (HR_zone_lower −
+      # HS_zone_upper) must clear BOTH floors (max wins):
+      #   * sr_scalp_min_distance_pct * close  (% of price)
+      #   * sr_scalp_min_distance_atr * atr     (ATR multiple)
+      # Tighter zones aren't worth the scalp's round-trip cost; build
+      # rejects with "htf_zones_too_close" so other regimes can fire.
+      #
+      # Proximity gate: close must be inside the entry-side zone OR within
+      # sr_scalp_max_distance_from_zone_atr * atr above its inner edge
+      # (toward midrange). Mid-range candles don't qualify (no clean
+      # bounce structure).
+      #
+      # Allowed windows: orb_end → no_new_entries_after (skips ORB chop).
+      # Index confirmation EXEMPT (mean-reversion thesis, same as range).
+      # Disable globally with `disable_sr_scalp_regime: true`.
+      min_sr_scalp_score: 4.0                  # HIGH_VOL: was 3.5 — more selective; S/R failures more common in high vol
+      sr_scalp_min_distance_pct: 0.012         # HIGH_VOL: was 0.008 — need wider zones (1.2% of price) to scalp safely
+      sr_scalp_min_distance_atr: 3.0           # HIGH_VOL: was 2.5 — same logic, 3x ATR floor
+      sr_scalp_max_distance_from_zone_atr: 0.4 # HIGH_VOL: was 0.5 — must be closer to zone inner edge (less mid-range tolerance)
+      disable_sr_scalp_regime: false
 
       # ===== Per-regime opt-out knobs (added 2026-05-12) =====
       # Set any of these to true to globally disable that regime across all
@@ -662,12 +722,61 @@ strategies:
 
       # Live directional bias threshold (added 2026-05-12). Day_strength is
       # computed LIVE from session_open + current close in the strategy
-      # (NOT from the screener's stale `change_from_open`). The bias drives
-      # Fix A's side selection (LONG-only / SHORT-only / both) — a value of
-      # 0.20 means day_strength must exceed ±0.20% before locking to a side.
-      # The screener also uses this same threshold for its own bias_fn so
-      # gatekeeper cooldown lookups stay aligned with strategy decisions.
-      directional_bias_min_day_strength: 0.20
+      # (NOT from the screener's stale `change_from_open`). A value of 0.20
+      # means day_strength must exceed ±0.20% before assigning a directional
+      # bias. The screener also uses this same threshold for its own
+      # bias_fn so gatekeeper cooldown lookups stay aligned with strategy
+      # decisions.
+      directional_bias_min_day_strength: 0.30  # HIGH_VOL: was 0.20 — higher threshold; less bias whipping when intraday swings are larger
+
+      # Soft-bias penalty (Fix A refactored 2026-05-12). When a candidate's
+      # live bias disagrees with the side being evaluated, each regime score
+      # for that side is reduced by `bias_penalty_base * min(1.0,
+      # |day_strength| / bias_penalty_saturate_at)` before the score-gap
+      # auction. Replaces the previous hard-lockout behavior (both sides
+      # now always evaluated; the penalty filters weak counter-bias setups
+      # while strong structural ones still qualify).
+      #
+      # Examples with defaults (base=1.0, saturate_at=2.0):
+      #   day_strength = -0.5% (mild SHORT bias) → penalty on LONG = 0.25.
+      #     A LONG trend score of 5.0 becomes 4.75 — still above min_trend
+      #     (3.5), so a strong LONG can fire.
+      #   day_strength = -2.0% (deep SHORT bias) → penalty on LONG = 1.0.
+      #     A LONG trend score of 4.0 becomes 3.0 — below min_trend, blocked.
+      #     Preserves the 2026-04-20 META/INTC/TSLA fade-protection.
+      #   day_strength = -3.0% → penalty saturates at 1.0 (no further
+      #     scaling past 2.0% magnitude).
+      bias_penalty_base: 1.0
+      bias_penalty_saturate_at: 2.5            # HIGH_VOL: was 2.0 — high vol produces 2-3% day_strength regularly; don't saturate the penalty too fast
+
+      # ===== Tier 2a: Volatility-aware stop widening (added 2026-05-12) =====
+      # When the current bar's ATR has expanded vs its 5-bar average
+      # (tech_ctx.atr_expansion_mult), all ATR-based stop buffers scale by
+      # 1.0 → atr_widening_max_factor proportionally. Risk MANAGER then
+      # downsizes share count so dollar risk per trade stays constant.
+      # Effect: fewer false stops on trend-day noise, more winners captured
+      # without increasing trade dollar risk.
+      #
+      # Example: ATR_expansion_mult=1.5 (50% above recent avg). With
+      # threshold=1.3 and max_factor=1.5: factor = 1.0 + (1.5-1.0) *
+      # (1.5-1.3)/1.3 ≈ 1.077. Stop buffers ~8% wider.
+      # ATR_expansion_mult=2.6 (saturated): factor = 1.5. Stops 50% wider.
+      atr_aware_stop_enabled: true
+      atr_widening_threshold: 1.2    # HIGH_VOL: was 1.3 — trigger widening sooner; ATR expansion is the norm in high vol
+      atr_widening_max_factor: 1.8   # HIGH_VOL: was 1.5 — more headroom (up to 80% wider stops on saturated ATR expansion)
+
+      # ===== Tier 3b: High-conviction peak-giveback loosening (added 2026-05-12) =====
+      # On trend days where the candidate's live day_strength is large
+      # (|day_strength| >= threshold %), stamp a per-trade override on
+      # signal metadata that raises the peak_giveback_min_r threshold from
+      # the global default (config.risk.peak_giveback_min_r, typically 1.0)
+      # to the high-conviction value. Effect: a winner that reaches 2R then
+      # retraces 50% won't get force-exited on a trend day — it has runway
+      # to recover and extend. The risk_manager reads the override from
+      # position.metadata; falls back to the global default for trades
+      # without the stamp (other strategies, non-conviction trades).
+      peak_giveback_high_conviction_day_strength_pct: 2.5  # HIGH_VOL: was 2.0 — 2% is common in high vol; require 2.5% for true trend-day conviction
+      peak_giveback_high_conviction_min_r: 2.5             # HIGH_VOL: was 2.0 — let conviction trades retrace from 2.5R peak (more runway)
 
       # Sector concentration guard — at most 2 same-direction positions per
       # GICS sector. Prevents 3 correlated longs dying together on one headline.
