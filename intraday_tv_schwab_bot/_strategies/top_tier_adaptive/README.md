@@ -4,13 +4,13 @@ This file documents the strategy that lives in this folder. The behavior describ
 
 ## How it works
 
-This is a **multi-regime adaptive intraday strategy** for a fixed universe of top-tier liquid stocks across six Tier 1 GICS sectors (Technology, Consumer Discretionary, Communication Services, Financials, Healthcare, Consumer Staples). It detects whether each symbol is trending, pulling back, ranging, breaking out of a volatility squeeze, or sustaining momentum from the session open, then applies the appropriate entry style. Trades both long and short across the full RTH session with time-of-day regime gating.
+This is a **multi-regime adaptive intraday strategy** for a fixed universe of top-tier liquid stocks across six Tier 1 GICS sectors (Technology, Consumer Discretionary, Communication Services, Financials, Healthcare, Consumer Staples). It detects whether each symbol is trending, pulling back, ranging, breaking out of a volatility squeeze, sustaining momentum from the session open, or scalping between HTF support/resistance zones, then applies the appropriate entry style. Trades both long and short across the full RTH session with time-of-day regime gating.
 
 ### 1. It trades a fixed universe, not a dynamic screener
 
 Unlike the dynamic-discovery strategies, this one operates on a predefined list of 23 top-tier symbols configured in `params.tradable`. The screener fetches those symbols from TradingView and ranks them by absolute intraday move weighted by relative volume. This means the bot always knows exactly what it is watching, and the screener simply decides which ones are most active right now.
 
-### 2. It scores five regimes for every candidate
+### 2. It scores six regimes for every candidate
 
 For each symbol and each direction (long/short), regime scores are computed for whichever regimes are allowed at the current time:
 
@@ -19,37 +19,38 @@ For each symbol and each direction (long/short), regime scores are computed for 
 - **Range**: VWAP proximity, EMA convergence, VWAP cross count, tight intraday range, index neutrality. Max score 5.5.
 - **Vol-squeeze** *(added 2026-05-12)*: detects a tight Bollinger compression box across `vol_squeeze_lookback_bars` (default 12), then scores breakout magnitude, confirming volume ratio, bar close position within the breakout candle, VWAP/EMA alignment. Allowed in the primary and afternoon windows.
 - **Momentum** *(added 2026-05-12, widened from afternoon-only and renamed from `momentum_close`)*: momentum-from-open continuation. Computes day_strength live from session open + current close, requires `momentum_min_day_strength` (default 1.5%) with the trade side, scores N-bar breakout + alignment. **Allowed post-ORB through close** (`orb_end_time` → `no_new_entries_after`) including midday — the day_strength hard gate is what filters chop, not the time window.
+- **Sr-scalp** *(added 2026-05-12)*: HTF S/R mean-reversion scalp. Uses the bot's existing `sr_ctx.nearest_support` (HS) and `nearest_resistance` (HR) as level prices and zone bands matching the dashboard's `key_level_zones` — NO strategy-local level creation. A distance gate requires the inner zone gap to clear BOTH `sr_scalp_min_distance_pct` (default 0.8% of close) AND `sr_scalp_min_distance_atr` (default 2.5x ATR); too-close zones reject at build time as `htf_zones_too_close` so other regimes can fall through. A proximity gate requires close to be inside the entry-side zone or within `sr_scalp_max_distance_from_zone_atr` of its inner edge. **Allowed post-ORB through close** (`orb_end_time` → `no_new_entries_after`). Index-confirmation EXEMPT (mean-reversion thesis, same as range). Max score 5.0.
 
-The highest-scoring regime wins, subject to a minimum score threshold and a gap requirement (the winning regime must score meaningfully higher than the runner-up to prevent ambiguous entries).
+Build-time fall-through: as of 2026-05-12 each side stores an ordered list of qualifying regimes (score-descending). The build phase iterates the list and tries each regime in turn — if a regime's build fails (e.g. trend's `no_fresh_breakout`, sr_scalp's `htf_zones_too_close`), the next qualifying regime on the same side gets a chance. Across sides, the higher-scored side's full build_order is tried first.
 
-Each regime can be globally disabled via its own opt-out knob: `disable_trend_regime`, `disable_pullback_regime`, `disable_range_regime`, `disable_vol_squeeze_regime`, `disable_momentum_regime` — all default `false`.
+Each regime can be globally disabled via its own opt-out knob: `disable_trend_regime`, `disable_pullback_regime`, `disable_range_regime`, `disable_vol_squeeze_regime`, `disable_momentum_regime`, `disable_sr_scalp_regime` — all default `false`.
 
 ### 3. Time-of-day gating controls which regimes are allowed
 
 Not all regimes fire at all times. All boundaries are param-driven (no hard-coded times):
 
 - **09:35 - `orb_end_time` (ORB window)**: trend only
-- **`orb_end_time` - `midday_start_time` (primary)**: trend, pullback, range, vol_squeeze, momentum
-- **`midday_start_time` - `midday_end_time` (midday)**: pullback, momentum
-- **`afternoon_start_time` - `no_new_entries_after` (afternoon)**: trend, pullback, range, vol_squeeze, momentum (range was disabled pre-2026-04-22; re-enabled so afternoon range-bound tapes get mean-reversion entries — disable with `afternoon_include_range: false`)
+- **`orb_end_time` - `midday_start_time` (primary)**: trend, pullback, range, vol_squeeze, momentum, sr_scalp
+- **`midday_start_time` - `midday_end_time` (midday)**: pullback, momentum, sr_scalp
+- **`afternoon_start_time` - `no_new_entries_after` (afternoon)**: trend, pullback, range, vol_squeeze, momentum, sr_scalp (range was disabled pre-2026-04-22; re-enabled so afternoon range-bound tapes get mean-reversion entries — disable with `afternoon_include_range: false`)
 - **After `no_new_entries_after`**: no new entries
 
 Default boundary values: ORB end `10:05`, midday `11:30`-`13:00`, afternoon `13:00`-`15:00`.
 
-Midday still favors pullbacks because top-tier stocks tend to chop during the lunch hour, but the momentum regime is allowed alongside — the `momentum_min_day_strength` hard gate (default 1.5%) filters out non-trending names automatically. As of 2026-05-12 the momentum regime is post-ORB-through-close (renamed from `momentum_close` and widened from afternoon-only).
+Midday still favors pullbacks because top-tier stocks tend to chop during the lunch hour, but the momentum and sr_scalp regimes are allowed alongside — the `momentum_min_day_strength` hard gate (default 1.5%) and the sr_scalp HTF zone-gap floor filter out non-qualifying names automatically. As of 2026-05-12 the momentum regime is post-ORB-through-close (renamed from `momentum_close` and widened from afternoon-only) and sr_scalp is post-ORB-through-close.
 
-Per-regime opt-out via params: each of the five regimes has its own `disable_*_regime` boolean knob (all default `false`). Disabling a regime strips it from every window. The afternoon-range sub-knob `afternoon_include_range` still works for window-scoped exclusion.
+Per-regime opt-out via params: each of the six regimes has its own `disable_*_regime` boolean knob (all default `false`). Disabling a regime strips it from every window. The afternoon-range sub-knob `afternoon_include_range` still works for window-scoped exclusion.
 
 ORB-window opt-out: set `disable_orb_window: true` (default `false`) to skip the entire 09:35 → `orb_end_time` window — distinct from the `orb_bypass_*` family which loosen filters DURING the ORB window. Useful on tapes where the opening 30 minutes are too whippy.
 
 ### 4. Index confirmation gates directional entries
 
-SPY and QQQ are used as index confirmation. For trend and pullback entries, at least one index must agree with the trade direction:
+SPY and QQQ are used as index confirmation. For trend, pullback, vol_squeeze, and momentum entries, at least one index must agree with the trade direction:
 
 - Long: index close > VWAP and EMA9 >= EMA20
 - Short: index close < VWAP and EMA9 <= EMA20
 
-Range entries do not require index confirmation but get a bonus when indices are neutral (both near VWAP).
+Range and sr_scalp entries do not require index confirmation (both are mean-reversion theses). Range entries get a bonus when indices are neutral (both near VWAP); sr_scalp's index exemption matches range's reasoning — index direction is orthogonal to a between-zone scalp.
 
 ### 5. Each regime builds a different signal
 
@@ -58,8 +59,9 @@ Range entries do not require index confirmation but get a bonus when indices are
 - **Range signal**: enters near range low (long) or range high (short). Stop outside the range boundary. Target at the opposite range boundary.
 - **Vol-squeeze signal**: stop just outside the compression box (low for long, high for short) buffered by `max(0.12·ATR, 0.10%·price, 0.22·box_range)` so tight squeezes don't get over-wide ATR-based stops. Target at `vol_squeeze_target_rr` (default 2.05).
 - **Momentum signal**: requires a fresh N-bar breakout (1m frame, `momentum_breakout_lookback_bars`, default 6) on the active session frame. Stop anchors below the recent swing low (long) / above recent swing high (short) with an ATR cushion (0.08·ATR) so single-bar wicks during midday/afternoon thin liquidity don't trigger the stop. Target at `momentum_target_rr` (default 2.0).
+- **Sr-scalp signal**: enters near the entry-side HTF zone — `HS` (`sr_ctx.nearest_support`) for long, `HR` (`sr_ctx.nearest_resistance`) for short. Stop just outside the entry-side zone: `HS_zone_lower − level_buffer` (long) / `HR_zone_upper + level_buffer` (short), where `level_buffer = sr_ctx.level_buffer * vol_widening` — the same buffer `_refine_*_sr_levels` uses to nudge stops past structural levels. Target at the inner edge of the opposite zone: `HR_zone_lower − level_buffer` (long) / `HS_zone_upper + level_buffer` (short) — exits at the inside of the opposite zone, matching the bot's structural-exit conventions elsewhere. No fixed R:R target — the zone gap (filtered by the distance gate) provides the reward.
 
-All five pass through the shared finalization pipeline (HTF bias, structure, S/R, exhaustion, chart pattern, FVG, adaptive management).
+All six pass through the shared finalization pipeline (HTF bias, structure, S/R, exhaustion, chart pattern, FVG, adaptive management).
 
 ### 6. Shared gates apply to every signal
 
@@ -169,7 +171,7 @@ A strong top-tier adaptive entry usually looks like:
 
 In plain English:
 
-**"This strategy picks the strongest-moving top-tier stocks, figures out whether they are trending, pulling back, ranging, breaking out of a volatility squeeze, or sustaining a directional move from the session open, confirms with the broader market, and enters only when the setup is clean and the time of day is right."**
+**"This strategy picks the strongest-moving top-tier stocks, figures out whether they are trending, pulling back, ranging, breaking out of a volatility squeeze, sustaining a directional move from the session open, or scalping between HTF support and resistance zones, confirms with the broader market (except for the two mean-reversion regimes), and enters only when the setup is clean and the time of day is right."**
 
 ### 11. How the screener ranks candidates
 
@@ -266,7 +268,7 @@ Strategy-specific knobs:
 
 - `tradable`: the fixed list of symbols to trade.
 - `index_symbols`: index ETFs used for directional confirmation (default SPY, QQQ).
-- `require_index_confirmation`: gate trend/pullback entries on index agreement.
+- `require_index_confirmation`: gate trend/pullback/vol_squeeze/momentum entries on index agreement. Range and sr_scalp are exempt (mean-reversion theses).
 - `require_htf_bias_alignment`: reject longs against bearish HTF (15m) structure and shorts against bullish HTF structure. Neutral never blocks. Default `true` — prevents counter-trend entries on days when the higher-timeframe structure is pinned against the trade direction. Set `false` to allow counter-HTF setups (the bot will still score them normally, but won't outright block).
 - `orb_bypass_htf_bias`: skip the HTF bias check during the ORB window (09:35 to `orb_end_time`). Default `true`. Set `false` to enforce HTF bias filtering even at the open.
 - `orb_bypass_exhaustion`: skip the VWAP/EMA extension exhaustion filters during the ORB window. Default `true`. Set `false` to enforce exhaustion filtering even at the open.
@@ -276,16 +278,18 @@ Strategy-specific knobs:
 - `orb_bypass_screener_bias`: restore fallthrough to the opposite side during the ORB window so Fix A (`respect_screener_bias`) doesn't block gap-reversal entries. Default `true`. Set `false` to enforce the screener's directional_bias during ORB too.
 - `orb_bypass_stretched_filter`: skip Fix D#1 (`reject_stretched_entries`) during the ORB window. Default `false` (flipped 2026-04-24 after morning session showed 3/5 ORB trend losers passed the bypass with breached thresholds; winner LLY was not stretched). Set `true` to restore the original "let gap-up continuations through" behavior.
 - `orb_bypass_tech_bias_contradiction`: skip Fix D#2 (`reject_tech_bias_contradiction`) during the ORB window because DMI/OBV reflect stale overnight state before fresh RTH bars build up. Default `true`. Set `false` to apply the contradiction check at the open.
-- `min_trend_score` / `min_pullback_score` / `min_range_score` / `min_vol_squeeze_score` / `min_momentum_score`: minimum regime score to qualify.
+- `min_trend_score` / `min_pullback_score` / `min_range_score` / `min_vol_squeeze_score` / `min_momentum_score` / `min_sr_scalp_score`: minimum regime score to qualify.
 - `min_pullback_trend_score`: minimum trend score required before pullback scoring begins.
-- `min_score_gap`: minimum score gap between winning and runner-up regime.
+- `min_score_gap`: minimum score gap between winning and runner-up regime (unused as of the 2026-05-12 flat-build-queue refactor; retained for backwards compat).
 - `min_adx14`: ADX floor for trend/pullback scoring.
-- `trend_target_rr` / `pullback_target_rr` / `range_target_rr` / `vol_squeeze_target_rr` / `momentum_target_rr`: initial R:R targets per regime.
+- `trend_target_rr` / `pullback_target_rr` / `range_target_rr` / `vol_squeeze_target_rr` / `momentum_target_rr`: initial R:R targets per regime. Sr_scalp has no R:R target — its target is the inner edge of the opposite HTF zone (zone gap provides the reward).
 - `stop_buffer_atr_mult`: ATR multiplier for stop buffer beyond the swing level.
 - `orb_end_time` / `midday_start_time` / `midday_end_time` / `afternoon_start_time` / `no_new_entries_after`: time-of-day regime window boundaries.
 - `vol_squeeze_lookback_bars` / `vol_squeeze_max_range_pct` / `vol_squeeze_max_range_atr` / `vol_squeeze_max_width_pct` / `vol_squeeze_breakout_buffer_pct` / `vol_squeeze_min_breakout_volume_ratio` / `vol_squeeze_min_bar_close_position`: vol_squeeze qualification knobs.
 - `momentum_breakout_lookback_bars` / `momentum_min_day_strength`: momentum qualification knobs.
-- `disable_trend_regime` / `disable_pullback_regime` / `disable_range_regime` / `disable_vol_squeeze_regime` / `disable_momentum_regime`: per-regime opt-out flags (all default `false`).
+- `sr_scalp_min_distance_pct` / `sr_scalp_min_distance_atr`: HTF zone-gap floors. The inner gap between HS and HR zones must clear BOTH (max wins) for the sr_scalp regime to qualify. Defaults `0.008` (0.8% of close) and `2.5` (2.5x ATR).
+- `sr_scalp_max_distance_from_zone_atr`: proximity gate — close must be inside the entry-side zone OR within this multiple of ATR of its inner edge (default `0.5`). Mid-range candles don't qualify.
+- `disable_trend_regime` / `disable_pullback_regime` / `disable_range_regime` / `disable_vol_squeeze_regime` / `disable_momentum_regime` / `disable_sr_scalp_regime`: per-regime opt-out flags (all default `false`).
 - `disable_orb_window`: whole-window opt-out for the 09:35 → `orb_end_time` ORB window (default `false`). Different from the `orb_bypass_*` family which loosen filters within the window — this skips it entirely.
 - `directional_bias_min_day_strength`: threshold (in %) for the live directional bias (default `0.20`). The strategy computes `day_strength = (close − session_open) / session_open * 100` from the LTF frame each cycle; bias = LONG when above `+threshold`, SHORT when below `−threshold`, else None. Drives Fix A side selection.
 - `sector_groups`: GICS sector groupings for concentration guard.
@@ -333,6 +337,7 @@ Current code defaults:
 | `min_range_score`                    | `3.5`                                                                                                                         |
 | `min_vol_squeeze_score`              | `4.0`                                                                                                                         |
 | `min_momentum_score`                 | `4.0`                                                                                                                         |
+| `min_sr_scalp_score`                 | `3.5`                                                                                                                         |
 | `min_score_gap`                      | `1.2`                                                                                                                         |
 | `min_adx14`                          | `15.0`                                                                                                                        |
 | `pullback_ema_touch_atr_mult`        | `0.35`                                                                                                                        |
@@ -356,6 +361,9 @@ Current code defaults:
 | `vol_squeeze_min_bar_close_position` | `0.63`                                                                                                                        |
 | `momentum_breakout_lookback_bars`    | `6`                                                                                                                           |
 | `momentum_min_day_strength`          | `1.5`                                                                                                                         |
+| `sr_scalp_min_distance_pct`          | `0.008`                                                                                                                       |
+| `sr_scalp_min_distance_atr`          | `2.5`                                                                                                                         |
+| `sr_scalp_max_distance_from_zone_atr` | `0.5`                                                                                                                        |
 | `disable_orb_window`                 | `false`                                                                                                                       |
 | `directional_bias_min_day_strength`  | `0.20`                                                                                                                        |
 | `disable_trend_regime`               | `false`                                                                                                                       |
@@ -363,6 +371,7 @@ Current code defaults:
 | `disable_range_regime`               | `false`                                                                                                                       |
 | `disable_vol_squeeze_regime`         | `false`                                                                                                                       |
 | `disable_momentum_regime`            | `false`                                                                                                                       |
+| `disable_sr_scalp_regime`            | `false`                                                                                                                       |
 | `stop_buffer_atr_mult`               | `0.25`                                                                                                                        |
 | `orb_end_time`                       | `10:05`                                                                                                                       |
 | `midday_start_time`                  | `11:30`                                                                                                                       |

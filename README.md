@@ -30,7 +30,7 @@ See also:
 - `peer_confirmed_key_levels_1m` — faster 1-minute LTF peer-confirmed HTF key-level/zone variant tuned as a compromise between aggressive and balanced confirmation
 - `peer_confirmed_trend_continuation` — peer-confirmed trend continuation strategy that trades controlled pullbacks and re-expansion without waiting for key-level touches
 - `peer_confirmed_htf_pivots` — peer-confirmed higher-timeframe pivot S/R scalp strategy with switchable reclaim, rejection, and continuation entry families
-- `top_tier_adaptive` — multi-regime adaptive strategy for top-tier liquid stocks across six Tier 1 GICS sectors with index confirmation and sector concentration guard; five regimes (trend, pullback, range, vol_squeeze, momentum) compete in a score-gap auction
+- `top_tier_adaptive` — multi-regime adaptive strategy for top-tier liquid stocks across six Tier 1 GICS sectors with index confirmation and sector concentration guard; six regimes (trend, pullback, range, vol_squeeze, momentum, sr_scalp) compete in a flat score-ordered build queue
 
 ### 0DTE ETF option strategies
 
@@ -1879,7 +1879,7 @@ Current package defaults:
 
 ### `top_tier_adaptive`
 
-Purpose: multi-regime adaptive strategy for a fixed universe of 23 top-tier liquid stocks across six Tier 1 GICS sectors: Technology (AAPL, MSFT, NVDA, INTC, AMD, AVGO, TSM, CRM), Consumer Discretionary (AMZN, TSLA, HD, LOW, UBER), Communication Services (GOOG, META, NFLX, RBLX, TMUS), Financials (JPM, GS, V), Healthcare (LLY), Consumer Staples (COST). Five regimes compete in a score-gap auction: trend, pullback, range, vol_squeeze, momentum — each independently togglable via `disable_*_regime` knobs.
+Purpose: multi-regime adaptive strategy for a fixed universe of 23 top-tier liquid stocks across six Tier 1 GICS sectors: Technology (AAPL, MSFT, NVDA, INTC, AMD, AVGO, TSM, CRM), Consumer Discretionary (AMZN, TSLA, HD, LOW, UBER), Communication Services (GOOG, META, NFLX, RBLX, TMUS), Financials (JPM, GS, V), Healthcare (LLY), Consumer Staples (COST). Six regimes compete in a flat score-ordered build queue: trend, pullback, range, vol_squeeze, momentum, sr_scalp — each independently togglable via `disable_*_regime` knobs.
 
 Default windows:
 
@@ -1891,13 +1891,15 @@ Strategy-specific knobs:
 
 - `tradable`: the fixed list of symbols to trade.
 - `index_symbols`: index ETFs for directional confirmation (default SPY, QQQ).
-- `require_index_confirmation`: gate trend/pullback/vol_squeeze/momentum entries on index agreement.
-- `min_trend_score` / `min_pullback_score` / `min_range_score` / `min_vol_squeeze_score` / `min_momentum_score`: minimum regime score to qualify.
+- `require_index_confirmation`: gate trend/pullback/vol_squeeze/momentum entries on index agreement. Range and sr_scalp are exempt (mean-reversion theses).
+- `min_trend_score` / `min_pullback_score` / `min_range_score` / `min_vol_squeeze_score` / `min_momentum_score` / `min_sr_scalp_score`: minimum regime score to qualify.
 - `min_pullback_trend_score`: minimum trend score required before pullback scoring begins.
-- `min_score_gap`: minimum gap between the winning and runner-up regime.
-- `trend_target_rr` / `pullback_target_rr` / `range_target_rr` / `vol_squeeze_target_rr` / `momentum_target_rr`: initial R:R targets per regime.
-- `orb_end_time` / `midday_start_time` / `midday_end_time` / `afternoon_start_time` / `no_new_entries_after`: time-of-day regime window boundaries (all five regimes use these — no hard-coded times).
-- `disable_trend_regime` / `disable_pullback_regime` / `disable_range_regime` / `disable_vol_squeeze_regime` / `disable_momentum_regime`: per-regime opt-out flags (all default `false`).
+- `min_score_gap`: minimum gap between the winning and runner-up regime (unused as of the 2026-05-12 flat-build-queue refactor; retained for backwards compat).
+- `trend_target_rr` / `pullback_target_rr` / `range_target_rr` / `vol_squeeze_target_rr` / `momentum_target_rr`: initial R:R targets per regime. Sr_scalp has no R:R target — its target is the inner edge of the opposite HTF zone.
+- `sr_scalp_min_distance_pct` / `sr_scalp_min_distance_atr`: HTF zone-gap floors for the sr_scalp regime (defaults `0.008` = 0.8% and `2.5` = 2.5x ATR). The inner gap between HS and HR zones must clear BOTH (max wins).
+- `sr_scalp_max_distance_from_zone_atr`: sr_scalp proximity gate — close must be inside the entry-side zone OR within this multiple of ATR of its inner edge (default `0.5`).
+- `orb_end_time` / `midday_start_time` / `midday_end_time` / `afternoon_start_time` / `no_new_entries_after`: time-of-day regime window boundaries (all six regimes use these — no hard-coded times).
+- `disable_trend_regime` / `disable_pullback_regime` / `disable_range_regime` / `disable_vol_squeeze_regime` / `disable_momentum_regime` / `disable_sr_scalp_regime`: per-regime opt-out flags (all default `false`).
 - `disable_orb_window`: whole-window opt-out for the 09:35 → `orb_end_time` ORB window (default `false`). Different from `orb_bypass_*` flags which loosen filters within the window — this skips it entirely.
 - `sector_groups`: GICS sector groupings for the concentration guard.
 - `max_same_sector_same_direction`: max same-direction positions per sector.
@@ -1929,6 +1931,10 @@ Current code defaults:
 | `min_range_score`                 | `3.5`                                                                                  |
 | `min_vol_squeeze_score`           | `4.0`                                                                                  |
 | `min_momentum_score`              | `4.0`                                                                                  |
+| `min_sr_scalp_score`              | `3.5`                                                                                  |
+| `sr_scalp_min_distance_pct`       | `0.008`                                                                                |
+| `sr_scalp_min_distance_atr`       | `2.5`                                                                                  |
+| `sr_scalp_max_distance_from_zone_atr` | `0.5`                                                                              |
 | `min_score_gap`                   | `1.2`                                                                                  |
 | `min_adx14`                       | `15.0`                                                                                 |
 | `trend_target_rr`                 | `2.0`                                                                                  |
@@ -1942,6 +1948,7 @@ Current code defaults:
 | `disable_range_regime`            | `false`                                                                                |
 | `disable_vol_squeeze_regime`      | `false`                                                                                |
 | `disable_momentum_regime`         | `false`                                                                                |
+| `disable_sr_scalp_regime`         | `false`                                                                                |
 | `stop_buffer_atr_mult`            | `0.25`                                                                                 |
 | `orb_end_time`                    | `10:05`                                                                                |
 | `midday_start_time`               | `11:30`                                                                                |
