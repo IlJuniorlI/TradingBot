@@ -21,16 +21,22 @@ body {
   min-height: 100vh;
 }
 
-/* Top bar: stack brand + compact pill grid vertically on mobile. */
+/* Top bar: stack brand + compact pill grid vertically on mobile.
+   Padding + shadow intentionally match the sibling .panel cards (which
+   use .panel-inner with 16px padding + var(--shadow) on the outer panel)
+   so the topbar visually reads as part of the same vertical stack.
+   Without the match, the topbar looked tight and shadowless against the
+   KPI / Risk / Open Positions / Candidates / Completed Trades cards. */
 .topbar.m-topbar {
   display: flex;
   flex-direction: column;
   align-items: stretch;
   gap: 10px;
-  padding: 12px 14px;
+  padding: 16px;
   background: var(--panel-bg, var(--panel));
   border: 1px solid var(--line);
   border-radius: var(--radius, 18px);
+  box-shadow: var(--shadow);
   min-height: 0;
   height: auto;
 }
@@ -85,9 +91,10 @@ body {
    Pills become inline ``label: value`` rows in a 3-col grid. Saves ~40-60%
    of vertical real-estate vs the 2-col stacked-pill layout. Brand badge
    shrinks slightly. Status pill drops the "Status" label (chip alone is
-   self-explanatory). Updated demoted into the same grid as the rest. */
+   self-explanatory). Updated demoted into the same grid as the rest.
+   Padding intentionally NOT overridden here — inherits the 16px from
+   ``.topbar.m-topbar`` so spacing matches the sibling .panel cards. */
 .topbar.m-topbar.m-topbar-compact {
-  padding: 10px 12px;
   gap: 8px;
 }
 
