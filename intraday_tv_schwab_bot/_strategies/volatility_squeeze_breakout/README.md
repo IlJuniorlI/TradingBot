@@ -121,8 +121,8 @@ Strategy-specific knobs:
 - `tier_atr_expansion_floor`: ATR expansion threshold for strong-quality classification (default `1.25`).
 - `tier_volume_ratio_floor`: breakout-bar volume / box-median volume threshold (default `1.5`).
 - `tier_close_position_floor`: minimum close position for LONG (1.0 - threshold for SHORT) (default `0.78`).
-- `screener_min_price`: minimum price floor used by the screener (default `12.0`). Filters low-float volatility traps.
-- `screener_max_session_range_pct`: maximum same-session range as fraction of price (default `0.018` = 1.8%). Tighter intraday range = more compressed tape = more probable squeeze release.
+- `screener_min_price`: minimum price floor used by the screener (default `10.0`). Filters low-float volatility traps.
+- `screener_max_session_range_pct`: maximum same-session range as fraction of price (default `0.035` = 3.5%). Acts as a "no-excess-noise" filter: a stock up 2.5% from open with session range 3% is a clean trend; same mover with 5% session range is choppy. **Important:** this value must EXCEED `max_change_from_open` (default 4.5%) since a stock up X% from open mathematically has session_range >= X%. Setting it below `max_change_from_open` collapses the effective change_from_open band.
 - `screener_rvol_bonus_threshold` / `screener_rvol_bonus_scale` / `screener_rvol_bonus_cap`: RVOL-tier bonus added to `_squeeze_focus_score`. Each unit of `_effective_relative_volume` above the threshold (default `1.8`) adds `scale` (default `2.0`) to the score, capped at `cap` (default `5.0`). Pushes strong-accumulation candidates to the top of the ranked list.
 
 Also uses these shared stock groups:
@@ -163,8 +163,8 @@ Current code defaults:
 | `tier_atr_expansion_floor`                        | `1.25`  (new 2026-05-14)        |
 | `tier_volume_ratio_floor`                         | `1.5`  (new 2026-05-14)         |
 | `tier_close_position_floor`                       | `0.78`  (new 2026-05-14)        |
-| `screener_min_price`                              | `12.0`  (was hardcoded 8.0 pre-2026-05-14) |
-| `screener_max_session_range_pct`                  | `0.018`  (was `0.025` pre-2026-05-14) |
+| `screener_min_price`                              | `10.0`  (was hardcoded 8.0 pre-2026-05-14) |
+| `screener_max_session_range_pct`                  | `0.035`  (was `0.025` pre-2026-05-14; briefly 0.018 — reverted same-day, see CHANGELOG) |
 | `screener_rvol_bonus_threshold`                   | `1.8`  (new 2026-05-14)         |
 | `screener_rvol_bonus_scale`                       | `2.0`  (new 2026-05-14)         |
 | `screener_rvol_bonus_cap`                         | `5.0`  (new 2026-05-14)         |

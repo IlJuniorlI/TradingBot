@@ -530,14 +530,24 @@ strategies:
       tier_atr_expansion_floor: 1.25
       tier_volume_ratio_floor: 1.5
       tier_close_position_floor: 0.78
-      # Screener tuning (2026-05-14): more probable symbols by filtering
-      # low-float volatility traps and stocks already overextended.
-      # screener_min_price: 12 (was hardcoded 8). screener_max_session_
-      # range_pct: 0.018 (was 0.025). RVOL bonus tier: extra +2.0 for
-      # each unit of effective_rvol above 1.8, capped at +5.0 — pushes
-      # strong-accumulation names to the top of the candidate list.
-      screener_min_price: 12.0
-      screener_max_session_range_pct: 0.018
+      # Screener tuning (2026-05-14 revised same-day):
+      # Initial pass set screener_max_session_range_pct to 0.018 (1.8%)
+      # which was mathematically inconsistent with max_change_from_open
+      # (4.5%): a stock up 2%+ from open MUST have session_range >= 2%,
+      # so the 1.8% cap effectively dropped the change_from_open band
+      # to 0.45-1.5% and the screener returned zero symbols. The cap
+      # must exceed max_change_from_open to act as a "no-excess-noise"
+      # filter (clean trend kept, choppy whip rejected).
+      #   * screener_min_price: 10.0 (was 8.0 hardcoded → tried 12.0
+      #     → settled at 10.0). Still filters penny-stock noise.
+      #   * screener_max_session_range_pct: 0.035 (3.5%). A 2.5%
+      #     mover with session_range 3% is clean (kept); same mover
+      #     with 5% session_range is choppy (rejected).
+      #   * RVOL bonus tier: extra +2.0 for each unit of effective_rvol
+      #     above 1.8, capped at +5.0 — pushes strong-accumulation
+      #     names to the top of the candidate list.
+      screener_min_price: 10.0
+      screener_max_session_range_pct: 0.035
       screener_rvol_bonus_threshold: 1.8
       screener_rvol_bonus_scale: 2.0
       screener_rvol_bonus_cap: 5.0

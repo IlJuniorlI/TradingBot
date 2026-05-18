@@ -16,14 +16,21 @@ class VolatilitySqueezeBreakoutScreener(BaseStrategyScreener):
         max_change = float(params.get("max_change_from_open", 8.0))
         min_rvol = float(params.get("min_rvol", 1.35))
         # 2026-05-14: tighter screener for higher-probability squeeze setups.
-        #   * min_price floor lifted 8 → 12 (param-tunable now) to filter
-        #     low-float volatility traps where a single 50k-share order
-        #     can move 2%+ on its own.
-        #   * default upper-band of change_from_open clamped further by
-        #     the strategy yaml (4.5% vs prior 7.5%) — stocks already up
-        #     5%+ rarely have clean continuation room out of a squeeze.
-        #   * session-range cap default tightened 2.5% → 1.8% (yaml).
-        screener_min_price = float(params.get("screener_min_price", 12.0))
+        # Revised same-day after the initial tightening returned zero
+        # symbols — session_range cap was set tighter than the max_change
+        # _from_open band, which is mathematically inconsistent (a stock
+        # up 3% from open MUST have session range >= 3% since the price
+        # moved at least that much).
+        #   * min_price floor: 8 → 10 (param-tunable). Still filters
+        #     the smallest low-float traps without over-restricting.
+        #   * max_change_from_open clamped at 4.5% (yaml) — stocks
+        #     already up 5%+ rarely have clean continuation runway.
+        #   * session-range cap default 3.5% (yaml). Set ABOVE
+        #     max_change_from_open so it acts as a "no excess noise"
+        #     filter rather than a hard contradiction. A 2.5% mover
+        #     with 4% session range = lots of intraday chop (rejected);
+        #     a 2.5% mover with 3% session range = clean trend (kept).
+        screener_min_price = float(params.get("screener_min_price", 10.0))
         # Select 'high' and 'low' so we can compute an intraday-range proxy
         # for compression: tight (high - low) / close = likely squeeze context.
         select_cols = ("name", "description", "exchange", "close", "high", "low", "volume", "market_cap_basic", "relative_volume_10d_calc", "change_from_open")
@@ -70,11 +77,13 @@ class VolatilitySqueezeBreakoutScreener(BaseStrategyScreener):
 
         # Post-filter: prefer stocks with tight intraday range (compression proxy).
         # (high - low) / close is a rough measure of session volatility.
-        # True squeezes have small intraday ranges relative to price.
-        # 2026-05-14: default tightened 2.5% → 1.8%. Stocks already showing
-        # >1.8% intraday range have already used much of the day's energy
-        # — less probable to produce a clean expansion-phase breakout.
-        max_session_range_pct = float(params.get("screener_max_session_range_pct", 0.018))
+        # 2026-05-14 revised: default 3.5% (was set 1.8% initially which
+        # was mathematically inconsistent with max_change_from_open: 4.5%
+        # — a stock up 2% from open MUST have session_range >= 2%). The
+        # 3.5% cap acts as a "no-excess-noise" filter: a stock up 2.5%
+        # with session_range 3% is a clean trend (kept); same stock with
+        # session_range 5% is choppy (rejected — too much intraday whip).
+        max_session_range_pct = float(params.get("screener_max_session_range_pct", 0.035))
         if "high" in df.columns and "low" in df.columns and "close" in df.columns:
             session_range_pct = ((df["high"].astype(float) - df["low"].astype(float)) / df["close"].astype(float).clip(lower=0.01)).clip(lower=0.0)
             df = df[session_range_pct <= max_session_range_pct].copy()

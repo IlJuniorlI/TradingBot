@@ -7,6 +7,28 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **volatility_squeeze_breakout screener: relaxed math-conflicting filters.** *2026-05-14*
+  - Initial 2026-05-14 tightening set `screener_max_session_range_pct`
+    to 0.018 (1.8%), which was mathematically inconsistent with
+    `max_change_from_open: 4.5%`: a stock up 2% from open MUST have
+    session_range >= 2% (the price moved at least that much), so the
+    1.8% cap effectively dropped the change_from_open band from
+    0.45-4.5% to ~0.45-1.5% and the screener returned zero symbols
+    in normal market conditions.
+  - Revised defaults that preserve the screener's "no excess noise"
+    intent without the math conflict:
+    - `screener_max_session_range_pct: 0.018 → 0.035` (must EXCEED
+      `max_change_from_open` to act as a noise filter, not a hard
+      contradiction). A 2.5% mover with session_range 3% is clean
+      (kept); same mover with 5% session_range is choppy (rejected).
+    - `screener_min_price: 12.0 → 10.0` (mild relaxation; still
+      filters the smallest low-float volatility traps).
+  - Updated manifest defaults + yaml preset + README guidance with
+    the math-conflict note so future tightening attempts don't
+    repeat the mistake.
+
 ### Added
 
 - **Dashboard watchlist: "IX" chip on index-confirmation ETF cards.** *2026-05-14*
