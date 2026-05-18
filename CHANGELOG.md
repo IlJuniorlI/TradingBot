@@ -9,6 +9,31 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **volatility_squeeze_breakout screener: resolved squeeze-paradox liquidity filters.** *2026-05-14*
+  - After fixing the math-conflicting session_range cap (see entry below),
+    the screener was still returning zero symbols. Root cause: the per-
+    minute liquidity gates compounded with `min_rvol: 1.35` to filter
+    OUT the very setups the strategy is built to find. A SQUEEZE is
+    defined by volume CONTRACTING (RVOL drops below 1.0 pre-breakout),
+    so requiring elevated minute-by-minute activity at screen time was
+    paradoxical. The strategy already has its own breakout-bar volume
+    check (`min_breakout_volume_ratio: 1.12 × box-median` in
+    `_score_vol_squeeze`) — that's the right place for the "elevated
+    volume" gate.
+  - Relaxed liquidity and RVOL gates in
+    `configs/config.volatility_squeeze_breakout.yaml`:
+    - `min_volume: 1,800,000 → 750,000` (still liquid for entry/exit)
+    - `min_value_traded_1m: 350,000 → 75,000` (~5x looser)
+    - `min_volume_1m: 45,000 → 8,000` (~5.6x looser; allows compressed-
+      tape stocks)
+    - `min_rvol: 1.35 → 1.00` (normal-or-better volume; pre-breakout
+      squeezes can have RVOL down to 0.6-0.9 so 1.0 is the practical
+      floor below which the stock is illiquid)
+  - Documented in the yaml that `min_market_cap` / `max_market_cap` are
+    inert for this strategy (only `_small_cap_base_conditions` enforces
+    them; vol_squeeze uses `_liquid_equity_conditions` which doesn't).
+  - Manifest default `min_rvol` updated 1.35 → 1.00 to match.
+
 - **volatility_squeeze_breakout screener: relaxed math-conflicting filters.** *2026-05-14*
   - Initial 2026-05-14 tightening set `screener_max_session_range_pct`
     to 0.018 (1.8%), which was mathematically inconsistent with

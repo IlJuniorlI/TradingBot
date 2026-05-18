@@ -17,15 +17,27 @@ schwab:
   open_browser_for_auth: true
 
 # TradingView and screener inputs used to source candidates.
+# 2026-05-14 revised: the original liquidity floors (1.8M session volume,
+# $350k/min, 45k shares/min) compounded with min_rvol: 1.35 produced a
+# screener paradox — a SQUEEZE setup is defined by volume CONTRACTING
+# (RVOL drops below 1.0 pre-breakout), so requiring elevated minute-by-
+# minute activity at screen time filtered out the very compressed-tape
+# candidates the strategy is built to find. The breakout-bar volume
+# confirmation lives at the strategy level (min_breakout_volume_ratio:
+# 1.12 × box-median in _score_vol_squeeze) — that's the right place for
+# the "elevated volume" check, not the screener.
+# NOTE: min_market_cap / max_market_cap are inert for this strategy
+# (only _small_cap_base_conditions uses them; vol_squeeze_breakout uses
+# _liquid_equity_conditions which doesn't filter by market cap).
 tradingview:
   market: america
   max_candidates: 6
   screener_refresh_seconds: 80
-  min_market_cap: 30000000
-  max_market_cap: 2000000000
-  min_volume: 1800000
-  min_value_traded_1m: 350000.0
-  min_volume_1m: 45000
+  min_market_cap: 30000000              # inert — see note above
+  max_market_cap: 2000000000            # inert — see note above
+  min_volume: 750000                    # was 1,800,000 — session-volume floor; still liquid
+  min_value_traded_1m: 75000.0          # was 350,000 — per-minute $ floor; ~5x looser
+  min_volume_1m: 8000                   # was 45,000 — per-minute share floor; allows compressed-tape squeezes
 
 # Paper-account starting state and retained history settings.
 paper:
@@ -503,7 +515,7 @@ strategies:
       min_breakout_volume_ratio: 1.12
       min_change_from_open: 0.9
       min_pressure_drift_pct: 0.0011
-      min_rvol: 1.35
+      min_rvol: 1.00                            # 2026-05-14: was 1.35 — squeezes have BELOW-average RVOL pre-breakout. The breakout-bar volume check lives at min_breakout_volume_ratio in _score_vol_squeeze, not here.
       ltf_fvg_entry_weight: 0.24
       opposing_fvg_entry_penalty_mult: 1.0
       prefer_bollinger_squeeze_flag: true

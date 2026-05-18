@@ -27,7 +27,7 @@
   "params": {
     "min_change_from_open": 0.9,
     "max_change_from_open": 7.5,
-    "min_rvol": 1.35,
+    "min_rvol": 1.00,
     "min_bars": 60,
     "squeeze_lookback_bars": 16,
     "squeeze_baseline_bars": 22,
