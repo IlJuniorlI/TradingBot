@@ -465,6 +465,13 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         candidate_day_move = self._safe_pct(candidate.metadata.get("change_from_open"))
 
         max_vix = float(self.optcfg.max_vix)
+        # Lower-bound VIX floor. 0.0 (default) disables the gate for
+        # backward-compat. Long-premium strategies should set this to
+        # ~12.0 — below that level the typical daily range is too small
+        # to overcome 0DTE theta + commissions even on a correct
+        # directional call. Credit-spread strategies leave it at 0.0
+        # since low-VIX is their target environment.
+        min_vix = float(getattr(self.optcfg, "min_vix", 0.0) or 0.0)
         vix_spike_pct = float(self.optcfg.vix_spike_pct)
         min_candidate_rvol = float(p.get("min_candidate_rvol", 1.15))
         min_candidate_rvol_required = self._relative_volume_gate_threshold(underlying, min_candidate_rvol, p)
@@ -475,6 +482,24 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         reasons: list[str] = []
         if vix_last is not None and vix_last > max_vix:
             reasons.append(_reason_with_values("vix_above_limit", current=vix_last, required=max_vix, op="<=", digits=2))
+        if vix_last is not None and min_vix > 0.0 and vix_last < min_vix:
+            reasons.append(_reason_with_values("vix_below_floor", current=vix_last, required=min_vix, op=">=", digits=2))
+        # IV-rank gate (2026-05-14). Normalize current VIX against the
+        # user-provided 52-week range. Long-premium strategies should
+        # cap max_iv_rank to avoid buying expensive premium; credit-
+        # spread strategies should floor min_iv_rank to ensure juicy
+        # credits. Defaults (min=0.0, max=1.0) disable the gate.
+        if vix_last is not None:
+            vix_52w_low = float(getattr(self.optcfg, "vix_52w_low", 12.0))
+            vix_52w_high = float(getattr(self.optcfg, "vix_52w_high", 30.0))
+            min_iv_rank = float(getattr(self.optcfg, "min_iv_rank", 0.0) or 0.0)
+            max_iv_rank = float(getattr(self.optcfg, "max_iv_rank", 1.0) or 1.0)
+            iv_range = max(0.01, vix_52w_high - vix_52w_low)
+            iv_rank = max(0.0, min(1.0, (vix_last - vix_52w_low) / iv_range))
+            if min_iv_rank > 0.0 and iv_rank < min_iv_rank:
+                reasons.append(_reason_with_values("iv_rank_too_low", current=iv_rank, required=min_iv_rank, op=">=", digits=2))
+            if max_iv_rank < 1.0 and iv_rank > max_iv_rank:
+                reasons.append(_reason_with_values("iv_rank_too_high", current=iv_rank, required=max_iv_rank, op="<=", digits=2))
         if abs(vix_pct) >= vix_spike_pct:
             reasons.append(_reason_with_values("vix_spike", current=abs(vix_pct), required=vix_spike_pct, op="<", digits=4))
         if candidate_rvol < min_candidate_rvol_required:

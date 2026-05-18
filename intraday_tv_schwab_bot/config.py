@@ -885,7 +885,28 @@ class ZeroDteOptionsConfig:
     single_target_mult: float = 1.50
     force_flatten_time: str = "15:18"
     max_vix: float = 22.5
+    # Lower VIX floor for long-premium strategies. When set > 0 and VIX
+    # is below this floor at entry-decision time, ``_option_entry_block_
+    # reason`` rejects with ``vix_below_floor``. Default 0.0 = filter
+    # disabled (preserves legacy behaviour). Set ~12.0 for long-premium
+    # strategies that suffer in dead-grind tape — typical daily range
+    # at VIX < 12 (~0.4%) makes the math for 0DTE long premium thin.
+    # Credit-spread strategies should leave this at 0.0 since low-VIX
+    # juicy environments are by design.
+    min_vix: float = 0.0
     vix_spike_pct: float = 0.0110
+    # IV-rank gates (2026-05-14). Compute current VIX position within a
+    # user-provided 52-week range. Rank 0.0 = at vix_52w_low, 1.0 = at
+    # vix_52w_high. Long-premium strategies want low rank (cheap IV);
+    # credit-spread strategies want high rank (juicy premium). Defaults
+    # are disabled (min=0.0, max=1.0). Set vix_52w_low / vix_52w_high
+    # in the preset yaml (refresh quarterly when VIX range shifts).
+    # Implementation note: uses the 52w range as PROVIDED, not fetched
+    # live — no extra Schwab calls, deterministic, user-controlled.
+    vix_52w_low: float = 12.0
+    vix_52w_high: float = 30.0
+    min_iv_rank: float = 0.0
+    max_iv_rank: float = 1.0
     vertical_limit_mode: str = "mid"
     quote_stability_checks: int = 3
     quote_stability_pause_ms: int = 500

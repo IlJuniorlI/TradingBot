@@ -7,7 +7,133 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **0DTE option configs: audit pass for liquidity, VIX, and HTF gates.** *2026-05-14*
+  - Found three mis-tuned areas after systematic param diff between
+    `config.zero_dte_etf_long_options.yaml` and the credit-spread parent
+    `config.zero_dte_etf_options.yaml`:
+  - **VIX caps were inverted**: long-options had `max_vix: 25.0` while
+    parent had `22.5`. Long premium suffers MORE in high VIX (expensive
+    entry + vega risk on IV crush) so it should have a LOWER cap.
+    Swapped to enforce the `long_max <= credit_max` hierarchy:
+    - long_options `max_vix: 25.0 → 22.0`
+    - credit-spread parent `max_vix: 22.5 → 24.0`
+  - **Liquidity gates were too loose** for 0DTE quality. SPY/QQQ ATM
+    0DTE typically trades 5k-20k contracts/day with OI 10k-50k+ and
+    bid-ask spreads of 1-3%. Old defaults (vol 500, OI 900, spread 7%)
+    admitted illiquid OTM strikes with poor fills. Tightened in BOTH
+    configs:
+    - `min_option_volume: 500 → 1000`
+    - `min_open_interest: 900 → 2000`
+    - `max_bid_ask_spread_pct: 0.07 (7%) → 0.04 (4%)`
+  - **`htf_lookback_days: 60`** on long-options was excessive. At 15-min
+    HTF that's ~1500 bars — way more than needed for HTF structure
+    detection. Reduced to 15 (matching parent) for ~390 bars.
+
+### Added
+
+- **0DTE option strategies: IV-rank gate + adaptive credit-spread width.** *2026-05-14*
+  - **IV-rank gate** — normalizes current VIX against a user-provided
+    52-week range rather than using absolute VIX level. Useful because
+    VIX 20 means different things in a 12-18 regime vs a 25-35 regime.
+    New `OptionsConfig` knobs (defaults disable the gate):
+    - `vix_52w_low: 12.0` / `vix_52w_high: 30.0` — the 52-week range
+      (refresh quarterly when VIX environment shifts; no live fetching)
+    - `min_iv_rank: 0.0` (disabled) — entries blocked when rank below
+    - `max_iv_rank: 1.0` (disabled) — entries blocked when rank above
+    - Computation: `iv_rank = clamp((vix_last − vix_52w_low) /
+      (vix_52w_high − vix_52w_low), 0, 1)`
+    - Skip reasons: `iv_rank_too_low`, `iv_rank_too_high`
+  - Strategy-specific defaults:
+    - `config.zero_dte_etf_long_options.yaml`: `max_iv_rank: 0.75`
+      (don't buy expensive premium when VIX is in top 25% of range)
+    - `config.zero_dte_etf_options.yaml`: `min_iv_rank: 0.30`
+      (don't sell skinny premium when VIX is in bottom 30% of range)
+  - Enabled **adaptive_width_enabled: true** in the credit-spread
+    parent yaml. `_adaptive_strike_width` scales vertical-spread strike
+    widths with `current_atr / 20-bar_median_atr` clamped to `[1.0,
+    adaptive_width_max_scale]`. High-vol days → wider strikes (more
+    credit, more cushion); quiet days → tighter strikes. Capped at
+    1.5× base width (`adaptive_width_max_scale: 1.5`). Long-options
+    don't use this — single-leg.
+
+- **`options.min_vix` lower-bound VIX floor for long-premium strategies.** *2026-05-14*
+  - New `OptionsConfig.min_vix` (default `0.0` = disabled, preserves
+    legacy behaviour). When set > 0 and VIX is below the floor at
+    entry-decision time, `_option_entry_block_reason` rejects with
+    `vix_below_floor`.
+  - Mirrors the existing `max_vix` cap. Together they let you define
+    a tradable VIX range: above `max_vix` premium is too expensive
+    (vega risk); below `min_vix` daily range is too thin to overcome
+    theta + commissions on long premium.
+  - Shipped defaults:
+    - `config.zero_dte_etf_long_options.yaml`: `min_vix: 12.0`
+      (long-premium strategy — needs movement to win)
+    - `config.zero_dte_etf_options.yaml`: `min_vix: 0.0` (explicit
+      no-op — credit spreads actually want low VIX)
+  - Backward compatible: any config without `min_vix` defaults to
+    `0.0` and the gate is fully bypassed.
+
 ### Fixed
+
+- **zero_dte_etf_long_options: ORB path bug audit fixes.** *2026-05-14*
+  - **B1 (real)**: ORB entry path now respects structural and S/R vetoes,
+    mirroring the trend-window gate behaviour. Previously, ORB-window
+    entries (09:35-10:05) could fire even when LTF structure was bearish
+    on a bullish ORB or when SR was broken below the entry price — risky
+    for 0DTE long premium (theta bleeds fast on mis-aligned setups).
+    Toggleable via `orb_apply_structure_veto` (default `true`) and
+    `orb_apply_sr_veto` (default `true`). Set both to `false` to restore
+    legacy "fire on any breakout" behaviour.
+  - **B2**: Aligned manifest-default and strategy.py-fallback values
+    that had silently drifted: `trend_end_time` fallback `"13:25"` →
+    `"13:30"` to match manifest; `min_bars` runtime-entry fallback
+    `35` → `90` to match `required_history_bars()` init fallback. The
+    manifest values were never the issue (they always load), but the
+    fallbacks were a silent-drift hazard if manifest loading ever
+    failed partially.
+  - **B3 + B4**: ORB window endpoints + opening-range window are now
+    BOTH configurable, decoupled. New params:
+    - `orb_start_time` (default `"09:35"`) — was previously hardcoded
+    - `orb_opening_window_start` (default `"09:30"`) — was hardcoded
+    - `orb_opening_window_end` (default `"09:34"`) — was hardcoded
+    Previously, a user setting `orb_end_time: "11:00"` to extend the
+    trading window would still derive or_high/or_low from the
+    09:30-09:34 5-min opening — stale references the breakout was
+    measured against. Now the user can extend BOTH together.
+  - **C1**: Defensive column access — `last["close"]` → `last.get("close")`
+    in the per-candidate setup. If a frame somehow ships without a
+    standard indicator column (rare warmup / data-gap edge case), the
+    `_safe_float` default kicks in instead of a `KeyError`.
+  - **C2**: New `orb_opening_min_bars` (default `3`). The opening
+    range now requires ≥ N bars in the configured opening window
+    before deriving `or_high` / `or_low`. Previously a single
+    09:34 bar would have been treated as the "opening range" and
+    produced trivially-passable breakout checks (`last_close > 0.0 *
+    1.0008` for empty references).
+  - Manifest + yaml preset + README updated with all new params and
+    explanatory comments.
+
+- **volatility_squeeze_breakout screener: drop per-minute liquidity filters to stop candidate churn.** *2026-05-14*
+  - Setting `min_value_traded_1m: 0.0` and `min_volume_1m: 0` in
+    `configs/config.volatility_squeeze_breakout.yaml` disables the
+    `Value.Traded|1` and `volume|1` TradingView filters (gated on
+    `> 0` in `screener_client._liquid_equity_conditions`).
+  - Symptom: per-minute volume metrics flicker around any non-zero
+    threshold each cycle (a stock trading 9k shares one minute and
+    7k the next would oscillate around an 8k floor), causing symbols
+    to drop in/out of the candidate list every refresh. That thrashes
+    the watchlist/warmup state and produces unstable screener output.
+  - Replaced by relying on the session-level `min_volume: 750,000`
+    floor (stable across the day) plus the strategy's own per-bar
+    `min_breakout_volume_ratio: 1.12 × box-median` check at entry
+    decision time.
+  - Other strategies (top_tier_adaptive, pairs_residual, opening_
+    range_breakout, etc.) retain their per-minute filters — those
+    strategies may have valid reasons (e.g. opening-range setups
+    need pre-market activity confirmation). Scoped change to
+    vol_squeeze_breakout only.
 
 - **volatility_squeeze_breakout screener: resolved squeeze-paradox liquidity filters.** *2026-05-14*
   - After fixing the math-conflicting session_range cap (see entry below),

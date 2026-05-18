@@ -124,7 +124,11 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
                 self._record_entry_decision(c.symbol, "skipped", ["underlying_already_open"])
                 continue
             frame = bars.get(c.symbol)
-            min_bars = int(self.params.get("min_bars", 35))
+            # B2 fix: aligned with required_history_bars() default (90) so the
+            # init-time history fetch and the runtime entry gate use the same
+            # floor. Manifest ships 90; the param.get fallback also lands at
+            # 90 if manifest loading somehow misses (silent-drift guard).
+            min_bars = int(self.params.get("min_bars", 90))
             if frame is None or len(frame) < min_bars:
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_underlying_bars", 0 if frame is None else len(frame), min_bars)])
                 continue
@@ -140,42 +144,95 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             if "atr14" in frame.columns:
                 atr_series = frame["atr14"].dropna().tail(20)
                 self._underlying_ref_atr_cache[c.symbol] = float(atr_series.median()) if len(atr_series) >= 5 else 0.0
-            opening = frame[_same_day_mask(frame, now_et().date())].between_time("09:30", "09:34")
+            # B3 / B4 fix: opening-range bars and ORB-window endpoints are
+            # both configurable. The opening window defines or_high/or_low
+            # (the levels we trade the breakout against); the ORB window
+            # defines WHEN we look for those breakouts. Defaults preserve
+            # legacy behaviour (09:30-09:34 opening, 09:35-10:05 trading).
+            orb_start_time = str(self.params.get("orb_start_time", "09:35"))
+            orb_end_time = str(self.params.get("orb_end_time", "10:05"))
+            opening_window_start = str(self.params.get("orb_opening_window_start", "09:30"))
+            opening_window_end = str(self.params.get("orb_opening_window_end", "09:34"))
+            opening = frame[_same_day_mask(frame, now_et().date())].between_time(opening_window_start, opening_window_end)
             regime_name = str(regime.get("regime") or "unknown")
             bullish = regime_name == "bullish_trend"
             bearish = regime_name == "bearish_trend"
             rangeish = regime_name == "range"
             attempted_style = False
-            last_close = _safe_float(last["close"])
-            last_vwap = _safe_float(last["vwap"], last_close)
-            last_ret5 = _safe_float(last["ret5"], 0.0)
+            # C1 fix: use .get() with _safe_float defaults so a frame that
+            # somehow ships without a column (rare edge — partial warmup,
+            # data gap) returns the default instead of KeyError-ing.
+            last_close = _safe_float(last.get("close"), 0.0)
+            last_vwap = _safe_float(last.get("vwap"), last_close)
+            last_ret5 = _safe_float(last.get("ret5"), 0.0)
             orb_enabled = self._long_option_style_enabled("orb_long_option")
-            orb_window = self._time_in_range(now_t, "09:35", self.params.get("orb_end_time", "10:05"))
+            orb_window = self._time_in_range(now_t, orb_start_time, orb_end_time)
             trend_enabled = self._long_option_style_enabled("trend_long_option")
-            trend_window = self._time_in_range(now_t, self.params.get("trend_start_time", "10:05"), self.params.get("trend_end_time", "13:25"))
-            or_high = _safe_float(opening["high"].max()) if not opening.empty else None
-            or_low = _safe_float(opening["low"].min()) if not opening.empty else None
+            # B2 fix: 13:30 default matches manifest.json (was 13:25 — a
+            # 5-minute silent drift if the manifest ever didn't apply).
+            trend_window = self._time_in_range(now_t, self.params.get("trend_start_time", "10:05"), self.params.get("trend_end_time", "13:30"))
+            # C2 fix: require a minimum number of bars in the opening
+            # window before deriving or_high / or_low. A single 09:34
+            # stream bar would otherwise be treated as the "opening range"
+            # and produce trivially-passable breakout checks. Default 3
+            # bars keeps things flexible for shortened sessions or late-
+            # start data while still requiring real structure.
+            opening_min_bars = int(self.params.get("orb_opening_min_bars", 3))
+            opening_ready = (not opening.empty) and len(opening) >= opening_min_bars
+            or_high = _safe_float(opening["high"].max()) if opening_ready else None
+            or_low = _safe_float(opening["low"].min()) if opening_ready else None
             buffer_pct = float(self.params.get("orb_breakout_buffer_pct", 0.0008))
             trend_min_ret5 = float(self.params.get("trend_min_ret5", 0.0006))
 
             if orb_enabled and orb_window and (bullish or bearish):
-                if not opening.empty:
+                if opening_ready:
+                    # B1 fix: optional structural / SR vetoes on the ORB
+                    # entry path. Default ON because long premium with
+                    # bearish HTF structure or trapped between broken
+                    # SR levels bleeds theta even on a clean breakout.
+                    # Toggle off via orb_apply_structure_veto / orb_apply
+                    # _sr_veto for users who want the legacy "fire on
+                    # any breakout" behaviour.
+                    orb_structure_veto = bool(self.params.get("orb_apply_structure_veto", True))
+                    orb_sr_veto = bool(self.params.get("orb_apply_sr_veto", True))
+                    ms_ctx = None
+                    sr_ctx = None
+                    if orb_structure_veto:
+                        ms_ctx = self._structure_context(frame, "ltf")
+                    if orb_sr_veto:
+                        sr_ctx = self._sr_context(c.symbol, frame, data)
                     if bullish and last_close > _safe_float(or_high) * (1.0 + buffer_pct) and last_close > last_vwap:
-                        attempted_style = True
-                        sig = self._build_single_option_signal(c.symbol, True, client, data, last_close, "orb_long_option", confirm_index, regime)
-                        if sig:
-                            out.append(self._attach_option_final_priority_score(sig, c, regime, bullish=True, rangeish=False))
-                            self._record_entry_decision(c.symbol, "signal", [sig.reason])
-                            continue
-                        reasons.append(self._consume_build_failure(c.symbol, "orb_long_option") or "orb_long_option_unavailable")
+                        veto_reason = None
+                        if orb_structure_veto and ms_ctx is not None and self._blocks_bullish_structure_entry(ms_ctx):
+                            veto_reason = f"orb_long_option_{self._bullish_structure_block_reason(ms_ctx)}"
+                        elif orb_sr_veto and sr_ctx is not None and self._blocks_bullish_sr_entry(sr_ctx):
+                            veto_reason = f"orb_long_option_{self._bullish_sr_block_reason(sr_ctx)}"
+                        if veto_reason:
+                            reasons.append(veto_reason)
+                        else:
+                            attempted_style = True
+                            sig = self._build_single_option_signal(c.symbol, True, client, data, last_close, "orb_long_option", confirm_index, regime)
+                            if sig:
+                                out.append(self._attach_option_final_priority_score(sig, c, regime, bullish=True, rangeish=False))
+                                self._record_entry_decision(c.symbol, "signal", [sig.reason])
+                                continue
+                            reasons.append(self._consume_build_failure(c.symbol, "orb_long_option") or "orb_long_option_unavailable")
                     if bearish and last_close < _safe_float(or_low) * (1.0 - buffer_pct) and last_close < last_vwap:
-                        attempted_style = True
-                        sig = self._build_single_option_signal(c.symbol, False, client, data, last_close, "orb_long_option", confirm_index, regime)
-                        if sig:
-                            out.append(self._attach_option_final_priority_score(sig, c, regime, bullish=False, rangeish=False))
-                            self._record_entry_decision(c.symbol, "signal", [sig.reason])
-                            continue
-                        reasons.append(self._consume_build_failure(c.symbol, "orb_long_option") or "orb_long_option_unavailable")
+                        veto_reason = None
+                        if orb_structure_veto and ms_ctx is not None and self._blocks_bearish_structure_entry(ms_ctx):
+                            veto_reason = f"orb_long_option_{self._bearish_structure_block_reason(ms_ctx)}"
+                        elif orb_sr_veto and sr_ctx is not None and self._blocks_bearish_sr_entry(sr_ctx):
+                            veto_reason = f"orb_long_option_{self._bearish_sr_block_reason(sr_ctx)}"
+                        if veto_reason:
+                            reasons.append(veto_reason)
+                        else:
+                            attempted_style = True
+                            sig = self._build_single_option_signal(c.symbol, False, client, data, last_close, "orb_long_option", confirm_index, regime)
+                            if sig:
+                                out.append(self._attach_option_final_priority_score(sig, c, regime, bullish=False, rangeish=False))
+                                self._record_entry_decision(c.symbol, "signal", [sig.reason])
+                                continue
+                            reasons.append(self._consume_build_failure(c.symbol, "orb_long_option") or "orb_long_option_unavailable")
 
             if trend_enabled and trend_window and (bullish or bearish):
                 momentum_ok = True

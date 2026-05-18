@@ -91,7 +91,13 @@ Current code defaults:
 
 | Option                               | Current code default |
 |--------------------------------------|----------------------|
+| `orb_start_time`                     | `09:35`              |
 | `orb_end_time`                       | `10:05`              |
+| `orb_opening_window_start`           | `09:30`              |
+| `orb_opening_window_end`             | `09:34`              |
+| `orb_opening_min_bars`               | `3`                  |
+| `orb_apply_structure_veto`           | `true`               |
+| `orb_apply_sr_veto`                  | `true`               |
 | `trend_start_time`                   | `10:05`              |
 | `trend_end_time`                     | `13:30`              |
 | `no_new_entries_after`               | `13:45`              |
@@ -154,7 +160,12 @@ Both option strategies use a regime engine that mixes ORB timing, trend scoring,
 Common parameter families:
 
 - Session clock:
-  - `orb_end_time`, `trend_start_time`, `trend_end_time`, `no_new_entries_after`
+  - `orb_start_time`, `orb_end_time`, `orb_opening_window_start`, `orb_opening_window_end`, `orb_opening_min_bars`, `trend_start_time`, `trend_end_time`, `no_new_entries_after`
+  - The **trading window** (`orb_start_time` → `orb_end_time`) determines when ORB entries are eligible to fire. The **opening window** (`orb_opening_window_start` → `orb_opening_window_end`) determines the bars used to derive `or_high` / `or_low` — the levels the breakout is measured against. Default keeps the legacy behaviour (09:30-09:34 opening, 09:35-10:05 trading) but the two are decoupled — extending the trading window without extending the opening window means later breakouts are measured against an unchanging early-session reference.
+  - `orb_opening_min_bars` (default `3`) requires at least N bars in the opening window before deriving or_high/or_low. Guards against the degenerate case where a single 09:34 bar is treated as the "opening range."
+- ORB structural / SR vetoes:
+  - `orb_apply_structure_veto` (default `true`): blocks bullish ORB entries when the LTF market structure is bearish (`_blocks_bullish_structure_entry`); mirror for bearish ORB entries. Mirrors the structural vetoes applied to trend-window entries via `_long_option_style_gate`. Set `false` to restore the pre-2026-05-14 "fire on any breakout that clears or_high/or_low" behaviour.
+  - `orb_apply_sr_veto` (default `true`): blocks ORB entries trapped against the wrong side of broken SR levels (`_blocks_bullish_sr_entry` / `_blocks_bearish_sr_entry`).
 - Minimum data:
   - `min_bars`, `min_confirm_bars`, `trend_vwap_lookback`, `flip_lookback`, `range_lookback`
 - RVOL / tape filters:

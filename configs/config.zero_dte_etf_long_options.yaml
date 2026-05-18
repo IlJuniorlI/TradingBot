@@ -425,9 +425,9 @@ options:
     - orb_long_option
     - trend_long_option
   min_underlying_price: 100.0
-  min_option_volume: 500
-  min_open_interest: 900
-  max_bid_ask_spread_pct: 0.07
+  min_option_volume: 1000             # 2026-05-14: was 500. SPY/QQQ 0DTE ATM typically trade 5k-20k contracts/day; 500 admitted illiquid OTM strikes with poor fills.
+  min_open_interest: 2000             # 2026-05-14: was 900. Same logic; OI 10k+ is typical for ATM 0DTE.
+  max_bid_ask_spread_pct: 0.04        # 2026-05-14: was 0.07 (7%). SPY/QQQ 0DTE ATM typically quotes at 1-3% spread; 7% accepted unfavorable fills.
   max_leg_spread_dollars: 0.08
   max_net_spread_pct: 0.2
   max_net_spread_price: 2.8
@@ -456,8 +456,22 @@ options:
   single_stop_frac: 0.38
   single_target_mult: 1.5
   force_flatten_time: "15:18"
-  max_vix: 25.0
+  max_vix: 22.0                       # 2026-05-14: was 25.0. Long premium suffers MORE in high VIX (expensive entry + vega risk on IV crush). Long_max should be <= credit_max.
+  # 2026-05-14: lower-bound VIX floor for this LONG-PREMIUM strategy.
+  # Below ~12 VIX the typical daily range is < 0.5%, which makes the
+  # math for 0DTE long options thin: premium is cheap but moves are
+  # too small to overcome theta + commissions. Set to 0.0 to disable.
+  min_vix: 12.0
   vix_spike_pct: 0.011
+  # IV-rank gate (2026-05-14). Long-premium pays MORE when implied vol is
+  # at the top of its 52w range — expensive entry, vega-crush risk on
+  # mean reversion. Cap max_iv_rank to skip entries when VIX is in the
+  # top 25% of its 52w range. min_iv_rank stays 0.0 (no floor for longs).
+  # REFRESH the 52w range quarterly when VIX environment shifts.
+  vix_52w_low: 12.0
+  vix_52w_high: 30.0
+  min_iv_rank: 0.0
+  max_iv_rank: 0.75
   vertical_limit_mode: mid
   quote_stability_checks: 3
   quote_stability_pause_ms: 500
@@ -523,7 +537,7 @@ strategies:
       flip_lookback: 14
       fvg_context_weight_scale: 0.9
       htf_ema_gap_pct: 0.0007
-      htf_lookback_days: 60
+      htf_lookback_days: 15                   # 2026-05-14: was 60. At 15-min HTF that's ~1500 bars — excessive for an intraday strategy. 15 days (~390 bars) is plenty for HTF structure detection. Matches the credit-spread parent preset.
       htf_min_bars: 20
       htf_min_ret3: 0.0009
       htf_range_ema_gap_pct: 0.001
@@ -547,6 +561,18 @@ strategies:
       no_new_entries_after: 13:45
       orb_breakout_buffer_pct: 0.0008
       orb_end_time: "10:05"
+      # 2026-05-14: ORB-window endpoints + opening-range window are now
+      # both configurable. The OPENING window defines or_high / or_low
+      # (levels we trade the breakout against); the TRADING window
+      # defines when we're willing to fire on those breakouts. Defaults
+      # preserve legacy behaviour (09:30-09:34 opening, 09:35-10:05
+      # trading) — change these together if you want longer ORB.
+      orb_start_time: "09:35"
+      orb_opening_window_start: "09:30"
+      orb_opening_window_end: "09:34"
+      orb_opening_min_bars: 3                 # require >= 3 bars in opening window before deriving or_high/or_low (guards single-bar references)
+      orb_apply_structure_veto: true          # 2026-05-14: ORB entries now also respect msltf structure veto (HTF bearish → no bullish ORB entry, mirror). Disable to revert to legacy "fire on any breakout".
+      orb_apply_sr_veto: true                 # 2026-05-14: ORB entries also respect HTF S/R veto (broken_resistance proximity for LONG, etc.).
       range_ema_gap_pct: 0.0007
       range_lookback: 25
       range_max_intraday_move_pct: 0.009

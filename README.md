@@ -880,7 +880,12 @@ Shared 0DTE ETF option-engine settings. Both option strategies use this block.
 | `single_target_mult`             | `1.5`                                                                                                        |
 | `force_flatten_time`             | `15:18`                                                                                                      |
 | `max_vix`                        | `22.5`                                                                                                       |
+| `min_vix`                        | `0.0`  (disabled by default; set ~12.0 for long-premium strategies)                                          |
 | `vix_spike_pct`                  | `0.011`                                                                                                      |
+| `vix_52w_low`                    | `12.0`  (used for IV-rank computation; refresh quarterly)                                                    |
+| `vix_52w_high`                   | `30.0`  (used for IV-rank computation; refresh quarterly)                                                    |
+| `min_iv_rank`                    | `0.0`  (disabled by default; set ~0.30 for credit-spread strategies — only sell premium when VIX is at least 30% up its 52w range) |
+| `max_iv_rank`                    | `1.0`  (disabled by default; set ~0.75 for long-premium strategies — don't buy premium when VIX is in the top 25% of its 52w range) |
 | `vertical_limit_mode`            | `mid`                                                                                                        |
 | `quote_stability_checks`         | `3`                                                                                                          |
 | `quote_stability_pause_ms`       | `500`                                                                                                        |
@@ -942,7 +947,10 @@ Behavior and valid values:
 - Time controls:
   - `force_flatten_time`: 24-hour `HH:MM` time string used by option strategies to flatten before the close.
 - Volatility guards:
-  - `max_vix`, `vix_spike_pct`
+  - `max_vix`: hard cap — block ALL option entries when VIX is above this level. Long premium gets too expensive (vega risk); credit spreads also less attractive vs the downside risk.
+  - `min_vix` (default `0.0` = disabled): hard floor — block entries when VIX is below this level. Long-premium strategies suffer in dead-grind tape where the typical daily range can't overcome theta + commissions. Set to `~12.0` for long-call/long-put strategies; leave at `0.0` for credit-spread strategies (which benefit from low VIX).
+  - `vix_spike_pct`: block when VIX is moving fast (mid-session repricing risk).
+  - **IV-rank gate** (`vix_52w_low` / `vix_52w_high` / `min_iv_rank` / `max_iv_rank`): computes `iv_rank = (vix_last − vix_52w_low) / (vix_52w_high − vix_52w_low)` clamped to `[0,1]` and blocks entries outside `[min_iv_rank, max_iv_rank]`. Normalizes against the rolling 52-week range rather than absolute VIX level — VIX 20 might be "high" in a 12-18 regime but "low" in a 25-35 regime. Long-premium strategies should cap `max_iv_rank: 0.75` (don't buy when in top 25% — IV expensive); credit-spread strategies should floor `min_iv_rank: 0.30` (don't sell when in bottom 30% — credits skinny). The `vix_52w_low` / `vix_52w_high` values are user-supplied (refresh quarterly) — no live fetching, deterministic, no extra API calls.
 - Quote-stability checks:
   - `quote_stability_checks`, `quote_stability_pause_ms`, `max_mid_drift_pct`, `max_quote_age_seconds`
   - These make the bot re-check quotes before finalizing a trade.

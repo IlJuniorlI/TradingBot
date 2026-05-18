@@ -17,15 +17,15 @@ schwab:
   open_browser_for_auth: true
 
 # TradingView and screener inputs used to source candidates.
-# 2026-05-14 revised: the original liquidity floors (1.8M session volume,
-# $350k/min, 45k shares/min) compounded with min_rvol: 1.35 produced a
-# screener paradox — a SQUEEZE setup is defined by volume CONTRACTING
-# (RVOL drops below 1.0 pre-breakout), so requiring elevated minute-by-
-# minute activity at screen time filtered out the very compressed-tape
-# candidates the strategy is built to find. The breakout-bar volume
-# confirmation lives at the strategy level (min_breakout_volume_ratio:
-# 1.12 × box-median in _score_vol_squeeze) — that's the right place for
-# the "elevated volume" check, not the screener.
+# 2026-05-14 revised: dropped the per-minute filters (Value.Traded|1 and
+# volume|1) because they were causing symbols to churn in and out of the
+# candidate list every cycle — a stock trading 9k shares one minute and
+# 7k the next would oscillate around the 8k threshold, getting added
+# then dropped repeatedly, which thrashes the watchlist/warmup state.
+# The session-level min_volume filter remains as the basic liquidity
+# gate; the strategy's own per-bar volume confirmation
+# (min_breakout_volume_ratio: 1.12 × box-median) handles the elevated-
+# volume check at the entry decision point.
 # NOTE: min_market_cap / max_market_cap are inert for this strategy
 # (only _small_cap_base_conditions uses them; vol_squeeze_breakout uses
 # _liquid_equity_conditions which doesn't filter by market cap).
@@ -36,8 +36,8 @@ tradingview:
   min_market_cap: 30000000              # inert — see note above
   max_market_cap: 2000000000            # inert — see note above
   min_volume: 750000                    # was 1,800,000 — session-volume floor; still liquid
-  min_value_traded_1m: 75000.0          # was 350,000 — per-minute $ floor; ~5x looser
-  min_volume_1m: 8000                   # was 45,000 — per-minute share floor; allows compressed-tape squeezes
+  min_value_traded_1m: 0.0              # dropped — was churning the candidate list every minute; 0 = filter disabled (see screener_client._liquid_equity_conditions)
+  min_volume_1m: 0                      # dropped — same churn issue; 0 = filter disabled
 
 # Paper-account starting state and retained history settings.
 paper:
