@@ -584,7 +584,19 @@ strategies:
       trend_end_time: "13:30"
       trend_min_ret15: 0.0013
       trend_min_ret5: 0.0006
-      trend_rvol: 1.25
+      trend_rvol: 1.25                       # 2026-05-14: NO LONGER GATING — kept for metadata stamping. Replaced by trend_activity_threshold below.
+      # Live activity score thresholds (2026-05-14). Replaces TV
+      # cumulative RVOL in 0DTE gating and bonus scoring. Self-
+      # normalizes against the symbol's own last 20 bars, so it works
+      # the same morning vs afternoon and isn't biased low for
+      # benchmark ETFs.
+      #   * min_activity_for_entry: hard gate (0.0 = disabled — we don't
+      #     filter SPY/QQQ for liveness; they're always trading).
+      #   * trend_activity_threshold: long premium needs MORE elevation
+      #     (1.20) than credit spreads (1.15) — long buyers want
+      #     real directional fuel beyond baseline noise.
+      min_activity_for_entry: 0.0
+      trend_activity_threshold: 1.20
       trend_start_time: "10:05"
       trend_vwap_distance_pct: 0.0014
       trend_vwap_lookback: 10

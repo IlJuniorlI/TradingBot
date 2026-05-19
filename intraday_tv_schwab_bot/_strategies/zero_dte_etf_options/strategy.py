@@ -393,6 +393,48 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         summary["timeframe_minutes"] = htf_tf
         return summary
 
+    @staticmethod
+    def _live_activity_score(frame: pd.DataFrame | None) -> float:
+        """Self-normalizing "is the tape live right now?" score for 0DTE.
+
+        Returns a unitless multiplier where 1.0 = neutral (normal pace
+        for this symbol's last 20 bars), > 1.0 = elevated, < 1.0 = quiet.
+
+        Replaces TradingView's ``relative_volume_10d_calc`` which is
+        session-cumulative and structurally low all morning for SPY/QQQ
+        — making the legacy ``trend_rvol`` / ``credit_rvol`` thresholds
+        effectively unreachable for benchmark ETFs before 14:00. This
+        score is computed from streamed bars and:
+
+          * 60% volume momentum: sum(last 5 bars) / (sum(prior 15 bars) / 3)
+            — recent vs prior averaged-per-5-bars, catches in-session
+            volume surges without baseline calibration.
+          * 40% ATR expansion: current atr14 / median(last 20 bars atr14)
+            — catches volatility expansion even when volume alone might
+            lie (illiquid spikes, etc).
+
+        Returns 1.0 (neutral) when the frame is None/insufficient or
+        when columns are missing — fails open, doesn't crash entry."""
+        if frame is None or len(frame) < 20:
+            return 1.0
+        try:
+            if "volume" in frame.columns:
+                recent_vol = float(frame.tail(5)["volume"].sum())
+                prior_vol = float(frame.iloc[-20:-5]["volume"].sum())
+                vol_momentum = recent_vol / max(prior_vol / 3.0, 1.0)
+            else:
+                vol_momentum = 1.0
+            if "atr14" in frame.columns:
+                atr_tail = frame["atr14"].dropna().tail(20)
+                atr_current = float(atr_tail.iloc[-1]) if len(atr_tail) > 0 else 0.0
+                atr_baseline = float(atr_tail.median()) if len(atr_tail) >= 5 else 0.0
+                atr_expansion = atr_current / max(atr_baseline, 0.01) if atr_baseline > 0 else 1.0
+            else:
+                atr_expansion = 1.0
+        except Exception:
+            return 1.0
+        return 0.6 * vol_momentum + 0.4 * atr_expansion
+
     def _regime_confirm(self, candidate: Candidate, bars: dict[str, pd.DataFrame], data) -> dict[str, Any]:
         p = self.params
         sr_cfg = getattr(self.config, "support_resistance", None)
@@ -463,6 +505,14 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         candidate_effective_rvol = self._effective_relative_volume(underlying, candidate_rvol, p, cap_default=2.5, standard_floor=1.0)
         candidate_rvol_profile = rvol_profile_for_symbol(underlying, p or {})
         candidate_day_move = self._safe_pct(candidate.metadata.get("change_from_open"))
+        # Live activity score (2026-05-14) — replaces TV cumulative RVOL
+        # for 0DTE gating and bonus scoring. Self-normalizing against
+        # the symbol's own last 20 bars, so it works the same morning
+        # vs afternoon and isn't biased low for benchmark ETFs. The TV
+        # candidate_rvol is still computed above and stamped in metadata
+        # for dashboard visibility, just no longer used as a decision
+        # input.
+        activity_score = self._live_activity_score(u)
 
         max_vix = float(self.optcfg.max_vix)
         # Lower-bound VIX floor. 0.0 (default) disables the gate for
@@ -502,8 +552,12 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 reasons.append(_reason_with_values("iv_rank_too_high", current=iv_rank, required=max_iv_rank, op="<=", digits=2))
         if abs(vix_pct) >= vix_spike_pct:
             reasons.append(_reason_with_values("vix_spike", current=abs(vix_pct), required=vix_spike_pct, op="<", digits=4))
-        if candidate_rvol < min_candidate_rvol_required:
-            reasons.append(_reason_with_values("weak_relative_volume", current=candidate_rvol, required=min_candidate_rvol_required, op=">=", digits=2))
+        # Live activity gate (replaces legacy weak_relative_volume gate that
+        # used TV cumulative RVOL — see _live_activity_score docstring for
+        # why that was unreachable for benchmark ETFs).
+        min_activity = float(p.get("min_activity_for_entry", 0.0))
+        if min_activity > 0.0 and activity_score < min_activity:
+            reasons.append(_reason_with_values("dead_tape", current=activity_score, required=min_activity, op=">=", digits=2))
         if u_range_pct >= chaos_intraday_range_pct and u_flip_count >= chop_flip_min:
             reasons.append(
                 _reason_with_values(
@@ -609,7 +663,9 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         bull_score += 1.0 if u_ret5 >= float(p.get("trend_min_ret5", 0.0008)) else 0.0
         bull_score += 1.0 if u_ret15 >= float(p.get("trend_min_ret15", 0.0014)) else 0.0
         bull_score += 1.0 if u_above_frac >= float(p.get("trend_above_vwap_frac", 0.75)) else 0.0
-        bull_score += 0.75 if candidate_effective_rvol >= float(p.get("trend_rvol", 1.25)) else 0.0
+        # Trend activity bonus — replaces legacy trend_rvol check that was
+        # structurally unreachable for SPY/QQQ (cumulative TV-RVOL).
+        bull_score += 0.75 if activity_score >= float(p.get("trend_activity_threshold", 1.15)) else 0.0
         bull_score += 1.0 if idx_bullish else (-0.5 if require_index_confirmation and idx_available else 0.0)
         bull_score += 1.25 if pattern_ctx.matched_bullish_continuation else 0.0
         bull_score += 0.75 if pattern_ctx.matched_bullish_reversal and u_vwap_dist >= 0 else 0.0
@@ -633,7 +689,8 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         bear_score += 1.0 if u_ret5 <= -float(p.get("trend_min_ret5", 0.0008)) else 0.0
         bear_score += 1.0 if u_ret15 <= -float(p.get("trend_min_ret15", 0.0014)) else 0.0
         bear_score += 1.0 if u_below_frac >= float(p.get("trend_above_vwap_frac", 0.75)) else 0.0
-        bear_score += 0.75 if candidate_effective_rvol >= float(p.get("trend_rvol", 1.25)) else 0.0
+        # Trend activity bonus (symmetric with bull side).
+        bear_score += 0.75 if activity_score >= float(p.get("trend_activity_threshold", 1.15)) else 0.0
         bear_score += 1.0 if idx_bearish else (-0.5 if require_index_confirmation and idx_available else 0.0)
         bear_score += 1.25 if pattern_ctx.matched_bearish_continuation else 0.0
         bear_score += 0.75 if pattern_ctx.matched_bearish_reversal and u_vwap_dist <= 0 else 0.0
@@ -658,10 +715,15 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         range_score += 1.0 if abs(u_day_ret) <= float(p.get("credit_max_day_move_pct", 0.010)) else 0.0
         range_score += 1.0 if u_flip_count >= int(p.get("chop_flip_min", 4)) else 0.0
         range_score += 0.75 if idx_available and idx_range else 0.0
-        range_score += 0.5 if candidate_effective_rvol >= float(p.get("credit_min_rvol", 0.90)) else 0.0
+        # Range/credit activity bonus — moderate activity is the credit
+        # sweet spot (theta-friendly tape). Floor + ceiling replace the
+        # legacy credit_min_rvol / credit_max_rvol thresholds.
+        range_score += 0.5 if activity_score >= float(p.get("credit_activity_min", 0.80)) else 0.0
         range_score -= 0.50 if pattern_ctx.matched_bullish_continuation or pattern_ctx.matched_bearish_continuation else 0.0
         range_score -= 0.25 if pattern_ctx.matched_bullish_reversal or pattern_ctx.matched_bearish_reversal else 0.0
-        range_score -= 1.0 if candidate_effective_rvol >= float(p.get("credit_max_rvol", 2.50)) else 0.0
+        # Too-active tape kills credit setups (likely directional move
+        # incoming, not range).
+        range_score -= 1.0 if activity_score >= float(p.get("credit_activity_max", 1.40)) else 0.0
         range_score -= 1.0 if abs(candidate_day_move) >= float(p.get("credit_max_day_move_pct", 0.010)) else 0.0
         range_score -= 1.0 if abs(vix_pct) >= float(p.get("credit_max_vix_change_pct", 0.015)) else 0.0
         range_score += sr_weight * 0.30 if sr_ctx.near_support and sr_ctx.near_resistance else 0.0
@@ -804,6 +866,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 "candidate_effective_rvol": candidate_effective_rvol,
                 "candidate_rvol_profile": candidate_rvol_profile,
                 "candidate_rvol_required": min_candidate_rvol_required,
+                "live_activity_score": activity_score,
                 "candidate_change_from_open": candidate_day_move,
                 "vix": vix_last,
                 "vix_pct": vix_pct,

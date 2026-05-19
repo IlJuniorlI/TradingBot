@@ -575,7 +575,22 @@ strategies:
       trend_end_time: "13:40"
       trend_min_ret15: 0.0015
       trend_min_ret5: 0.0009
-      trend_rvol: 1.3
+      trend_rvol: 1.3                        # 2026-05-14: NO LONGER GATING — kept for metadata stamping. Replaced by trend_activity_threshold below.
+      # Live activity score thresholds (2026-05-14). Replaces TV
+      # cumulative RVOL in 0DTE gating and bonus scoring. Self-
+      # normalizes against the symbol's own last 20 bars, so it
+      # works the same morning vs afternoon and isn't biased low
+      # for benchmark ETFs.
+      #   * min_activity_for_entry: hard gate (0.0 = disabled).
+      #   * trend_activity_threshold: trend bonus when activity
+      #     >= threshold. 1.15 = 15% above baseline.
+      #   * credit_activity_min / max: range/credit setups want
+      #     MODERATE activity — too quiet = no theta to capture,
+      #     too active = directional move incoming (kills range).
+      min_activity_for_entry: 0.0
+      trend_activity_threshold: 1.15
+      credit_activity_min: 0.80
+      credit_activity_max: 1.30
       trend_start_time: "10:05"
       trend_vwap_distance_pct: 0.0015
       trend_vwap_lookback: 10

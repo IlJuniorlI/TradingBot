@@ -33,6 +33,40 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **0DTE option strategies: live activity score replaces TV cumulative RVOL.** *2026-05-14*
+  - TradingView's `relative_volume_10d_calc` is session-cumulative
+    (today_so_far / 10d-avg-daily), so SPY/QQQ structurally read low
+    all morning and only approach normal RVOL late in the day. That
+    made the legacy `trend_rvol: 1.25` threshold effectively
+    unreachable for benchmark ETFs during 0DTE entry windows — the
+    trend-confirmation bonus was disabled-by-accident for the very
+    symbols this strategy targets.
+  - Added `_live_activity_score(frame)` to the parent zero_dte_etf_
+    options strategy. Computes from streamed bars:
+    - 60% volume momentum: `sum(last 5 bars) / (sum(prior 15) / 3)`
+      — recent vs prior on a per-5-bars-equivalent basis
+    - 40% ATR expansion: `current_atr14 / median(last 20 atr14)`
+    - 1.0 = neutral (normal pace for this symbol's last 20 bars).
+  - Replaced four use sites in `_regime_confirm`:
+    - Hard gate `weak_relative_volume` → `dead_tape` (default
+      `min_activity_for_entry: 0.0` = disabled; SPY/QQQ are always
+      live so the gate is opt-in)
+    - Trend bonus (bull/bear) → `activity_score >=
+      trend_activity_threshold` (default 1.15)
+    - Credit bonus → `activity_score >= credit_activity_min` (0.80)
+    - Credit penalty → `activity_score >= credit_activity_max` (1.40)
+  - New OptionsConfig knobs surface in both 0DTE yamls. Strategy-
+    specific tuning:
+    - `config.zero_dte_etf_long_options.yaml`: `trend_activity_
+      threshold: 1.20` (long premium needs more elevation than
+      credit spreads)
+    - `config.zero_dte_etf_options.yaml`: `trend_activity_threshold:
+      1.15`, `credit_activity_min: 0.80`, `credit_activity_max: 1.30`
+  - `candidate_rvol` / `candidate_effective_rvol` are still stamped
+    in metadata for dashboard / log visibility. They no longer
+    influence entry decisions for 0DTE — replaced wholesale by the
+    self-normalizing activity score.
+
 - **0DTE option strategies: IV-rank gate + adaptive credit-spread width.** *2026-05-14*
   - **IV-rank gate** — normalizes current VIX against a user-provided
     52-week range rather than using absolute VIX level. Useful because
