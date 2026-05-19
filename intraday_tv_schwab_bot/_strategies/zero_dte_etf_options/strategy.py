@@ -723,7 +723,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         range_score -= 0.25 if pattern_ctx.matched_bullish_reversal or pattern_ctx.matched_bearish_reversal else 0.0
         # Too-active tape kills credit setups (likely directional move
         # incoming, not range).
-        range_score -= 1.0 if activity_score >= float(p.get("credit_activity_max", 1.40)) else 0.0
+        range_score -= 1.0 if activity_score >= float(p.get("credit_activity_max", 1.30)) else 0.0
         range_score -= 1.0 if abs(candidate_day_move) >= float(p.get("credit_max_day_move_pct", 0.010)) else 0.0
         range_score -= 1.0 if abs(vix_pct) >= float(p.get("credit_max_vix_change_pct", 0.015)) else 0.0
         range_score += sr_weight * 0.30 if sr_ctx.near_support and sr_ctx.near_resistance else 0.0

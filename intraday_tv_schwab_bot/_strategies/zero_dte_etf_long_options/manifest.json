@@ -44,6 +44,8 @@
     "trend_rvol": 1.25,
     "credit_min_rvol": 0.88,
     "credit_max_rvol": 1.9,
+    "min_activity_for_entry": 0.0,
+    "trend_activity_threshold": 1.20,
     "trend_vwap_distance_pct": 0.0014,
     "trend_ema_gap_pct": 0.0007,
     "trend_above_vwap_frac": 0.74,
