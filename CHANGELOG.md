@@ -9,6 +9,60 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Scaffold generator: plugin-type-aware templates aligned with today's contract.** *2026-05-19*
+  - `scripts/scaffold_strategy_plugin.py` had drifted from the current
+    plugin contract in four places:
+    1. Scaffolded **equity** yamls inherited a dead `options:` block
+       from the `config.example.yaml` template — directly undoing the
+       same-day cleanup that stripped that block from all 14 existing
+       equity yamls.
+    2. `--plugin-type=option` produced an equity-style screener (TV
+       `Query().where(...rvol >= min_rvol)`) instead of the
+       local-synthesis pattern both real 0DTE strategies use.
+    3. `--plugin-type=option` produced an equity-style `entry_signals`
+       that read `candidate.metadata.relative_volume_10d_calc` (zero
+       under local synthesis) and didn't include
+       `live_activity_score` / `dashboard_directional_bias` public
+       hooks — a new option strategy would render with the stub-33%-red
+       dashboard ring until manually wired.
+    4. Manifest's `capabilities.dashboard.tradable_symbols_source`
+       hardcoded `"params.symbols"` for both plugin types — wrong for
+       option strategies (should be `"options.underlyings"`).
+  - Refactor: split the templates into stock- and option-specific
+    variants. `_stock_strategy_py` / `_option_strategy_py`,
+    `_stock_screener_py` / `_option_screener_py`,
+    `_stock_manifest_params` / `_option_manifest_params`,
+    `_stock_manifest_capabilities` / `_option_manifest_capabilities`,
+    `_full_config_yaml(name, plugin_type)` strips the `options:` block
+    from stock-type scaffolds and keeps it for option-type.
+  - Option-type template produces:
+    - Local-synthesis screener (mirrors `zero_dte_etf_options/screener
+      .py` — synthesizes candidates from `config.options.underlyings`,
+      no TV call).
+    - Strategy class with `live_activity_score(frame)` and
+      `dashboard_directional_bias(frame)` public hooks stubbed with
+      the same fail-open + threshold-based pattern the real 0DTE
+      strategies use.
+    - Manifest with `tradable_symbols_source: options.underlyings`,
+      watchlist `active_sources` declaring all the standard option
+      sources (`options.underlyings`,
+      `options.confirmation_symbols`, `options.volatility_symbol`,
+      plus position-metadata descriptors keyed to the new strategy
+      name), and quote sources for volatility + valuation legs.
+    - YAML scaffolded with the `options:` block kept (option
+      strategies actively need it).
+  - Stock-type template unchanged in shape; only the YAML generation
+    drops the `options:` block.
+  - Fixed a latent encoding bug in `Path.write_text(content)` —
+    without `encoding="utf-8"` Windows writes em-dashes as cp1252
+    bytes (0x97), then py_compile reads as UTF-8 and chokes. New
+    option template uses em-dashes in its docstrings; explicit
+    UTF-8 encoding now applied to all write_text + read_text calls.
+  - Smoke-test asserts: both scaffolds compile, both manifests are
+    valid JSON, both yamls are valid YAML, all 12 contract checks
+    pass (options-block presence, manifest source declarations,
+    public hook presence, local-synthesis vs TV-query).
+
 - **Plugin abstraction: live-publish hooks promoted to public + duck-typed dispatch.** *2026-05-19*
   - The candidate dashboard-publish resolver (added earlier today) had
     a polymorphism leak: `engine._publish_state` gated the live
