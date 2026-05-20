@@ -31,7 +31,110 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     HTF that's ~1500 bars — way more than needed for HTF structure
     detection. Reduced to 15 (matching parent) for ~390 bars.
 
+### Fixed
+
+- **Dashboard chart: drop canvas-drawn plot-area grid.** *2026-05-19*
+  - The chart paint loop was drawing 5 horizontal + 6 vertical grid
+    lines on the canvas at fixed proportions of the plot area. With
+    the radial-masked CSS overlay grid on `.chart-wrap::before` (32px-
+    spaced, theme-aware) the two grids stacked at different spacings
+    and the outermost canvas lines doubled as a fake inner border —
+    "extra grid + duplicate border" against the new gradient chart
+    background.
+  - Removed the canvas grid; CSS now owns the grid + outer border
+    exclusively. Canvas draws data, axes, and overlays only. The
+    `tintRgb` resolution stayed (still used by the time-axis ticks).
+  - `dashboard.js` `paint()` loses 15 lines of strokeStyle/lineWidth
+    + two for-loops. No data path or tooltip/hover math changed.
+
+- **Mobile candidate activity-score display: use shared scorePct().** *2026-05-19*
+  - Mobile was using `Math.round(clamp(score, 0, 1) * 100)` for the
+    score readout. With the new tape-aware live activity score (often
+    1.5–3.0+ for option strategies), every value clamped to 1.0 and
+    every candidate showed 100. Same log-scaled mapping the desktop
+    candidate ring uses is now shared via `helpers.js`.
+  - Promoted `scorePct(score)` from `dashboard.js` to `helpers.js` so
+    both renderers reference one implementation. `dashboard.js`
+    references the shared version (definition removed locally).
+
+- **Engine `_publish_state`: NaN/Side type guards on live candidate scoring.** *2026-05-19*
+  - The newly-added live activity_score and directional_bias
+    resolvers (see Added below) had two latent crash paths:
+    1. `float(live_score_fn(frame))` accepted NaN/+Inf silently; those
+       would propagate through `_json_safe` → `null` and break the
+       candidate ring render instead of falling back to the stub.
+       Added `math.isfinite` guard; non-finite results keep the
+       candidate stub (1.0).
+    2. `directional_bias_for_row.value` was outside the try/except
+       block — a subclass returning a string (`"LONG"`) instead of
+       `Side.LONG` would crash the entire publish loop and freeze
+       dashboard updates until restart. Added `isinstance(_, Side)`
+       guard; non-Side returns keep the candidate's existing bias.
+
+- **0DTE strategy `_regime_confirm`: reuse `u_day_ret` for change_from_open.** *2026-05-19*
+  - The local-synthesis screener change added a duplicate day-move
+    computation using `_same_day_mask` to derive
+    `candidate_day_move`. That implementation didn't distinguish RTH
+    vs extended-hours and reimplemented logic that already existed
+    eight lines above as `u_day_ret` (using `_session_open_price`
+    with proper RTH-first / extended fallback).
+  - Collapsed 18 lines to 1: `candidate_day_move = u_day_ret`. Strict
+    correctness improvement — the canonical helper handles session
+    edge cases the duplicate didn't.
+
+- **0DTE option strategies: bypass TV screener — synthesize candidates locally.** *2026-05-19*
+  - Diagnosis: 2026-05-19 session ran the bot on
+    ``zero_dte_etf_options`` and took 0 trades. Investigation showed
+    the TV screener silently returned 0 rows every cycle (visible as
+    ``Candidate cycle ... count=0 symbols=none`` log lines). The
+    screener uses ``Query().set_markets("america")`` and ``where(c
+    ("name").isin(["SPY", "QQQ"]))`` to pull SPY / QQQ. That pattern
+    works for stocks but appears to silently return empty rows for
+    ETFs under some conditions (no Schwab errors, no TV exceptions —
+    just an empty DataFrame).
+  - The 0DTE screener has been unchanged since the initial commit and
+    was never noticed broken because the bot has been running
+    ``top_tier_adaptive`` for the past sessions. Switching strategies
+    today exposed the bug.
+  - Fix: replaced both screeners (parent + long_options) with PURE
+    LOCAL SYNTHESIS — no TV call. The universe is fixed
+    (``options.underlyings: [SPY, QQQ]``) and these ETFs are always
+    liquid, so a TV existence-check adds zero value. Bypassing also
+    eliminates the silent-failure mode entirely.
+  - Downstream is unaffected: ``_regime_confirm`` already uses
+    ``bars[underlying]`` (Schwab data feed) for all metrics. Live
+    ``change_from_open`` is now computed from today's session bars in
+    the strategy (was previously sourced from the candidate metadata
+    that the TV screener populated). ``relative_volume_10d_calc`` was
+    already deprecated by the live-activity-score replacement (ce2f009).
+  - Together with the live-activity-score work, the 0DTE strategy is
+    now fully Schwab-driven for decisioning — TV is only consulted
+    indirectly via the bars feed (which uses Schwab).
+
 ### Added
+
+- **Dashboard candidates card: live activity_score + directional bias for option strategies.** *2026-05-19*
+  - With the local-synthesis screener, the 0DTE Candidate objects ship
+    with `activity_score=1.0` and `directional_bias=None` stubs because
+    the screener has no access to streamed bars to compute live values.
+    Every SPY/QQQ/IWM candidate tile rendered with a fixed 33% red
+    score ring and a permanent neutral tone — visually identical
+    regardless of tape state.
+  - `engine._publish_state` now resolves both values from the active
+    strategy when it's an option strategy and the strategy exposes
+    `_live_activity_score` / `_dashboard_directional_bias`. Single
+    `data.get_merged` frame fetch shared between both compute paths
+    (cycle cache means no API call).
+  - Added `_dashboard_directional_bias(frame)` to the parent
+    `ZeroDteEtfOptionsStrategy`. Returns `Side.LONG` / `Side.SHORT`
+    when VWAP-distance, EMA9-EMA20 gap, and day-return all align;
+    `None` otherwise. Long-options strategy inherits.
+  - Equity strategies fall through unchanged — their screeners already
+    set real activity_score and directional_bias values.
+  - Equivalent display now: tape-aware ring fill (log-scaled via
+    `helpers.js::scorePct` so the bounded `0..1` ratio maps a 0.5–3.0+
+    multiplier into a readable arc) and LONG/SHORT/neutral tone
+    matching the underlying's current lean.
 
 - **0DTE option strategies: live activity score replaces TV cumulative RVOL.** *2026-05-14*
   - TradingView's `relative_volume_10d_calc` is session-cumulative

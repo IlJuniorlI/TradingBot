@@ -1349,12 +1349,10 @@ function setDockTab(tab) {
   wireDockWheel();
 }
 
-function scorePct(score) {
-  const n = Number(score);
-  if (!Number.isFinite(n)) return 0.18;
-  const scaled = Math.max(12, Math.min(96, Math.log10(Math.abs(n) + 10) * 32));
-  return scaled / 100;
-}
+// scorePct moved to helpers.js so both desktop + mobile candidate
+// renderers can use the same log-scaled mapping. Kept here as a
+// reference so a future reader knows the function exists; the
+// definition is in helpers.js.
 
 function rangePct(price, support, resistance) {
   const p = positiveOrNull(price); const s = positiveOrNull(support); const r = positiveOrNull(resistance);
@@ -2986,26 +2984,19 @@ function drawSelectedChart(snapshot) {
     ctx.clearRect(0, 0, width, height);
     // Read the theme-aware --tint-rgb at paint time. Canvas strokeStyle
     // can't parse `var(...)` directly the way CSS can, so we resolve it
-    // once per paint and template it into rgba() strings below. Falls
-    // back to white tint if the variable isn't set (e.g. when the page
-    // loads before any theme stylesheet attaches).
+    // once per paint and template it into rgba() strings below (used by
+    // the time-axis tick marks further down). Falls back to white tint
+    // if the variable isn't set (e.g. when the page loads before any
+    // theme stylesheet attaches).
+    //
+    // 2026-05-19: removed the canvas-drawn plot-area grid (5 horizontals
+    // + 6 verticals at fixed proportions). It collided with the CSS
+    // `.chart-wrap::before` radial-masked grid, and its outermost lines
+    // doubled as a fake inner border that read like a duplicate panel
+    // frame against the new gradient chart background. CSS handles the
+    // grid + outer border now; canvas only draws data, axes, and
+    // overlays.
     const tintRgb = (getComputedStyle(document.documentElement).getPropertyValue('--tint-rgb') || '255, 255, 255').trim();
-    ctx.strokeStyle = `rgba(${tintRgb}, 0.08)`;
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 4; i += 1) {
-      const y = pad.top + (plotH / 4) * i;
-      ctx.beginPath();
-      ctx.moveTo(pad.left, y);
-      ctx.lineTo(width - pad.right, y);
-      ctx.stroke();
-    }
-    for (let i = 0; i < 6; i += 1) {
-      const x = pad.left + (plotW / 5) * i;
-      ctx.beginPath();
-      ctx.moveTo(x, pad.top);
-      ctx.lineTo(x, height - pad.bottom);
-      ctx.stroke();
-    }
 
     if (activeIndex !== null && activeIndex >= 0 && activeIndex < bars.length) {
       const x = xFor(activeIndex);

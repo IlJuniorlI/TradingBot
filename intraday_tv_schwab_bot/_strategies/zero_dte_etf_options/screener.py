@@ -1,52 +1,57 @@
 # SPDX-License-Identifier: MIT
 from ..shared import (
     Candidate,
-    Side,
-    pd,
 )
 from ..screener_base import BaseStrategyScreener
-from ..rvol import rvol_profile_for_symbol
 
 class ZeroDteEtfOptionsScreener(BaseStrategyScreener):
     strategy_name = 'zero_dte_etf_options'
 
     def run(self) -> list[Candidate]:
+        """Synthesize candidates for the fixed ETF universe without calling
+        TradingView. The 0DTE strategy targets a hardcoded set of liquid
+        ETFs (SPY / QQQ / IWM) that are always tradable — TV adds no
+        value here. Bypassing TV also eliminates a silent-failure mode
+        where TV's america-market scan returns 0 rows for ETFs despite
+        SPY / QQQ being present (observed live on 2026-05-19 — 0 trades
+        all session because of this).
+
+        Downstream decisioning (``_regime_confirm`` in strategy.py) uses
+        ``bars[underlying]`` (Schwab data feed) for ALL metrics:
+          * close / volume / change_from_open computed from the frame
+          * relative_volume_10d_calc replaced by ``_live_activity_score``
+          * confirm_index / volatility_symbol read from config
+        So the candidate object only needs to be PRESENT for the engine
+        to dispatch ``entry_signals`` per underlying. Metadata stubs are
+        populated for dashboard/log surface area only — the strategy
+        recomputes the real values from bars before scoring.
+        """
         if not bool(self.config.options.enabled):
             return []
-        underlyings = sorted(set(self.config.options.underlyings))
+        underlyings = list(self.config.options.underlyings)
         if not underlyings:
             return []
-        c = self._column
-        q = (
-            self._base_query(limit=max(10, len(underlyings)))
-            .select(*self._select_fields("name", "description", "exchange", "close", "volume", "relative_volume_10d_calc", "change_from_open"))
-            .where(
-                c("name").isin(underlyings),
-                c("close") >= self.config.options.min_underlying_price,
-                c("exchange") != "OTC",
-                c("volume") >= 100_000,
-            )
-        )
-        df = self._execute(q)
-        if df.empty:
-            return []
-        rows = []
-        for _, row in df.iterrows():
-            rec = self._row_metadata(row)
-            underlying_symbol = self._symbol_from_ticker(str(rec.get("name") or "")).upper().strip()
-            rec["confirm_index"] = self.config.options.confirmation_symbols.get(underlying_symbol, None)
-            raw_relative_volume = float(rec.get("relative_volume_10d_calc", 1.0) or 1.0)
-            effective_relative_volume = self._effective_relative_volume(underlying_symbol, raw_relative_volume, None, cap_default=2.5, standard_floor=1.0)
-            rec["rvol_profile"] = rvol_profile_for_symbol(underlying_symbol, {})
-            rec["activity_relative_volume"] = float(effective_relative_volume)
-            rec["raw_relative_volume_10d_calc"] = float(raw_relative_volume)
-            rec["activity_score"] = abs(float(rec.get("change_from_open", 0.0))) * effective_relative_volume
-            rows.append(rec)
-        sdf = pd.DataFrame(rows).sort_values(["activity_score", "change_from_open"], ascending=[False, False]).head(self.config.tradingview.max_candidates)
+        confirmation_map = dict(self.config.options.confirmation_symbols or {})
         out: list[Candidate] = []
-        for rank, (_, row) in enumerate(sdf.iterrows(), start=1):
-            symbol = self._symbol_from_ticker(str(row.get("name")))
-            metadata = self._row_metadata(row)
-            directional_bias = Side.LONG if float(metadata.get("change_from_open", 0.0)) >= 0 else Side.SHORT
-            out.append(Candidate(symbol=symbol, strategy=self.strategy_name, rank=rank, activity_score=float(metadata.get("activity_score", 0.0)), directional_bias=directional_bias, metadata=metadata))
+        for rank, symbol in enumerate(underlyings, start=1):
+            sym = str(symbol or "").upper().strip()
+            if not sym:
+                continue
+            metadata = {
+                "name": sym,
+                "confirm_index": confirmation_map.get(sym),
+                # Stub values; _regime_confirm computes live metrics from
+                # the underlying's frame. Kept here as non-None defaults
+                # so dashboard / log payloads don't render as "—".
+                "change_from_open": 0.0,
+                "relative_volume_10d_calc": 1.0,
+            }
+            out.append(Candidate(
+                symbol=sym,
+                strategy=self.strategy_name,
+                rank=rank,
+                activity_score=1.0,
+                directional_bias=None,
+                metadata=metadata,
+            ))
         return out

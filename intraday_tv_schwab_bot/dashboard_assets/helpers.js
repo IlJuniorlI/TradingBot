@@ -22,6 +22,20 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+// Log-scaled 0..1 score for the candidate ring + mobile score display.
+// Input is an unbounded multiplier (typically 0.5..3.0 for live activity
+// scores, but the strategy can return larger values during surge tape).
+// Output is clamped to 0.12..0.96 so even very high scores stay legible
+// in the ring track and very low scores still draw something. Returns
+// 0.18 (the empty/neutral fallback) for non-finite input so missing-data
+// candidates render with a default track instead of a black ring.
+function scorePct(score) {
+  const n = Number(score);
+  if (!Number.isFinite(n)) return 0.18;
+  const scaled = Math.max(12, Math.min(96, Math.log10(Math.abs(n) + 10) * 32));
+  return scaled / 100;
+}
+
 function escapeHtml(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;')

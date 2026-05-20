@@ -24,8 +24,8 @@ from .dashboard import DashboardServer
 from .data_feed import MarketDataStore, NON_STREAMABLE
 from .entry_gatekeeper import EntryGatekeeper
 from .execution import SchwabExecutor
-from .models import Candidate, Position
-from ._strategies.registry import option_strategy_names
+from .models import Candidate, Position, Side
+from ._strategies.registry import is_option_strategy, option_strategy_names
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .position_metrics import safe_float
@@ -1032,14 +1032,55 @@ class IntradayBot:
             if normalized_exchange:
                 symbol_exchanges[symbol_key] = normalized_exchange
 
+        # Live activity-score + directional-bias resolvers for the
+        # dashboard candidates card. Option strategies (zero_dte_etf_*)
+        # synthesize candidates locally without TV, so c.activity_score
+        # is a stub (1.0) and c.directional_bias is None (renders as
+        # neutral). The strategy's own _live_activity_score and
+        # _dashboard_directional_bias methods compute tape-aware values
+        # from streamed bars — we mirror them here so candidate tiles
+        # show useful score rings + LONG/SHORT/neutral tones for
+        # SPY/QQQ/IWM instead of a fixed 33% red ring and a permanent
+        # neutral tone. Equity strategies fall through (c.activity_score
+        # and c.directional_bias are already the screener's real
+        # values). Both compute paths share a single frame fetch.
+        is_option_publish = is_option_strategy(self.config.strategy)
+        live_score_fn = getattr(self.strategy, '_live_activity_score', None) if is_option_publish else None
+        live_bias_fn = getattr(self.strategy, '_dashboard_directional_bias', None) if is_option_publish else None
         all_candidate_rows: list[dict[str, Any]] = []
         for c in self.last_candidates:
             remember_exchange(c.symbol, c.metadata.get("exchange"))
             exchange = dashboard_normalize_exchange(c.metadata.get("exchange"))
+            activity_score_for_row = c.activity_score
+            directional_bias_for_row = c.directional_bias
+            if live_score_fn is not None or live_bias_fn is not None:
+                try:
+                    frame = self.data.get_merged(c.symbol, with_indicators=True)
+                    if live_score_fn is not None:
+                        live_score = float(live_score_fn(frame))
+                        # Reject NaN / +/-Inf — _live_activity_score is
+                        # designed to fail-open at 1.0 (neutral) but a
+                        # subclass override could regress, and downstream
+                        # _json_safe would silently coerce to null and
+                        # break the score ring rather than the candidate
+                        # stub of 1.0 the rest of the system expects.
+                        if math.isfinite(live_score):
+                            activity_score_for_row = live_score
+                    if live_bias_fn is not None:
+                        live_bias = live_bias_fn(frame)
+                        # Type guard — only accept Side enum members.
+                        # Defends against a subclass returning a string
+                        # ("LONG") or other shape that would crash the
+                        # ``.value`` deref below and kill the entire
+                        # publish loop.
+                        if isinstance(live_bias, Side):
+                            directional_bias_for_row = live_bias
+                except Exception:
+                    LOG.debug("Dashboard live-publish compute failed for %s; using candidate stubs.", c.symbol, exc_info=True)
             row = {
                 "symbol": c.symbol,
                 "rank": c.rank,
-                "activity_score": c.activity_score,
+                "activity_score": activity_score_for_row,
                 "exchange": exchange or None,
                 "change_from_open": c.metadata.get("change_from_open"),
                 # ``change`` (prior-close-relative) is shipped alongside
@@ -1052,7 +1093,7 @@ class IntradayBot:
                 "change": c.metadata.get("change"),
                 "close": c.metadata.get("close"),
                 "volume": c.metadata.get("volume"),
-                "directional_bias": c.directional_bias.value if c.directional_bias else None,
+                "directional_bias": directional_bias_for_row.value if directional_bias_for_row else None,
             }
             all_candidate_rows.append(row)
             if len(candidates) < candidate_limit:

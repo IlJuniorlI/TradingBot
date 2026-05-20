@@ -293,10 +293,13 @@
       const snap = snapshotsByKey.get(sym) || {};
       const bias = String(row.directional_bias || '').toUpperCase();
       const tone = bias === 'SHORT' ? 'tone-short' : (bias === 'LONG' ? 'tone-long' : 'tone-neutral');
-      // Activity score is a 0-1 ratio on most payloads; clamp + scale to
-      // a 0-100 integer for compact display.
+      // Activity score is an unbounded multiplier (live tape can push it
+      // well above 1.0 for option strategies — see engine._publish_state
+      // and ZeroDteEtfOptionsStrategy._live_activity_score). Use the
+      // shared log-scaled scorePct() so the mobile readout matches the
+      // desktop candidate ring and stays legible across the full range.
       const score = numOrNull(row.activity_score);
-      const scoreDisplay = score === null ? '—' : Math.round(clamp(score, 0, 1) * 100);
+      const scoreDisplay = score === null ? '—' : Math.round(scorePct(score) * 100);
       // Live-first display: prefer streamed Schwab quote when present.
       const liveChange = numOrNull(snap?.quote?.percent_change) ?? numOrNull(row.change) ?? numOrNull(row.change_from_open);
       const liveLast = numOrNull(snap?.quote?.last) ?? numOrNull(row.close);

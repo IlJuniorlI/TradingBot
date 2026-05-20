@@ -435,6 +435,57 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return 1.0
         return 0.6 * vol_momentum + 0.4 * atr_expansion
 
+    def _dashboard_directional_bias(self, frame: pd.DataFrame | None) -> Side | None:
+        """Quick directional read for the dashboard candidate tile.
+
+        Returns ``Side.LONG`` / ``Side.SHORT`` when the underlying's
+        VWAP distance, EMA9-vs-EMA20 gap, and session day-return all
+        agree on a direction; returns None (neutral) when they
+        disagree or the frame is insufficient.
+
+        This is a *display* heuristic — the strategy's actual entry
+        decision (``_regime_confirm``) runs additional gates (HTF
+        alignment, index confirmation, regime score, SR context,
+        candle bias, IV rank, etc.) before committing to a side. The
+        candidate tile color reflects the dominant tape lean so the
+        trader can see which side the strategy is biased toward
+        without waiting for an entry-window cycle to complete. A
+        tile that shows LONG here may still be skipped at entry if
+        e.g. SPX disagrees with SPY — neutral here means "no strong
+        lean," not "would never enter".
+
+        Thresholds reuse the strategy's own ``trend_vwap_distance_pct``
+        / ``trend_ema_gap_pct`` so the dashboard lean tracks the same
+        signal strengths the strategy uses internally.
+        """
+        if frame is None or frame.empty or len(frame) < 5:
+            return None
+        try:
+            last = frame.iloc[-1]
+            close = _safe_float(last.get("close"), 0.0)
+            if close <= 0:
+                return None
+            vwap = _safe_float(last.get("vwap"), close)
+            ema9 = _safe_float(last.get("ema9"), close)
+            ema20 = _safe_float(last.get("ema20"), close)
+            vwap_dist = (close - vwap) / close
+            ema_gap = (ema9 - ema20) / close
+            p = self.params
+            vwap_thresh = float(p.get("trend_vwap_distance_pct", 0.0016))
+            ema_thresh = float(p.get("trend_ema_gap_pct", 0.00075))
+            session_day = now_et().date()
+            u_open = _session_open_price(frame, session_day, regular_session_only=True)
+            if u_open is None:
+                u_open = _session_open_price(frame, session_day, regular_session_only=False)
+            day_ret = ((close / u_open) - 1.0) if u_open and u_open > 0 else 0.0
+            if vwap_dist >= vwap_thresh and ema_gap >= ema_thresh and day_ret > 0:
+                return Side.LONG
+            if vwap_dist <= -vwap_thresh and ema_gap <= -ema_thresh and day_ret < 0:
+                return Side.SHORT
+        except Exception:
+            return None
+        return None
+
     def _regime_confirm(self, candidate: Candidate, bars: dict[str, pd.DataFrame], data) -> dict[str, Any]:
         p = self.params
         sr_cfg = getattr(self.config, "support_resistance", None)
@@ -504,7 +555,13 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         candidate_rvol = _safe_float(candidate.metadata.get("relative_volume_10d_calc"), 0.0)
         candidate_effective_rvol = self._effective_relative_volume(underlying, candidate_rvol, p, cap_default=2.5, standard_floor=1.0)
         candidate_rvol_profile = rvol_profile_for_symbol(underlying, p or {})
-        candidate_day_move = self._safe_pct(candidate.metadata.get("change_from_open"))
+        # change_from_open: candidate.metadata stub (0.0) is bypassed in
+        # favor of u_day_ret computed above from Schwab session bars via
+        # _session_open_price (RTH-first with extended-hours fallback).
+        # See 2026-05-19 fix — TV-sourced day-move metadata is no longer
+        # trusted for ETF underlyings since the screener was switched to
+        # local candidate synthesis.
+        candidate_day_move = u_day_ret
         # Live activity score (2026-05-14) — replaces TV cumulative RVOL
         # for 0DTE gating and bonus scoring. Self-normalizing against
         # the symbol's own last 20 bars, so it works the same morning
