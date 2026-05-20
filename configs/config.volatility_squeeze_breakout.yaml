@@ -417,60 +417,6 @@ shared_exit:
 
 # Options-mode filters, pricing, and contract-selection controls.
   use_candle_pattern_exit: false
-options:
-  enabled: true
-  underlyings:
-    - SPY
-    - QQQ
-  confirmation_symbols:
-    SPY: "$SPX"
-    QQQ: "$COMPX"
-    IWM: "$RUT"
-  volatility_symbol: VIX
-  styles:
-    - orb_debit_spread
-    - trend_debit_spread
-    - midday_credit_spread
-  min_underlying_price: 100.0
-  min_option_volume: 300
-  min_open_interest: 600
-  max_bid_ask_spread_pct: 0.1
-  max_leg_spread_dollars: 0.08
-  max_net_spread_pct: 0.2
-  max_net_spread_price: 2.8
-  min_net_mid_price: 0.25
-  target_long_delta: 0.38
-  target_short_delta: 0.23
-  target_single_delta: 0.28
-  max_single_option_price: 2.25
-  option_limit_mode: mid
-  strike_width_by_symbol:
-    SPY: 2.0
-    QQQ: 2.0
-    IWM: 1.0
-  max_contracts_per_trade: 1
-  max_loss_per_trade: 200.0
-  debit_stop_frac: 0.45
-  debit_target_mult: 1.45
-  credit_stop_mult: 1.65
-  credit_target_frac: 0.32
-  single_stop_frac: 0.38
-  single_target_mult: 1.5
-  force_flatten_time: "15:18"
-  max_vix: 22.5
-  vix_spike_pct: 0.011
-  vertical_limit_mode: mid
-  quote_stability_checks: 3
-  quote_stability_pause_ms: 500
-  max_mid_drift_pct: 0.06
-  max_quote_age_seconds: 6
-  dry_run_replace_attempts: 2
-  dry_run_step_frac: 0.25
-  event_blackout_file: ./macro_events.auto.yaml
-  event_blackouts: []
-  option_chain_cache_seconds: 6
-  option_chain_cache_max_entries: 24
-
 # Strategy-specific windows and tuned parameters.
 strategies:
   volatility_squeeze_breakout:

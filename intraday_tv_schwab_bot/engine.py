@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
@@ -25,7 +26,7 @@ from .data_feed import MarketDataStore, NON_STREAMABLE
 from .entry_gatekeeper import EntryGatekeeper
 from .execution import SchwabExecutor
 from .models import Candidate, Position, Side
-from ._strategies.registry import is_option_strategy, option_strategy_names
+from ._strategies.registry import option_strategy_names
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .position_metrics import safe_float
@@ -1033,20 +1034,20 @@ class IntradayBot:
                 symbol_exchanges[symbol_key] = normalized_exchange
 
         # Live activity-score + directional-bias resolvers for the
-        # dashboard candidates card. Option strategies (zero_dte_etf_*)
-        # synthesize candidates locally without TV, so c.activity_score
-        # is a stub (1.0) and c.directional_bias is None (renders as
-        # neutral). The strategy's own _live_activity_score and
-        # _dashboard_directional_bias methods compute tape-aware values
-        # from streamed bars — we mirror them here so candidate tiles
-        # show useful score rings + LONG/SHORT/neutral tones for
-        # SPY/QQQ/IWM instead of a fixed 33% red ring and a permanent
-        # neutral tone. Equity strategies fall through (c.activity_score
-        # and c.directional_bias are already the screener's real
-        # values). Both compute paths share a single frame fetch.
-        is_option_publish = is_option_strategy(self.config.strategy)
-        live_score_fn = getattr(self.strategy, '_live_activity_score', None) if is_option_publish else None
-        live_bias_fn = getattr(self.strategy, '_dashboard_directional_bias', None) if is_option_publish else None
+        # dashboard candidates card. Strategies whose screeners can't
+        # populate real values at screen time (e.g. 0DTE option
+        # strategies that synthesize candidates locally without TV)
+        # opt into engine-side resolution by defining the public
+        # methods ``live_activity_score(frame)`` and
+        # ``dashboard_directional_bias(frame)`` on the strategy class.
+        # Strategies whose screeners DO populate real values (e.g.
+        # equity strategies pulling rvol + change_from_open from TV)
+        # just don't define them — the candidate's existing
+        # activity_score and directional_bias values flow through
+        # unchanged. Pure duck-typing — no plugin-type dispatch
+        # needed. Both compute paths share a single frame fetch.
+        live_score_fn = getattr(self.strategy, 'live_activity_score', None)
+        live_bias_fn = getattr(self.strategy, 'dashboard_directional_bias', None)
         all_candidate_rows: list[dict[str, Any]] = []
         for c in self.last_candidates:
             remember_exchange(c.symbol, c.metadata.get("exchange"))
@@ -1058,7 +1059,7 @@ class IntradayBot:
                     frame = self.data.get_merged(c.symbol, with_indicators=True)
                     if live_score_fn is not None:
                         live_score = float(live_score_fn(frame))
-                        # Reject NaN / +/-Inf — _live_activity_score is
+                        # Reject NaN / +/-Inf — live_activity_score is
                         # designed to fail-open at 1.0 (neutral) but a
                         # subclass override could regress, and downstream
                         # _json_safe would silently coerce to null and

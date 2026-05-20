@@ -106,10 +106,6 @@ Current code defaults:
 | `trend_vwap_lookback`                | `10`                 |
 | `flip_lookback`                      | `14`                 |
 | `range_lookback`                     | `25`                 |
-| `min_candidate_rvol`                 | `1.15`               |
-| `trend_rvol`                         | `1.25`               |
-| `credit_min_rvol`                    | `0.88`               |
-| `credit_max_rvol`                    | `1.9`                |
 | `trend_vwap_distance_pct`            | `0.0014`             |
 | `trend_ema_gap_pct`                  | `0.0007`             |
 | `trend_above_vwap_frac`              | `0.74`               |
@@ -168,8 +164,8 @@ Common parameter families:
   - `orb_apply_sr_veto` (default `true`): blocks ORB entries trapped against the wrong side of broken SR levels (`_blocks_bullish_sr_entry` / `_blocks_bearish_sr_entry`).
 - Minimum data:
   - `min_bars`, `min_confirm_bars`, `trend_vwap_lookback`, `flip_lookback`, `range_lookback`
-- RVOL / tape filters:
-  - `min_candidate_rvol`, `trend_rvol`, `credit_min_rvol`, `credit_max_rvol`
+- Live tape filters (replace legacy TV cumulative RVOL — 2026-05-14):
+  - `min_activity_for_entry`, `trend_activity_threshold`, `credit_activity_min`, `credit_activity_max`. See parent `zero_dte_etf_options/README.md` for the full description.
 - Trend scoring:
   - `trend_vwap_distance_pct`, `trend_ema_gap_pct`, `trend_above_vwap_frac`, `trend_min_ret5`, `trend_min_ret15`
 - Range / chop scoring:

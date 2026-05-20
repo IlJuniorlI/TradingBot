@@ -109,10 +109,6 @@ Current code defaults:
 | `trend_vwap_lookback`         | `10`                 |
 | `flip_lookback`               | `14`                 |
 | `range_lookback`              | `25`                 |
-| `min_candidate_rvol`          | `1.18`               |
-| `trend_rvol`                  | `1.3`                |
-| `credit_min_rvol`             | `0.95`               |
-| `credit_max_rvol`             | `1.65`               |
 | `trend_vwap_distance_pct`     | `0.0015`             |
 | `trend_ema_gap_pct`           | `0.0007`             |
 | `trend_above_vwap_frac`       | `0.76`               |
@@ -160,8 +156,11 @@ Common parameter families:
   - `orb_end_time`, `trend_start_time`, `trend_end_time`, `no_new_entries_after`
 - Minimum data:
   - `min_bars`, `min_confirm_bars`, `trend_vwap_lookback`, `flip_lookback`, `range_lookback`
-- RVOL / tape filters:
-  - `min_candidate_rvol`, `trend_rvol`, `credit_min_rvol`, `credit_max_rvol`
+- Live tape filters (replace legacy TV cumulative RVOL — 2026-05-14):
+  - `min_activity_for_entry`: hard floor; `0.0` (disabled) by default for SPY/QQQ which are always live.
+  - `trend_activity_threshold`: activity required to add the trend score bonus.
+  - `credit_activity_min` / `credit_activity_max`: window where credit-spread setups get the bonus; outside this range range-scoring is penalized.
+  - All are evaluated against `live_activity_score(frame)` (public hook on the strategy class — see `_strategies/README.md` "Extension hooks"): 60% volume momentum (last 5 vs prior 15) + 40% ATR expansion (current atr14 vs 20-bar median). Self-normalizing; 1.0 = neutral pace for the symbol.
 - Trend scoring:
   - `trend_vwap_distance_pct`, `trend_ema_gap_pct`, `trend_above_vwap_frac`, `trend_min_ret5`, `trend_min_ret15`
 - Range / chop scoring:

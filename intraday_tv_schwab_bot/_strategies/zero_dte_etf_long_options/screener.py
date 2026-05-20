@@ -29,9 +29,9 @@ class ZeroDteEtfLongOptionsScreener(BaseStrategyScreener):
             metadata = {
                 "name": sym,
                 "confirm_index": confirmation_map.get(sym),
-                "change_from_open": 0.0,
-                "relative_volume_10d_calc": 1.0,
             }
+            # change_from_open / relative_volume_10d_calc stubs were
+            # dropped (2026-05-19) — see parent screener docstring.
             out.append(Candidate(
                 symbol=sym,
                 strategy=self.strategy_name,

@@ -51,7 +51,6 @@ from ..shared import (
     yaml,
 )
 from ..strategy_base import BaseStrategy
-from ..rvol import rvol_profile_for_symbol
 
 class ZeroDteEtfOptionsStrategy(BaseStrategy):
     strategy_name = 'zero_dte_etf_options'
@@ -394,7 +393,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         return summary
 
     @staticmethod
-    def _live_activity_score(frame: pd.DataFrame | None) -> float:
+    def live_activity_score(frame: pd.DataFrame | None) -> float:
         """Self-normalizing "is the tape live right now?" score for 0DTE.
 
         Returns a unitless multiplier where 1.0 = neutral (normal pace
@@ -413,9 +412,9 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             — catches volatility expansion even when volume alone might
             lie (illiquid spikes, etc).
 
-        Returns 1.0 (neutral) when the frame is None/insufficient or
-        when columns are missing — fails open, doesn't crash entry."""
-        if frame is None or len(frame) < 20:
+        Returns 1.0 (neutral) when the frame is None/empty/insufficient
+        or when columns are missing — fails open, doesn't crash entry."""
+        if frame is None or frame.empty or len(frame) < 20:
             return 1.0
         try:
             if "volume" in frame.columns:
@@ -435,7 +434,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return 1.0
         return 0.6 * vol_momentum + 0.4 * atr_expansion
 
-    def _dashboard_directional_bias(self, frame: pd.DataFrame | None) -> Side | None:
+    def dashboard_directional_bias(self, frame: pd.DataFrame | None) -> Side | None:
         """Quick directional read for the dashboard candidate tile.
 
         Returns ``Side.LONG`` / ``Side.SHORT`` when the underlying's
@@ -552,24 +551,22 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 LOG.debug("Failed to validate freshness of volatility quote for %s; using current quote snapshot as-is.", vol_symbol, exc_info=True)
         vix_last = _positive_quote_value(q, "last", "mid", "mark")
         vix_pct = self._safe_pct(q.get("percent_change")) if q is not None and q.get("percent_change") is not None else 0.0
-        candidate_rvol = _safe_float(candidate.metadata.get("relative_volume_10d_calc"), 0.0)
-        candidate_effective_rvol = self._effective_relative_volume(underlying, candidate_rvol, p, cap_default=2.5, standard_floor=1.0)
-        candidate_rvol_profile = rvol_profile_for_symbol(underlying, p or {})
-        # change_from_open: candidate.metadata stub (0.0) is bypassed in
-        # favor of u_day_ret computed above from Schwab session bars via
-        # _session_open_price (RTH-first with extended-hours fallback).
-        # See 2026-05-19 fix — TV-sourced day-move metadata is no longer
-        # trusted for ETF underlyings since the screener was switched to
-        # local candidate synthesis.
+        # change_from_open is computed live from Schwab session bars
+        # (u_day_ret above, via _session_open_price with RTH-first +
+        # extended-hours fallback). The 2026-05-19 local-synthesis
+        # screener no longer stamps change_from_open on candidate.
+        # metadata at all — bypass was cleaner than carrying a 0.0
+        # stub through downstream consumers.
         candidate_day_move = u_day_ret
         # Live activity score (2026-05-14) — replaces TV cumulative RVOL
         # for 0DTE gating and bonus scoring. Self-normalizing against
         # the symbol's own last 20 bars, so it works the same morning
         # vs afternoon and isn't biased low for benchmark ETFs. The TV
-        # candidate_rvol is still computed above and stamped in metadata
-        # for dashboard visibility, just no longer used as a decision
-        # input.
-        activity_score = self._live_activity_score(u)
+        # candidate_rvol pipeline (raw / effective / profile / required-
+        # threshold) was removed in the same cleanup — those values
+        # were stub-only after the local-synthesis switch and no longer
+        # influenced any gate. Dashboard rings now use this live score.
+        activity_score = self.live_activity_score(u)
 
         max_vix = float(self.optcfg.max_vix)
         # Lower-bound VIX floor. 0.0 (default) disables the gate for
@@ -580,8 +577,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         # since low-VIX is their target environment.
         min_vix = float(getattr(self.optcfg, "min_vix", 0.0) or 0.0)
         vix_spike_pct = float(self.optcfg.vix_spike_pct)
-        min_candidate_rvol = float(p.get("min_candidate_rvol", 1.15))
-        min_candidate_rvol_required = self._relative_volume_gate_threshold(underlying, min_candidate_rvol, p)
         chaos_intraday_range_pct = float(p.get("chaos_intraday_range_pct", 0.016))
         chop_flip_min = int(p.get("chop_flip_min", 4))
         trend_vwap_distance_pct = float(p.get("trend_vwap_distance_pct", 0.0016))
@@ -610,7 +605,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         if abs(vix_pct) >= vix_spike_pct:
             reasons.append(_reason_with_values("vix_spike", current=abs(vix_pct), required=vix_spike_pct, op="<", digits=4))
         # Live activity gate (replaces legacy weak_relative_volume gate that
-        # used TV cumulative RVOL — see _live_activity_score docstring for
+        # used TV cumulative RVOL — see live_activity_score docstring for
         # why that was unreachable for benchmark ETFs).
         min_activity = float(p.get("min_activity_for_entry", 0.0))
         if min_activity > 0.0 and activity_score < min_activity:
@@ -919,10 +914,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 "confirm_vwap_dist": idx_vwap_dist,
                 "confirm_ema_gap": idx_ema_gap,
                 "confirm_flip_count": idx_flip_count,
-                "candidate_rvol": candidate_rvol,
-                "candidate_effective_rvol": candidate_effective_rvol,
-                "candidate_rvol_profile": candidate_rvol_profile,
-                "candidate_rvol_required": min_candidate_rvol_required,
                 "live_activity_score": activity_score,
                 "candidate_change_from_open": candidate_day_move,
                 "vix": vix_last,

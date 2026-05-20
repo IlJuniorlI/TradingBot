@@ -2010,10 +2010,6 @@ Current package defaults:
 | `trend_vwap_lookback`         | `10`                    |
 | `flip_lookback`               | `14`                    |
 | `range_lookback`              | `25`                    |
-| `min_candidate_rvol`          | `1.18`                  |
-| `trend_rvol`                  | `1.3`                   |
-| `credit_min_rvol`             | `0.95`                  |
-| `credit_max_rvol`             | `1.65`                  |
 | `trend_vwap_distance_pct`     | `0.0015`                |
 | `trend_ema_gap_pct`           | `0.0007`                |
 | `trend_above_vwap_frac`       | `0.76`                  |
@@ -2083,10 +2079,6 @@ Current package defaults:
 | `trend_vwap_lookback`                | `10`                    |
 | `flip_lookback`                      | `14`                    |
 | `range_lookback`                     | `25`                    |
-| `min_candidate_rvol`                 | `1.15`                  |
-| `trend_rvol`                         | `1.25`                  |
-| `credit_min_rvol`                    | `0.88`                  |
-| `credit_max_rvol`                    | `1.9`                   |
 | `trend_vwap_distance_pct`            | `0.0014`                |
 | `trend_ema_gap_pct`                  | `0.0007`                |
 | `trend_above_vwap_frac`              | `0.74`                  |

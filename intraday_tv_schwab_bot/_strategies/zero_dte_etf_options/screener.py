@@ -19,12 +19,19 @@ class ZeroDteEtfOptionsScreener(BaseStrategyScreener):
         Downstream decisioning (``_regime_confirm`` in strategy.py) uses
         ``bars[underlying]`` (Schwab data feed) for ALL metrics:
           * close / volume / change_from_open computed from the frame
-          * relative_volume_10d_calc replaced by ``_live_activity_score``
+            (change_from_open = u_day_ret from _session_open_price)
+          * relative_volume_10d_calc replaced by ``live_activity_score``
           * confirm_index / volatility_symbol read from config
         So the candidate object only needs to be PRESENT for the engine
-        to dispatch ``entry_signals`` per underlying. Metadata stubs are
-        populated for dashboard/log surface area only — the strategy
-        recomputes the real values from bars before scoring.
+        to dispatch ``entry_signals`` per underlying. The dashboard
+        candidate tile reads its activity_score + directional_bias from
+        ``engine._publish_state``'s live resolver (which calls back into
+        the strategy's public ``live_activity_score`` and
+        ``dashboard_directional_bias`` hooks against the streamed
+        frame — see _strategies/README.md "Extension hooks"), so
+        the screener's stub values on the Candidate itself are
+        intentionally minimal — only ``name`` and ``confirm_index`` are
+        useful downstream.
         """
         if not bool(self.config.options.enabled):
             return []
@@ -40,11 +47,6 @@ class ZeroDteEtfOptionsScreener(BaseStrategyScreener):
             metadata = {
                 "name": sym,
                 "confirm_index": confirmation_map.get(sym),
-                # Stub values; _regime_confirm computes live metrics from
-                # the underlying's frame. Kept here as non-None defaults
-                # so dashboard / log payloads don't render as "—".
-                "change_from_open": 0.0,
-                "relative_volume_10d_calc": 1.0,
             }
             out.append(Candidate(
                 symbol=sym,

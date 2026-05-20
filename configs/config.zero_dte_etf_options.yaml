@@ -539,9 +539,7 @@ strategies:
       chop_flip_min: 4
       credit_end_time: "13:40"
       credit_max_day_move_pct: 0.0075
-      credit_max_rvol: 1.65
       credit_max_vix_change_pct: 0.009
-      credit_min_rvol: 0.95
       credit_start_time: "11:10"
       flip_lookback: 14
       fvg_context_weight_scale: 0.9
@@ -556,7 +554,6 @@ strategies:
       htf_minutes: 15
       htf_vwap_distance_pct: 0.0009
       min_bars: 40
-      min_candidate_rvol: 1.18
       min_confirm_bars: 28
       min_range_score: 4.65
       min_score_gap: 1.6
@@ -575,7 +572,6 @@ strategies:
       trend_end_time: "13:40"
       trend_min_ret15: 0.0015
       trend_min_ret5: 0.0009
-      trend_rvol: 1.3                        # 2026-05-14: NO LONGER GATING — kept for metadata stamping. Replaced by trend_activity_threshold below.
       # Live activity score thresholds (2026-05-14). Replaces TV
       # cumulative RVOL in 0DTE gating and bonus scoring. Self-
       # normalizes against the symbol's own last 20 bars, so it

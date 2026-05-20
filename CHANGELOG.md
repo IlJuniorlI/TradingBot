@@ -9,6 +9,117 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Plugin abstraction: live-publish hooks promoted to public + duck-typed dispatch.** *2026-05-19*
+  - The candidate dashboard-publish resolver (added earlier today) had
+    a polymorphism leak: `engine._publish_state` gated the live
+    activity-score / directional-bias compute behind an
+    `is_option_strategy(self.config.strategy)` type check, then used
+    `getattr(self.strategy, '_live_activity_score', None)` against
+    underscore-prefixed (private) method names. Two issues:
+    1. The type check restricted the feature to option strategies even
+       though there's no semantic reason an equity strategy couldn't
+       provide live overrides if its screener can't populate real
+       values at screen time.
+    2. Private (underscore-prefixed) method names are not appropriate
+       for plugin extension points — `BaseStrategy`'s other public
+       hooks (`signal_priority_key`, `dashboard_level_context_spec`,
+       `dashboard_candidate_label`, etc.) all use public names.
+  - Clean break:
+    - Renamed `_live_activity_score` → `live_activity_score` and
+      `_dashboard_directional_bias` → `dashboard_directional_bias` on
+      `ZeroDteEtfOptionsStrategy` (long-options strategy inherits).
+    - Updated internal call site in `_regime_confirm` and all docstring
+      / comment references in strategy.py, screener.py, mobile.js, and
+      the two strategy READMEs.
+    - Dropped `is_option_strategy` from `engine.py` imports and from
+      the publish block. `engine._publish_state` now resolves the
+      hooks via pure `getattr(self.strategy, 'method_name', None)` —
+      any strategy that defines these methods opts into live publish
+      automatically, no plugin-type dispatch needed.
+  - Documented the new hooks in `_strategies/README.md` under the
+    "extension hooks" bulleted list, describing return contracts,
+    fail-open semantics, and the duck-typed dispatch model.
+  - Net result: option vs equity asymmetry is now SOURCE-ONLY (where
+    the activity_score / directional_bias come from — screener time
+    vs publish time) rather than DISPATCH (engine doesn't know or
+    care which is which).
+
+### Removed
+
+- **Equity strategy configs: drop dead `options:` block.** *2026-05-19*
+  - 14 equity-strategy YAML configs each carried a ~54-line `options:`
+    block that no equity strategy reads. Validation
+    (`config.py:1308`) only requires `options.underlyings` when
+    `is_option_strategy(strategy)` is true; every
+    `self.config.options.*` reader in the codebase is gated behind an
+    option-strategy check (risk.py:226, engine.py:296,
+    execution.py option order paths, position_manager.py option
+    quote freshness, entry_gatekeeper.py option-chain validation,
+    plus the 0DTE strategy + screeners themselves). So for equity
+    strategies the block was pure noise.
+  - Cleaned `configs/`:
+    - `config.closing_reversal.yaml`, `config.mean_reversion.yaml`,
+      `config.opening_range_breakout.yaml`,
+      `config.momentum_close.yaml`, `config.pairs_residual.yaml`,
+      `config.rth_trend_pullback.yaml`,
+      `config.volatility_squeeze_breakout.yaml`,
+      `config.peer_confirmed_htf_pivots.yaml`,
+      `config.peer_confirmed_key_levels.yaml`,
+      `config.peer_confirmed_key_levels_1m.yaml`,
+      `config.peer_confirmed_trend_continuation.yaml`,
+      `config.microcap_pm_breakout.yaml`,
+      `config.microcap_gap_orb.yaml`,
+      `config.top_tier_adaptive.yaml`.
+    - Net `783 lines` of dead config removed (most blocks were 54
+      lines; `microcap_gap_orb` had 79 because it carried all the
+      newer optional features like `options_breakeven_*` and
+      `delta_time_shift_*`; `top_tier_adaptive` had 57).
+  - Kept intentionally: `configs/config.yaml` (runtime template — you
+    might switch the active strategy at runtime) and
+    `configs/config.example.yaml` (documentation example demonstrating
+    every block).
+  - Loader tolerance verified: `config.py:1270` uses
+    `raw.get("options", {})` default, then `ZeroDteOptionsConfig(**{})`
+    constructs from dataclass field defaults. Smoke-loaded each
+    cleaned config to confirm `cfg.options.underlyings` resolves to
+    the default `['SPY', 'QQQ']` and other fields to their dataclass
+    defaults (e.g. `max_vix=22.5`). The 0DTE configs continue to
+    surface their YAML-supplied values (e.g. `max_vix=24.0` for the
+    credit-spread parent).
+
+- **0DTE option strategies: dead RVOL pipeline + stub metadata.** *2026-05-19*
+  - The legacy RVOL pipeline (`min_candidate_rvol`, `trend_rvol`,
+    `credit_min_rvol`, `credit_max_rvol`, plus the derived
+    `candidate_rvol`, `candidate_effective_rvol`,
+    `candidate_rvol_profile`, `min_candidate_rvol_required`) was
+    superseded by `_live_activity_score` on 2026-05-14 but the dead
+    code, dead config keys, and dead metadata-stamped fields were
+    left in place "for visibility". After the local-synthesis
+    screener switch (2026-05-19) the rvol values became stub-only
+    (always `1.0`) — the visibility argument no longer held.
+  - Clean break removals (no aliases, no fallback shims):
+    - `strategy.py`: 4 dead computations (lines 555-557, 583-584) and
+      4 dead metadata-dict entries (lines 922-925), plus the unused
+      `rvol_profile_for_symbol` import.
+    - Both manifests: `min_candidate_rvol`, `trend_rvol`,
+      `credit_min_rvol`, `credit_max_rvol` removed from `params`.
+    - Both YAML configs: same 4 keys dropped (plus the trailing
+      "NO LONGER GATING" inline comments).
+    - Both READMEs + project root README: param tables + "RVOL / tape
+      filters" sections updated to describe the live-activity-score
+      thresholds (`min_activity_for_entry`, `trend_activity_threshold`,
+      `credit_activity_min`, `credit_activity_max`) that actually
+      drive the gates.
+  - 0DTE screeners: dropped the stub `change_from_open: 0.0` and
+    `relative_volume_10d_calc: 1.0` from candidate metadata. No
+    downstream consumer reads them anymore (strategy uses `u_day_ret`
+    and `_live_activity_score(frame)` directly).
+  - `_live_activity_score` got an `frame.empty` check for parity
+    with `_dashboard_directional_bias` — functionally equivalent
+    (len(empty) == 0 < 20 was already safe), but consistent.
+
+### Changed
+
 - **0DTE option configs: audit pass for liquidity, VIX, and HTF gates.** *2026-05-14*
   - Found three mis-tuned areas after systematic param diff between
     `config.zero_dte_etf_long_options.yaml` and the credit-spread parent
