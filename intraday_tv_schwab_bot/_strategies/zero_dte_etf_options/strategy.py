@@ -485,6 +485,50 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return None
         return None
 
+    def dashboard_change_from_open(self, frame: pd.DataFrame | None) -> float | None:
+        """Live session-relative day return as a PERCENT for the
+        dashboard candidate / watchlist Day% display.
+
+        Returns e.g. ``1.23`` for +1.23% — matches the unit produced by
+        TradingView's ``change_from_open`` field (which equity screeners
+        still surface via candidate metadata) and the Schwab quote's
+        ``netPercentChangeInDouble`` / ``percentChange`` field that the
+        dashboard's fallback chain prefers. Returning a percent (not a
+        0..1 ratio) lets the dashboard concatenate ``%`` without unit
+        translation.
+
+        Engine ``_publish_state`` reads this via the same duck-typed
+        ``getattr`` dispatch used for ``live_activity_score`` and
+        ``dashboard_directional_bias``; strategies that don't define
+        the hook fall through to the candidate's existing
+        ``change_from_open`` metadata field. Used by the 0DTE
+        strategies because their local-synthesis screener doesn't
+        populate that field at screen time — the live Schwab quote's
+        ``percent_change`` is the primary, but it can be temporarily
+        missing during the gap between cycle quote refreshes and
+        stream ticks; this resolver gives the dashboard a tape-truth
+        fallback computed from the same ``_session_open_price`` helper
+        ``_regime_confirm`` uses internally.
+
+        Returns None when the frame is missing/empty or the session
+        open is unresolvable.
+        """
+        if frame is None or frame.empty:
+            return None
+        try:
+            session_day = now_et().date()
+            u_open = _session_open_price(frame, session_day, regular_session_only=True)
+            if u_open is None:
+                u_open = _session_open_price(frame, session_day, regular_session_only=False)
+            if not u_open or u_open <= 0:
+                return None
+            close = _safe_float(frame.iloc[-1].get("close"), 0.0)
+            if close <= 0:
+                return None
+            return ((close / u_open) - 1.0) * 100.0
+        except Exception:
+            return None
+
     def _regime_confirm(self, candidate: Candidate, bars: dict[str, pd.DataFrame], data) -> dict[str, Any]:
         p = self.params
         sr_cfg = getattr(self.config, "support_resistance", None)
@@ -704,8 +748,27 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         fvg_ltf_ctx = self._ltf_fvg_context(underlying, u, data)
         use_fvg_context = self._shared_entry_enabled("use_fvg_context", True)
         fvg_context_weight_scale = max(0.0, float(p.get("fvg_context_weight_scale", 0.9) or 0.0))
-        htf_fvg_score = self._score_fvg_context(u_close, htf_fvg_ctx, timeframe_minutes=getattr(htf_fvg_ctx, "timeframe_minutes", self._htf_minutes())) if use_fvg_context else {"bull_score": 0.0, "bear_score": 0.0, "directional_pressure": 0.0}
-        fvg_ltf_score = self._score_fvg_context(u_close, fvg_ltf_ctx, timeframe_minutes=self._ltf_minutes()) if use_fvg_context else {"bull_score": 0.0, "bear_score": 0.0, "directional_pressure": 0.0}
+        # Disabled-state fallback must mirror the FULL shape that
+        # _score_fvg_context returns when use_fvg_context is True (see
+        # strategy_base.py::_score_fvg_context). The entry_context
+        # metadata stamping at the bottom of this method reads
+        # ``nearest_bullish`` / ``nearest_bearish`` unconditionally —
+        # a partial fallback dict caused a KeyError("nearest_bullish")
+        # that propagated up to engine._publish_state and rendered as
+        # "Error: 'nearest_bullish'" in the status banner. Empty dicts
+        # for the two nearest_* fields are safe: the downstream
+        # ``.get("state", "none")`` / ``.get("midpoint")`` calls
+        # gracefully resolve to the disabled-state values.
+        _disabled_fvg_score = {
+            "bull_score": 0.0,
+            "bear_score": 0.0,
+            "directional_pressure": 0.0,
+            "timeframe_minutes": 0,
+            "nearest_bullish": {},
+            "nearest_bearish": {},
+        }
+        htf_fvg_score = self._score_fvg_context(u_close, htf_fvg_ctx, timeframe_minutes=getattr(htf_fvg_ctx, "timeframe_minutes", self._htf_minutes())) if use_fvg_context else dict(_disabled_fvg_score)
+        fvg_ltf_score = self._score_fvg_context(u_close, fvg_ltf_ctx, timeframe_minutes=self._ltf_minutes()) if use_fvg_context else dict(_disabled_fvg_score)
 
         bull_score = 0.0
         bear_score = 0.0

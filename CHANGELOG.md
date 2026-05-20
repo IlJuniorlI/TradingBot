@@ -198,6 +198,52 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **0DTE strategy: KeyError 'nearest_bullish' when `use_fvg_context` disabled.** *2026-05-19*
+  - `_regime_confirm` had a partial fallback dict at strategy.py:707-708:
+    `{"bull_score": 0.0, "bear_score": 0.0, "directional_pressure": 0.0}`
+    — but the entry-context metadata stamping at lines 952-961 reads
+    four more keys unconditionally (`nearest_bullish`, `nearest_bearish`
+    on both htf_fvg_score and fvg_ltf_score). When `use_fvg_context`
+    was False, accessing `htf_fvg_score["nearest_bullish"]` raised
+    `KeyError: 'nearest_bullish'`, which engine.py caught and
+    rendered as `"Error: 'nearest_bullish'"` in the status banner.
+  - Fix: padded the disabled-fallback dict to mirror the full shape
+    that `_score_fvg_context` returns when enabled (adds
+    `timeframe_minutes: 0`, `nearest_bullish: {}`, `nearest_bearish:
+    {}`). The empty dicts are safe — the downstream
+    `.get("state", "none")` and `.get("midpoint")` calls gracefully
+    resolve to the disabled-state defaults.
+  - Test suite missed the bug because no test exercises the
+    `use_fvg_context=False` path; only surfaced when a runtime config
+    disabled FVG context.
+
+- **0DTE candidate / watchlist tiles: Day% now resolved at publish time when live quote is missing.** *2026-05-19*
+  - The same-day local-synthesis cleanup removed the
+    `change_from_open: 0.0` stub from 0DTE candidate metadata
+    (rightly — a misleading 0.00% pretending to be a real value). But
+    the dashboard fallback chain
+    (`q.percent_change ?? row.change ?? row.change_from_open`)
+    now lands on `None` whenever the live Schwab quote's
+    `percent_change` is momentarily missing (gap between cycle quote
+    refreshes and stream ticks), rendering `"—"` instead of the real
+    tape value.
+  - Fix mirrors the live_activity_score / dashboard_directional_bias
+    pattern: added a third optional public hook
+    `dashboard_change_from_open(frame) -> float | None` on
+    `ZeroDteEtfOptionsStrategy`. Returns the session day-return as
+    PERCENT (e.g. `1.23` for +1.23%, matching the unit produced by
+    TradingView's `change_from_open` and the Schwab quote's
+    `percent_change` that the dashboard already prefers). Computed
+    via the same `_session_open_price` RTH-first / extended-fallback
+    helper `_regime_confirm` uses internally.
+  - `engine._publish_state` resolves the new hook via the same
+    duck-typed `getattr` dispatch as the other two — same single
+    `data.get_merged` frame fetch per candidate (cycle cache means no
+    extra API call), same `math.isfinite` finite-check guard.
+  - Documented in `_strategies/README.md` extension-hooks bullet
+    (now lists all three resolvers together with their return
+    contracts and unit conventions).
+
 - **Dashboard chart: drop canvas-drawn plot-area grid.** *2026-05-19*
   - The chart paint loop was drawing 5 horizontal + 6 vertical grid
     lines on the canvas at fixed proportions of the plot area. With

@@ -1038,23 +1038,27 @@ class IntradayBot:
         # populate real values at screen time (e.g. 0DTE option
         # strategies that synthesize candidates locally without TV)
         # opt into engine-side resolution by defining the public
-        # methods ``live_activity_score(frame)`` and
-        # ``dashboard_directional_bias(frame)`` on the strategy class.
+        # methods ``live_activity_score(frame)``,
+        # ``dashboard_directional_bias(frame)``, and/or
+        # ``dashboard_change_from_open(frame)`` on the strategy class.
         # Strategies whose screeners DO populate real values (e.g.
         # equity strategies pulling rvol + change_from_open from TV)
         # just don't define them — the candidate's existing
-        # activity_score and directional_bias values flow through
-        # unchanged. Pure duck-typing — no plugin-type dispatch
-        # needed. Both compute paths share a single frame fetch.
+        # activity_score / directional_bias / change_from_open values
+        # flow through unchanged. Pure duck-typing — no plugin-type
+        # dispatch needed. All compute paths share a single frame
+        # fetch per candidate.
         live_score_fn = getattr(self.strategy, 'live_activity_score', None)
         live_bias_fn = getattr(self.strategy, 'dashboard_directional_bias', None)
+        live_change_fn = getattr(self.strategy, 'dashboard_change_from_open', None)
         all_candidate_rows: list[dict[str, Any]] = []
         for c in self.last_candidates:
             remember_exchange(c.symbol, c.metadata.get("exchange"))
             exchange = dashboard_normalize_exchange(c.metadata.get("exchange"))
             activity_score_for_row = c.activity_score
             directional_bias_for_row = c.directional_bias
-            if live_score_fn is not None or live_bias_fn is not None:
+            change_from_open_for_row = c.metadata.get("change_from_open")
+            if live_score_fn is not None or live_bias_fn is not None or live_change_fn is not None:
                 try:
                     frame = self.data.get_merged(c.symbol, with_indicators=True)
                     if live_score_fn is not None:
@@ -1076,6 +1080,18 @@ class IntradayBot:
                         # publish loop.
                         if isinstance(live_bias, Side):
                             directional_bias_for_row = live_bias
+                    if live_change_fn is not None:
+                        live_change = live_change_fn(frame)
+                        # Same finite guard as activity_score — a None
+                        # return means "frame insufficient to compute,
+                        # fall back to candidate metadata" (which for
+                        # 0DTE is also None after the 2026-05-19
+                        # stub-removal, so the dashboard renders "—"
+                        # until session bars are sufficient).
+                        if live_change is not None:
+                            live_change_f = float(live_change)
+                            if math.isfinite(live_change_f):
+                                change_from_open_for_row = live_change_f
                 except Exception:
                     LOG.debug("Dashboard live-publish compute failed for %s; using candidate stubs.", c.symbol, exc_info=True)
             row = {
@@ -1083,7 +1099,7 @@ class IntradayBot:
                 "rank": c.rank,
                 "activity_score": activity_score_for_row,
                 "exchange": exchange or None,
-                "change_from_open": c.metadata.get("change_from_open"),
+                "change_from_open": change_from_open_for_row,
                 # ``change`` (prior-close-relative) is shipped alongside
                 # ``change_from_open`` (session-open-relative) for strategies
                 # that emit both (currently: top_tier_adaptive). Dashboard
