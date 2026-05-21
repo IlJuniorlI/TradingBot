@@ -943,6 +943,21 @@ class ZeroDteOptionsConfig:
     # --- Credit strike distance gate ---
     credit_distance_gate_enabled: bool = False
     min_credit_distance_atr: float = 1.8
+    # --- Credit short-strike pivot-buffer gate (2026-05-21) ---
+    # Rejects credit-spread entries where the short strike sits within
+    # ``min_short_strike_pivot_buffer_atr * atr`` of the most recent
+    # market-structure reference high (bear call) or reference low
+    # (bull put) on either the LTF or HTF frame. The existing
+    # ``min_credit_distance_atr`` only measures from current spot,
+    # which can pass even when the short is essentially AT the recent
+    # pivot — the 2026-05-21 session logged two such entries (SPY
+    # short 741 with mshtf_reference_high 740.62 → $0.39 cushion;
+    # QQQ short 712 with reference_high 711.89 → $0.11 cushion) that
+    # both stopped within 30 seconds on resistance_break_exit (-$60
+    # combined). Setting ``buffer = 1.0`` typically requires the
+    # short strike to be at least one strike beyond the recent pivot.
+    credit_pivot_buffer_gate_enabled: bool = False
+    min_short_strike_pivot_buffer_atr: float = 1.0
     # --- VIX-adaptive strike width ---
     adaptive_width_enabled: bool = False
     adaptive_width_max_scale: float = 1.5

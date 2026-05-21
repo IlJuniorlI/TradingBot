@@ -484,7 +484,15 @@ options:
   dry_run_step_frac: 0.25
   event_blackout_file: ./macro_events.auto.yaml
   event_blackouts: []
-  option_chain_cache_seconds: 4
+  # 2026-05-21: bumped 4 → 60. The chain content (strike list, OI,
+  # volume buckets, delta) doesn't materially change for 0DTE on this
+  # timescale, and post-selection leg quotes get refreshed separately
+  # via fetch_quotes (still on quote_cache_seconds=4) + the per-build
+  # stability check loop. Previous 4s value meant near-every cycle
+  # re-fetched the chain (~100-200 calls/session for 3 underlyings on
+  # a typical day); 60s collapses that to ~20-30 calls. Liquidity-filter
+  # drift over 60s is well within max_bid_ask_spread_pct slack.
+  option_chain_cache_seconds: 60
   option_chain_cache_max_entries: 24
   # Premium ratchet — prevent giving back all gains on winning options trades.
   options_breakeven_enabled: true
@@ -511,6 +519,18 @@ options:
   # Credit distance gate — reject when short strike is too close to underlying.
   credit_distance_gate_enabled: true
   min_credit_distance_atr: 1.8
+  # Credit pivot-buffer gate (2026-05-21). Rejects entries where the
+  # short strike sits within `min_short_strike_pivot_buffer_atr * atr`
+  # of the recent market-structure pivot (LTF/HTF reference_high for
+  # bear call; reference_low for bull put). Catches the case where the
+  # short lands AT or barely beyond a recent pivot — same-day post-
+  # mortem on the 2026-05-21 session showed two such entries (SPY 741
+  # / pivot 740.62 = $0.39 cushion; QQQ 712 / pivot 711.89 = $0.11)
+  # both stopped within 30s for -$60 combined. min_credit_distance_atr
+  # above only measures from CURRENT spot, which can pass even when
+  # the short is AT the pivot.
+  credit_pivot_buffer_gate_enabled: true
+  min_short_strike_pivot_buffer_atr: 1.0
   # 2026-05-14: enabled. _adaptive_strike_width scales the vertical-spread
   # strike width with current ATR / 20-bar median ATR, so high-vol days
   # widen strikes (more credit, more cushion) and quiet days tighten them.

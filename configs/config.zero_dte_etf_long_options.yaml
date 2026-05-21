@@ -481,7 +481,10 @@ options:
   dry_run_step_frac: 0.25
   event_blackout_file: ./macro_events.auto.yaml
   event_blackouts: []
-  option_chain_cache_seconds: 4
+  # 2026-05-21: bumped 4 → 60. See parent zero_dte_etf_options.yaml
+  # for the rationale (chain content stable across 60s, leg quote
+  # refresh still on the shorter quote_cache_seconds TTL).
+  option_chain_cache_seconds: 60
   option_chain_cache_max_entries: 24
   # Premium ratchet
   options_breakeven_enabled: true

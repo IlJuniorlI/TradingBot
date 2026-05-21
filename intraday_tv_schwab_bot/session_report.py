@@ -26,6 +26,7 @@ import json
 import logging
 import re
 from collections import defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -632,6 +633,178 @@ def _extract_decisions(log_path: Path) -> list[dict]:
     return rows
 
 
+_AMBIGUOUS_REGIME_RE = re.compile(
+    r"ambiguous_regime\(top=(?P<top>\w+),top_score=(?P<top_score>[-\d.]+),"
+    r"second=(?P<second>\w+),second_score=(?P<second_score>[-\d.]+),"
+    r"required_top_score>=(?P<req_top>[-\d.]+),"
+    r"required_score_gap>=(?P<req_gap>[-\d.]+),"
+    r"current_score_gap=(?P<gap>[-\d.]+)\)"
+)
+
+
+def _regime_call_outcomes(archive_root: Path) -> dict[str, Any]:
+    """Classify each ``ambiguous_regime`` decision against the 30-minute
+    forward price move and bucket results by outcome + hour.
+
+    Purpose: regime scoring is the strategy's directional bet. When it
+    says ``bullish_trend@4.50`` but the price drops 3 ATR in the next
+    30 minutes, that's a regression signal worth knowing about. This
+    helper writes the daily classification into ``manifest.json`` so a
+    week-over-week comparison surfaces drift (e.g. "right%" trending
+    below 30%) without anyone running ad-hoc post-mortems.
+
+    Classifier per call:
+      * ``right`` — top was ``*_trend`` and price moved >= 1 ATR in
+        that direction within the next 30 minutes.
+      * ``wrong`` — opposite direction had a larger excursion.
+      * ``flat`` — neither direction reached 1 ATR (or top was
+        ``range``/non-directional).
+      * ``unclear`` — insufficient forward bars or missing ATR.
+
+    Reads from the already-written ``decisions.csv`` and the per-symbol
+    1m bars under ``bars/1m/`` in the same archive directory. Dedupes
+    calls by (symbol, minute, top_score) so a single decision repeated
+    many times in one cycle is counted once.
+
+    Returns an empty dict on any I/O / parse failure — never crashes
+    the archive write.
+    """
+    try:
+        decisions_path = archive_root / "decisions.csv"
+        bars_dir = archive_root / "bars" / "1m"
+        if not decisions_path.exists() or not bars_dir.is_dir():
+            return {}
+
+        # Load bar timelines per symbol — only need ts/high/low/close/atr14.
+        # Bars timestamps are tz-aware ISO ("2026-05-21T11:12:00-04:00");
+        # decisions timestamps are naive ("2026-05-21 11:12:00,798").
+        # Normalize both to naive ET for the lookup comparison.
+        bars_by_sym: dict[str, list[dict[str, Any]]] = {}
+        for path in bars_dir.glob("*.csv"):
+            try:
+                rows: list[dict[str, Any]] = []
+                with open(path, newline="", encoding="utf-8") as fh:
+                    for row in csv.DictReader(fh):
+                        ts_raw = row.get("timestamp", "")
+                        try:
+                            ts = datetime.fromisoformat(ts_raw).replace(tzinfo=None)
+                        except (ValueError, TypeError):
+                            continue
+                        try:
+                            high = float(row.get("high"))
+                            low = float(row.get("low"))
+                            close = float(row.get("close"))
+                        except (TypeError, ValueError):
+                            continue
+                        try:
+                            atr14 = float(row.get("atr14") or 0.0)
+                        except (TypeError, ValueError):
+                            atr14 = 0.0
+                        rows.append({"ts": ts, "high": high, "low": low, "close": close, "atr14": atr14})
+                if rows:
+                    rows.sort(key=lambda r: r["ts"])
+                    bars_by_sym[path.stem] = rows
+            except (OSError, csv.Error):
+                continue
+
+        if not bars_by_sym:
+            return {}
+
+        # Parse ambiguous_regime calls, dedupe by (sym, minute, top_score).
+        calls: list[dict[str, Any]] = []
+        seen: set[tuple[str, datetime, float]] = set()
+        try:
+            with open(decisions_path, newline="", encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    sym = row.get("symbol", "")
+                    if sym not in bars_by_sym:
+                        continue
+                    m = _AMBIGUOUS_REGIME_RE.search(row.get("primary", ""))
+                    if not m:
+                        continue
+                    ts_raw = row.get("timestamp", "").strip('"').split(",")[0]
+                    try:
+                        ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        continue
+                    try:
+                        top_score = float(m.group("top_score"))
+                        gap = float(m.group("gap"))
+                    except ValueError:
+                        continue
+                    key = (sym, ts.replace(second=0), round(top_score, 2))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    calls.append({
+                        "ts": ts, "sym": sym,
+                        "top": m.group("top"),
+                        "top_score": top_score,
+                        "gap": gap,
+                    })
+        except OSError:
+            return {}
+
+        # Classify and aggregate.
+        by_outcome = {"right": 0, "wrong": 0, "flat": 0, "unclear": 0}
+        by_hour: dict[str, dict[str, int]] = defaultdict(
+            lambda: {"total": 0, "right": 0, "wrong": 0, "flat": 0, "unclear": 0}
+        )
+
+        for call in calls:
+            rows = bars_by_sym[call["sym"]]
+            call_ts = call["ts"]
+            window_end = call_ts + timedelta(minutes=30)
+            after = [r for r in rows if call_ts <= r["ts"] <= window_end]
+            prior = [r for r in rows if r["ts"] <= call_ts]
+            outcome = "unclear"
+            if len(after) >= 2 and prior:
+                atr = prior[-1]["atr14"]
+                if atr and atr > 0:
+                    p0 = after[0]["close"]
+                    high_max = max(r["high"] for r in after)
+                    low_min = min(r["low"] for r in after)
+                    up_atr = (high_max - p0) / atr
+                    down_atr = (p0 - low_min) / atr
+                    top = call["top"]
+                    if top == "bullish_trend":
+                        if up_atr >= 1.0 and up_atr > down_atr:
+                            outcome = "right"
+                        elif down_atr > up_atr:
+                            outcome = "wrong"
+                        else:
+                            outcome = "flat"
+                    elif top == "bearish_trend":
+                        if down_atr >= 1.0 and down_atr > up_atr:
+                            outcome = "right"
+                        elif up_atr > down_atr:
+                            outcome = "wrong"
+                        else:
+                            outcome = "flat"
+                    else:
+                        # range / non-directional top — not predictive
+                        outcome = "flat"
+            by_outcome[outcome] += 1
+            hour = call_ts.strftime("%H")
+            by_hour[hour]["total"] += 1
+            by_hour[hour][outcome] += 1
+
+        # Derived percentage (right vs evaluable calls). evaluable =
+        # not unclear, and at least one directional outcome possible.
+        directional = by_outcome["right"] + by_outcome["wrong"] + by_outcome["flat"]
+        right_pct = (by_outcome["right"] / directional) if directional > 0 else None
+
+        return {
+            "total_unique_calls": len(calls),
+            "by_outcome": by_outcome,
+            "right_pct_of_directional": round(right_pct, 4) if right_pct is not None else None,
+            "by_hour": {h: dict(d) for h, d in sorted(by_hour.items())},
+        }
+    except Exception as exc:
+        LOG.warning("Could not compute regime-call outcomes: %s", exc, exc_info=True)
+        return {}
+
+
 def export_session_archive(
     *,
     log_dir: str,
@@ -856,11 +1029,20 @@ def export_session_archive(
                 exit_time = getattr(trade, "exit_time", None)
                 if exit_time is None:
                     continue
+                exit_date = None
                 try:
                     exit_date = exit_time.astimezone(now_et().tzinfo).date()
                 except Exception:
                     LOG.debug("Could not normalize exit_time for trade %s; falling back to naive date()", trade, exc_info=True)
-                    exit_date = getattr(exit_time, "date", lambda: None)()
+                    # Naive datetime case — fall back to direct .date()
+                    # without tz translation. Anything that doesn't have
+                    # a .date() method (corrupt type) leaves exit_date
+                    # as None, which won't match session_date and the
+                    # trade is silently skipped (better than crashing).
+                    try:
+                        exit_date = exit_time.date()
+                    except (AttributeError, TypeError):
+                        pass
                 if exit_date == session_date:
                     closed_today.append(trade)
             with open(trades_dst, "w", newline="", encoding="utf-8") as dst_fh:
@@ -942,6 +1124,16 @@ def export_session_archive(
     except Exception as exc:
         LOG.warning("Could not extract decisions log: %s", exc)
 
+    # Regime-call outcome classification (2026-05-21) — for each
+    # ambiguous_regime decision today, classify whether the strategy's
+    # top-regime read was right/wrong/flat against the 30-min forward
+    # price move. Embedded in the manifest so day-over-day comparison
+    # surfaces regime-scoring drift without ad-hoc post-mortems.
+    # Reads from the already-written decisions.csv + bars/1m/ in this
+    # archive. Returns {} on any failure — never breaks the manifest
+    # write.
+    regime_outcomes = _regime_call_outcomes(archive_root)
+
     # Manifest with strategy + summary stats so future audits know
     # exactly which config produced these bars/trades.
     manifest = {
@@ -963,6 +1155,7 @@ def export_session_archive(
         "open_positions_at_close": len(positions or {}),
         "realized_pnl": float(getattr(account, "realized_pnl", 0.0) or 0.0) if account is not None else None,
         "session_skip_counts": dict(session_skip_counts or {}),
+        "regime_call_outcomes": regime_outcomes,
     }
     manifest_path = archive_root / "manifest.json"
     try:

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..shared import (
@@ -499,7 +500,8 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return None
         return None
 
-    def dashboard_change_from_open(self, frame: pd.DataFrame | None) -> float | None:
+    @staticmethod
+    def dashboard_change_from_open(frame: pd.DataFrame | None) -> float | None:
         """Live session-relative day return as a PERCENT for the
         dashboard candidate / watchlist Day% display.
 
@@ -1441,6 +1443,58 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                         underlying, style,
                         _style_unavailable_reason(style, f"reason=short_strike_too_close(distance_atr={distance_atr:.2f}<{min_dist})"))
                     return None
+        # Credit pivot-buffer gate (2026-05-21) — reject if the short
+        # strike is within ``min_short_strike_pivot_buffer_atr * atr`` of
+        # the most recent market-structure pivot. For bear_call we use
+        # max(LTF reference_high, HTF reference_high) as the
+        # nearest-resistance proxy; the short must sit at least
+        # ``buffer * atr`` ABOVE that. For bull_put we use
+        # min(reference_low, reference_low) and the short must sit at
+        # least ``buffer * atr`` BELOW. Without this gate a short can
+        # land essentially AT the recent pivot (observed 2026-05-21:
+        # SPY short 741 / pivot 740.62, QQQ short 712 / pivot 711.89)
+        # and stop out within 30s on resistance_break_exit / breakdown.
+        # The existing credit_distance_gate above measures from current
+        # spot, which can pass even when the short is AT the pivot.
+        # Skips silently when references or ATR are unavailable (early
+        # session, no pivots) — never blocks the build for missing data.
+        if getattr(self.optcfg, "credit_pivot_buffer_gate_enabled", False):
+            underlying_atr = getattr(self, "_underlying_atr_cache", {}).get(underlying)
+            if underlying_atr is not None and underlying_atr > 0 and math.isfinite(underlying_atr):
+                buffer_mult = float(getattr(self.optcfg, "min_short_strike_pivot_buffer_atr", 1.0))
+                ref_levels: list[float] = []
+                for key in (("mshtf_reference_high", "msltf_reference_high") if not bullish else ("mshtf_reference_low", "msltf_reference_low")):
+                    raw = regime.get(key)
+                    if raw is None:
+                        continue
+                    try:
+                        value = float(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    # ``float('nan')`` succeeds silently in Python and NaN
+                    # propagates through min/max — ``nan < buffer_mult``
+                    # is False, which would fail the gate open. Treat
+                    # non-finite refs as missing data (same as None).
+                    if not math.isfinite(value):
+                        continue
+                    ref_levels.append(value)
+                if ref_levels:
+                    short_strike = float(short_leg.strike)
+                    if bullish:
+                        nearest_pivot = min(ref_levels)
+                        cushion_atr = (nearest_pivot - short_strike) / underlying_atr
+                    else:
+                        nearest_pivot = max(ref_levels)
+                        cushion_atr = (short_strike - nearest_pivot) / underlying_atr
+                    if cushion_atr < buffer_mult:
+                        self._set_build_failure(
+                            underlying, style,
+                            _style_unavailable_reason(
+                                style,
+                                f"reason=short_strike_too_close_to_pivot(cushion_atr={cushion_atr:.2f}<{buffer_mult},short_strike={short_strike:.2f},nearest_pivot={nearest_pivot:.2f},side={'put' if bullish else 'call'})",
+                            ),
+                        )
+                        return None
         base_width = float(self.optcfg.strike_width_by_symbol.get(underlying, 2.0))
         width = self._adaptive_strike_width(underlying, base_width)
         hedge_target = short_leg.strike - width if bullish else short_leg.strike + width

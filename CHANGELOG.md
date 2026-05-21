@@ -9,6 +9,27 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **0DTE option strategies: option_chain_cache_seconds 4 → 60.** *2026-05-21*
+  - Both 0DTE configs previously overrode the default 6s chain-cache
+    TTL down to 4s — almost every entry cycle re-fetched the chain.
+    For a 6-hour session running 3 underlyings × ~100-200 entry cycles
+    that's 300-600 Schwab `option_chains()` calls.
+  - The chain content the strategy reads (strike list, OI, volume
+    buckets, deltas) doesn't materially change in 60s. Post-selection
+    leg quotes get refreshed independently via `fetch_quotes` (still
+    on the 4-6s `quote_cache_seconds` TTL) plus the per-build stability
+    check loop, so entry pricing freshness is unchanged.
+  - Bumped both 0DTE yamls to 60s, with the rationale documented
+    inline. Estimated savings: 60-150 redundant chain fetches per
+    session (15-25% reduction in option-chain API load).
+  - Other audit findings (per-position force=True quote re-fetches,
+    dual quote calls between position_manager + execution) were
+    considered but not changed: the force pattern exists for fresh
+    stop/target evaluation and stale leg quotes have tail risk, and
+    the dual-fetch overlap is bounded to fill events (rare). Worth
+    revisiting after a few sessions of observation if API load is
+    still the binding constraint.
+
 - **Scaffold generator: plugin-type-aware templates aligned with today's contract.** *2026-05-19*
   - `scripts/scaffold_strategy_plugin.py` had drifted from the current
     plugin contract in four places:
@@ -195,6 +216,62 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **`htf_lookback_days: 60`** on long-options was excessive. At 15-min
     HTF that's ~1500 bars — way more than needed for HTF structure
     detection. Reduced to 15 (matching parent) for ~390 bars.
+
+### Added
+
+- **Session report: regime-call outcome tracker.** *2026-05-21*
+  - New `manifest.json -> regime_call_outcomes` block embedded in
+    every per-day session archive. Classifies each
+    `ambiguous_regime` decision against the 30-min forward price
+    move and aggregates by outcome + hour, so a day-over-day
+    comparison surfaces drift in regime-scoring quality without
+    anyone running ad-hoc post-mortems.
+  - Classifier per call:
+    - `right`: top was `*_trend` and price moved >= 1 ATR in that
+      direction within 30 min.
+    - `wrong`: opposite direction had larger excursion.
+    - `flat`: neither direction reached 1 ATR (or top was `range`).
+    - `unclear`: insufficient forward bars or missing ATR.
+  - Output structure: `total_unique_calls`, `by_outcome`
+    (right/wrong/flat/unclear counts), `right_pct_of_directional`
+    (a quick health metric), and `by_hour` (HH → outcome breakdown).
+    Dedupes by `(symbol, minute, top_score)` so a single decision
+    repeated in many cycles within one minute is counted once.
+  - Reads from the already-written `decisions.csv` + `bars/1m/` in
+    the same archive directory. Returns `{}` on any I/O / parse
+    failure — never crashes the manifest write.
+  - Validation against 2026-05-21 archive: 31 unique calls, 2
+    right, 11 wrong, 18 flat (right% = 6.45%). Matches the manual
+    post-mortem numbers exactly. Hourly breakdown shows the 10am
+    whipsaw window where 10 of the 11 "wrong" calls landed.
+
+- **0DTE credit spreads: pivot-buffer gate.** *2026-05-21*
+  - New `OptionsConfig` knobs:
+    - `credit_pivot_buffer_gate_enabled` (default `False`)
+    - `min_short_strike_pivot_buffer_atr` (default `1.0`)
+  - When enabled, rejects credit-spread entries whose short strike is
+    within `buffer_atr * atr` of the recent market-structure pivot:
+    - bear_call: max(LTF / HTF reference_high) → short must sit >=
+      buffer ATR ABOVE
+    - bull_put: min(LTF / HTF reference_low) → short must sit >=
+      buffer ATR BELOW
+  - Diagnosis from 2026-05-21 session post-mortem: both bearish
+    credit entries at 11:13 had the short strike essentially AT the
+    most recent pivot high (SPY short 741 / mshtf_reference_high
+    740.615 → $0.39 cushion = 0.71 ATR; QQQ short 712 / reference_high
+    711.89 → $0.11 cushion = 0.15 ATR). Both stopped within 30
+    seconds on resistance_break_exit for -$60 combined.
+  - The existing `credit_distance_gate_enabled` (1.8 ATR from
+    CURRENT spot) passed both setups because price was a few strikes
+    away — but missed that the short was sitting ON the pivot. The
+    new gate measures from the pivot itself.
+  - Verified counterfactual: with gate active today, both BEAR
+    entries would have been blocked; the 3 BULL setups (all with
+    cushion 4.3-5.0 ATR) would have passed unchanged. Net PnL +$52
+    instead of -$8.
+  - Enabled in `config.zero_dte_etf_options.yaml` with default
+    threshold. Long-options yaml left untouched (long premium
+    doesn't have a "short strike" in the same sense).
 
 ### Fixed
 
