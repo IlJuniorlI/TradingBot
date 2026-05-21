@@ -1621,7 +1621,12 @@ function renderKpiAndGauges(data) {
     const tone = dayPnl > 0 ? 'good' : (dayPnl < 0 ? 'bad' : 'neutral');
     const arrow = dayPnl > 0 ? '▲' : (dayPnl < 0 ? '▼' : '—');
     chgEl.className = `kpi-hero-chg ${tone}`;
-    chgEl.querySelector('.arrow').textContent = arrow;
+    // Defensive null check on the .arrow child — element should always
+    // be present in dashboard.html (line 226), but guard against mid-
+    // render DOM state or layout refactors that could remove the class.
+    // Mirrors mobile.js's pattern (mobile.js:142-143).
+    const arrowEl = chgEl.querySelector('.arrow');
+    if (arrowEl) arrowEl.textContent = arrow;
     chgText.textContent = starting > 0 ? `${fmtPct(dayPct, 2)} today` : '— today';
   }
 
@@ -1644,12 +1649,17 @@ function renderKpiAndGauges(data) {
   const exposureRing = document.getElementById('gauge-exposure-ring');
   const winRing = document.getElementById('gauge-win-ring');
   const ddRing = document.getElementById('gauge-dd-ring');
-  exposureRing.style.setProperty('--pct', `${exposurePct}%`);
-  winRing.style.setProperty('--pct', `${riskPct}%`);
-  ddRing.style.setProperty('--pct', `${ddPct}%`);
+  // Defensive null checks — gauge ring elements exist in dashboard.html
+  // (lines 244, 249, 254) but a hot reload that interrupts JS before
+  // DOM is fully constructed, or a theme refactor that swaps the IDs,
+  // would null-deref the style.setProperty calls and break the entire
+  // KPI render. Mirrors mobile.js's pattern (mobile.js:171-177).
+  if (exposureRing) exposureRing.style.setProperty('--pct', `${exposurePct}%`);
+  if (winRing) winRing.style.setProperty('--pct', `${riskPct}%`);
+  if (ddRing) ddRing.style.setProperty('--pct', `${ddPct}%`);
   // Warn tone when over 100% — signals over-leverage (mixed long/short
   // positions inflate gross_market_value without inflating net liq).
-  exposureRing.className = `gauge-ring${exposurePctTrue > 100 ? ' warn' : ''}`;
+  if (exposureRing) exposureRing.className = `gauge-ring${exposurePctTrue > 100 ? ' warn' : ''}`;
   // Show true (unclamped) % in the text so 128% reads as "128%" instead
   // of "100%". Ring still caps visually at 100% fill — the warn tone
   // is the over-100% signal.
@@ -1724,7 +1734,10 @@ function renderSelectedSymbol() {
     document.getElementById('selected-price').textContent = 'Last —';
     document.getElementById('selected-change').className = 'tiny-chip tone-neutral';
     document.getElementById('selected-change').textContent = 'Change —';
-    document.getElementById('selected-spread').classList.add('hidden');
+    // Defensive null check — selected-spread is queried+guarded later
+    // in the populated-snapshot path, mirror the safety here.
+    const __spreadEarly = document.getElementById('selected-spread');
+    if (__spreadEarly) __spreadEarly.classList.add('hidden');
     document.getElementById('selected-volume').textContent = 'Vol —';
     renderChartTimeframeToggle(data);
     drawSelectedChart(null);
@@ -1973,7 +1986,14 @@ function drawSelectedChart(snapshot) {
   }
 
   function prettyLabel(value) {
-    return safe(value).replace(/_/g, ' ').replace(/\\b\\w/g, ch => ch.toUpperCase());
+    // 2026-05-21: the second regex was previously /\\b\\w/g — a regex
+    // literal where the double backslashes mean LITERAL backslash + 'b'
+    // and LITERAL backslash + 'w', not the word-boundary + word-character
+    // pair the original intent required. As a result every prettyLabel
+    // call returned its input lowercased (e.g. tooltip state read
+    // "bullish trend" instead of "Bullish Trend"). Single backslashes
+    // here are the correct regex escapes for \b and \w.
+    return safe(value).replace(/_/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase());
   }
 
   function lineValueAt(line, absIndex) {
