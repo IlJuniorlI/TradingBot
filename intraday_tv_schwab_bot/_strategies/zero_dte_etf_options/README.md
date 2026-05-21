@@ -177,6 +177,14 @@ Common parameter families:
   - `use_htf_trend_confirmation`, `require_htf_alignment`, `htf_minutes`, `htf_lookback_days`, `htf_min_bars`, `htf_vwap_distance_pct`, `htf_ema_gap_pct`, `htf_min_ret3`, `htf_range_vwap_distance_pct`, `htf_range_ema_gap_pct`, `htf_score_bonus`, `htf_score_penalty`
 - FVG contribution:
   - `fvg_context_weight_scale`
+- Credit-spread quality gates (credit_spread style only — long-option style ignores these):
+  - `credit_distance_gate_enabled`, `min_credit_distance_atr`: rejects entries where the short strike is within N×ATR of the **current spot**.
+  - `credit_pivot_buffer_gate_enabled`, `min_short_strike_pivot_buffer_atr`: rejects entries where the short strike is within N×ATR of the **recent market-structure pivot** (LTF/HTF `reference_high` for bear call; `reference_low` for bull put). Catches the "short sitting ON the recent high" failure mode the distance gate misses. Added 2026-05-21 after a same-day post-mortem showed both bearish credit entries at 11:13 had cushion < 1 ATR and stopped within 30s.
+- Adaptive strike width (credit_spread style only):
+  - `adaptive_width_enabled`, `adaptive_width_max_scale`: scale `strike_width_by_symbol` with current_atr / 20-bar median atr, capped at max_scale. Width is snapped to whole dollars so the hedge target always lands on a real strike on the SPY/QQQ/IWM chain.
+- Option-chain caching:
+  - `option_chain_cache_seconds` (default 60s for 0DTE — see comment in yaml for the rationale; chain content is stable on this timescale, and post-selection leg quotes get refreshed via `fetch_quotes` independently).
+  - `option_chain_cache_max_entries`: LRU cap on the per-symbol chain cache.
 
 General behavior:
 

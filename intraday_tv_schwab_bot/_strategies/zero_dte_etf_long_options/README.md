@@ -183,6 +183,16 @@ Common parameter families:
 - FVG contribution:
   - `fvg_context_weight_scale`
 
+**Knobs that DON'T apply to the long-options strategy** (inherited
+from parent but only meaningful for credit-spread builders):
+`credit_distance_gate_enabled`, `min_credit_distance_atr`,
+`credit_pivot_buffer_gate_enabled`,
+`min_short_strike_pivot_buffer_atr`, `adaptive_width_enabled`,
+`adaptive_width_max_scale`. The long-options yaml leaves all of
+these at their defaults. They're listed in `OptionsConfig` so the
+shared dataclass works for both strategies, but the long-only
+entry path never reads them — there's no short leg to gate.
+
 General behavior:
 
 - Raising score thresholds makes the option engine more selective.

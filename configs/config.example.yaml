@@ -570,8 +570,18 @@ options:
   # sits closer than min_credit_distance_atr * ATR to the underlying.
   credit_distance_gate_enabled: false
   min_credit_distance_atr: 1.8
+  # Credit pivot-buffer gate (2026-05-21) — reject when the short strike
+  # sits within `min_short_strike_pivot_buffer_atr * ATR` of the recent
+  # market-structure pivot (LTF/HTF reference_high for bear call;
+  # reference_low for bull put). Catches the case where the short lands
+  # AT a recent pivot — the credit_distance_gate above only measures
+  # from current spot, which can pass even when the short is ON the
+  # pivot. Credit-spread strategies only.
+  credit_pivot_buffer_gate_enabled: false
+  min_short_strike_pivot_buffer_atr: 1.0
   # Adaptive strike width — scale strike_width_by_symbol with VIX up to
-  # adaptive_width_max_scale.
+  # adaptive_width_max_scale. Width is snapped to whole dollars so the
+  # hedge target always lands on a real strike for SPY/QQQ/IWM.
   adaptive_width_enabled: false
   adaptive_width_max_scale: 1.5
 

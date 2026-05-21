@@ -917,6 +917,8 @@ Shared 0DTE ETF option-engine settings. Both option strategies use this block.
 | `trend_min_volume_ratio`         | `0.90`                                                                                                       |
 | `credit_distance_gate_enabled`   | `false`                                                                                                      |
 | `min_credit_distance_atr`        | `1.8`                                                                                                        |
+| `credit_pivot_buffer_gate_enabled` | `false`                                                                                                    |
+| `min_short_strike_pivot_buffer_atr` | `1.0`                                                                                                     |
 | `adaptive_width_enabled`         | `false`                                                                                                      |
 | `adaptive_width_max_scale`       | `1.5`                                                                                                        |
 
@@ -983,6 +985,9 @@ Behavior and valid values:
 - Credit strike distance gate (applies to `midday_credit_spread`):
   - `credit_distance_gate_enabled`: when `true`, requires the short strike to sit at least `min_credit_distance_atr × ATR` from the current underlying price before a credit spread is allowed.
   - `min_credit_distance_atr`: ATR multiple defining the minimum strike-to-spot distance.
+- Credit pivot-buffer gate (applies to `midday_credit_spread`; added 2026-05-21):
+  - `credit_pivot_buffer_gate_enabled`: when `true`, requires the short strike to sit at least `min_short_strike_pivot_buffer_atr × ATR` beyond the recent market-structure pivot (LTF/HTF `reference_high` for bear call; `reference_low` for bull put). Catches the "short sitting ON the pivot" failure mode the distance gate above misses — the distance gate measures from current spot, which can pass even when the short is at a recent high.
+  - `min_short_strike_pivot_buffer_atr`: ATR multiple defining the minimum cushion from the pivot.
 - VIX-adaptive strike width:
   - `adaptive_width_enabled`: when `true`, scales `strike_width_by_symbol` up by a VIX-driven factor capped at `adaptive_width_max_scale`. Wider verticals when VIX is elevated, baseline width when VIX is normal.
   - `adaptive_width_max_scale`: hard upper bound on the per-symbol width multiplier.
