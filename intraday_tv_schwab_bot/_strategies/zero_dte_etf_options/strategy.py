@@ -261,8 +261,16 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         return base_delta + shift
 
     def _adaptive_strike_width(self, underlying: str, base_width: float) -> float:
-        """Scale strike width with current ATR vs trailing median to adapt to
-        volatility. Wider on high-vol days (more premium), tighter on quiet."""
+        """Scale strike width with current ATR vs trailing median to adapt
+        to volatility. Wider on high-vol days (more premium), tighter on
+        quiet. Snapped to the chain's strike increment (whole dollars for
+        SPY/QQQ/IWM 0DTE) so hedge_target always lands on a real strike
+        — the 2026-05-20 session logged 183 ``no_hedge_leg`` skips with
+        fractional target_hedge_strike values (732.5, 701.5, 702.5)
+        because the previous $0.50 rounding produced strikes that don't
+        exist on the chain. Rounding to whole dollars matches the
+        ``strike_width_by_symbol`` defaults (all integer) and the actual
+        Schwab chain grid for these ETFs."""
         if not getattr(self.optcfg, "adaptive_width_enabled", False):
             return base_width
         current_atr = getattr(self, "_underlying_atr_cache", {}).get(underlying)
@@ -271,7 +279,13 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return base_width
         max_scale = float(getattr(self.optcfg, "adaptive_width_max_scale", 1.5))
         scale = max(1.0, min(max_scale, current_atr / ref_atr))
-        return round(base_width * scale * 2) / 2  # round to nearest $0.50
+        scaled = base_width * scale
+        # Round to whole dollars but never collapse below base_width —
+        # banker's rounding on 2.5 returns 2, which would be a no-op
+        # scale and silently disable adaptive widening. round-up via
+        # +0.5 ensures the gate-up step happens at the intended scale.
+        snapped = float(int(scaled + 0.5))
+        return max(snapped, float(base_width))
 
     @staticmethod
     def _option_quote_stability_force_cooldown_seconds() -> float:
@@ -1037,10 +1051,19 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         if cached is not None:
             return cached
         today = now_et().date()
+        # strikeCount=24 (was 12) — for 0DTE credit spreads the short leg
+        # sits at ~0.20-0.30 delta (3-5 strikes OTM) and the hedge then
+        # needs another 2-3 strikes further OTM. The previous 12-strike
+        # window (±6 around ATM) cut off the hedge target on most credit
+        # builds — 2026-05-20 session logged 183 no_hedge_leg skips
+        # because the chain returned didn't include strikes far enough
+        # from spot. 24 strikes (±12) gives the hedge plenty of headroom
+        # without meaningfully changing the API cost or liquidity-filter
+        # processing time.
         response = call_schwab_client(client, "option_chains",
             symbol=symbol,
             contractType="ALL",
-            strikeCount=12,
+            strikeCount=24,
             includeUnderlyingQuote=True,
             fromDate=today,
             toDate=today,

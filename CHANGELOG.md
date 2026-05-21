@@ -198,6 +198,79 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Session archive: trades.csv empty when daily fire runs before bot shutdown.** *2026-05-20*
+  - Diagnosis from 2026-05-20 session: bot took 2 SPY credit-spread
+    trades (both stopped, -$2 each → -$4 realized). Both appeared in
+    `events.jsonl`, `bot_*.log`, and the account snapshot — but the
+    archive's `trades.csv` was empty (only header) and
+    `manifest.trades_today` read 0.
+  - Root cause: `_maybe_export_session_archive` (engine.py:493) fires
+    once per ET trading day at ~16:00 ET when the equity session
+    ends, calling `_export_session_archive` directly. But the
+    cumulative `.logs/trades.csv` is only appended-to by
+    `write_session_report`, which **only runs on bot shutdown**
+    (engine.py:627). So the daily archive reads from a CSV last
+    touched at the previous bot shutdown — empty for today.
+  - Fix: `export_session_archive` (session_report.py:834+) now reads
+    closed trades **directly from `account.trades`** (filtered to
+    today's ET date via `exit_time.astimezone(now_et().tzinfo).date()`)
+    instead of filtering the stale cumulative CSV. The `account`
+    parameter was already passed in but was being ignored for this
+    purpose. Cumulative CSV append on shutdown still happens
+    unchanged — daily archive no longer depends on it.
+
+- **0DTE credit spreads: 183 `no_hedge_leg` skips per session due to chain truncation + fractional widths.** *2026-05-20*
+  - Two root causes stacking, both surfaced on 2026-05-20 session:
+    1. `_fetch_raw_option_chain` requested `strikeCount=12` — for
+       SPY at 740, that returns strikes 734-745. Short leg picked by
+       0.23-delta lands at ~735 (edge of chain). Hedge target 2.5
+       below = 732.5, **outside the 12-strike window**, so
+       `choose_nearest_strike("lower", 732.5)` returned None.
+    2. `_adaptive_strike_width` rounded scaled widths to nearest
+       $0.50 — produced fractional targets (732.5, 701.5, 702.5)
+       even when the chain only has integer strikes for these ETFs.
+  - Fixes:
+    - `strikeCount: 12 → 24` — ±12 around ATM gives credit-spread
+      hedges room without meaningfully changing API cost or
+      liquidity-filter processing time.
+    - `_adaptive_strike_width` now snaps to whole dollars via
+      explicit `int(scaled + 0.5)` (ceiling-on-half so 2.5 → 3, not
+      banker's-rounded 2) and clamps `>= base_width` so the gate-up
+      step never silently collapses to a no-op when scaling is just
+      above 1.0.
+  - Together: today's chain returned (with strikeCount=24) would
+    have included strike 732 — `choose_nearest_strike("lower", 732)`
+    finds it cleanly. No fractional targets generated. Should
+    eliminate the `no_hedge_leg` skip class entirely.
+
+- **Dashboard focus card: long skip reasons no longer push pills off the right edge.** *2026-05-20*
+  - The compact decision-label on the focus-meta line (top-left of
+    main focus card) could read e.g. `"skipped: option quote
+    unstable"` or `"skipped: insufficient underlying bars"` — long
+    enough to crowd the right-side `Last / Change / Spread / Vol`
+    pill stack and break the chart-head layout.
+  - Two-layer fix:
+    - **JS abbreviation map** (`COMPACT_DECISION_REASON_LABELS` in
+      `dashboard.js`) — 28 entries collapsing the most verbose
+      tokens (`insufficient_underlying_bars → low bars`,
+      `option_quote_unstable → quote unstable`,
+      `no_contract_near_target_delta → no delta match`, etc.).
+      Saves 10-30 chars per token. Unmapped tokens still fall
+      through to the existing underscore→space humanizer.
+    - **Drop the `"<action>: "` prefix in compact form** —
+      `entryDecisionLabelCompact` no longer prepends
+      `"skipped: "` / `"error: "`. The trade-not-taken state is
+      implied by the muted styling and the absence of an active-
+      position chip elsewhere on the card. Full-form
+      `entryDecisionLabel` keeps the prefix for roomier surfaces.
+    - **CSS safety net** — `.focus-meta` gets
+      `white-space: nowrap; overflow: hidden; text-overflow:
+      ellipsis; max-width: 100%`. `.chart-head > div:first-child`
+      gets `min-width: 0; flex: 0 1 auto; overflow: hidden` so the
+      left wrapper can shrink. Any future verbose token that
+      bypasses the abbreviation map truncates with `…` instead of
+      breaking layout.
+
 - **0DTE strategy: KeyError 'nearest_bullish' when `use_fvg_context` disabled.** *2026-05-19*
   - `_regime_confirm` had a partial fallback dict at strategy.py:707-708:
     `{"bull_score": 0.0, "bear_score": 0.0, "directional_pressure": 0.0}`

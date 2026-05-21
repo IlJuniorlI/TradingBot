@@ -598,9 +598,32 @@
       margin-bottom: 0;
       min-width: 0;
     }
+    /* Left wrapper (symbol + focus-meta) — must be allowed to shrink
+       below its intrinsic width so the right-side pill stack
+       (.focus-stack with Last/Change/Spread/Vol chips) always has room.
+       Without min-width: 0 + flex-shrink, a long entry-decision skip
+       reason on the focus-meta line pushes the pills off the right
+       edge of the chart panel. JS-side abbreviation + drop-action-
+       prefix lives in dashboard.js (COMPACT_DECISION_REASON_LABELS
+       and entryDecisionLabelCompact) — this CSS is the safety net
+       that keeps the layout intact when a new long token shows up
+       before the JS abbreviation map has caught it. */
+    .chart-head > div:first-child {
+      min-width: 0;
+      flex: 0 1 auto;
+      overflow: hidden;
+    }
     .symbol-focus-title { display: flex; align-items: center; gap: 12px; min-width: 0; flex: 0 1 auto; }
     .symbol-focus-title .symbol-name { font-size: 36px; }
-    .focus-meta { color: var(--muted); font-size: 13px; margin-top: 6px; }
+    .focus-meta {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 6px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 100%;
+    }
     .focus-stack {
       display: flex;
       flex: 1 1 auto;

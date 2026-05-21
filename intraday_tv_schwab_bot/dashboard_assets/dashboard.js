@@ -238,7 +238,51 @@ function humanizeDecisionToken(value) {
   return rest.length ? `${humanHead}: ${rest.join(':')}` : humanHead;
 }
 
-// Compact form: drops the parameter detail after the first colon.
+// Short-form labels for the most verbose entry-decision tokens. Used by
+// humanizeDecisionTokenCompact below for the focus-meta line where the
+// space budget is tight. Keys are the raw underscore tokens emitted by
+// the strategies (zero_dte_etf_options + equity strategies); values are
+// the abbreviated human labels. The full token still appears in the
+// score-sub line below the focus card, so the abbreviations here only
+// affect the always-visible top-left status text.
+//
+// Add new entries here when a new long token shows up — anything longer
+// than ~16 chars after underscore→space conversion is a candidate.
+const COMPACT_DECISION_REASON_LABELS = {
+  insufficient_underlying_bars: 'low bars',
+  insufficient_confirm_bars: 'low confirm bars',
+  insufficient_htf_bars: 'low htf bars',
+  insufficient_bars: 'low bars',
+  insufficient_chain: 'thin chain',
+  option_quote_unstable: 'quote unstable',
+  quote_not_stable: 'quote unstable',
+  option_chain_empty: 'no chain',
+  option_chain_invalid: 'bad chain',
+  no_contract_near_target_delta: 'no delta match',
+  vix_above_limit: 'vix high',
+  vix_below_floor: 'vix low',
+  vix_spike: 'vix spike',
+  iv_rank_too_low: 'iv low',
+  iv_rank_too_high: 'iv high',
+  dead_tape: 'dead tape',
+  weak_relative_volume: 'low rvol',
+  chaos_intraday_range: 'chop range',
+  chart_pattern_bias_too_low: 'pattern weak',
+  eql_eqh_compressed: 'eq compressed',
+  min_score_gap_not_met: 'score gap low',
+  regime_unclear: 'regime unclear',
+  no_setup: 'no setup',
+  already_in_position: 'in position',
+  outside_entry_window: 'window closed',
+  confirm_index_disagrees: 'idx disagrees',
+  htf_misaligned: 'htf misaligned',
+  style_unavailable: 'style off',
+  force_flatten_active: 'flatten now',
+  not_yet_implemented: 'todo',
+};
+
+// Compact form: drops the parameter detail after the first colon and
+// consults COMPACT_DECISION_REASON_LABELS for the most verbose tokens.
 // Used in tight UI spots (e.g. the focus-meta line next to the symbol name)
 // where long ETF-options skip reasons like
 // `option_quote_unstable:bid=1.05 ask=1.20 mid=1.13 stability_pct=14.2`
@@ -248,6 +292,8 @@ function humanizeDecisionTokenCompact(value) {
   const raw = String(value || '').trim();
   if (!raw) return '—';
   const head = raw.split(':')[0];
+  const abbrev = COMPACT_DECISION_REASON_LABELS[head];
+  if (abbrev) return abbrev;
   return head.replace(/_/g, ' ');
 }
 
@@ -268,17 +314,20 @@ function entryDecisionLabel(decision) {
 }
 
 // Compact variant for tight UI surfaces. Same shape as
-// entryDecisionLabel() but uses the head-only humanizer so long
-// parameter strings (e.g. option-strategy quote-stability values)
-// don't blow out the focus-meta line layout.
+// entryDecisionLabel() but uses the head-only humanizer + abbreviation
+// map so long parameter strings (e.g. option-strategy quote-stability
+// values) don't blow out the focus-meta line layout. Also drops the
+// "skipped: " action prefix — the trade-not-taken state is implied by
+// the muted styling and the absence of an active-position label
+// elsewhere on the card. The full prefix still appears in
+// entryDecisionLabel() used on roomier surfaces.
 function entryDecisionLabelCompact(decision) {
   if (!decision || typeof decision !== 'object') return '';
   const action = String(decision.action || '').trim().toLowerCase();
   const primary = humanizeDecisionTokenCompact(decision.primary_reason || (Array.isArray(decision.reasons) ? decision.reasons[0] : ''));
   if (!action && !primary) return '';
   if (!primary || primary === '—') return action || '';
-  if (!action || action === 'signal') return primary;
-  return `${action}: ${primary}`;
+  return primary;
 }
 
 function normalizeTradingViewSymbol(symbol) {

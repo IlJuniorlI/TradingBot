@@ -831,24 +831,46 @@ def export_session_archive(
         except Exception as exc:
             LOG.warning("Could not copy daily log %s: %s", log_src, exc)
 
-    # Filter the cumulative trades.csv down to today's trades for quick analysis.
-    trades_src = log_dir_path / "trades.csv"
+    # Write today's closed trades directly from the account's in-memory
+    # trade history. We previously filtered the cumulative trades.csv,
+    # but that file is only appended-to by write_session_report() (which
+    # runs on bot shutdown). When the daily end-of-day archive fires at
+    # ~16:00 ET via _maybe_export_session_archive, the cumulative CSV
+    # still has yesterday's last shutdown state — so today's trades
+    # never made it into the archive (observed live 2026-05-20: 2
+    # SPY credit-spread closes in account + log, 0 rows in archive
+    # trades.csv).
+    #
+    # account.trades is the source of truth. final_exit guards against
+    # partial-exit interim rows, and the ET-date filter matches the
+    # per-day boundary the archive uses everywhere else.
     trades_dst = archive_root / "trades.csv"
     trades_today = 0
-    if trades_src.exists():
+    session_date_str = session_date.isoformat()
+    if account is not None:
         try:
-            with open(trades_src, newline="") as src_fh:
-                rows = list(csv.reader(src_fh))
-            if rows:
-                header = rows[0]
-                body = [r for r in rows[1:] if r and r[0] == session_date.isoformat()]
-                with open(trades_dst, "w", newline="") as dst_fh:
-                    writer = csv.writer(dst_fh)
-                    writer.writerow(header)
-                    writer.writerows(body)
-                trades_today = len(body)
+            closed_today: list[TradeRecord] = []
+            for trade in getattr(account, "trades", []) or []:
+                if not bool(getattr(trade, "final_exit", True)):
+                    continue
+                exit_time = getattr(trade, "exit_time", None)
+                if exit_time is None:
+                    continue
+                try:
+                    exit_date = exit_time.astimezone(now_et().tzinfo).date()
+                except Exception:
+                    LOG.debug("Could not normalize exit_time for trade %s; falling back to naive date()", trade, exc_info=True)
+                    exit_date = getattr(exit_time, "date", lambda: None)()
+                if exit_date == session_date:
+                    closed_today.append(trade)
+            with open(trades_dst, "w", newline="", encoding="utf-8") as dst_fh:
+                writer = csv.DictWriter(dst_fh, fieldnames=TRADE_CSV_COLUMNS, extrasaction="raise")
+                writer.writeheader()
+                for trade in closed_today:
+                    writer.writerow(_trade_csv_row(trade, session_date_str))
+            trades_today = len(closed_today)
         except Exception as exc:
-            LOG.warning("Could not write daily trades CSV: %s", exc)
+            LOG.warning("Could not write daily trades CSV from account: %s", exc, exc_info=True)
 
     # Config snapshot: dump the resolved config (with secrets redacted)
     # so future audits can reproduce decisions even if config.yaml has
