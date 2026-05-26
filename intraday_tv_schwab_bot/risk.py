@@ -520,6 +520,33 @@ class RiskManager:
         else:
             min_r = default_min_r
         peak_r, current_r = self._peak_and_current_r(position, last_price, initial_risk)
+
+        # Low-tier check (2026-05-26). For trades that peaked between
+        # ``peak_giveback_low_tier_min_r`` and ``min_r`` (the main gate),
+        # arm a tighter give-back floor so 0.7-1R MFE trades don't
+        # round-trip back to BE / fixed stop with no exit. Skipped when
+        # the high-conviction override is active — those positions want
+        # the wider main-tier behavior. The floor uses a fixed giveback
+        # fraction (not the main tier's peak-size-dependent ladder)
+        # because at sub-1R peaks the run-vs-noise signal is weaker and
+        # a constant pct is simpler to reason about than tiers within
+        # tiers.
+        low_tier_enabled = bool(getattr(self.config.risk, "peak_giveback_low_tier_enabled", True))
+        low_tier_min_r = float(getattr(self.config.risk, "peak_giveback_low_tier_min_r", 0.7) or 0.0)
+        low_tier_frac = float(getattr(self.config.risk, "peak_giveback_low_tier_giveback_frac", 0.7))
+        if (
+                low_tier_enabled
+                and not override_active
+                and 0.0 < low_tier_min_r <= peak_r < min_r
+        ):
+            low_tier_floor = peak_r * (1.0 - low_tier_frac)
+            if current_r <= low_tier_floor:
+                if isinstance(meta, dict):
+                    meta["_peak_giveback_min_r_used"] = round(float(low_tier_min_r), 4)
+                    meta["_peak_giveback_override_active"] = False
+                    meta["_peak_giveback_low_tier_active"] = True
+                return True
+
         if peak_r < min_r:
             return False
         floor_r = self._peak_giveback_floor_r(peak_r)
@@ -528,9 +555,11 @@ class RiskManager:
         triggered = current_r <= floor_r
         if triggered and isinstance(meta, dict):
             # Stamp which threshold actually tripped so update_position can
-            # emit a differentiated exit reason (default vs high-conviction).
+            # emit a differentiated exit reason (default vs high-conviction
+            # vs low-tier).
             meta["_peak_giveback_min_r_used"] = round(float(min_r), 4)
             meta["_peak_giveback_override_active"] = bool(override_active)
+            meta["_peak_giveback_low_tier_active"] = False
         return triggered
 
     def update_position(self, position: Position, last_price: float) -> tuple[bool, str]:
@@ -561,12 +590,19 @@ class RiskManager:
         )
         if peak_giveback_exit:
             peak_r, current_r = self._peak_and_current_r(position, last_price, initial_risk)
-            floor_r = self._peak_giveback_floor_r(peak_r)
             # ``_peak_giveback_triggered`` stamped these markers right before
             # returning True; read them so we can emit a differentiated exit
-            # reason (default 1.0R floor vs Tier 3b high-conviction override).
+            # reason across the three tiers (low / default / high-conviction).
             min_r_used = float(meta.get("_peak_giveback_min_r_used") or 0.0) if isinstance(meta, dict) else 0.0
             override_active = bool(meta.get("_peak_giveback_override_active")) if isinstance(meta, dict) else False
+            low_tier_active = bool(meta.get("_peak_giveback_low_tier_active")) if isinstance(meta, dict) else False
+            # Floor for the exit reason string: low-tier uses fixed
+            # giveback_frac × peak; main tier uses the peak-size ladder.
+            if low_tier_active:
+                low_tier_frac = float(getattr(self.config.risk, "peak_giveback_low_tier_giveback_frac", 0.7))
+                floor_r = peak_r * (1.0 - low_tier_frac)
+            else:
+                floor_r = self._peak_giveback_floor_r(peak_r)
             if isinstance(meta, dict):
                 meta["peak_giveback_fired"] = True
                 meta["peak_giveback_peak_r"] = round(float(peak_r), 4)
@@ -574,10 +610,17 @@ class RiskManager:
                 meta["peak_giveback_current_r"] = round(float(current_r), 4)
                 meta["peak_giveback_min_r_used"] = round(min_r_used, 4)
                 meta["peak_giveback_override_active"] = override_active
+                meta["peak_giveback_low_tier_active"] = low_tier_active
                 # Drop the internal sentinels (we promoted them above).
                 meta.pop("_peak_giveback_min_r_used", None)
                 meta.pop("_peak_giveback_override_active", None)
-            reason_tag = "peak_giveback_high_conviction" if override_active else "peak_giveback"
+                meta.pop("_peak_giveback_low_tier_active", None)
+            if low_tier_active:
+                reason_tag = "peak_giveback_low_tier"
+            elif override_active:
+                reason_tag = "peak_giveback_high_conviction"
+            else:
+                reason_tag = "peak_giveback"
             return True, (
                 f"{reason_tag}:peak{peak_r:.2f}R_floor{(floor_r or 0.0):.2f}R"
                 f"_minR{min_r_used:.2f}"

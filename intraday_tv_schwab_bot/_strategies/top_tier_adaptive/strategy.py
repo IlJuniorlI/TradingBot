@@ -46,6 +46,16 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # infer the effective side from recent observations if one side
         # dominates.
         self._recent_directional_bias: dict[str, deque[Side | None]] = {}
+        # Per-symbol timestamp of the most recent stretched_at_top
+        # (or short stretched_at_bottom) build failure. Drives the
+        # hysteresis gate in ``_finalize_signal`` so a candidate that
+        # just failed the stretched check can't immediately re-arm
+        # on a single tick across the threshold. Session 2026-05-26:
+        # AMZN rejected at 10:11:41 with pct_b=0.851 (0.001 over the
+        # 0.85 cutoff), entered 46 s later as the bar's close ticked
+        # back across. ``Any`` to avoid pulling in datetime at module
+        # scope under ``from __future__ import annotations``.
+        self._stretched_failure_time: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Watchlist — include all configured index confirmation ETFs so they
@@ -165,6 +175,25 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             if vwap > 0 and abs((close - vwap) / vwap) >= 0.0025:
                 return False
         return True
+
+    def _sector_day_strength(self, symbol: str, bars: dict[str, pd.DataFrame]) -> float | None:
+        """Return the first available sector ETF's day_strength (close vs
+        session_open, in percent) for *symbol*. Used by the relative-strength
+        gate in entry_signals to compute how much the candidate is
+        leading/lagging its sector. Returns ``None`` when no sector ETF
+        bars are loaded or all session-open lookups fail."""
+        for sym in self._indices_for_symbol(symbol):
+            frame = bars.get(sym)
+            if frame is None or frame.empty:
+                continue
+            try:
+                close = _safe_float(frame.iloc[-1]["close"])
+            except Exception:
+                continue
+            _, ds = self._compute_live_bias_and_day_strength(frame, close)
+            if ds is not None:
+                return ds
+        return None
 
     # ------------------------------------------------------------------
     # Regime scoring
@@ -775,6 +804,51 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         if recent.empty:
             self._set_build_failure(c.symbol, "pullback", "insufficient_ltf_history")
             return None
+
+        # Pullback-completion confirmation (2026-05-26). The pullback regime
+        # is meant to fire on a bounce completing, not mid-fall. Without
+        # this gate, the bot can buy a pullback that's actually a rollover
+        # top — session 2026-05-26 FCX#1 entered at 10:12:26 with the
+        # in-progress 5m bar showing close_pos 0.186 (close in bottom 19%
+        # of the bar's range), then never bounced and lost $44. Require
+        # the current bar's close to be in the directional half AND the
+        # current close to be on the favorable side of the prior 5m bar's
+        # close. Both conditions together confirm the move has turned.
+        # Defaults: 0.5 close-position threshold (close in upper half for
+        # LONG, lower half for SHORT). Disable via
+        # ``pullback_require_bounce_confirmation: false``.
+        if bool(self.params.get("pullback_require_bounce_confirmation", True)):
+            if len(session_ltf) >= 2:
+                last_bar = session_ltf.iloc[-1]
+                prev_bar = session_ltf.iloc[-2]
+                bar_high = _safe_float(last_bar.get("high"), close)
+                bar_low = _safe_float(last_bar.get("low"), close)
+                bar_close = _safe_float(last_bar.get("close"), close)
+                bar_range = bar_high - bar_low
+                close_pos = (bar_close - bar_low) / bar_range if bar_range > 0 else 0.5
+                prior_close = _safe_float(prev_bar.get("close"), bar_close)
+                close_pos_min = float(self.params.get("pullback_bounce_close_position_min", 0.5))
+                if side == Side.LONG:
+                    bar_in_favorable_half = close_pos >= close_pos_min
+                    moved_favorable = bar_close > prior_close
+                    if not (bar_in_favorable_half and moved_favorable):
+                        self._set_build_failure(
+                            c.symbol, "pullback",
+                            f"long_pullback_no_bounce_confirm("
+                            f"close_pos={close_pos:.2f},prior_close={prior_close:.4f},close={bar_close:.4f})",
+                        )
+                        return None
+                else:
+                    bar_in_favorable_half = close_pos <= (1.0 - close_pos_min)
+                    moved_favorable = bar_close < prior_close
+                    if not (bar_in_favorable_half and moved_favorable):
+                        self._set_build_failure(
+                            c.symbol, "pullback",
+                            f"short_pullback_no_bounce_confirm("
+                            f"close_pos={close_pos:.2f},prior_close={prior_close:.4f},close={bar_close:.4f})",
+                        )
+                        return None
+
         # vol_widening applied to both ATR buffer and default_stop_pct floor (Tier 2a).
         buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening
         effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening
@@ -1300,6 +1374,32 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                         return None
         if regime in {"trend", "pullback"}:
             if bool(self.params.get("reject_stretched_entries", True)) and not orb_stretched_bypass:
+                # Hysteresis (2026-05-26). Once a candidate has failed the
+                # stretched check within the cooldown window, keep rejecting
+                # without re-evaluating thresholds. The 0.85 pct_b / 1.30
+                # ATR-stretch cutoffs are crisp — a single tick across the
+                # threshold relaxes them while the structural condition
+                # (price stretched above EMA20 / pinned near upper Bollinger
+                # band) is still active. Session 2026-05-26 AMZN was
+                # rejected at 10:11:41 with pct_b=0.851 then entered 46 s
+                # later as the bar's close ticked back across, losing $28.
+                # The cooldown is per-symbol regardless of side — opposite-
+                # side entries during this window are rare in practice
+                # (a stretched-top symbol won't pass stretched-bottom) and
+                # keeping a single timestamp avoids extra state.
+                cooldown_min = float(self.params.get("stretched_cooldown_minutes", 3.0))
+                if cooldown_min > 0:
+                    last_fail = self._stretched_failure_time.get(c.symbol)
+                    if last_fail is not None:
+                        elapsed_min = (now_et() - last_fail).total_seconds() / 60.0
+                        if elapsed_min < cooldown_min:
+                            side_prefix = "long" if side == Side.LONG else "short"
+                            self._set_build_failure(
+                                c.symbol, regime,
+                                f"{side_prefix}_stretched_cooldown("
+                                f"elapsed={elapsed_min:.1f}m<{cooldown_min:.1f}m)",
+                            )
+                            return None
                 pct_b = _optional_float(getattr(tech_ctx, "bollinger_percent_b", None))
                 atr_stretch = _optional_float(getattr(tech_ctx, "atr_stretch_ema20_mult", None))
                 pct_b_max = float(self.params.get("stretched_percent_b_max", 0.80))
@@ -1309,6 +1409,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     and pct_b is not None and atr_stretch is not None
                     and pct_b >= pct_b_max and atr_stretch >= stretch_max
                 ):
+                    self._stretched_failure_time[c.symbol] = now_et()
                     self._set_build_failure(
                         c.symbol, regime,
                         f"long_stretched_at_top(pct_b={pct_b:.3f}>={pct_b_max:.2f},stretch={atr_stretch:.2f}>={stretch_max:.2f})",
@@ -1326,6 +1427,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     # pct_b <= 0.15 = near lower band = stretched below. So the
                     # magnitude threshold stretch_max applies symmetrically to
                     # both sides; pct_b alone disambiguates direction.
+                    self._stretched_failure_time[c.symbol] = now_et()
                     self._set_build_failure(
                         c.symbol, regime,
                         f"short_stretched_at_bottom(pct_b={pct_b:.3f}<={1.0 - pct_b_max:.2f},stretch={atr_stretch:.2f}>={stretch_max:.2f})",
@@ -1888,6 +1990,69 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # counter-bias setups. Shorts can still be globally disabled
             # via ``allow_short = False``.
             preferred_sides = [Side.LONG, Side.SHORT] if allow_short else [Side.LONG]
+
+            # Hard screener-bias veto (2026-05-26). When the screener has
+            # tagged this candidate with a directional bias the strategy
+            # cannot trade (screener=SHORT with allow_short=False, or
+            # screener=LONG with a hypothetical long-disabled config),
+            # skip the candidate without scoring. The soft penalty in
+            # ``_bias_penalty`` is too weak on the typical 0.3-1% market
+            # day — its magnitude factor saturates at 2% day_strength so
+            # a -0.5% day applies only 0.25 to LONG-side regimes, leaving
+            # min_pullback_score: 3.5 effectively at 3.75. Session
+            # 2026-05-26 entered 7 LONGs while the screener flagged 3,959
+            # SHORT vs 2,533 LONG candidates and the per-cycle bias_pen
+            # ranged 0.14-0.21, gating nothing. Gated under the same
+            # ``respect_screener_bias`` toggle as the soft penalty so a
+            # single config switch controls both; ORB-window bypass also
+            # disables this veto via ``respect_bias`` (gap-fade entries
+            # against the screener still allowed during 09:35-orb_end).
+            if (
+                respect_bias
+                and c.directional_bias is not None
+                and c.directional_bias not in preferred_sides
+            ):
+                self._record_entry_decision(c.symbol, "skipped", [
+                    f"screener_bias_counter_to_tradable_sides({c.directional_bias.value})"
+                ])
+                continue
+
+            # Relative-strength filter (2026-05-26). The candidate's bias
+            # signals above measure absolute intraday move; this measures
+            # the candidate vs its sector ETF. A stock drifting at 0% on
+            # a +1% sector day is materially weak even though both
+            # ``day_strength`` and ``screener.directional_bias`` are None.
+            # Session 2026-05-26 entry forensics: INTC at 10:32 was +0.21%
+            # while XLK was +1.27% (rel −1.06%, lost $3); INTC at 14:04 was
+            # +0.10% vs XLK +0.90% (rel −0.80%, lost $64); NEM at 10:16 was
+            # −0.19% vs XLB +0.67% (rel −0.86%, lost $10). All three would
+            # be blocked at threshold 0.50%. META — the lone winner — was
+            # +0.20% vs XLC −0.04% (rel +0.25%), so the gate leaves
+            # legitimate setups alone. When the rel-strength conflicts
+            # with a side, that side is removed from ``preferred_sides``;
+            # if no sides remain the candidate is skipped entirely. ORB
+            # window is bypassed (the first 30 min of trading is too
+            # noisy for a stock-vs-sector divergence read).
+            rs_threshold = float(self.params.get("relative_strength_block_threshold_pct", 0.5))
+            rs_orb_bypass = bool(self.params.get("orb_bypass_relative_strength", True)) and in_orb_window
+            if rs_threshold > 0.0 and not rs_orb_bypass and day_strength is not None:
+                sector_ds = self._sector_day_strength(c.symbol, bars)
+                if sector_ds is not None:
+                    rel_strength = day_strength - sector_ds
+                    blocked_long = rel_strength <= -rs_threshold and Side.LONG in preferred_sides
+                    blocked_short = rel_strength >= rs_threshold and Side.SHORT in preferred_sides
+                    if blocked_long:
+                        preferred_sides = [s for s in preferred_sides if s != Side.LONG]
+                    if blocked_short:
+                        preferred_sides = [s for s in preferred_sides if s != Side.SHORT]
+                    if not preferred_sides:
+                        direction = "lagging" if blocked_long else "leading"
+                        self._record_entry_decision(c.symbol, "skipped", [
+                            f"relative_strength_{direction}_sector(rel={rel_strength:+.2f}%,"
+                            f"sym={day_strength:+.2f}%,sec={sector_ds:+.2f}%,"
+                            f"threshold={rs_threshold:.2f}%)"
+                        ])
+                        continue
 
             best_signal: Signal | None = None
             fail_reasons: list[str] = []

@@ -76,6 +76,16 @@ risk:
   # +$95→-$3 on 2026-04-17 are exactly this failure mode).
   peak_giveback_enabled: true
   peak_giveback_min_r: 1.0
+  # Low-tier peak-giveback (added 2026-05-26): catches 0.7-1.0R MFE
+  # trades that round-trip to BE before the main tier arms. Uses a fixed
+  # giveback fraction (not the main tier's peak-size-dependent ladder)
+  # because at sub-1R peaks the run-vs-noise signal is weaker. At 0.9R
+  # peak with default 0.7 giveback_frac, exits when current_r ≤ 0.27R.
+  # Skipped when the high-conviction override is active (those want the
+  # wider main-tier leash). Set _enabled: false to disable.
+  peak_giveback_low_tier_enabled: true
+  peak_giveback_low_tier_min_r: 0.7
+  peak_giveback_low_tier_giveback_frac: 0.7
 
 # Runtime cadence, streaming, reconciliation, and logging controls.
 runtime:

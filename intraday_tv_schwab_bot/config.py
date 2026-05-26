@@ -348,6 +348,24 @@ class RiskConfig:
     # peak_giveback_min_r=0 to disable entirely.
     peak_giveback_enabled: bool = True
     peak_giveback_min_r: float = 1.0
+    # Low-tier peak-giveback (2026-05-26). The main peak-giveback gate only
+    # arms when peak_r ≥ peak_giveback_min_r (default 1.0), which means
+    # trades that peak in the 0.5-1.0R range and retrace through entry
+    # round-trip back to the BE / fixed stop with no exit floor. Session
+    # 2026-05-14 had 5 such trades (TSLA 0.70R, AMD 0.74R, GOOG 0.97R,
+    # META 0.54R, AAPL 0.60R) all stopped at ~BE with cumulative -$50;
+    # 5/26 added INTC#4 (0.80R, -$3) and NEM (0.58R, -$10). The low tier
+    # catches these by arming when peak_r reaches peak_giveback_low_tier_min_r
+    # (default 0.7R) and exiting when current_r retraces past
+    # peak * (1 - peak_giveback_low_tier_giveback_frac). Defaults are
+    # conservative: 70% giveback (floor at 30% of peak) so a 0.7R peak
+    # arms at floor 0.21R — enough to wiggle but not enough to lose
+    # the trade entirely. Skipped when the high-conviction override is
+    # active (those trades want the wider main-tier leash). Set
+    # peak_giveback_low_tier_enabled=False to disable entirely.
+    peak_giveback_low_tier_enabled: bool = True
+    peak_giveback_low_tier_min_r: float = 0.7
+    peak_giveback_low_tier_giveback_frac: float = 0.7
 
 
 @dataclass(slots=True)

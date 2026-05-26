@@ -75,6 +75,14 @@ risk:
   # a tiered fraction of the peak — 50% at 1R-2R, 40% at 2R-3R, 30% at 3R+.
   peak_giveback_enabled: true
   peak_giveback_min_r: 1.0
+  # Low-tier peak-giveback (2026-05-26): catches 0.7-1.0R MFE trades
+  # that round-trip to BE before the main tier (peak_giveback_min_r=1.0)
+  # arms. 0.7 giveback_frac = floor at 30% of peak (e.g., 0.9R peak →
+  # exits when current_r ≤ 0.27R). Skipped when the high-conviction
+  # per-trade override is active.
+  peak_giveback_low_tier_enabled: true
+  peak_giveback_low_tier_min_r: 0.7
+  peak_giveback_low_tier_giveback_frac: 0.7
 
 # Runtime cadence, streaming, reconciliation, and logging controls.
 runtime:
@@ -516,6 +524,13 @@ strategies:
       pullback_ema_touch_atr_mult: 0.45    # HIGH_VOL: was 0.35 — pullbacks noisier; allow further from EMA
       pullback_hold_atr_mult: 0.50         # HIGH_VOL: was 0.40 — same logic
       pullback_lookback_bars: 5
+      # Pullback-completion confirmation (2026-05-26): require entry bar's
+      # close to be in the upper half (LONG) / lower half (SHORT) of its
+      # range AND favorable vs the prior bar's close. Blocks "pullback
+      # that's actually a rollover" entries (FCX 5/26 10:12 had close_pos
+      # 0.19 on the in-progress 5m bar, still entered, lost $44).
+      pullback_require_bounce_confirmation: true
+      pullback_bounce_close_position_min: 0.5
 
       # Range detection
       range_max_vwap_dist_pct: 0.0020
@@ -541,15 +556,29 @@ strategies:
       # (VWAP/EMA/DMI/OBV/pct_b) read extreme due to opening dynamics.
 
       # Screener bias: honor SHORT/LONG tag instead of falling through to
-      # opposite side on score ties.
+      # opposite side on score ties. As of 2026-05-26, this flag also gates
+      # a HARD veto when c.directional_bias lies outside preferred_sides
+      # (e.g., screener=SHORT with allow_short=false) — see strategy.py
+      # `entry_signals` and README section 6f.
       respect_screener_bias: true
       orb_bypass_screener_bias: true           # gap-reversal LONGs need fallthrough during ORB
+
+      # Relative-strength gate (2026-05-26): filter preferred_sides based
+      # on (candidate.day_strength − sector_ETF.day_strength). When stock
+      # lags its sector by ≥ threshold, LONG is removed; outperforms by
+      # ≥ threshold, SHORT is removed. If preferred_sides empty → skip.
+      # Catches the "drifting at 0% on a +1% sector day" pattern (INTC
+      # 5/26 at +0.21% vs XLK +1.27%, rel −1.06%). Set threshold to 0 to
+      # disable.
+      relative_strength_block_threshold_pct: 0.5
+      orb_bypass_relative_strength: true       # stock-vs-sector divergence noisy during 09:35-orb_end
 
       # Stretched entry filter: reject LONG at pct_b ≥ threshold AND
       # atr_stretch ≥ threshold (mirror for SHORT at pct_b ≤ 1-threshold).
       reject_stretched_entries: true
       stretched_percent_b_max: 0.85            # HIGH_VOL: was 0.80 — bands widen in high vol; allow %B up to 0.85 for trend continuation
       stretched_atr_mult_max: 1.3              # HIGH_VOL: was 1.1 — bars stretch more from VWAP in high vol
+      stretched_cooldown_minutes: 3.0          # 2026-05-26: hysteresis after a stretched failure — single-tick relaxations no longer re-arm entry within the window (AMZN 10:11:41 fail → 10:12:27 enter pattern)
       orb_bypass_stretched_filter: false       # flipped off — bypass let stretched ORB losers through; LLY winner had stretch 0.34
 
       # Bar-size gate (2026-05-14) — reject entries when the LTF 5m bar

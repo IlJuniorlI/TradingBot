@@ -7,7 +7,69 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **top_tier_adaptive: four entry-quality gates + low-tier peak-giveback.** *2026-05-26*
+  - **Hard screener-bias veto.** Gated by the existing `respect_screener_bias`,
+    skips a candidate entirely when `c.directional_bias` is set and lies
+    outside `preferred_sides` (e.g., screener=SHORT with `allow_short:
+    false`). The Fix A soft penalty (section 6a) drags counter-bias scores
+    down but doesn't outright filter weak-bias setups; on 5/26 the per-cycle
+    `bias_pen` ranged 0.14-0.21 and gated nothing, despite the screener
+    flagging 3,959 SHORT vs 2,533 LONG candidates that day.
+  - **Relative-strength gate.** New manifest knobs
+    `relative_strength_block_threshold_pct` (default `0.5`) and
+    `orb_bypass_relative_strength` (default `true`). Filters
+    `preferred_sides` based on `(candidate.day_strength −
+    sector_ETF.day_strength)`. Catches stocks under-performing their
+    sector — 5/26 INTC at +0.21% vs XLK +1.27% (rel −1.06%, lost $3),
+    INTC at 14:04 at +0.10% vs XLK +0.90% (rel −0.80%, lost $64), NEM at
+    −0.19% vs XLB +0.67% (rel −0.86%, lost $10). META (the lone winner)
+    had rel +0.25% and passes the gate.
+  - **Stretched-cooldown hysteresis.** New `stretched_cooldown_minutes`
+    (default `3.0`). The `reject_stretched_entries` thresholds
+    (`stretched_percent_b_max`, `stretched_atr_mult_max`) are crisp — a
+    single tick across relaxes them while the structural condition is
+    still active. AMZN on 5/26 was rejected at 10:11:41 with pct_b=0.851
+    then entered 46 s later as the close ticked back across (lost $28).
+    The cooldown stamps the failure timestamp and rejects subsequent
+    checks within the window. Per-symbol regardless of side.
+  - **Pullback bounce confirmation.** New `pullback_require_bounce_confirmation`
+    (default `true`) and `pullback_bounce_close_position_min` (default
+    `0.5`) in `_build_pullback_signal`. Requires the entry bar's close
+    to be in the directional half (close_pos ≥ threshold for LONG; ≤
+    1-threshold for SHORT) AND on the favorable side of the prior 5m
+    bar's close. Blocks the "pullback that's actually a rollover" pattern
+    — FCX on 5/26 entered at 10:12:26 with the in-progress 5m bar
+    showing close_pos 0.186 (close in the bottom 19% of the bar's
+    range), then never bounced and lost $44.
+  - **Low-tier peak-giveback.** Three new `RiskConfig` fields:
+    `peak_giveback_low_tier_enabled` (default `True`),
+    `peak_giveback_low_tier_min_r` (default `0.7`),
+    `peak_giveback_low_tier_giveback_frac` (default `0.7`). Catches the
+    0.7-1.0R MFE "purgatory" trades that round-trip to BE / fixed stop
+    before the main tier (`peak_giveback_min_r: 1.0`) arms. Uses a
+    fixed giveback fraction (not the main tier's peak-size-dependent
+    ladder) because at sub-1R peaks the run-vs-noise signal is weaker.
+    At 0.9R peak with default 0.7 frac, exits when current_r ≤ 0.27R.
+    Skipped when the high-conviction `peak_giveback_min_r_override` is
+    active (those trades want the wider main-tier leash).
+  - Modeled 5/26 effect: 5 of 7 trades blocked (NEM, INTC×2 by RS gate;
+    AMZN by stretched cooldown; FCX#1 by pullback bounce), 2 enter
+    (META +$10.40 winner, FCX#2 -$38.87 residual). Net P&L: -$28.47 vs
+    -$177.66 original (-84% loss reduction).
+
 ### Changed
+
+- **top_tier_adaptive: `bias_penalty_saturate_at` 2.0 → 0.75 (manifest default).** *2026-05-26*
+  - The original 2.0 saturation assumed daily moves regularly hit ±2%;
+    intraday reality on most days is 0.3-1.0%, where the penalty
+    produced was 0.15-0.50 — not enough to filter `min_pullback_score:
+    3.5` candidates with raw scores 3.75+. At 0.75, a -1% day applies
+    full 1.0 penalty (was 0.5); a -0.5% day applies 0.67 (was 0.25).
+  - The `config.top_tier_adaptive.yaml` HIGH_VOL preset still overrides
+    to 2.5 (high-vol days produce 2-3% day_strength regularly, where
+    the manifest default would saturate too fast).
 
 - **0DTE option strategies: option_chain_cache_seconds 4 → 60.** *2026-05-21*
   - Both 0DTE configs previously overrode the default 6s chain-cache
