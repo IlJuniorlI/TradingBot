@@ -9,6 +9,29 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Dashboard TradingView ticker deep-links were broken for top_tier_adaptive.** *2026-05-28*
+  - Ticker chips link to `tradingview.com/symbols/<EXCHANGE>-<SYMBOL>/`.
+    Two causes left `<EXCHANGE>` wrong for the entire top_tier universe:
+    - `top_tier_adaptive/screener.py` was the ONLY equity screener that did
+      not `select("exchange")`, so its candidates carried no exchange and
+      the dashboard fell back to the live Schwab quote.
+    - `dashboard_quote_exchange` read Schwab's single-letter `exchange`
+      code (`"q"`/`"n"`/`"a"`/`"p"`) BEFORE the full `exchangeName`
+      (`"NASDAQ"`/`"NYSE"`). Single letters aren't valid TradingView
+      exchanges (not in `_EXCHANGE_ALIASES`), so the builder produced
+      `symbols/N-XOM/` (404) for NYSE names; NASDAQ names (`"q"` → `''`
+      in the front-end guard) got no link at all.
+  - Fix: top_tier screener now selects `exchange` (matching every other
+    equity screener — `_row_metadata` carries it straight into
+    `metadata["exchange"]`); `dashboard_quote_exchange` now prefers the
+    full `exchangeName`/`primaryExchangeName` over the single-letter code,
+    falling back to the short code only as a last resort.
+  - Verified: `n+NYSE→NYSE`, `q+NASDAQ→NASDAQ`, `p+NYSE Arca→AMEX`,
+    `a+NYSE American→AMEX`, `q+"NASDAQ Global Select"→NASDAQ`; simulated
+    front-end URLs resolve to `symbols/NYSE-XOM/` and `symbols/NASDAQ-NVDA/`.
+    New regression coverage in
+    `tests/test_bug_regressions.py::TestTradingViewExchangeLinks2026_05_28`.
+
 - **Dashboard structure overlay now mirrors the strategy's LTF structure params.** *2026-05-27 PM*
   - `DashboardCache.current_structure_overlay` built its CHoCH/BOS/EQH/EQL
     annotation with base params (`pivot_span`, no `min_pivot_gap_bars`,

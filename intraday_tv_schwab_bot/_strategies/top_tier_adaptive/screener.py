@@ -45,9 +45,17 @@ class TopTierAdaptiveScreener(BaseStrategyScreener):
         # variants for ``change_from_open`` aren't a real concern, but
         # bypassing keeps the values stable if a cached candidate
         # survives a session transition.
+        # ``exchange`` is pulled purely for the dashboard's TradingView
+        # deep-links (symbol_exchanges map -> https://www.tradingview.com/
+        # symbols/<EXCHANGE>-<SYMBOL>/). The strategy itself doesn't consume
+        # it, but without it these candidates carry no exchange and the
+        # dashboard falls back to the Schwab single-letter quote code
+        # ("n"/"q"), which isn't a valid TradingView exchange — producing
+        # broken "N-XOM" links. Every other equity screener already selects
+        # it; top_tier was the lone exception.
         query = (
             self._base_query()
-            .select("name", "close", "volume", "change", "change_from_open", "market_cap_basic")
+            .select("name", "exchange", "close", "volume", "change", "change_from_open", "market_cap_basic")
             .where(
                 *self._common_equity_conditions(),
                 c("name").isin(tradable),

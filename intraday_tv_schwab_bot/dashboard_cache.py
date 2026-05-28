@@ -98,17 +98,23 @@ def dashboard_quote_exchange(quote: Mapping[str, Any] | None) -> str | None:
     raw_payload = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
     raw_quote = raw_payload.get("quote") if isinstance(raw_payload.get("quote"), dict) else raw_payload
     raw_reference = raw_payload.get("reference") if isinstance(raw_payload.get("reference"), dict) else {}
+    # Prefer the full exchange NAME fields ("NASDAQ" / "NYSE" / "NYSE Arca")
+    # over Schwab's single-letter ``exchange`` code ("q" / "n" / "a" / "p").
+    # The single letters aren't valid TradingView exchanges and aren't in
+    # _EXCHANGE_ALIASES, so they pass through raw and build broken deep-links
+    # (symbols/N-XOM/ -> 404). The full names map cleanly via _EXCHANGE_ALIASES,
+    # so they must win when present; the short codes stay only as a last resort.
     candidates = [
+        raw_quote.get("exchangeName"),
+        raw_quote.get("primaryExchangeName"),
+        raw_reference.get("exchangeName"),
+        raw_reference.get("primaryExchangeName"),
+        raw_reference.get("listingExchange"),
         quote.get("exchange"),
         raw_quote.get("exchange"),
-        raw_quote.get("exchangeName"),
         raw_quote.get("primaryExchange"),
-        raw_quote.get("primaryExchangeName"),
         raw_reference.get("exchange"),
-        raw_reference.get("exchangeName"),
-        raw_reference.get("listingExchange"),
         raw_reference.get("primaryExchange"),
-        raw_reference.get("primaryExchangeName"),
     ]
     for value in candidates:
         normalized = dashboard_normalize_exchange(value)
