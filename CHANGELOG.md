@@ -9,6 +9,19 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Dashboard HTF chart now draws the EMA 50/200 the bot actually uses (top_tier_adaptive).** *2026-05-28*
+  - The HTF trend context computes EMA 50/200 on the 15m frame
+    (`_default_htf_context_for_score` hardcodes `ema_fast_span=50,
+    ema_slow_span=200`), but the preset didn't set
+    `htf_ema_fast_span`/`htf_ema_slow_span`, so the dashboard HTF chart fell
+    back to ema9/ema20 (fast EMAs of the 15m bars) — misrepresenting the HTF
+    trend the bot evaluates. Added `htf_ema_fast_span: 50` /
+    `htf_ema_slow_span: 200` to the preset so the HTF chart EMA override
+    (`DashboardCache.chart_payload`) renders 50/200. Chart-only — entry logic
+    is unchanged (top_tier's HTF direction is structure-based via
+    `require_htf_bias_alignment`, not an EMA cross; the 50/200 `htf_trend_bias`
+    is recorded as context but not gated on).
+
 - **Dashboard TradingView ticker deep-links were broken for top_tier_adaptive.** *2026-05-28*
   - Ticker chips link to `tradingview.com/symbols/<EXCHANGE>-<SYMBOL>/`.
     Two causes left `<EXCHANGE>` wrong for the entire top_tier universe:

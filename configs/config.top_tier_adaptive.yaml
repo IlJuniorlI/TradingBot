@@ -527,6 +527,16 @@ strategies:
       ltf_minutes: 5
       htf_minutes: 15
       min_ltf_bars: 15
+      # HTF EMA spans — dashboard chart parity only (2026-05-28). The
+      # strategy's HTF trend context already computes EMA 50/200 on the 15m
+      # frame (hardcoded in strategy_base._default_htf_context_for_score);
+      # without these params the dashboard HTF chart fell back to ema9/ema20
+      # (fast EMAs of the 15m bars), so the chart didn't match the bot.
+      # Setting them makes the HTF chart draw the same 50/200 the bot uses.
+      # Entry logic is unchanged — top_tier's HTF direction is structure-
+      # based (require_htf_bias_alignment), not an EMA cross.
+      htf_ema_fast_span: 50
+      htf_ema_slow_span: 200
 
       # Regime scoring thresholds. min_score_gap raised 1.2 -> 1.4 because
       # HTF RSI confluence (htf_divergence_aligned_bonus_rsi=+0.20 vs
