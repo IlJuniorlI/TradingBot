@@ -86,6 +86,16 @@ risk:
   peak_giveback_low_tier_enabled: true
   peak_giveback_low_tier_min_r: 0.7
   peak_giveback_low_tier_giveback_frac: 0.7
+  # Main-tier give-back retain fractions (2026-05-27): fraction of the peak
+  # R kept before the floor fires, by peak-size tier. Tightened from the
+  # original 0.50/0.60/0.70 after 5/12-5/27 data showed winners captured
+  # only 44% of their MFE and made no new highs after their interim peak
+  # (loose floors were donating realized gains). Higher = capture more /
+  # exit sooner on a retrace; lower = more recovery room. At a 2R peak,
+  # 0.65 exits on a retrace to 1.3R.
+  peak_giveback_retain_1to2r: 0.65
+  peak_giveback_retain_2to3r: 0.72
+  peak_giveback_retain_3r_plus: 0.78
 
 # Runtime cadence, streaming, reconciliation, and logging controls.
 runtime:

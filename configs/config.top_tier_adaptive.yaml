@@ -83,6 +83,15 @@ risk:
   peak_giveback_low_tier_enabled: true
   peak_giveback_low_tier_min_r: 0.7
   peak_giveback_low_tier_giveback_frac: 0.7
+  # Main-tier give-back retain fractions (2026-05-27): fraction of the peak
+  # R kept before the floor fires. Tightened from 0.50/0.60/0.70 after the
+  # 5/12-5/27 sample showed winners captured only 44% of MFE and never made
+  # new highs after their interim peak (loose floors donated realized
+  # gains). Modeled +3.7R extra capture across 8 winners (~$465). At a 2R
+  # peak, 0.65 exits on a retrace to 1.3R. Tune down if runners get clipped.
+  peak_giveback_retain_1to2r: 0.65
+  peak_giveback_retain_2to3r: 0.72
+  peak_giveback_retain_3r_plus: 0.78
 
 # Runtime cadence, streaming, reconciliation, and logging controls.
 runtime:
@@ -524,13 +533,17 @@ strategies:
       pullback_ema_touch_atr_mult: 0.45    # HIGH_VOL: was 0.35 — pullbacks noisier; allow further from EMA
       pullback_hold_atr_mult: 0.50         # HIGH_VOL: was 0.40 — same logic
       pullback_lookback_bars: 5
-      # Pullback-completion confirmation (2026-05-26): require entry bar's
-      # close to be in the upper half (LONG) / lower half (SHORT) of its
-      # range AND favorable vs the prior bar's close. Blocks "pullback
-      # that's actually a rollover" entries (FCX 5/26 10:12 had close_pos
-      # 0.19 on the in-progress 5m bar, still entered, lost $44).
-      pullback_require_bounce_confirmation: true
-      pullback_bounce_close_position_min: 0.5
+      # Pullback maturity check (2026-05-27): reject pullback when BOTH
+      # the session extreme is older than max_minutes_since AND price has
+      # retraced more than max_leg_retrace_pct of the leg. AND-logic on
+      # purpose — fresh-but-deep pullbacks (NFLX morning) and old-but-
+      # shallow ones (mid-session ranges) still trade. NEM 5/27 LONG at
+      # 14:48 was 400 min past session high with 140% retracement — exactly
+      # the "multi-hour rollover dressed as a pullback" pattern this gate
+      # catches. Disable with pullback_require_fresh_leg: false.
+      pullback_require_fresh_leg: true
+      pullback_max_minutes_since_session_extreme: 45.0
+      pullback_max_leg_retrace_pct: 50.0
 
       # Range detection
       range_max_vwap_dist_pct: 0.0020
@@ -572,6 +585,33 @@ strategies:
       # disable.
       relative_strength_block_threshold_pct: 0.5
       orb_bypass_relative_strength: true       # stock-vs-sector divergence noisy during 09:35-orb_end
+
+      # Explicit side decision (2026-05-27, Fix A). Replaces the implicit
+      # "evaluate both sides per regime, pick highest-scoring" with an
+      # evidence-based vote across current price-action signals: recent
+      # return, close-vs-VWAP, ema9-vs-ema20, last 3 bars' direction.
+      # Each signal contributes one LONG or SHORT vote (or abstains).
+      # Side wins when its votes ≥ min_votes AND opposing ≤ max_opposing.
+      # Mixed reads → skip the candidate. The wrong side is never
+      # evaluated, so all downstream regime/bias filtering only sees the
+      # decided side.
+      require_explicit_side_decision: true
+      side_decision_recent_lookback_bars: 6     # 30 min recent-return window
+      side_decision_recent_threshold_pct: 0.1   # threshold for recent-return vote (above typical noise)
+      side_decision_vwap_buffer_pct: 0.0005     # 0.05% dead-band around VWAP — within = neutral vote
+      side_decision_min_votes: 3                # at least 3 of 4 signals must agree
+      side_decision_max_opposing: 1             # at most 1 opposing vote
+      orb_bypass_side_decision: true            # early-session signals gap-dominated, evaluate all sides
+
+      # Confirmation-bar trigger (2026-05-27, Fix B). For direction-
+      # following regimes (trend/pullback/momentum/vol_squeeze), the LAST
+      # FULLY CLOSED LTF bar must confirm direction: green AND > prior
+      # close for LONG, red AND < prior close for SHORT. Catches single-
+      # bar fakeouts where the in-progress bar tipped a score threshold
+      # but the move didn't carry. Range and sr_scalp are EXEMPT (mean-
+      # reversion theses where the last bar moves against entry by design).
+      require_entry_confirmation_bar: true
+      orb_bypass_entry_confirmation_bar: true   # opening-bar volatility makes confirmation unreliable
 
       # Stretched entry filter: reject LONG at pct_b ≥ threshold AND
       # atr_stretch ≥ threshold (mirror for SHORT at pct_b ≤ 1-threshold).
@@ -750,7 +790,7 @@ strategies:
       # Allowed windows: orb_end → no_new_entries_after (skips ORB chop).
       # Index confirmation EXEMPT (mean-reversion thesis, same as range).
       # Disable globally with `disable_sr_scalp_regime: true`.
-      min_sr_scalp_score: 4.0                  # HIGH_VOL: was 3.5 — more selective; S/R failures more common in high vol
+      min_sr_scalp_score: 3.0                  # 2026-05-27: was 4.0 — UNREACHABLE (sr_scalp score ceiling is 3.9 across 13.2k cycles, so the regime fired 0 times ever). 3.0 lets it qualify so its real-world edge can be evaluated.
       # Distance gates loosened 2026-05-14 after the 05-14 session showed
       # 559 ``htf_zones_too_close`` rejections (463 LONG, 96 SHORT) and
       # zero sr_scalp entries on a 16-trade day. The 1.2%/3.0x high-vol

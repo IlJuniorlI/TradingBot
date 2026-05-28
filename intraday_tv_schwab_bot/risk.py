@@ -478,21 +478,31 @@ class RiskManager:
             current_r = (entry - float(last_price)) / initial_risk
         return round(peak_r, 9), round(current_r, 9)
 
-    @staticmethod
-    def _peak_giveback_floor_r(peak_r: float) -> float | None:
-        """Tiered give-back floor (lock-in fraction grows with peak size).
+    def _peak_giveback_floor_r(self, peak_r: float) -> float | None:
+        """Tiered give-back floor (retain fraction grows with peak size).
 
         Returns the current_r level at which the trade should exit, given
         the peak reached since entry. None when peak is below the minimum
-        threshold — no floor in that case (Fix 4's BE arm handles <1R).
+        threshold — no floor in that case (the low-tier / BE arm handles <1R).
+
+        The retain fractions are configurable (``peak_giveback_retain_*``).
+        Tightened 2026-05-27 from the original 0.50/0.60/0.70 after the
+        5/12-5/27 sample showed winners captured only 44% of their MFE —
+        and did NOT make new highs after their interim peak in-sample, so
+        the loose floors were donating realized gains back to the market.
+        Higher retain = capture more / exit sooner on a retrace; lower =
+        more room to recover (risks clipping recoveries between the old
+        and new floor). Tune down if runners get clipped on normal
+        pullbacks.
         """
         if peak_r < 1.0:
             return None
+        risk_cfg = self.config.risk
         if peak_r < 2.0:
-            return peak_r * 0.5   # 50% giveback allowed 1R-2R
+            return peak_r * float(getattr(risk_cfg, "peak_giveback_retain_1to2r", 0.65))
         if peak_r < 3.0:
-            return peak_r * 0.6   # 40% giveback 2R-3R
-        return peak_r * 0.7       # 30% giveback 3R+
+            return peak_r * float(getattr(risk_cfg, "peak_giveback_retain_2to3r", 0.72))
+        return peak_r * float(getattr(risk_cfg, "peak_giveback_retain_3r_plus", 0.78))
 
     def _peak_giveback_triggered(self, position: Position, last_price: float, initial_risk: float) -> bool:
         # Per-position override (Tier 3b — high-conviction-day loosening).
@@ -535,9 +545,9 @@ class RiskManager:
         low_tier_min_r = float(getattr(self.config.risk, "peak_giveback_low_tier_min_r", 0.7) or 0.0)
         low_tier_frac = float(getattr(self.config.risk, "peak_giveback_low_tier_giveback_frac", 0.7))
         if (
-                low_tier_enabled
-                and not override_active
-                and 0.0 < low_tier_min_r <= peak_r < min_r
+            low_tier_enabled
+            and not override_active
+            and 0.0 < low_tier_min_r <= peak_r < min_r
         ):
             low_tier_floor = peak_r * (1.0 - low_tier_frac)
             if current_r <= low_tier_floor:

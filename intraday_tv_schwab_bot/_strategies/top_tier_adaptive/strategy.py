@@ -195,6 +195,146 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 return ds
         return None
 
+    @staticmethod
+    def _recent_momentum_pct(ltf: pd.DataFrame, lookback_bars: int) -> float | None:
+        """Return the percent change over the last ``lookback_bars`` of the
+        LTF frame: ``(last_close - close_lookback_bars_ago) / close_ago * 100``.
+
+        Used by the recent-momentum disagreement gate in ``entry_signals``
+        to detect when the LOCAL trend (last N bars) contradicts the
+        session-wide bias signals (which all derive from ``change_from_open``,
+        a backward-looking quantity). On stocks that have reversed intraday,
+        ``day_strength`` still reflects the original direction while recent
+        price action has flipped; the gap is the signal.
+
+        Returns ``None`` when there aren't enough bars or the prior close
+        is non-positive (defensive against bad data)."""
+        if ltf is None or len(ltf) < lookback_bars + 1:
+            return None
+        try:
+            last_close = float(ltf.iloc[-1]["close"])
+            prior_close = float(ltf.iloc[-(lookback_bars + 1)]["close"])
+        except (KeyError, ValueError, TypeError, IndexError):
+            return None
+        if prior_close <= 0:
+            return None
+        return (last_close - prior_close) / prior_close * 100.0
+
+    def _decide_side(
+        self,
+        ltf: pd.DataFrame,
+        close: float,
+        vwap: float,
+        ema9: float,
+        ema20: float,
+    ) -> tuple[Side | None, dict[str, Any]]:
+        """Pick the trade side from current price action (Fix A, 2026-05-27).
+
+        Counts LONG and SHORT votes across four current-action signals:
+          1. Recent return over the last N LTF bars (default 6 = 30 min at 5m)
+          2. Close vs session VWAP
+          3. EMA9 vs EMA20
+          4. Last 3 LTF bars' net direction (green-count vs red-count)
+
+        Each signal contributes one LONG or one SHORT vote, or abstains
+        when its read is genuinely neutral (e.g. recent return is within
+        the noise threshold). Decision threshold: side wins when its
+        votes ≥ ``side_decision_min_votes`` AND opposing ≤
+        ``side_decision_max_opposing``. Mixed reads return ``None`` and
+        the candidate is skipped — we'd rather not trade than trade with
+        contradicting signals.
+
+        This replaces the previous "evaluate both sides per regime, pick
+        highest-scoring" implicit side selection. The old approach could
+        pick SHORT just because the SHORT regime score was 0.5 higher
+        even when every meaningful current-action signal said LONG.
+        """
+        long_votes = 0
+        short_votes = 0
+        breakdown: list[str] = []
+
+        recent_lookback = max(1, int(self.params.get("side_decision_recent_lookback_bars", 6)))
+        recent_threshold = float(self.params.get("side_decision_recent_threshold_pct", 0.1))
+        recent_pct = self._recent_momentum_pct(ltf, recent_lookback)
+        if recent_pct is not None:
+            if recent_pct >= recent_threshold:
+                long_votes += 1
+                breakdown.append(f"recent+{recent_pct:.2f}%>L")
+            elif recent_pct <= -recent_threshold:
+                short_votes += 1
+                breakdown.append(f"recent{recent_pct:.2f}%>S")
+            else:
+                breakdown.append(f"recent{recent_pct:+.2f}%>neutral")
+
+        vwap_buffer = float(self.params.get("side_decision_vwap_buffer_pct", 0.0005))
+        if vwap > 0:
+            vwap_dist = (close - vwap) / vwap
+            if vwap_dist > vwap_buffer:
+                long_votes += 1
+                breakdown.append(f"close>vwap>L")
+            elif vwap_dist < -vwap_buffer:
+                short_votes += 1
+                breakdown.append(f"close<vwap>S")
+            else:
+                breakdown.append("close~vwap>neutral")
+
+        if ema9 > ema20:
+            long_votes += 1
+            breakdown.append("ema9>ema20>L")
+        elif ema9 < ema20:
+            short_votes += 1
+            breakdown.append("ema9<ema20>S")
+
+        if ltf is not None and len(ltf) >= 3:
+            try:
+                last_3 = ltf.iloc[-3:]
+                greens = sum(
+                    1 for _, b in last_3.iterrows()
+                    if float(b.get("close", 0)) > float(b.get("open", 0))
+                )
+            except (KeyError, ValueError, TypeError):
+                greens = -1
+            if greens >= 2:
+                long_votes += 1
+                breakdown.append(f"3b:{greens}G>L")
+            elif 0 <= greens <= 1:
+                short_votes += 1
+                breakdown.append(f"3b:{greens}G>S")
+
+        min_votes = int(self.params.get("side_decision_min_votes", 3))
+        max_opposing = int(self.params.get("side_decision_max_opposing", 1))
+        vote_info = {"long": long_votes, "short": short_votes, "breakdown": breakdown}
+        if long_votes >= min_votes and short_votes <= max_opposing:
+            return Side.LONG, vote_info
+        if short_votes >= min_votes and long_votes <= max_opposing:
+            return Side.SHORT, vote_info
+        return None, vote_info
+
+    @staticmethod
+    def _entry_bar_confirms(side: Side, ltf: pd.DataFrame) -> bool:
+        """Confirmation-bar trigger (Fix B, 2026-05-27): the most recent
+        FULLY CLOSED LTF bar must confirm direction before we enter.
+
+        For LONG: ``last_closed.close > last_closed.open`` (green bar) AND
+        ``last_closed.close > prev_closed.close`` (higher-high tape).
+        Mirror for SHORT. Uses ``iloc[-2]`` for the last closed bar (since
+        ``iloc[-1]`` is the in-progress bar) and ``iloc[-3]`` for the prior
+        closed bar. Returns ``True`` when not enough bars (don't block on
+        thin early-session data — other gates handle that case)."""
+        if ltf is None or len(ltf) < 3:
+            return True
+        try:
+            last_closed = ltf.iloc[-2]
+            prev_closed = ltf.iloc[-3]
+            last_open = float(last_closed.get("open", 0))
+            last_close = float(last_closed.get("close", 0))
+            prev_close = float(prev_closed.get("close", 0))
+        except (KeyError, ValueError, TypeError, IndexError):
+            return True
+        if side == Side.LONG:
+            return last_close > last_open and last_close > prev_close
+        return last_close < last_open and last_close < prev_close
+
     # ------------------------------------------------------------------
     # Regime scoring
     # ------------------------------------------------------------------
@@ -792,6 +932,55 @@ class TopTierAdaptiveStrategy(BaseStrategy):
 
         return self._finalize_signal(c, side, close, stop, target, "trend", regime_score, frame, data)
 
+    @staticmethod
+    def _pullback_leg_context(
+        side: Side, session_ltf: pd.DataFrame, current_close: float, ltf_minutes: int,
+    ) -> tuple[float | None, float | None]:
+        """Return ``(minutes_since_extreme, retrace_pct)`` for the pullback
+        maturity check in ``_build_pullback_signal``.
+
+        For LONG: extreme = session high, anchor = lowest low at-or-before
+        the high bar, leg_size = high - anchor, retrace_pct = how far
+        ``current_close`` has dropped from the high as a percentage of the
+        leg.  Mirror for SHORT (extreme = session low, anchor = highest
+        high at-or-before the low bar, retrace_pct = how far close has
+        risen back).
+
+        Returns ``(None, None)`` when context can't be computed reliably
+        (empty session, single-bar session, or non-positive leg_size).
+        ``minutes_since_extreme`` is estimated as ``bars_since_extreme *
+        ltf_minutes`` (the LTF bar grid is uniform within the session)
+        which avoids per-bar timestamp arithmetic.
+        """
+        if session_ltf is None or session_ltf.empty:
+            return None, None
+        n = len(session_ltf)
+        if n < 2:
+            return None, None
+        try:
+            if side == Side.LONG:
+                high_values = session_ltf["high"].values
+                extreme_pos = int(high_values.argmax())
+                extreme_value = float(high_values[extreme_pos])
+                anchor = float(session_ltf["low"].iloc[: extreme_pos + 1].min())
+                leg_size = extreme_value - anchor
+                retrace = extreme_value - current_close
+            else:
+                low_values = session_ltf["low"].values
+                extreme_pos = int(low_values.argmin())
+                extreme_value = float(low_values[extreme_pos])
+                anchor = float(session_ltf["high"].iloc[: extreme_pos + 1].max())
+                leg_size = anchor - extreme_value
+                retrace = current_close - extreme_value
+        except (KeyError, ValueError, TypeError):
+            return None, None
+        if leg_size <= 0.0:
+            return None, None
+        bars_since_extreme = max(0, n - 1 - extreme_pos)
+        minutes_since_extreme = float(bars_since_extreme * max(1, int(ltf_minutes)))
+        retrace_pct = max(0.0, (retrace / leg_size) * 100.0)
+        return minutes_since_extreme, retrace_pct
+
     def _build_pullback_signal(self, c: Candidate, side: Side, close: float, atr: float,
                                ltf: pd.DataFrame, frame: pd.DataFrame, regime_score: float,
                                data=None, vol_widening: float = 1.0) -> Signal | None:
@@ -805,49 +994,37 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             self._set_build_failure(c.symbol, "pullback", "insufficient_ltf_history")
             return None
 
-        # Pullback-completion confirmation (2026-05-26). The pullback regime
-        # is meant to fire on a bounce completing, not mid-fall. Without
-        # this gate, the bot can buy a pullback that's actually a rollover
-        # top — session 2026-05-26 FCX#1 entered at 10:12:26 with the
-        # in-progress 5m bar showing close_pos 0.186 (close in bottom 19%
-        # of the bar's range), then never bounced and lost $44. Require
-        # the current bar's close to be in the directional half AND the
-        # current close to be on the favorable side of the prior 5m bar's
-        # close. Both conditions together confirm the move has turned.
-        # Defaults: 0.5 close-position threshold (close in upper half for
-        # LONG, lower half for SHORT). Disable via
-        # ``pullback_require_bounce_confirmation: false``.
-        if bool(self.params.get("pullback_require_bounce_confirmation", True)):
-            if len(session_ltf) >= 2:
-                last_bar = session_ltf.iloc[-1]
-                prev_bar = session_ltf.iloc[-2]
-                bar_high = _safe_float(last_bar.get("high"), close)
-                bar_low = _safe_float(last_bar.get("low"), close)
-                bar_close = _safe_float(last_bar.get("close"), close)
-                bar_range = bar_high - bar_low
-                close_pos = (bar_close - bar_low) / bar_range if bar_range > 0 else 0.5
-                prior_close = _safe_float(prev_bar.get("close"), bar_close)
-                close_pos_min = float(self.params.get("pullback_bounce_close_position_min", 0.5))
-                if side == Side.LONG:
-                    bar_in_favorable_half = close_pos >= close_pos_min
-                    moved_favorable = bar_close > prior_close
-                    if not (bar_in_favorable_half and moved_favorable):
-                        self._set_build_failure(
-                            c.symbol, "pullback",
-                            f"long_pullback_no_bounce_confirm("
-                            f"close_pos={close_pos:.2f},prior_close={prior_close:.4f},close={bar_close:.4f})",
-                        )
-                        return None
-                else:
-                    bar_in_favorable_half = close_pos <= (1.0 - close_pos_min)
-                    moved_favorable = bar_close < prior_close
-                    if not (bar_in_favorable_half and moved_favorable):
-                        self._set_build_failure(
-                            c.symbol, "pullback",
-                            f"short_pullback_no_bounce_confirm("
-                            f"close_pos={close_pos:.2f},prior_close={prior_close:.4f},close={bar_close:.4f})",
-                        )
-                        return None
+        # Pullback maturity check (2026-05-27). The pullback regime works
+        # when the prior leg is YOUNG and the retracement shallow; it fails
+        # when the trend is stale and price has given back most of the
+        # move. Session 2026-05-27 NEM LONG entered at 14:48 — NEM's
+        # session high was ~10:30 (4+ hours earlier) and price had
+        # retraced ~89% off the peak (a multi-hour rollover dressed as a
+        # pullback), lost $37. NVDA SHORT at 12:36 was the mirror — a
+        # bounce in a multi-hour bleed (close_pos 0.90, top of bar), the
+        # bot sold the relief rally back into the trend that was already
+        # turning, lost $77. Reject pullback when BOTH age AND retracement
+        # exceed their thresholds — either alone is fine (fresh-but-deep
+        # pullbacks and old-but-shallow ones still trade).
+        if bool(self.params.get("pullback_require_fresh_leg", True)):
+            max_minutes = float(self.params.get("pullback_max_minutes_since_session_extreme", 45.0))
+            max_retrace_pct = float(self.params.get("pullback_max_leg_retrace_pct", 50.0))
+            ltf_min = max(1, int(self.params.get("ltf_minutes", 5)))
+            minutes_since, retrace_pct = self._pullback_leg_context(side, session_ltf, close, ltf_min)
+            if (
+                minutes_since is not None
+                and retrace_pct is not None
+                and minutes_since > max_minutes
+                and retrace_pct > max_retrace_pct
+            ):
+                side_prefix = "long" if side == Side.LONG else "short"
+                self._set_build_failure(
+                    c.symbol, "pullback",
+                    f"{side_prefix}_pullback_stale_leg("
+                    f"minutes_since_extreme={minutes_since:.0f}>{max_minutes:.0f},"
+                    f"retrace_pct={retrace_pct:.1f}>{max_retrace_pct:.1f})",
+                )
+                return None
 
         # vol_widening applied to both ATR buffer and default_stop_pct floor (Tier 2a).
         buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening
@@ -1991,31 +2168,41 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # via ``allow_short = False``.
             preferred_sides = [Side.LONG, Side.SHORT] if allow_short else [Side.LONG]
 
-            # Hard screener-bias veto (2026-05-26). When the screener has
-            # tagged this candidate with a directional bias the strategy
-            # cannot trade (screener=SHORT with allow_short=False, or
-            # screener=LONG with a hypothetical long-disabled config),
-            # skip the candidate without scoring. The soft penalty in
-            # ``_bias_penalty`` is too weak on the typical 0.3-1% market
-            # day — its magnitude factor saturates at 2% day_strength so
-            # a -0.5% day applies only 0.25 to LONG-side regimes, leaving
-            # min_pullback_score: 3.5 effectively at 3.75. Session
-            # 2026-05-26 entered 7 LONGs while the screener flagged 3,959
-            # SHORT vs 2,533 LONG candidates and the per-cycle bias_pen
-            # ranged 0.14-0.21, gating nothing. Gated under the same
-            # ``respect_screener_bias`` toggle as the soft penalty so a
-            # single config switch controls both; ORB-window bypass also
-            # disables this veto via ``respect_bias`` (gap-fade entries
-            # against the screener still allowed during 09:35-orb_end).
-            if (
-                respect_bias
-                and c.directional_bias is not None
-                and c.directional_bias not in preferred_sides
-            ):
-                self._record_entry_decision(c.symbol, "skipped", [
-                    f"screener_bias_counter_to_tradable_sides({c.directional_bias.value})"
-                ])
-                continue
+            # Explicit side decision (Fix A, 2026-05-27). Replaces the
+            # implicit "evaluate both sides per regime, pick highest-
+            # scoring" with an evidence-based vote across CURRENT price
+            # action signals. Side is decided BEFORE regime scoring so
+            # the wrong side is never evaluated. If no side wins a clean
+            # majority, skip the candidate (don't trade on contradicting
+            # signals). Bypassed during ORB when ``orb_bypass_side_decision``
+            # is true — early-session signals are gap-dominated. See
+            # ``_decide_side`` for the voting logic.
+            side_decision_orb_bypass = (
+                bool(self.params.get("orb_bypass_side_decision", True)) and in_orb_window
+            )
+            # Tracks whether ``_decide_side`` made an explicit, current-
+            # action side pick this cycle. When True, the soft bias
+            # penalty below is skipped — the explicit decision already
+            # chose the side, so docking it with the stale chg_open bias
+            # would re-introduce the backward-looking suppression Fix A
+            # replaced.
+            explicit_side_decided = False
+            if bool(self.params.get("require_explicit_side_decision", True)) and not side_decision_orb_bypass:
+                decided_side, votes = self._decide_side(ltf, close, vwap, ema9, ema20)
+                if decided_side is None:
+                    self._record_entry_decision(c.symbol, "skipped", [
+                        f"side_undecided(long={votes['long']},short={votes['short']},"
+                        f"votes=[{','.join(votes['breakdown'])}])"
+                    ])
+                    continue
+                if decided_side not in preferred_sides:
+                    self._record_entry_decision(c.symbol, "skipped", [
+                        f"side_decision_not_tradable(decided={decided_side.value},"
+                        f"allowed={[s.value for s in preferred_sides]})"
+                    ])
+                    continue
+                preferred_sides = [decided_side]
+                explicit_side_decided = True
 
             # Relative-strength filter (2026-05-26). The candidate's bias
             # signals above measure absolute intraday move; this measures
@@ -2129,7 +2316,19 @@ class TopTierAdaptiveStrategy(BaseStrategy):
 
                 # Soft-bias penalty (Fix A refactored 2026-05-12). See
                 # ``_bias_penalty`` docstring for rationale + worked examples.
-                bias_penalty = self._bias_penalty(side, day_strength, effective_bias, respect_bias)
+                # Skipped when an explicit side decision was made this cycle
+                # (2026-05-27): ``_decide_side`` already chose the side from
+                # current-action signals, so docking that side's score with
+                # the stale chg_open-derived bias would re-introduce the
+                # backward-looking suppression the explicit decision replaced
+                # — e.g. a stock down on the day but recovering, where Fix A
+                # picks LONG and this penalty would otherwise drag the LONG
+                # score below its min threshold. Stays active as the sole
+                # bias mechanism when require_explicit_side_decision is false.
+                bias_penalty = (
+                    0.0 if explicit_side_decided
+                    else self._bias_penalty(side, day_strength, effective_bias, respect_bias)
+                )
                 if bias_penalty > 0.0:
                     trend_score = max(0.0, trend_score - bias_penalty)
                     pullback_score = max(0.0, pullback_score - bias_penalty)
@@ -2245,6 +2444,31 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 if regime_name in {"trend", "pullback", "vol_squeeze", "momentum"} and not index_ok and not orb_index_bypass:
                     fail_reasons.append(
                         f"{side.value.lower()}_build_failed_{regime_name}_index_not_confirmed"
+                    )
+                    continue
+
+                # Confirmation-bar trigger (Fix B, 2026-05-27). For
+                # direction-following regimes, require the LAST FULLY
+                # CLOSED LTF bar to confirm direction before we call the
+                # build method (which would otherwise enter at current
+                # close on the same bar that scored the regime). Catches
+                # single-bar fakeouts where the in-progress bar tipped a
+                # score threshold but the move didn't carry. Range and
+                # sr_scalp are exempt — both are mean-reversion theses
+                # where the LAST CLOSED bar moves AGAINST the entry
+                # direction by design.
+                confirm_orb_bypass = (
+                    bool(self.params.get("orb_bypass_entry_confirmation_bar", True))
+                    and in_orb_window
+                )
+                if (
+                    regime_name in {"trend", "pullback", "vol_squeeze", "momentum"}
+                    and bool(self.params.get("require_entry_confirmation_bar", True))
+                    and not confirm_orb_bypass
+                    and not self._entry_bar_confirms(side, ltf)
+                ):
+                    fail_reasons.append(
+                        f"{side.value.lower()}_build_failed_{regime_name}_no_confirmation_bar"
                     )
                     continue
 

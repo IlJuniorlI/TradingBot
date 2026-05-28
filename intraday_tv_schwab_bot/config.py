@@ -366,6 +366,19 @@ class RiskConfig:
     peak_giveback_low_tier_enabled: bool = True
     peak_giveback_low_tier_min_r: float = 0.7
     peak_giveback_low_tier_giveback_frac: float = 0.7
+    # Main-tier peak-giveback retain fractions (2026-05-27): fraction of the
+    # peak R kept before the give-back floor fires, by peak-size tier.
+    # Tightened from the original 0.50/0.60/0.70 after the 5/12-5/27 sample
+    # showed winners captured only 44% of their MFE (gave back 56% of peak
+    # gains) — and made no new highs after their interim peak in-sample, so
+    # the loose floors donated realized gains. Modeled +3.7R additional
+    # capture across 8 winners (~$465 at full size). Higher = capture more /
+    # exit sooner on a retrace; lower = more recovery room (risks clipping
+    # a retrace-then-recover between the old and new floor). At a 2R peak,
+    # 0.65 exits on a retrace to 1.3R (was 1.0R at 0.50).
+    peak_giveback_retain_1to2r: float = 0.65
+    peak_giveback_retain_2to3r: float = 0.72
+    peak_giveback_retain_3r_plus: float = 0.78
 
 
 @dataclass(slots=True)

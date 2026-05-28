@@ -7,7 +7,199 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **top_tier_adaptive: lowered min_sr_scalp_score 4.0 → 3.0 (sr_scalp was structurally dead).** *2026-05-27 PM*
+  - `_score_sr_scalp` has a theoretical max of 5.0 but an empirical
+    ceiling of **3.9** across 13.2k observed cycles (the +1.5
+    rejection-wick component rarely co-occurs with all three
+    neutral/chop components). The preset's `min_sr_scalp_score: 4.0`
+    was therefore *unreachable* — the regime qualified 0 times and
+    fired 0 entries from its 2026-05-12 introduction through 2026-05-27.
+  - Lowered the manifest default (3.5 → 3.0) and the preset (4.0 → 3.0)
+    so the regime can actually qualify and its real-world edge can be
+    evaluated. Documented the 3.9 ceiling in the README so the
+    threshold isn't set above it again.
+  - Note: a separate live runtime `config.yaml` (e.g. on the
+    user-managed H: deployment) carries its own `min_sr_scalp_score`
+    and must be updated independently.
+- **top_tier_adaptive: static-analysis cleanup.** *2026-05-27 PM*
+  - `_recent_momentum_pct`, `_entry_bar_confirms`, `_pullback_leg_context`
+    converted to `@staticmethod` (no instance state used). Call sites
+    via `self.` are unaffected.
+  - `_peak_giveback_triggered` low-tier guard simplified to a single
+    chained comparison `0.0 < low_tier_min_r <= peak_r < min_r`.
+
+- **top_tier_adaptive: tightened main-tier peak-giveback retain fractions.** *2026-05-27 PM*
+  - `RiskManager._peak_giveback_floor_r` retain fractions raised from the
+    hardcoded 0.50/0.60/0.70 (1-2R / 2-3R / 3R+ tiers) to configurable
+    0.65/0.72/0.78 via new `RiskConfig.peak_giveback_retain_1to2r` /
+    `_2to3r` / `_3r_plus`. `_peak_giveback_floor_r` changed from a
+    `@staticmethod` to an instance method to read the config.
+  - Rationale from intra-trade R-path reconstruction (1m bars, 35
+    trades 5/12-5/27): winners captured only **44% of their MFE**
+    ($433 realized vs $978 of peak favorable excursion), and made NO
+    new highs after their interim peak in-sample — so the loose floors
+    were donating realized gains back to the market rather than
+    protecting runner upside. Worst cases: AVGO captured 30% of a
+    2.31R peak, COP 22-28%, META 29%.
+  - Modeled effect: +3.7R additional capture across 8 winners (~$465
+    at full size), no winners clipped (none recovered post-peak in
+    the sample). At a 2R peak the floor now sits at 1.3R (was 1.0R);
+    at 2.5R it sits at 1.8R (was 1.5R).
+  - Risk acknowledged: tighter floors exit sooner on a retrace, so a
+    future trade that dips into the [old-floor, new-floor] band and
+    then recovers to a bigger peak would be clipped. The fractions are
+    configurable — tune down if runner-clipping shows up in live data.
+  - Updated `TestPeakGivebackFloor` assertions for the new fractions.
+
+### Fixed
+
+- **top_tier_adaptive: soft bias penalty no longer second-guesses the explicit side decision.** *2026-05-27 PM*
+  - When `require_explicit_side_decision` makes a pick, `_decide_side`
+    has already chosen the side from current-action signals (recent
+    return, VWAP, EMA, bar direction). The soft `_bias_penalty` then
+    ran on that decided side and docked its regime scores when the
+    side disagreed with `effective_bias` (the chg_open-derived bias).
+    On a reversal setup — stock down on the day but recovering, where
+    Fix A correctly picks LONG — the penalty could push the LONG
+    score below `min_pullback_score` and skip the exact entry Fix A
+    was built to catch. Now the penalty is skipped entirely when an
+    explicit side decision was made this cycle; it remains the sole
+    bias mechanism when `require_explicit_side_decision: false`.
+
+### Removed
+
+- **top_tier_adaptive: dead-code cleanup after Fix A + B.** *2026-05-27 PM*
+  - Removed the hard screener-bias veto block from `entry_signals`
+    (and its `screener_bias_counter_to_tradable_sides` skip reason).
+    Fix A's explicit side decision uses current-action signals to pick
+    side; re-overriding that with the screener's session-time bias
+    (which can be minutes stale) re-introduced the backward-looking
+    decision Fix A was designed to replace. `respect_screener_bias`
+    param remains — still used by the soft-penalty / trailing-bias
+    fallback path when `require_explicit_side_decision: false`.
+  - Removed the recent-momentum disagreement gate (Fix E from
+    earlier today). Fix A's vote #1 IS the recent-return signal (at
+    0.1% threshold). Fix E hard-blocked on the same signal (at 0.3%
+    threshold). After Fix A narrows `preferred_sides` to one side,
+    Fix E was a no-op in every case except an unreachable edge.
+    Removed params: `recent_momentum_lookback_bars`,
+    `recent_momentum_disagree_threshold_pct`,
+    `orb_bypass_recent_momentum`. The `_recent_momentum_pct` helper
+    stays — Fix A's `_decide_side` still uses it.
+  - Removed the pullback-bounce-confirmation gate from
+    `_build_pullback_signal`. Fix B (confirmation-bar) does the same
+    check more reliably on the LAST FULLY CLOSED bar (not the
+    in-progress bar) and applies it to all direction-following
+    regimes uniformly. Removed params:
+    `pullback_require_bounce_confirmation`,
+    `pullback_bounce_close_position_min`.
+  - Net: -3 gates per cycle, same coverage, single source of truth
+    for side selection (`_decide_side`) + post-decision filters
+    (RS, pullback maturity, stretched cooldown, confirmation bar).
+
 ### Added
+
+- **top_tier_adaptive: explicit side decision + confirmation-bar entry (Fix A + B).** *2026-05-27*
+  - **Fix A — Explicit side decision before regime scoring.** Replaces
+    the implicit "evaluate both sides per regime, pick highest score"
+    with an evidence-based vote across CURRENT price-action signals.
+    The old approach could pick SHORT just because the SHORT regime
+    score was 0.5 higher even when every meaningful current-action
+    signal said LONG. New `_decide_side(ltf, close, vwap, ema9, ema20)`
+    votes across: (1) recent return over `side_decision_recent_lookback_bars`
+    (default `6` = 30 min at 5m), threshold
+    `side_decision_recent_threshold_pct` (default `0.1`); (2) close
+    vs session VWAP with `side_decision_vwap_buffer_pct` dead-band
+    (default `0.0005`); (3) EMA9 vs EMA20; (4) last 3 LTF bars'
+    green-count. Side wins when votes ≥ `side_decision_min_votes`
+    (default `3`) AND opposing ≤ `side_decision_max_opposing`
+    (default `1`). Mixed → skip the candidate. The wrong side is
+    never evaluated, so all downstream filters only see the decided
+    side. Bypassed during ORB via `orb_bypass_side_decision: true`
+    (early-session signals are gap-dominated). Disable with
+    `require_explicit_side_decision: false`.
+  - **Fix B — Confirmation-bar entry trigger.** Companion to Fix A.
+    For direction-following regimes (trend / pullback / momentum /
+    vol_squeeze), the LAST FULLY CLOSED LTF bar must confirm direction
+    before `_build_<regime>_signal` is called: green AND > prior close
+    for LONG (mirror for SHORT). Catches single-bar fakeouts where the
+    in-progress bar tipped a score threshold but the actual completed
+    bar didn't carry the move. Range and sr_scalp regimes are EXEMPT
+    — both are mean-reversion theses where the last closed bar moves
+    AGAINST the entry direction by design. New `_entry_bar_confirms`
+    helper reads `ltf.iloc[-2]` (last closed) and `ltf.iloc[-3]`
+    (prior closed). Bypassed during ORB via
+    `orb_bypass_entry_confirmation_bar: true`. Disable with
+    `require_entry_confirmation_bar: false`.
+  - Modeled 5/27 effect: 3 of 6 trades skipped (NVDA SHORT — votes
+    1L/2S mixed, NEM LONG — votes 2L/2S tied, COP LONG — votes 2L/0S
+    below min_votes=3). 3 enter (NFLX LONG +$67 winner, CVX SHORT
+    −$64 strong consensus, DOW SHORT −$41 strong consensus). Net
+    P&L: −$38.14 vs −$135.55 original (−71.9% loss reduction). Trade
+    count cut in half. The two unblocked losers had unanimous SHORT
+    votes — they lost from post-entry reversals, not pre-entry
+    direction errors.
+
+- **top_tier_adaptive: recent-momentum disagreement gate (Fix E).** *2026-05-27*
+  - The strategy's entire bias chain (`screener.directional_bias`,
+    `live_bias`, `trailing_bias`, soft `_bias_penalty`, relative-strength
+    gate) derives from `change_from_open` — a session-wide, backward-
+    looking quantity. On stocks that have reversed intraday, day_strength
+    still reflects the original direction while recent price action has
+    flipped. Forensic of 5/27 NVDA SHORT @ 12:36: chg_open −1.66% (all
+    signals SHORT), MSHTF bearish, XLK confirmed SHORT — but NVDA had
+    bounced 21% off the 11:00 low; bot shorted into the recovering tape.
+  - New `_recent_momentum_pct(ltf, lookback_bars)` helper returns the
+    percent change between the LTF frame's current close and the close
+    `lookback_bars` bars earlier. Returns `None` when there aren't
+    enough bars or the prior close is non-positive.
+  - New gate in `entry_signals` after the relative-strength filter:
+    when `recent_pct >= recent_momentum_disagree_threshold_pct`, SHORT
+    is removed from `preferred_sides`; when `recent_pct <= -threshold`,
+    LONG is removed. If `preferred_sides` becomes empty, the candidate
+    is skipped with reason `recent_momentum_disagrees_local_(up|down)(...)`.
+    Defaults: `recent_momentum_lookback_bars: 6` (= 30 min at
+    `ltf_minutes: 5`), `recent_momentum_disagree_threshold_pct: 0.3`
+    (above typical 5m bar noise ~0.1-0.2% on mega-caps, catches
+    reversals not random ticks). `orb_bypass_recent_momentum: true`
+    skips the gate during 09:35-`orb_end_time` (early-session momentum
+    is gap-dominated and not informative).
+  - Defaults are conservative — dry-run on 5/27 showed no winners
+    blocked and no losers blocked either at 30 min / 0.3% (today's
+    losers had local momentum AGREEING with the losing side at entry;
+    they failed via post-entry reversals, not pre-entry disagreement).
+    Tune `recent_momentum_lookback_bars` longer (e.g. 12 = 60 min) to
+    catch slower reversals like NVDA's 90-min bounce, at the cost of
+    a more aggressive filter that may block legitimate trades on
+    other days.
+
+- **top_tier_adaptive: pullback maturity check (Fix C).** *2026-05-27*
+  - New `_pullback_leg_context(side, session_ltf, current_close, ltf_minutes)`
+    helper on `TopTierAdaptiveStrategy` returns `(minutes_since_extreme,
+    retrace_pct)` for the side's session extreme. For LONG: extreme =
+    session high, anchor = lowest low at-or-before the high bar,
+    `leg_size = high − anchor`, `retrace_pct = (high − current_close) /
+    leg_size`. Mirror for SHORT. `minutes_since_extreme` is estimated as
+    `bars_since_extreme * ltf_minutes` (LTF bar grid is uniform within
+    the session, avoids per-bar timestamp arithmetic). Returns
+    `(None, None)` when context can't be computed reliably (single-bar
+    session, non-positive leg_size).
+  - New `_build_pullback_signal` gate at the top of the build: when
+    `pullback_require_fresh_leg` (default `true`), reject when BOTH
+    `minutes_since_extreme > pullback_max_minutes_since_session_extreme`
+    (default `45.0`) AND `retrace_pct > pullback_max_leg_retrace_pct`
+    (default `50.0`). AND-logic on purpose: fresh-but-deep retracements
+    and old-but-shallow ones both still trade. Targets the 5/27 NEM
+    pattern (LONG at 14:48, session high at 07:45 = 400 min stale,
+    retracement 140% off the peak — the entire leg gone) which the
+    other entry-quality gates didn't catch.
+  - Modeled 5/27 effect: blocks NEM (-$36.75 saved). NFLX (+$67) and
+    COP (+$17) winners pass cleanly (25 min / 34% and 45 min / 38%
+    respectively — neither condition triggered). Holds NVDA SHORT and
+    DOW SHORT as "stale but shallow" (95 min / 21% and 255 min / 26%);
+    those need a different signal.
 
 - **top_tier_adaptive: four entry-quality gates + low-tier peak-giveback.** *2026-05-26*
   - **Hard screener-bias veto.** Gated by the existing `respect_screener_bias`,
