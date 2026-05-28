@@ -688,6 +688,34 @@ class SupportResistanceConfig:
     # set so range-regime entries (which use the EQ labels) still see them.
     # Set 0.0 to disable. CHoCH still fires from the BoS-event path.
     structure_min_range_atr_mult: float = 1.5
+    # Minimum bar separation between consecutive (alternating) structure
+    # pivots (2026-05-27, "Fix B"). The pivot detector uses a fractal swing
+    # and merges consecutive same-kind pivots, but had NO rule against an
+    # alternating H->L registering 1-2 bars apart — so on volatile names a
+    # new "swing" prints every few bars and the HH/LH/EQH/LL/HL/EQL labels
+    # (and the BOS/CHoCH/structure-exit signals keyed on them) churn on
+    # 1-2-bar wiggles. When > 0, an alternating pivot closer than this many
+    # bars to the prior kept pivot is treated as noise within the current
+    # leg and skipped (the leg continues). Measured on NVDA: a 3-bar gap
+    # cut ≤2-bar-apart pivot pairs from 28/91 to 7/59. 0 = disabled
+    # (preserves the original behavior for every strategy that doesn't set
+    # it). The swings themselves are ATR-sized (median 1.9-5.2 ATR), so
+    # this is purely a temporal-density filter, not an amplitude one.
+    structure_min_pivot_gap_bars: int = 0
+    # Resample the LTF structure frame to this many minutes before pivot
+    # analysis (2026-05-27, "Fix D"). The "ltf" structure context runs on
+    # the raw streaming frame (1-minute bars), which is finer than the
+    # regime-scoring LTF (params.ltf_minutes, typically 5m) — a mismatch
+    # that makes structure pivots ~5x denser than the bars the strategy
+    # actually trades on. When > 0, _structure_context resamples the LTF
+    # frame to this timeframe first, so entry/exit/HTF-alignment all read
+    # the coarser structure. 0 = disabled (use the frame as-is). NOTE:
+    # raising this rescales every bar-based structure setting —
+    # structure_event_lookback_bars, the post-entry pivot count, etc. are
+    # now in units of this timeframe. Set structure_event_lookback_bars
+    # proportionally lower when enabling (e.g. 6 1m-bars -> 3 5m-bars to
+    # keep BOS/CHoCH event freshness near the original ~15-30 min).
+    structure_ltf_timeframe_minutes: int = 0
     # Grace window post-entry during which 1m structure-based exits
     # (structure_bearish_exit:EQL/LL/HL, structure_bullish_exit:HH/LH) are
     # suppressed. An EQL pivot forming in the first few minutes after entry

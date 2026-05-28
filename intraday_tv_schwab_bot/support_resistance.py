@@ -145,7 +145,9 @@ def _cluster_levels(points: Iterable[tuple[pd.Timestamp, float]], kind: str, tol
     return cluster_levels(points, kind, tolerance, max_levels, level_factory=SupportResistanceLevel)
 
 
-def _reduced_pivots(frame: pd.DataFrame, span: int) -> list[tuple[str, int, pd.Timestamp, float]]:
+def _reduced_pivots(
+    frame: pd.DataFrame, span: int, min_gap_bars: int = 0,
+) -> list[tuple[str, int, pd.Timestamp, float]]:
     highs, lows = _pivot_points(frame, span)
     if frame is None or frame.empty:
         return []
@@ -163,8 +165,15 @@ def _reduced_pivots(frame: pd.DataFrame, span: int) -> list[tuple[str, int, pd.T
         if not reduced:
             reduced.append((kind, pos, ts, price))
             continue
-        prev_kind, _, _, prev_price = reduced[-1]
+        prev_kind, prev_pos, _prev_ts, prev_price = reduced[-1]
         if kind != prev_kind:
+            # Minimum-gap filter (2026-05-27, Fix B): an alternating pivot
+            # closer than ``min_gap_bars`` to the prior kept pivot is noise
+            # within the current leg — skip it so the leg continues instead
+            # of registering a 1-2-bar swing that churns the structure
+            # labels. Disabled when min_gap_bars <= 0.
+            if min_gap_bars > 0 and (pos - prev_pos) < min_gap_bars:
+                continue
             reduced.append((kind, pos, ts, price))
             continue
         keep_current = price >= prev_price if kind == "H" else price <= prev_price
@@ -296,6 +305,7 @@ def analyze_market_structure(
     breakout_buffer_pct: float = 0.0015,
     structure_event_max_age_bars: int | None = 6,
     min_range_atr_mult: float = 1.5,
+    min_pivot_gap_bars: int = 0,
 ) -> MarketStructureContext:
     frame = ensure_standard_indicator_frame(frame)
     if frame.empty:
@@ -303,7 +313,7 @@ def analyze_market_structure(
     close = resolve_current_price(frame, current_price)
     atr = atr_value(frame)
     eq_tol = max(atr * float(eq_atr_mult), close * float(pct_tolerance))
-    pivots = _reduced_pivots(frame, int(pivot_span))
+    pivots = _reduced_pivots(frame, int(pivot_span), int(min_pivot_gap_bars))
     if not pivots:
         return MarketStructureContext(current_price=close, reason="no_confirmed_pivots")
 

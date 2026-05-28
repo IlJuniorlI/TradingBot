@@ -339,6 +339,18 @@ support_resistance:
   structure_ltf_weight: 0.65
   structure_htf_weight: 0.95
   structure_event_lookback_bars: 8
+  # Minimum bar separation between alternating structure pivots (Fix B,
+  # 2026-05-27). 0 = off (original behavior). When > 0, an alternating
+  # H<->L closer than this many bars is treated as noise within the leg
+  # and skipped — kills the rapid-alternation churn in CHoCH/BOS/EQH/EQL.
+  structure_min_pivot_gap_bars: 0
+  # Resample the LTF structure frame to N minutes before pivot analysis
+  # (Fix D, 2026-05-27). 0/1 = use the raw frame (typically 1m streaming
+  # bars). Set to your params.ltf_minutes (e.g. 5) so structure tracks the
+  # bars you trade. NOTE: raising this rescales all bar-based structure
+  # settings (structure_event_lookback_bars etc.) into the new timeframe —
+  # lower them proportionally.
+  structure_ltf_timeframe_minutes: 0
   # Tight-range detector (2026-05-14): when EQH and EQL coexist within
   # < N×ATR of each other, structure-derived bias resolves to "neutral"
   # so structure_bearish/bullish_exit doesn't fire on a noisy tight chop

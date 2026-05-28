@@ -7,7 +7,57 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dashboard structure overlay now mirrors the strategy's LTF structure params.** *2026-05-27 PM*
+  - `DashboardCache.current_structure_overlay` built its CHoCH/BOS/EQH/EQL
+    annotation with base params (`pivot_span`, no `min_pivot_gap_bars`,
+    base `pct_tolerance`) regardless of timeframe, so after Fix B/D the
+    LTF chart showed denser, noisier pivots than the bot actually acts on.
+  - Now, when the overlay's display timeframe equals the strategy's
+    effective LTF structure timeframe (`structure_ltf_timeframe_minutes`,
+    falling back to `params.ltf_minutes`), it applies the same LTF
+    overrides the strategy uses: `structure_ltf_pivot_span`, the 0.60x
+    `pct_tolerance`, and `structure_min_pivot_gap_bars`. HTF / other
+    timeframes keep the original base-param behavior unchanged. Mirrors
+    the existing "keep the chart faithful to the strategy" precedent (the
+    HTF-EMA override in the chart payload).
+  - Verified: on NVDA 5/27 the 5m overlay bias now matches the bot's LTF
+    structure read; the 15m overlay is byte-for-byte unchanged. Inherent
+    residual: a 1m chart can't match (the bot no longer computes 1m
+    structure under Fix D) — only the LTF (5m) and HTF (15m) charts do.
+
 ### Changed
+
+- **Market structure: minimum pivot-gap filter (Fix B) + LTF-frame resampling (Fix D).** *2026-05-27 PM*
+  - The pivot detector (`_reduced_pivots`) merged consecutive same-kind
+    pivots but had NO rule against an alternating H↔L registering 1-2
+    bars apart. On the raw 1m LTF structure frame with a 2-bar fractal,
+    that produced a new "swing" every ~5 min (≈⅓ of pivots within 2 min
+    of each other on NVDA), churning the HH/LH/EQH/LL/HL/EQL labels and
+    the BOS/CHoCH/structure-exit signals keyed on them. The swings were
+    genuine (median 1.9-5.2 ATR), so the problem was temporal density,
+    not amplitude.
+  - **Fix B** — new `structure_min_pivot_gap_bars` (default `0` = off).
+    When > 0, an alternating pivot closer than N bars to the prior kept
+    pivot is skipped as noise within the current leg. Added to
+    `analyze_market_structure` and threaded from `_structure_context`.
+  - **Fix D** — new `structure_ltf_timeframe_minutes` (default `0` = off).
+    When > 0, `_structure_context` resamples the LTF structure frame to
+    that timeframe before pivot analysis, so structure tracks the bars
+    the strategy trades (params.ltf_minutes) instead of the 1m stream.
+    Entry, exit, and HTF-alignment paths all pick it up.
+  - Both default OFF, so every strategy that doesn't set them keeps the
+    exact prior behavior. top_tier_adaptive opts in:
+    `structure_min_pivot_gap_bars: 3`, `structure_ltf_timeframe_minutes: 5`,
+    and the companion `structure_event_lookback_bars: 8 → 4` (bar-based
+    settings now count 5m bars; halved to keep BOS/CHoCH event freshness
+    near ~20 min instead of 40).
+  - Measured on NVDA 5/27 through the real code path: 92 → 8 structure
+    pivots, and the bias resolved from "neutral" (conflicted HH/EQL on
+    noise) to a clean "bullish" HH/HL read. Watch top_tier's first 2-3
+    sessions — structure feeds entry bias, structure exits, and HTF
+    alignment simultaneously.
 
 - **top_tier_adaptive: lowered min_sr_scalp_score 4.0 → 3.0 (sr_scalp was structurally dead).** *2026-05-27 PM*
   - `_score_sr_scalp` has a theoretical max of 5.0 but an empirical

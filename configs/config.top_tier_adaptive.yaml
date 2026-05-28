@@ -307,7 +307,20 @@ support_resistance:
   structure_eq_atr_mult: 0.25
   structure_ltf_weight: 0.65
   structure_htf_weight: 0.95
-  structure_event_lookback_bars: 8
+  # 2026-05-27: was 8 (= 8 min on the old 1m LTF structure). With Fix D
+  # below resampling LTF structure to 5m, bar-based settings now count 5m
+  # bars — halved to 4 (= 20 min) so BOS/CHoCH event freshness stays in a
+  # sane wall-clock range instead of 40 min.
+  structure_event_lookback_bars: 4
+  # Fix B (2026-05-27): reject alternating structure pivots closer than this
+  # many bars (on the LTF structure frame) — kills the rapid-alternation
+  # noise that churned CHoCH/BOS/EQH/EQL. At Fix D's 5m frame, 3 bars =
+  # 15 min minimum between swings.
+  structure_min_pivot_gap_bars: 3
+  # Fix D (2026-05-27): resample the LTF structure frame to 5m (matches
+  # params.ltf_minutes / the regime-scoring frame) instead of running on
+  # raw 1m bars. Cut NVDA structure pivots 92 -> 22. Set 0 to revert to 1m.
+  structure_ltf_timeframe_minutes: 5
   # Tight-range detector (2026-05-14): when EQH and EQL coexist within
   # < N×ATR of each other, structure-derived bias resolves to "neutral"
   # so structure_bearish/bullish_exit doesn't fire on noise. Set 0.0 to

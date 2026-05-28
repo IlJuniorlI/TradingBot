@@ -1852,14 +1852,25 @@ class BaseStrategy:
             return empty_ctx
         pivot_span = int(self._support_resistance_setting("pivot_span", 2) or 2)
         is_ltf_analysis = self._is_ltf_token(timeframe_token)
+        analysis_frame = frame
         if is_ltf_analysis:
             pivot_span = int(self._support_resistance_setting("structure_ltf_pivot_span", max(2, pivot_span)) or max(2, pivot_span))
+            # Fix D (2026-05-27): optionally resample the LTF structure frame
+            # to a coarser timeframe so structure pivots track the bars the
+            # strategy actually trades on (params.ltf_minutes) instead of the
+            # raw 1m stream. 0/1 = use the frame as-is (original behavior).
+            ltf_tf_min = int(self._support_resistance_setting("structure_ltf_timeframe_minutes", 0) or 0)
+            if ltf_tf_min > 1:
+                resampled = self._resampled_frame(frame, ltf_tf_min)
+                if resampled is not None and not resampled.empty:
+                    analysis_frame = resampled
+                    current_price = _safe_float(analysis_frame.iloc[-1]["close"], current_price)
         pct_tolerance = float(self._support_resistance_setting("pct_tolerance", 0.0030) or 0.0030)
         if is_ltf_analysis:
             pct_tolerance *= 0.60
         structure_event_max_age_bars = int(self._support_resistance_setting("structure_event_lookback_bars", 6) or 6)
         ctx = analyze_market_structure(
-            frame,
+            analysis_frame,
             current_price=current_price,
             pivot_span=pivot_span,
             eq_atr_mult=float(self._support_resistance_setting("structure_eq_atr_mult", 0.25) or 0.25),
@@ -1868,6 +1879,7 @@ class BaseStrategy:
             breakout_buffer_pct=float(self._support_resistance_setting("breakout_buffer_pct", 0.0015) or 0.0015),
             structure_event_max_age_bars=structure_event_max_age_bars,
             min_range_atr_mult=float(self._support_resistance_setting("structure_min_range_atr_mult", 1.5) or 0.0),
+            min_pivot_gap_bars=int(self._support_resistance_setting("structure_min_pivot_gap_bars", 0) or 0),
         )
         with self._structure_context_lock:
             self._structure_context_cache[cache_key] = ctx

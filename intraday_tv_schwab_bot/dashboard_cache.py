@@ -2152,16 +2152,42 @@ class DashboardCache:
             return payload
         try:
             sr_cfg = self.config.support_resistance
+            # Match the strategy's LTF-vs-HTF structure params so the overlay
+            # reflects what the bot actually computes — same "keep the chart
+            # faithful to the strategy" principle as the HTF-EMA override in
+            # the chart payload. The LTF structure context applies
+            # structure_ltf_pivot_span, a 0.60x pct_tolerance, and the
+            # min-pivot-gap filter (Fix B/D, 2026-05-27); the HTF/base context
+            # does not. Detect the LTF chart by matching the display timeframe
+            # to the strategy's effective LTF structure timeframe
+            # (structure_ltf_timeframe_minutes, falling back to
+            # params.ltf_minutes). HTF / other timeframes keep the original
+            # base-param behavior unchanged.
+            strat_params = getattr(self.strategy, "params", {}) or {}
+            ltf_struct_tf = int(getattr(sr_cfg, "structure_ltf_timeframe_minutes", 0) or 0) or int(strat_params.get("ltf_minutes", 1) or 1)
+            is_ltf_chart = int(timeframe_minutes or 1) == ltf_struct_tf
+            overlay_pivot_span = (
+                int(getattr(sr_cfg, "structure_ltf_pivot_span", 2) or 2)
+                if is_ltf_chart
+                else int(getattr(sr_cfg, "pivot_span", 2) or 2)
+            )
+            overlay_pct_tolerance = float(getattr(sr_cfg, "pct_tolerance", 0.0030) or 0.0030)
+            if is_ltf_chart:
+                overlay_pct_tolerance *= 0.60
+            overlay_gap_bars = (
+                int(getattr(sr_cfg, "structure_min_pivot_gap_bars", 0) or 0) if is_ltf_chart else 0
+            )
             ms_ctx = analyze_market_structure(
                 frame_for_analysis,
                 current_price=close_val,
-                pivot_span=int(getattr(sr_cfg, "pivot_span", 2) or 2),
+                pivot_span=overlay_pivot_span,
                 eq_atr_mult=float(getattr(sr_cfg, "structure_eq_atr_mult", 0.25) or 0.25),
-                pct_tolerance=float(getattr(sr_cfg, "pct_tolerance", 0.0030) or 0.0030),
+                pct_tolerance=overlay_pct_tolerance,
                 breakout_atr_mult=float(getattr(sr_cfg, "breakout_atr_mult", 0.35) or 0.35),
                 breakout_buffer_pct=float(getattr(sr_cfg, "breakout_buffer_pct", 0.0015) or 0.0015),
                 structure_event_max_age_bars=int(getattr(sr_cfg, "structure_event_lookback_bars", 6) or 6),
                 min_range_atr_mult=float(getattr(sr_cfg, "structure_min_range_atr_mult", 1.5) or 0.0),
+                min_pivot_gap_bars=overlay_gap_bars,
             )
         except Exception:
             self.log_component_failure(
