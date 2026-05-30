@@ -1287,18 +1287,24 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening
         effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening
         target_rr = float(self.params.get("pullback_target_rr", 2.0))
+        # Swing-target window ~100 wall-clock minutes (was a hardcoded 20 bars on
+        # the old 5m LTF = 100 min). Scaled by ltf_minutes so the 1m LTF uses
+        # ~100 bars, preserving the swing horizon the target extension was tuned
+        # to — without this the 1m target only reached back 20 min and stopped
+        # extending to meaningful prior swings.
+        swing_bars = max(8, round(100 / ltf_min))
 
         if side == Side.LONG:
             stop = _safe_float(recent["low"].min(), close) - buffer
             stop = min(stop, close * (1.0 - effective_default_stop_pct))
             risk = max(0.01, close - stop)
-            swing_high = _safe_float(session_ltf.tail(20)["high"].max(), close + risk * target_rr)
+            swing_high = _safe_float(session_ltf.tail(swing_bars)["high"].max(), close + risk * target_rr)
             target = max(close + risk * target_rr, swing_high)
         else:
             stop = _safe_float(recent["high"].max(), close) + buffer
             stop = max(stop, close * (1.0 + effective_default_stop_pct))
             risk = max(0.01, stop - close)
-            swing_low = _safe_float(session_ltf.tail(20)["low"].min(), close - risk * target_rr)
+            swing_low = _safe_float(session_ltf.tail(swing_bars)["low"].min(), close - risk * target_rr)
             target = max(0.01, min(close - risk * target_rr, swing_low))
 
         return self._finalize_signal(c, side, close, stop, target, "pullback", regime_score, frame, data)
