@@ -119,7 +119,8 @@ class MarketDataStore:
         self.started_at = now_et()
         self._forced_premarket_history_refresh_date: dict[str, date] = {}
         self._cycle_active = False
-        self._cycle_merged_cache: dict[tuple[str, str, bool], pd.DataFrame] = {}
+        # Keys: base OHLCV = (symbol, tf, False); enriched = (symbol, tf, True, span_scale).
+        self._cycle_merged_cache: dict[tuple, pd.DataFrame] = {}
         self._cycle_htf_context_cache: dict[tuple, HTFContext | None] = {}
         self._cycle_fvg_cache: dict[tuple, FairValueGapContext] = {}
         self._cycle_ob_cache: dict[tuple, OrderBlockContext] = {}
@@ -1952,11 +1953,16 @@ class MarketDataStore:
             frame = self.history.get(self._symbol_key(symbol))
         return None if frame is None else frame.copy()
 
-    def get_merged(self, symbol: str, timeframe: str | None = None, with_indicators: bool = True) -> pd.DataFrame:
+    def get_merged(self, symbol: str, timeframe: str | None = None, with_indicators: bool = True, span_scale: float = 1.0) -> pd.DataFrame:
         cache_key = self._symbol_key(symbol)
         tf = str(timeframe or "1min")
+        # Base (OHLCV-only) cache is span-independent and stays shared. The
+        # enriched cache is keyed by span_scale so a caller asking for stretched
+        # indicators (top_tier's 1m LTF passes span_scale=5) gets its own entry
+        # without clobbering the canonical span_scale=1.0 frame the engine bars,
+        # dashboard, and other strategies read.
         base_key = (cache_key, tf, False)
-        indicator_key = (cache_key, tf, True)
+        indicator_key = (cache_key, tf, True, float(span_scale))
         with self._lock:
             if self._cycle_active:
                 cached = self._cycle_merged_cache.get(indicator_key if with_indicators else base_key)
@@ -1973,7 +1979,7 @@ class MarketDataStore:
                 self._cycle_merged_cache[base_key] = merged.copy()
         if not with_indicators:
             return merged.copy()
-        enriched = ensure_standard_indicator_frame(merged)
+        enriched = ensure_standard_indicator_frame(merged, span_scale=span_scale)
         with self._lock:
             if self._cycle_active:
                 self._cycle_merged_cache[indicator_key] = enriched.copy()

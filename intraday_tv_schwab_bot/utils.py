@@ -31,6 +31,12 @@ from .models import DEFAULT_RUNTIME_TZ, Side, StrategySchedule, Window
 LOG = logging.getLogger(__name__)
 
 _USE_RTH_SESSION_INDICATORS = True
+# Which session window the per-session indicator reset (VWAP/EMA/TA-Lib
+# overlay) keys off when _USE_RTH_SESSION_INDICATORS is on. "rth" = the
+# 09:30-16:00 regular session (default, original behavior). "extended" =
+# the 07:00-20:00 equity stream window, for strategies that trade pre/post
+# market. Only affects the session mask predicate in add_indicators.
+_SESSION_INDICATOR_WINDOW = "rth"
 
 TRADEFLOW_LEVEL = 25
 TRADEFLOW = TRADEFLOW_LEVEL
@@ -220,6 +226,16 @@ def set_runtime_indicator_mode(enabled: bool) -> None:
 
 def get_runtime_indicator_mode() -> bool:
     return bool(_USE_RTH_SESSION_INDICATORS)
+
+
+def set_session_indicator_window(window: str) -> None:
+    global _SESSION_INDICATOR_WINDOW
+    w = str(window or "rth").strip().lower()
+    _SESSION_INDICATOR_WINDOW = "extended" if w == "extended" else "rth"
+
+
+def get_session_indicator_window() -> str:
+    return _SESSION_INDICATOR_WINDOW
 
 
 def _enable_windows_ansi() -> None:
@@ -741,21 +757,24 @@ def has_standard_indicator_columns(frame: pd.DataFrame) -> bool:
     return frame is not None and not frame.empty and all(col in frame.columns for col in STANDARD_INDICATOR_COLUMNS)
 
 
-def ensure_standard_indicator_frame(frame: pd.DataFrame) -> pd.DataFrame:
+def ensure_standard_indicator_frame(frame: pd.DataFrame, *, span_scale: float = 1.0) -> pd.DataFrame:
     # Fast path: if the frame already carries every standard indicator column,
     # it was produced by add_indicators() upstream which itself calls
     # ensure_ohlcv_frame internally. Re-running ensure_ohlcv_frame here on the
     # hot path (copy + sort + 5x to_numeric + dropna + reorder) is the single
     # biggest overhead in build_technical_levels_context / analyze_market_structure
     # when the frame is already clean. Skip it by trusting the indicator marker.
-    if frame is not None and not frame.empty and has_standard_indicator_columns(frame):
+    # The fast path is only valid for the canonical spans (span_scale == 1.0):
+    # a scaled caller must (re)compute because any existing indicator columns
+    # carry the default 9/20/14 spans, not the stretched ones.
+    if span_scale == 1.0 and frame is not None and not frame.empty and has_standard_indicator_columns(frame):
         return frame
     cleaned = ensure_ohlcv_frame(frame)
     if cleaned.empty:
         return cleaned
-    if has_standard_indicator_columns(cleaned):
+    if span_scale == 1.0 and has_standard_indicator_columns(cleaned):
         return cleaned
-    return add_indicators(cleaned)
+    return add_indicators(cleaned, span_scale=span_scale)
 
 
 FloatArray = npt.NDArray[np.float64]
@@ -827,12 +846,32 @@ def talib_bbands(
     )
 
 
-def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
+def add_indicators(frame: pd.DataFrame, *, span_scale: float = 1.0) -> pd.DataFrame:
     frame = ensure_ohlcv_frame(frame)
     if frame.empty:
         return frame
     out = frame.copy()
     ta = _require_talib()
+    # ``span_scale`` stretches every bar-count lookback so a finer timeframe can
+    # preserve a coarser timeframe's wall-clock horizon. Default 1.0 = the
+    # canonical 9/20/14/5/15-bar spans (byte-for-byte unchanged for every
+    # existing caller). top_tier_adaptive's 1m LTF passes span_scale=5 so its
+    # indicators behave like the old 5m frame (ema9->45, ema20->100, atr14->70,
+    # rsi14->70, bb20->100, ret5->25, ret15->75). The column NAMES keep their
+    # nominal numeric suffix; the EFFECTIVE span is suffix x span_scale.
+    def _span(base: int) -> int:
+        return max(1, int(round(base * float(span_scale))))
+    ema_fast_span = _span(9)
+    ema_slow_span = _span(20)
+    bb_length = _span(20)
+    bb_warmup_min = max(2, bb_length // 2)
+    atr_period = _span(14)
+    di_period = _span(14)
+    obv_ema_span = _span(20)
+    obv_delta_period = _span(5)
+    rsi_period = _span(14)
+    ret_fast_period = _span(5)
+    ret_slow_period = _span(15)
     close = out["close"].astype(float)
     high = out["high"].astype(float)
     low = out["low"].astype(float)
@@ -843,12 +882,22 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     cum_vol = volume.groupby(session_keys).cumsum().replace(0, math.nan)
     cum_tpv = tpv.groupby(session_keys).cumsum()
     out["vwap_all"] = cum_tpv / cum_vol
-    out["ema9_all"] = talib_ema(close, span=9)
-    out["ema20_all"] = talib_ema(close, span=20)
+    out["ema9_all"] = talib_ema(close, span=ema_fast_span)
+    out["ema20_all"] = talib_ema(close, span=ema_slow_span)
 
     index_dt = pd.DatetimeIndex(out.index)
+    # Session mask for the per-session VWAP/EMA reset. Defaults to the RTH
+    # (09:30-16:00) session; switches to the 07:00-20:00 equity stream window
+    # when the runtime opts into extended-session indicators (strategies that
+    # trade pre/post market). Variable name kept as rth_mask — it is the
+    # "session" mask downstream regardless of which window defines it.
+    _session_predicate = (
+        is_equity_stream_session
+        if get_session_indicator_window() == "extended"
+        else is_regular_equity_session
+    )
     rth_mask = pd.Series(
-        [is_regular_equity_session(ts) for ts in index_dt],
+        [_session_predicate(ts) for ts in index_dt],
         index=out.index,
         dtype=bool,
     )
@@ -873,8 +922,8 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
             result.loc[session_rth.index] = session_rth.astype(float).ewm(span=int(span), adjust=False).mean()
         return result
 
-    out["ema9_rth"] = _session_rth_ema(close, span=9)
-    out["ema20_rth"] = _session_rth_ema(close, span=20)
+    out["ema9_rth"] = _session_rth_ema(close, span=ema_fast_span)
+    out["ema20_rth"] = _session_rth_ema(close, span=ema_slow_span)
     rth_only_vwap = out["vwap_rth"].combine_first(out["vwap_all"])
     rth_only_ema9 = out["ema9_rth"].combine_first(out["ema9_all"])
     rth_only_ema20 = out["ema20_rth"].combine_first(out["ema20_all"])
@@ -903,7 +952,7 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     # to keep the band statistically meaningful.
     upper, middle, lower_band = ta.BBANDS(
         _to_float64_array(close),
-        timeperiod=20,
+        timeperiod=bb_length,
         nbdevup=2.0,
         nbdevdn=2.0,
         matype=ta.MA_Type.SMA,
@@ -911,8 +960,8 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     out["bb_mid"] = _series_from_talib(out.index, middle)
     out["bb_upper"] = _series_from_talib(out.index, upper)
     out["bb_lower"] = _series_from_talib(out.index, lower_band)
-    bb_warmup_mid = close.rolling(20, min_periods=10).mean()
-    bb_warmup_std = close.rolling(20, min_periods=10).std(ddof=0)
+    bb_warmup_mid = close.rolling(bb_length, min_periods=bb_warmup_min).mean()
+    bb_warmup_std = close.rolling(bb_length, min_periods=bb_warmup_min).std(ddof=0)
     bb_warmup_upper = bb_warmup_mid + 2.0 * bb_warmup_std
     bb_warmup_lower = bb_warmup_mid - 2.0 * bb_warmup_std
     out["bb_mid"] = out["bb_mid"].fillna(bb_warmup_mid)
@@ -923,19 +972,19 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     out["bb_percent_b"] = (close - out["bb_lower"]) / out["bb_width"].replace(0.0, math.nan)
     out["bb_zscore"] = (close - out["bb_mid"]) / bb_warmup_std.replace(0.0, math.nan)
 
-    out["atr14"] = _series_from_talib(out.index, ta.ATR(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=14))
-    out["plus_di14"] = _series_from_talib(out.index, ta.PLUS_DI(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=14))
-    out["minus_di14"] = _series_from_talib(out.index, ta.MINUS_DI(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=14))
-    out["adx14"] = _series_from_talib(out.index, ta.ADX(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=14))
+    out["atr14"] = _series_from_talib(out.index, ta.ATR(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=atr_period))
+    out["plus_di14"] = _series_from_talib(out.index, ta.PLUS_DI(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=di_period))
+    out["minus_di14"] = _series_from_talib(out.index, ta.MINUS_DI(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=di_period))
+    out["adx14"] = _series_from_talib(out.index, ta.ADX(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=di_period))
 
     out["obv"] = _series_from_talib(out.index, ta.OBV(_to_float64_array(close), _to_float64_array(volume)))
-    out["obv_ema20"] = talib_ema(out["obv"], span=20)
-    out["obv_delta5"] = out["obv"].diff(5)
-    out["rsi14"] = _series_from_talib(out.index, ta.RSI(_to_float64_array(close), timeperiod=14))
+    out["obv_ema20"] = talib_ema(out["obv"], span=obv_ema_span)
+    out["obv_delta5"] = out["obv"].diff(obv_delta_period)
+    out["rsi14"] = _series_from_talib(out.index, ta.RSI(_to_float64_array(close), timeperiod=rsi_period))
 
     out["ret1"] = close.pct_change()
-    out["ret5"] = close.pct_change(5)
-    out["ret15"] = close.pct_change(15)
+    out["ret5"] = close.pct_change(ret_fast_period)
+    out["ret15"] = close.pct_change(ret_slow_period)
 
     # --- RTH session-reset overlay for TA-Lib indicators ---
     # When use_rth_session_indicators is enabled, recompute indicators using
@@ -966,33 +1015,33 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
 
             # Returns — clean from bar 2 onward
             _overlay("ret1", rth_close.pct_change())
-            if n_rth >= 5:
-                _overlay("ret5", rth_close.pct_change(5))
-            if n_rth >= 15:
-                _overlay("ret15", rth_close.pct_change(15))
+            if n_rth >= ret_fast_period:
+                _overlay("ret5", rth_close.pct_change(ret_fast_period))
+            if n_rth >= ret_slow_period:
+                _overlay("ret15", rth_close.pct_change(ret_slow_period))
 
             # OBV — clean from bar 2 onward
             rth_obv = _series_from_talib(today_rth.index, ta.OBV(_to_float64_array(rth_close), _to_float64_array(rth_volume)))
             _overlay("obv", rth_obv)
-            if n_rth >= 20:
-                _overlay("obv_ema20", talib_ema(rth_obv, span=20))
-            _overlay("obv_delta5", rth_obv.diff(5))
+            if n_rth >= obv_ema_span:
+                _overlay("obv_ema20", talib_ema(rth_obv, span=obv_ema_span))
+            _overlay("obv_delta5", rth_obv.diff(obv_delta_period))
 
-            # ATR, DI, RSI — clean from bar 14+; ADX needs ~28
-            if n_rth >= 14:
+            # ATR, DI, RSI — clean from atr_period bars onward; ADX needs ~2x
+            if n_rth >= atr_period:
                 rth_h = _to_float64_array(rth_high)
                 rth_l = _to_float64_array(rth_low)
                 rth_c = _to_float64_array(rth_close)
-                _overlay("atr14", _series_from_talib(today_rth.index, ta.ATR(rth_h, rth_l, rth_c, timeperiod=14)))
-                _overlay("plus_di14", _series_from_talib(today_rth.index, ta.PLUS_DI(rth_h, rth_l, rth_c, timeperiod=14)))
-                _overlay("minus_di14", _series_from_talib(today_rth.index, ta.MINUS_DI(rth_h, rth_l, rth_c, timeperiod=14)))
-                _overlay("adx14", _series_from_talib(today_rth.index, ta.ADX(rth_h, rth_l, rth_c, timeperiod=14)))
-                _overlay("rsi14", _series_from_talib(today_rth.index, ta.RSI(_to_float64_array(rth_close), timeperiod=14)))
+                _overlay("atr14", _series_from_talib(today_rth.index, ta.ATR(rth_h, rth_l, rth_c, timeperiod=atr_period)))
+                _overlay("plus_di14", _series_from_talib(today_rth.index, ta.PLUS_DI(rth_h, rth_l, rth_c, timeperiod=di_period)))
+                _overlay("minus_di14", _series_from_talib(today_rth.index, ta.MINUS_DI(rth_h, rth_l, rth_c, timeperiod=di_period)))
+                _overlay("adx14", _series_from_talib(today_rth.index, ta.ADX(rth_h, rth_l, rth_c, timeperiod=di_period)))
+                _overlay("rsi14", _series_from_talib(today_rth.index, ta.RSI(_to_float64_array(rth_close), timeperiod=rsi_period)))
 
-            # Bollinger Bands — clean from bar 20 onward
-            if n_rth >= 20:
+            # Bollinger Bands — clean from bb_length bars onward
+            if n_rth >= bb_length:
                 r_upper, r_middle, r_lower = ta.BBANDS(
-                    _to_float64_array(rth_close), timeperiod=20,
+                    _to_float64_array(rth_close), timeperiod=bb_length,
                     nbdevup=2.0, nbdevdn=2.0, matype=ta.MA_Type.SMA,
                 )
                 rth_bb_mid = _series_from_talib(today_rth.index, r_middle)
@@ -1005,7 +1054,7 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
                 _overlay("bb_width", rth_bb_width)
                 _overlay("bb_width_pct", rth_bb_width / rth_bb_mid.replace(0.0, math.nan))
                 _overlay("bb_percent_b", (rth_close - rth_bb_lower) / rth_bb_width.replace(0.0, math.nan))
-                rth_std = rth_close.rolling(20, min_periods=10).std(ddof=0)
+                rth_std = rth_close.rolling(bb_length, min_periods=bb_warmup_min).std(ddof=0)
                 _overlay("bb_zscore", (rth_close - rth_bb_mid) / rth_std.replace(0.0, math.nan))
 
     return out

@@ -2357,6 +2357,32 @@ class DashboardCache:
                     ema_slow_span = htf_slow
                 except Exception:
                     LOG.debug("Failed to compute HTF strategy EMAs for %s; chart falls back to default ema9/ema20.", symbol_key, exc_info=True)
+        # In LTF mode, when the strategy stretches its LTF indicator spans
+        # (top_tier_adaptive runs a 1m LTF with ltf_indicator_span_scale=5 so
+        # its ema9/ema20 are effectively 45/100), redraw the chart EMAs at the
+        # same spans. Otherwise the compact chart's get_merged frame carries the
+        # default 9/20 EMAs the bot never looks at. Spans default to base×scale
+        # so this stays correct even if ltf_ema_fast/slow_span aren't set.
+        elif resolved_mode == "ltf" and frame is not None and not getattr(frame, "empty", True):
+            params = getattr(self.strategy, "params", {}) or {}
+            scale = float(params.get("ltf_indicator_span_scale", 1.0) or 1.0)
+            ltf_fast = max(1, int(params.get("ltf_ema_fast_span", round(ema_fast_span * scale)) or round(ema_fast_span * scale)))
+            ltf_slow = max(1, int(params.get("ltf_ema_slow_span", round(ema_slow_span * scale)) or round(ema_slow_span * scale)))
+            if ltf_fast != ema_fast_span or ltf_slow != ema_slow_span:
+                try:
+                    ema_fast_series = frame["close"].ewm(span=ltf_fast, adjust=False).mean()
+                    ema_slow_series = frame["close"].ewm(span=ltf_slow, adjust=False).mean()
+                    tail = frame.tail(len(bars))
+                    for bar, (idx, _row) in zip(bars, tail.iterrows()):
+                        try:
+                            bar["ema9"] = float(ema_fast_series.loc[idx])
+                            bar["ema20"] = float(ema_slow_series.loc[idx])
+                        except (KeyError, ValueError, TypeError):
+                            pass
+                    ema_fast_span = ltf_fast
+                    ema_slow_span = ltf_slow
+                except Exception:
+                    LOG.debug("Failed to compute LTF strategy EMAs for %s; chart falls back to default ema9/ema20.", symbol_key, exc_info=True)
         pattern_payload = self.current_pattern_payload(frame)
         structure_overlay = self.current_structure_overlay(frame, timeframe_minutes=timeframe_minutes)
         chart_config_profile = asdict(self.chart_profile("compact"))

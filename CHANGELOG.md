@@ -7,6 +7,98 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **top_tier_adaptive: 1-minute LTF with horizon-preserving indicator scaling.** *2026-05-29*
+  - The trend/pullback **LTF moved from 5m to 1m** (`ltf_minutes: 5 → 1`) so
+    entries/exits act on the freshest 1m close instead of waiting up to 5 min
+    for a 5m bar to print. **Behavior is preserved**, not changed: the 1m LTF's
+    indicators are stretched ×5 so their wall-clock horizons match the old 5m
+    frame.
+  - New shared capability — `add_indicators(frame, *, span_scale=1.0)` multiplies
+    every bar-count lookback (ema9→45, ema20→100, bb→100, atr14→70, ±DI/adx→70,
+    obv_ema→100, rsi14→70, ret5→25, ret15→75). **Default `1.0` is byte-for-byte
+    unchanged** for every existing caller. Threaded through
+    `ensure_standard_indicator_frame` → `DataFeed.get_merged` (the enriched
+    cache is now keyed by `span_scale`, so top_tier's scaled 1m frame never
+    collides with the shared `span_scale=1.0` frame the engine bars / dashboard /
+    other strategies read) → `_resampled_frame`. New `TestSpanScale`.
+  - top_tier params: `ltf_indicator_span_scale: 5`; bar-count LTF lookbacks
+    scaled to match (`pullback_lookback_bars` 5→25, `side_decision_recent_lookback_bars`
+    6→30); warmup gates bumped (`min_bars` 90→150, `min_ltf_bars` 15→120,
+    `history.required_bars` 90→150). The `range`/`vol_squeeze`/`momentum`
+    regimes, `technical_levels`, and chart-pattern detection read the **base 1m
+    frame** (unchanged by the switch), so their lookbacks were left as-is; the
+    structure-pivot frame stays 5m. Every ATR-mult/pct/score threshold is
+    unchanged (the whole point of preserving horizons).
+  - Dashboard: the compact (LTF) chart redraws its EMA lines at the scaled
+    spans (`ltf_ema_fast_span: 45` / `ltf_ema_slow_span: 100`, defaulting to
+    base×scale), mirroring the existing HTF-chart EMA parity, so the chart
+    matches what the bot evaluates.
+
+- **top_tier_adaptive: true Opening Range Breakout (ORB) regime.** *2026-05-29*
+  - The opening window used to run the **trend** regime with ~11
+    `orb_bypass_*` flags loosening its filters — there was no opening range
+    computed at all (the "breakout" was a rolling 5-bar-high). Replaced with a
+    real ORB regime:
+    - The **opening range** = high/low of the first `orb_range_minutes` of RTH
+      (default 15 → 09:30-09:45), computed on the raw 1m frame.
+    - **No entries while the range forms** (09:30 → range-end); from range-end
+      → `orb_end_time` the ORB regime is the ONLY regime, trading a break.
+    - **Entry:** close breaks the range edge by `orb_breakout_buffer_atr_mult`
+      × ATR. **Stop:** the OPPOSITE range edge. **Target:** a measured move
+      (range height × `orb_target_range_mult`, default 1.5×), then capped to
+      HTF levels / floored to min R:R by the shared finalize path.
+    - Range size is sanity-bounded (`orb_min_range_atr_mult` /
+      `orb_max_range_atr_mult`) so noise ranges and untradeable wide ranges
+      are skipped. Score floor `min_orb_score` (default 3.5).
+  - New scorer `_score_orb` + builder `_build_orb_signal` + helper
+    `_opening_range`; wired into the regime scoring/selection/dispatch and
+    `_allowed_regimes` (ORB window now returns `{"orb"}`, not `{"trend"}`).
+    The `orb_bypass_*` flags still apply (they loosen the shared finalize
+    filters that are stale at the open) and `disable_orb_window` still skips
+    the whole open. Regression tests in `TestORBRegime`.
+
+- **top_tier_adaptive extended-hours trading (07:00-20:00 ET).** *2026-05-28*
+  - New opt-in `runtime.equity_session_indicator_window: "rth" | "extended"`
+    (default `"rth"`). In `"extended"`, `add_indicators` anchors the
+    per-session VWAP/EMA reset to the 07:00-20:00 equity-stream window (via
+    `is_equity_stream_session`) instead of RTH 09:30-16:00, so pre/post-market
+    bars carry meaningful session indicators. Every RTH-only strategy/preset
+    is byte-for-byte unchanged (verified: default mode still resets VWAP at
+    09:30; 219+ regression tests green).
+  - `_session_open_price` gained a `session_start` anchor; top_tier's
+    `day_strength` bias keys off the 07:00 open in extended mode (matching the
+    VWAP reset) via `_day_strength_session_open`.
+  - `_allowed_regimes` opens the full non-ORB regime mix pre-market (<09:30)
+    in extended mode; ORB stays RTH-anchored (range-end → orb_end). After-RTH
+    is covered by the afternoon window once `no_new_entries_after` is extended.
+  - Extended-hours universe gate (`params.extended_hours_tradable`): outside
+    RTH only the configured liquid names may enter (thinner names trade RTH
+    only); empty list => no extended-hours entries.
+  - The shipped preset `config.top_tier_adaptive.yaml` defaults to **RTH-only**
+    (`equity_session_indicator_window: rth`, entry window `09:45-15:00` — entries
+    open when the ORB regime can first fire — management `09:30-15:55`,
+    `no_new_entries_after: 15:00`). The `extended_hours_tradable` list is retained
+    but inactive in RTH mode. To run extended hours, set the mode to `extended`
+    and widen the entry/management/screener windows (e.g. 07:00-19:30/19:55/19:45,
+    `no_new_entries_after: 19:30`).
+
+### Removed
+
+- **top_tier_adaptive: dead `orb_bypass_*` params (5).** *2026-05-29* Now that
+  the ORB window runs the dedicated `orb` regime (not trend-with-bypasses),
+  `orb_bypass_index_confirmation`, `orb_bypass_entry_confirmation_bar`,
+  `orb_bypass_stretched_filter`, `orb_bypass_oversized_entry_bar`, and
+  `orb_bypass_tech_bias_contradiction` were dead — their gates are keyed to
+  regime sets (`{trend,pullback,vol_squeeze,momentum}` / `{...,sr_scalp}`) that
+  exclude `orb`, and those regimes no longer run in the ORB window, so the
+  bypasses never fired. Removed from `strategy.py` (vars + the `and not
+  orb_*_bypass` clauses), `config.top_tier_adaptive.yaml`, `manifest.json`, and
+  the README. Surviving ORB bypasses (`htf_bias`, `exhaustion`,
+  `structure_entry`, `sr_entry`, `screener_bias`, `side_decision`,
+  `relative_strength`) DO apply to the ORB regime and were kept.
+
 ### Fixed
 
 - **Dashboard HTF chart now draws the EMA 50/200 the bot actually uses (top_tier_adaptive).** *2026-05-28*

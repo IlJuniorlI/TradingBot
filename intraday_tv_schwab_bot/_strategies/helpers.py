@@ -194,21 +194,28 @@ def _session_open_price(
     day: date | None = None,
     *,
     regular_session_only: bool = True,
+    session_start: time | None = None,
 ) -> float | None:
     """First open price of the trading day. Returns None if frame has
-    no bars for the requested day. With ``regular_session_only=True``
-    (default), prefers the first 09:30+ ET bar; falls back to extended
-    hours if the regular session hasn't started yet."""
+    no bars for the requested day.
+
+    The session-start cutoff is chosen in priority order: ``session_start``
+    when given (e.g. ``time(7, 0)`` to anchor to the 07:00 extended-hours
+    open, matching the extended-session VWAP reset), else the RTH 09:30 open
+    when ``regular_session_only`` (default), else the first bar of the day.
+    In every case it falls back to the first available same-day bar when no
+    bar sits at/after the cutoff (e.g. the regular session hasn't started)."""
     if frame is None or frame.empty:
         return None
     target_day = day or now_et().date()
     same_day = frame[_same_day_mask(frame, target_day)]
     if same_day.empty:
         return None
-    if regular_session_only:
-        regular = same_day[same_day.index.to_series().map(lambda ts: ts.time() >= time(9, 30))]
-        if not regular.empty:
-            same_day = regular
+    cutoff = session_start if session_start is not None else (time(9, 30) if regular_session_only else None)
+    if cutoff is not None:
+        windowed = same_day[same_day.index.to_series().map(lambda ts: ts.time() >= cutoff)]
+        if not windowed.empty:
+            same_day = windowed
     try:
         open_value = same_day.iloc[0]["open"]
     except Exception:

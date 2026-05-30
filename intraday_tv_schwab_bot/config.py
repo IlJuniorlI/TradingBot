@@ -33,7 +33,7 @@ from ._strategies.registry import (
     normalize_strategy_params as apply_strategy_param_normalizer,
     plugin_names,
 )
-from .utils import build_schedule, set_runtime_indicator_mode, set_runtime_timezone
+from .utils import build_schedule, set_runtime_indicator_mode, set_session_indicator_window, set_runtime_timezone
 
 LOG = logging.getLogger(__name__)
 
@@ -410,6 +410,13 @@ class RuntimeConfig:
     history_lookback_minutes: int = 390
     use_extended_hours_history: bool = True
     use_rth_session_indicators: bool = True
+    # Which session window the per-session VWAP/EMA/TA-Lib indicator reset
+    # keys off (only when use_rth_session_indicators is true). "rth" = the
+    # 09:30-16:00 regular session (default). "extended" = the 07:00-20:00
+    # equity stream window, for strategies that enter pre/post market
+    # (top_tier_adaptive extended-hours mode). Leave "rth" for every
+    # RTH-only strategy.
+    equity_session_indicator_window: str = "rth"
     warmup_minutes: int = 90
     prewarm_before_windows_minutes: int = 5
     log_dir: str = ".logs"
@@ -887,6 +894,12 @@ class SharedExitLogicConfig:
     use_channel_break: bool = True
     use_bollinger_reject: bool = False
     use_anchored_vwap_loss: bool = True
+    # Require TWO consecutive bar closes through the anchored-VWAP floor/
+    # ceiling before the anchored_vwap_loss / _reclaim exit fires (2026-05-29).
+    # A single bar's dip below the floor is normal continuation noise in a
+    # trending stock; the 2-bar confirm avoids exiting a working trade on one
+    # noise bar. Set false to fire on the first qualifying bar (original).
+    anchored_vwap_exit_require_two_bar_confirm: bool = True
     use_chart_pattern_exit: bool = False
     # Fire candle_pattern_exit when an opposing-direction candle cluster
     # crosses candles.opposing_net_score_threshold and the tape confirms
@@ -1373,6 +1386,7 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     _validate_runtime_config(runtime_cfg, config_path)
     set_runtime_timezone(runtime_cfg.timezone)
     set_runtime_indicator_mode(runtime_cfg.use_rth_session_indicators)
+    set_session_indicator_window(runtime_cfg.equity_session_indicator_window)
 
     risk_cfg = RiskConfig(**risk_raw)
     _validate_risk_config(risk_cfg, config_path)

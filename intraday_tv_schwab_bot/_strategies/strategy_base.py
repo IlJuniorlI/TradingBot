@@ -1813,21 +1813,27 @@ class BaseStrategy:
         *,
         symbol: str | None = None,
         data=None,
+        span_scale: float = 1.0,
     ) -> pd.DataFrame | None:
+        # span_scale stretches every indicator lookback so a fine timeframe can
+        # carry a coarser timeframe's wall-clock horizon (top_tier's 1m LTF uses
+        # span_scale=5). Default 1.0 = canonical spans, unchanged for every other
+        # caller. The merged-frame cache keys the enriched frame by span_scale,
+        # so a scaled request never collides with the shared span_scale=1.0 frame.
         if frame is None or frame.empty:
             return None
         tf = max(1, int(timeframe_minutes))
         if data is not None and symbol and hasattr(data, "get_merged"):
             try:
-                cached = data.get_merged(str(symbol), timeframe=f"{tf}min", with_indicators=True)
+                cached = data.get_merged(str(symbol), timeframe=f"{tf}min", with_indicators=True, span_scale=span_scale)
                 if cached is not None and not cached.empty:
                     return cached
             except Exception:
                 LOG.debug("Failed to load cached %s-minute merged frame for %s; resampling from base frame.", tf, symbol, exc_info=True)
         if tf <= 1:
-            return ensure_standard_indicator_frame(frame.copy())
+            return ensure_standard_indicator_frame(frame.copy(), span_scale=span_scale)
         out = resample_bars(frame, f"{tf}min")
-        return ensure_standard_indicator_frame(out)
+        return ensure_standard_indicator_frame(out, span_scale=span_scale)
 
     def _structure_context(self, frame: pd.DataFrame | None, timeframe: str = "ltf"):
         # Per-cycle cache. Timeframe goes in the key because the pivot_span /
@@ -2792,7 +2798,19 @@ class BaseStrategy:
                 highest_price = _safe_float(getattr(position, "highest_price", None), float(position.entry_price))
                 avwap_armed = avwap_floor > 0 and highest_price >= avwap_floor + buffer
                 tape_ok = self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.48)
-                if avwap_floor > 0 and avwap_armed and close < avwap_floor - buffer and tape_ok:
+                # 2-bar confirmation (2026-05-29). A single 1m close below the
+                # anchored-VWAP floor is normal continuation noise in a trending
+                # stock; AVGO 2026-05-29 12:09 LONG exited at 439.50 on one
+                # such dip while AVGO closed at 446.67 (-$17 realized vs +$183
+                # unrealized continuation). Require the PRIOR bar to also have
+                # closed below floor-buffer so a one-bar noise dip can't fire
+                # the exit. Disable via shared_exit.anchored_vwap_exit_require_two_bar_confirm.
+                two_bar = bool(self._shared_exit_enabled("anchored_vwap_exit_require_two_bar_confirm", True))
+                prior_confirms = True
+                if two_bar and frame is not None and len(frame) >= 2:
+                    prior_close = _safe_float(frame.iloc[-2].get("close"), close)
+                    prior_confirms = prior_close < avwap_floor - buffer
+                if avwap_floor > 0 and avwap_armed and close < avwap_floor - buffer and tape_ok and prior_confirms:
                     return True, f"anchored_vwap_loss_exit:{avwap_floor:.4f}"
         else:
             weak_tape = self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.52)
@@ -2823,7 +2841,16 @@ class BaseStrategy:
                 lowest_price = _safe_float(getattr(position, "lowest_price", None), float(position.entry_price))
                 avwap_armed = avwap_ceiling > 0 and lowest_price <= avwap_ceiling - buffer
                 tape_ok = self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.52)
-                if avwap_ceiling > 0 and avwap_armed and close > avwap_ceiling + buffer and tape_ok:
+                # 2-bar confirmation (2026-05-29). Mirror of the LONG branch:
+                # require the PRIOR bar to also have closed above ceiling+buffer
+                # so a one-bar noise spike can't fire the exit in a SHORT that
+                # is still working. Disable via shared_exit.anchored_vwap_exit_require_two_bar_confirm.
+                two_bar = bool(self._shared_exit_enabled("anchored_vwap_exit_require_two_bar_confirm", True))
+                prior_confirms = True
+                if two_bar and frame is not None and len(frame) >= 2:
+                    prior_close = _safe_float(frame.iloc[-2].get("close"), close)
+                    prior_confirms = prior_close > avwap_ceiling + buffer
+                if avwap_ceiling > 0 and avwap_armed and close > avwap_ceiling + buffer and tape_ok and prior_confirms:
                     return True, f"anchored_vwap_reclaim_exit:{avwap_ceiling:.4f}"
         return False, "hold"
 
