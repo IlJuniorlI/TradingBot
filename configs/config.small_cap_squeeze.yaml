@@ -1,0 +1,284 @@
+# Tuned runtime preset for small_cap_squeeze.
+# Long-only, multi-regime small-cap "squeeze" strategy. No fixed tradable list —
+# a dynamic TradingView screener picks low-float names gapping premarket on heavy
+# volume. Reuses the top_tier_adaptive multi-regime engine (trend / pullback /
+# range / vol_squeeze / momentum; ORB + sr_scalp off).
+# See intraday_tv_schwab_bot/_strategies/small_cap_squeeze/README.md.
+# Put SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_ACCOUNT_HASH, SCHWAB_ENCRYPTION_KEY,
+# and TRADINGVIEW_SESSIONID in a .env file at the repo root (see .env.example).
+
+strategy: small_cap_squeeze
+
+schwab:
+  callback_url: https://127.0.0.1
+  tokens_db: .schwabdev/tokens.db
+  timeout: 10
+  dry_run: true
+  open_browser_for_auth: true
+
+# Broad TradingView fetch knobs. The real per-symbol squeeze filters (float /
+# price / RVOL / change-from-open / volume / cap) live in the strategy params
+# block below; the floors here are kept permissive so they don't pre-filter the
+# universe before the strategy's own (stricter) screen runs.
+tradingview:
+  market: america
+  max_candidates: 20
+  screener_refresh_seconds: 30
+  min_market_cap: 1000000
+  max_market_cap: 2000000000
+  min_volume: 100000
+  min_value_traded_1m: 0.0
+  min_volume_1m: 1000
+
+paper:
+  starting_equity: 50000.0
+  max_equity_points: 2000
+  max_trade_history: 200
+
+# Position sizing / management. Long-only. Small caps swing 5-20%+, so the
+# default_stop_pct FLOOR is wider than the mega-cap preset and per-trade notional
+# is smaller — the risk manager downsizes share count on the (wide) ATR-based
+# structural stops to keep dollar risk per trade roughly constant.
+risk:
+  max_positions: 4
+  risk_per_trade_frac_of_notional: 0.008
+  max_notional_per_trade: 6000.0
+  max_total_notional: 24000.0
+  max_daily_loss: 600.0
+  default_stop_pct: 0.03
+  default_target_pct: 0.06
+  trailing_stop_pct: 0.03
+  trade_management_mode: adaptive_ladder
+  allow_short: false
+  cooldown_minutes: 5
+  reentry_policy: cooldown
+  cooldown_direction_aware: true
+  same_level_block_minutes: 15
+  same_level_block_atr_mult: 0.3
+  time_stop_minutes: 30
+  time_stop_min_return_pct: 0.005
+  peak_giveback_enabled: true
+  peak_giveback_min_r: 1.0
+  peak_giveback_low_tier_enabled: true
+  peak_giveback_low_tier_min_r: 0.7
+  peak_giveback_low_tier_giveback_frac: 0.7
+  peak_giveback_retain_1to2r: 0.6
+  peak_giveback_retain_2to3r: 0.7
+  peak_giveback_retain_3r_plus: 0.78
+
+runtime:
+  timezone: America/New_York
+  loop_sleep_seconds: 2.0
+  history_poll_seconds: 300
+  quote_poll_seconds: 6
+  quote_cache_seconds: 6
+  quote_batch_size: 20
+  history_lookback_minutes: 780
+  use_extended_hours_history: true
+  use_rth_session_indicators: true
+  # Premarket trading: anchor the per-session VWAP/EMA reset to the 07:00-20:00
+  # equity stream so the 08:05-09:30 premarket bars carry meaningful indicators.
+  equity_session_indicator_window: extended
+  warmup_minutes: 60
+  prewarm_before_windows_minutes: 15
+  log_dir: .logs
+  stream_fields: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+  stream_connect_timeout_seconds: 20
+  stream_fallback_poll_seconds: 25
+  stream_stale_fallback_seconds: 180
+  stream_health_log_seconds: 90
+  auto_exit_after_session: true
+  idle_sleep_seconds: 60.0
+  symbol_state_prune_seconds: 1800.0
+  session_reconcile_on_resume: true
+  cycle_precompute_workers: 4
+  max_consecutive_quote_failures: 5
+  export_session_archive: true
+  reconcile_on_startup: true
+  startup_reconcile_mode: ignore
+  startup_order_lookback_days: 2
+  startup_reconcile_ignore_symbols: []
+  startup_reconcile_metadata_db_path: .logs/startup_reconcile_metadata.sqlite
+
+execution:
+  # Marketable-limit buffers widened from the mega-cap preset (was 0.03 / 0.05 /
+  # 0.10 / 2 attempts). The buffer is a fixed DOLLAR amount — a buy submits at
+  # ask + buffer, clamped to [min_buffer, max_buffer] with a spread-scaled term
+  # in between: raw = max(0.01, min_buffer, spread * spread_frac); capped at
+  # max_buffer (execution.py:_marketable_limit_buffer / _equity_limit_price).
+  # Small-cap squeezers have wider spreads and faster tick movement, so the
+  # mega-cap 3-5c clamp left the limit non-marketable and missed fills on fast
+  # moves. spread_frac 0.30 lets the buffer track the actual spread; max_buffer
+  # 0.15 gives headroom for the widest books; 3 reprice attempts chase a moving
+  # ask. NOTE: dry-run fills marketable limits at the natural price regardless of
+  # buffer (execution.py:_simulate_equity_fill), so this only affects LIVE fills.
+  entry_limit_min_buffer: 0.04
+  entry_limit_max_buffer: 0.15
+  entry_limit_spread_frac: 0.30
+  entry_live_fill_timeout_seconds: 2.0
+  entry_live_poll_seconds: 0.25
+  entry_live_reprice_attempts: 3
+  entry_live_reprice_step_frac: 0.33
+  # Premarket entries require extended-hours orders.
+  extended_hours_enabled: true
+  market_exit_regular_hours: false
+
+dashboard:
+  enabled: true
+  host: 127.0.0.1
+  port: 8765
+  refresh_ms: 1500
+  state_path: .logs/dashboard_state.json
+  theme: default
+  https: false
+  ssl_certfile: ""
+  ssl_keyfile: ""
+  charting:
+    compact_chart_timeframe: ltf
+
+# Support/resistance — only the structure-frame de-noising knobs are set here
+# (the rest of SupportResistanceConfig uses its defaults). Mirrors top_tier's
+# Fix D: resample the LTF structure frame to 5m so BOS/CHoCH pivots — and the
+# structure-based EXITS — track a clean timeframe instead of churning on raw 1m
+# bars. Entries still run on the 1m LTF; only the structure analysis is
+# de-noised. The bar-count companions are sized for the 5m structure frame.
+support_resistance:
+  structure_ltf_timeframe_minutes: 5
+  structure_event_lookback_bars: 4      # = 20 min on the 5m structure frame
+  structure_min_pivot_gap_bars: 3       # = 15 min minimum between swings
+  # Looser entry-vs-opposing-SR clearance than the SR dataclass defaults
+  # (0.85 ATR / 0.38%, stricter even than top_tier's tuned 0.72 / 0.25%). A
+  # squeeze trades INTO and THROUGH levels, so the default clearance would
+  # reject exactly the near-resistance breakout entries this strategy exists to
+  # take. reject_target_beyond_sr + reject_entry_near_broken_level (strategy
+  # params) still guard against buying a hard ceiling. max_levels_per_side back
+  # to 4 (vs default 3) for more ladder rungs on the hybrid scale-out.
+  entry_min_clearance_atr: 0.55
+  entry_min_clearance_pct: 0.0020
+  max_levels_per_side: 4
+
+# Technical-levels scoring overlay. Only the extension PENALTIES are overridden;
+# every other knob uses TechnicalLevelsConfig defaults (per-key merge). A squeeze
+# candidate is BY DEFINITION extended — it rides the upper Bollinger band, sits
+# far above VWAP, and runs through fib extensions. The default soft penalties
+# (bollinger_entry_penalty_outer_band 0.22, atr_stretch_penalty 0.20,
+# entry_penalty_near_extension 0.40) exist to stop the mega-cap TREND strategy
+# from chasing, and would dock 0.2-0.6 of score from nearly every valid squeeze
+# entry against the 3.0-3.5 min-score floors. The matching HARD extension gates
+# are already off in the strategy params (reject_stretched_entries, etc.); these
+# are their soft-scoring counterparts. Zeroed so extension isn't double-blocked.
+# Raise back toward the defaults if dry-run shows entries chasing blow-off tops.
+technical_levels:
+  bollinger_entry_penalty_outer_band: 0.0
+  atr_stretch_penalty: 0.0
+  entry_penalty_near_extension: 0.0
+
+strategies:
+  small_cap_squeeze:
+    entry_windows:
+      - ["08:05", "11:50"]
+    management_windows:
+      - ["08:00", "13:00"]
+    screener_windows:
+      - ["07:45", "11:50"]
+    params:
+      # ============================ Screener universe ============================
+      # Dynamic TradingView screen (no fixed list). Long-only. Targets low-float
+      # names already running premarket on heavy volume — squeezing or about to.
+      # close / change_from_open / volume auto-resolve to their PREMARKET variants
+      # pre-09:30, so these thresholds mean premarket close/change/volume during
+      # the 08:05-09:30 window and RTH values after the open.
+      min_price: 2.0
+      max_price: 20.0
+      min_float_shares: 400000          # low float = the squeeze fuel
+      max_float_shares: 20000000
+      max_market_cap: 2000000000        # < $2B
+      min_rvol: 1.5                     # relative_volume_10d_calc
+      min_change_from_open: 5.0         # >= 5% from open
+      min_volume: 5000000              # >= 5M (premarket volume pre-RTH)
+      watchlist_mode: none              # re-screen every cycle (gappers churn)
+
+      # ============================ Regimes ============================
+      # Keep trend / pullback / range / vol_squeeze / momentum. ORB + sr_scalp off.
+      # With ORB disabled the opening-range carve-out is removed too, so the open
+      # trades the normal mix continuously from 08:05.
+      disable_orb_regime: true
+      disable_sr_scalp_regime: true
+
+      # VWAP-reclaim regime (opt-in, on for this strategy): a long re-entry when
+      # price dips below session VWAP (a flush that shakes out weak longs) then
+      # reclaims it on a volume pop — the squeeze re-igniting. Catches the entry
+      # that trend (needs close>VWAP & ema9>ema20), pullback (needs to hold above
+      # ema20), and momentum (needs a new N-bar high) all miss. Stop below the
+      # flush low; target rides toward the HOD.
+      enable_vwap_reclaim_regime: true
+      min_vwap_reclaim_score: 3.5
+      vwap_reclaim_lookback_bars: 6        # the dip must be within the last ~6 min
+      vwap_reclaim_min_volume_ratio: 1.2   # reclaim bar volume vs recent avg
+      vwap_reclaim_buffer_pct: 0.0005      # reclaim must clear VWAP by this (not a 1-tick poke)
+      vwap_reclaim_target_rr: 2.5          # runner-friendly; ladder/peak-giveback extend past it
+
+      # ===================== No confirmations / no sector =====================
+      require_index_confirmation: false
+      index_symbols: []
+      sector_groups: {}
+      sector_index_map: {}
+      relative_strength_block_threshold_pct: 0.0
+      require_htf_bias_alignment: false       # squeezes break prior 15m structure
+      require_htf_pivot_alignment_trend: false
+
+      # ===================== Long-only / extended hours =====================
+      # Every screened symbol is extended-hours eligible (dynamic universe, so a
+      # hand-listed sublist can't work). Long-only is set via risk.allow_short.
+      extended_hours_tradable_all: true
+
+      # ===================== Timeframe (1m LTF) =====================
+      # span_scale 1 = native 1m indicators (9/20 EMA, 14 ATR) — responsive and
+      # tighter ATR stops, which suits fast squeeze scalps. Raise toward 3-5 to
+      # smooth the signals and widen the ATR-based stops (PRIMARY tuning knob).
+      ltf_minutes: 1
+      ltf_indicator_span_scale: 1
+      min_bars: 20
+      min_ltf_bars: 15
+
+      # ===================== KEY squeeze tuning =====================
+      # A squeezer is ALWAYS extended (high %B, far above VWAP/EMA, big bars), so
+      # the mega-cap "don't chase extension" gates would block nearly every entry.
+      # They're off here. Keep the SR / broken-level / target-beyond-SR gates
+      # (those are about not buying straight into resistance).
+      reject_stretched_entries: false
+      entry_exhaustion_filter_enabled: false
+      reject_oversized_entry_bar: false
+      reject_tech_bias_contradiction: false
+      pullback_require_real_dip: false        # squeeze pullbacks are shallow/fast
+
+      # Momentum fires on a strong live move (the screener already gates 5%+).
+      momentum_min_day_strength: 3.0
+      directional_bias_min_day_strength: 0.5
+
+      # ===================== Hybrid scalp + runner management =====================
+      # Move to break-even early to lock the scalp risk; scale out at S/R rungs via
+      # the adaptive ladder; trail the remaining runner with peak-giveback (loose
+      # for high-conviction squeeze days so the big moves get room to extend).
+      adaptive_breakeven_rr: 0.6
+      adaptive_profit_lock_rr: 1.1
+      adaptive_profit_lock_stop_rr: 0.5
+      adaptive_runner_trigger_rr: 1.3
+      ladder_max_rungs: 4
+      momentum_target_rr: 2.5
+      peak_giveback_high_conviction_day_strength_pct: 5.0
+      peak_giveback_high_conviction_min_r: 2.5
+
+      # ===================== Time-of-day =====================
+      # Continuous full-mix entries 08:05-11:50: premarket (08:05-09:30) via the
+      # extended fallthrough, 09:30-11:50 via the primary window (midday_start =
+      # no_new = 11:50 collapses the midday/afternoon sub-windows).
+      no_new_entries_after: "11:50"
+      midday_start_time: "11:50"
+      midday_end_time: "11:50"
+      afternoon_start_time: "11:50"
+
+      force_flatten:
+        long: true
+        short: false
+pairs: []

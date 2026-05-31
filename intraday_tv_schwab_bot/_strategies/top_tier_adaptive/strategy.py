@@ -661,6 +661,69 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 score += 0.5
         return score
 
+    def _score_vwap_reclaim(self, side: Side, close: float, vwap: float, ema9: float,
+                            ema20: float, atr: float, frame: pd.DataFrame) -> float:
+        """Score a VWAP-reclaim momentum re-entry (opt-in regime, 2026-05-30).
+
+        Thesis (LONG; SHORT mirrors): a running name dips BELOW session VWAP — a
+        quick flush that shakes out weak longs / trips stops — then RECLAIMS VWAP
+        on a volume pop, the move (often a squeeze) re-igniting. That exact moment
+        falls between trend (needs close>VWAP AND ema9>ema20), pullback (needs to
+        HOLD above ema20), and momentum (needs a fresh N-bar high) — none of them
+        catch it. Computed on the base 1m ``frame`` (VWAP is session-cumulative).
+
+        Components (max ~5.0):
+          * +0.5  base
+          * +2.0  reclaim confirmed — a recent bar closed below VWAP within the
+                  last ``vwap_reclaim_lookback_bars`` AND current close is back
+                  above VWAP by a small buffer. No reclaim => 0 (regime sits out).
+          * +1.0  volume pop on the reclaim bar (cur vol >= recent avg x ratio)
+          * +0.7  trend intact — close > ema9
+          * +0.3  structure aligned — ema9 >= ema20
+          * +0.5  bounce character — wick on the flush side (bought the dip)
+        """
+        if vwap <= 0 or close <= 0 or atr <= 0 or frame is None or frame.empty:
+            return 0.0
+        session_frame = frame[_same_day_mask(frame, now_et().date())]
+        lookback = max(2, int(self.params.get("vwap_reclaim_lookback_bars", 6)))
+        if len(session_frame) < lookback + 1 or "vwap" not in session_frame.columns:
+            return 0.0
+        recent = session_frame.tail(lookback + 1).iloc[:-1]  # bars before the current one
+        if recent.empty:
+            return 0.0
+        buffer = float(self.params.get("vwap_reclaim_buffer_pct", 0.0005)) * close
+        recent_close = recent["close"].astype(float)
+        recent_vwap = recent["vwap"].astype(float)
+        if side == Side.LONG:
+            dipped = bool((recent_close < recent_vwap).any())
+            reclaimed = close > vwap + buffer
+        else:
+            dipped = bool((recent_close > recent_vwap).any())
+            reclaimed = close < vwap - buffer
+        if not (dipped and reclaimed):
+            return 0.0
+        score = 0.5 + 2.0
+        cur_vol = _safe_float(session_frame.iloc[-1].get("volume"), 0.0)
+        vol_mean = _safe_float(recent["volume"].mean(), 1.0)
+        if vol_mean > 0 and cur_vol / vol_mean >= float(self.params.get("vwap_reclaim_min_volume_ratio", 1.2)):
+            score += 1.0
+        if side == Side.LONG:
+            if close > ema9:
+                score += 0.7
+            if ema9 >= ema20:
+                score += 0.3
+        else:
+            if close < ema9:
+                score += 0.7
+            if ema9 <= ema20:
+                score += 0.3
+        upper_wick, lower_wick, _body, bar_range = _bar_wick_fractions(session_frame)
+        if bar_range > 0:
+            wick = lower_wick if side == Side.LONG else upper_wick
+            if wick >= 0.25:
+                score += 0.5
+        return score
+
     def _score_sr_scalp(self, side: Side, close: float, atr: float,
                         frame: pd.DataFrame, sr_ctx) -> float:
         """Score the HTF S/R scalp on ACTUAL level interaction (2026-05-29
@@ -959,9 +1022,14 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         vol_squeeze_enabled = not bool(self.params.get("disable_vol_squeeze_regime", False))
         momentum_enabled = not bool(self.params.get("disable_momentum_regime", False))
         sr_scalp_enabled = not bool(self.params.get("disable_sr_scalp_regime", False))
+        # vwap_reclaim is OPT-IN (off by default so top_tier and other presets
+        # are unaffected): enable via ``enable_vwap_reclaim_regime: true``. It is
+        # a momentum-family regime — available wherever momentum is, stripped
+        # otherwise.
+        vwap_reclaim_enabled = bool(self.params.get("enable_vwap_reclaim_regime", False))
 
         def _filter(regimes: set[str]) -> set[str]:
-            """Strip regimes whose disable knob is set."""
+            """Strip regimes whose disable knob is set (vwap_reclaim: opt-in)."""
             if not trend_enabled:
                 regimes.discard("trend")
             if not pullback_enabled:
@@ -974,36 +1042,45 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 regimes.discard("momentum")
             if not sr_scalp_enabled:
                 regimes.discard("sr_scalp")
+            if not vwap_reclaim_enabled:
+                regimes.discard("vwap_reclaim")
             return regimes
 
         if now_t > parse_hhmm(no_new):
             return set()
-        # Opening range forms over the first ``orb_range_minutes`` of RTH
-        # (09:30 →). NO entries while it forms — the true-ORB thesis waits for
-        # the range, it does not trade the opening chaos. This carve-out is
-        # unconditional (applies in extended mode too: pre-market 07:00-09:30
-        # still trades via the extended fallthrough below, but 09:30→range-end
-        # is reserved for range formation).
+        # ORB regime + its opening-range carve-out. ``disable_orb_regime``
+        # (off by default) removes BOTH: no 09:30→range-end no-entry zone and
+        # no ORB-only window — the open just trades the normal regime mix
+        # continuously (the primary window starts at 09:30 instead of orb_end).
+        # Used by momentum/squeeze strategies that want to trade the open
+        # directly. Distinct from ``disable_orb_window`` (which keeps the
+        # carve-out but skips entries until orb_end_time).
+        orb_disabled = bool(self.params.get("disable_orb_regime", False))
         orb_range_min = max(1, int(self.params.get("orb_range_minutes", 15)))
         orb_range_end_total = 9 * 60 + 30 + orb_range_min
         orb_range_end = f"{orb_range_end_total // 60:02d}:{orb_range_end_total % 60:02d}"
-        if self._time_in_range(now_t, "09:30", orb_range_end):
-            return set()
-        if self._time_in_range(now_t, orb_range_end, orb_end):
-            # ORB window: opening-range breakout only. Whole-window opt-out
-            # via disable_orb_window (skip the open, start at orb_end_time).
-            # The orb_bypass_* flags loosen the shared finalize filters within
-            # this window (15m structure / VWAP / DMI etc. are stale at the
-            # open); this flag skips the window entirely instead.
-            if not orb_window_enabled:
+        if not orb_disabled:
+            # Opening range forms over the first ``orb_range_minutes`` of RTH
+            # (09:30 →). NO entries while it forms — the true-ORB thesis waits
+            # for the range, it does not trade the opening chaos. (In extended
+            # mode pre-market 07:00-09:30 still trades via the fallthrough
+            # below; 09:30→range-end is reserved for range formation.)
+            if self._time_in_range(now_t, "09:30", orb_range_end):
                 return set()
-            return _filter({"orb"})
-        if self._time_in_range(now_t, orb_end, midday_start):
-            # Primary window: full regime mix including momentum + sr_scalp.
-            # The day_strength gate filters momentum; the distance gate
-            # filters sr_scalp (zones must be far enough apart). Neither
+            if self._time_in_range(now_t, orb_range_end, orb_end):
+                # ORB window: opening-range breakout only. Whole-window opt-out
+                # via disable_orb_window (skip the open, start at orb_end_time).
+                if not orb_window_enabled:
+                    return set()
+                return _filter({"orb"})
+        # Primary window. With ORB enabled it starts at orb_end; with the ORB
+        # regime disabled it starts at 09:30 so the open trades the normal mix.
+        primary_start = "09:30" if orb_disabled else orb_end
+        if self._time_in_range(now_t, primary_start, midday_start):
+            # Full regime mix including momentum + sr_scalp. The day_strength
+            # gate filters momentum; the distance gate filters sr_scalp. Neither
             # blocks the trend / pullback / range / vol_squeeze regimes.
-            return _filter({"trend", "pullback", "range", "vol_squeeze", "momentum", "sr_scalp"})
+            return _filter({"trend", "pullback", "range", "vol_squeeze", "momentum", "sr_scalp", "vwap_reclaim"})
         if self._time_in_range(now_t, midday_start, midday_end):
             # Midday: pullbacks remain the default fit for top-tier chop,
             # but momentum is allowed because day_strength >= threshold
@@ -1011,7 +1088,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # tape. sr_scalp is also allowed — midday's low-volatility
             # chop is often the cleanest scalp environment between HTF
             # zones (when the gap qualifies).
-            return _filter({"pullback", "momentum", "sr_scalp"})
+            return _filter({"pullback", "momentum", "sr_scalp", "vwap_reclaim"})
         if self._time_in_range(now_t, afternoon_start, no_new):
             # Range regime is included in afternoon by default because
             # afternoon tapes are often range-bound and forcing trend/pullback
@@ -1020,9 +1097,9 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # ``afternoon_include_range: false`` in params (or globally via
             # ``disable_range_regime: true``).
             if bool(self.params.get("afternoon_include_range", True)):
-                regimes = {"trend", "pullback", "range", "vol_squeeze", "momentum", "sr_scalp"}
+                regimes = {"trend", "pullback", "range", "vol_squeeze", "momentum", "sr_scalp", "vwap_reclaim"}
             else:
-                regimes = {"trend", "pullback", "vol_squeeze", "momentum", "sr_scalp"}
+                regimes = {"trend", "pullback", "vol_squeeze", "momentum", "sr_scalp", "vwap_reclaim"}
             return _filter(regimes)
         if get_session_indicator_window() == "extended" and now_t <= parse_hhmm(no_new):
             # Extended-hours opt-in (07:00-20:00 trading): times not matched by
@@ -1032,7 +1109,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # branch when no_new_entries_after is pushed past the close. The
             # per-regime score gates + the extended-hours universe gate in
             # entry_signals self-filter; this just opens the time window.
-            return _filter({"trend", "pullback", "range", "vol_squeeze", "momentum", "sr_scalp"})
+            return _filter({"trend", "pullback", "range", "vol_squeeze", "momentum", "sr_scalp", "vwap_reclaim"})
         return set()
 
     @staticmethod
@@ -1603,6 +1680,42 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             target = max(0.01, close - risk * target_rr)
 
         return self._finalize_signal(c, side, close, stop, target, "momentum", regime_score, frame, data)
+
+    def _build_vwap_reclaim_signal(self, c: Candidate, side: Side, close: float, atr: float,
+                                   frame: pd.DataFrame, regime_score: float,
+                                   data=None, vol_widening: float = 1.0) -> Signal | None:
+        """Build a VWAP-reclaim signal (2026-05-30). Stop sits below the flush —
+        LONG: below min(VWAP, the recent dip low) − buffer; SHORT mirror —
+        because losing VWAP again is the invalidation. Target rides toward the
+        session high/low (HOD/LOD) so a re-igniting squeeze gets room, floored to
+        the regime R:R (the runner/ladder management extends past it)."""
+        session_frame = frame[_same_day_mask(frame, now_et().date())]
+        lookback = max(2, int(self.params.get("vwap_reclaim_lookback_bars", 6)))
+        recent = session_frame.tail(lookback + 1).iloc[:-1] if len(session_frame) > lookback else session_frame.iloc[:-1]
+        if recent.empty:
+            self._set_build_failure(c.symbol, "vwap_reclaim", "insufficient_session_history")
+            return None
+        vwap = _safe_float(session_frame.iloc[-1].get("vwap"), close)
+        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening
+        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening
+        target_rr = float(self.params.get("vwap_reclaim_target_rr", 2.0))
+
+        if side == Side.LONG:
+            dip_low = _safe_float(recent["low"].min(), close)
+            stop = min(dip_low, vwap) - buffer
+            stop = min(stop, close * (1.0 - effective_default_stop_pct))
+            risk = max(0.01, close - stop)
+            session_high = _safe_float(session_frame["high"].max(), close + risk * target_rr)
+            target = max(close + risk * target_rr, session_high)
+        else:
+            dip_high = _safe_float(recent["high"].max(), close)
+            stop = max(dip_high, vwap) + buffer
+            stop = max(stop, close * (1.0 + effective_default_stop_pct))
+            risk = max(0.01, stop - close)
+            session_low = _safe_float(session_frame["low"].min(), close - risk * target_rr)
+            target = max(0.01, min(close - risk * target_rr, session_low))
+
+        return self._finalize_signal(c, side, close, stop, target, "vwap_reclaim", regime_score, frame, data)
 
     def _build_sr_scalp_signal(self, c: Candidate, side: Side, close: float, atr: float,
                                frame: pd.DataFrame, regime_score: float,
@@ -2351,13 +2464,18 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             get_session_indicator_window() == "extended"
             and not equity_session_state(now_et()).regular_session
         )
+        # ``extended_hours_tradable_all`` (off by default): when set, EVERY
+        # candidate is extended-hours eligible. For screener-universe strategies
+        # whose tradable set is dynamic each cycle, a hand-listed
+        # ``extended_hours_tradable`` sublist can't enumerate the universe.
+        ext_all = bool(self.params.get("extended_hours_tradable_all", False))
         ext_allowed = self._extended_hours_tradable_set() if ext_hours_now else set()
 
         for c in candidates:
             if c.symbol in positions:
                 self._record_entry_decision(c.symbol, "skipped", ["already_in_position"])
                 continue
-            if ext_hours_now and c.symbol.upper().strip() not in ext_allowed:
+            if ext_hours_now and not ext_all and c.symbol.upper().strip() not in ext_allowed:
                 self._record_entry_decision(c.symbol, "skipped", ["extended_hours_not_eligible"])
                 continue
             frame = bars.get(c.symbol)
@@ -2550,6 +2668,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             min_momentum = float(self.params.get("min_momentum_score", 4.0))
             min_sr_scalp = float(self.params.get("min_sr_scalp_score", 3.5))
             min_orb = float(self.params.get("min_orb_score", 3.5))
+            min_vwap_reclaim = float(self.params.get("min_vwap_reclaim_score", 3.5))
 
             # tech_ctx is built ONCE per candidate (per-frame @lru_cache makes
             # repeated calls O(1)). Used by vol_squeeze scoring AND by
@@ -2617,6 +2736,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     self._score_orb(side, close, atr, frame)
                     if "orb" in allowed_regimes else 0.0
                 )
+                # vwap_reclaim (opt-in, 2026-05-30): a VWAP-reclaim momentum
+                # re-entry — dipped below session VWAP then reclaimed it on a
+                # volume pop. Reads the base 1m frame (VWAP is session-cumulative).
+                vwap_reclaim_score = (
+                    self._score_vwap_reclaim(side, close, vwap, ema9, ema20, atr, frame)
+                    if "vwap_reclaim" in allowed_regimes else 0.0
+                )
 
                 # Soft-bias penalty (Fix A refactored 2026-05-12). See
                 # ``_bias_penalty`` docstring for rationale + worked examples.
@@ -2641,6 +2767,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     momentum_score = max(0.0, momentum_score - bias_penalty)
                     sr_scalp_score = max(0.0, sr_scalp_score - bias_penalty)
                     orb_score = max(0.0, orb_score - bias_penalty)
+                    vwap_reclaim_score = max(0.0, vwap_reclaim_score - bias_penalty)
 
                 scores = {
                     "trend": trend_score,
@@ -2650,6 +2777,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     "momentum": momentum_score,
                     "sr_scalp": sr_scalp_score,
                     "orb": orb_score,
+                    "vwap_reclaim": vwap_reclaim_score,
                 }
 
                 # Per-side BUILD ORDER: list of qualifying regimes in score
@@ -2671,6 +2799,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     "momentum": min_momentum,
                     "sr_scalp": min_sr_scalp,
                     "orb": min_orb,
+                    "vwap_reclaim": min_vwap_reclaim,
                 }
                 build_order: list[tuple[str, float]] = []
                 for regime_name, regime_score in sorted(scores.items(), key=lambda kv: kv[1], reverse=True):
@@ -2691,6 +2820,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     "momentum_score": momentum_score,
                     "sr_scalp_score": sr_scalp_score,
                     "orb_score": orb_score,
+                    "vwap_reclaim_score": vwap_reclaim_score,
                 }))
 
             # Pass 2 — record fail reasons for sides with no qualifying
@@ -2727,7 +2857,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                         f"squeeze={decision['vol_squeeze_score']:.1f},"
                         f"mom={decision['momentum_score']:.1f},"
                         f"sr_scalp={decision['sr_scalp_score']:.1f},"
-                        f"orb={decision['orb_score']:.1f}{penalty_suffix})"
+                        f"orb={decision['orb_score']:.1f},"
+                        f"vwap_reclaim={decision['vwap_reclaim_score']:.1f}{penalty_suffix})"
                     )
                     continue
                 for regime_name, regime_score in decision["build_order"]:
@@ -2743,14 +2874,15 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             for side, regime_name, regime_score, decision in build_queue:
                 index_ok = decision["index_ok"]
 
-                # Index confirmation for trend/pullback/vol_squeeze/momentum —
-                # these need a market-aligned tape. Range AND sr_scalp are
+                # Index confirmation for trend/pullback/vol_squeeze/momentum/
+                # vwap_reclaim — these momentum-family regimes need a market-
+                # aligned tape. Range AND sr_scalp are
                 # exempt — both are mean-reversion theses where a divergent
                 # index reads as "the index doesn't dictate intra-symbol
                 # rotation between levels." The orb regime is also exempt (not
                 # in the set) — its range-break is the directional proof. Index
                 # failure on one regime falls through to the next in the queue.
-                if regime_name in {"trend", "pullback", "vol_squeeze", "momentum"} and not index_ok:
+                if regime_name in {"trend", "pullback", "vol_squeeze", "momentum", "vwap_reclaim"} and not index_ok:
                     fail_reasons.append(
                         f"{side.value.lower()}_build_failed_{regime_name}_index_not_confirmed"
                     )
@@ -2765,7 +2897,10 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 # score threshold but the move didn't carry. Range and
                 # sr_scalp are exempt — both are mean-reversion theses
                 # where the LAST CLOSED bar moves AGAINST the entry
-                # direction by design. The orb regime is also exempt (not in
+                # direction by design. vwap_reclaim is also exempt — its prior
+                # closed bar is the flush (red, below VWAP) and would fail the
+                # green-bar check; the reclaim's own VWAP-buffer + volume
+                # confirmation stands in. The orb regime is also exempt (not in
                 # the set) — its range-break is the confirmation.
                 if (
                     regime_name in {"trend", "pullback", "vol_squeeze", "momentum"}
@@ -2792,6 +2927,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     sig = self._build_sr_scalp_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening)
                 elif regime_name == "orb":
                     sig = self._build_orb_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening)
+                elif regime_name == "vwap_reclaim":
+                    sig = self._build_vwap_reclaim_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening)
 
                 if sig is not None:
                     # Tier 3b: on high-conviction days, loosen the
