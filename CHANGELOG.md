@@ -9,6 +9,56 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`small_cap_squeeze` strategy — long-only small-cap squeeze.** *2026-05-30*
+  - New plugin (`_strategies/small_cap_squeeze/`): a long-only, multi-regime
+    small-cap "squeeze" strategy. A dynamic TradingView screener replaces the
+    fixed tradable list — float 400K-20M, market cap <$2B, change-from-open ≥5%,
+    RVOL ≥1.5, volume ≥5M, price $2-20 (the canonical `close`/`change_from_open`/
+    `volume` fields auto-resolve to premarket variants pre-09:30; float via
+    `float_shares_outstanding_current`). Ranked by gap% × clipped RVOL, bias
+    always LONG.
+  - Thin subclass of `TopTierAdaptiveStrategy` (sets `strategy_name` only) — all
+    behavior is the shared engine, driven by config. Regimes: trend / pullback /
+    range / vol_squeeze / momentum + opt-in `vwap_reclaim`; ORB and sr_scalp off
+    (with ORB off the opening carve-out is removed, so the open trades the normal
+    mix continuously 08:05-11:50). No index / sector / relative-strength
+    confirmation. 1m LTF with native indicators (`ltf_indicator_span_scale: 1`).
+    Long-only via `risk.allow_short: false`. Premarket/extended-hours eligible.
+  - Shipped preset `config.small_cap_squeeze.yaml` is a fully-explicit preset
+    (every engine section declared, mirroring `config.top_tier_adaptive.yaml`).
+    Beyond the strategy params it tunes: widened execution marketable-limit
+    buffers (wider/faster small-cap books — live-fill only, dry-run fills at the
+    natural price), zeroed the `technical_levels` soft extension penalties (a
+    squeezer is always extended — the matching hard gates are off too), and
+    looser SR entry clearance for buy-through-resistance breakouts. The tuning is
+    a starting point pending a beta dry-run.
+  - New `tests/test_small_cap_squeeze.py` (registration, config, allowed_regimes,
+    vwap_reclaim scorer).
+
+- **Shared engine: opt-in `vwap_reclaim` regime + two base flags.** *2026-05-30*
+  - **`vwap_reclaim` regime** (`enable_vwap_reclaim_regime`, default `false` →
+    `top_tier_adaptive` byte-for-byte unchanged). A long re-entry when price dips
+    below session VWAP (a flush that shakes out weak longs) then reclaims it on a
+    volume pop — the squeeze re-igniting. Catches the entry that trend (needs
+    `close>VWAP` & `ema9>ema20`), pullback (needs to hold above ema20), and
+    momentum (needs a new N-bar high) all miss. New `_score_vwap_reclaim` +
+    `_build_vwap_reclaim_signal` (stop below the flush low, target rides toward
+    the session high floored to `vwap_reclaim_target_rr`); exempt from the
+    confirmation-bar gate (it enters on the reclaim bar by design). Knobs:
+    `min_vwap_reclaim_score`, `vwap_reclaim_lookback_bars`,
+    `vwap_reclaim_min_volume_ratio`, `vwap_reclaim_buffer_pct`,
+    `vwap_reclaim_target_rr`.
+  - **`disable_orb_regime`** (default `false`) — drops the ORB regime AND its
+    opening-range carve-out, so the normal regime mix runs continuously from the
+    open. Distinct from `disable_orb_window` (which skips the opening window and
+    starts at `orb_end_time`).
+  - **`extended_hours_tradable_all`** (default `false`) — treat every screened
+    symbol as extended-hours eligible instead of gating on the
+    `extended_hours_tradable` sublist. For dynamic-universe strategies where a
+    hand-listed sublist can't enumerate the names.
+  - All three default off, so `top_tier_adaptive` and every other preset are
+    unchanged.
+
 - **top_tier_adaptive: 1-minute LTF with horizon-preserving indicator scaling.** *2026-05-29*
   - The trend/pullback **LTF moved from 5m to 1m** (`ltf_minutes: 5 → 1`) so
     entries/exits act on the freshest 1m close instead of waiting up to 5 min
