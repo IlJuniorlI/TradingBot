@@ -31,7 +31,7 @@ See also:
 - `peer_confirmed_trend_continuation` — peer-confirmed trend continuation strategy that trades controlled pullbacks and re-expansion without waiting for key-level touches
 - `peer_confirmed_htf_pivots` — peer-confirmed higher-timeframe pivot S/R scalp strategy with switchable reclaim, rejection, and continuation entry families
 - `top_tier_adaptive` — multi-regime adaptive strategy for top-tier liquid stocks across six Tier 1 GICS sectors with index confirmation and sector concentration guard; six core regimes (trend, pullback, range, vol_squeeze, momentum, sr_scalp) compete in a flat score-ordered build queue, plus a dedicated `orb` opening-range-breakout regime in the opening window
-- `small_cap_squeeze` — long-only multi-regime small-cap "squeeze" strategy; a dynamic TradingView screener (low float 400K-20M, market cap <$2B, premarket gap ≥5% on heavy volume) replaces the fixed list. Reuses the `top_tier_adaptive` engine (trend/pullback/range/vol_squeeze/momentum + opt-in `vwap_reclaim`; ORB and sr_scalp off), 1-minute LTF, premarket/extended-hours eligible
+- `small_cap_squeeze` — long-only multi-regime small-cap "squeeze" strategy; a dynamic TradingView screener (low float 400K-20M, premarket gap ≥5% on heavy volume, RVOL ≥2) replaces the fixed list. Reuses the `top_tier_adaptive` engine (trend/pullback/range/vol_squeeze/momentum + opt-in `vwap_reclaim`; ORB and sr_scalp off), 1-minute LTF, premarket/extended-hours eligible
 
 ### 0DTE ETF option strategies
 

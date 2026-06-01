@@ -52,7 +52,7 @@ risk:
   max_daily_loss: 600.0
   default_stop_pct: 0.03
   default_target_pct: 0.06
-  trailing_stop_pct: 0.03
+  trailing_stop_pct: 0.05   # 2026-06-01 dry-run: wider runner trail (3% exited on routine intra-move pullbacks); applies to the non-ladder fallback
   trade_management_mode: adaptive_ladder
   allow_short: false
   cooldown_minutes: 5
@@ -456,11 +456,19 @@ strategies:
       max_price: 20.0
       min_float_shares: 400000          # low float = the squeeze fuel
       max_float_shares: 20000000
-      max_market_cap: 2000000000        # < $2B
-      min_rvol: 1.5                     # relative_volume_10d_calc
+      # No market-cap cap (removed 2026-06-01): float (400K-20M) + price ($2-20)
+      # define the small bias, so a low-float name of any cap can qualify. (The
+      # broad tradingview.max_market_cap above is inert here — this screener uses
+      # the type-only equity baseline, not the cap-gated small_cap_base path.)
+      min_rvol: 2.0                     # relative_volume_10d_calc (raised from 1.5, 2026-06-01)
       min_change_from_open: 5.0         # >= 5% from open
       min_volume: 5000000              # >= 5M (premarket volume pre-RTH)
-      watchlist_mode: none              # re-screen every cycle (gappers churn)
+      # Hybrid watchlist (2026-06-01): pre-09:30 gappers are STICKY (locked once
+      # they qualify, so the pre-open universe doesn't churn); at the open it
+      # switches to a live RTH re-screen UNIONED with the locked premarket names
+      # (kept warm for a VWAP reclaim), capped to max_candidates by activity.
+      # Set 'none' to re-screen every cycle with no premarket lock.
+      watchlist_mode: premarket_lock_rth_live
 
       # ============================ Regimes ============================
       # Keep trend / pullback / range / vol_squeeze / momentum. ORB + sr_scalp off.
@@ -517,17 +525,35 @@ strategies:
       reject_tech_bias_contradiction: false
       pullback_require_real_dip: false        # squeeze pullbacks are shallow/fast
 
+      # Pullback selectivity (2026-06-01 dry-run). The pullback regime over-fired
+      # (17 of 28 trades) and lost -$327 — essentially the entire day's loss —
+      # by buying post-spike fades on these choppy names (many entries had MFE=0,
+      # straight to stop). trend / vwap_reclaim / momentum (which caught every big
+      # move) keep their manifest floors. Raised pullback's score floor and require
+      # a stronger underlying trend so it only fires on real continuation dips, not
+      # rollovers. If pullback still dominates the losses next dry-run, set
+      # disable_pullback_regime: true.
+      min_pullback_score: 3.5           # manifest default 3.0
+      min_pullback_trend_score: 3.0     # manifest default 2.5 — require a real trend under the dip
+
       # Momentum fires on a strong live move (the screener already gates 5%+).
       momentum_min_day_strength: 3.0
       directional_bias_min_day_strength: 0.5
 
       # ===================== Hybrid scalp + runner management =====================
-      # Move to break-even early to lock the scalp risk; scale out at S/R rungs via
-      # the adaptive ladder; trail the remaining runner with peak-giveback (loose
-      # for high-conviction squeeze days so the big moves get room to extend).
-      adaptive_breakeven_rr: 0.6
-      adaptive_profit_lock_rr: 1.1
-      adaptive_profit_lock_stop_rr: 0.5
+      # Scale out at S/R rungs via the adaptive ladder; trail the remaining runner
+      # with peak-giveback (loose for high-conviction squeeze days so big moves get
+      # room to extend).
+      # 2026-06-01 dry-run retune: the original 0.6R break-even / 1.1R profit-lock /
+      # 0.5R lock moved the stop up so early that routine mid-squeeze pullbacks
+      # (these names breathe 15-25% intra-move) stopped runners out at ~1R while
+      # they had 3-4R of MFE available (HKIT vwap_reclaim peaked +$94 exited +$29;
+      # momentum peaked +$84 exited +$19). Delayed break-even + profit-lock and a
+      # wider protected stop so peak_giveback (which captured 2.60R of a 3.33R peak
+      # on the one trade it managed) owns the runner instead of being pre-empted.
+      adaptive_breakeven_rr: 1.2          # was 0.6 — don't flatten risk until a real cushion
+      adaptive_profit_lock_rr: 1.8         # was 1.1 — lock later so early volatility doesn't trip it
+      adaptive_profit_lock_stop_rr: 1.0    # was 0.5 — protect 1R when it locks (captures more of the run)
       adaptive_runner_trigger_rr: 1.3
       ladder_max_rungs: 4
       momentum_target_rr: 2.5

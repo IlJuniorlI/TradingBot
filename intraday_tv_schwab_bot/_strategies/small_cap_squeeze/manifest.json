@@ -20,11 +20,10 @@
     "max_price": 20.0,
     "min_float_shares": 400000,
     "max_float_shares": 20000000,
-    "max_market_cap": 2000000000,
-    "min_rvol": 1.5,
+    "min_rvol": 2.0,
     "min_change_from_open": 5.0,
     "min_volume": 5000000,
-    "watchlist_mode": "none",
+    "watchlist_mode": "premarket_lock_rth_live",
 
     "min_bars": 20,
     "ltf_minutes": 1,

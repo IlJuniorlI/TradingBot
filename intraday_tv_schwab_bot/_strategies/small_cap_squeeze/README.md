@@ -10,15 +10,19 @@ moves.
 
 ### 1. Dynamic screener universe (no fixed list)
 Unlike `top_tier_adaptive` (a fixed mega-cap list), this strategy has **no
-`tradable` list**. Every cycle it re-screens TradingView for a fresh universe
-(`watchlist_mode: none`). Filters (long bias, ranked by gap% × clipped RVOL):
+`tradable` list** — it screens TradingView for a fresh universe. With the
+shipped `watchlist_mode: premarket_lock_rth_live`, premarket gappers are
+**sticky** (locked once they qualify, so the pre-open universe doesn't churn);
+at the 09:30 open it switches to a live RTH re-screen **unioned** with the
+locked premarket names (kept warm for a VWAP reclaim), capped to
+`tradingview.max_candidates` by activity. Set `watchlist_mode: none` to
+re-screen every cycle with no lock. Filters (long bias, ranked by gap% × clipped RVOL):
 
 | Filter | Value | TV field |
 |---|---|---|
 | Price | $2 – $20 | `close` (→ `premarket_close` pre-RTH) |
 | **Float** | **400K – 20M shares** | `float_shares_outstanding_current` |
-| Market cap | < $2B | `market_cap_basic` |
-| Relative volume | ≥ 1.5 | `relative_volume_10d_calc` |
+| Relative volume | ≥ 2.0 | `relative_volume_10d_calc` |
 | Change from open | ≥ 5% | `change_from_open` (→ `premarket_change_from_open` pre-RTH) |
 | Volume | ≥ 5M | `volume` (→ `premarket_volume` pre-RTH) |
 

@@ -12,11 +12,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`small_cap_squeeze` strategy — long-only small-cap squeeze.** *2026-05-30*
   - New plugin (`_strategies/small_cap_squeeze/`): a long-only, multi-regime
     small-cap "squeeze" strategy. A dynamic TradingView screener replaces the
-    fixed tradable list — float 400K-20M, market cap <$2B, change-from-open ≥5%,
-    RVOL ≥1.5, volume ≥5M, price $2-20 (the canonical `close`/`change_from_open`/
-    `volume` fields auto-resolve to premarket variants pre-09:30; float via
-    `float_shares_outstanding_current`). Ranked by gap% × clipped RVOL, bias
-    always LONG.
+    fixed tradable list — float 400K-20M, change-from-open ≥5%, RVOL ≥2.0,
+    volume ≥5M, price $2-20, no market-cap cap (float + price define the small
+    bias). The canonical `close`/`change_from_open`/`volume` fields auto-resolve
+    to premarket variants pre-09:30; float via `float_shares_outstanding_current`.
+    Ranked by gap% × clipped RVOL, bias always LONG. Watchlist mode
+    `premarket_lock_rth_live`: premarket gappers are sticky-locked (no pre-open
+    churn), then at 09:30 a live RTH re-screen is unioned with the locked set
+    (faded gappers kept warm for a VWAP reclaim), capped to max_candidates.
   - Thin subclass of `TopTierAdaptiveStrategy` (sets `strategy_name` only) — all
     behavior is the shared engine, driven by config. Regimes: trend / pullback /
     range / vol_squeeze / momentum + opt-in `vwap_reclaim`; ORB and sr_scalp off
