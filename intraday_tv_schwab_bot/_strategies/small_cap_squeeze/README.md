@@ -23,7 +23,7 @@ re-screen every cycle with no lock. Filters (long bias, ranked by gap% × clippe
 | Price | $2 – $20 | `close` (→ `premarket_close` pre-RTH) |
 | **Float** | **400K – 20M shares** | `float_shares_outstanding_current` |
 | Relative volume | ≥ 2.0 | `relative_volume_10d_calc` |
-| Change from open | ≥ 5% | `change_from_open` (→ `premarket_change_from_open` pre-RTH) |
+| Change from open | ≥ 5% | `change_from_open` (→ `premarket_change` pre-RTH = premarket gap from prior close) |
 | Volume | ≥ 5M | `volume` (→ `premarket_volume` pre-RTH) |
 
 The three canonical fields (`close` / `change_from_open` / `volume`)
@@ -32,15 +32,16 @@ thresholds mean *premarket* close/change/volume during the 08:05–09:30 window
 and *RTH* values after the open. Low **float** is the squeeze fuel.
 
 ### 2. Regimes
-Runs **trend, pullback, range, vol_squeeze, momentum**, plus the opt-in
-**vwap_reclaim** regime (`enable_vwap_reclaim_regime: true`) — a long re-entry
-when price flushes below session VWAP and then reclaims it on a volume pop (the
-squeeze re-igniting), the entry that trend (needs `close>VWAP` *and*
-`ema9>ema20`), pullback (needs to hold above ema20), and momentum (needs a new
-N-bar high) all miss. **ORB and sr_scalp are off** (`disable_orb_regime` /
-`disable_sr_scalp_regime`). With ORB disabled the opening-range carve-out is
-removed too, so the open trades the mix continuously — entries run
-**08:05 → 11:50** with no gap.
+Narrowed (2026-06-02, after two dry-runs) to the **momentum-continuation** set:
+**trend, momentum**, plus the opt-in **vwap_reclaim** regime
+(`enable_vwap_reclaim_regime: true`) — a long re-entry when price flushes below
+session VWAP and reclaims it on a volume pop (the squeeze re-igniting), the entry
+that trend (needs `close>VWAP` *and* `ema9>ema20`) and momentum (needs a new
+N-bar high) miss. **pullback, range, vol_squeeze, ORB, and sr_scalp are off**
+(`disable_*_regime`) — pullback bled on both dry-runs, and the mean-reversion /
+breakout regimes don't fit a squeeze-continuation thesis. With ORB disabled the
+opening-range carve-out is removed too, so the open trades the continuation mix
+continuously — entries run **08:05 → 11:50** with no gap.
 
 ### 3. What's removed vs top_tier_adaptive
 - **No index/ETF confirmation** (`require_index_confirmation: false`, empty `index_symbols`).

@@ -1,8 +1,9 @@
 # Tuned runtime preset for small_cap_squeeze.
 # Long-only, multi-regime small-cap "squeeze" strategy. No fixed tradable list —
 # a dynamic TradingView screener picks low-float names gapping premarket on heavy
-# volume. Reuses the top_tier_adaptive multi-regime engine (trend / pullback /
-# range / vol_squeeze / momentum + opt-in vwap_reclaim; ORB + sr_scalp off).
+# volume. Reuses the top_tier_adaptive engine, narrowed (2026-06-02) to the
+# momentum-continuation regimes: trend / momentum / vwap_reclaim
+# (pullback / range / vol_squeeze / ORB / sr_scalp off).
 # See intraday_tv_schwab_bot/_strategies/small_cap_squeeze/README.md.
 # Put SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_ACCOUNT_HASH, SCHWAB_ENCRYPTION_KEY,
 # and TRADINGVIEW_SESSIONID in a .env file at the repo root (see .env.example).
@@ -471,11 +472,18 @@ strategies:
       watchlist_mode: premarket_lock_rth_live
 
       # ============================ Regimes ============================
-      # Keep trend / pullback / range / vol_squeeze / momentum. ORB + sr_scalp off.
-      # With ORB disabled the opening-range carve-out is removed too, so the open
-      # trades the normal mix continuously from 08:05.
+      # Narrowed 2026-06-02 (after two dry-runs) to the momentum-continuation set:
+      # trend / momentum / vwap_reclaim ONLY. pullback was the worst line both days
+      # (0/4 on 06-02 even after the score-floor tightening; ~-$438 over the two
+      # runs); range + vol_squeeze (mean-reversion / breakout) don't fit a squeeze-
+      # continuation thesis and added noise. ORB + sr_scalp stay off too. With ORB
+      # disabled the opening-range carve-out is removed, so the open trades the
+      # continuation mix continuously from 08:05.
       disable_orb_regime: true
       disable_sr_scalp_regime: true
+      disable_pullback_regime: true     # 0/4 on 06-02, ~2/17 on 06-01 — worst line both days
+      disable_range_regime: true        # mean-reversion: wrong thesis for a squeeze
+      disable_vol_squeeze_regime: true  # 0/2 on 06-02; folded into trend/momentum
 
       # VWAP-reclaim regime (opt-in, on for this strategy): a long re-entry when
       # price dips below session VWAP (a flush that shakes out weak longs) then
@@ -486,8 +494,13 @@ strategies:
       enable_vwap_reclaim_regime: true
       min_vwap_reclaim_score: 3.5
       vwap_reclaim_lookback_bars: 6        # the dip must be within the last ~6 min
-      vwap_reclaim_min_volume_ratio: 1.2   # reclaim bar volume vs recent avg
-      vwap_reclaim_buffer_pct: 0.0005      # reclaim must clear VWAP by this (not a 1-tick poke)
+      # 2026-06-02: tightened the reclaim confirmation. On the 06-02 fady tape
+      # vwap_reclaim over-fired on FALSE reclaims (tiny VWAP pokes that failed
+      # back, exiting anchored_vwap_loss — ABTS alone took 4 such losers), and the
+      # hybrid watchlist amplifies it by keeping faded gappers warm. Require a
+      # decisive clear of VWAP + real volume on the reclaim bar.
+      vwap_reclaim_min_volume_ratio: 1.5   # was 1.2 — reclaim bar volume vs recent avg
+      vwap_reclaim_buffer_pct: 0.0025      # was 0.0005 — clear VWAP decisively, not a 1-tick poke
       vwap_reclaim_target_rr: 2.5          # runner-friendly; ladder/peak-giveback extend past it
 
       # ===================== No confirmations / no sector =====================

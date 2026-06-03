@@ -25,7 +25,13 @@ class TradingViewScreenerClient:
             "postmarket": "postmarket_close",
         },
         "change_from_open": {
-            "premarket": "premarket_change_from_open",
+            # premarket_change (% gap from prior close), NOT premarket_change_from_open:
+            # the latter lagged a day — it surfaced YESTERDAY's premarket gappers and
+            # missed today's until RTH (2026-06-02 dry-run: DXST +86% was absent from
+            # the premarket screen, only appeared at 09:30). premarket_change is the
+            # standard field (mirrors postmarket_change) that TV's "pre-market gainers"
+            # page uses. VERIFY LIVE that today's gappers now appear pre-09:30.
+            "premarket": "premarket_change",
             "postmarket": "postmarket_change",
         },
         "volume": {

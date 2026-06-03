@@ -21,10 +21,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     churn), then at 09:30 a live RTH re-screen is unioned with the locked set
     (faded gappers kept warm for a VWAP reclaim), capped to max_candidates.
   - Thin subclass of `TopTierAdaptiveStrategy` (sets `strategy_name` only) — all
-    behavior is the shared engine, driven by config. Regimes: trend / pullback /
-    range / vol_squeeze / momentum + opt-in `vwap_reclaim`; ORB and sr_scalp off
-    (with ORB off the opening carve-out is removed, so the open trades the normal
-    mix continuously 08:05-11:50). No index / sector / relative-strength
+    behavior is the shared engine, driven by config. Regimes (narrowed 2026-06-02
+    after two dry-runs): trend / momentum + opt-in `vwap_reclaim` ONLY — pullback /
+    range / vol_squeeze / ORB / sr_scalp off (pullback bled both runs; the mean-
+    reversion / breakout regimes don't fit a squeeze-continuation thesis). With ORB
+    off the opening carve-out is removed, so the open trades the mix continuously
+    08:05-11:50. No index / sector / relative-strength
     confirmation. 1m LTF with native indicators (`ltf_indicator_span_scale: 1`).
     Long-only via `risk.allow_short: false`. Premarket/extended-hours eligible.
   - Shipped preset `config.small_cap_squeeze.yaml` is a fully-explicit preset

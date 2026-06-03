@@ -12,8 +12,8 @@ preferreds excluded by ``_common_equity_conditions``):
   * float 400K-20M shares                (``float_shares_outstanding_current``; low float
                                           = the squeeze fuel)
   * relative volume >= 2.0               (``relative_volume_10d_calc``)
-  * change from open >= 5%               (``change_from_open`` ->
-                                          ``premarket_change_from_open`` pre-RTH)
+  * change from open >= 5%               (``change_from_open`` -> ``premarket_change``
+                                          pre-RTH = the premarket gap from prior close)
   * volume >= 5M                         (``volume`` -> ``premarket_volume`` pre-RTH)
 
 The three canonical fields (close / change_from_open / volume) auto-resolve to
