@@ -133,7 +133,7 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                     elif self._blocks_bullish_sr_entry(sr_ctx):
                         reasons.append(self._bullish_sr_block_reason(sr_ctx))
                     else:
-                        stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx)
+                        stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx, frame)
                         stop, target = self._refine_bullish_technical_levels(last_close, stop, target, tech_ctx, frame)
                         stop = self._apply_retest_stop_anchor(Side.LONG, last_close, stop, retest_plan)
                         structure_bonus = 0.75 if getattr(ms_ctx, "bias", "neutral") == "bullish" else 0.0
@@ -206,7 +206,7 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                     elif self._blocks_bearish_sr_entry(sr_ctx):
                         reasons.append(self._bearish_sr_block_reason(sr_ctx))
                     else:
-                        stop, target = self._refine_bearish_sr_levels(last_close, stop, target, sr_ctx)
+                        stop, target = self._refine_bearish_sr_levels(last_close, stop, target, sr_ctx, frame)
                         stop, target = self._refine_bearish_technical_levels(last_close, stop, target, tech_ctx, frame)
                         stop = self._apply_retest_stop_anchor(Side.SHORT, last_close, stop, retest_plan)
                         structure_bonus = 0.75 if getattr(ms_ctx, "bias", "neutral") == "bearish" else 0.0

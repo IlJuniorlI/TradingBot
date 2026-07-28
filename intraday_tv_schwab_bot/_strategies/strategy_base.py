@@ -593,6 +593,62 @@ class BaseStrategy:
             min_rr = 1.0
         return (reward / risk) >= max(0.0, min_rr)
 
+    @staticmethod
+    def _frame_atr14(frame: pd.DataFrame | None, close: float) -> float:
+        """ATR14 from the last bar of ``frame``, with a price-scaled fallback."""
+        if frame is not None and not frame.empty and "atr14" in frame.columns:
+            return _safe_float(frame.iloc[-1]["atr14"], close * 0.0015)
+        return max(close * 0.0015, 0.01)
+
+    def _clamp_refined_stop(self, close: float, incoming_stop: float,
+                            proposed_stop: float, atr: float) -> float:
+        """Bound how far the refinement pipeline may pull a stop toward entry.
+
+        Both refinement passes (SR levels, technical levels) move the stop
+        TOWARD entry whenever a support/resistance level or trendline sits
+        inside the strategy's structural stop, and neither had a floor. A
+        level a few cents from entry therefore produced a few-cent stop,
+        silently overriding the ``default_stop_pct`` backstop the builder
+        applied a few lines earlier.
+
+        ``_target_meets_min_rr`` cannot police this — tightening the stop
+        RAISES reward/risk, so the R:R guard that protects the target cap
+        never binds on the stop side. The floor has to be absolute, so it is
+        expressed in ATR: refinement may not pull the stop closer to entry
+        than ``shared_entry.min_stop_atr_mult`` ATR.
+
+        An over-tight proposal is clamped BACK TO that distance rather than
+        discarded. Discarding would revert to the builder's stop, and the
+        builder backstop is a flat ``default_stop_pct`` — a percentage floor
+        applied regardless of the symbol's volatility. On a quiet name that
+        is enormous in ATR terms (COP 2026-05-14: 1% of price = 6.8 ATR,
+        one logged case reached 11 ATR), which would blow R out far enough
+        that nothing downstream priced in R — breakeven, profit-lock, runner,
+        peak-giveback, ``shared_exit.discretionary_exit_min_r`` — could ever
+        arm. Clamping keeps the stop volatility-scaled and keeps R in the
+        band the management ladder is tuned for.
+
+        The clamp never WIDENS past the incoming stop. A builder that
+        deliberately chose a stop tighter than the floor (range / sr_scalp
+        anchor to level geometry, momentum caps at ``default_stop_pct``)
+        keeps it exactly. Both callers pass a ``proposed_stop`` already on
+        the tightening side of ``incoming_stop``, so its sign relative to
+        ``close`` identifies the trade direction.
+        """
+        try:
+            min_atr_mult = float(self._shared_entry_value("min_stop_atr_mult", 1.5) or 0.0)
+        except (TypeError, ValueError):
+            min_atr_mult = 1.5
+        close_v, proposed_v = float(close), float(proposed_stop)
+        if min_atr_mult <= 0 or atr <= 0:
+            return proposed_v
+        incoming_distance = abs(close_v - float(incoming_stop))
+        proposed_distance = abs(close_v - proposed_v)
+        floor_distance = min(incoming_distance, min_atr_mult * float(atr))
+        if proposed_distance >= floor_distance:
+            return proposed_v
+        return close_v - floor_distance if proposed_v < close_v else close_v + floor_distance
+
     def _shared_exit_enabled(self, key: str, default: bool = True) -> bool:
         cfg = getattr(self.config, "shared_exit", None)
         base = getattr(cfg, key, default) if cfg is not None else default
@@ -2697,13 +2753,15 @@ class BaseStrategy:
             return float(stop), (None if target is None else float(target))
         if not bool(self._technical_level_setting("enabled", True)):
             return float(stop), (None if target is None else float(target))
-        atr = _safe_float(frame.iloc[-1]["atr14"], close * 0.0015) if frame is not None and not frame.empty and "atr14" in frame.columns else max(close * 0.0015, 0.01)
+        atr = self._frame_atr14(frame, close)
         buffer = max(atr * 0.12, close * 0.0010)
         if bool(self._technical_level_setting("stop_use_trendline", True)) and getattr(tech_ctx, "support_trendline", None) is not None:
             support_value = _safe_float(getattr(tech_ctx.support_trendline, "current_value", None), 0.0)
             trend_stop = support_value - buffer
             if 0 < trend_stop < close:
-                stop = max(float(stop), float(trend_stop))
+                stop = self._clamp_refined_stop(
+                    close, stop, max(float(stop), float(trend_stop)), atr,
+                )
         if target is not None:
             risk = max(close - float(stop), buffer)
             caps: list[float] = []
@@ -2731,13 +2789,15 @@ class BaseStrategy:
             return float(stop), (None if target is None else float(target))
         if not bool(self._technical_level_setting("enabled", True)):
             return float(stop), (None if target is None else float(target))
-        atr = _safe_float(frame.iloc[-1]["atr14"], close * 0.0015) if frame is not None and not frame.empty and "atr14" in frame.columns else max(close * 0.0015, 0.01)
+        atr = self._frame_atr14(frame, close)
         buffer = max(atr * 0.12, close * 0.0010)
         if bool(self._technical_level_setting("stop_use_trendline", True)) and getattr(tech_ctx, "resistance_trendline", None) is not None:
             resistance_value = _safe_float(getattr(tech_ctx.resistance_trendline, "current_value", None), 0.0)
             trend_stop = resistance_value + buffer
             if trend_stop > close:
-                stop = min(float(stop), float(trend_stop))
+                stop = self._clamp_refined_stop(
+                    close, stop, min(float(stop), float(trend_stop)), atr,
+                )
         if target is not None:
             risk = max(float(stop) - close, buffer)
             caps: list[float] = []
@@ -2758,13 +2818,67 @@ class BaseStrategy:
                     target = proposed_target
         return float(stop), (None if target is None else float(target))
 
+    def _position_r_multiple(self, position: Position, close: float) -> float | None:
+        """Open profit at ``close`` in initial-risk (R) units.
+
+        Anchors to ``metadata['initial_stop_price']`` — stamped once at entry
+        by the gatekeeper — rather than ``position.stop_price``, which moves
+        with breakeven/trailing management and would make R drift over the
+        life of the trade. Returns None when the initial risk is unknown or
+        degenerate, which callers treat as "no opinion".
+        """
+        meta = position.metadata if isinstance(position.metadata, dict) else {}
+        entry = _optional_float(position.entry_price)
+        initial_stop = _optional_float(meta.get("initial_stop_price"), position.stop_price)
+        if entry is None or initial_stop is None:
+            return None
+        risk = abs(entry - initial_stop)
+        if risk <= 0:
+            return None
+        move = (close - entry) if position.side == Side.LONG else (entry - close)
+        return move / risk
+
+    def _discretionary_exit_allowed(self, position: Position, close: float) -> bool:
+        """Gate for the exit families that carry no R condition of their own.
+
+        Bias-based structure exits, the technical exits, and the S/R break
+        exits are all pattern reads on the tape: they fire on a pivot label,
+        a trendline touch, an anchored-VWAP cross. None of them ask whether
+        the trade has earned anything yet, so on a trade still hovering
+        around entry they act as an arbitrary tightened stop. Measured over
+        2026-05-12..29 they closed 19 of 48 top_tier_adaptive trades at a
+        median MFE of 0.09-0.29R for -$831 — and in the widest-stop bucket
+        0 of 22 trades ever reached their protective stop, because one of
+        these got there first.
+
+        Below ``shared_exit.discretionary_exit_min_r`` the protective stop
+        governs the trade and these exits stay silent. CHoCH exits are not
+        routed through here — a genuine change-of-character is a reversal
+        signal rather than noise — nor are the stop, target, time-stop,
+        peak-giveback or trailing paths, which have their own R logic.
+        """
+        try:
+            min_r = float(self._shared_exit_value("discretionary_exit_min_r", 0.5) or 0.0)
+        except (TypeError, ValueError):
+            min_r = 0.5
+        if min_r <= 0:
+            return True
+        current_r = self._position_r_multiple(position, close)
+        if current_r is None:
+            return True
+        return current_r >= min_r
+
     def _technical_exit_signal(self, direction: str, frame: pd.DataFrame, close: float, ema9: float, ema20: float, vwap: float, close_pos: float, position: Position) -> tuple[bool, str]:
         if not self._shared_exit_enabled("use_technical_exit", True):
+            return False, "hold"
+        # Every branch below (trendline / channel / bollinger / anchored-VWAP)
+        # is a discretionary tape read; gate the whole family in one place.
+        if not self._discretionary_exit_allowed(position, close):
             return False, "hold"
         if not bool(self._technical_level_setting("enabled", True)):
             return False, "hold"
         tech_ctx = self._technical_context(frame)
-        atr = _safe_float(frame.iloc[-1]["atr14"], close * 0.0015) if frame is not None and not frame.empty and "atr14" in frame.columns else max(close * 0.0015, 0.01)
+        atr = self._frame_atr14(frame, close)
         buffer = max(atr * float(self._technical_level_setting("trendline_breakout_buffer_atr_mult", 0.15) or 0.15), close * 0.0010)
         if direction == "bullish":
             weak_tape = self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.48)
@@ -3518,14 +3632,17 @@ class BaseStrategy:
         )
         return bool(too_close and not actively_below)
 
-    def _refine_bullish_sr_levels(self, close: float, stop: float, target: float | None, sr_ctx):
+    def _refine_bullish_sr_levels(self, close: float, stop: float, target: float | None, sr_ctx, frame: pd.DataFrame | None):
         if not self._shared_entry_enabled("use_sr_stop_target_refinement", True):
             return float(stop), (None if target is None else float(target))
         level_buffer = float(sr_ctx.level_buffer or 0.0)
         if sr_ctx.nearest_support and close > float(sr_ctx.nearest_support.price):
             support_stop = float(sr_ctx.nearest_support.price) - level_buffer
             if support_stop < close:
-                stop = max(float(stop), support_stop)
+                stop = self._clamp_refined_stop(
+                    close, stop, max(float(stop), support_stop),
+                    self._frame_atr14(frame, close),
+                )
         if target is not None and sr_ctx.nearest_resistance and close < float(sr_ctx.nearest_resistance.price):
             capped_target = max(close * 1.001, float(sr_ctx.nearest_resistance.price) - level_buffer)
             proposed_target = min(float(target), capped_target)
@@ -3536,14 +3653,17 @@ class BaseStrategy:
                 target = proposed_target
         return float(stop), (None if target is None else float(target))
 
-    def _refine_bearish_sr_levels(self, close: float, stop: float, target: float | None, sr_ctx):
+    def _refine_bearish_sr_levels(self, close: float, stop: float, target: float | None, sr_ctx, frame: pd.DataFrame | None):
         if not self._shared_entry_enabled("use_sr_stop_target_refinement", True):
             return float(stop), (None if target is None else float(target))
         level_buffer = float(sr_ctx.level_buffer or 0.0)
         if sr_ctx.nearest_resistance and close < float(sr_ctx.nearest_resistance.price):
             resistance_stop = float(sr_ctx.nearest_resistance.price) + level_buffer
             if resistance_stop > close:
-                stop = min(float(stop), resistance_stop)
+                stop = self._clamp_refined_stop(
+                    close, stop, min(float(stop), resistance_stop),
+                    self._frame_atr14(frame, close),
+                )
         if target is not None and sr_ctx.nearest_support and close > float(sr_ctx.nearest_support.price):
             capped_target = min(close * 0.999, float(sr_ctx.nearest_support.price) + level_buffer)
             proposed_target = max(float(target), capped_target)
@@ -3725,7 +3845,16 @@ class BaseStrategy:
         # ORB-entry grace extends the suppression of non-CHoCH structure
         # exits for positions entered during the ORB window; OR'd with the
         # existing time/pivot gates so the stricter of the two wins.
-        structure_exit_gated = hold_minutes < grace_minutes or post_entry_pivots < min_post_entry_pivots or orb_grace_active
+        # The R gate joins the existing time/pivot/ORB gates: below
+        # shared_exit.discretionary_exit_min_r a bias flip is not worth
+        # abandoning the protective stop for. CHoCH exits are checked before
+        # this flag is consulted and stay exempt.
+        structure_exit_gated = (
+            hold_minutes < grace_minutes
+            or post_entry_pivots < min_post_entry_pivots
+            or orb_grace_active
+            or not self._discretionary_exit_allowed(position, close)
+        )
         # BoS-confirmation gate: when enabled, bias-based structure exits
         # additionally require an active BoS event (bos_down for long-exit,
         # bos_up for short-exit). Without this, a single EQL/HH pivot can
@@ -3759,7 +3888,11 @@ class BaseStrategy:
         if triggered:
             return True, reason
 
-        if self._shared_exit_enabled("use_sr_loss_exit", True) and bool(self._support_resistance_setting("enabled", True)):
+        if (
+            self._shared_exit_enabled("use_sr_loss_exit", True)
+            and bool(self._support_resistance_setting("enabled", True))
+            and self._discretionary_exit_allowed(position, close)
+        ):
             sr_ctx = self._sr_context(symbol, frame, data)
             level_buffer = float(sr_ctx.level_buffer or 0.0)
             entry_price = float(position.entry_price)

@@ -111,7 +111,7 @@ class PairsResidualStrategy(BaseStrategy):
                 if not reasons:
                     stop = last_close * (1.0 - self.config.risk.default_stop_pct)
                     target = last_close * (1.0 + self.config.risk.default_target_pct)
-                    stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx)
+                    stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx, left)
                     stop, target = self._refine_bullish_technical_levels(last_close, stop, target, tech_ctx, left)
                     structure_bonus = 0.75 if getattr(ms_ctx, "bias", "neutral") == "bullish" else 0.0
                     if bool(getattr(ms_ctx, "bos_up", False)) and self._structure_event_recent(getattr(ms_ctx, "bos_up_age_bars", None)):
@@ -150,7 +150,7 @@ class PairsResidualStrategy(BaseStrategy):
                 if not reasons:
                     stop = last_close * (1.0 + self.config.risk.default_stop_pct)
                     target = last_close * (1.0 - self.config.risk.default_target_pct)
-                    stop, target = self._refine_bearish_sr_levels(last_close, stop, target, sr_ctx)
+                    stop, target = self._refine_bearish_sr_levels(last_close, stop, target, sr_ctx, left)
                     stop, target = self._refine_bearish_technical_levels(last_close, stop, target, tech_ctx, left)
                     structure_bonus = 0.75 if getattr(ms_ctx, "bias", "neutral") == "bearish" else 0.0
                     if bool(getattr(ms_ctx, "bos_down", False)) and self._structure_event_recent(getattr(ms_ctx, "bos_down_age_bars", None)):

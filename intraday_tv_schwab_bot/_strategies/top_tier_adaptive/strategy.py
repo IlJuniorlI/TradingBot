@@ -2211,7 +2211,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             if opposing_sr_block:
                 self._set_build_failure(c.symbol, regime, f"long_orb_opposing_resistance_within_{orb_opposing_atr_mult:.2f}atr")
                 return None
-            stop, target = self._refine_bullish_sr_levels(close, stop, target, sr_ctx)
+            stop, target = self._refine_bullish_sr_levels(close, stop, target, sr_ctx, frame)
             stop, target = self._refine_bullish_technical_levels(close, stop, target, tech_ctx, frame)
         else:
             if not orb_structure_bypass and self._blocks_bearish_structure_entry(ms_ctx):
@@ -2223,7 +2223,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             if opposing_sr_block:
                 self._set_build_failure(c.symbol, regime, f"short_orb_opposing_support_within_{orb_opposing_atr_mult:.2f}atr")
                 return None
-            stop, target = self._refine_bearish_sr_levels(close, stop, target, sr_ctx)
+            stop, target = self._refine_bearish_sr_levels(close, stop, target, sr_ctx, frame)
             stop, target = self._refine_bearish_technical_levels(close, stop, target, tech_ctx, frame)
 
         # Entry exhaustion check — skipped during the ORB window because
@@ -2656,11 +2656,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             fail_reasons: list[str] = []
 
             # Score thresholds — read once, used for both sides' qualifier
-            # filtering. ``min_score_gap`` is intentionally NOT read: the
-            # primary-vs-fallback selection paths that used it are collapsed
-            # into the flat score-ordered build_queue, so the gap no longer
-            # gates anything. The param remains in user configs for
-            # backwards compat but is silently ignored.
+            # filtering.
             min_trend = float(self.params.get("min_trend_score", 4.0))
             min_pullback = float(self.params.get("min_pullback_score", 4.0))
             min_range = float(self.params.get("min_range_score", 3.5))
@@ -2787,10 +2783,6 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 # cross-side score order so no regime blocks another (within
                 # OR across sides). Both sides' qualifiers compete in the
                 # same flat queue.
-                #
-                # ``min_score_gap`` config param is silently ignored — the
-                # primary-vs-fallback selection paths it used to gate are
-                # collapsed into the unified score-ordered queue.
                 thresholds = {
                     "trend": min_trend,
                     "pullback": min_pullback,

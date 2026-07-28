@@ -86,7 +86,6 @@
 
     "trend_target_rr": 2.0,
     "pullback_target_rr": 2.0,
-    "range_target_rr": 1.5,
     "vol_squeeze_target_rr": 2.0,
     "momentum_target_rr": 2.5,
     "stop_buffer_atr_mult": 0.3,

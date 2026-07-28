@@ -1219,7 +1219,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                     target = expansion_target
             if target is None:
                 target = close + (risk_per_share * max(float(self.params.get("target_rr", 2.0)), float(self.params.get("min_rr", 1.65))))
-            stop, target = self._refine_bullish_sr_levels(close, stop, target, sr_ctx)
+            stop, target = self._refine_bullish_sr_levels(close, stop, target, sr_ctx, ltf)
             stop, target = self._refine_bullish_technical_levels(close, stop, target, tech_ctx, ltf)
         else:
             stop = max(raw_stop_anchor, pivot_price) + zone_width + (atr * stop_buffer_atr)
@@ -1233,7 +1233,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
             if target is None:
                 target = close - (risk_per_share * max(float(self.params.get("target_rr", 2.0)), float(self.params.get("min_rr", 1.65))))
                 target = max(0.01, target)
-            stop, target = self._refine_bearish_sr_levels(close, stop, target, sr_ctx)
+            stop, target = self._refine_bearish_sr_levels(close, stop, target, sr_ctx, ltf)
             stop, target = self._refine_bearish_technical_levels(close, stop, target, tech_ctx, ltf)
 
         fvg_adjustments = self._fvg_entry_adjustment_components(side, candidate.symbol, ltf, data)

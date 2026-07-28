@@ -306,9 +306,8 @@ Strategy-specific knobs:
 - `entry_bar_body_max_atr_mult`: max bar body (|close − open|) as multiple of ATR14. Default `1.4`. Catches directional thrust bars (the ones that "ran") even when wicks are small. Lower = stricter.
 - `min_trend_score` / `min_pullback_score` / `min_range_score` / `min_vol_squeeze_score` / `min_momentum_score` / `min_sr_scalp_score`: minimum regime score to qualify.
 - `min_pullback_trend_score`: minimum trend score required before pullback scoring begins.
-- `min_score_gap`: minimum score gap between winning and runner-up regime (unused as of the 2026-05-12 flat-build-queue refactor; retained for backwards compat).
 - `min_adx14`: ADX floor for trend/pullback scoring.
-- `trend_target_rr` / `pullback_target_rr` / `range_target_rr` / `vol_squeeze_target_rr` / `momentum_target_rr`: initial R:R targets per regime. Sr_scalp has no R:R target — its target is the inner edge of the opposite HTF zone (zone gap provides the reward).
+- `trend_target_rr` / `pullback_target_rr` / `vol_squeeze_target_rr` / `momentum_target_rr`: initial R:R targets per regime. Range and sr_scalp have no R:R target — range targets the opposite edge of the range, sr_scalp the inner edge of the opposite HTF zone (zone gap provides the reward).
 - `stop_buffer_atr_mult`: ATR multiplier for stop buffer beyond the swing level.
 - `orb_end_time` / `midday_start_time` / `midday_end_time` / `afternoon_start_time` / `no_new_entries_after`: time-of-day regime window boundaries.
 - `vol_squeeze_lookback_bars` / `vol_squeeze_max_range_pct` / `vol_squeeze_max_range_atr` / `vol_squeeze_max_width_pct` / `vol_squeeze_breakout_buffer_pct` / `vol_squeeze_min_breakout_volume_ratio` / `vol_squeeze_min_bar_close_position`: vol_squeeze qualification knobs.
@@ -382,7 +381,6 @@ Current code defaults:
 | `min_vol_squeeze_score`              | `4.0`                                                                                                                         |
 | `min_momentum_score`                 | `4.0`                                                                                                                         |
 | `min_sr_scalp_score`                 | `3.5`                                                                                                                         |
-| `min_score_gap`                      | `1.2`                                                                                                                         |
 | `min_adx14`                          | `15.0`                                                                                                                        |
 | `pullback_ema_touch_atr_mult`        | `0.35`                                                                                                                        |
 | `pullback_hold_atr_mult`             | `0.40`                                                                                                                        |
@@ -393,7 +391,6 @@ Current code defaults:
 | `range_lookback_bars`                | `20`                                                                                                                          |
 | `trend_target_rr`                    | `2.0`                                                                                                                         |
 | `pullback_target_rr`                 | `2.0`                                                                                                                         |
-| `range_target_rr`                    | `1.5`                                                                                                                         |
 | `vol_squeeze_target_rr`              | `2.05`                                                                                                                        |
 | `momentum_target_rr`                 | `2.0`                                                                                                                         |
 | `vol_squeeze_lookback_bars`          | `12`                                                                                                                          |

@@ -450,7 +450,7 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             risk_per_share = max(0.01, trend["close"] - stop)
             target_rr = max(float(self.params.get("target_rr", 2.05)), float(self.params.get("min_rr", 1.8)))
             target = trend["close"] + (risk_per_share * target_rr)
-            stop, target = self._refine_bullish_sr_levels(trend["close"], stop, target, sr_ctx)
+            stop, target = self._refine_bullish_sr_levels(trend["close"], stop, target, sr_ctx, ltf)
             stop, target = self._refine_bullish_technical_levels(trend["close"], stop, target, tech_ctx, ltf)
         else:
             stop = float(trigger.get("stop_anchor", trend["close"])) + (trend["atr"] * stop_buffer_atr)
@@ -459,7 +459,7 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             risk_per_share = max(0.01, stop - trend["close"])
             target_rr = max(float(self.params.get("target_rr", 2.05)), float(self.params.get("min_rr", 1.8)))
             target = max(0.01, trend["close"] - (risk_per_share * target_rr))
-            stop, target = self._refine_bearish_sr_levels(trend["close"], stop, target, sr_ctx)
+            stop, target = self._refine_bearish_sr_levels(trend["close"], stop, target, sr_ctx, ltf)
             stop, target = self._refine_bearish_technical_levels(trend["close"], stop, target, tech_ctx, ltf)
 
         adjustments = self._entry_adjustment_components(side, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf)

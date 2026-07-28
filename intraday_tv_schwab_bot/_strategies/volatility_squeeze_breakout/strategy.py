@@ -241,7 +241,7 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 elif self._blocks_bullish_sr_entry(sr_ctx):
                     long_reasons.append(self._bullish_sr_block_reason(sr_ctx))
                 else:
-                    stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx)
+                    stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx, frame)
                     stop, target = self._refine_bullish_technical_levels(last_close, stop, target, tech_ctx, frame)
                     stop = self._apply_retest_stop_anchor(Side.LONG, last_close, stop, long_retest_plan)
                     adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
@@ -331,7 +331,7 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 elif self._blocks_bearish_sr_entry(sr_ctx):
                     short_reasons.append(self._bearish_sr_block_reason(sr_ctx))
                 else:
-                    stop, target = self._refine_bearish_sr_levels(last_close, stop, target, sr_ctx)
+                    stop, target = self._refine_bearish_sr_levels(last_close, stop, target, sr_ctx, frame)
                     stop, target = self._refine_bearish_technical_levels(last_close, stop, target, tech_ctx, frame)
                     stop = self._apply_retest_stop_anchor(Side.SHORT, last_close, stop, short_retest_plan)
                     adjustments = self._entry_adjustment_components(Side.SHORT, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)

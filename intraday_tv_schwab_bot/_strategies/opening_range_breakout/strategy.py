@@ -133,7 +133,7 @@ class ORBStrategy(BaseStrategy):
                 elif self._blocks_bullish_sr_entry(sr_ctx):
                     reasons.append(self._bullish_sr_block_reason(sr_ctx))
                 else:
-                    stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx)
+                    stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx, frame)
                     stop, target = self._refine_bullish_technical_levels(last_close, stop, target, tech_ctx, frame)
                     stop = self._apply_retest_stop_anchor(Side.LONG, last_close, stop, retest_plan)
                     breakout_pct = max(0.0, (last_close - trigger) / trigger) if trigger > 0 else 0.0

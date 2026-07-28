@@ -7,6 +7,126 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stop-refinement had no floor and silently overrode every builder's
+  `default_stop_pct` backstop.** *2026-07-27*
+  - `_refine_bullish_sr_levels` / `_refine_bearish_sr_levels` /
+    `_refine_bullish_technical_levels` / `_refine_bearish_technical_levels`
+    each moved the stop TOWARD entry whenever a support/resistance level or
+    trendline sat inside the strategy's structural stop, with no lower bound.
+    A level a few cents from entry produced a few-cent stop. `min_target_rr`
+    could not catch it: tightening a stop RAISES reward/risk, so the R:R guard
+    that protects the *target* cap never binds on the stop side.
+  - Measured over 2026-05-12..29 on `top_tier_adaptive`: **46 of 57 entries had
+    their stop pinned exactly to `nearest_support - level_buffer`**, a median 2x
+    (worst 10x — META 2026-05-26 got 0.11% of price against the 1.0%
+    `default_stop_pct` floor) tighter than the builder intended, parking the
+    stop on the single price most likely to be swept.
+  - New `shared_entry.min_stop_atr_mult` (default `1.5`) floors the refined
+    stop in ATR14 units, via `BaseStrategy._clamp_refined_stop`. An over-tight
+    proposal is *clamped back* to the floor rather than discarded: discarding
+    reverts to the flat `default_stop_pct`, which on a quiet symbol is enormous
+    in ATR terms (one logged case reached 11 ATR) and would push R out far
+    enough that nothing priced in R — breakeven, profit-lock, runner,
+    peak-giveback, `discretionary_exit_min_r` — could ever arm. The clamp never
+    widens past the incoming stop, so builders that deliberately choose a
+    tighter stop (range / sr_scalp / momentum) keep it.
+  - Replayed against all 57 logged entries: 9 stops adjusted, all to exactly
+    1.5 ATR; median stop width unchanged at 3.87 ATR.
+  - The two SR helpers now take the bar `frame` (to read ATR14); all 16 call
+    sites across 9 strategies updated.
+
+- **Discretionary exits carried no R condition and were displacing the stop.**
+  *2026-07-27*
+  - The bias-based structure exits, every branch of `_technical_exit_signal`
+    (trendline / channel / bollinger / anchored-VWAP) and the S/R break exits
+    are pattern reads on the tape gated only by grace windows and tape
+    confirmation. On a trade still hovering around entry they acted as an
+    arbitrary tightened stop.
+  - Over 2026-05-12..29 they closed **19 of 48 `top_tier_adaptive` trades at a
+    median MFE of 0.09-0.29R for -$831 combined**, and among trades whose stop
+    sat beyond 4 ATR, **0 of 22 ever reached that stop** — one of these got
+    there first, every time.
+  - New `shared_exit.discretionary_exit_min_r` (default `0.5`) gates the family
+    on open profit in initial-risk R units, via
+    `BaseStrategy._discretionary_exit_allowed` / `_position_r_multiple`. R is
+    measured against `metadata['initial_stop_price']`, not the trailing
+    `position.stop_price`, so it does not drift as management moves the stop.
+    CHoCH exits stay exempt — a true change-of-character is a reversal signal,
+    not noise.
+  - Counterfactual replay of the 21 suppressed exits against the archived 1m
+    bars: **-$722 under the full post-fix ladder vs -$859 actually booked
+    (+$137)**, and -$874 under a deliberately pessimistic bound that caps all
+    upside at the moment the gate opens. 7 of the 21 go on to hit a full stop —
+    the discretionary exits were partly doing useful work, so the gain is
+    materially smaller than the -$831 those exits booked. A threshold sweep
+    (0.25 / 0.5 / 0.75 / 1.0R) favours the gate at every non-zero value under
+    the full-ladder replay, but one-trade differences swing the ranking at
+    n=22, so the sample cannot tune it further.
+
+- **`sector_index_map` could silently disable five regimes for a whole sector.**
+  *2026-07-27*
+  - `TopTierAdaptiveStrategy.active_watchlist` streams bars for `index_symbols`
+    and nothing else, while `_indices_for_symbol` resolves a candidate's sector
+    through `sector_index_map`. When the two disagreed, `_index_confirms` got
+    `None` bars for every mapped ETF, fell through its loop and returned False —
+    permanently blocking every symbol in that sector from the five
+    index-confirmed regimes (trend / pullback / vol_squeeze / momentum /
+    vwap_reclaim). The only symptom was a `..._index_not_confirmed` skip line,
+    indistinguishable from the index genuinely disagreeing.
+  - `config.load_config` now runs `_validate_sector_index_map` and fails loudly
+    at load time. Only sectors that actually have members are checked — mapping
+    a sector you have not populated yet is harmless, and presets routinely carry
+    a full 11-GICS map against a narrower traded universe.
+
+- **README `top_tier_adaptive` defaults table had drifted from the manifest.**
+  *2026-07-27* — `min_bars` 60→150, `ltf_minutes` 5→1 (the 1m-LTF migration
+  landed 2026-05-29 but the table kept the 5m-era numbers), `min_ltf_bars`
+  15→120, `min_sr_scalp_score` 3.5→3.0.
+
+### Changed
+
+- **`top_tier_adaptive` regime mix and profit ladder retuned from measured
+  excursion.** *2026-07-27*
+  - Measuring excursion in ATR units (independent of stop placement, so the
+    regimes are comparable) over 2026-05-12..29: `vol_squeeze` MFE 1.45 / MAE
+    0.75 ATR = **1.93** edge; `pullback` 1.65 / 2.04 = **0.81**; `trend` 1.79 /
+    2.36 = **0.76**. The two sub-1.0 regimes were carrying 60% of trade volume
+    (pullback alone 24 of 48). `min_trend_score` 3.5 → **4.5**,
+    `min_pullback_score` 3.5 → **4.0**; `vol_squeeze` untouched at 4.0. Sized
+    against the score ceilings (`_score_trend` caps at 6.0, `_score_pullback` at
+    5.0, `bias_penalty` subtracts at most 1.0) so neither becomes unreachable —
+    cf. `min_sr_scalp_score`, which once sat above its own ceiling and fired
+    zero times ever. This cuts VOLUME, not per-trade edge: `regime_score` was
+    not stamped into signal metadata during those sessions, so the score/outcome
+    curve is unknown. It is stamped now, so the next dry-run can set these from
+    data.
+  - Every profit-protection trigger sat at or above 1.0R while **79% of trades
+    (38 of 48) never reached 1R at all**, so the ladder almost never armed and
+    sub-1R trades ran unprotected back to the stop (GOOG 2026-05-14 peaked at
+    0.97R and closed at -0.01R; INTC 2026-05-26 0.80R → -0.02R). Excursion is
+    MFE p25 0.43 / median 1.55 / p75 3.05 ATR against a typical ~3 ATR stop, so
+    the median trade peaks near 0.5R. `adaptive_breakeven_rr` 1.00 → **0.60**,
+    `adaptive_profit_lock_rr` 1.20 → **0.85**, `adaptive_runner_trigger_rr`
+    1.10 → **0.90** (`adaptive_profit_lock_stop_rr` unchanged at 0.45).
+    Breakeven now arms on 40% of trades instead of 21%. Ordering is deliberate:
+    `discretionary_exit_min_r` 0.50 < breakeven 0.60 <
+    `peak_giveback_low_tier_min_r` 0.70 < profit-lock 0.85 < runner 0.90 <
+    `peak_giveback_min_r` 1.00.
+
+### Removed
+
+- **Dead config parameters.** *2026-07-27*
+  - `min_score_gap` from `top_tier_adaptive` (manifest, preset, README, strategy
+    README). The primary-vs-fallback selection paths it gated were collapsed
+    into the flat score-ordered build queue on 2026-05-12; the code had carried
+    a comment saying it was "silently ignored" ever since. Still live and read
+    by `zero_dte_etf_options` / `zero_dte_etf_long_options`, which are untouched.
+  - `range_target_rr` from `top_tier_adaptive` and `small_cap_squeeze` — no code
+    in the package ever read it. `_build_range_signal` targets
+    `range_high - buffer`, never an R multiple.
+
 ### Added
 
 - **`small_cap_squeeze` strategy — long-only small-cap squeeze.** *2026-05-30*

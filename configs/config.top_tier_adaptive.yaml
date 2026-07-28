@@ -453,6 +453,18 @@ shared_entry:
   divergence_entry_score_bump: 0.20
   use_opposing_chart_filter: true
   use_opposing_candle_filter: false
+  # R:R floor for the TARGET side of the refinement pipeline.
+  min_target_rr: 1.0
+  # Floor on how far refinement may pull the STOP toward entry, in ATR14.
+  # min_target_rr cannot police the stop side — tightening the stop RAISES
+  # reward/risk, so the R:R guard never binds there. Over 2026-05-12..29,
+  # 46 of 57 entries had their stop pinned exactly to
+  # `nearest_support - level_buffer`, a median 2x (worst 10x: META 05-26
+  # got 0.11% vs the 1.0% default_stop_pct backstop) tighter than the
+  # builder floor — parking the stop on the one price most likely to be
+  # swept. 1.5 ATR only refuses to tighten; a builder that deliberately
+  # chose a tighter stop (range / sr_scalp / momentum) keeps it.
+  min_stop_atr_mult: 1.5
 
 # Shared exit-side toggles — tape-confirmation thresholds and exit gates.
 shared_exit:
@@ -479,6 +491,16 @@ shared_exit:
   bullish_close_position_loose_max: 0.38
   bearish_close_position_loose_min: 0.62
   use_candle_pattern_exit: false
+  # Minimum open profit (R) before the discretionary exit families may fire:
+  # bias-based structure exits, the technical exits (trendline / channel /
+  # bollinger / anchored-VWAP) and the S/R break exits. None of them carried
+  # an R condition, so they were acting as an arbitrary tightened stop:
+  # 2026-05-12..29 they closed 19 of 48 trades at a median MFE of 0.09-0.29R
+  # for -$831 combined, and among trades whose stop sat beyond 4 ATR, 0 of 22
+  # ever reached that stop — a discretionary exit always got there first.
+  # Below this threshold the protective stop governs the trade. CHoCH exits
+  # stay exempt (a real change-of-character is reversal, not noise).
+  discretionary_exit_min_r: 0.5
 
 # Per-strategy windows and parameter blocks.
 strategies:
@@ -588,18 +610,33 @@ strategies:
       htf_ema_fast_span: 50
       htf_ema_slow_span: 200
 
-      # Regime scoring thresholds. min_score_gap raised 1.2 -> 1.4 because
-      # HTF RSI confluence (htf_divergence_aligned_bonus_rsi=+0.20 vs
-      # htf_divergence_counter_penalty_rsi=-0.25) now spreads aligned vs
-      # counter setups by ~0.45 of score on average — the gap can be tighter
-      # while still picking the right regime decisively. min_adx14 bumped
-      # 15.0 -> 16.0 since HTF momentum filter now rejects weak trends
-      # upstream, so the ADX gate can demand slightly more trend strength.
-      min_trend_score: 3.5
-      min_pullback_score: 3.5
+      # Regime scoring thresholds. min_adx14 bumped 15.0 -> 16.0 -> 18.0
+      # since the HTF momentum filter rejects weak trends upstream, so the
+      # ADX gate can demand more trend strength.
+      #
+      # 2026-07-27 regime-mix retune. Measured over 2026-05-12..29 with
+      # excursion in ATR units (stop-placement independent, so the regimes
+      # are comparable): vol_squeeze MFE 1.45 / MAE 0.75 ATR = 1.93 edge;
+      # pullback 1.65 / 2.04 = 0.81; trend 1.79 / 2.36 = 0.76. The two
+      # sub-1.0 regimes were carrying 60% of trade volume (pullback alone
+      # 24 of 48). Thresholds raised to cut volume through them while
+      # leaving vol_squeeze untouched at 4.0.
+      #
+      # Sized against the score ceilings so neither regime becomes
+      # unreachable (cf. min_sr_scalp_score below, which sat above its own
+      # ceiling and fired zero times ever): _score_trend caps at 6.0 and
+      # _score_pullback at 5.0, and bias_penalty subtracts at most 1.0.
+      # 4.5/4.0 are reachable with or without the penalty applied.
+      #
+      # This cuts VOLUME, not per-trade edge — a higher regime score is not
+      # yet known to correlate with a better outcome, because regime_score
+      # was not stamped into signal metadata during the sessions above. It
+      # is now (strategy.py `leading` dict), so the next dry-run can set
+      # these thresholds from the score/outcome curve instead of by volume.
+      min_trend_score: 4.5
+      min_pullback_score: 4.0
       min_pullback_trend_score: 3.0
       min_range_score: 3.5
-      min_score_gap: 1.5      # HIGH_VOL: was 1.4 — bigger gap needed in noisier scoring environment
       min_adx14: 18.0          # HIGH_VOL: was 16.0 — ADX naturally higher in high vol; demand stronger trend
 
       # Pullback detection
@@ -630,10 +667,9 @@ strategies:
       range_min_flip_count: 3
       range_lookback_bars: 20              # base-1m frame (unchanged by LTF switch — _score_range/_build_range_signal index `frame`, not `ltf`)
 
-      # Target R:R by regime
+      # Target R:R by regime (range targets range_high, not an R multiple)
       trend_target_rr: 2.0
       pullback_target_rr: 2.0
-      range_target_rr: 1.5
       stop_buffer_atr_mult: 0.30          # HIGH_VOL: was 0.25 — wider base buffer (Tier 2a scales this further when ATR expands)
 
       # Time-of-day regime windows
@@ -773,10 +809,22 @@ strategies:
       # giveback is faster in high vol so capture more, lock harder. Tier 3b
       # high-conviction override (peak_giveback_high_conviction_min_r) still
       # keeps trend-day winners' runway open via the per-trade metadata stamp.
-      adaptive_breakeven_rr: 1.00
-      adaptive_profit_lock_rr: 1.20            # HIGH_VOL: was 1.30 — engage profit-lock sooner
-      adaptive_profit_lock_stop_rr: 0.45       # HIGH_VOL: was 0.35 — lock more profit when triggered
-      adaptive_runner_trigger_rr: 1.10
+      # 2026-07-27 rescale. Every trigger below sat at or above 1.0R while
+      # 79% of trades (38 of 48, 2026-05-12..29) never reached 1R at all —
+      # so the entire profit-protection ladder almost never armed and
+      # sub-1R trades ran unprotected all the way back to the stop (GOOG
+      # 05-14 peaked at 0.97R and closed at -0.01R; INTC 05-26 0.80R ->
+      # -0.02R). Excursion measured in ATR is MFE p25 0.43 / median 1.55 /
+      # p75 3.05, and a typical stop is ~3 ATR, so the median trade peaks
+      # near 0.5R. Triggers moved onto that distribution: breakeven arms on
+      # roughly half of trades instead of a fifth. Ordering is deliberate —
+      # discretionary_exit_min_r (0.50) < breakeven (0.60) <
+      # peak_giveback_low_tier_min_r (0.70) < profit-lock (0.85) < runner
+      # (0.90) < peak_giveback_min_r (1.00).
+      adaptive_breakeven_rr: 0.60              # was 1.00 — armed on only ~21% of trades
+      adaptive_profit_lock_rr: 0.85            # was 1.20
+      adaptive_profit_lock_stop_rr: 0.45       # unchanged — locks +0.45R once the 0.85R trigger arms
+      adaptive_runner_trigger_rr: 0.90         # was 1.10
 
       # Adaptive ladder rung builder (used when risk.trade_management_mode
       # is "adaptive_ladder"). Walks S/R resistances (long) / supports

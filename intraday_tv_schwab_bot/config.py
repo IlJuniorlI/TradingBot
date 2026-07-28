@@ -885,6 +885,17 @@ class SharedEntryLogicConfig:
     # toward zero. Default 1.0 = require at least 1:1 R:R after any
     # refinement.
     min_target_rr: float = 1.0
+    # Floor on how far the SR/technical refinement pipeline may pull a stop
+    # TOWARD entry, in ATR14 units. min_target_rr cannot police this: pulling
+    # the stop in RAISES reward/risk, so the R:R guard never binds on the
+    # stop side. Without an absolute floor, a support level sitting a few
+    # cents under entry produced a few-cent stop and silently overrode the
+    # `default_stop_pct` backstop each strategy builder applies — measured
+    # over 2026-05-12..29, 46 of 57 top_tier_adaptive entries had their stop
+    # pinned exactly to `nearest_support - level_buffer`, a median 2x (worst
+    # 10x) tighter than the builder floor. The floor only refuses to TIGHTEN;
+    # a builder that deliberately set a stop inside this distance keeps it.
+    min_stop_atr_mult: float = 1.5
 
 
 @dataclass(slots=True)
@@ -908,6 +919,19 @@ class SharedExitLogicConfig:
     use_candle_pattern_exit: bool = False
     use_structure_exit: bool = True
     use_sr_loss_exit: bool = True
+    # Minimum open profit (in initial-risk R units) before the discretionary
+    # exit families may fire: bias-based structure exits, the technical
+    # exits (trendline / channel / bollinger / anchored-VWAP), and the S/R
+    # break exits. Below this threshold the protective stop governs the
+    # trade. These families carry no R condition of their own — only grace
+    # windows and tape confirmation — so they were cutting trades that had
+    # barely moved: over 2026-05-12..29 they closed 19 of 48 top_tier_adaptive
+    # trades at a median MFE of 0.09-0.29R for -$831 combined, and in the
+    # widest-stop bucket 0 of 22 trades ever reached their stop because a
+    # discretionary exit got there first. CHoCH exits are exempt — a true
+    # change-of-character is a reversal signal, not noise. Set to 0 to
+    # restore the un-gated behaviour.
+    discretionary_exit_min_r: float = 0.5
     # Divergence exit (counter-direction REGULAR divergence forms while
     # holding). LONG + new bearish RSI/OBV div -> consider partial close.
     # SHORT + new bullish div -> mirror. Hidden divergence is continuation
@@ -1271,6 +1295,56 @@ def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path)
         raise ValueError(f"{config_path}: invalid options configuration:\n  " + "\n  ".join(errors))
 
 
+def _validate_sector_index_map(strategies: dict[str, "StrategyConfig"], config_path: Path) -> None:
+    """Reject a ``sector_index_map`` that references un-streamed ETFs.
+
+    ``TopTierAdaptiveStrategy.active_watchlist`` subscribes bars for the
+    ``index_symbols`` list and nothing else, while ``_indices_for_symbol``
+    resolves a candidate's sector through ``sector_index_map``. When those
+    two disagree, ``_index_confirms`` calls ``bars.get(sym)``, gets None for
+    every mapped ETF, falls through the loop and returns False — so every
+    candidate in that sector is permanently blocked from the five
+    momentum-family regimes (trend / pullback / vol_squeeze / momentum /
+    vwap_reclaim). The only symptom is a ``..._index_not_confirmed`` skip
+    line, indistinguishable from the index genuinely disagreeing.
+
+    Only sectors that actually have members are checked: mapping a sector
+    you have not populated yet is harmless, and configs routinely carry a
+    full 11-GICS map against a narrower traded universe.
+    """
+    errors: list[str] = []
+    for name, cfg in strategies.items():
+        params = cfg.params or {}
+        sector_groups = params.get("sector_groups") or {}
+        sector_index_map = params.get("sector_index_map") or {}
+        if not sector_groups or not sector_index_map:
+            continue
+        streamed = {
+            str(s).upper().strip()
+            for s in (params.get("index_symbols") or [])
+            if str(s).strip()
+        }
+        for sector, members in sector_groups.items():
+            if not isinstance(members, (list, tuple)) or not members:
+                continue
+            mapped = sector_index_map.get(sector) or []
+            missing = sorted(
+                {str(s).upper().strip() for s in mapped if str(s).strip()} - streamed
+            )
+            if missing:
+                errors.append(
+                    f"strategies.{name}.sector_index_map[{sector!r}] references "
+                    f"{missing} which are absent from index_symbols, so their bars are "
+                    f"never streamed — every symbol in that sector "
+                    f"({[str(m) for m in members][:4]}...) would be permanently blocked "
+                    "from the index-confirmed regimes. Add them to index_symbols."
+                )
+    if errors:
+        raise ValueError(
+            f"{config_path}: invalid sector index mapping:\n  " + "\n  ".join(errors)
+        )
+
+
 def load_config(path: str | Path, strategy_override: str | None = None, env_path: str | Path | None = None) -> BotConfig:
     config_path = Path(path).expanduser()
     if not config_path.exists():
@@ -1370,6 +1444,8 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
             screener_windows=deepcopy(value.get("screener_windows", base.screener_windows)),
             params=_normalize_strategy_params(merged_params, name),
         )
+
+    _validate_sector_index_map(strategies, config_path)
 
     active_base = strategies[strategy]
     strategies[strategy] = StrategyConfig(

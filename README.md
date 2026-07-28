@@ -792,6 +792,7 @@ Global entry-side helper toggles. These replace the old per-strategy logic-overr
 | `use_opposing_chart_filter`                  | `true`       |
 | `use_opposing_candle_filter`                 | `false`      |
 | `min_target_rr`                              | `1.0`        |
+| `min_stop_atr_mult`                          | `1.5`        |
 
 Behavior:
 
@@ -808,6 +809,7 @@ Behavior:
 - `use_opposing_chart_filter`: block entries when opposing chart patterns are present.
 - `use_opposing_candle_filter`: block entries when opposing-direction candle patterns cluster above `candles.opposing_net_score_threshold` (default 0.70 = "solid" tier). Reuses the cached candle context — no extra ta-lib calls.
 - `min_target_rr` (float, default `1.0`): risk-to-reward floor enforced by **all four** target-refinement passes (`_refine_bullish_sr_levels`, `_refine_bearish_sr_levels`, `_refine_bullish_technical_levels`, `_refine_bearish_technical_levels`). When a refine pass would cap the target so close to entry that R:R drops below this threshold, the cap is rejected and the strategy's original target is kept. Protects against the "$0.10 target" failure mode where nearby S/R or technical levels collapse R:R toward zero. The check is independent of `risk.trade_management_mode` — it applies whether you run `adaptive`, `adaptive_ladder`, `none`, `sr_flip`, or any other mode. Set higher (e.g. `1.5` or `2.0`) for stricter quality, lower (or `0`) to disable.
+- `min_stop_atr_mult` (float, default `1.5`): floor, in ATR14 units, on how far those same four passes may pull the **stop** toward entry. `min_target_rr` cannot police the stop side — tightening a stop *raises* reward/risk, so the R:R guard never binds there. Without an absolute floor, a support level sitting a few cents under entry produced a few-cent stop and silently overrode the `risk.default_stop_pct` backstop the strategy builder applied a few lines earlier: measured over 2026-05-12..29, 46 of 57 `top_tier_adaptive` entries had their stop pinned exactly to `nearest_support - level_buffer`, a median 2x (worst 10x) tighter than the builder floor. An over-tight proposal is clamped back to this distance rather than discarded — discarding would revert to the flat `default_stop_pct`, which on a quiet symbol is enormous in ATR terms (one logged case reached 11 ATR) and would push R far enough out that nothing priced in R could arm. The clamp never *widens* past the incoming stop, so a builder that deliberately chose a tighter stop (range / sr_scalp / momentum) keeps it. Set `0` to disable.
 
 ### `shared_exit`
 
@@ -824,6 +826,7 @@ Global exit-side helper toggles and tape-confirmation thresholds.
 | `use_candle_pattern_exit`          | `false`      |
 | `use_structure_exit`               | `true`       |
 | `use_sr_loss_exit`                 | `true`       |
+| `discretionary_exit_min_r`         | `0.5`        |
 | `use_divergence_exit_signal`       | `false`      |
 | `divergence_exit_partial_frac`     | `0.5`        |
 | `divergence_exit_min_age_bars`     | `1`          |
@@ -846,6 +849,7 @@ Behavior:
 - `use_candle_pattern_exit`: fire `candle_pattern_exit:<pattern>` when an opposing-direction candle cluster crosses `candles.opposing_net_score_threshold` and the tape confirms (via `confirm_with_*` thresholds below). Reuses cached candle context.
 - `use_structure_exit`: allow CHOCH / structure-loss exits.
 - `use_sr_loss_exit`: allow exits on confirmed loss of important support/resistance.
+- `discretionary_exit_min_r` (float, default `0.5`): minimum open profit, in initial-risk R units, before the **discretionary** exit families may fire — the bias-based structure exits, every branch of `_technical_exit_signal` (trendline / channel / bollinger / anchored-VWAP) and the S/R break exits. None of them carry an R condition of their own — only grace windows and tape confirmation — so on a trade still hovering around entry they act as an arbitrary tightened stop. Over 2026-05-12..29 they closed 19 of 48 `top_tier_adaptive` trades at a median MFE of 0.09-0.29R for -$831 combined, and among trades whose stop sat beyond 4 ATR, 0 of 22 ever reached that stop because one of these got there first. Below the threshold the protective stop governs the trade. R is measured against `metadata['initial_stop_price']`, not the trailing `position.stop_price`, so it does not drift as management moves the stop. CHoCH exits are exempt — a true change-of-character is a reversal signal, not noise. Set `0` to restore the un-gated behaviour.
 - `use_divergence_exit_signal` (off by default): enable the shared opt-in exit helper `_divergence_exit_signal(side, in_profit, tech_ctx)` in `BaseStrategy`. When a counter-direction REGULAR divergence forms on a held position and its age is in `[divergence_exit_min_age_bars, technical_levels.divergence_max_age_bars]`, the helper returns `(reason, partial_frac)` and the strategy can act on it. Hidden divergence (continuation) is never an exit trigger. `divergence_exit_partial_frac` controls partial close size (0.0-1.0; 0.5 closes half, leaving the other half on a trailing stop). `divergence_exit_require_in_profit` (default true) gates the exit so a losing position isn't scratched on noise.
 - `confirm_with_ema9`, `confirm_with_ema20`, `confirm_with_vwap`, `confirm_with_close_position`: tape-confirmation requirements applied before shared exits are accepted.
 - `bullish_close_position_max` / `bearish_close_position_min`: strict candle close-location thresholds used when confirming bearish exits from long trades or bullish exits from short trades.
@@ -1920,8 +1924,7 @@ Strategy-specific knobs:
 - `require_index_confirmation`: gate trend/pullback/vol_squeeze/momentum entries on index agreement. Range and sr_scalp are exempt (mean-reversion theses).
 - `min_trend_score` / `min_pullback_score` / `min_range_score` / `min_vol_squeeze_score` / `min_momentum_score` / `min_sr_scalp_score`: minimum regime score to qualify.
 - `min_pullback_trend_score`: minimum trend score required before pullback scoring begins.
-- `min_score_gap`: minimum gap between the winning and runner-up regime (unused as of the 2026-05-12 flat-build-queue refactor; retained for backwards compat).
-- `trend_target_rr` / `pullback_target_rr` / `range_target_rr` / `vol_squeeze_target_rr` / `momentum_target_rr`: initial R:R targets per regime. Sr_scalp has no R:R target — its target is the inner edge of the opposite HTF zone.
+- `trend_target_rr` / `pullback_target_rr` / `vol_squeeze_target_rr` / `momentum_target_rr`: initial R:R targets per regime. Range and sr_scalp have no R:R target — range targets the opposite edge of the range, sr_scalp the inner edge of the opposite HTF zone.
 - `sr_scalp_min_distance_pct` / `sr_scalp_min_distance_atr`: HTF zone-gap floors for the sr_scalp regime (defaults `0.008` = 0.8% and `2.5` = 2.5x ATR). The inner gap between HS and HR zones must clear BOTH (max wins).
 - `sr_scalp_max_distance_from_zone_atr`: sr_scalp proximity gate — close must be inside the entry-side zone OR within this multiple of ATR of its inner edge (default `0.5`).
 - `orb_end_time` / `midday_start_time` / `midday_end_time` / `afternoon_start_time` / `no_new_entries_after`: time-of-day regime window boundaries (all six regimes use these — no hard-coded times).
@@ -1948,25 +1951,23 @@ Current code defaults:
 | `index_symbols`                   | `XLK, XLC, XLY, XLF, XLV, XLP`                                                         |
 | `sector_index_map`                | `{tech: [XLK], consumer_discretionary: [XLY], communication: [XLC], financials: [XLF], healthcare: [XLV], industrials: [XLI], energy: [XLE], consumer_staples: [XLP], materials: [XLB, GDX, COPX], real_estate: [XLRE], utilities: [XLU]}` |
 | `require_index_confirmation`      | `true`                                                                                 |
-| `min_bars`                        | `60`                                                                                   |
-| `ltf_minutes`       | `5`                                                                                    |
+| `min_bars`                        | `150`                                                                                  |
+| `ltf_minutes`       | `1`                                                                                    |
 | `htf_minutes`           | `15`                                                                                   |
-| `min_ltf_bars`                | `15`                                                                                   |
+| `min_ltf_bars`                | `120`                                                                                  |
 | `min_trend_score`                 | `3.5`                                                                                  |
 | `min_pullback_score`              | `3.5`                                                                                  |
 | `min_pullback_trend_score`        | `3.0`                                                                                  |
 | `min_range_score`                 | `3.5`                                                                                  |
 | `min_vol_squeeze_score`           | `4.0`                                                                                  |
 | `min_momentum_score`              | `4.0`                                                                                  |
-| `min_sr_scalp_score`              | `3.5`                                                                                  |
+| `min_sr_scalp_score`              | `3.0`                                                                                  |
 | `sr_scalp_min_distance_pct`       | `0.008`                                                                                |
 | `sr_scalp_min_distance_atr`       | `2.5`                                                                                  |
 | `sr_scalp_max_distance_from_zone_atr` | `0.5`                                                                              |
-| `min_score_gap`                   | `1.2`                                                                                  |
 | `min_adx14`                       | `15.0`                                                                                 |
 | `trend_target_rr`                 | `2.0`                                                                                  |
 | `pullback_target_rr`              | `2.0`                                                                                  |
-| `range_target_rr`                 | `1.5`                                                                                  |
 | `vol_squeeze_target_rr`           | `2.05`                                                                                 |
 | `momentum_target_rr`              | `2.0`                                                                                  |
 | `disable_orb_window`              | `false`                                                                                |

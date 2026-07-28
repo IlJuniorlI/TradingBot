@@ -82,7 +82,7 @@ class MeanReversionStrategy(BaseStrategy):
                 elif self._blocks_bullish_sr_entry(sr_ctx):
                     reasons.append(self._bullish_sr_block_reason(sr_ctx))
                 else:
-                    stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx)
+                    stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx, frame)
                     stop, target = self._refine_bullish_technical_levels(last_close, stop, target, tech_ctx, frame)
                     candle_part = '+'.join(sorted(matched_patterns)) if matched_patterns else 'chart_only'
                     chart_part = '+'.join(sorted(ctx.matched_bullish_reversal | ctx.matched_bullish_continuation))
