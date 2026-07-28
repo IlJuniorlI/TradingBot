@@ -411,6 +411,15 @@ shared_entry:
   divergence_entry_score_bump: 0.20
   use_opposing_chart_filter: true
   use_opposing_candle_filter: false
+  # R:R floor for the TARGET side of the SR/technical refinement pipeline.
+  min_target_rr: 1.0
+  # Floor on how far refinement may pull the STOP toward entry, in ATR14.
+  # min_target_rr cannot police the stop side — tightening a stop RAISES
+  # reward/risk, so that guard never binds there. Without this floor a
+  # support level a few cents under entry produced a few-cent stop,
+  # overriding the builder's default_stop_pct backstop. Expressed in ATR so
+  # it ports unchanged from the large-cap top_tier tape to $2-20 small-caps.
+  min_stop_atr_mult: 1.5
 
 # Shared exit-side toggles — tape-confirmation thresholds and exit gates. Only
 # the long (bullish) side is exercised (long-only), but both are declared for
@@ -437,6 +446,15 @@ shared_exit:
   bullish_close_position_loose_max: 0.38
   bearish_close_position_loose_min: 0.62
   use_candle_pattern_exit: false
+  # Minimum open profit (R) before the discretionary exit families may fire:
+  # bias structure exits, the technical exits (trendline / channel /
+  # bollinger / anchored-VWAP) and the S/R break exits. None carry an R
+  # condition of their own, so below this threshold they act as an arbitrary
+  # tightened stop; the protective stop governs instead. CHoCH stays exempt.
+  # R-denominated, so it ports across price ranges. NOTE: this preset's
+  # ladder is deliberately LATER than top_tier's (breakeven 1.2 vs 0.6) —
+  # this gate sits well below it and does not interact.
+  discretionary_exit_min_r: 0.5
 
 strategies:
   small_cap_squeeze:

@@ -2818,7 +2818,8 @@ class BaseStrategy:
                     target = proposed_target
         return float(stop), (None if target is None else float(target))
 
-    def _position_r_multiple(self, position: Position, close: float) -> float | None:
+    @staticmethod
+    def _position_r_multiple(position: Position, close: float) -> float | None:
         """Open profit at ``close`` in initial-risk (R) units.
 
         Anchors to ``metadata['initial_stop_price']`` — stamped once at entry

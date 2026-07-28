@@ -13,12 +13,12 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "schwabdev==3.0.4",
-    "tradingview-screener==3.2.0",
-    "pandas==2.3.3",
-    "numpy==2.4.4",
+    "schwabdev==3.0.5",
+    "tradingview-screener==3.2.1",
+    "pandas==3.0.5",
+    "numpy==2.4.6",
     "PyYAML==6.0.3",
-    "TA-Lib==0.6.8",
+    "TA-Lib==0.7.1",
 ]
 
 [project.scripts]

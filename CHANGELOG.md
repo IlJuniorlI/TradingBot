@@ -9,6 +9,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`BaseStrategy._position_r_multiple` is now a `@staticmethod`.**
+  *2026-07-27* — it never referenced `self`. Matches the neighbouring
+  `_frame_atr14`; both call sites are unchanged.
+
 - **Stop-refinement had no floor and silently overrode every builder's
   `default_stop_pct` backstop.** *2026-07-27*
   - `_refine_bullish_sr_levels` / `_refine_bearish_sr_levels` /
@@ -86,6 +90,43 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   15→120, `min_sr_scalp_score` 3.5→3.0.
 
 ### Changed
+
+- **Dependency pins bumped to latest.** *2026-07-27*
+  - `schwabdev` 3.0.4 → 3.0.5, `tradingview-screener` 3.2.0 → 3.2.1,
+    `pandas` 2.3.3 → **3.0.5**, `numpy` 2.4.4 → 2.4.6, `TA-Lib` 0.6.8 → **0.7.1**.
+    `PyYAML` stays at 6.0.3 (already latest). `requires-python = ">=3.11"` is
+    unchanged — pandas 3 and numpy both floor at 3.11.
+  - pandas 3 makes **Copy-on-Write the default**, the usual breaking point for
+    this upgrade. The package is CoW-safe by construction: zero `inplace=True`
+    across the codebase, no chained DataFrame assignment, no `applymap` /
+    `DataFrame.append` / `.ix` / `iteritems`. No migration was needed.
+  - Verified numerically rather than by test pass alone. The session archive's
+    `bars/1m/*.csv` carry indicator columns computed under the OLD stack
+    (pandas 2.3.3 + TA-Lib 0.6.8), so they serve as a regression oracle:
+    recomputing `vwap / ema9 / ema20 / atr14 / rsi14 / adx14 / ±DI /
+    bollinger / obv / ret5 / ret15` from raw OHLCV under the new stack over
+    8 symbols × 15 columns (~8,100 bars) gives a worst relative drift of
+    **9.2e-13**, confined to the `ret5`/`ret15` percentage columns — float64
+    round-off, not a behaviour change. This covers the TA-Lib bump too.
+  - schwabdev surface re-checked against the string-dispatch call sites: all 9
+    methods the bot invokes (`account_details`, `account_orders`,
+    `cancel_order`, `linked_accounts`, `option_chains`, `order_details`,
+    `place_order`, `price_history`, `quote`) exist in 3.0.5, and
+    `Client.__init__` still accepts `open_browser_for_auth`, which
+    `SchwabConfig` depends on. `Stream.chart_equity/send/start/stop` intact.
+  - 471 tests pass, `pip check` clean, all 19 shipped configs load and build
+    their strategy. Not yet exercised against the live broker or the live
+    TradingView endpoint — the beta dry-run this file's header calls for still
+    applies before prod.
+
+- **`config.small_cap_squeeze.yaml` declares the two new shared knobs.**
+  *2026-07-27* — `min_target_rr: 1.0`, `min_stop_atr_mult: 1.5` and
+  `discretionary_exit_min_r: 0.5` are now explicit, matching this preset's
+  fully-explicit convention. Functionally a no-op — the dataclass defaults
+  already supplied those values — but the preset should show what it runs. Its
+  adaptive ladder is deliberately left alone (breakeven 1.2 / lock 1.8 /
+  lock-stop 1.0 / runner 1.3): those were tuned UP for small-caps, the opposite
+  direction from the top_tier retune, which was calibrated on large-cap tape.
 
 - **`top_tier_adaptive` regime mix and profit ladder retuned from measured
   excursion.** *2026-07-27*

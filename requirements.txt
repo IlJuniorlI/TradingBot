@@ -1,9 +1,20 @@
 # Runtime dependencies, strictly pinned. Last verified on Python 3.11.2.
 # Bumping any of these requires a full pytest pass + a dry-run on beta
 # before promoting to prod.
-schwabdev==3.0.4
-tradingview-screener==3.2.0
-pandas==2.3.3
-numpy==2.4.4
+#
+# 2026-07-27 bump. pandas 2.3.3 -> 3.0.5 is a major release: Copy-on-Write is
+# now the default. The codebase is CoW-safe by construction (no inplace=True
+# anywhere, no chained DataFrame assignment, no applymap / DataFrame.append),
+# and the indicator pipeline was regression-checked against archived bars whose
+# indicator columns were computed under 2.3.3 + TA-Lib 0.6.8 — worst relative
+# drift 9.2e-13 across 8 symbols x 15 columns, i.e. float64 round-off on the
+# ret5/ret15 percentage columns only. TA-Lib 0.6.8 -> 0.7.1 is covered by the
+# same check. All 9 schwabdev API methods the bot dispatches still exist in
+# 3.0.5 and Client.__init__ keeps open_browser_for_auth. PyYAML 6.0.3 is
+# already latest. 471 tests pass; `pip check` clean.
+schwabdev==3.0.5
+tradingview-screener==3.2.1
+pandas==3.0.5
+numpy==2.4.6
 PyYAML==6.0.3
-TA-Lib==0.6.8
+TA-Lib==0.7.1
