@@ -9,6 +9,71 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Side-decision gate rejected shorts throughout a tech selloff.** *2026-07-29*
+  - Over 2026-07-27..29 the tech universe fell 4-12% (AMD -12.3%, NVDA -6.2%,
+    INTC -4.6%, TSLA -4.4%, XLK -3.9%) and `top_tier_adaptive` won zero shorts.
+    `side_undecided` was the single largest blocker on those names — 3,506 of
+    12,935 decision rows — ahead of every regime and quality gate.
+  - Two defects in `_decide_side`. **(a)** `side_decision_min_votes` was an
+    ABSOLUTE count against a variable number of voters, while `recent` and
+    `vwap` both carry neutral dead-bands and abstain ~35% of the time; a
+    unanimous 2-0 read therefore failed a 3-vote bar. **(b)** the last-3-bars
+    colour signal had no neutral band (`greens >= 2` LONG else SHORT), so with
+    three bars it always voted, and in a downtrend the constant two-green
+    bounce bars voted LONG against the trend while carrying the same weight as
+    the EMA structure — it split 1,021 L / 1,053 S, a coin flip.
+  - Net effect: the reliably-achievable SHORT tally in a downtrend was 2
+    (vwap + ema), so requiring 3 only admitted shorts once price was already
+    making a new low — at local exhaustion, right before the bounce that swept
+    the stop. This is the same root cause as the "entered late, stopped on the
+    reversal" pattern (XOM 07-29 entered at 98.7% of its leg).
+  - `side_decision_min_votes` is REMOVED. The threshold is now a majority of
+    the signals that actually voted:
+    `required = max(side_decision_min_agreeing, ceil(participating × side_decision_majority_frac))`,
+    defaults `2` and `0.6`. The 3-bar signal votes only when unanimous (3 green
+    / 0 green) and otherwise abstains. Replaying the 3,506 undecided rows:
+    07-28 (bounce, XLK +0.23%) 49% LONG / 19% SHORT; 07-29 (selloff,
+    XLK -2.10%) 37% LONG / 38% SHORT — shorts go from unavailable to available
+    on the down day, with the long-lean preserved on the bounce day. A lone
+    structural signal still abstains (`min_agreeing` floor).
+
+- **`min_pullback_score: 4.0` was above the regime's reachable ceiling.**
+  *2026-07-29* — raised from 3.5 two days earlier on a 48-trade sample. Live
+  pullback scores top out at 3.5, so the floor silently disabled the regime
+  (185 of 185 otherwise-qualifying tech shorts blocked) — the same failure the
+  config comment warns about for `min_sr_scalp_score`. Reverted to 3.5.
+  `min_trend_score` 4.5 -> 4.0 as well: 4.5 blocked 384 of the 631 tech shorts
+  that cleared the old floor. A regression test now asserts both floors sit
+  below their observed ceilings.
+
+- **sr_scalp built stops inside the noise band.** *2026-07-29* — zone geometry
+  can park the stop a fraction of an ATR from entry regardless of how wide the
+  tape is. On 07-28 META chopped 11.9 ATR between 13:50-14:50 while sr_scalp
+  shorted the FLOOR of that band three times with stops 1.09-2.70 ATR out; 63%
+  of the window's bars traded above those stops. All three needed 2.7-4.3 ATR
+  to survive and all three resolved in the trade's direction after stopping
+  out. `shared_entry.min_stop_atr_mult` does not cover this — it bounds only
+  the refinement passes, never a builder's own stop. New
+  `sr_scalp_min_stop_atr_mult` (default 2.5) floors the builder stop, and when
+  widening drops R:R below `shared_entry.min_target_rr` the setup is rejected
+  outright, since sr_scalp's reward is capped by the opposing zone.
+
+- **Partial-breakeven tier scratched working trades.** *2026-07-29* — it moved
+  the stop to entry + `adaptive_partial_breakeven_offset_r` (0.0 = exactly
+  entry) once `max_favorable_r` crossed 0.5R. Median trade MFE is ~0.5R, so it
+  armed at the median trade's peak and a normal retrace then scratched it.
+  NFLX 07-28 SHORT: a 5.9-ATR stop it never came near (needed 1.1), ratcheted
+  to entry at a 0.52R peak, shaken out for -$2.18 — then ran to +2.47R. The
+  tier existed to bridge the gap between the trail and a 1.0R breakeven; with
+  breakeven now at 0.60R that gap is gone and the two sat 0.1R apart doing the
+  same thing. Disabled (`adaptive_partial_breakeven_rr: null`).
+
+- **Same-level re-entry block was too narrow to catch repeats.** *2026-07-29* —
+  `same_level_block_atr_mult: 0.3` is $0.14 on META, so the three 07-28 SHORTs
+  at 593.05 / 593.82 / 593.17 (13:55, 14:20, 14:39, all stopped at ~594.3) read
+  as three different levels, and the 12-minute cooldown was cleared by the
+  19-25 minute gaps. Widened to 1.5 ATR, which folds that pocket into one level.
+
 - **`BaseStrategy._position_r_multiple` is now a `@staticmethod`.**
   *2026-07-27* — it never referenced `self`. Matches the neighbouring
   `_frame_atr14`; both call sites are unchanged.

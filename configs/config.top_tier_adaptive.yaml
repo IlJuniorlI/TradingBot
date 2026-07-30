@@ -65,7 +65,12 @@ risk:
   # of the prior fill for same_level_block_minutes minutes. A fib-pullback
   # entry (retrace to 0.5-0.786 of the swing) overrides the block.
   same_level_block_minutes: 30
-  same_level_block_atr_mult: 0.3
+  # 2026-07-29: was 0.3. On META that is $0.14 — so the three SHORTs at
+  # 593.05 / 593.82 / 593.17 on 07-28 (13:55, 14:20, 14:39, all stopped
+  # at ~594.3) read as three DIFFERENT levels and none was blocked. The
+  # 12-minute cooldown was cleared by the 19-25 minute gaps between them.
+  # 1.5 ATR treats that whole pocket as one level.
+  same_level_block_atr_mult: 1.5
   # Time-stop: positions held >= time_stop_minutes with |return_pct| below
   # time_stop_min_return_pct are scratched to free a slot. 0 = disabled.
   time_stop_minutes: 45
@@ -633,8 +638,8 @@ strategies:
       # was not stamped into signal metadata during the sessions above. It
       # is now (strategy.py `leading` dict), so the next dry-run can set
       # these thresholds from the score/outcome curve instead of by volume.
-      min_trend_score: 4.5
-      min_pullback_score: 4.0
+      min_trend_score: 4.0                # 2026-07-29: 4.5 blocked 384 of 631 qualifying tech SHORTs
+      min_pullback_score: 3.5             # 2026-07-29: reverted — 4.0 was UNREACHABLE (observed pullback score maxes at 3.5), which silently killed the regime
       min_pullback_trend_score: 3.0
       min_range_score: 3.5
       min_adx14: 18.0          # HIGH_VOL: was 16.0 — ADX naturally higher in high vol; demand stronger trend
@@ -728,7 +733,20 @@ strategies:
       side_decision_recent_lookback_bars: 30    # 1m-LTF: ×5 (was 6 at 5m) = 30 min recent-return window
       side_decision_recent_threshold_pct: 0.1   # threshold for recent-return vote (above typical noise)
       side_decision_vwap_buffer_pct: 0.0005     # 0.05% dead-band around VWAP — within = neutral vote
-      side_decision_min_votes: 3                # at least 3 of 4 signals must agree
+      # Threshold is a MAJORITY OF THE SIGNALS THAT VOTED, not an absolute
+      # count (2026-07-29 — replaces side_decision_min_votes, removed).
+      # `recent` and `vwap` carry neutral dead-bands and abstain ~35% of the
+      # time, so an absolute floor of 3 was unreachable whenever two signals
+      # sat out: NVDA 07-28 read long=0 short=2 (UNANIMOUS short) and was
+      # rejected for having only two votes. In a downtrend the reliably
+      # achievable short tally is 2 (vwap + ema), so the old rule only let
+      # shorts through once price was already making a new low — i.e. at
+      # local exhaustion, right before the bounce that swept the stop.
+      # side_undecided was the largest single blocker across the tech
+      # universe (3,506 of 12,935 rows) in a week those names fell 4-12%.
+      # required = max(min_agreeing, ceil(participating * majority_frac))
+      side_decision_min_agreeing: 2             # never decide on a lone signal
+      side_decision_majority_frac: 0.6          # 2 of 2, 2 of 3, 3 of 4
       side_decision_max_opposing: 1             # at most 1 opposing vote
       orb_bypass_side_decision: true            # early-session signals gap-dominated, evaluate all sides
 
@@ -824,6 +842,21 @@ strategies:
       adaptive_breakeven_rr: 0.60              # was 1.00 — armed on only ~21% of trades
       adaptive_profit_lock_rr: 0.85            # was 1.20
       adaptive_profit_lock_stop_rr: 0.45       # unchanged — locks +0.45R once the 0.85R trigger arms
+      # Partial-breakeven tier DISABLED 2026-07-29 (null = off; see
+      # risk.py, which skips the tier when the value is None).
+      # It existed to bridge the gap between the trail and a 1.0R
+      # breakeven, moving the stop to entry + adaptive_partial_breakeven_
+      # offset_r (0.0 = exactly entry) once max_favorable_r crossed 0.5R.
+      # With breakeven now at 0.60R the gap it filled no longer exists —
+      # the two tiers sat 0.1R apart doing the same thing. Worse, median
+      # trade MFE is ~0.5R, so it armed AT the median trade's peak and a
+      # normal retrace then scratched it. NFLX 07-28 SHORT: 6.64 ATR stop
+      # (5x the room it needed), peaked 0.52R, tier moved the stop
+      # 73.44 -> 73.12 (exact entry), shaken out at 73.13 for -$2.18 —
+      # then ran to 72.33, +2.47R. Re-enable by setting an RR here AND a
+      # non-zero offset_r so it actually locks something.
+      adaptive_partial_breakeven_rr: null
+      adaptive_partial_breakeven_offset_r: 0.0
       adaptive_runner_trigger_rr: 0.90         # was 1.10
 
       # Adaptive ladder rung builder (used when risk.trade_management_mode
@@ -936,6 +969,14 @@ strategies:
       sr_scalp_min_distance_pct: 0.008         # was 0.012 — 0.8% of price floor
       sr_scalp_min_distance_atr: 2.0           # was 3.0 — 2x ATR floor
       sr_scalp_max_distance_from_zone_atr: 0.4 # HIGH_VOL: was 0.5 — must be closer to zone inner edge (less mid-range tolerance)
+      # Noise floor on the scalp stop (2026-07-29). Zone geometry alone put
+      # stops 1.09-2.70 ATR out on 07-28 META while the tape chopped 11.9 ATR;
+      # 63% of bars traded above those stops. shared_entry.min_stop_atr_mult
+      # does NOT cover this — it bounds only the refinement passes, never a
+      # builder's own stop. When widening to this floor drops R:R below
+      # shared_entry.min_target_rr the setup is rejected outright, since
+      # sr_scalp's reward is capped by the opposing zone and cannot stretch.
+      sr_scalp_min_stop_atr_mult: 2.5
       disable_sr_scalp_regime: false
 
       # ===== Per-regime opt-out knobs (added 2026-05-12) =====

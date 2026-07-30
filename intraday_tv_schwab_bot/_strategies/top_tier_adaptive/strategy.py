@@ -12,6 +12,7 @@ gating.
 """
 from __future__ import annotations
 
+import math
 from collections import deque
 from typing import Any
 
@@ -240,12 +241,15 @@ class TopTierAdaptiveStrategy(BaseStrategy):
           4. Last 3 LTF bars' net direction (green-count vs red-count)
 
         Each signal contributes one LONG or one SHORT vote, or abstains
-        when its read is genuinely neutral (e.g. recent return is within
-        the noise threshold). Decision threshold: side wins when its
-        votes ≥ ``side_decision_min_votes`` AND opposing ≤
-        ``side_decision_max_opposing``. Mixed reads return ``None`` and
-        the candidate is skipped — we'd rather not trade than trade with
-        contradicting signals.
+        when its read is genuinely neutral (recent return inside the noise
+        threshold, price inside the VWAP dead-band, a mixed 3-bar colour
+        count). Decision threshold is a MAJORITY OF THE SIGNALS THAT VOTED:
+        a side wins when its votes ≥
+        ``max(side_decision_min_agreeing, ceil(participating × side_decision_majority_frac))``
+        AND opposing ≤ ``side_decision_max_opposing``. Scaling to the
+        participating count matters because two of the four signals abstain
+        often — an absolute threshold rejected unanimous 2-0 reads. Mixed
+        reads return ``None`` and the candidate is skipped.
 
         This replaces the previous "evaluate both sides per regime, pick
         highest-scoring" implicit side selection. The old approach could
@@ -288,6 +292,14 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             short_votes += 1
             breakdown.append("ema9<ema20>S")
 
+        # Last-3-bars direction. Requires UNANIMITY to vote (2026-07-29).
+        # The old rule (greens >= 2 -> LONG, else SHORT) had no neutral band,
+        # so with three bars it ALWAYS voted — and in a downtrend the constant
+        # two-green bounce bars voted LONG against the trend while carrying
+        # the same weight as the EMA structure. Across 2,074 undecided tech
+        # rows on 2026-07-28/29 it split 1,021 LONG / 1,053 SHORT: a coin
+        # flip. Three consecutive same-colour bars is a real read; 2-of-3 is
+        # not, so mixed counts now abstain like the other two signals.
         if ltf is not None and len(ltf) >= 3:
             try:
                 last_3 = ltf.iloc[-3:]
@@ -297,19 +309,44 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 )
             except (KeyError, ValueError, TypeError):
                 greens = -1
-            if greens >= 2:
+            if greens == 3:
                 long_votes += 1
                 breakdown.append(f"3b:{greens}G>L")
-            elif 0 <= greens <= 1:
+            elif greens == 0:
                 short_votes += 1
                 breakdown.append(f"3b:{greens}G>S")
+            elif greens > 0:
+                breakdown.append(f"3b:{greens}G>neutral")
 
-        min_votes = int(self.params.get("side_decision_min_votes", 3))
+        # Decision threshold is a MAJORITY OF THE SIGNALS THAT ACTUALLY VOTED,
+        # not an absolute count (2026-07-29). ``recent`` and ``vwap`` both
+        # carry neutral dead-bands and abstain ~35% of the time, so the old
+        # absolute ``side_decision_min_votes: 3`` was unreachable whenever two
+        # signals sat out — a UNANIMOUS 2-0 read was rejected for having only
+        # two votes. Observed directly on 2026-07-28:
+        #   NVDA long=0 short=2 [recent-0.01%>neutral, close~vwap>neutral,
+        #                        ema9<ema20>S, 3b:1G>S]   -> rejected
+        # In a downtrend the reliably-achievable SHORT tally is 2 (vwap +
+        # ema), so requiring 3 only admitted shorts when price was already
+        # making a new low — i.e. at local exhaustion, right before the
+        # bounce that then swept the stop. side_undecided was the single
+        # largest blocker across the tech universe (3,506 of 12,935 rows)
+        # during a week those names fell 4-12%.
+        participating = long_votes + short_votes
+        min_agreeing = int(self.params.get("side_decision_min_agreeing", 2))
+        majority_frac = float(self.params.get("side_decision_majority_frac", 0.6))
         max_opposing = int(self.params.get("side_decision_max_opposing", 1))
-        vote_info = {"long": long_votes, "short": short_votes, "breakdown": breakdown}
-        if long_votes >= min_votes and short_votes <= max_opposing:
+        required = max(min_agreeing, math.ceil(participating * majority_frac))
+        vote_info = {
+            "long": long_votes,
+            "short": short_votes,
+            "participating": participating,
+            "required": required,
+            "breakdown": breakdown,
+        }
+        if long_votes >= required and short_votes <= max_opposing:
             return Side.LONG, vote_info
-        if short_votes >= min_votes and long_votes <= max_opposing:
+        if short_votes >= required and long_votes <= max_opposing:
             return Side.SHORT, vote_info
         return None, vote_info
 
@@ -1851,6 +1888,44 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 return None
             stop = (ceil_px + zone_half_width) + level_buffer
             target = (sup_px + zone_half_width) + level_buffer
+
+        # Noise floor on the scalp stop (2026-07-29). Zone geometry can park
+        # the stop a fraction of an ATR from entry when the S/R zones are
+        # tight — fine only if the tape is equally tight, which is not what
+        # the gates above check. On 2026-07-28 META chopped 11.9 ATR between
+        # 13:50-14:50 while sr_scalp shorted the FLOOR of that band three
+        # times with stops 1.09-2.70 ATR away; 63% of the window's bars traded
+        # above those stops, so being swept was closer to certain than not.
+        # All three needed 2.7-4.3 ATR to survive, and all three resolved in
+        # the trade's direction AFTER stopping out.
+        #
+        # ``shared_entry.min_stop_atr_mult`` does not cover this: that clamp
+        # bounds only the SR/technical REFINEMENT passes and deliberately
+        # never widens a builder's own stop. This is the builder's own stop,
+        # so the regime needs its own floor. Left as a plain ATR multiple —
+        # ``atr`` already tracks current volatility, and unlike the other
+        # builders sr_scalp does not scale its geometry by ``vol_widening``.
+        min_stop_atr = float(self.params.get("sr_scalp_min_stop_atr_mult", 2.5))
+        if min_stop_atr > 0 and atr > 0:
+            floor_distance = min_stop_atr * atr
+            if side == Side.LONG:
+                stop = min(stop, close - floor_distance)
+            else:
+                stop = max(stop, close + floor_distance)
+            # Widening the stop costs R:R, and sr_scalp cannot extend its
+            # reward to compensate — the target IS the opposing zone. When the
+            # zone gap can no longer pay for the tape's noise the setup simply
+            # isn't tradeable, so reject instead of taking a sub-floor R:R.
+            if not self._target_meets_min_rr(side, close, stop, target):
+                risk = abs(close - stop)
+                reward = abs(target - close)
+                self._set_build_failure(
+                    c.symbol, "sr_scalp",
+                    f"{'long' if side == Side.LONG else 'short'}_stop_floor_kills_rr("
+                    f"stop_atr={min_stop_atr:.2f},risk={risk:.4f},reward={reward:.4f},"
+                    f"rr={(reward / risk) if risk > 0 else 0.0:.2f})",
+                )
+                return None
 
         return self._finalize_signal(c, side, close, stop, target, "sr_scalp", regime_score, frame, data)
 
