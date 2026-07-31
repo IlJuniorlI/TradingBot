@@ -15,17 +15,31 @@ LOG = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
-class StopoutRecord:
-    """One record per recent losing exit, used for the same-level retry block.
+class RecentExitRecord:
+    """One record per recent exit, used for the same-level retry block.
 
-    ``exit_price`` is where the loss actually fired (the fill price), not the
-    configured stop level — a structure_bearish_exit at 200.30 and a hard
-    stop at 198.98 both populate exit_price=fill. Kept in a list (not a dict
-    keyed by symbol) so multiple stopouts on the same symbol within the
-    window all participate in the block check.
+    ``entry_price`` is the LEVEL the block keys off — the price we already
+    tried. It replaced ``exit_price`` on 2026-07-31: measuring from the exit
+    made the block structurally unable to catch a repeat. A stopped-out SHORT
+    exits roughly 1R ABOVE its entry, so re-entering the SAME level always
+    sits ~1R away from that exit and cleared any sane threshold. Observed on
+    AAPL 2026-07-30, five shorts inside $0.37 (331.46 / 331.57 / 331.66 /
+    331.78 / 331.83): consecutive entries were 0.05-0.12 apart (0.1-0.25 ATR)
+    while the exit-referenced distances were 0.50-1.02 — four to ten times
+    larger. Only one of the five was ever blocked.
+
+    ``exit_price`` is retained for logging: it is what the operator sees in
+    the block message and is useful when reading the decision back.
+
+    Every exit is recorded, not only losses. The old loser-only rule left a
+    re-entry after a WIN completely unchecked, which is how that AAPL run
+    alternated win/loss/win/loss/loss through one price for three hours.
+    Kept in a list (not a dict keyed by symbol) so multiple exits on the same
+    symbol within the window all participate in the check.
     """
     symbol: str
     side: Side
+    entry_price: float
     exit_price: float
     atr: float
     timestamp: datetime
@@ -52,7 +66,7 @@ class RiskState:
     cooldown_until: dict[tuple[str, "Side"], datetime] = field(default_factory=dict)
     # Recent stopouts for the same-level retry block. Pruned lazily inside
     # can_open; cap at ~100 records in pathological scenarios.
-    recent_stopouts: list[StopoutRecord] = field(default_factory=list)
+    recent_exits: list[RecentExitRecord] = field(default_factory=list)
     # ET session date that owns the current realized_pnl tally. When the date
     # rolls over, realized_pnl is reset to 0.0 so that max_daily_loss behaves
     # as a per-day gate rather than a per-lifetime cap. Eager-initialized to
@@ -152,17 +166,20 @@ class RiskManager:
         *,
         additional_symbol: str | None = None,
         side: "Side | None" = None,
+        entry_price: float | None = None,
         exit_price: float | None = None,
         atr: float | None = None,
     ) -> None:
-        """Record an exit: update realized_pnl, cooldown, and recent-stopout log.
+        """Record an exit: update realized_pnl, cooldown, and recent-exit log.
 
         ``side`` — when provided, drives direction-aware cooldown. Callers that
         still pass only symbol/pnl get both-direction cooldown for backward
         compatibility.
-        ``exit_price`` + ``atr`` — when provided AND the exit was a loss, a
-        ``StopoutRecord`` is appended so ``can_open`` can enforce the
-        same-level retry block. ``exit_price`` is the actual fill price.
+        ``entry_price`` + ``atr`` — when provided, a ``RecentExitRecord`` is
+        appended so ``can_open`` can enforce the same-level retry block.
+        ``entry_price`` is the LEVEL the block keys off (the price already
+        tried); ``exit_price`` is carried for logging only. Every exit is
+        recorded, win or loss.
         """
         self.register_realized_pnl(pnl)
         key = self._symbol_key(symbol)
@@ -191,27 +208,29 @@ class RiskManager:
         else:
             _apply(now_et() + timedelta(minutes=self.config.risk.cooldown_minutes))
 
-        # Record stopout for same-level retry block. Only meaningful when we
-        # have a fill price and ATR — callers without these pass None and the
-        # block is skipped for this exit. Also skip if the exit was a winner
-        # (pnl > 0): the "chase a losing level" pattern only applies to losses.
-        if side is not None and exit_price is not None and atr is not None and float(pnl) <= 0:
+        # Record the exit for the same-level retry block. Needs the ENTRY price
+        # (the level being re-tried) and an ATR to scale the tolerance;
+        # callers without them pass None and the block skips this exit.
+        # Every exit is recorded regardless of P&L — see RecentExitRecord for
+        # why the old loser-only rule could not catch a repeat sequence.
+        if side is not None and entry_price is not None and atr is not None:
             try:
-                record = StopoutRecord(
+                record = RecentExitRecord(
                     symbol=key,
                     side=side,
-                    exit_price=float(exit_price),
+                    entry_price=float(entry_price),
+                    exit_price=float(exit_price) if exit_price is not None else float(entry_price),
                     atr=max(1e-6, float(atr)),
                     timestamp=now_et(),
                 )
-                self.state.recent_stopouts.append(record)
+                self.state.recent_exits.append(record)
                 # Trim: keep only records within the block window (plus a small
                 # margin) to cap memory in pathological sessions.
                 window_minutes = max(1, int(getattr(self.config.risk, "same_level_block_minutes", 30)))
                 cutoff = now_et() - timedelta(minutes=window_minutes * 2)
-                self.state.recent_stopouts = [r for r in self.state.recent_stopouts if r.timestamp >= cutoff]
+                self.state.recent_exits = [r for r in self.state.recent_exits if r.timestamp >= cutoff]
             except Exception:
-                LOG.debug("Could not record stopout for same-level block", exc_info=True)
+                LOG.debug("Could not record exit for same-level block", exc_info=True)
 
     def can_open(self, signal: Signal, positions: dict[str, Position]) -> tuple[bool, str]:
         self._reset_if_new_session()
@@ -296,8 +315,8 @@ class RiskManager:
         blocks the signal iff:
           - same symbol (or its underlying key)
           - same side
-          - within ``same_level_block_minutes`` of the stopout
-          - |signal_entry - stopout_price| <= same_level_block_atr_mult * atr
+          - within ``same_level_block_minutes`` of the prior exit
+          - |signal_entry - prior ENTRY| <= same_level_block_atr_mult * atr
 
         If all four hold, the fib-pullback check runs: if the signal's entry
         price is inside the [0.5, 0.786] retracement band of the swing
@@ -307,7 +326,7 @@ class RiskManager:
         """
         window_minutes = max(0, int(getattr(self.config.risk, "same_level_block_minutes", 30)))
         atr_mult = max(0.0, float(getattr(self.config.risk, "same_level_block_atr_mult", 0.3)))
-        if window_minutes <= 0 or atr_mult <= 0 or not self.state.recent_stopouts:
+        if window_minutes <= 0 or atr_mult <= 0 or not self.state.recent_exits:
             return False, "ok"
         key = self._symbol_key(signal.symbol)
         meta = signal.metadata if isinstance(signal.metadata, dict) else {}
@@ -317,7 +336,7 @@ class RiskManager:
         if signal_entry is None or signal_entry <= 0:
             return False, "ok"
         cutoff = now_et() - timedelta(minutes=window_minutes)
-        for record in reversed(self.state.recent_stopouts):
+        for record in reversed(self.state.recent_exits):
             if record.timestamp < cutoff:
                 continue
             if record.side != signal.side:
@@ -327,7 +346,9 @@ class RiskManager:
             threshold = atr_mult * record.atr
             if threshold <= 0:
                 continue
-            if abs(signal_entry - record.exit_price) > threshold:
+            # Distance to the LEVEL WE ALREADY TRIED, not to where that
+            # attempt was closed out. See RecentExitRecord.
+            if abs(signal_entry - record.entry_price) > threshold:
                 continue
             # Fib-pullback override: allow the entry if it sits inside the
             # [0.5, 0.786] retracement band of the most-recent swing stored
@@ -336,9 +357,9 @@ class RiskManager:
             if self._fib_pullback_override(signal, signal_entry):
                 LOG.info(
                     "Same-level block overridden by fib-pullback for %s %s entry=%.4f "
-                    "prior_exit=%.4f atr=%.4f",
+                    "prior_entry=%.4f prior_exit=%.4f atr=%.4f",
                     signal.symbol, signal.side.value, signal_entry,
-                    record.exit_price, record.atr,
+                    record.entry_price, record.exit_price, record.atr,
                 )
                 return False, "ok"
             return True, "same_level_retry_block"

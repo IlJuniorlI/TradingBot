@@ -87,7 +87,14 @@ risk:
   # per-trade override is active.
   peak_giveback_low_tier_enabled: true
   peak_giveback_low_tier_min_r: 0.7
-  peak_giveback_low_tier_giveback_frac: 0.7
+  # 2026-07-31: was 0.7 (retain only 30% of peak). With the partial-
+  # breakeven tier disabled this became the EARLIEST ratchet, and it was
+  # booking almost nothing: NEM 07-31 peaked 0.85R and closed +0.17R.
+  # Across 07-30/31 winners realised 39% of their peak (avg +0.58R
+  # against a 1.39R median MFE) while losers ran -1.23R, which needs a
+  # 68% win rate to break even — 55% was achieved. 0.45 retains 55% of
+  # peak, bridging smoothly to the main tier's 0.65 retain at 1R+.
+  peak_giveback_low_tier_giveback_frac: 0.45
   # Main-tier give-back retain fractions (2026-05-27): fraction of the peak
   # R kept before the floor fires. Tightened from 0.50/0.60/0.70 after the
   # 5/12-5/27 sample showed winners captured only 44% of MFE and never made

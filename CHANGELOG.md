@@ -9,6 +9,31 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Same-level retry block measured from the wrong price and ignored winners.**
+  *2026-07-31* — `StopoutRecord` is now `RecentExitRecord` and the block keys off
+  the prior ENTRY price, the level actually being re-tried, instead of the exit.
+  A stopped-out SHORT exits roughly 1R ABOVE its entry, so re-entering the same
+  level always sat ~1R from that exit and cleared any sane threshold. AAPL
+  2026-07-30 took FIVE shorts inside $0.37 (331.46 / 331.57 / 331.66 / 331.78 /
+  331.83): consecutive entries were 0.05-0.12 apart (0.1-0.25 ATR) while the
+  exit-referenced distances were 0.50-1.02 — four to ten times larger. Only one
+  of the five was ever blocked, and widening `same_level_block_atr_mult` to 1.5
+  the day before had not helped because the reference point was wrong.
+  Additionally, every exit is now recorded rather than losses only: the
+  loser-only rule left a re-entry after a WIN completely unchecked, which is how
+  that run alternated W/L/W/L/L through one price for three hours. All four
+  `position_manager` call sites pass `entry_price`; a test asserts none can
+  regress.
+
+- **Low-tier peak-giveback retained almost nothing.** *2026-07-31* — with the
+  partial-breakeven tier disabled the day before, `peak_giveback_low_tier`
+  became the earliest ratchet, and at `giveback_frac: 0.7` it kept only 30% of
+  peak. NEM 2026-07-31 peaked 0.85R and booked +0.17R. Across 07-30/31 winners
+  realised 39% of their peak (avg +0.58R against a 1.39R median MFE) while
+  losers ran -1.23R, which needs a 68% win rate to break even; 55% was achieved.
+  `peak_giveback_low_tier_giveback_frac` 0.7 -> 0.45 retains 55%, bridging to
+  the main tier's 0.65 retain at 1R+.
+
 - **Side-decision gate rejected shorts throughout a tech selloff.** *2026-07-29*
   - Over 2026-07-27..29 the tech universe fell 4-12% (AMD -12.3%, NVDA -6.2%,
     INTC -4.6%, TSLA -4.4%, XLK -3.9%) and `top_tier_adaptive` won zero shorts.

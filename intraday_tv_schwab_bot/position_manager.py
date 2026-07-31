@@ -880,6 +880,7 @@ class PositionManager:
                 realized,
                 additional_symbol=position.symbol,
                 side=position.side,
+                entry_price=float(position.entry_price),
                 exit_price=exit_price,
                 atr=None,  # broker-recovery path: no bars context for ATR
             )
@@ -969,6 +970,7 @@ class PositionManager:
                 realized,
                 additional_symbol=position.symbol,
                 side=position.side,
+                entry_price=float(position.entry_price),
                 exit_price=exit_price,
                 atr=None,  # broker-recovery path: no bars context for ATR
             )
@@ -1125,6 +1127,7 @@ class PositionManager:
                     realized,
                     additional_symbol=key,
                     side=position.side,
+                    entry_price=float(position.entry_price),
                     exit_price=exit_price,
                     atr=exit_atr,
                 )
