@@ -25,7 +25,7 @@ For each symbol and each direction (long/short), regime scores are computed for 
 
 Build-time fall-through: as of 2026-05-12 each side stores an ordered list of qualifying regimes (score-descending). The build phase iterates the list and tries each regime in turn — if a regime's build fails (e.g. trend's `no_fresh_breakout`, sr_scalp's `htf_zones_too_close`), the next qualifying regime on the same side gets a chance. Across sides, the higher-scored side's full build_order is tried first.
 
-Each regime can be globally disabled via its own opt-out knob: `disable_trend_regime`, `disable_pullback_regime`, `disable_range_regime`, `disable_vol_squeeze_regime`, `disable_momentum_regime`, `disable_sr_scalp_regime` — all default `false`. The 7th regime, **orb** (the true Opening Range Breakout, sole regime in the opening window), can be skipped two ways: `disable_orb_window` skips the opening window entirely (start trading at `orb_end_time`), while `disable_orb_regime` drops the ORB regime *and* its opening-range carve-out so the normal regime mix runs continuously from the open (used by the `small_cap_squeeze` subclass). An 8th regime, **vwap_reclaim** (a long re-entry on a VWAP flush-and-reclaim), is **opt-in** via `enable_vwap_reclaim_regime` (default `false`, so `top_tier_adaptive` is unaffected) — see the `small_cap_squeeze` README for its knobs.
+Each regime can be globally disabled via its own opt-out knob: `disable_trend_regime`, `disable_pullback_regime`, `disable_range_regime`, `disable_vol_squeeze_regime`, `disable_momentum_regime`, `disable_sr_scalp_regime` — all default `false`. The 7th regime, **orb** (the true Opening Range Breakout, sole regime in the opening window), can be skipped two ways: `disable_orb_window` skips the opening window entirely (start trading at `orb_end_time`), while `disable_orb_regime` drops the ORB regime *and* its opening-range carve-out so the normal regime mix runs continuously from the open (used by the `small_cap_squeeze` subclass). An 8th regime, **vwap_reclaim** (a re-entry on a VWAP flush-and-reclaim), is opt-in via `enable_vwap_reclaim_regime` (default `false`) and is **ENABLED in the shipped preset** as of 2026-09-18 — it is the strategy's only reversal builder, see section 19.
 
 ### 3. Time-of-day gating controls which regimes are allowed
 
@@ -293,7 +293,9 @@ Strategy-specific knobs:
 - `tradable`: the fixed list of symbols to trade.
 - `index_symbols`: index ETFs streamed for directional confirmation. Default is the SPDR Select Sector ETFs that cover the default tradable universe's sectors (XLK / XLC / XLY / XLF / XLV / XLP). Must include every ETF referenced by `sector_index_map` for actively-traded sectors.
 - `sector_index_map`: per-GICS-sector mapping → list of index ETFs to consult for confirming trades on symbols in that sector (default uses the canonical SPDR Select Sector ETFs). Falls back to OR-ing across all `index_symbols` when a sector has no mapping.
-- `require_index_confirmation`: gate trend/pullback/vol_squeeze/momentum entries on index agreement. Range and sr_scalp are exempt (mean-reversion theses).
+- `require_index_confirmation`: gate trend/pullback/vol_squeeze/momentum/vwap_reclaim entries on index agreement. Range and sr_scalp are exempt (mean-reversion theses).
+- `leg_anchored_confirmation`: measure the index/peer agreement test against the current leg's anchored VWAP instead of session VWAP. Default `false`; `true` in the shipped preset. See section 19.
+- `leg_anchor_min_age_bars` / `leg_anchor_min_impulse_pct`: how old and how large the leg must be before the anchor moves. Guards against reading an ordinary pullback as a reversal.
 - `require_htf_bias_alignment`: reject longs against bearish HTF (15m) structure and shorts against bullish HTF structure. Neutral never blocks. Default `true` — prevents counter-trend entries on days when the higher-timeframe structure is pinned against the trade direction. Set `false` to allow counter-HTF setups (the bot will still score them normally, but won't outright block).
 - `orb_bypass_htf_bias`: skip the HTF bias check during the ORB window (through `orb_end_time`). Default `true`. Set `false` to enforce HTF bias filtering even at the open.
 - `orb_bypass_exhaustion`: skip the VWAP/EMA extension exhaustion filters during the ORB window. Default `true`. Set `false` to enforce exhaustion filtering even at the open.
@@ -473,6 +475,54 @@ This also retires the hand-maintained `HIGH_VOL:` overrides scattered through th
 The ETF test is close to circular on a mega-cap universe - AAPL+MSFT+NVDA+AVGO are roughly 45% of XLK, GOOG+META about 45% of XLC, AMZN+TSLA about 40% of XLY. Asking XLK whether AAPL's move is confirmed substantially asks AAPL about AAPL, and it fails in the one case that matters: the mega cap moving against the rest of its sector. Breadth excludes the symbol itself.
 
 Single-member sectors (healthcare/LLY, staples/COST here) have no peers and fall back to the original ETF check.
+
+## 19. Reversal handling: leg-anchored confirmation + vwap_reclaim (2026-09-18)
+
+A session that flushed and then turned produced **zero** entries on the recovering side. Driving a 3% flush that retraced 87% through the gates bar by bar, across the 90-bar recovery leg: 45 bars blocked on `index_not_confirmed`, 41 with no regime qualifying at all, 0 signals. Both directions.
+
+The stale `day_strength` bias is *not* the cause, which is worth stating because it is the visible symptom. `day_strength` is anchored to the session open, so it still read SHORT with price 87% of the way back — but `_decide_side` voted the correct side on 75 of 90 bars, and an explicit side decision forces `bias_penalty` to `0.0`. The bias costs nothing.
+
+Two changes, and they only work as a pair.
+
+### The gate: `leg_anchored_confirmation`
+
+`_frame_agrees` tests `close > vwap` — against **session** VWAP, a whole-day average. After a morning flush it sits far above price, so the confirmation only turns true long after the reversal is running. And because the same test is applied to every *peer*, the whole breadth gate inherits the lag.
+
+| reference | reclaimed | move gone |
+|---|---|---|
+| session VWAP | +44 min after the low | 50% |
+| VWAP anchored at the low | +1 min after the low | 1% |
+
+With the flag on, `_leg_anchor_vwap` anchors at today's more recent extreme — the low in an up-leg, the high in a down-leg — and the reference falls back to session VWAP when no leg is established, which is the correct reference for a session that has not turned.
+
+Two guards stop the anchor chasing a pullback and confirming the wrong side. `leg_anchor_min_age_bars` (20) requires the extreme to be old enough to be a confirmed pivot — a pullback high in a grind is only a few bars old, a reversal pivot is not. `leg_anchor_min_impulse_pct` (0.005) requires price to have travelled meaningfully from it.
+
+Measured deltas vs session VWAP, in confirmed bars per tape: pure trend up/down **0**, grind-with-pullbacks **0**, chop **+1**, V-reversal LONG **+22**, inverted-V SHORT **+22**. It changes the answer only where the session actually turned.
+
+`min_age_bars` is the guard that does the work — at 15 an ordinary grind produced 12 spurious counter-trend confirmations, at 20 none. Raising it trades reversal responsiveness for pullback immunity (V-reversal gain at 15/20/25/30 bars: +27/+22/+17/+12). **Known behaviour:** a grind carrying deep (~0.8%) pullbacks still confirms the counter side on some bars (+19 at 20 bars, +9 at 30) — a deep pullback genuinely resembles a reversal. The regime floors, HTF-bias, structure and side-decision gates all still apply downstream.
+
+The flag defaults to `false`: `SmallCapSqueezeStrategy` subclasses this strategy and inherits the method, and its dry-run results must not move.
+
+### The builder: `vwap_reclaim`
+
+Fixing the gate alone still produced **0** signals — the blocker simply moved to `no_fresh_breakout`, 38 of 90 bars. Every other surviving regime triggers on a *breakout*: trend and momentum need a fresh N-bar high, pullback needs an established aligned trend. A reversal is not a breakout, it is a reclaim, so no builder recognised the shape.
+
+`vwap_reclaim` is that builder, and it pairs with the gate — on its own it managed 2 signals, 12 of its bars blocked by the same lagging breadth check. It stays in `INDEX_CONFIRMED_REGIMES`; with the leg anchor in place that gate is no longer what blocks it.
+
+| | LONG reversal | SHORT reversal |
+|---|---|---|
+| before | 0 signals | 0 signals |
+| gate only | 0 | 0 |
+| builder only | 2 | 2 |
+| both | **18** | **15** |
+
+Because it is momentum-family it is offered in the midday window too, where trend and range are not — which is when sessions most often turn.
+
+Entries land at the VWAP reclaim, roughly the midpoint of the move, **not at the low**. Catching the turn itself is not the goal. Signal count is also not edge: 30 bars still die on `no_fresh_breakout`, which is correct behaviour for a trend builder.
+
+Knob values are adapted from `config.small_cap_squeeze.yaml`, where the regime is already tuned and live. `vwap_reclaim_buffer_pct` is the one that needed rescaling — it runs through `_pct_param`, so it is multiplied by the symbol's ADR over `reference_adr_pct`. Small caps use 0.0025 against a far larger ADR; 0.0015 here lands near 0.10% on a low-ADR mega cap and 0.20% on a high-ADR one, enough to reject the one-tick VWAP poke that over-fired on small caps without demanding a mega cap clear VWAP by a small-cap margin.
+
+**Not measured:** `sr_scalp` showed no change on the same tape, but the synthetic tape carries no real S/R structure, so that is inconclusive rather than evidence against enabling it. Re-anchoring `momentum`'s `day_strength` gate was tried and contributed nothing (18 signals with it, 18 without) and was dropped.
 
 ## 18. Scheduled-event blackouts (2026-09-18)
 

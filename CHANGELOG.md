@@ -9,6 +9,56 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`top_tier_adaptive` can now trade a reversal.** *2026-09-18* — a session
+  that flushed and then turned produced zero entries on the recovering side.
+  Driving a 3% flush that retraced 87% through the gates bar by bar: of 90 bars
+  on the recovery leg, 45 blocked on `index_not_confirmed`, 41 had no regime
+  qualify at all, 0 signals — both directions. The stale `day_strength` bias is
+  not the cause: `_decide_side` voted the correct side on 75 of 90 bars, and an
+  explicit side decision already forces `bias_penalty` to 0.0. Two changes,
+  which only work as a pair (gate alone 0 signals, builder alone 2, both 18
+  LONG / 15 SHORT).
+  - **Leg-anchored confirmation** (`leg_anchored_confirmation`, default
+    `false`, `true` in the preset). `_frame_agrees` measured `close > vwap`
+    against SESSION VWAP — a whole-day average that after a flush sits far
+    above price, so the confirmation only turned true long after the reversal
+    was running. Applied to every PEER, the breadth gate inherited the lag: on
+    the test tape session VWAP was reclaimed 44 minutes after the low with half
+    the move gone, a VWAP anchored at the low after 1 minute. New
+    `_leg_anchor_vwap` anchors at today's more recent extreme, guarded by
+    `leg_anchor_min_age_bars` (20) and `leg_anchor_min_impulse_pct` (0.005) so
+    an ordinary pullback is not read as a reversal, and falls back to session
+    VWAP when no leg is established. Measured deltas in confirmed bars: pure
+    trend 0, grind-with-pullbacks 0, chop +1, V-reversal LONG +22, inverted-V
+    SHORT +22. Default `false` because `SmallCapSqueezeStrategy` subclasses
+    this strategy and inherits the method.
+  - **`vwap_reclaim` enabled in the preset.** Fixing the gate alone still
+    produced 0 signals — the blocker moved to `no_fresh_breakout` on 38 of 90
+    bars. Every other surviving regime triggers on a BREAKOUT (trend/momentum
+    need a fresh N-bar high, pullback an established aligned trend); a reversal
+    is a reclaim, so no builder recognised the shape. Knobs adapted from
+    `config.small_cap_squeeze.yaml` where the regime is already tuned;
+    `vwap_reclaim_buffer_pct` rescaled 0.0025 -> 0.0015 because it runs through
+    `_pct_param` and small caps carry a far larger ADR. Entries land at the
+    VWAP reclaim — around the midpoint of the move, not at the low.
+
+### Changed
+
+- `_frame_agrees` is no longer a `@staticmethod` (it reads `self.params`). Both
+  call sites already invoked it through `self`, so no call site changed.
+- `_leg_anchor_vwap` scans from the session open the rest of the strategy uses
+  (`EQUITY_RTH_OPEN`, or `EQUITY_STREAM_START` in extended-indicator mode),
+  matching `_day_strength_session_open`. Scanning from midnight let a thin
+  pre-market print become the leg anchor while the rest of the strategy was
+  still measuring from 09:30: on a frame carrying an 08:00 dump that moved the
+  anchor off the session low entirely and flipped the verdict.
+- `_leg_anchor_vwap` takes those bars by position rather than through
+  `_same_day_mask`, which maps a Python lambda over every bar of the merged
+  frame. At 12 peers x 2 sides that was ~15ms of per-candidate overhead for a
+  slice `searchsorted` does in microseconds; the leg anchor now costs ~4ms.
+- `EQUITY_RTH_OPEN` is re-exported from `_strategies.shared` alongside
+  `EQUITY_STREAM_START`.
+
 - **`top_tier_adaptive` retargeted at a mega-cap universe.** *2026-09-18* — the
   preset traded 23 mega caps with parameters written as if the universe were
   homogeneous. It is not: sector betas run roughly 0.5 (COST/V/TMUS) to 1.8

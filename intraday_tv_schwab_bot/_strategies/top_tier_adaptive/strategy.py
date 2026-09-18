@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
+from datetime import datetime
 from typing import Any
 
 from ..shared import (
@@ -28,6 +29,7 @@ from ..shared import (
     _safe_float,
     _same_day_mask,
     _session_open_price,
+    EQUITY_RTH_OPEN,
     EQUITY_STREAM_START,
     equity_session_state,
     get_session_indicator_window,
@@ -74,6 +76,21 @@ REGIME_SCORE_CEILINGS = {
     "sr_scalp": 5.0,
     "orb": 5.0,
     "vwap_reclaim": 5.0,
+}
+
+# Short labels for the per-regime scores in the
+# ``<side>_unqualified_no_qualifying_regime(...)`` skip reason. Keys must
+# cover every key of the per-side ``scores`` dict; iteration order here is
+# the order the scores are printed in.
+REGIME_SKIP_LABELS = {
+    "trend": "trend",
+    "pullback": "pb",
+    "range": "range",
+    "vol_squeeze": "squeeze",
+    "momentum": "mom",
+    "sr_scalp": "sr_scalp",
+    "orb": "orb",
+    "vwap_reclaim": "vwap_reclaim",
 }
 
 
@@ -184,24 +201,106 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 break
         return fallback
 
-    @staticmethod
-    def _frame_agrees(side: Side, frame: pd.DataFrame | None) -> bool | None:
+    def _leg_anchor_vwap(self, frame: pd.DataFrame) -> float | None:
+        """VWAP anchored at the CURRENT LEG's origin instead of at 09:30.
+
+        Session VWAP is a whole-day average, so after a morning flush it sits
+        far above price and "price has reclaimed VWAP" only becomes true long
+        after a reversal is under way. Measured on a 3% flush that retraced
+        87%: session VWAP was reclaimed 44 minutes after the low with half the
+        move already gone, while a VWAP anchored at the low was reclaimed
+        after 1 minute. Anchoring to the leg is what lets the confirmation
+        describe the move that is actually happening.
+
+        The anchor is today's more recent extreme — the low when we are in an
+        up-leg, the high when we are in a down-leg. Two guards stop it
+        chasing every wiggle, which would read an ordinary pullback as a
+        reversal and confirm the wrong side:
+
+          * ``leg_anchor_min_age_bars`` — the extreme must be far enough back
+            to be a confirmed pivot. A pullback high in a grind is only a few
+            bars old; a reversal pivot is not. This is the guard that does
+            the work: at 15 bars an ordinary grind-with-pullbacks produced 12
+            spurious counter-trend confirmations, at 20 it produced none.
+          * ``leg_anchor_min_impulse_pct`` — price must have travelled far
+            enough from the anchor for the leg to mean anything.
+
+        Returns ``None`` when there is no established leg, in which case the
+        caller uses session VWAP — the correct reference when the session has
+        not yet turned.
+        """
+        if frame is None or frame.empty or "volume" not in frame.columns:
+            return None
+        # Scan from where the REST of the strategy's session logic starts
+        # (mirrors `_day_strength_session_open`): the RTH open, or the 07:00
+        # equity-stream open in extended-indicator mode. Scanning from
+        # midnight instead lets a thin pre-market print become the anchor —
+        # on a frame carrying an 08:00 dump that moved the anchor off the
+        # session low entirely and flipped the verdict, while the rest of the
+        # strategy was still measuring from 09:30.
+        #
+        # Taken by POSITION: today's bars are a contiguous tail of a
+        # time-ordered frame, and `_same_day_mask` maps a Python lambda over
+        # EVERY bar of the merged frame. This runs once per peer per side, so
+        # on a 12-peer group that was ~15ms of per-candidate overhead for a
+        # slice `searchsorted` does in microseconds. `tz=index.tz` covers
+        # tz-aware and naive indexes identically.
+        index = frame.index
+        session_start = (
+            EQUITY_STREAM_START if get_session_indicator_window() == "extended"
+            else EQUITY_RTH_OPEN
+        )
+        opened_at = pd.Timestamp(datetime.combine(now_et().date(), session_start), tz=index.tz)
+        session = frame.iloc[index.searchsorted(opened_at):]
+        if len(session) < 5:
+            return None
+        closes = session["close"].to_numpy(dtype=float)
+        pos = max(int(closes.argmin()), int(closes.argmax()))
+        if (len(closes) - 1 - pos) < int(self.params.get("leg_anchor_min_age_bars", 20)):
+            return None
+        anchor_px = closes[pos]
+        if anchor_px <= 0:
+            return None
+        min_impulse = float(self.params.get("leg_anchor_min_impulse_pct", 0.005))
+        if abs(closes[-1] - anchor_px) / anchor_px < min_impulse:
+            return None
+        leg = session.iloc[pos:]
+        volume = leg["volume"].to_numpy(dtype=float)
+        total = float(volume.sum())
+        if not total > 0:
+            return None
+        typical = (leg["high"].to_numpy(dtype=float)
+                   + leg["low"].to_numpy(dtype=float)
+                   + leg["close"].to_numpy(dtype=float)) / 3.0
+        return float((typical * volume).sum() / total)
+
+    def _frame_agrees(self, side: Side, frame: pd.DataFrame | None) -> bool | None:
         """Does *frame*'s latest bar lean *side*? ``None`` when unreadable.
 
-        The shared posture test — close vs session VWAP plus EMA9/EMA20
+        The shared posture test — close vs a VWAP reference plus EMA9/EMA20
         alignment — used for both the sector ETF and each sector peer so the
         two confirmation paths answer the same question.
+
+        The reference is session VWAP, or the current leg's anchored VWAP
+        when ``leg_anchored_confirmation`` is on and a leg is established
+        (see ``_leg_anchor_vwap``). On a trending or choppy session the two
+        agree; they diverge only after the session has turned, which is
+        exactly where session VWAP describes the wrong move.
         """
         if frame is None or frame.empty:
             return None
         last = frame.iloc[-1]
         close = _safe_float(last["close"])
-        vwap = _safe_float(last.get("vwap"), close)
+        reference = None
+        if bool(self.params.get("leg_anchored_confirmation", False)):
+            reference = self._leg_anchor_vwap(frame)
+        if reference is None:
+            reference = _safe_float(last.get("vwap"), close)
         ema9 = _safe_float(last.get("ema9"), close)
         ema20 = _safe_float(last.get("ema20"), close)
         if side == Side.LONG:
-            return bool(close > vwap and ema9 >= ema20)
-        return bool(close < vwap and ema9 <= ema20)
+            return bool(close > reference and ema9 >= ema20)
+        return bool(close < reference and ema9 <= ema20)
 
     def _index_confirms(self, side: Side, symbol: str, bars: dict[str, pd.DataFrame], _data=None) -> bool:
         """Return True when *symbol*'s sector tape agrees with *side*.
@@ -3268,14 +3367,6 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     "scores": scores,
                     "index_ok": index_ok,
                     "bias_penalty": bias_penalty,
-                    "trend_score": trend_score,
-                    "pullback_score": pullback_score,
-                    "range_score": range_score,
-                    "vol_squeeze_score": vol_squeeze_score,
-                    "momentum_score": momentum_score,
-                    "sr_scalp_score": sr_scalp_score,
-                    "orb_score": orb_score,
-                    "vwap_reclaim_score": vwap_reclaim_score,
                 }))
 
             # Pass 2 — record fail reasons for sides with no qualifying
@@ -3304,16 +3395,22 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                         f",bias_pen={decision['bias_penalty']:.2f}"
                         if decision["bias_penalty"] > 0.0 else ""
                     )
+                    # Only the regimes that could actually have fired this
+                    # cycle. A regime outside ``allowed_regimes`` is never
+                    # scored and reports a constant 0.0 — whether it was
+                    # switched off by its ``disable_*_regime`` knob or simply
+                    # not offered by the current time window. Listing it says
+                    # nothing about why the side failed and buries the scores
+                    # that do: top_tier_adaptive disables four of the eight,
+                    # so half of every line was filler.
+                    score_detail = ",".join(
+                        f"{REGIME_SKIP_LABELS[name]}={score:.1f}"
+                        for name, score in decision["scores"].items()
+                        if name in allowed_regimes
+                    )
                     fail_reasons.append(
                         f"{side.value.lower()}_unqualified_no_qualifying_regime("
-                        f"trend={decision['trend_score']:.1f},"
-                        f"pb={decision['pullback_score']:.1f},"
-                        f"range={decision['range_score']:.1f},"
-                        f"squeeze={decision['vol_squeeze_score']:.1f},"
-                        f"mom={decision['momentum_score']:.1f},"
-                        f"sr_scalp={decision['sr_scalp_score']:.1f},"
-                        f"orb={decision['orb_score']:.1f},"
-                        f"vwap_reclaim={decision['vwap_reclaim_score']:.1f}{penalty_suffix})"
+                        f"{score_detail}{penalty_suffix})"
                     )
                     continue
                 for regime_name, regime_score, regime_norm in decision["build_order"]:

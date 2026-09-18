@@ -1088,6 +1088,40 @@ strategies:
       # the ORB regime and its window.
       disable_orb_regime: true
 
+      # --- vwap_reclaim (enabled 2026-09-18) -----------------------------
+      # The reversal builder. Every other surviving regime triggers on a
+      # BREAKOUT (trend/momentum need a fresh N-bar high, pullback needs an
+      # established aligned trend). A reversal is not a breakout, it is a
+      # reclaim, so with vwap_reclaim off there was no builder that
+      # recognised the shape: fixing the confirmation lag alone still
+      # produced 0 signals, with 38 of 90 bars dying on `no_fresh_breakout`.
+      # Together with `leg_anchored_confirmation` it produced 18.
+      #
+      # It pairs with that setting and is close to inert without it: on its
+      # own it scored 2 signals, 12 of its bars blocked by the same lagging
+      # breadth gate (vwap_reclaim is in INDEX_CONFIRMED_REGIMES and stays
+      # there — with the leg anchor in place that gate is no longer what
+      # blocks it).
+      #
+      # Entries land at the VWAP reclaim, i.e. around the midpoint of the
+      # move, NOT at the low. Catching the turn itself is not the goal.
+      #
+      # Values adapted from config.small_cap_squeeze.yaml, where this regime
+      # is already tuned and live. buffer_pct is the one that needed
+      # rescaling: it runs through `_pct_param`, so it is multiplied by the
+      # symbol's ADR over `reference_adr_pct` (0.022). Small caps used 0.0025
+      # against a far larger ADR; 0.0015 here lands at roughly 0.10% on a
+      # low-ADR mega cap (AAPL) and 0.20% on a high-ADR one (NVDA) — enough
+      # to reject the one-tick VWAP poke that over-fired on small caps
+      # (their 0.0005 -> 0.0025 retune) without demanding a mega cap clear
+      # VWAP by a small-cap margin.
+      enable_vwap_reclaim_regime: true
+      min_vwap_reclaim_score: 3.5   # ceiling 5.0; a bare reclaim scores 2.5, so this needs a second component. SHORTs clear 4.0 via short_min_score_premium
+      vwap_reclaim_lookback_bars: 6 # the dip below VWAP must be within the last ~6 min
+      vwap_reclaim_min_volume_ratio: 1.5
+      vwap_reclaim_buffer_pct: 0.0015
+      vwap_reclaim_target_rr: 2.0   # matches trend/pullback/momentum; the ladder extends past it
+
       # Live directional bias threshold (added 2026-05-12). Day_strength is
       # computed LIVE from session_open + current close in the strategy
       # (NOT from the screener's stale `change_from_open`). A value of 0.20
@@ -1268,6 +1302,38 @@ strategies:
       # peers and fall back to the ETF check.
       index_breadth_min_peers: 3
       index_breadth_min_agree_frac: 0.5
+
+      # --- Leg-anchored confirmation (2026-09-18) ------------------------
+      # What `_frame_agrees` measures "close > VWAP" AGAINST. Session VWAP is
+      # a whole-day average, so after a morning flush it sits far above price
+      # and the confirmation only turns true long after a reversal is already
+      # running. Measured on a 3% flush that retraced 87%: session VWAP was
+      # reclaimed 44 min after the low with half the move gone; a VWAP
+      # anchored at the low was reclaimed after 1 min. Because the same test
+      # is applied to every PEER, the whole breadth gate inherited that lag —
+      # it was the single largest blocker on the reversing side (45 of 90
+      # bars on the reversal leg; 0 signals).
+      #
+      # With this on, the reference becomes the current leg's anchored VWAP
+      # once a leg is established, and stays session VWAP otherwise. Measured
+      # deltas vs session VWAP across synthetic tapes (count of confirmed
+      # bars): pure trend up/down 0, grind-with-pullbacks 0, chop +1,
+      # V-reversal LONG +22, inverted-V SHORT +22. It changes the answer
+      # only where the session has actually turned.
+      leg_anchored_confirmation: true
+      # The anchor is today's more recent extreme. These two guards stop it
+      # chasing a pullback and confirming the wrong side.
+      # min_age_bars is the one that does the work: at 15 an ordinary
+      # grind-with-pullbacks produced 12 spurious counter-trend
+      # confirmations, at 20 it produced none. Raising it trades reversal
+      # responsiveness for pullback immunity (V-reversal gain at 15/20/25/30
+      # bars: +27/+22/+17/+12).
+      # KNOWN BEHAVIOUR: a grind carrying DEEP pullbacks (~0.8% swings) still
+      # confirms the counter side on some bars (+19 at 20 bars, +9 at 30).
+      # A deep pullback genuinely resembles a reversal; the regime floors,
+      # HTF-bias, structure and side-decision gates all still apply downstream.
+      leg_anchor_min_age_bars: 20
+      leg_anchor_min_impulse_pct: 0.005
 
       # Force flatten at management window end
       force_flatten:
