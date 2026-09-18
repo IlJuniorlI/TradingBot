@@ -128,6 +128,14 @@ class PairDefinition:
     industry: str | None = None
 
 
+# noinspection PyDataclass
+#   PyCharm's checker mis-reports field access on a `@dataclass(slots=True)`
+#   instance as "object has no attribute '<field>'". It flags every
+#   `result.bracket = ...` in execution.py even though `bracket` is a declared
+#   field and is present in __slots__. Suppressed rather than dropping
+#   slots=True: OrderResult is constructed per order, so the slots benefit is
+#   real, unlike RiskState (a singleton) where slots was turned off for the
+#   same false positive — see the RiskState docstring in risk.py.
 @dataclass(slots=True)
 class OrderResult:
     ok: bool
@@ -137,3 +145,9 @@ class OrderResult:
     fill_price: float | None = None
     filled_qty: int | None = None
     simulated: bool = False
+    # Broker-side bracket state for an equity entry submitted as a
+    # first-triggers-OCO order: the parent/child order ids and the levels the
+    # broker is actually resting at. None for every non-bracketed order.
+    # Consumed by entry_gatekeeper to stamp position metadata, and by
+    # position_manager to reconcile broker fills and replace-sync levels.
+    bracket: dict[str, Any] | None = None

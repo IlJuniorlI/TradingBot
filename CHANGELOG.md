@@ -7,6 +7,388 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`top_tier_adaptive` retargeted at a mega-cap universe.** *2026-09-18* — the
+  preset traded 23 mega caps with parameters written as if the universe were
+  homogeneous. It is not: sector betas run roughly 0.5 (COST/V/TMUS) to 1.8
+  (NVDA/AMD/TSLA) and ADR spans about 0.9% to 3%+, so one number was a
+  different gate on every name. Seven changes, plus the two prerequisites they
+  depended on.
+  - **Per-symbol volatility scaling** (`daily_stats.py`, new). Every
+    percent-of-price threshold is multiplied by the symbol's 20-day ADR (true
+    range, so gaps count) over `reference_adr_pct`, clamped to
+    `[volatility_scale_min, volatility_scale_max]`. Scaled:
+    `default_stop_pct`, `momentum_min_day_strength`,
+    `sr_scalp_min_distance_pct`, `relative_strength_block_threshold_pct`,
+    `range_max_vwap_dist_pct`, `range_max_intraday_range_pct`,
+    `vol_squeeze_max_range_pct`, `broken_level_min_clearance_pct`. ATR-multiple
+    params are deliberately NOT scaled (already volatility-relative; scaling
+    would square the adjustment). `momentum_min_day_strength: 2.0` was about a
+    0.6-sigma move on TSLA and a 2-sigma move on COST, which made the momentum
+    regime structurally a five-name strategy. Backed by
+    `MarketDataStore.get_daily_history` — one Schwab daily `price_history` call
+    per symbol per ET day; `vol_scale` is 1.0 (thresholds exactly as written)
+    when stats are unavailable.
+  - **Relative strength is now a beta residual**, `day_strength - beta *
+    sector_ds` rather than a raw difference. The old form assumed beta 1.0 for
+    every name and so measured beta, not alpha: on a −1.0% XLK day NVDA at
+    −1.6% is performing exactly to a 1.6 beta — zero alpha — yet scored −0.6%
+    and had LONG blocked. The gate was blocking high-beta names in the
+    direction the tape was already moving while low-beta names essentially
+    never tripped it. Beta comes from a 60-day daily regression against the
+    symbol's sector ETF; when it is unavailable the gate is skipped rather than
+    falling back to 1.0.
+  - **Sector-breadth index confirmation.** `_index_confirms` now counts how
+    many of a symbol's `sector_groups` peers lean the trade's way
+    (`index_breadth_min_peers` / `index_breadth_min_agree_frac`), falling back
+    to the sector ETF only for single-member sectors. The ETF test is close to
+    circular on this universe — AAPL+MSFT+NVDA+AVGO are ~45% of XLK,
+    GOOG+META ~45% of XLC — so it substantially asked AAPL about AAPL and
+    failed in the one case that matters: the mega cap moving against its
+    sector.
+  - **Correlation-group concentration guard.** New `correlation_groups` /
+    `max_same_correlation_group_same_direction`, replacing `sector_groups` /
+    `max_same_sector_same_direction` for risk purposes (`sector_groups` stays,
+    at GICS granularity, for ETF routing and peer breadth). Two LONG per sector
+    across six sectors permitted up to 10 same-direction positions in names
+    that run ~0.85 correlated on any macro day — one leveraged index bet
+    wearing four tickers, with `max_daily_loss` reached in one move instead of
+    four independent ones. The preset collapses tech + communication +
+    consumer discretionary into one `mega_beta` bucket.
+  - **Scheduled-event blackouts for equity strategies**
+    (`event_blackouts.py`, new; top-level `events:` config section). Macro
+    windows (CPI/FOMC, now optionally scoped with `symbols: [...]`) and a
+    per-symbol **earnings** calendar blocking a weekend-aware
+    `earnings_block_sessions_before`/`_after` window. Across 23 mega caps that
+    is roughly 92 scheduled events a year.
+  - **Cross-regime score normalisation.** `_normalized_regime_score` maps a
+    score to its fraction of `(ceiling - threshold)` via the new
+    `REGIME_SCORE_CEILINGS` table, and drives both the per-candidate build
+    order and — through a new `signal_priority_key` override — the
+    cross-signal slot auction.
+  - **Regime trim**: `vol_squeeze`, `sr_scalp` and `orb` disabled in the
+    preset, leaving trend / pullback / range / momentum.
+
+### Changed
+
+- **Dependency bump: schwabdev 4.0.0, TA-Lib 0.8.0, pandas 3.0.6,
+  tradingview-screener 3.2.2.** *2026-09-18* — plus the security-relevant
+  transitives (cryptography 46.0.7 -> 50.0.1, aiohttp 3.13.5 -> 3.14.3,
+  websockets 16.0 -> 17.1, urllib3 2.6.3 -> 2.8.0, requests 2.33.1 -> 2.34.2,
+  certifi 2026.2.25 -> 2026.7.22). See the requirements.txt header for the
+  verification detail. Highlights: schwabdev 4.0.0 changes no API the bot
+  touches, but adds request parameter validation ON by default — both
+  price_history call shapes and the account-hash length rule were checked
+  against it. TA-Lib 0.8.0's BBANDS/APO/PPO default changes do not reach this
+  codebase (all BBANDS call sites pass their parameters explicitly); indicator
+  regression showed worst absolute drift 7.5e-09 confined to three Bollinger
+  columns, and two technical_levels snapshots were regenerated for the same
+  round-off. **websockets 16 -> 17 is a major bump under schwabdev's streaming
+  layer that the test suite cannot exercise — verify the stream on beta.**
+- **Transitive dependencies are now pinned in `constraints.txt`.**
+  *2026-09-18* — requirements.txt pinned only the 6 direct packages while
+  schwabdev declares its four dependencies unbounded, so a rebuilt box
+  resolved whatever was newest that day. Install with
+  `pip install -r requirements.txt -c constraints.txt`.
+- **Test and lint tooling is declared in `[project.optional-dependencies].dev`.**
+  *2026-09-18* — pytest, hypothesis, flake8, vermin, vulture, pandas-stubs and
+  build were installed in the working venv but declared nowhere, so
+  `pip install -e .` produced a package that could not be tested. Install with
+  `pip install -e ".[dev]"`.
+
+- **`events.blackout_file` / `events.blackouts` replace
+  `options.event_blackout_file` / `options.event_blackouts`.** *2026-09-18* —
+  the blackout calendar lived inside `ZeroDteOptionsConfig` and was reachable
+  only from the 0DTE options strategy. **Breaking for existing configs**: move
+  those two keys from the `options:` block to the new top-level `events:`
+  block. All shipped presets are updated. `EventBlackoutCalendar` now owns
+  loading, mtime-based reload and matching; the 0DTE strategy's private copy
+  is gone.
+- **`_decide_side` is scoped to direction-following regimes.** *2026-09-18* —
+  it collapsed `preferred_sides` for the whole candidate before any regime was
+  scored, which silently removed both mean-reversion regimes: `range` enters
+  within the bottom 35% of the range and `sr_scalp` at a support price has just
+  fallen into, exactly where the vote's trend-following signals say the
+  opposite. Simulated over a clean oscillating range with the shipped params,
+  the vote agreed with the range regime's own entry zone on 3 of 54 in-zone
+  bars (5.5%). The index and confirmation-bar gates already exempted these
+  regimes; the vote running candidate-wide made those exemptions unreachable.
+  Now gated per (side, regime) against `SIDE_DECISION_REGIMES`. New skip
+  reason: `<side>_build_failed_<regime>_side_decision_opposed`.
+
+### Changed
+
+- **`top_tier_adaptive` retargeted at mega-cap Tech + AI, tuned for both
+  directions.** *2026-09-18*
+  - **Universe**: 25 names in three co-movement blocks — `ai_hardware`
+    (NVDA/AVGO/AMD/TSM/MU/QCOM/ARM/MRVL/INTC/ANET/VRT/DELL), `platforms`
+    (AAPL/MSFT/GOOG/AMZN/META/NFLX/ORCL/TSLA) and `software`
+    (CRM/ADBE/NOW/PLTR/PANW). Dropped JPM/GS/V, LLY, COST, HD/LOW/UBER,
+    TMUS/RBLX — none are Tech/AI and each dragged in an ETF that had to be
+    streamed for one name's confirmation. `index_symbols` shrinks from six
+    ETFs to three (SMH / IGV / XLK).
+  - **Groups are by co-movement, not GICS.** META/GOOG/NFLX are Communication
+    Services and AMZN/TSLA Consumer Discretionary, but across this universe
+    they trade as part of the mega-cap compute complex, and peer breadth over
+    that complex is a better confirmation than XLC or XLY. Every group has
+    >= 5 members, so breadth (not the circular ETF check) is the live path for
+    every symbol.
+  - **`correlation_groups`** collapse to `ai_complex` (20) + `software` (5) at
+    a cap of 2 — semis and platforms move together on any AI-narrative day.
+  - **`reference_adr_pct` 0.018 -> 0.022.** The reference must sit near the
+    median ADR of the traded universe or every percent threshold is
+    systematically mis-scaled; the old value centred a mixed book that
+    included ~1% names. `volatility_scale_min` 0.6 -> 0.55 so AAPL/MSFT are
+    not clamped off the bottom, `_max` 2.2 -> 2.0.
+  - **`momentum_min_day_strength` 2.0 -> 1.8**, now meaning "what a
+    median-volatility name in this universe must move" — roughly 1.1% on AAPL
+    and 3.4% on PLTR after scaling. The flat 2.0 made momentum a
+    high-beta-only regime.
+
+### Added
+
+- **Long/short asymmetry knobs for `top_tier_adaptive`.** *2026-09-18* — every
+  threshold was previously shared between the sides, which assumes they are
+  mirror images. On equities they are not: squeezes are faster than flushes,
+  the market drifts up, and short profits are less durable. Three multipliers
+  encode exactly those asymmetries instead of duplicating the parameter block
+  per side, and all are neutral by default so existing presets are unchanged:
+  - `short_min_score_premium` (0.5) raises the regime floor for SHORTs — and
+    raises the normalisation denominator too, so a short that barely clears
+    its higher bar still ranks as marginal in the cross-regime auction rather
+    than being flattered by the long-side floor.
+  - `short_stop_buffer_mult` (1.25) widens the ATR cushion on shorts. It never
+    moves the structural level the strategy chose. Dollar risk per trade is
+    unchanged — the wider stop simply sizes to fewer shares.
+  - `short_target_rr_mult` (0.85) banks short profits sooner: a 2.0R long
+    target becomes 1.7R short.
+
+### Added
+
+- **Test coverage for every previously-untested module.** *2026-09-18* — the
+  full-bot review found seven modules with no direct tests, several of them in
+  the money path. Now covered: `startup_reconciler` (541 LOC — what the bot
+  owns after a restart: ignore lists, restore eligibility, metadata matching,
+  level reconstruction, the entry block and its broker recheck, and the
+  restore loop), `cycle_gate` (which subsystems may run this cycle),
+  `warmup_tracker` (history-fetch scheduling and readiness), `position_store`
+  (sqlite round-trip, replace semantics, pruning), `_sr_ladder` (rung spacing
+  and next-level selection for adaptive_ladder), `dashboard`
+  (NaN/numpy-safe serialization, disk-state signature, theme-name handling,
+  concurrent state access) and `audit_logger`. Every module in the package now
+  has direct coverage.
+
+### Fixed
+
+- **ORB could emit a target on the wrong side of its own entry.**
+  *2026-09-18* — found by property-testing every builder over randomised
+  opening ranges. `_build_orb_signal` anchors its measured move to the RANGE
+  EDGE (`edge + range_height * orb_target_range_mult`), not to the entry, so a
+  break that had already run past that level produced a LONG whose take-profit
+  sat BELOW its entry — 57 of 514 builder invocations, e.g. close 107.26 with
+  a target of 101.01. The gatekeeper's `_entry_levels_valid` refused those
+  signals so nothing traded, and the ORB regime is currently disabled in the
+  shipped preset; but a builder should not emit a structurally invalid setup
+  and rely on a downstream guard. It now rejects with
+  `orb_measured_move_exhausted` when the target cannot clear
+  `shared_entry.min_target_rr` from the current close — the same way sr_scalp
+  rejects when its zone gap cannot pay for its stop. A re-run shows 0
+  violations across 457 invocations of all seven builders, both sides.
+
+- **Risk controls that failed open now say so.** *2026-09-18* —
+  `open_risk_to_stops` skipped positions whose levels would not parse, which
+  UNDER-counts open risk and makes the daily-loss projection more permissive;
+  and `can_open` swallowed a strategy-params lookup failure, silently
+  disabling the correlation concentration guard entirely (`max_group` -> 0).
+  Both now log. A zero-quantity position stays silent — that is normal, not a
+  data problem.
+
+- **`_strategies/rvol.py`: three defects in the liquidity-profile module.**
+  *2026-09-18* — six strategies route their volume gating and focus scoring
+  through it and it had no direct coverage.
+  - **`_symbol_set` mishandled every Mapping spelling.** It read `.values()`,
+    so the natural YAML set `{AAPL: true, MSFT: true}` collapsed to the single
+    token `TRUE` and silently discarded the symbols, while
+    `{tech: [AAPL, MSFT]}` stringified the list into one bogus token. Now the
+    key is the symbol when the value is scalar and the values are the symbols
+    when the value is a container; nested structures flatten and the recursion
+    is depth-bounded.
+  - **A `rvol_score_floor` above `rvol_score_cap` silently returned a
+    constant.** `min(cap, max(floor, raw))` with an inverted pair yields `cap`
+    for every input, so the volume term stopped distinguishing a dead tape
+    from a 5x surge and every `focus_score` built on it degenerated to a
+    scaled day-change. The floor is now DROPPED rather than clamped to the cap
+    (clamping leaves `floor == cap`, still a constant), and the
+    misconfiguration is logged once per process — it fires from a per-symbol
+    hot path.
+  - **The hard-coded liquidity lists had drifted.** ORCL, PLTR, ARM, MU, ANET,
+    QCOM, ADBE, NOW, PANW, MRVL and DELL were all absent, so they were gated
+    at the full threshold while AAPL got an 80% relaxation — a 5x gap between
+    comparably liquid mega caps. `IGV` was missing from the benchmark list
+    while `SMH` and `XLK` were present. Lists refreshed, and
+    `rvol_profile_for_symbol` now takes an optional `dollar_volume` so a
+    symbol above `rvol_high_liquidity_dollar_volume` (default $1B) is treated
+    as liquid regardless of the list. Threaded through all six consuming
+    screeners, which already select `close` and `volume`.
+  - 50 new tests, including one asserting no caller ever gates on the floored
+    value — the separation that stops a benchmark ETF's 0.90 score floor from
+    carrying it through its own volume gate on a dead tape.
+
+- **`audit_logger` fallbacks could themselves raise.** *2026-09-18* — found by
+  the new tests. `log_structured`'s except branch called `str(payload)`, which
+  re-raises for a payload whose `__repr__` throws, so the safety net
+  propagated into the caller — and the callers are the entry and exit flows
+  (`ENTRY_CONTEXT` / `EXIT_CONTEXT`). `_json_ready`'s final `str(value)` had
+  the same hazard, and it also feeds the sqlite position-metadata write. Both
+  now degrade to `<unserializable {type}>` instead of throwing.
+- **The engine now escalates persistent failures.** *2026-09-18* — the main
+  loop backs off exponentially and never gives up, which is right, but a
+  sustained outage during the management window left open positions unmanaged
+  behind a throttled WARNING. After `runtime.error_escalation_cycles`
+  consecutive failed cycles (default 10, roughly 10 minutes at the capped 60s
+  backoff) the engine logs CRITICAL naming the exposed positions and the
+  dashboard status carries the same alarm text. Re-announces on each multiple
+  so a long outage does not scroll away. Set to 0 to disable.
+
+- **`max_daily_loss` now projects open risk instead of comparing realized P&L
+  alone.** *2026-09-18* — the gate blocked new entries once REALIZED P&L
+  crossed the limit, and never flattened anything. With `max_positions` open
+  at full risk at that moment, the day could finish at roughly twice the
+  configured cap. `can_open` now subtracts `RiskManager.open_risk_to_stops`
+  (each position's remaining loss to its CURRENT stop, so a stop trailed to
+  breakeven contributes zero) before comparing. Set
+  `risk.daily_loss_includes_open_risk: false` for the old realized-only
+  comparison.
+- **Per-day risk state survives a restart.** *2026-09-18* — `RiskState` was
+  memory-only, so a crash or restart mid-session reset `realized_pnl` to 0.0
+  and dropped every cooldown and same-level block. A bot restarted after
+  losing most of its `max_daily_loss` came back believing the day was flat and
+  could lose the limit again — and a restart is most likely exactly when
+  something has already gone wrong. Open positions were always recovered from
+  the broker; the counters that decide whether to open MORE were not. New
+  `position_store.SessionRiskStateStore` keeps them in the same sqlite file as
+  the reconcile metadata, keyed by ET session date so the daily reset is just
+  the absence of a matching row. `RiskManager` takes the store at construction
+  and restores before the first cycle; persistence failures log and never
+  raise.
+
+- **Entry sizing now accounts for slippage, and realized risk is reconciled
+  after the fill.** *2026-09-18* — `qty` is computed before the order from the
+  previewed limit price, but realized risk is `qty * |fill - stop|`, so an
+  adverse fill risked more than `max_notional_per_trade *
+  risk_per_trade_frac_of_notional`. `size_position` now takes a
+  `slippage_allowance` that widens the SIZING distance only (never the actual
+  stop), derived from the live spread via `RiskManager.entry_slippage_allowance`
+  and capped at `entry_slippage_allowance_max_pct` of price.
+  `RiskManager.realized_entry_risk` then reconciles what the trade actually
+  risks against the budget; anything beyond `risk_overage_warn_frac` is logged
+  and stamped on the position as `entry_risk_overage_frac`. Detection only on
+  that half — the shares are already bought, so the sizing allowance is the
+  preventive control.
+  - Scope note: the exposure is bounded by whichever constraint sized the
+    trade. The risk budget only binds when stop distance exceeds
+    `budget / max_notional` as a fraction of price (0.800% on the top_tier
+    preset); below that the notional cap decides the size and leaves large
+    slack. The worst case is therefore a LOW-priced name with a stop just past
+    that crossover (a $50 name on a 1% stop, where a 10c slip reaches ~20% over
+    budget), not the tightest structural stops — at 0.11% of price the notional
+    cap holds realized risk ~80% UNDER budget.
+- **Equity entries re-validate their levels after the fill.** *2026-09-18* —
+  the pre-order check ran against the previewed price, so a fill that slipped
+  through its own stop left a position whose entry was already past its stop
+  with no warning (`initial_risk` uses `abs()`, so it still read positive and
+  the stop simply fired on the next management cycle). The options path had
+  always revalidated here; equities now match it, falling back to
+  `default_stop_pct` / `default_target_pct` distances from the actual fill
+  rather than orphaning the position or keeping levels the fill invalidated.
+- **Entry slippage is now watched, not just recorded.** *2026-09-18* —
+  `entry_slippage_pct` reached `paper_account` and the end-of-day report and
+  nothing else, so a routing or liquidity degradation surfaced only if someone
+  diffed reports by hand. Breaches of `entry_slippage_warn_pct` are logged and
+  flagged on the position. `realized_entry_risk`, `entry_risk_budget` and
+  `entry_risk_overage_frac` are carried on `TradeRecord` and serialized into
+  the session report alongside it.
+- **`_in_orb_window` is bounded at both ends.** *2026-09-18* — it read
+  `now <= orb_end_time` with no lower bound and no check that the ORB regime
+  existed, so the seven `orb_bypass_*` relaxations (HTF bias, structure, S/R,
+  exhaustion, side decision, relative strength, screener bias) applied to
+  entries with no ORB thesis behind them. Harmless on the RTH top_tier preset
+  (09:45 is its first entry), but live on `small_cap_squeeze`, which sets
+  `equity_session_indicator_window: extended` and `disable_orb_regime: true`:
+  its entries from 08:05 to 10:05 — the majority of an 08:05-11:50 window —
+  ran with those gates off. Now `[opening-range end, orb_end]`, and always
+  `False` when `disable_orb_regime` is set.
+- **`daily_stats.compute_adr_pct` dropped the window's first bar.** Its
+  `prev_close` is NaN and the row-wise max skips NaN rather than propagating
+  it, so that bar contributed a high-low value instead of a true range and a
+  20-day lookback returned 21 samples.
+
+### Added
+
+- **Broker-side bracket orders: the entry, stop, and target go out as one
+  Schwab first-triggers-OCO order.** *2026-07-27* — the protective exit now
+  rests AT THE BROKER instead of waiting for the engine's management poll to
+  observe the level and fire a marketable limit. At `quote_poll_seconds: 6`
+  that removed up to ~6s of latency on exactly the fast moves where it costs
+  most. Opt-in via `execution.bracket_orders_enabled` (default `false`), so
+  every existing preset keeps today's fully engine-managed exits.
+  - **Spec** (`execution.py::build_bracket_order`): a `TRIGGER` parent whose
+    child OCO carries a `LIMIT` target and a `STOP`/`STOP_LIMIT` protective
+    stop. A lone stop is attached directly rather than wrapped in a
+    single-child OCO. Levels round to valid ticks (penny at/above $1) biased
+    so a stop never lands *tighter* than intended and a target never lands
+    further away — sub-penny prices are rejected outright on stop legs.
+  - **`execution.bracket_legs`** — `stop_and_target` rests both;
+    **`stop_only`** rests only the stop and leaves the target engine-side.
+    `stop_only` is *required* with `trade_management_mode: adaptive_ladder`
+    and is enforced at config load: a resting target limit fills through
+    `adaptive_ladder_suppress_target_exit` (the ladder declining a target tag
+    so it can roll to the next rung) and through the final-rung runner
+    (`target_price` cleared to `None`), so the ladder could never extend.
+  - **`execution.bracket_sync_mode`** — `static` submits once and never
+    touches the order; `replace` keeps the engine managing and pushes every
+    stop/target move onto the resting child via `replace_order`, debounced by
+    `bracket_replace_min_price_delta` so a per-cycle trail ratchet cannot burn
+    the Schwab rate budget. `static` is refused at load for the ratcheting
+    management modes, which would otherwise leave the broker on the entry-time
+    stop for the life of the trade.
+  - **Ownership split** — `RiskManager.update_position` suppresses only the
+    exits actually resting at the broker, keyed on the live child order ids
+    (not the config) so a bracket that failed to establish correctly falls
+    back to engine exits. Engine-only exits (peak giveback, trailing, time
+    stop, CHoCH, force flatten) still fire, and `PositionManager` cancels the
+    resting orders **before** marketing out. A failed cancel *defers* the exit
+    rather than double-filling — the protective stop is still resting, so the
+    position is not left unguarded.
+  - **Phantom-position reconciliation** — `_reconcile_bracket_fills` runs at
+    the TOP of `manage_positions`, booking any exit the broker already
+    executed before anything can manage or exit a position that no longer
+    exists. Uses one `account_orders` call for all positions, not per-position
+    `order_details`: at 4 positions and `loop_sleep_seconds: 2.0` the latter
+    would be 120 req/min, the entire Schwab budget. An unreadable broker
+    response is treated as "unknown", never as "nothing filled".
+  - **Short-flip guard** — children are submitted for the *requested* entry
+    quantity, so a partial fill leaves an oversized resting exit that would
+    take a long-only strategy net short when it triggers. The partial path
+    cancels the parent first (so the resize target cannot move underneath),
+    then replaces both children at the filled quantity; if the children never
+    materialised, standalone protection is submitted for the shares actually
+    held.
+  - **Adoption** — `ensure_position_protected` adopts still-working children
+    and submits fresh protection only when they are dead, so broker entry
+    recovery and startup restore can never stack a second protective order.
+    Startup restore also rewrites stale `bracket` metadata: left alone, a dict
+    whose children died overnight would suppress the engine's stop exit for a
+    position with nothing resting at the broker.
+  - **Dry run** keeps exits engine-side and stamps the intended bracket for
+    inspection. Live fills at the resting limit will beat these poll-priced
+    exits, so dry-run *understates* the benefit.
+  - No reprice loop on a bracketed entry: cancel/replace churn on a `TRIGGER`
+    parent with live children is how brackets get orphaned, and an entry
+    needing several reprices has already left the level it was built on.
+  - 40 tests in `tests/test_bracket_orders.py`.
+
 ### Fixed
 
 - **Same-level retry block measured from the wrong price and ignored winners.**

@@ -5,7 +5,9 @@ import logging
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from typing import Any
 
+from .broker_positions import active_broker_bracket
 from .config import BotConfig
 from .models import ASSET_TYPE_EQUITY, OPTION_ASSET_TYPES, Position, Side, Signal
 from ._strategies.registry import is_option_strategy
@@ -76,10 +78,94 @@ class RiskState:
 
 
 class RiskManager:
-    def __init__(self, config: BotConfig):
+    def __init__(self, config: BotConfig, state_store: Any = None):
         self.config = config
         self.state = RiskState()
         self._reentry_policy = self._normalized_reentry_policy()
+        # Optional SessionRiskStateStore. When attached, the per-day tallies
+        # survive a restart (see attach_state_store).
+        self._state_store = None
+        if state_store is not None:
+            self.attach_state_store(state_store)
+
+    # ------------------------------------------------------------------
+    # Cross-restart persistence
+    # ------------------------------------------------------------------
+    def attach_state_store(self, store: Any) -> None:
+        """Attach a ``SessionRiskStateStore`` and restore today's tallies.
+
+        Without this the risk counters are memory-only: a restart reset
+        ``realized_pnl`` to 0.0 and dropped every cooldown and same-level
+        block, so a bot restarted after most of ``max_daily_loss`` was gone
+        came back able to lose the whole limit again. Open positions were
+        already recovered from the broker; this recovers the counters that
+        decide whether to open more.
+
+        Only a row matching today's ET session date is restored, so the daily
+        reset still happens by itself.
+        """
+        self._state_store = store
+        today = now_et().date()
+        payload = None
+        try:
+            payload = store.load(today.isoformat())
+        except Exception:
+            LOG.warning("Could not restore session risk state; starting the day flat.", exc_info=True)
+        if not payload:
+            return
+        self.state.session_date = today
+        self.state.realized_pnl = float(payload.get("realized_pnl", 0.0) or 0.0)
+        restored_cooldowns = 0
+        for row in payload.get("cooldowns") or []:
+            try:
+                key = (str(row["symbol"]).upper(), Side(row["side"]))
+                self.state.cooldown_until[key] = datetime.fromisoformat(row["until"])
+                restored_cooldowns += 1
+            except Exception:
+                LOG.debug("Skipping unparseable restored cooldown row: %r", row, exc_info=True)
+        restored_exits = 0
+        for row in payload.get("recent_exits") or []:
+            try:
+                self.state.recent_exits.append(
+                    RecentExitRecord(
+                        symbol=str(row["symbol"]).upper(),
+                        side=Side(row["side"]),
+                        entry_price=float(row["entry_price"]),
+                        exit_price=float(row["exit_price"]),
+                        atr=float(row["atr"]),
+                        timestamp=datetime.fromisoformat(row["timestamp"]),
+                    )
+                )
+                restored_exits += 1
+            except Exception:
+                LOG.debug("Skipping unparseable restored exit row: %r", row, exc_info=True)
+        LOG.info(
+            "Restored session risk state for %s: realized_pnl=%.2f cooldowns=%d recent_exits=%d",
+            today.isoformat(), self.state.realized_pnl, restored_cooldowns, restored_exits,
+        )
+
+    def _persist_state(self) -> None:
+        """Write the current tallies. No-op when no store is attached."""
+        if self._state_store is None:
+            return
+        cooldowns = [
+            {"symbol": symbol, "side": side.value, "until": until.isoformat()}
+            for (symbol, side), until in self.state.cooldown_until.items()
+        ]
+        recent_exits = [
+            {
+                "symbol": record.symbol,
+                "side": record.side.value,
+                "entry_price": record.entry_price,
+                "exit_price": record.exit_price,
+                "atr": record.atr,
+                "timestamp": record.timestamp.isoformat(),
+            }
+            for record in self.state.recent_exits
+        ]
+        self._state_store.save(
+            self.state.session_date.isoformat(), self.state.realized_pnl, cooldowns, recent_exits,
+        )
 
     @staticmethod
     def floor_discrete_units(budget: float, unit_cost: float) -> int:
@@ -154,10 +240,25 @@ class RiskManager:
                 )
             self.state.realized_pnl = 0.0
             self.state.session_date = current_date
+            self._persist_state()
 
     def register_realized_pnl(self, pnl: float) -> None:
+        """Add *pnl* to today's realized tally and persist it.
+
+        Persisting HERE rather than only in ``register_exit`` matters: a
+        PARTIAL exit books P&L through this method directly and never reaches
+        ``register_exit`` (see position_manager's ``remaining_qty <= 0``
+        branches). Under ``adaptive_ladder`` — the live management mode —
+        every rung is a partial, so persisting only on full exits would have
+        left the bulk of a day's realized P&L unrecoverable after a restart,
+        which is precisely the hole the state store exists to close.
+        ``register_exit`` persists again once it has also updated the cooldown
+        and same-level log; an extra sqlite write per exit is not worth
+        avoiding.
+        """
         self._reset_if_new_session()
         self.state.realized_pnl += float(pnl)
+        self._persist_state()
 
     def register_exit(
         self,
@@ -232,12 +333,73 @@ class RiskManager:
             except Exception:
                 LOG.debug("Could not record exit for same-level block", exc_info=True)
 
+        # One write per exit — the only point where realized_pnl, the
+        # cooldowns and the same-level log all change together.
+        self._persist_state()
+
+    @staticmethod
+    def open_risk_to_stops(positions: dict[str, Position]) -> float:
+        """Total remaining loss if every open position stopped out right now.
+
+        Measured to each position's CURRENT stop, so a stop trailed to
+        breakeven or beyond contributes 0.0 rather than a negative (that is
+        locked-in profit, not risk, and netting it off would understate the
+        downside).
+
+        A position whose levels cannot be read contributes 0.0 and is LOGGED.
+        Skipping it silently would under-count open risk, which pushes the
+        daily-loss projection in the permissive direction — the one case where
+        a quiet failure lets the bot keep opening trades it should not.
+        """
+        total = 0.0
+        for key, position in (positions or {}).items():
+            try:
+                entry = float(position.entry_price)
+                stop = float(position.stop_price)
+                qty = max(0, int(position.qty))
+            except (TypeError, ValueError):
+                LOG.warning(
+                    "Open-risk projection could not read levels for %s "
+                    "(entry=%r stop=%r qty=%r); it contributes 0 to the daily-loss "
+                    "projection, which UNDER-counts risk.",
+                    key, getattr(position, "entry_price", None),
+                    getattr(position, "stop_price", None), getattr(position, "qty", None),
+                )
+                continue
+            if qty <= 0:
+                continue
+            if entry <= 0 or stop <= 0:
+                LOG.warning(
+                    "Open-risk projection skipping %s: non-positive entry=%.4f or stop=%.4f. "
+                    "Its risk is NOT counted against max_daily_loss.",
+                    key, entry, stop,
+                )
+                continue
+            per_unit = (entry - stop) if position.side == Side.LONG else (stop - entry)
+            total += max(0.0, per_unit) * qty
+        return total
+
     def can_open(self, signal: Signal, positions: dict[str, Position]) -> tuple[bool, str]:
         self._reset_if_new_session()
-        if self.state.realized_pnl <= -abs(self.config.risk.max_daily_loss):
+        # Daily loss gate. Compares the WORST-CASE day against the limit when
+        # ``daily_loss_includes_open_risk`` is on: realized P&L less what the
+        # currently-open positions would lose if every one of them stopped
+        # out. Comparing realized P&L alone let the bot keep opening trades
+        # until the realized damage reached the limit, at which point
+        # max_positions could still be open at full risk — finishing the day
+        # at roughly twice the configured cap.
+        limit = abs(self.config.risk.max_daily_loss)
+        open_risk = (
+            self.open_risk_to_stops(positions)
+            if bool(getattr(self.config.risk, "daily_loss_includes_open_risk", True))
+            else 0.0
+        )
+        projected_pnl = self.state.realized_pnl - open_risk
+        if projected_pnl <= -limit:
             LOG.warning(
-                "Daily loss limit reached: realized_pnl=%.2f limit=%.2f — blocking %s %s",
-                self.state.realized_pnl, self.config.risk.max_daily_loss,
+                "Daily loss limit reached: realized_pnl=%.2f open_risk=%.2f projected=%.2f "
+                "limit=%.2f — blocking %s %s",
+                self.state.realized_pnl, open_risk, projected_pnl, limit,
                 signal.symbol, signal.side.value,
             )
             return False, "daily_loss_limit"
@@ -257,36 +419,52 @@ class RiskManager:
         signal_slot = f"pair:{signal_pair_id}" if signal_pair_id else f"symbol:{key}"
         if signal_slot not in active_slots and len(active_slots) >= max_positions:
             return False, "max_positions"
-        # Sector concentration guard — block if too many same-direction positions
-        # in the same correlated group (e.g., 3 LONG tech stocks simultaneously).
-        # Configured per-strategy in params.sector_groups / params.max_same_sector_same_direction.
+        # Correlation concentration guard — block when too many same-direction
+        # positions already sit in the same correlated group.
+        #
+        # Configured per-strategy in params.correlation_groups /
+        # params.max_same_correlation_group_same_direction. These are
+        # DELIBERATELY separate from params.sector_groups, which exists to
+        # route a symbol to its confirmation ETF and must stay at GICS
+        # granularity. Risk grouping wants the opposite: on a mega-cap
+        # universe the tech, communication and consumer-discretionary names
+        # trade as one book (roughly 0.85 correlated on any macro day), so
+        # treating them as three independent sectors let one directional bet
+        # fill every position slot while appearing diversified.
         strategy_params = {}
         try:
             strategy_params = self.config.strategies.get(signal.strategy, self.config.active_strategy).params or {}
         except Exception:
-            pass
-        max_sector = int(strategy_params.get("max_same_sector_same_direction", 0) or 0)
-        if max_sector > 0:
-            sector_groups = strategy_params.get("sector_groups") or {}
+            # Swallowing this silently disables the concentration guard
+            # entirely (max_group falls to 0), so the bot would happily stack
+            # correlated positions with nothing to show for it. Log loudly —
+            # a risk control must not fail open in silence.
+            LOG.warning(
+                "Could not read strategy params for %s; the correlation concentration "
+                "guard is INACTIVE for this signal.", signal.strategy, exc_info=True,
+            )
+        max_group = int(strategy_params.get("max_same_correlation_group_same_direction", 0) or 0)
+        if max_group > 0:
+            correlation_groups = strategy_params.get("correlation_groups") or {}
             signal_symbol = self._symbol_key(signal.symbol)
-            signal_sector = None
-            for sector, members in sector_groups.items():
+            signal_group = None
+            for group, members in correlation_groups.items():
                 if signal_symbol in {self._symbol_key(m) for m in (members or [])}:
-                    signal_sector = sector
+                    signal_group = group
                     break
-            if signal_sector is not None:
-                sector_members = {self._symbol_key(m) for m in sector_groups.get(signal_sector, [])}
-                same_sector_same_dir = sum(
+            if signal_group is not None:
+                group_members = {self._symbol_key(m) for m in correlation_groups.get(signal_group, [])}
+                same_group_same_dir = sum(
                     1 for pos in positions.values()
-                    if pos.side == signal.side and self._symbol_key(pos.symbol) in sector_members
+                    if pos.side == signal.side and self._symbol_key(pos.symbol) in group_members
                 )
-                if same_sector_same_dir >= max_sector:
+                if same_group_same_dir >= max_group:
                     LOG.warning(
-                        "Sector concentration limit: %s %s blocked — %d/%d %s positions in sector '%s'",
-                        signal.symbol, signal.side.value, same_sector_same_dir, max_sector,
-                        signal.side.value, signal_sector,
+                        "Correlation concentration limit: %s %s blocked — %d/%d %s positions in group '%s'",
+                        signal.symbol, signal.side.value, same_group_same_dir, max_group,
+                        signal.side.value, signal_group,
                     )
-                    return False, "sector_concentration"
+                    return False, "correlation_concentration"
         if key in positions:
             return False, "already_in_position"
         # Direction-aware cooldown: a LONG exit only blocks a LONG re-entry;
@@ -457,20 +635,79 @@ class RiskManager:
             return False, "max_total_notional"
         return True, "ok"
 
-    def size_position(self, entry_price: float, stop_price: float) -> int:
+    def entry_risk_budget(self) -> float:
+        """Dollar risk allowed on a single trade.
+
+        ``max_notional_per_trade * risk_per_trade_frac_of_notional`` — a
+        fraction of the per-trade notional cap, NOT of account equity. See the
+        RiskConfig docstring in config.py for the full convention.
+        """
+        return float(self.config.risk.max_notional_per_trade) * float(
+            self.config.risk.risk_per_trade_frac_of_notional
+        )
+
+    def entry_slippage_allowance(self, bid: float | None, ask: float | None, reference_price: float) -> float:
+        """Expected adverse slippage on an entry, in price units.
+
+        Sizing happens against the previewed limit price, but realized risk is
+        ``qty * |fill - stop|``. Padding the stop distance by this amount makes
+        the size conservative enough that a fill slipping by up to this much
+        still lands inside ``entry_risk_budget``.
+
+        Derived from the live spread, which is the actual cost of crossing,
+        and capped at ``entry_slippage_allowance_max_pct`` of price so a single
+        pathological quote cannot shrink a position to nothing. Returns 0.0
+        when the spread is unusable or the feature is switched off — which
+        restores the previous "size on the raw stop distance" behaviour.
+        """
+        spread_frac = float(self.config.risk.entry_slippage_allowance_spread_frac)
+        if spread_frac <= 0.0 or reference_price <= 0:
+            return 0.0
+        try:
+            spread = float(ask) - float(bid)
+        except (TypeError, ValueError):
+            return 0.0
+        if not (spread > 0.0):
+            return 0.0
+        cap = float(self.config.risk.entry_slippage_allowance_max_pct) * float(reference_price)
+        allowance = spread * spread_frac
+        return max(0.0, min(allowance, cap) if cap > 0 else allowance)
+
+    def size_position(self, entry_price: float, stop_price: float, *, slippage_allowance: float = 0.0) -> int:
+        """Share count for an entry, sized so the trade risks at most
+        ``entry_risk_budget`` even if the fill slips by ``slippage_allowance``.
+
+        ``slippage_allowance`` widens the stop distance used for sizing only —
+        it never moves the actual stop, which stays where the strategy put it.
+        Default 0.0 keeps the original behaviour for callers that do not have
+        a spread to work from.
+        """
         if entry_price <= 0 or stop_price <= 0:
             return 0
         stop_distance = abs(entry_price - stop_price)
         if stop_distance <= 0:
             return 0
-        # Risk budget is max_notional_per_trade * risk_per_trade_frac_of_notional.
-        # Both inputs come from config.risk. This is a fraction of the
-        # per-trade notional cap, not a fraction of account equity — see
-        # the RiskConfig docstring in config.py for the full convention.
-        risk_budget = self.config.risk.max_notional_per_trade * self.config.risk.risk_per_trade_frac_of_notional
-        qty = self.floor_discrete_units(risk_budget, stop_distance)
+        sizing_distance = stop_distance + max(0.0, float(slippage_allowance))
+        qty = self.floor_discrete_units(self.entry_risk_budget(), sizing_distance)
         max_qty_by_notional = self.floor_discrete_units(self.config.risk.max_notional_per_trade, entry_price)
         return max(0, min(qty, max_qty_by_notional))
+
+    def realized_entry_risk(self, qty: int, fill_price: float, stop_price: float) -> dict[str, float]:
+        """Reconcile the risk actually taken against the budget.
+
+        Returns ``{"risk", "budget", "overage_frac"}`` where ``overage_frac``
+        is the fraction ABOVE budget (0.0 when at or under it). Detection
+        only: by the time this runs the shares are bought, so there is nothing
+        to reject — ``size_position``'s slippage allowance is the preventive
+        half of the pair.
+        """
+        try:
+            risk = abs(float(fill_price) - float(stop_price)) * max(0, int(qty))
+        except (TypeError, ValueError):
+            return {"risk": 0.0, "budget": 0.0, "overage_frac": 0.0}
+        budget = self.entry_risk_budget()
+        overage = (risk / budget - 1.0) if budget > 0 else 0.0
+        return {"risk": risk, "budget": budget, "overage_frac": max(0.0, overage)}
 
     def size_option_position(self, max_loss_per_contract: float) -> int:
         if max_loss_per_contract <= 0:
@@ -712,6 +949,17 @@ class RiskManager:
         trailing_enabled = (not options_position) and (trade_management_mode == "adaptive" or (trade_management_mode == "adaptive_ladder" and not ladder_management_enabled))
         suppress_target_exit = (not options_position) and trade_management_mode == "adaptive_ladder" and bool(meta.get("adaptive_ladder_suppress_target_exit", False))
 
+        # Broker-side bracket: whichever legs are actually RESTING at the broker
+        # are owned by the broker, and the engine must not also fire them --
+        # both fills would land and take the strategy net short. Keyed on the
+        # resting child ids rather than the config, so a bracket that failed to
+        # establish (state "unprotected") correctly falls back to engine exits.
+        # Engine-only exits above/below this (peak giveback, trailing, time stop)
+        # are unaffected; position_manager cancels the bracket before those.
+        bracket = active_broker_bracket(position)
+        broker_owns_stop = bracket is not None and bracket.get("stop_order_id") is not None
+        broker_owns_target = bracket is not None and bracket.get("target_order_id") is not None
+
         def _meta_float(key: str, default: float | None = None) -> float | None:
             value = meta.get(key, default)
             try:
@@ -796,9 +1044,9 @@ class RiskManager:
                     position.stop_price = candidate_stop
                     if isinstance(meta, dict) and candidate_stop > prior_stop + 1e-12:
                         append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "trail", "from": prior_stop, "to": float(candidate_stop)})
-            if last_price <= position.stop_price:
+            if last_price <= position.stop_price and not broker_owns_stop:
                 return True, "stop"
-            if position.target_price is not None and last_price >= position.target_price and not suppress_target_exit:
+            if position.target_price is not None and last_price >= position.target_price and not suppress_target_exit and not broker_owns_target:
                 return True, "target"
         else:
             if adaptive_enabled:
@@ -870,8 +1118,8 @@ class RiskManager:
                     position.stop_price = candidate_stop
                     if isinstance(meta, dict) and candidate_stop < prior_stop - 1e-12:
                         append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "trail", "from": prior_stop, "to": float(candidate_stop)})
-            if last_price >= position.stop_price:
+            if last_price >= position.stop_price and not broker_owns_stop:
                 return True, "stop"
-            if position.target_price is not None and last_price <= position.target_price and not suppress_target_exit:
+            if position.target_price is not None and last_price <= position.target_price and not suppress_target_exit and not broker_owns_target:
                 return True, "target"
         return False, "hold"

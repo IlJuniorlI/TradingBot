@@ -21,7 +21,7 @@ For each symbol and each direction (long/short), regime scores are computed for 
 - **Range**: VWAP proximity, EMA convergence, VWAP cross count, tight intraday range, index neutrality. Max score 5.5.
 - **Vol-squeeze** *(added 2026-05-12)*: detects a tight Bollinger compression box across `vol_squeeze_lookback_bars` (default 12), then scores breakout magnitude, confirming volume ratio, bar close position within the breakout candle, VWAP/EMA alignment. Allowed in the primary and afternoon windows.
 - **Momentum** *(added 2026-05-12, widened from afternoon-only and renamed from `momentum_close`)*: momentum-from-open continuation. Computes day_strength live from session open + current close, requires `momentum_min_day_strength` (default 1.5%) with the trade side, scores N-bar breakout + alignment. **Allowed post-ORB through close** (`orb_end_time` → `no_new_entries_after`) including midday — the day_strength hard gate is what filters chop, not the time window.
-- **Sr-scalp** *(added 2026-05-12)*: HTF S/R mean-reversion scalp. Uses the bot's existing `sr_ctx.nearest_support` (HS) and `nearest_resistance` (HR) as level prices and zone bands matching the dashboard's `key_level_zones` — NO strategy-local level creation. A distance gate requires the inner zone gap to clear BOTH `sr_scalp_min_distance_pct` (default 0.8% of close) AND `sr_scalp_min_distance_atr` (default 2.5x ATR); too-close zones reject at build time as `htf_zones_too_close` so other regimes can fall through. A proximity gate requires close to be inside the entry-side zone or within `sr_scalp_max_distance_from_zone_atr` of its inner edge. **Allowed post-ORB through close** (`orb_end_time` → `no_new_entries_after`). Index-confirmation EXEMPT (mean-reversion thesis, same as range). Theoretical max score 5.0, but the **empirical ceiling is ~3.9** across 13.2k observed cycles (the +1.5 rejection-wick component rarely co-occurs with all three neutral/chop components). **Keep `min_sr_scalp_score` ≤ 3.9 or the regime can never qualify** — it was silently dead from 2026-05-12 to 2026-05-27 with a 4.0 threshold (0 entries ever); lowered to 3.0 on 2026-05-27 so it can fire.
+- **Sr-scalp** *(added 2026-05-12)*: HTF S/R mean-reversion scalp. Uses the bot's existing `sr_ctx.nearest_support` (HS) and `nearest_resistance` (HR) as level prices and zone bands matching the dashboard's `key_level_zones` — NO strategy-local level creation. A distance gate requires the inner zone gap to clear BOTH `sr_scalp_min_distance_pct` (default 0.8% of close) AND `sr_scalp_min_distance_atr` (default 2.5x ATR); too-close zones reject at build time as `htf_zones_too_close` so other regimes can fall through. A proximity gate requires close to be inside the entry-side zone or within `sr_scalp_max_distance_from_zone_atr` of its inner edge. **Allowed post-ORB through close** (`orb_end_time` → `no_new_entries_after`). Index-confirmation EXEMPT (mean-reversion thesis, same as range). Max score 5.0 (`REGIME_SCORE_CEILINGS['sr_scalp']`), reached only on the flip-continuation path; the proximity path caps at 4.5. The pre-2026-05-29 chop-character scorer had an empirical ceiling near 3.9 and sat silently dead from 2026-05-12 to 2026-05-27 behind a 4.0 threshold (0 entries ever) — that note no longer describes the current level-geometry scorer. **DISABLED in the shipped preset** as of 2026-09-18 (`disable_sr_scalp_regime: true`): its `sr_scalp_min_distance_atr` (reward floor) and `sr_scalp_min_stop_atr_mult` (risk floor) are both 2.5, so a setup at the gap floor lands near R:R 0.8 and is rejected by `stop_floor_kills_rr` — the effective gap requirement is nearer 3.1 ATR than the 2.5 the parameter claims.
 
 Build-time fall-through: as of 2026-05-12 each side stores an ordered list of qualifying regimes (score-descending). The build phase iterates the list and tries each regime in turn — if a regime's build fails (e.g. trend's `no_fresh_breakout`, sr_scalp's `htf_zones_too_close`), the next qualifying regime on the same side gets a chance. Across sides, the higher-scored side's full build_order is tried first.
 
@@ -169,11 +169,16 @@ Candle patterns do not block entries — they only boost priority when multiple 
 
 The sector ETFs configured in `index_symbols` (e.g. XLK, XLC, XLY, XLE, XLB depending on which sectors your universe touches) are added to the active watchlist so they receive history fetching, streaming, and appear in the bars dict. Without this, index confirmation would silently fail because `bars.get("XLK")` would return None for an AAPL trade.
 
-### 9. Sector concentration guard prevents correlated stacking
+### 9. Correlation concentration guard prevents correlated stacking
 
-The strategy defines sector groups aligned to GICS sectors. A configurable limit (`max_same_sector_same_direction`, default 2) prevents more than N same-direction positions in the same sector. For example, you cannot hold 3 LONG tech positions simultaneously.
+Two groupings exist and they are deliberately different:
 
-All 11 GICS sectors are pre-defined in the manifest so new symbols can be dropped into the correct group without code changes.
+- **`sector_groups`** - GICS granularity. Routes a symbol to its confirmation ETF (`sector_index_map`) and supplies the peer list for breadth confirmation. All 11 GICS sectors are pre-defined in the manifest so new symbols can be dropped into the correct group without code changes.
+- **`correlation_groups`** - risk granularity, coarser. Drives the concentration guard via `max_same_correlation_group_same_direction` (default 2).
+
+They were one map until 2026-09-18, which under-counted risk: names across the tech / communication / consumer-discretionary line run roughly 0.85 correlated on any macro day, so treating them as independent sectors allowed a single directional bet to fill every `risk.max_positions` slot while appearing diversified - four tickers, one leveraged index bet, and `risk.max_daily_loss` reached in one move instead of four independent ones. On the Tech/AI universe the shipped preset therefore uses two risk buckets: `ai_complex` (semis + platforms, 20 names) and `software` (5), each capped at 2.
+
+Every symbol in `tradable` must appear in some `correlation_groups` entry; an ungrouped symbol bypasses the guard entirely (pinned by `test_every_tradable_symbol_is_grouped`).
 
 ### 10. What a good setup looks like
 
@@ -231,23 +236,17 @@ Exits can also be triggered by:
 
 ### 13. Sector groups
 
-The default sector groupings cover all 11 GICS sectors. Symbols are assigned to their proper sector so the concentration guard fires correctly:
+Three co-movement blocks covering the 25-name Tech/AI universe. Every symbol in
+`tradable` must appear in exactly one, and every block is large enough for peer
+breadth (>= `index_breadth_min_peers`) so the ETF is only ever the fallback:
 
-| Sector                     | Symbols                                     |
-|----------------------------|---------------------------------------------|
-| **Technology**             | AAPL, MSFT, NVDA, INTC, AMD, AVGO, TSM, CRM |
-| **Consumer Discretionary** | AMZN, TSLA, HD, LOW, UBER                   |
-| **Communication Services** | GOOG, META, NFLX, RBLX, TMUS                |
-| **Financials**             | JPM, GS, V                                  |
-| **Healthcare**             | LLY                                         |
-| **Consumer Staples**       | COST                                        |
-| Industrials                | *(empty — ready for additions)*             |
-| Energy                     | *(empty)*                                   |
-| Materials                  | *(empty)*                                   |
-| Real Estate                | *(empty)*                                   |
-| Utilities                  | *(empty)*                                   |
+| Group                | ETF | Symbols                                                          |
+|----------------------|-----|------------------------------------------------------------------|
+| **ai_hardware** (12) | SMH | NVDA, AVGO, AMD, TSM, MU, QCOM, ARM, MRVL, INTC, ANET, VRT, DELL |
+| **platforms** (8)    | XLK | AAPL, MSFT, GOOG, AMZN, META, NFLX, ORCL, TSLA                   |
+| **software** (5)     | IGV | CRM, ADBE, NOW, PLTR, PANW                                       |
 
-With `max_same_sector_same_direction: 2`, you can hold at most 2 LONG per sector. Across the now-6 populated sectors that's up to 12 LONG positions if perfectly diversified (but capped by `risk.max_positions`). Adding a symbol to the tradable list requires also adding it to the correct sector group, otherwise it bypasses the concentration guard.
+The table above is `sector_groups` - the ETF-routing / peer-breadth map (`ai_hardware` -> SMH, `platforms` -> XLK, `software` -> IGV). The concentration guard reads `correlation_groups` instead (see section 9): `ai_complex` (semis + platforms, 20 names) and `software` (5), each capped at 2 by `max_same_correlation_group_same_direction`. Groups are drawn by CO-MOVEMENT, not GICS: META/GOOG/NFLX are Communication Services and AMZN/TSLA Consumer Discretionary, but across this universe they trade as part of the mega-cap compute complex. Adding a symbol to `tradable` requires adding it to BOTH maps - its sector group (for ETF routing and breadth) and its correlation group (for the risk guard); `test_every_tradable_symbol_is_grouped` fails if you forget.
 
 ### 14. Recommended risk config
 
@@ -331,8 +330,12 @@ Strategy-specific knobs:
 - `side_decision_max_opposing`: maximum opposing votes allowed for a decision (default `1`). Tighter values demand cleaner consensus.
 - `orb_bypass_side_decision`: skip the explicit side decision during the ORB window (through `orb_end_time`) (default `true`).
 - `require_entry_confirmation_bar`: require the last fully closed LTF bar to confirm direction (green AND > prior close for LONG; mirror for SHORT) before entry on trend/pullback/momentum/vol_squeeze regimes (default `true`). See section 6f Fix B.
-- `sector_groups`: GICS sector groupings for concentration guard.
-- `max_same_sector_same_direction`: max same-direction positions per sector.
+- `sector_groups`: GICS sector groupings - ETF routing (`sector_index_map`) and the peer list for breadth confirmation.
+- `correlation_groups`: coarser risk groupings for the concentration guard.
+- `max_same_correlation_group_same_direction`: max same-direction positions per correlation group.
+- `volatility_scaled_thresholds` / `reference_adr_pct` / `volatility_scale_min` / `volatility_scale_max` / `adr_lookback_days`: per-symbol ADR scaling of every percent-of-price threshold (see section 16).
+- `beta_lookback_days`: daily regression window for the sector-beta used by the relative-strength residual.
+- `index_breadth_min_peers` / `index_breadth_min_agree_frac`: sector-breadth confirmation (see section 17).
 
 Also uses these shared stock groups:
 
@@ -348,7 +351,7 @@ Current code defaults:
 
 | Option                               | Default                                                                                                                       |
 |--------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
-| `tradable`                           | `AAPL, MSFT, NVDA, INTC, AMD, AVGO, TSM, CRM, AMZN, TSLA, HD, LOW, UBER, COST, GOOG, META, NFLX, RBLX, TMUS, JPM, GS, V, LLY` |
+| `tradable`                           | `AAPL, MSFT, GOOG, AMZN, META, NFLX, ORCL, TSLA, NVDA, AVGO, AMD, TSM, MU, QCOM, ARM, MRVL, INTC, ANET, VRT, DELL, CRM, ADBE, NOW, PLTR, PANW` |
 | `index_symbols`                      | `XLK, XLC, XLY, XLF, XLV, XLP`                                                                                                |
 | `sector_index_map`                   | All 11 GICS sectors mapped to their canonical SPDR Select Sector ETF (XLK, XLC, XLY, XLF, XLV, XLI, XLE, XLP, XLRE, XLU). Materials maps to `[XLB, GDX, COPX]` (XLB is chemicals-heavy so gold/copper miners need GDX/COPX for proper alignment) |
 | `early_session_stop_widening_enabled`| `true`                                                                                                                        |
@@ -434,7 +437,7 @@ Current code defaults:
 | `adaptive_profit_lock_rr`            | `1.30`                                                                                                                        |
 | `adaptive_profit_lock_stop_rr`       | `0.35`                                                                                                                        |
 | `adaptive_runner_trigger_rr`         | `1.15`                                                                                                                        |
-| `max_same_sector_same_direction`     | `2`                                                                                                                           |
+| `max_same_correlation_group_same_direction` | `2`                                                                                                                     |
 | `force_flatten`                      | `{'long': true, 'short': true}`                                                                                               |
 
 ## Files in this folder
@@ -443,3 +446,90 @@ Current code defaults:
 - `configs/config.top_tier_adaptive.yaml` is the matching top-level tuned preset for this strategy.
 - `screener.py` fetches the fixed tradable universe from TradingView and ranks by activity.
 - `strategy.py` contains the regime scoring, signal building, and entry logic.
+
+---
+
+## 16. Per-symbol volatility scaling (2026-09-18)
+
+Every percent-of-price threshold is multiplied by `vol_scale` - the symbol's 20-day ADR (true range, so overnight gaps count) divided by `reference_adr_pct`, clamped to `[volatility_scale_min, volatility_scale_max]`.
+
+Without it a single number is a different gate on every name. This universe spans roughly 1.3% ADR (AAPL, MSFT) to 4%+ (PLTR, ARM, MU), so:
+
+- `momentum_min_day_strength` as a flat figure was a routine move on PLTR/ARM and a 2-sigma day on AAPL/MSFT - the momentum regime was structurally a high-beta-only strategy. Scaled, the written 1.8 lands near 1.1% on AAPL and ~3.4% on PLTR.
+- `default_stop_pct: 0.010` is a tight stop on PLTR/ARM and a very wide one on AAPL/MSFT.
+
+Scaled params: `default_stop_pct`, `momentum_min_day_strength`, `sr_scalp_min_distance_pct`, `relative_strength_block_threshold_pct`, `range_max_vwap_dist_pct`, `range_max_intraday_range_pct`, `vol_squeeze_max_range_pct`, `vol_squeeze_breakout_buffer_pct`, `vwap_reclaim_buffer_pct`, `broken_level_min_clearance_pct`.
+
+**ATR-multiple params (`*_atr_mult`) are NOT scaled** - they are already volatility-relative and scaling them would square the adjustment.
+
+Data comes from `MarketDataStore.get_daily_history` (one Schwab daily `price_history` call per symbol per ET day) via `daily_stats.build_symbol_stats`. When the fetch fails or returns too few sessions, `vol_scale` is 1.0 and thresholds are exactly as written - the pre-scaling behaviour, not an invented default.
+
+This also retires the hand-maintained `HIGH_VOL:` overrides scattered through the preset: those exist because absolute thresholds do not survive a volatility regime change, whereas ADR-relative ones largely do.
+
+## 17. Sector-breadth index confirmation (2026-09-18)
+
+`_index_confirms` prefers **peer breadth** over the sector ETF whenever the symbol has at least `index_breadth_min_peers` peers with readable bars in its `sector_groups` entry: it counts how many of those peers lean the trade's way and requires `index_breadth_min_agree_frac` of them.
+
+The ETF test is close to circular on a mega-cap universe - AAPL+MSFT+NVDA+AVGO are roughly 45% of XLK, GOOG+META about 45% of XLC, AMZN+TSLA about 40% of XLY. Asking XLK whether AAPL's move is confirmed substantially asks AAPL about AAPL, and it fails in the one case that matters: the mega cap moving against the rest of its sector. Breadth excludes the symbol itself.
+
+Single-member sectors (healthcare/LLY, staples/COST here) have no peers and fall back to the original ETF check.
+
+## 18. Scheduled-event blackouts (2026-09-18)
+
+Driven by the top-level `events:` config section and `event_blackouts.EventBlackoutCalendar`, shared by every strategy (it previously lived inside the 0DTE options strategy, so equity strategies had no event awareness at all).
+
+- **Macro windows** (`events.blackout_file`, `events.blackouts`) - CPI, FOMC and similar. A window may now carry `symbols: [...]` to scope it. Checked once per cycle; blocks every candidate.
+- **Earnings** (`events.earnings_file`, `events.earnings`) - per-symbol dates. Blocks `earnings_block_sessions_before` / `_after` trading sessions either side, weekend-aware. Across 23 mega caps that is roughly 92 scheduled events a year, clustered into three weeks a quarter; an earnings print resets the symbol's volatility regime, so the ATR-derived stops and session-open-anchored `day_strength` are both calibrated to a distribution that no longer holds.
+
+Skip reasons: `event_blackout(<label>)` and `earnings_blackout(<SYM> <date>,<when>,offset=+/-Nsession)`.
+
+## 19. Cross-regime score normalisation (2026-09-18)
+
+Raw regime scores are not comparable: each `_score_*` method has its own ceiling (see `REGIME_SCORE_CEILINGS`) and its own `min_*_score` floor. `_normalized_regime_score` maps a score onto `(score - threshold) / (ceiling - threshold)`, so 0.0 is exactly at the floor and 1.0 at the scorer's maximum.
+
+This drives both auctions:
+
+- The per-candidate **build order** - previously sorted raw, which handed the queue to whichever scorer had the most components. A trend at 4.5/6.0 (25% of its headroom) outranked an sr_scalp at 4.4/5.0 (93% of its headroom).
+- The cross-signal **slot auction** - `signal_priority_key` now ranks on `regime_score_normalized`, then `final_priority_score`. Previously the gatekeeper's generic path sorted on raw `regime_score`, and `final_priority_score` (which carries the structure / pattern / candle / S/R / FVG quality work) only broke ties between identical raw scores.
+
+## 20. Side decision is scoped to direction-following regimes (2026-09-18)
+
+`_decide_side` votes on four trend-following signals (recent return, close vs VWAP, EMA9/20, last-3-bar colour). It used to collapse `preferred_sides` to the winning side for the whole candidate, before any regime was scored.
+
+That silently removed both mean-reversion regimes. `range` only enters within the bottom 35% of the range (LONG), and `sr_scalp` only at a support price has just fallen into - exactly the conditions where recent-return and close-vs-VWAP both vote SHORT. Simulated over a clean oscillating range with the shipped params, the vote agreed with the range regime's own entry zone on 3 of 54 in-zone bars (5.5%).
+
+The vote now gates per (side, regime) against `SIDE_DECISION_REGIMES`, matching the exemptions the index and confirmation-bar gates already made for `MEAN_REVERSION_REGIMES`. New skip reason: `<side>_build_failed_<regime>_side_decision_opposed(decided=...)`.
+
+## 21. Long / short asymmetry (2026-09-18)
+
+Every other threshold is shared between the two sides, which assumes they are
+mirror images. On equities they are not, so three multipliers encode the
+asymmetries that actually exist. All default neutral, so a preset that does not
+set them stays fully symmetric.
+
+| Param | Preset | Effect |
+|---|---|---|
+| `short_min_score_premium` | `0.5` | Raises the regime floor for SHORTs only |
+| `short_stop_buffer_mult` | `1.25` | Widens the ATR cushion on shorts |
+| `short_target_rr_mult` | `0.85` | Banks short profits sooner |
+
+Rationale: squeezes are faster than flushes, so the same "normal" adverse move
+costs a short more; equities drift up, so a short fights the base rate and
+deserves a higher bar; and that drift makes short profits less durable.
+
+Two details worth knowing:
+
+- The premium raises the **normalisation denominator** too, so a short that
+  barely clears its higher bar still ranks as marginal in the cross-regime
+  auction instead of being flattered by the long-side floor.
+- The wider short stop does **not** raise dollar risk. `size_position` divides
+  the budget by stop distance, so a 1.25x stop simply sizes to ~20% fewer
+  shares. It never moves the structural level the strategy chose - only the
+  cushion beyond it.
+
+On the shipped preset that means, for the trend regime:
+
+```
+LONG    floor 4.00    stop buffer x1.00    target 2.00R
+SHORT   floor 4.50    stop buffer x1.25    target 1.70R
+```

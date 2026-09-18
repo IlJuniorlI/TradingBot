@@ -92,6 +92,11 @@ class MarketDataStore:
         except TypeError:
             self.stream = Stream()
         self.history: dict[str, pd.DataFrame] = {}
+        # Daily OHLC bars, one fetch per symbol per ET date (see
+        # get_daily_history). A None value is a cached failure for that
+        # date, not "not fetched yet" — last_daily_refresh distinguishes.
+        self.daily_history: dict[str, pd.DataFrame | None] = {}
+        self.last_daily_refresh: dict[str, date] = {}
         self.live: dict[str, pd.DataFrame] = {}
         self.quote_cache: dict[str, dict] = {}
         self.sr_cache: dict[tuple[str, int], SupportResistanceContext] = {}
@@ -1100,6 +1105,57 @@ class MarketDataStore:
         if df.empty and not self.is_regular_session(fetched_at):
             LOG.info("price_history returned no candles for %s outside regular session; using slower retry cadence", symbol)
         return self.get_merged(symbol)
+
+    def get_daily_history(self, symbol: str, calendar_days: int = 180) -> pd.DataFrame | None:
+        """Daily OHLC bars for *symbol*, fetched at most once per ET date.
+
+        Feeds ``daily_stats`` (per-symbol ADR scale + benchmark beta), which
+        needs a horizon the intraday store cannot provide — ``history`` spans
+        ``runtime.history_lookback_minutes`` (hours, not months).
+
+        One Schwab ``price_history`` call per symbol per day, cached in
+        memory for the process lifetime and re-fetched when the ET date
+        rolls. Returns ``None`` on a failed or empty fetch; the caller must
+        treat that as "no stats available" rather than substituting a
+        default. A failure is cached for the day too, so a delisted or
+        mis-typed symbol does not retry on every cycle.
+        """
+        key = self._symbol_key(symbol)
+        today = now_et().date()
+        with self._lock:
+            if self.last_daily_refresh.get(key) == today:
+                cached = self.daily_history.get(key)
+                return None if cached is None else cached.copy()
+        end = now_et()
+        start = end - timedelta(days=max(1, int(calendar_days)))
+        try:
+            payload, source_symbol = self._fetch_price_history_payload_with_aliases(
+                symbol,
+                periodType="year",
+                frequencyType="daily",
+                frequency=1,
+                startDate=start,
+                endDate=end,
+                needExtendedHoursData=False,
+                needPreviousClose=False,
+            )
+        except Exception:
+            LOG.warning("Daily price_history fetch failed for %s; daily stats unavailable today.", symbol, exc_info=True)
+            with self._lock:
+                self.daily_history[key] = None
+                self.last_daily_refresh[key] = today
+            return None
+        frame = self._history_candles_to_frame(payload.get("candles", []))
+        if frame.empty:
+            LOG.warning("Daily price_history returned no candles for %s (via %s).", symbol, source_symbol)
+            frame_or_none = None
+        else:
+            frame_or_none = frame
+            LOG.info("Daily history for %s: %d sessions (via %s).", symbol, len(frame), source_symbol)
+        with self._lock:
+            self.daily_history[key] = frame_or_none
+            self.last_daily_refresh[key] = today
+        return None if frame_or_none is None else frame_or_none.copy()
 
     def fetch_support_resistance(
         self,

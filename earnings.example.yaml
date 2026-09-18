@@ -1,0 +1,15 @@
+# Per-symbol earnings blackout calendar.
+#
+# An earnings print resets a symbol's volatility regime, so ATR-derived stops
+# and the session-open-anchored day_strength the strategies rely on are both
+# calibrated to a distribution that no longer applies. Entries are blocked on
+# the date itself plus `events.earnings_block_sessions_before` /
+# `_after` trading sessions either side (weekend-aware).
+#
+# Copy to ./earnings.yaml and fill in. Dates are the SESSION DATE of the
+# report; for an after-close print use that day's date. Refresh quarterly.
+earnings:
+  AAPL: ["2026-10-29"]
+  MSFT: ["2026-10-28"]
+  NVDA: ["2026-11-18"]
+  # ... one entry per symbol in params.tradable

@@ -330,6 +330,44 @@ class RiskConfig:
     # can override the block.
     same_level_block_minutes: int = 30
     same_level_block_atr_mult: float = 0.3
+    # --- Entry slippage / realized-risk controls (2026-09-18) ---
+    # Position size is computed BEFORE the order from the previewed limit
+    # price, but realized risk is qty * |fill - stop|. An adverse fill
+    # therefore risks more than the budget, and the overage scales inversely
+    # with stop distance: on a 1%-wide stop a 5c slip is ~2% over, but on a
+    # structural stop 10x tighter the same slip is ~25% over.
+    #
+    # entry_slippage_allowance_* pads the stop distance used for SIZING by an
+    # expected-slippage amount, so a fill that slips by up to that amount
+    # still lands inside the budget. Derived from the live spread (the actual
+    # cost of crossing) and capped as a fraction of price so one pathological
+    # quote cannot size a trade to zero. Set the spread fraction to 0.0 to
+    # size on the raw stop distance, as before.
+    entry_slippage_allowance_spread_frac: float = 1.0
+    entry_slippage_allowance_max_pct: float = 0.002
+    # Post-fill reconciliation. Realized risk is compared against the budget
+    # and anything beyond this fraction over is logged and stamped on the
+    # position. Detection only — the shares are already bought, so there is
+    # nothing to reject; the sizing allowance above is the preventive half.
+    risk_overage_warn_frac: float = 0.15
+    # Entry slippage beyond this fraction of the signal price is logged and
+    # flagged on the position, so a routing or liquidity degradation surfaces
+    # in the log rather than only in an end-of-day report nobody diffs.
+    entry_slippage_warn_pct: float = 0.0015
+    # --- Daily loss projection (2026-09-18) ---
+    # max_daily_loss gates NEW ENTRIES on REALIZED P&L only, and open
+    # positions are never flattened when it trips. With max_positions open at
+    # full risk when realized P&L reaches the limit, the day can finish at
+    # roughly twice it. When this is on, can_open subtracts the open
+    # positions' remaining risk-to-stop from realized P&L before comparing,
+    # so the bot stops opening new trades once the WORST CASE would breach
+    # the limit rather than once the realized damage already has.
+    #
+    # Remaining risk per position is measured to its CURRENT stop, so a stop
+    # trailed to breakeven or better contributes zero — this tightens the gate
+    # without punishing positions that are already de-risked. Set False to
+    # restore the realized-only comparison.
+    daily_loss_includes_open_risk: bool = True
     # Time-stop: scratch a trade held too long without meaningful price
     # movement. 2026-04-17 META held 223 min for +$0.16 on EQL exit — dead
     # capital blocking a slot. 0 = disabled.
@@ -385,6 +423,16 @@ class RiskConfig:
 class RuntimeConfig:
     timezone: str = "America/New_York"
     loop_sleep_seconds: float = 2.0
+    # --- Persistent-failure escalation (2026-09-18) ---
+    # The main loop already backs off exponentially on errors and never gives
+    # up, but nothing said so out loud: a sustained outage during the
+    # management window left open positions unmanaged with only a throttled
+    # WARNING line to show for it. After this many consecutive failed cycles
+    # the engine escalates to a CRITICAL log naming the open positions, and
+    # the dashboard status turns into an explicit alarm. At the capped 60s
+    # backoff, 10 cycles is roughly 10 minutes of no management.
+    # Set to 0 to disable the escalation (the backoff is unaffected).
+    error_escalation_cycles: int = 10
     # When the bot is in "deep idle" (always-on mode with
     # auto_exit_after_session=false, outside the 7am–8pm ET equity stream
     # session, and no open positions), the main loop sleeps this long
@@ -581,6 +629,43 @@ class EquityExecutionConfig:
     entry_live_reprice_step_frac: float = 0.50
     extended_hours_enabled: bool = True
     market_exit_regular_hours: bool = True
+
+    # --- Broker-side bracket (first-triggers-OCO) orders ---
+    # When enabled the entry is submitted as a single Schwab TRIGGER order
+    # whose child OCO carries the protective stop (and optionally the target),
+    # so the exit rests AT THE BROKER instead of waiting for the engine's
+    # management poll. Off by default: every existing preset keeps today's
+    # fully engine-managed exits.
+    bracket_orders_enabled: bool = False
+    # static  = submit once, never touch. Broker owns the resting levels for
+    #           the life of the trade. Correct for fixed-stop/fixed-target
+    #           scalps that do no in-trade level management.
+    # replace = engine keeps managing levels; every stop/target move issues a
+    #           replace_order against the corresponding child. Required for the
+    #           adaptive/ladder strategies whose edge is the in-trade ratchet.
+    bracket_sync_mode: str = "static"
+    # stop_and_target = both OCO children rest at the broker.
+    # stop_only       = only the protective stop rests; the target stays
+    #   engine-side. REQUIRED for `trade_management_mode: adaptive_ladder`:
+    #   the ladder deliberately declines a target-tag exit
+    #   (`adaptive_ladder_suppress_target_exit`) so it can roll to the next
+    #   rung, and it clears target_price entirely on the final rung to run a
+    #   runner. A resting target limit fills through both behaviours.
+    bracket_legs: str = "stop_and_target"
+    # STOP fills wherever a flush ends — punishing on thin small caps.
+    # STOP_LIMIT bounds the slippage at the cost of a no-fill tail risk.
+    bracket_stop_order_type: str = "STOP_LIMIT"
+    # STOP_LIMIT only: limit offset below (LONG) / above (SHORT) the stop
+    # trigger, expressed in units of initial R.
+    bracket_stop_limit_offset_r: float = 0.5
+    # Schwab rejects STOP orders outside the NORMAL session. With this true a
+    # bracketed entry is REJECTED pre/post market rather than silently sent
+    # naked; set false only if you accept unbracketed extended-hours entries.
+    bracket_require_normal_session: bool = True
+    # replace mode debounce: skip the replace_order round trip unless a level
+    # moved at least this many dollars. Stops the per-cycle trail ratchet from
+    # burning the Schwab rate budget on sub-penny adjustments.
+    bracket_replace_min_price_delta: float = 0.01
 
 
 @dataclass(slots=True)
@@ -951,6 +1036,29 @@ class SharedExitLogicConfig:
 
 
 @dataclass(slots=True)
+class EventsConfig:
+    """Scheduled-event blackouts shared by every strategy.
+
+    Lifted out of ``ZeroDteOptionsConfig`` (2026-09-18) — the blackout
+    calendar was reachable only from the 0DTE options strategy, so equity
+    strategies had no macro-event awareness and no earnings awareness at all.
+    See ``event_blackouts.EventBlackoutCalendar`` for the evaluation.
+    """
+
+    enabled: bool = True
+    # Macro windows (CPI / FOMC / ...). Same schema the 0DTE path used, plus
+    # an optional ``symbols`` list to scope a window to specific tickers.
+    blackout_file: str | None = "./macro_events.auto.yaml"
+    blackouts: list[dict[str, Any]] = field(default_factory=list)
+    # Per-symbol earnings dates: {"AAPL": ["2026-10-30", ...], ...}
+    earnings_file: str | None = "./earnings.yaml"
+    earnings: dict[str, list[str]] = field(default_factory=dict)
+    # Trading sessions either side of an earnings date that block entries.
+    earnings_block_sessions_before: int = 1
+    earnings_block_sessions_after: int = 1
+
+
+@dataclass(slots=True)
 class ZeroDteOptionsConfig:
     enabled: bool = True
     underlyings: list[str] = field(default_factory=lambda: ["SPY", "QQQ"])
@@ -1010,8 +1118,6 @@ class ZeroDteOptionsConfig:
     max_quote_age_seconds: int = 6
     dry_run_replace_attempts: int = 2
     dry_run_step_frac: float = 0.25
-    event_blackout_file: str | None = "./macro_events.auto.yaml"
-    event_blackouts: list[dict[str, Any]] = field(default_factory=list)
     option_chain_cache_seconds: int = 6
     option_chain_cache_max_entries: int = 24
     # --- Options premium ratchet (post-entry stop management) ---
@@ -1087,6 +1193,7 @@ class BotConfig:
     technical_levels: TechnicalLevelsConfig
     options: ZeroDteOptionsConfig
     strategies: dict[str, StrategyConfig]
+    events: EventsConfig = field(default_factory=EventsConfig)
     shared_entry: SharedEntryLogicConfig = field(default_factory=SharedEntryLogicConfig)
     shared_exit: SharedExitLogicConfig = field(default_factory=SharedExitLogicConfig)
     pairs: list[PairDefinition] = field(default_factory=list)
@@ -1278,6 +1385,69 @@ def _validate_runtime_config(runtime: RuntimeConfig, config_path: Path) -> None:
         raise ValueError(f"{config_path}: invalid runtime configuration:\n  " + "\n  ".join(errors))
 
 
+def _validate_execution_config(execution: EquityExecutionConfig, risk: RiskConfig, config_path: Path) -> None:
+    """Plausibility checks for the equity execution / bracket-order block.
+
+    The bracket knobs are enum-ish strings whose misspelling would otherwise
+    fall through to a silent "not that mode" branch at order-build time — by
+    which point a live order is already in flight. Validate at load."""
+    errors: list[str] = []
+    sync_modes = {"static", "replace"}
+    if execution.bracket_sync_mode not in sync_modes:
+        errors.append(
+            f"execution.bracket_sync_mode must be one of {sorted(sync_modes)}, "
+            f"got {execution.bracket_sync_mode!r}"
+        )
+    leg_modes = {"stop_and_target", "stop_only"}
+    if execution.bracket_legs not in leg_modes:
+        errors.append(
+            f"execution.bracket_legs must be one of {sorted(leg_modes)}, "
+            f"got {execution.bracket_legs!r}"
+        )
+    stop_types = {"STOP", "STOP_LIMIT"}
+    if execution.bracket_stop_order_type not in stop_types:
+        errors.append(
+            f"execution.bracket_stop_order_type must be one of {sorted(stop_types)}, "
+            f"got {execution.bracket_stop_order_type!r}"
+        )
+    if execution.bracket_stop_limit_offset_r < 0:
+        errors.append(
+            "execution.bracket_stop_limit_offset_r must be >= 0, got "
+            f"{execution.bracket_stop_limit_offset_r}"
+        )
+    if execution.bracket_replace_min_price_delta < 0:
+        errors.append(
+            "execution.bracket_replace_min_price_delta must be >= 0, got "
+            f"{execution.bracket_replace_min_price_delta}"
+        )
+    if execution.bracket_orders_enabled:
+        # A resting target limit defeats the ladder's two defining behaviours:
+        # suppress-target-exit (roll to the next rung) and final-rung runner
+        # (target_price cleared to None). Refuse the combination outright
+        # rather than let it silently degrade every ladder trade to a rung-1
+        # scalp.
+        if risk.trade_management_mode == "adaptive_ladder" and execution.bracket_legs == "stop_and_target":
+            errors.append(
+                "execution.bracket_legs must be 'stop_only' when "
+                "risk.trade_management_mode is 'adaptive_ladder': a resting "
+                "target limit fills through adaptive_ladder_suppress_target_exit "
+                "and through the final-rung runner, so the ladder can never extend"
+            )
+        # static sync + an engine that ratchets stops = the broker holds a
+        # stale protective level for the life of the trade. Every breakeven /
+        # profit-lock / trail move would be invisible to the resting order.
+        if execution.bracket_sync_mode == "static" and risk.trade_management_mode in {"adaptive", "adaptive_ladder"}:
+            errors.append(
+                f"execution.bracket_sync_mode 'static' cannot be used with "
+                f"risk.trade_management_mode {risk.trade_management_mode!r}: the engine "
+                "ratchets stop_price in-trade and static mode never replaces the "
+                "resting child, leaving the broker on the entry-time stop. Use "
+                "bracket_sync_mode: replace, or a non-adaptive management mode"
+            )
+    if errors:
+        raise ValueError(f"{config_path}: invalid execution configuration:\n  " + "\n  ".join(errors))
+
+
 def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path) -> None:
     """Plausibility checks for options sizing and quote-freshness.
 
@@ -1426,6 +1596,7 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     _validate_pattern_config(config_path, candles_raw, chart_patterns_raw)
     support_resistance_raw = dict(raw.get("support_resistance", {}) or {})
     technical_levels_raw = dict(raw.get("technical_levels", {}) or {})
+    events_raw = dict(raw.get("events", {}) or {})
     shared_entry_raw = dict(raw.get("shared_entry", {}) or {})
     shared_exit_raw = dict(raw.get("shared_exit", {}) or {})
     options_raw = _normalize_options_config(raw.get("options", {}))
@@ -1467,6 +1638,9 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     risk_cfg = RiskConfig(**risk_raw)
     _validate_risk_config(risk_cfg, config_path)
 
+    execution_cfg = EquityExecutionConfig(**execution_raw)
+    _validate_execution_config(execution_cfg, risk_cfg, config_path)
+
     options_cfg = ZeroDteOptionsConfig(**options_raw)
     _validate_options_config(options_cfg, config_path)
     if is_option_strategy(strategy) and not options_cfg.underlyings:
@@ -1491,11 +1665,12 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
                 expanded=DashboardChartConfig(**expanded_charting_raw),
             ),
         ),
-        execution=EquityExecutionConfig(**execution_raw),
+        execution=execution_cfg,
         candles=CandlesConfig(**candles_raw),
         chart_patterns=ChartPatternsConfig(**chart_patterns_raw),
         support_resistance=SupportResistanceConfig(**support_resistance_raw),
         technical_levels=TechnicalLevelsConfig(**technical_levels_raw),
+        events=EventsConfig(**events_raw),
         shared_entry=SharedEntryLogicConfig(**shared_entry_raw),
         shared_exit=SharedExitLogicConfig(**shared_exit_raw),
         options=options_cfg,

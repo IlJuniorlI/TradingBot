@@ -59,7 +59,7 @@ from .position_metrics import (
 from .risk import RiskManager
 from ._sr_ladder import _select_next_distinct_level, _sr_effective_side_tolerance
 from ._strategies.strategy_base import BaseStrategy
-from .broker_positions import broker_position_side_qty, order_result_needs_broker_recheck
+from .broker_positions import active_broker_bracket, broker_position_side_qty, order_result_needs_broker_recheck
 from .support_resistance import zone_flip_confirmed
 from .utils import TRADEFLOW_LEVEL, append_management_adjustment as _append_adjustment, now_et
 
@@ -823,6 +823,154 @@ class PositionManager:
                 meta["adaptive_ladder_suppress_target_exit"] = False
 
     # ------------------------------------------------------------------
+    # Broker-side bracket lifecycle
+    #
+    # With execution.bracket_orders_enabled the protective stop (and, in
+    # stop_and_target leg mode, the target) rest AT THE BROKER. That moves
+    # three responsibilities here: notice when a resting child filled, keep
+    # the resting levels in step with the engine's in-trade management, and
+    # cancel them before the engine markets out for its own reasons.
+    # ------------------------------------------------------------------
+
+    def _book_broker_exit(self, key: str, position: Position, exit_qty: int, exit_price: float,
+                          reason: str, bars) -> None:
+        """Record an exit the BROKER executed, mirroring the manage_positions tail."""
+        management_symbol = str(position.metadata.get("underlying") or position.symbol)
+        management_frame = bars.get(management_symbol)
+        exit_context = self._position_exit_context(position, reason, exit_price, exit_price, None, bars)
+        exited_position = copy.copy(position)
+        exited_position.qty = int(exit_qty)
+        remaining_qty_after_exit = max(0, int(position.qty) - int(exit_qty))
+        final_exit = int(exit_qty) >= int(position.qty)
+        realized = self.account.record_exit(
+            exited_position, float(exit_price), reason,
+            final_exit=final_exit,
+            remaining_qty_after_exit=remaining_qty_after_exit,
+            fill_price_estimated=False,
+            broker_recovered=True,
+        )
+        self.audit.log_structured("EXIT_CONTEXT", {
+            **exit_context, "symbol": key, "qty": int(exit_qty), "filled_qty": int(exit_qty),
+            "remaining_qty_after_exit": remaining_qty_after_exit,
+            "result_message": "bracket_child_filled", "fill_price": float(exit_price),
+            "realized_pnl": float(realized), "attempt_status": "broker_bracket",
+        })
+        self.audit.log_structured("TRADE_SUMMARY", self._trade_summary_payload(
+            exited_position, float(exit_price), realized, reason,
+            final_exit=final_exit, remaining_qty_after_exit=remaining_qty_after_exit,
+            broker_recovered=True, fill_price_estimated=False,
+        ))
+        if final_exit:
+            exit_atr = (
+                safe_float(management_frame.iloc[-1].get("atr14"), None)
+                if (management_frame is not None and not management_frame.empty and "atr14" in management_frame.columns)
+                else None
+            )
+            self.risk.register_exit(
+                management_symbol, realized, additional_symbol=key, side=position.side,
+                entry_price=float(position.entry_price), exit_price=float(exit_price),
+                atr=exit_atr,
+            )
+            self.positions.pop(key, None)
+        else:
+            self.risk.register_realized_pnl(realized)
+            position.qty -= int(exit_qty)
+            if isinstance(position.metadata, dict):
+                position.metadata["qty"] = position.qty
+            self.positions[key] = position
+        self._save_reconcile_metadata()
+
+    def _reconcile_bracket_fills(self, bars) -> None:
+        """Book exits the broker already executed, before anything else runs.
+
+        MUST run ahead of the management loop: a filled resting child means the
+        position no longer exists at the broker, and managing or exiting a
+        phantom position sends a duplicate order that opens a NEW position in
+        the opposite direction.
+        """
+        bracketed = {
+            key: position for key, position in self.positions.items()
+            if active_broker_bracket(position) is not None
+        }
+        if not bracketed:
+            return
+        states = self.executor.fetch_order_states()
+        if states is None:
+            # Could not read broker state. Do NOT assume "nothing filled" --
+            # log loudly and leave positions untouched for the next cycle.
+            LOG.warning(
+                "Bracket reconcile could not read broker order state for %s position(s); "
+                "engine state may be stale this cycle", len(bracketed),
+            )
+            return
+        for key, position in bracketed.items():
+            bracket = active_broker_bracket(position)
+            if bracket is None:
+                continue
+            for child_key, reason in (("stop_order_id", "broker_stop"), ("target_order_id", "broker_target")):
+                child_id = bracket.get(child_key)
+                if not child_id:
+                    continue
+                state = states.get(str(child_id))
+                if not isinstance(state, dict) or not state.get("is_filled"):
+                    continue
+                filled_qty = int(state.get("filled_qty") or 0)
+                if filled_qty <= 0:
+                    continue
+                exit_qty = max(1, min(int(position.qty), filled_qty))
+                fill_price = state.get("fill_price")
+                if fill_price is None:
+                    # Broker reported a fill without a price; fall back to the
+                    # level the child was resting at, which is what it triggered on.
+                    fill_price = bracket.get("stop_price") if child_key == "stop_order_id" else bracket.get("target_price")
+                if fill_price is None:
+                    LOG.error(
+                        "Bracket child %s for %s filled but no fill price is available; "
+                        "cannot book the exit this cycle", child_id, key,
+                    )
+                    continue
+                LOG.log(TRADEFLOW_LEVEL, "Bracket %s filled for %s qty=%s price=%s", reason, key, exit_qty, fill_price)
+                bracket["active"] = False
+                bracket["state"] = f"filled:{reason}"
+                self._book_broker_exit(key, position, exit_qty, float(fill_price), reason, bars)
+                break
+
+    def _sync_bracket_children(self, position: Position) -> None:
+        """Push engine-side level changes onto the resting broker children.
+
+        Only runs in ``replace`` sync mode. ``static`` deliberately leaves the
+        entry-time levels alone, which is why config validation refuses to pair
+        it with a management mode that ratchets stops.
+        """
+        bracket = active_broker_bracket(position)
+        if bracket is None:
+            return
+        if str(bracket.get("sync_mode") or "static") != "replace":
+            return
+        symbol = str(position.metadata.get("underlying") or position.symbol)
+        entry_price = float(position.entry_price)
+        qty = int(position.qty)
+
+        engine_target = safe_float(position.target_price, None)
+        resting_target = safe_float(bracket.get("target_price"), None)
+        if bracket.get("target_order_id") and engine_target is None and resting_target is not None:
+            # The ladder cleared the target to run a runner. A resting target
+            # limit would cap exactly the move the runner exists to capture, so
+            # tear the OCO down and re-establish stop-only protection.
+            self.executor.cancel_bracket(bracket)
+            replacement = self.executor.ensure_position_protected(
+                symbol, qty, position.side, entry_price, float(position.stop_price), None,
+            )
+            if replacement is not None and isinstance(position.metadata, dict):
+                position.metadata["bracket"] = replacement
+            return
+
+        for adjustment in self.executor.sync_bracket_levels(
+            bracket, symbol, position.side, qty, entry_price, float(position.stop_price), engine_target,
+        ):
+            _append_adjustment(position.metadata, adjustment)
+
+    # ------------------------------------------------------------------
     # Broker exit recovery — called when a close_position() returned an
     # ambiguous result and we need to re-check broker state.
     # ------------------------------------------------------------------
@@ -993,6 +1141,11 @@ class PositionManager:
     # ------------------------------------------------------------------
 
     def manage_positions(self, _now: datetime, bars) -> None:
+        # Book any exit the broker already executed BEFORE evaluating anything.
+        # A filled resting child means the position is gone at the broker, and
+        # managing or exiting a phantom position sends a duplicate order that
+        # opens a new one in the opposite direction.
+        self._reconcile_bracket_fills(bars)
         for key, position in list(self.positions.items()):
             last_price, market_snapshot = self._position_management_snapshot(position, bars)
             asset_type = str(position.metadata.get("asset_type") or ASSET_TYPE_EQUITY)
@@ -1021,6 +1174,10 @@ class PositionManager:
                 self._adaptive_ladder_management(position, management_frame, float(last_price))
                 self._update_position_diagnostics(position, last_price, underlying_price)
                 should_exit, reason = self.risk.update_position(position, last_price)
+                # Push any level the managers just moved onto the resting
+                # broker children, before the exit decision below can cancel
+                # them. No-op outside `replace` sync mode.
+                self._sync_bracket_children(position)
                 adjustments = position.metadata.get("management_adjustments") if isinstance(position.metadata, dict) else None
                 if adjustments:
                     for adj in adjustments:
@@ -1057,6 +1214,26 @@ class PositionManager:
                     level=TRADEFLOW_LEVEL,
                 )
                 continue
+            # The engine has decided to exit for a reason the broker cannot see
+            # (peak giveback, time stop, CHoCH, force flatten). Tear down the
+            # resting protection FIRST: leaving it live means the market-out and
+            # the resting stop both fill, taking the strategy net short.
+            open_bracket = active_broker_bracket(position)
+            if open_bracket is not None:
+                cancel_ok, cancel_msg = self.executor.cancel_bracket(open_bracket)
+                if not cancel_ok:
+                    # Defer rather than double-exit. The protective stop is still
+                    # resting, so the position is not unguarded while we retry.
+                    LOG.error(
+                        "Could not cancel resting bracket for %s before %s exit (%s); "
+                        "deferring exit to avoid a double fill", key, reason, cancel_msg,
+                    )
+                    self.audit.log_structured("EXIT_CONTEXT", {
+                        **exit_context, "symbol": key, "qty": int(position.qty),
+                        "result_message": f"bracket_cancel_failed:{cancel_msg}",
+                        "attempt_status": "deferred_bracket_cancel_failed",
+                    })
+                    continue
             result = self.executor.close_position(position, data=self.data, market_snapshot=market_snapshot)
             if not result.ok:
                 if asset_type == ASSET_TYPE_EQUITY:
@@ -1138,6 +1315,18 @@ class PositionManager:
                 position.qty -= exit_qty
                 if isinstance(position.metadata, dict):
                     position.metadata["qty"] = position.qty
+                    if open_bracket is not None:
+                        # The exit only partially filled and we cancelled the
+                        # bracket to get here, so the remaining shares are now
+                        # unprotected. Re-establish protection at the current
+                        # engine levels, sized to what is left.
+                        reprotected = self.executor.ensure_position_protected(
+                            str(position.metadata.get("underlying") or position.symbol),
+                            int(position.qty), position.side, float(position.entry_price),
+                            float(position.stop_price), position.target_price,
+                        )
+                        if reprotected is not None:
+                            position.metadata["bracket"] = reprotected
                 self.positions[key] = position
                 self._save_reconcile_metadata()
 

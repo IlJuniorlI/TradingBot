@@ -8,7 +8,6 @@ from ..shared import (
     Candidate,
     LOG,
     OptionContract,
-    Path,
     Position,
     Side,
     Signal,
@@ -49,7 +48,6 @@ from ..shared import (
     time_mod,
     vertical_limit_price,
     vertical_price_bounds,
-    yaml,
 )
 from ..strategy_base import BaseStrategy
 
@@ -65,10 +63,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         super().__init__(config)
         self.optcfg = config.options
         self.force_flat_time = parse_hhmm(self.optcfg.force_flatten_time)
-        self.event_blackouts: list[dict[str, Any]] = []
-        self._event_blackout_source_mtime: float | None = None
-        self._event_blackout_source_path: str | None = None
-        self.event_blackouts = self._load_event_blackouts(force_reload=True)
         self._option_chain_cache: dict[tuple[str, str], tuple[datetime, list[OptionContract]]] = {}
         self._underlying_atr_cache: dict[str, float] = {}
         self._underlying_ref_atr_cache: dict[str, float] = {}
@@ -84,95 +78,12 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         allowed = {str(s).strip() for s in (self.optcfg.styles or []) if str(s).strip()}
         return style in allowed
 
-    @staticmethod
-    def _weekday_token(value: Any) -> str | None:
-        if value is None:
-            return None
-        token = str(value).strip().upper()
-        mapping = {"0": "MON", "1": "TUE", "2": "WED", "3": "THU", "4": "FRI", "5": "SAT", "6": "SUN", "MONDAY": "MON", "TUESDAY": "TUE", "WEDNESDAY": "WED", "THURSDAY": "THU", "FRIDAY": "FRI", "SATURDAY": "SAT", "SUNDAY": "SUN"}
-        return mapping.get(token, token[:3] if token else None)
-
-    def _load_event_blackouts(self, *, force_reload: bool = False) -> list[dict[str, Any]]:
-        events: list[dict[str, Any]] = []
-        for row in list(self.optcfg.event_blackouts or []):
-            if isinstance(row, dict):
-                events.append(dict(row))
-        path = self.optcfg.event_blackout_file
-        if path:
-            raw_path = Path(path).expanduser()
-            candidate_paths: list[Path] = [raw_path]
-
-            if not raw_path.is_absolute():
-                package_root = Path(__file__).resolve().parents[2]
-                project_root = Path(__file__).resolve().parents[3]
-                for base_dir in (package_root, project_root):
-                    alt_path = (base_dir / raw_path).resolve()
-                    if alt_path not in candidate_paths:
-                        candidate_paths.append(alt_path)
-
-            chosen_path = next((candidate for candidate in candidate_paths if candidate.exists()), candidate_paths[0])
-            current_mtime: float | None = None
-            if chosen_path.exists():
-                try:
-                    current_mtime = float(chosen_path.stat().st_mtime)
-                except Exception:
-                    current_mtime = None
-            path_token = str(chosen_path)
-            if (
-                not force_reload
-                and path_token == self._event_blackout_source_path
-                and current_mtime == self._event_blackout_source_mtime
-            ):
-                return list(self.event_blackouts)
-
-            try:
-                payload = yaml.safe_load(chosen_path.read_text()) or []
-                if isinstance(payload, dict):
-                    payload = payload.get("events", [])
-                for row in payload or []:
-                    if isinstance(row, dict):
-                        events.append(dict(row))
-                self._event_blackout_source_path = path_token
-                self._event_blackout_source_mtime = current_mtime
-            except FileNotFoundError:
-                self._event_blackout_source_path = path_token
-                self._event_blackout_source_mtime = None
-                LOG.warning("Event blackout file not found. Tried: %s", candidate_paths)
-            except Exception as exc:
-                self._event_blackout_source_path = path_token
-                self._event_blackout_source_mtime = current_mtime
-                LOG.warning("Failed to load event blackout file %s: %s", chosen_path, exc)
-        self.event_blackouts = list(events)
-        return list(events)
-
     def _matching_event_blackout(self, now_dt=None) -> dict[str, Any] | None:
-        now_dt = now_dt or now_et()
-        self.event_blackouts = self._load_event_blackouts()
-        today = now_dt.date().isoformat()
-        weekday = self._weekday_token(now_dt.weekday())
-        now_t = now_dt.time()
-        for event in self.event_blackouts:
-            if not bool(event.get("enabled", True)):
-                continue
-            event_date = event.get("date")
-            event_weekday = self._weekday_token(event.get("weekday")) if event.get("weekday") is not None else None
-            if event_date and str(event_date) != today:
-                continue
-            if event_weekday and event_weekday != weekday:
-                continue
-            start = event.get("start")
-            end = event.get("end")
-            if not start or not end:
-                continue
-            if parse_hhmm(str(start)) <= now_t <= parse_hhmm(str(end)):
-                return event
-        return None
+        """Macro window covering *now_dt*, via the shared event calendar."""
+        return self._event_calendar.matching_macro_event(now_dt=now_dt)
 
     def _option_entry_block_reason(self, now_dt=None) -> str | None:
-        event = self._matching_event_blackout(now_dt)
-        if event and bool(event.get("block_new_entries", True)):
-            return str(event.get("label") or "event_blackout")
-        return None
+        return self._event_calendar.entry_block_reason(now_dt=now_dt)
 
     @staticmethod
     def _option_chain_cache_key(symbol: str) -> tuple[str, str]:
@@ -1772,8 +1683,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         return out
 
     def should_force_flatten(self, position: Position) -> bool:
-        event = self._matching_event_blackout(now_et())
-        if event and bool(event.get("force_flatten", False)):
+        if self._event_calendar.force_flatten_event(now_dt=now_et()) is not None:
             return True
         now_dt = now_et()
         flat_time = self.force_flat_time

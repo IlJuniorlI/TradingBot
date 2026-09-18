@@ -1,0 +1,4 @@
+# Active earnings blackout calendar — see earnings.example.yaml for the format
+# and `events.earnings_block_sessions_before/_after` in the config for the
+# window width. Empty = no earnings blackouts applied.
+earnings: {}

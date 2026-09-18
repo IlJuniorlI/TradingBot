@@ -92,12 +92,17 @@ class VolatilitySqueezeBreakoutScreener(BaseStrategyScreener):
 
         df["_symbol"] = df["name"].map(lambda value: self._symbol_from_ticker(str(value)).upper().strip())
         df["_raw_relative_volume"] = df["relative_volume_10d_calc"].fillna(0.0).astype(float)
-        df["_rvol_required"] = df["_symbol"].map(lambda symbol: self._relative_volume_gate_threshold(symbol, min_rvol, params))
+        # Dollar volume lets rvol classify liquidity from the tape instead of a
+        # hand-maintained ticker list, which drifts as the market does.
+        df["_dollar_volume"] = (df["close"].fillna(0.0).astype(float)
+                                * df["volume"].fillna(0.0).astype(float))
+        df["_rvol_required"] = df.apply(lambda row: self._relative_volume_gate_threshold(
+            str(row.get("_symbol") or ""), min_rvol, params, dollar_volume=row.get("_dollar_volume")), axis=1)
         df = df[df["_raw_relative_volume"] >= df["_rvol_required"]].copy()
         if df.empty:
             return []
-        df["_effective_relative_volume"] = df.apply(lambda row: self._effective_relative_volume(str(row.get("_symbol") or ""), row.get("_raw_relative_volume", 0.0), params, cap_default=2.5, standard_floor=0.5), axis=1)
-        df["_rvol_profile"] = df["_symbol"].map(lambda symbol: rvol_profile_for_symbol(symbol, params or {}))
+        df["_effective_relative_volume"] = df.apply(lambda row: self._effective_relative_volume(str(row.get("_symbol") or ""), row.get("_raw_relative_volume", 0.0), params, cap_default=2.5, standard_floor=0.5, dollar_volume=row.get("_dollar_volume")), axis=1)
+        df["_rvol_profile"] = df.apply(lambda row: rvol_profile_for_symbol(str(row.get("_symbol") or ""), params or {}, dollar_volume=row.get("_dollar_volume")), axis=1)
         abs_change = df["change_from_open"].fillna(0.0).astype(float).abs()
         # Squeeze focus: prioritize small moves (about to break out) + high RVOL
         # + tight session range. Tight range stocks get a bonus.

@@ -230,6 +230,48 @@ class StartupReconciler:
             return str(key), position
         return None
 
+    def _reprotect_restored_position(self, position: Position) -> None:
+        """Make a restored position's bracket state truthful before it is managed.
+
+        The hybrid path rehydrates metadata written before the restart, so a
+        restored position can carry a ``bracket`` dict whose child order ids
+        were cancelled or filled while the bot was down. Left alone, that stale
+        dict makes RiskManager suppress the engine's stop exit for a position
+        that has nothing resting at the broker -- unprotected AND unmanaged.
+
+        ``ensure_position_protected`` adopts the children when they are still
+        working and submits fresh protection when they are not; it returns None
+        when bracket mode is off, in which case any stale key is dropped so the
+        engine unambiguously owns the exits.
+        """
+        metadata = position.metadata if isinstance(position.metadata, dict) else None
+        if metadata is None:
+            return
+        stale = metadata.get("bracket") if isinstance(metadata.get("bracket"), dict) else None
+        parent_order_id = stale.get("parent_order_id") if stale else None
+        try:
+            refreshed = self.executor.ensure_position_protected(
+                str(metadata.get("underlying") or position.symbol),
+                int(position.qty), position.side, float(position.entry_price),
+                float(position.stop_price), position.target_price,
+                parent_order_id=str(parent_order_id) if parent_order_id else None,
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Could not re-establish broker protection for restored position %s: %s; "
+                "dropping stale bracket so the engine owns the exits", position.symbol, exc,
+            )
+            metadata.pop("bracket", None)
+            return
+        if refreshed is None:
+            metadata.pop("bracket", None)
+            return
+        metadata["bracket"] = refreshed
+        LOG.info(
+            "Restored position %s protection state=%s stop=%s target=%s",
+            position.symbol, refreshed.get("state"), refreshed.get("stop_price"), refreshed.get("target_price"),
+        )
+
     def _restore_broker_positions(self, positions: list[dict[str, Any]], *, use_metadata: bool) -> tuple[int, int]:
         if is_option_strategy(self.config.strategy):
             LOG.warning("startup_reconcile_mode=%s does not restore option strategies; leaving options handling unchanged", self.config.runtime.startup_reconcile_mode)
@@ -346,6 +388,7 @@ class StartupReconciler:
                     reference_symbol=None,
                     metadata=metadata,
                 )
+            self._reprotect_restored_position(position)
             self.positions[symbol] = position
             try:
                 self.account.record_entry(position, float(position.entry_price))

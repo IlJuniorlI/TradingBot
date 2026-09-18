@@ -28,35 +28,34 @@
     "tradable": [
       "AAPL",
       "MSFT",
-      "NVDA",
-      "INTC",
-      "AMD",
-      "AVGO",
-      "TSM",
-      "CRM",
-      "AMZN",
-      "TSLA",
-      "HD",
-      "LOW",
-      "UBER",
-      "COST",
       "GOOG",
+      "AMZN",
       "META",
       "NFLX",
-      "RBLX",
-      "TMUS",
-      "JPM",
-      "GS",
-      "V",
-      "LLY"
+      "ORCL",
+      "TSLA",
+      "NVDA",
+      "AVGO",
+      "AMD",
+      "TSM",
+      "MU",
+      "QCOM",
+      "ARM",
+      "MRVL",
+      "INTC",
+      "ANET",
+      "VRT",
+      "DELL",
+      "CRM",
+      "ADBE",
+      "NOW",
+      "PLTR",
+      "PANW"
     ],
     "index_symbols": [
-      "XLK",
-      "XLC",
-      "XLY",
-      "XLF",
-      "XLV",
-      "XLP"
+      "SMH",
+      "IGV",
+      "XLK"
     ],
     "min_bars": 150,
     "ltf_minutes": 1,
@@ -100,12 +99,12 @@
     "vol_squeeze_min_breakout_volume_ratio": 1.12,
     "vol_squeeze_min_bar_close_position": 0.63,
     "vol_squeeze_hard_breakout_gates": true,
-    "vol_squeeze_min_sr_bias_alignment": 0.20,
-    "vol_squeeze_min_pct_b_directional": 0.50,
+    "vol_squeeze_min_sr_bias_alignment": 0.2,
+    "vol_squeeze_min_pct_b_directional": 0.5,
     "momentum_target_rr": 2.0,
     "momentum_breakout_lookback_bars": 6,
     "momentum_min_day_strength": 1.5,
-    "directional_bias_min_day_strength": 0.20,
+    "directional_bias_min_day_strength": 0.2,
     "bias_penalty_base": 1.0,
     "bias_penalty_saturate_at": 0.75,
     "relative_strength_block_threshold_pct": 0.5,
@@ -192,65 +191,96 @@
     "adaptive_profit_lock_stop_rr": 0.35,
     "adaptive_runner_trigger_rr": 1.15,
     "sector_groups": {
-      "tech": [
+      "ai_hardware": [
+        "NVDA",
+        "AVGO",
+        "AMD",
+        "TSM",
+        "MU",
+        "QCOM",
+        "ARM",
+        "MRVL",
+        "INTC",
+        "ANET",
+        "VRT",
+        "DELL"
+      ],
+      "platforms": [
         "AAPL",
         "MSFT",
-        "NVDA",
-        "INTC",
-        "AMD",
-        "AVGO",
-        "TSM",
-        "CRM"
-      ],
-      "consumer_discretionary": [
-        "AMZN",
-        "TSLA",
-        "HD",
-        "LOW",
-        "UBER"
-      ],
-      "communication": [
         "GOOG",
+        "AMZN",
         "META",
         "NFLX",
-        "RBLX",
-        "TMUS"
+        "ORCL",
+        "TSLA"
       ],
-      "financials": [
-        "JPM",
-        "GS",
-        "V"
-      ],
-      "healthcare": [
-        "LLY"
-      ],
-      "industrials": [],
-      "energy": [],
-      "consumer_staples": [
-        "COST"
-      ],
-      "materials": [],
-      "real_estate": [],
-      "utilities": []
+      "software": [
+        "CRM",
+        "ADBE",
+        "NOW",
+        "PLTR",
+        "PANW"
+      ]
     },
     "sector_index_map": {
-      "tech": ["XLK"],
-      "consumer_discretionary": ["XLY"],
-      "communication": ["XLC"],
-      "financials": ["XLF"],
-      "healthcare": ["XLV"],
-      "industrials": ["XLI"],
-      "energy": ["XLE"],
-      "consumer_staples": ["XLP"],
-      "materials": ["XLB", "GDX", "COPX"],
-      "real_estate": ["XLRE"],
-      "utilities": ["XLU"]
+      "ai_hardware": [
+        "SMH"
+      ],
+      "platforms": [
+        "XLK"
+      ],
+      "software": [
+        "IGV"
+      ]
     },
-    "max_same_sector_same_direction": 2,
     "force_flatten": {
       "long": true,
       "short": true
-    }
+    },
+    "correlation_groups": {
+      "ai_complex": [
+        "NVDA",
+        "AVGO",
+        "AMD",
+        "TSM",
+        "MU",
+        "QCOM",
+        "ARM",
+        "MRVL",
+        "INTC",
+        "ANET",
+        "VRT",
+        "DELL",
+        "AAPL",
+        "MSFT",
+        "GOOG",
+        "AMZN",
+        "META",
+        "NFLX",
+        "ORCL",
+        "TSLA"
+      ],
+      "software": [
+        "CRM",
+        "ADBE",
+        "NOW",
+        "PLTR",
+        "PANW"
+      ]
+    },
+    "max_same_correlation_group_same_direction": 2,
+    "volatility_scaled_thresholds": true,
+    "reference_adr_pct": 0.018,
+    "volatility_scale_min": 0.6,
+    "volatility_scale_max": 2.2,
+    "adr_lookback_days": 20,
+    "beta_lookback_days": 60,
+    "index_breadth_min_peers": 3,
+    "index_breadth_min_agree_frac": 0.5,
+    "short_min_score_premium": 0.0,
+    "short_stop_buffer_mult": 1.0,
+    "short_target_rr_mult": 1.0
   },
   "capabilities": {
     "dashboard": {

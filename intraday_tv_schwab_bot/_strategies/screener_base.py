@@ -65,12 +65,12 @@ class BaseStrategyScreener:
         return self.client.row_metadata(row)
 
     @staticmethod
-    def _effective_relative_volume(symbol: str, raw_relative_volume: object, params: dict[str, Any] | None = None, *, cap_default: float = 2.5, standard_floor: float = 0.5) -> float:
-        return effective_relative_volume(symbol, raw_relative_volume, params or {}, cap_default=cap_default, standard_floor=standard_floor)
+    def _effective_relative_volume(symbol: str, raw_relative_volume: object, params: dict[str, Any] | None = None, *, cap_default: float = 2.5, standard_floor: float = 0.5, dollar_volume: object = None) -> float:
+        return effective_relative_volume(symbol, raw_relative_volume, params or {}, cap_default=cap_default, standard_floor=standard_floor, dollar_volume=dollar_volume)
 
     @staticmethod
-    def _relative_volume_gate_threshold(symbol: str, base_threshold: object, params: dict[str, Any] | None = None) -> float:
-        return relative_volume_gate_threshold(symbol, base_threshold, params or {})
+    def _relative_volume_gate_threshold(symbol: str, base_threshold: object, params: dict[str, Any] | None = None, *, dollar_volume: object = None) -> float:
+        return relative_volume_gate_threshold(symbol, base_threshold, params or {}, dollar_volume=dollar_volume)
 
     def _candidate_rows(self, df: pd.DataFrame, strategy: str, directional_bias_fn=None, activity_score_fn=None) -> list[Candidate]:
         return self.client.candidate_rows(df, strategy, directional_bias_fn=directional_bias_fn, activity_score_fn=activity_score_fn)

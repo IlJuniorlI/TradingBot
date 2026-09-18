@@ -30,7 +30,7 @@ from ._strategies.registry import option_strategy_names
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .position_metrics import safe_float
-from .position_store import ReconcileMetadataStore
+from .position_store import ReconcileMetadataStore, SessionRiskStateStore
 from .risk import RiskManager
 from .screener_client import TradingViewScreenerClient
 from .startup_reconciler import StartupReconciler
@@ -62,7 +62,12 @@ class IntradayBot:
         self.screener = TradingViewScreenerClient(config)
         self.data = MarketDataStore(self.client, config)
         self.executor = SchwabExecutor(self.client, config)
-        self.risk = RiskManager(config)
+        # Per-day risk tallies (realized P&L, cooldowns, same-level blocks)
+        # persist across restarts in the same sqlite file as the reconcile
+        # metadata. Passed at construction so the first cycle already sees the
+        # restored numbers rather than a flat day.
+        self.session_risk_state_store = SessionRiskStateStore(config.runtime.startup_reconcile_metadata_db_path)
+        self.risk = RiskManager(config, state_store=self.session_risk_state_store)
         self.strategy: BaseStrategy = build_strategy(config)
         self.account = PaperAccount(
             starting_equity=self._tracked_capital_baseline(),
@@ -326,6 +331,15 @@ class IntradayBot:
                     LOG.exception("Unhandled engine error (consecutive=%d): %s", consecutive_errors, exc)
                 else:
                     LOG.warning("Engine error (consecutive=%d): %s", consecutive_errors, first_line)
+                # Escalation. The backoff below keeps retrying forever, which
+                # is right, but a sustained outage with positions open means
+                # nothing is managing them and a throttled WARNING is easy to
+                # miss. Say so loudly, and name what is exposed.
+                status_message = f"Error: {exc}"
+                escalation_message = self._error_escalation_message(consecutive_errors, first_line)
+                if escalation_message is not None:
+                    LOG.critical("%s", escalation_message)
+                    status_message = escalation_message
                 now = now_et()
                 gate_state = self.cycle_gate.evaluate(now, self.config.active_strategy.schedule())
                 self._publish_state(
@@ -333,7 +347,7 @@ class IntradayBot:
                     screening_active=False,
                     streaming_active=self.data.has_stream_symbols(),
                     management_active=False,
-                    message=f"Error: {exc}",
+                    message=status_message,
                     context_refresh_active=gate_state.context_refresh_active,
                     gate_state=gate_state,
                 )
@@ -371,6 +385,30 @@ class IntradayBot:
                 backoff = min(60.0, sleep_secs * (2.0 ** min(consecutive_errors - 1, 5)))
                 sleep_secs = max(sleep_secs, backoff)
             time.sleep(sleep_secs)
+
+    def _error_escalation_message(self, consecutive_errors: int, first_line: str) -> str | None:
+        """Alarm text once the engine has failed ``error_escalation_cycles`` in
+        a row, or ``None`` while it is still below the threshold.
+
+        Fires on the threshold cycle and every multiple after, so a long
+        outage keeps re-announcing itself rather than scrolling away once.
+        Open positions are named explicitly — that is the part that costs
+        money while nothing is managing them.
+        """
+        threshold = int(getattr(self.config.runtime, "error_escalation_cycles", 0) or 0)
+        if threshold <= 0 or consecutive_errors < threshold:
+            return None
+        if consecutive_errors % threshold != 0:
+            return None
+        open_symbols = sorted(self.positions)
+        exposure = (
+            f"{len(open_symbols)} OPEN POSITION(S) UNMANAGED: {', '.join(open_symbols)}"
+            if open_symbols else "no open positions"
+        )
+        return (
+            f"ENGINE DEGRADED — {consecutive_errors} consecutive failed cycles ({exposure}). "
+            f"Last error: {first_line}"
+        )
 
     def _maybe_session_reconcile(self) -> None:
         """Re-run startup reconcile when a new ET trading day begins.

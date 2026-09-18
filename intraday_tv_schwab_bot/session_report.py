@@ -79,6 +79,9 @@ def _trade_csv_row(trade: TradeRecord, session_date: str) -> dict[str, Any]:
         "max_favorable_pnl": _round_opt(trade.max_favorable_pnl, 2),
         "max_adverse_pnl": _round_opt(trade.max_adverse_pnl, 2),
         "entry_slippage_pct": _round_opt(trade.entry_slippage_pct, 6),
+        "realized_entry_risk": _round_opt(trade.realized_entry_risk, 4),
+        "entry_risk_budget": _round_opt(trade.entry_risk_budget, 4),
+        "entry_risk_overage_frac": _round_opt(trade.entry_risk_overage_frac, 6),
     }
 
 

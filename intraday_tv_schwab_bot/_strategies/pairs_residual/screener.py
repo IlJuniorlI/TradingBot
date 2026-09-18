@@ -38,10 +38,14 @@ class PairsResidualScreener(BaseStrategyScreener):
             if not row or not ref_row:
                 continue
             traded_rvol = float(row.get("relative_volume_10d_calc", 0.0) or 0.0)
-            required_rvol = self._relative_volume_gate_threshold(symbol, min_rvol, params)
+            # Dollar volume classifies liquidity from the tape rather than a
+            # hand-maintained ticker list.
+            traded_dollar_volume = (float(row.get("close", 0.0) or 0.0)
+                                    * float(row.get("volume", 0.0) or 0.0))
+            required_rvol = self._relative_volume_gate_threshold(symbol, min_rvol, params, dollar_volume=traded_dollar_volume)
             if traded_rvol < required_rvol:
                 continue
-            effective_traded_rvol = self._effective_relative_volume(symbol, traded_rvol, params, cap_default=2.5, standard_floor=0.5)
+            effective_traded_rvol = self._effective_relative_volume(symbol, traded_rvol, params, cap_default=2.5, standard_floor=0.5, dollar_volume=traded_dollar_volume)
             day_strength = float(row.get("change_from_open", 0.0) or 0.0)
             if abs(day_strength) < min_day_strength:
                 continue
@@ -63,7 +67,7 @@ class PairsResidualScreener(BaseStrategyScreener):
                 "pair_reference_relative_volume_10d_calc": float(ref_row.get("relative_volume_10d_calc", 0.0) or 0.0),
                 "activity_relative_volume": float(effective_traded_rvol),
                 "raw_relative_volume_10d_calc": float(traded_rvol),
-                "rvol_profile": rvol_profile_for_symbol(symbol, params or {}),
+                "rvol_profile": rvol_profile_for_symbol(symbol, params or {}, dollar_volume=traded_dollar_volume),
                 "relative_volume_gate_required": float(required_rvol),
                 "pair": {
                     "symbol": symbol,

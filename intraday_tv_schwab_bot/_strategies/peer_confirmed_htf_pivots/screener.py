@@ -85,7 +85,13 @@ class PeerConfirmedHTFPivotsScreener(BaseStrategyScreener):
             abs_day_change = abs(day_change)
             raw_relative_volume = float(metadata.get("relative_volume_10d_calc", 1.0) or 1.0)
             relative_volume_cap = max(0.75, float(params.get("screener_relative_volume_cap", 2.5) or 2.5))
-            effective_relative_volume = self._effective_relative_volume(symbol, raw_relative_volume, params, cap_default=relative_volume_cap, standard_floor=0.5)
+            # Per-symbol values live in `metadata`; `row` here is a leaked
+            # variable from the earlier df.iterrows() loop and would
+            # attribute the LAST row's volume to every symbol (or raise
+            # NameError on an empty frame).
+            _dollar_volume = (float(metadata.get("close", 0.0) or 0.0)
+                              * float(metadata.get("volume", 0.0) or 0.0))
+            effective_relative_volume = self._effective_relative_volume(symbol, raw_relative_volume, params, cap_default=relative_volume_cap, standard_floor=0.5, dollar_volume=_dollar_volume)
             move_sweet_spot = max(0.20, float(params.get("screener_activity_move_sweet_spot_pct", 1.25) or 1.25))
             move_cap = max(move_sweet_spot, float(params.get("screener_activity_move_cap_pct", 3.0) or 3.0))
             if abs_day_change <= move_sweet_spot:
@@ -108,7 +114,7 @@ class PeerConfirmedHTFPivotsScreener(BaseStrategyScreener):
             metadata["abs_change_from_open"] = float(abs_day_change)
             metadata["activity_relative_volume"] = float(effective_relative_volume)
             metadata["raw_relative_volume_10d_calc"] = float(raw_relative_volume)
-            metadata["rvol_profile"] = rvol_profile_for_symbol(symbol, params or {})
+            metadata["rvol_profile"] = rvol_profile_for_symbol(symbol, params or {}, dollar_volume=_dollar_volume)
             metadata["screener_bias_mode"] = "contrarian_sr_scalp"
             rows.append(
                 Candidate(

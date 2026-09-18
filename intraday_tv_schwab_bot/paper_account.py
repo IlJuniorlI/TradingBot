@@ -60,6 +60,14 @@ class TradeRecord:
     max_favorable_pnl: float | None = None       # peak unrealized PnL (MFE in $)
     max_adverse_pnl: float | None = None         # trough unrealized PnL (MAE in $)
     entry_slippage_pct: float | None = None      # |fill - signal| / signal
+    # Post-fill risk reconciliation (2026-09-18). realized_entry_risk is
+    # qty * |fill - stop| — what the trade actually risked once the fill was
+    # known, versus entry_risk_budget (max_notional_per_trade *
+    # risk_per_trade_frac_of_notional). entry_risk_overage_frac is the
+    # fraction above budget, 0.0 when at or under it.
+    realized_entry_risk: float | None = None
+    entry_risk_budget: float | None = None
+    entry_risk_overage_frac: float | None = None
 
 
 @dataclass(slots=True)
@@ -202,6 +210,9 @@ class PaperAccount:
                 max_favorable_pnl=_opt_float("best_unrealized_pnl", "diag_best_unrealized_pnl"),
                 max_adverse_pnl=_opt_float("worst_unrealized_pnl", "diag_worst_unrealized_pnl"),
                 entry_slippage_pct=_opt_float("entry_slippage_pct"),
+                realized_entry_risk=_opt_float("realized_entry_risk"),
+                entry_risk_budget=_opt_float("entry_risk_budget"),
+                entry_risk_overage_frac=_opt_float("entry_risk_overage_frac"),
             )
             # LIFO: newest trade at index 0 (consumers iterate from the left).
             self.trades.appendleft(trade)

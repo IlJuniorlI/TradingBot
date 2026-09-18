@@ -1930,8 +1930,9 @@ Strategy-specific knobs:
 - `orb_end_time` / `midday_start_time` / `midday_end_time` / `afternoon_start_time` / `no_new_entries_after`: time-of-day regime window boundaries (all six regimes use these — no hard-coded times).
 - `disable_trend_regime` / `disable_pullback_regime` / `disable_range_regime` / `disable_vol_squeeze_regime` / `disable_momentum_regime` / `disable_sr_scalp_regime`: per-regime opt-out flags (all default `false`).
 - `disable_orb_window`: whole-window opt-out for the 09:35 → `orb_end_time` ORB window (default `false`). Different from `orb_bypass_*` flags which loosen filters within the window — this skips it entirely.
-- `sector_groups`: GICS sector groupings for the concentration guard.
-- `max_same_sector_same_direction`: max same-direction positions per sector.
+- `sector_groups`: GICS sector groupings - ETF routing (`sector_index_map`) and the peer list for breadth confirmation.
+- `correlation_groups`: coarser risk groupings for the concentration guard (mega caps across tech/communication/consumer-discretionary trade as one beta book, so they share one bucket).
+- `max_same_correlation_group_same_direction`: max same-direction positions per correlation group.
 
 Also uses these shared stock groups:
 
@@ -1983,7 +1984,7 @@ Current code defaults:
 | `midday_end_time`                 | `13:00`                                                                                |
 | `afternoon_start_time`            | `13:00`                                                                                |
 | `no_new_entries_after`            | `15:00`                                                                                |
-| `max_same_sector_same_direction`  | `2`                                                                                    |
+| `max_same_correlation_group_same_direction` | `2`                                                                      |
 | `adaptive_breakeven_rr`           | `1.00`                                                                                 |
 | `adaptive_profit_lock_rr`         | `1.30`                                                                                 |
 | `adaptive_runner_trigger_rr`      | `1.15`                                                                                 |

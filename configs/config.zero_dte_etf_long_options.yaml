@@ -411,6 +411,25 @@ shared_exit:
 
 # Options-mode filters, pricing, and contract-selection controls.
   use_candle_pattern_exit: false
+# Scheduled-event blackouts, shared by every strategy (equity and options).
+# Moved out of `options:` 2026-09-18 — the calendar used to be reachable only
+# from the 0DTE options strategy, so equity strategies had no macro-event
+# awareness and no earnings awareness at all.
+events:
+  enabled: true
+  # Macro windows (CPI / FOMC / ...). Same schema as before; each event may
+  # now also carry `symbols: [...]` to scope the window to specific tickers.
+  blackout_file: ./macro_events.auto.yaml
+  blackouts: []
+  # Per-symbol earnings dates -> {SYMBOL: [YYYY-MM-DD, ...]}. Maintain either
+  # here or in the file; both are merged.
+  earnings_file: ./earnings.yaml
+  earnings: {}
+  # Trading sessions either side of an earnings date that block new entries
+  # (the date itself is always blocked). Weekend-aware.
+  earnings_block_sessions_before: 1
+  earnings_block_sessions_after: 1
+
 options:
   enabled: true
   underlyings:
@@ -479,8 +498,6 @@ options:
   max_quote_age_seconds: 4
   dry_run_replace_attempts: 2
   dry_run_step_frac: 0.25
-  event_blackout_file: ./macro_events.auto.yaml
-  event_blackouts: []
   # 2026-05-21: bumped 4 → 60. See parent zero_dte_etf_options.yaml
   # for the rationale (chain content stable across 60s, leg quote
   # refresh still on the shorter quote_cache_seconds TTL).

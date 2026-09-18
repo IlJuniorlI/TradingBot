@@ -174,3 +174,114 @@ class ReconcileMetadataStore:
             return 0
         finally:
             conn.close()
+
+
+class SessionRiskStateStore:
+    """Persists the per-day risk tallies across a restart.
+
+    ``RiskState`` lived only in memory, so a crash or restart mid-session
+    reset ``realized_pnl`` to 0.0 and emptied the cooldown and same-level
+    blocks. A bot restarted after losing most of its ``max_daily_loss``
+    therefore came back believing the day was flat and could lose the limit
+    again — and a restart is most likely exactly when something has already
+    gone wrong. Open positions were always recovered (see
+    ``ReconcileMetadataStore``); this closes the same gap for the risk
+    counters that decide whether to open more.
+
+    Stored in the same sqlite file as the reconcile metadata so both share one
+    path, one lifecycle and one backup. A single row keyed by ET session date;
+    a row from an earlier date is ignored, which gives the daily reset for
+    free.
+    """
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path).expanduser()
+        self._initialized = False
+
+    def _ensure_ready(self) -> None:
+        if self._initialized:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_risk_state (
+                    session_date TEXT PRIMARY KEY,
+                    realized_pnl REAL NOT NULL,
+                    cooldowns_json TEXT NOT NULL,
+                    recent_exits_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self._initialized = True
+
+    def save(self, session_date: str, realized_pnl: float,
+             cooldowns: list[dict[str, Any]], recent_exits: list[dict[str, Any]]) -> None:
+        """Upsert today's tallies. Never raises — a persistence failure must
+        not take down a running bot, but it is logged at WARNING because the
+        restart guarantee is gone until it succeeds again."""
+        try:
+            self._ensure_ready()
+            conn = sqlite3.connect(self.path)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO session_risk_state
+                        (session_date, realized_pnl, cooldowns_json, recent_exits_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(session_date) DO UPDATE SET
+                        realized_pnl=excluded.realized_pnl,
+                        cooldowns_json=excluded.cooldowns_json,
+                        recent_exits_json=excluded.recent_exits_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        str(session_date),
+                        float(realized_pnl),
+                        json.dumps(_json_ready(cooldowns), separators=(",", ":")),
+                        json.dumps(_json_ready(recent_exits), separators=(",", ":")),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as exc:
+            LOG.warning("Could not persist session risk state to %s: %s", self.path, exc)
+
+    def load(self, session_date: str) -> dict[str, Any] | None:
+        """Return the stored tallies for *session_date*, or ``None``.
+
+        A row from any other date is deliberately not returned: the daily
+        reset is the absence of a match, so a stale row can never resurrect
+        yesterday's losses into today's budget.
+        """
+        if not self.path.exists():
+            return None
+        try:
+            self._ensure_ready()
+            conn = sqlite3.connect(self.path)
+            try:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT * FROM session_risk_state WHERE session_date = ?",
+                    (str(session_date),),
+                ).fetchone()
+            finally:
+                conn.close()
+            if row is None:
+                return None
+            return {
+                "session_date": row["session_date"],
+                "realized_pnl": float(row["realized_pnl"]),
+                "cooldowns": json.loads(row["cooldowns_json"] or "[]"),
+                "recent_exits": json.loads(row["recent_exits_json"] or "[]"),
+            }
+        except Exception as exc:
+            LOG.warning("Could not load session risk state from %s: %s", self.path, exc)
+            return None

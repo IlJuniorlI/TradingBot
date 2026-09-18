@@ -56,7 +56,16 @@ def _json_ready(value: Any) -> Any:
     try:
         return float(value)
     except Exception:
+        pass
+    try:
         return str(value)
+    except Exception:
+        # str() itself can raise when __str__/__repr__ is broken. This is the
+        # LAST fallback in the normalizer, so it must not be able to throw —
+        # _json_ready feeds audit logging and the sqlite position-metadata
+        # write, and neither should ever fail because a value could not
+        # describe itself.
+        return f"<unserializable {type(value).__name__}>"
 
 
 class AuditLogger:
@@ -126,5 +135,18 @@ class AuditLogger:
         try:
             text = json.dumps(_json_ready(payload), sort_keys=True, separators=(",", ":"))
         except Exception:
-            text = json.dumps({"serialization_error": True, "payload": str(payload)})
+            try:
+                text = json.dumps({"serialization_error": True, "payload": str(payload)})
+            except Exception:
+                # The fallback must not be able to raise either. It did: a
+                # payload whose __repr__ throws made str(payload) re-raise out
+                # of the except block, so an audit-logging failure propagated
+                # into the caller — and the callers are the entry and exit
+                # flows (ENTRY_CONTEXT / EXIT_CONTEXT). Losing one line's
+                # fidelity is acceptable; taking a trade operation down with
+                # it is not.
+                text = json.dumps({
+                    "serialization_error": True,
+                    "payload": f"<unserializable {type(payload).__name__}>",
+                })
         LOG.log(level, "%s %s", prefix, text)

@@ -69,7 +69,13 @@ class PeerConfirmedTrendContinuationScreener(BaseStrategyScreener):
                 }
             day_change = float(metadata.get("change_from_open", 0.0) or 0.0)
             raw_relative_volume = float(metadata.get("relative_volume_10d_calc", 1.0) or 1.0)
-            effective_relative_volume = self._effective_relative_volume(symbol, raw_relative_volume, params, cap_default=2.5, standard_floor=0.5)
+            # Per-symbol values live in `metadata`; `row` here is a leaked
+            # variable from the earlier df.iterrows() loop and would
+            # attribute the LAST row's volume to every symbol (or raise
+            # NameError on an empty frame).
+            _dollar_volume = (float(metadata.get("close", 0.0) or 0.0)
+                              * float(metadata.get("volume", 0.0) or 0.0))
+            effective_relative_volume = self._effective_relative_volume(symbol, raw_relative_volume, params, cap_default=2.5, standard_floor=0.5, dollar_volume=_dollar_volume)
             focus_score = abs(day_change) * effective_relative_volume
             directional_bias = None
             if day_change > 0.30:
@@ -80,7 +86,7 @@ class PeerConfirmedTrendContinuationScreener(BaseStrategyScreener):
             metadata["trend_focus_score"] = float(focus_score)
             metadata["activity_relative_volume"] = float(effective_relative_volume)
             metadata["raw_relative_volume_10d_calc"] = float(raw_relative_volume)
-            metadata["rvol_profile"] = rvol_profile_for_symbol(symbol, params or {})
+            metadata["rvol_profile"] = rvol_profile_for_symbol(symbol, params or {}, dollar_volume=_dollar_volume)
             rows.append(
                 Candidate(
                     symbol=symbol,

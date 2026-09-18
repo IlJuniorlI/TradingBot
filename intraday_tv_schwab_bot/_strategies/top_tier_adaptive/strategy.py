@@ -36,6 +36,45 @@ from ..shared import (
     pd,
 )
 from ..strategy_base import BaseStrategy
+from ...daily_stats import SymbolDailyStats, build_symbol_stats, volatility_scale
+
+# Regime families. Several gates apply to one family and deliberately exempt
+# another, so the membership lives here once instead of being re-spelled at
+# each call site.
+#
+# MEAN_REVERSION_REGIMES enter AGAINST current price action by design (buy the
+# range low, buy the support bounce). Every gate that asks "is price already
+# moving my way?" — index confirmation, the confirmation bar, and the
+# _decide_side vote — must exempt them or the regimes cannot fire at all.
+MEAN_REVERSION_REGIMES = frozenset({"range", "sr_scalp"})
+# Need a market-aligned tape.
+INDEX_CONFIRMED_REGIMES = frozenset({"trend", "pullback", "vol_squeeze", "momentum", "vwap_reclaim"})
+# Need the last CLOSED bar to point the trade's way. vwap_reclaim is excluded
+# because its prior closed bar is the flush; orb because its range-break is
+# the confirmation.
+CONFIRMATION_BAR_REGIMES = frozenset({"trend", "pullback", "vol_squeeze", "momentum"})
+# Regimes whose side must match the _decide_side vote. Everything except the
+# mean-reversion pair and orb (which carries its own bypass because the
+# opening tape is gap-dominated).
+SIDE_DECISION_REGIMES = frozenset({"trend", "pullback", "vol_squeeze", "momentum", "vwap_reclaim"})
+
+# Per-regime score ceilings — the maximum each _score_* method can return.
+# Used to normalise scores onto a common 0..1 scale before the build-order
+# auction and the cross-signal slot auction compare them. Without this a
+# trend at 4.5/6.0 (25% of its headroom) outranks an sr_scalp at 4.4/4.5
+# (93% of its headroom) purely because trend's scorer has more components.
+# Keep in sync with the _score_* methods; ``test_regime_score_ceilings``
+# asserts each scorer cannot exceed its entry here.
+REGIME_SCORE_CEILINGS = {
+    "trend": 6.0,
+    "pullback": 5.0,
+    "range": 5.0,
+    "vol_squeeze": 6.5,
+    "momentum": 6.0,
+    "sr_scalp": 5.0,
+    "orb": 5.0,
+    "vwap_reclaim": 5.0,
+}
 
 
 class TopTierAdaptiveStrategy(BaseStrategy):
@@ -60,6 +99,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # back across. ``Any`` to avoid pulling in datetime at module
         # scope under ``from __future__ import annotations``.
         self._stretched_failure_time: dict[str, Any] = {}
+        # Per-symbol daily stats (ADR scale + sector beta), rebuilt when the
+        # ET date rolls. Keyed by symbol; ``_daily_stats_date`` is the ET
+        # date the cache was built for.
+        self._daily_stats: dict[str, SymbolDailyStats] = {}
+        self._daily_stats_date: Any = None
 
     # ------------------------------------------------------------------
     # Watchlist — include all configured index confirmation ETFs so they
@@ -140,27 +184,66 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 break
         return fallback
 
+    @staticmethod
+    def _frame_agrees(side: Side, frame: pd.DataFrame | None) -> bool | None:
+        """Does *frame*'s latest bar lean *side*? ``None`` when unreadable.
+
+        The shared posture test — close vs session VWAP plus EMA9/EMA20
+        alignment — used for both the sector ETF and each sector peer so the
+        two confirmation paths answer the same question.
+        """
+        if frame is None or frame.empty:
+            return None
+        last = frame.iloc[-1]
+        close = _safe_float(last["close"])
+        vwap = _safe_float(last.get("vwap"), close)
+        ema9 = _safe_float(last.get("ema9"), close)
+        ema20 = _safe_float(last.get("ema20"), close)
+        if side == Side.LONG:
+            return bool(close > vwap and ema9 >= ema20)
+        return bool(close < vwap and ema9 <= ema20)
+
     def _index_confirms(self, side: Side, symbol: str, bars: dict[str, pd.DataFrame], _data=None) -> bool:
-        """Return True if at least one index ETF for *symbol*'s sector
-        agrees with *side*. The candidate-aware lookup prevents e.g. an
-        AAPL LONG from being confirmed by XLE (energy ETF) just because
-        XLE happens to be bullish-aligned. See ``_indices_for_symbol`` for
-        the lookup behavior + fallback semantics."""
+        """Return True when *symbol*'s sector tape agrees with *side*.
+
+        Two paths, chosen by how much of the sector the symbol itself is:
+
+        **Breadth** (preferred). Counts how many of the symbol's OTHER
+        ``sector_groups`` members lean *side*, and requires at least
+        ``index_breadth_min_agree_frac`` of them. Used whenever at least
+        ``index_breadth_min_peers`` peers have readable bars.
+
+        **Sector ETF** (fallback). The original check — at least one mapped
+        ETF leaning *side*. Used when the symbol has too few mapped peers to
+        measure breadth (single-member sectors like healthcare/staples here).
+
+        Breadth exists because the ETF test is close to circular on a mega-cap
+        universe: AAPL+MSFT+NVDA+AVGO are roughly 45% of XLK, GOOG+META about
+        45% of XLC, AMZN+TSLA about 40% of XLY. Asking XLK whether AAPL's
+        move is confirmed substantially asks AAPL about AAPL, and it fails in
+        the one case that matters — the mega cap moving against the rest of
+        its sector. Peer breadth excludes the symbol itself, so it cannot
+        confirm a move with that move.
+        """
         if not bool(self.params.get("require_index_confirmation", True)):
             return True
-        index_symbols = self._indices_for_symbol(symbol)
-        for sym in index_symbols:
-            frame = bars.get(sym)
-            if frame is None or frame.empty:
-                continue
-            last = frame.iloc[-1]
-            close = _safe_float(last["close"])
-            vwap = _safe_float(last.get("vwap"), close)
-            ema9 = _safe_float(last.get("ema9"), close)
-            ema20 = _safe_float(last.get("ema20"), close)
-            if side == Side.LONG and close > vwap and ema9 >= ema20:
-                return True
-            if side == Side.SHORT and close < vwap and ema9 <= ema20:
+        peers = self._sector_peers(symbol)
+        min_peers = max(1, int(self.params.get("index_breadth_min_peers", 3)))
+        if len(peers) >= min_peers:
+            agree = 0
+            readable = 0
+            for peer in peers:
+                verdict = self._frame_agrees(side, bars.get(peer))
+                if verdict is None:
+                    continue
+                readable += 1
+                if verdict:
+                    agree += 1
+            if readable >= min_peers:
+                min_frac = float(self.params.get("index_breadth_min_agree_frac", 0.5))
+                return (agree / readable) >= min_frac
+        for sym in self._indices_for_symbol(symbol):
+            if self._frame_agrees(side, bars.get(sym)) is True:
                 return True
         return False
 
@@ -198,6 +281,189 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             if ds is not None:
                 return ds
         return None
+
+    # ------------------------------------------------------------------
+    # Daily statistics — per-symbol volatility scale + sector beta
+    # ------------------------------------------------------------------
+    def _symbol_daily_stats(self, symbol: str, data=None) -> SymbolDailyStats | None:
+        """Cached :class:`SymbolDailyStats` for *symbol*, or ``None``.
+
+        Mega-cap universes span a wide volatility range (COST/V/TMUS around
+        0.9% ADR, NVDA/TSLA/AMD around 3%+), so a parameter written as a flat
+        percentage is a different gate on every name. This resolves the two
+        daily-horizon numbers that let the strategy state thresholds in
+        symbol-relative terms: ``adr_pct`` (the scale) and ``beta`` versus the
+        symbol's own sector ETF (the expected share of a sector move).
+
+        Costs one Schwab daily ``price_history`` call per symbol per ET day
+        via ``MarketDataStore.get_daily_history``; everything after that is a
+        dict lookup. Returns ``None`` when the feed is unavailable or the
+        fetch failed — callers must gate on that explicitly instead of
+        assuming a default ADR or a beta of 1.0.
+        """
+        if data is None or not hasattr(data, "get_daily_history"):
+            return None
+        today = now_et().date()
+        if self._daily_stats_date != today:
+            self._daily_stats.clear()
+            self._daily_stats_date = today
+        key = str(symbol).upper().strip()
+        cached = self._daily_stats.get(key)
+        if cached is not None:
+            return cached
+        try:
+            symbol_daily = data.get_daily_history(key)
+        except Exception:
+            return None
+        if symbol_daily is None or symbol_daily.empty:
+            return None
+        benchmark = None
+        benchmark_daily = None
+        indices = self._indices_for_symbol(key)
+        if indices:
+            benchmark = indices[0]
+            try:
+                benchmark_daily = data.get_daily_history(benchmark)
+            except Exception:
+                benchmark_daily = None
+            if benchmark_daily is None or benchmark_daily.empty:
+                benchmark_daily = None
+        stats = build_symbol_stats(
+            key,
+            symbol_daily,
+            benchmark_symbol=benchmark if benchmark_daily is not None else None,
+            benchmark_frame=benchmark_daily,
+            adr_lookback_days=int(self.params.get("adr_lookback_days", 20)),
+            beta_lookback_days=int(self.params.get("beta_lookback_days", 60)),
+        )
+        self._daily_stats[key] = stats
+        return stats
+
+    def _vol_scale(self, symbol: str, data=None) -> float:
+        """Multiplier that converts a percent-of-price parameter tuned on a
+        reference-volatility name into this symbol's equivalent.
+
+        ``reference_adr_pct`` is the ADR the existing absolute thresholds were
+        written against; a symbol running twice that gets 2.0. Returns 1.0
+        (parameters unchanged) when scaling is disabled or the symbol has no
+        usable daily stats, so a feed outage degrades to the previous
+        behaviour rather than to an arbitrary number.
+        """
+        if not bool(self.params.get("volatility_scaled_thresholds", True)):
+            return 1.0
+        stats = self._symbol_daily_stats(symbol, data)
+        return volatility_scale(
+            stats,
+            float(self.params.get("reference_adr_pct", 0.018)),
+            min_scale=float(self.params.get("volatility_scale_min", 0.6)),
+            max_scale=float(self.params.get("volatility_scale_max", 2.2)),
+        )
+
+    @staticmethod
+    def _normalized_regime_score(regime: str, score: float, threshold: float) -> float:
+        """Fraction of a regime's own headroom that *score* used, in 0..1.
+
+        ``(score - threshold) / (ceiling - threshold)`` — 0.0 sits exactly on
+        the regime's qualifying floor, 1.0 at the most its scorer can return.
+        This is the only form in which two regimes' scores may be compared:
+        raw scores are on per-regime scales (see REGIME_SCORE_CEILINGS).
+
+        A regime missing from REGIME_SCORE_CEILINGS, or one whose configured
+        threshold is at or above its ceiling, degenerates to 0.0 rather than
+        raising — a mis-set threshold should surface as "never wins the
+        auction", not as a crash mid-cycle.
+        """
+        ceiling = REGIME_SCORE_CEILINGS.get(regime)
+        if ceiling is None:
+            return 0.0
+        headroom = float(ceiling) - float(threshold)
+        if headroom <= 0.0:
+            return 0.0
+        return max(0.0, min(1.0, (float(score) - float(threshold)) / headroom))
+
+    def signal_priority_key(self, signal, candidate, *, metadata, strength,
+                            candidate_activity_score, rank):
+        """Rank competing signals by normalised regime score.
+
+        The gatekeeper's generic path sorts on raw ``regime_score``, which is
+        not comparable across this strategy's regimes (see
+        ``_normalized_regime_score``) — so with more signals than free
+        position slots, slots went to whichever regime's scorer had the
+        highest ceiling rather than to the best setup. ``final_priority_score``
+        — which carries the structure / pattern / candle / S/R / FVG quality
+        work — only ever acted as a tiebreak between identical raw scores.
+
+        Ordering here: normalised regime score, then ``final_priority_score``,
+        then screener activity, then candidate rank.
+        """
+        _ = signal, candidate
+        return (
+            float(_safe_float(metadata.get("regime_score_normalized"), 0.0) or 0.0),
+            float(strength),
+            float(candidate_activity_score),
+            -float(rank),
+        )
+
+    # ------------------------------------------------------------------
+    # Side asymmetry
+    #
+    # Every threshold in this strategy is shared between LONG and SHORT, which
+    # assumes the two sides are mirror images. On an equity universe they are
+    # not:
+    #   * Upside moves in crowded names are faster and sharper than downside
+    #     ones — a short covering into a squeeze needs more stop room to
+    #     survive the same amount of "normal" adverse movement.
+    #   * Equities drift up over time, so a short is fighting the base rate
+    #     and deserves a higher bar to fire at all.
+    #   * That same drift means short profits are less durable, so taking them
+    #     sooner is worth more than holding for the last fraction of R.
+    # These three multipliers encode exactly those three asymmetries rather
+    # than duplicating the whole parameter block per side. All default to
+    # symmetric (premium 0.0, mults 1.0), so a preset that does not set them
+    # behaves exactly as before.
+    # ------------------------------------------------------------------
+    def _short_score_premium(self, side: Side) -> float:
+        """Extra regime score a SHORT must clear beyond its normal floor."""
+        if side != Side.SHORT:
+            return 0.0
+        return max(0.0, float(self.params.get("short_min_score_premium", 0.0)))
+
+    def _side_stop_buffer_mult(self, side: Side) -> float:
+        """Stop-buffer multiplier for *side* — widens shorts against squeezes."""
+        if side != Side.SHORT:
+            return 1.0
+        return max(0.1, float(self.params.get("short_stop_buffer_mult", 1.0)))
+
+    def _side_target_rr_mult(self, side: Side) -> float:
+        """Target-R:R multiplier for *side* — banks short profits sooner."""
+        if side != Side.SHORT:
+            return 1.0
+        return max(0.1, float(self.params.get("short_target_rr_mult", 1.0)))
+
+    def _pct_param(self, name: str, default: float, vol_scale: float) -> float:
+        """A percent-of-price parameter, rescaled to the symbol's own ADR.
+
+        Only percent-of-price thresholds go through here. Parameters already
+        expressed in ATR multiples (``*_atr_mult``) are volatility-relative by
+        construction and must NOT be scaled again — doing so would square the
+        adjustment.
+        """
+        return float(self.params.get(name, default)) * float(vol_scale)
+
+    def _sector_peers(self, symbol: str) -> list[str]:
+        """Other members of *symbol*'s ``sector_groups`` entry.
+
+        Feeds the breadth confirmation in ``_index_breadth_confirms``. Returns
+        an empty list when the symbol is unmapped or alone in its sector.
+        """
+        symbol_upper = str(symbol).upper().strip()
+        for members in (self.params.get("sector_groups") or {}).values():
+            if not isinstance(members, (list, tuple)):
+                continue
+            cleaned = [str(m).upper().strip() for m in members if str(m or "").strip()]
+            if symbol_upper in cleaned:
+                return [m for m in cleaned if m != symbol_upper]
+        return []
 
     @staticmethod
     def _recent_momentum_pct(ltf: pd.DataFrame, lookback_bars: int) -> float | None:
@@ -523,10 +789,10 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         return score
 
     def _score_range(self, close: float, vwap: float, ema9: float, ema20: float,
-                     frame: pd.DataFrame, index_neutral: bool) -> float:
+                     frame: pd.DataFrame, index_neutral: bool, vol_scale: float = 1.0) -> float:
         session_frame = frame[_same_day_mask(frame, now_et().date())]
         score = 0.0
-        max_vwap_dist = float(self.params.get("range_max_vwap_dist_pct", 0.0020))
+        max_vwap_dist = self._pct_param("range_max_vwap_dist_pct", 0.0020, vol_scale)
         max_ema_gap = float(self.params.get("range_max_ema_gap_pct", 0.0008))
         min_flips = int(self.params.get("range_min_flip_count", 3))
         lookback = max(8, int(self.params.get("range_lookback_bars", 20)))
@@ -549,7 +815,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # Tight intraday range
         if len(recent) >= 8:
             range_pct = (float(recent["high"].max()) - float(recent["low"].min())) / max(close, 1.0)
-            if range_pct <= 0.012:
+            if range_pct <= self._pct_param("range_max_intraday_range_pct", 0.012, vol_scale):
                 score += 1.0
 
         if index_neutral:
@@ -557,7 +823,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         return score
 
     def _score_vol_squeeze(self, side: Side, close: float, vwap: float, ema9: float,
-                           ema20: float, atr: float, frame: pd.DataFrame, tech_ctx) -> float:
+                           ema20: float, atr: float, frame: pd.DataFrame, tech_ctx,
+                           vol_scale: float = 1.0) -> float:
         """Score the Bollinger-squeeze breakout setup. Looks for compressed-range
         consolidation followed by a directional break out of the box. Compression
         comes from a tight box_range + low BB width OR an active BB squeeze flag
@@ -580,7 +847,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         box_range = max(0.0, box_high - box_low)
         box_range_pct = (box_range / close) if close > 0 else 0.0
         box_range_atr = (box_range / atr) if atr > 0 else float("inf")
-        max_range_pct = float(self.params.get("vol_squeeze_max_range_pct", 0.012))
+        max_range_pct = self._pct_param("vol_squeeze_max_range_pct", 0.012, vol_scale)
         max_range_atr = float(self.params.get("vol_squeeze_max_range_atr", 1.8))
         compression_box_ok = box_range_pct <= max_range_pct and box_range_atr <= max_range_atr
         bb_squeeze_flag = bool(getattr(tech_ctx, "bollinger_squeeze", False))
@@ -598,7 +865,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             score += 0.5
 
         # Breakout detection (side-aware)
-        buffer = float(self.params.get("vol_squeeze_breakout_buffer_pct", 0.0008))
+        buffer = self._pct_param("vol_squeeze_breakout_buffer_pct", 0.0008, vol_scale)
         if side == Side.LONG:
             broke_out = _safe_float(last["close"]) >= box_high * (1.0 + buffer)
         else:
@@ -632,7 +899,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         return score
 
     def _score_momentum(self, side: Side, close: float, vwap: float, ema9: float,
-                        ema20: float, ret15: float, frame: pd.DataFrame) -> float:
+                        ema20: float, ret15: float, frame: pd.DataFrame,
+                        vol_scale: float = 1.0) -> float:
         """Score the momentum-from-open setup. The thesis is a stock with
         strong day-direction (live ``day_strength`` from session open) that's
         breaking out of a recent N-bar high (or low for SHORT), still in a
@@ -648,7 +916,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         if today_open is None or today_open <= 0:
             return 0.0
         day_strength = (close - today_open) / today_open * 100.0
-        min_day = float(self.params.get("momentum_min_day_strength", 1.5))
+        min_day = self._pct_param("momentum_min_day_strength", 1.5, vol_scale)
 
         # Hard gate: side-correct day strength magnitude
         if side == Side.LONG and day_strength < min_day:
@@ -699,7 +967,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         return score
 
     def _score_vwap_reclaim(self, side: Side, close: float, vwap: float, ema9: float,
-                            ema20: float, atr: float, frame: pd.DataFrame) -> float:
+                            ema20: float, atr: float, frame: pd.DataFrame,
+                            vol_scale: float = 1.0) -> float:
         """Score a VWAP-reclaim momentum re-entry (opt-in regime, 2026-05-30).
 
         Thesis (LONG; SHORT mirrors): a running name dips BELOW session VWAP — a
@@ -728,7 +997,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         recent = session_frame.tail(lookback + 1).iloc[:-1]  # bars before the current one
         if recent.empty:
             return 0.0
-        buffer = float(self.params.get("vwap_reclaim_buffer_pct", 0.0005)) * close
+        buffer = self._pct_param("vwap_reclaim_buffer_pct", 0.0005, vol_scale) * close
         recent_close = recent["close"].astype(float)
         recent_vwap = recent["vwap"].astype(float)
         if side == Side.LONG:
@@ -762,7 +1031,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         return score
 
     def _score_sr_scalp(self, side: Side, close: float, atr: float,
-                        frame: pd.DataFrame, sr_ctx) -> float:
+                        frame: pd.DataFrame, sr_ctx, vol_scale: float = 1.0) -> float:
         """Score the HTF S/R scalp on ACTUAL level interaction (2026-05-29
         redesign).
 
@@ -850,7 +1119,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         if 0.0 < sup_px < res_px:
             inner_gap = (res_px - zone_hw) - (sup_px + zone_hw)
             required_gap = max(
-                float(self.params.get("sr_scalp_min_distance_pct", 0.008)) * close,
+                self._pct_param("sr_scalp_min_distance_pct", 0.008, vol_scale) * close,
                 float(self.params.get("sr_scalp_min_distance_atr", 2.5)) * atr,
             )
             if inner_gap >= required_gap:
@@ -1000,6 +1269,32 @@ class TopTierAdaptiveStrategy(BaseStrategy):
     @staticmethod
     def _time_in_range(now_t, start: str, end: str) -> bool:
         return parse_hhmm(start) <= now_t <= parse_hhmm(end)
+
+    def _orb_range_end(self) -> str:
+        """HH:MM at which today's opening range finishes forming."""
+        total = 9 * 60 + 30 + max(1, int(self.params.get("orb_range_minutes", 15)))
+        return f"{total // 60:02d}:{total % 60:02d}"
+
+    def _in_orb_window(self, now_t) -> bool:
+        """Is *now_t* inside the ORB window — the span where the ORB regime
+        is the only regime allowed?
+
+        The window is BOUNDED AT BOTH ENDS: ``[opening-range end, orb_end]``,
+        and it does not exist at all when ``disable_orb_regime`` is set.
+
+        This drives every ``orb_bypass_*`` flag (HTF bias, structure, S/R,
+        exhaustion, side decision, relative strength, screener bias) — seven
+        gates that are relaxed on the argument that the opening range-break
+        is its own directional proof. An open-ended "before orb_end" reading
+        hands those bypasses to entries that have no ORB thesis behind them:
+        with ``equity_session_indicator_window: extended`` the whole
+        pre-market session qualifies, and with ``disable_orb_regime: true``
+        (where there IS no ORB regime) so does every entry from the open
+        through orb_end.
+        """
+        if bool(self.params.get("disable_orb_regime", False)):
+            return False
+        return self._time_in_range(now_t, self._orb_range_end(), str(self.params.get("orb_end_time", "10:05")))
 
     def _allowed_regimes(self, now_t) -> set[str]:
         """Return which regimes are allowed at the current time.
@@ -1170,7 +1465,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
     # ------------------------------------------------------------------
     def _build_trend_signal(self, c: Candidate, side: Side, close: float, atr: float,
                             ltf: pd.DataFrame, frame: pd.DataFrame, regime_score: float,
-                            data=None, vol_widening: float = 1.0) -> Signal | None:
+                            data=None, vol_widening: float = 1.0, vol_scale: float = 1.0) -> Signal | None:
         lookback = max(3, int(self.params.get("pullback_lookback_bars", 5)))
         session_ltf = ltf[_same_day_mask(ltf, now_et().date())]
         recent = session_ltf.tail(lookback + 1).iloc[:-1] if len(session_ltf) > lookback else session_ltf.iloc[:-1]
@@ -1180,9 +1475,9 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # ATR buffer + default_stop_pct floor both scale with vol_widening
         # (Tier 2a) — trend-day capture: wider noise tolerance, same dollar
         # risk per trade (risk manager downsizes share count).
-        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening
-        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening
-        target_rr = float(self.params.get("trend_target_rr", 2.0))
+        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening * self._side_stop_buffer_mult(side)
+        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening * vol_scale
+        target_rr = float(self.params.get("trend_target_rr", 2.0)) * self._side_target_rr_mult(side)
 
         if side == Side.LONG:
             trigger_high = _safe_float(recent["high"].max(), close)
@@ -1209,11 +1504,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             risk = max(0.01, stop - close)
             target = max(0.01, close - risk * target_rr)
 
-        return self._finalize_signal(c, side, close, stop, target, "trend", regime_score, frame, data)
+        return self._finalize_signal(c, side, close, stop, target, "trend", regime_score, frame, data, vol_scale=vol_scale)
 
     def _build_orb_signal(self, c: Candidate, side: Side, close: float, atr: float,
                           frame: pd.DataFrame, regime_score: float,
-                          data=None, vol_widening: float = 1.0) -> Signal | None:
+                          data=None, vol_widening: float = 1.0, vol_scale: float = 1.0) -> Signal | None:
         """Build a true Opening Range Breakout signal.
 
         Entry: a confirmed break of today's opening range (close above
@@ -1245,7 +1540,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             )
             return None
         breakout_buffer = float(self.params.get("orb_breakout_buffer_atr_mult", 0.05)) * atr
-        stop_buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening
+        stop_buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening * self._side_stop_buffer_mult(side)
         target_mult = float(self.params.get("orb_target_range_mult", 1.5))
         if side == Side.LONG:
             if close <= or_high + breakout_buffer:
@@ -1266,7 +1561,29 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             stop = or_high + stop_buffer
             target = or_low - range_height * target_mult
 
-        return self._finalize_signal(c, side, close, stop, target, "orb", regime_score, frame, data)
+        # The measured move is anchored to the RANGE EDGE, not to the entry, so
+        # a break that has already run past `edge + range_height * mult` yields
+        # a target on the WRONG SIDE of the close — a LONG whose take-profit
+        # sits below its entry. Observed across randomised opening ranges: 57
+        # of 514 builder invocations produced an inverted target, e.g. close
+        # 107.26 with a LONG target of 101.01.
+        #
+        # The gatekeeper's `_entry_levels_valid` would refuse such a signal, so
+        # nothing traded, but a builder should not emit a structurally invalid
+        # setup for a downstream guard to catch. When the measured move is
+        # already exhausted the ORB thesis is simply spent — reject, the same
+        # way sr_scalp rejects when its zone gap cannot pay for its stop.
+        if not self._target_meets_min_rr(side, close, stop, target):
+            risk = abs(close - stop)
+            reward = (target - close) if side == Side.LONG else (close - target)
+            self._set_build_failure(
+                c.symbol, "orb",
+                f"{'long' if side == Side.LONG else 'short'}_orb_measured_move_exhausted("
+                f"close={close:.4f},target={target:.4f},reward={reward:.4f},risk={risk:.4f})",
+            )
+            return None
+
+        return self._finalize_signal(c, side, close, stop, target, "orb", regime_score, frame, data, vol_scale=vol_scale)
 
     @staticmethod
     def _pullback_leg_context(
@@ -1319,7 +1636,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
 
     def _build_pullback_signal(self, c: Candidate, side: Side, close: float, atr: float,
                                ltf: pd.DataFrame, frame: pd.DataFrame, regime_score: float,
-                               data=None, vol_widening: float = 1.0) -> Signal | None:
+                               data=None, vol_widening: float = 1.0, vol_scale: float = 1.0) -> Signal | None:
         lookback = max(3, int(self.params.get("pullback_lookback_bars", 5)))
         # ltf is resampled from the full multi-day history frame, so tail(N)
         # crosses session boundary during early RTH. Scope swing/stop lookups
@@ -1398,9 +1715,9 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 return None
 
         # vol_widening applied to both ATR buffer and default_stop_pct floor (Tier 2a).
-        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening
-        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening
-        target_rr = float(self.params.get("pullback_target_rr", 2.0))
+        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening * self._side_stop_buffer_mult(side)
+        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening * vol_scale
+        target_rr = float(self.params.get("pullback_target_rr", 2.0)) * self._side_target_rr_mult(side)
         # Swing-target window ~100 wall-clock minutes (was a hardcoded 20 bars on
         # the old 5m LTF = 100 min). Scaled by ltf_minutes so the 1m LTF uses
         # ~100 bars, preserving the swing horizon the target extension was tuned
@@ -1421,11 +1738,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             swing_low = _safe_float(session_ltf.tail(swing_bars)["low"].min(), close - risk * target_rr)
             target = max(0.01, min(close - risk * target_rr, swing_low))
 
-        return self._finalize_signal(c, side, close, stop, target, "pullback", regime_score, frame, data)
+        return self._finalize_signal(c, side, close, stop, target, "pullback", regime_score, frame, data, vol_scale=vol_scale)
 
     def _build_range_signal(self, c: Candidate, side: Side, close: float, atr: float,
                             frame: pd.DataFrame, regime_score: float, data=None,
-                            vol_widening: float = 1.0) -> Signal | None:
+                            vol_widening: float = 1.0, vol_scale: float = 1.0) -> Signal | None:
         lookback = max(8, int(self.params.get("range_lookback_bars", 20)))
         # Scope to today's session so range_high/range_low are not polluted
         # by prior-session bars during early RTH.
@@ -1454,7 +1771,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # pulls in the target (target = range_high - buffer for LONG) so
         # both stop room AND target conservatism scale with volatility,
         # which is the correct direction (wider noise needs both).
-        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening
+        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening * self._side_stop_buffer_mult(side)
         # Previous-bar confirmation — 2026-04-23 red-from-tick-one bucket
         # (AMZN 10:07, COST 11:09/13:02/15:15, LOW 13:08, HD 14:12 SHORT,
         # V 14:14 SHORT) all fired on an in-progress bar whose live tick
@@ -1504,11 +1821,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             stop = range_high + buffer
             target = max(0.01, range_low + buffer)
 
-        return self._finalize_signal(c, side, close, stop, target, "range", regime_score, frame, data)
+        return self._finalize_signal(c, side, close, stop, target, "range", regime_score, frame, data, vol_scale=vol_scale)
 
     def _build_vol_squeeze_signal(self, c: Candidate, side: Side, close: float, atr: float,
                                   frame: pd.DataFrame, regime_score: float,
-                                  data=None, vol_widening: float = 1.0) -> Signal | None:
+                                  data=None, vol_widening: float = 1.0, vol_scale: float = 1.0) -> Signal | None:
         """Build a Bollinger-squeeze breakout signal. Stops sit just outside
         the squeeze box (below box_low for LONG / above box_high for SHORT),
         with an ATR-floored buffer to absorb noise around the breakout. Target
@@ -1556,7 +1873,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         if bool(self.params.get("vol_squeeze_hard_breakout_gates", True)):
             last_bar = session_frame.iloc[-1]
             last_close = _safe_float(last_bar.get("close"), close)
-            buffer_pct = float(self.params.get("vol_squeeze_breakout_buffer_pct", 0.0008))
+            buffer_pct = self._pct_param("vol_squeeze_breakout_buffer_pct", 0.0008, vol_scale)
             if side == Side.LONG:
                 required_clearance = box_high * (1.0 + buffer_pct)
                 if last_close < required_clearance:
@@ -1637,13 +1954,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 )
                 return None
 
-        target_rr = float(self.params.get("vol_squeeze_target_rr", 2.05))
+        target_rr = float(self.params.get("vol_squeeze_target_rr", 2.05)) * self._side_target_rr_mult(side)
         # Stop buffer scales with box range so tighter squeezes don't get
         # over-wide ATR-based stops. Mirrors source strategy logic.
         # vol_widening (Tier 2a) applies on top of the max() so all three
         # buffer floors expand together in trend-day regimes.
-        stop_buffer = max(atr * 0.12, close * 0.0010, box_range * 0.22) * vol_widening
-        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening
+        stop_buffer = max(atr * 0.12, close * 0.0010, box_range * 0.22) * vol_widening * self._side_stop_buffer_mult(side)
+        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening * vol_scale
 
         if side == Side.LONG:
             stop = box_low - stop_buffer
@@ -1656,12 +1973,12 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             risk = max(0.01, stop - close)
             target = max(0.01, close - risk * target_rr)
 
-        return self._finalize_signal(c, side, close, stop, target, "vol_squeeze", regime_score, frame, data)
+        return self._finalize_signal(c, side, close, stop, target, "vol_squeeze", regime_score, frame, data, vol_scale=vol_scale)
 
     def _build_momentum_signal(self, c: Candidate, side: Side, close: float, atr: float,
                                frame: pd.DataFrame,
                                regime_score: float, data=None,
-                               vol_widening: float = 1.0) -> Signal | None:
+                               vol_widening: float = 1.0, vol_scale: float = 1.0) -> Signal | None:
         """Build a momentum-from-open continuation signal. Stops anchor below
         recent swing low (LONG) / above recent swing high (SHORT) with an
         ATR-cushioned buffer so single-bar wicks (during midday's lower volume
@@ -1699,28 +2016,28 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 )
                 return None
 
-        target_rr = float(self.params.get("momentum_target_rr", 2.0))
+        target_rr = float(self.params.get("momentum_target_rr", 2.0)) * self._side_target_rr_mult(side)
         # ATR-cushioned swing anchor (mirrors standalone momentum_close/strategy.py:76-79).
         # vol_widening (Tier 2a) widens the ATR cushion AND the
         # default_stop_pct floor so momentum trades on trend days don't
         # get knocked out by expanded per-bar noise.
-        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening
+        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening * vol_scale
         if side == Side.LONG:
-            swing = _safe_float(recent["low"].min(), close) - (atr * 0.08 * vol_widening)
+            swing = _safe_float(recent["low"].min(), close) - (atr * 0.08 * vol_widening * self._side_stop_buffer_mult(side))
             stop = max(close * (1.0 - effective_default_stop_pct), swing)
             risk = max(0.01, close - stop)
             target = close + risk * target_rr
         else:
-            swing = _safe_float(recent["high"].max(), close) + (atr * 0.08 * vol_widening)
+            swing = _safe_float(recent["high"].max(), close) + (atr * 0.08 * vol_widening * self._side_stop_buffer_mult(side))
             stop = min(close * (1.0 + effective_default_stop_pct), swing)
             risk = max(0.01, stop - close)
             target = max(0.01, close - risk * target_rr)
 
-        return self._finalize_signal(c, side, close, stop, target, "momentum", regime_score, frame, data)
+        return self._finalize_signal(c, side, close, stop, target, "momentum", regime_score, frame, data, vol_scale=vol_scale)
 
     def _build_vwap_reclaim_signal(self, c: Candidate, side: Side, close: float, atr: float,
                                    frame: pd.DataFrame, regime_score: float,
-                                   data=None, vol_widening: float = 1.0) -> Signal | None:
+                                   data=None, vol_widening: float = 1.0, vol_scale: float = 1.0) -> Signal | None:
         """Build a VWAP-reclaim signal (2026-05-30). Stop sits below the flush —
         LONG: below min(VWAP, the recent dip low) − buffer; SHORT mirror —
         because losing VWAP again is the invalidation. Target rides toward the
@@ -1733,9 +2050,9 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             self._set_build_failure(c.symbol, "vwap_reclaim", "insufficient_session_history")
             return None
         vwap = _safe_float(session_frame.iloc[-1].get("vwap"), close)
-        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening
-        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening
-        target_rr = float(self.params.get("vwap_reclaim_target_rr", 2.0))
+        buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening * self._side_stop_buffer_mult(side)
+        effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening * vol_scale
+        target_rr = float(self.params.get("vwap_reclaim_target_rr", 2.0)) * self._side_target_rr_mult(side)
 
         if side == Side.LONG:
             dip_low = _safe_float(recent["low"].min(), close)
@@ -1752,11 +2069,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             session_low = _safe_float(session_frame["low"].min(), close - risk * target_rr)
             target = max(0.01, min(close - risk * target_rr, session_low))
 
-        return self._finalize_signal(c, side, close, stop, target, "vwap_reclaim", regime_score, frame, data)
+        return self._finalize_signal(c, side, close, stop, target, "vwap_reclaim", regime_score, frame, data, vol_scale=vol_scale)
 
     def _build_sr_scalp_signal(self, c: Candidate, side: Side, close: float, atr: float,
                                frame: pd.DataFrame, regime_score: float,
-                               data=None, vol_widening: float = 1.0) -> Signal | None:
+                               data=None, vol_widening: float = 1.0, vol_scale: float = 1.0) -> Signal | None:
         """Build an HTF S/R scalp signal (2026-05-29 redesign).
 
         Two LONG setups (SHORT mirrors), both riding to the next rung:
@@ -1812,13 +2129,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         proximity_buffer = float(self.params.get("sr_scalp_max_distance_from_zone_atr", 0.5)) * atr
         # Stop nudge — bot's existing ``sr_ctx.level_buffer`` (same buffer the
         # _refine_*_sr_levels paths use). Scales with vol_widening (Tier 2a).
-        level_buffer = float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0) * vol_widening
+        level_buffer = float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0) * vol_widening * self._side_stop_buffer_mult(side)
         if level_buffer <= 0.0:
             level_buffer = max(atr * 0.05, 0.01) * vol_widening
         # Inner-gap floor (tradeable distance to the next rung). Max of the
         # % and ATR floors, same as before.
         required_gap = max(
-            float(self.params.get("sr_scalp_min_distance_pct", 0.008)) * close,
+            self._pct_param("sr_scalp_min_distance_pct", 0.008, vol_scale) * close,
             float(self.params.get("sr_scalp_min_distance_atr", 2.5)) * atr,
         )
 
@@ -1927,11 +2244,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 )
                 return None
 
-        return self._finalize_signal(c, side, close, stop, target, "sr_scalp", regime_score, frame, data)
+        return self._finalize_signal(c, side, close, stop, target, "sr_scalp", regime_score, frame, data, vol_scale=vol_scale)
 
     def _finalize_signal(self, c: Candidate, side: Side, close: float, stop: float,
                          target: float, regime: str, regime_score: float,
-                         frame: pd.DataFrame, data=None) -> Signal | None:
+                         frame: pd.DataFrame, data=None, vol_scale: float = 1.0) -> Signal | None:
         """Apply shared gates (structure, S/R, exhaustion, chart patterns) and
         build the final Signal with adaptive management metadata."""
         sr_ctx = self._sr_context(c.symbol, frame, data)
@@ -1946,7 +2263,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # avoid duplicate now_et() calls with potential clock-skew at the
         # 10:05 boundary.
         orb_end = self.params.get("orb_end_time", "10:05")
-        in_orb_window = now_et().time() <= parse_hhmm(orb_end)
+        in_orb_window = self._in_orb_window(now_et().time())
 
         # Fix D — reject stretched / contradicted entries before expensive
         # signal refinement. Applies to trend / pullback / momentum only;
@@ -2095,7 +2412,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # (_bearish_sr_block_reason): require both pct and ATR clearance
         # so the stop and exit are separated by a non-trivial band.
         if bool(self.params.get("reject_entry_near_broken_level", True)):
-            min_pct = float(self.params.get("broken_level_min_clearance_pct", 0.0025))
+            min_pct = self._pct_param("broken_level_min_clearance_pct", 0.0025, vol_scale)
             min_atr = float(self.params.get("broken_level_min_clearance_atr", 0.72))
             atr_local = _safe_float(
                 frame.iloc[-1].get("atr14") if (frame is not None and not frame.empty and "atr14" in frame.columns) else None,
@@ -2519,8 +2836,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # confirmation / confirmation-bar regime sets, so it never hits those
         # gates — the old orb_bypass_index_confirmation / _entry_confirmation_bar
         # companions were removed (2026-05-29).
-        orb_end = self.params.get("orb_end_time", "10:05")
-        in_orb_window = now_t <= parse_hhmm(orb_end)
+        in_orb_window = self._in_orb_window(now_t)
 
         # Index ok / neutral are now PER-CANDIDATE because of the
         # ``sector_index_map``-driven per-sector ETF lookup (see
@@ -2546,9 +2862,27 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         ext_all = bool(self.params.get("extended_hours_tradable_all", False))
         ext_allowed = self._extended_hours_tradable_set() if ext_hours_now else set()
 
+        # Macro-window blackout applies to the whole cycle (CPI, FOMC — not
+        # symbol-specific), so evaluate it once rather than per candidate.
+        macro_block = self._event_calendar.entry_block_reason()
+        if macro_block is not None:
+            for c in candidates:
+                self._record_entry_decision(c.symbol, "skipped", [f"event_blackout({macro_block})"])
+            return out
+
         for c in candidates:
             if c.symbol in positions:
                 self._record_entry_decision(c.symbol, "skipped", ["already_in_position"])
+                continue
+            # Per-symbol earnings blackout. An earnings print resets the
+            # symbol's volatility regime, so the ATR-derived stops and the
+            # session-open-anchored day_strength this strategy relies on are
+            # both calibrated to a distribution that no longer holds. Across
+            # 23 mega caps that is roughly 92 scheduled events a year,
+            # clustered into three weeks a quarter.
+            earnings_block = self._event_calendar.earnings_block_reason(c.symbol)
+            if earnings_block is not None:
+                self._record_entry_decision(c.symbol, "skipped", [earnings_block])
                 continue
             if ext_hours_now and not ext_all and c.symbol.upper().strip() not in ext_allowed:
                 self._record_entry_decision(c.symbol, "skipped", ["extended_hours_not_eligible"])
@@ -2579,6 +2913,16 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             ret5 = _safe_float(last.get("ret5"), 0.0)
             ret15 = _safe_float(last.get("ret15"), 0.0)
             atr = max(_safe_float(last.get("atr14"), close * 0.0015), close * 0.0005, 0.01)
+
+            # Per-symbol volatility scale: this symbol's 20-day ADR relative
+            # to ``reference_adr_pct``, the ADR the percent-of-price params
+            # were tuned against. Every percent threshold below is multiplied
+            # by it so one parameter means one thing across a universe whose
+            # ADR spans roughly 0.9% (COST/V/TMUS) to 3%+ (NVDA/TSLA/AMD).
+            # Orthogonal to ``vol_widening``: that reacts to TODAY's ATR
+            # expansion, this encodes how volatile the name normally is.
+            # 1.0 when the daily feed has no stats for the symbol.
+            vol_scale = self._vol_scale(c.symbol, data)
 
             # Soft-bias gating (Fix A, refactored 2026-05-12). The original
             # Fix A hard-locked ``preferred_sides`` to one direction when
@@ -2654,15 +2998,31 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # via ``allow_short = False``.
             preferred_sides = [Side.LONG, Side.SHORT] if allow_short else [Side.LONG]
 
-            # Explicit side decision (Fix A, 2026-05-27). Replaces the
-            # implicit "evaluate both sides per regime, pick highest-
-            # scoring" with an evidence-based vote across CURRENT price
-            # action signals. Side is decided BEFORE regime scoring so
-            # the wrong side is never evaluated. If no side wins a clean
-            # majority, skip the candidate (don't trade on contradicting
-            # signals). Bypassed during ORB when ``orb_bypass_side_decision``
-            # is true — early-session signals are gap-dominated. See
-            # ``_decide_side`` for the voting logic.
+            # Explicit side decision (Fix A, 2026-05-27; scoped to
+            # direction-following regimes 2026-09-18). An evidence-based vote
+            # across CURRENT price-action signals — recent return, close vs
+            # VWAP, EMA9/20, last-3-bar colour — replacing the old implicit
+            # "score both sides, take the higher" side selection.
+            #
+            # The vote now GATES REGIMES rather than collapsing
+            # ``preferred_sides``. Every one of its four signals is
+            # trend-following, so applying it to the whole candidate silently
+            # removed the two mean-reversion regimes: ``range`` only enters
+            # within the bottom 35% of the range (LONG), and ``sr_scalp``
+            # only at a support that price has just fallen into — exactly the
+            # conditions under which recent-return and close-vs-VWAP both
+            # vote SHORT. Simulated over a clean oscillating range with the
+            # shipped params, the vote agreed with the range regime's own
+            # entry zone on 3 of 54 in-zone bars (5.5%). The confirmation-bar
+            # and index gates already exempt these two regimes for precisely
+            # this reason (see CONFIRMATION_BAR_REGIMES / the
+            # MEAN_REVERSION_REGIMES comment); the vote running candidate-wide
+            # and BEFORE regime scoring made those exemptions unreachable.
+            #
+            # ``decided_side`` is applied per (side, regime) pair in the build
+            # queue below against SIDE_DECISION_REGIMES. Bypassed inside the
+            # ORB window when ``orb_bypass_side_decision`` is true — the
+            # opening tape is gap-dominated.
             side_decision_orb_bypass = (
                 bool(self.params.get("orb_bypass_side_decision", True)) and in_orb_window
             )
@@ -2673,45 +3033,49 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # would re-introduce the backward-looking suppression Fix A
             # replaced.
             explicit_side_decided = False
+            decided_side: Side | None = None
+            side_vote_note = ""
             if bool(self.params.get("require_explicit_side_decision", True)) and not side_decision_orb_bypass:
                 decided_side, votes = self._decide_side(ltf, close, vwap, ema9, ema20)
-                if decided_side is None:
-                    self._record_entry_decision(c.symbol, "skipped", [
-                        f"side_undecided(long={votes['long']},short={votes['short']},"
-                        f"votes=[{','.join(votes['breakdown'])}])"
-                    ])
-                    continue
-                if decided_side not in preferred_sides:
-                    self._record_entry_decision(c.symbol, "skipped", [
-                        f"side_decision_not_tradable(decided={decided_side.value},"
-                        f"allowed={[s.value for s in preferred_sides]})"
-                    ])
-                    continue
-                preferred_sides = [decided_side]
-                explicit_side_decided = True
+                side_vote_note = (
+                    f"long={votes['long']},short={votes['short']},"
+                    f"votes=[{','.join(votes['breakdown'])}]"
+                )
+                if decided_side is not None:
+                    explicit_side_decided = True
 
-            # Relative-strength filter (2026-05-26). The candidate's bias
-            # signals above measure absolute intraday move; this measures
-            # the candidate vs its sector ETF. A stock drifting at 0% on
-            # a +1% sector day is materially weak even though both
-            # ``day_strength`` and ``screener.directional_bias`` are None.
-            # Session 2026-05-26 entry forensics: INTC at 10:32 was +0.21%
-            # while XLK was +1.27% (rel −1.06%, lost $3); INTC at 14:04 was
-            # +0.10% vs XLK +0.90% (rel −0.80%, lost $64); NEM at 10:16 was
-            # −0.19% vs XLB +0.67% (rel −0.86%, lost $10). All three would
-            # be blocked at threshold 0.50%. META — the lone winner — was
-            # +0.20% vs XLC −0.04% (rel +0.25%), so the gate leaves
-            # legitimate setups alone. When the rel-strength conflicts
-            # with a side, that side is removed from ``preferred_sides``;
-            # if no sides remain the candidate is skipped entirely. ORB
-            # window is bypassed (the first 30 min of trading is too
-            # noisy for a stock-vs-sector divergence read).
-            rs_threshold = float(self.params.get("relative_strength_block_threshold_pct", 0.5))
+            # Relative-strength filter (2026-05-26; beta-adjusted 2026-09-18).
+            # Measures the candidate against its sector — a stock drifting at
+            # 0% on a +1% sector day is materially weak even when
+            # ``day_strength`` alone reads neutral.
+            #
+            # The comparison is a RESIDUAL, not a difference: a symbol is
+            # expected to move ``beta`` times its sector, so only the part of
+            # its move that beta does not explain is strength or weakness.
+            # The raw ``day_strength - sector_ds`` form assumed beta 1.0 for
+            # every name, which on a mega-cap universe (sector betas roughly
+            # 0.5 on COST/V/TMUS to 1.8 on NVDA/AMD/TSLA) measured beta
+            # instead of alpha: on a −1.0% XLK day NVDA at −1.6% is performing
+            # exactly to a 1.6 beta — zero alpha — yet scored −0.6% and had
+            # LONG blocked. The gate therefore blocked high-beta names in the
+            # direction the tape was already moving, while low-beta names
+            # essentially never tripped it.
+            #
+            # Beta comes from ``_symbol_daily_stats``. When it is unavailable
+            # the gate is SKIPPED for that symbol and the reason is recorded —
+            # falling back to beta 1.0 would reintroduce the exact bug.
+            # When the rel-strength conflicts with a side, that side is
+            # removed from ``preferred_sides``; if no sides remain the
+            # candidate is skipped. ORB window is bypassed (the opening
+            # window is too noisy for a stock-vs-sector divergence read).
+            rs_threshold = self._pct_param("relative_strength_block_threshold_pct", 0.5, vol_scale)
             rs_orb_bypass = bool(self.params.get("orb_bypass_relative_strength", True)) and in_orb_window
             if rs_threshold > 0.0 and not rs_orb_bypass and day_strength is not None:
                 sector_ds = self._sector_day_strength(c.symbol, bars)
-                if sector_ds is not None:
-                    rel_strength = day_strength - sector_ds
+                stats = self._symbol_daily_stats(c.symbol, data)
+                beta = stats.beta if (stats is not None and stats.has_beta) else None
+                if sector_ds is not None and beta is not None:
+                    rel_strength = day_strength - (beta * sector_ds)
                     blocked_long = rel_strength <= -rs_threshold and Side.LONG in preferred_sides
                     blocked_short = rel_strength >= rs_threshold and Side.SHORT in preferred_sides
                     if blocked_long:
@@ -2721,8 +3085,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     if not preferred_sides:
                         direction = "lagging" if blocked_long else "leading"
                         self._record_entry_decision(c.symbol, "skipped", [
-                            f"relative_strength_{direction}_sector(rel={rel_strength:+.2f}%,"
-                            f"sym={day_strength:+.2f}%,sec={sector_ds:+.2f}%,"
+                            f"relative_strength_{direction}_sector(resid={rel_strength:+.2f}%,"
+                            f"sym={day_strength:+.2f}%,sec={sector_ds:+.2f}%,beta={beta:.2f},"
                             f"threshold={rs_threshold:.2f}%)"
                         ])
                         continue
@@ -2774,7 +3138,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     if "pullback" in allowed_regimes else 0.0
                 )
                 range_score = (
-                    self._score_range(close, vwap, ema9, ema20, frame, idx_neutral)
+                    self._score_range(close, vwap, ema9, ema20, frame, idx_neutral, vol_scale)
                     if "range" in allowed_regimes else 0.0
                 )
                 # vol_squeeze and momentum: scoring methods read live frame
@@ -2783,11 +3147,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 # open. ``momentum`` was renamed from ``momentum_close`` and
                 # widened from afternoon-only to post-ORB through close.
                 vol_squeeze_score = (
-                    self._score_vol_squeeze(side, close, vwap, ema9, ema20, atr, frame, tech_ctx_for_candidate)
+                    self._score_vol_squeeze(side, close, vwap, ema9, ema20, atr, frame, tech_ctx_for_candidate, vol_scale)
                     if "vol_squeeze" in allowed_regimes else 0.0
                 )
                 momentum_score = (
-                    self._score_momentum(side, close, vwap, ema9, ema20, ret15, frame)
+                    self._score_momentum(side, close, vwap, ema9, ema20, ret15, frame, vol_scale)
                     if "momentum" in allowed_regimes else 0.0
                 )
                 # sr_scalp: level-aware scoring (2026-05-29). Scores the
@@ -2796,7 +3160,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 # bar character, and room to the next rung. sr_ctx is the
                 # per-cycle-cached context (same object the builder reads).
                 sr_scalp_score = (
-                    self._score_sr_scalp(side, close, atr, frame, self._sr_context(c.symbol, frame, data))
+                    self._score_sr_scalp(side, close, atr, frame, self._sr_context(c.symbol, frame, data), vol_scale)
                     if "sr_scalp" in allowed_regimes else 0.0
                 )
                 # orb: true Opening Range Breakout (2026-05-29). Allowed only
@@ -2811,7 +3175,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 # re-entry — dipped below session VWAP then reclaimed it on a
                 # volume pop. Reads the base 1m frame (VWAP is session-cumulative).
                 vwap_reclaim_score = (
-                    self._score_vwap_reclaim(side, close, vwap, ema9, ema20, atr, frame)
+                    self._score_vwap_reclaim(side, close, vwap, ema9, ema20, atr, frame, vol_scale)
                     if "vwap_reclaim" in allowed_regimes else 0.0
                 )
 
@@ -2868,12 +3232,36 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     "orb": min_orb,
                     "vwap_reclaim": min_vwap_reclaim,
                 }
-                build_order: list[tuple[str, float]] = []
-                for regime_name, regime_score in sorted(scores.items(), key=lambda kv: kv[1], reverse=True):
+                # Ordering uses the NORMALISED score — how far into its own
+                # headroom a regime scored — not the raw one. Raw scores are
+                # not comparable across regimes because each scorer has a
+                # different ceiling and floor (vol_squeeze tops out at 6.5
+                # over a 4.0 floor; sr_scalp at 5.0 over a 3.0 floor). Sorting
+                # raw handed the queue to whichever scorer had the most
+                # components: a trend at 4.5 (25% of its headroom) outranked
+                # an sr_scalp at 4.4 (93% of its headroom, near its ceiling).
+                # ``build_order`` carries both — normalised for ordering, raw
+                # for the metadata and skip-summary lines operators read.
+                # SHORTs clear their floor plus ``short_min_score_premium``.
+                # Equities drift up, so a short fights the base rate and needs
+                # more evidence than the mirror-image long. The premium raises
+                # the floor for BOTH qualification and the normalisation
+                # denominator, so a short that only just clears its raised bar
+                # still ranks as a marginal setup rather than being flattered
+                # by the lower long floor.
+                score_premium = self._short_score_premium(side)
+                build_order: list[tuple[str, float, float]] = []
+                for regime_name, regime_score in scores.items():
                     if regime_name not in allowed_regimes:
                         continue
-                    if regime_score >= thresholds.get(regime_name, float("inf")):
-                        build_order.append((regime_name, regime_score))
+                    floor = thresholds.get(regime_name, float("inf"))
+                    if floor != float("inf"):
+                        floor += score_premium
+                    if regime_score >= floor:
+                        build_order.append(
+                            (regime_name, regime_score, self._normalized_regime_score(regime_name, regime_score, floor))
+                        )
+                build_order.sort(key=lambda item: item[2], reverse=True)
 
                 side_decisions.append((side, {
                     "build_order": build_order,
@@ -2909,7 +3297,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             #     gate inside the builder rejected. Signal was attempted.
             # Differentiating these matters for tuning: the first wants
             # looser score thresholds; the second wants looser hard gates.
-            build_queue: list[tuple[Side, str, float, dict[str, Any]]] = []
+            build_queue: list[tuple[Side, str, float, float, dict[str, Any]]] = []
             for side, decision in side_decisions:
                 if not decision["build_order"]:
                     penalty_suffix = (
@@ -2928,18 +3316,41 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                         f"vwap_reclaim={decision['vwap_reclaim_score']:.1f}{penalty_suffix})"
                     )
                     continue
-                for regime_name, regime_score in decision["build_order"]:
-                    build_queue.append((side, regime_name, regime_score, decision))
+                for regime_name, regime_score, regime_norm in decision["build_order"]:
+                    build_queue.append((side, regime_name, regime_score, regime_norm, decision))
 
-            # Stable sort by score desc — ties default to preferred_sides
+            # Stable sort by NORMALISED score desc (see
+            # ``_normalized_regime_score``) — ties default to preferred_sides
             # insertion order (LONG before SHORT) since side_decisions was
             # built in that order.
-            build_queue.sort(key=lambda item: item[2], reverse=True)
+            build_queue.sort(key=lambda item: item[3], reverse=True)
 
             winning_decision: dict[str, Any] | None = None
             winning_regime: str | None = None
-            for side, regime_name, regime_score, decision in build_queue:
+            winning_norm: float = 0.0
+            for side, regime_name, regime_score, regime_norm, decision in build_queue:
                 index_ok = decision["index_ok"]
+
+                # Explicit side decision, applied per regime. Direction-
+                # following regimes must match the vote; the mean-reversion
+                # pair (range / sr_scalp) is exempt because it enters against
+                # current price action by design, and orb is exempt via its
+                # own window bypass. See the side-decision block above.
+                if regime_name in SIDE_DECISION_REGIMES and explicit_side_decided is False and side_vote_note:
+                    fail_reasons.append(
+                        f"{side.value.lower()}_build_failed_{regime_name}_side_undecided({side_vote_note})"
+                    )
+                    continue
+                if (
+                    regime_name in SIDE_DECISION_REGIMES
+                    and decided_side is not None
+                    and side != decided_side
+                ):
+                    fail_reasons.append(
+                        f"{side.value.lower()}_build_failed_{regime_name}_side_decision_opposed"
+                        f"(decided={decided_side.value})"
+                    )
+                    continue
 
                 # Index confirmation for trend/pullback/vol_squeeze/momentum/
                 # vwap_reclaim — these momentum-family regimes need a market-
@@ -2949,7 +3360,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 # rotation between levels." The orb regime is also exempt (not
                 # in the set) — its range-break is the directional proof. Index
                 # failure on one regime falls through to the next in the queue.
-                if regime_name in {"trend", "pullback", "vol_squeeze", "momentum", "vwap_reclaim"} and not index_ok:
+                if regime_name in INDEX_CONFIRMED_REGIMES and not index_ok:
                     fail_reasons.append(
                         f"{side.value.lower()}_build_failed_{regime_name}_index_not_confirmed"
                     )
@@ -2970,7 +3381,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 # confirmation stands in. The orb regime is also exempt (not in
                 # the set) — its range-break is the confirmation.
                 if (
-                    regime_name in {"trend", "pullback", "vol_squeeze", "momentum"}
+                    regime_name in CONFIRMATION_BAR_REGIMES
                     and bool(self.params.get("require_entry_confirmation_bar", True))
                     and not self._entry_bar_confirms(side, ltf)
                 ):
@@ -2981,21 +3392,21 @@ class TopTierAdaptiveStrategy(BaseStrategy):
 
                 sig = None
                 if regime_name == "trend":
-                    sig = self._build_trend_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening)
+                    sig = self._build_trend_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
                 elif regime_name == "pullback":
-                    sig = self._build_pullback_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening)
+                    sig = self._build_pullback_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
                 elif regime_name == "range":
-                    sig = self._build_range_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening)
+                    sig = self._build_range_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
                 elif regime_name == "vol_squeeze":
-                    sig = self._build_vol_squeeze_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening)
+                    sig = self._build_vol_squeeze_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
                 elif regime_name == "momentum":
-                    sig = self._build_momentum_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening)
+                    sig = self._build_momentum_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
                 elif regime_name == "sr_scalp":
-                    sig = self._build_sr_scalp_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening)
+                    sig = self._build_sr_scalp_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
                 elif regime_name == "orb":
-                    sig = self._build_orb_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening)
+                    sig = self._build_orb_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
                 elif regime_name == "vwap_reclaim":
-                    sig = self._build_vwap_reclaim_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening)
+                    sig = self._build_vwap_reclaim_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
 
                 if sig is not None:
                     # Tier 3b: on high-conviction days, loosen the
@@ -3027,9 +3438,23 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     # ``_ladder_indices_still_aligned``.
                     if isinstance(sig.metadata, dict):
                         sig.metadata["confirmation_indices"] = list(self._indices_for_symbol(c.symbol))
+                        # Cross-regime-comparable score. ``signal_priority_key``
+                        # ranks competing signals on this when there are more
+                        # signals than free position slots; the raw
+                        # ``regime_score`` next to it stays for reporting.
+                        sig.metadata["regime_score_normalized"] = round(float(regime_norm), 4)
+                        stats = self._symbol_daily_stats(c.symbol, data)
+                        if stats is not None:
+                            if stats.has_scale:
+                                sig.metadata["daily_adr_pct"] = round(float(stats.adr_pct), 5)
+                                sig.metadata["vol_scale"] = round(self._vol_scale(c.symbol, data), 4)
+                            if stats.has_beta:
+                                sig.metadata["sector_beta"] = round(float(stats.beta), 3)
+                                sig.metadata["sector_beta_benchmark"] = stats.beta_benchmark
                     best_signal = sig
                     winning_decision = decision
                     winning_regime = regime_name
+                    winning_norm = regime_norm
                     break
 
                 # Build attempted but rejected by a hard gate inside the
@@ -3058,6 +3483,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                         detail_payload["regime"] = winning_regime
                         scores_dict = winning_decision.get("scores") or {}
                         detail_payload["score"] = round(float(scores_dict.get(winning_regime, 0.0)), 4)
+                        detail_payload["score_norm"] = round(float(winning_norm), 4)
                 self._record_entry_decision(
                     c.symbol, "signal", [best_signal.reason],
                     details=detail_payload or None,

@@ -690,6 +690,16 @@ class EntryGatekeeper:
         position_metadata["broker_reconciled_after_order_uncertainty"] = True
         position_metadata["broker_recovery_order_id"] = str(result.order_id)
         position_metadata["broker_recovery_message"] = str(result.message)
+        # The order result was ambiguous, so we do not know whether the bracket
+        # children ever materialised. ensure_position_protected adopts them if
+        # they are still working and submits fresh protection only if not.
+        recovered_bracket = self.executor.ensure_position_protected(
+            signal.symbol, int(qty), signal.side, float(recovered_entry),
+            float(signal.stop_price), signal.target_price,
+            parent_order_id=str(result.order_id),
+        )
+        if recovered_bracket is not None:
+            position_metadata["bracket"] = recovered_bracket
         position = Position(
             symbol=signal.symbol,
             strategy=signal.strategy,
@@ -1186,7 +1196,16 @@ class EntryGatekeeper:
             if not levels_ok:
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, levels_reason or "invalid_levels"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, entry_price, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)})
                 continue
-            qty = self.risk.size_position(entry_price, signal.stop_price)
+            # Size against a stop distance padded by expected slippage, so an
+            # adverse fill still lands inside the per-trade risk budget. The
+            # allowance comes from the live spread in this same preview; it
+            # widens the SIZING distance only and never moves signal.stop_price.
+            slippage_allowance = self.risk.entry_slippage_allowance(
+                preview.get("bid"), preview.get("ask"), entry_price,
+            )
+            qty = self.risk.size_position(
+                entry_price, signal.stop_price, slippage_allowance=slippage_allowance,
+            )
             remaining_notional = self.risk.remaining_stock_notional_capacity(self.positions)
             if entry_price > 0:
                 qty = min(qty, self.risk.floor_discrete_units(remaining_notional, entry_price))
@@ -1200,7 +1219,17 @@ class EntryGatekeeper:
                 LOG.log(TRADEFLOW_LEVEL, "Skipping %s %s: %s", signal.symbol, signal.reason, reason)
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, reason], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, entry_price, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)})
                 continue
-            result = self.executor.submit_equity_entry(signal.symbol, qty, intent, data=self.data, market_snapshot=preview.get("market_snapshot") if isinstance(preview, dict) else None)
+            # side/stop/target are what turn this into a broker-side bracket:
+            # when execution.bracket_orders_enabled is false the executor
+            # ignores them and submits today's plain repriced limit.
+            result = self.executor.submit_equity_entry(
+                signal.symbol, qty, intent,
+                data=self.data,
+                market_snapshot=preview.get("market_snapshot") if isinstance(preview, dict) else None,
+                side=signal.side,
+                stop_price=signal.stop_price,
+                target_price=signal.target_price,
+            )
             filled_qty = int(result.filled_qty or 0) if result.ok else 0
             if result.ok and filled_qty <= 0:
                 LOG.warning("Entry %s ok=True but filled_qty=%s — treating as unfilled", signal.symbol, result.filled_qty)
@@ -1221,14 +1250,91 @@ class EntryGatekeeper:
                 continue
             signal_entry_price = float(entry_price)  # pre-fill intended price
             entry_price = float(result.fill_price if result.fill_price is not None else entry_price)
+            stop_price = float(signal.stop_price)
+            target_price = safe_float(signal.target_price, None)
+
+            # Post-fill level revalidation. The pre-order check above ran
+            # against the PREVIEWED price; a fill that slipped through its own
+            # stop (fast tape on a marketable limit, or a gap) would otherwise
+            # leave a position whose entry is already past its stop with no
+            # warning — initial_risk uses abs() so it still reads positive and
+            # the stop simply fires on the next management cycle. The options
+            # path has always revalidated here; equities now match it.
+            levels_ok, levels_reason = self._entry_levels_valid(
+                signal.side, entry_price, stop_price, target_price,
+            )
+            if not levels_ok:
+                # Already filled at the broker — we MUST track the position, so
+                # fall back to the configured default distances rather than
+                # orphaning it or keeping levels the fill has invalidated.
+                fallback_stop_pct = float(self.config.risk.default_stop_pct)
+                fallback_target_pct = float(self.config.risk.default_target_pct)
+                LOG.error(
+                    "Post-fill level validation FAILED for %s (reason=%s side=%s fill=%.4f "
+                    "signal_entry=%.4f stop=%.4f target=%s); applying default-distance fallback levels.",
+                    signal.symbol, levels_reason, signal.side.value, entry_price,
+                    signal_entry_price, stop_price, target_price,
+                )
+                if signal.side == Side.LONG:
+                    stop_price = max(0.01, entry_price * (1.0 - fallback_stop_pct))
+                    target_price = entry_price * (1.0 + fallback_target_pct)
+                else:
+                    stop_price = entry_price * (1.0 + fallback_stop_pct)
+                    target_price = max(0.01, entry_price * (1.0 - fallback_target_pct))
+
             position_metadata = dict(signal.metadata or {})
-            position_metadata.setdefault("initial_stop_price", float(signal.stop_price))
-            position_metadata.setdefault("initial_target_price", safe_float(signal.target_price, None))
+            position_metadata.setdefault("initial_stop_price", stop_price)
+            position_metadata.setdefault("initial_target_price", target_price)
             position_metadata.setdefault("trail_armed", False)
+            if not levels_ok:
+                position_metadata["emergency_fallback_levels"] = True
+                position_metadata["original_levels_reason"] = levels_reason
             # Slippage tracking: signal price vs actual fill
+            entry_slippage_pct = abs(entry_price - signal_entry_price) / max(signal_entry_price, 0.01)
             position_metadata["signal_entry_price"] = signal_entry_price
             position_metadata["entry_slippage"] = round(abs(entry_price - signal_entry_price), 6)
-            position_metadata["entry_slippage_pct"] = round(abs(entry_price - signal_entry_price) / max(signal_entry_price, 0.01), 6)
+            position_metadata["entry_slippage_pct"] = round(entry_slippage_pct, 6)
+            slippage_warn_pct = float(self.config.risk.entry_slippage_warn_pct)
+            if 0 < slippage_warn_pct < entry_slippage_pct:
+                position_metadata["entry_slippage_exceeded"] = True
+                LOG.warning(
+                    "Entry slippage %s: signal=%.4f fill=%.4f slip=%.4f (%.3f%% > %.3f%% threshold) — "
+                    "persistent breaches point at routing or liquidity, not one bad print.",
+                    signal.symbol, signal_entry_price, entry_price,
+                    abs(entry_price - signal_entry_price),
+                    entry_slippage_pct * 100.0, slippage_warn_pct * 100.0,
+                )
+
+            # Realized-risk reconciliation. Sizing happened against the
+            # previewed price; this is what the trade actually risks now that
+            # the fill and the filled quantity are known. Detection only — the
+            # shares are bought. The sizing allowance above is what keeps this
+            # from firing in the first place.
+            risk_recon = self.risk.realized_entry_risk(qty_for_position, entry_price, stop_price)
+            position_metadata["realized_entry_risk"] = round(risk_recon["risk"], 4)
+            position_metadata["entry_risk_budget"] = round(risk_recon["budget"], 4)
+            position_metadata["entry_risk_overage_frac"] = round(risk_recon["overage_frac"], 6)
+            overage_warn = float(self.config.risk.risk_overage_warn_frac)
+            if 0 <= overage_warn < risk_recon["overage_frac"]:
+                position_metadata["entry_risk_overage_exceeded"] = True
+                LOG.warning(
+                    "Realized entry risk over budget for %s: qty=%d x |fill %.4f - stop %.4f| = $%.2f "
+                    "vs budget $%.2f (%.1f%% over, threshold %.1f%%).",
+                    signal.symbol, qty_for_position, entry_price, stop_price,
+                    risk_recon["risk"], risk_recon["budget"],
+                    risk_recon["overage_frac"] * 100.0, overage_warn * 100.0,
+                )
+            if result.bracket is not None:
+                # Resting broker-side protection for this position. position_manager
+                # reads this to reconcile broker fills, replace-sync moved levels,
+                # and cancel the resting orders before any engine-side exit.
+                position_metadata["bracket"] = dict(result.bracket)
+                if not result.bracket.get("active") and not result.bracket.get("simulated"):
+                    LOG.error(
+                        "Entry %s filled but has NO resting broker protection (state=%s) - "
+                        "engine-side management is the only guard on this position",
+                        signal.symbol, result.bracket.get("state"),
+                    )
             position = Position(
                 symbol=signal.symbol,
                 strategy=signal.strategy,
@@ -1236,8 +1342,8 @@ class EntryGatekeeper:
                 qty=qty_for_position,
                 entry_price=entry_price,
                 entry_time=now_et(),
-                stop_price=signal.stop_price,
-                target_price=signal.target_price,
+                stop_price=stop_price,
+                target_price=target_price,
                 trail_pct=self.stock_position_trail_pct(position_metadata),
                 highest_price=entry_price,
                 lowest_price=entry_price,

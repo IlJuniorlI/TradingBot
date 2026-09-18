@@ -19,6 +19,7 @@ from .helpers import (
     _reason_with_values,
     _safe_float,
 )
+from ..event_blackouts import EventBlackoutCalendar
 from ..order_blocks import (
     OrderBlockContext,
     build_order_block_context,
@@ -154,6 +155,10 @@ class BaseStrategy:
             self._manifest = get_plugin(config.strategy)
         except Exception:
             self._manifest = None
+        # Scheduled-event calendar (macro windows + per-symbol earnings),
+        # shared by every strategy. Lazily re-reads its YAML sources when
+        # their mtime changes, so it is safe to build once here.
+        self._event_calendar = EventBlackoutCalendar(config)
         self._entry_decisions: dict[str, dict[str, Any]] = {}
         self._build_failures: dict[tuple[str, str], dict[str, Any]] = {}
         self._candle_context_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -173,12 +178,12 @@ class BaseStrategy:
         return default
 
     @staticmethod
-    def _effective_relative_volume(symbol: str, raw_relative_volume: object, params: dict[str, Any] | None = None, *, cap_default: float = 2.5, standard_floor: float = 0.5) -> float:
-        return effective_relative_volume(symbol, raw_relative_volume, params or {}, cap_default=cap_default, standard_floor=standard_floor)
+    def _effective_relative_volume(symbol: str, raw_relative_volume: object, params: dict[str, Any] | None = None, *, cap_default: float = 2.5, standard_floor: float = 0.5, dollar_volume: object = None) -> float:
+        return effective_relative_volume(symbol, raw_relative_volume, params or {}, cap_default=cap_default, standard_floor=standard_floor, dollar_volume=dollar_volume)
 
     @staticmethod
-    def _relative_volume_gate_threshold(symbol: str, base_threshold: object, params: dict[str, Any] | None = None) -> float:
-        return relative_volume_gate_threshold(symbol, base_threshold, params or {})
+    def _relative_volume_gate_threshold(symbol: str, base_threshold: object, params: dict[str, Any] | None = None, *, dollar_volume: object = None) -> float:
+        return relative_volume_gate_threshold(symbol, base_threshold, params or {}, dollar_volume=dollar_volume)
 
     def _watchlist_capability_sources(self, kind: str) -> list[object] | None:
         raw = self._capability(f"watchlist.{kind}_sources", None)

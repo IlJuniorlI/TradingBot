@@ -66,6 +66,27 @@ def extract_working_orders(payload: Any) -> list[dict[str, Any]]:
     return out
 
 
+def active_broker_bracket(position: Any) -> dict[str, Any] | None:
+    """Resting broker-side bracket for a position, or None.
+
+    Returns None for dry-run (``simulated``) brackets and for any bracket whose
+    protection could not be established (``active`` false). In both cases
+    nothing rests at a broker, so the engine must keep owning the stop/target
+    exits. Shared by ``RiskManager`` (which suppresses the exits the broker
+    owns) and ``PositionManager`` (reconcile / sync / cancel-before-exit) so
+    the two can never disagree about who owns an exit.
+    """
+    meta = getattr(position, "metadata", None)
+    if not isinstance(meta, dict):
+        return None
+    bracket = meta.get("bracket")
+    if not isinstance(bracket, dict):
+        return None
+    if bracket.get("simulated") or not bracket.get("active"):
+        return None
+    return bracket
+
+
 def order_result_needs_broker_recheck(message: Any) -> bool:
     text = str(message or "").strip().lower()
     if not text:
