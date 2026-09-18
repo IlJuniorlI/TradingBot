@@ -1,0 +1,41 @@
+# Transitive dependency pins — the exact tree requirements.txt was verified
+# against on 2026-09-18 (Python 3.11.2, win_amd64).
+#
+# Install with:
+#     pip install -r requirements.txt -c constraints.txt
+#
+# requirements.txt pins only the 6 direct dependencies. schwabdev declares
+# aiohttp / requests / websockets / cryptography with no upper bound, and
+# tradingview-screener declares pandas<4,>=2 and requests<3,>=2, so a plain
+# `pip install -r requirements.txt` on a rebuilt box resolves whatever is
+# newest that day. Before this file existed, a fresh install picked up
+# cryptography 50.0.1 while a machine provisioned earlier still ran 46.0.7 —
+# four major versions apart in the library terminating TLS to Schwab, with
+# nothing recording which one had been tested.
+#
+# Regenerate after any verified dependency bump:
+#     pip freeze | sort > constraints.txt   (then re-add this header, and
+#     drop the 6 direct pins plus dev-only tooling)
+aiohappyeyeballs==2.6.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+attrs==26.1.0
+certifi==2026.7.22
+cffi==2.0.0
+charset-normalizer==3.5.1
+colorama==0.4.6
+cryptography==50.0.1
+frozenlist==1.8.0
+idna==3.20
+multidict==6.7.1
+propcache==0.4.1
+pycparser==3.0
+python-dateutil==2.9.0.post0
+pytz==2026.1.post1
+requests==2.34.2
+six==1.17.0
+typing_extensions==4.15.0
+tzdata==2026.1
+urllib3==2.8.0
+websockets==17.1
+yarl==1.23.0

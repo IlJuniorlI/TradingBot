@@ -2,19 +2,59 @@
 # Bumping any of these requires a full pytest pass + a dry-run on beta
 # before promoting to prod.
 #
-# 2026-07-27 bump. pandas 2.3.3 -> 3.0.5 is a major release: Copy-on-Write is
-# now the default. The codebase is CoW-safe by construction (no inplace=True
-# anywhere, no chained DataFrame assignment, no applymap / DataFrame.append),
-# and the indicator pipeline was regression-checked against archived bars whose
-# indicator columns were computed under 2.3.3 + TA-Lib 0.6.8 — worst relative
-# drift 9.2e-13 across 8 symbols x 15 columns, i.e. float64 round-off on the
-# ret5/ret15 percentage columns only. TA-Lib 0.6.8 -> 0.7.1 is covered by the
-# same check. All 9 schwabdev API methods the bot dispatches still exist in
-# 3.0.5 and Client.__init__ keeps open_browser_for_auth. PyYAML 6.0.3 is
-# already latest. 471 tests pass; `pip check` clean.
-schwabdev==3.0.5
-tradingview-screener==3.2.1
-pandas==3.0.5
+# Transitive dependencies are pinned separately in constraints.txt — install
+# with `pip install -r requirements.txt -c constraints.txt` so a rebuilt box
+# resolves the same tree this one was verified against. Without the
+# constraints file pip is free to pick newer transitives (cryptography,
+# aiohttp, websockets, urllib3 all float under schwabdev's unpinned specs).
+#
+# 2026-09-18 bump. schwabdev 3.0.5 -> 4.0.0, TA-Lib 0.7.1 -> 0.8.0,
+# pandas 3.0.5 -> 3.0.6, tradingview-screener 3.2.1 -> 3.2.2.
+#
+#   * schwabdev 4.0.0 is a major release but changes no API the bot touches:
+#     all 9 dispatched Client methods (account_details, cancel_order,
+#     linked_accounts, option_chains, order_details, place_order,
+#     price_history, quote, replace_order), all 7 Client.__init__ kwargs the
+#     engine passes, the 4 Stream methods (chart_equity, send, start, stop)
+#     and Stream.active are present and unchanged. The last structural break
+#     was 3.0.0. New in 4.0.0: request parameter validation, ON by default
+#     (`validate_params=False` to disable). Both of the bot's price_history
+#     call shapes were checked against the new validator and pass — the
+#     1m dates-mode fetch (frequencyType=minute, frequency=1) and the daily
+#     stats fetch (periodType=year, frequencyType=daily, frequency=1). HTF
+#     fetches use _direct_history_frequency, whose output set {1,5,10,15,30}
+#     is exactly the validator's allowed minute frequencies. The validator
+#     also rejects account hashes shorter than 14 chars; the bot resolves its
+#     hash from linked_accounts() hashValue, and dry_run short-circuits
+#     before place_order, so neither path is affected.
+#   * TA-Lib 0.8.0 requires TA-Lib C 0.8.1 — the cp311 win_amd64 wheel bundles
+#     it, so no separate native install was needed. Its behaviour changes
+#     (BBANDS default timeperiod 5 -> 20; APO/PPO default matype -> EMA) do
+#     not reach this codebase: all three BBANDS call sites in utils.py pass
+#     timeperiod/nbdevup/nbdevdn/matype explicitly, and APO/PPO are unused.
+#     The bot's whole TA-Lib surface is BBANDS, OBV, RSI, PLUS_DI, MINUS_DI,
+#     ATR, ADX, EMA, MA_Type. Indicator regression over 5 synthetic regimes x
+#     2 span_scales x 35 columns: worst ABSOLUTE drift 7.5e-09, confined to
+#     bb_percent_b / bb_width / bb_width_pct, with no NaN-pattern or column
+#     changes. (Worst RELATIVE reads 1.1e-07 only because bb_percent_b is
+#     near zero where it occurs — the absolute diff there is 3.1e-10.) Two
+#     technical_levels snapshots were regenerated for the same round-off:
+#     69 keys each, 3 changed on SPY and 1 on TSLA, all Bollinger, all 1e-08.
+#   * pandas and tradingview-screener are patch bumps.
+#   * Security-relevant transitives refreshed in the same pass:
+#     cryptography 46.0.7 -> 50.0.1, aiohttp 3.13.5 -> 3.14.3,
+#     websockets 16.0 -> 17.1, urllib3 2.6.3 -> 2.8.0,
+#     requests 2.33.1 -> 2.34.2, certifi 2026.2.25 -> 2026.7.22.
+#     websockets 16 -> 17 is a major bump under schwabdev's streaming layer
+#     that the test suite cannot exercise; the API schwabdev uses
+#     (websockets.connect with ping_timeout, ConnectionClosed /
+#     ConnectionClosedOK / ConnectionClosedError) was verified present.
+#     VERIFY THE STREAM ON BETA before promoting.
+#
+# 592 tests pass; `pip check` clean.
+schwabdev==4.0.0
+tradingview-screener==3.2.2
+pandas==3.0.6
 numpy==2.4.6
 PyYAML==6.0.3
-TA-Lib==0.7.1
+TA-Lib==0.8.0
