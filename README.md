@@ -371,6 +371,13 @@ This block controls how equity orders are priced and managed after submission.
 | `entry_live_reprice_step_frac`    | `0.5`        |
 | `extended_hours_enabled`          | `true`       |
 | `market_exit_regular_hours`       | `true`       |
+| `bracket_orders_enabled`          | `false`      |
+| `bracket_sync_mode`               | `static`     |
+| `bracket_legs`                    | `stop_and_target` |
+| `bracket_stop_order_type`         | `STOP_LIMIT` |
+| `bracket_stop_limit_offset_r`     | `0.5`        |
+| `bracket_require_normal_session`  | `true`       |
+| `bracket_replace_min_price_delta` | `0.01`       |
 
 Behavior and valid values:
 
@@ -382,6 +389,99 @@ Behavior and valid values:
 - `entry_live_reprice_step_frac`: size of each reprice step as a fraction of the entry buffer.
 - `extended_hours_enabled`: allow equity orders outside regular hours when the broker permits it.
 - `market_exit_regular_hours`: when `true`, stock exits during regular hours can use market orders.
+- `bracket_orders_enabled`: submit equity entries as a broker-side bracket. See below.
+- `bracket_sync_mode`: `static` | `replace` — who owns the resting levels after entry.
+- `bracket_legs`: `stop_and_target` | `stop_only` — which children rest at the broker.
+- `bracket_stop_order_type`: `STOP` | `STOP_LIMIT` — the resting protective stop's order type.
+- `bracket_stop_limit_offset_r`: `STOP_LIMIT` only; limit offset beyond the trigger, in units of initial R.
+- `bracket_require_normal_session`: reject a bracketed entry outside regular hours rather than send it unprotected.
+- `bracket_replace_min_price_delta`: `replace` mode debounce, in dollars.
+
+#### Broker-side bracket orders
+
+By default every exit is **engine-side**: the bot holds the stop and target in
+memory and acts on them when its management poll observes the level. That poll
+runs at `runtime.quote_poll_seconds`, so on a fast move the protective exit can
+lag the price by up to one poll interval — exactly when it costs most.
+
+With `bracket_orders_enabled: true`, an equity entry instead goes out as a
+single Schwab **first-triggers-OCO** order: a `TRIGGER` parent (the entry)
+whose child OCO carries the protective stop and, in `stop_and_target` mode, the
+target. The protection then **rests at the broker** and fires without the bot
+being involved — or even running.
+
+Off by default, so every existing preset keeps today's fully engine-managed
+behaviour.
+
+**Choosing a sync mode**
+
+- `static` — submit once and never touch. The broker owns the resting levels
+  for the life of the trade. Correct for fixed-stop/fixed-target scalps that do
+  no in-trade level management.
+- `replace` — the engine keeps managing levels, and every stop or target move
+  issues a `replace_order` against the corresponding child. Required for any
+  strategy whose edge is the in-trade ratchet (breakeven moves, profit locks,
+  trailing). `bracket_replace_min_price_delta` debounces this so a per-cycle
+  trail does not burn the Schwab rate budget on sub-penny adjustments.
+
+**Two combinations are refused at config load**
+
+Both are rejected when the config is read, not at order-build time when a live
+order would already be in flight.
+
+`bracket_sync_mode: static` with `trade_management_mode: adaptive` **or**
+`adaptive_ladder` — the engine ratchets `stop_price` in-trade (breakeven moves,
+profit locks, trailing) and `static` never replaces the resting child, so the
+broker would sit on the entry-time stop for the life of the trade while the
+engine believed it had tightened. Use `replace`.
+
+`bracket_legs: stop_and_target` with `trade_management_mode: adaptive_ladder` —
+a resting target limit defeats both of the ladder's defining behaviours: it
+deliberately declines a target-tag exit
+(`adaptive_ladder_suppress_target_exit`) so it can roll to the next rung, and
+on the final rung it clears `target_price` entirely to run a runner. A resting
+target fills through both, silently degrading every ladder trade into a rung-1
+scalp. Use `stop_only` and let the target stay engine-side.
+
+So on an `adaptive_ladder` preset — which is what `top_tier_adaptive` and
+`small_cap_squeeze` ship with — enabling brackets means setting **both**:
+
+```yaml
+execution:
+  bracket_orders_enabled: true
+  bracket_sync_mode: replace      # static is refused with adaptive/adaptive_ladder
+  bracket_legs: stop_only         # stop_and_target is refused with adaptive_ladder
+```
+
+**Stop order type**
+
+`STOP` fills wherever a flush ends, which is punishing on thin names.
+`STOP_LIMIT` bounds that slippage at the cost of a no-fill tail: if price gaps
+straight through the limit, the stop does not fill and the position is still
+open. `bracket_stop_limit_offset_r` sets how far beyond the trigger the limit
+sits, in units of the trade's initial R — wider tolerates more slippage in
+exchange for a smaller no-fill risk.
+
+**Extended hours**
+
+Schwab rejects `STOP` orders outside the `NORMAL` session. With
+`bracket_require_normal_session: true` (the default) a bracketed entry is
+**rejected** pre/post market rather than sent unprotected. Set it to `false`
+only if you knowingly accept naked extended-hours entries.
+
+**What the engine still does**
+
+Resting protection does not make the position unmanaged. Each cycle the engine
+reconciles the bracket against the broker: it notices when a child filled and
+books the exit, keeps the resting levels in step in `replace` mode, and cancels
+the children before marketing out for any engine-side reason (time stop,
+structure break, force-flatten). While a child is confirmed resting, the risk
+manager suppresses the engine-side exit that the broker now owns, so the two
+cannot both fire.
+
+Dry runs keep exits engine-side. The bracket is recorded on the `OrderResult`
+for parity and inspection, but nothing rests at a broker and the recorded state
+is marked `simulated`.
 
 ### `candles`
 
