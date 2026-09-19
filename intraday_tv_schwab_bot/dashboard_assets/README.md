@@ -173,3 +173,35 @@ themes/<name>/
 - Requests return `400` for bad names, `404` for missing files, `415` for disallowed extensions.
 - All responses set `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`.
 - Asset contents are cached in-process once read; **restart the bot** after editing theme files.
+
+## Mobile auto-redirect (2026-09-19)
+
+A document request from a **phone** is answered with `302 -> /mobile`. Tablets
+and desktops get the normal layout: a tablet has the width for it, so the split
+is phone-vs-everything-else rather than touch-vs-mouse.
+
+Detection is server-side on `User-Agent` (`_is_phone_user_agent` in
+`dashboard.py`), which avoids the flash of desktop content a client-side check
+would cause.
+
+- **Android** must say both `Android` *and* `Mobile` — tablets send the same
+  string without the latter. This is a presence test, not a positional regex:
+  `Android 14; Pixel 8)` sits inside the parenthesised platform token while
+  `Mobile Safari` trails at the end, so a pattern trying to span them dies on
+  the `;`.
+- **iPad** is excluded explicitly and the tablet check runs first, because iPad
+  Safari sends `Mobile/15E148` and would otherwise match.
+- **Modern iPadOS** reports a desktop Macintosh UA and is indistinguishable from
+  a Mac server-side. Tablet -> desktop is the intended outcome, so this is not a
+  gap.
+
+**Escape hatch:** `?desktop=1` (also `true` / `yes` / `on`) forces the desktop
+layout on a phone. It is bookmarkable, which is enough here — the dashboard is a
+single page that polls `/api/state` rather than navigating, so the query
+survives for the life of the tab.
+
+The redirect only fires on the document fallthrough. `/assets/*`, `/api/state`,
+`/api/chart`, `/health`, `/mobile` and `/m` all return earlier, so the mobile
+page can still load its own JS and poll from a phone UA. It is a `302`, never a
+`301`: the response depends on the requesting device, so it must not be cached
+against the URL.

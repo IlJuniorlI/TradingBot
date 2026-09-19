@@ -128,6 +128,54 @@ _THEME_ASSET_MIME: dict[str, str] = {
 }
 
 
+# Phones are redirected to /mobile; tablets are not. A tablet has the width for
+# the desktop layout, and the distinction has to be made explicitly because
+# several tablet user agents contain "Mobile" (iPad Safari sends
+# "... Mobile/15E148 Safari") and would otherwise match. The tablet pattern is
+# therefore checked FIRST and wins.
+#
+# Modern iPadOS Safari reports a desktop Macintosh UA and is indistinguishable
+# from a Mac server-side. That is the intended outcome here (tablet -> desktop),
+# not a gap.
+_TABLET_UA_PATTERN = re.compile(r"ipad|tablet|playbook|silk", re.IGNORECASE)
+_PHONE_UA_PATTERN = re.compile(
+    r"iphone|ipod|windows phone|iemobile|blackberry|bb10|opera mini",
+    re.IGNORECASE,
+)
+
+
+def _is_phone_user_agent(user_agent: str | None) -> bool:
+    """True when the User-Agent looks like a phone (not a tablet or desktop)."""
+    if not user_agent:
+        return False
+    if _TABLET_UA_PATTERN.search(user_agent):
+        return False
+    lowered = user_agent.lower()
+    if "android" in lowered:
+        # Android phones say "Mobile", Android tablets send the same string
+        # without it. This is deliberately a PRESENCE test, not a positional
+        # one: the two tokens sit far apart — "Android 14; Pixel 8)" is inside
+        # the parenthesised platform token while "Mobile Safari" trails at the
+        # end — so any regex trying to span them either has to cross a ";" and
+        # ")" or match greedily across unrelated tokens.
+        return "mobile" in lowered
+    return bool(_PHONE_UA_PATTERN.search(user_agent))
+
+
+def _wants_desktop_override(query: str | None) -> bool:
+    """True when the request explicitly asks for the desktop layout.
+
+    Without an escape hatch a phone could never reach the desktop dashboard.
+    `?desktop=1` is bookmarkable, which is enough here: the dashboard is a
+    single page that polls `/api/state` rather than navigating, so the query
+    survives for the life of the tab.
+    """
+    if not query:
+        return False
+    values = parse_qs(query).get("desktop") or []
+    return any(str(v).strip().lower() in {"1", "true", "yes", "on"} for v in values)
+
+
 def _resolve_asset_path(name: str) -> Path:
     resolved = (_DASHBOARD_ASSETS_DIR / name).resolve()
     if not resolved.is_relative_to(_DASHBOARD_ASSETS_DIR.resolve()):
@@ -430,6 +478,23 @@ class DashboardServer:
                         exc,
                     )
 
+            def _redirect(self, location: str) -> None:
+                """302 to `location`. Temporary, not permanent: the choice
+                depends on the requesting device, so it must not be cached as
+                a property of the URL."""
+                try:
+                    self.send_response(HTTPStatus.FOUND)
+                    self.send_header("Location", location)
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Cache-Control", "no-store")
+                    self._security_headers()
+                    self.end_headers()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
+                    LOG.info(
+                        "Dashboard client disconnected during redirect to %s: %s",
+                        location, exc,
+                    )
+
             def _serve_html(self, body: bytes) -> None:
                 try:
                     self.send_response(HTTPStatus.OK)
@@ -537,6 +602,16 @@ class DashboardServer:
                     return
                 if parsed.path.startswith("/health"):
                     self._write_json({"ok": True})
+                    return
+                # Everything above has returned, so this is a document request.
+                # Send phones to the mobile layout unless they asked for the
+                # desktop one. Assets, /api/* and /health are all handled
+                # earlier, so a redirect here can never catch the mobile page's
+                # own polling.
+                if not _wants_desktop_override(parsed.query) and _is_phone_user_agent(
+                    self.headers.get("User-Agent")
+                ):
+                    self._redirect("/mobile")
                     return
                 body = _html(refresh_ms, theme=theme).encode("utf-8")
                 self._serve_html(body)

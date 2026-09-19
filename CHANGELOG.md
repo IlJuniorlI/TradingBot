@@ -9,6 +9,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The dashboard redirects phones to the mobile layout.** *2026-09-19* — a
+  document request from a phone User-Agent gets `302 -> /mobile`; tablets and
+  desktops are unchanged, since a tablet has the width for the desktop layout.
+  Detection is server-side so there is no flash of desktop content. `?desktop=1`
+  forces the desktop layout on a phone and is bookmarkable. The redirect fires
+  only on the document fallthrough — `/assets/*`, `/api/*`, `/health`, `/mobile`
+  and `/m` all return earlier, so the mobile page still loads its own JS and
+  polls `/api/state` from a phone UA — and it is a 302 rather than a 301 because
+  the response depends on the device, not the URL.
+
 - **`top_tier_adaptive` can now trade a reversal.** *2026-09-18* — a session
   that flushed and then turned produced zero entries on the recovering side.
   Driving a 3% flush that retraced 87% through the gates bar by bar: of 90 bars
