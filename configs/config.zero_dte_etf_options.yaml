@@ -451,6 +451,12 @@ options:
   max_leg_spread_dollars: 0.05
   max_net_spread_pct: 0.16
   max_net_spread_price: 2.4
+  # Net price as a fraction of the spread's STRIKE WIDTH. max_net_spread_price
+  # is one dollar cap while widths differ per symbol (SPY/QQQ $200, IWM $100),
+  # so at 2.4 it sits above every width here and cannot reject a quote implying
+  # a credit at or above the spread itself — which books max_loss = 0. Set 0.0
+  # to disable. Verticals only; single long options use their own price gate.
+  max_net_price_frac_of_width: 0.90
   min_net_mid_price: 0.25
   target_long_delta: 0.38
   target_short_delta: 0.23

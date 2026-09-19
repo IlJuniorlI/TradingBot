@@ -1072,6 +1072,12 @@ class ZeroDteOptionsConfig:
     max_leg_spread_dollars: float = 0.08
     max_net_spread_pct: float = 0.20
     max_net_spread_price: float = 2.80
+    # Net price as a fraction of the spread's STRIKE WIDTH. max_net_spread_price
+    # is a single dollar cap while widths differ per symbol, so at its shipped
+    # value it sat above every configured width and could not reject a quote
+    # implying a credit larger than the spread itself — which books a max loss
+    # of zero. This asks the question structurally instead. 0.0 disables.
+    max_net_price_frac_of_width: float = 0.90
     min_net_mid_price: float = 0.25
     target_long_delta: float = 0.38
     target_short_delta: float = 0.23

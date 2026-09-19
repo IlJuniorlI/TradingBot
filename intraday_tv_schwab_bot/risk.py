@@ -709,6 +709,26 @@ class RiskManager:
         overage = (risk / budget - 1.0) if budget > 0 else 0.0
         return {"risk": risk, "budget": budget, "overage_frac": max(0.0, overage)}
 
+    def realized_option_risk(self, qty: int, max_loss_per_contract: float) -> dict[str, float]:
+        """Reconcile an option entry against ``options.max_loss_per_trade``.
+
+        The equity counterpart is ``realized_entry_risk``; options had none, so
+        a fill worse than the previewed limit went unnoticed. It matters most
+        in dry runs, where ``submit_option_vertical`` deliberately walks the
+        price toward the natural to model a chase — sweeping the shipped gates
+        produced a worst case of 20 contracts booked at $25 of max loss each
+        that actually risked $38.79 each, $776 against a $500 budget.
+
+        Detection only: by the time this runs the contracts are filled.
+        """
+        try:
+            risk = max(0.0, float(max_loss_per_contract)) * max(0, int(qty))
+        except (TypeError, ValueError):
+            return {"risk": 0.0, "budget": 0.0, "overage_frac": 0.0}
+        budget = float(self.config.options.max_loss_per_trade)
+        overage = (risk / budget - 1.0) if budget > 0 else 0.0
+        return {"risk": risk, "budget": budget, "overage_frac": max(0.0, overage)}
+
     def size_option_position(self, max_loss_per_contract: float) -> int:
         if max_loss_per_contract <= 0:
             return 0

@@ -973,6 +973,7 @@ Shared 0DTE ETF option-engine settings. Both option strategies use this block.
 | `max_leg_spread_dollars`         | `0.08`                                                                                                       |
 | `max_net_spread_pct`             | `0.2`                                                                                                        |
 | `max_net_spread_price`           | `2.8`                                                                                                        |
+| `max_net_price_frac_of_width`    | `0.9`                                                                                                        |
 | `min_net_mid_price`              | `0.25`                                                                                                       |
 | `target_long_delta`              | `0.38`                                                                                                       |
 | `target_short_delta`             | `0.23`                                                                                                       |
@@ -1043,6 +1044,7 @@ Behavior and valid values:
 - Basic chain quality filters:
   - `min_underlying_price`, `min_option_volume`, `min_open_interest` filter the option universe.
   - `max_bid_ask_spread_pct`, `max_leg_spread_dollars`, `max_net_spread_pct`, `max_net_spread_price`, `min_net_mid_price` filter quote quality.
+  - `max_net_price_frac_of_width` caps a vertical's net price as a fraction of its STRIKE WIDTH (default `0.9`, `0.0` disables). `max_net_spread_price` is a single dollar cap while widths differ per symbol, so it cannot police structure: at the shipped 0DTE values it sat above every configured width, which let a quote implying a credit at or above the spread itself through. Such a quote books `max_loss = width - credit = 0`. `size_option_position` refuses a zero max loss so the outcome was a silent no-trade rather than a blow-up, but a degenerate chain then looked identical to "no setup today". Applies to verticals only; single long options are validated by their own price gate.
 - Target deltas / structure:
   - `target_long_delta`, `target_short_delta` are used for vertical spreads.
   - `target_single_delta` is used for long-premium single legs.

@@ -53,7 +53,8 @@ continuously — entries run **08:05 → 11:50** with no gap.
 ### 4. Timeframe + the key squeeze tuning
 - **1m LTF, native indicators** (`ltf_indicator_span_scale: 1` → 9/20 EMA, 14 ATR) — responsive, with tight ATR-based stops that suit fast scalps. **Raise `ltf_indicator_span_scale` toward 3–5 to smooth signals and widen stops** (primary tuning knob).
 - **A squeezer is *always* extended** (high %B, far above VWAP, big bars), so the mega-cap "don't chase extension" gates are **off**: `reject_stretched_entries`, `entry_exhaustion_filter_enabled`, `reject_oversized_entry_bar`, `reject_tech_bias_contradiction`. Leaving them on would block nearly every squeeze entry. The SR / broken-level / target-beyond-SR gates stay on (those keep you from buying straight into resistance).
-- **Hybrid scalp + runner management**: move to break-even early (`adaptive_breakeven_rr: 0.6`) to lock the scalp, scale out at S/R rungs via the adaptive ladder, and trail the remaining runner with peak-giveback (loosened for high-conviction days so big moves get room).
+- **Hybrid scalp + runner management**: move to break-even early (`adaptive_breakeven_rr: 0.6`) to lock the scalp, roll the target up the S/R rungs via the adaptive ladder, and let the final rung release the position as a runner held by peak-giveback (loosened for high-conviction days so big moves get room).
+  - The adaptive ladder does **not** scale out. Each confirmed rung promotes the stop below the cleared zone and moves the target to the next rung; the position rides **full size** until the ladder is spent, at which point the target is cleared and peak-giveback governs the runner. `partial_exit` on a trade record comes from a broker partial fill or exit recovery, never from a rung. (Corrected 2026-09-19 — an earlier note here and in commit `4af0bf7` described rungs as partial exits.)
 
 ### 5. Extended hours
 `equity_session_indicator_window: extended` + `extended_hours_tradable_all: true`

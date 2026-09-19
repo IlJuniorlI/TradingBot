@@ -83,6 +83,30 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   flatten still guarantees the exit; it now only supplies the reason when no
   other exit already did.
 
+- **0DTE option entries now reconcile risk against the actual fill.**
+  *2026-09-19* — `qty` is sized from a `max_loss_per_contract` computed before
+  the order goes out, off the previewed limit, and nothing recomputed it once
+  the fill was known. The equity path has done this since 2026-09-18 via
+  `realized_entry_risk`; options had no counterpart. It bites hardest in dry
+  runs, where `submit_option_vertical` passes `allow_natural_fill=True` to model
+  a chase, so fills land worse than the sizing assumed: sweeping the shipped
+  gates over 60,000 quote pairs found 20 contracts booked at $25 of max loss
+  each that actually risked $38.79 each, $776 against a $500 budget. Live limit
+  orders cannot fill worse than their limit, so this was a measurement problem —
+  the dry-run risk figures the strategy is tuned from were quietly optimistic.
+  New `realized_max_loss_per_contract` + `RiskManager.realized_option_risk`;
+  results land on position metadata with a WARNING past
+  `risk.risk_overage_warn_frac`. Detection only.
+- **`max_net_price_frac_of_width` (new, default 0.90) gates the net price
+  against the strike width.** *2026-09-19* — `max_net_spread_price` is one
+  dollar cap while widths differ per symbol, and at its shipped 2.40 it sat
+  above every configured width (SPY/QQQ $200, IWM $100), so it could not reject
+  a quote implying a credit at or above the spread itself. That books
+  `max_loss = 0`; `size_option_position` refuses it, so the outcome was a silent
+  no-trade rather than a blow-up, but a degenerate chain looked identical to "no
+  setup today". The new gate removed all 53 credit-above-width cases on the same
+  sweep and cut worst measured exposure from +55% to +36% of budget.
+
 ### Changed
 
 - **`_decide_side`'s VWAP arm reads the same reference as `_frame_agrees`.**

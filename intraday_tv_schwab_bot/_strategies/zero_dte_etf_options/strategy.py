@@ -36,6 +36,7 @@ from ..shared import (
     equity_session_state,
     filter_contracts,
     net_credit_dollars,
+    net_price_frac_of_width,
     net_debit_dollars,
     now_et,
     parse_hhmm,
@@ -1057,6 +1058,15 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return None
         if (ask - bid) / max(mid, 0.01) > float(self.optcfg.max_net_spread_pct):
             return None
+        # Structural sanity: the net price must be a sane fraction of the
+        # strike width. A quote implying a credit at or above the width is
+        # free money and books a max loss of zero, which then sizes to the
+        # contract cap on a position whose real risk is the full width.
+        width_frac_cap = float(getattr(self.optcfg, "max_net_price_frac_of_width", 0.0) or 0.0)
+        if width_frac_cap > 0:
+            frac = net_price_frac_of_width(first_leg, second_leg, ask)
+            if frac is None or frac > width_frac_cap:
+                return None
         return bid, ask, mid
 
     def _long_option_style_gate(self, symbol: str, bullish: bool, frame: pd.DataFrame, regime: dict[str, Any], data) -> list[str]:

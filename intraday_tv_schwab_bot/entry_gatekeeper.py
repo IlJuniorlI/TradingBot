@@ -57,6 +57,7 @@ from .models import (
     Position,
     Side,
 )
+from .options_mode import realized_max_loss_per_contract
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .position_metrics import safe_float
@@ -1158,6 +1159,28 @@ class EntryGatekeeper:
                         target_price = max(0.01, entry_price * 0.50)
                     position_metadata["emergency_fallback_levels"] = True
                     position_metadata["original_levels_reason"] = levels_reason
+                # Realized-risk reconciliation, mirroring the equity path above.
+                # qty was sized from the max loss computed BEFORE the order went
+                # out, off the previewed limit; this is what the contracts
+                # actually risk now the fill is known. Detection only.
+                realized_max_loss = realized_max_loss_per_contract(signal.metadata, entry_price)
+                if realized_max_loss is not None:
+                    option_recon = self.risk.realized_option_risk(qty_for_position, realized_max_loss)
+                    position_metadata["realized_entry_risk"] = round(option_recon["risk"], 4)
+                    position_metadata["entry_risk_budget"] = round(option_recon["budget"], 4)
+                    position_metadata["entry_risk_overage_frac"] = round(option_recon["overage_frac"], 6)
+                    position_metadata["realized_max_loss_per_contract"] = round(realized_max_loss, 4)
+                    overage_warn = float(self.config.risk.risk_overage_warn_frac)
+                    if 0 <= overage_warn < option_recon["overage_frac"]:
+                        position_metadata["entry_risk_overage_exceeded"] = True
+                        LOG.warning(
+                            "Realized option risk over budget for %s: qty=%d x $%.2f max loss = $%.2f "
+                            "vs budget $%.2f (%.1f%% over, threshold %.1f%%). Sized on the previewed "
+                            "limit; the fill came in worse.",
+                            signal.metadata.get("position_key", signal.symbol), qty_for_position,
+                            realized_max_loss, option_recon["risk"], option_recon["budget"],
+                            option_recon["overage_frac"] * 100.0, overage_warn * 100.0,
+                        )
                 position_key = str(signal.metadata.get("position_key") or signal.symbol)
                 position = Position(
                     symbol=position_key,

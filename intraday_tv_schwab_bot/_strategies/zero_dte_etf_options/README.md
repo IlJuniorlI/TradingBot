@@ -199,3 +199,53 @@ General behavior:
 - `configs/config.zero_dte_etf_options.yaml` is the matching top-level tuned preset for this strategy.
 - `screener.py` builds the candidate list for this strategy.
 - `strategy.py` contains the actual entry / exit logic.
+
+## Risk reconciliation and the width-relative price gate (2026-09-19)
+
+### Sizing is reconciled against the actual fill
+
+`qty` comes from `max_loss_per_contract`, computed **before** the order goes out
+from the previewed limit: the debit paid for a debit vertical, `width - credit`
+for a credit vertical. What the position really risks is set by the **fill**, so
+a fill worse than the limit risks more than the sizing assumed — and nothing
+recomputed it. The equity path has reconciled this since 2026-09-18 via
+`realized_entry_risk`; options had no counterpart.
+
+It matters most in **dry runs**, the mode the strategy is tuned from:
+`submit_option_vertical` passes `allow_natural_fill=True` so the reprice loop can
+reach the natural price, deliberately modelling a chase. Sweeping the shipped
+gates over 60,000 quote pairs found a worst case of 20 contracts booked at $25 of
+max loss each that actually risked $38.79 each — **$776 against a $500 budget**.
+
+In live trading a limit order cannot fill worse than its limit, so this is
+primarily a measurement problem rather than a capital one. That is exactly why it
+was worth closing: the dry-run risk figures were quietly optimistic.
+
+`realized_max_loss_per_contract` (options_mode) derives the per-contract risk from
+the fill, and `RiskManager.realized_option_risk` compares `qty x` that against
+`options.max_loss_per_trade`. Results land on position metadata as
+`realized_entry_risk`, `entry_risk_budget`, `entry_risk_overage_frac` and
+`realized_max_loss_per_contract`, with a WARNING past
+`risk.risk_overage_warn_frac`. Detection only — by the time it runs the contracts
+are filled.
+
+### `max_net_price_frac_of_width`
+
+`max_net_spread_price` is a single dollar cap while strike widths differ per
+symbol. At its shipped 2.40 it sits above **every** configured width (SPY/QQQ
+$200, IWM $100), so it could never reject a quote implying a credit at or above
+the spread itself. Such a quote books `max_loss = width - credit = 0`, which
+would size to the contract cap on a position whose real risk is the full width.
+`size_option_position` refuses a zero max loss, so the outcome was a silent
+no-trade rather than a blow-up — but the guard was not doing what its name
+suggests, and a degenerate chain looked identical to "no setup today".
+
+The new gate asks the question structurally: the net ask must be at most
+`max_net_price_frac_of_width` (default 0.90) of the strike width. On the same
+sweep it removed all 53 credit-above-width cases and cut the worst measured
+exposure from +55% to +36% of budget. Set to 0.0 to disable.
+
+**Not changed:** `force_flatten_time: "15:18"` sits after the management window
+ends at 15:15, which reads as though force flatten could never fire. It does —
+`cycle_gate._positions_management_actionable` drops the window entirely whenever
+positions are open, so management runs as long as `can_close_position_now` holds.

@@ -245,6 +245,38 @@ def net_credit_dollars(short_leg: OptionContract, long_leg: OptionContract) -> t
     return conservative, mid, max_loss
 
 
+def realized_max_loss_per_contract(metadata: dict[str, Any], fill_price_dollars: float) -> float | None:
+    """Max loss per contract implied by the price the order ACTUALLY filled at.
+
+    Sizing runs before the order goes out, off the previewed limit. What the
+    position really risks is set by the fill: a debit vertical (and a single
+    long option) risks the premium it paid, a credit vertical risks the strike
+    width minus the credit it received. A fill worse than the limit therefore
+    risks more than the sizing assumed.
+
+    Returns ``None`` when the shape cannot be reconstructed — a credit spread
+    with no recorded strike width — so the caller can skip the check rather
+    than book a wrong number.
+    """
+    try:
+        fill = float(fill_price_dollars)
+    except (TypeError, ValueError):
+        return None
+    if not fill > 0:
+        return None
+    style = str((metadata or {}).get("spread_style") or "").upper()
+    if style == "CREDIT":
+        try:
+            width = float((metadata or {}).get("strike_width_dollars") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if width <= 0:
+            return None
+        return max(0.0, width - fill)
+    # Debit verticals and single long options both risk exactly what they paid.
+    return max(0.0, fill)
+
+
 def _round_net_price(value: float) -> float:
     return round(max(0.01, float(value)), 2)
 
@@ -257,6 +289,26 @@ def vertical_price_bounds(first_leg: OptionContract, second_leg: OptionContract)
     else:
         mid = max(0.0, float(first_leg.mid) - float(second_leg.mid))
     return bid, ask, mid
+
+
+def net_price_frac_of_width(first_leg: OptionContract, second_leg: OptionContract,
+                            net_price: float) -> float | None:
+    """``net_price`` as a fraction of the spread's strike width.
+
+    The absolute ``max_net_spread_price`` cap cannot police structure: it is a
+    single dollar figure while widths differ per symbol, and at its shipped
+    value it sat ABOVE every configured width, so it could not reject a quote
+    implying a credit larger than the spread itself. This expresses the same
+    question structurally instead. Returns ``None`` when the width is
+    unusable.
+    """
+    width = abs(float(first_leg.strike) - float(second_leg.strike))
+    if width <= 0:
+        return None
+    try:
+        return float(net_price) / width
+    except (TypeError, ValueError):
+        return None
 
 
 def vertical_limit_price(first_leg: OptionContract, second_leg: OptionContract, mode: str = "mid") -> float:
