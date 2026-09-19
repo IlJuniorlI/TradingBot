@@ -601,7 +601,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
 
         Counts LONG and SHORT votes across four current-action signals:
           1. Recent return over the last N LTF bars (default 30 = 30 min at 1m)
-          2. Close vs session VWAP
+          2. Close vs VWAP — the current leg's anchored VWAP under
+             ``leg_anchored_confirmation``, session VWAP otherwise
           3. EMA9 vs EMA20
           4. Last 3 LTF bars' net direction (green-count vs red-count)
 
@@ -638,17 +639,41 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             else:
                 breakdown.append(f"recent{recent_pct:+.2f}%>neutral")
 
+        # VWAP arm. Under ``leg_anchored_confirmation`` this reads the SAME
+        # reference ``_frame_agrees`` does — the current leg's anchored VWAP —
+        # rather than session VWAP.
+        #
+        # Session VWAP is a whole-day average, so after a flush it sits far
+        # above price and this arm keeps voting for the OLD direction well
+        # into the reversal. Auditing each arm against the tape's actual
+        # direction on a V-reversal: this one was wrong on 54 of 120 bars and
+        # the EMA arm on 59, while the recent-return arm — the only genuinely
+        # current-action signal — was wrong on 14. The two lagging arms are
+        # also the two that vote most reliably (``recent`` and ``bars3`` carry
+        # dead-bands and abstain often), so they outvote the accurate one.
+        #
+        # Leaving the layers on different references was also incoherent: the
+        # vote and the confirmation gate disagreed about what "reclaimed VWAP"
+        # meant for the same symbol on the same bar.
         vwap_buffer = float(self.params.get("side_decision_vwap_buffer_pct", 0.0005))
-        if vwap > 0:
-            vwap_dist = (close - vwap) / vwap
+        vwap_reference = None
+        if bool(self.params.get("leg_anchored_confirmation", False)):
+            vwap_reference = self._leg_anchor_vwap(ltf)
+        # Label the breakdown so an operator reading a `side_undecided(...)`
+        # line can tell which reference produced the vote.
+        vwap_label = "legvwap" if vwap_reference is not None else "vwap"
+        if vwap_reference is None:
+            vwap_reference = vwap
+        if vwap_reference > 0:
+            vwap_dist = (close - vwap_reference) / vwap_reference
             if vwap_dist > vwap_buffer:
                 long_votes += 1
-                breakdown.append("close>vwap>L")
+                breakdown.append(f"close>{vwap_label}>L")
             elif vwap_dist < -vwap_buffer:
                 short_votes += 1
-                breakdown.append("close<vwap>S")
+                breakdown.append(f"close<{vwap_label}>S")
             else:
-                breakdown.append("close~vwap>neutral")
+                breakdown.append(f"close~{vwap_label}>neutral")
 
         if ema9 > ema20:
             long_votes += 1

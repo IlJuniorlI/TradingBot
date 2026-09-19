@@ -42,8 +42,63 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `_pct_param` and small caps carry a far larger ADR. Entries land at the
     VWAP reclaim — around the midpoint of the move, not at the low.
 
+### Fixed
+
+- **`adaptive_ladder` left the target behind price on fast moves.** *2026-09-19*
+  — `_adaptive_ladder_management` stepped `ladder_active_index` to
+  `active_index + 1` unconditionally, while the guard beside it correctly
+  refused to set a target UNDER price. When one cycle cleared several rungs at
+  once the index walked forward and the target stayed on the first rung, so
+  `update_position` saw `last_price >= target_price` and exited the remainder.
+  Walked a LONG from 100.5 to 104.9 against rungs at 101/102/103/104: the index
+  stepped 1, 2, 3 while the target stayed 101.00 the whole way. The ladder
+  therefore cut the position at rung 1 on exactly the fast moves it exists to
+  ride, which matches the 2026-06-01 dry run where runners came in around 1R
+  against 3-4R of MFE. New `_next_unpassed_rung` advances to the first rung
+  price has NOT passed, and promotes straight to a runner when price has
+  outrun the whole ladder. The orderly one-rung-at-a-time path is byte
+  identical. Found by walking the state machine, not by inspection.
+
+- **`adaptive_ladder` could promote a stop the quote had already passed.**
+  *2026-09-19* — the promotion guard validated the candidate stop against
+  `close`, taken from the management frame, while the exit check in
+  `RiskManager.update_position` runs against the quote snapshot. Those are two
+  different sources and diverge on a fast move, so a rung price had already
+  fallen back through still promoted, and update_position stopped the trade out
+  on the same cycle at a price well past the new stop: rung 1 at 101.00 with
+  the bar closing 101.50 and a 99.00 quote promoted the stop to 100.69 and
+  exited immediately, where the original 98.00 stop would have held. The guard
+  now takes the tighter of bar close and live price — `min` for LONG, `max` for
+  SHORT — so such a rung simply does not promote and the position keeps its
+  existing stop. Promotions where the quote is still beyond the candidate stop
+  are unchanged.
+
+- **`force_flatten` overwrote the real exit reason.** *2026-09-19* — the
+  force-flatten branch in `manage_positions` ran unconditionally and reassigned
+  `reason`, so every stop, target or peak-giveback that fired inside the
+  force-flatten window was recorded as `force_flatten`. The position closed
+  correctly either way, but the `per_exit_reason` table that tuning is read
+  from had its force_flatten bucket inflated and its `stop` / `target` buckets
+  hollowed out at exactly the end-of-session hour when those fire most. Force
+  flatten still guarantees the exit; it now only supplies the reason when no
+  other exit already did.
+
 ### Changed
 
+- **`_decide_side`'s VWAP arm reads the same reference as `_frame_agrees`.**
+  *2026-09-19* — the confirmation gate moved off session VWAP while the side
+  vote did not, so the two layers disagreed about what "reclaimed VWAP" meant
+  for the same symbol on the same bar. Auditing each arm against the tape's
+  real direction on a V-reversal: the VWAP arm was wrong on 54 of 120 bars and
+  the EMA arm on 59, while the recent-return arm — the only genuinely
+  current-action signal — was wrong on 14. The two lagging arms are also the
+  two that vote most reliably, because `recent` and `bars3` carry dead-bands
+  and abstain often. Under `leg_anchored_confirmation` the arm now reads
+  `_leg_anchor_vwap`: the vote goes from 66 ok / 18 undecided to 98 ok / 1
+  undecided on a V-reversal (and 66 / 15 to 98 / 3 inverted), with trends,
+  grinds and chop unchanged. The breakdown token becomes `legvwap` so a
+  `side_undecided(...)` line names the reference. The EMA arm is deliberately
+  untouched — its span is shared with the trend filters.
 - `_frame_agrees` is no longer a `@staticmethod` (it reads `self.params`). Both
   call sites already invoked it through `self`, so no call site changed.
 - `_leg_anchor_vwap` scans from the session open the rest of the strategy uses

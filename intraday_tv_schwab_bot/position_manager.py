@@ -66,6 +66,33 @@ from .utils import TRADEFLOW_LEVEL, append_management_adjustment as _append_adju
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
 
+def _next_unpassed_rung(rungs: list, active_index: int, close: float,
+                        side: Side, gap: float) -> int | None:
+    """Index of the first rung after ``active_index`` that price has not already
+    passed, or ``None`` when every remaining rung is behind the trade.
+
+    A rung behind price cannot serve as a target — setting one would exit
+    immediately — and cannot serve as a defense level either, so the ladder is
+    finished and the caller promotes the position to a runner.
+    """
+    for index in range(int(active_index) + 1, len(rungs)):
+        entry = rungs[index]
+        if not isinstance(entry, dict):
+            continue
+        try:
+            price = float(entry.get("price", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0:
+            continue
+        if side == Side.LONG:
+            if price > close + gap:
+                return index
+        elif price < close - gap:
+            return index
+    return None
+
+
 class PositionManager:
     def __init__(
         self,
@@ -751,8 +778,21 @@ class PositionManager:
             )
             if not rung_confirmed:
                 return
+            # Validate the promoted stop against BOTH the bar close and the
+            # LIVE price. `close` comes from the management frame, while the
+            # exit check in RiskManager.update_position runs against the quote
+            # snapshot — two different sources that diverge on a fast move.
+            # Promoting on `close` alone could set a stop the quote had already
+            # fallen through, and update_position then stopped the trade out on
+            # the same cycle at a price well past it: rung 1 at 101.00 with the
+            # bar closing 101.50 and a 99.00 quote promoted the stop to 100.69
+            # and exited immediately, where the original 98.00 stop would have
+            # held. Taking the tighter of the two means a rung price has
+            # already fallen back through simply does not promote, and the
+            # position keeps the stop it had.
+            reference_price = min(close, float(last_price))
             candidate_stop = float(lower) - stop_buffer
-            if close > candidate_stop > float(position.stop_price):
+            if reference_price > candidate_stop > float(position.stop_price):
                 prior_stop = float(position.stop_price)
                 position.stop_price = float(candidate_stop)
                 _append_adjustment(meta,{"manager": "adaptive_ladder", "kind": "stop", "reason": "promoted_support", "from": prior_stop, "to": float(candidate_stop), "source_level": float(rung_price)})
@@ -760,17 +800,32 @@ class PositionManager:
             meta["ladder_defense_zone_width"] = float(zone_width)
             meta["ladder_defense_kind"] = str(current.get("kind") or "target")
             meta["ladder_last_promoted_price"] = float(rung_price)
-            if active_index + 1 < len(rungs):
-                next_rung = rungs[active_index + 1]
-                try:
-                    candidate_target = float(next_rung.get("price", 0.0) or 0.0)
-                except Exception:
-                    candidate_target = 0.0
-                if candidate_target > close and (current_target is None or candidate_target > float(current_target) + max(close * 0.0005, 1e-6)):
+            # Advance to the first rung price has NOT already passed.
+            #
+            # Stepping blindly to active_index + 1 left the target frozen on a
+            # rung BEHIND price whenever one cycle cleared several rungs at
+            # once. The guard below correctly refuses to set a target under
+            # price, but the index advanced regardless, so the position kept a
+            # stale target it had already blown through and update_position
+            # fired a target exit on the next tick. Walked a LONG from 100.5 to
+            # 104.9 against rungs at 101/102/103/104: the index stepped 1, 2, 3
+            # while the target stayed 101.00 the whole way, exiting the
+            # remainder at rung 1 on exactly the fast move the ladder exists to
+            # ride. Consistent with the 2026-06-01 dry run, where runners came
+            # in around 1R against 3-4R of MFE.
+            #
+            # When price has outrun EVERY remaining rung the ladder is spent,
+            # so it falls through to the runner branch below instead of
+            # defending a level that is now behind the trade.
+            rung_gap = max(close * 0.0005, 1e-6)
+            next_index = _next_unpassed_rung(rungs, active_index, close, Side.LONG, rung_gap)
+            if next_index is not None:
+                candidate_target = float(rungs[next_index].get("price", 0.0) or 0.0)
+                if current_target is None or candidate_target > float(current_target) + rung_gap:
                     prior_target = float(current_target) if current_target is not None else None
                     position.target_price = float(candidate_target)
                     _append_adjustment(meta,{"manager": "adaptive_ladder", "kind": "target", "reason": "next_rung", "from": prior_target, "to": float(candidate_target), "source_level": float(candidate_target)})
-                meta["ladder_active_index"] = int(active_index + 1)
+                meta["ladder_active_index"] = int(next_index)
                 meta["ladder_final_rung_cleared"] = False
             else:
                 if current_target is not None:
@@ -793,8 +848,12 @@ class PositionManager:
             )
             if not rung_confirmed:
                 return
+            # Mirror of the LONG guard above: the tighter of bar close and
+            # live quote, so a promotion is never validated against a price
+            # the quote has already passed.
+            reference_price = max(close, float(last_price))
             candidate_stop = float(upper) + stop_buffer
-            if close < candidate_stop < float(position.stop_price):
+            if reference_price < candidate_stop < float(position.stop_price):
                 prior_stop = float(position.stop_price)
                 position.stop_price = float(candidate_stop)
                 _append_adjustment(meta,{"manager": "adaptive_ladder", "kind": "stop", "reason": "promoted_resistance", "from": prior_stop, "to": float(candidate_stop), "source_level": float(rung_price)})
@@ -802,17 +861,16 @@ class PositionManager:
             meta["ladder_defense_zone_width"] = float(zone_width)
             meta["ladder_defense_kind"] = str(current.get("kind") or "target")
             meta["ladder_last_promoted_price"] = float(rung_price)
-            if active_index + 1 < len(rungs):
-                next_rung = rungs[active_index + 1]
-                try:
-                    candidate_target = float(next_rung.get("price", 0.0) or 0.0)
-                except Exception:
-                    candidate_target = 0.0
-                if 0 < candidate_target < close and (current_target is None or candidate_target < float(current_target) - max(close * 0.0005, 1e-6)):
+            # Mirror of the LONG skip-ahead above.
+            rung_gap = max(close * 0.0005, 1e-6)
+            next_index = _next_unpassed_rung(rungs, active_index, close, Side.SHORT, rung_gap)
+            if next_index is not None:
+                candidate_target = float(rungs[next_index].get("price", 0.0) or 0.0)
+                if current_target is None or candidate_target < float(current_target) - rung_gap:
                     prior_target = float(current_target) if current_target is not None else None
                     position.target_price = float(candidate_target)
                     _append_adjustment(meta,{"manager": "adaptive_ladder", "kind": "target", "reason": "next_rung", "from": prior_target, "to": float(candidate_target), "source_level": float(candidate_target)})
-                meta["ladder_active_index"] = int(active_index + 1)
+                meta["ladder_active_index"] = int(next_index)
                 meta["ladder_final_rung_cleared"] = False
             else:
                 if current_target is not None:
@@ -1201,7 +1259,15 @@ class PositionManager:
                 if not position.metadata.get("_force_flatten_logged"):
                     LOG.warning("Force flatten triggered for %s qty=%s side=%s", key, position.qty, position.side.value)
                     position.metadata["_force_flatten_logged"] = True
-                should_exit, reason = True, "force_flatten"
+                # Force flatten guarantees the exit but must not RELABEL one
+                # that a real level already triggered. This ran
+                # unconditionally, so every stop or target that fired inside
+                # the force-flatten window was recorded as "force_flatten" —
+                # inflating that bucket and hollowing out `stop` / `target` in
+                # the per_exit_reason table the tuning is read from. Either
+                # branch leaves should_exit True, so the guarantee holds.
+                if not should_exit:
+                    should_exit, reason = True, "force_flatten"
             if not should_exit:
                 continue
             exit_context = self._position_exit_context(position, reason, last_price, underlying_price, market_snapshot, bars)

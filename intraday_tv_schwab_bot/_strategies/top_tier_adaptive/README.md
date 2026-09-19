@@ -294,7 +294,7 @@ Strategy-specific knobs:
 - `index_symbols`: index ETFs streamed for directional confirmation. Default is the SPDR Select Sector ETFs that cover the default tradable universe's sectors (XLK / XLC / XLY / XLF / XLV / XLP). Must include every ETF referenced by `sector_index_map` for actively-traded sectors.
 - `sector_index_map`: per-GICS-sector mapping → list of index ETFs to consult for confirming trades on symbols in that sector (default uses the canonical SPDR Select Sector ETFs). Falls back to OR-ing across all `index_symbols` when a sector has no mapping.
 - `require_index_confirmation`: gate trend/pullback/vol_squeeze/momentum/vwap_reclaim entries on index agreement. Range and sr_scalp are exempt (mean-reversion theses).
-- `leg_anchored_confirmation`: measure the index/peer agreement test against the current leg's anchored VWAP instead of session VWAP. Default `false`; `true` in the shipped preset. See section 19.
+- `leg_anchored_confirmation`: measure the index/peer agreement test AND `_decide_side`'s VWAP arm against the current leg's anchored VWAP instead of session VWAP. Default `false`; `true` in the shipped preset. See section 19.
 - `leg_anchor_min_age_bars` / `leg_anchor_min_impulse_pct`: how old and how large the leg must be before the anchor moves. Guards against reading an ordinary pullback as a reversal.
 - `require_htf_bias_alignment`: reject longs against bearish HTF (15m) structure and shorts against bullish HTF structure. Neutral never blocks. Default `true` — prevents counter-trend entries on days when the higher-timeframe structure is pinned against the trade direction. Set `false` to allow counter-HTF setups (the bot will still score them normally, but won't outright block).
 - `orb_bypass_htf_bias`: skip the HTF bias check during the ORB window (through `orb_end_time`). Default `true`. Set `false` to enforce HTF bias filtering even at the open.
@@ -521,6 +521,31 @@ Because it is momentum-family it is offered in the midday window too, where tren
 Entries land at the VWAP reclaim, roughly the midpoint of the move, **not at the low**. Catching the turn itself is not the goal. Signal count is also not edge: 30 bars still die on `no_fresh_breakout`, which is correct behaviour for a trend builder.
 
 Knob values are adapted from `config.small_cap_squeeze.yaml`, where the regime is already tuned and live. `vwap_reclaim_buffer_pct` is the one that needed rescaling — it runs through `_pct_param`, so it is multiplied by the symbol's ADR over `reference_adr_pct`. Small caps use 0.0025 against a far larger ADR; 0.0015 here lands near 0.10% on a low-ADR mega cap and 0.20% on a high-ADR one, enough to reject the one-tick VWAP poke that over-fired on small caps without demanding a mega cap clear VWAP by a small-cap margin.
+
+### The vote reads the same reference
+
+`_decide_side` votes on four current-action signals, and one of them is `close vs VWAP`. It was still measuring against **session** VWAP after the gate had moved off it, so the two layers disagreed about what "reclaimed VWAP" meant for the same symbol on the same bar. Auditing each arm against the tape's real direction:
+
+| arm | wrong bars on a reversal (of 120) |
+|---|---|
+| `close vs VWAP` (session) | 54 |
+| `EMA9 vs EMA20` | 59 |
+| recent return | **14** |
+| last-3-bar colour | 0 |
+
+The two *level-comparison* arms are the least accurate on a reversal and also the two that vote most reliably — `recent` and `bars3` carry dead-bands and abstain often — so they outvote the one genuinely current-action signal.
+
+Pointing the VWAP arm at `_leg_anchor_vwap` under the same `leg_anchored_confirmation` flag:
+
+| tape | before | after |
+|---|---|---|
+| V-reversal | 66 ok / 36 wrong / 18 undecided | **98 ok / 21 wrong / 1 undecided** |
+| inverted-V | 66 ok / 39 wrong / 15 undecided | **98 ok / 19 wrong / 3 undecided** |
+| trend up/down, grind, chop | — | unchanged |
+
+Its VWAP arm's own error count drops 54 → 22. The breakdown token becomes `legvwap` instead of `vwap` so a `side_undecided(...)` line says which reference produced the vote.
+
+The EMA arm is **deliberately left alone**: its span is shared with the trend filters, and changing it would move far more than the side decision.
 
 **Not measured:** `sr_scalp` showed no change on the same tape, but the synthetic tape carries no real S/R structure, so that is inconclusive rather than evidence against enabling it. Re-anchoring `momentum`'s `day_strength` gate was tried and contributed nothing (18 signals with it, 18 without) and was dropped.
 
