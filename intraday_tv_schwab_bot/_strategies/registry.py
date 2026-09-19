@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from ..utils import parse_hhmm
 from .plugin_api import StrategyManifest
 
 if TYPE_CHECKING:
@@ -294,6 +295,20 @@ def _coerce_windows(raw: object, *, field_name: str, manifest_path: Path) -> lis
         end = str(item[1]).strip()
         if not start or not end:
             raise ValueError(f"{manifest_path}:{field_name}[{idx}] start/end must be non-empty")
+        # Validate that the values are actually parseable TIMES, not just
+        # non-empty strings. Shape-only validation let "9am" — or a bare
+        # integer, which str() turns into "930" — through manifest load, and
+        # parse_hhmm then raised inside a trading cycle instead. Load-time
+        # validation exists precisely so a manifest typo fails before capital
+        # is at risk, so the check belongs here.
+        for label, value in (("start", start), ("end", end)):
+            try:
+                parse_hhmm(value)
+            except Exception as exc:
+                raise ValueError(
+                    f"{manifest_path}:{field_name}[{idx}] {label} {value!r} "
+                    f"is not a valid HH:MM time: {exc}"
+                ) from exc
         out.append((start, end))
     return out
 

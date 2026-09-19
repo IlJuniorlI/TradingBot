@@ -117,6 +117,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   setup today". The new gate removed all 53 credit-above-width cases on the same
   sweep and cut worst measured exposure from +55% to +36% of budget.
 
+- **Strategy manifests validate their window TIMES, not just their shape.**
+  *2026-09-19* — `_coerce_windows` checked that each window was a list of two
+  non-empty values but never that those values were parseable times, so `"9am"`
+  (or a bare integer, which `str()` coerces to `"930"`) passed manifest load and
+  `parse_hhmm` raised inside a trading cycle instead. Each end now parses at
+  load and the rejection names the field, index, end and value. All 17 shipped
+  manifests were verified clean first — 57 windows, 114 time values — so this
+  only affects newly authored plugins. Overnight windows (`start > end`, which
+  wrap past midnight by design) remain valid.
+
 ### Changed
 
 - **`_decide_side`'s VWAP arm reads the same reference as `_frame_agrees`.**

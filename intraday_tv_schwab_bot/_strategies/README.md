@@ -489,3 +489,28 @@ Recommended practices:
 - use `self.config.active_strategy.params` or `self.params` consistently
 - avoid hidden import-time work
 - keep module names stable once released
+
+## Manifest window validation (2026-09-19)
+
+`entry_windows` / `management_windows` / `screener_windows` are validated at
+manifest LOAD time, not just for shape. Each `start` and `end` must parse
+through `parse_hhmm`, and the rejection names the field, the index, which end
+failed and the offending value:
+
+```
+manifest.json:entry_windows[0] start '9am' is not a valid HH:MM time: ...
+```
+
+Previously only the shape was checked — a list of two non-empty values — so
+`"9am"`, or a bare integer (which `str()` turns into `"930"`), passed load and
+`parse_hhmm` raised inside a trading cycle instead. Load-time validation exists
+so a manifest typo fails before capital is at risk, which means the check
+belongs at load.
+
+**An overnight window is still valid.** `["22:00", "02:00"]` wraps past midnight
+by design — see `Window.contains` in `models.py` — so `start > end` is a
+legitimate configuration and is deliberately not rejected.
+
+Two things remain accepted on purpose: a missing `schema_version` defaults to 1
+for backward compatibility, and a non-string `strategy_class` is caught later
+when the class is resolved rather than at manifest load.
