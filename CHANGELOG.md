@@ -54,6 +54,99 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Indicator lengths now mean the same thing on a span-scaled frame.**
+  *2026-09-19* — `add_indicators(span_scale=N)` stretches every bar-count
+  lookback but keeps the nominal column NAMES, so on `top_tier_adaptive`'s 1m
+  LTF (`ltf_indicator_span_scale: 5`) `adx14` is a 70-bar ADX and `bb_*` are
+  100-bar bands. `build_technical_levels_context` reads those columns when the
+  requested length matches the nominal one and recomputes otherwise — and the
+  recompute ran at the NATIVE length. `adx_length: 14` therefore meant ADX-70
+  while `adx_length: 15` meant a true ADX-15: a one-digit config change
+  swapping the lookback by 5x with nothing to warn on. Four parameters had the
+  shape — `adx_length`, `bollinger_length`, `obv_ema_length` and
+  `divergence_rsi_length`. On a 400-bar span_scale=5 tape, 14 vs 15 drifted
+  59.7% on ADX and 86.4% on Bollinger `width_pct` (band width off by ~7x);
+  after the fix, 8.9% and 2.3% — neighbouring lookbacks, which is what one more
+  bar should mean. `add_indicators` now stamps the applied scale on
+  `frame.attrs` and each `*_length` is treated as nominal, with the fallback
+  computed at `nominal x span_scale`. The stamp is written unconditionally,
+  including at 1.0: pandas propagates `attrs` through `__finalize__`, so a
+  frame resampled off a stretched one inherits the stale scale while losing the
+  stretched columns, and only an unconditional write on rebuild clears it. New
+  `scaled_span` is the single definition of that arithmetic — `add_indicators`
+  builds with it and every consumer recomputes with it, so producer and
+  consumer cannot drift. LATENT when found, on two independent axes: all 19
+  shipped configs and the `config.py` defaults sit on 14 / 20 / 2.0 so the fast
+  path always won, AND no shipped call path hands a stretched frame to
+  `build_technical_levels_context` in the first place — `top_tier_adaptive`
+  passes the base 1m frame (as its README records), both `peer_confirmed_*`
+  strategies build their LTF at scale 1.0, and the dashboard's `get_merged`
+  call does not pass a scale. Nothing changes at `span_scale` 1.0; this closes
+  the trap before either axis moves, and the `small_cap_squeeze` README
+  actively invites one of them ("Raise `ltf_indicator_span_scale` toward 3-5").
+  Deliberately NOT scaled: the
+  `*_lookback_bars` / `pivot_span` window sizes, which have a single
+  computation path and therefore no second path to disagree with, and
+  `bollinger_std_mult`, which multiplies a standard deviation rather than a bar
+  count. `add_indicators` also now rejects a zero, negative or non-finite
+  `span_scale` by name instead of letting it surface as "TA_BBANDS function
+  failed with error code 2: Bad Parameter" from inside TA-Lib.
+
+- **Chart pattern detection could report a pattern that was not there.**
+  *2026-09-19* — `chart_patterns._CHART_HELPER_CACHE` keys on `id(frame)`,
+  which only identifies an object while it is alive: CPython hands a freed
+  address to the next allocation of the same size. Three call sites built a
+  slice that died inside the helper it was passed to (`_pivot_order`'s
+  `frame.tail(10)`, and `f.tail(14)` in both symmetrical-triangle detectors),
+  so a later `_tail(frame, 40)` could land on the dead slice's address and read
+  ITS `_mean_range` — which sets `_level_tolerance` and the `_find_pivots`
+  prominence floor. Instrumented over 400 analysis calls, 21 served at least
+  one stale value; against a cache-free reference over 1500 frames, one frame
+  gained a `bullish_ascending_triangle` the bars did not support, taking the
+  context from bias 0.0 "neutral" to 1.1 "bullish". Nondeterministic — the same
+  bars give a different answer depending on heap layout, which is why it never
+  showed up as a reproducible complaint. Fixed structurally rather than site by
+  site: the cache now pins every frame it keys on, so no address can be
+  recycled while an entry names it. Benchmarked at no measurable cost (-1.9%,
+  within noise, over 200 calls).
+
+- **Bollinger context fields returned NaN where they promised `float | None`.**
+  *2026-09-19* — the guard was `not series.dropna().empty` — "does this series
+  hold a value ANYWHERE" — followed by an unconditional `.iloc[-1]`. Ten
+  instances in `technical_levels.py`. A symbol that stops ticking for
+  `bollinger_length` bars has zero rolling std, so `bb_width` is 0 and
+  `percent_b` / `zscore` divide by it, and `ctx.bollinger_percent_b` came back
+  as `float('nan')` rather than `None`. NaN fails every comparison, so
+  `strategy_base`'s `bb_pct is None or float(bb_pct) <= 0.82` became *neither*
+  and silently dropped the mid-band entry-score bonus; it also made the audit
+  log invalid JSON. Replaced with a `_last_value` helper that checks the value
+  actually read.
+
+- **The exported candle detectors were starved of context.** *2026-09-19* —
+  `detect_bullish_patterns` / `detect_bearish_patterns` sliced to 3 bars while
+  `detect_candle_context` used `CANDLE_CONTEXT_BARS` (30). TA-Lib builds
+  average-body and trend state from preceding bars and emits 0 inside its
+  warmup, so 3 bars starves nearly every pattern: over 600 tapes the 3-bar
+  slice fired on 88 where the 30-bar slice fired on 441. Neither has an
+  in-repo caller, but both are re-exported from `_strategies/shared.py`, so a
+  plugin author reaching for them inherited the shortfall with no error to go
+  on. Both now use `CANDLE_CONTEXT_BARS` and agree with `detect_candle_context`
+  exactly.
+
+- **Tweezer patterns expired three times faster than every other 2-bar
+  pattern.** *2026-09-19* — TA-Lib patterns stay reportable for three bars
+  after completing (`_talib_pattern_value_from_key` scans outputs -1, -2, -3),
+  but the two custom tweezers only ever compared the final pair, so they
+  vanished one bar after completing. Same tier, same registry, a third of the
+  lifespan. It reached the tier cascade, which returns only the longest tier
+  that fired: a tweezer ageing out early let a 1-bar match win and downgraded
+  the confirm tier from `solid_2c` (weight 0.70) to `weak_1c` (0.35) on bars
+  where a TA-Lib 2-bar pattern would still have held. Both now share a
+  `CANDLE_PERSISTENCE_BARS` constant that the TA-Lib scan loop derives its own
+  window from, so the two cannot drift. The per-bar dashboard map stays
+  completion-only — persistence belongs to the snapshot path, and smearing a
+  match forward would mark bars the pattern did not complete on.
+
 - **`adaptive_ladder` left the target behind price on fast moves.** *2026-09-19*
   — `_adaptive_ladder_management` stepped `ladder_active_index` to
   `active_index + 1` unconditionally, while the guard beside it correctly

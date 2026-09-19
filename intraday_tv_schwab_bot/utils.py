@@ -764,9 +764,16 @@ def ensure_standard_indicator_frame(frame: pd.DataFrame, *, span_scale: float = 
     # hot path (copy + sort + 5x to_numeric + dropna + reorder) is the single
     # biggest overhead in build_technical_levels_context / analyze_market_structure
     # when the frame is already clean. Skip it by trusting the indicator marker.
-    # The fast path is only valid for the canonical spans (span_scale == 1.0):
-    # a scaled caller must (re)compute because any existing indicator columns
-    # carry the default 9/20/14 spans, not the stretched ones.
+    # Only the span_scale == 1.0 caller may take it: a caller asking for
+    # stretched spans must (re)compute, because it has no way to tell from the
+    # column names whether existing columns already carry the scale it wants.
+    #
+    # Note what this does NOT do: a frame stretched upstream keeps its stretched
+    # columns here even though the default argument asks for canonical ones.
+    # That is relied on — top_tier_adaptive's technical context is meant to read
+    # its span_scale=5 LTF columns, and build_technical_levels_context calls
+    # this with the default. Read INDICATOR_SPAN_SCALE_ATTR (via
+    # indicator_span_scale) rather than assuming the returned frame is native.
     if span_scale == 1.0 and frame is not None and not frame.empty and has_standard_indicator_columns(frame):
         return frame
     cleaned = ensure_ohlcv_frame(frame)
@@ -778,6 +785,43 @@ def ensure_standard_indicator_frame(frame: pd.DataFrame, *, span_scale: float = 
 
 
 FloatArray = npt.NDArray[np.float64]
+
+# ``add_indicators`` stamps the span_scale it applied onto its output frame.
+# Column NAMES keep their nominal suffix while the EFFECTIVE span is
+# ``suffix x span_scale``, so a consumer that wants to recompute an indicator
+# at a DIFFERENT length has to know the scale or it will silently compute a
+# native-timeframe indicator where every shared column is stretched. Without
+# this, `adx_length: 14` read a 70-period ADX off the frame while
+# `adx_length: 15` computed a true 15-period one — a one-digit config change
+# swapping the lookback by 5x with nothing to warn on.
+INDICATOR_SPAN_SCALE_ATTR = "indicator_span_scale"
+
+
+def scaled_span(base: int, span_scale: float) -> int:
+    """Stretch a nominal bar-count lookback by ``span_scale``.
+
+    The single definition of that arithmetic: ``add_indicators`` builds its
+    columns with it and every consumer recomputing an indicator at another
+    length must use the same rounding, or the two paths disagree by a bar.
+    """
+    return max(1, int(round(int(base) * float(span_scale))))
+
+
+def indicator_span_scale(frame: pd.DataFrame | None) -> float:
+    """The span_scale ``frame``'s indicator columns were built with.
+
+    Returns 1.0 for a frame that did not come from ``add_indicators`` — that
+    is the honest answer (nothing was stretched), not a fallback: such a
+    frame has no stretched columns to disagree with.
+    """
+    if frame is None:
+        return 1.0
+    attrs = getattr(frame, "attrs", None) or {}
+    try:
+        scale = float(attrs.get(INDICATOR_SPAN_SCALE_ATTR, 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+    return scale if math.isfinite(scale) and scale > 0.0 else 1.0
 
 
 def _to_float64_array(series: pd.Series) -> FloatArray:
@@ -847,10 +891,30 @@ def talib_bbands(
 
 
 def add_indicators(frame: pd.DataFrame, *, span_scale: float = 1.0) -> pd.DataFrame:
+    # Reject a nonsensical scale here, where the offending value is still in
+    # hand. Every span collapses to max(1, ...) below, so a zero or negative
+    # scale used to surface as "TA_BBANDS function failed with error code 2:
+    # Bad Parameter" from inside TA-Lib, which names neither span_scale nor
+    # the config key (`ltf_indicator_span_scale`) that set it.
+    try:
+        span_scale = float(span_scale)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"span_scale must be a number, got {span_scale!r}") from exc
+    if not math.isfinite(span_scale) or span_scale <= 0.0:
+        raise ValueError(
+            f"span_scale must be a positive finite number, got {span_scale!r} "
+            "(check the strategy's ltf_indicator_span_scale)"
+        )
     frame = ensure_ohlcv_frame(frame)
     if frame.empty:
         return frame
     out = frame.copy()
+    # Stamp the scale before anything else so every return path carries it and
+    # a consumer can tell a stretched frame from a native one. Set
+    # unconditionally, including at 1.0: a frame resampled from a stretched one
+    # inherits its attrs through pandas' __finalize__, so only an unconditional
+    # write clears a stale scale when the indicators are rebuilt natively.
+    out.attrs[INDICATOR_SPAN_SCALE_ATTR] = float(span_scale)
     ta = _require_talib()
     # ``span_scale`` stretches every bar-count lookback so a finer timeframe can
     # preserve a coarser timeframe's wall-clock horizon. Default 1.0 = the
@@ -860,7 +924,7 @@ def add_indicators(frame: pd.DataFrame, *, span_scale: float = 1.0) -> pd.DataFr
     # rsi14->70, bb20->100, ret5->25, ret15->75). The column NAMES keep their
     # nominal numeric suffix; the EFFECTIVE span is suffix x span_scale.
     def _span(base: int) -> int:
-        return max(1, int(round(base * float(span_scale))))
+        return scaled_span(base, span_scale)
     ema_fast_span = _span(9)
     ema_slow_span = _span(20)
     bb_length = _span(20)

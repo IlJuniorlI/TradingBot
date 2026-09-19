@@ -23,6 +23,15 @@ except Exception:  # pragma: no cover - optional until pattern detection is used
 # cache-key slice and detection slice stay consistent.
 CANDLE_CONTEXT_BARS: int = 30
 
+# How many bars back a completed pattern stays reportable. TA-Lib patterns get
+# this window for free in ``_talib_pattern_value_from_key``, which scans the
+# last three outputs; the two custom tweezers only ever compared the final
+# pair, so they vanished one bar after completing while every TA-Lib pattern of
+# the same 2-bar tier survived three. That asymmetry reached the tier cascade:
+# a tweezer aging out of view let a 1-bar match win the cascade and downgrade
+# the confirm tier from solid_2c (0.70) to weak_1c (0.35) on the same bars.
+CANDLE_PERSISTENCE_BARS: int = 3
+
 
 FIXED_BULLISH_1C_PATTERNS: tuple[str, ...] = (
     "CDLDRAGONFLYDOJI",
@@ -282,12 +291,12 @@ def _talib_pattern_value_from_key(
     # non-zero signal. TA-Lib emits the signal on the completion bar of a
     # pattern — e.g. a 2-bar engulfing ending at bar N-1 lands at values[-2],
     # not values[-1]. Reading only values[-1] would discard any pattern that
-    # completed on an earlier bar of the tail(3) window, which made patterns
-    # "disappear" from the report as soon as a new bar arrived even though
-    # they're still visible on the chart (INTC 2026-04-24 10:08 bullish
-    # engulfing was lost at the 10:09 cycle). Signed value preserved:
+    # completed on an earlier bar of the CANDLE_PERSISTENCE_BARS window, which
+    # made patterns "disappear" from the report as soon as a new bar arrived
+    # even though they're still visible on the chart (INTC 2026-04-24 10:08
+    # bullish engulfing was lost at the 10:09 cycle). Signed value preserved:
     # +N = bullish, -N = bearish (TA-Lib's ±100 and occasional ±200).
-    for idx in (-1, -2, -3):
+    for idx in range(-1, -CANDLE_PERSISTENCE_BARS - 1, -1):
         if len(values) + idx < 0:
             break
         try:
@@ -322,20 +331,37 @@ def _near(a: float | None, b: float | None, tolerance: float) -> bool:
     return abs(float(a) - float(b)) <= max(0.0, float(tolerance))
 
 
-def _tweezer_bottom_from_key(frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...]) -> bool:
-    if len(frame_key) < 2:
-        return False
-    prev, cur = frame_key[-2], frame_key[-1]
+def _tweezer_bottom_at(pair: tuple[tuple[float | None, ...], tuple[float | None, ...]]) -> bool:
+    prev, cur = pair
     tolerance = max(_range_from_row(prev), _range_from_row(cur)) * 0.05
     return bool(_bear_from_row(prev) and _bull_from_row(cur) and _near(prev[2], cur[2], tolerance))
 
 
-def _tweezer_top_from_key(frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...]) -> bool:
-    if len(frame_key) < 2:
-        return False
-    prev, cur = frame_key[-2], frame_key[-1]
+def _tweezer_top_at(pair: tuple[tuple[float | None, ...], tuple[float | None, ...]]) -> bool:
+    prev, cur = pair
     tolerance = max(_range_from_row(prev), _range_from_row(cur)) * 0.05
     return bool(_bull_from_row(prev) and _bear_from_row(cur) and _near(prev[1], cur[1], tolerance))
+
+
+def _tweezer_pairs(
+    frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...],
+) -> list[tuple[tuple[float | None, ...], tuple[float | None, ...]]]:
+    """The adjacent bar pairs completing within the persistence window."""
+    pairs = []
+    for offset in range(CANDLE_PERSISTENCE_BARS):
+        end = len(frame_key) - offset
+        if end < 2:
+            break
+        pairs.append((frame_key[end - 2], frame_key[end - 1]))
+    return pairs
+
+
+def _tweezer_bottom_from_key(frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...]) -> bool:
+    return any(_tweezer_bottom_at(pair) for pair in _tweezer_pairs(frame_key))
+
+
+def _tweezer_top_from_key(frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...]) -> bool:
+    return any(_tweezer_top_at(pair) for pair in _tweezer_pairs(frame_key))
 
 
 def _evaluate_side_pattern(
@@ -611,8 +637,11 @@ def detect_per_bar_candle_patterns(
             continue
         if token == "TWEEZER_BOTTOM":
             # 2-bar custom: completion at position i requires bars (i-1, i).
+            # Uses the single-pair check, not _tweezer_bottom_from_key: this
+            # map is completion-only (as the TA-Lib per-bar arrays are), so
+            # the 3-bar persistence window must not smear a match forward.
             for i in range(1, n):
-                if _tweezer_bottom_from_key(frame_key[:i + 1]):
+                if _tweezer_bottom_at((frame_key[i - 1], frame_key[i])):
                     bullish_by_pos[i].append(token)
             continue
         values = _talib_pattern_array_from_key(frame_key, token)
@@ -625,7 +654,7 @@ def detect_per_bar_candle_patterns(
             continue
         if token == "TWEEZER_TOP":
             for i in range(1, n):
-                if _tweezer_top_from_key(frame_key[:i + 1]):
+                if _tweezer_top_at((frame_key[i - 1], frame_key[i])):
                     bearish_by_pos[i].append(token)
             continue
         values = _talib_pattern_array_from_key(frame_key, token)
@@ -693,18 +722,31 @@ def directional_candle_signal(candle_ctx: dict[str, Any] | None, *, bullish: boo
 
 
 def detect_bullish_patterns(frame: pd.DataFrame, allowed_patterns: Iterable[str] | None = None) -> set[str]:
+    """Bullish candle patterns on the latest bars. Same semantics as the
+    ``matched_bullish_candles`` field of ``detect_candle_context``.
+
+    Slices to ``CANDLE_CONTEXT_BARS``, not to 3. TA-Lib's pattern functions
+    build average-body and trend state from preceding bars and return 0 for
+    anything inside their warmup, so a 3-bar input starves nearly all of
+    them: over 600 random tapes the 3-bar slice fired on 88 where the
+    30-bar slice fired on 441. Re-exported from ``_strategies.shared`` for
+    plugin authors, who would otherwise inherit that silent shortfall.
+    """
     allowed = _normalize_allowed_patterns(allowed_patterns, bullish=True)
     if not allowed:
         return set()
-    frame_key = _ohlc_frame_key(frame, lookback=3)
+    frame_key = _ohlc_frame_key(frame, lookback=CANDLE_CONTEXT_BARS)
     return set(_detect_side_patterns_cached(frame_key, allowed, True))
 
 
 def detect_bearish_patterns(frame: pd.DataFrame, allowed_patterns: Iterable[str] | None = None) -> set[str]:
+    """Bearish candle patterns on the latest bars. Mirror of
+    ``detect_bullish_patterns``; see there for why the slice is
+    ``CANDLE_CONTEXT_BARS`` rather than 3."""
     allowed = _normalize_allowed_patterns(allowed_patterns, bullish=False)
     if not allowed:
         return set()
-    frame_key = _ohlc_frame_key(frame, lookback=3)
+    frame_key = _ohlc_frame_key(frame, lookback=CANDLE_CONTEXT_BARS)
     return set(_detect_side_patterns_cached(frame_key, allowed, False))
 
 

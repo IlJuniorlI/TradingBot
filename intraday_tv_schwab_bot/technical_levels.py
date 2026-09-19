@@ -14,7 +14,9 @@ from .utils import (
     atr_value,
     ensure_ohlcv_frame,
     ensure_standard_indicator_frame,
+    indicator_span_scale,
     resolve_current_price,
+    scaled_span,
     talib_obv,
 )
 
@@ -721,13 +723,22 @@ def _populate_adx_context(
     frame: pd.DataFrame,
     *,
     adx_length: int,
+    span_scale: float = 1.0,
 ) -> None:
     """Compute ADX / +DI / -DI / DMI bias / adx_rising on ctx.
     Fast path when adx_length==14 and precomputed columns exist; otherwise
     compute Wilder-smoothed DMI from scratch. Extracted from
-    build_technical_levels_context for Phase 3a decomposition."""
-    adx_period = max(5, int(adx_length))
-    if adx_period == 14 and {"adx14", "plus_di14", "minus_di14"}.issubset(frame.columns):
+    build_technical_levels_context for Phase 3a decomposition.
+
+    ``adx_length`` is NOMINAL — it counts bars of the notional timeframe, the
+    same unit the shared ``adx14`` column is named in. The fallback therefore
+    computes at ``adx_length x span_scale`` so both branches mean the same
+    horizon: on top_tier's span_scale=5 LTF, ``adx14`` holds a 70-bar ADX, and
+    asking for 15 must give a 75-bar ADX rather than a native 15-bar one.
+    """
+    adx_nominal = max(5, int(adx_length))
+    adx_period = scaled_span(adx_nominal, span_scale)
+    if adx_nominal == 14 and {"adx14", "plus_di14", "minus_di14"}.issubset(frame.columns):
         adx_series = frame["adx14"].astype(float)
         plus_di_series = frame["plus_di14"].astype(float)
         minus_di_series = frame["minus_di14"].astype(float)
@@ -774,6 +785,27 @@ def _populate_adx_context(
         ctx.adx_rising = bool(adx > prev_adx)
 
 
+def _last_value(series: pd.Series) -> float | None:
+    """The series' final value as a float, or None when it is not finite.
+
+    The guard this replaces was ``not series.dropna().empty`` — "does this
+    series hold a value ANYWHERE" — followed by an unconditional
+    ``.iloc[-1]``. When only the last bar was NaN the caller got
+    ``float('nan')`` in a field typed ``float | None``, and NaN fails every
+    comparison, so a gate written as "unset or below the threshold" silently
+    became "neither". A symbol that stops ticking for ``bollinger_length``
+    bars has zero rolling std, so bb_width is 0 and percent_b / zscore divide
+    by it — the leak was reachable on any halted or frozen tape.
+    """
+    if series is None or series.empty:
+        return None
+    value = series.iloc[-1]
+    if pd.isna(value):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
 def _populate_bollinger_bands(
     ctx: TechnicalLevelsContext,
     frame: pd.DataFrame,
@@ -782,14 +814,22 @@ def _populate_bollinger_bands(
     bollinger_length: int,
     bollinger_std_mult: float,
     bollinger_squeeze_width_pct: float,
+    span_scale: float = 1.0,
 ) -> None:
     """Set Bollinger fields on ctx: bollinger_mid/upper/lower/width/width_pct/
     percent_b/zscore/squeeze/upper_reject/lower_reject. Fast path when
     length==20 and mult==2.0 and frame already has bb_* columns (shared
-    indicator). Extracted from build_technical_levels_context."""
-    bb_len = max(5, int(bollinger_length))
+    indicator). Extracted from build_technical_levels_context.
+
+    ``bollinger_length`` is NOMINAL and the fallback stretches it by
+    ``span_scale`` so it matches the shared ``bb_*`` columns' horizon — see
+    ``_populate_adx_context``. ``bollinger_std_mult`` is deliberately NOT
+    scaled: it multiplies a standard deviation, not a bar count.
+    """
+    bb_nominal = max(5, int(bollinger_length))
+    bb_len = scaled_span(bb_nominal, span_scale)
     bb_mult = max(0.5, float(bollinger_std_mult))
-    use_shared_bbands = bb_len == 20 and abs(bb_mult - 2.0) <= 1e-9 and {"bb_mid", "bb_upper", "bb_lower", "bb_width", "bb_width_pct", "bb_percent_b", "bb_zscore"}.issubset(frame.columns)
+    use_shared_bbands = bb_nominal == 20 and abs(bb_mult - 2.0) <= 1e-9 and {"bb_mid", "bb_upper", "bb_lower", "bb_width", "bb_width_pct", "bb_percent_b", "bb_zscore"}.issubset(frame.columns)
     bb_mid_series: pd.Series | None = None
     bb_upper_series: pd.Series | None = None
     bb_lower_series: pd.Series | None = None
@@ -802,18 +842,18 @@ def _populate_bollinger_bands(
         bb_width_pct_series = frame["bb_width_pct"].astype(float)
         bb_percent_b_series = frame["bb_percent_b"].astype(float)
         bb_zscore_series = frame["bb_zscore"].astype(float)
-        bb_mid = float(shared_bb_mid_series.iloc[-1]) if not shared_bb_mid_series.dropna().empty else None
-        bb_upper = float(bb_upper_series.iloc[-1]) if not bb_upper_series.dropna().empty else None
-        bb_lower = float(bb_lower_series.iloc[-1]) if not bb_lower_series.dropna().empty else None
-        bb_width = float(bb_width_series.iloc[-1]) if not bb_width_series.dropna().empty else None
-        ctx.bollinger_width_pct = float(bb_width_pct_series.iloc[-1]) if not bb_width_pct_series.dropna().empty else None
-        ctx.bollinger_percent_b = float(bb_percent_b_series.iloc[-1]) if not bb_percent_b_series.dropna().empty else None
-        ctx.bollinger_zscore = float(bb_zscore_series.iloc[-1]) if not bb_zscore_series.dropna().empty else None
+        bb_mid = _last_value(shared_bb_mid_series)
+        bb_upper = _last_value(bb_upper_series)
+        bb_lower = _last_value(bb_lower_series)
+        bb_width = _last_value(bb_width_series)
+        ctx.bollinger_width_pct = _last_value(bb_width_pct_series)
+        ctx.bollinger_percent_b = _last_value(bb_percent_b_series)
+        ctx.bollinger_zscore = _last_value(bb_zscore_series)
     else:
         bb_mid_series = frame["close"].rolling(bb_len, min_periods=max(5, bb_len // 2)).mean()
         bb_std_series = frame["close"].rolling(bb_len, min_periods=max(5, bb_len // 2)).std(ddof=0)
-        bb_mid = float(bb_mid_series.iloc[-1]) if not bb_mid_series.dropna().empty else None
-        bb_std = float(bb_std_series.iloc[-1]) if not bb_std_series.dropna().empty else None
+        bb_mid = _last_value(bb_mid_series)
+        bb_std = _last_value(bb_std_series)
         bb_upper = None
         bb_lower = None
         bb_width = None
@@ -928,6 +968,19 @@ def build_technical_levels_context(
     fib_min_impulse_mult = float(fib_min_impulse_atr)
     avwap_min_impulse_mult = float(anchored_vwap_min_impulse_atr if anchored_vwap_min_impulse_atr is not None else fib_min_impulse_mult)
 
+    frame = ensure_standard_indicator_frame(raw_frame)
+    # The *_length arguments (adx_length, bollinger_length, obv_ema_length,
+    # divergence_rsi_length) count bars of the NOTIONAL timeframe — the same
+    # unit the shared indicator columns are named in. Read the scale those
+    # columns were actually built at so a recomputation at a non-default
+    # length lands on the same horizon instead of the native one.
+    #
+    # Deliberately NOT scaled: the *_lookback_bars / pivot_span window sizes
+    # below. Those have a single computation path, so there is no second path
+    # to disagree with, and stretching them would change what every current
+    # config already does.
+    span_scale = indicator_span_scale(frame)
+
     tail_requirements = [20]
     if fib_enabled:
         tail_requirements.append(fib_lookback)
@@ -938,9 +991,14 @@ def build_technical_levels_context(
     if channel_enabled:
         tail_requirements.append(int(channel_lookback_bars))
     if divergence_enabled:
-        tail_requirements.append(max(int(divergence_rsi_length or 14) * 4, max(12, base_pivot_span) * 8, 40))
+        # Scaled: this budget exists to give the divergence RSI enough bars,
+        # and that RSI is computed at the scaled span.
+        tail_requirements.append(max(
+            scaled_span(int(divergence_rsi_length or 14), span_scale) * 4,
+            max(12, base_pivot_span) * 8,
+            40,
+        ))
 
-    frame = ensure_standard_indicator_frame(raw_frame)
     frame = frame.tail(max(tail_requirements)).copy()
     close = resolve_current_price(frame, current_price)
     needs_atr = bool(impulse_context_enabled or trendline_enabled or channel_enabled or atr_context_enabled)
@@ -969,7 +1027,7 @@ def build_technical_levels_context(
         _populate_atr_context(ctx, frame, close=close, atr_expansion_lookback=atr_expansion_lookback)
 
     if adx_enabled:
-        _populate_adx_context(ctx, frame, adx_length=adx_length)
+        _populate_adx_context(ctx, frame, adx_length=adx_length, span_scale=span_scale)
 
     obv_series: pd.Series | None = None
     if obv_enabled or divergence_enabled:
@@ -980,10 +1038,15 @@ def build_technical_levels_context(
             # explicit fillna keeps NaN volume from propagating into the cumsum.
             obv_series = talib_obv(frame["close"], frame["volume"].fillna(0.0))
         if obv_enabled:
-            if int(obv_ema_length) == 20 and "obv_ema20" in frame.columns:
+            # Nominal length, same contract as adx_length / bollinger_length:
+            # the shared obv_ema20 column is a 20 x span_scale EMA.
+            obv_ema_nominal = max(2, int(obv_ema_length))
+            if obv_ema_nominal == 20 and "obv_ema20" in frame.columns:
                 obv_ema_series = frame["obv_ema20"].astype(float)
             else:
-                obv_ema_series = obv_series.ewm(span=max(2, int(obv_ema_length)), adjust=False).mean()
+                obv_ema_series = obv_series.ewm(
+                    span=scaled_span(obv_ema_nominal, span_scale), adjust=False
+                ).mean()
             ctx.obv = float(obv_series.iloc[-1]) if not obv_series.empty else None
             ctx.obv_ema = float(obv_ema_series.iloc[-1]) if not obv_ema_series.empty else None
             if ctx.obv is not None and ctx.obv_ema is not None:
@@ -1016,13 +1079,17 @@ def build_technical_levels_context(
         if "rsi14" in frame.columns:
             display_rsi_series = frame["rsi14"].astype(float)
         else:
-            display_rsi_series = _build_rsi(frame["close"].astype(float), 14)
-        ctx.rsi14 = float(display_rsi_series.iloc[-1]) if not display_rsi_series.dropna().empty else None
-        rsi_len = max(5, int(divergence_rsi_length))
-        if rsi_len == 14:
+            display_rsi_series = _build_rsi(frame["close"].astype(float),
+                                            scaled_span(14, span_scale))
+        ctx.rsi14 = _last_value(display_rsi_series)
+        # Nominal length, same contract as adx_length / bollinger_length: the
+        # shared rsi14 column is a 14 x span_scale RSI.
+        rsi_nominal = max(5, int(divergence_rsi_length))
+        if rsi_nominal == 14:
             rsi_series = display_rsi_series
         else:
-            rsi_series = _build_rsi(frame["close"].astype(float), rsi_len)
+            rsi_series = _build_rsi(frame["close"].astype(float),
+                                    scaled_span(rsi_nominal, span_scale))
 
     if anchored_vwap_enabled:
         index_dt = pd.DatetimeIndex(frame.index)
@@ -1047,6 +1114,7 @@ def build_technical_levels_context(
             bollinger_length=bollinger_length,
             bollinger_std_mult=bollinger_std_mult,
             bollinger_squeeze_width_pct=bollinger_squeeze_width_pct,
+            span_scale=span_scale,
         )
 
     if divergence_enabled and rsi_series is not None and obv_series is not None:
