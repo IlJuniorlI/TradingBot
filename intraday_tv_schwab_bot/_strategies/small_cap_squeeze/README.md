@@ -34,7 +34,7 @@ and *RTH* values after the open. Low **float** is the squeeze fuel.
 ### 2. Regimes
 Narrowed (2026-06-02, after two dry-runs) to the **momentum-continuation** set:
 **trend, momentum**, plus the opt-in **vwap_reclaim** regime
-(`enable_vwap_reclaim_regime: true`) — a long re-entry when price flushes below
+(`disable_vwap_reclaim_regime: false`) — a long re-entry when price flushes below
 session VWAP and reclaims it on a volume pop (the squeeze re-igniting), the entry
 that trend (needs `close>VWAP` *and* `ema9>ema20`) and momentum (needs a new
 N-bar high) miss. **pullback, range, vol_squeeze, ORB, and sr_scalp are off**

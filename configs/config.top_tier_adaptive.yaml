@@ -1115,7 +1115,7 @@ strategies:
       # to reject the one-tick VWAP poke that over-fired on small caps
       # (their 0.0005 -> 0.0025 retune) without demanding a mega cap clear
       # VWAP by a small-cap margin.
-      enable_vwap_reclaim_regime: true
+      disable_vwap_reclaim_regime: false
       min_vwap_reclaim_score: 3.5   # ceiling 5.0; a bare reclaim scores 2.5, so this needs a second component. SHORTs clear 4.0 via short_min_score_premium
       vwap_reclaim_lookback_bars: 6 # the dip below VWAP must be within the last ~6 min
       vwap_reclaim_min_volume_ratio: 1.5

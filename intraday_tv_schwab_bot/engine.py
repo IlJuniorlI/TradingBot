@@ -666,6 +666,22 @@ class IntradayBot:
         except Exception:
             LOG.exception("Session report write failed during shutdown")
 
+    def _session_report_bars(self, symbol: str):
+        """1m bars for the post-stop continuation aggregate.
+
+        Deliberately 1m regardless of the strategy's LTF: the question is how
+        far price ran in the half hour after a stop, and the finest available
+        resolution gives the truest high/low for that window. Returns None on
+        any failure — the aggregate treats a missing frame as unevaluable
+        rather than as zero continuation, so a data gap cannot quietly look
+        like "the stop was right".
+        """
+        try:
+            return self.data.get_merged(str(symbol), timeframe="1min", with_indicators=False)
+        except Exception:
+            LOG.debug("Session-report bar lookup failed for %s", symbol, exc_info=True)
+            return None
+
     def _write_session_report(self) -> None:
         write_session_report(
             self.account,
@@ -675,6 +691,10 @@ class IntradayBot:
             log_dir=self.config.runtime.log_dir,
             structured_logger=self.audit.log_structured,
             skip_counts=dict(self.entry_gatekeeper.session_skip_counts),
+            # Post-stop continuation needs bars AFTER each stop-out. Passed as
+            # a callable so session_report stays a pure aggregator over
+            # TradeRecords and doesn't take a DataFeed dependency.
+            bars_for=self._session_report_bars,
         )
         if bool(self.config.runtime.export_session_archive):
             try:

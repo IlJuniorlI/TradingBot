@@ -9,6 +9,67 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A skipped entry decision now records which regime it came from.**
+  *2026-09-19* — `decisions.csv` carries a `family` column sourced from
+  `entry_gatekeeper._decision_entry_family`, which reads
+  `details['entry_family']`. top_tier's success path stamped `regime`; the
+  skip path passed no details at all, so `family` was `none` on every skipped
+  row — and skips are essentially every row (4,316 decisions, 0 trades, in one
+  archived session).
+
+  The cost was concrete: a post-mortem could establish that ~20% of RTH
+  decisions (22,231 of 109,840 across 13 sessions) die on `no_fresh_breakout`,
+  but not whether that was `trend` (25-bar lookback on the LTF, 3 trades ever)
+  or `momentum` (6-bar on the base frame, 0 trades) — the difference between a
+  tuning problem and a dead regime.
+
+  The skip branch now stamps `entry_family` (the regime that came closest to
+  producing a signal, or `none_qualified` when nothing cleared its score
+  threshold — a different failure worth telling apart), plus `regime_score`,
+  `regime_score_norm` and `regimes_tried`, which separate "nothing was close"
+  from "it missed by 0.1 and the threshold may be wrong".
+
+  `entry_family` is the key the gatekeeper already reads, so this populates the
+  EXISTING `family=` log field and CSV column — no log-format, parser or schema
+  change.
+
+- **The EOD session report measures post-stop continuation.** *2026-09-19* —
+  a new `post_stop_continuation` aggregate (structured payload + log table)
+  answering the one question every other aggregate misses: when a trade was
+  stopped out, how far did price then run the trade's way? Every other section
+  scores the trade as it was closed, which cannot separate "the stop was
+  right" from "we were right and got shaken out".
+
+  Measured in R off `initial_risk_per_unit` so it is comparable across symbols
+  and sizes, over a `window_minutes` (default 30) bound after the exit —
+  deliberately the same span as `same_level_block_minutes`, so the number
+  reads directly as the cost of the re-entry lockout. Reports counts reaching
+  1R and 2R, avg/median/max R, and `opportunity_usd`.
+
+  `opportunity_usd` is labelled an UPPER BOUND in both the log line and the
+  docstring: it assumes re-entry at the stop price and an exit at the window's
+  best tick. It is "the move left on the table", not money the bot would have
+  made.
+
+  A trade whose `initial_risk_per_unit` is absent, non-positive or NON-FINITE,
+  a missing frame, an infinite bar, or a raising bar lookup all count as
+  UNEVALUATED rather than as zero continuation — otherwise a data gap would
+  quietly read as "the stop was right" and bias the whole aggregate toward
+  vindicating stops. The finiteness checks are not belt-and-braces: NaN
+  survives `<= 0` because every comparison against NaN is False, and
+  `ensure_ohlcv_frame` drops NaN OHLC but NOT inf — both were found by
+  fuzzing this function after it was written, having reached the arithmetic
+  and turned `opportunity_usd` into NaN and every R aggregate into inf.
+
+  Bars arrive through a `bars_for(symbol)` callable supplied by the engine, so
+  `session_report` stays a pure aggregator over `TradeRecord`s with no
+  DataFeed dependency. The engine passes 1m bars regardless of the strategy's
+  LTF — the finest resolution gives the truest high/low for the window.
+
+  Validated against the archived sessions (old code, so not a verdict on the
+  current bot): of 30 stop exits, 27 evaluable, **16 ran at least 1R the
+  trade's way within 30 minutes of being stopped**.
+
 - **The dashboard redirects phones to the mobile layout.** *2026-09-19* — a
   document request from a phone User-Agent gets `302 -> /mobile`; tablets and
   desktops are unchanged, since a tablet has the width for the desktop layout.
@@ -52,7 +113,65 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `_pct_param` and small caps carry a far larger ADR. Entries land at the
     VWAP reclaim — around the midpoint of the move, not at the low.
 
+### Changed
+
+- **`enable_vwap_reclaim_regime` -> `disable_vwap_reclaim_regime`.**
+  *2026-09-20* — all eight regime knobs now read the same way. The flag shipped
+  2026-05-30 as an opt-IN (default off) so that adding the regime to the shared
+  engine could not silently switch it on for `SmallCapSqueezeStrategy`, which
+  subclasses `TopTierAdaptiveStrategy`. That protection is spent:
+  small_cap_squeeze sets the flag explicitly in its own manifest, so nothing
+  depended on the inverted default, while the odd polarity left one knob
+  reading backwards from the other seven.
+
+  Behaviour is unchanged — both shipped presets ran the regime before and run
+  it after, verified by resolving the loaded config for each. One reader
+  (`strategy.py`), two yaml presets, one manifest; renamed and inverted in one
+  cut with no alias.
+
+  Two absent declarations surfaced while doing it, both cases of a CODE default
+  doing load-bearing work: `top_tier_adaptive/manifest.json` declared neither
+  `disable_vwap_reclaim_regime` nor `disable_orb_regime`, so a config-less run
+  resolved both off `params.get(..., False)` rather than anything declared.
+  Both are now declared at their existing effective values, so the defaults are
+  inert. Note the baseline that exposes: the manifest says ORB **on** while
+  every shipped preset turns it off — worth a separate decision.
+
+  Coverage: `tests/test_regime_flag_polarity.py`, 55 tests. Pins the property
+  rather than the instance — a ninth regime added with an `enable_*` knob fails
+  across every manifest, every shipped config and the strategy's own param
+  reads, instead of being discovered by someone reading a config and getting
+  the sense of it backwards.
+
 ### Fixed
+
+- **The session manifest's realized PnL described the account, not the
+  session.** *2026-09-19* — `manifest.realized_pnl` read
+  `account.realized_pnl`, a LIFETIME accumulator: set to 0.0 once in
+  `PaperAccount.__init__` and only ever incremented, with no per-day reset.
+  Beside it, `trades_today` and `trades.csv` are filtered to the session date.
+  Two scopes in one manifest, and the wrong one is the headline number.
+
+  Across the archived sessions that traded, **5 of 10 disagreed with their own
+  `trades.csv`**, in both directions. 2026-07-31 shows the mechanism
+  arithmetically: manifest −80.77 against a CSV summing to −60.22, a gap of
+  exactly −20.55 — the previous session's PnL, carried forward by a bot that
+  ran across both days without restarting. Four other sessions reported 0.00
+  while holding real trades, understating a +13.59 day and a −122.80 day
+  alike.
+
+  The manifest now sums the same date-filtered list that produces `trades.csv`
+  and `trades_today`, so `manifest.realized_pnl == sum(trades.csv)` holds by
+  construction. Summing the ROUNDED per-row values (rather than rounding the
+  sum) is deliberate — that is what `_trade_csv_row` writes, so the equality is
+  exact rather than within a cent.
+
+  A failed CSV export now reports `null` and a new `trades_export_error` field
+  rather than leaving the initialized 0.0 in place. `_trade_csv_row` reads
+  every `TradeRecord` field by name, so one record missing a field added later
+  raises and is swallowed as a warning — and a wrong-but-plausible zero is
+  worse than an absent value, because nobody investigates a zero. This is the
+  likeliest explanation for the four 0.00 sessions.
 
 - **A screener row with no usable ticker became a candidate.** *2026-09-19* —
   `_candidate_rows` built its symbol with `str(row.get("name"))`, which turns a

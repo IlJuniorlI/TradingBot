@@ -1093,7 +1093,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
     def _score_vwap_reclaim(self, side: Side, close: float, vwap: float, ema9: float,
                             ema20: float, atr: float, frame: pd.DataFrame,
                             vol_scale: float = 1.0) -> float:
-        """Score a VWAP-reclaim momentum re-entry (opt-in regime, 2026-05-30).
+        """Score a VWAP-reclaim momentum re-entry (2026-05-30).
 
         Thesis (LONG; SHORT mirrors): a running name dips BELOW session VWAP — a
         quick flush that shakes out weak longs / trips stops — then RECLAIMS VWAP
@@ -1478,14 +1478,19 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         vol_squeeze_enabled = not bool(self.params.get("disable_vol_squeeze_regime", False))
         momentum_enabled = not bool(self.params.get("disable_momentum_regime", False))
         sr_scalp_enabled = not bool(self.params.get("disable_sr_scalp_regime", False))
-        # vwap_reclaim is OPT-IN (off by default so top_tier and other presets
-        # are unaffected): enable via ``enable_vwap_reclaim_regime: true``. It is
-        # a momentum-family regime — available wherever momentum is, stripped
+        # A momentum-family regime — available wherever momentum is, stripped
         # otherwise.
-        vwap_reclaim_enabled = bool(self.params.get("enable_vwap_reclaim_regime", False))
+        #
+        # This was `enable_vwap_reclaim_regime` (opt-IN, default off) when it
+        # shipped, so adding it to the shared engine could not silently switch
+        # it on for `SmallCapSqueezeStrategy`, which subclasses this class.
+        # That protection is spent: small_cap_squeeze now opts in explicitly in
+        # its own manifest, so nothing depended on the inverted default while
+        # the odd polarity made it the one regime flag that reads backwards.
+        vwap_reclaim_enabled = not bool(self.params.get("disable_vwap_reclaim_regime", False))
 
         def _filter(regimes: set[str]) -> set[str]:
-            """Strip regimes whose disable knob is set (vwap_reclaim: opt-in)."""
+            """Strip regimes whose disable knob is set."""
             if not trend_enabled:
                 regimes.discard("trend")
             if not pullback_enabled:
@@ -3295,7 +3300,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     self._score_orb(side, close, atr, frame)
                     if "orb" in allowed_regimes else 0.0
                 )
-                # vwap_reclaim (opt-in, 2026-05-30): a VWAP-reclaim momentum
+                # vwap_reclaim (2026-05-30): a VWAP-reclaim momentum
                 # re-entry — dipped below session VWAP then reclaimed it on a
                 # volume pop. Reads the base 1m frame (VWAP is session-cumulative).
                 vwap_reclaim_score = (
@@ -3611,7 +3616,40 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     details=detail_payload or None,
                 )
             else:
-                self._record_entry_decision(c.symbol, "skipped", fail_reasons or ["no_setup"])
+                # Stamp WHICH regime the skip came from. Without this the
+                # `family` column in decisions.csv is "none" on every skipped
+                # row, so a post-mortem can establish that ~20% of decisions
+                # die on `no_fresh_breakout` but not whether that is `trend`
+                # or `momentum` — two regimes with very different lookbacks
+                # (25 bars on the LTF vs 6 on the base frame) and very
+                # different trade counts. The success path above already
+                # stamps `regime`; this is the same information on the path
+                # that produces almost every row.
+                #
+                # `entry_family` is the key `_decision_entry_family` reads, so
+                # this populates the EXISTING `family=` log field and CSV
+                # column — no log-format, parser or schema change.
+                skip_details: dict[str, Any] = {}
+                if build_queue:
+                    # Sorted by normalised score desc, so [0] is the regime
+                    # that came closest to producing a signal.
+                    _q_side, top_regime, top_score, top_norm, _q_decision = build_queue[0]
+                    skip_details["entry_family"] = str(top_regime)
+                    # How far the best candidate regime was from its
+                    # threshold — the difference between "nothing was close"
+                    # and "it missed by 0.1 and the threshold may be wrong".
+                    skip_details["regime_score"] = round(float(top_score), 3)
+                    skip_details["regime_score_norm"] = round(float(top_norm), 4)
+                    skip_details["regimes_tried"] = len(build_queue)
+                else:
+                    # Nothing cleared its score threshold on either side. A
+                    # different failure from "a builder rejected it", and the
+                    # two are worth telling apart in the histogram.
+                    skip_details["entry_family"] = "none_qualified"
+                self._record_entry_decision(
+                    c.symbol, "skipped", fail_reasons or ["no_setup"],
+                    details=skip_details,
+                )
         return out
 
     # ------------------------------------------------------------------

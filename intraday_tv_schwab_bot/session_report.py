@@ -9,13 +9,15 @@ aggregates closed trades along five axes to support strategy/config tuning:
   * per-exit-reason   — surfaces leaky exit mechanisms (phantom stops, tight targets)
   * per-hour          — identifies dead zones in the trading day
   * MAE / MFE         — max adverse / favorable excursion in R-multiples
+  * post-stop run     — how far price ran the trade's way AFTER the stop,
+                        i.e. how much of a correctly-called move a shakeout cost
   * filter rejections — tally of skip reasons the engine logged during the session
 
 All aggregate sections are emitted both in the human log (fixed-width tables)
 and inside the SESSION_REPORT structured JSON payload (under top-level keys
 ``per_regime``, ``per_symbol``, ``per_exit_reason``, ``per_hour``,
-``mae_mfe``, ``filter_rejections``) so downstream tooling can parse them
-without re-scraping.
+``mae_mfe``, ``post_stop_continuation``, ``filter_rejections``) so
+downstream tooling can parse them without re-scraping.
 """
 from __future__ import annotations
 
@@ -24,6 +26,7 @@ import dataclasses
 import io
 import json
 import logging
+import math
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -203,6 +206,119 @@ def _mae_mfe_summary(trades: list[TradeRecord]) -> dict[str, Any]:
     }
 
 
+def _post_stop_continuation(
+    trades: list[TradeRecord],
+    bars_for: Any | None,
+    *,
+    window_minutes: int = 30,
+) -> dict[str, Any]:
+    """How far price ran the trade's way AFTER it was stopped out.
+
+    The question this answers: when the bot called the direction correctly but
+    was shaken out on the retrace, how much of the move did it miss? Every
+    other aggregate here scores the trade as it was closed; this one scores
+    what happened next.
+
+    It matters because of how the trend regime is shaped. Entry requires
+    ``close > max(high of the previous N bars)``, so the fill is at a fresh
+    N-bar extreme by construction — there is no retest path. The stop lands
+    roughly 1-1.5% away once the ``default_stop_pct`` and ``min_stop_atr_mult``
+    floors apply, which is inside the ordinary retest band for a mega cap. And
+    ``same_level_block_minutes`` (30) then bars same-direction re-entry within
+    ``same_level_block_atr_mult`` x ATR of the stop, which is usually where and
+    when the next leg starts.
+
+    Measured in R (``initial_risk_per_unit``), so it is comparable across
+    symbols and sizes. ``window_minutes`` bounds how long after the stop
+    counts — beyond that it is a different trade, not a missed continuation.
+
+    ``opportunity_usd`` is an UPPER BOUND, not recoverable profit: it assumes
+    re-entry at the stop price and an exit at the window's best tick. Read it
+    as "the move left on the table", not "money the bot would have made".
+
+    ``bars_for`` is a ``symbol -> DataFrame`` callable (the engine passes a
+    thin wrapper over the data feed). Passing None disables the section, which
+    is what the pure-aggregate tests do.
+    """
+    stop_exits = [
+        t for t in trades
+        if str(t.reason or "").split(":", 1)[0].strip().lower() == "stop"
+    ]
+    summary: dict[str, Any] = {
+        "window_minutes": int(window_minutes),
+        "stop_exits": len(stop_exits),
+        "evaluated": 0,
+        "not_evaluated": len(stop_exits),
+        "reached_1r": 0,
+        "reached_2r": 0,
+        "avg_post_stop_r": None,
+        "median_post_stop_r": None,
+        "max_post_stop_r": None,
+        "opportunity_usd": None,
+    }
+    if not stop_exits or bars_for is None:
+        return summary
+
+    post_r: list[float] = []
+    opportunity = 0.0
+    for trade in stop_exits:
+        risk_per_unit = trade.initial_risk_per_unit
+        # NaN survives `<= 0` (every comparison against NaN is False), so a
+        # NaN risk used to reach the arithmetic below and turn
+        # `opportunity_usd` into NaN — the same "unevaluable masquerading as
+        # a value" this function is written to avoid. Require finite.
+        if risk_per_unit is None or not math.isfinite(float(risk_per_unit)) or risk_per_unit <= 0:
+            continue
+        try:
+            frame = bars_for(trade.symbol)
+        except Exception:
+            LOG.debug("post-stop lookup failed for %s", trade.symbol, exc_info=True)
+            continue
+        if frame is None or getattr(frame, "empty", True):
+            continue
+        try:
+            window_end = trade.exit_time + timedelta(minutes=int(window_minutes))
+            after = frame[(frame.index > trade.exit_time) & (frame.index <= window_end)]
+            if after.empty:
+                continue
+            if str(trade.side).upper().endswith("LONG"):
+                best = float(after["high"].max())
+                excursion = best - float(trade.exit_price)
+            else:
+                best = float(after["low"].min())
+                excursion = float(trade.exit_price) - best
+        except Exception:
+            LOG.debug("post-stop window failed for %s", trade.symbol, exc_info=True)
+            continue
+        # An infinite high would divide through to an infinite R and poison
+        # every aggregate below it. `ensure_ohlcv_frame` drops NaN OHLC but
+        # NOT inf, so this is the frame's own guard, not a duplicate.
+        if not math.isfinite(excursion):
+            continue
+        # Negative means it kept going against the trade; the stop was right.
+        r_multiple = max(0.0, excursion / float(risk_per_unit))
+        post_r.append(r_multiple)
+        opportunity += r_multiple * float(risk_per_unit) * abs(int(trade.qty))
+
+    if not post_r:
+        return summary
+
+    ordered = sorted(post_r)
+    mid = len(ordered) // 2
+    median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+    summary.update({
+        "evaluated": len(post_r),
+        "not_evaluated": len(stop_exits) - len(post_r),
+        "reached_1r": sum(1 for r in post_r if r >= 1.0),
+        "reached_2r": sum(1 for r in post_r if r >= 2.0),
+        "avg_post_stop_r": round(sum(post_r) / len(post_r), 3),
+        "median_post_stop_r": round(median, 3),
+        "max_post_stop_r": round(max(post_r), 3),
+        "opportunity_usd": round(opportunity, 2),
+    })
+    return summary
+
+
 def _normalize_skip_reason(reason: str) -> str:
     """Collapse parameterized skip reasons into a stable bucket name.
 
@@ -297,6 +413,37 @@ def _log_mae_mfe(summary: dict[str, Any]) -> None:
     )
 
 
+def _log_post_stop_continuation(summary: dict[str, Any]) -> None:
+    """Only logged when there were stop exits — silence is the common case
+    early in a session and an empty table is noise."""
+    if not summary.get("stop_exits"):
+        return
+    LOG.info("--- Post-stop continuation (%d min window) ---", summary.get("window_minutes", 0))
+    evaluated = int(summary.get("evaluated") or 0)
+    LOG.info(
+        "  stop exits=%d  evaluated=%d  (unevaluated=%d: no initial risk or no bars)",
+        int(summary.get("stop_exits") or 0), evaluated,
+        int(summary.get("not_evaluated") or 0),
+    )
+    if not evaluated:
+        return
+    LOG.info(
+        "  ran >=1R after the stop: %d/%d      >=2R: %d/%d",
+        int(summary.get("reached_1r") or 0), evaluated,
+        int(summary.get("reached_2r") or 0), evaluated,
+    )
+    LOG.info(
+        "  post-stop R  avg=%s  median=%s  max=%s",
+        summary.get("avg_post_stop_r"), summary.get("median_post_stop_r"),
+        summary.get("max_post_stop_r"),
+    )
+    LOG.info(
+        "  move left on the table: %s  (UPPER BOUND - assumes re-entry at the "
+        "stop and an exit at the window's best tick)",
+        _fmt_money(summary.get("opportunity_usd")),
+    )
+
+
 def _log_filter_rejections(summary: dict[str, Any]) -> None:
     total = int(summary.get("total_skips", 0))
     if total == 0:
@@ -319,6 +466,8 @@ def write_session_report(
     log_dir: str,
     structured_logger: Any | None = None,
     skip_counts: dict[str, int] | None = None,
+    bars_for: Any | None = None,
+    post_stop_window_minutes: int = 30,
 ) -> None:
     """Write an end-of-session summary to the log, append trades to a
     persistent CSV file in the log directory, and emit a structured
@@ -389,6 +538,8 @@ def write_session_report(
         per_hour = _per_hour(closed)
         mae_mfe = _mae_mfe_summary(closed)
         filter_rejections = _filter_rejection_summary(skip_counts)
+        post_stop = _post_stop_continuation(
+            closed, bars_for, window_minutes=post_stop_window_minutes)
 
         # --- Human-readable aggregate tables ---
         if closed:
@@ -397,6 +548,7 @@ def write_session_report(
             _log_group_table("Per exit reason", per_exit_reason, key_label="exit_reason")
             _log_group_table("Per hour (entry)", per_hour, key_label="hour_et")
             _log_mae_mfe(mae_mfe)
+            _log_post_stop_continuation(post_stop)
         _log_filter_rejections(filter_rejections)
 
         # --- Structured JSON log ---
@@ -417,6 +569,7 @@ def write_session_report(
             "per_exit_reason": per_exit_reason,
             "per_hour": per_hour,
             "mae_mfe": mae_mfe,
+            "post_stop_continuation": post_stop,
             "filter_rejections": filter_rejections,
         }
         if structured_logger is not None:
@@ -1022,6 +1175,26 @@ def export_session_archive(
     # per-day boundary the archive uses everywhere else.
     trades_dst = archive_root / "trades.csv"
     trades_today = 0
+    # Today's realized PnL, summed from the SAME date-filtered list that
+    # produces trades.csv and trades_today.
+    #
+    # The manifest used to report `account.realized_pnl`, which is a LIFETIME
+    # accumulator — set to 0.0 once in PaperAccount.__init__ and only ever
+    # incremented, with no per-day reset. So an always-on bot carried prior
+    # days forward into a field sitting next to `trades_today`, which is
+    # date-filtered. Two scopes in one manifest. Observed on 2026-07-31:
+    # manifest -80.77 against trades.csv -60.22, a gap of exactly -20.55 =
+    # the previous session's PnL. Five of the ten sessions that traded
+    # disagreed with their own trades.csv, in both directions.
+    #
+    # Summing the rounded per-row values (not rounding the sum) is
+    # deliberate: it is what _trade_csv_row writes, so
+    # `manifest.realized_pnl == sum(trades.csv.realized_pnl)` holds exactly
+    # rather than within a cent.
+    #
+    # Stays None when there is no account, preserving the previous contract.
+    realized_pnl_today: float | None = None if account is None else 0.0
+    trades_export_error: str | None = None
     session_date_str = session_date.isoformat()
     if account is not None:
         try:
@@ -1054,8 +1227,20 @@ def export_session_archive(
                 for trade in closed_today:
                     writer.writerow(_trade_csv_row(trade, session_date_str))
             trades_today = len(closed_today)
+            realized_pnl_today = round(
+                sum(round(float(trade.realized_pnl), 2) for trade in closed_today), 2
+            )
         except Exception as exc:
             LOG.warning("Could not write daily trades CSV from account: %s", exc, exc_info=True)
+            # Report UNKNOWN, not flat. Leaving the initialized 0.0 in place
+            # made a failed export indistinguishable in the manifest from a
+            # genuinely flat day — and the failure is easy to hit, because
+            # `_trade_csv_row` reads every TradeRecord field by name, so one
+            # record missing a field added later (rehydrated from an older
+            # store, say) raises here and is swallowed. A wrong-but-plausible
+            # zero is worse than an absent value: nobody investigates a zero.
+            trades_export_error = str(exc)
+            realized_pnl_today = None
 
     # Config snapshot: dump the resolved config (with secrets redacted)
     # so future audits can reproduce decisions even if config.yaml has
@@ -1156,7 +1341,8 @@ def export_session_archive(
         "events_extracted": events_written,
         "decisions_extracted": decisions_written,
         "open_positions_at_close": len(positions or {}),
-        "realized_pnl": float(getattr(account, "realized_pnl", 0.0) or 0.0) if account is not None else None,
+        "realized_pnl": realized_pnl_today,
+        "trades_export_error": trades_export_error,
         "session_skip_counts": dict(session_skip_counts or {}),
         "regime_call_outcomes": regime_outcomes,
     }
