@@ -54,6 +54,63 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A screener row with no usable ticker became a candidate.** *2026-09-19* —
+  `_candidate_rows` built its symbol with `str(row.get("name"))`, which turns a
+  missing value into the literal symbol `"None"` and a NaN into `"nan"`. The
+  engine drops an EMPTY symbol from the watchlist but not a non-empty junk
+  one, so the bot would fetch history and quotes for a ticker that does not
+  exist and show it on the dashboard. Every screener's rows arrive from an
+  external API, so the ticker is not ours to trust. New `_candidate_symbol`
+  rejects genuinely absent values and normalizes the rest; dropped rows are
+  counted and logged, because silently discarding screener rows would hide a
+  TradingView schema change. Deliberately no blacklist of junk-looking tokens
+  — that risks excluding a real ticker, so a ticker with no exchange prefix is
+  still kept.
+
+- **A raising strategy callback took down the whole screener run.**
+  *2026-09-19* — `_candidate_rows` wrapped only the `float()` conversion in its
+  try, leaving the `activity_score_fn(row)` CALL unguarded, and
+  `directional_bias_fn` had no guard at all. Both belong to the strategy
+  plugin, so one bad row's exception aborted the entire candidate list rather
+  than that candidate. Both are now wrapped, warning once per cause per
+  process — they fire per candidate per cycle, so unthrottled they would flood
+  the log.
+
+- **An unscored candidate list came back in reverse.** *2026-09-19* — with no
+  `activity_score_fn` the score defaulted to the row's ordinal, and
+  `_candidate_rows` sorts DESCENDING, so the last row of a screener's
+  "best first" `order_by` came out on top. Unscored candidates now all get
+  0.0 and the existing `-candidate_query_order` tiebreak restores the
+  screener's own order. Latent — all 12 shipped call sites pass
+  `activity_score_fn` — but it is reachable by any plugin that omits the
+  callback, and it was also the fallback path the fix above just made
+  reachable.
+
+- **`small_cap_squeeze` emitted stale and duplicated candidate ranks.**
+  *2026-09-19* — `_candidate_rows` numbers candidates 1..N within a single
+  screen. `_merge_premarket_lock` then unions the premarket-locked set with
+  the live RTH screen, re-sorts by `activity_score` and caps to
+  `max_candidates` — but never re-ranked, so the output carried ranks like
+  `[1, 2, 2, 3, 3]`: three candidates claiming rank 2 or 3. `rank` is the
+  final tiebreak in `entry_gatekeeper._signal_priority_key` and is what the
+  dashboard candidate card and the audit log's `candidate_rank` display, so
+  the visible damage is diagnostic rather than directional — it only reaches
+  execution order on an exact score tie. The merge now re-ranks and uses the
+  same `(score, -query_order)` tiebreak `_candidate_rows` applies, instead of
+  a plain stable sort that put locked-but-faded names ahead of equally scored
+  fresh ones. The only screener with the problem: the other 17 either sort and
+  cap the DataFrame BEFORE `_candidate_rows`, or build candidates manually and
+  reassign `rank` after sorting.
+
+- **`top_tier_adaptive`'s screener read the ACTIVE strategy's params.**
+  *2026-09-19* — `config.active_strategy.params` rather than
+  `config.strategies[self.strategy_name].params`, the sole outlier among 18
+  screeners. Identical today: `get_candidates` has exactly one caller
+  (`engine._run_cycle`, passing `config.strategy`), so the screener is only
+  ever built for the running strategy. But the failure mode if that stops
+  holding is silent — another strategy's params carry no `tradable`, so `run()`
+  returns an empty universe with no error.
+
 - **Indicator lengths now mean the same thing on a span-scaled frame.**
   *2026-09-19* — `add_indicators(span_scale=N)` stretches every bar-count
   lookback but keeps the nominal column NAMES, so on `top_tier_adaptive`'s 1m

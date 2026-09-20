@@ -135,9 +135,27 @@ class SmallCapSqueezeScreener(BaseStrategyScreener):
             merged.update(fresh)
         self._premarket_locked = locked
         max_n = int(self.config.tradingview.max_candidates)
-        ranked = sorted(
-            merged.values(),
-            key=lambda c: float(getattr(c, "activity_score", 0.0) or 0.0),
-            reverse=True,
-        )
-        return ranked[:max_n]
+
+        def _rank_key(candidate: Candidate) -> tuple[float, int]:
+            """Same ordering `_candidate_rows` applies: score first, then the
+            screener's own query order, so ties are broken deterministically
+            rather than by dict insertion order (which puts locked-but-faded
+            names ahead of fresh ones)."""
+            score = float(getattr(candidate, "activity_score", 0.0) or 0.0)
+            raw_order = candidate.metadata.get("candidate_query_order")
+            try:
+                query_order = int(raw_order) if raw_order is not None else 9_999_999
+            except (TypeError, ValueError):
+                query_order = 9_999_999
+            return score, -query_order
+
+        ranked = sorted(merged.values(), key=_rank_key, reverse=True)[:max_n]
+        # Re-rank. `_candidate_rows` numbered these 1..N within their own
+        # screen, so after merging two screens and re-sorting, the ranks are
+        # stale AND duplicated — three candidates can all claim rank 2.
+        # `rank` is the final tiebreak in
+        # entry_gatekeeper._signal_priority_key and is what the dashboard
+        # candidate card and the audit log's `candidate_rank` display.
+        for position, candidate in enumerate(ranked, start=1):
+            candidate.rank = position
+        return ranked

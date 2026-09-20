@@ -17,6 +17,17 @@ LOG = logging.getLogger(__name__)
 
 __all__ = ["TradingViewScreenerClient"]
 
+# A misbehaving strategy callback fires once per candidate per cycle, so warn
+# once per process for each distinct cause instead of flooding the log.
+_WARNED: set[str] = set()
+
+
+def _warn_once(key: str) -> bool:
+    if key in _WARNED:
+        return False
+    _WARNED.add(key)
+    return True
+
 
 class TradingViewScreenerClient:
     _CANONICAL_SCREEN_FIELDS = {
@@ -300,21 +311,78 @@ class TradingViewScreenerClient:
     def _row_metadata(cls, row: pd.Series, session: str | None = None) -> dict[str, Any]:
         return cls._normalize_screen_metadata({str(k): v for k, v in row.to_dict().items()}, session=session)
 
+    @classmethod
+    def _candidate_symbol(cls, raw: Any) -> str:
+        """Bare symbol from a TradingView ticker, or ``""`` when unusable.
+
+        Every screener's rows arrive from an external API, so the ticker is
+        not ours to trust. ``str(row.get("name"))`` turned a missing value
+        into the literal symbol ``"None"`` and a NaN into ``"nan"``, and both
+        reached the watchlist: the engine drops an EMPTY symbol but not a
+        non-empty junk one, so the bot would fetch history and quotes for a
+        ticker that does not exist and show it on the dashboard.
+
+        Deliberately no blacklist of junk-looking tokens — that risks
+        excluding a real ticker. Only genuinely absent values are rejected.
+        """
+        if raw is None:
+            return ""
+        try:
+            if pd.isna(raw):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return cls._symbol_from_ticker(str(raw)).strip().upper()
+
     def _candidate_rows(self, df: pd.DataFrame, strategy: str, directional_bias_fn=None, activity_score_fn=None) -> list[Candidate]:
         out: list[Candidate] = []
+        skipped = 0
         for ordinal, (_, row) in enumerate(df.iterrows(), start=1):
-            symbol = self._symbol_from_ticker(str(row.get("name")))
-            directional_bias = directional_bias_fn(row) if directional_bias_fn else None
-            raw_activity_score = activity_score_fn(row) if activity_score_fn else ordinal
+            symbol = self._candidate_symbol(row.get("name"))
+            if not symbol:
+                skipped += 1
+                continue
+            # The scoring/bias callbacks belong to the strategy plugin, so a
+            # raising one must not take down the whole screener run. The
+            # fallback below already existed but the try wrapped only the
+            # float conversion, leaving the CALL itself unguarded; the bias
+            # callback had no guard at all.
             try:
-                activity_score = float(raw_activity_score)
+                directional_bias = directional_bias_fn(row) if directional_bias_fn else None
             except Exception:
-                activity_score = float(ordinal)
+                if _warn_once(f"bias_fn:{strategy}"):
+                    LOG.warning(
+                        "directional_bias_fn raised for strategy %s; treating the "
+                        "candidate as unbiased. Further occurrences are not logged.",
+                        strategy, exc_info=True,
+                    )
+                directional_bias = None
+            # Unscored candidates all get 0.0 so the `-candidate_query_order`
+            # tiebreak below restores the order the screener's own `order_by`
+            # asked for. Scoring them by `ordinal` instead REVERSED it: the
+            # sort is descending, so the last row of a "best first" query came
+            # out on top. Reachable two ways — a plugin that omits
+            # activity_score_fn, and the fallback when one raises.
+            try:
+                activity_score = float(activity_score_fn(row)) if activity_score_fn else 0.0
+            except Exception:
+                if _warn_once(f"activity_fn:{strategy}"):
+                    LOG.warning(
+                        "activity_score_fn raised for strategy %s; falling back to "
+                        "the screener's query order. Further occurrences are not logged.",
+                        strategy, exc_info=True,
+                    )
+                activity_score = 0.0
             if not math.isfinite(activity_score):
                 activity_score = 0.0
             metadata = self._row_metadata(row, session=self._current_run_session())
             metadata.setdefault("candidate_query_order", int(ordinal))
             out.append(Candidate(symbol=symbol, strategy=strategy, rank=ordinal, activity_score=activity_score, directional_bias=directional_bias, metadata=metadata))
+        if skipped:
+            LOG.warning(
+                "Dropped %d screener row(s) for strategy %s with no usable ticker "
+                "in the 'name' column.", skipped, strategy,
+            )
         def _tiebreak_key(c: Candidate) -> tuple[float, int]:
             qo_raw = c.metadata.get("candidate_query_order")
             if qo_raw is None:

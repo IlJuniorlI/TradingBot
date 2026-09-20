@@ -32,7 +32,13 @@ class TopTierAdaptiveScreener(BaseStrategyScreener):
     strategy_name = "top_tier_adaptive"
 
     def run(self) -> list[Candidate]:
-        params = self.config.active_strategy.params
+        # Keyed by THIS screener's name, not by whichever strategy happens to
+        # be active. Identical today — the only caller is
+        # `engine._run_cycle`, which asks for `config.strategy` — but every
+        # other shipped screener reads `strategies[self.strategy_name]`, and
+        # the failure mode here is silent: params from another strategy carry
+        # no `tradable`, so the universe comes back empty with no error.
+        params = self.config.strategies[self.strategy_name].params
         tradable = [str(s).upper().strip() for s in (params.get("tradable") or []) if str(s).strip()]
         if not tradable:
             return []
