@@ -87,6 +87,8 @@ def _trade_csv_row(trade: TradeRecord, session_date: str) -> dict[str, Any]:
         "realized_entry_risk": _round_opt(trade.realized_entry_risk, 4),
         "entry_risk_budget": _round_opt(trade.entry_risk_budget, 4),
         "entry_risk_overage_frac": _round_opt(trade.entry_risk_overage_frac, 6),
+        "armed_retest_status": trade.armed_retest_status,
+        "armed_retest_waited_minutes": _round_opt(trade.armed_retest_waited_minutes, 2),
     }
 
 
@@ -136,6 +138,31 @@ def _group_by(trades: Iterable[TradeRecord], key_fn) -> dict[str, list[TradeReco
 
 def _per_regime(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
     return {regime: _summarize_group(group) for regime, group in _group_by(trades, lambda t: t.regime or "unknown").items()}
+
+
+def _per_entry_path(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
+    """Outcomes split by HOW the entry was reached, for the arming regimes.
+
+    ``retest`` — the entry fired on the retest the regime waited for.
+    ``market_fallback`` — the wait expired and it entered at market, which is
+    the pre-2026-09-20 behaviour and therefore the control.
+    ``immediate`` — a regime that does not arm.
+
+    This is the A/B. Without it the week produces a single blended number and
+    the change cannot be judged: a good week could be the fallback entries
+    carrying poor retest entries, or the reverse, and both read identically in
+    the headline PnL.
+    """
+    def _bucket(trade: TradeRecord) -> str:
+        status = (trade.armed_retest_status or "").strip()
+        if status == "retest_confirmed":
+            return "retest"
+        if status == "expired_market_entry":
+            return "market_fallback"
+        return "immediate"
+
+    return {key: _summarize_group(group)
+            for key, group in sorted(_group_by(trades, _bucket).items())}
 
 
 def _per_symbol(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
@@ -383,6 +410,7 @@ def _entry_timing(
         "reached_half_stop_pct": None,
         "reached_stop_pct": None,
         "by_regime": {},
+        "by_entry_path": {},
     }
     if not trades or bars_for is None:
         return summary
@@ -412,6 +440,13 @@ def _entry_timing(
     baseline: list[float] = []
     per_regime: dict[str, list[float]] = defaultdict(list)
     per_regime_baseline: dict[str, list[float]] = defaultdict(list)
+    # Split by HOW the entry was reached. This is the mechanism test for the
+    # armed retest: a retest entry should show a SHALLOWER post-fill retrace
+    # than a market fallback on the same regime, because the retrace already
+    # happened before the fill. If the two are equal the feature is not doing
+    # what it was built to do, whatever the PnL says.
+    per_path: dict[str, list[float]] = defaultdict(list)
+    per_path_baseline: dict[str, list[float]] = defaultdict(list)
 
     for trade in trades:
         risk_per_unit = trade.initial_risk_per_unit
@@ -437,8 +472,12 @@ def _entry_timing(
         if actual is None:
             continue
         regime = (trade.regime or "none").strip() or "none"
+        status = (trade.armed_retest_status or "").strip()
+        path = {"retest_confirmed": "retest",
+                "expired_market_entry": "market_fallback"}.get(status, "immediate")
         observed.append(actual)
         per_regime[regime].append(actual)
+        per_path[path].append(actual)
 
         # Baseline: the same measurement from arbitrary moments in this
         # symbol's session, anchored on each sampled bar's own close and
@@ -466,6 +505,7 @@ def _entry_timing(
                 if sampled is not None:
                     baseline.append(sampled)
                     per_regime_baseline[regime].append(sampled)
+                    per_path_baseline[path].append(sampled)
 
     if not observed:
         return summary
@@ -506,6 +546,24 @@ def _entry_timing(
             "reached_stop_pct": round(
                 100.0 * sum(1 for v in values if v >= 1.0) / len(values), 1),
         }
+    by_path: dict[str, Any] = {}
+    for path, values in per_path.items():
+        path_baseline = per_path_baseline.get(path, [])
+        path_median = _median(values)
+        base_median = _median(path_baseline) if path_baseline else None
+        by_path[path] = {
+            "trades": len(values),
+            "low_sample": len(values) < int(min_regime_samples),
+            "median_retrace_r": round(path_median, 3),
+            "median_baseline_retrace_r": (
+                round(base_median, 3) if base_median is not None else None),
+            "edge_over_baseline_r": (
+                round(path_median - base_median, 3)
+                if base_median is not None else None),
+            "reached_stop_pct": round(
+                100.0 * sum(1 for v in values if v >= 1.0) / len(values), 1),
+        }
+    summary["by_entry_path"] = dict(sorted(by_path.items()))
     summary["min_regime_samples"] = int(min_regime_samples)
     summary["by_regime"] = dict(
         sorted(by_regime.items(),
@@ -653,6 +711,12 @@ def _log_entry_timing(summary: dict[str, Any]) -> None:
     )
     baseline = summary.get("median_baseline_retrace_r")
     edge = summary.get("edge_over_baseline_r")
+
+    # These fields are already percentages; `_fmt_pct_opt` formats a FRACTION
+    # as a percent, so routing them through it multiplies by 100 twice.
+    def _pct(value: float | None) -> str:
+        return f"{value:.1f}%" if value is not None else "n/a"
+
     LOG.info(
         "  all trades: n=%d median=%.2fR baseline=%s edge=%s "
         "| reached 1/4 stop %s, 1/2 stop %s, full stop %s",
@@ -660,17 +724,26 @@ def _log_entry_timing(summary: dict[str, Any]) -> None:
         summary.get("median_retrace_r") or 0.0,
         f"{baseline:.2f}R" if baseline is not None else "n/a",
         f"{edge:+.2f}R" if edge is not None else "n/a",
-        _fmt_pct_opt(summary.get("reached_quarter_stop_pct")),
-        _fmt_pct_opt(summary.get("reached_half_stop_pct")),
-        _fmt_pct_opt(summary.get("reached_stop_pct")),
+        _pct(summary.get("reached_quarter_stop_pct")),
+        _pct(summary.get("reached_half_stop_pct")),
+        _pct(summary.get("reached_stop_pct")),
     )
+    for path, row in (summary.get("by_entry_path") or {}).items():
+        path_edge = row.get("edge_over_baseline_r")
+        LOG.info(
+            "    path=%-16s n=%-3d median=%.2fR edge=%s stopped_out=%s%s",
+            path, row.get("trades", 0), row.get("median_retrace_r") or 0.0,
+            f"{path_edge:+.2f}R" if path_edge is not None else "n/a",
+            _pct(row.get("reached_stop_pct")),
+            "  (low sample)" if row.get("low_sample") else "",
+        )
     for regime, row in (summary.get("by_regime") or {}).items():
         regime_edge = row.get("edge_over_baseline_r")
         LOG.info(
             "    %-14s n=%-3d median=%.2fR edge=%s stopped_out=%s%s",
             regime, row.get("trades", 0), row.get("median_retrace_r") or 0.0,
             f"{regime_edge:+.2f}R" if regime_edge is not None else "n/a",
-            _fmt_pct_opt(row.get("reached_stop_pct")),
+            _pct(row.get("reached_stop_pct")),
             "  (low sample)" if row.get("low_sample") else "",
         )
 
@@ -765,6 +838,7 @@ def write_session_report(
 
         # --- Aggregates ---
         per_regime = _per_regime(closed)
+        per_entry_path = _per_entry_path(closed)
         per_symbol = _per_symbol(closed)
         per_exit_reason = _per_exit_reason(closed)
         per_hour = _per_hour(closed)
@@ -778,6 +852,7 @@ def write_session_report(
         # --- Human-readable aggregate tables ---
         if closed:
             _log_group_table("Per regime", per_regime, key_label="regime")
+            _log_group_table("Per entry path", per_entry_path, key_label="entry_path")
             _log_group_table("Per symbol", per_symbol, key_label="symbol")
             _log_group_table("Per exit reason", per_exit_reason, key_label="exit_reason")
             _log_group_table("Per hour (entry)", per_hour, key_label="hour_et")
@@ -800,6 +875,7 @@ def write_session_report(
             "average_trade": round(avg_trade, 2) if avg_trade is not None else None,
             "max_drawdown": round(max_dd, 2),
             "per_regime": per_regime,
+            "per_entry_path": per_entry_path,
             "per_symbol": per_symbol,
             "per_exit_reason": per_exit_reason,
             "per_hour": per_hour,

@@ -455,6 +455,13 @@ class EntryGatekeeper:
         }
         include_prefixes = (
             'fvg_', 'htf_fvg_', 'adaptive_', 'anti_chase_fvg_retest_',
+            # Armed-retest provenance (2026-09-20): whether this entry came
+            # from the retest the regime waited for or from the market
+            # fallback after the wait expired, the level it armed on, and how
+            # long it waited. Without this prefix the keys are stamped on the
+            # Signal and then dropped here, and the A/B the feature exists to
+            # settle cannot be measured after the fact.
+            'armed_retest_',
             'msltf_', 'mshtf_', 'sr_', 'tech_', 'matched_', 'chart_pattern_',
             'decision_', 'gate_', 'peak_giveback_', 'orb_',
         )

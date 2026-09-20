@@ -82,6 +82,42 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nothing resolves off a code default. Coverage: `tests/test_armed_retest.py`
   (42).
 
+- **The armed retest is now answerable after the fact.** *2026-09-20* — an
+  audit before the first live week found the change shipping blind. Its one
+  question is "did the retest path fire, or did everything fall back to a
+  market entry", and nothing could answer it: `armed_retest_status` was stamped
+  on the Signal, but `EntryGatekeeper.structured_metadata_snapshot` filters
+  metadata through an allow-list and `armed_retest_` was not a permitted
+  prefix, so all three keys were dropped before `events.jsonl`. `TradeRecord`
+  had no field for it either, so `trades.csv` had no column and no aggregate
+  could group by it. A week would have produced one blended PnL number that
+  reads identically whether good fallback entries carried poor retest entries
+  or the reverse.
+
+  Four additions, all observability — no decision logic touched:
+  * `armed_retest_` added to the ENTRY_CONTEXT prefix allow-list.
+  * `TradeRecord.armed_retest_status` / `.armed_retest_waited_minutes`,
+    populated from position metadata at exit. `TRADE_CSV_COLUMNS` derives from
+    the dataclass, so both reach `trades.csv` (and the archive copy)
+    automatically; the existing schema-drift guard rotates the old file rather
+    than writing a malformed one.
+  * `per_entry_path` in the report and the EOD log — the same columns as
+    `per_regime`, bucketed `retest` / `market_fallback` / `immediate`. The
+    fallback IS the pre-change behaviour, so it is the control group and gets
+    its own bucket rather than being folded in with non-arming regimes.
+  * `entry_timing.by_entry_path`, each path carrying its own baseline. This is
+    the mechanism test rather than the outcome one: a retest entry should
+    retrace less after the fill than a market fallback, because the retrace
+    already happened. Equal numbers mean the feature is not working whatever
+    the PnL says.
+
+  Found while writing the smoke test, not by the unit tests: the entry-timing
+  log line printed `6670.0%`. `_fmt_pct_opt` formats a FRACTION as a percent
+  and these fields are already percentages, so they were multiplied by 100
+  twice. Every unit test passed because none asserted on the rendered string,
+  which is the only thing an operator reads. There are now two tests over the
+  rendered line, one of which simply asserts no percentage in it exceeds 100.
+
 - **The session report measures whether entries are chasing.** *2026-09-20* —
   a new `entry_timing` block in the `SESSION_REPORT` payload and the EOD log:
   for every trade, the deepest retrace in the 15 minutes AFTER the fill,

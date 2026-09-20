@@ -68,6 +68,14 @@ class TradeRecord:
     realized_entry_risk: float | None = None
     entry_risk_budget: float | None = None
     entry_risk_overage_frac: float | None = None
+    # Armed retest (2026-09-20). ``retest_confirmed`` means the entry came
+    # from the retest the regime waited for; ``expired_market_entry`` means
+    # the wait ran out and it entered at market, which is the pre-change
+    # behaviour. None for every regime that does not arm. This is the column
+    # the A/B is read from -- without it a retest entry and a fallback entry
+    # are indistinguishable in trades.csv.
+    armed_retest_status: str | None = None
+    armed_retest_waited_minutes: float | None = None
 
 
 @dataclass(slots=True)
@@ -206,6 +214,10 @@ class PaperAccount:
                 fill_price_estimated=bool(fill_price_estimated),
                 broker_recovered=bool(broker_recovered),
                 regime=(str(metadata.get("regime")) if metadata.get("regime") else None),
+                armed_retest_status=(
+                    str(metadata.get("armed_retest_status"))
+                    if metadata.get("armed_retest_status") else None),
+                armed_retest_waited_minutes=_opt_float("armed_retest_waited_minutes"),
                 initial_risk_per_unit=initial_risk,
                 max_favorable_pnl=_opt_float("best_unrealized_pnl", "diag_best_unrealized_pnl"),
                 max_adverse_pnl=_opt_float("worst_unrealized_pnl", "diag_worst_unrealized_pnl"),
