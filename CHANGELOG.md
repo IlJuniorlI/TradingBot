@@ -33,6 +33,141 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   EXISTING `family=` log field and CSV column — no log-format, parser or schema
   change.
 
+- **`trend` and `momentum` now arm on qualification and enter on the retest.**
+  *2026-09-20* — both trigger on `close > max(high of the previous N bars)` (25
+  LTF bars, 6 base-1m bars), so the fill sits at the highest price in 25 or 6
+  minutes BY CONSTRUCTION, the stop lands inside the retrace that normally
+  follows, and `same_level_block_minutes` then bars re-entry at the level where
+  the next leg starts.
+
+  The new `entry_timing` block measured it: a trend fill was followed by a
+  retrace covering 85% of the way to its stop, against 13% from an arbitrary
+  moment in the same tape (+0.715R over baseline, 9 trades). `pullback` was
+  +0.249R and `vol_squeeze` +0.008R.
+
+  Qualifying now records the level that was cleared and waits for price to come
+  back to it (`_armed_retest_verdict`, `ARMED_RETEST_REGIMES`). The retest
+  fires the entry; if none comes inside `armed_retest_max_minutes` (12) it
+  enters at market, which is the previous behaviour. **That fallback is
+  deliberate** — a strong trend day never offers the retest, and forfeiting
+  those setups would deepen the "some days it doesn't trade at all" problem
+  rather than fix the entry. `armed_retest_enabled: false` is the A/B.
+
+  Only `trend` and `momentum` arm, decided on the same measurement: `pullback`
+  already requires a 25-50% leg retracement before it fires, `range` and
+  `vwap_reclaim` enter against the move by design, and `vol_squeeze` showed no
+  retrace above baseline at all.
+
+  A `wait` short-circuits BEFORE the build method, and leaves the rest of the
+  build queue alone — arming `trend` does not stop `pullback` firing on the
+  same symbol in the same cycle.
+
+  **Stop rules are unchanged on a retest entry.** The gain is a fill at a level
+  price has already tested and held rather than at a fresh extreme; deriving
+  the stop from the retest low would mean bypassing `default_stop_pct` /
+  `min_stop_atr_mult`, which are risk floors and a separate decision. The
+  retest low is stamped in metadata so that can be settled from data.
+
+  Two things found while building it. `_breakout_reference` was extracted so
+  the builder's fresh-breakout check and the armed level come from ONE
+  computation — two copies would drift the moment either lookback was retuned
+  and the bot would arm on one level and enter against another; the extraction
+  is behaviour-neutral and the suite confirms it. And invalidation was
+  initially measured against the CURRENT N-bar reference, which walks up as new
+  highs print: that moved the invalidation line away from price on the setups
+  still working and dragged it behind a rolling-over one. Now anchored to the
+  armed level. Caught by the tests, not by review.
+
+  All five knobs are declared in both the shipped preset and the manifest, so
+  nothing resolves off a code default. Coverage: `tests/test_armed_retest.py`
+  (42).
+
+- **The session report measures whether entries are chasing.** *2026-09-20* —
+  a new `entry_timing` block in the `SESSION_REPORT` payload and the EOD log:
+  for every trade, the deepest retrace in the 15 minutes AFTER the fill,
+  expressed as a fraction of that trade's own entry-to-stop distance, split by
+  regime.
+
+  That denominator is what makes it readable without a second unit — 0.4 means
+  the retrace covered 40% of the way to the stop, so a patient entry down there
+  would have been 0.4R better with the same stop, and 1.0 means price reached
+  the stop, which is what being stopped out IS.
+
+  The point is the regime split. `trend`, `momentum` and `vol_squeeze` can only
+  fill at an N-bar extreme (`close > max(high of the previous N bars)`, 25 bars
+  and 6 bars respectively), while `pullback` refuses to fire until price has
+  given back 25-50% of the leg (`pullback_require_real_dip`). If the bot is
+  entering ahead of the natural pullback rather than on it, those two groups
+  separate.
+
+  **The baseline is the whole measurement.** Price dips below any given price
+  most of the time, so a raw count of "a better entry existed" measures nothing
+  — the mistake the first version of `_gate_attribution` made, which ranked a
+  gate with no edge as the costliest one. Each trade is therefore scored
+  against arbitrary moments in the SAME symbol's session carrying THAT TRADE'S
+  risk distance, which controls for the symbol's volatility and the trade's own
+  stop width at once.
+
+  On the archived sessions (old code and the pre-retarget universe, so not a
+  verdict on the current bot) the baseline is 0.352R against an observed
+  0.666R, and the regimes separate as predicted: `trend` +0.715R over baseline
+  across 9 trades, `pullback` +0.249R across 8, and `vol_squeeze` +0.008R
+  across 11 — no edge at all, consistent with its 0.25R median MAE, the lowest
+  of any regime.
+
+  Same honesty guards as `gate_attribution`: labelled NOT a backtest in the
+  payload, the docstring and the README, because it says a better price existed
+  and not that the fill was reachable. A trade with a non-finite or
+  non-positive `initial_risk_per_unit`, a bad entry price, a missing frame or a
+  raising bar lookup counts as unevaluated rather than as zero retrace —
+  scoring it zero would read as evidence AGAINST chasing, which is the claim on
+  trial. A regime under `min_regime_samples` (5) is kept but marked
+  `low_sample` and sorted last; without it a regime with a single archived fill
+  topped the table at +7.4R.
+
+  No engine change: `bars_for` was already wired for `post_stop_continuation`.
+  Coverage: `tests/test_entry_timing.py` (32).
+
+- **The session archive measures what each gate cost.** *2026-09-20* — a new
+  `gate_attribution` block in `manifest.json`: for every SKIPPED decision, the
+  net forward price move over 30 minutes toward the side the bot was about to
+  take, in ATR, bucketed by skip reason and split by the regime that produced
+  it.
+
+  Skip reasons were only ever counts. `no_fresh_breakout` fired 22,231 times
+  across 13 sessions — 20.2% of all RTH decisions — and a count says how much
+  work a gate did, never whether the work was worth doing. Every gate was added
+  in response to a specific loss and none had been measured since.
+
+  Two things make it readable, both learned by running it on real archives
+  rather than by design:
+
+  The metric is the NET close-to-close move, not the excursion. The first
+  version scored "did price move 1 ATR our way" and ranked the
+  highest-volume gate as costliest — but 77% of RANDOM 30-minute windows on
+  this universe touch 1 ATR up, because a 1m ATR-14 measures fourteen minutes
+  of range and the window is thirty. That gate turned out to have no
+  directional edge at all. Net movement has a real baseline; excursion does
+  not.
+
+  And the baseline is sampled from the SAME session's bars. A trending day
+  lifts every LONG-side number, so only the gap above an arbitrary moment in
+  the same session counts as evidence.
+
+  Labelled `NOT a backtest` in the payload, the docstring and the README: price
+  movement only, no stop, target, sizing or slippage. Gates below
+  `min_samples` (20) stay in `by_reason` but are kept out of the ranking — a
+  reason seen once has a "median" of that single observation, and on real data
+  those produce the largest numbers in the table purely because nothing
+  averages out.
+
+  `_regime_call_outcomes` already asked a version of this question of the same
+  files, so its bar loader and forward-excursion maths were extracted into
+  shared helpers rather than copied — one place for the tz-aware/naive
+  timestamp normalisation to live.
+
+  Coverage: `tests/test_gate_attribution.py`, 22 tests.
+
 - **The EOD session report measures post-stop continuation.** *2026-09-19* —
   a new `post_stop_continuation` aggregate (structured payload + log table)
   answering the one question every other aggregate misses: when a trade was
@@ -115,6 +250,52 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **README drift: both READMEs said "six regimes".** *2026-09-20* — there have
+  been eight since `vwap_reclaim` and `orb` were added; the strategy README's
+  regime-defaults table was also missing `disable_vwap_reclaim_regime` and
+  `disable_orb_regime`. Corrected, and the table now carries the armed-retest
+  knobs too.
+
+- **`vol_squeeze` re-enabled in the `top_tier_adaptive` preset.** *2026-09-20* —
+  the 2026-09-18 regime trim turned it off on the grounds that it "had the
+  highest score ceiling (6.5) so it won more auctions than its edge justified".
+  That was true of RAW score sorting, and `_normalized_regime_score` +
+  `REGIME_SCORE_CEILINGS` shipped in the SAME change — the two are consecutive
+  bullets in this file's 2026-09-18 Added section. Ranking is now
+  `(score - floor) / (ceiling - floor)`, under which a 6.5 ceiling over a 4.0
+  floor is the WIDEST headroom of any enabled regime (trend/momentum 2.0,
+  pullback/range/vwap_reclaim 1.5), so the property cited as the reason to
+  disable it now holds it back rather than flattering it: a vol_squeeze at 5.5
+  ranks level with a pullback at 4.4.
+
+  The second reason is a hand-off that had nowhere to go. `bollinger_squeeze`
+  is read in exactly two places in the strategy — this regime's scorer
+  (`_score_vol_squeeze`) and `range`'s `reject_range_during_squeeze` rejection
+  — and they partition the same condition: `range` declines squeeze setups
+  *because* vol_squeeze is meant to take them. With vol_squeeze off, `range`
+  kept declining and nothing picked them up. The new `gate_attribution` block
+  puts a number on it: on the 2026-09-18 archive
+  `long_build_failed_range_bollinger_squeeze` blocked 149 decisions at +0.853
+  ATR above the same-session baseline.
+
+  No code change and no conflict with the other regimes: the build queue is
+  flat and cross-side (a regime cannot block another, within or across sides),
+  and `vol_squeeze` is not referenced in `strategy_base.py`, `engine.py` or
+  `risk.py` at all. Three interactions are real but pre-existing and shared by
+  every regime — one more competitor for `risk.max_positions` (4) slots, one
+  more producer of `same_level_block_minutes` re-entry lockouts (which are
+  symbol + side + level scoped, regime-agnostic), and no runner treatment on
+  exit (that path is trend/pullback only). The regime is exempt from
+  `reject_oversized_entry_bar`, as it has been since 2026-05-14, because a big
+  bar IS the setup.
+
+  This is a measurement, not a verdict. The trim's small/mid-cap objection
+  still stands and is untested on this universe: with the flag off the regime
+  is never scored and is omitted from the `no_qualifying_regime` skip line, so
+  there is no record of how often it would have qualified on mega caps. All 12
+  `vol_squeeze_*` knobs are already declared explicitly in the preset, so
+  nothing resolves off a code default.
+
 - **`enable_vwap_reclaim_regime` -> `disable_vwap_reclaim_regime`.**
   *2026-09-20* — all eight regime knobs now read the same way. The flag shipped
   2026-05-30 as an opt-IN (default off) so that adding the regime to the shared
@@ -144,6 +325,55 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the sense of it backwards.
 
 ### Fixed
+
+- **A confirmed armed retest could never build a signal.** *2026-09-20* —
+  found in the final bug pass on the same day the feature shipped, before any
+  dry-run. `_build_trend_signal` / `_build_momentum_signal` reject unless
+  `close > max(high of the previous N bars)`. On the retest cycle that window
+  STILL CONTAINS THE BREAKOUT BAR, whose high is above the reclaim close —
+  which is what a retest *is*. So every confirmed retest died on
+  `no_fresh_breakout`, and the feature could only ever produce expiry/market
+  fills: precisely the chasing behaviour it was built to remove.
+
+  Both builders now take `breakout_confirmed`, set only when
+  `_armed_retest_verdict` returns `enter`. The arm already recorded the
+  breakout and the verdict only confirms with close back above that level, so
+  the gate is satisfied by construction rather than skipped — an EXPIRED arm
+  passes `False` and must still clear it on its own, or a faded setup would
+  enter where the bot would never have traded before.
+
+  The end-to-end tests missed it because they stubbed the builder to isolate
+  the wiring. `tests/test_armed_retest.py::TestTheRetestCanActuallyBuild` now
+  drives the real builder on a real retest tape, and pins the rejection with
+  the flag off so the fix cannot silently regress.
+
+- **The armed retest would have switched itself on for `small_cap_squeeze`.**
+  *2026-09-20* — `SmallCapSqueezeStrategy` subclasses `TopTierAdaptiveStrategy`
+  and runs `trend` and `momentum` as its only two entry regimes, so a code
+  default of `True` would have converted both of its entry paths to
+  arm-and-wait with nobody choosing that — the same trap the vwap_reclaim knob
+  shipped opt-IN to avoid on 2026-05-30, and its 2026-06-02 dry-run is the
+  baseline for the next one. Now declared `false` in both its preset and its
+  manifest, with a test that pins the premise (that it still runs the two
+  arming regimes) alongside the opt-out, so the guard fails loudly rather than
+  passing vacuously if that changes.
+
+- **Eight params resolved off a code default.** *2026-09-20* — `zone_pct`,
+  `zone_atr_mult`, `range_max_intraday_range_pct`,
+  `range_require_prev_bar_confirmation`, `trailing_bias_enabled`,
+  `trailing_bias_lookback`, `trailing_bias_majority_threshold` and
+  `extended_hours_tradable_all` were read by the strategy and declared in
+  neither the shipped preset nor the manifest. Live gates whose state could
+  only be discovered by grepping the strategy, and editing any of those
+  defaults would have silently retuned every preset at once — how
+  `disable_orb_regime` came to say ORB-on as the config-less baseline while
+  every preset turned it off. All declared at the value they were already
+  resolving to, so behaviour is unchanged and the defaults are now inert.
+
+  `tests/test_param_declaration_drift.py` pins the property rather than the
+  list: every `self.params.get(...)` name must appear in the preset or the
+  manifest, with a guard test that fails if the scan itself stops matching.
+
 
 - **The session manifest's realized PnL described the account, not the
   session.** *2026-09-19* — `manifest.realized_pnl` read

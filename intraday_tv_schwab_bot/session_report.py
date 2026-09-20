@@ -11,6 +11,8 @@ aggregates closed trades along five axes to support strategy/config tuning:
   * MAE / MFE         — max adverse / favorable excursion in R-multiples
   * post-stop run     — how far price ran the trade's way AFTER the stop,
                         i.e. how much of a correctly-called move a shakeout cost
+  * gate attribution  — what price did after each SKIP, by reason (manifest
+                        only): whether a gate blocks moves or blocks losses
   * filter rejections — tally of skip reasons the engine logged during the session
 
 All aggregate sections are emitted both in the human log (fixed-width tables)
@@ -28,7 +30,7 @@ import json
 import logging
 import math
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
@@ -319,6 +321,191 @@ def _post_stop_continuation(
     return summary
 
 
+def _entry_timing(
+    trades: list[TradeRecord],
+    bars_for: Any | None,
+    *,
+    window_minutes: int = 15,
+    baseline_stride: int = 7,
+    min_regime_samples: int = 5,
+) -> dict[str, Any]:
+    """Whether waiting for a pullback would have bought a better entry.
+
+    For each trade, the best price available in the trade's favour within
+    ``window_minutes`` AFTER the fill — the lowest low for a LONG, the highest
+    high for a SHORT — expressed as a fraction of that trade's own
+    entry-to-stop distance (``initial_risk_per_unit``). That denominator is
+    what makes the number readable without a second unit: 0.4 means the
+    retrace covered 40% of the way to the stop, so a patient entry down there
+    would have been 0.4R better with the same stop. 1.0 or more means price
+    reached the stop, which is what being stopped out IS.
+
+    The point is the regime split. trend / momentum / vol_squeeze can only
+    fill at an N-bar extreme by construction, so if the bot is chasing they
+    should show a systematically deeper retrace than pullback, which requires
+    a 25-50% leg retracement before it fires at all.
+
+    THE BASELINE IS THE WHOLE MEASUREMENT. Price dips below any given price
+    most of the time, so a raw "a better entry existed" count is noise — the
+    first version of ``_gate_attribution`` made exactly this mistake and
+    ranked a gate with no edge as the costliest one. So each trade is scored
+    against arbitrary moments in the SAME symbol's session, using THAT TRADE'S
+    risk distance as the denominator, which controls for the symbol's
+    volatility and the trade's own stop width at once. Only the gap between
+    the two is evidence.
+
+    NOT a backtest. It says a better price existed, not that the bot could
+    have got it: no fill model, and no claim the setup would still have been
+    valid down there. Read it as "how far into the stop the ordinary retrace
+    reached", not as recoverable profit.
+
+    A regime with fewer than ``min_regime_samples`` trades is kept in
+    ``by_regime`` but marked ``low_sample`` and sorted last. A single trade has
+    a "median" of that one trade, and on the archives that put a regime with
+    one fill at the top of the table with +7.4R -- the same small-sample trap
+    that made the first ranking in ``_gate_attribution`` unreadable.
+
+    ``bars_for`` is a ``symbol -> DataFrame`` callable. Passing None disables
+    the section, which is what the pure-aggregate tests do.
+    """
+    summary: dict[str, Any] = {
+        "window_minutes": int(window_minutes),
+        "measures": ("retrace after entry as a fraction of the entry-to-stop "
+                     "distance, against a same-session baseline - NOT a "
+                     "backtest: no fill model, no re-validation of the setup"),
+        "trades": len(trades),
+        "evaluated": 0,
+        "not_evaluated": len(trades),
+        "median_retrace_r": None,
+        "median_baseline_retrace_r": None,
+        "edge_over_baseline_r": None,
+        "reached_quarter_stop_pct": None,
+        "reached_half_stop_pct": None,
+        "reached_stop_pct": None,
+        "by_regime": {},
+    }
+    if not trades or bars_for is None:
+        return summary
+
+    def _median(values: list[float]) -> float:
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[mid]
+        return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+    def _retrace_r(frame, at, is_long: bool, entry: float, risk: float) -> float | None:
+        """Deepest move AGAINST *entry* in the window after *at*, in R."""
+        try:
+            window = frame[(frame.index > at) & (frame.index <= at + timedelta(minutes=int(window_minutes)))]
+            if window.empty:
+                return None
+            worst = float(window["low"].min()) if is_long else float(window["high"].max())
+        except Exception:
+            return None
+        adverse = (entry - worst) if is_long else (worst - entry)
+        if not math.isfinite(adverse):
+            return None
+        return max(0.0, adverse / risk)
+
+    observed: list[float] = []
+    baseline: list[float] = []
+    per_regime: dict[str, list[float]] = defaultdict(list)
+    per_regime_baseline: dict[str, list[float]] = defaultdict(list)
+
+    for trade in trades:
+        risk_per_unit = trade.initial_risk_per_unit
+        # Same finiteness rule as _post_stop_continuation: NaN survives `<= 0`
+        # because every comparison against NaN is False, and an unevaluable
+        # trade must not be scored as "no retrace" — that would read as
+        # evidence AGAINST chasing, which is the conclusion being tested.
+        if risk_per_unit is None or not math.isfinite(float(risk_per_unit)) or risk_per_unit <= 0:
+            continue
+        entry_price = trade.entry_price
+        if entry_price is None or not math.isfinite(float(entry_price)) or entry_price <= 0:
+            continue
+        try:
+            frame = bars_for(trade.symbol)
+        except Exception:
+            LOG.debug("entry-timing lookup failed for %s", trade.symbol, exc_info=True)
+            continue
+        if frame is None or getattr(frame, "empty", True):
+            continue
+        is_long = str(trade.side).upper().endswith("LONG")
+        risk = float(risk_per_unit)
+        actual = _retrace_r(frame, trade.entry_time, is_long, float(entry_price), risk)
+        if actual is None:
+            continue
+        regime = (trade.regime or "none").strip() or "none"
+        observed.append(actual)
+        per_regime[regime].append(actual)
+
+        # Baseline: the same measurement from arbitrary moments in this
+        # symbol's session, anchored on each sampled bar's own close and
+        # carrying THIS trade's risk distance.
+        try:
+            rows = frame.iloc[::max(1, int(baseline_stride))]
+        except Exception:
+            rows = None
+        if rows is not None:
+            for at, row in rows.iterrows():
+                anchor_price = float(row.get("close", float("nan")))
+                if not math.isfinite(anchor_price) or anchor_price <= 0:
+                    continue
+                sampled = _retrace_r(frame, at, is_long, anchor_price, risk)
+                if sampled is not None:
+                    baseline.append(sampled)
+                    per_regime_baseline[regime].append(sampled)
+
+    if not observed:
+        return summary
+
+    median_observed = _median(observed)
+    median_baseline = _median(baseline) if baseline else None
+    summary.update({
+        "evaluated": len(observed),
+        "not_evaluated": len(trades) - len(observed),
+        "median_retrace_r": round(median_observed, 3),
+        "median_baseline_retrace_r": (
+            round(median_baseline, 3) if median_baseline is not None else None),
+        "edge_over_baseline_r": (
+            round(median_observed - median_baseline, 3)
+            if median_baseline is not None else None),
+        "baseline_samples": len(baseline),
+        "reached_quarter_stop_pct": round(
+            100.0 * sum(1 for v in observed if v >= 0.25) / len(observed), 1),
+        "reached_half_stop_pct": round(
+            100.0 * sum(1 for v in observed if v >= 0.50) / len(observed), 1),
+        "reached_stop_pct": round(
+            100.0 * sum(1 for v in observed if v >= 1.0) / len(observed), 1),
+    })
+    by_regime: dict[str, Any] = {}
+    for regime, values in per_regime.items():
+        regime_baseline = per_regime_baseline.get(regime, [])
+        regime_median = _median(values)
+        base_median = _median(regime_baseline) if regime_baseline else None
+        by_regime[regime] = {
+            "trades": len(values),
+            "low_sample": len(values) < int(min_regime_samples),
+            "median_retrace_r": round(regime_median, 3),
+            "median_baseline_retrace_r": (
+                round(base_median, 3) if base_median is not None else None),
+            "edge_over_baseline_r": (
+                round(regime_median - base_median, 3)
+                if base_median is not None else None),
+            "reached_stop_pct": round(
+                100.0 * sum(1 for v in values if v >= 1.0) / len(values), 1),
+        }
+    summary["min_regime_samples"] = int(min_regime_samples)
+    summary["by_regime"] = dict(
+        sorted(by_regime.items(),
+               key=lambda kv: (kv[1]["low_sample"],
+                               kv[1]["edge_over_baseline_r"] is None,
+                               -(kv[1]["edge_over_baseline_r"] or 0.0)))
+    )
+    return summary
+
+
 def _normalize_skip_reason(reason: str) -> str:
     """Collapse parameterized skip reasons into a stable bucket name.
 
@@ -444,6 +631,40 @@ def _log_post_stop_continuation(summary: dict[str, Any]) -> None:
     )
 
 
+def _log_entry_timing(summary: dict[str, Any]) -> None:
+    """Render the entry-timing block. Reads as 'how far into the stop the
+    ordinary retrace after our fills reached, versus an arbitrary moment'."""
+    if not summary or not summary.get("evaluated"):
+        return
+    LOG.info(
+        "Entry timing (%d min after fill, retrace as a fraction of the stop "
+        "distance; NOT a backtest):",
+        summary.get("window_minutes", 0),
+    )
+    baseline = summary.get("median_baseline_retrace_r")
+    edge = summary.get("edge_over_baseline_r")
+    LOG.info(
+        "  all trades: n=%d median=%.2fR baseline=%s edge=%s "
+        "| reached 1/4 stop %s, 1/2 stop %s, full stop %s",
+        summary.get("evaluated", 0),
+        summary.get("median_retrace_r") or 0.0,
+        f"{baseline:.2f}R" if baseline is not None else "n/a",
+        f"{edge:+.2f}R" if edge is not None else "n/a",
+        _fmt_pct_opt(summary.get("reached_quarter_stop_pct")),
+        _fmt_pct_opt(summary.get("reached_half_stop_pct")),
+        _fmt_pct_opt(summary.get("reached_stop_pct")),
+    )
+    for regime, row in (summary.get("by_regime") or {}).items():
+        regime_edge = row.get("edge_over_baseline_r")
+        LOG.info(
+            "    %-14s n=%-3d median=%.2fR edge=%s stopped_out=%s%s",
+            regime, row.get("trades", 0), row.get("median_retrace_r") or 0.0,
+            f"{regime_edge:+.2f}R" if regime_edge is not None else "n/a",
+            _fmt_pct_opt(row.get("reached_stop_pct")),
+            "  (low sample)" if row.get("low_sample") else "",
+        )
+
+
 def _log_filter_rejections(summary: dict[str, Any]) -> None:
     total = int(summary.get("total_skips", 0))
     if total == 0:
@@ -468,6 +689,7 @@ def write_session_report(
     skip_counts: dict[str, int] | None = None,
     bars_for: Any | None = None,
     post_stop_window_minutes: int = 30,
+    entry_timing_window_minutes: int = 15,
 ) -> None:
     """Write an end-of-session summary to the log, append trades to a
     persistent CSV file in the log directory, and emit a structured
@@ -540,6 +762,8 @@ def write_session_report(
         filter_rejections = _filter_rejection_summary(skip_counts)
         post_stop = _post_stop_continuation(
             closed, bars_for, window_minutes=post_stop_window_minutes)
+        entry_timing = _entry_timing(
+            closed, bars_for, window_minutes=entry_timing_window_minutes)
 
         # --- Human-readable aggregate tables ---
         if closed:
@@ -549,6 +773,7 @@ def write_session_report(
             _log_group_table("Per hour (entry)", per_hour, key_label="hour_et")
             _log_mae_mfe(mae_mfe)
             _log_post_stop_continuation(post_stop)
+            _log_entry_timing(entry_timing)
         _log_filter_rejections(filter_rejections)
 
         # --- Structured JSON log ---
@@ -570,6 +795,7 @@ def write_session_report(
             "per_hour": per_hour,
             "mae_mfe": mae_mfe,
             "post_stop_continuation": post_stop,
+            "entry_timing": entry_timing,
             "filter_rejections": filter_rejections,
         }
         if structured_logger is not None:
@@ -798,6 +1024,314 @@ _AMBIGUOUS_REGIME_RE = re.compile(
 )
 
 
+def _load_archive_bars(bars_dir: Path) -> dict[str, list[dict[str, Any]]]:
+    """Per-symbol 1m timelines from an archive's ``bars/1m/``.
+
+    Only ts/high/low/close/atr14 — the fields every forward-looking
+    classifier here needs. Bar timestamps are tz-aware ISO
+    ("2026-05-21T11:12:00-04:00") while decisions.csv timestamps are naive
+    ("2026-05-21 11:12:00,798"), so these are normalised to naive ET to make
+    the two comparable.
+
+    Shared by ``_regime_call_outcomes`` and ``_gate_attribution``; both ask
+    the same question (what did price do after this decision) of the same
+    files, and a second copy of the parsing would be a second place for the
+    timestamp normalisation to drift.
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    if not bars_dir.is_dir():
+        return out
+    for path in bars_dir.glob("*.csv"):
+        try:
+            rows: list[dict[str, Any]] = []
+            with open(path, newline="", encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    try:
+                        ts = datetime.fromisoformat(row.get("timestamp", "")).replace(tzinfo=None)
+                    except (ValueError, TypeError):
+                        continue
+                    try:
+                        high = float(row.get("high"))
+                        low = float(row.get("low"))
+                        close = float(row.get("close"))
+                    except (TypeError, ValueError):
+                        continue
+                    try:
+                        atr14 = float(row.get("atr14") or 0.0)
+                    except (TypeError, ValueError):
+                        atr14 = 0.0
+                    rows.append({"ts": ts, "high": high, "low": low,
+                                 "close": close, "atr14": atr14})
+            if rows:
+                rows.sort(key=lambda r: r["ts"])
+                out[path.stem] = rows
+        except (OSError, csv.Error):
+            continue
+    return out
+
+
+def _forward_excursion_atr(
+    rows: list[dict[str, Any]], at: datetime, window_minutes: int,
+) -> tuple[float, float, float] | None:
+    """``(up_atr, down_atr, net_atr)`` over ``(at, at + window]``, or None.
+
+    All three measured from the close of the first bar at or after ``at`` and
+    scaled by the ATR as of ``at``, so they are comparable across symbols and
+    price levels. None when there are too few forward bars or no usable ATR —
+    callers must treat that as UNEVALUATED, not as zero movement.
+
+    ``net_atr`` is the close-to-close move and is the one worth reading. The
+    EXCURSIONS are nearly useless on their own at this window: sampled over
+    random 30-minute windows on this bot's universe, the median up-excursion
+    is 2.24 ATR and 77% of windows touch at least 1 ATR up — because a 1m
+    ATR-14 measures fourteen minutes of range and the window is thirty. Any
+    "% that moved 1 ATR our way" therefore sits near chance no matter what
+    produced the window. The net move has a real baseline: +0.07 ATR over the
+    same sample, i.e. zero.
+    """
+    window_end = at + timedelta(minutes=int(window_minutes))
+    after = [r for r in rows if at <= r["ts"] <= window_end]
+    prior = [r for r in rows if r["ts"] <= at]
+    if len(after) < 2 or not prior:
+        return None
+    atr = prior[-1]["atr14"]
+    if not atr or atr <= 0 or not math.isfinite(atr):
+        return None
+    p0 = after[0]["close"]
+    up_atr = (max(r["high"] for r in after) - p0) / atr
+    down_atr = (p0 - min(r["low"] for r in after)) / atr
+    net_atr = (after[-1]["close"] - p0) / atr
+    if not all(math.isfinite(v) for v in (up_atr, down_atr, net_atr)):
+        return None
+    return max(0.0, up_atr), max(0.0, down_atr), net_atr
+
+
+def _forward_baseline(
+    bars_by_sym: dict[str, list[dict[str, Any]]], window_minutes: int, stride: int = 7,
+) -> dict[str, Any]:
+    """The unconditional forward move, sampled from the SAME session's bars.
+
+    Without this every gate statistic is unreadable. A gate whose blocks were
+    followed by a +0.3 ATR net move only matters if an arbitrary moment in the
+    same session was not also followed by +0.3. Sampling from the session being
+    reported also absorbs the day's character: a trending day lifts every
+    LONG-side number, and only the gap above baseline is evidence.
+
+    Measured from a LONG viewpoint, so a SHORT gate's favourable direction is
+    the mirror of ``up_pct``.
+    """
+    nets: list[float] = []
+    for rows in bars_by_sym.values():
+        for i in range(0, max(0, len(rows) - window_minutes - 1), max(1, stride)):
+            excursion = _forward_excursion_atr(rows, rows[i]["ts"], window_minutes)
+            if excursion is not None:
+                nets.append(excursion[2])
+    if not nets:
+        return {"samples": 0, "median_net_atr": None, "up_pct": None}
+    ordered = sorted(nets)
+    mid = len(ordered) // 2
+    median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+    return {
+        "samples": len(nets),
+        "median_net_atr": round(median, 3),
+        "up_pct": round(100.0 * sum(1 for v in nets if v > 0) / len(nets), 1),
+    }
+
+
+def _gate_attribution(
+    archive_root: Path, window_minutes: int = 30, min_samples: int = 20,
+) -> dict[str, Any]:
+    """What did price do AFTER each gate blocked a candidate?
+
+    Every skip reason is currently a count: `no_fresh_breakout` fired 22,231
+    times across 13 sessions, ~20% of all RTH decisions. A count says how much
+    work a gate did, never whether the work was worth doing. Each gate was
+    added in response to a specific loss, and none has been measured since.
+
+    For every skipped decision this takes the forward excursion over
+    ``window_minutes``, in ATR, split into the direction the bot was ABOUT to
+    trade (favourable) and the opposite (adverse), and buckets it by skip
+    reason. A gate whose blocks are consistently followed by a favourable move
+    is costing money; one whose blocks are followed by adverse moves is
+    earning its place.
+
+    WHAT THIS IS NOT: a backtest. It measures PRICE MOVEMENT after the block,
+    with no stop, no target, no sizing and no slippage. `favourable_1atr_pct`
+    of 60 does not mean 60% of those trades would have won — the stop might
+    have been hit first. Read it as "the gate blocked a move", not "the gate
+    blocked a winner".
+
+    Reasons are normalised through ``_normalize_skip_reason``, so the numeric
+    detail that fragments `session_skip_counts` into hundreds of near-
+    duplicates rolls up. Decisions are deduped by (symbol, minute, reason)
+    because one decision is logged repeatedly across a cycle.
+
+    Returns {} on any I/O or parse failure — never crashes the archive write.
+    """
+    try:
+        decisions_path = archive_root / "decisions.csv"
+        bars_by_sym = _load_archive_bars(archive_root / "bars" / "1m")
+        if not decisions_path.exists() or not bars_by_sym:
+            return {}
+
+        net_moves: dict[str, list[float]] = defaultdict(list)
+        favourable: dict[str, list[float]] = defaultdict(list)
+        adverse: dict[str, list[float]] = defaultdict(list)
+        families: dict[str, Counter] = defaultdict(Counter)
+        blocked = Counter()
+        unevaluated = Counter()
+        seen: set[tuple[str, datetime, str]] = set()
+
+        with open(decisions_path, newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                if str(row.get("action", "")).strip().lower() != "skipped":
+                    continue
+                symbol = str(row.get("symbol", "") or "")
+                rows = bars_by_sym.get(symbol)
+                if not rows:
+                    continue
+                primary = str(row.get("primary", "") or "").strip()
+                if not primary or primary == "none":
+                    continue
+                reason = _normalize_skip_reason(primary)
+                ts_raw = str(row.get("timestamp", "")).strip('"').split(",")[0]
+                try:
+                    ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                key = (symbol, ts.replace(second=0), reason)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                # Which way was the bot about to trade? `side_pref` when the
+                # gatekeeper resolved one, else the reason's own side prefix
+                # (`long_build_failed_...`). Without a side there is no
+                # "favourable" direction and the row cannot be scored.
+                side = str(row.get("side_pref", "") or "").strip().upper()
+                if side not in {"LONG", "SHORT"}:
+                    lowered = primary.lower()
+                    if lowered.startswith("long_"):
+                        side = "LONG"
+                    elif lowered.startswith("short_"):
+                        side = "SHORT"
+                    else:
+                        continue
+
+                blocked[reason] += 1
+                family = str(row.get("family", "") or "none").strip() or "none"
+                families[reason][family] += 1
+
+                excursion = _forward_excursion_atr(rows, ts, window_minutes)
+                if excursion is None:
+                    unevaluated[reason] += 1
+                    continue
+                up_atr, down_atr, net_atr = excursion
+                if side == "LONG":
+                    favourable[reason].append(up_atr)
+                    adverse[reason].append(down_atr)
+                    net_moves[reason].append(net_atr)
+                else:
+                    favourable[reason].append(down_atr)
+                    adverse[reason].append(up_atr)
+                    net_moves[reason].append(-net_atr)
+
+        if not blocked:
+            return {}
+
+        def _median(values: list[float]) -> float:
+            ordered = sorted(values)
+            mid = len(ordered) // 2
+            if len(ordered) % 2:
+                return ordered[mid]
+            return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+        by_reason: dict[str, dict[str, Any]] = {}
+        for reason, count in blocked.items():
+            nets = net_moves.get(reason, [])
+            fav = favourable.get(reason, [])
+            adv = adverse.get(reason, [])
+            entry: dict[str, Any] = {
+                "blocked": int(count),
+                "evaluated": len(nets),
+                "unevaluated": int(unevaluated.get(reason, 0)),
+                "regimes": dict(families[reason].most_common(4)),
+                # The headline: net close-to-close move toward the side the bot
+                # wanted. Baseline is ~0, so a positive number is evidence the
+                # gate blocked a move that was going to happen anyway.
+                "median_net_atr": None,
+                "favourable_pct": None,
+                # Secondary, and near chance at this window (77% of random
+                # 30-minute windows touch 1 ATR up). Kept because a wide
+                # favourable excursion against a flat net says "it went our way
+                # and came back", which is a stop-placement story rather than an
+                # entry one.
+                "median_favourable_excursion_atr": None,
+                "median_adverse_excursion_atr": None,
+            }
+            if nets:
+                entry.update({
+                    "median_net_atr": round(_median(nets), 3),
+                    "favourable_pct": round(
+                        100.0 * sum(1 for v in nets if v > 0) / len(nets), 1),
+                    "median_favourable_excursion_atr": round(_median(fav), 3),
+                    "median_adverse_excursion_atr": round(_median(adv), 3),
+                })
+            by_reason[reason] = entry
+
+        # Rank by blocks x favourable edge: a gate that fires rarely cannot
+        # cost much however wrong it is, and one that fires constantly with no
+        # directional edge is not costing anything either.
+        baseline_stats = _forward_baseline(bars_by_sym, window_minutes)
+        baseline_net = float(baseline_stats.get("median_net_atr") or 0.0)
+
+        def _cost(item: tuple[str, dict[str, Any]]) -> float:
+            """Blocks x edge ABOVE baseline, for gates with enough samples.
+
+            A gate that fires rarely cannot cost much however wrong it is, and
+            one that fires constantly with no edge over an arbitrary moment is
+            not costing anything either.
+
+            ``min_samples`` is what keeps this honest. A reason seen once has a
+            "median" of that single observation, and on real data those produce
+            the largest numbers in the table (+7.4 ATR off 11 blocks, +7.4 off
+            1) purely because nothing averages out. They stay in ``by_reason``
+            — nothing is hidden — but they must not head a list labelled
+            "costliest".
+            """
+            entry = item[1]
+            net = entry.get("median_net_atr")
+            if net is None or int(entry.get("evaluated", 0)) < min_samples:
+                return 0.0
+            edge = float(net) - baseline_net
+            return edge * int(entry["blocked"]) if edge > 0 else 0.0
+
+        ranked = sorted(by_reason.items(), key=_cost, reverse=True)
+        return {
+            "window_minutes": int(window_minutes),
+            "min_samples_for_ranking": int(min_samples),
+            "decisions_scored": int(sum(blocked.values())),
+            "measures": ("net forward price movement against a same-session "
+                         "baseline - NOT a backtest: no stop, target, sizing "
+                         "or slippage"),
+            "baseline": baseline_stats,
+            "costliest_gates": [
+                {
+                    "gate": name,
+                    "blocked": entry["blocked"],
+                    "net_atr": entry["median_net_atr"],
+                    "edge_over_baseline_atr": round(
+                        float(entry["median_net_atr"]) - baseline_net, 3),
+                }
+                for name, entry in ranked[:8] if _cost((name, entry)) > 0
+            ],
+            "by_reason": dict(ranked),
+        }
+    except Exception as exc:
+        LOG.warning("Could not compute gate attribution: %s", exc, exc_info=True)
+        return {}
+
+
 def _regime_call_outcomes(archive_root: Path) -> dict[str, Any]:
     """Classify each ``ambiguous_regime`` decision against the 30-minute
     forward price move and bucket results by outcome + hour.
@@ -831,38 +1365,7 @@ def _regime_call_outcomes(archive_root: Path) -> dict[str, Any]:
         if not decisions_path.exists() or not bars_dir.is_dir():
             return {}
 
-        # Load bar timelines per symbol — only need ts/high/low/close/atr14.
-        # Bars timestamps are tz-aware ISO ("2026-05-21T11:12:00-04:00");
-        # decisions timestamps are naive ("2026-05-21 11:12:00,798").
-        # Normalize both to naive ET for the lookup comparison.
-        bars_by_sym: dict[str, list[dict[str, Any]]] = {}
-        for path in bars_dir.glob("*.csv"):
-            try:
-                rows: list[dict[str, Any]] = []
-                with open(path, newline="", encoding="utf-8") as fh:
-                    for row in csv.DictReader(fh):
-                        ts_raw = row.get("timestamp", "")
-                        try:
-                            ts = datetime.fromisoformat(ts_raw).replace(tzinfo=None)
-                        except (ValueError, TypeError):
-                            continue
-                        try:
-                            high = float(row.get("high"))
-                            low = float(row.get("low"))
-                            close = float(row.get("close"))
-                        except (TypeError, ValueError):
-                            continue
-                        try:
-                            atr14 = float(row.get("atr14") or 0.0)
-                        except (TypeError, ValueError):
-                            atr14 = 0.0
-                        rows.append({"ts": ts, "high": high, "low": low, "close": close, "atr14": atr14})
-                if rows:
-                    rows.sort(key=lambda r: r["ts"])
-                    bars_by_sym[path.stem] = rows
-            except (OSError, csv.Error):
-                continue
-
+        bars_by_sym = _load_archive_bars(bars_dir)
         if not bars_by_sym:
             return {}
 
@@ -1321,6 +1824,8 @@ def export_session_archive(
     # archive. Returns {} on any failure — never breaks the manifest
     # write.
     regime_outcomes = _regime_call_outcomes(archive_root)
+    # Runs after decisions.csv and the bars are written — it reads both.
+    gate_attribution = _gate_attribution(archive_root)
 
     # Manifest with strategy + summary stats so future audits know
     # exactly which config produced these bars/trades.
@@ -1345,6 +1850,7 @@ def export_session_archive(
         "trades_export_error": trades_export_error,
         "session_skip_counts": dict(session_skip_counts or {}),
         "regime_call_outcomes": regime_outcomes,
+        "gate_attribution": gate_attribution,
     }
     manifest_path = archive_root / "manifest.json"
     try:

@@ -110,6 +110,7 @@
     },
     "correlation_groups": {},
     "max_same_correlation_group_same_direction": 0,
-    "volatility_scaled_thresholds": false
+    "volatility_scaled_thresholds": false,
+    "armed_retest_enabled": false
   }
 }

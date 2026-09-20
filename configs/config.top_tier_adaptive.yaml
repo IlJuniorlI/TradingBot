@@ -820,6 +820,46 @@ strategies:
       # reversion theses where the last bar moves against entry by design).
       require_entry_confirmation_bar: true
 
+      # ===== declared 2026-09-20: previously code-default only =====
+      # Each of these is read by the strategy but was declared in neither this
+      # preset nor the manifest, so its effective value lived only in a
+      # `params.get(name, default)` call. Same latent problem as the missing
+      # `disable_orb_regime` declaration: the shipped behaviour is invisible
+      # here, and editing a code default silently retunes every preset. All
+      # are set to the value they were already resolving to, so this changes
+      # nothing -- it makes the defaults inert.
+      zone_pct: 0.0015                          # SR zone half-width as a fraction of price
+      zone_atr_mult: 0.20                       # ...and as a multiple of ATR; the wider of the two wins
+      range_max_intraday_range_pct: 0.012       # range regime: session range ceiling (ADR-scaled)
+      range_require_prev_bar_confirmation: true # range regime: prior bar must confirm the fade
+      trailing_bias_enabled: true               # Fix A: infer side from recent bias when today's is neutral
+      trailing_bias_lookback: 10
+      trailing_bias_majority_threshold: 0.7
+      extended_hours_tradable_all: false        # RTH-only; true would make every symbol pre/post eligible
+
+      # ===== armed retest (added 2026-09-20) =====
+      # `trend` and `momentum` no longer enter on the cycle they qualify.
+      # Both trigger on `close > max(high of the previous N bars)`, so the fill
+      # is the highest price in 25 / 6 minutes BY CONSTRUCTION and the stop
+      # then sits inside the retrace that normally follows. Measured on the
+      # archived sessions via the new `entry_timing` report block: a trend fill
+      # was followed by a retrace covering 85% of the way to its stop, against
+      # 13% from an arbitrary moment in the same tape (+0.715R over baseline
+      # across 9 trades). `pullback` was +0.249R and `vol_squeeze` +0.008R --
+      # no edge at all -- which is why neither arms.
+      #
+      # Qualifying now records the level that was cleared and waits for price
+      # to come back to it. On the retest the entry fires; if no retest comes
+      # inside the window it enters at market, which is the old behaviour.
+      # The market fallback is deliberate: a strong trend day never offers the
+      # retest, and forfeiting those would deepen "some days it doesn't trade
+      # at all" rather than fix the entry.
+      armed_retest_enabled: true
+      armed_retest_max_minutes: 12.0        # how long to wait before entering at market anyway
+      armed_retest_zone_atr: 0.35           # price must come back within this x ATR of the cleared level
+      armed_retest_min_close_position: 0.60 # reclaim bar must close in the upper 60% of its range (mirror for SHORT)
+      armed_retest_invalidation_atr: 0.75   # a close this far back through the level kills the arm
+
       # Stretched entry filter: reject LONG at pct_b ≥ threshold AND
       # atr_stretch ≥ threshold (mirror for SHORT at pct_b ≤ 1-threshold).
       reject_stretched_entries: true
@@ -976,15 +1016,47 @@ strategies:
       vol_squeeze_min_sr_bias_alignment: 0.20  # 2026-05-14: NEW. LONG rejects when sr_bias_score < -0.20 (HTF SR against side). Mirror for SHORT. Set 0.0 to disable.
       vol_squeeze_min_pct_b_directional: 0.50  # 2026-05-14: NEW. LONG requires pct_b >= 0.50 (upper half of BBs at breakout); SHORT requires <= 0.50. Set 0.0 to disable.
       vol_squeeze_target_rr: 2.05
-      # 2026-09-18 regime trim. Mega caps intraday are VWAP-reverting with
-      # occasional trend days — no float dynamics, no squeeze mechanics, no
-      # gap-and-go — so seven regimes were being maintained to produce
-      # entries from about three. vol_squeeze OFF: its thesis (compression
-      # resolving into expansion) is a small/mid-cap pattern; on names this
-      # liquid the "box" is usually just low-volume drift, and it had the
-      # highest score ceiling (6.5) so it won more auctions than its edge
-      # justified.
-      disable_vol_squeeze_regime: true
+      # 2026-09-18 regime trim, REVERSED 2026-09-20. Mega caps intraday are
+      # VWAP-reverting with occasional trend days — no float dynamics, no
+      # squeeze mechanics, no gap-and-go — so seven regimes were being
+      # maintained to produce entries from about three, and vol_squeeze went
+      # off alongside sr_scalp and orb: its thesis (compression resolving into
+      # expansion) is a small/mid-cap pattern, and on names this liquid the
+      # "box" is often just low-volume drift.
+      #
+      # Back ON for two reasons, neither of which is a claim that the regime
+      # has edge here:
+      #
+      #   (1) The auction complaint that justified the trim — "highest score
+      #       ceiling (6.5), so it won more auctions than its edge justified"
+      #       — described RAW score sorting, and `_normalized_regime_score` +
+      #       REGIME_SCORE_CEILINGS shipped in the SAME 2026-09-18 change.
+      #       Ranking is now (score - floor) / (ceiling - floor), so this
+      #       regime's 6.5 - 4.0 = 2.5 headroom — the WIDEST of any enabled
+      #       regime (trend/momentum 2.0, pullback/range/vwap_reclaim 1.5) —
+      #       makes the high ceiling the thing that holds it BACK, not the
+      #       thing that flatters it. A vol_squeeze at 5.5 now ties a
+      #       pullback at 4.4.
+      #
+      #   (2) `range` refuses to trade a squeeze (reject_range_during_squeeze)
+      #       precisely because this regime is meant to take it —
+      #       `bollinger_squeeze` is read in exactly two places in the whole
+      #       strategy, this regime's scorer and that rejection, and they
+      #       partition the same condition. With vol_squeeze off the hand-off
+      #       goes nowhere: `gate_attribution` on the 2026-09-18 archive shows
+      #       `long_build_failed_range_bollinger_squeeze` blocking 149
+      #       decisions at +0.853 ATR above the same-session baseline.
+      #
+      # The small/mid-cap objection stands and is UNTESTED on this universe:
+      # with the flag off the regime is never scored, and the
+      # `<side>_unqualified_no_qualifying_regime(...)` skip line only prints
+      # regimes in `allowed_regimes`, so there is no record of how often it
+      # would have qualified on mega caps. Measuring that is what the flag
+      # being on is for. Archived evidence is 11 trades on the pre-retarget
+      # universe and old code — net +$9.58, the only positive regime in the
+      # archive, and positive only because of one TSLA winner (see the
+      # 2026-05-14 note above: without it, -$120).
+      disable_vol_squeeze_regime: false
 
       # ===== momentum regime (added 2026-05-12; widened from afternoon-only
       # and renamed from momentum_close) =====

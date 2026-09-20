@@ -282,7 +282,12 @@
     "index_breadth_min_agree_frac": 0.5,
     "short_min_score_premium": 0.0,
     "short_stop_buffer_mult": 1.0,
-    "short_target_rr_mult": 1.0
+    "short_target_rr_mult": 1.0,
+    "armed_retest_enabled": true,
+    "armed_retest_max_minutes": 12.0,
+    "armed_retest_zone_atr": 0.35,
+    "armed_retest_min_close_position": 0.6,
+    "armed_retest_invalidation_atr": 0.75
   },
   "capabilities": {
     "dashboard": {

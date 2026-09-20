@@ -12,14 +12,14 @@ This is a **multi-regime adaptive intraday strategy** for a fixed universe of to
 
 Unlike the dynamic-discovery strategies, this one operates on a predefined list of 23 top-tier symbols configured in `params.tradable`. The screener fetches those symbols from TradingView and ranks them by absolute intraday move weighted by relative volume. This means the bot always knows exactly what it is watching, and the screener simply decides which ones are most active right now.
 
-### 2. It scores six regimes for every candidate
+### 2. It scores eight regimes for every candidate
 
 For each symbol and each direction (long/short), regime scores are computed for whichever regimes are allowed at the current time:
 
 - **Trend**: close vs VWAP, EMA alignment, momentum (ret5/ret15), ADX strength, index confirmation. Max score 6.0.
 - **Pullback**: requires underlying trend first, then checks for EMA20/VWAP touch, support/resistance hold, EMA9 reclaim, close quality, volume expansion. Max score 5.0.
 - **Range**: VWAP proximity, EMA convergence, VWAP cross count, tight intraday range, index neutrality. Max score 5.5.
-- **Vol-squeeze** *(added 2026-05-12)*: detects a tight Bollinger compression box across `vol_squeeze_lookback_bars` (default 12), then scores breakout magnitude, confirming volume ratio, bar close position within the breakout candle, VWAP/EMA alignment. Allowed in the primary and afternoon windows.
+- **Vol-squeeze** *(added 2026-05-12)*: detects a tight Bollinger compression box across `vol_squeeze_lookback_bars` (default 12), then scores breakout magnitude, confirming volume ratio, bar close position within the breakout candle, VWAP/EMA alignment. Allowed in the primary and afternoon windows. **DISABLED in the shipped preset on 2026-09-18, RE-ENABLED 2026-09-20** (`disable_vol_squeeze_regime: false`): the trim's stated reason was that its 6.5 score ceiling won it more auctions than its edge justified, but `_normalized_regime_score` shipped in the same change and ranks on `(score - floor) / (ceiling - floor)` — its 2.5 headroom is the widest of any enabled regime, so the ceiling now works against it. It is also the only consumer of the squeeze condition that `range` rejects (`reject_range_during_squeeze`), so with it off that hand-off goes nowhere. Whether the regime has edge on mega caps is still unmeasured: with the flag off it was never scored and never appeared in the skip line. See *Cross-regime score normalisation* for the ranking maths.
 - **Momentum** *(added 2026-05-12, widened from afternoon-only and renamed from `momentum_close`)*: momentum-from-open continuation. Computes day_strength live from session open + current close, requires `momentum_min_day_strength` (default 1.5%) with the trade side, scores N-bar breakout + alignment. **Allowed post-ORB through close** (`orb_end_time` → `no_new_entries_after`) including midday — the day_strength hard gate is what filters chop, not the time window.
 - **Sr-scalp** *(added 2026-05-12)*: HTF S/R mean-reversion scalp. Uses the bot's existing `sr_ctx.nearest_support` (HS) and `nearest_resistance` (HR) as level prices and zone bands matching the dashboard's `key_level_zones` — NO strategy-local level creation. A distance gate requires the inner zone gap to clear BOTH `sr_scalp_min_distance_pct` (default 0.8% of close) AND `sr_scalp_min_distance_atr` (default 2.5x ATR); too-close zones reject at build time as `htf_zones_too_close` so other regimes can fall through. A proximity gate requires close to be inside the entry-side zone or within `sr_scalp_max_distance_from_zone_atr` of its inner edge. **Allowed post-ORB through close** (`orb_end_time` → `no_new_entries_after`). Index-confirmation EXEMPT (mean-reversion thesis, same as range). Max score 5.0 (`REGIME_SCORE_CEILINGS['sr_scalp']`), reached only on the flip-continuation path; the proximity path caps at 4.5. The pre-2026-05-29 chop-character scorer had an empirical ceiling near 3.9 and sat silently dead from 2026-05-12 to 2026-05-27 behind a 4.0 threshold (0 entries ever) — that note no longer describes the current level-geometry scorer. **DISABLED in the shipped preset** as of 2026-09-18 (`disable_sr_scalp_regime: true`): its `sr_scalp_min_distance_atr` (reward floor) and `sr_scalp_min_stop_atr_mult` (risk floor) are both 2.5, so a setup at the gap floor lands near R:R 0.8 and is rejected by `stop_floor_kills_rr` — the effective gap requirement is nearer 3.1 ATR than the 2.5 the parameter claims.
 
@@ -42,7 +42,7 @@ Default boundary values: opening range `09:30`-`09:45` (`orb_range_minutes: 15`)
 
 Midday still favors pullbacks because top-tier stocks tend to chop during the lunch hour, but the momentum and sr_scalp regimes are allowed alongside — the `momentum_min_day_strength` hard gate (default 1.5%) and the sr_scalp HTF zone-gap floor filter out non-qualifying names automatically. As of 2026-05-12 the momentum regime is post-ORB-through-close (renamed from `momentum_close` and widened from afternoon-only) and sr_scalp is post-ORB-through-close.
 
-Per-regime opt-out via params: each of the six regimes has its own `disable_*_regime` boolean knob (all default `false`). Disabling a regime strips it from every window. The afternoon-range sub-knob `afternoon_include_range` still works for window-scoped exclusion.
+Per-regime opt-out via params: each of the eight regimes has its own `disable_*_regime` boolean knob (all default `false`). Disabling a regime strips it from every window. The afternoon-range sub-knob `afternoon_include_range` still works for window-scoped exclusion.
 
 ORB-window opt-out: set `disable_orb_window: true` (default `false`) to skip the entire opening window (09:30 → `orb_end_time`, i.e. range formation + the ORB regime) and start trading at `orb_end_time` — distinct from the `orb_bypass_*` family which loosen the shared finalize filters DURING the ORB window. Useful on tapes where the opening 30 minutes are too whippy.
 
@@ -332,6 +332,7 @@ Strategy-specific knobs:
 - `side_decision_max_opposing`: maximum opposing votes allowed for a decision (default `1`). Tighter values demand cleaner consensus.
 - `orb_bypass_side_decision`: skip the explicit side decision during the ORB window (through `orb_end_time`) (default `true`).
 - `require_entry_confirmation_bar`: require the last fully closed LTF bar to confirm direction (green AND > prior close for LONG; mirror for SHORT) before entry on trend/pullback/momentum/vol_squeeze regimes (default `true`). See section 6f Fix B.
+- `armed_retest_enabled` / `armed_retest_max_minutes` / `armed_retest_zone_atr` / `armed_retest_min_close_position` / `armed_retest_invalidation_atr`: the armed-retest trigger for `trend` and `momentum` - qualifying records the level that was cleared and waits for price to retest it, entering at market only if the wait expires (defaults `true` / `12.0` / `0.35` / `0.60` / `0.75`). See section 22.
 - `sector_groups`: GICS sector groupings - ETF routing (`sector_index_map`) and the peer list for breadth confirmation.
 - `correlation_groups`: coarser risk groupings for the concentration guard.
 - `max_same_correlation_group_same_direction`: max same-direction positions per correlation group.
@@ -418,6 +419,13 @@ Current code defaults:
 | `disable_vol_squeeze_regime`         | `false`                                                                                                                       |
 | `disable_momentum_regime`            | `false`                                                                                                                       |
 | `disable_sr_scalp_regime`            | `false`                                                                                                                       |
+| `disable_vwap_reclaim_regime`        | `false`                                                                                                                       |
+| `disable_orb_regime`                 | `false`                                                                                                                       |
+| `armed_retest_enabled`               | `true`                                                                                                                        |
+| `armed_retest_max_minutes`           | `12.0`                                                                                                                        |
+| `armed_retest_zone_atr`              | `0.35`                                                                                                                        |
+| `armed_retest_min_close_position`    | `0.60`                                                                                                                        |
+| `armed_retest_invalidation_atr`      | `0.75`                                                                                                                        |
 | `stop_buffer_atr_mult`               | `0.25`                                                                                                                        |
 | `orb_end_time`                       | `10:05`                                                                                                                       |
 | `midday_start_time`                  | `11:30`                                                                                                                       |
@@ -608,3 +616,74 @@ On the shipped preset that means, for the trend regime:
 LONG    floor 4.00    stop buffer x1.00    target 2.00R
 SHORT   floor 4.50    stop buffer x1.25    target 1.70R
 ```
+
+## 22. Armed retest: qualifying arms the trigger, the retest fires it (2026-09-20)
+
+`trend` and `momentum` both enter on `close > max(high of the previous N bars)`
+— 25 LTF bars and 6 base-1m bars. The fill therefore sits at the highest price
+in 25 or 6 minutes **by construction**, and the stop, once the
+`default_stop_pct` (1.0%) and `min_stop_atr_mult` (1.5) floors apply, lands
+inside the retrace that normally follows. `same_level_block_minutes` (30) then
+bars same-direction re-entry within 1.5×ATR of that level — which is usually
+where and when the next leg starts.
+
+The `entry_timing` block in the session report put a number on it. Measured
+across the archived sessions (old code, pre-retarget universe):
+
+| regime | n | median retrace | baseline | edge |
+|---|---|---|---|---|
+| `trend` | 9 | 0.847R | 0.132R | **+0.715R** |
+| `sr_scalp` | 15 | 1.002R | 0.569R | +0.432R |
+| `pullback` | 8 | 0.471R | 0.222R | +0.249R |
+| `vol_squeeze` | 11 | 0.398R | 0.390R | +0.008R |
+
+A trend fill was followed by a retrace covering 85% of the way to its stop,
+against 13% from an arbitrary moment in the same tape.
+
+**So qualifying no longer means entering.** A regime in `ARMED_RETEST_REGIMES`
+records the level it cleared and waits (`_armed_retest_verdict`). Four
+outcomes:
+
+- `none` — feature off, or no usable trigger level. Behaves as before.
+- `wait` — armed, retest not confirmed. The cycle records
+  `<side>_build_failed_<regime>_armed_awaiting_retest(...)` and skips. Other
+  regimes in the build queue are unaffected, so arming `trend` does not stop
+  `pullback` firing on the same symbol in the same cycle.
+- `enter` — price returned to within `armed_retest_zone_atr` (0.35) ATR of the
+  level and closed back through it on a bar closing in the top
+  `armed_retest_min_close_position` (60%) of its range.
+- `expired` — no retest inside `armed_retest_max_minutes` (12). **Enters at
+  market**, which is the pre-2026-09-20 behaviour.
+
+The market fallback is deliberate, not a hedge: a strong trend day never offers
+the retest, and those are exactly the setups worth having. Forfeiting them
+would deepen the "some days it doesn't trade at all" problem rather than fix
+the entry.
+
+Which regimes arm is decided by the same table. `pullback` already requires a
+25–50% leg retracement before it fires (`pullback_require_real_dip`), `range`
+and `vwap_reclaim` enter against the move by design, and `vol_squeeze` measured
+**no** retrace above baseline at all — so arming it would add latency for
+nothing. Only `trend` and `momentum` arm.
+
+**The stop rules are not changed on a retest entry.** The gain is that the fill
+sits at a level price has already tested and held instead of at a fresh
+extreme. Re-deriving the stop from the retest low would mean bypassing
+`default_stop_pct` / `min_stop_atr_mult`, which are risk floors and a separate
+decision; the retest low is stamped in metadata so that question can be
+answered from data later.
+
+Invalidation is measured against the **armed** level, not the current N-bar
+reference. The reference walks up as new highs print, so testing against it
+would move the invalidation line away from price on exactly the setups still
+working, and drag it along behind a rolling-over one.
+
+Signals carry `armed_retest_status` (`retest_confirmed` / `expired_market_entry`),
+`armed_retest_level` and `armed_retest_waited_minutes`, which is what lets the
+session report tell the two populations apart. Turn the whole mechanism off
+with `armed_retest_enabled: false` — that is the A/B.
+
+`_breakout_reference` is the single source for both the builder's own
+fresh-breakout check and the armed level. Two copies would drift the moment
+either lookback was retuned, and the bot would arm on one level and enter
+against another.

@@ -60,6 +60,17 @@ CONFIRMATION_BAR_REGIMES = frozenset({"trend", "pullback", "vol_squeeze", "momen
 # opening tape is gap-dominated).
 SIDE_DECISION_REGIMES = frozenset({"trend", "pullback", "vol_squeeze", "momentum", "vwap_reclaim"})
 
+# Regimes that ARM instead of entering the moment they qualify. Both can only
+# fill at an N-bar extreme -- `close > max(high of the previous N bars)` -- so
+# the fill sits at the highest price in 25 (trend) or 6 (momentum) minutes by
+# construction, and the stop then lands inside the ordinary retrace band. The
+# other four are excluded on their own evidence: `pullback` already requires a
+# 25-50% leg retracement before it fires, `range` and `vwap_reclaim` enter
+# AGAINST the move by design, and `vol_squeeze` measured no post-entry retrace
+# above baseline at all (+0.008R across 11 archived trades, against trend's
+# +0.715R across 9) -- arming it would add latency for nothing.
+ARMED_RETEST_REGIMES = frozenset({"trend", "momentum"})
+
 # Per-regime score ceilings — the maximum each _score_* method can return.
 # Used to normalise scores onto a common 0..1 scale before the build-order
 # auction and the cross-signal slot auction compare them. Without this a
@@ -121,6 +132,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # date the cache was built for.
         self._daily_stats: dict[str, SymbolDailyStats] = {}
         self._daily_stats_date: Any = None
+        # Armed breakout triggers, keyed ``symbol|SIDE|regime``. A regime in
+        # ARMED_RETEST_REGIMES that qualifies does NOT enter on that cycle; it
+        # records the level it cleared and waits for price to come back and
+        # retest it. Survives across cycles by design -- this is the only
+        # cross-cycle entry state in the strategy -- and is pruned on session
+        # rollover and on expiry.
+        self._armed_retests: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Watchlist — include all configured index confirmation ETFs so they
@@ -1592,13 +1610,233 @@ class TopTierAdaptiveStrategy(BaseStrategy):
     # ------------------------------------------------------------------
     # Signal building per regime
     # ------------------------------------------------------------------
+    def _prune_armed_retests(self) -> None:
+        """Drop arms from a previous session, and any that outlived their
+        window without being consumed. Called once per ``entry_signals`` so a
+        symbol that stops appearing in the watchlist cannot leak an entry."""
+        if not self._armed_retests:
+            return
+        now = now_et()
+        today = now.date()
+        max_minutes = float(self.params.get("armed_retest_max_minutes", 12.0))
+        # A generous multiple of the window: expiry itself is handled in the
+        # verdict (where it produces a market entry). This only reaps arms
+        # nothing came back for.
+        stale_after = max(max_minutes * 3.0, max_minutes + 30.0)
+        for key, arm in list(self._armed_retests.items()):
+            if arm.get("session_date") != today:
+                del self._armed_retests[key]
+                continue
+            armed_at = arm.get("armed_at")
+            if armed_at is None:
+                del self._armed_retests[key]
+                continue
+            if (now - armed_at).total_seconds() / 60.0 >= stale_after:
+                del self._armed_retests[key]
+
+    def _armed_retest_verdict(
+        self, symbol: str, side: Side, regime: str, close: float, atr: float,
+        ltf: pd.DataFrame, frame: pd.DataFrame,
+    ) -> dict[str, Any]:
+        """Arm on qualification; enter on the retest, or at market on expiry.
+
+        The problem: ``trend`` and ``momentum`` fill at an N-bar extreme by
+        construction, so the entry is the top of the move so far and the stop
+        sits inside the retrace that normally follows. Measured on the archived
+        sessions, a trend fill was followed by a retrace covering 85% of the way
+        to its stop, against 13% from an arbitrary moment in the same tape.
+
+        So qualification no longer means "enter". It means "remember the level
+        that was cleared and wait for price to come back to it". Four outcomes:
+
+        ``none``   feature off, or no usable trigger level -- behave as before.
+        ``wait``   armed, retest not yet confirmed. The cycle skips; other
+                   regimes in the build queue are unaffected, so arming trend
+                   does not stop a pullback firing on the same symbol.
+        ``enter``  price returned to within ``armed_retest_zone_atr`` of the
+                   level and closed back through it on a bar with the right
+                   shape. This is the entry the regime was waiting for.
+        ``expired``no retest inside ``armed_retest_max_minutes``. Enters at
+                   market, which is the pre-2026-09-20 behaviour. Deliberate:
+                   a strong trend day never offers the retest, and those are
+                   exactly the setups worth having -- forfeiting them would
+                   deepen the "some days it doesn't trade at all" problem
+                   rather than fix the entry.
+
+        The stop rules are NOT changed on a retest entry. The gain is that the
+        fill sits at a level price has already tested and held instead of at a
+        fresh extreme; re-deriving the stop from a retest low would mean
+        bypassing ``default_stop_pct`` / ``min_stop_atr_mult``, which are risk
+        floors and a separate decision. The retest low is stamped in metadata
+        so the question can be answered from data later.
+        """
+        out: dict[str, Any] = {"status": "none", "reason": None, "metadata": {}}
+        if regime not in ARMED_RETEST_REGIMES:
+            return out
+        if not bool(self.params.get("armed_retest_enabled", True)):
+            return out
+        if not math.isfinite(close) or close <= 0 or not math.isfinite(atr) or atr <= 0:
+            return out
+        _recent, trigger_level = self._breakout_reference(regime, side, ltf, frame)
+        if trigger_level is None or not math.isfinite(trigger_level) or trigger_level <= 0:
+            return out
+
+        now = now_et()
+        key = f"{symbol}|{side.value}|{regime}"
+        arm = self._armed_retests.get(key)
+        zone_atr = max(0.0, float(self.params.get("armed_retest_zone_atr", 0.35)))
+        invalidation_atr = max(0.0, float(self.params.get("armed_retest_invalidation_atr", 0.75)))
+        max_minutes = float(self.params.get("armed_retest_max_minutes", 12.0))
+
+        # A close well back through the level means the breakout failed; the
+        # arm is dead. No rejection is raised here -- the builder's own
+        # fresh-breakout check owns that message, and duplicating it would put
+        # two different reasons on the same condition.
+        #
+        # Measured against the ARMED level, not the current one. The N-bar
+        # reference walks up as new highs print, so testing against it would
+        # move the invalidation line away from price on exactly the setups
+        # that are still working, and drag it along behind a rolling-over one.
+        # The level we are waiting for is the level we armed on.
+        reference = float(arm["trigger_level"]) if arm is not None else float(trigger_level)
+        if side == Side.LONG:
+            invalidated = close < reference - invalidation_atr * atr
+        else:
+            invalidated = close > reference + invalidation_atr * atr
+        if invalidated:
+            self._armed_retests.pop(key, None)
+            return out
+
+        if arm is None or arm.get("session_date") != now.date():
+            self._armed_retests[key] = {
+                "armed_at": now,
+                "session_date": now.date(),
+                "trigger_level": float(trigger_level),
+                "arm_close": float(close),
+                "atr": float(atr),
+            }
+            out.update({
+                "status": "wait",
+                "reason": (f"armed_awaiting_retest(level={trigger_level:.4f},"
+                           f"close={close:.4f},wait={max_minutes:.0f}m)"),
+            })
+            return out
+
+        armed_at = arm["armed_at"]
+        level = float(arm["trigger_level"])
+        waited_minutes = (now - armed_at).total_seconds() / 60.0
+
+        # Did price come back to the level while we waited? Measured on the
+        # base 1m frame regardless of the regime's own timeframe -- the finest
+        # resolution gives the truest extreme for the window.
+        touched = False
+        extreme: float | None = None
+        if frame is not None and not frame.empty:
+            since = frame[frame.index > armed_at]
+            if not since.empty:
+                extreme = (float(since["low"].min()) if side == Side.LONG
+                           else float(since["high"].max()))
+        if extreme is not None and math.isfinite(extreme):
+            if side == Side.LONG:
+                touched = extreme <= level + zone_atr * atr
+            else:
+                touched = extreme >= level - zone_atr * atr
+
+        reclaimed = close > level if side == Side.LONG else close < level
+        min_close_pos = min(0.95, max(0.05, float(
+            self.params.get("armed_retest_min_close_position", 0.60))))
+        close_pos = _bar_close_position(frame)
+        bar_ok = (close_pos >= min_close_pos if side == Side.LONG
+                  else close_pos <= (1.0 - min_close_pos))
+
+        base_meta = {
+            "armed_retest_regime": regime,
+            "armed_retest_level": round(level, 4),
+            "armed_retest_waited_minutes": round(waited_minutes, 2),
+            "armed_retest_extreme": (round(extreme, 4) if extreme is not None
+                                     and math.isfinite(extreme) else None),
+        }
+
+        if touched and reclaimed and bar_ok:
+            self._armed_retests.pop(key, None)
+            out.update({
+                "status": "enter",
+                "metadata": {**base_meta, "armed_retest_status": "retest_confirmed"},
+            })
+            return out
+
+        if waited_minutes >= max_minutes:
+            self._armed_retests.pop(key, None)
+            out.update({
+                "status": "expired",
+                "metadata": {**base_meta, "armed_retest_status": "expired_market_entry",
+                             "armed_retest_touched": bool(touched)},
+            })
+            return out
+
+        out.update({
+            "status": "wait",
+            "reason": (f"armed_awaiting_retest(level={level:.4f},"
+                       f"waited={waited_minutes:.1f}m/{max_minutes:.0f}m,"
+                       f"touched={int(bool(touched))},reclaimed={int(bool(reclaimed))})"),
+        })
+        return out
+
+    def _breakout_reference(
+        self, regime: str, side: Side, ltf: pd.DataFrame, frame: pd.DataFrame,
+    ) -> tuple[pd.DataFrame | None, float | None]:
+        """The N-bar extreme a breakout regime has to clear, and the window it
+        came from.
+
+        Single source for two readers that must agree: the builder's own
+        fresh-breakout check, and the armed-retest level in
+        ``_armed_retest_verdict``. A second copy of this arithmetic would drift
+        the moment either lookback was retuned, and the failure would be
+        silent — the bot would arm on one level and enter against another.
+
+        ``trend`` reads the LTF (25 bars at ``ltf_minutes: 1``); ``momentum``
+        reads the base 1m frame (6 bars), matching the standalone
+        momentum_close strategy it was generalised from. Both are scoped to
+        today's session, because the resampled LTF crosses the session
+        boundary during early RTH.
+        """
+        if regime == "trend":
+            source, lookback = ltf, max(3, int(self.params.get("pullback_lookback_bars", 5)))
+        elif regime == "momentum":
+            source, lookback = frame, max(3, int(self.params.get("momentum_breakout_lookback_bars", 6)))
+        else:
+            return None, None
+        if source is None or source.empty:
+            return None, None
+        session = source[_same_day_mask(source, now_et().date())]
+        recent = session.tail(lookback + 1).iloc[:-1] if len(session) > lookback else session.iloc[:-1]
+        if recent.empty:
+            return None, None
+        if side == Side.LONG:
+            level = _safe_float(recent["high"].max(), float("nan"))
+        else:
+            level = _safe_float(recent["low"].min(), float("nan"))
+        if level is None or not math.isfinite(float(level)):
+            return recent, None
+        return recent, float(level)
+
     def _build_trend_signal(self, c: Candidate, side: Side, close: float, atr: float,
                             ltf: pd.DataFrame, frame: pd.DataFrame, regime_score: float,
-                            data=None, vol_widening: float = 1.0, vol_scale: float = 1.0) -> Signal | None:
-        lookback = max(3, int(self.params.get("pullback_lookback_bars", 5)))
-        session_ltf = ltf[_same_day_mask(ltf, now_et().date())]
-        recent = session_ltf.tail(lookback + 1).iloc[:-1] if len(session_ltf) > lookback else session_ltf.iloc[:-1]
-        if recent.empty:
+                            data=None, vol_widening: float = 1.0, vol_scale: float = 1.0,
+                            breakout_confirmed: bool = False) -> Signal | None:
+        """``breakout_confirmed`` is set only by a CONFIRMED armed retest.
+
+        The fresh-breakout gate below asks "is close above the last N bars'
+        high". On a retest cycle that window still holds the breakout bar,
+        whose high is above the reclaim close -- which is what a retest IS --
+        so the gate would reject every armed entry and leave the feature able
+        to produce nothing but expiry/market fills. The arm already recorded
+        the breakout, and ``_armed_retest_verdict`` only returns ``enter`` with
+        close back above that level, so the condition is satisfied by
+        construction here rather than skipped.
+        """
+        recent, trigger_level = self._breakout_reference("trend", side, ltf, frame)
+        if recent is None or recent.empty:
             self._set_build_failure(c.symbol, "trend", "insufficient_ltf_history")
             return None
         # ATR buffer + default_stop_pct floor both scale with vol_widening
@@ -1609,8 +1847,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         target_rr = float(self.params.get("trend_target_rr", 2.0)) * self._side_target_rr_mult(side)
 
         if side == Side.LONG:
-            trigger_high = _safe_float(recent["high"].max(), close)
-            if close <= trigger_high:
+            trigger_high = trigger_level if trigger_level is not None else close
+            if not breakout_confirmed and close <= trigger_high:
                 self._set_build_failure(
                     c.symbol, "trend",
                     f"no_fresh_breakout(close={close:.4f}<=recent_high={trigger_high:.4f})",
@@ -1622,7 +1860,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             target = close + risk * target_rr
         else:
             trigger_low = _safe_float(recent["low"].min(), close)
-            if close >= trigger_low:
+            if not breakout_confirmed and close >= trigger_low:
                 self._set_build_failure(
                     c.symbol, "trend",
                     f"no_fresh_breakdown(close={close:.4f}>=recent_low={trigger_low:.4f})",
@@ -2107,7 +2345,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
     def _build_momentum_signal(self, c: Candidate, side: Side, close: float, atr: float,
                                frame: pd.DataFrame,
                                regime_score: float, data=None,
-                               vol_widening: float = 1.0, vol_scale: float = 1.0) -> Signal | None:
+                               vol_widening: float = 1.0, vol_scale: float = 1.0,
+                               breakout_confirmed: bool = False) -> Signal | None:
         """Build a momentum-from-open continuation signal. Stops anchor below
         recent swing low (LONG) / above recent swing high (SHORT) with an
         ATR-cushioned buffer so single-bar wicks (during midday's lower volume
@@ -2119,26 +2358,28 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         momentum_close strategy. Renamed from ``_build_momentum_close_signal``
         2026-05-12 when the regime was generalized from afternoon-only to
         post-ORB through close.
+
+        ``breakout_confirmed`` is set only by a CONFIRMED armed retest, where
+        the breakout is already established and the fresh-breakout gate would
+        reject the retest fill by definition. See ``_build_trend_signal``.
         """
-        lookback = max(3, int(self.params.get("momentum_breakout_lookback_bars", 6)))
-        session_frame = frame[_same_day_mask(frame, now_et().date())]
-        recent = session_frame.tail(lookback + 1).iloc[:-1] if len(session_frame) > lookback else session_frame.iloc[:-1]
-        if recent.empty:
+        recent, trigger_level = self._breakout_reference("momentum", side, frame, frame)
+        if recent is None or recent.empty:
             self._set_build_failure(c.symbol, "momentum", "insufficient_session_history")
             return None
 
         # Fresh-breakout gate (matches the source strategy's check)
         if side == Side.LONG:
-            breakout_level = _safe_float(recent["high"].max(), close)
-            if close <= breakout_level:
+            breakout_level = trigger_level if trigger_level is not None else close
+            if not breakout_confirmed and close <= breakout_level:
                 self._set_build_failure(
                     c.symbol, "momentum",
                     f"no_fresh_breakout(close={close:.4f}<=recent_high={breakout_level:.4f})",
                 )
                 return None
         else:
-            breakout_level = _safe_float(recent["low"].min(), close)
-            if close >= breakout_level:
+            breakout_level = trigger_level if trigger_level is not None else close
+            if not breakout_confirmed and close >= breakout_level:
                 self._set_build_failure(
                     c.symbol, "momentum",
                     f"no_fresh_breakdown(close={close:.4f}>=recent_low={breakout_level:.4f})",
@@ -2940,6 +3181,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         data=None,
     ) -> list[Signal]:
         self._reset_entry_decisions()
+        self._prune_armed_retests()
         out: list[Signal] = []
         min_bars = int(self.params.get("min_bars", 60) or 60)
         ltf_min = max(1, int(self.params.get("ltf_minutes", 5)))
@@ -3517,9 +3759,45 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     )
                     continue
 
+                # Armed retest (2026-09-20). For trend / momentum,
+                # qualifying does not mean entering: the level that was
+                # cleared is remembered and the entry waits for price to come
+                # back and retest it, or for the wait to expire. See
+                # ``_armed_retest_verdict``. Placed AFTER the index and
+                # confirmation-bar gates so a setup that would have been
+                # rejected anyway never arms.
+                #
+                # That ordering is load-bearing, not incidental. While price
+                # is pulling back the last CLOSED bar is against the trade, so
+                # ``require_entry_confirmation_bar`` rejects and the verdict is
+                # never consulted -- which is correct: there is nothing to
+                # decide mid-pullback. The first cycle that reaches the verdict
+                # again is the one AFTER a bar closed back the trade's way,
+                # which is exactly the reclaim the retest is waiting for. Move
+                # this above the confirmation gate and entries would fire
+                # partway down the retrace.
+                retest_meta: dict[str, Any] = {}
+                if regime_name in ARMED_RETEST_REGIMES:
+                    verdict = self._armed_retest_verdict(
+                        c.symbol, side, regime_name, close, atr, ltf, frame)
+                    if verdict["status"] == "wait":
+                        fail_reasons.append(
+                            f"{side.value.lower()}_build_failed_{regime_name}_"
+                            f"{verdict['reason']}"
+                        )
+                        continue
+                    retest_meta = dict(verdict.get("metadata") or {})
+                    # Only a CONFIRMED retest satisfies the builder's
+                    # fresh-breakout gate in advance. An expired arm falls back
+                    # to a market entry and must still clear it on its own --
+                    # if price faded while we waited, there is no trade.
+                    breakout_confirmed = verdict["status"] == "enter"
+                else:
+                    breakout_confirmed = False
+
                 sig = None
                 if regime_name == "trend":
-                    sig = self._build_trend_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
+                    sig = self._build_trend_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale, breakout_confirmed=breakout_confirmed)
                 elif regime_name == "pullback":
                     sig = self._build_pullback_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
                 elif regime_name == "range":
@@ -3527,7 +3805,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 elif regime_name == "vol_squeeze":
                     sig = self._build_vol_squeeze_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
                 elif regime_name == "momentum":
-                    sig = self._build_momentum_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
+                    sig = self._build_momentum_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale, breakout_confirmed=breakout_confirmed)
                 elif regime_name == "sr_scalp":
                     sig = self._build_sr_scalp_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
                 elif regime_name == "orb":
@@ -3536,6 +3814,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     sig = self._build_vwap_reclaim_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
 
                 if sig is not None:
+                    # How this entry was reached: on the retest the regime
+                    # waited for, or at market after the wait expired. Read by
+                    # the session report to tell the two populations apart.
+                    if retest_meta and isinstance(sig.metadata, dict):
+                        sig.metadata.update(retest_meta)
                     # Tier 3b: on high-conviction days, loosen the
                     # peak-giveback threshold so a 2R+ runner doesn't get
                     # cut by a normal 50% retracement. Override is stamped
