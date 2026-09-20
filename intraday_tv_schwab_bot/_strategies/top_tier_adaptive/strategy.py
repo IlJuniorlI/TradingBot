@@ -67,8 +67,8 @@ SIDE_DECISION_REGIMES = frozenset({"trend", "pullback", "vol_squeeze", "momentum
 # other four are excluded on their own evidence: `pullback` already requires a
 # 25-50% leg retracement before it fires, `range` and `vwap_reclaim` enter
 # AGAINST the move by design, and `vol_squeeze` measured no post-entry retrace
-# above baseline at all (+0.008R across 11 archived trades, against trend's
-# +0.715R across 9) -- arming it would add latency for nothing.
+# above baseline at all (-0.024R across 11 archived trades, against trend's
+# +0.641R across 9) -- arming it would add latency for nothing.
 ARMED_RETEST_REGIMES = frozenset({"trend", "momentum"})
 
 # Per-regime score ceilings — the maximum each _score_* method can return.
@@ -138,6 +138,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # retest it. Survives across cycles by design -- this is the only
         # cross-cycle entry state in the strategy -- and is pruned on session
         # rollover and on expiry.
+        #
+        # In memory only. A restart mid-session loses every arm, and the
+        # affected symbols re-arm on their next qualifying cycle -- so the
+        # worst case is one ``armed_retest_max_minutes`` delay on the first
+        # trend/momentum entry after a restart, which the market fallback
+        # bounds. Not worth persisting: a stale arm reloaded against a level
+        # that has since been swept is worse than re-deriving it.
         self._armed_retests: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
@@ -1644,7 +1651,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         construction, so the entry is the top of the move so far and the stop
         sits inside the retrace that normally follows. Measured on the archived
         sessions, a trend fill was followed by a retrace covering 85% of the way
-        to its stop, against 13% from an arbitrary moment in the same tape.
+        to its stop, against 21% from an arbitrary moment in the same session.
 
         So qualification no longer means "enter". It means "remember the level
         that was cleared and wait for price to come back to it". Four outcomes:
@@ -1712,8 +1719,6 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 "armed_at": now,
                 "session_date": now.date(),
                 "trigger_level": float(trigger_level),
-                "arm_close": float(close),
-                "atr": float(atr),
             }
             out.update({
                 "status": "wait",

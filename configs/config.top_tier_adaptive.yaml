@@ -844,8 +844,8 @@ strategies:
       # then sits inside the retrace that normally follows. Measured on the
       # archived sessions via the new `entry_timing` report block: a trend fill
       # was followed by a retrace covering 85% of the way to its stop, against
-      # 13% from an arbitrary moment in the same tape (+0.715R over baseline
-      # across 9 trades). `pullback` was +0.249R and `vol_squeeze` +0.008R --
+      # 21% from an arbitrary moment in the same session (+0.641R over baseline
+      # across 9 trades). `pullback` was +0.213R and `vol_squeeze` -0.024R --
       # no edge at all -- which is why neither arms.
       #
       # Qualifying now records the level that was cleared and waits for price

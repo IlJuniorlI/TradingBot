@@ -41,9 +41,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the next leg starts.
 
   The new `entry_timing` block measured it: a trend fill was followed by a
-  retrace covering 85% of the way to its stop, against 13% from an arbitrary
-  moment in the same tape (+0.715R over baseline, 9 trades). `pullback` was
-  +0.249R and `vol_squeeze` +0.008R.
+  retrace covering 85% of the way to its stop, against 21% from an arbitrary
+  moment in the same session (+0.641R over baseline, 9 trades). `pullback` was
+  +0.213R and `vol_squeeze` -0.024R.
 
   Qualifying now records the level that was cleared and waits for price to come
   back to it (`_armed_retest_verdict`, `ARMED_RETEST_REGIMES`). The retest
@@ -109,9 +109,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stop width at once.
 
   On the archived sessions (old code and the pre-retarget universe, so not a
-  verdict on the current bot) the baseline is 0.352R against an observed
-  0.666R, and the regimes separate as predicted: `trend` +0.715R over baseline
-  across 9 trades, `pullback` +0.249R across 8, and `vol_squeeze` +0.008R
+  verdict on the current bot) the baseline is 0.358R against an observed
+  0.666R, and the regimes separate as predicted: `trend` +0.641R over baseline
+  across 9 trades, `pullback` +0.213R across 8, and `vol_squeeze` -0.024R
   across 11 — no edge at all, consistent with its 0.25R median MAE, the lowest
   of any regime.
 
@@ -325,6 +325,33 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the sense of it backwards.
 
 ### Fixed
+
+- **`entry_timing`'s baseline sampled the wrong tape.** *2026-09-20* — found
+  in a second bug pass, after the metric had already been published. The
+  docstring claimed a same-session comparison, but `bars_for` hands back the
+  MULTI-DAY history frame and the sampler walked all of it — folding quiet
+  overnight and prior-session bars into the baseline, depressing it, and
+  inflating every edge measured above it.
+
+  The whole metric is the gap between observed and baseline, so a baseline
+  drawn from a different tape measures nothing. Now scoped to the trade's own
+  session date. Every published number moved:
+
+  | metric | before | after |
+  |---|---|---|
+  | overall baseline | 0.352R | 0.358R |
+  | `trend` edge | +0.715R | **+0.641R** |
+  | `sr_scalp` edge | +0.432R | +0.410R |
+  | `pullback` edge | +0.249R | +0.213R |
+  | `vol_squeeze` edge | +0.008R | **-0.024R** |
+  | baseline samples | 8,140 | 3,477 |
+
+  The conclusions hold and sharpen — `trend` still chases by a wide margin and
+  `vol_squeeze` now reads as slightly BELOW an arbitrary moment, i.e. no edge
+  at all rather than a sliver of one. Every citation of the old figures in the
+  READMEs, the preset comment, the strategy docstrings and this file was
+  corrected in the same change; leaving docs quoting a measurement the code no
+  longer produces is how a number outlives the analysis that made it.
 
 - **A confirmed armed retest could never build a signal.** *2026-09-20* —
   found in the final bug pass on the same day the feature shipped, before any

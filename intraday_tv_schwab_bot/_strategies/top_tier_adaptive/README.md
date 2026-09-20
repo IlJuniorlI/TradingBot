@@ -632,13 +632,13 @@ across the archived sessions (old code, pre-retarget universe):
 
 | regime | n | median retrace | baseline | edge |
 |---|---|---|---|---|
-| `trend` | 9 | 0.847R | 0.132R | **+0.715R** |
-| `sr_scalp` | 15 | 1.002R | 0.569R | +0.432R |
-| `pullback` | 8 | 0.471R | 0.222R | +0.249R |
-| `vol_squeeze` | 11 | 0.398R | 0.390R | +0.008R |
+| `trend` | 9 | 0.847R | 0.206R | **+0.641R** |
+| `sr_scalp` | 15 | 1.002R | 0.592R | +0.410R |
+| `pullback` | 8 | 0.471R | 0.258R | +0.213R |
+| `vol_squeeze` | 11 | 0.398R | 0.422R | **-0.024R** |
 
 A trend fill was followed by a retrace covering 85% of the way to its stop,
-against 13% from an arbitrary moment in the same tape.
+against 21% from an arbitrary moment in the same session.
 
 **So qualifying no longer means entering.** A regime in `ARMED_RETEST_REGIMES`
 records the level it cleared and waits (`_armed_retest_verdict`). Four

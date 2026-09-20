@@ -443,8 +443,18 @@ def _entry_timing(
         # Baseline: the same measurement from arbitrary moments in this
         # symbol's session, anchored on each sampled bar's own close and
         # carrying THIS trade's risk distance.
+        #
+        # Scoped to the TRADE'S OWN SESSION DATE. `bars_for` hands back the
+        # multi-day history frame, and sampling all of it would fold a quiet
+        # overnight stretch into the baseline, depress it, and inflate every
+        # edge above it -- while the docstring claimed a same-session
+        # comparison. The whole metric is the gap between observed and
+        # baseline, so a baseline drawn from a different tape measures nothing.
         try:
-            rows = frame.iloc[::max(1, int(baseline_stride))]
+            session_mask = frame.index.date == trade.entry_time.date()
+            session = frame[session_mask]
+            rows = (session.iloc[::max(1, int(baseline_stride))]
+                    if not session.empty else None)
         except Exception:
             rows = None
         if rows is not None:
