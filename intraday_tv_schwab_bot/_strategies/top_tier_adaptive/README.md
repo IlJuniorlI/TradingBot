@@ -673,6 +673,21 @@ extreme. Re-deriving the stop from the retest low would mean bypassing
 decision; the retest low is stamped in metadata so that question can be
 answered from data later.
 
+Two rules bound how stale an arm can get, because an arm past its window is a
+licence to enter at market on the next qualifying cycle:
+
+- **A position on the symbol drops its arms.** An arm can never produce the
+  entry it was created for once a position exists, and leaving it meant that
+  when the position closed the next qualifying cycle found an expired arm and
+  took the market fallback immediately — skipping the wait on the re-entry,
+  which is the most chase-prone entry there is.
+- **Arms are reaped past twice the window.** The regime can go a long time
+  without qualifying (index confirmation lapses, the score dips), so without a
+  bound a fallback entry could be justified by a breakout most of an hour old
+  at a level the tape had moved away from. Past 2x, the arm is dropped and the
+  next qualifying cycle arms again — waiting rather than entering on stale
+  evidence.
+
 Invalidation is measured against the **armed** level, not the current N-bar
 reference. The reference walks up as new highs print, so testing against it
 would move the invalidation line away from price on exactly the setups still

@@ -362,6 +362,32 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An armed retest could go stale and then justify a market entry.**
+  *2026-09-20* — two holes in the arm lifecycle, both found by walking the
+  state transitions rather than the happy path. An arm past its window is a
+  licence to enter at market on the next qualifying cycle, so how long one can
+  survive is a trading question, not bookkeeping.
+
+  * **A held position did not clear the symbol's arms.** An arm can never
+    produce the entry it was created for once a position exists, and
+    `_prune_armed_retests` kept it well past its window — so when the position
+    closed, twenty minutes later and at a different level, the next qualifying
+    cycle found an EXPIRED arm and took the market fallback immediately. The
+    re-entry, which is the most chase-prone entry there is, was the one entry
+    guaranteed to skip the wait. `entry_signals` now drops a symbol's arms
+    when it is already held.
+  * **The reaping window was 3x (42 minutes).** The regime can go a long time
+    without qualifying — index confirmation lapses, the score dips — so a
+    fallback entry could be justified by a breakout most of an hour earlier at
+    a level the tape had moved away from. Now 2x the configured wait: past
+    that the arm is dropped and the next qualifying cycle arms again, waiting
+    rather than entering on stale evidence.
+
+  Both are in the safe direction — the bot waits where it previously would
+  have entered — and `per_entry_path` will show the effect as a shift from
+  `market_fallback` toward `retest`. Coverage: 9 tests over the lifecycle,
+  including that `AA` must not drop `AAPL`'s arms.
+
 - **`entry_timing`'s baseline sampled the wrong tape.** *2026-09-20* — found
   in a second bug pass, after the metric had already been published. The
   docstring claimed a same-session comparison, but `bars_for` hands back the

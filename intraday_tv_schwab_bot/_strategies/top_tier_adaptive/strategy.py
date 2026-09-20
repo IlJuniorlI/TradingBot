@@ -1626,10 +1626,18 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         now = now_et()
         today = now.date()
         max_minutes = float(self.params.get("armed_retest_max_minutes", 12.0))
-        # A generous multiple of the window: expiry itself is handled in the
-        # verdict (where it produces a market entry). This only reaps arms
-        # nothing came back for.
-        stale_after = max(max_minutes * 3.0, max_minutes + 30.0)
+        # Twice the window. Expiry itself is handled in the verdict, where it
+        # produces the market entry; this reaps arms nothing came back for.
+        #
+        # The bound matters. An arm past its window is a licence to enter at
+        # market on the next qualifying cycle, and the regime can go a long
+        # time without qualifying -- index confirmation lapses, the score
+        # dips. Keeping arms for 40+ minutes meant a fallback entry could be
+        # justified by a breakout that happened most of an hour earlier, at a
+        # level the tape had moved away from. Past 2x, the arm is dropped and
+        # the next qualifying cycle arms again, which waits rather than
+        # entering on stale evidence.
+        stale_after = max_minutes * 2.0
         for key, arm in list(self._armed_retests.items()):
             if arm.get("session_date") != today:
                 del self._armed_retests[key]
@@ -1640,6 +1648,14 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 continue
             if (now - armed_at).total_seconds() / 60.0 >= stale_after:
                 del self._armed_retests[key]
+
+    def _drop_armed_retests(self, symbol: str) -> None:
+        """Forget every arm on *symbol*, both sides and both regimes."""
+        if not self._armed_retests:
+            return
+        prefix = f"{symbol}|"
+        for key in [k for k in self._armed_retests if k.startswith(prefix)]:
+            del self._armed_retests[key]
 
     def _armed_retest_verdict(
         self, symbol: str, side: Side, regime: str, close: float, atr: float,
@@ -3248,6 +3264,16 @@ class TopTierAdaptiveStrategy(BaseStrategy):
 
         for c in candidates:
             if c.symbol in positions:
+                # Drop any arm on a symbol we already hold. An arm records
+                # "a breakout happened, wait for the retest", and once a
+                # position exists it can never produce the entry it was
+                # created for. Leaving it is not harmless: `_prune_armed_retests`
+                # keeps an arm well past its window, so when the position
+                # closes -- 20 minutes later, at a different level -- the next
+                # qualifying cycle finds an EXPIRED arm and takes the market
+                # fallback immediately, skipping the wait on the re-entry,
+                # which is the most chase-prone entry there is.
+                self._drop_armed_retests(c.symbol)
                 self._record_entry_decision(c.symbol, "skipped", ["already_in_position"])
                 continue
             # Per-symbol earnings blackout. An earnings print resets the
