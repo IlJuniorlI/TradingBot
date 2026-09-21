@@ -1657,9 +1657,75 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         for key in [k for k in self._armed_retests if k.startswith(prefix)]:
             del self._armed_retests[key]
 
+    def _expired_armed_retests(
+        self, symbol: str, allowed_regimes: set[str],
+    ) -> list[tuple[Side, str, dict[str, Any]]]:
+        """Arms whose wait ran out, popped and returned for immediate entry.
+
+        This is the market fallback, and it runs BEFORE the build queue and
+        outside the per-cycle gates on purpose.
+
+        Those gates -- the ``_decide_side`` vote, index confirmation, the
+        confirmation bar -- were ALL satisfied at arm time; that is the only
+        way an arm gets created. Re-imposing them at expiry means an arm can
+        only take its fallback on a cycle where the setup happens to fully
+        re-qualify, and if it does not, the trade is silently dropped.
+
+        That is not hypothetical. INTC, 2026-09-21: armed 09:58 at 118.39 on a
+        setup that passed every gate, index confirmation lapsed at 10:03, and
+        the stock ran to 124.64 without a single entry. The retest never came
+        (``touched=0`` throughout), so the fallback was the whole point, and it
+        never fired once -- the expiry check sat behind the gate that had
+        failed.
+
+        Index confirmation is an ENTRY gate: once in a position it no longer
+        applies. Arming holds the trade OUT across exactly the window where a
+        lapse can lock it out, so the setup is re-validated against conditions
+        it had already cleared. The fallback has to be judged on the arm-time
+        decision or it is not a fallback.
+
+        What still applies: the regime must still be offered in this window
+        (a trend arm does not fire at midday), and the builder's own checks run
+        unchanged -- ``breakout_confirmed`` is False on this path, so a faded
+        setup fails ``no_fresh_breakout``, and ``_finalize_signal`` still
+        applies the stretched / SR / structure rejections. A runaway that has
+        gone too far to chase is still declined, by the gate that exists for
+        that.
+        """
+        if not self._armed_retests:
+            return []
+        now = now_et()
+        max_minutes = float(self.params.get("armed_retest_max_minutes", 12.0))
+        prefix = f"{symbol}|"
+        out: list[tuple[Side, str, dict[str, Any]]] = []
+        for key in [k for k in self._armed_retests if k.startswith(prefix)]:
+            arm = self._armed_retests[key]
+            armed_at = arm.get("armed_at")
+            if armed_at is None or arm.get("session_date") != now.date():
+                del self._armed_retests[key]
+                continue
+            if (now - armed_at).total_seconds() / 60.0 < max_minutes:
+                continue
+            try:
+                _sym, side_token, regime = key.split("|", 2)
+            except ValueError:
+                del self._armed_retests[key]
+                continue
+            del self._armed_retests[key]
+            # The time window is a real constraint, not a gate the arm can
+            # carry past: a trend arm must not fire during midday, when the
+            # regime is not offered at all.
+            if regime not in allowed_regimes:
+                continue
+            side = Side.LONG if str(side_token).upper() == "LONG" else Side.SHORT
+            arm["waited_minutes"] = (now - armed_at).total_seconds() / 60.0
+            out.append((side, regime, arm))
+        return out
+
     def _armed_retest_verdict(
         self, symbol: str, side: Side, regime: str, close: float, atr: float,
         ltf: pd.DataFrame, frame: pd.DataFrame,
+        *, regime_score: float = 0.0, regime_norm: float = 0.0,
     ) -> dict[str, Any]:
         """Arm on qualification; enter on the retest, or at market on expiry.
 
@@ -1679,12 +1745,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         ``enter``  price returned to within ``armed_retest_zone_atr`` of the
                    level and closed back through it on a bar with the right
                    shape. This is the entry the regime was waiting for.
-        ``expired``no retest inside ``armed_retest_max_minutes``. Enters at
-                   market, which is the pre-2026-09-20 behaviour. Deliberate:
-                   a strong trend day never offers the retest, and those are
-                   exactly the setups worth having -- forfeiting them would
-                   deepen the "some days it doesn't trade at all" problem
-                   rather than fix the entry.
+
+        EXPIRY IS NOT HANDLED HERE. It lives in ``_expired_armed_retests``,
+        which runs before the build queue, because this method is only reached
+        once a setup has re-cleared the side / index / confirmation-bar gates
+        -- and an arm whose index confirmation lapsed while it waited would
+        then never reach its own expiry. See that method for the INTC case
+        that proved it.
 
         The stop rules are NOT changed on a retest entry. The gain is that the
         fill sits at a level price has already tested and held instead of at a
@@ -1735,6 +1802,12 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 "armed_at": now,
                 "session_date": now.date(),
                 "trigger_level": float(trigger_level),
+                # Carried so the expiry sweep can build the signal from the
+                # score the setup had WHEN IT WAS VALIDATED. Re-scoring at
+                # expiry would ask a different question -- the trade was
+                # justified at arm time, the wait was only about price.
+                "regime_score": float(regime_score),
+                "regime_score_norm": float(regime_norm),
             }
             out.update({
                 "status": "wait",
@@ -1783,15 +1856,6 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             out.update({
                 "status": "enter",
                 "metadata": {**base_meta, "armed_retest_status": "retest_confirmed"},
-            })
-            return out
-
-        if waited_minutes >= max_minutes:
-            self._armed_retests.pop(key, None)
-            out.update({
-                "status": "expired",
-                "metadata": {**base_meta, "armed_retest_status": "expired_market_entry",
-                             "armed_retest_touched": bool(touched)},
             })
             return out
 
@@ -3725,12 +3789,45 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # built in that order.
             build_queue.sort(key=lambda item: item[3], reverse=True)
 
+            # Arms whose wait ran out. They go to the FRONT of the queue and
+            # skip the per-cycle gates -- see ``_expired_armed_retests``. The
+            # gates were all satisfied when the arm was created, and requiring
+            # them again at expiry is what let INTC run 117->124 on
+            # 2026-09-21 with no entry.
+            expired_arms = self._expired_armed_retests(c.symbol, allowed_regimes)
+            expired_keys = {(side, regime) for side, regime, _arm in expired_arms}
+            queue: list[tuple[bool, Side, str, float, float, dict[str, Any]]] = [
+                (True, side, regime,
+                 float(arm.get("regime_score", 0.0)),
+                 float(arm.get("regime_score_norm", 0.0)),
+                 # index_ok stays False: the exemption is `pre_validated`,
+                 # explicitly, rather than a synthetic True smuggling the
+                 # behaviour through the gate. A fake value here would also
+                 # make any test of the exemption pass vacuously.
+                 {"index_ok": False, "bias_penalty": 0.0,
+                  "scores": {regime: float(arm.get("regime_score", 0.0))},
+                  "expired_arm": arm})
+                for side, regime, arm in expired_arms
+            ]
+            # A regime with an expired arm is already represented above; its
+            # queue entry would re-arm at a fresh level on the same cycle.
+            queue += [
+                (False, side, regime, score, norm, decision)
+                for side, regime, score, norm, decision in build_queue
+                if (side, regime) not in expired_keys
+            ]
+
             winning_decision: dict[str, Any] | None = None
             winning_regime: str | None = None
             winning_norm: float = 0.0
-            for side, regime_name, regime_score, regime_norm, decision in build_queue:
+            for pre_validated, side, regime_name, regime_score, regime_norm, decision in queue:
                 index_ok = decision["index_ok"]
 
+                # An expired arm skips every gate below: all three were
+                # satisfied when it armed, and re-imposing them means the
+                # fallback only fires on a cycle where the setup happens to
+                # fully re-qualify. See ``_expired_armed_retests``.
+                #
                 # Explicit side decision, applied per regime. Direction-
                 # following regimes must match the vote; the mean-reversion
                 # pair (range / sr_scalp) is exempt because it enters against
@@ -3741,7 +3838,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                         f"{side.value.lower()}_build_failed_{regime_name}_side_undecided({side_vote_note})"
                     )
                     continue
-                if (
+                if not pre_validated and (
                     regime_name in SIDE_DECISION_REGIMES
                     and decided_side is not None
                     and side != decided_side
@@ -3760,7 +3857,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 # rotation between levels." The orb regime is also exempt (not
                 # in the set) — its range-break is the directional proof. Index
                 # failure on one regime falls through to the next in the queue.
-                if regime_name in INDEX_CONFIRMED_REGIMES and not index_ok:
+                if not pre_validated and regime_name in INDEX_CONFIRMED_REGIMES and not index_ok:
                     fail_reasons.append(
                         f"{side.value.lower()}_build_failed_{regime_name}_index_not_confirmed"
                     )
@@ -3780,7 +3877,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 # green-bar check; the reclaim's own VWAP-buffer + volume
                 # confirmation stands in. The orb regime is also exempt (not in
                 # the set) — its range-break is the confirmation.
-                if (
+                if not pre_validated and (
                     regime_name in CONFIRMATION_BAR_REGIMES
                     and bool(self.params.get("require_entry_confirmation_bar", True))
                     and not self._entry_bar_confirms(side, ltf)
@@ -3808,9 +3905,23 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 # this above the confirmation gate and entries would fire
                 # partway down the retrace.
                 retest_meta: dict[str, Any] = {}
-                if regime_name in ARMED_RETEST_REGIMES:
+                breakout_confirmed = False
+                if pre_validated:
+                    arm = decision["expired_arm"]
+                    retest_meta = {
+                        "armed_retest_regime": regime_name,
+                        "armed_retest_level": round(float(arm["trigger_level"]), 4),
+                        "armed_retest_waited_minutes": round(
+                            float(arm.get("waited_minutes", 0.0)), 2),
+                        "armed_retest_status": "expired_market_entry",
+                    }
+                    # `breakout_confirmed` stays False: the fallback has to
+                    # clear the builder's own fresh-breakout check on its own.
+                    # If price faded while we waited, there is no trade.
+                elif regime_name in ARMED_RETEST_REGIMES:
                     verdict = self._armed_retest_verdict(
-                        c.symbol, side, regime_name, close, atr, ltf, frame)
+                        c.symbol, side, regime_name, close, atr, ltf, frame,
+                        regime_score=regime_score, regime_norm=regime_norm)
                     if verdict["status"] == "wait":
                         fail_reasons.append(
                             f"{side.value.lower()}_build_failed_{regime_name}_"
@@ -3819,12 +3930,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                         continue
                     retest_meta = dict(verdict.get("metadata") or {})
                     # Only a CONFIRMED retest satisfies the builder's
-                    # fresh-breakout gate in advance. An expired arm falls back
-                    # to a market entry and must still clear it on its own --
-                    # if price faded while we waited, there is no trade.
+                    # fresh-breakout gate in advance.
                     breakout_confirmed = verdict["status"] == "enter"
-                else:
-                    breakout_confirmed = False
 
                 sig = None
                 if regime_name == "trend":
@@ -3944,17 +4051,24 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 # this populates the EXISTING `family=` log field and CSV
                 # column — no log-format, parser or schema change.
                 skip_details: dict[str, Any] = {}
-                if build_queue:
+                if queue:
+                    # Reads `queue`, not `build_queue`: an expired arm is
+                    # tried without being in the score-ordered queue, so a
+                    # cycle whose only attempt was a fallback would otherwise
+                    # report `none_qualified` while a builder had in fact
+                    # rejected it.
+                    #
                     # Sorted by normalised score desc, so [0] is the regime
-                    # that came closest to producing a signal.
-                    _q_side, top_regime, top_score, top_norm, _q_decision = build_queue[0]
+                    # that came closest to producing a signal (expired arms
+                    # sit at the front — they were already validated).
+                    _pre, _q_side, top_regime, top_score, top_norm, _q_decision = queue[0]
                     skip_details["entry_family"] = str(top_regime)
                     # How far the best candidate regime was from its
                     # threshold — the difference between "nothing was close"
                     # and "it missed by 0.1 and the threshold may be wrong".
                     skip_details["regime_score"] = round(float(top_score), 3)
                     skip_details["regime_score_norm"] = round(float(top_norm), 4)
-                    skip_details["regimes_tried"] = len(build_queue)
+                    skip_details["regimes_tried"] = len(queue)
                 else:
                     # Nothing cleared its score threshold on either side. A
                     # different failure from "a builder rejected it", and the

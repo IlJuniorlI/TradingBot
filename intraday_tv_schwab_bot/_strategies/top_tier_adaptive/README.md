@@ -653,7 +653,9 @@ outcomes:
   level and closed back through it on a bar closing in the top
   `armed_retest_min_close_position` (60%) of its range.
 - `expired` — no retest inside `armed_retest_max_minutes` (12). **Enters at
-  market**, which is the pre-2026-09-20 behaviour.
+  market**, which is the pre-2026-09-20 behaviour. Handled by
+  `_expired_armed_retests`, which runs BEFORE the build queue and **skips the
+  side / index-confirmation / confirmation-bar gates** — see below.
 
 The market fallback is deliberate, not a hedge: a strong trend day never offers
 the retest, and those are exactly the setups worth having. Forfeiting them
@@ -672,6 +674,30 @@ extreme. Re-deriving the stop from the retest low would mean bypassing
 `default_stop_pct` / `min_stop_atr_mult`, which are risk floors and a separate
 decision; the retest low is stamped in metadata so that question can be
 answered from data later.
+
+**Expiry is evaluated outside the per-cycle gates, and that is load-bearing.**
+Those gates were all satisfied when the arm was created — that is the only way
+an arm exists. Judging the fallback against them again means it can only fire
+on a cycle where the setup happens to fully re-qualify, and if it never does,
+the trade is silently dropped.
+
+INTC on 2026-09-21 is the proof: armed 09:58 at 118.39 on a setup that passed
+every gate, the sector index lapsed at 10:03, and the stock ran 117.26 → 124.64
+with no entry. The retest never came (`touched=0` throughout), so the fallback
+was the entire point — and it never fired once, because the expiry check sat
+behind the gate that had failed.
+
+The asymmetry underneath it: index confirmation is an **entry** gate. Once in a
+position it no longer applies. Arming holds the trade out across exactly the
+window where a lapse can lock it out, so a setup that had already cleared the
+gates gets re-validated against them and can fail.
+
+What still applies on the fallback path: the regime must still be offered in
+the current window (a trend arm does not fire at midday), and the builder's own
+checks run unchanged — `breakout_confirmed` is False, so a faded setup fails
+`no_fresh_breakout`, and `_finalize_signal` still applies the stretched / SR /
+structure rejections. A runaway that has gone too far to chase is still
+declined, by the gate that exists for that.
 
 Two rules bound how stale an arm can get, because an arm past its window is a
 licence to enter at market on the next qualifying cycle:

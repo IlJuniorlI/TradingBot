@@ -362,6 +362,47 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An expired arm could never produce its entry.** *2026-09-21* — found on
+  day one of the armed retest, from a live miss. The market fallback exists so
+  a runaway move that never offers the retest still gets traded; it was
+  evaluated inside the build queue, AFTER the side / index-confirmation /
+  confirmation-bar gates. The moment any of those lapsed while the arm waited,
+  `_armed_retest_verdict` stopped being called and the 12-minute expiry was
+  never reached.
+
+  INTC: armed 09:58 at 118.39 on a setup that had passed every gate — only the
+  arm held it back — the sector index lapsed at 10:03, and the stock ran 117.26
+  → 124.64 with no entry. `touched=0` throughout, so the retest genuinely never
+  came and the fallback was the whole point. It never fired once.
+
+  The asymmetry that made it possible: index confirmation is an ENTRY gate, and
+  once in a position it no longer applies. Arming holds the trade OUT across
+  exactly the window where a lapse can lock it out, so a setup that had already
+  cleared the gates is re-validated against them and can fail. The fallback has
+  to be judged on the arm-time decision or it is not a fallback.
+
+  Expiry now lives in `_expired_armed_retests`, which runs before the queue and
+  is exempt from those three gates; the verdict keeps `none` / `wait` / `enter`
+  and no longer reports expiry at all. The arm carries the `regime_score` it
+  was validated with, so the fallback builds from the score the setup HAD
+  rather than a fresh one that asks a different question. Still enforced: the
+  regime must be offered in the current window, and the builder's own checks
+  run unchanged (`breakout_confirmed` False → a faded setup still fails
+  `no_fresh_breakout`; `_finalize_signal` still applies the stretched / SR /
+  structure rejections).
+
+  `skip_details` now reads the combined queue rather than `build_queue`, so a
+  cycle whose only attempt was a fallback reports the regime that was tried
+  instead of `none_qualified`.
+
+  Note on the test: the first version of the regression passed against the
+  UNFIXED code, because the synthetic decision for an expired arm set
+  `index_ok: True` — a fake value that smuggled the exemption through the gate
+  and made the test vacuous. It now carries `index_ok: False` and the exemption
+  is `pre_validated`, explicitly, so reverting the fix fails the test.
+
+  Coverage: 1,712 passing (+7).
+
 - **An armed retest could go stale and then justify a market entry.**
   *2026-09-20* — two holes in the arm lifecycle, both found by walking the
   state transitions rather than the happy path. An arm past its window is a
