@@ -381,6 +381,41 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The EOD report's headline described the ACCOUNT, not the session.**
+  *2026-09-21* — the same bug fixed in `manifest.realized_pnl` on 2026-09-19,
+  in the call site that fix missed one function over.
+  `account.capture_snapshot()` returns `account.realized_pnl`, a lifetime
+  accumulator set to 0.0 once in `PaperAccount.__init__` and only ever
+  incremented, and every headline number in `SESSION_REPORT` and the human log
+  line read from it — pnl, wins, losses, win_rate, profit_factor,
+  average_trade — while `trades` counted the list beside them. Two scopes in
+  one line, the wrong one as the headline, which is the exact wording of the
+  earlier fix.
+
+  `closed` was also filtered only to final exits, never to the session date, so
+  on a bot running across midnight without restarting the persistent
+  `trades.csv` **re-appended the prior day's rows under today's date**. Both
+  now use the same date filter `export_session_archive` already applied, so the
+  report, the CSV it writes and the archive all describe one day. The headline
+  sums the ROUNDED per-row values, so `realized_pnl` equals the sum of
+  `trades.csv` exactly rather than to within a cent.
+
+  A trade whose `exit_time` cannot be read is dropped rather than kept. The
+  first version kept it, on the "unevaluable is not absent" principle — and a
+  test written to assert that failed, because `_trade_csv_row` calls
+  `exit_time.isoformat()` and one bad record raises inside the broad
+  try/except around the whole block, costing the entire report. Losing a row
+  beats losing the session.
+
+- **An unreadable timestamp could take down the report and the dashboard.**
+  *2026-09-21* — found while testing the above, and upstream of it.
+  `PaperAccount._trade_to_dict` called `trade.exit_time.isoformat()`
+  unguarded, and it runs inside `capture_snapshot`, which is the FIRST thing
+  `write_session_report` does — so the session-date filter could never protect
+  against it. One record with a bad timestamp destroyed the whole EOD report,
+  and the dashboard snapshot shares the same path. Both timestamps now
+  serialize to null instead of raising.
+
 - **An expired arm could never produce its entry.** *2026-09-21* — found on
   day one of the armed retest, from a live miss. The market fallback exists so
   a runaway move that never offers the retest still gets traded; it was

@@ -466,9 +466,26 @@ class PaperAccount:
 
     @staticmethod
     def _trade_to_dict(trade: TradeRecord) -> dict[str, Any]:
+        """Serialize one trade. A timestamp that is not a datetime serializes
+        to None rather than raising.
+
+        `entry_time` / `exit_time` are declared non-optional, so this looks
+        like dead defensive code -- it is not. `capture_snapshot` calls this
+        for every recent trade, and it is the FIRST thing
+        `write_session_report` does; one record with an unreadable timestamp
+        (rehydrated from an older store, recovered from the broker) raises
+        here and takes down the entire EOD report from inside its broad
+        try/except, plus the dashboard snapshot that shares this path. Found
+        2026-09-21 while testing the session-scope fix, which could not
+        protect against it because the raise happens upstream of the filter.
+        """
         payload = asdict(trade)
-        payload["entry_time"] = trade.entry_time.isoformat()
-        payload["exit_time"] = trade.exit_time.isoformat()
+        for field_name in ("entry_time", "exit_time"):
+            value = getattr(trade, field_name, None)
+            try:
+                payload[field_name] = value.isoformat()
+            except AttributeError:
+                payload[field_name] = None
         return payload
 
     @staticmethod

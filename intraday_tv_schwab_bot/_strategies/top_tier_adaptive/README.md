@@ -40,7 +40,7 @@ Not all regimes fire at all times. All boundaries are param-driven (no hard-code
 
 Default boundary values: opening range `09:30`-`09:45` (`orb_range_minutes: 15`), ORB end `10:05`, midday `11:30`-`13:00`, afternoon `13:00`-`no_new_entries_after` (`15:00` in the shipped RTH-only preset; `19:30` if extended-hours trading is enabled).
 
-Midday still favors pullbacks because top-tier stocks tend to chop during the lunch hour, but the momentum and sr_scalp regimes are allowed alongside — the `momentum_min_day_strength` hard gate (default 1.5%) and the sr_scalp HTF zone-gap floor filter out non-qualifying names automatically. As of 2026-05-12 the momentum regime is post-ORB-through-close (renamed from `momentum_close` and widened from afternoon-only) and sr_scalp is post-ORB-through-close.
+Midday still favors pullbacks because top-tier stocks tend to chop during the lunch hour, but the momentum, sr_scalp and (since 2026-09-21) vol_squeeze regimes are allowed alongside — that chop is itself the compression vol_squeeze trades — the `momentum_min_day_strength` hard gate (default 1.5%) and the sr_scalp HTF zone-gap floor filter out non-qualifying names automatically. As of 2026-05-12 the momentum regime is post-ORB-through-close (renamed from `momentum_close` and widened from afternoon-only) and sr_scalp is post-ORB-through-close.
 
 Per-regime opt-out via params: each of the eight regimes has its own `disable_*_regime` boolean knob (all default `false`). Disabling a regime strips it from every window. The afternoon-range sub-knob `afternoon_include_range` still works for window-scoped exclusion.
 

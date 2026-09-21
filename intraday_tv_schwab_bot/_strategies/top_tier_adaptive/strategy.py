@@ -1706,9 +1706,20 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         """
         if not self._armed_retests:
             return []
+        prefix = f"{symbol}|"
+        # `armed_retest_enabled` is the A/B control and the revert path, so it
+        # has to be a clean off switch. The verdict already refuses to create
+        # arms when it is false, but without this an arm created moments
+        # earlier would still fire its fallback here -- the flag would stop
+        # new arms and keep producing entries from old ones, which is the one
+        # behaviour a kill switch must not have. Flipping it off drops
+        # whatever is in flight.
+        if not bool(self.params.get("armed_retest_enabled", True)):
+            for key in [k for k in self._armed_retests if k.startswith(prefix)]:
+                del self._armed_retests[key]
+            return []
         now = now_et()
         max_minutes = float(self.params.get("armed_retest_max_minutes", 12.0))
-        prefix = f"{symbol}|"
         out: list[tuple[Side, str, dict[str, Any]]] = []
         for key in [k for k in self._armed_retests if k.startswith(prefix)]:
             arm = self._armed_retests[key]

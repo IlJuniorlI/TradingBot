@@ -809,16 +809,59 @@ def write_session_report(
     try:
         performance = account.capture_snapshot(positions)
         trades = list(account.trades)
-        closed = [t for t in trades if bool(getattr(t, "final_exit", True))]
-        session_date = now_et().date().isoformat()
+        today = now_et().date()
+        session_date = today.isoformat()
+
+        # Scoped to the SESSION, not the account. `account.realized_pnl` is a
+        # lifetime accumulator -- set to 0.0 once in `PaperAccount.__init__`,
+        # only ever incremented, never reset per day -- and every headline
+        # number below used to come from it while `trades` counted the list
+        # beside it. Two scopes in one line, with the wrong one as the
+        # headline. `manifest.realized_pnl` was fixed for exactly this on
+        # 2026-09-19; this is the call site that fix missed.
+        #
+        # The date filter matters for the same reason it does in
+        # `export_session_archive`: a bot that runs across midnight without
+        # restarting keeps the prior day's records in `account.trades`, so
+        # without it the headline mixes days AND the persistent trades.csv
+        # re-appends yesterday's rows under today's date.
+        #
+        # A trade whose exit timestamp cannot be read is DROPPED, matching
+        # `export_session_archive`. Keeping it looks like the more careful
+        # choice -- "unevaluable is not the same as absent" -- and here it is
+        # the opposite: `_trade_csv_row` calls `exit_time.isoformat()`, so one
+        # unreadable record raises inside the broad try/except around this
+        # whole block and costs the ENTIRE report, every aggregate and the CSV
+        # append with it. Losing one row beats losing the session.
+        def _closed_today(trade: TradeRecord) -> bool:
+            if not bool(getattr(trade, "final_exit", True)):
+                return False
+            exit_time = getattr(trade, "exit_time", None)
+            try:
+                return exit_time.date() == today
+            except (AttributeError, TypeError):
+                LOG.warning(
+                    "Dropping %s from the session report: unreadable exit_time %r",
+                    getattr(trade, "symbol", "?"), exit_time,
+                )
+                return False
+
+        closed = [t for t in trades if _closed_today(t)]
 
         # --- Log summary ---
-        total_pnl = float(performance.get("realized_pnl", 0.0) or 0.0)
-        wins = int(performance.get("wins", 0) or 0)
-        losses = int(performance.get("losses", 0) or 0)
-        win_rate = performance.get("win_rate")
-        profit_factor = performance.get("profit_factor")
-        avg_trade = performance.get("average_trade")
+        wins = sum(1 for t in closed if t.realized_pnl > 0)
+        losses = sum(1 for t in closed if t.realized_pnl < 0)
+        # Summing the ROUNDED per-row values, so this equals the sum of
+        # trades.csv exactly rather than to within a cent -- `_trade_csv_row`
+        # is what writes those rows.
+        total_pnl = round(sum(round(float(t.realized_pnl), 2) for t in closed), 2)
+        win_rate = (wins / len(closed)) if closed else None
+        gross_profit = sum(t.realized_pnl for t in closed if t.realized_pnl > 0)
+        gross_loss = abs(sum(t.realized_pnl for t in closed if t.realized_pnl < 0))
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
+        avg_trade = (total_pnl / len(closed)) if closed else None
+        # Drawdown stays account-derived: it is an equity-curve metric, not a
+        # per-trade aggregate, and has no meaningful session-only form here.
         max_dd = float(performance.get("max_drawdown", 0.0) or 0.0)
         LOG.info(
             "SESSION REPORT %s: strategy=%s pnl=%.2f trades=%d wins=%d losses=%d win_rate=%s pf=%s avg_trade=%s max_drawdown=%.2f",
