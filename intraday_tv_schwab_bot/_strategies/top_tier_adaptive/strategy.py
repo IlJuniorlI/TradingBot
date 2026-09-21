@@ -1461,8 +1461,9 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             no-entry zone (the range is still forming).
           - trend / pullback / range: primary scoring regimes
           - vol_squeeze: Bollinger-squeeze breakout. Allowed in the primary
-            window (orb_end → midday_start) and the afternoon
-            (afternoon_start → no_new).
+            window (orb_end → midday_start), midday (2026-09-21 — the
+            lunchtime tape IS the compression its thesis is about) and the
+            afternoon (afternoon_start → no_new).
           - momentum: momentum-from-open continuation. Allowed post-ORB
             through close (orb_end → no_new). Includes midday because the
             ``momentum_min_day_strength`` hard gate filters out chop —
@@ -1574,7 +1575,18 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # tape. sr_scalp is also allowed — midday's low-volatility
             # chop is often the cleanest scalp environment between HTF
             # zones (when the gap qualifies).
-            return _filter({"pullback", "momentum", "sr_scalp", "vwap_reclaim"})
+            #
+            # vol_squeeze added 2026-09-21. Its thesis is compression
+            # resolving into expansion, and the lunchtime tape IS the
+            # compression — it was excluded from the one window where its
+            # setup is most common. The measurement that prompted it: on
+            # 2026-09-21, 51% of midday skips across the session's five
+            # biggest movers (INTC/META/AMD/QCOM/NFLX, all +3% to +6%) were
+            # "no regime qualified", and of the three regimes offered, NONE
+            # came within half a point of its floor — pullback peaked at
+            # 3.00 against 3.5, momentum at 3.00 against 4.0, vwap_reclaim
+            # at 0.00. Ninety minutes a day in which nothing could fire.
+            return _filter({"pullback", "momentum", "sr_scalp", "vwap_reclaim", "vol_squeeze"})
         if self._time_in_range(now_t, afternoon_start, no_new):
             # Range regime is included in afternoon by default because
             # afternoon tapes are often range-bound and forcing trend/pullback

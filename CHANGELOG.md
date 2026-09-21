@@ -286,6 +286,25 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`vol_squeeze` now runs at midday.** *2026-09-21* — its thesis is
+  compression resolving into expansion, and the lunchtime tape IS the
+  compression, so it had been excluded from the one window where its setup is
+  most common. The midday carve-out predates the regime's reinstatement and was
+  written about the regimes that existed then.
+
+  The measurement that prompted it, from the live session: across the day's
+  five biggest movers (INTC, META, AMD, QCOM, NFLX — all +3% to +6%), **51% of
+  midday skips were "no regime qualified"**, and of the three regimes then
+  offered, not one came within half a point of its floor — pullback peaked at
+  3.00 against a 3.5 floor, momentum at 3.00 against 4.0, vwap_reclaim at 0.00.
+  Ninety minutes a day in which effectively nothing could fire. The morning
+  profile is completely different: only 4% of blocks were score-related, the
+  rest being downstream gates.
+
+  `trend` and `range` stay out of midday — this is not a reversal of the
+  carve-out, only of the part that excluded the regime whose setup midday
+  produces.
+
 - **README drift: both READMEs said "six regimes".** *2026-09-20* — there have
   been eight since `vwap_reclaim` and `orb` were added; the strategy README's
   regime-defaults table was also missing `disable_vwap_reclaim_regime` and

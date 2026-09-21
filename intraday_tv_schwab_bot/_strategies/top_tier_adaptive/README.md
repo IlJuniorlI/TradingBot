@@ -34,7 +34,7 @@ Not all regimes fire at all times. All boundaries are param-driven (no hard-code
 - **09:30 - opening-range-end (range formation)**: NO entries — the opening range (first `orb_range_minutes`, default 15 → 09:30-09:45) is still forming
 - **opening-range-end - `orb_end_time` (ORB window)**: **orb only** — a true Opening Range Breakout. Trades a break of the opening range (stop = opposite range edge, target = measured move). As of 2026-05-29 this replaced the old "trend regime with bypasses" approach.
 - **`orb_end_time` - `midday_start_time` (primary)**: trend, pullback, range, vol_squeeze, momentum, sr_scalp
-- **`midday_start_time` - `midday_end_time` (midday)**: pullback, momentum, sr_scalp
+- **`midday_start_time` - `midday_end_time` (midday)**: pullback, momentum, sr_scalp, vol_squeeze *(added 2026-09-21 — its thesis is compression resolving into expansion and the lunchtime tape IS the compression; it had been excluded from the one window where its setup is most common. On 2026-09-21, 51% of midday skips on the day's five biggest movers were "no regime qualified", with none of the three regimes then offered coming within half a point of its floor)*
 - **`afternoon_start_time` - `no_new_entries_after` (afternoon)**: trend, pullback, range, vol_squeeze, momentum, sr_scalp (range was disabled pre-2026-04-22; re-enabled so afternoon range-bound tapes get mean-reversion entries — disable with `afternoon_include_range: false`)
 - **After `no_new_entries_after`**: no new entries
 
