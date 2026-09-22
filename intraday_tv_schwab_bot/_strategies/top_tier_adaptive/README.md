@@ -617,6 +617,67 @@ LONG    floor 4.00    stop buffer x1.00    target 2.00R
 SHORT   floor 4.50    stop buffer x1.25    target 1.70R
 ```
 
+## 23. ORB logic fixes, and why the regime has never traded (2026-09-22)
+
+**It has never traded.** Across the whole archive, every ORB attempt died on
+`orb_range_too_wide` — 3,403 of them, and not one of any other ORB failure
+reason. No ORB signal has ever been built, so the "thin evidence — one session"
+note in the preset describes a session that contained no ORB fills.
+
+That is a **calibration** problem and it is still open. `orb_max_range_atr_mult:
+4.0` compares a **15-bar** opening range against a **1-bar** `atr14`. Measured
+across 462 real symbol-days the opening range is:
+
+| | ratio to 1m ATR |
+|---|---|
+| min | 2.21 |
+| p10 | 3.20 |
+| **median** | **4.64** |
+| p90 | 6.45 |
+| max | 11.24 |
+
+The cap sits *below the median*. `orb_min_range_atr_mult: 0.5` has never bound
+and cannot — the minimum observed is 2.21. A band of roughly `[2.5, 8.0]` would
+match observed reality (8.0 admits 96.5%). **Not changed**: enabling ORB is a
+trading decision, and it is disabled in the shipped preset.
+
+Four **logic** defects found underneath the calibration issue were fixed. None
+of them is why ORB does not trade; all four would have produced visible effects
+the moment the cap was corrected.
+
+1. **The score qualified on a bare break; the builder demanded a buffered
+   one.** `_score_orb` awarded +2.5 for `close > or_high` with no buffer and
+   treated clearing `orb_breakout_buffer_atr_mult` as an optional +1.0, while
+   `_build_orb_signal` rejected anything that did not clear it. A one-tick poke
+   scored 4.0, beat the 3.5 floor, won its place in the build queue and died on
+   `orb_no_break_above` — a guaranteed-fail path. The +2.5 now requires the
+   buffered break and the +1.0 marks a *decisive* one at 2× the buffer; the
+   ceiling stays 5.0. `vol_squeeze` had the same shape and was fixed the same
+   way on 2026-05-14.
+2. **The window lost a minute.** `_time_in_range` is inclusive at both ends, so
+   the range-formation check overlapped the ORB window at `orb_range_end` — and
+   since formation returns first, that minute was unreachable. With the default
+   15-minute range the window ran 09:46–10:05 while `entry_windows` opened at
+   09:45. The formation check is now half-open.
+3. **`orb_range_minutes` and `orb_end_time` had an unvalidated ordering.**
+   Violating it did not error, it silently shrank the window: 30 minutes left
+   5 tradeable minutes, 34 left 1, and 35 left none at all with no error and no
+   log line. `_validate_orb_window` now raises at construction, and only when
+   the regime is enabled.
+4. **The range-end derivation existed in three copies** —
+   `_opening_range`, `_orb_range_end` and `_allowed_regimes` each recomputed
+   it. They agreed, but three copies of one rule is how the bot ends up forming
+   the range over one span and opening the window against another;
+   `_breakout_reference` was extracted for exactly this on 2026-09-20.
+
+Two things worth knowing that were **not** changed. ORB's achievable R:R is
+capped below its own `orb_target_range_mult: 1.5` — the stop is the *opposite*
+range edge plus a buffer while the target is measured from the *broken* edge,
+so R:R asymptotes to 1.5 without reaching it (1.07 at a 1-ATR range, 1.37 at
+4 ATR) against 2.0+ for every other regime. And if `min_target_rr` were ever
+raised to 1.5, ORB would become mathematically incapable of producing a signal,
+silently.
+
 ## 22. Armed retest: qualifying arms the trigger, the retest fires it (2026-09-20)
 
 `trend` and `momentum` both enter on `close > max(high of the previous N bars)`

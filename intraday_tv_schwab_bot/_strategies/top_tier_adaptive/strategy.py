@@ -146,6 +146,47 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # bounds. Not worth persisting: a stale arm reloaded against a level
         # that has since been swept is worse than re-deriving it.
         self._armed_retests: dict[str, dict[str, Any]] = {}
+        self._validate_orb_window()
+
+    def _validate_orb_window(self) -> None:
+        """Fail loudly when the opening range cannot finish before the ORB
+        window is meant to close.
+
+        ``orb_range_minutes`` and ``orb_end_time`` are independent knobs with
+        an implicit ordering between them, and nothing checked it. Violating
+        it does not error -- it silently shrinks the window to nothing:
+
+            orb_range_minutes=15 -> 20 tradeable minutes
+                            =30 ->  5
+                            =34 ->  1
+                            =35 ->  NEVER, with no error and no log line
+
+        A regime that quietly stops existing is the worst way for a config
+        mistake to present, so this raises at construction instead. Only
+        checked when the regime is ON; with ``disable_orb_regime`` the knobs
+        are inert and an odd pair is harmless.
+        """
+        if bool(self.params.get("disable_orb_regime", False)):
+            return
+        try:
+            range_end = parse_hhmm(self._orb_range_end())
+            orb_end = parse_hhmm(str(self.params.get("orb_end_time", "10:05")))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"top_tier_adaptive: cannot parse the ORB window "
+                f"(orb_range_minutes={self.params.get('orb_range_minutes')!r}, "
+                f"orb_end_time={self.params.get('orb_end_time')!r}): {exc}"
+            ) from exc
+        if range_end >= orb_end:
+            raise ValueError(
+                f"top_tier_adaptive: the opening range finishes at "
+                f"{range_end.strftime('%H:%M')} but orb_end_time is "
+                f"{orb_end.strftime('%H:%M')}, so the ORB window would never "
+                f"open. Lower orb_range_minutes "
+                f"({self.params.get('orb_range_minutes', 15)}) or raise "
+                f"orb_end_time, or set disable_orb_regime: true if the regime "
+                f"is not wanted."
+            )
 
     # ------------------------------------------------------------------
     # Watchlist — include all configured index confirmation ETFs so they
@@ -833,13 +874,15 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         extended-hours mode."""
         if frame is None or frame.empty:
             return None, None
-        range_min = max(1, int(self.params.get("orb_range_minutes", 15)))
         today = frame[_same_day_mask(frame, now_et().date())]
         if today.empty:
             return None, None
         rth_open = parse_hhmm("09:30")
-        end_total = 9 * 60 + 30 + range_min
-        range_end = parse_hhmm(f"{end_total // 60:02d}:{end_total % 60:02d}")
+        # Via `_orb_range_end`, not a local recomputation. The same derivation
+        # used to appear here, in `_orb_range_end` and in `_allowed_regimes`;
+        # three copies of one rule is how the bot ends up forming the range
+        # over one span and opening the window against another.
+        range_end = parse_hhmm(self._orb_range_end())
         in_window = today.index.to_series().map(lambda ts: rth_open <= ts.time() < range_end)
         window = today[in_window.values]
         if window.empty:
@@ -854,13 +897,23 @@ class TopTierAdaptiveStrategy(BaseStrategy):
 
         Components (max 5.0):
           * +0.5  base (regime in play)
-          * +2.5  price has broken the opening range on the trade side. No
-                  break => base only (the bot waits for the break, it does
-                  not trade inside the range).
-          * +1.0  breakout conviction — the break clears the edge by at least
-                  a small ATR buffer (not a 1-tick poke).
+          * +2.5  price has broken the opening range on the trade side BY AT
+                  LEAST ``orb_breakout_buffer_atr_mult`` x ATR -- the same
+                  condition ``_build_orb_signal`` enforces. No break => base
+                  only (the bot waits for the break, it does not trade inside
+                  the range).
+          * +1.0  breakout conviction — the break clears the edge by TWICE
+                  that buffer, i.e. decisively rather than marginally.
           * +1.0  range is a sane, tradeable size (>= orb_min_range_atr_mult
                   ATR and, when capped, <= orb_max_range_atr_mult ATR).
+
+        The +2.5 used to be awarded for a BARE break, with clearing the buffer
+        as the optional +1.0 -- while the builder rejected anything that did
+        not clear it. A one-tick poke therefore scored 4.0, beat the 3.5 floor,
+        won its place in the build queue and then died on
+        ``orb_no_break_above``: a guaranteed-fail path, not merely an
+        optimistic one. `vol_squeeze` had the same shape and was fixed the
+        same way on 2026-05-14, by making the scoring bonuses hard gates.
         """
         if atr <= 0 or close <= 0:
             return 0.0
@@ -868,13 +921,15 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         if or_high is None or or_low is None or or_high <= or_low:
             return 0.5
         score = 0.5
-        broke = close > or_high if side == Side.LONG else close < or_low
+        buffer = float(self.params.get("orb_breakout_buffer_atr_mult", 0.05)) * atr
+        broke = (close > or_high + buffer if side == Side.LONG
+                 else close < or_low - buffer)
         if not broke:
             return score
         score += 2.5
-        buffer = float(self.params.get("orb_breakout_buffer_atr_mult", 0.05)) * atr
-        clears = close > or_high + buffer if side == Side.LONG else close < or_low - buffer
-        if clears:
+        decisive = (close > or_high + 2.0 * buffer if side == Side.LONG
+                    else close < or_low - 2.0 * buffer)
+        if decisive:
             score += 1.0
         range_height = or_high - or_low
         min_range = float(self.params.get("orb_min_range_atr_mult", 0.5)) * atr
@@ -1543,16 +1598,22 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # directly. Distinct from ``disable_orb_window`` (which keeps the
         # carve-out but skips entries until orb_end_time).
         orb_disabled = bool(self.params.get("disable_orb_regime", False))
-        orb_range_min = max(1, int(self.params.get("orb_range_minutes", 15)))
-        orb_range_end_total = 9 * 60 + 30 + orb_range_min
-        orb_range_end = f"{orb_range_end_total // 60:02d}:{orb_range_end_total % 60:02d}"
+        orb_range_end = self._orb_range_end()
         if not orb_disabled:
             # Opening range forms over the first ``orb_range_minutes`` of RTH
             # (09:30 →). NO entries while it forms — the true-ORB thesis waits
             # for the range, it does not trade the opening chaos. (In extended
             # mode pre-market 07:00-09:30 still trades via the fallthrough
             # below; 09:30→range-end is reserved for range formation.)
-            if self._time_in_range(now_t, "09:30", orb_range_end):
+            # HALF-OPEN at the end. `_time_in_range` is inclusive on both
+            # sides, so a closed check here overlapped the ORB window by one
+            # minute at `orb_range_end` -- and since this branch returns
+            # first, that minute was silently unreachable: with the default
+            # 15-minute range the window ran 09:46-10:05, not 09:45-10:05,
+            # while `entry_windows` opened at 09:45. The range is built from
+            # bars in [09:30, range_end), so at range_end it is complete and
+            # the window should already be open.
+            if parse_hhmm("09:30") <= now_t < parse_hhmm(orb_range_end):
                 return set()
             if self._time_in_range(now_t, orb_range_end, orb_end):
                 # ORB window: opening-range breakout only. Whole-window opt-out

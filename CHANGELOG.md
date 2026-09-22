@@ -381,6 +381,43 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Four logic defects in the ORB regime.** *2026-09-22* — found while
+  evaluating why it has never worked. The headline answer is that **it has
+  never run**: every attempt in the archive died on `orb_range_too_wide`, 3,403
+  of them, with not one of any other ORB failure reason ever logged. That is a
+  calibration problem — `orb_max_range_atr_mult: 4.0` compares a 15-bar opening
+  range against a 1-bar `atr14`, and across 462 real symbol-days the median
+  ratio is 4.64, i.e. the cap sits below the median. Left alone; enabling ORB
+  is a trading decision and it ships disabled.
+
+  The four logic defects underneath it were fixed, since all would have
+  surfaced the moment the cap was corrected:
+
+  * `_score_orb` awarded its +2.5 for a BARE break while `_build_orb_signal`
+    required the break to clear `orb_breakout_buffer_atr_mult`. A one-tick poke
+    scored 4.0, cleared the 3.5 floor, won its slot in the build queue and died
+    on `orb_no_break_above` — a guaranteed-fail path, not an optimistic one.
+    The +2.5 now requires the buffered break; the +1.0 marks a decisive break
+    at 2x the buffer; the ceiling stays 5.0.
+  * `_time_in_range` is inclusive at both ends, so the range-formation window
+    overlapped the ORB window at `orb_range_end`, and formation returns first —
+    making that minute unreachable. The window ran 09:46-10:05 while
+    `entry_windows` opened at 09:45. The formation check is now half-open.
+  * `orb_range_minutes` and `orb_end_time` had an unvalidated implicit
+    ordering. Violating it silently shrank the window rather than erroring: 30
+    minutes left 5 tradeable minutes, 34 left 1, 35 left none, with no error
+    and no log line. `_validate_orb_window` raises at construction, only when
+    the regime is enabled.
+  * The range-end derivation was written out in three places. They agreed, but
+    three copies of one rule is how the bot forms the range over one span and
+    opens the window against another.
+
+  Coverage: `tests/test_orb_regime.py` (22). Each fix was reverted
+  individually and confirmed to fail its own tests — the first attempt at that
+  check silently overwrote its own backup after a crash and left one fix
+  reverted in the tree, so the verification is now driven from an immutable
+  copy.
+
 - **The EOD report's headline described the ACCOUNT, not the session.**
   *2026-09-21* — the same bug fixed in `manifest.realized_pnl` on 2026-09-19,
   in the call site that fix missed one function over.
