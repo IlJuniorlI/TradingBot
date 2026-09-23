@@ -535,16 +535,19 @@ shared_exit:
 # Per-strategy windows and parameter blocks.
 strategies:
   top_tier_adaptive:
-    # RTH-only windows. Entries open at 09:45 — the moment the ORB regime can
-    # first fire (= 09:30 + orb_range_minutes, the opening-range formation
-    # window). No entries before then: 09:30-09:45 is reserved for the opening
-    # range to form, and there is no pre-market trading in rth indicator mode.
-    # If you change orb_range_minutes, move this window start to match. Entries
-    # stop at no_new_entries_after (15:00). Management runs to 15:55 (force-
-    # flatten ~15:50 = mgmt end - force_flatten_buffer_minutes); the screener
-    # runs the full session so candidates are ready when the ORB window opens.
+    # RTH-only windows. Entries open at 09:35 (2026-09-23; was 09:45). With
+    # disable_orb_regime true there is no opening-range carve-out, so the
+    # regime mix is live from 09:30 and this window is the only thing holding
+    # entries back; 09:35 skips the first five minutes of the open. There is
+    # no pre-market trading in rth indicator mode.
+    # If you turn the ORB regime back on, 09:30 -> 09:30 + orb_range_minutes
+    # (09:45) is a no-entry zone again regardless of this window, so an
+    # earlier start here is harmless but inert until range-end. Entries stop
+    # at no_new_entries_after (15:00). Management runs to 15:55 (force-flatten
+    # ~15:50 = mgmt end - force_flatten_buffer_minutes); the screener runs the
+    # full session so candidates are ready when entries open.
     entry_windows:
-      - ["09:45", "15:00"]
+      - ["09:35", "15:00"]
     management_windows:
       - ["09:30", "15:55"]
     screener_windows:
@@ -1195,7 +1198,12 @@ strategies:
       # (toward midrange). Mid-range candles don't qualify (no clean
       # bounce structure).
       #
-      # Allowed windows: orb_end → no_new_entries_after (skips ORB chop).
+      # Allowed windows: orb_end_time -> no_new_entries_after (primary, midday
+      # and afternoon), WHETHER OR NOT the ORB regime is on. With it off, as
+      # here, the other regimes trade from the 09:35 entry-window open, but
+      # sr_scalp still waits for orb_end_time (10:05): its reason for skipping
+      # the open -- morning chop near recent levels breaks through them -- is
+      # about the tape, not about ORB.
       # Index confirmation EXEMPT (mean-reversion thesis, same as range).
       # Disable globally with `disable_sr_scalp_regime: true`.
       min_sr_scalp_score: 3.0                  # 2026-05-27: was 4.0 — UNREACHABLE (sr_scalp score ceiling is 3.9 across 13.2k cycles, so the regime fired 0 times ever). 3.0 lets it qualify so its real-world edge can be evaluated.
@@ -1231,15 +1239,14 @@ strategies:
       # level nothing has touched.
       sr_scalp_noise_lookback_bars: 20         # bars used to measure how far the level has been pierced
       sr_scalp_min_stop_atr_mult: 0.5          # was 2.5 — now a backstop, not the binding floor
-      # sr_scalp OFF. The geometry that made it unbuildable is FIXED as of
-      # 2026-09-22 (see the stop-floor note above): the two knobs no longer
-      # fight, and a setup at the documented `sr_scalp_min_distance_atr` gap
-      # can now clear min_target_rr. What is left is a trading decision, not a
-      # defect — the regime has 15 archived trades for -$179.67 on the old
-      # geometry, and turning it on is a second variable on a week that is
-      # already measuring the armed retest. Flip this to false to trade S/R
-      # bounces and rejections; nothing else needs to change.
-      disable_sr_scalp_regime: true
+      # sr_scalp ON (re-enabled 2026-09-23). The geometry that made it
+      # unbuildable was fixed on 2026-09-22 (see the stop-floor note above):
+      # the two knobs no longer fight, and a setup at the documented
+      # `sr_scalp_min_distance_atr` gap can clear min_target_rr. Its 15
+      # archived trades (-$179.67) are all on the OLD geometry, so they say
+      # little about this one. Set true to switch S/R bounces and rejections
+      # off again; nothing else needs to change.
+      disable_sr_scalp_regime: false
 
       # ===== Per-regime opt-out knobs (added 2026-05-12) =====
       # Set any of these to true to globally disable that regime across all

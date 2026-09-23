@@ -1239,8 +1239,9 @@ def _forward_excursion_atr(
 
 def _forward_baseline(
     bars_by_sym: dict[str, list[dict[str, Any]]], window_minutes: int, stride: int = 7,
+    *, start: datetime | None = None, end: datetime | None = None,
 ) -> dict[str, Any]:
-    """The unconditional forward move, sampled from the SAME session's bars.
+    """The unconditional forward move over the span the decisions cover.
 
     Without this every gate statistic is unreadable. A gate whose blocks were
     followed by a +0.3 ATR net move only matters if an arbitrary moment in the
@@ -1248,13 +1249,23 @@ def _forward_baseline(
     reported also absorbs the day's character: a trending day lifts every
     LONG-side number, and only the gap above baseline is evidence.
 
-    Measured from a LONG viewpoint, so a SHORT gate's favourable direction is
-    the mirror of ``up_pct``.
+    ``start`` / ``end`` bound the sampled bars to the decisions' own span. The
+    archived 1m frames carry the PRIOR session and extended hours too, and
+    until 2026-09-23 all of it was sampled: about 43% of a top_tier baseline
+    came from yesterday or from pre/post-market bars, whose tiny ATR inflates
+    any move measured in ATR. That is not the population any gate decided on.
+
+    Measured from a LONG viewpoint (``median_net_atr``, ``up_pct``); the SHORT
+    baseline is its mirror. Callers comparing a SHORT gate must use that
+    mirror, not this number.
     """
     nets: list[float] = []
     for rows in bars_by_sym.values():
         for i in range(0, max(0, len(rows) - window_minutes - 1), max(1, stride)):
-            excursion = _forward_excursion_atr(rows, rows[i]["ts"], window_minutes)
+            ts = rows[i]["ts"]
+            if (start is not None and ts < start) or (end is not None and ts > end):
+                continue
+            excursion = _forward_excursion_atr(rows, ts, window_minutes)
             if excursion is not None:
                 nets.append(excursion[2])
     if not nets:
@@ -1267,6 +1278,16 @@ def _forward_baseline(
         "median_net_atr": round(median, 3),
         "up_pct": round(100.0 * sum(1 for v in nets if v > 0) / len(nets), 1),
     }
+
+
+def _reason_side(primary: str) -> str | None:
+    """``LONG`` / ``SHORT`` when a skip reason names the side it stopped
+    (``long_build_failed_...``, ``build_failed_short_...``), else None."""
+    lowered = primary.strip().lower()
+    for side in ("long", "short"):
+        if lowered.startswith(f"{side}_") or lowered.startswith(f"build_failed_{side}_"):
+            return side.upper()
+    return None
 
 
 def _gate_attribution(
@@ -1306,15 +1327,31 @@ def _gate_attribution(
             return {}
 
         net_moves: dict[str, list[float]] = defaultdict(list)
+        edges: dict[str, list[float]] = defaultdict(list)
         favourable: dict[str, list[float]] = defaultdict(list)
         adverse: dict[str, list[float]] = defaultdict(list)
         families: dict[str, Counter] = defaultdict(Counter)
         blocked = Counter()
         unevaluated = Counter()
         seen: set[tuple[str, datetime, str]] = set()
+        # (reason, side, excursion) -- scored after the baseline, which needs
+        # the span of every decision first.
+        scored: list[tuple[str, str, tuple[float, float, float]]] = []
+        first_ts: datetime | None = None
+        last_ts: datetime | None = None
 
         with open(decisions_path, newline="", encoding="utf-8") as fh:
             for row in csv.DictReader(fh):
+                ts_raw = str(row.get("timestamp", "")).strip('"').split(",")[0]
+                try:
+                    ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                # The baseline's span: every moment the strategy was deciding,
+                # whatever it decided -- entries, sideless skips and all. It is
+                # the population a blocked moment competes with.
+                first_ts = ts if first_ts is None or ts < first_ts else first_ts
+                last_ts = ts if last_ts is None or ts > last_ts else last_ts
                 if str(row.get("action", "")).strip().lower() != "skipped":
                     continue
                 symbol = str(row.get("symbol", "") or "")
@@ -1325,29 +1362,23 @@ def _gate_attribution(
                 if not primary or primary == "none":
                     continue
                 reason = _normalize_skip_reason(primary)
-                ts_raw = str(row.get("timestamp", "")).strip('"').split(",")[0]
-                try:
-                    ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    continue
                 key = (symbol, ts.replace(second=0), reason)
                 if key in seen:
                     continue
                 seen.add(key)
 
-                # Which way was the bot about to trade? `side_pref` when the
-                # gatekeeper resolved one, else the reason's own side prefix
-                # (`long_build_failed_...`). Without a side there is no
-                # "favourable" direction and the row cannot be scored.
-                side = str(row.get("side_pref", "") or "").strip().upper()
+                # Which way was the bot about to trade? The reason's own side
+                # when it names one -- `short_build_failed_...` is the SHORT
+                # build this gate stopped. `side_pref` is the CANDIDATE's
+                # screener bias, and it disagrees with a side-prefixed reason
+                # on about a quarter of rows (2026-09-22: 2,065 `short_` rows
+                # carried side_pref=LONG); read first, it scored those blocks
+                # in the wrong direction. It stands in only for reasons that
+                # name no side. Without a side there is no "favourable"
+                # direction and the row cannot be scored.
+                side = _reason_side(primary) or str(row.get("side_pref", "") or "").strip().upper()
                 if side not in {"LONG", "SHORT"}:
-                    lowered = primary.lower()
-                    if lowered.startswith("long_"):
-                        side = "LONG"
-                    elif lowered.startswith("short_"):
-                        side = "SHORT"
-                    else:
-                        continue
+                    continue
 
                 blocked[reason] += 1
                 family = str(row.get("family", "") or "none").strip() or "none"
@@ -1357,18 +1388,28 @@ def _gate_attribution(
                 if excursion is None:
                     unevaluated[reason] += 1
                     continue
-                up_atr, down_atr, net_atr = excursion
-                if side == "LONG":
-                    favourable[reason].append(up_atr)
-                    adverse[reason].append(down_atr)
-                    net_moves[reason].append(net_atr)
-                else:
-                    favourable[reason].append(down_atr)
-                    adverse[reason].append(up_atr)
-                    net_moves[reason].append(-net_atr)
+                scored.append((reason, side, excursion))
 
         if not blocked:
             return {}
+
+        baseline_stats = _forward_baseline(bars_by_sym, window_minutes, start=first_ts, end=last_ts)
+        baseline_net = float(baseline_stats.get("median_net_atr") or 0.0)
+        for reason, side, (up_atr, down_atr, net_atr) in scored:
+            # Everything toward the side the bot wanted, and its edge over the
+            # SAME side's baseline. Until 2026-09-23 every gate was compared
+            # with the LONG baseline, so on an up day a SHORT gate's edge came
+            # out understated by twice the drift, and on a down day overstated.
+            if side == "LONG":
+                favourable[reason].append(up_atr)
+                adverse[reason].append(down_atr)
+                net_moves[reason].append(net_atr)
+                edges[reason].append(net_atr - baseline_net)
+            else:
+                favourable[reason].append(down_atr)
+                adverse[reason].append(up_atr)
+                net_moves[reason].append(-net_atr)
+                edges[reason].append(-net_atr + baseline_net)
 
         def _median(values: list[float]) -> float:
             ordered = sorted(values)
@@ -1391,6 +1432,8 @@ def _gate_attribution(
                 # wanted. Baseline is ~0, so a positive number is evidence the
                 # gate blocked a move that was going to happen anyway.
                 "median_net_atr": None,
+                # The same move less its side's baseline: what the ranking uses.
+                "median_edge_atr": None,
                 "favourable_pct": None,
                 # Secondary, and near chance at this window (77% of random
                 # 30-minute windows touch 1 ATR up). Kept because a wide
@@ -1403,6 +1446,7 @@ def _gate_attribution(
             if nets:
                 entry.update({
                     "median_net_atr": round(_median(nets), 3),
+                    "median_edge_atr": round(_median(edges[reason]), 3),
                     "favourable_pct": round(
                         100.0 * sum(1 for v in nets if v > 0) / len(nets), 1),
                     "median_favourable_excursion_atr": round(_median(fav), 3),
@@ -1413,9 +1457,6 @@ def _gate_attribution(
         # Rank by blocks x favourable edge: a gate that fires rarely cannot
         # cost much however wrong it is, and one that fires constantly with no
         # directional edge is not costing anything either.
-        baseline_stats = _forward_baseline(bars_by_sym, window_minutes)
-        baseline_net = float(baseline_stats.get("median_net_atr") or 0.0)
-
         def _cost(item: tuple[str, dict[str, Any]]) -> float:
             """Blocks x edge ABOVE baseline, for gates with enough samples.
 
@@ -1431,11 +1472,10 @@ def _gate_attribution(
             "costliest".
             """
             entry = item[1]
-            net = entry.get("median_net_atr")
-            if net is None or int(entry.get("evaluated", 0)) < min_samples:
+            edge = entry.get("median_edge_atr")
+            if edge is None or int(entry.get("evaluated", 0)) < min_samples:
                 return 0.0
-            edge = float(net) - baseline_net
-            return edge * int(entry["blocked"]) if edge > 0 else 0.0
+            return float(edge) * int(entry["blocked"]) if edge > 0 else 0.0
 
         ranked = sorted(by_reason.items(), key=_cost, reverse=True)
         return {
@@ -1445,14 +1485,19 @@ def _gate_attribution(
             "measures": ("net forward price movement against a same-session "
                          "baseline - NOT a backtest: no stop, target, sizing "
                          "or slippage"),
-            "baseline": baseline_stats,
+            "baseline": {
+                **baseline_stats,
+                "short_median_net_atr": (None if baseline_stats.get("median_net_atr") is None
+                                         else round(-baseline_net, 3)),
+                "span": [first_ts.isoformat() if first_ts else None,
+                         last_ts.isoformat() if last_ts else None],
+            },
             "costliest_gates": [
                 {
                     "gate": name,
                     "blocked": entry["blocked"],
                     "net_atr": entry["median_net_atr"],
-                    "edge_over_baseline_atr": round(
-                        float(entry["median_net_atr"]) - baseline_net, 3),
+                    "edge_over_baseline_atr": entry["median_edge_atr"],
                 }
                 for name, entry in ranked[:8] if _cost((name, entry)) > 0
             ],
@@ -1463,9 +1508,52 @@ def _gate_attribution(
         return {}
 
 
+_QUALIFIED_REGIME_NAMES = ("vwap_reclaim", "vol_squeeze", "sr_scalp", "pullback", "momentum", "trend", "range", "orb")
+_BUILD_FAILED_SIDE_RE = re.compile(
+    r"^(?:(?P<side_a>long|short)_build_failed_|build_failed_(?P<side_b>long|short)_)(?P<rest>.*)$"
+)
+_ENTERED_REGIME_RE = re.compile(
+    r"(?:^|_)(?P<regime>" + "|".join(_QUALIFIED_REGIME_NAMES) + r")_(?P<side>long|short)$"
+)
+
+
+def _qualified_regime_call(row: dict[str, Any]) -> tuple[str, int] | None:
+    """``(regime, direction)`` when *row* records a regime that QUALIFIED on
+    a side, else None. Direction is +1 LONG / -1 SHORT.
+
+    The multi-regime equity strategies (top_tier_adaptive and its subclass)
+    never emit ``ambiguous_regime``: every regime that clears its score floor
+    joins a build queue, and the call is visible as that regime's build
+    failing on a side (``long_build_failed_trend_...``, or the older
+    ``build_failed_short_pullback_...`` shape) or as the entry itself
+    (``top_tier_trend_long``). A reason with no regime in it
+    (``no_fresh_breakout``) falls back to the row's ``family`` -- the regime
+    that came closest. ``unqualified_no_qualifying_regime`` is not a call.
+    """
+    primary = str(row.get("primary", "") or "").strip().lower()
+    action = str(row.get("action", "") or "").strip().lower()
+    if action == "entered":
+        m = _ENTERED_REGIME_RE.search(primary)
+        if not m:
+            return None
+        return m.group("regime"), (1 if m.group("side") == "long" else -1)
+    m = _BUILD_FAILED_SIDE_RE.match(primary)
+    if not m:
+        return None
+    side = m.group("side_a") or m.group("side_b")
+    rest = m.group("rest")
+    regime = next((name for name in _QUALIFIED_REGIME_NAMES if rest.startswith(name + "_") or rest == name), None)
+    if regime is None:
+        family = str(row.get("family", "") or "").strip().lower()
+        regime = family if family in _QUALIFIED_REGIME_NAMES else None
+    if regime is None:
+        return None
+    return regime, (1 if side == "long" else -1)
+
+
 def _regime_call_outcomes(archive_root: Path) -> dict[str, Any]:
-    """Classify each ``ambiguous_regime`` decision against the 30-minute
-    forward price move and bucket results by outcome + hour.
+    """Classify each directional regime call against the 30-minute forward
+    price move and bucket results by outcome, hour, regime and side.
 
     Purpose: regime scoring is the strategy's directional bet. When it
     says ``bullish_trend@4.50`` but the price drops 3 ATR in the next
@@ -1474,20 +1562,32 @@ def _regime_call_outcomes(archive_root: Path) -> dict[str, Any]:
     week-over-week comparison surfaces drift (e.g. "right%" trending
     below 30%) without anyone running ad-hoc post-mortems.
 
-    Classifier per call:
-      * ``right`` — top was ``*_trend`` and price moved >= 1 ATR in
-        that direction within the next 30 minutes.
-      * ``wrong`` — opposite direction had a larger excursion.
-      * ``flat`` — neither direction reached 1 ATR (or top was
-        ``range``/non-directional).
-      * ``unclear`` — insufficient forward bars or missing ATR.
+    Two sources of calls, whichever the strategy emits:
+      * ``ambiguous_regime(top=...)`` skips (0DTE options) -- the top
+        regime; ``bullish_trend`` / ``bearish_trend`` are directional,
+        any other top is recorded as non-directional.
+      * a regime that QUALIFIED on a side (top_tier_adaptive and its
+        subclass) -- see ``_qualified_regime_call``. Until 2026-09-23 only
+        the first source was read, so every top_tier manifest reported 0
+        calls: a measurement that could not see the strategy, not a
+        strategy that made no calls.
+
+    Classifier per call (excursions from ``_forward_excursion_atr``):
+      * ``right`` -- price moved >= 1 ATR in the call's direction within
+        the next 30 minutes, and further that way than the other.
+      * ``wrong`` -- the opposite excursion was larger.
+      * ``flat`` -- neither of the above, or a non-directional call.
+      * ``unclear`` -- insufficient forward bars or missing ATR.
+
+    Read ``by_side`` against the day: on a trend day most of one side is
+    "right" whatever the regimes did.
 
     Reads from the already-written ``decisions.csv`` and the per-symbol
     1m bars under ``bars/1m/`` in the same archive directory. Dedupes
-    calls by (symbol, minute, top_score) so a single decision repeated
-    many times in one cycle is counted once.
+    calls by (symbol, minute, regime, direction) because one decision is
+    logged on every cycle within the minute.
 
-    Returns an empty dict on any I/O / parse failure — never crashes
+    Returns an empty dict on any I/O / parse failure -- never crashes
     the archive write.
     """
     try:
@@ -1500,9 +1600,9 @@ def _regime_call_outcomes(archive_root: Path) -> dict[str, Any]:
         if not bars_by_sym:
             return {}
 
-        # Parse ambiguous_regime calls, dedupe by (sym, minute, top_score).
         calls: list[dict[str, Any]] = []
-        seen: set[tuple[str, datetime, float]] = set()
+        seen: set[tuple[str, datetime, str, int]] = set()
+        sources: Counter = Counter()
         try:
             with open(decisions_path, newline="", encoding="utf-8") as fh:
                 for row in csv.DictReader(fh):
@@ -1510,85 +1610,75 @@ def _regime_call_outcomes(archive_root: Path) -> dict[str, Any]:
                     if sym not in bars_by_sym:
                         continue
                     m = _AMBIGUOUS_REGIME_RE.search(row.get("primary", ""))
-                    if not m:
-                        continue
+                    if m:
+                        top = m.group("top")
+                        direction = 1 if top == "bullish_trend" else -1 if top == "bearish_trend" else 0
+                        source = "ambiguous_regime"
+                    else:
+                        qualified = _qualified_regime_call(row)
+                        if qualified is None:
+                            continue
+                        top, direction = qualified
+                        source = "qualified_regime"
                     ts_raw = row.get("timestamp", "").strip('"').split(",")[0]
                     try:
                         ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
                     except ValueError:
                         continue
-                    try:
-                        top_score = float(m.group("top_score"))
-                        gap = float(m.group("gap"))
-                    except ValueError:
-                        continue
-                    key = (sym, ts.replace(second=0), round(top_score, 2))
+                    key = (sym, ts.replace(second=0), top, direction)
                     if key in seen:
                         continue
                     seen.add(key)
-                    calls.append({
-                        "ts": ts, "sym": sym,
-                        "top": m.group("top"),
-                        "top_score": top_score,
-                        "gap": gap,
-                    })
+                    sources[source] += 1
+                    calls.append({"ts": ts, "sym": sym, "top": top, "direction": direction})
         except OSError:
             return {}
 
-        # Classify and aggregate.
+        def _bucket() -> dict[str, int]:
+            return {"total": 0, "right": 0, "wrong": 0, "flat": 0, "unclear": 0}
+
         by_outcome = {"right": 0, "wrong": 0, "flat": 0, "unclear": 0}
-        by_hour: dict[str, dict[str, int]] = defaultdict(
-            lambda: {"total": 0, "right": 0, "wrong": 0, "flat": 0, "unclear": 0}
-        )
+        by_hour: dict[str, dict[str, int]] = defaultdict(_bucket)
+        by_regime: dict[str, dict[str, int]] = defaultdict(_bucket)
+        by_side: dict[str, dict[str, int]] = defaultdict(_bucket)
 
         for call in calls:
-            rows = bars_by_sym[call["sym"]]
-            call_ts = call["ts"]
-            window_end = call_ts + timedelta(minutes=30)
-            after = [r for r in rows if call_ts <= r["ts"] <= window_end]
-            prior = [r for r in rows if r["ts"] <= call_ts]
             outcome = "unclear"
-            if len(after) >= 2 and prior:
-                atr = prior[-1]["atr14"]
-                if atr and atr > 0:
-                    p0 = after[0]["close"]
-                    high_max = max(r["high"] for r in after)
-                    low_min = min(r["low"] for r in after)
-                    up_atr = (high_max - p0) / atr
-                    down_atr = (p0 - low_min) / atr
-                    top = call["top"]
-                    if top == "bullish_trend":
-                        if up_atr >= 1.0 and up_atr > down_atr:
-                            outcome = "right"
-                        elif down_atr > up_atr:
-                            outcome = "wrong"
-                        else:
-                            outcome = "flat"
-                    elif top == "bearish_trend":
-                        if down_atr >= 1.0 and down_atr > up_atr:
-                            outcome = "right"
-                        elif up_atr > down_atr:
-                            outcome = "wrong"
-                        else:
-                            outcome = "flat"
-                    else:
-                        # range / non-directional top — not predictive
-                        outcome = "flat"
+            excursion = _forward_excursion_atr(bars_by_sym[call["sym"]], call["ts"], 30)
+            if excursion is not None:
+                up_atr, down_atr, _net = excursion
+                favourable, adverse = (up_atr, down_atr) if call["direction"] > 0 else (down_atr, up_atr)
+                if call["direction"] == 0:
+                    outcome = "flat"
+                elif favourable >= 1.0 and favourable > adverse:
+                    outcome = "right"
+                elif adverse > favourable:
+                    outcome = "wrong"
+                else:
+                    outcome = "flat"
+            side = "LONG" if call["direction"] > 0 else "SHORT" if call["direction"] < 0 else "none"
             by_outcome[outcome] += 1
-            hour = call_ts.strftime("%H")
-            by_hour[hour]["total"] += 1
-            by_hour[hour][outcome] += 1
+            for bucket in (by_hour[call["ts"].strftime("%H")], by_regime[call["top"]], by_side[side]):
+                bucket["total"] += 1
+                bucket[outcome] += 1
 
-        # Derived percentage (right vs evaluable calls). evaluable =
-        # not unclear, and at least one directional outcome possible.
-        directional = by_outcome["right"] + by_outcome["wrong"] + by_outcome["flat"]
-        right_pct = (by_outcome["right"] / directional) if directional > 0 else None
+        def _right_pct(bucket: dict[str, int]) -> float | None:
+            directional = bucket["right"] + bucket["wrong"] + bucket["flat"]
+            return round(bucket["right"] / directional, 4) if directional > 0 else None
 
+        call_times = [call["ts"] for call in calls]
         return {
             "total_unique_calls": len(calls),
+            "sources": dict(sources),
+            # The tape over the same span, LONG viewpoint: what "right" is
+            # competing with. A 60% up_pct day makes most LONG calls right.
+            "baseline": (_forward_baseline(bars_by_sym, 30, start=min(call_times), end=max(call_times))
+                         if call_times else {}),
             "by_outcome": by_outcome,
-            "right_pct_of_directional": round(right_pct, 4) if right_pct is not None else None,
+            "right_pct_of_directional": _right_pct(by_outcome),
             "by_hour": {h: dict(d) for h, d in sorted(by_hour.items())},
+            "by_regime": {r: {**d, "right_pct": _right_pct(d)} for r, d in sorted(by_regime.items())},
+            "by_side": {s: {**d, "right_pct": _right_pct(d)} for s, d in sorted(by_side.items())},
         }
     except Exception as exc:
         LOG.warning("Could not compute regime-call outcomes: %s", exc, exc_info=True)

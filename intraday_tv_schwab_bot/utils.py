@@ -6,7 +6,7 @@ import os
 import sys
 import time as _monotonic_time
 from collections import deque
-from threading import RLock
+from threading import Lock, RLock
 from urllib.parse import urlsplit
 from datetime import date as date_cls, datetime, time, timedelta
 from pathlib import Path
@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+from schwabdev import Client as SchwabClient
 
 try:
     import talib  # type: ignore
@@ -182,10 +183,29 @@ def _truncate_log_text(value: Any, limit: int = 500) -> str:
     return text[: limit - 3] + "..."
 
 
+# schwabdev's access-token refresh is not safe across threads. Its
+# ``Tokens.update_tokens`` checks expiry OUTSIDE its lock, and
+# ``_update_access_token`` records the last-known issue time only AFTER taking
+# the lock -- so every thread queued behind the first refresh reads the NEW
+# token as "last known" and refreshes again. On 2026-09-22 at 09:15 the prewarm
+# fan-out produced four refreshes in two seconds. Checking the token here, one
+# caller at a time, lets the first caller refresh and the rest find a fresh
+# token; the request's own internal check then has nothing to do.
+_TOKEN_REFRESH_LOCK = Lock()
+
+
+def _refresh_token_serialized(client: Any) -> None:
+    if not isinstance(client, SchwabClient):
+        return
+    with _TOKEN_REFRESH_LOCK:
+        client.update_tokens()
+
+
 def call_schwab_client(client: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
     tracker = get_schwab_api_tracker(client)
     if tracker is not None:
         tracker.record_call(method_name)
+    _refresh_token_serialized(client)
     method = getattr(client, method_name)
     response = method(*args, **kwargs)
     status = getattr(response, "status_code", None)

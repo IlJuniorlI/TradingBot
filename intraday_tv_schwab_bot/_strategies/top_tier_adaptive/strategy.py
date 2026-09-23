@@ -1718,13 +1718,19 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             stocks without enough intraday move score zero. Renamed from
             ``momentum_close`` 2026-05-12 when the window was widened from
             afternoon-only.
-          - sr_scalp: HTF S/R mean-reversion scalp. Allowed post-ORB
-            through close (orb_end → no_new). Excluded from the ORB
-            window because morning chop near recent levels often breaks
-            through; the build-time distance gate
-            (``sr_scalp_min_distance_pct`` / ``sr_scalp_min_distance_atr``)
-            rejects when the HTF zones are too close to be worth the
-            round-trip.
+          - sr_scalp: HTF S/R mean-reversion scalp. Allowed from orb_end
+            through close (orb_end → no_new) WHETHER OR NOT the ORB regime
+            is on. Excluded from the opening window because morning chop
+            near recent levels often breaks through; the build-time
+            distance gate (``sr_scalp_min_distance_pct`` /
+            ``sr_scalp_min_distance_atr``) rejects when the HTF zones are
+            too close to be worth the round-trip.
+
+        "Post-ORB" above for vol_squeeze and momentum assumes the ORB regime
+        is on. With ``disable_orb_regime`` there is no ORB window: the primary
+        window starts at 09:30, so they are available from the open and the
+        strategy's ``entry_windows`` decide when entries actually begin.
+        sr_scalp is the exception and still waits for orb_end.
 
         Each regime has its own opt-out knob via params:
           disable_trend_regime / disable_pullback_regime /
@@ -1821,7 +1827,17 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # Full regime mix including momentum + sr_scalp. The day_strength
             # gate filters momentum; the distance gate filters sr_scalp. Neither
             # blocks the trend / pullback / range / vol_squeeze regimes.
-            return _filter({"trend", "pullback", "range", "vol_squeeze", "momentum", "sr_scalp", "vwap_reclaim"})
+            regimes = {"trend", "pullback", "range", "vol_squeeze", "momentum", "sr_scalp", "vwap_reclaim"}
+            if now_t <= parse_hhmm(orb_end):
+                # sr_scalp waits for orb_end_time whether or not the ORB regime
+                # is on. Its reason for skipping the opening window -- morning
+                # chop near recent levels breaks through them -- is about the
+                # tape, not about ORB, so dropping the ORB regime must not open
+                # the window to it. Only reachable with ORB off (with it on the
+                # branch above owns everything up to orb_end); `<=` matches that
+                # branch's inclusive end, so the two modes agree to the second.
+                regimes.discard("sr_scalp")
+            return _filter(regimes)
         if self._time_in_range(now_t, midday_start, midday_end):
             # Midday: pullbacks remain the default fit for top-tier chop,
             # but momentum is allowed because day_strength >= threshold
@@ -1951,12 +1967,15 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         decision or it is not a fallback.
 
         What still applies: the regime must still be offered in this window
-        (a trend arm does not fire at midday), and the builder's own checks run
-        unchanged -- ``breakout_confirmed`` is False on this path, so a faded
-        setup fails ``no_fresh_breakout``, and ``_finalize_signal`` still
-        applies the stretched / SR / structure rejections. A runaway that has
-        gone too far to chase is still declined, by the gate that exists for
-        that.
+        (a trend arm does not fire at midday); the breakout must still HOLD --
+        close on the trade's side of the armed level, or the arm has faded and
+        is dropped as ``armed_retest_faded`` (checked at the entry path, which
+        has the close); and ``_finalize_signal`` still applies the stretched /
+        SR / structure rejections. A runaway that has gone too far to chase is
+        still declined, by the gate that exists for that. The builder's
+        fresh-N-bar-extreme check is NOT re-run: a runaway that never retested
+        is rarely at a new extreme on the exact expiry minute, and requiring
+        one made the fallback fire only by coincidence (2026-09-22).
         """
         if not self._armed_retests:
             return []
@@ -2186,7 +2205,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                             ltf: pd.DataFrame, frame: pd.DataFrame, regime_score: float,
                             data=None, vol_widening: float = 1.0, vol_scale: float = 1.0,
                             breakout_confirmed: bool = False) -> Signal | None:
-        """``breakout_confirmed`` is set only by a CONFIRMED armed retest.
+        """``breakout_confirmed`` is set by an armed retest: a CONFIRMED retest,
+        or an expired arm whose breakout still holds (the market fallback).
 
         The fresh-breakout gate below asks "is close above the last N bars'
         high". On a retest cycle that window still holds the breakout bar,
@@ -2705,9 +2725,10 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         2026-05-12 when the regime was generalized from afternoon-only to
         post-ORB through close.
 
-        ``breakout_confirmed`` is set only by a CONFIRMED armed retest, where
-        the breakout is already established and the fresh-breakout gate would
-        reject the retest fill by definition. See ``_build_trend_signal``.
+        ``breakout_confirmed`` is set by an armed retest -- a confirmed retest,
+        or an expired arm whose breakout still holds -- where the breakout is
+        already established and the fresh-breakout gate would reject the fill
+        by definition. See ``_build_trend_signal``.
         """
         recent, trigger_level = self._breakout_reference("momentum", side, frame, frame)
         if recent is None or recent.empty:
@@ -4291,16 +4312,36 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 breakout_confirmed = False
                 if pre_validated:
                     arm = decision["expired_arm"]
+                    armed_level = float(arm["trigger_level"])
                     retest_meta = {
                         "armed_retest_regime": regime_name,
-                        "armed_retest_level": round(float(arm["trigger_level"]), 4),
+                        "armed_retest_level": round(armed_level, 4),
                         "armed_retest_waited_minutes": round(
                             float(arm.get("waited_minutes", 0.0)), 2),
                         "armed_retest_status": "expired_market_entry",
                     }
-                    # `breakout_confirmed` stays False: the fallback has to
-                    # clear the builder's own fresh-breakout check on its own.
-                    # If price faded while we waited, there is no trade.
+                    # The fallback enters while the breakout the arm recorded
+                    # still HOLDS: close on the trade's side of the armed
+                    # level, the same `reclaimed` test a retest entry passes.
+                    # Faded means price came back through that level.
+                    #
+                    # It used to be left to the builder's fresh-breakout check
+                    # (`breakout_confirmed` False), which asks a different
+                    # question -- is THIS bar a new N-bar extreme. A runaway
+                    # that never retested, the case the fallback exists for,
+                    # is rarely at a fresh extreme on the exact expiry minute:
+                    # on 2026-09-22 all three arms that reached expiry (CRM,
+                    # ADBE, NFLX shorts, touched=0, still through their levels)
+                    # died on `no_fresh_breakdown` while the moves carried on.
+                    # The fallback only ever fired by coincidence.
+                    held = close > armed_level if side == Side.LONG else close < armed_level
+                    if not held:
+                        fail_reasons.append(
+                            f"{side.value.lower()}_build_failed_{regime_name}_armed_retest_faded("
+                            f"level={armed_level:.4f},close={close:.4f})"
+                        )
+                        continue
+                    breakout_confirmed = True
                 elif regime_name in ARMED_RETEST_REGIMES:
                     verdict = self._armed_retest_verdict(
                         c.symbol, side, regime_name, close, atr, ltf, frame,
@@ -4312,8 +4353,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                         )
                         continue
                     retest_meta = dict(verdict.get("metadata") or {})
-                    # Only a CONFIRMED retest satisfies the builder's
-                    # fresh-breakout gate in advance.
+                    # A CONFIRMED retest satisfies the builder's fresh-breakout
+                    # gate in advance; a wait never reaches the builder.
                     breakout_confirmed = verdict["status"] == "enter"
 
                 sig = None

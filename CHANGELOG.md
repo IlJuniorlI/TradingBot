@@ -286,6 +286,28 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **top_tier: entries open at 09:35, and `sr_scalp` is back on -- from
+  `orb_end_time`.** *2026-09-23*
+  - `entry_windows` starts at 09:35 instead of 09:45. The preset runs with
+    `disable_orb_regime: true`, so there is no 09:30-09:45 opening-range
+    carve-out and the regime mix is live from 09:30 -- the entry window was
+    the only thing holding the first ten minutes back, and 09:45 was left
+    over from when the ORB range had to form first. The manifest keeps 09:45
+    because its defaults leave ORB on, where 09:30-09:45 is a no-entry zone
+    regardless.
+  - `disable_sr_scalp_regime: false`. It was switched off on 2026-09-18 while
+    its stop floor made it unbuildable; that was fixed on 2026-09-22 (the
+    stop now leans on how far the level has actually been pierced), and its
+    15 archived trades (-$179.67) all predate the fix.
+  - `sr_scalp` now waits for `orb_end_time` whether or not the ORB regime is
+    on (`_allowed_regimes`). It skipped the opening window because morning
+    chop near recent levels breaks through them -- a property of the tape,
+    not of ORB -- but with `disable_orb_regime` the primary window starts at
+    09:30 and took sr_scalp with it. The boundary matches the ORB-on path to
+    the second (excluded through 10:05:00). Pre-market in extended-hours
+    mode is unchanged and identical in both modes.
+  - Preset and code only; the manifest is untouched.
+
 - **Config / manifest / README drift pass.** *2026-09-22* — every param the
   code reads checked against its preset and manifest, every config field
   against `config.example.yaml` and the README, and every README defaults
@@ -417,6 +439,49 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the sense of it backwards.
 
 ### Fixed
+
+- **top_tier: an expired armed retest took its market fallback only by
+  coincidence.** *2026-09-23* — at expiry the fallback re-ran the builder's
+  fresh-N-bar-extreme check, which asks whether THIS bar is a new extreme. A
+  runaway that never retested -- the case the fallback exists for -- is rarely
+  at one on the exact expiry minute: on 2026-09-22 all three arms that reached
+  expiry (CRM, ADBE, NFLX shorts, `touched=0`, still through their levels)
+  died on `no_fresh_breakdown` while the moves carried on. The fallback now
+  enters while the breakout still HOLDS (close on the trade's side of the
+  armed level, the retest's own `reclaimed` test) and drops a faded arm as
+  `armed_retest_faded(level=...,close=...)`. Affects both sides.
+- **Gate attribution read SHORT gates against the wrong baseline, from the
+  wrong bars, on the wrong side.** *2026-09-23* — three defects in the
+  manifest's `gate_attribution`, which had flagged the short-side gates as
+  costly on 2026-09-22:
+  - every gate was compared with the LONG baseline, so on an up day a SHORT
+    gate's edge was understated by twice the drift (overstated on a down day);
+    each is now compared with its own side's, and `median_edge_atr` carries it;
+  - the baseline sampled the whole archived 1m frame -- the prior session and
+    extended hours too, about 43% of a top_tier sample, with tiny
+    extended-hours ATRs inflating every move -- and is now bounded to the span
+    the decisions cover;
+  - the side was taken from `side_pref`, the candidate's screener bias, before
+    the side the reason names; they disagree on about a quarter of rows
+    (2,065 `short_...` rows carried `side_pref=LONG` on 09-22). The reason's
+    side now wins.
+  Re-measured across all 15 archived top_tier sessions, the short-side
+  confirmation-bar and index gates are NOT costly: blocked shorts were
+  followed by adverse moves on most days (trend confirmation bar positive in 3
+  of 8 sessions, block-weighted -0.23 ATR; trend index confirmation 2 of 10,
+  -0.15 ATR). 09-22 was an outlier; no gate was retuned.
+- **`regime_call_outcomes` was always 0 for top_tier.** *2026-09-23* — it read
+  only `ambiguous_regime` skips, which only the 0DTE options strategy emits,
+  so every top_tier manifest reported "0 calls". It now also counts a regime
+  that QUALIFIED on a side (its build failing on a later gate, or entering),
+  and adds `by_regime`, `by_side`, `sources` and a same-span `baseline`.
+  09-22 re-read: 2,613 calls, 50.3% right.
+- **Concurrent callers each refreshed the Schwab access token.** *2026-09-23*
+  -- schwabdev checks expiry outside its lock and reads the last-known issue
+  time inside it, so every thread queued behind the first refresh refreshed
+  again (09-22 09:15: four refreshes in two seconds from the prewarm
+  fan-out). `call_schwab_client` now checks the token one caller at a time,
+  so the first refreshes and the rest find it fresh.
 
 - **Whole-project sweep: order handling, options, data, reports and
   screeners.** *2026-09-22* — every `.py` outside the eight level/pattern
