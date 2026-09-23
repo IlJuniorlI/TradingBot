@@ -779,8 +779,8 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
 
         bull_score += mshtf_weight * 0.60 if mshtf_ctx.bias == "bullish" else 0.0
         bull_score -= mshtf_weight * 0.60 if mshtf_ctx.bias == "bearish" else 0.0
-        bull_score += mshtf_weight * 0.95 if self._active_structure_break(mshtf_ctx.bos_up, mshtf_ctx.bos_up_age_bars) else 0.0
-        bull_score -= mshtf_weight * 1.05 if self._active_structure_break(mshtf_ctx.choch_down, mshtf_ctx.choch_down_age_bars) else 0.0
+        bull_score += mshtf_weight * 0.95 if self._active_structure_break(mshtf_ctx.bos_up, mshtf_ctx.bos_up_age_bars, htf=True) else 0.0
+        bull_score -= mshtf_weight * 1.05 if self._active_structure_break(mshtf_ctx.choch_down, mshtf_ctx.choch_down_age_bars, htf=True) else 0.0
         bull_score += ms_ltf_weight * 0.70 if ms_ltf_ctx.bias == "bullish" else 0.0
         bull_score -= ms_ltf_weight * 0.75 if ms_ltf_ctx.bias == "bearish" else 0.0
         bull_score += ms_ltf_weight if (ms_ltf_ctx.bos_up and self._structure_event_recent(ms_ltf_ctx.bos_up_age_bars)) else 0.0
@@ -788,8 +788,8 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
 
         bear_score += mshtf_weight * 0.60 if mshtf_ctx.bias == "bearish" else 0.0
         bear_score -= mshtf_weight * 0.60 if mshtf_ctx.bias == "bullish" else 0.0
-        bear_score += mshtf_weight * 0.95 if self._active_structure_break(mshtf_ctx.bos_down, mshtf_ctx.bos_down_age_bars) else 0.0
-        bear_score -= mshtf_weight * 1.05 if self._active_structure_break(mshtf_ctx.choch_up, mshtf_ctx.choch_up_age_bars) else 0.0
+        bear_score += mshtf_weight * 0.95 if self._active_structure_break(mshtf_ctx.bos_down, mshtf_ctx.bos_down_age_bars, htf=True) else 0.0
+        bear_score -= mshtf_weight * 1.05 if self._active_structure_break(mshtf_ctx.choch_up, mshtf_ctx.choch_up_age_bars, htf=True) else 0.0
         bear_score += ms_ltf_weight * 0.70 if ms_ltf_ctx.bias == "bearish" else 0.0
         bear_score -= ms_ltf_weight * 0.75 if ms_ltf_ctx.bias == "bullish" else 0.0
         bear_score += ms_ltf_weight if (ms_ltf_ctx.bos_down and self._structure_event_recent(ms_ltf_ctx.bos_down_age_bars)) else 0.0
@@ -1260,7 +1260,8 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             self._set_build_failure(underlying, style, "spread_market_invalid")
             return None
         nat_bid, nat_ask, quoted_mid = market
-        entry_limit = vertical_limit_price(long_leg, short_leg, mode=self.optcfg.vertical_limit_mode)
+        entry_limit = vertical_limit_price(long_leg, short_leg, mode=self.optcfg.vertical_limit_mode,
+                                           spread_side=Side.LONG, opening=True)
         entry_value = entry_limit * 100.0
         # Guard: debit stop must be below entry, target must be above entry
         debit_stop_frac = max(0.01, min(0.99, float(self.optcfg.debit_stop_frac)))
@@ -1471,7 +1472,8 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             )
             return None
         nat_bid, nat_ask, quoted_mid = market
-        entry_limit = vertical_limit_price(short_leg, long_leg, mode=self.optcfg.vertical_limit_mode)
+        entry_limit = vertical_limit_price(short_leg, long_leg, mode=self.optcfg.vertical_limit_mode,
+                                           spread_side=Side.SHORT, opening=True)
         entry_credit_value = entry_limit * 100.0
         # Guard: credit stop must be above entry (cost-to-close > credit received = loss),
         # target must be below entry (buy back for less than credit = profit)

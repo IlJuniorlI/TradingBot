@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover - test/import fallback when schwabdev is u
         def send(_request: Any) -> None:
             return None
 
-from .config import BotConfig
+from .config import BotConfig, htf_structure_event_lookback
 from .support_resistance import SupportResistanceContext, build_support_resistance_context
 from .htf_levels import HTFContext, FairValueGapContext, build_fair_value_gap_context, build_htf_context, empty_fvg_context
 from .order_blocks import OrderBlockContext, build_order_block_context, empty_order_block_context
@@ -116,6 +116,12 @@ class MarketDataStore:
         self.last_stream_update: dict[str, datetime] = {}
         self.last_stream_bar_time: dict[str, pd.Timestamp] = {}
         self.last_empty_history_refresh: dict[str, datetime] = {}
+        # Most bars any price_history fetch returned per symbol: the depth a
+        # fresh start would hold. The deepest, not the latest, so one short
+        # response (an API hiccup) cannot trim away good history; bounded all
+        # the same, since every fetch is bounded by its lookback. See
+        # _retain_window.
+        self._history_window_rows: dict[str, int] = {}
         self.stream_symbols: set[str] = set()
         self.stream_start_requested_at: datetime | None = None
         self._stream_seen_symbols: set[str] = set()
@@ -283,6 +289,7 @@ class MarketDataStore:
                 self.last_stream_bar_time.pop(sym, None)
                 self.last_stream_health_log.pop(sym, None)
                 self.last_empty_history_refresh.pop(sym, None)
+                self._history_window_rows.pop(sym, None)
                 self._consecutive_quote_failures.pop(sym, None)
                 self._quote_blacklist.pop(sym, None)
                 self._forced_premarket_history_refresh_date.pop(sym, None)
@@ -417,11 +424,7 @@ class MarketDataStore:
         cols = [col for col in ("open", "high", "low", "close", "volume") if col in frame.columns]
         if len(cols) < 5:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-        out = frame.loc[:, ["open", "high", "low", "close", "volume"]].copy()
-        time_label = getattr(frame, "attrs", {}).get("time_label")
-        if time_label is not None:
-            out.attrs["time_label"] = time_label
-        return out
+        return frame.loc[:, ["open", "high", "low", "close", "volume"]].copy()
 
     @staticmethod
     def _merge_htf_frames(existing: pd.DataFrame | None, incoming: pd.DataFrame | None) -> pd.DataFrame:
@@ -432,11 +435,7 @@ class MarketDataStore:
         if update.empty:
             return base
         combined = pd.concat([base, update]).sort_index()
-        combined = combined[~combined.index.duplicated(keep="last")]
-        time_label = getattr(update, "attrs", {}).get("time_label") or getattr(base, "attrs", {}).get("time_label")
-        if time_label is not None:
-            combined.attrs["time_label"] = time_label
-        return combined
+        return combined[~combined.index.duplicated(keep="last")]
 
     @staticmethod
     def _trim_frame_to_days(frame: pd.DataFrame, end: datetime, lookback_days: int) -> pd.DataFrame:
@@ -1078,7 +1077,12 @@ class MarketDataStore:
             if self.is_regular_session(fetched_at) and latest_bar_age_seconds >= float(self._stream_stale_after_seconds()):
                 self._log_stream_health(symbol, f"price_history latest 1m bar stale for {latest_bar_age_seconds:.0f}s after repair fetch", level=logging.INFO)
         with self._lock:
-            self.history[cache_key] = self._merge_frames(self.history.get(cache_key), df)
+            if not df.empty:
+                self._history_window_rows[cache_key] = max(len(df), self._history_window_rows.get(cache_key, 0))
+            keep_rows = self._history_window_rows.get(cache_key)
+            self.history[cache_key] = self._retain_window(self._merge_frames(self.history.get(cache_key), df), keep_rows)
+            if cache_key in self.live:
+                self.live[cache_key] = self._retain_window(self.live[cache_key], keep_rows)
             self.last_history_refresh[cache_key] = fetched_at
             if df.empty:
                 self.last_empty_history_refresh[cache_key] = fetched_at
@@ -1219,7 +1223,7 @@ class MarketDataStore:
             breakout_buffer_pct=float(cfg.breakout_buffer_pct),
             stop_buffer_atr_mult=float(cfg.stop_buffer_atr_mult),
             structure_eq_atr_mult=float(getattr(cfg, "structure_eq_atr_mult", 0.25)),
-            structure_event_max_age_bars=int(getattr(cfg, "structure_event_lookback_bars", 6) or 6),
+            structure_event_max_age_bars=htf_structure_event_lookback(cfg),
             structure_min_range_atr_mult=float(getattr(cfg, "structure_min_range_atr_mult", 1.5) or 0.0),
             use_prior_day_high_low=resolved_use_prior_day_high_low,
             use_prior_week_high_low=resolved_use_prior_week_high_low,
@@ -1309,7 +1313,7 @@ class MarketDataStore:
             breakout_buffer_pct=float(cfg.breakout_buffer_pct),
             stop_buffer_atr_mult=float(cfg.stop_buffer_atr_mult),
             structure_eq_atr_mult=float(getattr(cfg, "structure_eq_atr_mult", 0.25)),
-            structure_event_max_age_bars=int(getattr(cfg, "structure_event_lookback_bars", 6) or 6),
+            structure_event_max_age_bars=htf_structure_event_lookback(cfg),
             structure_min_range_atr_mult=float(getattr(cfg, "structure_min_range_atr_mult", 1.5) or 0.0),
             use_prior_day_high_low=resolved_use_prior_day_high_low,
             use_prior_week_high_low=resolved_use_prior_week_high_low,
@@ -1862,9 +1866,7 @@ class MarketDataStore:
         df["timestamp"] = timestamps
         df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"})
         df = df.set_index(df["timestamp"].map(floor_minute)).drop(columns=["timestamp", "datetime"], errors="ignore")
-        out = ensure_ohlcv_frame(df)
-        out.attrs["time_label"] = "unknown"
-        return out
+        return ensure_ohlcv_frame(df)
 
     def start_streaming(self, symbols: Iterable[str]) -> None:
         # Lock only wraps state mutations — network I/O (stream.start/send)
@@ -1945,7 +1947,10 @@ class MarketDataStore:
         # Acquire lock only for the cache mutation phase.
         with self._lock:
             for cache_key, new_df, bar_ts in parsed_updates:
-                self.live[cache_key] = self._merge_frames(self.live.get(cache_key), new_df)
+                self.live[cache_key] = self._retain_window(
+                    self._merge_frames(self.live.get(cache_key), new_df),
+                    self._history_window_rows.get(cache_key),
+                )
                 self.merge_stats[cache_key].stream_rows = len(self.live[cache_key])
                 self.last_stream_update[cache_key] = received_at
                 self.last_stream_bar_time[cache_key] = bar_ts
@@ -1987,6 +1992,27 @@ class MarketDataStore:
             "source": "stream",
         }
         return sym, ts, row
+
+    @staticmethod
+    def _retain_window(frame: pd.DataFrame, keep_rows: int | None) -> pd.DataFrame:
+        """Bound a 1m frame: every bar of the latest session day, plus the
+        last ``keep_rows`` bars overall.
+
+        Neither the history merge nor the stream append ever trimmed, and
+        ``prune_inactive_symbols`` only evicts symbols that LEFT the active
+        set, so an always-on run over a fixed universe (top_tier's 28) grew
+        every frame by a day of bars per day -- and ``get_merged`` recomputes
+        indicators over the whole frame every cycle. ``keep_rows`` is what
+        the deepest price_history fetch returned, i.e. the depth a fresh
+        start would have; the latest day is kept whole regardless, because session
+        VWAP, the opening range and the day's extremes read all of it.
+        No fetch yet (``keep_rows`` None): left alone.
+        """
+        if keep_rows is None or frame is None or len(frame) <= keep_rows:
+            return frame
+        index = pd.DatetimeIndex(frame.index)
+        cutoff = min(index[-1].normalize(), index[-int(keep_rows)])
+        return frame[index >= cutoff]
 
     @staticmethod
     def _merge_frames(left: pd.DataFrame | None, right: pd.DataFrame | None) -> pd.DataFrame:

@@ -99,7 +99,6 @@
     "max_entry_lower_wick_frac": 0.3,
     "min_rr": 1.65,
     "target_rr": 1.95,
-    "runner_target_rr": 2.45,
     "stop_buffer_atr_mult": 0.5,
     "strong_setup_runner_enabled": true,
     "adaptive_breakeven_rr": 0.9,

@@ -286,6 +286,43 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Config / manifest / README drift pass.** *2026-09-22* — every param the
+  code reads checked against its preset and manifest, every config field
+  against `config.example.yaml` and the README, and every README defaults
+  table against the manifests. No effective value changes: each edited preset
+  loads to the same config before and after.
+  - **Undeclared params.** `config.small_cap_squeeze.yaml` now declares the 89
+    top_tier-engine params it reads, at the values it was already running --
+    it inherits the engine, but only its own knobs had ever been declared, so
+    any code-default edit silently retuned it. The two `peer_confirmed_*`
+    subclass presets declare the 19 inherited `peer_confirmed_key_levels`
+    params each; `closing_reversal` / `mean_reversion` declare
+    `screener_min_pullback_from_high`. `test_param_declaration_drift.py` now
+    covers small_cap_squeeze as well as top_tier.
+  - **Dead `runner_target_rr` removed** from the `peer_confirmed_htf_pivots`
+    and `peer_confirmed_trend_continuation` manifests, presets, the example
+    config and their README tables. Nothing read it: the runner target comes
+    from `_adaptive_management_components` and `adaptive_runner_target_rr`.
+    `volatility_squeeze_breakout` does read its own and keeps it.
+  - **`config.example.yaml`** carries the 28 config fields it was missing
+    (slippage/overage risk, daily-loss open risk, bracket orders, escalation,
+    IV rank, ...). Three keys sat under the next section's header comment,
+    and the peak-giveback comment still quoted the pre-2026-05-27 tiers.
+  - **README.** 20 undocumented fields documented, plus a new `events`
+    section: the options table still listed `event_blackout_file` /
+    `event_blackouts`, keys removed on 2026-09-18. Package-default rows
+    corrected where they had drifted from the manifest (vsb `min_rvol` /
+    `target_rr` / `runner_target_rr`, closing_reversal `min_rvol`, the
+    peer_confirmed `force_flatten` rows, top_tier `min_sr_scalp_score`), and
+    the top_tier universe prose, `index_symbols` and `sector_index_map`
+    brought up to the 2026-09-18 Tech/AI retarget -- they still described 23
+    names across six GICS sectors. top_tier README sections renumbered (two
+    were numbered 19).
+  - `no_new_entries_after: 13:45` quoted in
+    `config.zero_dte_etf_long_options.yaml`. Unquoted, YAML 1.1 reads it as
+    the sexagesimal integer 825; `parse_hhmm` converts that back, but the
+    value should not depend on it.
+
 - **`vol_squeeze` now runs at midday.** *2026-09-21* — its thesis is
   compression resolving into expansion, and the lunchtime tape IS the
   compression, so it had been excluded from the one window where its setup is
@@ -380,6 +417,625 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the sense of it backwards.
 
 ### Fixed
+
+- **Whole-project sweep: order handling, options, data, reports and
+  screeners.** *2026-09-22* — every `.py` outside the eight level/pattern
+  modules reviewed earlier today. Each fix fails its tests when reverted
+  (60-mutation matrix, all caught); new coverage in
+  `tests/test_sweep_fixes.py` (87 tests) plus the rewritten resample /
+  completion tests in `test_properties.py` and `test_bug_regressions.py`.
+
+  *Live orders*
+  - **Sub-penny limits.** Entry/exit limits were the touch plus a spread-scaled
+    buffer rounded to 4dp, and the reprice loop multiplies that buffer by
+    1.33 / 1.66, so every live reprice on a stock at/above $1 was sub-penny
+    (150.1599) and rejected under Rule 612 -- dry-run has no tick check.
+    Limits now round to the tick away from the touch (a buy up, a sell down).
+  - **A second exit for the same shares.** A MARKET exit that did not fill in
+    its poll window (a halt, an LULD pause) was left working and nothing
+    tracked it; the next cycle sent another, and both filled on the resume.
+    `OrderResult.may_still_be_working` now marks every order that reached the
+    broker without a confirmed terminal state, and the position manager
+    tracks it (`working_exit_order`), books its fills from the order's own
+    record each cycle, re-cancels a live limit, and sends nothing else for
+    the position until it is terminal.
+  - **A partial fill read as "cancelled".** The post-cancel check returned
+    success for any order with fills, so a partially filled order whose
+    remainder was still live was treated as done. It now waits for a
+    terminal status.
+  - **Recovery read a stale positions snapshot.** Order-uncertainty recovery
+    read broker positions through a snapshot cached once per cycle; every
+    recovery after the cycle's first read positions from before its own
+    order (a filled exit looked unfilled, a filled entry looked absent), and
+    a failed read was taken as "no position" and booked a full exit. Entries
+    and exits are now settled from the order's own fills, the snapshot
+    (`broker_position_row(s)`, `begin_cycle`/`end_cycle`) is gone, and a
+    filled entry whose fill no longer fits the signal's levels is tracked
+    with fallback levels instead of left untracked.
+  - **A filled exit with no price was re-sent.** With neither a broker fill
+    price nor a last price the booking was skipped "to retry next cycle" --
+    for shares already sold. It is booked at entry, flagged estimated.
+  - **Vertical fill prices averaged the legs.** A 2.00/1.00 debit spread read
+    back as 1.50; the net is now the signed sum of the leg prices. Its
+    filled QUANTITY had the same flaw where an order carries no
+    `filledQuantity`: the executions arrive once per leg, so summing them
+    read a 2-lot vertical as 4 filled. It is now the least-filled leg per
+    unit of order quantity.
+  - **Messages that needed a recheck and did not get one:**
+    `partial_fill_*` and `bracket_*` failures now count as having reached
+    the broker.
+
+  *Broker-side brackets (off by default)*
+  - **Replace kept the old id.** Schwab's replace cancels the child and
+    creates a new order; the bracket kept the dead id, so later replaces
+    were rejected (the broker stop froze while the engine deferred to it)
+    and the replacement's fill was never booked. The bracket now follows the
+    new id.
+  - **Cancel before an engine exit ignored child fills**, and cancelled only
+    the OCO wrapper (a replaced child may not be under it). It now takes
+    down every tracked child and reports what filled first; the engine books
+    that and exits only the rest. After a child fills, anything left of the
+    bracket is cancelled.
+  - **Adoption never resized** (a dead key comparison), recorded the engine's
+    levels instead of the broker's, and on a restart adopted off the parent's
+    original children -- REPLACED after any move -- then stacked fresh
+    protection on the live replacement. It now compares the resting quantity,
+    records what the broker holds, and adopts the ids the bot last tracked
+    (or, for restore_basic, the stop found resting at startup).
+  - **Own stops blocked all entries after a restart.** A restored position's
+    protective orders counted as foreign working orders
+    (`working_orders_present` for the whole session).
+
+  *Session state*
+  - **Positions closed overnight stayed tracked.** The new-day reconcile only
+    added positions; one closed in the Schwab app kept a slot, fed the
+    correlation guard and open risk, and sent rejected exits every cycle. It
+    is now booked as `closed_outside_bot` at the last mark (estimated,
+    broker-recovered), dropped or cut to what the broker holds, and its
+    resting bracket cancelled. Skipped in dry-run, where positions are
+    simulated and the real account holding none of them is not a close --
+    the first cut wiped every paper position held into a new session.
+  - **1m frames grew without bound** for always-active symbols; frames now
+    keep the latest session day whole plus the depth of the deepest history
+    fetch (the deepest, so one short response cannot trim good history).
+  - **Dec 31 was a holiday** when New Year's Day falls on a Saturday (NYSE
+    stays open; next 2027-12-31).
+
+  *Options*
+  - **Exits compared the underlying with option premium.** R, the time stop,
+    the S/R-break guards and the anchored-VWAP arming read the underlying's
+    frame against premium-space entry/extremes: a debit position read as
+    about +7R (discretionary exits always armed), a credit spread about -5R
+    (never), and the time stop could never fire. R now uses the option's
+    mark; the rest use `underlying_entry` and the underlying's range since
+    entry, both tracked by the position manager. Option entries also record
+    their opening stop, so R no longer re-bases after a ratchet.
+  - **`natural` / `bid` vertical pricing ignored direction** -- `natural`
+    took the ask for a credit open and a debit close (the far side). Both
+    modes now follow whether the order buys or sells the spread.
+
+  *Data and reports*
+  - **Resampled bars were one source bar late, and end-labelled.**
+    `resample_bars` ran `closed="right", label="right"` on start-labelled
+    bars: the 5m bar labelled 09:35 held 09:31-09:35 and the 09:30 bar mixed
+    four premarket minutes into the open. And since everything downstream
+    reads a timestamp as a bar START (the RTH mask behind session VWAP/EMA,
+    session-open helpers, the ORB follow-through gate), an end-labelled
+    premarket bar counted as RTH. Bars are now `[T, T + rule)` labelled `T`,
+    the broker's own convention, anchored on the 09:30 open (clock bars for
+    5/15/30m, session hours for 60m); completion is `T + tf <= now` for
+    every frame, and the `time_label` / `source_bar_minutes` attrs are gone.
+    This moves top_tier's 5m LTF structure bars by one minute.
+  - **Partial exits vanished from every report.** The EOD report,
+    `trades.csv`, the manifest and the account snapshot kept only final
+    exit slices (100 shares out 40 + 60 at +$1 reported $60). Slices now
+    fold into one row per trade.
+  - **Fractional score thresholds were rounded up** (`min_ltf_score` 2.5 -> 3,
+    `min_total_score` 5.5 -> 6) in the peer_confirmed presets.
+
+  *Screeners*
+  - **ARM and TSM never reached top_tier** (0 of 526 candidate cycles on
+    2026-09-21): the curated list ran through the open-screen filters --
+    ADRs are TradingView type `dr`, and TSM is not a primary listing. The
+    same filters ran on the peer_confirmed lists. Curated lists now filter
+    only to their names, off OTC; top_tier logs any configured name the
+    screen does not return.
+  - **The library's default universe dropped every ETF.** Its `filter2`
+    survives `where()`, so pairs_residual's QQQ reference never came back
+    (and it is the "0 rows for ETFs" the 0DTE screener routed around on
+    2026-05-19). Each screen now states its own instrument conditions.
+  - **The description filters were no-ops.** `not_like("%ETF%")` and nine
+    siblings matched nothing -- TradingView takes the `%` literally (checked
+    live) -- so 56 preferred shares passed the open screens; without the `%`
+    "Unit" would drop UnitedHealth, United Airlines, UPS and URI. Replaced by
+    `typespecs has_none_of ["preferred"]`.
+
+  *Strategies*
+  - **top_tier: an expired armed retest died on a side vote gone
+    undecided.** The expiry fallback is exempt from the per-cycle gates
+    (they were all satisfied at arm time -- the INTC 2026-09-21 fix), but
+    the `side_undecided` gate lacked the exemption, so a vote flickering to
+    undecided while the arm waited dropped the entry silently.
+  - **microcap_pm_breakout: the blowoff guard measured R off the trailing
+    stop.** Once the stop reached breakeven, R divided by ~1e-8 and
+    `blowoff_min_rr` cleared on any wide bar at +0.1R. It now uses the
+    opening stop, like every other R in the exit path.
+
+  *Levels*
+  - **A swing whose extreme printed twice had no pivot.** The shared
+    `pivot_points` disqualified every bar of a window holding a tie, so a
+    flat top or a two-bar bottom registered nothing -- 4.4% of swing
+    highs/lows on archived 5m RTH bars (180 of ~4,130 over 138
+    symbol-days), exact penny ties that are routine at round numbers, and
+    more on 1m bars (the SPY 1m snapshot gains 50 structure pivots, 282 ->
+    332). A tied V-bottom lost its low entirely and market structure read an
+    older pivot as the reference low -- surfaced when the corrected 5m
+    buckets put a tied top_tier reversal bottom in two bars. A tied extreme
+    is now one pivot, at its first bar. S/R, HTF and technical-level
+    snapshots regenerated (touch counts up, level prices move by cents).
+  - **top_tier: the trailing-bias memory counted loop cycles, not bars.**
+    One observation was appended per `entry_signals` call, so
+    `trailing_bias_lookback: 10` spanned 20-30 seconds at a 2s loop
+    (varying with cycle time), and the memory written for the GOOG
+    2026-04-23 case -- a LONG into ten SHORT-biased bars -- had faded long
+    before it mattered. It now keeps one observation per LTF bar (a later
+    cycle on the same bar updates it) and starts empty each session. The
+    penalty it feeds scales with the day's move, so inside the neutral band
+    it stays small.
+
+- **`bollinger_squeeze_width_pct` was a constant in every preset but
+  top_tier.** *2026-09-22* — the same units error top_tier's value was
+  corrected for earlier today: `bollinger_width_pct` is `(bb_upper - bb_lower)
+  / bb_mid`, a FRACTION of price, and `0.06` sits above nearly every bar the
+  bot computes it on, so `bollinger_squeeze` was simply on. Each preset now
+  carries the p25 of RTH BB(20,2) widths on the timeframe that strategy
+  actually builds its technical context on, over its own universe's archived
+  bars:
+
+      universe / timeframe      value    presets                                   0.06 flagged -> now
+      large caps, 1m            0.0025   top_tier + 7 other 1m large-cap presets,   99.9% -> 25.0%
+                                         peer_confirmed_key_levels_1m
+      large caps, 5m LTF        0.0061   peer_confirmed_htf_pivots /                98.4% -> 25.0%
+                                         _trend_continuation / _key_levels
+      SPY / QQQ, 1m             0.0014   both zero_dte presets                     100.0% -> 26.9%
+      small caps, 1m            0.076    small_cap_squeeze, both microcap presets   16.4% -> 25.1%
+
+  Large-cap values use the pooled definition top_tier's `0.0025` was set with,
+  which includes the sector ETFs and indices in the archive; on candidate
+  stocks alone `0.0025` flags 19.6% of bars and their own p25 is `0.0028`.
+  `peer_confirmed_key_levels` builds its trading context on 1m but only reads
+  Bollinger REJECT flags there; the dashboard shows its squeeze flag on the 5m
+  LTF, so it is calibrated on 5m. Six presets have no trading path that reads
+  the flag (microcap_gap_orb, both zero_dte, peer_confirmed_key_levels, `_1m`,
+  and peer_confirmed_htf_pivots, whose only use is the target cap it
+  disables); they are set for consistency and say so.
+
+  **Small caps were not broken.** Their 1m bands are wide (median width 0.117
+  of price), so `0.06` flagged 16.4% of bars, a working threshold. They move
+  to their p25, `0.076`, so the flag means the tightest quarter everywhere, on
+  thin evidence: 1,646 bars from 9 symbol-days of dry-run momentum names,
+  per-symbol-day p25 0.043-0.135.
+
+  **`volatility_squeeze_breakout` barely moves.** Expected to lose candidates
+  sharply once the flag stopped being constant; it does not. The flag is one
+  of three alternatives inside its `no_valid_squeeze` gate, and replaying the
+  real `entry_signals` over the same 17 sessions (29,916 evaluations) takes
+  that gate from 18,367 rejections to 18,368 and
+  `bollinger_squeeze_not_confirmed` from 22 to 97. It produced zero signals at
+  either value: `weak_day_strength` alone rejects ~99%. Its other gates were
+  deliberately not touched.
+
+  Where the flag is live it now also stops suppressing two shared terms most
+  of the time: the Bollinger target cap (only closing_reversal and
+  mean_reversion enable `target_use_bollinger`) and the weak-ADX entry penalty
+  in `_technical_entry_adjustment`, a priority/score input.
+  `configs/config.yaml` was left at `0.06` on purpose (runtime config), as was
+  the code default, which only fits small caps.
+
+- **Ten defects in the level and pattern modules.** *2026-09-22* — from a
+  review of sr_ladder, chart_patterns, candles, htf_levels, levels_shared,
+  order_blocks, support_resistance and technical_levels. Each was reproduced
+  before it was fixed; the numbers below are from replaying the archived
+  2026-09-21 session (28 symbols, real 1m bars) before and after.
+
+  **`anchored_vwap_open` turned into a rolling VWAP by late morning.** It was
+  computed after `build_technical_levels_context` had cut the frame to its
+  longest lookback (~120 bars), so once 09:30 left that window the session
+  anchor silently became the window's first bar. Against the archived
+  `vwap_rth` it was 0.00 ATR off at 11:15, 3.4 ATR (median) at 12:00 and 6.1
+  at 13:30, with a 20.9 ATR worst case. It drives `anchored_vwap_loss_exit`.
+  It is now computed on the untrimmed frame: 0.000 ATR at every checkpoint
+  from 10:30 to 15:00.
+
+  **`atr_expansion_mult` measured displacement, not volatility.** It was
+  `|close - close[-6]| / atr14`, so a clean trend read as an ATR expansion and
+  a violent chop with no net move read as none. Every consumer documents it as
+  volatility against the ATR the stops were sized on, and it is now exactly
+  that: the mean true range of the last `atr_expansion_lookback` bars over the
+  `atr14` just before them. The literal reading of the docs, `atr14` over its
+  own 5-bar mean, was measured and rejected: ATR14 is smoothed so heavily that
+  the ratio sits at 1.00 ± 0.06. How often each consumer's threshold is met
+  (9,498 RTH bars; the second pair is the 453 bars that close out of a <= 2.8
+  ATR 12-bar box):
+
+      threshold  consumer                                all bars      squeeze breakouts
+                                                         old    new      old    new
+      >= 0.80    shared entry-score ATR bonus            54%    70%      90%    73%
+      >= 1.00    volatility_squeeze_breakout gate        46%    37%      83%    37%
+      >= 1.12    volatility_squeeze_breakout runner      40%    23%      78%    20%
+      >= 1.20    top_tier Tier 2a stop widening          37%    16%      75%    13%
+      >= 1.25    volatility_squeeze_breakout quality     35%    13%      72%    10%
+
+  Tier 2a's full widening (1.8x in top_tier, reached at twice the threshold)
+  now applies on 0.6% of bars, down from 8.8%. **`volatility_squeeze_breakout`
+  was NOT retuned.** Its `min_atr_expansion_mult: 1.0` gate was, in effect,
+  tuned against displacement, which is naturally large on a breakout, and it
+  now passes 37% of squeeze breakouts instead of 83%. That preset is not in
+  the live rotation; retune it against outcomes before running it again.
+
+  **A right-labelled HTF bar was treated as complete while still forming.**
+  `resample_bars` labels with `closed="right"`, so the bar labelled T includes
+  the source bar STARTING at T, and it is complete at T + one source bar, not
+  at T. `_completed_htf_frame` admitted it at T. At 11:10, the "completed" 60m
+  frame built from 30m bars carried an 11:00 bar whose 11:00-11:30 half was
+  still forming, and HTF data is fetched once per bar, so that partial bar was
+  used for the rest of the hour. `resample_bars` now records
+  `source_bar_minutes` in `attrs`, the HTF cache carries it through its
+  merges, and completion waits for the last source bar. A frame without it
+  waits a whole HTF bar: late, never early.
+
+  **One structure-event window was sizing two timeframes.**
+  `structure_event_lookback_bars` judged both LTF structure events and the S/R
+  context's HTF ones. top_tier halved it 8 -> 4 for 5m structure bars on
+  2026-05-27, and that silently cut the 15m HTF window from 120 minutes to 60.
+  The new `support_resistance.htf_structure_event_lookback_bars` (`null` =
+  same as the LTF knob) sizes the HTF window. top_tier_adaptive and
+  small_cap_squeeze pin it at 8, and every other preset resolves as before.
+  The builders, the dashboard's HTF overlay and every age check that reads the
+  S/R context's `market_structure` now use it. That means
+  peer_confirmed_key_levels' ladder exits and zero_dte_etf_options' HTF
+  structure score (6/6 there, so its value does not change). A test scans the
+  whole package for any age check on that structure without `htf=True`. The
+  first version of this fix missed zero_dte's four checks, and the scan is
+  what found them.
+
+  **Divergence paired the newest swing with the OLDEST qualifying one.** Lows
+  at 100 (RSI 20), 96 (RSI 35) and 95 (RSI 30) were reported as a bullish
+  divergence 100 -> 95. That stepped over the 96 swing, where RSI had in fact
+  CONFIRMED the new low (30 < 35). `find_divergence` now takes the latest
+  pivot and the nearest earlier one that makes the pattern's price move. Noise
+  pivots inside `price_move_frac` are skipped. An intervening pivot on the
+  wrong side of the latest one means there is no divergence to report: for
+  regular divergence the latest pivot is then not the extreme, and for hidden
+  divergence it broke the swing it claims to hold above (or below). The first
+  cut applied that rule to regular divergence only, so lows 95 -> 103 -> 101
+  still read as hidden bullish 95 -> 101 across the 103 swing; a bug check
+  over the day's changes caught it before commit. One unit test had asserted
+  the old pairing (lows 100 -> 99 -> 99.5
+  reported as divergence 100 -> 99.5). It now asserts none. The span-scale
+  test moved from seed 39 to 309, because seed 39's "divergence" was exactly
+  that bogus pairing.
+
+  **`CDLGRAVESTONEDOJI` could never match.** It sits in the bearish list, and
+  TA-Lib emits it as +100 (9,181 times across 400 real frames, never
+  negative), while bearish matching required a negative value. Fixed-direction
+  patterns now match on any non-zero value, and sign-dependent ones still read
+  the sign. Every other fixed pattern was checked and is already signed to
+  match its list. The gravestone now appears on 1.15% of RTH bars.
+
+  **Chart-pattern thresholds were sized for small caps.** Each
+  percent-of-price constant was paired with an ATR-relative one, and the pairs
+  coincide at a ~0.67% mean 1m bar range. On liquid mega caps (~0.1%) the
+  percent floors were ~7x too wide. The module fired 7 times in 1,850
+  evaluations, and 16 of 18 patterns never fired. Those constants now scale by
+  the frame's range over that reference, clamped to [0.1, 1.0], so a name at
+  or above it keeps exactly the thresholds it had: 97 fires across 10
+  patterns, and none above 1.35% of evaluations. The six strategies that gate
+  entries on an opposing pattern (closing_reversal, mean_reversion,
+  momentum_close, opening_range_breakout, rth_trend_pullback,
+  volatility_squeeze_breakout) will now block on patterns they almost never
+  saw; top_tier does not use that filter. The flag's slope allowance also had
+  an absolute $0.04/bar floor, which let a steadily rising consolidation pass
+  as a flag on a $5 name and nothing on a $500 one. It is now 0.1 bar ranges,
+  which gives the same verdict on the same shape at any price.
+
+  **Order blocks were born filled.** Fill was measured from the closes after
+  the OB candle, which included the bars between it and the breakout, and
+  those are the zone forming, not price returning to it. One block was "64%
+  filled" at birth. Fill is now measured from the closes after price first
+  closes beyond the zone following the OB candle, or after the breakout if it
+  has not yet. The first cut measured from whichever breakout found the
+  candle, but the same candle is found again from every new extreme within 5
+  bars: a breakout, a gap-down close below the zone, then a second breakout
+  returned the zone fresh at 0% filled, a block the pre-review code had
+  correctly dropped. The same bug check caught it before commit.
+
+  **A trendline price had cut through still counted.** Touches were counted
+  and nothing else was checked, so a "support" carried a pivot low 11 points
+  below it mid-span. A pivot beyond the line by more than the tolerance
+  between its first point and its last touch now disqualifies it. A break
+  after the last touch does not; `trendline_break_*` reports that.
+
+  Also: `technical_levels._pivot_points` had become a copy of the shared
+  `pivot_points`, and it is now a thin wrapper around it. The HTF FVG detector
+  replaced a NaN high/low with 0.0, which would have made a bullish gap
+  reaching from zero up to price. The NaN now fails its comparison.
+
+  **Net effect on top_tier, 2026-09-21.** The real `entry_signals` was driven
+  over every 5-minute cycle twice, once with every fix above reverted and once
+  as shipped. A code fingerprint in each arm confirmed which code had loaded.
+  Both arms produced the same 9 entries (same symbols, times, sides and
+  regimes) and the same 4,031 skips. 6 of the 9 stops moved, all through Tier
+  2a and in both directions: GOOG's `vwap_reclaim` long went 348.73 -> 345.41,
+  and AMZN's short 259.91 -> 259.75. The HTF fixes cannot show in this replay,
+  because it runs without a data feed. The AVWAP fix acts on exits
+  (`anchored_vwap_loss_exit`), not entries.
+
+  Coverage: 1,851 passing (+40). `test_levels_review_fixes.py` holds one class
+  per defect, plus divergence cases in `test_levels_shared_divergence.py` and
+  O3-O5 in `test_properties.py`. Each fix was reverted in turn, and 15 of 15
+  reverts are caught; the two follow-ups were reverted both to their first
+  cut and, for order blocks, to the pre-review window, and all are caught. O5
+  initially wasn't: `pd.concat` keeps `attrs` only when
+  all inputs match, so it now merges a fetch without a source size into a
+  cached frame that has one. The three technical-levels snapshots were
+  regenerated. Only `anchored_vwap_open` and `atr_expansion_mult` changed, and
+  both were checked against an independent computation first.
+
+- **`range` had lost its only counter-trend filter.** *2026-09-22* — found
+  on a bug pass over this week's mean-reversion work, and caused by it:
+  nothing here was new code, but making `range` able to qualify turned a
+  latent interaction into a live one.
+
+  `range` is exempt from the `_decide_side` vote because a fade has to enter
+  against the move (2026-09-18). Its counter-trend protection is therefore
+  the soft `_bias_penalty` — which is skipped whenever the vote picks a side,
+  on the grounds that "the explicit decision already chose the side"
+  (2026-05-27). That reasoning is right for SIDE_DECISION_REGIMES, which the
+  build queue holds to the voted side. It is wrong for MEAN_REVERSION_REGIMES,
+  which do not follow the vote: scored on the side AGAINST it, `range` got no
+  penalty precisely because the vote had decided something `range` ignores.
+  The two changes were written four months apart and compose badly; with the
+  regime unable to qualify, nobody could see it.
+
+  Driving the real `entry_signals` over 2026-09-18, 09-21 and 05-28, 6 of 11
+  `range` signals faded their own symbol's day by >= 0.30%, three by >= 1% —
+  QCOM LONG on a -6.85% day, META LONG on -2.61%, GOOG LONG on -1.59%. When
+  the vote decides, the penalty now still applies to MEAN_REVERSION_REGIMES
+  (scaled by the day's move exactly as `_bias_penalty` documents; zero in the
+  neutral band and for a fade WITH the day), and remains skipped for the
+  vote-bound regimes. Same sessions after: 5 signals, 0 fading their own day
+  by >= 0.30% — the remaining five are neutral-day fades or trend-aligned
+  ones (buying a dip on an up day). It is logged as `mr_bias_pen`, separately
+  from `bias_pen`, so a skip line does not read as though trend was docked.
+
+  Two things this does not do, stated so they are not assumed. The penalty
+  caps at 1.0 and `range`'s headroom is exactly 1.0 (5.0 - 4.0), so a PERFECT
+  5.0 fade still clears at the floor on a deep down day — the penalty's own
+  docstring says it filters "most" counter-bias setups, not all; none of the
+  three sessions produced one. And it keys on the symbol's own move, not the
+  sector's: two of the five survivors were flat names on a -0.9% sector day,
+  which reads as relative strength rather than a knife.
+
+  Also on this pass: one new test took 14s a side because its tape builder
+  reloaded the preset ~420 times (now cached, ~2s); the preset's headroom
+  comment still gave `range` 1.5 after its floor moved to 4.0; and the
+  README's Range bullet predated both the scorer's squeeze gate and the new
+  floor. The 81 "no regime qualified" lines that printed `range` at or above
+  4.0 were NOT a scoring mismatch: SHORTs clear `min_range_score` plus
+  `short_min_score_premium` (0.5), so a short `range` needs 4.5 and the regime
+  now leans long by design.
+
+  Coverage: 1,811 passing (+5). The tests drive `entry_signals` itself, since
+  the defect was in how it composed the penalty with the vote rather than in
+  `_bias_penalty`, which was already unit-tested and correct. Each revert is
+  caught by the test aimed at it: removing the fix fails the deep-down-day and
+  skip-line tests, and over-applying it to every regime fails the one that
+  pins trend's exemption.
+
+- **vol_squeeze's compression gate was calibrated in the wrong units, and a
+  bug pass found a fourth score/build mismatch.** *2026-09-22*
+
+  **`vol_squeeze_max_range_atr` compares a TWELVE-bar box against a ONE-bar
+  `atr14`** — the same units mismatch as `orb_max_range_atr_mult`, and worse.
+  Measured over 167,447 RTH 1m bars across 18 archived sessions
+  (2026-05-01 .. 09-22) the ratio runs:
+
+      p5 2.17   p25 2.81   median 3.44   p75 4.26   p95 5.75   max 15.71
+
+  The shipped `1.8` sits BELOW the 5th percentile, so 0.79% of bars could ever
+  be "compressed" and the regime reached its full gate stack 3.4 times a
+  session across 28 symbols. A random walk puts the expected 12-bar range near
+  3.3x a 1-bar ATR, so the measured median is the NEUTRAL box width, not a
+  tight one. Now `2.8`, the p25 — the same definition
+  `bollinger_squeeze_width_pct` uses at its own p25, so the regime's two
+  compression tests finally mean the same thing. Replaying 2026-09-21 takes
+  the regime from 3 qualifying candidates to 44, none of which the builder
+  would reject for a weak breakout. The breakout buffer is deliberately NOT
+  touched in the same change: this regime's archive is 11 trades for +$9.58
+  that becomes -$120 without one TSLA winner, so it gets one variable at a
+  time.
+
+  `vol_squeeze_max_range_pct: 0.012` admits 95.59% of bars and never binds. It
+  is kept as the absolute backstop for a name whose `atr14` is unusually small
+  relative to price, and is now documented as such rather than reading like a
+  live gate.
+
+  **`_score_range` still ignored one of its builder's gates.**
+  `_build_range_signal` refuses outright when the tape is in a Bollinger
+  squeeze (`reject_range_during_squeeze`) and the scorer never looked, so a
+  squeezed bar could score the full 5.0, win the auction and die on
+  `range_bollinger_squeeze` — 25 of those on 2026-09-21 even after the
+  threshold recalibration, and 387 of 387 before it. Fourth instance of this
+  shape in a week, after ORB's bare-break +2.5, the range regime's optional
+  prev-bar confirmation and vol_squeeze's three breakout bonuses. `_score_range`
+  now takes `tech_ctx` (required, not optional — an optional one is a caller
+  that can silently forget it) and mirrors the gate, flag and all.
+
+  **`min_range_score` re-derived, 3.5 -> 4.0.** A score floor only means
+  something relative to the scorer it gates, and the scorer was replaced. At
+  3.5 the minimum qualifying setup was zone + prev-bar + rejection wick and
+  nothing else: a fade off the range edge with NEITHER piece of evidence that
+  the tape is ranging rather than trending, which is the falling knife the two
+  +0.5 context components exist to tell apart. 19 of the 28 range setups on
+  2026-09-21 and 9 of 26 on 09-18 scored exactly that. 4.0 requires 1.5 beyond
+  the zone — the wick plus any one +0.5, or all three together. 4.5 measures
+  back to 0 setups on 09-21 and 2 on 09-18, i.e. the dead-regime state this
+  week's work exists to fix, which is the `min_pullback_score: 4.0` and
+  `min_sr_scalp_score: 4.0` mistake in the other direction.
+
+  **Left alone, and worth stating plainly: `range` now takes most of the
+  book.** Driving the real `entry_signals` over full archived sessions with
+  all 28 frames, it is 62.5% of the signals on 2026-09-21 (down from 85%
+  before the squeeze gate and the floor) and 97.0% on 09-18. That is NOT the
+  auction normalisation — it is that `range` is the only regime exempt from
+  BOTH `require_entry_confirmation_bar` and `require_index_confirmation`, and
+  those two account for ~700 of the directional regimes' rejections across the
+  two sessions. The exemption is deliberate and documented; it simply never
+  mattered while the regime could not qualify. Narrowing it, or capping
+  concurrent mean-reversion positions, is a strategy decision and not
+  something a bug pass should make on its own.
+
+  Coverage: 1,806 passing (+9). The new assertions pin the calibration the way
+  the squeeze-threshold ones do — the ATR cap must sit above the 5th
+  percentile of the ratio it gates and below its median, or it is either
+  always-false or not selective; the pct gate must stay above the tape's own
+  p95 so its backstop role is a conscious choice; and the range floor must be
+  both unreachable-by-a-bare-fade and reachable by a real one.
+
+- **`vol_squeeze` could qualify a setup its own builder was certain to
+  reject.** *2026-09-22* — the preset records the 2026-05-14 change as "convert
+  vol_ratio / close_pos / buffer from +0.5 bonuses to HARD gates". Only
+  `_build_vol_squeeze_signal` was changed. `_score_vol_squeeze` kept all three
+  as optional bonuses, so a setup with none of them scored 2.0 box compression
+  + 1.0 BB compression + 0.5 both-agree + 0.5 VWAP alignment = exactly
+  `min_vol_squeeze_score` (4.0) — it cleared the floor, won its place in the
+  build queue and then died on `vol_squeeze_weak_breakout_*`.
+
+  Measured: **1,838** such rejections across the 2026-09-21 and 09-22 sessions,
+  every one of them `weak_breakout_buffer` — i.e. a setup that qualified as a
+  squeeze BREAKOUT with no break at all. The queue falls through to the next
+  regime, so this did not lose trades outright; it inflated the normalised
+  score that orders the auction, and made a guaranteed-fail regime the
+  `entry_family` recorded against the skip — corrupting the attribution added
+  on 2026-09-19 to tell a tuning problem from a dead regime.
+
+  Third instance of this shape this month, after ORB's bare-break +2.5 and the
+  range regime's optional prev-bar confirmation, so the fix follows the same
+  pattern: one derivation, `_vol_squeeze_breakout_quality`, read by the scorer
+  and the builder. Clearing all three gates is now the +1.5, and the freed
+  bonuses re-point at DEGREE — +0.5 for a break at twice
+  `vol_squeeze_breakout_buffer_pct` and +0.5 for volume at 1.5x the required
+  ratio — so the score still discriminates among qualifying setups. The ceiling
+  stays 6.5, which matters more here than elsewhere: vol_squeeze has the widest
+  headroom of any enabled regime, so its ceiling drives its ranking. Compression
+  alone now caps at 3.5, below the floor. `vol_squeeze_hard_breakout_gates:
+  false` reverts BOTH, because the point is that they agree under either
+  setting.
+
+  Coverage: 1,797 passing (+24). `tests/test_vol_squeeze_regime.py` sweeps the
+  grid of break strength x breakout volume x bar close position and asserts
+  nothing the scorer qualifies is rejected by the builder for a weak breakout,
+  on both sides and under both settings of the flag, with the builder's failure
+  tags pinned so re-deriving them from the shared helper cannot silently rename
+  one.
+
+- **Neither mean-reversion regime could take a mean-reversion trade.**
+  *2026-09-22* — the strategy declares two, `range` and `sr_scalp`, against a
+  preset whose own universe thesis is that these names are "VWAP-reverting with
+  occasional trend days". Three independent defects, one per stage of the
+  funnel, and all three had to go for a support bounce or a resistance
+  rejection to reach an order.
+
+  **`_score_range` measured close to the opposite of what its builder gates
+  on.** `_build_range_signal` enters only from the outer 35% of the lookback
+  range; the scorer never looked at where in the range price was, and paid its
+  largest single component (+1.5 of a 5.0 ceiling) for sitting within 0.20% of
+  VWAP — the middle. Replayed over 10,162 real 1m bars (28 symbols,
+  2026-09-21) it correlated **-0.17** with distance from mid-range, averaged
+  1.94 at an edge against 2.19 mid-range, and blocked 6,485 of the 7,477 bars
+  that were actually at an edge. It also took no `side`, so LONG and SHORT
+  scored identically and the auction could not tell which edge price was on —
+  every other regime scorer is side-aware.
+
+  This is the defect `_score_sr_scalp` was redesigned out of on 2026-05-29
+  ("measured chop character ... UNCORRELATED with the level geometry the
+  builder actually gates on"), in the other mean-reversion regime; the lesson
+  was never carried across. Same fix: score the builder's geometry, keep the
+  character checks as corroboration. The fade zone now comes from one helper,
+  `_range_entry_zone`, that both the scorer and the builder call — the
+  `_breakout_reference` precedent from two days ago. Prev-bar confirmation
+  moved from an optional +0.5 to part of the hard +2.0, because the builder
+  demands it: a single-bar poke scored 3.5, cleared the floor, won its place in
+  the build queue and then died on `not_near_range_low_prev_bar`. The freed
+  +0.5 marks a deep rather than marginal fade. After: correlation **+0.68**,
+  mean 3.04 at an edge against 0.50 mid-range, and 100% of qualifying bars in
+  the builder's entry zone. `range_max_vwap_dist_pct` is removed.
+
+  **`bollinger_squeeze_width_pct: 0.06` was not a threshold on this universe.**
+  `bollinger_width_pct` is `(bb_upper - bb_lower) / bb_mid`, a FRACTION of
+  price. Across 162,056 RTH 1m bars over 17 archived sessions (2026-05-01 ..
+  09-21) it runs median 0.0041, p95 0.0167, max 0.236 — so 0.06 flagged
+  **99.87%** of all bars as "in a squeeze". The flag PARTITIONS the two
+  regimes: `_score_vol_squeeze` reads it as the compression to trade and
+  `_build_range_signal` reads it as the condition to refuse. At 99.87% that
+  partition was degenerate — vol_squeeze owned every bar and `range` owned
+  none, which is why one session logged 387 of 387 range build failures on
+  `bollinger_squeeze` and the regime has a single trade in the whole archive.
+  The preset now sets 0.0025, the p25 of the measured distribution, and the
+  flag fires on 25.7% of bars. `vol_squeeze_max_width_pct` moves 0.05 ->
+  0.0035 for the same units reason: it is the OR-branch of the same test, and
+  at 0.05 it was true on ~100% of bars, making `_score_vol_squeeze`'s +1.0
+  compression point and its +0.5 "both signals agree" bonus free — 1.5 of a
+  4.0 floor paid for nothing. **Preset only**; the code default in `config.py`
+  is untouched, so no other strategy is affected.
+
+  **`sr_scalp`'s stop floor bound on every setup, not the noisy ones.** The
+  flat `sr_scalp_min_stop_atr_mult: 2.5` installed on 2026-07-29 after META
+  07-28 (three shorts into a band the tape chopped 11.9 ATR through, stops
+  1.09-2.70 ATR away, 63% of the window's bars trading through them) was the
+  right diagnosis with the wrong instrument: the geometric stop here is at most
+  proximity 0.4 + zone half-width 0.2 + `level_buffer` ~0.3 = about 0.9 ATR
+  from entry, so 2.5 always won. The level picked the direction and was then
+  discarded on the risk side, which is not what an S/R scalp is. It also made
+  `sr_scalp_min_distance_atr: 2.0` a fiction — a flat 2.5 ATR risk against a
+  target pinned to the opposing zone needs 2.4-3.2 ATR of gap to clear
+  `min_target_rr`, so a setup at the documented floor could never build. Two
+  floors with one silently dominant is the shape that also hid inside ORB.
+
+  The floor is now measured against the level's own violation history: how far
+  price has PIERCED it over `sr_scalp_noise_lookback_bars` (new, 20). A level
+  that has been holding keeps its own tight stop; a level being cut through
+  pushes the stop out past the breaches and, because the reward cannot stretch,
+  the R:R check then rejects the setup — the META case, rejected for the right
+  reason. `sr_scalp_min_stop_atr_mult` drops to 0.5 as an absolute backstop,
+  and the rejection reason now names which floor bound (`bound_by=pierce|atr`).
+
+  A same-day bug check found the first cut counting pierces from the start of
+  the window, which includes a fresh flip's approach from the far side.
+  FLIP-CONTINUATION leans on a confirmed-flipped level by definition, so it
+  died on `stop_floor_kills_rr` whenever the break was inside the lookback
+  (reproduced: `bound_by=pierce`, R:R 0.97 on a clean flip). Pierces now count
+  from the first close on the entry side of the level, the crossing bar itself
+  excluded; a flip that is later closed back through is still priced in. Found
+  with the regime switched off and fixed anyway, so re-enabling it does not
+  inherit it. Pinned by `TestSrScalpPierceStartsWhenTheLevelTookItsRole`, with
+  the old window and two plausible wrong fixes (counting the crossing bar,
+  restarting at the last reclaim) each caught.
+
+  `disable_sr_scalp_regime` stays `true`. The geometry defect is fixed, so
+  re-enabling it is now a trading decision rather than a bug fix, and the
+  current week is already measuring the armed retest. `range` is enabled and
+  its fixes are live.
+
+  Coverage: 1,773 passing (+27). `tests/test_mean_reversion_regimes.py` pins
+  the properties rather than the instances — that everything the scorer
+  qualifies is in the builder's entry zone across the whole band of positions,
+  that both follow a retuned `range_entry_zone_frac` together, that the squeeze
+  threshold sits inside the measured distribution in both directions, and that
+  a setup at the advertised gap floor builds — with a control that restores the
+  old flat 2.5 and confirms the same setup is rejected, so the test cannot pass
+  against the unfixed code.
 
 - **Four logic defects in the ORB regime.** *2026-09-22* — found while
   evaluating why it has never worked. The headline answer is that **it has

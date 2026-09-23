@@ -39,6 +39,19 @@ class OrderRequest:
     duration: str = "DAY"
 
 
+@dataclass(slots=True)
+class BracketCancel:
+    """Outcome of tearing down a position's resting broker protection."""
+    ok: bool
+    message: str
+    # Shares the resting children filled before the cancel landed, their
+    # average price, and the exit they were ("broker_stop" / "broker_target").
+    # The caller books these before exiting what is left.
+    filled_qty: int = 0
+    fill_price: float | None = None
+    fill_reason: str | None = None
+
+
 class SchwabExecutor:
     _EQUITY_WORKING_STATUSES = {
         "AWAITING_PARENT_ORDER",
@@ -178,8 +191,7 @@ class SchwabExecutor:
             value = cls._safe_int(payload.get(key))
             if value is not None:
                 return max(0, value)
-        total = 0
-        found = False
+        per_leg: dict[Any, int] = {}
         for activity in payload.get("orderActivityCollection") or []:
             if not isinstance(activity, dict):
                 continue
@@ -189,16 +201,33 @@ class SchwabExecutor:
                 qty = cls._safe_int(leg.get("quantity"))
                 if qty is None:
                     continue
-                total += max(0, qty)
-                found = True
-        return total if found else None
+                per_leg[leg.get("legId")] = per_leg.get(leg.get("legId"), 0) + max(0, qty)
+        if not per_leg:
+            return None
+        legs = [leg for leg in (payload.get("orderLegCollection") or []) if isinstance(leg, dict)]
+        if len(legs) <= 1:
+            return sum(per_leg.values())
+        # A vertical's executions arrive once per LEG: summing them counted
+        # every spread twice. A spread unit is filled once every leg is, so
+        # the order's fill is its least-filled leg, per unit of order quantity.
+        order_qty = cls._safe_float(payload.get("quantity"))
+        ratios: list[float] = []
+        for leg in legs:
+            leg_qty = cls._safe_float(leg.get("quantity"))
+            ratios.append(leg_qty / order_qty if leg_qty and order_qty and order_qty > 0 else 1.0)
+        if set(per_leg) == {None}:
+            # No legId on any execution: the pool holds every leg's shares.
+            return int(sum(per_leg.values()) / sum(ratios))
+        return min(int(per_leg.get(leg.get("legId"), 0) / ratio) for leg, ratio in zip(legs, ratios))
 
     @classmethod
-    def _equity_order_fill_price(cls, payload: dict[str, Any] | None) -> float | None:
-        if not isinstance(payload, dict):
-            return None
-        weighted_notional = 0.0
-        weighted_qty = 0.0
+    def _order_executions(cls, payload: dict[str, Any]) -> dict[Any, tuple[float, float]]:
+        """``(notional, quantity)`` of an order's executions, per ``legId``.
+
+        Executions carrying no ``legId`` pool under ``None``; a single-leg
+        order's executions need no attribution.
+        """
+        out: dict[Any, tuple[float, float]] = {}
         for activity in payload.get("orderActivityCollection") or []:
             if not isinstance(activity, dict):
                 continue
@@ -209,10 +238,51 @@ class SchwabExecutor:
                 qty = cls._safe_float(leg.get("quantity"))
                 if px is None or qty is None or px <= 0 or qty <= 0:
                     continue
-                weighted_notional += px * qty
-                weighted_qty += qty
-        if weighted_qty > 0:
-            return weighted_notional / weighted_qty
+                notional, filled = out.get(leg.get("legId"), (0.0, 0.0))
+                out[leg.get("legId")] = (notional + px * qty, filled + qty)
+        return out
+
+    @classmethod
+    def _multi_leg_net_fill_price(cls, payload: dict[str, Any], legs: list[dict[str, Any]],
+                                  executions: dict[Any, tuple[float, float]]) -> float | None:
+        """Net price per spread unit of a multi-leg order (a vertical).
+
+        Each leg executes at its OWN price, so pooling the executions averaged
+        the long and short strikes: a 2.00/1.00 vertical read back as 1.50
+        instead of its 1.00 net, and the stop, target and P&L built on that
+        entry price inherited the error. The net is the signed sum of the leg
+        prices (buys add, sells subtract) scaled by each leg's ratio to the
+        order quantity; its magnitude is the debit paid or credit received.
+        None when any leg has no attributable execution.
+        """
+        order_qty = cls._safe_float(payload.get("quantity"))
+        net = 0.0
+        for leg in legs:
+            notional, filled = executions.get(leg.get("legId"), (0.0, 0.0))
+            leg_qty = cls._safe_float(leg.get("quantity"))
+            if filled <= 0 or leg_qty is None or leg_qty <= 0:
+                return None
+            ratio = leg_qty / order_qty if order_qty and order_qty > 0 else 1.0
+            sign = 1.0 if str(leg.get("instruction") or "").upper().startswith("BUY") else -1.0
+            net += sign * (notional / filled) * ratio
+        net = abs(net)
+        return net if net > 0 else None
+
+    @classmethod
+    def _equity_order_fill_price(cls, payload: dict[str, Any] | None) -> float | None:
+        """Average fill price per unit: per share, or per spread for a vertical."""
+        if not isinstance(payload, dict):
+            return None
+        executions = cls._order_executions(payload)
+        legs = [leg for leg in (payload.get("orderLegCollection") or []) if isinstance(leg, dict)]
+        if len(legs) > 1:
+            net = cls._multi_leg_net_fill_price(payload, legs, executions)
+            if net is not None:
+                return net
+        elif executions:
+            notional = sum(value[0] for value in executions.values())
+            filled = sum(value[1] for value in executions.values())
+            return notional / filled
         for key in ("price", "filledPrice", "averagePrice"):
             px = cls._safe_float(payload.get(key))
             if px is not None and px > 0:
@@ -296,19 +366,29 @@ class SchwabExecutor:
         return round(max(0.01, capped), 4)
 
     def _equity_limit_price(self, intent: OrderIntent, bid: float | None, ask: float | None, last: float | None, *, buffer_mult: float = 1.0) -> float | None:
+        """Marketable limit: the touch plus a spread-scaled buffer, on a valid tick.
+
+        The buffer is a fraction of the spread and the reprice loop scales it
+        by ``1 + attempt * step``, so the raw sum is routinely sub-penny
+        (150.1599). Schwab rejects a sub-penny limit on a stock at/above $1
+        (SEC Rule 612) -- dry-run has no tick check, so this only ever bit
+        live. Rounding runs AWAY from the touch (a buy up, a sell down) so the
+        order stays at least as marketable as the unrounded price.
+        """
         buffer = self._marketable_limit_buffer(bid, ask) * max(1.0, float(buffer_mult))
         buy_side = intent in {OrderIntent.BUY, OrderIntent.BUY_TO_COVER}
         if buy_side:
             reference = ask if ask is not None else last
             if reference is None or not math.isfinite(reference) or reference <= 0:
                 return None
-            price = round(reference + buffer, 4)
-            return price if math.isfinite(price) else None
+            raw = reference + buffer
+            if not math.isfinite(raw):
+                return None
+            return self._round_equity_price(raw, "up")
         reference = bid if bid is not None else last
         if reference is None or not math.isfinite(reference) or reference <= 0:
             return None
-        price = round(max(0.01, reference - buffer), 4)
-        return price if math.isfinite(price) else None
+        return self._round_equity_price(max(0.01, reference - buffer), "down")
 
     def _simulate_equity_fill(self, request: OrderRequest, data, refresh_quotes: bool = False, market_snapshot: Any | None = None) -> OrderResult:
         market = self._coerce_equity_market(market_snapshot)
@@ -372,6 +452,14 @@ class SchwabExecutor:
             time_module.sleep(max(0.05, poll_seconds))
 
     def _cancel_live_equity_order(self, order_id: str) -> tuple[bool, str, dict[str, Any] | None]:
+        """Cancel ``order_id``; True only once the broker shows it TERMINAL.
+
+        A partial fill is not terminal. This used to return True for any order
+        with fills, so a partially filled order whose cancel had not landed read
+        as cancelled while its remainder was still live -- and an exit's
+        remainder filling after the engine sent a fresh exit for the same
+        shares takes the position net short.
+        """
         timeout_seconds = max(0.5, min(5.0, float(self.config.execution.entry_live_fill_timeout_seconds)))
         poll_seconds = max(0.1, float(self.config.execution.entry_live_poll_seconds))
 
@@ -382,9 +470,6 @@ class SchwabExecutor:
             if self._equity_order_is_terminal_failure(payload):
                 return True, f"{prefix}:{status}", payload
             if self._equity_order_is_filled(payload):
-                return True, f"{prefix}:{status}", payload
-            filled_qty = self._equity_order_filled_qty(payload) or 0
-            if filled_qty > 0:
                 return True, f"{prefix}:{status}", payload
             return False, f"{prefix}_unconfirmed:{status}", payload
 
@@ -402,6 +487,13 @@ class SchwabExecutor:
         if ok:
             return ok, msg, payload
         return False, f"cancel_status={status_code}", payload
+
+    def cancel_working_order(self, order_id: str) -> tuple[bool, str]:
+        """Cancel an order a submit path left live; True once it is terminal."""
+        if self.config.schwab.dry_run:
+            return True, "dry_run_cancel"
+        ok, msg, _payload = self._cancel_live_equity_order(str(order_id))
+        return ok, msg
 
     def _build_repriced_equity_request(self, request: OrderRequest, data, attempt_index: int) -> OrderRequest | None:
         market = self._equity_market(request.symbol, data, refresh_quotes=True)
@@ -482,11 +574,13 @@ class SchwabExecutor:
             cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
             latest_payload = cancel_payload or payload
             result = self._finalize_live_polled_order_result(spec, latest_payload, order_id, f"live_partial_fill:{cancel_msg}", price_scale=price_scale)
-            if result.ok:
-                return result
-            return OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message=f"partial_fill_finalize_failed:{cancel_msg}", simulated=False)
+            if not result.ok:
+                result = OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message=f"partial_fill_finalize_failed:{cancel_msg}", simulated=False)
+            result.may_still_be_working = not cancel_ok
+            return result
         if not cancel_on_timeout:
-            return OrderResult(ok=False, order_id=order_id, raw=payload or spec, message=f"live_unfilled_timeout:{status}", simulated=False)
+            return OrderResult(ok=False, order_id=order_id, raw=payload or spec, message=f"live_unfilled_timeout:{status}", simulated=False,
+                               may_still_be_working=True)
         cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
         latest_payload = cancel_payload or payload
         if latest_payload is not None and self._equity_order_is_filled(latest_payload):
@@ -494,11 +588,13 @@ class SchwabExecutor:
         latest_filled_qty = self._equity_order_filled_qty(latest_payload) or 0
         if latest_filled_qty > 0:
             result = self._finalize_live_polled_order_result(spec, latest_payload, order_id, f"live_partial_fill_after_cancel:{cancel_msg}", price_scale=price_scale)
-            if result.ok:
-                return result
-            return OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message=f"partial_fill_after_cancel_finalize_failed:{cancel_msg}", simulated=False)
+            if not result.ok:
+                result = OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message=f"partial_fill_after_cancel_finalize_failed:{cancel_msg}", simulated=False)
+            result.may_still_be_working = not cancel_ok
+            return result
         if not cancel_ok:
-            return OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message=f"live_unfilled_cancel_failed:{cancel_msg}", simulated=False)
+            return OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message=f"live_unfilled_cancel_failed:{cancel_msg}", simulated=False,
+                               may_still_be_working=True)
         return OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message="live_unfilled_canceled", simulated=False)
 
     def _submit_live_equity_entry_with_reprice(self, initial_request: OrderRequest, data=None) -> OrderResult:
@@ -524,7 +620,8 @@ class SchwabExecutor:
                 latest_payload = cancel_payload or payload
                 result = self._finalize_live_equity_entry_result(current_request, current_spec, latest_payload, order_id, f"live_partial_fill_attempt_{attempt}:{cancel_msg}", data=data)
                 if not result.ok:
-                    return OrderResult(ok=False, order_id=order_id, raw=latest_payload or current_spec, message=f"partial_fill_finalize_failed:{cancel_msg}", simulated=False)
+                    result = OrderResult(ok=False, order_id=order_id, raw=latest_payload or current_spec, message=f"partial_fill_finalize_failed:{cancel_msg}", simulated=False)
+                result.may_still_be_working = not cancel_ok
                 return result
             if attempt >= reprice_attempts:
                 cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
@@ -535,9 +632,11 @@ class SchwabExecutor:
                 if latest_filled_qty > 0:
                     result = self._finalize_live_equity_entry_result(current_request, current_spec, latest_payload, order_id, f"live_partial_fill_after_cancel_attempt_{attempt}:{cancel_msg}", data=data)
                     if result.ok:
+                        result.may_still_be_working = not cancel_ok
                         return result
                 if not cancel_ok:
-                    return OrderResult(ok=False, order_id=order_id, raw=latest_payload or current_spec, message=f"live_unfilled_cancel_failed:{cancel_msg}", simulated=False)
+                    return OrderResult(ok=False, order_id=order_id, raw=latest_payload or current_spec, message=f"live_unfilled_cancel_failed:{cancel_msg}", simulated=False,
+                                       may_still_be_working=True)
                 return OrderResult(ok=False, order_id=order_id, raw=latest_payload or current_spec, message="live_unfilled_canceled", simulated=False)
             cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
             latest_payload = cancel_payload or payload
@@ -547,9 +646,11 @@ class SchwabExecutor:
             if latest_filled_qty > 0:
                 result = self._finalize_live_equity_entry_result(current_request, current_spec, latest_payload, order_id, f"live_partial_fill_after_reprice_cancel_attempt_{attempt}:{cancel_msg}", data=data)
                 if result.ok:
+                    result.may_still_be_working = not cancel_ok
                     return result
             if not cancel_ok:
-                return OrderResult(ok=False, order_id=order_id, raw=latest_payload or current_spec, message=f"live_reprice_cancel_failed:{cancel_msg}", simulated=False)
+                return OrderResult(ok=False, order_id=order_id, raw=latest_payload or current_spec, message=f"live_reprice_cancel_failed:{cancel_msg}", simulated=False,
+                                   may_still_be_working=True)
             next_request = self._build_repriced_equity_request(current_request, data, attempt_index=attempt + 1)
             if next_request is None:
                 return OrderResult(ok=False, order_id=order_id, raw=payload or current_spec, message="live_reprice_missing_or_stale_quotes", simulated=False)
@@ -877,6 +978,7 @@ class SchwabExecutor:
             return
         order_id = node.get("orderId")
         if order_id is not None:
+            legs = [leg for leg in (node.get("orderLegCollection") or []) if isinstance(leg, dict)]
             out[str(order_id)] = {
                 "status": cls._equity_order_status(node),
                 "order_type": str(node.get("orderType") or "").upper(),
@@ -884,6 +986,12 @@ class SchwabExecutor:
                 "fill_price": cls._equity_order_fill_price(node),
                 "is_filled": cls._equity_order_is_filled(node),
                 "is_terminal_failure": cls._equity_order_is_terminal_failure(node),
+                # Shares still resting: what adoption compares against the
+                # position before it trusts a working child.
+                "remaining_qty": cls._equity_order_remaining_qty(node),
+                "leg_qty": cls._safe_int(legs[0].get("quantity")) if len(legs) == 1 else None,
+                "stop_price": cls._safe_float(node.get("stopPrice")),
+                "price": cls._safe_float(node.get("price")),
             }
         cls._flatten_order_tree(node.get("childOrderStrategies"), out)
 
@@ -917,6 +1025,20 @@ class SchwabExecutor:
         out: dict[str, dict[str, Any]] = {}
         self._flatten_order_tree(payload, out)
         return out
+
+    def order_state(self, order_id: str) -> dict[str, Any] | None:
+        """One order's state row (the ``fetch_order_states`` shape) via
+        ``order_details``, for an order the account_orders listing did not
+        return -- aged out of its lookback, or not listed yet. None when the
+        broker cannot be read."""
+        if self.config.schwab.dry_run:
+            return None
+        payload, _status = self._equity_order_details(str(order_id))
+        if not isinstance(payload, dict):
+            return None
+        out: dict[str, dict[str, Any]] = {}
+        self._flatten_order_tree(payload, out)
+        return out.get(str(order_id))
 
     def _bracket_state_from_order(self, order_id: str) -> dict[str, Any]:
         """Read child order ids back off a submitted bracket/OCO parent.
@@ -964,13 +1086,23 @@ class SchwabExecutor:
 
     def ensure_position_protected(self, symbol: str, qty: int, side: Side, entry_price: float,
                                   stop_price: float, target_price: float | None,
-                                  parent_order_id: str | None = None) -> dict[str, Any] | None:
+                                  parent_order_id: str | None = None,
+                                  known_bracket: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Guarantee an open position has resting broker protection.
 
-        Adopts the children of ``parent_order_id`` when they are still working,
-        and only submits fresh protection when they are not -- submitting
-        unconditionally would double the resting exit size and take the
-        position net short when it triggers.
+        Adopts protection that is still working and only submits fresh
+        protection when none is -- submitting unconditionally would double the
+        resting exit size and take the position net short when it triggers.
+
+        ``known_bracket`` is the bracket the bot last tracked for this position
+        (restored metadata). Its child ids are the CURRENT ones: a stop moved
+        by replace is a new order, so the parent's original children read
+        REPLACED and would look dead while the replacement still rests.
+        Without it, the children are read off ``parent_order_id``.
+
+        An adopted child resting a different share count than ``qty`` (sized to
+        the requested entry, not the fill) is resized, and the levels recorded
+        are the ones the broker actually holds.
 
         Returns the bracket state dict, or None when bracket mode is off.
         """
@@ -992,21 +1124,21 @@ class SchwabExecutor:
             ),
             "qty": int(qty),
         }
-        if parent_order_id:
-            existing = self._bracket_state_from_order(str(parent_order_id))
-            stop_id = existing.get("stop_order_id")
-            if stop_id:
-                states = self.fetch_order_states() or {}
-                state = states.get(str(stop_id))
-                # No state row means account_orders failed or the order aged
-                # out of the lookback; treat as still-working and adopt rather
-                # than risk stacking a second protective order.
-                still_working = state is None or not (state.get("is_filled") or state.get("is_terminal_failure"))
-                if still_working:
-                    adopted = {**base, **existing, "active": True, "state": "adopted"}
-                    if int(qty) != int(existing.get("qty") or qty):
-                        self.resize_bracket_children(adopted, symbol, side, int(qty), entry_price, session)
-                    return adopted
+        existing = self._adoptable_protection(parent_order_id, known_bracket)
+        if existing is not None:
+            resting_qty = existing.pop("resting_qty", None)
+            adopted = {**base, **existing, "active": True, "state": "adopted"}
+            if resting_qty is not None and int(resting_qty) != int(qty):
+                adopted["qty"] = int(resting_qty)
+                resized, msg = self.resize_bracket_children(adopted, symbol, side, int(qty), entry_price, session)
+                if not resized:
+                    adopted["state"] = "qty_mismatch"
+                    LOG.error(
+                        "Adopted protection for %s rests %s shares against a %s-share position and could not "
+                        "be resized (%s) -- the resting exit would flip the position on trigger",
+                        symbol, resting_qty, qty, msg,
+                    )
+            return adopted
         replacement = self.submit_protective_oco(
             symbol, int(qty), side, entry_price, float(base["stop_price"]), target_price, session,
         )
@@ -1020,20 +1152,85 @@ class SchwabExecutor:
         return {**base, **(replacement.bracket or {}), "protective_order_id": replacement.order_id,
                 "active": True, "state": "standalone_oco"}
 
-    def replace_bracket_child(self, child_order_id: str, spec: dict[str, Any]) -> tuple[bool, str]:
-        """Replace one resting protective child in place.
+    def _adoptable_protection(self, parent_order_id: str | None,
+                              known_bracket: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Child ids (plus what they rest) of protection still working, or None.
+
+        No state row for the stop means account_orders failed or the order
+        aged out of the lookback: it is treated as still working and adopted,
+        rather than risk stacking a second protective order on a live one.
+        """
+        if isinstance(known_bracket, dict) and known_bracket.get("stop_order_id"):
+            ids: dict[str, Any] = {
+                key: known_bracket.get(key)
+                for key in ("oco_order_id", "protective_order_id", "stop_order_id", "target_order_id")
+            }
+            ids["child_order_ids"] = [str(oid) for oid in (known_bracket.get("child_order_ids") or []) if oid]
+        elif parent_order_id:
+            ids = self._bracket_state_from_order(str(parent_order_id))
+        else:
+            return None
+        stop_id = ids.get("stop_order_id")
+        if not stop_id:
+            return None
+        states = self.fetch_order_states() or {}
+        stop_state = states.get(str(stop_id))
+        if stop_state is not None and (stop_state.get("is_filled") or stop_state.get("is_terminal_failure")):
+            return None
+        adopted = dict(ids)
+        if stop_state is not None:
+            remaining = stop_state.get("remaining_qty")
+            adopted["resting_qty"] = remaining if remaining is not None else stop_state.get("leg_qty")
+            if stop_state.get("stop_price") is not None:
+                adopted["stop_price"] = float(stop_state["stop_price"])
+        target_id = ids.get("target_order_id")
+        if target_id:
+            target_state = states.get(str(target_id))
+            if target_state is not None and (target_state.get("is_filled") or target_state.get("is_terminal_failure")):
+                adopted["target_order_id"] = None
+                adopted["child_order_ids"] = [oid for oid in adopted.get("child_order_ids") or [] if oid != str(target_id)]
+            elif target_state is not None and target_state.get("price") is not None:
+                adopted["target_price"] = float(target_state["price"])
+        return adopted
+
+    def replace_bracket_child(self, bracket: dict[str, Any], child_key: str, spec: dict[str, Any]) -> tuple[bool, str]:
+        """Replace the resting protective child ``bracket[child_key]`` in place.
 
         ``replace_order`` is atomic at the broker, so the position is never
         momentarily unprotected the way a cancel-then-place pair would be.
+
+        It is also NOT an edit: Schwab cancels the original (status REPLACED)
+        and creates a new order, returning the new id in the Location header.
+        The bracket is re-pointed at that id. Keeping the old one sent every
+        later replace at a dead order -- rejected, so the broker stop froze at
+        its first moved level while the engine kept deferring its stop to it --
+        and the fill reconcile watched the dead id, so the replacement's fill
+        was never booked.
         """
+        child_order_id = str(bracket.get(child_key) or "")
         try:
             response = call_schwab_client(self.client, "replace_order", self.account_hash, child_order_id, spec)
         except Exception as exc:
             return False, f"replace_error:{exc}"
         status_code = getattr(response, "status_code", 0)
-        if 200 <= status_code < 300:
-            return True, f"replaced:{status_code}"
-        return False, f"replace_status={status_code}"
+        if not 200 <= status_code < 300:
+            return False, f"replace_status={status_code}"
+        new_order_id = self._response_order_id(response)
+        if not new_order_id:
+            LOG.error(
+                "Bracket %s %s replaced but the broker returned no new order id; "
+                "the bracket still points at the replaced order", child_key, child_order_id,
+            )
+            return True, f"replaced:{status_code}:new_id_unknown"
+        if new_order_id != child_order_id:
+            bracket[child_key] = new_order_id
+            children = [str(oid) for oid in (bracket.get("child_order_ids") or [])]
+            if child_order_id in children:
+                children[children.index(child_order_id)] = new_order_id
+            else:
+                children.append(new_order_id)
+            bracket["child_order_ids"] = children
+        return True, f"replaced:{status_code}"
 
     def resize_bracket_children(self, bracket: dict[str, Any], symbol: str, side: Side, qty: int,
                                 entry_price: float, session: str) -> tuple[bool, str]:
@@ -1048,17 +1245,15 @@ class SchwabExecutor:
         target_price = bracket.get("target_price")
         messages: list[str] = []
         ok = True
-        stop_id = bracket.get("stop_order_id")
-        if stop_id and stop_price > 0:
+        if bracket.get("stop_order_id") and stop_price > 0:
             stop_limit = self.bracket_stop_limit_price(side, entry_price, stop_price)
             spec = self._bracket_stop_child(symbol, qty, exit_intent, stop_price, stop_limit, session)
-            child_ok, msg = self.replace_bracket_child(str(stop_id), spec)
+            child_ok, msg = self.replace_bracket_child(bracket, "stop_order_id", spec)
             ok = ok and child_ok
             messages.append(f"stop:{msg}")
-        target_id = bracket.get("target_order_id")
-        if target_id and target_price is not None:
+        if bracket.get("target_order_id") and target_price is not None:
             spec = self._bracket_target_child(symbol, qty, exit_intent, float(target_price), session)
-            child_ok, msg = self.replace_bracket_child(str(target_id), spec)
+            child_ok, msg = self.replace_bracket_child(bracket, "target_order_id", spec)
             ok = ok and child_ok
             messages.append(f"target:{msg}")
         if ok:
@@ -1081,14 +1276,13 @@ class SchwabExecutor:
         session = str(bracket.get("session") or "NORMAL")
         adjustments: list[dict[str, Any]] = []
 
-        stop_id = bracket.get("stop_order_id")
-        if stop_id is not None:
+        if bracket.get("stop_order_id") is not None:
             resting_stop = bracket.get("stop_price")
             rounded = self._round_equity_price(stop_price, direction)
             if resting_stop is None or abs(rounded - float(resting_stop)) >= min_delta:
                 stop_limit = self.bracket_stop_limit_price(side, entry_price, rounded)
                 spec = self._bracket_stop_child(symbol, int(qty), exit_intent, rounded, stop_limit, session)
-                ok, msg = self.replace_bracket_child(str(stop_id), spec)
+                ok, msg = self.replace_bracket_child(bracket, "stop_order_id", spec)
                 if ok:
                     bracket["stop_price"] = rounded
                     adjustments.append({"manager": "bracket_sync", "kind": "stop", "reason": "replace_child",
@@ -1097,13 +1291,12 @@ class SchwabExecutor:
                     LOG.warning("Bracket stop replace failed for %s (%s); broker still rests at %s",
                                 symbol, msg, resting_stop)
 
-        target_id = bracket.get("target_order_id")
-        if target_id is not None and target_price is not None:
+        if bracket.get("target_order_id") is not None and target_price is not None:
             resting_target = bracket.get("target_price")
             rounded = self._round_equity_price(target_price, direction)
             if resting_target is None or abs(rounded - float(resting_target)) >= min_delta:
                 spec = self._bracket_target_child(symbol, int(qty), exit_intent, rounded, session)
-                ok, msg = self.replace_bracket_child(str(target_id), spec)
+                ok, msg = self.replace_bracket_child(bracket, "target_order_id", spec)
                 if ok:
                     bracket["target_price"] = rounded
                     adjustments.append({"manager": "bracket_sync", "kind": "target", "reason": "replace_child",
@@ -1113,40 +1306,82 @@ class SchwabExecutor:
                                 symbol, msg, resting_target)
         return adjustments
 
-    def cancel_bracket(self, bracket: dict[str, Any] | None) -> tuple[bool, str]:
+    def cancel_bracket(self, bracket: dict[str, Any] | None) -> BracketCancel:
         """Cancel every resting protective order for a position.
 
         Called before ANY engine-side exit (peak giveback, time stop, CHoCH,
         force flatten). Without it the engine's market-out and the broker's
         resting stop both fill and the strategy ends up net short.
+
+        The wrapper (the OCO, or the standalone protective order) takes the
+        original legs down in one call. A child REPLACED since entry is a new
+        order the wrapper may not own, so every tracked child id is checked
+        too and cancelled if it is still live.
+
+        The result carries what the children FILLED before the cancel landed.
+        A stop that triggered after this cycle's fill reconcile has already
+        sold those shares; the caller must book them and exit only the rest.
         """
         if not isinstance(bracket, dict):
-            return True, "no_bracket"
+            return BracketCancel(True, "no_bracket")
         if self.config.schwab.dry_run:
-            return True, "dry_run_cancel"
-        # Cancelling the OCO wrapper cancels both legs in one call; fall back
-        # to the individual child ids when the broker exposed no wrapper.
-        order_ids: list[str] = []
-        oco_id = bracket.get("oco_order_id")
-        protective_id = bracket.get("protective_order_id")
-        if oco_id:
-            order_ids.append(str(oco_id))
-        elif protective_id:
-            order_ids.append(str(protective_id))
-        else:
-            order_ids = [str(oid) for oid in (bracket.get("child_order_ids") or []) if oid]
-        if not order_ids:
-            return True, "no_resting_orders"
+            return BracketCancel(True, "dry_run_cancel")
+        wrapper_id = bracket.get("oco_order_id") or bracket.get("protective_order_id")
+        child_ids: list[str] = []
+        for oid in (bracket.get("stop_order_id"), bracket.get("target_order_id"), *(bracket.get("child_order_ids") or [])):
+            if oid and str(oid) != str(wrapper_id or "") and str(oid) not in child_ids:
+                child_ids.append(str(oid))
+        if not wrapper_id and not child_ids:
+            return BracketCancel(True, "no_resting_orders")
         ok = True
         messages: list[str] = []
-        for order_id in order_ids:
-            cancel_ok, msg, _payload = self._cancel_live_equity_order(order_id)
+        fills: dict[str, tuple[int, float | None, str]] = {}
+        if wrapper_id:
+            cancel_ok, msg, payload = self._cancel_live_equity_order(str(wrapper_id))
+            ok = cancel_ok
+            messages.append(f"{wrapper_id}:{msg}")
+            self._collect_protective_fills(payload, fills)
+        for child_id in child_ids:
+            if wrapper_id:
+                # Usually already down with the wrapper: confirm before
+                # spending a cancel call on it.
+                payload, _status = self._equity_order_details(child_id)
+                if payload is not None and (self._equity_order_is_terminal_failure(payload) or self._equity_order_is_filled(payload)):
+                    self._collect_protective_fills(payload, fills)
+                    continue
+            cancel_ok, msg, payload = self._cancel_live_equity_order(child_id)
             ok = ok and cancel_ok
-            messages.append(f"{order_id}:{msg}")
+            messages.append(f"{child_id}:{msg}")
+            self._collect_protective_fills(payload, fills)
         if ok:
             bracket["active"] = False
             bracket["state"] = "canceled"
-        return ok, ",".join(messages)
+        filled_qty = sum(qty for qty, _px, _kind in fills.values())
+        priced = [(qty, px) for qty, px, _kind in fills.values() if px is not None]
+        priced_qty = sum(qty for qty, _px in priced)
+        fill_price = sum(qty * px for qty, px in priced) / priced_qty if priced_qty > 0 else None
+        fill_reason = max(fills.values(), key=lambda fill: fill[0])[2] if fills else None
+        return BracketCancel(ok, ",".join(messages), int(filled_qty), fill_price, fill_reason)
+
+    @classmethod
+    def _collect_protective_fills(cls, payload: Any, into: dict[str, tuple[int, float | None, str]]) -> None:
+        """Record ``order_id -> (filled_qty, fill_price, exit reason)`` for every
+        protective leg in *payload* that has fills. Keyed by order id so a leg
+        seen both under its wrapper and on its own is counted once."""
+        if isinstance(payload, list):
+            for node in payload:
+                cls._collect_protective_fills(node, into)
+            return
+        if not isinstance(payload, dict):
+            return
+        order_id = payload.get("orderId")
+        if order_id is not None and str(payload.get("orderStrategyType") or "").upper() != "OCO":
+            filled_qty = cls._equity_order_filled_qty(payload) or 0
+            if filled_qty > 0:
+                order_type = str(payload.get("orderType") or "").upper()
+                reason = "broker_stop" if order_type in cls._BRACKET_STOP_ORDER_TYPES else "broker_target"
+                into[str(order_id)] = (int(filled_qty), cls._equity_order_fill_price(payload), reason)
+        cls._collect_protective_fills(payload.get("childOrderStrategies"), into)
 
     def _finalize_bracket_protection(self, result: OrderResult, request: OrderRequest, side: Side,
                                      stop_price: float, target_price: float | None,
@@ -1243,12 +1478,14 @@ class SchwabExecutor:
         if (self._equity_order_filled_qty(payload) or 0) > 0:
             # Partial fill: stop further shares arriving BEFORE sizing the
             # protection, so the resize target quantity cannot move underneath.
-            _cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
+            cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
             latest = cancel_payload or payload
             result = self._finalize_live_equity_entry_result(request, spec, latest, order_id, f"live_bracket_partial_fill:{cancel_msg}", data=data)
             if not result.ok:
                 return OrderResult(ok=False, order_id=order_id, raw=latest or spec,
-                                   message=f"bracket_partial_fill_finalize_failed:{cancel_msg}", simulated=False)
+                                   message=f"bracket_partial_fill_finalize_failed:{cancel_msg}", simulated=False,
+                                   may_still_be_working=not cancel_ok)
+            result.may_still_be_working = not cancel_ok
             return self._finalize_bracket_protection(result, request, side, stop_price, target_price, order_id, latest)
         cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
         latest = cancel_payload or payload
@@ -1258,10 +1495,12 @@ class SchwabExecutor:
         if (self._equity_order_filled_qty(latest) or 0) > 0:
             result = self._finalize_live_equity_entry_result(request, spec, latest, order_id, f"live_bracket_partial_fill_after_cancel:{cancel_msg}", data=data)
             if result.ok:
+                result.may_still_be_working = not cancel_ok
                 return self._finalize_bracket_protection(result, request, side, stop_price, target_price, order_id, latest)
         if not cancel_ok:
             return OrderResult(ok=False, order_id=order_id, raw=latest or spec,
-                               message=f"bracket_unfilled_cancel_failed:{cancel_msg}", simulated=False)
+                               message=f"bracket_unfilled_cancel_failed:{cancel_msg}", simulated=False,
+                               may_still_be_working=True)
         return OrderResult(ok=False, order_id=order_id, raw=latest or spec, message="bracket_unfilled_canceled", simulated=False)
 
     def _vertical_market(self, metadata: dict[str, Any], data, refresh_quotes: bool = True) -> tuple[float, float, float] | None:

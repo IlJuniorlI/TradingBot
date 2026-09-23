@@ -26,7 +26,6 @@ class PeerConfirmedHTFPivotsScreener(BaseStrategyScreener):
             "change_from_open",
             "relative_volume_10d_calc",
         ]
-        c = self._column
         query = (
             self._base_query(
                 limit=max(
@@ -36,8 +35,7 @@ class PeerConfirmedHTFPivotsScreener(BaseStrategyScreener):
             )
             .select(*self._select_fields(*select_cols))
             .where(
-                c("name").isin(configured_symbols),
-                *self._common_equity_conditions(),
+                *self._curated_symbol_conditions(configured_symbols),
             )
         )
         df = self._execute(query)

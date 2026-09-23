@@ -168,8 +168,6 @@ class IntradayBot:
             dashboard_cache=self.dashboard_cache,
             positions=self.positions,
             save_reconcile_metadata=self._save_reconcile_metadata,
-            broker_position_row=self.entry_gatekeeper.broker_position_row,
-            broker_position_rows=self.entry_gatekeeper.broker_position_rows,
             structured_metadata_snapshot=self.entry_gatekeeper.structured_metadata_snapshot,
         )
         # Close the cycle: EntryGatekeeper also needs a PositionManager ref
@@ -733,7 +731,6 @@ class IntradayBot:
     def step(self) -> None:
 
         self.data.begin_cycle()
-        self.entry_gatekeeper.begin_cycle()
         try:
             now = now_et()
             schedule = self.config.active_strategy.schedule()
@@ -870,6 +867,9 @@ class IntradayBot:
             self.account.mark_prices(self._extract_last_prices(bars))
             self.account.mark_prices(self._extract_position_marks())
             if gate_state.management_active:
+                # Settle entry orders an earlier cycle could not, first, so a
+                # position they turn out to have opened is managed this cycle.
+                self.entry_gatekeeper.settle_unsettled_entry_orders()
                 self.position_manager.manage_positions(now, bars)
             if self.startup_reconciler.trading_blocked_reason:
                 candidate_symbols = [c.symbol for c in self.last_candidates]
@@ -934,7 +934,6 @@ class IntradayBot:
             )
         finally:
             self.data.end_cycle()
-            self.entry_gatekeeper.end_cycle()
 
     @staticmethod
     def _extract_last_prices(bars: dict[str, Any]) -> dict[str, float]:

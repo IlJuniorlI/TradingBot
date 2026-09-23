@@ -4,7 +4,7 @@ This file documents the strategy that lives in this folder. The behavior describ
 
 ## How it works
 
-This is a **multi-regime adaptive intraday strategy** for a fixed universe of top-tier liquid stocks across six Tier 1 GICS sectors (Technology, Consumer Discretionary, Communication Services, Financials, Healthcare, Consumer Staples). It detects whether each symbol is trending, pulling back, ranging, breaking out of a volatility squeeze, sustaining momentum from the session open, or scalping between HTF support/resistance zones, then applies the appropriate entry style. Trades both long and short across the full RTH session with time-of-day regime gating.
+This is a **multi-regime adaptive intraday strategy** for a fixed universe of 25 mega-cap Tech / AI stocks in three co-movement groups (`ai_hardware`, `platforms`, `software`). It detects whether each symbol is trending, pulling back, ranging, breaking out of a volatility squeeze, sustaining momentum from the session open, or scalping between HTF support/resistance zones, then applies the appropriate entry style. Trades both long and short across the full RTH session with time-of-day regime gating.
 
 **Timeframes (1m LTF, 2026-05-29).** The trend/pullback "LTF" runs on **1-minute bars** (`ltf_minutes: 1`) so entries and exits act on the freshest close instead of waiting up to 5 minutes for a 5m bar to print. To keep the *behavior* identical to the prior 5m tune, that 1m LTF's indicators are stretched ×5 via `ltf_indicator_span_scale: 5` — `add_indicators(span_scale=5)` makes its ema9/ema20/atr14/adx14/rsi14/ret5/ret15 effectively 45/100/70/70/70/25/75-bar, i.e. the same wall-clock horizons the 5m frame had. Consequently every ATR-based stop/buffer and every score threshold keeps its 5m calibration unchanged; only the bar granularity got finer. Two LTF lookbacks that *count* bars were scaled to match (`pullback_lookback_bars` 5→25, `side_decision_recent_lookback_bars` 6→30). The `range`/`vol_squeeze`/`momentum` regimes, the `technical_levels` context, and chart-pattern detection all read the **base 1m frame** (unchanged before and after this switch), so their lookbacks did *not* change. HTF stays 15m; the structure-pivot frame stays 5m (`support_resistance.structure_ltf_timeframe_minutes: 5`).
 
@@ -18,14 +18,15 @@ For each symbol and each direction (long/short), regime scores are computed for 
 
 - **Trend**: close vs VWAP, EMA alignment, momentum (ret5/ret15), ADX strength, index confirmation. Max score 6.0.
 - **Pullback**: requires underlying trend first, then checks for EMA20/VWAP touch, support/resistance hold, EMA9 reclaim, close quality, volume expansion. Max score 5.0.
-- **Range**: VWAP proximity, EMA convergence, VWAP cross count, tight intraday range, index neutrality. Max score 5.5.
-- **Vol-squeeze** *(added 2026-05-12)*: detects a tight Bollinger compression box across `vol_squeeze_lookback_bars` (default 12), then scores breakout magnitude, confirming volume ratio, bar close position within the breakout candle, VWAP/EMA alignment. Allowed in the primary and afternoon windows. **DISABLED in the shipped preset on 2026-09-18, RE-ENABLED 2026-09-20** (`disable_vol_squeeze_regime: false`): the trim's stated reason was that its 6.5 score ceiling won it more auctions than its edge justified, but `_normalized_regime_score` shipped in the same change and ranks on `(score - floor) / (ceiling - floor)` — its 2.5 headroom is the widest of any enabled regime, so the ceiling now works against it. It is also the only consumer of the squeeze condition that `range` rejects (`reject_range_during_squeeze`), so with it off that hand-off goes nowhere. Whether the regime has edge on mega caps is still unmeasured: with the flag off it was never scored and never appeared in the skip line. See *Cross-regime score normalisation* for the ranking maths.
+- **Range**: fade the edge of the lookback range. Scored on the geometry `_build_range_signal` gates on — close in the fade zone at this side's edge (the outer `range_entry_zone_frac`, default 35%) with the last completed bar in it too (+2.0, both required), a rejection wick off that edge (+1.0), a deep rather than marginal fade (+0.5), a two-sided tape (+0.5: `range_min_flip_count` VWAP crosses and the lookback range within `range_max_intraday_range_pct`), and nothing trending against it (+0.5: indices VWAP-neutral and ema9/ema20 within `range_max_ema_gap_pct`). Side-aware. A Bollinger squeeze scores base only when `reject_range_during_squeeze` is on, because the builder refuses those outright. Max score 5.0 (`REGIME_SCORE_CEILINGS['range']`); `min_range_score: 4.0` requires 1.5 beyond the zone — the wick plus any one +0.5, or all three together — so a marginal fade with a wick and no evidence the tape is actually ranging does not qualify. Exempt from the `_decide_side` vote (a fade must enter against the move), so it carries the soft `_bias_penalty` even when the vote decides — the only counter-trend filter it has. That penalty was skipped for it until 2026-09-22 (see CHANGELOG), which let live range signals fade their own day by >= 0.30% in 6 of 11 cases, QCOM LONG on a -6.85% day among them.
+  *Rewritten 2026-09-22.* The previous scorer measured range CHARACTER — VWAP proximity (+1.5), EMA gap, VWAP cross count, intraday range width, index neutrality — and never looked at where in the range price was, while the builder has only ever entered from the outer 35%. Those are close to opposites: the largest single component paid for sitting on VWAP, i.e. the MIDDLE. Replayed over 10,162 real 1m bars (28 symbols, 2026-09-21) the old scorer correlated **-0.17** with distance from mid-range, averaged 1.94 at an edge against 2.19 mid-range, and blocked 6,485 of the 7,477 bars that were at an edge; the new one correlates **+0.68**, and every bar it qualifies is in the builder's entry zone. `range_max_vwap_dist_pct` was removed with it.
+- **Vol-squeeze** *(added 2026-05-12)*: detects a tight Bollinger compression box across `vol_squeeze_lookback_bars` (default 12), then requires the break to clear **all three** of the builder's hard gates — buffered break of the box edge, breakout volume ratio, and bar close position — for +1.5, with +0.5 each for a DECISIVE break (2x the buffer) and DECISIVE volume (1.5x the required ratio), plus +0.5 for VWAP/EMA alignment. *Score/build mismatch fixed 2026-09-22:* those three were HARD gates in `_build_vol_squeeze_signal` from 2026-05-14 but stayed optional bonuses in `_score_vol_squeeze`, so a setup with none of them scored 2.0 + 1.0 + 0.5 + 0.5 = exactly `min_vol_squeeze_score` (4.0), cleared the floor, won its place in the build queue and was then certain to die on `vol_squeeze_weak_breakout_*` — 1,838 of them across the 09-21 and 09-22 sessions, every one an inflated normalised score that also became the `entry_family` recorded for the skip. Both now read `_vol_squeeze_breakout_quality`, and `vol_squeeze_hard_breakout_gates` moves the two together. Compression alone caps at 3.5, below the floor. Allowed in the primary and afternoon windows. **DISABLED in the shipped preset on 2026-09-18, RE-ENABLED 2026-09-20** (`disable_vol_squeeze_regime: false`): the trim's stated reason was that its 6.5 score ceiling won it more auctions than its edge justified, but `_normalized_regime_score` shipped in the same change and ranks on `(score - floor) / (ceiling - floor)` — its 2.5 headroom is the widest of any enabled regime, so the ceiling now works against it. It is also the only consumer of the squeeze condition that `range` rejects (`reject_range_during_squeeze`), so with it off that hand-off goes nowhere. Whether the regime has edge on mega caps is still unmeasured: with the flag off it was never scored and never appeared in the skip line. See *Cross-regime score normalisation* for the ranking maths.
 - **Momentum** *(added 2026-05-12, widened from afternoon-only and renamed from `momentum_close`)*: momentum-from-open continuation. Computes day_strength live from session open + current close, requires `momentum_min_day_strength` (default 1.5%) with the trade side, scores N-bar breakout + alignment. **Allowed post-ORB through close** (`orb_end_time` → `no_new_entries_after`) including midday — the day_strength hard gate is what filters chop, not the time window.
-- **Sr-scalp** *(added 2026-05-12)*: HTF S/R mean-reversion scalp. Uses the bot's existing `sr_ctx.nearest_support` (HS) and `nearest_resistance` (HR) as level prices and zone bands matching the dashboard's `key_level_zones` — NO strategy-local level creation. A distance gate requires the inner zone gap to clear BOTH `sr_scalp_min_distance_pct` (default 0.8% of close) AND `sr_scalp_min_distance_atr` (default 2.5x ATR); too-close zones reject at build time as `htf_zones_too_close` so other regimes can fall through. A proximity gate requires close to be inside the entry-side zone or within `sr_scalp_max_distance_from_zone_atr` of its inner edge. **Allowed post-ORB through close** (`orb_end_time` → `no_new_entries_after`). Index-confirmation EXEMPT (mean-reversion thesis, same as range). Max score 5.0 (`REGIME_SCORE_CEILINGS['sr_scalp']`), reached only on the flip-continuation path; the proximity path caps at 4.5. The pre-2026-05-29 chop-character scorer had an empirical ceiling near 3.9 and sat silently dead from 2026-05-12 to 2026-05-27 behind a 4.0 threshold (0 entries ever) — that note no longer describes the current level-geometry scorer. **DISABLED in the shipped preset** as of 2026-09-18 (`disable_sr_scalp_regime: true`): its `sr_scalp_min_distance_atr` (reward floor) and `sr_scalp_min_stop_atr_mult` (risk floor) are both 2.5, so a setup at the gap floor lands near R:R 0.8 and is rejected by `stop_floor_kills_rr` — the effective gap requirement is nearer 3.1 ATR than the 2.5 the parameter claims.
+- **Sr-scalp** *(added 2026-05-12)*: HTF S/R mean-reversion scalp. Uses the bot's existing `sr_ctx.nearest_support` (HS) and `nearest_resistance` (HR) as level prices and zone bands matching the dashboard's `key_level_zones` — NO strategy-local level creation. A distance gate requires the inner zone gap to clear BOTH `sr_scalp_min_distance_pct` (default 0.8% of close) AND `sr_scalp_min_distance_atr` (default 2.5x ATR); too-close zones reject at build time as `htf_zones_too_close` so other regimes can fall through. A proximity gate requires close to be inside the entry-side zone or within `sr_scalp_max_distance_from_zone_atr` of its inner edge. **Allowed post-ORB through close** (`orb_end_time` → `no_new_entries_after`). Index-confirmation EXEMPT (mean-reversion thesis, same as range). Max score 5.0 (`REGIME_SCORE_CEILINGS['sr_scalp']`), reached only on the flip-continuation path; the proximity path caps at 4.5. The pre-2026-05-29 chop-character scorer had an empirical ceiling near 3.9 and sat silently dead from 2026-05-12 to 2026-05-27 behind a 4.0 threshold (0 entries ever) — that note no longer describes the current level-geometry scorer. **DISABLED in the shipped preset** as of 2026-09-18 (`disable_sr_scalp_regime: true`). The geometry that made it unbuildable was FIXED 2026-09-22: `sr_scalp_min_stop_atr_mult` was a flat 2.5 ATR floor while the geometric stop is at most ~0.9 ATR from entry (proximity 0.4 + zone half-width 0.2 + `level_buffer` ~0.3), so the floor bound on **every** setup — the level picked the direction and was then discarded on the risk side. It also made the reward floor a fiction: a flat 2.5 ATR risk against a target pinned to the opposing zone needs 2.4-3.2 ATR of gap to clear `min_target_rr`, so a setup at the advertised `sr_scalp_min_distance_atr` could never build. The floor is now measured against how far price has PIERCED the level being leaned on over `sr_scalp_noise_lookback_bars`, counted from when it took its current role (a fresh resistance→support flip's approach from below is not a breach, or FLIP-CONTINUATION could never build) — a level that has been holding keeps its own tight stop, a level being cut through pushes the stop past the breaches and is then rejected on R:R, which is the 2026-07-28 META case rejected for the right reason. `sr_scalp_min_stop_atr_mult` drops to 0.5 as an absolute backstop. **Re-enabling the regime is now a trading decision, not a defect** — the flag is the only change needed.
 
 Build-time fall-through: as of 2026-05-12 each side stores an ordered list of qualifying regimes (score-descending). The build phase iterates the list and tries each regime in turn — if a regime's build fails (e.g. trend's `no_fresh_breakout`, sr_scalp's `htf_zones_too_close`), the next qualifying regime on the same side gets a chance. Across sides, the higher-scored side's full build_order is tried first.
 
-Each regime can be globally disabled via its own opt-out knob: `disable_trend_regime`, `disable_pullback_regime`, `disable_range_regime`, `disable_vol_squeeze_regime`, `disable_momentum_regime`, `disable_sr_scalp_regime`, `disable_vwap_reclaim_regime` — all default `false`. The 7th regime, **orb** (the true Opening Range Breakout, sole regime in the opening window), can be skipped two ways: `disable_orb_window` skips the opening window entirely (start trading at `orb_end_time`), while `disable_orb_regime` drops the ORB regime *and* its opening-range carve-out so the normal regime mix runs continuously from the open (used by the `small_cap_squeeze` subclass). An 8th regime, **vwap_reclaim** (a re-entry on a VWAP flush-and-reclaim), uses the same `disable_vwap_reclaim_regime` opt-out (default `false`) as the rest and is **ENABLED in the shipped preset** as of 2026-09-18 — it is the strategy's only reversal builder, see section 19. It shipped on 2026-05-30 as an opt-IN `enable_vwap_reclaim_regime` so it could not switch itself on for the `small_cap_squeeze` subclass; that subclass now sets the flag explicitly, so the polarity was normalised on 2026-09-20 and all eight regime knobs now read the same way.
+Each regime can be globally disabled via its own opt-out knob: `disable_trend_regime`, `disable_pullback_regime`, `disable_range_regime`, `disable_vol_squeeze_regime`, `disable_momentum_regime`, `disable_sr_scalp_regime`, `disable_vwap_reclaim_regime` — all default `false`. The 7th regime, **orb** (the true Opening Range Breakout, sole regime in the opening window), can be skipped two ways: `disable_orb_window` skips the opening window entirely (start trading at `orb_end_time`), while `disable_orb_regime` drops the ORB regime *and* its opening-range carve-out so the normal regime mix runs continuously from the open (used by the `small_cap_squeeze` subclass). An 8th regime, **vwap_reclaim** (a re-entry on a VWAP flush-and-reclaim), uses the same `disable_vwap_reclaim_regime` opt-out (default `false`) as the rest and is **ENABLED in the shipped preset** as of 2026-09-18 — it is the strategy's only reversal builder, see section 18. It shipped on 2026-05-30 as an opt-IN `enable_vwap_reclaim_regime` so it could not switch itself on for the `small_cap_squeeze` subclass; that subclass now sets the flag explicitly, so the polarity was normalised on 2026-09-20 and all eight regime knobs now read the same way.
 
 ### 3. Time-of-day gating controls which regimes are allowed
 
@@ -48,7 +49,7 @@ ORB-window opt-out: set `disable_orb_window: true` (default `false`) to skip the
 
 ### 4. Index confirmation gates directional entries
 
-Per-sector index ETFs (via `sector_index_map`) are used for confirmation — each stock is gated by its own sector's tape, not an arbitrary broad-market ETF. For example AAPL is confirmed by XLK; XOM by XLE; FCX by XLB. The default mapping is the canonical SPDR Select Sector ETFs (XLK / XLC / XLY / XLF / XLV / XLI / XLE / XLP / XLB / XLRE / XLU). Symbols whose sector isn't mapped fall back to the universe-wide `index_symbols` list. For trend, pullback, vol_squeeze, and momentum entries, at least one mapped index must agree with the trade direction:
+Each stock is gated by its own group's tape, not an arbitrary broad-market ETF. The live path is peer breadth across the symbol's `sector_groups` peers (section 17); the group's ETF from `sector_index_map` — SMH for `ai_hardware`, XLK for `platforms`, IGV for `software` — is the fallback when peer bars are missing. Symbols whose group isn't mapped fall back to the universe-wide `index_symbols` list. For trend, pullback, vol_squeeze, and momentum entries, at least one mapped index must agree with the trade direction:
 
 - Long: index close > VWAP and EMA9 >= EMA20
 - Short: index close < VWAP and EMA9 <= EMA20
@@ -105,7 +106,7 @@ All five are independently toggleable via `params` in `configs/config.top_tier_a
 Post-mortem on the first dry-run (19 trades, 26% WR, -$231 on range-heavy afternoon tape) added four more filters:
 
 - **`reject_entry_near_broken_level`** (default `true`). Entry-side mirror of the `resistance_break_exit` / `support_break_exit` gates in `strategy_base.position_exit_signal`. Rejects SHORT when `sr_ctx.broken_resistance` sits above entry within `broken_level_min_clearance_pct` (default `0.0025` = 0.25%) OR `broken_level_min_clearance_atr` (default `0.72`). Symmetric for LONG on `broken_support`. Fires across all regimes. Would have blocked 2026-04-23 NVDA 09:35 SHORT (level $0.04 above entry) and HD 14:12 SHORT (level $0.26 above entry), a combined -$62.54 of avoidable losses.
-- **`trailing_bias_enabled`** (default `true`). Adds per-symbol trailing-bias memory to Fix A. The strategy keeps a `deque(maxlen=trailing_bias_lookback)` (default 10) of recent `candidate_directional_bias` values. When the screener reports `None` for the current bar but ≥70% (`trailing_bias_majority_threshold`) of recent directional observations were one side, Fix A infers that side as the effective bias and restricts `preferred_sides` accordingly. Blocks the 2026-04-23 GOOG 12:51 LONG pullback that fired into 10 consecutive SHORT-biased bars.
+- **`trailing_bias_enabled`** (default `true`). Adds per-symbol trailing-bias memory to Fix A. The strategy keeps a `deque(maxlen=trailing_bias_lookback)` (default 10) of the LIVE bias, one observation per LTF bar (a later cycle on the same bar updates that bar's read; the memory starts empty each session), so the default spans the last 10 bars. When the current live bias is `None` but ≥70% (`trailing_bias_majority_threshold`) of the recent directional reads were one side, that side becomes the effective bias for the soft `_bias_penalty` (it no longer restricts `preferred_sides`). Written for the 2026-04-23 GOOG 12:51 LONG pullback that fired into 10 consecutive SHORT-biased bars. Until 2026-09-22 it appended one observation per loop cycle, so the memory actually spanned 20-30 seconds.
 - **`adaptive_partial_breakeven_rr` / `adaptive_partial_breakeven_offset_r`** (defaults `0.5` / `0.0`). A third adaptive-management tier sitting below the existing breakeven (`1.0R`) and profit_lock (`1.3R`). Moves the stop to `entry + offset * initial_risk` when `max_favorable_r` first crosses the threshold. Only 3 of 19 trades on 2026-04-23 reached the 1.0R breakeven gate, leaving modest-peak winners (AVGO 0.82R, RBLX 10:00 0.56R, COST 09:51 0.56R) unprotected. Set `adaptive_partial_breakeven_rr: null` to disable.
 - **`range_require_prev_bar_confirmation`** (default `true`). Applies to `_build_range_signal` only. Requires the last COMPLETED bar's close (`session_frame.iloc[-2]`) to also sit in the entry zone — filters single-tick whipsaws where an in-progress bar briefly crosses the range-edge threshold but closes back mid-range. All 7 red-from-tick-one losers on 2026-04-23 (AMZN 10:07, COST 11:09/13:02/15:15, LOW 13:08, HD 14:12 SHORT, V 14:14 SHORT) fit this pattern.
 
@@ -133,9 +134,13 @@ No ORB bypass — structural soundness of target vs. SR is timing-independent.
 
 #### 6e. 2026-04-24 PM — Fix H: reject range entries during Bollinger squeeze
 
+*Threshold recalibrated 2026-09-22 — see below; the mismatch this section describes was real, but `bollinger_squeeze_width_pct: 0.06` made the guard fire on 99.87% of bars rather than on squeezes.*
+
 Afternoon live-session trade (NFLX 13:22 SHORT, -$11.34 in 2.2 min) surfaced a structural mismatch: the range regime qualified and prev-bar confirmation passed, but the underlying tape was in a `bollinger_squeeze` (compressed volatility). Range mean-reversion needs oscillating vol; a squeeze typically resolves via breakout in the opposite direction. NFLX entry context showed `bollinger_width_pct: 0.0015` (0.155%), `atr14: 0.044` on a $92 stock — a 12-cent range where stops and targets are both 1-2 ticks away. R:R math was fine (2.27) but absolute edge was swallowed by noise.
 
 - **`reject_range_during_squeeze`** (default `true`). In `_build_range_signal`, after the insufficient-bars check, read `tech_ctx.bollinger_squeeze`. If true, skip the entry with reason `range_bollinger_squeeze(width_pct=X)`. Disable via `reject_range_during_squeeze: false`.
+
+**`bollinger_squeeze_width_pct` recalibrated (2026-09-22).** `bollinger_width_pct` is `(bb_upper - bb_lower) / bb_mid`, a FRACTION of price. Across 162,056 RTH 1m bars over 17 archived sessions (2026-05-01 .. 09-21) it runs median `0.0041`, p75 `0.0071`, p95 `0.0167`, max `0.236` — so the shipped `0.06` flagged **99.87%** of all bars as "in a squeeze". The flag PARTITIONS the two regimes (`_score_vol_squeeze` trades compression, `_build_range_signal` refuses it), so at 99.87% vol_squeeze owned the whole tape and `range` owned none: 387 of 387 range build failures in one session were `bollinger_squeeze`, and the regime has one trade in the entire archive. The preset now sets `0.0025`, the p25 of the measured distribution — a squeeze is the tightest quarter of the tape. `vol_squeeze_max_width_pct` moves `0.05` -> `0.0035` for the same units reason: it is the OR-branch of the same test, and at `0.05` it was true on ~100% of bars, making `_score_vol_squeeze`'s +1.0 compression point and +0.5 "both agree" bonus free. This is a preset change only — the code default in `config.py` is untouched, so other strategies are unaffected.
 
 No ORB bypass — squeeze is a volatility state, not a time-of-day artifact.
 
@@ -167,13 +172,13 @@ Candle patterns do not block entries — they only boost priority when multiple 
 
 ### 8. Index symbols are automatically added to the watchlist
 
-The sector ETFs configured in `index_symbols` (e.g. XLK, XLC, XLY, XLE, XLB depending on which sectors your universe touches) are added to the active watchlist so they receive history fetching, streaming, and appear in the bars dict. Without this, index confirmation would silently fail because `bars.get("XLK")` would return None for an AAPL trade.
+The ETFs configured in `index_symbols` (SMH / IGV / XLK in the shipped config) are added to the active watchlist so they receive history fetching, streaming, and appear in the bars dict. Without this, index confirmation would silently fail because `bars.get("XLK")` would return None for an AAPL trade.
 
 ### 9. Correlation concentration guard prevents correlated stacking
 
 Two groupings exist and they are deliberately different:
 
-- **`sector_groups`** - GICS granularity. Routes a symbol to its confirmation ETF (`sector_index_map`) and supplies the peer list for breadth confirmation. All 11 GICS sectors are pre-defined in the manifest so new symbols can be dropped into the correct group without code changes.
+- **`sector_groups`** - co-movement granularity (`ai_hardware` / `platforms` / `software`). Routes a symbol to its confirmation ETF (`sector_index_map`) and supplies the peer list for breadth confirmation.
 - **`correlation_groups`** - risk granularity, coarser. Drives the concentration guard via `max_same_correlation_group_same_direction` (default 2).
 
 They were one map until 2026-09-18, which under-counted risk: names across the tech / communication / consumer-discretionary line run roughly 0.85 correlated on any macro day, so treating them as independent sectors allowed a single directional bet to fill every `risk.max_positions` slot while appearing diversified - four tickers, one leveraged index bet, and `risk.max_daily_loss` reached in one move instead of four independent ones. On the Tech/AI universe the shipped preset therefore uses two risk buckets: `ai_complex` (semis + platforms, 20 names) and `software` (5), each capped at 2.
@@ -291,10 +296,10 @@ Default windows:
 Strategy-specific knobs:
 
 - `tradable`: the fixed list of symbols to trade.
-- `index_symbols`: index ETFs streamed for directional confirmation. Default is the SPDR Select Sector ETFs that cover the default tradable universe's sectors (XLK / XLC / XLY / XLF / XLV / XLP). Must include every ETF referenced by `sector_index_map` for actively-traded sectors.
-- `sector_index_map`: per-GICS-sector mapping → list of index ETFs to consult for confirming trades on symbols in that sector (default uses the canonical SPDR Select Sector ETFs). Falls back to OR-ing across all `index_symbols` when a sector has no mapping.
+- `index_symbols`: index ETFs streamed for directional confirmation. Default `SMH` / `IGV` / `XLK`, one per group. Must include every ETF referenced by `sector_index_map`.
+- `sector_index_map`: group → list of index ETFs to consult for confirming trades on symbols in that group (default `ai_hardware: [SMH]`, `platforms: [XLK]`, `software: [IGV]`). Falls back to OR-ing across all `index_symbols` when a group has no mapping.
 - `require_index_confirmation`: gate trend/pullback/vol_squeeze/momentum/vwap_reclaim entries on index agreement. Range and sr_scalp are exempt (mean-reversion theses).
-- `leg_anchored_confirmation`: measure the index/peer agreement test AND `_decide_side`'s VWAP arm against the current leg's anchored VWAP instead of session VWAP. Default `false`; `true` in the shipped preset. See section 19.
+- `leg_anchored_confirmation`: measure the index/peer agreement test AND `_decide_side`'s VWAP arm against the current leg's anchored VWAP instead of session VWAP. Default `false`; `true` in the shipped preset. See section 18.
 - `leg_anchor_min_age_bars` / `leg_anchor_min_impulse_pct`: how old and how large the leg must be before the anchor moves. Guards against reading an ordinary pullback as a reversal.
 - `require_htf_bias_alignment`: reject longs against bearish HTF (15m) structure and shorts against bullish HTF structure. Neutral never blocks. Default `true` — prevents counter-trend entries on days when the higher-timeframe structure is pinned against the trade direction. Set `false` to allow counter-HTF setups (the bot will still score them normally, but won't outright block).
 - `orb_bypass_htf_bias`: skip the HTF bias check during the ORB window (through `orb_end_time`). Default `true`. Set `false` to enforce HTF bias filtering even at the open.
@@ -311,7 +316,7 @@ Strategy-specific knobs:
 - `trend_target_rr` / `pullback_target_rr` / `vol_squeeze_target_rr` / `momentum_target_rr`: initial R:R targets per regime. Range and sr_scalp have no R:R target — range targets the opposite edge of the range, sr_scalp the inner edge of the opposite HTF zone (zone gap provides the reward).
 - `stop_buffer_atr_mult`: ATR multiplier for stop buffer beyond the swing level.
 - `orb_end_time` / `midday_start_time` / `midday_end_time` / `afternoon_start_time` / `no_new_entries_after`: time-of-day regime window boundaries.
-- `vol_squeeze_lookback_bars` / `vol_squeeze_max_range_pct` / `vol_squeeze_max_range_atr` / `vol_squeeze_max_width_pct` / `vol_squeeze_breakout_buffer_pct` / `vol_squeeze_min_breakout_volume_ratio` / `vol_squeeze_min_bar_close_position`: vol_squeeze qualification knobs.
+- `vol_squeeze_lookback_bars` / `vol_squeeze_max_range_pct` / `vol_squeeze_max_range_atr` / `vol_squeeze_max_width_pct` / `vol_squeeze_breakout_buffer_pct` / `vol_squeeze_min_breakout_volume_ratio` / `vol_squeeze_min_bar_close_position`: vol_squeeze qualification knobs. **`vol_squeeze_max_range_atr` is the one that binds** — it compares a 12-bar box against a 1-bar `atr14`, the same units mismatch as `orb_max_range_atr_mult`. Measured over 167,447 RTH 1m bars across 18 archived sessions the ratio runs p5 `2.17` / p25 `2.81` / median `3.44` / p95 `5.75`, so the shipped `1.8` sat below the 5th percentile and only 0.79% of bars could ever be "compressed" — 3.4 candidates a session across 28 symbols. Recalibrated to `2.8` (the p25, matching the definition `bollinger_squeeze_width_pct` uses) on 2026-09-22, giving ~40. `vol_squeeze_max_range_pct` admits 95.6% at `0.012` and is an absolute backstop, not a selectivity gate.
 - `momentum_breakout_lookback_bars` / `momentum_min_day_strength`: momentum qualification knobs.
 - `sr_scalp_min_distance_pct` / `sr_scalp_min_distance_atr`: HTF zone-gap floors. The inner gap between HS and HR zones must clear BOTH (max wins) for the sr_scalp regime to qualify. Defaults `0.008` (0.8% of close) and `2.5` (2.5x ATR).
 - `sr_scalp_max_distance_from_zone_atr`: proximity gate — close must be inside the entry-side zone OR within this multiple of ATR of its inner edge (default `0.5`). Mid-range candles don't qualify.
@@ -332,8 +337,8 @@ Strategy-specific knobs:
 - `side_decision_max_opposing`: maximum opposing votes allowed for a decision (default `1`). Tighter values demand cleaner consensus.
 - `orb_bypass_side_decision`: skip the explicit side decision during the ORB window (through `orb_end_time`) (default `true`).
 - `require_entry_confirmation_bar`: require the last fully closed LTF bar to confirm direction (green AND > prior close for LONG; mirror for SHORT) before entry on trend/pullback/momentum/vol_squeeze regimes (default `true`). See section 6f Fix B.
-- `armed_retest_enabled` / `armed_retest_max_minutes` / `armed_retest_zone_atr` / `armed_retest_min_close_position` / `armed_retest_invalidation_atr`: the armed-retest trigger for `trend` and `momentum` - qualifying records the level that was cleared and waits for price to retest it, entering at market only if the wait expires (defaults `true` / `12.0` / `0.35` / `0.60` / `0.75`). See section 22.
-- `sector_groups`: GICS sector groupings - ETF routing (`sector_index_map`) and the peer list for breadth confirmation.
+- `armed_retest_enabled` / `armed_retest_max_minutes` / `armed_retest_zone_atr` / `armed_retest_min_close_position` / `armed_retest_invalidation_atr`: the armed-retest trigger for `trend` and `momentum` - qualifying records the level that was cleared and waits for price to retest it, entering at market only if the wait expires (defaults `true` / `12.0` / `0.35` / `0.60` / `0.75`). See section 24.
+- `sector_groups`: co-movement groupings - ETF routing (`sector_index_map`) and the peer list for breadth confirmation.
 - `correlation_groups`: coarser risk groupings for the concentration guard.
 - `max_same_correlation_group_same_direction`: max same-direction positions per correlation group.
 - `volatility_scaled_thresholds` / `reference_adr_pct` / `volatility_scale_min` / `volatility_scale_max` / `adr_lookback_days`: per-symbol ADR scaling of every percent-of-price threshold (see section 16).
@@ -355,8 +360,8 @@ Current code defaults:
 | Option                               | Default                                                                                                                       |
 |--------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
 | `tradable`                           | `AAPL, MSFT, GOOG, AMZN, META, NFLX, ORCL, TSLA, NVDA, AVGO, AMD, TSM, MU, QCOM, ARM, MRVL, INTC, ANET, VRT, DELL, CRM, ADBE, NOW, PLTR, PANW` |
-| `index_symbols`                      | `XLK, XLC, XLY, XLF, XLV, XLP`                                                                                                |
-| `sector_index_map`                   | All 11 GICS sectors mapped to their canonical SPDR Select Sector ETF (XLK, XLC, XLY, XLF, XLV, XLI, XLE, XLP, XLRE, XLU). Materials maps to `[XLB, GDX, COPX]` (XLB is chemicals-heavy so gold/copper miners need GDX/COPX for proper alignment) |
+| `index_symbols`                      | `SMH, IGV, XLK`                                                                                                               |
+| `sector_index_map`                   | `{ai_hardware: [SMH], platforms: [XLK], software: [IGV]}`                                                                     |
 | `early_session_stop_widening_enabled`| `true`                                                                                                                        |
 | `early_session_stop_widening_until`  | `10:30`                                                                                                                       |
 | `early_session_stop_widening_mult`   | `1.3`                                                                                                                         |
@@ -383,15 +388,15 @@ Current code defaults:
 | `min_trend_score`                    | `3.5`                                                                                                                         |
 | `min_pullback_score`                 | `3.5`                                                                                                                         |
 | `min_pullback_trend_score`           | `3.0`                                                                                                                         |
-| `min_range_score`                    | `3.5`                                                                                                                         |
+| `min_range_score`                    | `4.0`                                                                                                                         |
 | `min_vol_squeeze_score`              | `4.0`                                                                                                                         |
 | `min_momentum_score`                 | `4.0`                                                                                                                         |
-| `min_sr_scalp_score`                 | `3.5`                                                                                                                         |
+| `min_sr_scalp_score`                 | `3.0`                                                                                                                         |
 | `min_adx14`                          | `15.0`                                                                                                                        |
 | `pullback_ema_touch_atr_mult`        | `0.35`                                                                                                                        |
 | `pullback_hold_atr_mult`             | `0.40`                                                                                                                        |
 | `pullback_lookback_bars`             | `25`                                                                                                                          |
-| `range_max_vwap_dist_pct`            | `0.0020`                                                                                                                      |
+| `range_entry_zone_frac`              | `0.35`                                                                                                                        |
 | `range_max_ema_gap_pct`              | `0.0008`                                                                                                                      |
 | `range_min_flip_count`               | `3`                                                                                                                           |
 | `range_lookback_bars`                | `20`                                                                                                                          |
@@ -401,8 +406,8 @@ Current code defaults:
 | `momentum_target_rr`                 | `2.0`                                                                                                                         |
 | `vol_squeeze_lookback_bars`          | `12`                                                                                                                          |
 | `vol_squeeze_max_range_pct`          | `0.012`                                                                                                                       |
-| `vol_squeeze_max_range_atr`          | `1.8`                                                                                                                         |
-| `vol_squeeze_max_width_pct`          | `0.05`                                                                                                                        |
+| `vol_squeeze_max_range_atr`          | `2.8`                                                                                                                         |
+| `vol_squeeze_max_width_pct`          | `0.0035`                                                                                                                      |
 | `vol_squeeze_breakout_buffer_pct`    | `0.0008`                                                                                                                      |
 | `vol_squeeze_min_breakout_volume_ratio` | `1.12`                                                                                                                    |
 | `vol_squeeze_min_bar_close_position` | `0.63`                                                                                                                        |
@@ -411,6 +416,8 @@ Current code defaults:
 | `sr_scalp_min_distance_pct`          | `0.008`                                                                                                                       |
 | `sr_scalp_min_distance_atr`          | `2.5`                                                                                                                         |
 | `sr_scalp_max_distance_from_zone_atr` | `0.5`                                                                                                                        |
+| `sr_scalp_min_stop_atr_mult`         | `0.5`                                                                                                                         |
+| `sr_scalp_noise_lookback_bars`       | `20`                                                                                                                          |
 | `disable_orb_window`                 | `false`                                                                                                                       |
 | `directional_bias_min_day_strength`  | `0.20`                                                                                                                        |
 | `disable_trend_regime`               | `false`                                                                                                                       |
@@ -468,7 +475,7 @@ Without it a single number is a different gate on every name. This universe span
 - `momentum_min_day_strength` as a flat figure was a routine move on PLTR/ARM and a 2-sigma day on AAPL/MSFT - the momentum regime was structurally a high-beta-only strategy. Scaled, the written 1.8 lands near 1.1% on AAPL and ~3.4% on PLTR.
 - `default_stop_pct: 0.010` is a tight stop on PLTR/ARM and a very wide one on AAPL/MSFT.
 
-Scaled params: `default_stop_pct`, `momentum_min_day_strength`, `sr_scalp_min_distance_pct`, `relative_strength_block_threshold_pct`, `range_max_vwap_dist_pct`, `range_max_intraday_range_pct`, `vol_squeeze_max_range_pct`, `vol_squeeze_breakout_buffer_pct`, `vwap_reclaim_buffer_pct`, `broken_level_min_clearance_pct`.
+Scaled params: `default_stop_pct`, `momentum_min_day_strength`, `sr_scalp_min_distance_pct`, `relative_strength_block_threshold_pct`, `range_max_intraday_range_pct`, `vol_squeeze_max_range_pct`, `vol_squeeze_breakout_buffer_pct`, `vwap_reclaim_buffer_pct`, `broken_level_min_clearance_pct`.
 
 **ATR-multiple params (`*_atr_mult`) are NOT scaled** - they are already volatility-relative and scaling them would square the adjustment.
 
@@ -484,7 +491,7 @@ The ETF test is close to circular on a mega-cap universe - AAPL+MSFT+NVDA+AVGO a
 
 Single-member sectors (healthcare/LLY, staples/COST here) have no peers and fall back to the original ETF check.
 
-## 19. Reversal handling: leg-anchored confirmation + vwap_reclaim (2026-09-18)
+## 18. Reversal handling: leg-anchored confirmation + vwap_reclaim (2026-09-18)
 
 A session that flushed and then turned produced **zero** entries on the recovering side. Driving a 3% flush that retraced 87% through the gates bar by bar, across the 90-bar recovery leg: 45 bars blocked on `index_not_confirmed`, 41 with no regime qualifying at all, 0 signals. Both directions.
 
@@ -557,7 +564,7 @@ The EMA arm is **deliberately left alone**: its span is shared with the trend fi
 
 **Not measured:** `sr_scalp` showed no change on the same tape, but the synthetic tape carries no real S/R structure, so that is inconclusive rather than evidence against enabling it. Re-anchoring `momentum`'s `day_strength` gate was tried and contributed nothing (18 signals with it, 18 without) and was dropped.
 
-## 18. Scheduled-event blackouts (2026-09-18)
+## 19. Scheduled-event blackouts (2026-09-18)
 
 Driven by the top-level `events:` config section and `event_blackouts.EventBlackoutCalendar`, shared by every strategy (it previously lived inside the 0DTE options strategy, so equity strategies had no event awareness at all).
 
@@ -566,7 +573,7 @@ Driven by the top-level `events:` config section and `event_blackouts.EventBlack
 
 Skip reasons: `event_blackout(<label>)` and `earnings_blackout(<SYM> <date>,<when>,offset=+/-Nsession)`.
 
-## 19. Cross-regime score normalisation (2026-09-18)
+## 20. Cross-regime score normalisation (2026-09-18)
 
 Raw regime scores are not comparable: each `_score_*` method has its own ceiling (see `REGIME_SCORE_CEILINGS`) and its own `min_*_score` floor. `_normalized_regime_score` maps a score onto `(score - threshold) / (ceiling - threshold)`, so 0.0 is exactly at the floor and 1.0 at the scorer's maximum.
 
@@ -575,7 +582,7 @@ This drives both auctions:
 - The per-candidate **build order** - previously sorted raw, which handed the queue to whichever scorer had the most components. A trend at 4.5/6.0 (25% of its headroom) outranked an sr_scalp at 4.4/5.0 (93% of its headroom).
 - The cross-signal **slot auction** - `signal_priority_key` now ranks on `regime_score_normalized`, then `final_priority_score`. Previously the gatekeeper's generic path sorted on raw `regime_score`, and `final_priority_score` (which carries the structure / pattern / candle / S/R / FVG quality work) only broke ties between identical raw scores.
 
-## 20. Side decision is scoped to direction-following regimes (2026-09-18)
+## 21. Side decision is scoped to direction-following regimes (2026-09-18)
 
 `_decide_side` votes on four trend-following signals (recent return, close vs VWAP, EMA9/20, last-3-bar colour). It used to collapse `preferred_sides` to the winning side for the whole candidate, before any regime was scored.
 
@@ -583,7 +590,7 @@ That silently removed both mean-reversion regimes. `range` only enters within th
 
 The vote now gates per (side, regime) against `SIDE_DECISION_REGIMES`, matching the exemptions the index and confirmation-bar gates already made for `MEAN_REVERSION_REGIMES`. New skip reason: `<side>_build_failed_<regime>_side_decision_opposed(decided=...)`.
 
-## 21. Long / short asymmetry (2026-09-18)
+## 22. Long / short asymmetry (2026-09-18)
 
 Every other threshold is shared between the two sides, which assumes they are
 mirror images. On equities they are not, so three multipliers encode the
@@ -678,7 +685,7 @@ so R:R asymptotes to 1.5 without reaching it (1.07 at a 1-ATR range, 1.37 at
 raised to 1.5, ORB would become mathematically incapable of producing a signal,
 silently.
 
-## 22. Armed retest: qualifying arms the trigger, the retest fires it (2026-09-20)
+## 24. Armed retest: qualifying arms the trigger, the retest fires it (2026-09-20)
 
 `trend` and `momentum` both enter on `close > max(high of the previous N bars)`
 — 25 LTF bars and 6 base-1m bars. The fill therefore sits at the highest price

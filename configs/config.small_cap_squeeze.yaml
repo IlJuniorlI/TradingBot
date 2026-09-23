@@ -308,6 +308,11 @@ support_resistance:
   # frame). The bar-count companions are sized for that 5m frame.
   structure_ltf_timeframe_minutes: 5
   structure_event_lookback_bars: 4      # = 20 min on the 5m structure frame
+  # HTF window, in 15m HTF bars. The line above is sized for the 5m LTF
+  # structure frame; until 2026-09-22 it sized the HTF one too, so halving
+  # it for 5m bars cut HTF BOS/CHoCH freshness from 120 to 60 minutes under
+  # the HTF bias entry gate. 8 restores 120.
+  htf_structure_event_lookback_bars: 8
   structure_min_pivot_gap_bars: 3       # = 15 min minimum between swings
   structure_min_range_atr_mult: 1.5
   structure_exit_grace_minutes_pullback: 15
@@ -372,7 +377,13 @@ technical_levels:
   bollinger_enabled: true
   bollinger_length: 20
   bollinger_std_mult: 2.0
-  bollinger_squeeze_width_pct: 0.06
+  # 2026-09-22: was 0.06 -- which, unlike on large caps, was NOT a units error
+  # here: small caps' 1m bands are wide (median width 0.117 of price) and 0.06
+  # flagged 16.4% of RTH bars. Set to the p25, 0.076, so the flag means what it
+  # means in every other preset -- the tightest quarter of the tape. Thin
+  # evidence: 1,646 RTH bars from 9 symbol-days (2026-06-01..03 dry-runs),
+  # per-symbol-day p25 0.043-0.135. Re-measure once more sessions exist.
+  bollinger_squeeze_width_pct: 0.076
   bollinger_entry_bonus_midband: 0.16
   # OVERRIDE (extension penalty 2/3): a squeezer rides the upper band by design.
   bollinger_entry_penalty_outer_band: 0.0
@@ -614,6 +625,109 @@ strategies:
       midday_start_time: "11:50"
       midday_end_time: "11:50"
       afternoon_start_time: "11:50"
+
+      # ===== top_tier engine params, declared at their code defaults (2026-09-22) =====
+      # small_cap_squeeze runs top_tier_adaptive's engine, and until now none of
+      # these were declared for it: every value below was already in effect,
+      # but only as the default inside a `self.params.get(...)` call -- invisible
+      # here, and retuned for this preset whenever a code default changed.
+      # Values are unchanged from what the bot has been running; tune from here.
+      # -- side decision / bias
+      bias_penalty_base: 1.0
+      bias_penalty_saturate_at: 2.0
+      require_explicit_side_decision: true
+      respect_screener_bias: true
+      short_min_score_premium: 0.0
+      short_stop_buffer_mult: 1.0
+      short_target_rr_mult: 1.0
+      side_decision_majority_frac: 0.6
+      side_decision_max_opposing: 1
+      side_decision_min_agreeing: 2
+      side_decision_recent_threshold_pct: 0.1
+      side_decision_vwap_buffer_pct: 0.0005
+      trailing_bias_enabled: true
+      trailing_bias_lookback: 10
+      trailing_bias_majority_threshold: 0.7
+      # -- entry gates
+      activity_score_weight: 0.12
+      broken_level_min_clearance_atr: 0.72
+      broken_level_min_clearance_pct: 0.0025
+      entry_bar_body_max_atr_mult: 1.4
+      entry_bar_range_max_atr_mult: 1.8
+      stretched_atr_mult_max: 1.1
+      stretched_cooldown_minutes: 3.0
+      stretched_percent_b_max: 0.8
+      target_max_sr_ratio: 0.8
+      # -- stops / volatility scaling
+      adr_lookback_days: 20
+      atr_aware_stop_enabled: true
+      atr_widening_max_factor: 1.5
+      atr_widening_threshold: 1.3
+      beta_lookback_days: 60
+      early_session_stop_widening_enabled: true
+      early_session_stop_widening_mult: 1.3
+      early_session_stop_widening_until: "10:30"
+      reference_adr_pct: 0.018
+      volatility_scale_max: 2.2
+      volatility_scale_min: 0.6
+      zone_atr_mult: 0.2
+      zone_pct: 0.0015
+      # -- leg-anchored confirmation / index breadth
+      index_breadth_min_agree_frac: 0.5
+      index_breadth_min_peers: 3
+      leg_anchor_min_age_bars: 20
+      leg_anchor_min_impulse_pct: 0.005
+      leg_anchored_confirmation: false
+      # -- armed retest (armed_retest_enabled is false here)
+      armed_retest_invalidation_atr: 0.75
+      armed_retest_max_minutes: 12.0
+      armed_retest_min_close_position: 0.6
+      armed_retest_zone_atr: 0.35
+      # -- regimes switched off here (pullback / range / sr_scalp / vol_squeeze / orb)
+      disable_orb_window: false
+      extended_hours_tradable: []
+      min_orb_score: 3.5
+      min_sr_scalp_score: 3.5
+      orb_breakout_buffer_atr_mult: 0.05
+      orb_bypass_exhaustion: true
+      orb_bypass_htf_bias: true
+      orb_bypass_relative_strength: true
+      orb_bypass_screener_bias: true
+      orb_bypass_side_decision: true
+      orb_bypass_sr_entry: true
+      orb_bypass_structure_entry: true
+      orb_max_range_atr_mult: 4.0
+      orb_min_range_atr_mult: 0.5
+      orb_opposing_sr_atr_mult: 0.5
+      orb_range_minutes: 15
+      orb_require_5m_followthrough: true
+      orb_target_range_mult: 1.5
+      pullback_ema_touch_atr_mult: 0.35
+      pullback_hold_atr_mult: 0.4
+      pullback_max_leg_retrace_pct: 50.0
+      pullback_max_minutes_since_session_extreme: 45.0
+      pullback_min_leg_retrace_pct: 25.0
+      pullback_require_fresh_leg: true
+      range_entry_zone_frac: 0.35
+      range_max_ema_gap_pct: 0.0008
+      range_max_intraday_range_pct: 0.012
+      range_min_flip_count: 3
+      range_require_prev_bar_confirmation: true
+      sr_scalp_max_distance_from_zone_atr: 0.5
+      sr_scalp_min_distance_atr: 2.5
+      sr_scalp_min_distance_pct: 0.008
+      sr_scalp_min_stop_atr_mult: 0.5
+      sr_scalp_noise_lookback_bars: 20
+      vol_squeeze_breakout_buffer_pct: 0.0008
+      vol_squeeze_hard_breakout_gates: true
+      vol_squeeze_max_range_atr: 1.8
+      vol_squeeze_max_range_pct: 0.012
+      vol_squeeze_max_width_pct: 0.05
+      vol_squeeze_min_bar_close_position: 0.63
+      vol_squeeze_min_breakout_volume_ratio: 1.12
+      vol_squeeze_min_pct_b_directional: 0.5
+      vol_squeeze_min_sr_bias_alignment: 0.2
+
 
       force_flatten:
         long: true

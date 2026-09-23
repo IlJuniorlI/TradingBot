@@ -625,15 +625,12 @@ def _completed_flip_frames(flip_frame: pd.DataFrame | None) -> tuple[pd.DataFram
         return completed_1m, pd.DataFrame(columns=completed_1m.columns)
     completed_5m = resample_bars(completed_1m, "5min")
     if not completed_5m.empty:
-        # A 5m bar labeled T is built (via label='right', closed='right') from
-        # 1m bars in (T-5min, T). The last required 1m bar is T itself, which
-        # must be strictly below one_min_cutoff to be a completed bar — i.e.,
-        # we can only trust the 5m bar labeled T once now >= T + 1min. Using
-        # `now_ts.floor('5min')` as the cutoff would incorrectly admit a 5m
-        # bar that's still missing its final 1m constituent, letting flip
-        # confirmation fire on partial data in the 1-minute window right
-        # after a 5-minute boundary.
-        completed_5m = completed_5m[completed_5m.index < one_min_cutoff]
+        # A 5m bar labelled T holds the 1m bars starting T .. T+4 (see
+        # resample_bars), so it is complete once its last constituent, T+4,
+        # is: T + 5min <= one_min_cutoff. The bucket still filling when the
+        # completed 1m bars run out fails that and is dropped, so flip
+        # confirmation never reads a partial 5m bar.
+        completed_5m = completed_5m[completed_5m.index + pd.Timedelta(minutes=5) <= one_min_cutoff]
     return completed_1m, completed_5m
 
 

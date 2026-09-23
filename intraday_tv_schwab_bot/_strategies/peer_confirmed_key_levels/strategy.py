@@ -134,14 +134,14 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             if zone_lost and close <= lower - buffer:
                 return True, f"ladder_support_lost:{defense_price:.4f}"
             ms = getattr(sr_ctx, "market_structure", None)
-            if ms is not None and (self._active_structure_break(bool(getattr(ms, "choch_down", False)), getattr(ms, "choch_down_age_bars", None)) or self._active_structure_break(bool(getattr(ms, "bos_down", False)), getattr(ms, "bos_down_age_bars", None))) and close < min(ema9, ema20, vwap):
+            if ms is not None and (self._active_structure_break(bool(getattr(ms, "choch_down", False)), getattr(ms, "choch_down_age_bars", None), htf=True) or self._active_structure_break(bool(getattr(ms, "bos_down", False)), getattr(ms, "bos_down_age_bars", None), htf=True)) and close < min(ema9, ema20, vwap):
                 return True, f"ladder_structure_fail_long:{defense_price:.4f}"
         else:
             zone_lost = zone_flip_confirmed("resistance", lower, upper, flip_frame=frame, confirm_1m_bars=confirm_1m, confirm_5m_bars=confirm_5m, fallback_bar=None, eps=eps)
             if zone_lost and close >= upper + buffer:
                 return True, f"ladder_resistance_lost:{defense_price:.4f}"
             ms = getattr(sr_ctx, "market_structure", None)
-            if ms is not None and (self._active_structure_break(bool(getattr(ms, "choch_up", False)), getattr(ms, "choch_up_age_bars", None)) or self._active_structure_break(bool(getattr(ms, "bos_up", False)), getattr(ms, "bos_up_age_bars", None))) and close > max(ema9, ema20, vwap):
+            if ms is not None and (self._active_structure_break(bool(getattr(ms, "choch_up", False)), getattr(ms, "choch_up_age_bars", None), htf=True) or self._active_structure_break(bool(getattr(ms, "bos_up", False)), getattr(ms, "bos_up_age_bars", None), htf=True)) and close > max(ema9, ema20, vwap):
                 return True, f"ladder_structure_fail_short:{defense_price:.4f}"
         return False, "hold"
 

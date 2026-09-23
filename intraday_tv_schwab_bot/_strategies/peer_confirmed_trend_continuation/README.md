@@ -111,7 +111,7 @@ Strategy-specific knobs:
   - `min_peer_agreement`, `min_peer_score`
   - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`
 - R:R and adaptive management:
-  - `min_rr`, `target_rr`, `runner_target_rr`, `stop_buffer_atr_mult`
+  - `min_rr`, `target_rr`, `stop_buffer_atr_mult`
   - `strong_setup_runner_enabled`, `adaptive_breakeven_rr`, `adaptive_profit_lock_rr`, `adaptive_profit_lock_stop_rr`, `adaptive_runner_trigger_rr`
 - Context overlays:
   - `htf_fvg_entry_weight`, `ltf_fvg_entry_weight`, `opposing_fvg_entry_penalty_mult`, `fvg_runner_rr_bonus`
@@ -163,7 +163,6 @@ Current package defaults:
 | `max_extension_from_ema9_atr`     | `0.88`                                    |
 | `min_rr`                          | `1.8`                                     |
 | `target_rr`                       | `2.05`                                    |
-| `runner_target_rr`                | `2.45`                                    |
 | `stop_buffer_atr_mult`            | `0.5`                                     |
 | `strong_setup_runner_enabled`     | `true`                                    |
 | `adaptive_breakeven_rr`           | `0.92`                                    |

@@ -52,6 +52,9 @@ class BaseStrategyScreener:
     def _common_equity_conditions(self) -> list:
         return self.client.common_equity_conditions()
 
+    def _curated_symbol_conditions(self, symbols: list[str]) -> list:
+        return self.client.curated_symbol_conditions(symbols)
+
     def _liquid_equity_conditions(self, min_price: float = 5.0, max_price: float | None = None):
         return self.client.liquid_equity_conditions(min_price=min_price, max_price=max_price)
 

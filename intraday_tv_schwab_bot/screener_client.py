@@ -118,6 +118,9 @@ class TradingViewScreenerClient:
     def common_equity_conditions(self) -> list:
         return self._common_equity_conditions()
 
+    def curated_symbol_conditions(self, symbols: list[str]) -> list:
+        return self._curated_symbol_conditions(symbols)
+
     def liquid_equity_conditions(self, min_price: float = 5.0, max_price: float | None = None):
         return self._liquid_equity_conditions(min_price=min_price, max_price=max_price)
 
@@ -248,7 +251,16 @@ class TradingViewScreenerClient:
     def _base_query(self, limit: int | None = None):
         from tradingview_screener import Query
 
-        return Query().set_markets(self.config.tradingview.market).limit(limit or self.config.tradingview.max_candidates)
+        query = Query().set_markets(self.config.tradingview.market).limit(limit or self.config.tradingview.max_candidates)
+        # The library seeds every query with TradingView's own stock-screener
+        # universe as ``filter2`` (common + preferred + ADR + non-ETF funds),
+        # which ``where()`` does not replace. It silently dropped every ETF --
+        # pairs_residual's QQQ reference never came back, so its AAPL/QQQ pair
+        # could never form, and it is the "0 rows for ETFs" the 0DTE screener
+        # routed around on 2026-05-19. Each screen states its own instrument
+        # conditions (``_common_equity_conditions`` / ``_curated_symbol_conditions``).
+        query.query.pop("filter2", None)
+        return query
 
     @classmethod
     def _column(cls, name: str, session: str | None = None):
@@ -256,24 +268,49 @@ class TradingViewScreenerClient:
 
         return Column(cls._canonical_screen_field(name, session=session))
 
+    def _curated_symbol_conditions(self, symbols: list[str]) -> list:
+        """Conditions for an explicitly configured symbol list: the names, off OTC.
+
+        ``_common_equity_conditions`` exists to keep funds, ADRs and
+        preferreds out of an OPEN screen; run over a hand-picked list it
+        silently dropped names the user chose. ARM and TSM are ADRs
+        (TradingView type "dr", not "stock") and never reached
+        top_tier_adaptive in any logged session. ``is_primary`` goes too:
+        TSM's primary listing is in Taiwan, so its NYSE line is not primary
+        (nor NVO's or ASML's). Off OTC every configured name resolves to one
+        row (checked 2026-09-22 across every shipped list), so nothing else
+        is needed to keep it unambiguous.
+        """
+        c = self._column
+        return [
+            c("name").isin(list(symbols)),
+            c("exchange") != "OTC",
+        ]
+
     def _common_equity_conditions(self) -> list:
+        """Ordinary common shares, primary listing, off OTC.
+
+        Structure is read from TradingView's own classification. ETFs,
+        closed-end funds and SPAC units are type "fund", ADRs "dr"; preferred
+        shares are type "stock" and are told apart only by
+        ``typespecs: ["preferred"]`` (56 primary, non-OTC listings when
+        checked on 2026-09-22).
+
+        This used to exclude them by name with ``description.not_like("%...%")``
+        -- ten filters that did nothing: TradingView takes the ``%`` literally,
+        so no description ever matched and every preferred passed. Without
+        the ``%`` it is a case-insensitive substring match, which would have
+        been worse: "Unit" drops UnitedHealth, United Airlines, UPS and
+        United Rentals.
+        """
         c = self._column
         return [
             c("type") == "stock",
+            c("typespecs").has_none_of(["preferred"]),
             c("is_primary") == True,
             c("exchange") != "OTC",
             c("etf_holdings_count").empty(),
             c("expense_ratio").empty(),
-            c("description").not_like("%ETF%"),
-            c("description").not_like("%Exchange Traded Fund%"),
-            c("description").not_like("%Warrant%"),
-            c("description").not_like("%Right%"),
-            c("description").not_like("%Rights%"),
-            c("description").not_like("%Unit%"),
-            c("description").not_like("%Units%"),
-            c("description").not_like("%Preferred%"),
-            c("description").not_like("%Preference%"),
-            c("description").not_like("%Depositary Share%"),
         ]
 
     def _small_cap_base_conditions(self, min_price: float = 2.0, max_price: float = 20.0):

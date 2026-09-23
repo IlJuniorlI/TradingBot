@@ -384,7 +384,14 @@ technical_levels:
   bollinger_enabled: true
   bollinger_length: 20
   bollinger_std_mult: 2.0
-  bollinger_squeeze_width_pct: 0.06
+  # 2026-09-22: was 0.06. `bollinger_width_pct` is (bb_upper - bb_lower) /
+  # bb_mid, a FRACTION of price. This preset builds its technical context on
+  # its 5m LTF, where 0.06 sat above 98.4% of RTH bars. 0.0061 is the p25 of
+  # RTH BB(20,2) widths on 5m bars (resampled as `_resampled_frame` does) over
+  # 17 archived large-cap sessions (32,390 bars, per-session p25
+  # 0.0050-0.0090). 1m presets use 0.0025: the width scales with bar size.
+  # No trading path in this preset reads the flag; the dashboard shows it.
+  bollinger_squeeze_width_pct: 0.0061
   bollinger_entry_bonus_midband: 0.16
   bollinger_entry_penalty_outer_band: 0.22
   target_use_bollinger: false

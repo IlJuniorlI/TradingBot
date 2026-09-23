@@ -349,7 +349,13 @@ technical_levels:
   bollinger_enabled: true
   bollinger_length: 20
   bollinger_std_mult: 2.0
-  bollinger_squeeze_width_pct: 0.06
+  # 2026-09-22: was 0.06. `bollinger_width_pct` is (bb_upper - bb_lower) /
+  # bb_mid, a FRACTION of price. This preset builds its technical context on
+  # its 5m LTF, where 0.06 sat above 98.4% of RTH bars. 0.0061 is the p25 of
+  # RTH BB(20,2) widths on 5m bars (resampled as `_resampled_frame` does) over
+  # 17 archived large-cap sessions (32,390 bars, per-session p25
+  # 0.0050-0.0090). 1m presets use 0.0025: the width scales with bar size.
+  bollinger_squeeze_width_pct: 0.0061
   bollinger_entry_bonus_midband: 0.16
   bollinger_entry_penalty_outer_band: 0.22
   target_use_bollinger: false
@@ -474,7 +480,6 @@ strategies:
       opposing_fvg_entry_penalty_mult: 1.0
       pullback_hold_atr: 0.38
       require_macro_agreement_count: 1
-      runner_target_rr: 2.45
       stop_buffer_atr_mult: 0.5
       strong_setup_runner_enabled: true
       target_rr: 2.05
@@ -489,4 +494,27 @@ strategies:
       volatility_symbol: VIX
 
 # Pair definitions used by the pairs_residual strategy.
+      # ===== inherited peer_confirmed_key_levels params, at their code defaults (2026-09-22) =====
+      # Read by the shared peer_confirmed engine but never declared for this
+      # preset, so each ran on the default inside its `self.params.get(...)`.
+      # Values are unchanged; declared so they are visible and tunable here.
+      level_round_number_tolerance_pct: 0.002
+      level_score_raw_htf_weight: 0.65
+      ltf_candle_quality_bonus_cap: 0.5
+      ltf_quality_bonus_enabled: true
+      ltf_quality_max_bonus: 2.0
+      ltf_range_expansion_bonus_cap: 0.4
+      ltf_reclaim_quality_bonus_cap: 0.8
+      ltf_volume_quality_bonus_cap: 0.4
+      ltf_zone_interaction_bonus_cap: 0.5
+      min_level_score: 2.9
+      require_htf_bias_alignment: true
+      require_macro_net_bias: true
+      strong_setup_min_htf_vote_edge: 1
+      strong_setup_min_level_score: 3.4
+      strong_setup_min_ltf_score: 3.2
+      strong_setup_min_peer_score: 2
+      strong_setup_target_level_offset: 1
+      zone_atr_mult: 0.21
+      zone_pct: 0.0015
 pairs: []

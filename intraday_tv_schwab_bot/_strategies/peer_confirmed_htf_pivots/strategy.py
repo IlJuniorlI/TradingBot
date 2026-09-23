@@ -10,7 +10,7 @@ from ..shared import (
     Signal,
     _bar_close_position,
     _bar_wick_fractions,
-    _discrete_score_threshold,
+    _score_threshold,
     _gate_snapshot,
     insufficient_bars_reason,
     _optional_float,
@@ -1056,8 +1056,8 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         selected_family_pass = bool(family_payload.get("selected_pass", not family_diagnostics))
         hard_reasons: list[str] = []
 
-        min_regime_score = _discrete_score_threshold(self.params.get("min_regime_score", 4), 4, minimum=1)
-        min_ltf_score = _discrete_score_threshold(self.params.get("min_ltf_score", 2.5), 3, minimum=1)
+        min_regime_score = _score_threshold(self.params.get("min_regime_score", 4.0), 4.0, minimum=1.0)
+        min_ltf_score = _score_threshold(self.params.get("min_ltf_score", 2.5), 2.5, minimum=1.0)
         regime_score = float(regime.get("score", 0.0) or 0.0)
         ltf_score = float(family_payload.get("score", 0.0) or 0.0)
         if regime_score < min_regime_score:
@@ -1100,7 +1100,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
             hard_reasons.append("macro_not_aligned")
         else:
             total_score -= macro_miss_penalty
-        min_total_score = _discrete_score_threshold(self.params.get("min_total_score", 5.0), 6, minimum=1)
+        min_total_score = _score_threshold(self.params.get("min_total_score", 5.0), 5.0, minimum=1.0)
         if total_score < min_total_score:
             hard_reasons.append(_reason_with_values("weak_total_score", current=total_score, required=min_total_score, op=">=", digits=4))
         if family_key == "pivot_reclaim":

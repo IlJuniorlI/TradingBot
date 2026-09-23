@@ -414,6 +414,22 @@ def _observed_fixed_holiday(year: int, month: int, day: int) -> date_cls:
     return holiday
 
 
+def _new_years_day_observed(year: int) -> date_cls | None:
+    """New Year's Day as the exchanges observe it, or None when they don't.
+
+    NYSE Rule 7.2 moves a Saturday holiday to the preceding Friday EXCEPT when
+    that Friday ends a monthly or yearly accounting period -- so a Saturday New
+    Year's Day is simply not observed. Shifting it back the usual way closed
+    Friday Dec 31, which was a full session in 2021 (next hit: 2027-12-31).
+    """
+    holiday = date_cls(year, 1, 1)
+    if holiday.weekday() == 5:
+        return None
+    if holiday.weekday() == 6:
+        return holiday + timedelta(days=1)
+    return holiday
+
+
 @lru_cache(maxsize=32)
 def us_equity_early_close_days(year: int) -> frozenset[date_cls]:
     """Return standard NYSE/Nasdaq early-close days (1:00 PM ET close) for *year*.
@@ -462,7 +478,6 @@ def us_equity_market_holidays(year: int) -> frozenset[date_cls]:
     """
     easter = _easter_sunday(year)
     holidays: set[date_cls] = {
-        _observed_fixed_holiday(year, 1, 1),
         _nth_weekday_of_month(year, 1, 0, 3),
         _nth_weekday_of_month(year, 2, 0, 3),
         easter - timedelta(days=2),
@@ -473,9 +488,9 @@ def us_equity_market_holidays(year: int) -> frozenset[date_cls]:
         _nth_weekday_of_month(year, 11, 3, 4),
         _observed_fixed_holiday(year, 12, 25),
     }
-    next_new_year_observed = _observed_fixed_holiday(year + 1, 1, 1)
-    if next_new_year_observed.year == year:
-        holidays.add(next_new_year_observed)
+    new_year = _new_years_day_observed(year)
+    if new_year is not None:
+        holidays.add(new_year)
     return frozenset(holidays)
 
 
@@ -707,16 +722,36 @@ def ensure_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
     return frame[["open", "high", "low", "close", "volume"] + [c for c in frame.columns if c not in {"open", "high", "low", "close", "volume"}]]
 
 
+_SESSION_BIN_OFFSET = pd.Timedelta(hours=EQUITY_RTH_OPEN.hour, minutes=EQUITY_RTH_OPEN.minute)
+
+
 def resample_bars(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Aggregate start-labelled bars into ``rule`` bars, labelled at their START.
+
+    The same convention as the source bars (Schwab price_history candles,
+    CHART_EQUITY) and the broker's own coarser bars, so every consumer reads
+    a timestamp the same way whatever frame it came from: bar ``T`` holds the
+    source bars starting in ``[T, T + rule)`` and is complete at
+    ``T + rule``. Buckets are anchored on the 09:30 session open: identical to
+    clock buckets for every rule that divides 30 minutes (5/15/30m match the
+    broker's bars) and session hours (09:30, 10:30, ...) for 60m.
+
+    Until 2026-09-22 this ran ``closed="right", label="right"``: the source
+    bar starting AT the label joined the bucket, so the 5m bar labelled 09:35
+    held 09:31-09:35 and the one labelled 09:30 folded four premarket
+    minutes into the opening minute (10,162 premarket shares on AAPL
+    2026-09-21). And because everything downstream -- the RTH mask behind
+    session VWAP/EMA, session-open and same-day helpers, the ORB
+    follow-through gate -- reads a timestamp as a bar START, an end label
+    counted a premarket bar as RTH and dropped the last RTH bar.
+    """
     frame = ensure_ohlcv_frame(frame)
     if frame.empty:
         return frame
-    agg = frame.resample(rule, label="right", closed="right").agg(
+    agg = frame.resample(rule, label="left", closed="left", origin="start_day", offset=_SESSION_BIN_OFFSET).agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     )
-    out = agg.dropna(subset=["open", "high", "low", "close"])
-    out.attrs["time_label"] = "right"
-    return out
+    return agg.dropna(subset=["open", "high", "low", "close"])
 
 
 STANDARD_INDICATOR_COLUMNS: tuple[str, ...] = (

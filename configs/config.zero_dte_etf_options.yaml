@@ -349,7 +349,11 @@ technical_levels:
   bollinger_enabled: true
   bollinger_length: 20
   bollinger_std_mult: 2.0
-  bollinger_squeeze_width_pct: 0.06
+  # 2026-09-22: was 0.06, above every SPY/QQQ 1m bar measured (100% flagged).
+  # 0.0014 is the p25 of RTH BB(20,2) widths on 1m bars, SPY + QQQ,
+  # 2026-05-19..22 (2,754 bars, per-session p25 0.0010-0.0019).
+  # No trading path in this preset reads the flag; the dashboard shows it.
+  bollinger_squeeze_width_pct: 0.0014
   bollinger_entry_bonus_midband: 0.16
   bollinger_entry_penalty_outer_band: 0.22
   target_use_bollinger: false

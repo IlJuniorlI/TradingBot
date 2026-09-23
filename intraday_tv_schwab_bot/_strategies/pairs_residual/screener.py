@@ -16,15 +16,10 @@ class PairsResidualScreener(BaseStrategyScreener):
         tickers = sorted({str(p.symbol).upper().strip() for p in pairs} | {str(p.reference).upper().strip() for p in pairs})
         params = self.config.strategies[self.strategy_name].params
         min_rvol = float(params.get("min_rvol", 1.5))
-        c = self._column
         q = (
             self._base_query(limit=max(5, len(tickers)))
             .select(*self._select_fields("name", "description", "exchange", "close", "volume", "market_cap_basic", "relative_volume_10d_calc", "change_from_open"))
-            .where(
-                c("name").isin(tickers),
-                c("is_primary") == True,
-                c("exchange") != "OTC",
-            )
+            .where(*self._curated_symbol_conditions(tickers))
         )
         df = self._execute(q)
         by_symbol = {self._symbol_from_ticker(str(row.get("name"))).upper().strip(): self._row_metadata(row) for _, row in df.iterrows()}

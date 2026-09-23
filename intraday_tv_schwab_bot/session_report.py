@@ -40,7 +40,7 @@ try:
 except ImportError:  # pragma: no cover — yaml is a hard dep elsewhere
     _yaml = None  # type: ignore[assignment]
 
-from .paper_account import PaperAccount, TradeRecord
+from .paper_account import PaperAccount, TradeRecord, closed_trade_lifecycles
 from .models import Position
 from .utils import now_et
 
@@ -833,9 +833,11 @@ def write_session_report(
         # unreadable record raises inside the broad try/except around this
         # whole block and costs the ENTIRE report, every aggregate and the CSV
         # append with it. Losing one row beats losing the session.
+        #
+        # Trades, not exit slices: ``closed_trade_lifecycles`` folds a trade's
+        # partial exits into it, so no slice's P&L is lost and a trade is a
+        # win or a loss on its whole result.
         def _closed_today(trade: TradeRecord) -> bool:
-            if not bool(getattr(trade, "final_exit", True)):
-                return False
             exit_time = getattr(trade, "exit_time", None)
             try:
                 return exit_time.date() == today
@@ -846,7 +848,7 @@ def write_session_report(
                 )
                 return False
 
-        closed = [t for t in trades if _closed_today(t)]
+        closed = [t for t in closed_trade_lifecycles(trades) if _closed_today(t)]
 
         # --- Log summary ---
         wins = sum(1 for t in closed if t.realized_pnl > 0)
@@ -1802,9 +1804,10 @@ def export_session_archive(
     # SPY credit-spread closes in account + log, 0 rows in archive
     # trades.csv).
     #
-    # account.trades is the source of truth. final_exit guards against
-    # partial-exit interim rows, and the ET-date filter matches the
-    # per-day boundary the archive uses everywhere else.
+    # account.trades is the source of truth. closed_trade_lifecycles folds
+    # each trade's partial-exit slices into one row (dropping them instead
+    # lost their P&L), and the ET-date filter matches the per-day boundary
+    # the archive uses everywhere else.
     trades_dst = archive_root / "trades.csv"
     trades_today = 0
     # Today's realized PnL, summed from the SAME date-filtered list that
@@ -1831,9 +1834,7 @@ def export_session_archive(
     if account is not None:
         try:
             closed_today: list[TradeRecord] = []
-            for trade in getattr(account, "trades", []) or []:
-                if not bool(getattr(trade, "final_exit", True)):
-                    continue
+            for trade in closed_trade_lifecycles(getattr(account, "trades", []) or []):
                 exit_time = getattr(trade, "exit_time", None)
                 if exit_time is None:
                     continue

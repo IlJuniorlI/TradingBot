@@ -138,7 +138,7 @@ Current code defaults:
 | Option                                            | Current code default            |
 |---------------------------------------------------|---------------------------------|
 | `min_change_from_open`                            | `0.9`                           |
-| `max_change_from_open`                            | `4.5`  (was `7.5` pre-2026-05-14) |
+| `max_change_from_open`                            | `7.5`  (preset: `4.5` since 2026-05-14) |
 | `min_rvol`                                        | `1.00`  (was `1.35` pre-2026-05-14; lowered because squeeze setups have BELOW-average RVOL pre-breakout — the breakout-bar volume check lives at `min_breakout_volume_ratio` in the strategy, not the screener) |
 | `min_bars`                                        | `60`                            |
 | `squeeze_lookback_bars`                           | `16`                            |

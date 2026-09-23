@@ -15,11 +15,10 @@ Design notes:
   also needs to call it from entry paths (``_open_positions``, broker
   entry recovery). Keeping a single source of truth on the engine avoids
   diverging metadata-signature caches between the two owners.
-- ``_broker_position_row`` / ``_broker_position_rows`` live on engine for
-  now — they depend on ``self.client`` / ``self.executor.account_hash``
-  for live broker queries, and are also used by entry recovery. They're
-  injected as callables so exit recovery can reach them without pulling
-  the whole broker surface into PositionManager.
+- An exit order whose submit call could not settle it (left working through
+  a halt, a cancel the broker never confirmed) is tracked on the position
+  and settled from the order's own fill record (``_exit_order_in_flight``),
+  never from a positions snapshot.
 - Config accessors ``active_htf_*`` (HTF timeframe / lookback) live here
   so engine call sites in entry / screening paths can dispatch through
   ``self.position_manager.active_htf_*()`` — the accessors read
@@ -40,7 +39,7 @@ from .audit_logger import AuditLogger
 from .config import BotConfig
 from .dashboard_cache import DashboardCache
 from .data_feed import MarketDataStore
-from .execution import SchwabExecutor
+from .execution import BracketCancel, SchwabExecutor
 from .models import (
     ASSET_TYPE_EQUITY,
     ASSET_TYPE_OPTION_SINGLE,
@@ -59,7 +58,7 @@ from .position_metrics import (
 from .risk import RiskManager
 from ._sr_ladder import _select_next_distinct_level, _sr_effective_side_tolerance
 from ._strategies.strategy_base import BaseStrategy
-from .broker_positions import active_broker_bracket, broker_position_side_qty, order_result_needs_broker_recheck
+from .broker_positions import active_broker_bracket, order_result_needs_broker_recheck
 from .support_resistance import zone_flip_confirmed
 from .utils import TRADEFLOW_LEVEL, append_management_adjustment as _append_adjustment, now_et
 
@@ -107,8 +106,6 @@ class PositionManager:
         dashboard_cache: DashboardCache,
         positions: dict[str, Position],
         save_reconcile_metadata: Callable[[], None],
-        broker_position_row: Callable[[str], dict[str, Any] | None],
-        broker_position_rows: Callable[[list[str]], dict[str, dict[str, Any]]],
         structured_metadata_snapshot: Callable[[Mapping[str, Any] | None], dict[str, Any]],
     ) -> None:
         self.config = config
@@ -121,8 +118,6 @@ class PositionManager:
         self.dashboard_cache = dashboard_cache
         self.positions = positions
         self._save_reconcile_metadata = save_reconcile_metadata
-        self._broker_position_row = broker_position_row
-        self._broker_position_rows = broker_position_rows
         self._structured_metadata_snapshot = structured_metadata_snapshot
 
     # ------------------------------------------------------------------
@@ -284,9 +279,12 @@ class PositionManager:
         meta['diag_worst_unrealized_ts'] = ts
         meta['diag_best_mark_price'] = float(mark_price)
         meta['diag_worst_mark_price'] = float(mark_price)
+        meta['last_mark_price'] = float(mark_price)
         if underlying_price is not None:
             meta['diag_best_underlying_price'] = float(underlying_price)
             meta['diag_worst_underlying_price'] = float(underlying_price)
+            meta['underlying_high_since_entry'] = float(underlying_price)
+            meta['underlying_low_since_entry'] = float(underlying_price)
 
     @staticmethod
     def _update_position_diagnostics(position: Position, mark_price: float, underlying_price: float | None = None) -> None:
@@ -298,6 +296,14 @@ class PositionManager:
         best = float(meta.get('diag_best_unrealized_pnl', 0.0))
         worst = float(meta.get('diag_worst_unrealized_pnl', 0.0))
         ts = now_et().isoformat()
+        # The exit signal runs on the UNDERLYING's frame. For an option these
+        # are what it compares against: the premium it is holding at (for R)
+        # and how far the underlying itself has travelled since entry.
+        meta['last_mark_price'] = float(mark_price)
+        if underlying_price is not None:
+            underlying = float(underlying_price)
+            meta['underlying_high_since_entry'] = max(underlying, float(meta.get('underlying_high_since_entry', underlying)))
+            meta['underlying_low_since_entry'] = min(underlying, float(meta.get('underlying_low_since_entry', underlying)))
         if unrealized > best:
             meta['diag_best_unrealized_pnl'] = unrealized
             meta['diag_best_unrealized_ts'] = ts
@@ -891,8 +897,12 @@ class PositionManager:
     # ------------------------------------------------------------------
 
     def _book_broker_exit(self, key: str, position: Position, exit_qty: int, exit_price: float,
-                          reason: str, bars) -> None:
-        """Record an exit the BROKER executed, mirroring the manage_positions tail."""
+                          reason: str, bars, *, result_message: str, attempt_status: str,
+                          fill_price_estimated: bool) -> float:
+        """Record an exit the engine learned of from the BROKER -- a resting
+        bracket child that filled, or an exit order that filled after its
+        submit call returned -- mirroring the manage_positions tail. Returns
+        the realized P&L of the slice."""
         management_symbol = str(position.metadata.get("underlying") or position.symbol)
         management_frame = bars.get(management_symbol)
         exit_context = self._position_exit_context(position, reason, exit_price, exit_price, None, bars)
@@ -904,19 +914,19 @@ class PositionManager:
             exited_position, float(exit_price), reason,
             final_exit=final_exit,
             remaining_qty_after_exit=remaining_qty_after_exit,
-            fill_price_estimated=False,
+            fill_price_estimated=fill_price_estimated,
             broker_recovered=True,
         )
         self.audit.log_structured("EXIT_CONTEXT", {
             **exit_context, "symbol": key, "qty": int(exit_qty), "filled_qty": int(exit_qty),
             "remaining_qty_after_exit": remaining_qty_after_exit,
-            "result_message": "bracket_child_filled", "fill_price": float(exit_price),
-            "realized_pnl": float(realized), "attempt_status": "broker_bracket",
+            "result_message": result_message, "fill_price": float(exit_price),
+            "realized_pnl": float(realized), "attempt_status": attempt_status,
         })
         self.audit.log_structured("TRADE_SUMMARY", self._trade_summary_payload(
             exited_position, float(exit_price), realized, reason,
             final_exit=final_exit, remaining_qty_after_exit=remaining_qty_after_exit,
-            broker_recovered=True, fill_price_estimated=False,
+            broker_recovered=True, fill_price_estimated=fill_price_estimated,
         ))
         if final_exit:
             exit_atr = (
@@ -937,6 +947,7 @@ class PositionManager:
                 position.metadata["qty"] = position.qty
             self.positions[key] = position
         self._save_reconcile_metadata()
+        return float(realized)
 
     def _reconcile_bracket_fills(self, bars) -> None:
         """Book exits the broker already executed, before anything else runs.
@@ -990,10 +1001,54 @@ class PositionManager:
                 LOG.log(TRADEFLOW_LEVEL, "Bracket %s filled for %s qty=%s price=%s", reason, key, exit_qty, fill_price)
                 bracket["active"] = False
                 bracket["state"] = f"filled:{reason}"
-                self._book_broker_exit(key, position, exit_qty, float(fill_price), reason, bars)
+                self._book_broker_exit(
+                    key, position, exit_qty, float(fill_price), reason, bars,
+                    result_message="bracket_child_filled", attempt_status="broker_bracket",
+                    fill_price_estimated=state.get("fill_price") is None,
+                )
+                if key not in self.positions:
+                    # The OCO normally takes the sibling down, but a child moved
+                    # by replace is a new order the OCO may not link. Anything
+                    # still resting against a closed position opens a new one
+                    # in the opposite direction when it triggers.
+                    leftover = self.executor.cancel_bracket(bracket)
+                    if not leftover.ok:
+                        LOG.error(
+                            "Could not confirm the rest of %s's bracket is down after its %s filled (%s) -- "
+                            "check the broker for a resting order on a closed position",
+                            key, reason, leftover.message,
+                        )
                 break
 
-    def _sync_bracket_children(self, position: Position) -> None:
+    def _book_bracket_cancel_fills(self, key: str, position: Position, bracket: dict[str, Any],
+                                   cancel: BracketCancel, last_price: float | None, bars) -> None:
+        """Book what the resting children filled before a cancel landed.
+
+        A stop that triggered after this cycle's fill reconcile has already
+        sold those shares; exiting the full local quantity on top of it takes
+        the position net short.
+        """
+        if cancel.filled_qty <= 0:
+            return
+        reason = cancel.fill_reason or "broker_stop"
+        fill_price = cancel.fill_price
+        if fill_price is None:
+            level = bracket.get("stop_price") if reason == "broker_stop" else bracket.get("target_price")
+            fill_price = safe_float(level, None) if level is not None else safe_float(last_price, None)
+        if fill_price is None:
+            LOG.error(
+                "Bracket children for %s filled %s share(s) before the cancel but no fill price is available; "
+                "booking at entry so the quantity is right", key, cancel.filled_qty,
+            )
+            fill_price = float(position.entry_price)
+        LOG.log(TRADEFLOW_LEVEL, "Bracket %s filled for %s qty=%s before its cancel landed", reason, key, cancel.filled_qty)
+        self._book_broker_exit(
+            key, position, max(1, min(int(position.qty), int(cancel.filled_qty))), float(fill_price), reason, bars,
+            result_message="bracket_child_filled_before_cancel", attempt_status="broker_bracket",
+            fill_price_estimated=cancel.fill_price is None,
+        )
+
+    def _sync_bracket_children(self, key: str, position: Position, last_price: float | None, bars) -> None:
         """Push engine-side level changes onto the resting broker children.
 
         Only runs in ``replace`` sync mode. ``static`` deliberately leaves the
@@ -1007,192 +1062,125 @@ class PositionManager:
             return
         symbol = str(position.metadata.get("underlying") or position.symbol)
         entry_price = float(position.entry_price)
-        qty = int(position.qty)
 
         engine_target = safe_float(position.target_price, None)
         resting_target = safe_float(bracket.get("target_price"), None)
         if bracket.get("target_order_id") and engine_target is None and resting_target is not None:
             # The ladder cleared the target to run a runner. A resting target
             # limit would cap exactly the move the runner exists to capture, so
-            # tear the OCO down and re-establish stop-only protection.
-            self.executor.cancel_bracket(bracket)
+            # tear the OCO down and re-establish stop-only protection -- but
+            # only once the old one is confirmed down, or the new stop rests
+            # beside the old and both fill.
+            cancel = self.executor.cancel_bracket(bracket)
+            if not cancel.ok:
+                LOG.warning(
+                    "Could not cancel %s's resting target to run the runner (%s); the old bracket "
+                    "still protects the position, retrying next cycle", key, cancel.message,
+                )
+                return
+            self._book_bracket_cancel_fills(key, position, bracket, cancel, last_price, bars)
+            if key not in self.positions:
+                return
             replacement = self.executor.ensure_position_protected(
-                symbol, qty, position.side, entry_price, float(position.stop_price), None,
+                symbol, int(position.qty), position.side, entry_price, float(position.stop_price), None,
             )
             if replacement is not None and isinstance(position.metadata, dict):
                 position.metadata["bracket"] = replacement
             return
 
         for adjustment in self.executor.sync_bracket_levels(
-            bracket, symbol, position.side, qty, entry_price, float(position.stop_price), engine_target,
+            bracket, symbol, position.side, int(position.qty), entry_price, float(position.stop_price), engine_target,
         ):
             _append_adjustment(position.metadata, adjustment)
 
     # ------------------------------------------------------------------
-    # Broker exit recovery — called when a close_position() returned an
-    # ambiguous result and we need to re-check broker state.
+    # Exit orders whose outcome the submit call could not settle.
+    #
+    # A MARKET exit that did not fill inside the poll window (a halt, an LULD
+    # pause) is deliberately left working, and a cancel the broker never
+    # confirmed may leave a limit live. Either can still fill. The order is
+    # tracked on the position and settled from its OWN fill record each cycle
+    # -- the broker's per-order fills, not a positions snapshot -- and nothing
+    # else is sent for the position while it is live.
     # ------------------------------------------------------------------
 
-    def _recover_equity_exit_from_broker(self, position: Position, result, reason: str, last_price: float | None) -> tuple[bool, int, float | None, float | None]:
-        if getattr(result, "ok", False):
-            return False, 0, None, None
-        if not getattr(result, "order_id", None):
-            return False, 0, None, None
-        if not order_result_needs_broker_recheck(getattr(result, "message", None)):
-            return False, 0, None, None
-        broker_symbol = str(position.metadata.get("underlying") or position.symbol)
-        row = self._broker_position_row(broker_symbol)
-        side, broker_qty, _ = broker_position_side_qty(row)
-        local_qty = int(position.qty)
-        remaining_qty = int(broker_qty) if side == position.side else 0
-        if remaining_qty >= local_qty:
-            return False, 0, None, None
-        exit_qty = max(1, local_qty - max(0, remaining_qty))
-        exit_price_value = safe_float(getattr(result, "fill_price", None), None)
-        if exit_price_value is None:
-            exit_price_value = safe_float(last_price, None)
-        if exit_price_value is None:
-            exit_price_value = float(position.entry_price)
-        exit_price = float(exit_price_value)
-        exited_position = copy.copy(position)
-        exited_position.qty = int(exit_qty)
-        fill_price_estimated = getattr(result, "fill_price", None) is None
-        final_exit = remaining_qty <= 0
-        realized = self.account.record_exit(
-            exited_position,
-            exit_price,
-            reason,
-            final_exit=final_exit,
-            remaining_qty_after_exit=int(max(0, remaining_qty)),
-            fill_price_estimated=fill_price_estimated,
-            broker_recovered=True,
-        )
-        self.audit.log_structured(
-            "TRADE_SUMMARY",
-            self._trade_summary_payload(
-                exited_position,
-                exit_price,
-                realized,
-                reason,
-                final_exit=final_exit,
-                remaining_qty_after_exit=int(max(0, remaining_qty)),
-                broker_recovered=True,
-                fill_price_estimated=fill_price_estimated,
-            ),
-        )
-        if remaining_qty <= 0:
-            self.risk.register_exit(
-                str(position.metadata.get("underlying") or position.symbol),
-                realized,
-                additional_symbol=position.symbol,
-                side=position.side,
-                entry_price=float(position.entry_price),
-                exit_price=exit_price,
-                atr=None,  # broker-recovery path: no bars context for ATR
-            )
-            self.positions.pop(position.symbol, None)
-        else:
-            self.risk.register_realized_pnl(realized)
-            position.qty = int(remaining_qty)
-            if isinstance(position.metadata, dict):
-                position.metadata["qty"] = int(remaining_qty)
-                position.metadata["broker_reconciled_after_order_uncertainty"] = True
-                position.metadata["broker_recovery_order_id"] = str(result.order_id)
-                position.metadata["broker_recovery_message"] = str(result.message)
-            self.positions[position.symbol] = position
-        self._save_reconcile_metadata()
-        LOG.warning("Recovered equity exit state from broker for %s exit_qty=%s remaining_qty=%s after ambiguous order result=%s", position.symbol, exit_qty, remaining_qty, result.message)
-        return True, int(exit_qty), float(exit_price), float(realized)
+    @staticmethod
+    def _track_working_exit(position: Position, result, reason: str, booked_qty: int) -> None:
+        if isinstance(position.metadata, dict):
+            position.metadata["working_exit_order"] = {
+                "order_id": str(result.order_id),
+                "reason": str(reason),
+                "message": str(result.message),
+                "booked_qty": int(booked_qty),
+                "since": now_et().isoformat(),
+            }
 
-    def _recover_option_exit_from_broker(self, position: Position, result, reason: str, last_price: float | None) -> tuple[bool, int, float | None, float | None]:
-        if getattr(result, "ok", False):
-            return False, 0, None, None
-        if not getattr(result, "order_id", None):
-            return False, 0, None, None
-        if not order_result_needs_broker_recheck(getattr(result, "message", None)):
-            return False, 0, None, None
-        asset_type = str(position.metadata.get("asset_type") or "").upper()
-        local_qty = int(position.qty)
-        if asset_type == ASSET_TYPE_OPTION_SINGLE:
-            option_symbol = str(position.metadata.get("option_symbol") or "")
-            row = self._broker_position_row(option_symbol)
-            side, broker_qty, _ = broker_position_side_qty(row)
-            remaining_qty = int(broker_qty) if side == position.side else 0
-        elif asset_type == ASSET_TYPE_OPTION_VERTICAL:
-            long_symbol = str(position.metadata.get("long_leg_symbol") or "")
-            short_symbol = str(position.metadata.get("short_leg_symbol") or "")
-            rows = self._broker_position_rows([long_symbol, short_symbol])
-            long_row = rows.get(long_symbol.upper()) if long_symbol else None
-            short_row = rows.get(short_symbol.upper()) if short_symbol else None
-            long_side, long_qty, _ = broker_position_side_qty(long_row)
-            short_side, short_qty, _ = broker_position_side_qty(short_row)
-            if (long_qty > 0 or short_qty > 0) and (long_side != Side.LONG or short_side != Side.SHORT):
-                return False, 0, None, None
-            remaining_qty = 0
-            if int(long_qty) > 0 or int(short_qty) > 0:
-                if int(long_qty) != int(short_qty):
-                    return False, 0, None, None
-                remaining_qty = int(long_qty)
-        else:
-            return False, 0, None, None
-        if remaining_qty >= local_qty:
-            return False, 0, None, None
-        exit_qty = max(1, local_qty - max(0, remaining_qty))
-        exit_price_value = safe_float(getattr(result, "fill_price", None), None)
-        if exit_price_value is None:
-            exit_price_value = safe_float(last_price, None)
-        if exit_price_value is None:
-            exit_price_value = float(position.entry_price)
-        exit_price = float(exit_price_value)
-        exited_position = copy.copy(position)
-        exited_position.qty = int(exit_qty)
-        fill_price_estimated = getattr(result, "fill_price", None) is None
-        final_exit = remaining_qty <= 0
-        realized = self.account.record_exit(
-            exited_position,
-            exit_price,
-            reason,
-            final_exit=final_exit,
-            remaining_qty_after_exit=int(max(0, remaining_qty)),
-            fill_price_estimated=fill_price_estimated,
-            broker_recovered=True,
-        )
-        self.audit.log_structured(
-            "TRADE_SUMMARY",
-            self._trade_summary_payload(
-                exited_position,
-                exit_price,
-                realized,
-                reason,
-                final_exit=final_exit,
-                remaining_qty_after_exit=int(max(0, remaining_qty)),
-                broker_recovered=True,
-                fill_price_estimated=fill_price_estimated,
-            ),
-        )
-        if remaining_qty <= 0:
-            self.risk.register_exit(
-                str(position.metadata.get("underlying") or position.symbol),
-                realized,
-                additional_symbol=position.symbol,
-                side=position.side,
-                entry_price=float(position.entry_price),
-                exit_price=exit_price,
-                atr=None,  # broker-recovery path: no bars context for ATR
+    def _exit_order_in_flight(self, key: str, position: Position, last_price: float | None, bars,
+                              order_states: dict[str, Any]) -> bool:
+        """Settle an exit order an earlier cycle left working. True while it
+        still is -- the caller must send nothing else for the position.
+
+        Fills booked here are the order's fills beyond what was already
+        booked from it, so a partial booked at submit time is not counted
+        twice. A live LIMIT exit is re-cancelled each cycle so a fresh,
+        repriced exit can follow; a live MARKET exit is the most aggressive
+        order there is and is left to fill.
+        """
+        record = position.metadata.get("working_exit_order") if isinstance(position.metadata, dict) else None
+        if not isinstance(record, dict):
+            return False
+        if "states" not in order_states:
+            order_states["states"] = self.executor.fetch_order_states()
+        states = order_states["states"]
+        order_id = str(record.get("order_id") or "")
+        state = states.get(order_id) if isinstance(states, dict) else None
+        if state is None:
+            state = self.executor.order_state(order_id)
+        if state is None:
+            self.audit.log_cycle(
+                f"exit_gate:{key}", "exit_order_unresolved",
+                f"Exit held {key}: state of working exit order {order_id} unavailable this cycle",
+                interval=60.0, level=TRADEFLOW_LEVEL,
             )
-            self.positions.pop(position.symbol, None)
-        else:
-            self.risk.register_realized_pnl(realized)
-            position.qty = int(remaining_qty)
-            if isinstance(position.metadata, dict):
-                position.metadata["qty"] = int(remaining_qty)
-                position.metadata["broker_reconciled_after_order_uncertainty"] = True
-                position.metadata["broker_recovery_order_id"] = str(result.order_id)
-                position.metadata["broker_recovery_message"] = str(result.message)
-            self.positions[position.symbol] = position
-        self._save_reconcile_metadata()
-        LOG.warning("Recovered option exit state from broker for %s exit_qty=%s remaining_qty=%s asset_type=%s after ambiguous order result=%s", position.symbol, exit_qty, remaining_qty, asset_type, result.message)
-        return True, int(exit_qty), float(exit_price), float(realized)
+            return True
+        filled = int(state.get("filled_qty") or 0)
+        booked = int(record.get("booked_qty") or 0)
+        if filled > booked:
+            slice_qty = max(1, min(int(position.qty), filled - booked))
+            asset_type = str(position.metadata.get("asset_type") or ASSET_TYPE_EQUITY)
+            broker_price = safe_float(state.get("fill_price"), None)
+            if broker_price is not None and asset_type in OPTION_ASSET_TYPES:
+                broker_price *= 100.0
+            exit_price = broker_price if broker_price is not None else safe_float(last_price, None)
+            if exit_price is None:
+                self.audit.log_cycle(
+                    f"exit_gate:{key}", "exit_order_fill_unpriced",
+                    f"Exit held {key}: working exit order {order_id} filled {filled - booked} with no price yet",
+                    interval=60.0, level=TRADEFLOW_LEVEL,
+                )
+                return True
+            record["booked_qty"] = booked + slice_qty
+            self._book_broker_exit(
+                key, position, slice_qty, float(exit_price), str(record.get("reason") or "exit"), bars,
+                result_message=f"working_exit_filled:{state.get('status')}", attempt_status="broker_working_exit",
+                fill_price_estimated=broker_price is None,
+            )
+            if key not in self.positions:
+                return True
+        if state.get("is_filled") or state.get("is_terminal_failure"):
+            position.metadata.pop("working_exit_order", None)
+            self._save_reconcile_metadata()
+            return False
+        if str(state.get("order_type") or "") != "MARKET":
+            cancel_ok, cancel_msg = self.executor.cancel_working_order(order_id)
+            if not cancel_ok:
+                LOG.warning("Working exit %s for %s still live; cancel unconfirmed (%s)", order_id, key, cancel_msg)
+        self.audit.log_cycle(
+            f"exit_gate:{key}", "exit_order_working",
+            f"Exit held {key}: exit order {order_id} is still working at the broker",
+            interval=60.0, level=TRADEFLOW_LEVEL,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Main entry point — runs every management cycle.
@@ -1204,8 +1192,13 @@ class PositionManager:
         # managing or exiting a phantom position sends a duplicate order that
         # opens a new one in the opposite direction.
         self._reconcile_bracket_fills(bars)
+        order_states: dict[str, Any] = {}  # account_orders, fetched once and only if needed
         for key, position in list(self.positions.items()):
+            if key not in self.positions:
+                continue
             last_price, market_snapshot = self._position_management_snapshot(position, bars)
+            if self._exit_order_in_flight(key, position, last_price, bars, order_states):
+                continue
             asset_type = str(position.metadata.get("asset_type") or ASSET_TYPE_EQUITY)
             management_symbol = str(position.metadata.get("underlying") or position.symbol)
             management_frame = bars.get(management_symbol)
@@ -1235,7 +1228,9 @@ class PositionManager:
                 # Push any level the managers just moved onto the resting
                 # broker children, before the exit decision below can cancel
                 # them. No-op outside `replace` sync mode.
-                self._sync_bracket_children(position)
+                self._sync_bracket_children(key, position, last_price, bars)
+                if key not in self.positions:
+                    continue
                 adjustments = position.metadata.get("management_adjustments") if isinstance(position.metadata, dict) else None
                 if adjustments:
                     for adj in adjustments:
@@ -1286,33 +1281,35 @@ class PositionManager:
             # the resting stop both fill, taking the strategy net short.
             open_bracket = active_broker_bracket(position)
             if open_bracket is not None:
-                cancel_ok, cancel_msg = self.executor.cancel_bracket(open_bracket)
-                if not cancel_ok:
+                cancel = self.executor.cancel_bracket(open_bracket)
+                if not cancel.ok:
                     # Defer rather than double-exit. The protective stop is still
                     # resting, so the position is not unguarded while we retry.
                     LOG.error(
                         "Could not cancel resting bracket for %s before %s exit (%s); "
-                        "deferring exit to avoid a double fill", key, reason, cancel_msg,
+                        "deferring exit to avoid a double fill", key, reason, cancel.message,
                     )
                     self.audit.log_structured("EXIT_CONTEXT", {
                         **exit_context, "symbol": key, "qty": int(position.qty),
-                        "result_message": f"bracket_cancel_failed:{cancel_msg}",
+                        "result_message": f"bracket_cancel_failed:{cancel.message}",
                         "attempt_status": "deferred_bracket_cancel_failed",
                     })
                     continue
+                self._book_bracket_cancel_fills(key, position, open_bracket, cancel, last_price, bars)
+                if key not in self.positions:
+                    continue
             result = self.executor.close_position(position, data=self.data, market_snapshot=market_snapshot)
             if not result.ok:
-                if asset_type == ASSET_TYPE_EQUITY:
-                    recovered, recovered_exit_qty, recovered_exit_price, recovered_realized = self._recover_equity_exit_from_broker(position, result, reason, last_price)
-                elif asset_type in OPTION_ASSET_TYPES:
-                    recovered, recovered_exit_qty, recovered_exit_price, recovered_realized = self._recover_option_exit_from_broker(position, result, reason, last_price)
-                else:
-                    recovered, recovered_exit_qty, recovered_exit_price, recovered_realized = (False, 0, None, None)
-                if recovered:
-                    remaining_qty_after_exit = 0
-                    if key in self.positions:
-                        remaining_qty_after_exit = max(0, int(self.positions[key].qty))
-                    self.audit.log_structured("EXIT_CONTEXT", {**exit_context, "symbol": key, "qty": int(recovered_exit_qty), "filled_qty": int(recovered_exit_qty), "remaining_qty_after_exit": int(remaining_qty_after_exit), "result_message": result.message, "fill_price": safe_float(recovered_exit_price, None), "realized_pnl": safe_float(recovered_realized, None), "attempt_status": "broker_recovered"})
+                if result.order_id and (result.may_still_be_working or order_result_needs_broker_recheck(result.message)):
+                    # The order reached the broker and its outcome is not
+                    # settled: it may be live, or have filled shares the result
+                    # does not report. Track it and settle from its own fill
+                    # record next cycle; sending another exit meanwhile is how
+                    # a halted market-out fills twice.
+                    self._track_working_exit(position, result, reason, booked_qty=0)
+                    self._save_reconcile_metadata()
+                    LOG.log(TRADEFLOW_LEVEL, "Exit order %s for %s unsettled (%s); tracking it", result.order_id, key, result.message)
+                    self.audit.log_structured("EXIT_CONTEXT", {**exit_context, "symbol": key, "qty": int(position.qty), "result_message": result.message, "attempt_status": "tracking_unsettled_order"})
                     continue
                 LOG.log(TRADEFLOW_LEVEL, "Exit attempt %s qty=%s reason=%s result=%s", key, position.qty, reason, result.message)
                 self.audit.log_structured("EXIT_CONTEXT", {**exit_context, "symbol": key, "qty": int(position.qty), "result_message": result.message, "attempt_status": "not_filled"})
@@ -1334,8 +1331,11 @@ class PositionManager:
                 LOG.log(TRADEFLOW_LEVEL, "Exit %s qty=%s reason=%s result=%s", key, position.qty, reason, result.message)
             exit_price_value = result.fill_price if result.fill_price is not None else last_price
             if exit_price_value is None:
-                LOG.warning("Exit fill price unavailable for %s after close_position(); skipping trade record this cycle — will retry with fresh quotes", key)
-                continue
+                # The shares are GONE -- skipping the booking to "retry next
+                # cycle" sent a second exit for them. Book at entry, flagged
+                # estimated, so the quantity is right and P&L reads flat.
+                LOG.error("Exit fill price unavailable for %s after a filled close_position(); booking at entry price (estimated)", key)
+                exit_price_value = float(position.entry_price)
             exit_price = float(exit_price_value)
             # Exit slippage: how far the fill was from the intended level
             if isinstance(position.metadata, dict):
@@ -1379,13 +1379,21 @@ class PositionManager:
             else:
                 self.risk.register_realized_pnl(realized)
                 position.qty -= exit_qty
+                if result.may_still_be_working:
+                    # Partial fill whose cancel never confirmed: the remainder
+                    # may still fill. Track it so this cycle's slice is not
+                    # followed by a second exit for the same shares.
+                    self._track_working_exit(position, result, reason, booked_qty=exit_qty)
                 if isinstance(position.metadata, dict):
                     position.metadata["qty"] = position.qty
-                    if open_bracket is not None:
+                    if open_bracket is not None and not result.may_still_be_working:
                         # The exit only partially filled and we cancelled the
                         # bracket to get here, so the remaining shares are now
                         # unprotected. Re-establish protection at the current
-                        # engine levels, sized to what is left.
+                        # engine levels, sized to what is left -- unless the
+                        # exit's remainder may still be live, in which case a
+                        # resting stop beside it would sell the same shares
+                        # twice; the engine-side stop covers them meanwhile.
                         reprotected = self.executor.ensure_position_protected(
                             str(position.metadata.get("underlying") or position.symbol),
                             int(position.qty), position.side, float(position.entry_price),

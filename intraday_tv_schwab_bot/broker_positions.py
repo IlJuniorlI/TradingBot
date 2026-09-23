@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 """Pure broker-side position/order parsing helpers.
 
-Previously ``@staticmethod`` on ``IntradayBot``; extracted here so both
-``PositionManager`` (exit recovery) and engine entry recovery can share
-without dragging the full engine surface along. These are parsing-only —
-no Schwab client or executor state — which is why they live as free
+Previously ``@staticmethod`` on ``IntradayBot``; extracted here so the
+startup reconciler, ``PositionManager`` and ``EntryGatekeeper`` can share
+them without dragging the full engine surface along. These are parsing-only
+— no Schwab client or executor state — which is why they live as free
 functions rather than methods on a broker client wrapper.
 """
 from __future__ import annotations
@@ -55,13 +55,16 @@ def extract_working_orders(payload: Any) -> list[dict[str, Any]]:
         status = str(row.get("status") or "").upper()
         if status not in active:
             continue
-        legs = row.get("orderLegCollection") or []
-        symbols = [str(((leg.get("instrument") or {}).get("symbol") or "")) for leg in legs if isinstance(leg, dict)]
+        legs = [leg for leg in (row.get("orderLegCollection") or []) if isinstance(leg, dict)]
+        symbols = [str(((leg.get("instrument") or {}).get("symbol") or "")) for leg in legs]
         out.append({
             "orderId": row.get("orderId"),
             "status": status,
             "symbols": [s for s in symbols if s],
             "enteredTime": row.get("enteredTime"),
+            "orderType": str(row.get("orderType") or "").upper(),
+            "orderStrategyType": str(row.get("orderStrategyType") or "").upper(),
+            "instructions": [str(leg.get("instruction") or "").upper() for leg in legs],
         })
     return out
 
@@ -88,12 +91,22 @@ def active_broker_bracket(position: Any) -> dict[str, Any] | None:
 
 
 def order_result_needs_broker_recheck(message: Any) -> bool:
+    """True when a failed order REACHED the broker, so some of it may have filled.
+
+    A rejected submission (``status=`` / ``bracket_status=``) never did. Every
+    other failure from the live submit paths -- an unfilled order, a partial
+    fill whose cancel could not be confirmed, a bracket parent that would not
+    cancel -- may have left shares filled that the result does not report.
+    """
     text = str(message or "").strip().lower()
     if not text:
         return False
-    if text.startswith("status="):
+    if text.startswith(("status=", "bracket_status=")):
         return False
-    return text.startswith("live_") or "order_details_" in text or text.startswith("cancel_")
+    return (
+        text.startswith(("live_", "cancel_", "partial_fill_", "bracket_"))
+        or "order_details_" in text
+    )
 
 
 def broker_position_side_qty(row: dict[str, Any] | None) -> tuple[Side | None, int, float | None]:

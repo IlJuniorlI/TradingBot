@@ -24,12 +24,17 @@ in ``strategy.py`` — that method is the authoritative bias for entry
 decisions; the screener-emitted bias is what the gatekeeper consults for
 cooldown lookups before the strategy runs.
 """
+import logging
+
 from ..shared import Candidate, Side
 from ..screener_base import BaseStrategyScreener
+
+LOG = logging.getLogger(__name__)
 
 
 class TopTierAdaptiveScreener(BaseStrategyScreener):
     strategy_name = "top_tier_adaptive"
+    _last_missing: tuple[str, ...] = ()
 
     def run(self) -> list[Candidate]:
         # Keyed by THIS screener's name, not by whichever strategy happens to
@@ -42,7 +47,6 @@ class TopTierAdaptiveScreener(BaseStrategyScreener):
         tradable = [str(s).upper().strip() for s in (params.get("tradable") or []) if str(s).strip()]
         if not tradable:
             return []
-        c = self._column
         bias_threshold = float(params.get("directional_bias_min_day_strength", 0.20))
         # Raw field names (no _select_fields canonical mapping). Both
         # ``change`` and ``change_from_open`` are pulled so display +
@@ -60,14 +64,22 @@ class TopTierAdaptiveScreener(BaseStrategyScreener):
         # broken "N-XOM" links. Every other equity screener already selects
         # it; top_tier was the lone exception.
         query = (
-            self._base_query()
+            self._base_query(limit=max(len(tradable), self.config.tradingview.max_candidates))
             .select("name", "exchange", "close", "volume", "change", "change_from_open", "market_cap_basic")
-            .where(
-                *self._common_equity_conditions(),
-                c("name").isin(tradable),
-            )
+            .where(*self._curated_symbol_conditions(tradable))
         )
         rows = self._execute(query)
+        returned = {self._symbol_from_ticker(str(name)).upper().strip() for name in rows.get("name", [])}
+        missing = tuple(sym for sym in tradable if sym not in returned)
+        if missing and missing != self._last_missing:
+            # A configured name the screen never returns is prewarmed and
+            # streamed but can never be traded. Logged when the set changes,
+            # not every cycle.
+            LOG.warning(
+                "top_tier_adaptive screener missing %d/%d configured tradables: %s",
+                len(missing), len(tradable), ",".join(missing),
+            )
+        self._last_missing = missing
         return self._candidate_rows(
             rows,
             strategy=self.strategy_name,

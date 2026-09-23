@@ -311,13 +311,39 @@ def net_price_frac_of_width(first_leg: OptionContract, second_leg: OptionContrac
         return None
 
 
-def vertical_limit_price(first_leg: OptionContract, second_leg: OptionContract, mode: str = "mid") -> float:
+def vertical_limit_price(first_leg: OptionContract, second_leg: OptionContract, mode: str = "mid", *,
+                         spread_side: Side, opening: bool) -> float:
+    """Net limit for an order on the vertical quoted ``first_leg - second_leg``.
+
+    ``first_leg`` is the leg the position is named for -- the long leg of a
+    debit spread (``spread_side`` LONG), the short leg of a credit spread
+    (SHORT) -- so the quote reads as the debit paid / credit received. Opening
+    a debit spread or closing a credit spread BUYS that quote (pays toward its
+    ask); the other two SELL it (receive toward its bid).
+
+    * ``natural`` takes the side that fills now: the ask when buying, the bid
+      when selling.
+    * ``bid`` is the defensive mode: the passive side to OPEN (the bid when
+      buying, the ask when selling) and the natural side to CLOSE, so an exit
+      is never parked where it cannot fill -- the same split
+      ``single_option_limit_price`` makes.
+    * ``mid`` prices off the mid.
+
+    Both non-mid modes used to ignore the direction: ``natural`` always took
+    the ask, which for a credit open or a debit close is the far side of the
+    market (unmarketable; live option orders do not reprice), and ``bid``
+    always took the bid, which for those two orders is the natural side.
+    """
     bid, ask, mid = vertical_price_bounds(first_leg, second_leg)
+    buying = opening if spread_side == Side.LONG else not opening
+    natural, passive = (ask, bid) if buying else (bid, ask)
     mode = str(mode or "mid").lower()
     if mode == "natural":
-        price = ask if ask > 0 else (mid if mid > 0 else bid)
+        price = natural if natural > 0 else (mid if mid > 0 else passive)
     elif mode == "bid":
-        price = bid if bid > 0 else (mid if mid > 0 else ask)
+        preferred = passive if opening else natural
+        fallback = natural if opening else passive
+        price = preferred if preferred > 0 else (mid if mid > 0 else fallback)
     else:
         price = mid if mid > 0 else (ask if ask > 0 else bid)
     return _round_net_price(price)
@@ -379,7 +405,7 @@ def close_limit_price_from_metadata(position_metadata: dict[str, Any], first_quo
         first_meta, second_meta = position_metadata.get("short_leg"), position_metadata.get("long_leg")
     first_leg = contract_from_quote(first_symbol, first_quote, first_meta)
     second_leg = contract_from_quote(second_symbol, second_quote, second_meta)
-    return vertical_limit_price(first_leg, second_leg, mode=mode)
+    return vertical_limit_price(first_leg, second_leg, mode=mode, spread_side=spread_side, opening=False)
 
 
 def build_single_option_order(contract: OptionContract, qty: int, limit_price: float | None = None) -> dict[str, Any]:

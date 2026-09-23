@@ -7,7 +7,7 @@ from ..shared import (
     Side,
     Signal,
     _bar_close_position,
-    _discrete_score_threshold,
+    _score_threshold,
     _gate_snapshot,
     insufficient_bars_reason,
     _reason_with_values,
@@ -349,8 +349,8 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
         diagnostics.extend([r for r in trend.get("reasons", []) if r not in diagnostics])
         diagnostics.extend([r for r in trigger.get("reasons", []) if r not in diagnostics])
 
-        min_total = _discrete_score_threshold(self.params.get("min_total_score", 5.5), 6, minimum=1)
-        min_ltf_score = _discrete_score_threshold(self.params.get("min_ltf_score", 2.5), 2, minimum=1)
+        min_total = _score_threshold(self.params.get("min_total_score", 5.5), 5.5, minimum=1.0)
+        min_ltf_score = _score_threshold(self.params.get("min_ltf_score", 2.5), 2.5, minimum=1.0)
         if float(trigger.get("score", 0.0) or 0.0) < min_ltf_score:
             hard_reasons.append(_reason_with_values("weak_ltf_score", current=float(trigger.get("score", 0.0) or 0.0), required=min_ltf_score, op=">=", digits=4))
 

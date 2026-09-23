@@ -117,6 +117,24 @@ def _bool_token(value: Any) -> str:
     return "true" if bool(value) else "false"
 
 
+def _score_threshold(value: Any, default: float, *, minimum: float = 0.0) -> float:
+    """Threshold for a CONTINUOUS score, kept as configured.
+
+    The LTF trigger score moves in 0.5 / 0.75 steps plus candle bonuses and
+    the total score is continuous, so ``_discrete_score_threshold``'s ceil
+    turned ``min_ltf_score: 2.5`` into 3 and ``min_total_score: 5.5`` into 6:
+    setups the configured threshold passes were rejected. Falls back to
+    ``default`` on parse failure; floors at ``minimum``.
+    """
+    try:
+        raw = float(value)
+    except Exception:
+        raw = float(default)
+    if math.isnan(raw):
+        raw = float(default)
+    return max(float(minimum), raw)
+
+
 def _discrete_score_threshold(
     value: Any,
     default: int,
@@ -126,7 +144,12 @@ def _discrete_score_threshold(
 ) -> int:
     """Coerce ``value`` to an integer threshold, falling back to
     ``default`` on parse failure and clamping to ``[minimum, maximum]``
-    (maximum optional)."""
+    (maximum optional).
+
+    For INTEGER-valued counts only (peer agreement). A fractional setting is
+    rounded UP, which is right for a count -- "at least 2.5 peers" means 3 --
+    and wrong for a continuous score; use ``_score_threshold`` for those.
+    """
     try:
         raw = float(value)
     except Exception:
@@ -623,6 +646,7 @@ __all__ = [
     "_reason_with_values",
     "_safe_float",
     "_same_day_mask",
+    "_score_threshold",
     "_session_open_price",
     "_side_prefixed_reason",
     "_side_prefixed_reasons",

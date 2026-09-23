@@ -333,6 +333,11 @@ support_resistance:
   # bars — halved to 4 (= 20 min) so BOS/CHoCH event freshness stays in a
   # sane wall-clock range instead of 40 min.
   structure_event_lookback_bars: 4
+  # HTF window, in 15m HTF bars. The line above is sized for the 5m LTF
+  # structure frame; until 2026-09-22 it sized the HTF one too, so halving
+  # it for 5m bars cut HTF BOS/CHoCH freshness from 120 to 60 minutes under
+  # the HTF bias entry gate. 8 restores 120.
+  htf_structure_event_lookback_bars: 8
   # Fix B (2026-05-27): reject alternating structure pivots closer than this
   # many bars (on the LTF structure frame) — kills the rapid-alternation
   # noise that churned CHoCH/BOS/EQH/EQL. At Fix D's 5m frame, 3 bars =
@@ -431,7 +436,20 @@ technical_levels:
   bollinger_enabled: true
   bollinger_length: 20
   bollinger_std_mult: 2.0
-  bollinger_squeeze_width_pct: 0.06
+  # 2026-09-22: was 0.06, which is not a threshold on this universe but an
+  # always-true flag. `bollinger_width_pct` is (bb_upper - bb_lower) / bb_mid,
+  # a FRACTION of price. Measured over 162,056 RTH 1m bars across 17 archived
+  # sessions (2026-05-01 .. 09-21): median 0.0041, p75 0.0071, p95 0.0167,
+  # max 0.236 -- 0.06 flagged 99.87% of all bars as "in a squeeze".
+  #
+  # The flag PARTITIONS the two regimes: `_score_vol_squeeze` reads it as
+  # compression to trade, `_build_range_signal` reads it as the condition to
+  # refuse. At 99.87% that partition was degenerate -- vol_squeeze owned every
+  # bar and `range` owned none, which is why range logged 387/387 build
+  # failures on `bollinger_squeeze` and has one trade in the whole archive.
+  # 0.0025 is the p25 of the measured distribution: a squeeze is the tightest
+  # quarter of the tape, and the other three quarters are available to fade.
+  bollinger_squeeze_width_pct: 0.0025
   bollinger_entry_bonus_midband: 0.16
   bollinger_entry_penalty_outer_band: 0.22
   target_use_bollinger: false
@@ -570,8 +588,8 @@ strategies:
       # Symbols eligible for pre/post-market entries (07:00-09:30 & 16:00-20:00)
       # when equity_session_indicator_window=extended. Restricted to the names
       # with the deepest extended-hours liquidity (mega-cap tech + high retail
-      # flow); the thinner names (CRM/TSM/HD/LOW/UBER/COST/RBLX/TMUS/JPM/GS/V/LLY)
-      # trade RTH-only. Empty list => no extended-hours entries. ADJUST AS
+      # flow); the thinner names (TSM/QCOM/ARM/MRVL/ANET/VRT/DELL/ORCL/CRM/
+      # ADBE/NOW/PANW) trade RTH-only. Empty list => no extended-hours entries. ADJUST AS
       # DESIRED — this is a liquidity judgment, not a hard rule.
       extended_hours_tradable: [AAPL, MSFT, NVDA, AMD, AVGO, AMZN, TSLA, GOOG, META, NFLX, INTC, MU, PLTR]
       # ETFs consulted by ``sector_index_map`` for the three populated groups.
@@ -664,7 +682,28 @@ strategies:
       min_trend_score: 4.0                # 2026-07-29: 4.5 blocked 384 of 631 qualifying tech SHORTs
       min_pullback_score: 3.5             # 2026-07-29: reverted — 4.0 was UNREACHABLE (observed pullback score maxes at 3.5), which silently killed the regime
       min_pullback_trend_score: 3.0
-      min_range_score: 3.5
+      # 4.0 of a 5.0 ceiling. Re-derived 2026-09-22 with the scorer, because a
+      # score floor only means something relative to the scorer it gates — the
+      # same reason `min_pullback_score` went back to 3.5 and
+      # `min_sr_scalp_score` to 3.0 when theirs turned out unreachable, in the
+      # opposite direction.
+      #
+      # base 0.5 + in-the-fade-zone 2.0 = 2.5. At 3.5 the minimum qualifying
+      # setup was zone + prev-bar + rejection wick and NOTHING else — a fade
+      # off the edge with neither piece of evidence that the tape is ranging
+      # rather than trending, which is the definition of catching a falling
+      # knife. The two +0.5 context components (a two-sided tape; indices and
+      # EMAs not trending against the fade) exist to tell those apart, and 19
+      # of the 28 range setups on 2026-09-21 and 9 of 26 on 09-18 scored
+      # exactly 3.5 — i.e. had neither.
+      #
+      # 4.0 requires 1.5 beyond the zone: the wick plus any one +0.5, or all
+      # three +0.5s together. A marginal fade with a wick and nothing else no
+      # longer clears it. 4.5 would require the wick AND both context
+      # components, which measures back to 0
+      # setups on 09-21 and 2 on 09-18 — the dead-regime state this rewrite
+      # exists to fix. Mid-range still cannot reach any of these.
+      min_range_score: 4.0
       min_adx14: 18.0          # HIGH_VOL: was 16.0 — ADX naturally higher in high vol; demand stronger trend
 
       # Pullback detection
@@ -690,7 +729,14 @@ strategies:
       pullback_min_leg_retrace_pct: 25.0
 
       # Range detection
-      range_max_vwap_dist_pct: 0.0020
+      # `range_max_vwap_dist_pct` was REMOVED 2026-09-22 with the _score_range
+      # rewrite. It paid the scorer's largest single component (+1.5) for
+      # sitting within 0.20% of VWAP -- i.e. for being in the MIDDLE of the
+      # range -- while _build_range_signal only ever enters from the outer
+      # `range_entry_zone_frac`. Over 10,162 real 1m bars the old scorer
+      # correlated -0.17 with distance from mid-range and blocked 6,485 of the
+      # 7,477 bars that were actually at an edge.
+      range_entry_zone_frac: 0.35   # fade zone = outer 35% of the lookback range; scorer and builder both read it
       range_max_ema_gap_pct: 0.0008
       range_min_flip_count: 3
       range_lookback_bars: 20              # base-1m frame (unchanged by LTF switch — _score_range/_build_range_signal index `frame`, not `ltf`)
@@ -1006,13 +1052,58 @@ strategies:
       #       Set either threshold to 0.0 to disable that gate.
       min_vol_squeeze_score: 4.0
       vol_squeeze_lookback_bars: 12          # base-1m frame (unchanged — _score/_build_vol_squeeze index `frame`, not `ltf`)
-      vol_squeeze_max_range_pct: 0.012       # box height vs price (LTF)
-      vol_squeeze_max_range_atr: 1.8          # box height vs ATR
-      vol_squeeze_max_width_pct: 0.05         # bollinger width fraction ceiling
+      # Compression. These two are an AND, and only the second one binds.
+      #
+      # `vol_squeeze_max_range_pct` admits 95.59% of bars at 0.012 (the box
+      # height is p50 0.33% of price, p95 1.15%). It is kept as the absolute
+      # backstop for a name whose atr14 is unusually small relative to its
+      # price, where the ATR test below could pass on a box that is large in
+      # percentage terms. It is not the selectivity gate and should not be
+      # read as one.
+      #
+      # `vol_squeeze_max_range_atr` is the gate that decides. 2026-09-22: was
+      # 1.8, which compares a TWELVE-bar box against a ONE-bar atr14 — the
+      # same units mismatch as `orb_max_range_atr_mult`, and worse here.
+      # Measured over 167,447 RTH 1m bars across 18 archived sessions
+      # (2026-05-01 .. 09-22):
+      #
+      #     p5 2.17   p25 2.81   median 3.44   p75 4.26   p95 5.75   max 15.71
+      #
+      # 1.8 sits BELOW the 5th percentile, so 0.79% of bars could ever be
+      # "compressed" and the regime was off by calibration: 3.4 candidates a
+      # session reached the full gate stack across 28 symbols. A random walk
+      # puts the expected 12-bar range near 3.3x a 1-bar ATR, so the measured
+      # median of 3.44 is the NEUTRAL value, not a tight one.
+      #
+      # 2.8 is the p25 — the tightest quarter of the tape, the same definition
+      # `bollinger_squeeze_width_pct` now uses at its own p25, so the regime's
+      # two compression tests mean the same thing. That yields ~40 candidates
+      # a session before the score floor, the auction and the setup-quality
+      # gates. The breakout buffer is deliberately NOT touched in the same
+      # change: this regime has 11 archived trades for +$9.58 that turn into
+      # -$120 without one TSLA winner, so it gets one variable at a time.
+      vol_squeeze_max_range_pct: 0.012        # absolute backstop; does not bind
+      vol_squeeze_max_range_atr: 2.8          # box height vs 1-bar ATR — the binding gate
+      # 2026-09-22: was 0.05 — same units error as bollinger_squeeze_width_pct
+      # above, in the OR-branch of the same test
+      # (`bb_squeeze_flag or 0 < bb_width_pct <= this`). At 0.05 the branch was
+      # true on ~100% of bars, so _score_vol_squeeze's +1.0 compression point
+      # and its +0.5 "both signals agree" bonus were free. 0.0035 (~p42) keeps
+      # this looser than the strict squeeze flag, which is what an OR-fallback
+      # is for, without handing out 1.5 points unconditionally.
+      vol_squeeze_max_width_pct: 0.0035       # bollinger width fraction ceiling
       vol_squeeze_breakout_buffer_pct: 0.0012  # HIGH_VOL: was 0.0008 — moderate buffer; TSLA-style breakouts clear ~0.1%
       vol_squeeze_min_breakout_volume_ratio: 1.25  # 2026-05-14: softened from 1.40 to 1.25 — most real breakouts hit this; HARD gate
       vol_squeeze_min_bar_close_position: 0.65  # 2026-05-14: softened from 0.75 to 0.65 — close in upper 65% of bar; HARD gate
-      vol_squeeze_hard_breakout_gates: true    # 2026-05-14: convert vol_ratio/close_pos/buffer from +0.5 bonuses to HARD gates
+      # 2026-05-14: convert vol_ratio/close_pos/buffer from +0.5 bonuses to HARD
+      # gates. That is what this line has always said, but only the BUILDER was
+      # changed — `_score_vol_squeeze` kept all three as bonuses until 2026-09-22,
+      # so a setup with none of them scored 2.0 box + 1.0 bb + 0.5 agreement + 0.5
+      # VWAP alignment = exactly min_vol_squeeze_score, qualified, and was then
+      # certain to die on `vol_squeeze_weak_breakout_*` (1,838 of them across the
+      # 09-21 and 09-22 sessions). Both now read `_vol_squeeze_breakout_quality`,
+      # and this flag moves the two together.
+      vol_squeeze_hard_breakout_gates: true
       vol_squeeze_min_sr_bias_alignment: 0.20  # 2026-05-14: NEW. LONG rejects when sr_bias_score < -0.20 (HTF SR against side). Mirror for SHORT. Set 0.0 to disable.
       vol_squeeze_min_pct_b_directional: 0.50  # 2026-05-14: NEW. LONG requires pct_b >= 0.50 (upper half of BBs at breakout); SHORT requires <= 0.50. Set 0.0 to disable.
       vol_squeeze_target_rr: 2.05
@@ -1033,7 +1124,8 @@ strategies:
       #       REGIME_SCORE_CEILINGS shipped in the SAME 2026-09-18 change.
       #       Ranking is now (score - floor) / (ceiling - floor), so this
       #       regime's 6.5 - 4.0 = 2.5 headroom — the WIDEST of any enabled
-      #       regime (trend/momentum 2.0, pullback/range/vwap_reclaim 1.5) —
+      #       regime (trend/momentum 2.0, pullback/vwap_reclaim 1.5, range 1.0
+      #       since its floor moved to 4.0 on 2026-09-22) —
       #       makes the high ceiling the thing that holds it BACK, not the
       #       thing that flatters it. A vol_squeeze at 5.5 now ties a
       #       pullback at 4.4.
@@ -1116,19 +1208,37 @@ strategies:
       sr_scalp_min_distance_pct: 0.008         # was 0.012 — 0.8% of price floor
       sr_scalp_min_distance_atr: 2.0           # was 3.0 — 2x ATR floor
       sr_scalp_max_distance_from_zone_atr: 0.4 # HIGH_VOL: was 0.5 — must be closer to zone inner edge (less mid-range tolerance)
-      # Noise floor on the scalp stop (2026-07-29). Zone geometry alone put
-      # stops 1.09-2.70 ATR out on 07-28 META while the tape chopped 11.9 ATR;
-      # 63% of bars traded above those stops. shared_entry.min_stop_atr_mult
-      # does NOT cover this — it bounds only the refinement passes, never a
-      # builder's own stop. When widening to this floor drops R:R below
-      # shared_entry.min_target_rr the setup is rejected outright, since
-      # sr_scalp's reward is capped by the opposing zone and cannot stretch.
-      sr_scalp_min_stop_atr_mult: 2.5
-      # sr_scalp OFF: zero entries in its first 15 days live (threshold set
-      # above its reachable ceiling), and its two 2.5 knobs fight each other
-      # — `sr_scalp_min_distance_atr` sets the reward floor while
-      # `sr_scalp_min_stop_atr_mult` sets the risk floor, so a setup at the
-      # gap floor lands near R:R 0.8 and is rejected by `stop_floor_kills_rr`.
+      # Noise floor on the scalp stop. 2026-09-22: the flat 2.5 ATR floor put
+      # here on 2026-07-29 (after 07-28 META: three shorts into a band the tape
+      # chopped 11.9 ATR through, 63% of bars trading through their stops) bound
+      # on EVERY setup, not the noisy ones — the geometric stop is at most
+      # proximity 0.4 + zone_half_width 0.2 + level_buffer ~0.3 = ~0.9 ATR from
+      # entry, so 2.5 always won. That threw the level away on the risk side,
+      # and made `sr_scalp_min_distance_atr: 2.0` a fiction: a flat 2.5 ATR risk
+      # against a target pinned to the opposing zone needs 2.4-3.2 ATR of gap to
+      # clear shared_entry.min_target_rr, so a setup at the documented floor
+      # could never build.
+      #
+      # The floor is now measured against the LEVEL's own violation history —
+      # how far price has pushed through it over the lookback, counted from
+      # when it took the role it plays now (a fresh resistance->support flip's
+      # approach from below is not a breach; counting it made FLIP-CONTINUATION
+      # unbuildable whenever the break was in the lookback). A level that has
+      # been holding leaves the geometric stop alone; a level being cut through
+      # pushes the stop past the breaches and, since the reward cannot stretch,
+      # the R:R check rejects the setup. That is the META case, rejected for the
+      # right reason. What remains below is a small absolute backstop for a
+      # level nothing has touched.
+      sr_scalp_noise_lookback_bars: 20         # bars used to measure how far the level has been pierced
+      sr_scalp_min_stop_atr_mult: 0.5          # was 2.5 — now a backstop, not the binding floor
+      # sr_scalp OFF. The geometry that made it unbuildable is FIXED as of
+      # 2026-09-22 (see the stop-floor note above): the two knobs no longer
+      # fight, and a setup at the documented `sr_scalp_min_distance_atr` gap
+      # can now clear min_target_rr. What is left is a trading decision, not a
+      # defect — the regime has 15 archived trades for -$179.67 on the old
+      # geometry, and turning it on is a second variable on a week that is
+      # already measuring the armed retest. Flip this to false to trade S/R
+      # bounces and rejections; nothing else needs to change.
       disable_sr_scalp_regime: true
 
       # ===== Per-regime opt-out knobs (added 2026-05-12) =====
@@ -1211,6 +1321,17 @@ strategies:
       # now always evaluated; the penalty filters weak counter-bias setups
       # while strong structural ones still qualify).
       #
+      # SCOPE under the shipped `require_explicit_side_decision: true`: when
+      # `_decide_side` picks a side, the penalty is skipped for the regimes
+      # the build queue holds to that side (SIDE_DECISION_REGIMES) — the vote
+      # already made the call — and applied ONLY to MEAN_REVERSION_REGIMES
+      # (range, sr_scalp), which are exempt from the vote and would otherwise
+      # have no counter-trend filter at all. Until 2026-09-22 it was skipped
+      # for those too: live `range` signals were fading their own day by
+      # >= 0.30% in 6 of 11 cases across three archived sessions, including
+      # QCOM LONG on a -6.85% day. With the vote off, it applies to every
+      # regime as before. Logged as `mr_bias_pen` when it is the MR-only form.
+      #
       # Examples with defaults (base=1.0, saturate_at=2.0):
       #   day_strength = -0.5% (mild SHORT bias) → penalty on LONG = 0.25.
       #     A LONG trend score of 5.0 becomes 4.75 — still above min_trend
@@ -1224,9 +1345,12 @@ strategies:
       bias_penalty_saturate_at: 2.5            # HIGH_VOL: was 2.0 — high vol produces 2-3% day_strength regularly; don't saturate the penalty too fast
 
       # ===== Tier 2a: Volatility-aware stop widening (added 2026-05-12) =====
-      # When the current bar's ATR has expanded vs its 5-bar average
-      # (tech_ctx.atr_expansion_mult), all ATR-based stop buffers scale by
-      # 1.0 → atr_widening_max_factor proportionally. Risk MANAGER then
+      # When the last 5 bars' mean true range has expanded vs the atr14 in
+      # force before them (tech_ctx.atr_expansion_mult), all ATR-based stop
+      # buffers scale by 1.0 → atr_widening_max_factor proportionally.
+      # (Until 2026-09-22 the mult was a 5-bar net displacement in ATRs, so a
+      # clean trend "expanded" -- over 1.2 on 37% of RTH bars; 16% now, and the
+      # full widening applies on 0.6% of bars instead of 8.8%.) Risk MANAGER then
       # downsizes share count so dollar risk per trade stays constant.
       # Effect: fewer false stops on trend-day noise, more winners captured
       # without increasing trade dollar risk.
@@ -1273,9 +1397,8 @@ strategies:
       peak_giveback_high_conviction_day_strength_pct: 2.5  # HIGH_VOL: was 2.0 — 2% is common in high vol; require 2.5% for true trend-day conviction
       peak_giveback_high_conviction_min_r: 2.5             # HIGH_VOL: was 2.0 — let conviction trades retrace from 2.5R peak (more runway)
 
-      # Sector concentration guard — at most 2 same-direction positions per
-      # GICS sector. Prevents 3 correlated longs dying together on one headline.
-      # Group membership drives two things: which ETF a symbol falls back to
+      # Confirmation groups (the concentration guard reads correlation_groups
+      # below, not these). Group membership drives two things: which ETF a symbol falls back to
       # for confirmation, and — primarily — which peers its breadth vote is
       # counted across. Grouped by how the names actually co-move rather than
       # by GICS: META/GOOG/NFLX are Communication Services and AMZN/TSLA are
@@ -1287,35 +1410,22 @@ strategies:
         platforms: [AAPL, MSFT, GOOG, AMZN, META, NFLX, ORCL, TSLA]
         software: [CRM, ADBE, NOW, PLTR, PANW]
 
-      # Per-sector index ETF map (added 2026-05-13). The index-confirmation
+      # Per-group index ETF map (added 2026-05-13). The index-confirmation
       # gate (require_index_confirmation) consults THESE indices for each
-      # candidate's sector instead of OR-ing across the entire index_symbols
-      # list. Prevents e.g. an AAPL LONG from being confirmed by XLE just
-      # because energy happens to be bullish — AAPL is checked against QQQ
-      # / SPY only. Sectors with no entry fall back to ``index_symbols``,
-      # so dropping this map = old "OR across every index_symbols entry"
-      # behavior. ETFs listed here must also appear in ``index_symbols``
-      # so their data gets streamed.
-      # Strict per-sector confirmation — each sector confirmed by its
-      # canonical SPDR Select Sector ETF only. No SPY fallback:
-      #   * SPY's per-sector weight is dominated by Tech (~30%) +
-      #     Financials (~13%) + Health Care (~12%); a bullish SPY mostly
-      #     reflects those three sectors. Stocks in Energy (3% weight),
-      #     Materials (2%), Real Estate (2%), Utilities (2%) regularly
-      #     diverge — NEM (gold miner) often INVERSE to SPY entirely.
-      #   * Using sector ETFs only keeps confirmation faithful to each
-      #     stock's actual peer tape.
-      # All 11 GICS sectors mapped so future symbols added to currently-
-      # empty buckets (industrials, real_estate, utilities, etc.) get the
-      # correct ETF without further config.
+      # candidate's group instead of OR-ing across the entire index_symbols
+      # list, so a symbol is confirmed by its own group's tape. No SPY
+      # fallback: SPY is a blend of every sector and says little about any
+      # one group. Groups with no entry fall back to ``index_symbols``.
+      # ETFs listed here must also appear in ``index_symbols`` so their data
+      # gets streamed. With >= 5 members per group, peer breadth is the live
+      # path and these ETFs are the fallback (see index_breadth_* below).
       sector_index_map:
         ai_hardware: [SMH]
         platforms: [XLK]
         software: [IGV]
       # Correlation grouping for the risk concentration guard. DELIBERATELY
       # coarser than `sector_groups` above, which exists to route a symbol to
-      # its confirmation ETF and must stay at GICS granularity. Risk grouping
-      # wants the opposite: on a mega-cap universe the tech / communication /
+      # its confirmation ETF and peers. Risk grouping wants the coarser cut: on a mega-cap universe the tech / communication /
       # consumer-discretionary names run ~0.85 correlated on any macro day, so
       # treating them as three independent sectors let a single directional
       # bet fill all `risk.max_positions` slots while looking diversified —
@@ -1330,7 +1440,7 @@ strategies:
       # --- Per-symbol volatility scaling (2026-09-18) --------------------
       # Every percent-of-price threshold below (default_stop_pct,
       # momentum_min_day_strength, sr_scalp_min_distance_pct,
-      # relative_strength_block_threshold_pct, range_max_vwap_dist_pct,
+      # relative_strength_block_threshold_pct,
       # range_max_intraday_range_pct, vol_squeeze_max_range_pct,
       # broken_level_min_clearance_pct) is multiplied by this symbol's
       # 20-day ADR divided by `reference_adr_pct`. Without it one number is a

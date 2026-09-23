@@ -30,7 +30,7 @@ See also:
 - `peer_confirmed_key_levels_1m` — faster 1-minute LTF peer-confirmed HTF key-level/zone variant tuned as a compromise between aggressive and balanced confirmation
 - `peer_confirmed_trend_continuation` — peer-confirmed trend continuation strategy that trades controlled pullbacks and re-expansion without waiting for key-level touches
 - `peer_confirmed_htf_pivots` — peer-confirmed higher-timeframe pivot S/R scalp strategy with switchable reclaim, rejection, and continuation entry families
-- `top_tier_adaptive` — multi-regime adaptive strategy for top-tier liquid stocks across six Tier 1 GICS sectors with index confirmation and sector concentration guard; six core regimes (trend, pullback, range, vol_squeeze, momentum, sr_scalp) compete in a flat score-ordered build queue, plus a dedicated `orb` opening-range-breakout regime in the opening window
+- `top_tier_adaptive` — multi-regime adaptive strategy for 25 mega-cap Tech / AI stocks with peer-breadth index confirmation and a correlation concentration guard; six core regimes (trend, pullback, range, vol_squeeze, momentum, sr_scalp) compete in a flat score-ordered build queue, plus a dedicated `orb` opening-range-breakout regime in the opening window
 - `small_cap_squeeze` — long-only multi-regime small-cap "squeeze" strategy; a dynamic TradingView screener (low float 400K-20M, premarket gap ≥5% on heavy volume, RVOL ≥2) replaces the fixed list. Reuses the `top_tier_adaptive` engine (trend/pullback/range/vol_squeeze/momentum + opt-in `vwap_reclaim`; ORB and sr_scalp off), 1-minute LTF, premarket/extended-hours eligible
 
 ### 0DTE ETF option strategies
@@ -228,6 +228,17 @@ This block controls shared position sizing, daily guardrails, re-entry behavior,
 | `time_stop_min_return_pct`        | `0.003`           |
 | `peak_giveback_enabled`           | `true`            |
 | `peak_giveback_min_r`             | `1.0`             |
+| `peak_giveback_low_tier_enabled`  | `true`            |
+| `peak_giveback_low_tier_min_r`    | `0.7`             |
+| `peak_giveback_low_tier_giveback_frac` | `0.7`        |
+| `peak_giveback_retain_1to2r`      | `0.65`            |
+| `peak_giveback_retain_2to3r`      | `0.72`            |
+| `peak_giveback_retain_3r_plus`    | `0.78`            |
+| `entry_slippage_allowance_spread_frac` | `1.0`        |
+| `entry_slippage_allowance_max_pct` | `0.002`          |
+| `risk_overage_warn_frac`          | `0.15`            |
+| `entry_slippage_warn_pct`         | `0.0015`          |
+| `daily_loss_includes_open_risk`   | `true`            |
 
 Behavior and valid values:
 
@@ -252,10 +263,16 @@ Behavior and valid values:
 - `cooldown_direction_aware`: when `true` (the recommended default), the cooldown is keyed by `(symbol, side)` — a LONG exit on `NVDA` only blocks LONG re-entries on `NVDA`; a SHORT can still fire immediately if a genuine bearish setup develops. When `false`, the cooldown blocks both directions on the symbol for the full `cooldown_minutes` window. Has no effect under `reentry_policy: immediate` or `rest_of_day`.
 - `same_level_block_minutes`: after a stop-out, block **same-direction** re-entry on the same symbol for this many minutes. Targets the breakout-chase pattern where the bot enters → stops → re-enters at the same level → stops again. Set to `0` to disable. Independent of `cooldown_minutes`; both blocks apply.
 - `same_level_block_atr_mult`: the same-level block only fires when the new entry sits within `same_level_block_atr_mult × ATR` of the prior stop price. Lower values block a tighter price band around the prior stop; higher values widen it. Fib-pullback entries (where the new entry sits in the [0.5, 0.786] retracement zone of a tagged anchor) override the block.
-- `time_stop_minutes`: scratch-exit a trade held this long with `|return_pct| < time_stop_min_return_pct`. Targets dead-capital trades that aren't moving. Set to `0` to disable.
+- `time_stop_minutes`: scratch-exit a trade held this long with `|return_pct| < time_stop_min_return_pct`. Targets dead-capital trades that aren't moving. An option position's return is its underlying's since entry (`underlying_entry`), the instrument the exit logic reads. Set to `0` to disable.
 - `time_stop_min_return_pct`: the absolute return threshold under which the time-stop fires (e.g. `0.003` = 0.3%). Trades outside this band aren't time-stopped regardless of duration.
-- `peak_giveback_enabled`: when `true`, fires `peak_giveback:peakXR_floorYR` once `max_favorable_r` crosses `peak_giveback_min_r` and `current_r` retraces past a tiered floor (50% at 1R peak, 40% at 2R, 30% at 3R+). Complements the protective-BE logic at +0.5R: BE catches 0.5–1R winners, peak-giveback catches 1R+ runners that give back too much.
+- `peak_giveback_enabled`: when `true`, fires `peak_giveback:peakXR_floorYR` once `max_favorable_r` crosses `peak_giveback_min_r` and `current_r` retraces past a tiered floor set by the `peak_giveback_retain_*` fractions below. Complements the protective-BE logic at +0.5R: BE catches 0.5–1R winners, peak-giveback catches 1R+ runners that give back too much.
 - `peak_giveback_min_r`: minimum peak R-multiple before the peak-giveback floor activates. Set to `0` together with `peak_giveback_enabled: false` to disable entirely.
+- `peak_giveback_retain_1to2r` / `peak_giveback_retain_2to3r` / `peak_giveback_retain_3r_plus`: the fraction of the peak R the main tier keeps before its floor fires, by peak size (1-2R, 2-3R, 3R+). At a 2R peak, `0.65` exits on a retrace to 1.3R. Higher captures more and exits sooner on a retrace; lower leaves more recovery room. Tightened from the original 0.50/0.60/0.70 after the 2026-05-12..27 sample showed winners keeping only 44% of their MFE.
+- `peak_giveback_low_tier_enabled` / `peak_giveback_low_tier_min_r` / `peak_giveback_low_tier_giveback_frac`: a second, lower tier for trades that peak between `peak_giveback_low_tier_min_r` and `peak_giveback_min_r` and would otherwise round-trip to the breakeven stop. It arms at the low-tier peak and exits once `current_r` falls below `peak × (1 − giveback_frac)` — a 0.7R peak with the default `0.7` exits at 0.21R. Skipped while the high-conviction override is active, since those trades want the main tier's wider leash.
+- `entry_slippage_allowance_spread_frac` / `entry_slippage_allowance_max_pct`: sizing pads the stop distance by an expected-slippage amount — the live spread times `entry_slippage_allowance_spread_frac`, capped at `entry_slippage_allowance_max_pct` of price — so a fill that slips by up to that much still lands inside the risk budget. Without it, realized risk is `qty × |fill − stop|` against a budget sized on the signal price, and the overage scales inversely with stop width (5c of slip is ~2% over on a 1% stop, ~25% over on a stop 10x tighter). Set the spread fraction to `0.0` to size on the raw stop distance.
+- `risk_overage_warn_frac`: after a fill, realized risk more than this fraction over budget is logged and stamped on the position. Detection only — the shares are already bought; the sizing allowance above is the preventive half.
+- `entry_slippage_warn_pct`: entry slippage beyond this fraction of the signal price is logged and flagged on the position, so a routing or liquidity problem shows up in the log rather than only in an end-of-day report.
+- `daily_loss_includes_open_risk`: `max_daily_loss` gates new entries, and open positions are never flattened when it trips. When `true`, `can_open` subtracts the open positions' remaining risk to their CURRENT stop from realized P&L before comparing, so entries stop once the worst case would breach the limit rather than once realized losses already have. A stop trailed to breakeven or better contributes zero. `false` restores the realized-only comparison, under which a day can finish at roughly twice the limit.
 
 ### `runtime`
 
@@ -265,6 +282,7 @@ This block controls loop timing, quote/history refresh cadence, stream fallback 
 |--------------------------------------|-------------------------------------------|
 | `timezone`                           | `America/New_York`                        |
 | `loop_sleep_seconds`                 | `2.0`                                     |
+| `error_escalation_cycles`            | `10`                                      |
 | `history_poll_seconds`               | `300`                                     |
 | `quote_poll_seconds`                 | `6`                                       |
 | `quote_cache_seconds`                | `6`                                       |
@@ -272,6 +290,7 @@ This block controls loop timing, quote/history refresh cadence, stream fallback 
 | `history_lookback_minutes`           | `390`                                     |
 | `use_extended_hours_history`         | `true`                                    |
 | `use_rth_session_indicators`         | `true`                                    |
+| `equity_session_indicator_window`    | `rth`                                     |
 | `warmup_minutes`                     | `90`                                      |
 | `prewarm_before_windows_minutes`     | `5`                                       |
 | `log_dir`                            | `.logs`                                   |
@@ -297,6 +316,7 @@ Behavior and valid values:
 
 - `timezone`: IANA timezone string. All configured times are interpreted in this timezone.
 - `loop_sleep_seconds`: base engine sleep between iterations.
+- `error_escalation_cycles`: the main loop backs off exponentially on errors and never gives up. After this many consecutive failed cycles it escalates to a CRITICAL log naming the open positions, and the dashboard status turns into an explicit alarm, so a sustained outage during the management window cannot pass as a throttled warning. At the capped 60s backoff, `10` is roughly ten minutes without management. `0` disables the escalation; the backoff is unaffected.
 - `history_poll_seconds`: cadence for history refreshes.
 - `quote_poll_seconds`: cadence for quote refreshes when polling is used.
 - `quote_cache_seconds`: max age of cached quotes before forcing a refresh.
@@ -307,6 +327,7 @@ Behavior and valid values:
   - **Visual consequence on the dashboard chart.** The LTF chart's window covers ~30 trading hours at most (`tail(360 × ltf_minutes)`); the most recent overnight gap dominates the visible range until Schwab fills it in. The HTF chart spans 5+ weeks at `60m × 360`, so older overnights with the lag already resolved fill the chart and the gap is barely visible. The **underlying data has the same gap in both timeframes** — only the visible-window-vs-data-density ratio differs. This is a Schwab data-availability constraint, not a bot pipeline bug; nothing is filtering bars in the bot itself.
   - **No fix planned.** Fetching directly at coarser minute frequencies (`5`/`15`/`30`) doesn't help — they all share the same lag for the most recent overnight. Extending `history_lookback_minutes` past 24h would eventually pick up overnight bars on heal fetches once Schwab releases them, but at the cost of larger fetch payloads on every heal. Current design keeps `history_lookback_minutes: 780` (13h) and accepts that the freshest overnight is invisible on the LTF chart.
 - `use_rth_session_indicators`: use regular-session-only EMA/VWAP during RTH, while premarket and postmarket continue using all-session indicator values.
+- `equity_session_indicator_window`: which session the per-session VWAP/EMA/TA-Lib reset keys off when `use_rth_session_indicators` is on. `rth` (default) is 09:30-16:00; `extended` is the 07:00-20:00 equity stream window, for strategies that enter pre/post market. Leave `rth` for every RTH-only strategy.
 - Screener queries are session-aware: canonical `close`, `change_from_open`, and `volume` map to `premarket_*` fields before 09:30 ET, regular-session fields during RTH, and `postmarket_*` fields after 16:00 ET. Returned screener rows are normalized back to the canonical column names so strategy code keeps reading `close`, `change_from_open`, and `volume` consistently across sessions.
 - `warmup_minutes`: minimum history seeded when a symbol is first watched. The bot now also respects each strategy's required bar warmup and will request a deeper preload when the active strategy needs more bars than the current session has provided yet.
 - Startup before premarket history is available now schedules a one-shot retry at **7:01 AM ET** for that session, so aliases/index-like symbols can recover promptly once Schwab starts serving candles.
@@ -333,7 +354,7 @@ Behavior and valid values:
 - `symbol_state_prune_seconds`: cadence at which the engine evicts per-symbol state (history frames, HTF/SR caches, dashboard snapshot/chart payloads) for symbols that have dropped out of the active set (streamed symbols + last watchlist + open positions). Long-running multi-day bots otherwise accumulate history dicts (~240KB per 1m frame at default lookback) for every symbol the screener has ever returned. Set to `0` to disable pruning entirely.
 - `session_reconcile_on_resume`: when `true`, the engine re-runs the startup reconcile at the first cycle on each new ET trading day where streaming is back online (i.e., the first cycle past 7am ET). Catches positions that closed overnight via the Schwab app or broker-side stops — without this, an always-on bot would wake at 7am still believing those positions are open and try to manage phantoms. Honors the same `reconcile_on_startup` and `startup_reconcile_mode` knobs as the startup reconcile (no separate mode). Set to `false` to disable if you handle reconciliation externally or only run single-day sessions.
 - `cycle_precompute_workers`: thread-pool size used to precompute per-symbol indicator/structure context in parallel each engine cycle. Higher values reduce per-cycle latency on wide watchlists at the cost of CPU; lower values trade latency for less contention.
-- Cycle-scoped broker positions cache: `account_details` is fetched at most once per `step()` regardless of how many `broker_position_row` / `broker_position_rows` consumers (entry gatekeeper + exit recovery in position manager) run inside the cycle. Eliminates the N-fetches-per-cycle redundancy when many signals or positions overlap; failure latches per-cycle to avoid retry storms during Schwab outages. Mirrors the per-cycle FVG/OB/S-R caches in `data_feed.py`.
+- Orders whose outcome is unsettled: a live order that neither filled nor confirmed its cancel -- a MARKET exit left working through a halt, a cancel Schwab never acknowledged, a partial fill whose remainder may still be live -- is tracked (`working_exit_order` on the position for exits, `EntryGatekeeper.unsettled_entry_orders` for entries) and settled every management cycle from the order's own fills (`account_orders`, falling back to `order_details`). Nothing else is sent for that position or symbol while the order may still be live: fills are booked as they land (exits), adopted as a position or folded into the one a partial already opened (entries), and a live limit is re-cancelled so a fresh one can follow. This replaced a recovery that read broker *positions* through a snapshot cached once per cycle, which after the cycle's first order was already stale.
 - `max_consecutive_quote_failures`: per-symbol quote-fetch failure threshold. After a symbol fails this many consecutive quote refreshes (typically symbol-specific Schwab 401/403/404 such as restricted-security responses), it is silenced from quote refresh for the rest of the session. The counter resets on any successful fetch; the blacklist clears on bot restart. Set to `0` to disable (always retry — pre-2026-04-29 behavior). The default `5` catches symbol-specific permission errors without triggering on transient hiccups. Other endpoints (history, stream) for the same symbol are unaffected.
 - `export_session_archive`: when `true`, the engine writes a per-day archive to `{log_dir}/sessions/{YYYY-MM-DD}/` containing `bars/{SYMBOL}.csv` for every active watchlist symbol (RTH only, with indicators), `trades.csv` filtered to the day, and `manifest.json` with strategy + summary stats. The archive fires automatically once per ET trading day after the stream window closes (8 PM ET), so an always-on bot produces one archive per session without waiting for shutdown; shutdown still writes its own (potentially overwriting today's bundle with a fresher snapshot). Useful for trade audits and post-session analysis. Disable to save disk space if running without dashboard/analysis needs.
 
@@ -364,7 +385,7 @@ When the bot shuts down (auto-exit, manual interrupt, or non-trading day), it wr
 
   **NOT a backtest**: price movement only, with no stop, target, sizing or slippage. `favourable_pct` is not a win rate. Gates with fewer than `min_samples` (20) observations stay in `by_reason` but are excluded from the ranking, since a reason seen once has a "median" of that single observation.
 
-- **Persistent CSV**: `.logs/trades.csv` — one row per closed trade, appended across sessions. Columns: `date, symbol, strategy, side, qty, entry_price, exit_price, entry_time, exit_time, realized_pnl, return_pct, hold_minutes, reason, asset_type, partial_exit, fill_price_estimated, broker_recovered, regime, initial_risk_per_unit, max_favorable_pnl, max_adverse_pnl, entry_slippage_pct`.
+- **Persistent CSV**: `.logs/trades.csv` — one row per closed trade, appended across sessions. A trade's partial exits are folded into its row (quantity and P&L summed, prices quantity-weighted, the final exit's reason), so `partial_exit` is always false here and the session P&L, `trades.csv` and `manifest.json` agree with the account. Columns: `date, symbol, strategy, side, qty, entry_price, exit_price, entry_time, exit_time, realized_pnl, return_pct, hold_minutes, reason, asset_type, partial_exit, fill_price_estimated, broker_recovered, regime, initial_risk_per_unit, max_favorable_pnl, max_adverse_pnl, entry_slippage_pct`.
 
 The CSV file accumulates over time — open it in Excel or load with `pd.read_csv(".logs/trades.csv")` for multi-day analysis.
 
@@ -436,7 +457,10 @@ behaviour.
   issues a `replace_order` against the corresponding child. Required for any
   strategy whose edge is the in-trade ratchet (breakeven moves, profit locks,
   trailing). `bracket_replace_min_price_delta` debounces this so a per-cycle
-  trail does not burn the Schwab rate budget on sub-penny adjustments.
+  trail does not burn the Schwab rate budget on sub-penny adjustments. A
+  replace cancels the child and creates a NEW order; the bracket follows the
+  new id (the fill reconcile, later replaces, the cancel before an engine exit
+  and a restart's adoption all use it).
 
 **Two combinations are refused at config load**
 
@@ -551,6 +575,7 @@ Behavior:
 - `lookback_bars`: bars inspected when scanning for patterns.
 - `bullish_patterns` / `bearish_patterns`: allowed pattern lists. Shorter lists make the filter narrower.
 - Entry/exit toggles for opposing-pattern gating live in `shared_entry.use_opposing_chart_filter` and `shared_exit.use_chart_pattern_exit`.
+- Detection thresholds expressed as a percent of price (equal-high/low tolerance, minimum prior impulse, a flag's pole, breakout readiness) are sized for a mean 1m bar range of ~0.67% of price — small/mid-cap volatility — and scale down with the symbol's own bar range, floored at 0.1×. A name at or above that volatility uses them unchanged. Before 2026-09-22 they were fixed, which on liquid mega caps (~0.1% bars) made them ~7× too wide: one replayed session fired 7 patterns in 1,850 evaluations, 16 of 18 patterns never; 97 fires across 10 patterns after.
 
 ### `paper`
 
@@ -724,6 +749,7 @@ Higher-timeframe support/resistance, prior-day/week levels, FVG mapping, flip ha
 | `structure_ltf_weight`                    | `0.65`       |
 | `structure_htf_weight`                   | `0.85`       |
 | `structure_event_lookback_bars`          | `6`          |
+| `htf_structure_event_lookback_bars`      | `null`       |
 | `structure_min_range_atr_mult`           | `1.5`        |
 | `structure_min_pivot_gap_bars`           | `0`          |
 | `structure_ltf_timeframe_minutes`        | `0`          |
@@ -766,9 +792,10 @@ How the groups work:
 - Regime and structure:
   - `regime_weight` controls how strongly the S/R regime influences scoring.
   - `structure_enabled`, `structure_ltf_pivot_span`, `structure_eq_atr_mult`, `structure_ltf_weight`, `structure_htf_weight`, `structure_event_lookback_bars` control the mixed-timeframe structure layer. The CHoCH-exit toggle is `shared_exit.use_structure_exit`.
+  - `htf_structure_event_lookback_bars` (default `null` = same as `structure_event_lookback_bars`) — BOS/CHoCH freshness window for the HTF structure (the S/R context's `market_structure`, on `timeframe_minutes` bars), counted in HTF bars. `structure_event_lookback_bars` keeps counting LTF structure bars. They were one knob until 2026-09-22, so retuning the LTF window for a resampled LTF frame silently rescaled the HTF one too: top_tier's 8 → 4 for 5m bars halved its 15m HTF window from 120 to 60 minutes. top_tier_adaptive and small_cap_squeeze pin it to `8`.
   - `structure_min_range_atr_mult` (default `1.5`) — when both EQH and EQL flags are set AND the spread between `reference_high` and `reference_low` is below this ATR threshold, the structure-derived `bias` resolves to `"neutral"` instead of firing midpoint / pivot / recent-event bias. Prevents bias-based structure exits (`structure_bearish_exit` / `structure_bullish_exit`) from firing inside a tight consolidation where bias would flip on noise. Genuine BoS through `reference_high` / `reference_low` (price actually broke out) still fires bias unchanged — that check runs BEFORE the tight-range short-circuit. `eqh` / `eql` flags remain set so range-regime entries (which key on the EQ labels for mean-reversion setups) still see them. CHoCH exits unaffected. Set `0.0` to disable.
   - `structure_min_pivot_gap_bars` (default `0`) — minimum bar separation between consecutive *alternating* structure pivots. When `> 0`, an opposite-kind pivot that prints closer than this many bars to the prior kept pivot is treated as intra-leg noise and skipped, so the leg continues instead of registering a 1-2-bar swing. Suppresses the HH/LH/EQH/LL/HL/EQL churn (and the BOS/CHoCH/structure-exit signals keyed on those labels) that volatile names produce on a fine frame. The swings are still ATR-sized, so this is purely a temporal-density filter, not an amplitude one. `0` disables it (original behavior for every strategy that doesn't set it).
-  - `structure_ltf_timeframe_minutes` (default `0`) — resample the `"ltf"` structure frame to this many minutes before pivot analysis. The LTF structure context otherwise runs on the raw streaming frame (1m), which is finer than the regime-scoring LTF (`params.ltf_minutes`, often 5m) — making structure pivots ~5x denser than the bars the strategy actually trades on. When `> 0`, entry/exit/HTF-alignment all read structure off the coarser frame. `0` disables it (use the frame as-is). NOTE: raising this rescales every bar-based structure setting — `structure_event_lookback_bars` and `structure_exit_min_post_entry_pivots` are then in units of this timeframe, so lower them proportionally when enabling (e.g. `structure_event_lookback_bars` 6 → 3 for a 1m→5m switch).
+  - `structure_ltf_timeframe_minutes` (default `0`) — resample the `"ltf"` structure frame to this many minutes before pivot analysis. The LTF structure context otherwise runs on the raw streaming frame (1m), which is finer than the regime-scoring LTF (`params.ltf_minutes`, often 5m) — making structure pivots ~5x denser than the bars the strategy actually trades on. When `> 0`, entry/exit/HTF-alignment all read structure off the coarser frame. `0` disables it (use the frame as-is). NOTE: raising this rescales every bar-based structure setting — `structure_event_lookback_bars` and `structure_exit_min_post_entry_pivots` are then in units of this timeframe, so lower them proportionally when enabling (e.g. `structure_event_lookback_bars` 6 → 3 for a 1m→5m switch). `htf_structure_event_lookback_bars` counts HTF bars and is not rescaled — pin it before lowering the LTF window.
 - Structure-exit grace windows:
   - `structure_exit_grace_minutes` (default `10`) suppresses `structure_bearish_exit` / `structure_bullish_exit` for the first N minutes after entry. Prevents a minor EQL/LL pivot forming in the first few minutes from exiting an otherwise-healthy trade. CHoCH exits still fire.
   - `structure_exit_min_post_entry_pivots` (default `2`) requires at least N new LTF-structure pivots to form AFTER entry before structure-based bias exits can fire. Complements the time grace. (The LTF structure frame is 1m by default but follows `structure_ltf_timeframe_minutes` — so under a 5m structure these are 5m pivots and take proportionally longer to accumulate; lower this knob if the coarser frame holds losers too long.)
@@ -840,9 +867,29 @@ Optional technical overlays used as confluence, refinement, and exits.
 | `bollinger_enabled`                   | `true`                                  |
 | `bollinger_length`                    | `20`                                    |
 | `bollinger_std_mult`                  | `2.0`                                   |
-| `bollinger_squeeze_width_pct`         | `0.06`                                  |
+| `bollinger_squeeze_width_pct`         | `0.06` (see note)                       |
 | `bollinger_entry_bonus_midband`       | `0.16`                                  |
 | `bollinger_entry_penalty_outer_band`  | `0.22`                                  |
+
+> **Note on `bollinger_squeeze_width_pct`.** The value is a FRACTION of price
+> (`(bb_upper - bb_lower) / bb_mid`), not a percentage, and the width scales
+> with bar size and universe. Every preset sets it to the p25 of RTH BB(20,2)
+> widths on the timeframe that strategy builds its technical context on
+> (measured 2026-09-22 on archived bars):
+>
+> | Universe / timeframe | Value | Presets | `0.06` flagged |
+> |---|---|---|---|
+> | large caps, 1m | `0.0025` | top_tier and every other large-cap 1m preset (incl. `peer_confirmed_key_levels_1m`) | 99.9% |
+> | large caps, 5m LTF | `0.0061` | `peer_confirmed_htf_pivots` / `_trend_continuation` / `_key_levels` | 98.4% |
+> | SPY / QQQ, 1m | `0.0014` | both `zero_dte` presets | 100% |
+> | small caps, 1m | `0.076` | `small_cap_squeeze`, both `microcap` presets | 16.4% |
+>
+> The `0.06` code default only fits wide-banded small caps; everywhere else it
+> made `bollinger_squeeze` a constant. The flag is a hard gate for top_tier's
+> `range`, a scoring input for `vol_squeeze` and `volatility_squeeze_breakout`,
+> and while it is on it suppresses the Bollinger target cap and the weak-ADX
+> entry penalty. Re-measure rather than copy when a preset's universe or
+> timeframe changes.
 | `target_use_bollinger`                | `false`                                 |
 | `target_use_fib`                      | `true`                                  |
 | `target_use_channel`                  | `true`                                  |
@@ -936,6 +983,7 @@ Global exit-side helper toggles and tape-confirmation thresholds.
 | `use_channel_break`                | `true`       |
 | `use_bollinger_reject`             | `false`      |
 | `use_anchored_vwap_loss`           | `true`       |
+| `anchored_vwap_exit_require_two_bar_confirm` | `true` |
 | `use_chart_pattern_exit`           | `false`      |
 | `use_candle_pattern_exit`          | `false`      |
 | `use_structure_exit`               | `true`       |
@@ -959,6 +1007,7 @@ Behavior:
 - The `use_*` fields are booleans.
 - `use_technical_exit`: master enable for technical exits.
 - `use_trendline_break`, `use_channel_break`, `use_bollinger_reject`, `use_anchored_vwap_loss`: finer control over which technical exits are allowed.
+- `anchored_vwap_exit_require_two_bar_confirm`: require two consecutive closes through the anchored-VWAP floor (long) or ceiling (short) before the `anchored_vwap_loss_exit` / `anchored_vwap_reclaim_exit` fires. One bar through the level is ordinary noise in a trending stock. `false` fires on the first qualifying bar.
 - `use_chart_pattern_exit`: allow opposing chart patterns to help trigger exits.
 - `use_candle_pattern_exit`: fire `candle_pattern_exit:<pattern>` when an opposing-direction candle cluster crosses `candles.opposing_net_score_threshold` and the tape confirms (via `confirm_with_*` thresholds below). Reuses cached candle context.
 - `use_structure_exit`: allow CHOCH / structure-loss exits.
@@ -968,6 +1017,27 @@ Behavior:
 - `confirm_with_ema9`, `confirm_with_ema20`, `confirm_with_vwap`, `confirm_with_close_position`: tape-confirmation requirements applied before shared exits are accepted.
 - `bullish_close_position_max` / `bearish_close_position_min`: strict candle close-location thresholds used when confirming bearish exits from long trades or bullish exits from short trades.
 - `bullish_close_position_loose_max` / `bearish_close_position_loose_min`: looser fallback thresholds for the same confirmation family.
+
+### `events`
+
+Scheduled-event blackouts shared by every strategy, equity and options alike. Moved out of `options:` on 2026-09-18 (the old `options.event_blackout_file` / `options.event_blackouts` keys are gone).
+
+| Option                           | Code default               |
+|----------------------------------|----------------------------|
+| `enabled`                        | `true`                     |
+| `blackout_file`                  | `./macro_events.auto.yaml` |
+| `blackouts`                      | `[]`                       |
+| `earnings_file`                  | `./earnings.yaml`          |
+| `earnings`                       | `{}`                       |
+| `earnings_block_sessions_before` | `1`                        |
+| `earnings_block_sessions_after`  | `1`                        |
+
+Behavior:
+
+- `enabled`: master switch for both calendars.
+- `blackout_file` / `blackouts`: macro windows (CPI, FOMC, ...) from a YAML file and/or inline; both are loaded. Each row needs `start` and `end` (HH:MM, `runtime.timezone`) and can add `enabled`, `label`, `date` or `weekday`, `symbols`, `block_new_entries` (default `true`) and `force_flatten` (default `false`). `symbols: [...]` scopes a window to those tickers; without it the window applies to every symbol. The file is re-read when its mtime changes, so a blackout can be added to a running bot.
+- `earnings_file` / `earnings`: per-symbol earnings dates, `{SYMBOL: [YYYY-MM-DD, ...]}`, from a file and/or inline; both are merged.
+- `earnings_block_sessions_before` / `earnings_block_sessions_after`: trading sessions either side of an earnings date that block new entries (the date itself is always blocked). Weekends are skipped; market holidays count as sessions, which errs toward blocking one day too many.
 
 ### `options`
 
@@ -1018,8 +1088,6 @@ Shared 0DTE ETF option-engine settings. Both option strategies use this block.
 | `max_quote_age_seconds`          | `6`                                                                                                          |
 | `dry_run_replace_attempts`       | `2`                                                                                                          |
 | `dry_run_step_frac`              | `0.25`                                                                                                       |
-| `event_blackout_file`            | `./macro_events.auto.yaml`                                                                                   |
-| `event_blackouts`                | `[]`                                                                                                         |
 | `option_chain_cache_seconds`     | `6`                                                                                                          |
 | `option_chain_cache_max_entries` | `24`                                                                                                         |
 | `options_breakeven_enabled`      | `false`                                                                                                      |
@@ -1070,8 +1138,8 @@ Behavior and valid values:
 - Entry pricing:
   - `option_limit_mode` and `vertical_limit_mode` valid values are `mid`, `natural`, `bid`.
     - `mid`: price off mid when possible.
-    - `natural`: pay/receive the natural side first, then fall back.
-    - `bid`: price more defensively.
+    - `natural`: the side that fills now -- pay the ask when the order buys (a debit open, a credit close), take the bid when it sells (a credit open, a debit close) -- then fall back.
+    - `bid`: price more defensively: the passive side to open, the natural side to close, so an exit is never parked where it cannot fill.
 - Time controls:
   - `force_flatten_time`: 24-hour `HH:MM` time string used by option strategies to flatten before the close.
 - Volatility guards:
@@ -1084,10 +1152,7 @@ Behavior and valid values:
   - These make the bot re-check quotes before finalizing a trade.
 - Dry-run replace controls:
   - `dry_run_replace_attempts`, `dry_run_step_frac`
-- Macro-event blackout controls:
-  - `event_blackout_file`: YAML file with recurring or dated blackout windows.
-  - `event_blackouts`: inline list of blackout rows. File rows and inline rows are both loaded.
-  - Each blackout row can use: `enabled`, `label`, `date`, `weekday`, `start`, `end`, `block_new_entries`, `force_flatten`.
+- Macro-event blackouts are configured in the top-level [`events`](#events) block, which both option strategies read.
 - Chain cache:
   - `option_chain_cache_seconds`, `option_chain_cache_max_entries`
   - 0DTE strategies (`zero_dte_etf_options`, `zero_dte_etf_long_options`) parallel-prefetch chains for all qualifying candidates at the start of each `entry_signals` pass; the sequential per-candidate build loop then hits the warm cache. Size `option_chain_cache_max_entries` ≥ the number of underlyings you trade so prefetched chains aren't evicted before consumption.
@@ -1398,7 +1463,7 @@ Current package defaults:
 |---------------------------------------------------|---------------------------------|
 | `min_change_from_open`                            | `0.9`                           |
 | `max_change_from_open`                            | `7.5`                           |
-| `min_rvol`                                        | `1.35`                          |
+| `min_rvol`                                        | `1.0`                           |
 | `min_bars`                                        | `60`                            |
 | `squeeze_lookback_bars`                           | `16`                            |
 | `squeeze_baseline_bars`                           | `22`                            |
@@ -1414,9 +1479,9 @@ Current package defaults:
 | `require_vwap_alignment`                          | `True`                          |
 | `require_avwap_alignment`                         | `True`                          |
 | `prefer_bollinger_squeeze_flag`                   | `True`                          |
-| `target_rr`                                       | `2.05`                          |
+| `target_rr`                                       | `1.95`                          |
 | `runner_enabled`                                  | `True`                          |
-| `runner_target_rr`                                | `2.4`                           |
+| `runner_target_rr`                                | `2.6`                           |
 | `entry_exhaustion_filter_enabled`                 | `True`                          |
 | `max_entry_vwap_extension_atr`                    | `0.88`                          |
 | `max_entry_ema9_extension_atr`                    | `0.68`                          |
@@ -1513,7 +1578,7 @@ Current package defaults:
 |-----------------------------------|---------------------------------|
 | `min_day_strength`                | `6.0`                           |
 | `max_day_strength`                | `16.5`                          |
-| `min_rvol`                        | `3.0`                           |
+| `min_rvol`                        | `2.5` (preset: `3.0`)           |
 | `max_pullback_from_high`          | `0.05`                          |
 | `min_reversal_close_position`     | `0.6`                           |
 | `require_positive_reversal_ret5`  | `True`                          |
@@ -1668,7 +1733,7 @@ Strategy-specific knobs:
   - `min_peer_agreement`, `min_peer_score`
   - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`
 - R:R and adaptive management:
-  - `min_rr`, `target_rr`, `runner_target_rr`, `stop_buffer_atr_mult`
+  - `min_rr`, `target_rr`, `stop_buffer_atr_mult`
   - `strong_setup_runner_enabled`, `adaptive_breakeven_rr`, `adaptive_profit_lock_rr`, `adaptive_profit_lock_stop_rr`, `adaptive_runner_trigger_rr`
 - Context overlays:
   - `htf_fvg_entry_weight`, `ltf_fvg_entry_weight`, `opposing_fvg_entry_penalty_mult`, `fvg_runner_rr_bonus`
@@ -1720,7 +1785,6 @@ Current package defaults:
 | `max_extension_from_ema9_atr`     | `0.88`                                    |
 | `min_rr`                          | `1.8`                                     |
 | `target_rr`                       | `2.05`                                    |
-| `runner_target_rr`                | `2.45`                                    |
 | `stop_buffer_atr_mult`            | `0.5`                                     |
 | `strong_setup_runner_enabled`     | `True`                                    |
 | `adaptive_breakeven_rr`           | `0.92`                                    |
@@ -1737,7 +1801,7 @@ Current package defaults:
 | `macro_miss_penalty`              | `0.3`                                     |
 | `extension_penalty_per_atr`       | `0.72`                                    |
 | `extension_hard_cap_mult`         | `1.45`                                    |
-| `force_flatten`                   | `{'long': False, 'short': False}`         |
+| `force_flatten`                   | `{long: true, short: true}` (preset: both `false`) |
 
 ### `peer_confirmed_key_levels`
 
@@ -1830,7 +1894,7 @@ Current package defaults:
 | `adaptive_profit_lock_rr`            | `1.25`                                    |
 | `adaptive_profit_lock_stop_rr`       | `0.32`                                    |
 | `adaptive_runner_trigger_rr`         | `1.12`                                    |
-| `force_flatten`                      | `{'long': False, 'short': False}`         |
+| `force_flatten`                      | `{long: true, short: true}` (preset: long `false`, short `true`) |
 
 ### `peer_confirmed_key_levels_1m`
 
@@ -1907,7 +1971,7 @@ Current package defaults:
 | `adaptive_profit_lock_rr`            | `1.08`                                    |
 | `adaptive_profit_lock_stop_rr`       | `0.28`                                    |
 | `adaptive_runner_trigger_rr`         | `1.02`                                    |
-| `force_flatten`                      | `{'long': False, 'short': False}`         |
+| `force_flatten`                      | `{long: true, short: true}` (preset: long `false`, short `true`) |
 
 ### `peer_confirmed_htf_pivots`
 
@@ -1942,7 +2006,7 @@ Strategy-specific knobs:
   - `entry_exhaustion_filter_enabled`, `max_entry_vwap_extension_atr`, `max_entry_ema9_extension_atr`, `max_entry_bar_range_atr`, `max_entry_upper_wick_frac`, `max_entry_lower_wick_frac`
   - `use_sr_veto` (disabled by default so the strategy stays anchored to the HTF pivot model rather than generic S/R vetoes)
 - R:R and adaptive management:
-  - `min_rr`, `target_rr`, `runner_target_rr`, `stop_buffer_atr_mult`
+  - `min_rr`, `target_rr`, `stop_buffer_atr_mult`
   - `strong_setup_runner_enabled`, `adaptive_breakeven_rr`, `adaptive_profit_lock_rr`, `adaptive_profit_lock_stop_rr`, `adaptive_runner_trigger_rr`
 - Context overlays:
   - `htf_fvg_entry_weight`, `ltf_fvg_entry_weight`, `opposing_fvg_entry_penalty_mult`, `fvg_runner_rr_bonus`
@@ -2006,7 +2070,6 @@ Current package defaults:
 | `max_entry_lower_wick_frac`                    | `0.3`                                           |
 | `min_rr`                                       | `1.65`                                          |
 | `target_rr`                                    | `1.95`                                          |
-| `runner_target_rr`                             | `2.45`                                          |
 | `stop_buffer_atr_mult`                         | `0.5`                                           |
 | `strong_setup_runner_enabled`                  | `True`                                          |
 | `adaptive_breakeven_rr`                        | `0.9`                                           |
@@ -2024,7 +2087,7 @@ Current package defaults:
 
 ### `top_tier_adaptive`
 
-Purpose: multi-regime adaptive strategy for a fixed universe of 23 top-tier liquid stocks across six Tier 1 GICS sectors: Technology (AAPL, MSFT, NVDA, INTC, AMD, AVGO, TSM, CRM), Consumer Discretionary (AMZN, TSLA, HD, LOW, UBER), Communication Services (GOOG, META, NFLX, RBLX, TMUS), Financials (JPM, GS, V), Healthcare (LLY), Consumer Staples (COST). Six regimes compete in a flat score-ordered build queue: trend, pullback, range, vol_squeeze, momentum, sr_scalp — each independently togglable via `disable_*_regime` knobs.
+Purpose: multi-regime adaptive strategy for a fixed universe of 25 mega-cap Tech / AI stocks in three co-movement groups: `ai_hardware` (NVDA, AVGO, AMD, TSM, MU, QCOM, ARM, MRVL, INTC, ANET, VRT, DELL), `platforms` (AAPL, MSFT, GOOG, AMZN, META, NFLX, ORCL, TSLA) and `software` (CRM, ADBE, NOW, PLTR, PANW). Six regimes compete in a flat score-ordered build queue: trend, pullback, range, vol_squeeze, momentum, sr_scalp — each independently togglable via `disable_*_regime` knobs.
 
 Default windows:
 
@@ -2035,8 +2098,8 @@ Default windows:
 Strategy-specific knobs:
 
 - `tradable`: the fixed list of symbols to trade.
-- `index_symbols`: index ETFs streamed for directional confirmation. The default ships with the canonical SPDR Select Sector ETFs that match the default tradable universe's GICS sectors (XLK / XLC / XLY / XLF / XLV / XLP). Pair with `sector_index_map` (below) to control which ETFs confirm which symbols.
-- `sector_index_map`: per-sector mapping from GICS sector name (matches `sector_groups` keys) → list of index ETFs to consult when confirming trades on symbols in that sector. Default: each sector maps to its canonical SPDR Select Sector ETF (`tech: [XLK]`, `energy: [XLE]`, ...). Materials defaults to `[XLB, GDX, COPX]` because XLB is dominated by chemicals (LIN/SHW/APD/ECL) — pure miners (NEM gold / FCX copper) correlate more with GDX/COPX. OR semantics across the list: a NEM LONG passes when GDX is bullish even if XLB is flat. When the map is omitted entirely, the bot falls back to OR-ing across the entire `index_symbols` list (legacy behavior).
+- `index_symbols`: index ETFs streamed for directional confirmation — `SMH`, `IGV`, `XLK`, one per group. Every ETF referenced by `sector_index_map` must be listed here so its bars are streamed. Pair with `sector_index_map` (below) to control which ETFs confirm which symbols.
+- `sector_index_map`: group name (matches `sector_groups` keys) → list of index ETFs to consult when confirming trades on symbols in that group. Default `ai_hardware: [SMH]`, `platforms: [XLK]`, `software: [IGV]`. OR semantics across a list. Every group has at least `index_breadth_min_peers` members, so peer breadth is the live confirmation path and the ETF is consulted only when peer bars are missing. A group with no entry falls back to OR-ing across the whole `index_symbols` list.
 - `require_index_confirmation`: gate trend/pullback/vol_squeeze/momentum entries on index agreement. Range and sr_scalp are exempt (mean-reversion theses).
 - `min_trend_score` / `min_pullback_score` / `min_range_score` / `min_vol_squeeze_score` / `min_momentum_score` / `min_sr_scalp_score`: minimum regime score to qualify.
 - `min_pullback_trend_score`: minimum trend score required before pullback scoring begins.
@@ -2046,7 +2109,7 @@ Strategy-specific knobs:
 - `orb_end_time` / `midday_start_time` / `midday_end_time` / `afternoon_start_time` / `no_new_entries_after`: time-of-day regime window boundaries (all eight regimes use these — no hard-coded times).
 - `disable_trend_regime` / `disable_pullback_regime` / `disable_range_regime` / `disable_vol_squeeze_regime` / `disable_momentum_regime` / `disable_sr_scalp_regime`: per-regime opt-out flags (all default `false`).
 - `disable_orb_window`: whole-window opt-out for the 09:35 → `orb_end_time` ORB window (default `false`). Different from `orb_bypass_*` flags which loosen filters within the window — this skips it entirely.
-- `sector_groups`: GICS sector groupings - ETF routing (`sector_index_map`) and the peer list for breadth confirmation.
+- `sector_groups`: co-movement groupings - ETF routing (`sector_index_map`) and the peer list for breadth confirmation.
 - `correlation_groups`: coarser risk groupings for the concentration guard (mega caps across tech/communication/consumer-discretionary trade as one beta book, so they share one bucket).
 - `max_same_correlation_group_same_direction`: max same-direction positions per correlation group.
 
@@ -2064,9 +2127,9 @@ Current code defaults:
 
 | Option                            | Default                                                                                |
 |-----------------------------------|----------------------------------------------------------------------------------------|
-| `tradable`                        | `AAPL, MSFT, NVDA, INTC, AMD, AVGO, TSM, CRM, AMZN, TSLA, HD, LOW, UBER, COST, GOOG, META, NFLX, RBLX, TMUS, JPM, GS, V, LLY` |
-| `index_symbols`                   | `XLK, XLC, XLY, XLF, XLV, XLP`                                                         |
-| `sector_index_map`                | `{tech: [XLK], consumer_discretionary: [XLY], communication: [XLC], financials: [XLF], healthcare: [XLV], industrials: [XLI], energy: [XLE], consumer_staples: [XLP], materials: [XLB, GDX, COPX], real_estate: [XLRE], utilities: [XLU]}` |
+| `tradable`                        | `AAPL, MSFT, GOOG, AMZN, META, NFLX, ORCL, TSLA, NVDA, AVGO, AMD, TSM, MU, QCOM, ARM, MRVL, INTC, ANET, VRT, DELL, CRM, ADBE, NOW, PLTR, PANW` |
+| `index_symbols`                   | `SMH, IGV, XLK`                                                                        |
+| `sector_index_map`                | `{ai_hardware: [SMH], platforms: [XLK], software: [IGV]}`                              |
 | `require_index_confirmation`      | `true`                                                                                 |
 | `min_bars`                        | `150`                                                                                  |
 | `ltf_minutes`       | `1`                                                                                    |
@@ -2075,7 +2138,7 @@ Current code defaults:
 | `min_trend_score`                 | `3.5`                                                                                  |
 | `min_pullback_score`              | `3.5`                                                                                  |
 | `min_pullback_trend_score`        | `3.0`                                                                                  |
-| `min_range_score`                 | `3.5`                                                                                  |
+| `min_range_score`                 | `4.0`                                                                                  |
 | `min_vol_squeeze_score`           | `4.0`                                                                                  |
 | `min_momentum_score`              | `4.0`                                                                                  |
 | `min_sr_scalp_score`              | `3.0`                                                                                  |

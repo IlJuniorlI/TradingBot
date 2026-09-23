@@ -71,7 +71,7 @@ risk:
   time_stop_min_return_pct: 0.003
   # Peak-giveback floor: once max_favorable_r since entry crosses
   # peak_giveback_min_r (default 1.0), exit when current_r retraces below
-  # a tiered fraction of the peak — 50% at 1R-2R, 40% at 2R-3R, 30% at 3R+.
+  # a tiered fraction of the peak (the peak_giveback_retain_* keys below).
   # Protects 1R+ winners from becoming losers (AMZN +$62→-$13, INTC
   # +$95→-$3 on 2026-04-17 are exactly this failure mode).
   peak_giveback_enabled: true
@@ -96,11 +96,31 @@ risk:
   peak_giveback_retain_1to2r: 0.65
   peak_giveback_retain_2to3r: 0.72
   peak_giveback_retain_3r_plus: 0.78
+  # Sizing pads the stop distance by an expected-slippage amount so a fill
+  # that slips by up to it still lands inside the risk budget: the live
+  # spread times entry_slippage_allowance_spread_frac, capped at
+  # entry_slippage_allowance_max_pct of price. Spread frac 0.0 = size on the
+  # raw stop distance.
+  entry_slippage_allowance_spread_frac: 1.0
+  entry_slippage_allowance_max_pct: 0.002
+  # Post-fill checks (log + stamp the position, never reject — the shares
+  # are already bought): realized risk more than risk_overage_warn_frac over
+  # budget, and entry slippage beyond entry_slippage_warn_pct of the signal.
+  risk_overage_warn_frac: 0.15
+  entry_slippage_warn_pct: 0.0015
+  # max_daily_loss gates new entries. When true, open positions' remaining
+  # risk to their CURRENT stop counts against it, so entries stop once the
+  # worst case would breach the limit (a stop at breakeven contributes 0).
+  daily_loss_includes_open_risk: true
 
 # Runtime cadence, streaming, reconciliation, and logging controls.
 runtime:
   timezone: America/New_York
   loop_sleep_seconds: 2.0
+  # After this many consecutive failed cycles the engine logs a CRITICAL
+  # naming the open positions and the dashboard shows an alarm (the backoff
+  # itself never gives up). 0 = no escalation.
+  error_escalation_cycles: 10
   history_poll_seconds: 300
   quote_poll_seconds: 6
   quote_cache_seconds: 6
@@ -108,6 +128,9 @@ runtime:
   history_lookback_minutes: 780
   use_extended_hours_history: true
   use_rth_session_indicators: true
+  # Session window the per-session VWAP/EMA reset keys off: "rth"
+  # (09:30-16:00) or "extended" (07:00-20:00, for pre/post-market entries).
+  equity_session_indicator_window: rth
   warmup_minutes: 150
   prewarm_before_windows_minutes: 15
   log_dir: .logs
@@ -163,6 +186,24 @@ execution:
   entry_live_reprice_step_frac: 0.33
   extended_hours_enabled: true
   market_exit_regular_hours: false
+  # Broker-side bracket orders: the entry goes out as a Schwab TRIGGER order
+  # whose child OCO rests the protective stop (and optionally the target) at
+  # the broker. Off = fully engine-managed exits.
+  bracket_orders_enabled: false
+  # static = submit once, never touch; replace = every engine stop/target
+  # move replaces the child (required for adaptive / adaptive_ladder).
+  bracket_sync_mode: static
+  # stop_and_target | stop_only (stop_only is required for adaptive_ladder,
+  # which rolls past targets and clears the final one for a runner).
+  bracket_legs: stop_and_target
+  # STOP_LIMIT bounds slippage at the cost of a no-fill tail; STOP always fills.
+  bracket_stop_order_type: STOP_LIMIT
+  bracket_stop_limit_offset_r: 0.5
+  # Schwab rejects STOP orders outside the NORMAL session; true rejects a
+  # bracketed pre/post-market entry instead of sending it naked.
+  bracket_require_normal_session: true
+  # replace mode: skip a replace unless a level moved at least this many $.
+  bracket_replace_min_price_delta: 0.01
 
 # Candle-pattern inputs used by strategies that support them.
 candles:
@@ -174,6 +215,11 @@ candles:
     - bearish_1c
     - bearish_2c
     - bearish_3c
+  # Minimum opposing net_score that blocks an entry / fires an exit. 0.70 is
+  # the "solid" tier (2+ corroborating candles). Used by
+  # shared_entry.use_opposing_candle_filter and shared_exit.use_candle_pattern_exit.
+  opposing_net_score_threshold: 0.7
+
 # Higher-level chart-pattern detection and entry filters.
 chart_patterns:
   enabled: true
@@ -339,6 +385,13 @@ support_resistance:
   structure_ltf_weight: 0.65
   structure_htf_weight: 0.95
   structure_event_lookback_bars: 8
+  # BOS/CHoCH freshness window for the HTF structure (the S/R context's
+  # market_structure, on `timeframe_minutes` bars), in HTF bars. Omit / null
+  # = same as structure_event_lookback_bars. Set it when you retune the LTF
+  # window for a resampled LTF frame (structure_ltf_timeframe_minutes below):
+  # the two knobs were one until 2026-09-22, and halving the LTF value
+  # silently halved the HTF window with it.
+  htf_structure_event_lookback_bars: null
   # Minimum bar separation between alternating structure pivots (Fix B,
   # 2026-05-27). 0 = off (original behavior). When > 0, an alternating
   # H<->L closer than this many bars is treated as noise within the leg
@@ -349,7 +402,8 @@ support_resistance:
   # bars). Set to your params.ltf_minutes (e.g. 5) so structure tracks the
   # bars you trade. NOTE: raising this rescales all bar-based structure
   # settings (structure_event_lookback_bars etc.) into the new timeframe —
-  # lower them proportionally.
+  # lower them proportionally. htf_structure_event_lookback_bars counts HTF
+  # bars and is unaffected; pin it before lowering the LTF window.
   structure_ltf_timeframe_minutes: 0
   # Tight-range detector (2026-05-14): when EQH and EQL coexist within
   # < N×ATR of each other, structure-derived bias resolves to "neutral"
@@ -393,6 +447,11 @@ technical_levels:
   fib_lookback_bars: 120
   fib_min_impulse_atr: 1.25
   fib_near_extension_pct: 0.0055
+  # Anchored-VWAP anchor search. null = reuse the fib settings above
+  # (fib_lookback_bars / fib_min_impulse_atr) and the structure pivot span.
+  anchored_vwap_impulse_lookback_bars: null
+  anchored_vwap_min_impulse_atr: null
+  anchored_vwap_pivot_span: null
   channel_enabled: false
   channel_lookback_bars: 120
   channel_min_touches: 3
@@ -431,9 +490,11 @@ technical_levels:
   divergence_obv_min_volume_frac: 0.65
   divergence_counter_rsi_penalty: 0.12
   divergence_counter_obv_penalty: 0.1
+  # Block the entry outright when RSI and OBV BOTH diverge against it.
+  divergence_block_dual_counter: true
   # Multi-pivot divergence detection (added with the levels_shared.find_divergence
   # refactor): walk the last N pivots and return the most recent qualifying
-  # pair, gated by max-age in bars so stale divergences don'''t dominate.
+  # pair, gated by max-age in bars so stale divergences don't dominate.
   divergence_pivot_lookback: 4
   divergence_max_age_bars: 8
   divergence_min_price_move_pct: 0.0015
@@ -447,7 +508,17 @@ technical_levels:
   bollinger_enabled: true
   bollinger_length: 20
   bollinger_std_mult: 2.0
-  bollinger_squeeze_width_pct: 0.06
+  # FRACTION of price: `bollinger_width_pct` is (bb_upper - bb_lower) / bb_mid.
+  # Calibrate it to the p25 of RTH widths on the timeframe the strategy builds
+  # its technical context on -- the width scales with bar size and universe.
+  # Measured 2026-09-22 on archived bars (BB(20,2), RTH):
+  #   large caps, 1m ........ 0.0025  (0.06 flagged 99.8% of bars)
+  #   large caps, 5m LTF .... 0.0061  (0.06 flagged 98.4%)
+  #   SPY / QQQ, 1m ......... 0.0014  (0.06 flagged 100%)
+  #   small caps, 1m ........ 0.076   (0.06 flagged 16.4%; thin sample)
+  # This example runs peer_confirmed_htf_pivots on a 5m LTF, hence 0.0061.
+  # The code default (0.06) only fits wide-banded small caps.
+  bollinger_squeeze_width_pct: 0.0061
   bollinger_entry_bonus_midband: 0.16
   bollinger_entry_penalty_outer_band: 0.22
   target_use_bollinger: false
@@ -487,18 +558,30 @@ shared_entry:
   # entering with collapsed R:R when a nearby level happens to sit right
   # above (for longs) or below (for shorts) the entry price.
   min_target_rr: 1.0
+  use_opposing_candle_filter: false
+  # Absolute stop-distance floor, in ATR14 units. The S/R and technical stop
+  # refinements can pull a stop TOWARD entry, and min_target_rr cannot police
+  # that (a tighter stop raises R:R). This only refuses to TIGHTEN a stop
+  # inside the floor; a builder that deliberately set a closer stop keeps it.
+  min_stop_atr_mult: 1.5
 
 # Shared exit and management settings used across strategies.
-  use_opposing_candle_filter: false
 shared_exit:
   use_technical_exit: true
   use_trendline_break: true
   use_channel_break: true
   use_bollinger_reject: false
   use_anchored_vwap_loss: true
+  # Require two consecutive closes through the anchored VWAP before the
+  # anchored_vwap_loss / _reclaim exit fires (one bar through is noise).
+  anchored_vwap_exit_require_two_bar_confirm: true
   use_chart_pattern_exit: false
   use_structure_exit: true
   use_sr_loss_exit: true
+  # Minimum open profit (R) before the discretionary exits (structure,
+  # technical, S/R break) may fire; below it the protective stop governs.
+  # CHoCH exits are exempt. 0 = un-gated.
+  discretionary_exit_min_r: 0.5
   # Counter-direction REGULAR divergence forming on a held position.
   # Hidden divergence is continuation context and never triggers exit.
   use_divergence_exit_signal: false
@@ -513,9 +596,10 @@ shared_exit:
   bearish_close_position_min: 0.54
   bullish_close_position_loose_max: 0.38
   bearish_close_position_loose_min: 0.62
-
-# Options-mode filters, pricing, and contract-selection controls.
+  # Fire candle_pattern_exit when an opposing candle cluster crosses
+  # candles.opposing_net_score_threshold and the tape confirms.
   use_candle_pattern_exit: false
+
 # Scheduled-event blackouts, shared by every strategy (equity and options).
 # Moved out of `options:` 2026-09-18 — the calendar used to be reachable only
 # from the 0DTE options strategy, so equity strategies had no macro-event
@@ -535,6 +619,7 @@ events:
   earnings_block_sessions_before: 1
   earnings_block_sessions_after: 1
 
+# Options-mode filters, pricing, and contract-selection controls.
 options:
   enabled: true
   underlyings:
@@ -558,6 +643,9 @@ options:
   max_leg_spread_dollars: 0.08
   max_net_spread_pct: 0.2
   max_net_spread_price: 2.8
+  # Net price as a fraction of the spread's strike width (a credit wider than
+  # the spread itself books a max loss of zero). 0.0 disables.
+  max_net_price_frac_of_width: 0.9
   min_net_mid_price: 0.25
   target_long_delta: 0.38
   target_short_delta: 0.23
@@ -578,7 +666,16 @@ options:
   single_target_mult: 1.5
   force_flatten_time: "15:18"
   max_vix: 22.5
+  # Long-premium VIX floor (0.0 = off; ~12 skips dead-grind tape).
+  min_vix: 0.0
   vix_spike_pct: 0.011
+  # IV-rank gate: VIX's position inside the 52-week range you supply here
+  # (refresh quarterly). 0.0 = at vix_52w_low, 1.0 = at vix_52w_high.
+  # min 0.0 / max 1.0 = disabled.
+  vix_52w_low: 12.0
+  vix_52w_high: 30.0
+  min_iv_rank: 0.0
+  max_iv_rank: 1.0
   vertical_limit_mode: mid
   quote_stability_checks: 3
   quote_stability_pause_ms: 500
@@ -716,7 +813,6 @@ strategies:
       pivot_zone_atr_mult: 0.24
       pivot_zone_pct: 0.0018
       require_macro_agreement_count: 1
-      runner_target_rr: 2.45
       # FVG scoring penalty applied when a same-direction fair-value gap has
       # been filled/invalidated. Defaults to opposing_fvg_active_penalty * 0.85
       # when omitted. A filled continuation gap is a weaker directional signal

@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import logging
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from threading import RLock
-from typing import Any
+from typing import Any, Iterable
 
 from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side
 from .utils import TRADEFLOW_LEVEL, now_et, register_tradeflow_logging_level
@@ -76,6 +77,55 @@ class TradeRecord:
     # are indistinguishable in trades.csv.
     armed_retest_status: str | None = None
     armed_retest_waited_minutes: float | None = None
+
+
+def closed_trade_lifecycles(trades: Iterable[Any]) -> list[Any]:
+    """One record per CLOSED trade, its exit slices folded together.
+
+    ``record_exit`` books every exit slice on its own -- a partial exit fill,
+    a broker-recovered remainder, a bracket child that filled part of the
+    position -- and only the last slice carries ``final_exit``. Reports that
+    kept just that slice dropped the earlier slices' P&L (100 shares out as
+    40 + 60 at +$1: $100 realized, $60 reported, in the EOD report,
+    trades.csv and the manifest alike) and judged the trade a win or loss on
+    its last slice alone.
+
+    Slices group by ``lifecycle_id`` (position key + entry time). A
+    lifecycle with no final slice is still open and is left out. Quantities
+    and P&L sum; entry and exit prices are quantity-weighted; the reason,
+    exit time and diagnostics are the final slice's. A single-slice trade is
+    returned as-is. Output follows the input order of each lifecycle's first
+    appearance -- newest first for ``PaperAccount.trades``.
+    """
+    groups: dict[Any, list[Any]] = {}
+    for trade in trades:
+        key = getattr(trade, "lifecycle_id", None) or ("__unkeyed__", id(trade))
+        groups.setdefault(key, []).append(trade)
+    closed: list[Any] = []
+    for group in groups.values():
+        final = next((t for t in group if bool(getattr(t, "final_exit", True))), None)
+        if final is None:
+            continue
+        if len(group) == 1:
+            closed.append(final)
+            continue
+        qty = sum(int(t.qty) for t in group)
+        entry_price = sum(float(t.entry_price) * int(t.qty) for t in group) / qty
+        exit_price = sum(float(t.exit_price) * int(t.qty) for t in group) / qty
+        closed.append(dataclasses.replace(
+            final,
+            qty=qty,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            realized_pnl=sum(float(t.realized_pnl) for t in group),
+            return_pct=_return_pct(Side(final.side), entry_price, exit_price),
+            partial_exit=False,
+            final_exit=True,
+            remaining_qty_after_exit=0,
+            fill_price_estimated=any(bool(t.fill_price_estimated) for t in group),
+            broker_recovered=any(bool(t.broker_recovered) for t in group),
+        ))
+    return closed
 
 
 @dataclass(slots=True)
@@ -431,7 +481,7 @@ class PaperAccount:
                 self.equity_curve[-1] = point
 
             trade_events = list(self.trades)
-            closed = [trade for trade in trade_events if bool(getattr(trade, "final_exit", True))]
+            closed = closed_trade_lifecycles(trade_events)
             wins = sum(1 for trade in closed if trade.realized_pnl > 0)
             losses = sum(1 for trade in closed if trade.realized_pnl < 0)
             gross_profit = sum(trade.realized_pnl for trade in closed if trade.realized_pnl > 0)

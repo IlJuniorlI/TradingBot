@@ -41,13 +41,19 @@ def pivot_points(
     ``(positional_index, timestamp, price)`` — used by callers that need
     to anchor levels to the bar index for downstream age computation.
 
-    The strict-equality + uniqueness check (``hi == max(hi_window) and
-    hi_window.count(hi) == 1``) discards plateaus where multiple bars
-    share the extreme — only true pivots count, matching how a trader
-    visually identifies a high/low. Shared by ``htf_levels._pivot_points``
-    and ``support_resistance._pivot_points`` so the pivot-detection
-    semantics can't drift between the two builders (the kind of bug we
-    debugged through the AMD/INTC support-list mismatch).
+    A bar is a pivot when it holds its window's extreme and no bar in the
+    LEFT half of the window ties it: a run of bars that share the extreme
+    (a flat top, a two-bar bottom) is ONE pivot, at its first bar. Until
+    2026-09-22 a tie anywhere in the window disqualified every bar in it,
+    so a swing whose extreme printed twice registered no pivot at all --
+    4.4% of swing highs/lows on archived 5m RTH bars (180 of ~4,130 over
+    138 symbol-days), exact penny ties that are routine at a round number.
+    A V-bottom that tied lost its low entirely and market structure fell
+    back to an older pivot as the reference low. Shared by
+    ``htf_levels._pivot_points`` and ``support_resistance._pivot_points``
+    so the pivot-detection semantics can't drift between the two builders
+    (the kind of bug we debugged through the AMD/INTC support-list
+    mismatch).
     """
     highs: list = []
     lows: list = []
@@ -72,9 +78,9 @@ def pivot_points(
         lo = lows_arr[i]
         hi_window = highs_arr[i - span : i + span + 1]
         lo_window = lows_arr[i - span : i + span + 1]
-        if hi == max(hi_window) and hi_window.count(hi) == 1:
+        if hi == max(hi_window) and hi not in hi_window[:span]:
             highs.append((i, idxs[i], float(hi)) if include_idx else (idxs[i], float(hi)))
-        if lo == min(lo_window) and lo_window.count(lo) == 1:
+        if lo == min(lo_window) and lo not in lo_window[:span]:
             lows.append((i, idxs[i], float(lo)) if include_idx else (idxs[i], float(lo)))
     return highs, lows
 
@@ -486,9 +492,11 @@ def prior_week_levels(frame: pd.DataFrame) -> tuple[float | None, float | None]:
 #   hidden bearish: at pivot highs, price prints LH but indicator prints
 #       HH. Continuation in a downtrend.
 #
-# The detector walks pairs (a, b) in the most recent ``pivot_lookback``
-# pivots and returns the most recent qualifying pair (highest j), filtered
-# by ``max_age_bars`` (how many bars old the latest pivot can be).
+# ``b`` is always the most recent pivot (and must be within
+# ``max_age_bars``); ``a`` is the nearest earlier pivot, within
+# ``pivot_lookback``, that satisfies the price half of the pattern, and a
+# pivot in between that contradicts it means there is no divergence. See
+# ``find_divergence`` for why it is the nearest and not merely any.
 # ---------------------------------------------------------------------------
 
 
@@ -613,6 +621,35 @@ def _pivot_indicator_value(indicator: pd.Series, pos: int) -> float | None:
     return float(value)
 
 
+def _b_above_a(kind: str, direction: str) -> bool:
+    """Does the pattern need the latest pivot ``b`` ABOVE the earlier ``a``?
+    Regular bearish (HH) and hidden bullish (HL) do; regular bullish (LL) and
+    hidden bearish (LH) need it below."""
+    return (kind == "regular") == (direction == "bearish")
+
+
+def _price_condition(*, kind: str, direction: str, price_a: float, price_b: float,
+                     price_move_frac: float) -> bool:
+    """The price half of ``_qualifies`` -- does ``b`` make the swing the
+    pattern needs against ``a``, by at least ``price_move_frac``?"""
+    if _b_above_a(kind, direction):
+        return price_b > price_a * (1.0 + price_move_frac)
+    return price_b < price_a * (1.0 - price_move_frac)
+
+
+def _contradicts(*, kind: str, direction: str, price_a: float, price_b: float) -> bool:
+    """Is ``a`` on the wrong side of ``b`` for this pattern -- so that, against
+    the swing ``a`` marks, ``b`` made the OPPOSITE move to the one claimed?
+
+    Regular bullish: a lower low than ``b`` (``b`` is not the extreme).
+    Hidden bullish: a higher low than ``b`` (``b`` broke it -- not a higher
+    low). The bearish two mirror them. A pivot on the right side of ``b`` but
+    inside ``price_move_frac`` is neither: it is noise, and skipped."""
+    if _b_above_a(kind, direction):
+        return price_a > price_b
+    return price_a < price_b
+
+
 def _qualifies(
     *,
     kind: str,
@@ -663,19 +700,36 @@ def find_divergence(
     max_age_bars: int,
     last_bar_pos: int,
 ) -> DivergenceMatch | None:
-    """Walk recent pivots and return the most recent qualifying pair.
+    """Divergence between the latest swing and the swing it is measured
+    against, or None.
 
-    ``points`` is a list of ``(pos, ts, price)`` tuples — pivot lows for
-    bullish patterns, pivot highs for bearish patterns. The caller is
-    responsible for picking the right list per direction.
+    ``points`` is a list of ``(pos, ts, price)`` tuples -- pivot lows for
+    bullish patterns, pivot highs for bearish ones.
 
-    Algorithm: take the last ``pivot_lookback`` points (most recent first
-    after slicing). Walk pairs (a, b) where a is older and b is more recent.
-    Return the match with the most recent ``b`` whose ``last_bar_pos -
-    b.pos`` is within ``max_age_bars``.
+    ``b`` is the MOST RECENT pivot, and it must be within ``max_age_bars``.
+    A newer pivot that does not diverge supersedes an older one that did:
+    reporting the older one would describe a state the tape has moved past.
 
-    Returns None if no pair qualifies, or if the indicator series is missing
-    a value at either pivot position.
+    ``a`` is the NEAREST earlier pivot (within ``pivot_lookback``) that
+    satisfies the price half of the pattern, and only that pair has its
+    indicator tested. Pivots nearer than it that miss the minimum price move
+    are skipped as noise. A pivot on the WRONG side of ``b`` ends the scan
+    with no divergence (``_contradicts``): for regular divergence ``b`` is then
+    not the extreme of the swing, and for hidden divergence ``b`` broke the
+    swing it would be a higher low (or lower high) against. The regular half
+    of that rule landed first; hidden divergence kept skipping such pivots,
+    so lows 95 -> 103 -> 101 were reported as a hidden bullish divergence
+    95 -> 101 across the 103 swing that 101 broke.
+
+    Until 2026-09-22 this paired ``b`` with the OLDEST qualifying pivot in
+    the window. Lows at 100 (RSI 20), 96 (RSI 35), 95 (RSI 30) were reported
+    as a bullish divergence 100 -> 95, stepping over the 96 swing at which
+    RSI had in fact CONFIRMED the new low (30 < 35). Divergence is a claim
+    about the swing price just made against the one before it; an older
+    pivot is only a valid reference when nothing in between contradicts it.
+
+    Returns None when no pair qualifies or the indicator is missing at
+    either pivot.
     """
     if not points or len(points) < 2:
         return None
@@ -684,50 +738,47 @@ def find_divergence(
     candidates = points[-pivot_lookback:]
     if len(candidates) < 2:
         return None
-    best: DivergenceMatch | None = None
-    # Iterate so most recent b wins; pair each candidate b against every
-    # earlier a in the same window.
-    for j in range(len(candidates) - 1, 0, -1):
-        pos_b, ts_b, price_b = candidates[j]
-        age = max(0, int(last_bar_pos) - int(pos_b))
-        if age > max_age_bars:
+    pos_b, ts_b, price_b = candidates[-1]
+    age = max(0, int(last_bar_pos) - int(pos_b))
+    if age > max_age_bars:
+        return None
+    ind_b = _pivot_indicator_value(indicator, pos_b)
+    if ind_b is None:
+        return None
+    for pos_a, ts_a, price_a in reversed(candidates[:-1]):
+        if _contradicts(kind=kind, direction=direction, price_a=float(price_a), price_b=float(price_b)):
+            return None
+        if not _price_condition(kind=kind, direction=direction, price_a=float(price_a),
+                                price_b=float(price_b), price_move_frac=float(price_move_frac)):
             continue
-        ind_b = _pivot_indicator_value(indicator, pos_b)
-        if ind_b is None:
-            continue
-        for i in range(0, j):
-            pos_a, ts_a, price_a = candidates[i]
-            ind_a = _pivot_indicator_value(indicator, pos_a)
-            if ind_a is None:
-                continue
-            matched, delta = _qualifies(
-                kind=kind,
-                direction=direction,
-                price_a=float(price_a),
-                price_b=float(price_b),
-                ind_a=ind_a,
-                ind_b=ind_b,
-                price_move_frac=float(price_move_frac),
-                indicator_delta=float(indicator_delta),
-            )
-            if not matched:
-                continue
-            best = DivergenceMatch(
-                kind=kind,
-                direction=direction,
-                indicator=indicator_name,
-                pivot_a_pos=int(pos_a),
-                pivot_a_ts=ts_a,
-                pivot_a_price=float(price_a),
-                pivot_a_indicator=float(ind_a),
-                pivot_b_pos=int(pos_b),
-                pivot_b_ts=ts_b,
-                pivot_b_price=float(price_b),
-                pivot_b_indicator=float(ind_b),
-                indicator_delta=float(delta),
-                age_bars=int(age),
-            )
-            break  # Found most recent valid b; stop scanning earlier a's
-        if best is not None:
-            break  # Stop scanning earlier b's
-    return best
+        ind_a = _pivot_indicator_value(indicator, pos_a)
+        if ind_a is None:
+            return None
+        matched, delta = _qualifies(
+            kind=kind,
+            direction=direction,
+            price_a=float(price_a),
+            price_b=float(price_b),
+            ind_a=ind_a,
+            ind_b=ind_b,
+            price_move_frac=float(price_move_frac),
+            indicator_delta=float(indicator_delta),
+        )
+        if not matched:
+            return None
+        return DivergenceMatch(
+            kind=kind,
+            direction=direction,
+            indicator=indicator_name,
+            pivot_a_pos=int(pos_a),
+            pivot_a_ts=ts_a,
+            pivot_a_price=float(price_a),
+            pivot_a_indicator=float(ind_a),
+            pivot_b_pos=int(pos_b),
+            pivot_b_ts=ts_b,
+            pivot_b_price=float(price_b),
+            pivot_b_indicator=float(ind_b),
+            indicator_delta=float(delta),
+            age_bars=int(age),
+        )
+    return None

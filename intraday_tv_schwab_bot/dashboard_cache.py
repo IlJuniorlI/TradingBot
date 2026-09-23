@@ -38,7 +38,7 @@ import copy
 
 from .candles import detect_candle_context, detect_per_bar_candle_patterns
 from .chart_patterns import analyze_chart_pattern_context
-from .config import DashboardChartConfig, DashboardChartingConfig
+from .config import DashboardChartConfig, DashboardChartingConfig, htf_structure_event_lookback
 from .htf_levels import summarize_htf_trend
 from .models import Side
 from .support_resistance import analyze_market_structure, zone_flip_confirmed
@@ -2191,7 +2191,12 @@ class DashboardCache:
                 pct_tolerance=overlay_pct_tolerance,
                 breakout_atr_mult=float(getattr(sr_cfg, "breakout_atr_mult", 0.35) or 0.35),
                 breakout_buffer_pct=float(getattr(sr_cfg, "breakout_buffer_pct", 0.0015) or 0.0015),
-                structure_event_max_age_bars=int(getattr(sr_cfg, "structure_event_lookback_bars", 6) or 6),
+                # LTF overlay counts LTF bars, HTF overlay counts HTF bars --
+                # the same split the pivot gap above already makes.
+                structure_event_max_age_bars=(
+                    int(getattr(sr_cfg, "structure_event_lookback_bars", 6) or 6)
+                    if is_ltf_chart else htf_structure_event_lookback(sr_cfg)
+                ),
                 min_range_atr_mult=float(getattr(sr_cfg, "structure_min_range_atr_mult", 1.5) or 0.0),
                 min_pivot_gap_bars=overlay_gap_bars,
             )

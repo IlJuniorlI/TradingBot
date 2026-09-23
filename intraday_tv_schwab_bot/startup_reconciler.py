@@ -37,6 +37,7 @@ Design notes:
 """
 from __future__ import annotations
 
+import copy
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -44,10 +45,10 @@ from typing import Any, Callable
 
 from schwabdev import Client
 
-from .broker_positions import extract_broker_positions, extract_working_orders
+from .broker_positions import active_broker_bracket, broker_position_side_qty, extract_broker_positions, extract_working_orders
 from .config import BotConfig
 from .data_feed import MarketDataStore
-from .models import ASSET_TYPE_EQUITY, Position, Side
+from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side
 from .paper_account import PaperAccount
 from .position_metrics import safe_float
 from .position_store import ReconcileMetadataStore
@@ -230,7 +231,7 @@ class StartupReconciler:
             return str(key), position
         return None
 
-    def _reprotect_restored_position(self, position: Position) -> None:
+    def _reprotect_restored_position(self, position: Position, working_orders: list[dict[str, Any]]) -> None:
         """Make a restored position's bracket state truthful before it is managed.
 
         The hybrid path rehydrates metadata written before the restart, so a
@@ -242,19 +243,24 @@ class StartupReconciler:
         ``ensure_position_protected`` adopts the children when they are still
         working and submits fresh protection when they are not; it returns None
         when bracket mode is off, in which case any stale key is dropped so the
-        engine unambiguously owns the exits.
+        engine unambiguously owns the exits. The persisted bracket goes along
+        as ``known_bracket``: its child ids are the ones the bot last tracked,
+        so a stop replaced before the restart is adopted instead of being read
+        as dead (its original, off the parent, is REPLACED) and stacked on.
         """
         metadata = position.metadata if isinstance(position.metadata, dict) else None
         if metadata is None:
             return
         stale = metadata.get("bracket") if isinstance(metadata.get("bracket"), dict) else None
         parent_order_id = stale.get("parent_order_id") if stale else None
+        known = stale if stale and stale.get("stop_order_id") else self._resting_stop_for(position, working_orders)
         try:
             refreshed = self.executor.ensure_position_protected(
                 str(metadata.get("underlying") or position.symbol),
                 int(position.qty), position.side, float(position.entry_price),
                 float(position.stop_price), position.target_price,
                 parent_order_id=str(parent_order_id) if parent_order_id else None,
+                known_bracket=known,
             )
         except Exception as exc:
             LOG.warning(
@@ -272,7 +278,135 @@ class StartupReconciler:
             position.symbol, refreshed.get("state"), refreshed.get("stop_price"), refreshed.get("target_price"),
         )
 
-    def _restore_broker_positions(self, positions: list[dict[str, Any]], *, use_metadata: bool) -> tuple[int, int]:
+    @staticmethod
+    def _broker_held_qty(position: Position, held: dict[str, dict[str, Any]]) -> int | None:
+        """Units the broker holds of *position* (0 when none), or None when
+        its rows cannot be read as this position (vertical legs out of step)."""
+        meta = position.metadata if isinstance(position.metadata, dict) else {}
+        asset_type = str(meta.get("asset_type") or ASSET_TYPE_EQUITY).upper()
+        if asset_type == ASSET_TYPE_OPTION_VERTICAL:
+            long_side, long_qty, _ = broker_position_side_qty(held.get(str(meta.get("long_leg_symbol") or "").upper().strip()))
+            short_side, short_qty, _ = broker_position_side_qty(held.get(str(meta.get("short_leg_symbol") or "").upper().strip()))
+            if long_qty <= 0 and short_qty <= 0:
+                return 0
+            if long_side != Side.LONG or short_side != Side.SHORT or long_qty != short_qty:
+                return None
+            return int(long_qty)
+        if asset_type == ASSET_TYPE_OPTION_SINGLE:
+            symbol = str(meta.get("option_symbol") or "")
+        else:
+            symbol = str(meta.get("underlying") or position.symbol)
+        side, qty, _ = broker_position_side_qty(held.get(symbol.upper().strip()))
+        return int(qty) if side == position.side else 0
+
+    def _settle_positions_closed_at_broker(self, raw_positions: list[dict[str, Any]]) -> None:
+        """Stop managing what the broker no longer holds.
+
+        The session-boundary re-run of ``reconcile`` exists for positions
+        closed while the bot could not trade -- in the Schwab app, or by a
+        broker stop -- but restore only ever ADDED positions, so those stayed
+        tracked: holding a ``max_positions`` slot, feeding the correlation
+        guard and open risk, and sending exits the broker rejects (a
+        ``status=`` failure is never rechecked, so they repeat every cycle).
+
+        Each is booked as an exit (``closed_outside_bot``) at the last mark,
+        flagged estimated and broker-recovered so reports can tell it apart,
+        and dropped; one only partly closed is cut to what remains. Anything
+        of its bracket still resting is cancelled -- a stop left against a
+        closed position opens a new one when it triggers. Not registered with
+        the risk manager: the close happened outside this session.
+
+        Skipped in dry-run: those positions are simulated and never reach the
+        broker, so the account holding none of them says nothing -- reading
+        it as a close wiped every paper position held into a new session.
+        """
+        if not self.positions or self.config.schwab.dry_run:
+            return
+        held = {str(row.get("symbol") or "").upper().strip(): row for row in raw_positions}
+        changed = False
+        for key, position in list(self.positions.items()):
+            remaining = self._broker_held_qty(position, held)
+            if remaining is None:
+                LOG.warning("Broker rows for %s do not read as its position; leaving it tracked", key)
+                continue
+            if remaining >= int(position.qty):
+                continue
+            closed_qty = int(position.qty) - int(remaining)
+            mark = self.account.last_prices.get(position.symbol)
+            exit_price = float(mark) if mark is not None and float(mark) > 0 else float(position.entry_price)
+            exited = copy.copy(position)
+            exited.qty = closed_qty
+            self.account.record_exit(
+                exited, exit_price, "closed_outside_bot",
+                final_exit=remaining <= 0,
+                remaining_qty_after_exit=int(remaining),
+                fill_price_estimated=True,
+                broker_recovered=True,
+            )
+            bracket = active_broker_bracket(position)
+            if bracket is not None:
+                leftover = self.executor.cancel_bracket(bracket)
+                if not leftover.ok:
+                    LOG.error("Could not confirm %s's resting bracket is down (%s) -- check the broker",
+                              key, leftover.message)
+            if remaining <= 0:
+                self.positions.pop(key, None)
+                LOG.warning("%s qty=%s is no longer held at the broker; closed outside the bot, "
+                            "booked at the last mark %.4f (estimated)", key, closed_qty, exit_price)
+            else:
+                position.qty = int(remaining)
+                if isinstance(position.metadata, dict):
+                    position.metadata["qty"] = int(remaining)
+                    if bracket is not None:
+                        position.metadata.pop("bracket", None)
+                        self._reprotect_restored_position(position, [])
+                LOG.warning("%s: broker holds %s of %s; %s closed outside the bot, booked at the last "
+                            "mark %.4f (estimated)", key, remaining, remaining + closed_qty, closed_qty, exit_price)
+            changed = True
+        if changed:
+            self._save_reconcile_metadata()
+
+    @staticmethod
+    def _resting_stop_for(position: Position, working_orders: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """A working protective stop at the broker for *position*, as a bracket stub.
+
+        Used when the restored metadata carries no child ids (restore_basic,
+        or a position entered before bracket mode was on). Without it the
+        restore submitted FRESH protection beside the stop still resting from
+        before the restart; both trigger together and take the position net
+        short. The first match is adopted; any other stop on the symbol stays
+        a foreign order and keeps entries blocked for a human to look at.
+        """
+        exit_instruction = "SELL" if position.side == Side.LONG else "BUY_TO_COVER"
+        symbol = str(position.symbol).upper().strip()
+        for order in working_orders:
+            if order.get("orderId") is None:
+                continue
+            if [str(s).upper().strip() for s in order.get("symbols") or []] != [symbol]:
+                continue
+            if order.get("orderType") not in {"STOP", "STOP_LIMIT"}:
+                continue
+            if list(order.get("instructions") or []) != [exit_instruction]:
+                continue
+            order_id = str(order["orderId"])
+            return {"stop_order_id": order_id, "child_order_ids": [order_id]}
+        return None
+
+    def _foreign_working_orders(self, working_orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Working orders no restored position owns as its resting protection."""
+        owned: set[str] = set()
+        for position in self.positions.values():
+            bracket = position.metadata.get("bracket") if isinstance(position.metadata, dict) else None
+            if not isinstance(bracket, dict) or not bracket.get("active"):
+                continue
+            for key in ("oco_order_id", "protective_order_id", "stop_order_id", "target_order_id"):
+                if bracket.get(key):
+                    owned.add(str(bracket[key]))
+            owned.update(str(oid) for oid in (bracket.get("child_order_ids") or []) if oid)
+        return [order for order in working_orders if str(order.get("orderId")) not in owned]
+
+    def _restore_broker_positions(self, positions: list[dict[str, Any]], *, use_metadata: bool,
+                                  working_orders: list[dict[str, Any]]) -> tuple[int, int]:
         if is_option_strategy(self.config.strategy):
             LOG.warning("startup_reconcile_mode=%s does not restore option strategies; leaving options handling unchanged", self.config.runtime.startup_reconcile_mode)
             return 0, len(positions)
@@ -388,7 +522,7 @@ class StartupReconciler:
                     reference_symbol=None,
                     metadata=metadata,
                 )
-            self._reprotect_restored_position(position)
+            self._reprotect_restored_position(position, working_orders)
             self.positions[symbol] = position
             try:
                 self.account.record_entry(position, float(position.entry_price))
@@ -451,6 +585,7 @@ class StartupReconciler:
                 account = account_future.result().json()
                 orders_resp = orders_future.result()
             raw_positions = extract_broker_positions(account)
+            self._settle_positions_closed_at_broker(raw_positions)
             ignored_open_position_symbols = sorted(self._ignored_open_position_symbols(raw_positions))
             if ignored_open_position_symbols:
                 self._entry_block_symbols = set(ignored_open_position_symbols)
@@ -491,7 +626,15 @@ class StartupReconciler:
                     self.trading_blocked_reason = None
                     self.trading_blocked_message = None
                 elif mode in {"restore_basic", "restore_hybrid"}:
-                    restored, skipped = self._restore_broker_positions(positions, use_metadata=(mode == "restore_hybrid"))
+                    restored, skipped = self._restore_broker_positions(
+                        positions, use_metadata=(mode == "restore_hybrid"), working_orders=working_orders,
+                    )
+                    # A restored position's own resting protection is not a
+                    # foreign order. Counting it blocked every entry for the
+                    # rest of the session in bracket mode -- and "clear them"
+                    # meant stripping the position's stop.
+                    foreign_orders = self._foreign_working_orders(working_orders)
+                    self.result["foreign_working_orders"] = foreign_orders
                     self.result["restored_positions"] = restored
                     self.result["skipped_restore_positions"] = skipped
                     if restored:
@@ -505,9 +648,9 @@ class StartupReconciler:
                             f"Startup reconciliation found {len(positions)} broker position(s) for an option strategy, "
                             "but restore is unsupported; reconcile or close them before new entries"
                         )
-                    elif working_orders:
+                    elif foreign_orders:
                         self.trading_blocked_reason = "working_orders_present"
-                        self.trading_blocked_message = f"Startup reconciliation restored positions but found {len(working_orders)} working orders; clear them before new entries"
+                        self.trading_blocked_message = f"Startup reconciliation restored positions but found {len(foreign_orders)} working orders they do not own; clear them before new entries"
                     else:
                         self.trading_blocked_reason = None
                         self.trading_blocked_message = None

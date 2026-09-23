@@ -21,10 +21,10 @@ Design notes:
 - ``is_startup_reconcile_entry_blocked`` injected as callable — the
   startup-reconcile state (`_startup_reconcile_entry_block_symbols`) lives
   on engine because startup reconciliation is engine-level bootstrap.
-- Broker-query helpers (``broker_position_row`` / ``broker_position_rows``)
-  live here because entry recovery is their primary consumer.
-  ``PositionManager`` receives them as callables (its exit-recovery path
-  is the only other consumer).
+- An entry order whose submit call could not settle it is tracked in
+  ``unsettled_entry_orders`` and settled from the order's own fill record
+  (``settle_unsettled_entry_orders``, run by the engine every management
+  cycle), never from a positions snapshot.
 - Config accessor ``stock_position_trail_pct`` moved here even though
   ``_restore_levels_for_stock_position`` on engine still needs it —
   engine dispatches through ``self.entry_gatekeeper.stock_position_trail_pct``.
@@ -41,11 +41,7 @@ from typing import Any, Callable
 from schwabdev import Client
 
 from .audit_logger import AuditLogger
-from .broker_positions import (
-    broker_position_side_qty,
-    extract_broker_positions,
-    order_result_needs_broker_recheck,
-)
+from .broker_positions import active_broker_bracket, order_result_needs_broker_recheck
 from .config import BotConfig
 from .data_feed import MarketDataStore
 from .execution import SchwabExecutor
@@ -63,7 +59,7 @@ from .position_manager import PositionManager
 from .position_metrics import safe_float
 from .risk import RiskManager
 from ._strategies.strategy_base import BaseStrategy
-from .utils import TRADEFLOW_LEVEL, call_schwab_client, now_et
+from .utils import TRADEFLOW_LEVEL, now_et
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -113,15 +109,9 @@ class EntryGatekeeper:
         self.session_skip_counts: dict[str, int] = {}
         self._option_entry_retry_until: dict[str, datetime] = {}
         self._option_entry_retry_counts: dict[str, int] = {}
-        # Per-cycle broker-positions cache. Without this, every signal in a
-        # cycle (entry checks + exit recovery) issues its own account_details
-        # call returning identical data; 5 signals = 5 redundant Schwab
-        # fetches. The cache is cleared at begin_cycle() and end_cycle() to
-        # match data_feed.py's lifecycle pattern. _cycle_positions_failed
-        # latches a failed fetch so we don't retry-storm Schwab if the API
-        # is unhealthy mid-cycle.
-        self._cycle_positions_cache: list[dict[str, Any]] | None = None
-        self._cycle_positions_failed: bool = False
+        # Entry orders whose outcome the submit call could not settle, keyed
+        # by position key. See settle_unsettled_entry_orders.
+        self.unsettled_entry_orders: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _safe_series_last(frame, field: str, default: float | None = None) -> float | None:
@@ -176,6 +166,16 @@ class EntryGatekeeper:
     # ------------------------------------------------------------------
 
     def _materialize_option_position_levels(self, signal, entry_price: float) -> tuple[float, float | None, dict[str, Any]]:
+        stop, target, metadata = self._option_position_levels(signal, entry_price)
+        # R is measured against the stop the trade was OPENED with; the
+        # breakeven / profit-lock ratchets move ``stop_price`` afterwards, and
+        # without this anchor every R read after a ratchet re-based on the
+        # tightened stop.
+        metadata["initial_stop_price"] = float(stop)
+        metadata["initial_target_price"] = None if target is None else float(target)
+        return stop, target, metadata
+
+    def _option_position_levels(self, signal, entry_price: float) -> tuple[float, float | None, dict[str, Any]]:
         metadata = dict(signal.metadata or {})
         asset_type = str(metadata.get("asset_type") or "")
         entry_value = max(0.01, float(entry_price))
@@ -276,91 +276,6 @@ class EntryGatekeeper:
         for leg in payload.get("orderLegCollection", []):
             leg["quantity"] = qty
         return payload
-
-    # ------------------------------------------------------------------
-    # Broker position-query helpers (wrap schwabdev calls). Exit recovery
-    # in PositionManager also uses these — injected as callables there.
-    # By default, all callers within a single engine.step() share one
-    # cached snapshot via _get_cycle_positions(); cache is invalidated at
-    # begin_cycle() and end_cycle(). Pass force_refresh=True to bypass
-    # the cache and issue a fresh account_details fetch.
-    # ------------------------------------------------------------------
-
-    def begin_cycle(self) -> None:
-        # Mirrors data_feed.MarketDataStore.begin_cycle(). Called from
-        # engine.step() so per-cycle caches start fresh each tick.
-        self._cycle_positions_cache = None
-        self._cycle_positions_failed = False
-
-    def end_cycle(self) -> None:
-        # Symmetric clear so a stale snapshot can never leak into the
-        # gap between cycles (defensive — begin_cycle() also clears).
-        self._cycle_positions_cache = None
-        self._cycle_positions_failed = False
-
-    def _fetch_broker_positions_uncached(self) -> list[dict[str, Any]] | None:
-        # Issue an unconditional account_details fetch, bypassing the
-        # cycle cache. Used by force_refresh callers and as the underlying
-        # implementation of the cycle-cached path. Returns None on Schwab
-        # failure to match the legacy broker_position_row contract.
-        try:
-            account = call_schwab_client(self.client, "account_details", self.executor.account_hash, fields="positions").json()
-            return extract_broker_positions(account)
-        except Exception as exc:
-            LOG.warning("Could not query broker position snapshot: %s", exc)
-            return None
-
-    def _get_cycle_positions(self) -> list[dict[str, Any]] | None:
-        # Return the broker positions list for the current cycle, fetching
-        # once if not yet cached. Returns None if the fetch failed (caller
-        # treats as 'no broker data', matching the legacy behaviour where
-        # an exception in broker_position_row returned None). A failed
-        # fetch latches via _cycle_positions_failed so subsequent callers
-        # within the same cycle don't retry-storm Schwab.
-        if self._cycle_positions_failed:
-            return None
-        if self._cycle_positions_cache is not None:
-            return self._cycle_positions_cache
-        rows = self._fetch_broker_positions_uncached()
-        if rows is None:
-            self._cycle_positions_failed = True
-            return None
-        self._cycle_positions_cache = rows
-        return rows
-
-    def broker_position_row(self, symbol: str, *, force_refresh: bool = False) -> dict[str, Any] | None:
-        # Default: returns the row from the cycle-cached snapshot
-        # (account_details fetched at most once per engine.step()).
-        # force_refresh=True bypasses the cache and issues a fresh fetch
-        # — use only when the cycle-start snapshot would be misleading
-        # (e.g., post-place_order verification before the next cycle).
-        symbol_upper = str(symbol or "").upper().strip()
-        if not symbol_upper:
-            return None
-        rows = self._fetch_broker_positions_uncached() if force_refresh else self._get_cycle_positions()
-        if rows is None:
-            return None
-        for row in rows:
-            row_symbol = str(row.get("symbol") or "").upper().strip()
-            if row_symbol == symbol_upper:
-                return row
-        return None
-
-    def broker_position_rows(self, symbols: list[str], *, force_refresh: bool = False) -> dict[str, dict[str, Any]]:
-        # Same snapshot semantics as broker_position_row — see its
-        # docstring for the force_refresh contract.
-        wanted = {str(symbol or "").upper().strip() for symbol in (symbols or []) if str(symbol or "").strip()}
-        if not wanted:
-            return {}
-        rows = self._fetch_broker_positions_uncached() if force_refresh else self._get_cycle_positions()
-        if rows is None:
-            return {}
-        out: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            row_symbol = str(row.get("symbol") or "").upper().strip()
-            if row_symbol in wanted:
-                out[row_symbol] = row
-        return out
 
     # ------------------------------------------------------------------
     # Entry-time snapshot builders (context logged at entry decision).
@@ -669,188 +584,191 @@ class EntryGatekeeper:
         return strength, secondary, tertiary, -rank
 
     # ------------------------------------------------------------------
-    # Broker entry recovery — used when entry submit returned an ambiguous
-    # result. Queries broker to determine whether the order filled.
+    # Entry orders whose outcome the submit call could not settle.
+    #
+    # A cancel the broker never confirmed can leave an entry live, and an
+    # unreadable post-cancel payload can hide shares that filled. Either way
+    # there may be shares at the broker the engine is not tracking -- no stop,
+    # no management. The order is recorded here and settled from its OWN fill
+    # record (account_orders) each cycle: fills are adopted as a position, or
+    # grow the position a partial fill already opened, and no new entry is
+    # sent for the symbol while the order may still be live.
+    #
+    # This replaced a recovery that read broker POSITIONS through a snapshot
+    # cached once per cycle: every recovery after the cycle's first read a
+    # snapshot taken before its own order, so a filled entry looked absent
+    # and was left untracked.
     # ------------------------------------------------------------------
 
-    def _recover_equity_entry_from_broker(self, signal, result, entry_price: float) -> bool:
-        if getattr(result, "ok", False):
-            return False
-        if not getattr(result, "order_id", None):
-            return False
-        if not order_result_needs_broker_recheck(getattr(result, "message", None)):
-            return False
-        row = self.broker_position_row(signal.symbol)
-        side, qty, broker_avg_price = broker_position_side_qty(row)
-        if side != signal.side or qty <= 0:
-            return False
-        recovered_entry = float(broker_avg_price if broker_avg_price is not None and broker_avg_price > 0 else entry_price)
-        levels_ok, _ = self._entry_levels_valid(signal.side, recovered_entry, signal.stop_price, signal.target_price)
-        if not levels_ok:
-            recovered_entry = float(entry_price)
-            levels_ok, _ = self._entry_levels_valid(signal.side, recovered_entry, signal.stop_price, signal.target_price)
-            if not levels_ok:
-                return False
-        position_metadata = dict(signal.metadata or {})
-        position_metadata.setdefault("initial_stop_price", float(signal.stop_price))
-        position_metadata.setdefault("initial_target_price", safe_float(signal.target_price, None))
-        position_metadata.setdefault("trail_armed", False)
-        position_metadata["broker_reconciled_after_order_uncertainty"] = True
-        position_metadata["broker_recovery_order_id"] = str(result.order_id)
-        position_metadata["broker_recovery_message"] = str(result.message)
-        # The order result was ambiguous, so we do not know whether the bracket
-        # children ever materialised. ensure_position_protected adopts them if
-        # they are still working and submits fresh protection only if not.
-        recovered_bracket = self.executor.ensure_position_protected(
-            signal.symbol, int(qty), signal.side, float(recovered_entry),
-            float(signal.stop_price), signal.target_price,
-            parent_order_id=str(result.order_id),
+    def _track_unsettled_entry(self, signal, result, *, position_key: str, asset_type: str,
+                               preview_entry_price: float, booked_qty: int) -> None:
+        self.unsettled_entry_orders[position_key] = {
+            "order_id": str(result.order_id),
+            "symbol": str(signal.symbol),
+            "signal": signal,
+            "asset_type": asset_type,
+            "preview_entry_price": float(preview_entry_price),
+            "booked_qty": int(booked_qty),
+            "booked_price": safe_float(result.fill_price, None) if booked_qty > 0 else None,
+            "message": str(result.message),
+        }
+        LOG.warning(
+            "Entry order %s for %s unsettled (%s); tracking it until the broker reports it terminal",
+            result.order_id, position_key, result.message,
         )
-        if recovered_bracket is not None:
-            position_metadata["bracket"] = recovered_bracket
-        position = Position(
-            symbol=signal.symbol,
-            strategy=signal.strategy,
-            side=signal.side,
-            qty=int(qty),
-            entry_price=float(recovered_entry),
-            entry_time=now_et(),
-            stop_price=signal.stop_price,
-            target_price=signal.target_price,
-            trail_pct=self.stock_position_trail_pct(position_metadata),
-            highest_price=float(recovered_entry),
-            lowest_price=float(recovered_entry),
-            pair_id=signal.pair_id,
-            reference_symbol=signal.reference_symbol,
-            metadata=position_metadata,
-        )
-        self.position_manager.initialize_position_diagnostics(position, recovered_entry, self.position_manager.underlying_price_for_position(position, {}))
-        self.positions[signal.symbol] = position
-        self.account.record_entry(position, recovered_entry)
+
+    def has_unsettled_entry(self, symbol: str) -> bool:
+        wanted = str(symbol or "").upper().strip()
+        return any(str(record.get("symbol") or "").upper().strip() == wanted
+                   for record in self.unsettled_entry_orders.values())
+
+    def settle_unsettled_entry_orders(self) -> None:
+        """Adopt whatever the tracked entry orders filled; drop the terminal ones."""
+        if not self.unsettled_entry_orders:
+            return
+        states = self.executor.fetch_order_states()
+        if states is None:
+            LOG.warning("Could not read broker order state for %s unsettled entry order(s); holding",
+                        len(self.unsettled_entry_orders))
+            return
+        for position_key, record in list(self.unsettled_entry_orders.items()):
+            order_id = str(record["order_id"])
+            state = states.get(order_id) or self.executor.order_state(order_id)
+            if state is None:
+                self.audit.log_cycle(
+                    f"entry_unsettled:{position_key}", "state_unavailable",
+                    f"Entry order {order_id} for {position_key} not listed by the broker yet; holding",
+                    interval=60.0, level=TRADEFLOW_LEVEL,
+                )
+                continue
+            filled = int(state.get("filled_qty") or 0)
+            booked = int(record["booked_qty"])
+            if filled > booked:
+                scale = 100.0 if record["asset_type"] in OPTION_ASSET_TYPES else 1.0
+                average = safe_float(state.get("fill_price"), None)
+                average = average * scale if average is not None else None
+                extra = filled - booked
+                booked_price = record.get("booked_price")
+                if average is not None and booked > 0 and booked_price is not None:
+                    # The order's average covers every fill; strip out the
+                    # slice already booked to price the new one.
+                    extra_price = max(0.0001, (average * filled - float(booked_price) * booked) / extra)
+                else:
+                    extra_price = average
+                if position_key in self.positions:
+                    self._grow_position(position_key, extra, extra_price, record)
+                else:
+                    self._adopt_entry_fill(position_key, extra, extra_price, record)
+                record["booked_qty"] = filled
+                record["booked_price"] = average if average is not None else booked_price
+            if state.get("is_filled") or state.get("is_terminal_failure"):
+                del self.unsettled_entry_orders[position_key]
+                continue
+            cancel_ok, cancel_msg = self.executor.cancel_working_order(order_id)
+            if not cancel_ok:
+                LOG.warning("Unsettled entry order %s for %s still live; cancel unconfirmed (%s)",
+                            order_id, position_key, cancel_msg)
+
+    def _grow_position(self, position_key: str, extra_qty: int, extra_price: float | None,
+                       record: dict[str, Any]) -> None:
+        """Fold late fills of a partially filled entry into its open position."""
+        position = self.positions[position_key]
+        price = float(extra_price) if extra_price is not None else float(position.entry_price)
+        added = copy.copy(position)
+        added.qty = int(extra_qty)
+        self.account.record_entry(added, price)
+        total_qty = int(position.qty) + int(extra_qty)
+        position.entry_price = (float(position.entry_price) * int(position.qty) + price * int(extra_qty)) / total_qty
+        position.qty = total_qty
+        if isinstance(position.metadata, dict):
+            position.metadata["qty"] = total_qty
+            position.metadata["entry_late_fill_qty"] = int(position.metadata.get("entry_late_fill_qty") or 0) + int(extra_qty)
+            bracket = active_broker_bracket(position)
+            if bracket is not None:
+                resized, msg = self.executor.resize_bracket_children(
+                    bracket, str(position.metadata.get("underlying") or position.symbol), position.side,
+                    total_qty, float(position.entry_price), str(bracket.get("session") or "NORMAL"),
+                )
+                if not resized:
+                    LOG.error("Could not resize %s's resting protection to %s after late entry fills (%s)",
+                              position_key, total_qty, msg)
         self._save_reconcile_metadata()
-        LOG.warning("Recovered equity entry state from broker for %s qty=%s after ambiguous order result=%s", signal.symbol, qty, result.message)
-        return True
+        LOG.warning("Entry order %s for %s filled %s more share(s) after its submit returned; position now %s",
+                    record["order_id"], position_key, extra_qty, total_qty)
 
-    @staticmethod
-    def _option_single_entry_price_from_broker(row: dict[str, Any] | None) -> float | None:
-        if not isinstance(row, dict):
-            return None
-        try:
-            avg_price = row.get("averagePrice")
-            if avg_price is None:
-                return None
-            avg = float(avg_price)
-        except Exception:
-            return None
-        if avg <= 0:
-            return None
-        return float(avg * 100.0)
+    def _adopt_entry_fill(self, position_key: str, qty: int, fill_price: float | None,
+                          record: dict[str, Any]) -> None:
+        """Open the position an unsettled entry order turned out to fill.
 
-    @staticmethod
-    def _option_vertical_entry_price_from_broker(metadata: dict[str, Any] | None, long_row: dict[str, Any] | None, short_row: dict[str, Any] | None) -> float | None:
-        if not isinstance(metadata, dict) or not isinstance(long_row, dict) or not isinstance(short_row, dict):
-            return None
-        try:
-            long_avg = float(long_row.get("averagePrice") or 0.0)
-            short_avg = float(short_row.get("averagePrice") or 0.0)
-        except Exception:
-            return None
-        if long_avg <= 0 or short_avg <= 0:
-            return None
-        spread_side = str(metadata.get("spread_side") or Side.LONG.value)
-        if spread_side == Side.SHORT.value:
-            net_points = short_avg - long_avg
+        The shares exist at the broker, so the position is ALWAYS tracked: a
+        fill that invalidates the signal's levels gets the post-fill fallback
+        levels, as a normal filled entry would, never an untracked position.
+        """
+        signal = record["signal"]
+        asset_type = str(record["asset_type"])
+        entry_price = float(fill_price) if fill_price is not None and fill_price > 0 else float(record["preview_entry_price"])
+        if asset_type in OPTION_ASSET_TYPES:
+            stop_price, target_price, position_metadata = self._materialize_option_position_levels(signal, entry_price)
+            position_metadata["qty"] = int(qty)
+            position_metadata["entry_price"] = float(entry_price)
+            trail_pct = None
+            reference_symbol = signal.reference_symbol or (signal.metadata or {}).get("confirm_index")
         else:
-            net_points = long_avg - short_avg
-        if net_points <= 0:
-            net_points = abs(short_avg - long_avg)
-        if net_points <= 0:
-            return None
-        return float(net_points * 100.0)
-
-    def _recover_option_entry_from_broker(self, signal, result) -> bool:
-        if getattr(result, "ok", False):
-            return False
-        if not getattr(result, "order_id", None):
-            return False
-        if not order_result_needs_broker_recheck(getattr(result, "message", None)):
-            return False
-        meta = dict(signal.metadata or {})
-        asset_type = str(meta.get("asset_type") or "").upper()
-        position_key = str(meta.get("position_key") or signal.symbol)
-        if asset_type == ASSET_TYPE_OPTION_SINGLE:
-            option_symbol = str(meta.get("option_symbol") or "")
-            row = self.broker_position_row(option_symbol)
-            side, qty, _ = broker_position_side_qty(row)
-            if side != signal.side or qty <= 0:
-                return False
-            recovered_entry = safe_float(getattr(result, "fill_price", None), None)
-            if recovered_entry is None:
-                recovered_entry = self._option_single_entry_price_from_broker(row)
-            if recovered_entry is None or recovered_entry <= 0:
-                recovered_entry = safe_float(meta.get("entry_price"), None)
-            if recovered_entry is None or recovered_entry <= 0:
-                return False
-        elif asset_type == ASSET_TYPE_OPTION_VERTICAL:
-            long_symbol = str(meta.get("long_leg_symbol") or "")
-            short_symbol = str(meta.get("short_leg_symbol") or "")
-            rows = self.broker_position_rows([long_symbol, short_symbol])
-            long_row = rows.get(long_symbol.upper()) if long_symbol else None
-            short_row = rows.get(short_symbol.upper()) if short_symbol else None
-            long_side, long_qty, _ = broker_position_side_qty(long_row)
-            short_side, short_qty, _ = broker_position_side_qty(short_row)
-            if long_side != Side.LONG or short_side != Side.SHORT:
-                return False
-            if long_qty <= 0 or short_qty <= 0 or int(long_qty) != int(short_qty):
-                return False
-            qty = int(long_qty)
-            recovered_entry = safe_float(getattr(result, "fill_price", None), None)
-            if recovered_entry is None:
-                recovered_entry = self._option_vertical_entry_price_from_broker(meta, long_row, short_row)
-            if recovered_entry is None or recovered_entry <= 0:
-                recovered_entry = safe_float(meta.get("entry_price"), None)
-            if recovered_entry is None or recovered_entry <= 0:
-                return False
-        else:
-            return False
-        stop_price, target_price, position_metadata = self._materialize_option_position_levels(signal, float(recovered_entry))
-        levels_ok, _ = self._entry_levels_valid(signal.side, float(recovered_entry), stop_price, target_price)
-        if not levels_ok:
-            fallback_entry = safe_float(meta.get("entry_price"), None)
-            if fallback_entry is None or fallback_entry <= 0:
-                return False
-            recovered_entry = float(fallback_entry)
-            stop_price, target_price, position_metadata = self._materialize_option_position_levels(signal, recovered_entry)
-            levels_ok, _ = self._entry_levels_valid(signal.side, recovered_entry, stop_price, target_price)
+            stop_price = float(signal.stop_price)
+            target_price = safe_float(signal.target_price, None)
+            levels_ok, levels_reason = self._entry_levels_valid(signal.side, entry_price, stop_price, target_price)
+            position_metadata = dict(signal.metadata or {})
             if not levels_ok:
-                return False
+                stop_price, target_price = self._fallback_equity_levels(signal.side, entry_price)
+                position_metadata["emergency_fallback_levels"] = True
+                position_metadata["original_levels_reason"] = levels_reason
+            position_metadata.setdefault("initial_stop_price", float(stop_price))
+            position_metadata.setdefault("initial_target_price", target_price)
+            position_metadata.setdefault("trail_armed", False)
+            # The children of a bracketed entry may or may not have
+            # materialised; adopt them if they are working, protect if not.
+            bracket = self.executor.ensure_position_protected(
+                signal.symbol, int(qty), signal.side, float(entry_price),
+                float(stop_price), target_price, parent_order_id=str(record["order_id"]),
+            )
+            if bracket is not None:
+                position_metadata["bracket"] = bracket
+            trail_pct = self.stock_position_trail_pct(position_metadata)
+            reference_symbol = signal.reference_symbol
         position_metadata["broker_reconciled_after_order_uncertainty"] = True
-        position_metadata["broker_recovery_order_id"] = str(result.order_id)
-        position_metadata["broker_recovery_message"] = str(result.message)
-        position_metadata["qty"] = int(qty)
-        position_metadata["entry_price"] = float(recovered_entry)
+        position_metadata["broker_recovery_order_id"] = str(record["order_id"])
+        position_metadata["broker_recovery_message"] = str(record["message"])
+        position_metadata["entry_fill_price_estimated"] = fill_price is None
         position = Position(
             symbol=position_key,
             strategy=signal.strategy,
             side=signal.side,
             qty=int(qty),
-            entry_price=float(recovered_entry),
+            entry_price=float(entry_price),
             entry_time=now_et(),
             stop_price=float(stop_price),
             target_price=float(target_price) if target_price is not None else None,
-            trail_pct=None,
-            highest_price=float(recovered_entry),
-            lowest_price=float(recovered_entry),
+            trail_pct=trail_pct,
+            highest_price=float(entry_price),
+            lowest_price=float(entry_price),
             pair_id=signal.pair_id,
-            reference_symbol=signal.reference_symbol or meta.get("confirm_index"),
+            reference_symbol=reference_symbol,
             metadata=position_metadata,
         )
-        self.position_manager.initialize_position_diagnostics(position, float(recovered_entry), self.position_manager.underlying_price_for_position(position, {}))
+        self.position_manager.initialize_position_diagnostics(position, float(entry_price), self.position_manager.underlying_price_for_position(position, {}))
         self.positions[position_key] = position
-        self.account.record_entry(position, float(recovered_entry))
+        self.account.record_entry(position, float(entry_price))
         self._save_reconcile_metadata()
-        LOG.warning("Recovered option entry state from broker for %s qty=%s asset_type=%s after ambiguous order result=%s", position_key, qty, asset_type, result.message)
-        return True
+        LOG.warning("Adopted entry %s qty=%s @ %.4f from unsettled order %s (%s)",
+                    position_key, qty, entry_price, record["order_id"], record["message"])
+
+    def _fallback_equity_levels(self, side: Side, entry_price: float) -> tuple[float, float]:
+        """Default-distance stop/target for a fill the signal's levels no longer fit."""
+        stop_pct = float(self.config.risk.default_stop_pct)
+        target_pct = float(self.config.risk.default_target_pct)
+        if side == Side.LONG:
+            return max(0.01, entry_price * (1.0 - stop_pct)), entry_price * (1.0 + target_pct)
+        return entry_price * (1.0 + stop_pct), max(0.01, entry_price * (1.0 - target_pct))
 
     # ------------------------------------------------------------------
     # Entry-decision logging + per-cycle summary.
@@ -1088,6 +1006,11 @@ class EntryGatekeeper:
             if self._is_startup_reconcile_entry_blocked(signal.symbol):
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "startup_reconcile_ignored_open_position"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)})
                 continue
+            if self.has_unsettled_entry(signal.symbol):
+                # An earlier entry order for this symbol may still be live or
+                # hold unbooked fills; a second one could double the position.
+                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "entry_order_unsettled"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)})
+                continue
             allowed, reason = self.risk.can_open(signal, self.positions)
             if not allowed:
                 LOG.log(TRADEFLOW_LEVEL, "Skipping %s %s: %s", signal.symbol, signal.reason, reason)
@@ -1134,9 +1057,13 @@ class EntryGatekeeper:
                 entry_context_payload = self._entry_context_payload(signal, candidate_by_symbol.get(signal.symbol), bars, qty_for_position, preview_entry_price, result.message, result)
                 self.audit.log_structured("ENTRY_CONTEXT", entry_context_payload)
                 if not result.ok:
-                    if self._recover_option_entry_from_broker(signal, result):
-                        self._clear_option_entry_retry_backoff(signal.symbol, signal.metadata)
-                        self._log_entry_decision(signal.strategy, signal.symbol, "entered", [signal.reason, "broker_recovered_after_order_uncertainty"])
+                    if result.order_id and (result.may_still_be_working or order_result_needs_broker_recheck(result.message)):
+                        self._track_unsettled_entry(
+                            signal, result,
+                            position_key=str(signal.metadata.get("position_key") or signal.symbol),
+                            asset_type=str(asset_type), preview_entry_price=preview_entry_price, booked_qty=0,
+                        )
+                        self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_unsettled:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, preview_entry_price, result.message)})
                         continue
                     if self.config.schwab.dry_run and str(result.message).startswith("dry_run_not_filled_"):
                         self._register_option_entry_retry_backoff(signal.symbol, signal.metadata)
@@ -1166,6 +1093,8 @@ class EntryGatekeeper:
                         target_price = max(0.01, entry_price * 0.50)
                     position_metadata["emergency_fallback_levels"] = True
                     position_metadata["original_levels_reason"] = levels_reason
+                    position_metadata["initial_stop_price"] = float(stop_price)
+                    position_metadata["initial_target_price"] = float(target_price)
                 # Realized-risk reconciliation, mirroring the equity path above.
                 # qty was sized from the max loss computed BEFORE the order went
                 # out, off the previewed limit; this is what the contracts
@@ -1208,6 +1137,13 @@ class EntryGatekeeper:
                 self.position_manager.initialize_position_diagnostics(position, entry_price, self.position_manager.underlying_price_for_position(position, bars))
                 self.positions[position_key] = position
                 self.account.record_entry(position, entry_price)
+                if result.may_still_be_working:
+                    # Partial fill whose cancel never confirmed: the rest of
+                    # the order may still fill and must grow this position.
+                    self._track_unsettled_entry(
+                        signal, result, position_key=position_key, asset_type=str(asset_type),
+                        preview_entry_price=preview_entry_price, booked_qty=qty_for_position,
+                    )
                 self._save_reconcile_metadata()
                 self._log_entry_decision(signal.strategy, signal.symbol, "entered", [signal.reason])
                 continue
@@ -1273,8 +1209,12 @@ class EntryGatekeeper:
             entry_context_payload = self._entry_context_payload(signal, candidate_by_symbol.get(signal.symbol), bars, qty_for_position, entry_price, result.message, result, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)
             self.audit.log_structured("ENTRY_CONTEXT", entry_context_payload)
             if not result.ok:
-                if self._recover_equity_entry_from_broker(signal, result, entry_price):
-                    self._log_entry_decision(signal.strategy, signal.symbol, "entered", [signal.reason, "broker_recovered_after_order_uncertainty"])
+                if result.order_id and (result.may_still_be_working or order_result_needs_broker_recheck(result.message)):
+                    self._track_unsettled_entry(
+                        signal, result, position_key=signal.symbol, asset_type="EQUITY",
+                        preview_entry_price=entry_price, booked_qty=0,
+                    )
+                    self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_unsettled:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, entry_price, result_message=result.message, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)})
                     continue
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_failed:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, entry_price, result_message=result.message, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent), **self._risk_snapshot(signal, entry_price, qty_for_position)})
                 continue
@@ -1384,6 +1324,13 @@ class EntryGatekeeper:
             self.position_manager.initialize_position_diagnostics(position, entry_price, self.position_manager.underlying_price_for_position(position, bars))
             self.positions[signal.symbol] = position
             self.account.record_entry(position, entry_price)
+            if result.may_still_be_working:
+                # Partial fill whose cancel never confirmed: the rest of the
+                # order may still fill and must grow this position.
+                self._track_unsettled_entry(
+                    signal, result, position_key=signal.symbol, asset_type="EQUITY",
+                    preview_entry_price=signal_entry_price, booked_qty=qty_for_position,
+                )
             self._save_reconcile_metadata()
             self._log_entry_decision(signal.strategy, signal.symbol, "entered", [signal.reason])
 

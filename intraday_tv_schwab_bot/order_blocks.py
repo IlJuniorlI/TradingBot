@@ -27,6 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import logging
 
+import numpy as np
 import pandas as pd
 
 from .support_resistance import _pivot_points
@@ -145,6 +146,31 @@ def _filled_pct_for_bearish(ob_lower: float, ob_upper: float, max_close_after: f
     size = max(ob_upper - ob_lower, 1e-9)
     fill_top = min(ob_upper, max(ob_lower, max_close_after))
     return max(0.0, min(1.0, (fill_top - ob_lower) / size))
+
+
+def _fill_window_start(close_arr: np.ndarray, k: int, breakout_idx: int, edge: float,
+                       *, bullish: bool) -> int:
+    """Bar whose close first LEFT the zone of the OB candle at ``k``; fill is
+    measured on the closes after it.
+
+    That is the first close beyond the zone's far edge (above ``upper`` for a
+    bullish block, below ``lower`` for a bearish one) after ``k``, or
+    ``breakout_idx`` when price has not closed beyond it by then. Bars between
+    the OB candle and that departure are the zone forming, not price returning
+    to it.
+
+    It has to be the FIRST departure, not the breakout that happened to find
+    the candle. The same candle is found again from every new extreme within
+    ``max_distance_back`` bars (and, in strict mode, from every swing whose
+    break walks back to it), and a later finder measuring from itself misses a
+    close THROUGH the zone between the two -- reviving, at 0% filled, a block
+    the earlier finder had correctly discarded. Measuring from each finder was
+    how this worked for a few hours on 2026-09-22.
+    """
+    for j in range(k + 1, breakout_idx + 1):
+        if (close_arr[j] > edge) if bullish else (close_arr[j] < edge):
+            return j
+    return breakout_idx
 
 
 def _earlier(ts_a: str | None, ts_b: str | None) -> str | None:
@@ -276,9 +302,13 @@ def _detect_order_blocks_loose(
                     thrust_distance = float(close_arr[idx] - close_arr[k])
                     if thrust_distance < min_thrust:
                         continue
-                    # Compute filled_pct from CLOSES after k — wicks that
-                    # pierce the OB but close back inside are tolerated.
-                    after = close_arr[k + 1:]
+                    # Fill is measured from CLOSES after price first left the
+                    # zone (see ``_fill_window_start``) — wicks that pierce the
+                    # OB but close back inside are tolerated. Counting from the
+                    # OB candle itself (as this did until 2026-09-22) had a
+                    # fresh OB born "64% filled" by a consolidation bar that
+                    # closed inside it before price ever departed.
+                    after = close_arr[_fill_window_start(close_arr, k, idx, upper, bullish=True) + 1:]
                     min_close_after = float(after.min()) if after.size else upper
                     filled_pct = _filled_pct_for_bullish(lower, upper, min_close_after)
                     if filled_pct >= 1.0 - 1e-9:
@@ -320,7 +350,7 @@ def _detect_order_blocks_loose(
                     thrust_distance = float(close_arr[k] - close_arr[idx])
                     if thrust_distance < min_thrust:
                         continue
-                    after = close_arr[k + 1:]
+                    after = close_arr[_fill_window_start(close_arr, k, idx, lower, bullish=False) + 1:]
                     max_close_after = float(after.max()) if after.size else lower
                     filled_pct = _filled_pct_for_bearish(lower, upper, max_close_after)
                     if filled_pct >= 1.0 - 1e-9:
@@ -404,7 +434,7 @@ def _detect_order_blocks_strict(
                 thrust_distance = float(close_arr[bos_idx] - close_arr[k])
                 if thrust_distance < min_thrust:
                     continue
-                after = close_arr[k + 1:]
+                after = close_arr[_fill_window_start(close_arr, k, bos_idx, upper, bullish=True) + 1:]
                 min_close_after = float(after.min()) if after.size else upper
                 filled_pct = _filled_pct_for_bullish(lower, upper, min_close_after)
                 if filled_pct >= 1.0 - 1e-9:
@@ -449,7 +479,7 @@ def _detect_order_blocks_strict(
                 thrust_distance = float(close_arr[k] - close_arr[bos_idx])
                 if thrust_distance < min_thrust:
                     continue
-                after = close_arr[k + 1:]
+                after = close_arr[_fill_window_start(close_arr, k, bos_idx, lower, bullish=False) + 1:]
                 max_close_after = float(after.max()) if after.size else lower
                 filled_pct = _filled_pct_for_bearish(lower, upper, max_close_after)
                 if filled_pct >= 1.0 - 1e-9:

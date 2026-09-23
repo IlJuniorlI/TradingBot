@@ -151,3 +151,9 @@ class OrderResult:
     # Consumed by entry_gatekeeper to stamp position metadata, and by
     # position_manager to reconcile broker fills and replace-sync levels.
     bracket: dict[str, Any] | None = None
+    # True when the order reached the broker and was NOT confirmed terminal:
+    # a MARKET exit deliberately left working past its poll window (a halt),
+    # or a cancel the broker never confirmed. The order can still fill, so the
+    # caller must track ``order_id`` until it is terminal rather than send a
+    # second order for the same shares.
+    may_still_be_working: bool = False

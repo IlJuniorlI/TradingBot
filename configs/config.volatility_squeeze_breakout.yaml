@@ -355,7 +355,20 @@ technical_levels:
   bollinger_enabled: true
   bollinger_length: 20
   bollinger_std_mult: 2.0
-  bollinger_squeeze_width_pct: 0.06
+  # 2026-09-22: was 0.06. `bollinger_width_pct` is (bb_upper - bb_lower) /
+  # bb_mid, a FRACTION of price, and on this universe's 1m bars 0.06 sat above
+  # 99.8% of them -- `bollinger_squeeze` was on almost permanently. 0.0025 is
+  # the p25 of RTH BB(20,2) widths on 1m bars over 17 archived large-cap
+  # sessions (162,001 bars, per-session p25 0.0022-0.0035): the tightest
+  # quarter of the tape, the same definition and value top_tier_adaptive uses.
+  # Here the flag is one of three alternatives inside the `no_valid_squeeze`
+  # compression gate, triggers `bollinger_squeeze_not_confirmed` when absent
+  # (prefer_bollinger_squeeze_flag), and adds 0.45 to priority. Replaying
+  # entry_signals over those 17 sessions (29,916 evaluations): no_valid_squeeze
+  # 18,367 -> 18,368, bollinger_squeeze_not_confirmed 22 -> 97. Zero signals
+  # at either value -- weak_day_strength alone rejects ~99% -- so this preset's
+  # other gates decide what it trades. They were deliberately left as they are.
+  bollinger_squeeze_width_pct: 0.0025
   bollinger_entry_bonus_midband: 0.16
   bollinger_entry_penalty_outer_band: 0.22
   target_use_bollinger: false
@@ -455,6 +468,10 @@ strategies:
       max_squeeze_range_pct: 0.011
       max_squeeze_width_pct: 0.05
       max_squeeze_width_ratio: 0.74
+      # NOT RETUNED after 2026-09-22: atr_expansion_mult changed from a 5-bar
+      # net displacement in ATRs to recent true range over prior ATR. On
+      # squeeze breakouts 1.0 passed 83% under the old measure, 37% now (and
+      # tier_atr_expansion_floor 1.25: 72% -> 10%). Retune before running.
       min_atr_expansion_mult: 1.0
       min_bar_close_position: 0.63
       min_bars: 60

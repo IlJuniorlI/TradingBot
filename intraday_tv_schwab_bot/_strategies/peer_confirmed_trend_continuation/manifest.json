@@ -76,7 +76,6 @@
     "max_extension_from_ema9_atr": 0.88,
     "min_rr": 1.8,
     "target_rr": 2.05,
-    "runner_target_rr": 2.45,
     "stop_buffer_atr_mult": 0.5,
     "strong_setup_runner_enabled": true,
     "adaptive_breakeven_rr": 0.92,

@@ -9,7 +9,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-from .levels_shared import DivergenceMatch, find_divergence
+from .levels_shared import DivergenceMatch, find_divergence, pivot_points
 from .utils import (
     atr_value,
     ensure_ohlcv_frame,
@@ -347,24 +347,12 @@ def empty_technical_levels_context(current_price: float = 0.0) -> TechnicalLevel
     return TechnicalLevelsContext(current_price=float(current_price or 0.0), reason="disabled")
 
 def _pivot_points(frame: pd.DataFrame, span: int) -> tuple[list[tuple[int, pd.Timestamp, float]], list[tuple[int, pd.Timestamp, float]]]:
-    highs: list[tuple[int, pd.Timestamp, float]] = []
-    lows: list[tuple[int, pd.Timestamp, float]] = []
-    if frame is None or len(frame) < (span * 2 + 3):
-        return highs, lows
-    span = max(1, int(span))
-    highs_arr = frame["high"].astype(float).tolist()
-    lows_arr = frame["low"].astype(float).tolist()
-    idxs = list(frame.index)
-    for i in range(span, len(frame) - span):
-        hi = highs_arr[i]
-        lo = lows_arr[i]
-        hi_window = highs_arr[i - span : i + span + 1]
-        lo_window = lows_arr[i - span : i + span + 1]
-        if hi == max(hi_window) and hi_window.count(hi) == 1:
-            highs.append((i, idxs[i], float(hi)))
-        if lo == min(lo_window) and lo_window.count(lo) == 1:
-            lows.append((i, idxs[i], float(lo)))
-    return highs, lows
+    # Thin wrapper around the shared detector, as support_resistance and
+    # htf_levels already are. This module carried its own copy of the loop;
+    # identical today, but `levels_shared.pivot_points` exists precisely so
+    # pivot semantics cannot drift between builders, and a third copy is how
+    # they would.
+    return pivot_points(frame, span, include_idx=True)
 
 
 def _reduced_pivots(
@@ -442,6 +430,21 @@ def _build_best_line(
                     touches += 1
                     last_touch_pos = pos
             if touches < int(min_touches):
+                continue
+            # A line price has cut straight through is not support or
+            # resistance, however many other pivots it touches. Counting
+            # touches alone accepted a "support" with a pivot low 11 points
+            # below it in the middle of its span. Only the span BETWEEN the
+            # first point and the last touch is checked: a pivot through the
+            # line after its last touch is a break -- information that
+            # `trendline_break_*` exists to report -- not proof the line was
+            # never valid.
+            if any(
+                (price < _line_value(slope, intercept, pos) - tolerance) if kind == "support"
+                else (price > _line_value(slope, intercept, pos) + tolerance)
+                for pos, _ts, price in pts[i:]
+                if p1 < pos < last_touch_pos
+            ):
                 continue
             current_value = _line_value(slope, intercept, current_pos)
             direction = _line_direction(slope, slope_tol)
@@ -686,6 +689,34 @@ def _anchored_vwap(frame: pd.DataFrame, start_pos: int) -> float | None:
     return float((typical * vol_arr).sum() / vol_sum)
 
 
+def _session_open_anchored_vwap(frame: pd.DataFrame) -> float | None:
+    """VWAP anchored at the latest session's 09:30 open (or its first bar,
+    when no RTH bar exists yet), computed over the frame as passed.
+
+    Must be given the UNTRIMMED frame. Until 2026-09-22 this ran after
+    ``build_technical_levels_context`` cut the frame to its longest lookback
+    (~120 bars on the 1m base frame), so once 09:30 fell out of the window --
+    about 11:30 ET -- the session start silently became position 0 and
+    "anchored at the open" became a rolling 120-bar VWAP. Against the real
+    session VWAP it read 0.00 ATR off at 11:15, 3.4 ATR (median) at 12:00 and
+    6.1 at 13:30, with a 20.9 ATR worst case -- and it drives
+    ``anchored_vwap_loss_exit``.
+    """
+    if frame is None or frame.empty:
+        return None
+    index_dt = pd.DatetimeIndex(frame.index)
+    on_last_day = np.asarray(index_dt.normalize() == index_dt[-1].normalize())
+    # Prefer the 09:30 open over the pre-market start so thin pre-market
+    # volume does not skew the anchor.
+    after_open = on_last_day & np.asarray((index_dt.hour * 60 + index_dt.minute) >= 9 * 60 + 30)
+    positions = np.flatnonzero(after_open)
+    if positions.size == 0:
+        positions = np.flatnonzero(on_last_day)
+    if positions.size == 0:
+        return None
+    return _anchored_vwap(frame, int(positions[0]))
+
+
 # NOTE: divergence detection moved to ``levels_shared.find_divergence``
 # (DivergenceMatch + multi-pivot + age-cutoff). The old _last_two_pivots /
 # _pivot_series_value / _bullish_divergence / _bearish_divergence helpers
@@ -701,15 +732,42 @@ def _populate_atr_context(
     atr_expansion_lookback: int,
 ) -> None:
     """Set ATR fields on ctx: atr14, atr_pct, atr_expansion_mult, atr_stretch_*.
-    Extracted from build_technical_levels_context for Phase 3a decomposition."""
+    Extracted from build_technical_levels_context for Phase 3a decomposition.
+
+    ``atr_expansion_mult`` is the mean TRUE RANGE of the last
+    ``atr_expansion_lookback`` bars over the ``atr14`` in force just BEFORE
+    them: recent realised volatility against the volatility the ATR-based stop
+    buffers were sized on. 1.0 is "as expected", 1.5 is "ranges 50% wider than
+    the ATR assumes" -- the scale every consumer's docs and thresholds use.
+
+    Until 2026-09-22 this computed ``|close - close[-lookback-1]| / atr14``: a
+    directional DISPLACEMENT in ATRs, not volatility. A clean trend tripped it
+    with no expansion at all and a violent chop with zero net move did not.
+    Over 83,217 real 1m bars it crossed Tier 2a's 1.2 stop-widening trigger on
+    40.2% of bars; this form does on 15.6%.
+
+    The literal reading of those docs, ``atr14 / mean(atr14 over the prior 5
+    bars)``, was measured too and rejected: ATR14 is smoothed so heavily that
+    the ratio sits at 1.00 +/- 0.06 -- above 1.2 on 1.1% of bars and at or
+    above 0.8 on 100%, dead in both directions. The baseline is taken BEFORE
+    the window so the recent bars do not dilute their own denominator.
+    """
     last = frame.iloc[-1]
     ctx.atr14 = float(last["atr14"]) if pd.notna(last.get("atr14", math.nan)) else None
     ctx.atr_pct = (ctx.atr14 / close) if ctx.atr14 is not None and close > 0 else None
     if ctx.atr14 and ctx.atr14 > 0:
         expansion_lb = max(1, int(atr_expansion_lookback))
-        if len(frame) > expansion_lb:
-            prev_close = float(frame.iloc[-(expansion_lb + 1)]["close"])
-            ctx.atr_expansion_mult = abs(close - prev_close) / ctx.atr14
+        if len(frame) > expansion_lb + 1:
+            window = frame.iloc[-(expansion_lb + 1):]
+            high = window["high"].astype(float)
+            low = window["low"].astype(float)
+            prev_close = window["close"].astype(float).shift(1)
+            true_range = pd.concat(
+                [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1,
+            ).max(axis=1).iloc[1:]
+            baseline_atr = frame["atr14"].iloc[-(expansion_lb + 1)]
+            if pd.notna(baseline_atr) and float(baseline_atr) > 0:
+                ctx.atr_expansion_mult = float(true_range.mean()) / float(baseline_atr)
         ema20 = float(last["ema20"]) if pd.notna(last.get("ema20", math.nan)) else None
         vwap = float(last["vwap"]) if pd.notna(last.get("vwap", math.nan)) else None
         if ema20 is not None:
@@ -999,6 +1057,9 @@ def build_technical_levels_context(
             40,
         ))
 
+    # The anchored VWAP from the open needs the WHOLE session, which the trim
+    # below can cut off -- keep a handle on the untrimmed frame for it.
+    session_frame = frame
     frame = frame.tail(max(tail_requirements)).copy()
     close = resolve_current_price(frame, current_price)
     needs_atr = bool(impulse_context_enabled or trendline_enabled or channel_enabled or atr_context_enabled)
@@ -1092,20 +1153,7 @@ def build_technical_levels_context(
                                     scaled_span(rsi_nominal, span_scale))
 
     if anchored_vwap_enabled:
-        index_dt = pd.DatetimeIndex(frame.index)
-        last_day = index_dt[-1].normalize()
-        day_bars = frame[index_dt.normalize() == last_day]
-        if not day_bars.empty:
-            # Prefer RTH open (9:30) over pre-market start so the anchored
-            # VWAP isn't skewed by thin pre-market volume.
-            from datetime import time as _time
-            rth_open = _time(9, 30)
-            rth_bars = day_bars[day_bars.index.to_series().map(lambda ts: ts.time() >= rth_open)]
-            if not rth_bars.empty:
-                session_start_pos = len(frame) - len(rth_bars)
-            else:
-                session_start_pos = len(frame) - len(day_bars)
-            ctx.anchored_vwap_open = _anchored_vwap(frame, session_start_pos)
+        ctx.anchored_vwap_open = _session_open_anchored_vwap(session_frame)
 
     if bollinger_enabled:
         _populate_bollinger_bands(

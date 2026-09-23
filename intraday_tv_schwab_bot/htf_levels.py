@@ -306,12 +306,13 @@ def _completed_htf_frame(frame: pd.DataFrame, timeframe_minutes: int) -> pd.Data
             now_ts = et_now.tz_convert(idx.tz)
         else:
             now_ts = et_now.tz_localize(None)
-        cutoff = now_ts.floor(f"{max(1, int(timeframe_minutes))}min")
-        time_label = str(getattr(frame, "attrs", {}).get("time_label", "unknown") or "unknown").lower()
-        if time_label == "right":
-            completed = base[base.index <= cutoff]
-        else:
-            completed = base[base.index < cutoff]
+        # Every frame is labelled at bar START -- the broker's and
+        # `resample_bars`' alike -- so bar T is complete once T + tf has
+        # passed. Not `T < now.floor(tf)`: that holds only for clock-aligned
+        # bars, and 60m bars are anchored on the 09:30 open (10:30 would read
+        # complete at 11:00, half an hour early).
+        tf = max(1, int(timeframe_minutes))
+        completed = base[base.index + pd.Timedelta(minutes=tf) <= now_ts]
         return completed if isinstance(completed, pd.DataFrame) else pd.DataFrame(columns=base.columns)
     except Exception:
         return frame.iloc[:-1].copy() if len(frame) > 1 else pd.DataFrame(columns=frame.columns)
@@ -498,10 +499,15 @@ def _detect_fair_value_gaps(
     for idx in range(2, n):
         if high_arr is None or low_arr is None:
             break
-        left_high = float(high_arr[idx - 2]) if not (high_arr[idx - 2] != high_arr[idx - 2]) else 0.0
-        left_low = float(low_arr[idx - 2]) if not (low_arr[idx - 2] != low_arr[idx - 2]) else 0.0
-        right_low = float(low_arr[idx]) if not (low_arr[idx] != low_arr[idx]) else 0.0
-        right_high = float(high_arr[idx]) if not (high_arr[idx] != high_arr[idx]) else 0.0
+        # No NaN substitution. ensure_ohlcv_frame above has already dropped
+        # NaN OHLC rows, and a NaN that did get here fails both comparisons
+        # below and yields no gap -- the safe outcome. The old guard replaced
+        # NaN with 0.0, which would have made `right_low > 0 + eps` true and
+        # manufactured a bullish gap spanning from zero up to price.
+        left_high = float(high_arr[idx - 2])
+        left_low = float(low_arr[idx - 2])
+        right_low = float(low_arr[idx])
+        right_high = float(high_arr[idx])
         if right_low > left_high + eps:
             lower = left_high
             upper = right_low
@@ -578,9 +584,7 @@ def build_fair_value_gap_context(
 ) -> FairValueGapContext:
     if frame is None or frame.empty:
         return empty_fvg_context(float(current_price or 0.0), timeframe_minutes=timeframe_minutes)
-    time_label = str(getattr(frame, "attrs", {}).get("time_label", "unknown") or "unknown").lower()
     base = ensure_standard_indicator_frame(ensure_ohlcv_frame(frame.copy()))
-    base.attrs["time_label"] = time_label
     if base.empty:
         return empty_fvg_context(float(current_price or 0.0), timeframe_minutes=timeframe_minutes)
     close = resolve_current_price(base, current_price)
@@ -631,9 +635,7 @@ def build_htf_context(
     divergence_min_price_move_pct: float = 0.0015,
     divergence_rsi_min_delta: float = 2.5,
 ) -> HTFContext:
-    time_label = str(getattr(frame, "attrs", {}).get("time_label", "unknown") or "unknown").lower()
     frame = ensure_standard_indicator_frame(ensure_ohlcv_frame(frame))
-    frame.attrs["time_label"] = time_label
     if frame.empty:
         return empty_htf_context(float(current_price or 0.0), timeframe_minutes=timeframe_minutes)
 

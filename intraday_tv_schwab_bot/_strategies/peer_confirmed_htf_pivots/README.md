@@ -141,7 +141,7 @@ Strategy-specific knobs:
   - `entry_exhaustion_filter_enabled`, `max_entry_vwap_extension_atr`, `max_entry_ema9_extension_atr`, `max_entry_bar_range_atr`, `max_entry_upper_wick_frac`, `max_entry_lower_wick_frac`
   - `use_sr_veto` (disabled by default so the strategy stays anchored to the HTF pivot model rather than generic S/R vetoes)
 - R:R and adaptive management:
-  - `min_rr`, `target_rr`, `runner_target_rr`, `stop_buffer_atr_mult`
+  - `min_rr`, `target_rr`, `stop_buffer_atr_mult`
   - `strong_setup_runner_enabled`, `adaptive_breakeven_rr`, `adaptive_profit_lock_rr`, `adaptive_profit_lock_stop_rr`, `adaptive_runner_trigger_rr`
 - Screener shaping:
   - `screener_contrarian_bias_threshold_pct`, `screener_activity_move_sweet_spot_pct`, `screener_activity_move_cap_pct`, `screener_relative_volume_cap`
@@ -219,7 +219,6 @@ Current package defaults:
 | `max_entry_lower_wick_frac`                    | `0.3`                                           |
 | `min_rr`                                       | `1.65`                                          |
 | `target_rr`                                    | `1.95`                                          |
-| `runner_target_rr`                             | `2.45`                                          |
 | `stop_buffer_atr_mult`                         | `0.5`                                           |
 | `strong_setup_runner_enabled`                  | `true`                                          |
 | `adaptive_breakeven_rr`                        | `0.9`                                           |

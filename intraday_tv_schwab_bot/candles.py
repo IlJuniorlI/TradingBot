@@ -364,6 +364,27 @@ def _tweezer_top_from_key(frame_key: tuple[tuple[float | None, float | None, flo
     return any(_tweezer_top_at(pair) for pair in _tweezer_pairs(frame_key))
 
 
+def _talib_value_matches_side(token: str, value: int, *, bullish: bool) -> bool:
+    """Does a TA-Lib output ``value`` count as a match for this side?
+
+    SIGN-DEPENDENT patterns (engulfing, harami, marubozu, ...) encode their
+    direction in the sign, so the sign decides. FIXED-direction patterns take
+    their direction from the list they are in; for them TA-Lib's sign is not
+    a direction and any non-zero value is a match.
+
+    Until 2026-09-22 every pattern was matched on its sign, which is only
+    correct if TA-Lib always signs a fixed pattern the way its list does. It
+    does not: ``CDLGRAVESTONEDOJI`` sits in the BEARISH list and TA-Lib emits
+    it as +100 -- 9,181 times across 400 real 1m frames, never once negative
+    -- so a bearish match, which required a negative value, was impossible.
+    Every other fixed pattern was checked on the same data and is signed to
+    match its list; for those this changes nothing.
+    """
+    if token in _SIGN_DEPENDENT_PATTERNS:
+        return value > 0 if bullish else value < 0
+    return value != 0
+
+
 def _evaluate_side_pattern(
     frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...],
     name: str,
@@ -378,7 +399,7 @@ def _evaluate_side_pattern(
     if (not bullish) and token == "TWEEZER_TOP":
         return _tweezer_top_from_key(frame_key)
     value = _talib_pattern_value_from_key(frame_key, token)
-    return value > 0 if bullish else value < 0
+    return _talib_value_matches_side(token, value, bullish=bullish)
 
 
 @lru_cache(maxsize=4096)
@@ -646,7 +667,7 @@ def detect_per_bar_candle_patterns(
             continue
         values = _talib_pattern_array_from_key(frame_key, token)
         for i, v in enumerate(values):
-            if v > 0:
+            if _talib_value_matches_side(token, v, bullish=True):
                 bullish_by_pos[i].append(token)
 
     for token in bearish_allowed_tuple:
@@ -659,7 +680,7 @@ def detect_per_bar_candle_patterns(
             continue
         values = _talib_pattern_array_from_key(frame_key, token)
         for i, v in enumerate(values):
-            if v < 0:
+            if _talib_value_matches_side(token, v, bullish=False):
                 bearish_by_pos[i].append(token)
 
     def _apply_tier_cascade(matches: list[str]) -> list[str]:

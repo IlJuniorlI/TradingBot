@@ -689,6 +689,16 @@ class ChartPatternsConfig:
     bearish_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_BEARISH_CHART_PATTERNS))
 
 
+def htf_structure_event_lookback(sr_cfg: Any) -> int:
+    """HTF BOS/CHoCH freshness window in HTF bars: the explicit
+    ``htf_structure_event_lookback_bars`` when set, else the shared
+    ``structure_event_lookback_bars``. The one place that fallback lives."""
+    explicit = getattr(sr_cfg, "htf_structure_event_lookback_bars", None)
+    if explicit is not None:
+        return max(1, int(explicit))
+    return max(1, int(getattr(sr_cfg, "structure_event_lookback_bars", 6) or 6))
+
+
 @dataclass(slots=True)
 class SupportResistanceConfig:
     enabled: bool = True
@@ -768,6 +778,17 @@ class SupportResistanceConfig:
     structure_ltf_weight: float = 0.65
     structure_htf_weight: float = 0.85
     structure_event_lookback_bars: int = 6
+    # BOS/CHoCH freshness window for the HTF structure (the S/R context's
+    # `market_structure`, built on `timeframe_minutes` bars), in HTF bars.
+    # None = same as `structure_event_lookback_bars`, which keeps every preset
+    # that never distinguished the two exactly as it was.
+    #
+    # It exists because one knob was sizing two different clocks. The LTF
+    # value is routinely retuned for the LTF frame -- top_tier halved it 8 -> 4
+    # on 2026-05-27 "(= 20 min)" on 5m bars -- and that silently halved the
+    # 15m HTF window too, 120 -> 60 minutes, under the HTF bias entry gate.
+    # Resolve through `htf_structure_event_lookback`, never read it raw.
+    htf_structure_event_lookback_bars: int | None = None
     # Minimum spread between the most recent reference_high and reference_low
     # (in ATR units) for structure-derived bias to be considered meaningful.
     # When EQH and EQL coexist within a tight range (e.g. 0.3 ATR), the bias

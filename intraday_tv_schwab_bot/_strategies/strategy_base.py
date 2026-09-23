@@ -26,6 +26,7 @@ from ..order_blocks import (
     empty_order_block_context,
 )
 from .rvol import effective_relative_volume, relative_volume_gate_threshold
+from ..models import OPTION_ASSET_TYPES
 from .shared import (
     Any,
     Candidate,
@@ -2832,6 +2833,12 @@ class BaseStrategy:
         with breakeven/trailing management and would make R drift over the
         life of the trade. Returns None when the initial risk is unknown or
         degenerate, which callers treat as "no opinion".
+
+        An option position's entry and stop are PREMIUM while ``close`` is the
+        underlying's, so its R is measured on the option's own mark (stamped
+        each cycle by the position manager) -- dividing an underlying move by
+        a premium risk read a debit position as ~+7R (discretionary exits
+        always armed) and a credit spread as ~-5R (never armed).
         """
         meta = position.metadata if isinstance(position.metadata, dict) else {}
         entry = _optional_float(position.entry_price)
@@ -2841,8 +2848,49 @@ class BaseStrategy:
         risk = abs(entry - initial_stop)
         if risk <= 0:
             return None
-        move = (close - entry) if position.side == Side.LONG else (entry - close)
+        price: float | None = close
+        if BaseStrategy._is_option_position(position):
+            price = _optional_float(meta.get("last_mark_price"))
+            if price is None:
+                return None
+        move = (price - entry) if position.side == Side.LONG else (entry - price)
         return move / risk
+
+    @staticmethod
+    def _is_option_position(position: Position) -> bool:
+        meta = position.metadata if isinstance(position.metadata, dict) else {}
+        return str(meta.get("asset_type") or "").upper() in OPTION_ASSET_TYPES
+
+    @staticmethod
+    def _underlying_entry_price(position: Position) -> float | None:
+        """Entry in the price space of the frame the exit logic reads.
+
+        An equity's own entry. An option's ``entry_price`` is premium, so its
+        underlying's price at entry (``underlying_entry``, stamped by every
+        option signal builder) -- None when that was never recorded, which
+        callers treat as "no opinion".
+        """
+        if not BaseStrategy._is_option_position(position):
+            return _optional_float(position.entry_price)
+        meta = position.metadata if isinstance(position.metadata, dict) else {}
+        return _optional_float(meta.get("underlying_entry"))
+
+    @staticmethod
+    def _underlying_extremes(position: Position) -> tuple[float | None, float | None]:
+        """(high, low) since entry in the underlying's price space.
+
+        An option position's ``highest_price`` / ``lowest_price`` track its
+        PREMIUM; the underlying's own range is tracked separately by the
+        position manager. Falls back to the entry when nothing has been seen.
+        """
+        entry = BaseStrategy._underlying_entry_price(position)
+        if not BaseStrategy._is_option_position(position):
+            return (_optional_float(position.highest_price, entry), _optional_float(position.lowest_price, entry))
+        meta = position.metadata if isinstance(position.metadata, dict) else {}
+        return (
+            _optional_float(meta.get("underlying_high_since_entry"), entry),
+            _optional_float(meta.get("underlying_low_since_entry"), entry),
+        )
 
     def _discretionary_exit_allowed(self, position: Position, close: float) -> bool:
         """Gate for the exit families that carry no R condition of their own.
@@ -2915,8 +2963,8 @@ class BaseStrategy:
                 # how trail_armed requires a favorable move before arming.
                 # Buffer tightens the armed threshold so a one-tick poke
                 # right at the floor doesn't arm the exit prematurely.
-                highest_price = _safe_float(getattr(position, "highest_price", None), float(position.entry_price))
-                avwap_armed = avwap_floor > 0 and highest_price >= avwap_floor + buffer
+                highest_price, _lowest = self._underlying_extremes(position)
+                avwap_armed = avwap_floor > 0 and highest_price is not None and highest_price >= avwap_floor + buffer
                 tape_ok = self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.48)
                 # 2-bar confirmation (2026-05-29). A single 1m close below the
                 # anchored-VWAP floor is normal continuation noise in a trending
@@ -2958,8 +3006,8 @@ class BaseStrategy:
                 # price already near the AVWAP ceiling triggers an instant
                 # reclaim exit on the next tick — observed on META
                 # 2026-04-24 09:35 (55-second exit, -$68.86).
-                lowest_price = _safe_float(getattr(position, "lowest_price", None), float(position.entry_price))
-                avwap_armed = avwap_ceiling > 0 and lowest_price <= avwap_ceiling - buffer
+                _highest, lowest_price = self._underlying_extremes(position)
+                avwap_armed = avwap_ceiling > 0 and lowest_price is not None and lowest_price <= avwap_ceiling - buffer
                 tape_ok = self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.52)
                 # 2-bar confirmation (2026-05-29). Mirror of the LONG branch:
                 # require the PRIOR bar to also have closed above ceiling+buffer
@@ -2974,12 +3022,22 @@ class BaseStrategy:
                     return True, f"anchored_vwap_reclaim_exit:{avwap_ceiling:.4f}"
         return False, "hold"
 
-    def _structure_event_recent(self, age_bars: int | None) -> bool:
-        lookback = int(self._support_resistance_setting("structure_event_lookback_bars", 6) or 6)
+    def _structure_event_recent(self, age_bars: int | None, *, htf: bool = False) -> bool:
+        """Is a BOS/CHoCH ``age_bars`` old still fresh? ``age_bars`` is in the
+        bars of the structure it came from, so pass ``htf=True`` for the S/R
+        context's ``market_structure`` -- its ages are HTF bars and must be
+        judged by the HTF window, not the LTF one."""
+        # Local import: this module keeps `..config` behind TYPE_CHECKING.
+        from ..config import htf_structure_event_lookback
+        cfg = getattr(self.config, "support_resistance", None)
+        lookback = (
+            htf_structure_event_lookback(cfg) if htf
+            else int(self._support_resistance_setting("structure_event_lookback_bars", 6) or 6)
+        )
         return age_bars is not None and age_bars <= lookback
 
-    def _active_structure_break(self, flag: bool, age_bars: int | None) -> bool:
-        return bool(flag) and self._structure_event_recent(age_bars)
+    def _active_structure_break(self, flag: bool, age_bars: int | None, *, htf: bool = False) -> bool:
+        return bool(flag) and self._structure_event_recent(age_bars, htf=htf)
 
     @staticmethod
     def _fvg_gap_state(gap: Any, current_price: float) -> dict[str, Any]:
@@ -3697,7 +3755,11 @@ class BaseStrategy:
             except Exception:
                 held_minutes = 0.0
             if held_minutes >= time_stop_minutes:
-                entry = float(position.entry_price) if position.entry_price else 0.0
+                # "Gone nowhere" is judged on the frame's own instrument: for
+                # an option, the underlying since entry. Its premium against
+                # the underlying's close was never under the threshold, so the
+                # time stop could not scratch an option.
+                entry = self._underlying_entry_price(position) or 0.0
                 last_close: float | None = None
                 if frame is not None and not frame.empty and "close" in frame.columns:
                     last_close = _optional_float(frame.iloc[-1]["close"], None)
@@ -3901,7 +3963,12 @@ class BaseStrategy:
         ):
             sr_ctx = self._sr_context(symbol, frame, data)
             level_buffer = float(sr_ctx.level_buffer or 0.0)
-            entry_price = float(position.entry_price)
+            # The level has to sit beyond ENTRY, both on the underlying's
+            # scale; an option's premium entry would compare a $500 level to
+            # a $1.20 debit. No recorded underlying entry: no opinion.
+            entry_price = self._underlying_entry_price(position)
+            if entry_price is None:
+                return False, "hold"
             if direction == "bullish":
                 # Only fire on a CONFIRMED break event from the SR engine
                 # (broken_support), not a positional proximity check. Also

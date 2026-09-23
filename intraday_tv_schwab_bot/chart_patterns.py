@@ -251,8 +251,38 @@ def _atr_pct(frame: pd.DataFrame) -> float:
     return _cache_put(frame, key, _mean_range(frame) / close)
 
 
+# The volatility this module's percent-of-price constants were sized for.
+# Each one is paired with an ATR-relative term -- max(1.2%, 1.8 x bar range)
+# for an impulse, max(2%, 3 x bar range) for a flag's pole -- and the pairs
+# coincide at a mean 1m bar range of ~0.67% of price. That is the volatility
+# of a small/mid cap on 1m bars.
+#
+# On liquid mega caps (~0.1% per bar) the percent floors dominated by ~7x: a
+# 1.2% "prior impulse" over 8 bars is ~10 bar ranges, a 1.5% "equal highs"
+# tolerance is about a full day's range. Replayed over 1,850 real (symbol,
+# cycle) evaluations on 2026-09-21, 16 of the 18 patterns fired ZERO times
+# and the module fired 7 times in total -- so the opposing-pattern entry
+# filter and the pattern bonus it feeds were effectively switched off.
+_REFERENCE_BAR_RANGE_PCT = 0.0067
+
+
+def _vol_scale(frame: pd.DataFrame) -> float:
+    """This frame's volatility relative to ``_REFERENCE_BAR_RANGE_PCT``,
+    clamped to [0.1, 1.0]. Capped at 1.0 so a name at or above the design
+    volatility keeps EXACTLY the thresholds it always had; floored at 0.1 so
+    a near-frozen tape cannot shrink them to nothing."""
+    return max(0.1, min(1.0, _atr_pct(frame) / _REFERENCE_BAR_RANGE_PCT))
+
+
+def _pct(frame: pd.DataFrame, value: float) -> float:
+    """A percent-of-price constant from this module, rescaled to *frame*'s
+    volatility. Every such constant goes through here so the whole module
+    speaks one unit; ATR-relative terms need no rescaling and do not."""
+    return float(value) * _vol_scale(frame)
+
+
 def _level_tolerance(frame: pd.DataFrame, price: float) -> float:
-    base = abs(float(price)) * 0.015
+    base = abs(float(price)) * _pct(frame, 0.015)
     noise = _mean_range(frame) * 0.90
     return max(0.02, base, noise)
 
@@ -342,7 +372,7 @@ def _has_volume_expansion(frame: pd.DataFrame, ratio: float = 1.15, bars: int = 
 def _prior_impulse(frame: pd.DataFrame, direction: str, bars: int = 8) -> bool:
     f = _tail(frame, bars)
     move = _ret_pct(f)
-    threshold = max(0.012, _atr_pct(f) * 1.8)
+    threshold = max(_pct(f, 0.012), _atr_pct(f) * 1.8)
     return move >= threshold if direction == "up" else move <= -threshold
 
 
@@ -403,7 +433,7 @@ def _find_pivots(frame: pd.DataFrame, order: int | None = None) -> list[tuple[st
     # keep the inner loop Python-native so max()/min() stay fast.
     highs = frame["high"].to_numpy(dtype=np.float64, copy=False).tolist()
     lows = frame["low"].to_numpy(dtype=np.float64, copy=False).tolist()
-    prominence = max(_mean_range(frame) * 0.05, abs(_close(frame)) * 0.0005)
+    prominence = max(_mean_range(frame) * 0.05, abs(_close(frame)) * _pct(frame, 0.0005))
     raw: list[tuple[str, int, float]] = []
     for idx in range(order, len(frame) - order):
         hi_window = highs[idx - order: idx + order + 1]
@@ -451,8 +481,8 @@ def _bullish_breakout_ready(frame: pd.DataFrame, level: float, tol: float) -> bo
         return False
     close = _close(frame)
     near_high = _bar_close_position(frame) >= 0.58
-    directional = _recent_move(frame, 3) >= -0.002
-    trend_ok = close >= _ema(frame, "ema9") * 0.997
+    directional = _recent_move(frame, 3) >= -_pct(frame, 0.002)
+    trend_ok = close >= _ema(frame, "ema9") * (1.0 - _pct(frame, 0.003))
     return bool(close >= level - tol * 0.20 and near_high and directional and trend_ok and _has_volume_expansion(frame, ratio=1.08))
 
 
@@ -461,8 +491,8 @@ def _bearish_breakdown_ready(frame: pd.DataFrame, level: float, tol: float) -> b
         return False
     close = _close(frame)
     near_low = _bar_close_position(frame) <= 0.42
-    directional = _recent_move(frame, 3) <= 0.002
-    trend_ok = close <= _ema(frame, "ema9") * 1.003
+    directional = _recent_move(frame, 3) <= _pct(frame, 0.002)
+    trend_ok = close <= _ema(frame, "ema9") * (1.0 + _pct(frame, 0.003))
     return bool(close <= level + tol * 0.20 and near_low and directional and trend_ok and _has_volume_expansion(frame, ratio=1.08))
 
 
@@ -471,8 +501,9 @@ def _bullish_reversal_breakout_ready(frame: pd.DataFrame, level: float, tol: flo
         return False
     close = _close(frame)
     close_pos = _bar_close_position(frame)
-    directional = _recent_move(frame, 3) >= -0.004
-    trend_ok = close >= _ema(frame, "ema9") * 0.994 or close >= _ema(frame, "vwap") * 0.998
+    directional = _recent_move(frame, 3) >= -_pct(frame, 0.004)
+    trend_ok = (close >= _ema(frame, "ema9") * (1.0 - _pct(frame, 0.006))
+                or close >= _ema(frame, "vwap") * (1.0 - _pct(frame, 0.002)))
     reclaim_ok = close >= level - tol * 0.35
     candle_ok = close_pos >= 0.52 or _body_fraction(frame) >= 0.28
     volume_ok = _has_volume_expansion(frame, ratio=1.03)
@@ -484,8 +515,9 @@ def _bearish_reversal_breakdown_ready(frame: pd.DataFrame, level: float, tol: fl
         return False
     close = _close(frame)
     close_pos = _bar_close_position(frame)
-    directional = _recent_move(frame, 3) <= 0.004
-    trend_ok = close <= _ema(frame, "ema9") * 1.006 or close <= _ema(frame, "vwap") * 1.002
+    directional = _recent_move(frame, 3) <= _pct(frame, 0.004)
+    trend_ok = (close <= _ema(frame, "ema9") * (1.0 + _pct(frame, 0.006))
+                or close <= _ema(frame, "vwap") * (1.0 + _pct(frame, 0.002)))
     reclaim_ok = close <= level + tol * 0.35
     candle_ok = close_pos <= 0.48 or _body_fraction(frame) >= 0.28
     volume_ok = _has_volume_expansion(frame, ratio=1.03)
@@ -608,7 +640,7 @@ def bearish_broadening_top(frame: pd.DataFrame) -> bool:
     prior_trend = _ret_pct(_head(f, max(8, len(f) // 2)))
     midrange = (float(f.iloc[-1].high) + float(f.iloc[-1].low)) / 2.0
     return bool(
-        prior_trend > 0.015
+        prior_trend > _pct(f, 0.015)
         and stats.slope_high > 0 > stats.slope_low
         and stats.range_end > stats.range_start * 1.18
         and _close(f) <= midrange
@@ -625,7 +657,7 @@ def bullish_broadening_bottom(frame: pd.DataFrame) -> bool:
     prior_trend = _ret_pct(_head(f, max(8, len(f) // 2)))
     midrange = (float(f.iloc[-1].high) + float(f.iloc[-1].low)) / 2.0
     return bool(
-        prior_trend < -0.015
+        prior_trend < -_pct(f, 0.015)
         and stats.slope_high > 0 > stats.slope_low
         and stats.range_end > stats.range_start * 1.18
         and _close(f) >= midrange
@@ -647,7 +679,7 @@ def bullish_flag(frame: pd.DataFrame) -> bool:
     if impulse is None or flag is None:
         return False
     impulse_move = _close(impulse) - _open(impulse, 0)
-    min_impulse = max(_mean_range(impulse) * 3.0, _open(impulse, 0) * 0.02)
+    min_impulse = max(_mean_range(impulse) * 3.0, _open(impulse, 0) * _pct(impulse, 0.02))
     if impulse_move <= min_impulse:
         return False
     flag_slope, _ = _line_fit(flag["close"])
@@ -655,7 +687,13 @@ def bullish_flag(frame: pd.DataFrame) -> bool:
     prior_flag_high = float(flag["high"].iloc[:-1].max()) if len(flag) > 1 else float(flag["high"].max())
     contraction = float(flag["high"].max() - flag["low"].min()) <= impulse_move * 0.65
     breakout_ready = _bullish_breakout_ready(flag, prior_flag_high, _level_tolerance(flag, prior_flag_high))
-    return bool(flag_slope <= max(0.04, impulse_move / max(len(flag), 1) * 0.18) and 0 <= retrace <= impulse_move * 0.55 and contraction and breakout_ready)
+    # A flag may drift WITH the pole by a small fraction of it. The floor on
+    # that allowance was an absolute $0.04 per bar until 2026-09-22 -- 0.8% a
+    # bar on a $5 stock, which lets a strong up-trend pass for a flag, and
+    # nothing at all on a $500 one. 0.10 bar ranges per bar is about one
+    # standard error of an OLS slope fitted to 11 flat noisy bars.
+    slope_allowance = max(0.10 * _mean_range(flag), impulse_move / max(len(flag), 1) * 0.18)
+    return bool(flag_slope <= slope_allowance and 0 <= retrace <= impulse_move * 0.55 and contraction and breakout_ready)
 
 
 def bearish_flag(frame: pd.DataFrame) -> bool:
@@ -663,7 +701,7 @@ def bearish_flag(frame: pd.DataFrame) -> bool:
     if impulse is None or flag is None:
         return False
     impulse_move = _open(impulse, 0) - _close(impulse)
-    min_impulse = max(_mean_range(impulse) * 3.0, _open(impulse, 0) * 0.02)
+    min_impulse = max(_mean_range(impulse) * 3.0, _open(impulse, 0) * _pct(impulse, 0.02))
     if impulse_move <= min_impulse:
         return False
     flag_slope, _ = _line_fit(flag["close"])
@@ -671,7 +709,8 @@ def bearish_flag(frame: pd.DataFrame) -> bool:
     prior_flag_low = float(flag["low"].iloc[:-1].min()) if len(flag) > 1 else float(flag["low"].min())
     contraction = float(flag["high"].max() - flag["low"].min()) <= impulse_move * 0.65
     breakdown_ready = _bearish_breakdown_ready(flag, prior_flag_low, _level_tolerance(flag, prior_flag_low))
-    return bool(flag_slope >= min(-0.04, -impulse_move / max(len(flag), 1) * 0.18) and 0 <= retrace <= impulse_move * 0.55 and contraction and breakdown_ready)
+    slope_allowance = max(0.10 * _mean_range(flag), impulse_move / max(len(flag), 1) * 0.18)
+    return bool(flag_slope >= -slope_allowance and 0 <= retrace <= impulse_move * 0.55 and contraction and breakdown_ready)
 
 
 def bullish_pennant(frame: pd.DataFrame) -> bool:
@@ -679,7 +718,7 @@ def bullish_pennant(frame: pd.DataFrame) -> bool:
     if impulse is None or pennant is None:
         return False
     impulse_move = _close(impulse) - _open(impulse, 0)
-    if impulse_move <= max(_mean_range(impulse) * 3.0, _open(impulse, 0) * 0.02):
+    if impulse_move <= max(_mean_range(impulse) * 3.0, _open(impulse, 0) * _pct(impulse, 0.02)):
         return False
     stats = _trend_stats(pennant)
     if stats is None:
@@ -695,7 +734,7 @@ def bearish_pennant(frame: pd.DataFrame) -> bool:
     if impulse is None or pennant is None:
         return False
     impulse_move = _open(impulse, 0) - _close(impulse)
-    if impulse_move <= max(_mean_range(impulse) * 3.0, _open(impulse, 0) * 0.02):
+    if impulse_move <= max(_mean_range(impulse) * 3.0, _open(impulse, 0) * _pct(impulse, 0.02)):
         return False
     stats = _trend_stats(pennant)
     if stats is None:
@@ -747,7 +786,7 @@ def bullish_symmetrical_triangle(frame: pd.DataFrame) -> bool:
     prior_ret = _ret_pct(_head(f, max(8, len(f) // 2)))
     upper = max(p[2] for p in highs[-2:])
     tol = _level_tolerance(f, upper)
-    return bool(descending_highs and ascending_lows and prior_ret > 0.012 and stats.range_end < stats.range_start * 0.78 and _bullish_breakout_ready(f, upper, tol))
+    return bool(descending_highs and ascending_lows and prior_ret > _pct(f, 0.012) and stats.range_end < stats.range_start * 0.78 and _bullish_breakout_ready(f, upper, tol))
 
 
 def bearish_symmetrical_triangle(frame: pd.DataFrame) -> bool:
@@ -763,7 +802,7 @@ def bearish_symmetrical_triangle(frame: pd.DataFrame) -> bool:
     prior_ret = _ret_pct(_head(f, max(8, len(f) // 2)))
     lower = min(p[2] for p in lows[-2:])
     tol = _level_tolerance(f, lower)
-    return bool(descending_highs and ascending_lows and prior_ret < -0.012 and stats.range_end < stats.range_start * 0.78 and _bearish_breakdown_ready(f, lower, tol))
+    return bool(descending_highs and ascending_lows and prior_ret < -_pct(f, 0.012) and stats.range_end < stats.range_start * 0.78 and _bearish_breakdown_ready(f, lower, tol))
 
 
 BULLISH_CHART_PATTERN_REGISTRY: dict[str, PatternFunc] = {
@@ -905,13 +944,14 @@ def _bullish_pattern_still_valid(frame: pd.DataFrame, *, continuation: bool) -> 
     close = _close(f)
     ema9 = _ema(f, "ema9")
     vwap = _ema(f, "vwap")
-    atr_pct = max(_atr_pct(f), 0.0015)
+    atr_pct = max(_atr_pct(f), _pct(f, 0.0015))
     recent_move = _recent_move(f, 3)
     tolerance = _level_tolerance(f, close)
     support_floor = recent_low + (span * (0.14 if continuation else 0.10))
     decisive_break = close < support_floor - max(tolerance * 0.10, span * 0.02)
-    below_trend = close < ema9 * (0.993 if continuation else 0.990) and close < vwap * (0.997 if continuation else 0.995)
-    adverse_move = recent_move <= -max(0.0045 if continuation else 0.0060, atr_pct * (0.80 if continuation else 1.00))
+    below_trend = (close < ema9 * (1.0 - _pct(f, 0.007 if continuation else 0.010))
+                   and close < vwap * (1.0 - _pct(f, 0.003 if continuation else 0.005)))
+    adverse_move = recent_move <= -max(_pct(f, 0.0045 if continuation else 0.0060), atr_pct * (0.80 if continuation else 1.00))
     stale_position = pos < (0.34 if continuation else 0.24)
     return not ((decisive_break and below_trend) or (below_trend and adverse_move and stale_position))
 
@@ -925,13 +965,14 @@ def _bearish_pattern_still_valid(frame: pd.DataFrame, *, continuation: bool) -> 
     close = _close(f)
     ema9 = _ema(f, "ema9")
     vwap = _ema(f, "vwap")
-    atr_pct = max(_atr_pct(f), 0.0015)
+    atr_pct = max(_atr_pct(f), _pct(f, 0.0015))
     recent_move = _recent_move(f, 3)
     tolerance = _level_tolerance(f, close)
     resistance_ceiling = recent_high - (span * (0.14 if continuation else 0.10))
     decisive_break = close > resistance_ceiling + max(tolerance * 0.10, span * 0.02)
-    above_trend = close > ema9 * (1.007 if continuation else 1.010) and close > vwap * (1.003 if continuation else 1.005)
-    adverse_move = recent_move >= max(0.0045 if continuation else 0.0060, atr_pct * (0.80 if continuation else 1.00))
+    above_trend = (close > ema9 * (1.0 + _pct(f, 0.007 if continuation else 0.010))
+                   and close > vwap * (1.0 + _pct(f, 0.003 if continuation else 0.005)))
+    adverse_move = recent_move >= max(_pct(f, 0.0045 if continuation else 0.0060), atr_pct * (0.80 if continuation else 1.00))
     stale_position = pos > (0.66 if continuation else 0.76)
     return not ((decisive_break and above_trend) or (above_trend and adverse_move and stale_position))
 

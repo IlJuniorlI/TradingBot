@@ -32,13 +32,11 @@ class PeerConfirmedKeyLevelsScreener(BaseStrategyScreener):
             "change_from_open",
             "relative_volume_10d_calc",
         ]
-        c = self._column
         q = (
             self._base_query(limit=max(len(configured_symbols), self.config.tradingview.max_candidates))
             .select(*self._select_fields(*select_cols))
             .where(
-                c("name").isin(configured_symbols),
-                *self._common_equity_conditions(),
+                *self._curated_symbol_conditions(configured_symbols),
             )
         )
         df = self._execute(q)
