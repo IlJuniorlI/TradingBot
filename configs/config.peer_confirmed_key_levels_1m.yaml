@@ -50,15 +50,16 @@ risk:
   # Direction-aware cooldown: a LONG exit only blocks same-direction
   # re-entries; SHORTs remain available to capture genuine reversals.
   cooldown_direction_aware: true
-  # Same-level retry block: after a losing exit, same-direction re-entry
-  # on the same symbol is blocked within same_level_block_atr_mult * ATR
-  # of the prior fill for same_level_block_minutes minutes. A fib-pullback
-  # entry (retrace to 0.5-0.786 of the swing) overrides the block.
+  # Same-level retry block: after any exit (win or loss), same-direction
+  # re-entry on the same symbol is blocked for same_level_block_minutes
+  # minutes when the new entry sits within same_level_block_atr_mult * ATR
+  # of the prior ENTRY. A fib-pullback entry (retrace to 0.5-0.786 of the
+  # swing) overrides the block.
   same_level_block_minutes: 30
   same_level_block_atr_mult: 0.3
   # Time-stop: positions held >= time_stop_minutes with |return_pct| below
   # time_stop_min_return_pct are scratched to free a slot. 0 = disabled.
-  time_stop_minutes: 45
+  time_stop_minutes: 0  # parity: the peer exit path never ran it before 2026-09-24
   time_stop_min_return_pct: 0.003
   # Peak-giveback floor: once max_favorable_r since entry crosses
   # peak_giveback_min_r (default 1.0), exit when current_r retraces below
@@ -256,7 +257,7 @@ support_resistance:
   stop_buffer_atr_mult: 0.25
   entry_min_clearance_atr: 0.56
   entry_min_clearance_pct: 0.0019
-  entry_proximity_scoring_enabled: true
+  entry_proximity_scoring_enabled: false  # parity: this strategy never read it before 2026-09-24
   entry_bias_score_weight: 0.5
   entry_favorable_proximity_bonus: 0.3
   entry_opposing_proximity_penalty: 0.3
@@ -307,7 +308,15 @@ technical_levels:
   trendline_lookback_bars: 120
   trendline_min_touches: 3
   trendline_atr_tolerance_mult: 0.35
-  trendline_breakout_buffer_atr_mult: 0.15
+  # 2026-09-23: was 0.15, which never applied -- a 0.10%-of-price floor
+  # always won. With the floor gone (CT-4) this ATR multiple IS the buffer;
+  # 0.65 matches the old effective buffer at the median on 1m bars
+  # (0.10% of price / atr_value, archived RTH decisions: 0.667), so breaks
+  # fire where they did on a typical tape. The ATR is atr_value =
+  # max(ATR14, 0.15% of price), so the buffer scales with volatility only
+  # once ATR14 passes 0.15% of price (on 1m large caps that floor decides
+  # ~70-80% of bars, giving 0.0975% of price at 0.65).
+  trendline_breakout_buffer_atr_mult: 0.65
   adx_enabled: true
   adx_length: 14
   adx_min_strength: 18.0
@@ -368,30 +377,35 @@ technical_levels:
   entry_bonus_trendline_respect: 0.2
   entry_penalty_near_extension: 0.4
 
-# Shared entry filters and scoring knobs used across strategies.
+# Shared entry knobs. Global since 2026-09-24: each one acts on every strategy
+# through the shared entry stage; a value marked "parity" is what this
+# strategy effectively did before (a knob it never read was off).
 shared_entry:
   use_fvg_context: true
-  use_divergence_filter: true
-  use_technical_entry_adjustment: true
-  use_technical_stop_target_refinement: true
-  use_structure_filter: true
-  use_sr_filter: true
-  use_sr_stop_target_refinement: true
-  # HTF divergence multi-timeframe confluence (alongside use_divergence_filter
-  # which gates LTF counter-divergence penalties).
-  use_htf_divergence_filter: true
+  # Veto an entry when RSI AND OBV both diverge against it.
+  use_dual_divergence_veto: false  # parity: this strategy never read it before 2026-09-24
+  use_technical_entry_adjustment: false  # parity: this strategy never read it before 2026-09-24
+  use_technical_stop_target_refinement: false  # parity: this strategy never read it before 2026-09-24
+  use_structure_filter: false  # parity: this strategy never read it before 2026-09-24
+  use_sr_filter: false  # parity: the AND check is params.require_peer_target_clearance now
+  use_sr_stop_target_refinement: false  # parity: this strategy never read it before 2026-09-24
+  # HTF RSI divergence SCORE term (+aligned / -counter / +hidden, the
+  # technical_levels.htf_divergence_* weights); it never blocks. The LTF
+  # counter-divergence penalties are part of use_technical_entry_adjustment.
+  use_htf_divergence_score: true
   # Divergence as a primary entry trigger (off by default). When enabled,
   # any strategy can fire a secondary entry signal on a confirmed divergence
-  # at S/R confluence. See _divergence_entry_candidate in strategy_base.py.
+  # at S/R confluence. See _divergence_entry_candidate in _strategies/shared_entry.py.
   use_divergence_entry_signal: false
   divergence_entry_min_age_bars: 0
   divergence_entry_require_sr_confluence: true
   divergence_entry_score_floor: 1.5
   divergence_entry_score_bump: 0.20
   use_opposing_chart_filter: false
+  use_opposing_candle_filter: false
+  use_broken_level_guard: false  # ships off in every preset (2026-09-24)
 
 # Shared exit and management settings used across strategies.
-  use_opposing_candle_filter: false
 shared_exit:
   use_technical_exit: true
   use_trendline_break: false
@@ -400,7 +414,7 @@ shared_exit:
   use_anchored_vwap_loss: false
   use_chart_pattern_exit: false
   use_structure_exit: false
-  use_sr_loss_exit: true
+  use_sr_loss_exit: false  # ships off in every preset (2026-09-24), see config.example.yaml
   # Counter-direction REGULAR divergence forming on a held position.
   # Hidden divergence is continuation context and never triggers exit.
   use_divergence_exit_signal: false
@@ -415,9 +429,8 @@ shared_exit:
   bearish_close_position_min: 0.54
   bullish_close_position_loose_max: 0.38
   bearish_close_position_loose_min: 0.62
-
-# Options-mode filters, pricing, and contract-selection controls.
   use_candle_pattern_exit: false
+
 # Strategy-specific windows and tuned parameters.
 strategies:
   peer_confirmed_key_levels_1m:
@@ -476,6 +489,11 @@ strategies:
       require_macro_agreement_count: 1
       require_macro_net_bias: true
       require_htf_bias_alignment: true
+      # key_levels' own S/R check: refuse when the peer target level ahead is
+      # inside BOTH support_resistance.entry_min_clearance_pct AND _atr. It ran
+      # under shared_entry.use_sr_filter until 2026-09-24; the global S/R veto
+      # (OR semantics) is off for this strategy (parity).
+      require_peer_target_clearance: true
       stop_buffer_atr_mult: 0.56
       strong_setup_min_htf_vote_edge: 1
       strong_setup_min_level_score: 3.0

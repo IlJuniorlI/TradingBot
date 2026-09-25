@@ -10,9 +10,45 @@ from ..shared import (
     _safe_float,
     pd,
 )
+from ..shared_entry import EntryContexts, EntryProposal, RetestTrigger
 from ..strategy_base import BaseStrategy
 
+# The pending reasons an FVG retest of the re-expansion trigger may clear,
+# per side: no re-expansion yet, a stretched or weak trigger bar, or the
+# anti-chase exhaustion checks (the wick check is side-specific). Until
+# 2026-09-24 two passes cleared them -- the own reasons first, the
+# exhaustion ones only once nothing else was pending -- and one pass over
+# the union decides the same.
+_RETEST_DEFERRABLE = {
+    Side.LONG: frozenset({
+        "too_extended_from_vwap", "no_reexpansion_trigger", "weak_bar_close",
+        "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large",
+    }),
+    Side.SHORT: frozenset({
+        "too_extended_from_vwap", "no_reexpansion_trigger", "weak_bar_close",
+        "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "lower_wick_rejection", "expansion_bar_too_large",
+    }),
+}
+
+
 class RTHTrendPullbackStrategy(BaseStrategy):
+    """Regular-session trend pullback re-entry, on the candidate's side.
+
+    One proposal per candidate on its directional bias (style / family
+    ``pullback``): the setup's own blockers and the anti-chase exhaustion
+    checks are its pending reasons, and an FVG retest of the re-expansion
+    trigger may clear the stretched / weak-trigger / exhaustion ones. The
+    stop sits beyond the pullback extreme and the VWAP / EMA20 support
+    (at least ``default_stop_pct`` away), the target at ``target_rr``
+    (``strong_trend_target_rr`` on a structure-confirmed continuation).
+    Every shared_entry knob -- the vetoes, the refinement, the retest stop
+    anchor, the score terms -- is applied by ``self.entry_policy.admit``.
+    The ``pullback`` family puts the entry under the exit side's pullback
+    structure grace (``support_resistance.structure_exit_grace_minutes_
+    pullback``), which until 2026-09-24 covered only top_tier's pullback
+    regime.
+    """
+
     strategy_name = 'rth_trend_pullback'
 
     def required_history_bars(self, symbol: str | None = None, positions: dict[str, Position] | None = None) -> int:
@@ -36,6 +72,8 @@ class RTHTrendPullbackStrategy(BaseStrategy):
         trend_min_ret5 = float(self.params.get("trend_min_ret5", 0.0002))
         trend_min_ret15 = float(self.params.get("trend_min_ret15", 0.0004))
         target_rr = max(1.0, float(self.params.get("target_rr", 2.0)))
+        strong_trend_runner_enabled = bool(self.params.get("strong_trend_runner_enabled", True))
+        strong_trend_target_rr = float(self.params.get("strong_trend_target_rr", target_rr + 0.3))
         allow_short = bool(self.config.risk.allow_short)
         history_bars = max(min_bars, support_lookback + trigger_lookback + 5)
         for c in candidates:
@@ -70,28 +108,13 @@ class RTHTrendPullbackStrategy(BaseStrategy):
             pullback_low = _safe_float(pullback_slice["low"].min(), last_close)
             pullback_high = _safe_float(pullback_slice["high"].max(), last_close)
             ctx = self._chart_context(frame)
-            sr_ctx = self._sr_context(c.symbol, frame, data)
             ms_ctx = self._structure_context(frame, "ltf")
-            tech_ctx = self._technical_context(frame)
-            htf_ctx = self._default_htf_context_for_score(c.symbol, data)
-            metadata = {
-                "trigger_high": trigger_high,
-                "trigger_low": trigger_low,
-                "support_low": support_low,
-                "resistance_high": resistance_high,
-                "pullback_low": pullback_low,
-                "pullback_high": pullback_high,
-                "extension_from_vwap_pct": extension_pct,
-                **self._chart_lists(ctx),
-                **self._structure_lists(ms_ctx, prefix="msltf"),
-                **self._sr_lists(sr_ctx),
-                **self._technical_lists(tech_ctx),
-            }
             if directional_bias == Side.LONG:
-                long_support_ref = min(last_vwap, last_ema20)
-                bullish_trigger = bool(self._structure_event_recent(getattr(ms_ctx, "bos_up_age_bars", None)) and getattr(ms_ctx, "bos_up", False)) or last_close > trigger_high
-                retest_plan = self._continuation_fvg_retest_plan(Side.LONG, c.symbol, frame, data, trigger_level=trigger_high, breakout_active=bool(bullish_trigger), close=last_close, vwap=last_vwap, ema9=last_ema9)
-                pullback_hold_ok = pullback_low >= (long_support_ref * (1.0 - support_hold_pct)) if long_support_ref > 0 else True
+                side = Side.LONG
+                support_ref = min(last_vwap, last_ema20)
+                trigger_level = trigger_high
+                trigger_fired = bool(self._structure_event_recent(getattr(ms_ctx, "bos_up_age_bars", None)) and getattr(ms_ctx, "bos_up", False)) or last_close > trigger_high
+                pullback_hold_ok = pullback_low >= (support_ref * (1.0 - support_hold_pct)) if support_ref > 0 else True
                 if day_strength < min_change:
                     reasons.append(_reason_with_values("weak_day_strength", current=day_strength, required=min_change, op=">=", digits=4))
                 if last_close <= last_vwap:
@@ -105,66 +128,24 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                 if extension_pct > max_extension:
                     reasons.append(_reason_with_values("too_extended_from_vwap", current=extension_pct, required=max_extension, op="<=", digits=4))
                 if not pullback_hold_ok:
-                    reasons.append(_reason_with_values("pullback_lost_support", current=pullback_low, required=long_support_ref * (1.0 - support_hold_pct), op=">=", digits=4))
-                if not bullish_trigger:
+                    reasons.append(_reason_with_values("pullback_lost_support", current=pullback_low, required=support_ref * (1.0 - support_hold_pct), op=">=", digits=4))
+                if not trigger_fired:
                     reasons.append(_reason_with_values("no_reexpansion_trigger", current=last_close, required=trigger_high, op=">", digits=4))
                 if close_pos < min_bar_close_position:
                     reasons.append(_reason_with_values("weak_bar_close", current=close_pos, required=min_bar_close_position, op=">=", digits=4))
-                if not reasons and self._shared_entry_enabled("use_opposing_chart_filter", True) and self._blocks_bullish_entry(ctx):
-                    reasons.append("chart_pattern_opposed")
-                reasons = self._apply_continuation_zone_retest_plans(reasons, [retest_plan], deferrable_prefixes={"too_extended_from_vwap", "no_reexpansion_trigger", "weak_bar_close", "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large"})
-                if not reasons:
-                    reasons.extend(self._entry_exhaustion_reasons(Side.LONG, frame, close=last_close, vwap=last_vwap, ema9=last_ema9))
-                    reasons = self._apply_continuation_zone_retest_plans(reasons, [retest_plan], deferrable_prefixes={"too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large"})
-                if not reasons:
-                    divergence_reason = self._dual_counter_divergence_reason(Side.LONG, tech_ctx)
-                    if divergence_reason:
-                        reasons.append(divergence_reason)
-                if not reasons:
-                    stop = min(pullback_low, long_support_ref * (1.0 - support_hold_pct)) if long_support_ref > 0 else pullback_low
-                    stop = min(stop, last_close * (1.0 - self.config.risk.default_stop_pct))
-                    risk_per_share = max(0.01, last_close - stop)
-                    effective_target_rr = target_rr
-                    if bool(self.params.get("strong_trend_runner_enabled", True)) and getattr(ms_ctx, "bias", "neutral") == "bullish" and bool(getattr(ms_ctx, "bos_up", False)) and ctx.matched_bullish_continuation:
-                        effective_target_rr = max(target_rr, float(self.params.get("strong_trend_target_rr", target_rr + 0.3)))
-                    target = last_close + risk_per_share * effective_target_rr
-                    if self._blocks_bullish_structure_entry(ms_ctx):
-                        reasons.append(self._bullish_structure_block_reason(ms_ctx))
-                    elif self._blocks_bullish_sr_entry(sr_ctx):
-                        reasons.append(self._bullish_sr_block_reason(sr_ctx))
-                    else:
-                        stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx, frame)
-                        stop, target = self._refine_bullish_technical_levels(last_close, stop, target, tech_ctx, frame)
-                        stop = self._apply_retest_stop_anchor(Side.LONG, last_close, stop, retest_plan)
-                        structure_bonus = 0.75 if getattr(ms_ctx, "bias", "neutral") == "bullish" else 0.0
-                        if bool(getattr(ms_ctx, "bos_up", False)) and self._structure_event_recent(getattr(ms_ctx, "bos_up_age_bars", None)):
-                            structure_bonus += 0.5
-                        pattern_bonus = 0.35 if ctx.matched_bullish_continuation else 0.15 if ctx.matched_bullish_reversal else 0.0
-                        adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
-                        fvg_adjustments = self._fvg_entry_adjustment_components(Side.LONG, c.symbol, frame, data)
-                        runner_allowed = bool((effective_target_rr > target_rr or float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0) >= 0.35) and getattr(ms_ctx, "bias", "neutral") == "bullish")
-                        management = self._adaptive_management_components(Side.LONG, last_close, stop, target, style="trend", runner_allowed=runner_allowed, continuation_bias=float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0), strong_setup=bool(effective_target_rr > target_rr))
-                        final_priority_score = float(c.activity_score) + (max(0.0, last_ret5) * 50.0) + (max(0.0, last_ret15) * 100.0) + structure_bonus + pattern_bonus + adjustments["entry_context_adjustment"] + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
-                        metadata["final_priority_score"] = round(final_priority_score, 4)
-                        metadata.update(adjustments)
-                        metadata.update(fvg_adjustments)
-                        metadata.update(management)
-                        metadata.update(retest_plan.get("metadata", {}))
-                        metadata.update(self._technical_lists(tech_ctx))
-                        reason = "rth_trend_pullback_long_fvg_retest" if str(retest_plan.get("status", "none") or "none") == "allow" else "rth_trend_pullback_long"
-                        if ctx.matched_bullish_continuation:
-                            reason += f":{'+'.join(sorted(ctx.matched_bullish_continuation))}"
-                        out.append(Signal(symbol=c.symbol, strategy=self.strategy_name, side=Side.LONG, reason=reason, stop_price=stop, target_price=target, metadata=metadata))
-                        self._record_entry_decision(c.symbol, "signal", [reason])
-                        continue
+                stop = min(pullback_low, support_ref * (1.0 - support_hold_pct)) if support_ref > 0 else pullback_low
+                stop = min(stop, last_close * (1.0 - self.config.risk.default_stop_pct))
+                risk_per_share = max(0.01, last_close - stop)
+                strong_trend = getattr(ms_ctx, "bias", "neutral") == "bullish" and bool(getattr(ms_ctx, "bos_up", False)) and bool(ctx.matched_bullish_continuation)
             else:
                 if not allow_short:
                     self._record_entry_decision(c.symbol, "skipped", ["shorts_disabled"])
                     continue
-                short_res_ref = max(last_vwap, last_ema20)
-                bearish_trigger = bool(self._structure_event_recent(getattr(ms_ctx, "bos_down_age_bars", None)) and getattr(ms_ctx, "bos_down", False)) or last_close < trigger_low
-                retest_plan = self._continuation_fvg_retest_plan(Side.SHORT, c.symbol, frame, data, trigger_level=trigger_low, breakout_active=bool(bearish_trigger), close=last_close, vwap=last_vwap, ema9=last_ema9)
-                pullback_hold_ok = pullback_high <= (short_res_ref * (1.0 + support_hold_pct)) if short_res_ref > 0 else True
+                side = Side.SHORT
+                support_ref = max(last_vwap, last_ema20)
+                trigger_level = trigger_low
+                trigger_fired = bool(self._structure_event_recent(getattr(ms_ctx, "bos_down_age_bars", None)) and getattr(ms_ctx, "bos_down", False)) or last_close < trigger_low
+                pullback_hold_ok = pullback_high <= (support_ref * (1.0 + support_hold_pct)) if support_ref > 0 else True
                 if day_strength > -min_change:
                     reasons.append(_reason_with_values("weak_day_weakness", current=day_strength, required=-min_change, op="<=", digits=4))
                 if last_close >= last_vwap:
@@ -178,59 +159,82 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                 if extension_pct > max_extension:
                     reasons.append(_reason_with_values("too_extended_from_vwap", current=extension_pct, required=max_extension, op="<=", digits=4))
                 if not pullback_hold_ok:
-                    reasons.append(_reason_with_values("bounce_lost_resistance", current=pullback_high, required=short_res_ref * (1.0 + support_hold_pct), op="<=", digits=4))
-                if not bearish_trigger:
+                    reasons.append(_reason_with_values("bounce_lost_resistance", current=pullback_high, required=support_ref * (1.0 + support_hold_pct), op="<=", digits=4))
+                if not trigger_fired:
                     reasons.append(_reason_with_values("no_reexpansion_trigger", current=last_close, required=trigger_low, op="<", digits=4))
                 if close_pos > (1.0 - min_bar_close_position):
                     reasons.append(_reason_with_values("weak_bar_close", current=close_pos, required=1.0 - min_bar_close_position, op="<=", digits=4))
-                if not reasons and self._shared_entry_enabled("use_opposing_chart_filter", True) and self._blocks_bearish_entry(ctx):
-                    reasons.append("chart_pattern_opposed")
-                reasons = self._apply_continuation_zone_retest_plans(reasons, [retest_plan], deferrable_prefixes={"too_extended_from_vwap", "no_reexpansion_trigger", "weak_bar_close", "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "lower_wick_rejection", "expansion_bar_too_large"})
-                if not reasons:
-                    reasons.extend(self._entry_exhaustion_reasons(Side.SHORT, frame, close=last_close, vwap=last_vwap, ema9=last_ema9))
-                    reasons = self._apply_continuation_zone_retest_plans(reasons, [retest_plan], deferrable_prefixes={"too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "lower_wick_rejection", "expansion_bar_too_large"})
-                if not reasons:
-                    divergence_reason = self._dual_counter_divergence_reason(Side.SHORT, tech_ctx)
-                    if divergence_reason:
-                        reasons.append(divergence_reason)
-                if not reasons:
-                    stop = max(pullback_high, short_res_ref * (1.0 + support_hold_pct)) if short_res_ref > 0 else pullback_high
-                    stop = max(stop, last_close * (1.0 + self.config.risk.default_stop_pct))
-                    risk_per_share = max(0.01, stop - last_close)
-                    effective_target_rr = target_rr
-                    if bool(self.params.get("strong_trend_runner_enabled", True)) and getattr(ms_ctx, "bias", "neutral") == "bearish" and bool(getattr(ms_ctx, "bos_down", False)) and ctx.matched_bearish_continuation:
-                        effective_target_rr = max(target_rr, float(self.params.get("strong_trend_target_rr", target_rr + 0.3)))
-                    target = max(0.01, last_close - risk_per_share * effective_target_rr)
-                    if self._blocks_bearish_structure_entry(ms_ctx):
-                        reasons.append(self._bearish_structure_block_reason(ms_ctx))
-                    elif self._blocks_bearish_sr_entry(sr_ctx):
-                        reasons.append(self._bearish_sr_block_reason(sr_ctx))
-                    else:
-                        stop, target = self._refine_bearish_sr_levels(last_close, stop, target, sr_ctx, frame)
-                        stop, target = self._refine_bearish_technical_levels(last_close, stop, target, tech_ctx, frame)
-                        stop = self._apply_retest_stop_anchor(Side.SHORT, last_close, stop, retest_plan)
-                        structure_bonus = 0.75 if getattr(ms_ctx, "bias", "neutral") == "bearish" else 0.0
-                        if bool(getattr(ms_ctx, "bos_down", False)) and self._structure_event_recent(getattr(ms_ctx, "bos_down_age_bars", None)):
-                            structure_bonus += 0.5
-                        pattern_bonus = 0.35 if ctx.matched_bearish_continuation else 0.15 if ctx.matched_bearish_reversal else 0.0
-                        adjustments = self._entry_adjustment_components(Side.SHORT, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
-                        fvg_adjustments = self._fvg_entry_adjustment_components(Side.SHORT, c.symbol, frame, data)
-                        runner_allowed = bool((effective_target_rr > target_rr or float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0) >= 0.35) and getattr(ms_ctx, "bias", "neutral") == "bearish")
-                        management = self._adaptive_management_components(Side.SHORT, last_close, stop, target, style="trend", runner_allowed=runner_allowed, continuation_bias=float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0), strong_setup=bool(effective_target_rr > target_rr))
-                        final_priority_score = float(c.activity_score) + (max(0.0, -last_ret5) * 50.0) + (max(0.0, -last_ret15) * 100.0) + structure_bonus + pattern_bonus + adjustments["entry_context_adjustment"] + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
-                        metadata["final_priority_score"] = round(final_priority_score, 4)
-                        metadata.update(adjustments)
-                        metadata.update(fvg_adjustments)
-                        metadata.update(management)
-                        metadata.update(retest_plan.get("metadata", {}))
-                        metadata.update(self._technical_lists(tech_ctx))
-                        reason = "rth_trend_pullback_short_fvg_retest" if str(retest_plan.get("status", "none") or "none") == "allow" else "rth_trend_pullback_short"
-                        if ctx.matched_bearish_continuation:
-                            reason += f":{'+'.join(sorted(ctx.matched_bearish_continuation))}"
-                        out.append(Signal(symbol=c.symbol, strategy=self.strategy_name, side=Side.SHORT, reason=reason, stop_price=stop, target_price=target, metadata=metadata))
-                        self._record_entry_decision(c.symbol, "signal", [reason])
-                        continue
-            self._record_entry_decision(c.symbol, "skipped", reasons or ["no_setup"])
+                stop = max(pullback_high, support_ref * (1.0 + support_hold_pct)) if support_ref > 0 else pullback_high
+                stop = max(stop, last_close * (1.0 + self.config.risk.default_stop_pct))
+                risk_per_share = max(0.01, stop - last_close)
+                strong_trend = getattr(ms_ctx, "bias", "neutral") == "bearish" and bool(getattr(ms_ctx, "bos_down", False)) and bool(ctx.matched_bearish_continuation)
+            reasons.extend(self._entry_exhaustion_reasons(side, frame, close=last_close, vwap=last_vwap, ema9=last_ema9))
+            effective_target_rr = target_rr
+            if strong_trend_runner_enabled and strong_trend:
+                effective_target_rr = max(target_rr, strong_trend_target_rr)
+            if side == Side.LONG:
+                target = last_close + risk_per_share * effective_target_rr
+            else:
+                target = max(0.01, last_close - risk_per_share * effective_target_rr)
+            proposal = EntryProposal(
+                candidate=c,
+                direction=side,
+                style="pullback",
+                style_family="pullback",
+                close=last_close,
+                stop=stop,
+                target=target,
+                gate_frame=frame,
+                sr_frame=frame,
+                level_frame=frame,
+                data=data,
+                pending_reasons=tuple(reasons),
+                deferrable=_RETEST_DEFERRABLE[side],
+                retest=RetestTrigger(trigger_level, bool(trigger_fired), last_vwap, last_ema9),
+                contexts=EntryContexts(ms=ms_ctx, chart=ctx),
+            )
+            admitted = self.entry_policy.admit(proposal)
+            if admitted is None:
+                refusal = self._consume_build_failure_payload(c.symbol, proposal.style)
+                self._record_entry_decision(c.symbol, "skipped", refusal["reasons"])
+                continue
+            long = side == Side.LONG
+            with_bias = getattr(ms_ctx, "bias", "neutral") == ("bullish" if long else "bearish")
+            structure_bonus = 0.75 if with_bias else 0.0
+            bos_active = bool(getattr(ms_ctx, "bos_up" if long else "bos_down", False))
+            if bos_active and self._structure_event_recent(getattr(ms_ctx, "bos_up_age_bars" if long else "bos_down_age_bars", None)):
+                structure_bonus += 0.5
+            continuation = ctx.matched_bullish_continuation if long else ctx.matched_bearish_continuation
+            reversal = ctx.matched_bullish_reversal if long else ctx.matched_bearish_reversal
+            pattern_bonus = 0.35 if continuation else 0.15 if reversal else 0.0
+            fvg_continuation_bias = float(admitted.fvg["fvg_continuation_bias"])
+            strong_setup = bool(effective_target_rr > target_rr)
+            runner_allowed = bool((strong_setup or fvg_continuation_bias >= 0.35) and with_bias)
+            management = self._adaptive_management_components(
+                side, last_close, admitted.stop, admitted.target,
+                style="trend", runner_allowed=runner_allowed, continuation_bias=fvg_continuation_bias, strong_setup=strong_setup,
+            )
+            ret5_term = max(0.0, last_ret5 if long else -last_ret5)
+            ret15_term = max(0.0, last_ret15 if long else -last_ret15)
+            strategy_score = float(c.activity_score) + (ret5_term * 50.0) + (ret15_term * 100.0) + structure_bonus + pattern_bonus
+            reason = f"rth_trend_pullback_{'long' if long else 'short'}"
+            if admitted.admitted_via_retest:
+                reason += "_fvg_retest"
+            if continuation:
+                reason += f":{'+'.join(sorted(continuation))}"
+            out.append(self.entry_policy.emit(
+                admitted, reason=reason, strategy_score=strategy_score, management=management, target=admitted.target,
+                metadata={
+                    "trigger_high": trigger_high,
+                    "trigger_low": trigger_low,
+                    "support_low": support_low,
+                    "resistance_high": resistance_high,
+                    "pullback_low": pullback_low,
+                    "pullback_high": pullback_high,
+                    "extension_from_vwap_pct": extension_pct,
+                },
+            ))
+            self._record_entry_decision(c.symbol, "signal", [reason])
         return out
 
     def should_force_flatten(self, position: Position) -> bool:

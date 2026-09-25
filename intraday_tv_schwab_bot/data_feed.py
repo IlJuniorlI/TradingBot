@@ -11,38 +11,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from threading import RLock
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, NamedTuple
 
 import pandas as pd
-try:
-    from schwabdev import Client, Stream
-except Exception:  # pragma: no cover - test/import fallback when schwabdev is unavailable
-    class Client:  # type: ignore[no-redef]
-        pass
+from schwabdev import Client, Stream
 
-    class Stream:  # type: ignore[no-redef]
-        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-            self.active = False
-
-        def start(self, _receiver: Any | None = None) -> None:
-            self.active = True
-
-        def stop(self, _clear_subscriptions: bool = True) -> None:
-            self.active = False
-
-        @staticmethod
-        def chart_equity(symbols: list[str], fields: Any, command: str = "SUBS") -> dict[str, Any]:
-            return {"symbols": list(symbols), "fields": fields, "command": command}
-
-        @staticmethod
-        def send(_request: Any) -> None:
-            return None
-
-from .config import BotConfig, htf_structure_event_lookback
+from .config import BotConfig, flip_confirmation_bars, htf_structure_event_lookback
 from .support_resistance import SupportResistanceContext, build_support_resistance_context
 from .htf_levels import HTFContext, FairValueGapContext, build_fair_value_gap_context, build_htf_context, empty_fvg_context
+from .levels_shared import latest_session_date
 from .order_blocks import OrderBlockContext, build_order_block_context, empty_order_block_context
-from .utils import EQUITY_STREAM_HISTORY_REFRESH_READY, call_schwab_client, ensure_ohlcv_frame, ensure_standard_indicator_frame, floor_minute, get_runtime_timezone_name, is_equity_stream_session, is_regular_equity_session, is_weekday_session_day, now_et, resample_bars
+from .utils import EQUITY_STREAM_HISTORY_REFRESH_READY, call_schwab_client, ensure_ohlcv_frame, ensure_standard_indicator_frame, equity_stream_window_bars, floor_minute, get_runtime_timezone_name, indicator_session_open, is_equity_stream_session, is_regular_equity_session, is_weekday_session_day, now_et, resample_bars, resolve_ema_spans, session_bucket_ends, session_bucket_floor
 
 LOG = logging.getLogger(__name__)
 STREAMABLE_EQUITY_RE = re.compile(r"^[A-Z]{1,6}$")
@@ -83,6 +62,33 @@ class MergeStats:
     stream_rows: int = 0
 
 
+class _HTFCacheEntry(NamedTuple):
+    """An HTF context, the ``history_htf`` frame object it was built from,
+    the session date its prior day/week were measured back from, and whether
+    it was built inside the session (``utils.indicator_session_open``).
+
+    ``get_htf_context`` serves ``context`` only while ``frame`` IS still the
+    stored frame (identity, not equality), ``as_of`` is still the latest
+    session date and the session state is unchanged. Every refresh stores a
+    new frame object, so every cache key rebuilds from it on its next read,
+    whichever caller's read triggered the refresh; and a read after midnight
+    rebuilds even before the first refresh of the day, or the dashboard's
+    reads served yesterday's prior day/week until the prewarm.
+
+    The session state is in it because a build reads the clock (2026-09-24):
+    inside the session the ATR and the divergence age come from session bars
+    only, outside it from every bar. At the open the stored frame object is
+    unchanged until the first refresh after the 09:30 boundary (and its 10 s
+    settle) succeeds, so a context built on the premarket clock was served
+    into the session until then, and for as long as that refresh failed.
+    """
+
+    frame: pd.DataFrame
+    as_of: date
+    session_open: bool
+    context: HTFContext
+
+
 class MarketDataStore:
     def __init__(self, client: Client, config: BotConfig):
         self.client = client
@@ -100,8 +106,12 @@ class MarketDataStore:
         self.live: dict[str, pd.DataFrame] = {}
         self.quote_cache: dict[str, dict] = {}
         self.sr_cache: dict[tuple[str, int], SupportResistanceContext] = {}
+        # One HTF frame per (symbol, tf): completed bars only, inside the
+        # 07:00-20:00 equity stream window (see _refresh_htf_frame).
         self.history_htf: dict[tuple[str, int], pd.DataFrame] = {}
-        self.htf_cache: dict[tuple, HTFContext] = {}
+        # Contexts per _htf_context_cache_key, each tagged with the frame it
+        # was built from (see _HTFCacheEntry / get_htf_context).
+        self.htf_cache: dict[tuple, _HTFCacheEntry] = {}
         self.last_htf_refresh: dict[tuple[str, int], datetime] = {}
         self.last_quote_refresh: dict[str, datetime] = {}
         # Per-symbol quote-failure tracking. Counter increments on each
@@ -125,12 +135,18 @@ class MarketDataStore:
         self.stream_symbols: set[str] = set()
         self.stream_start_requested_at: datetime | None = None
         self._stream_seen_symbols: set[str] = set()
+        # Timestamp of each symbol's first CHART_EQUITY bar since the stream
+        # (re)started or the symbol was (re)subscribed. History fetched before
+        # that bar leaves a hole up to it; should_backfill_stream_symbol
+        # refetches once to close it.
+        self._stream_first_bar_time: dict[str, pd.Timestamp] = {}
         self.last_stream_health_log: dict[str, datetime] = {}
         self._lock = RLock()
         self.started_at = now_et()
         self._forced_premarket_history_refresh_date: dict[str, date] = {}
         self._cycle_active = False
-        # Keys: base OHLCV = (symbol, tf, False); enriched = (symbol, tf, True, span_scale).
+        # Keys: base OHLCV = (symbol, tf, False); enriched =
+        # (symbol, tf, True, span_scale, (ema fast, ema slow)).
         self._cycle_merged_cache: dict[tuple, pd.DataFrame] = {}
         self._cycle_htf_context_cache: dict[tuple, HTFContext | None] = {}
         self._cycle_fvg_cache: dict[tuple, FairValueGapContext] = {}
@@ -295,6 +311,7 @@ class MarketDataStore:
                 self._forced_premarket_history_refresh_date.pop(sym, None)
                 self.merge_stats.pop(sym, None)
                 self._stream_seen_symbols.discard(sym)
+                self._stream_first_bar_time.pop(sym, None)
             # Tuple-keyed dicts: drop any (sym, *) entry where sym is stale.
             self.history_htf = {k: v for k, v in self.history_htf.items() if k[0] not in stale}
             self.htf_cache = {k: v for k, v in self.htf_cache.items() if k[0] not in stale}
@@ -354,26 +371,23 @@ class MarketDataStore:
                 del self._cycle_sr_cache[k]
 
     @staticmethod
-    def _htf_context_cache_key(
-        symbol: str,
-        timeframe_minutes: int,
-        *,
-        use_prior_day_high_low: bool = True,
-        use_prior_week_high_low: bool = True,
-        include_fair_value_gaps: bool = True,
-        fair_value_gap_max_per_side: int = 4,
-        fair_value_gap_min_atr_mult: float = 0.05,
-        fair_value_gap_min_pct: float = 0.0005,
-    ) -> tuple:
+    def _htf_context_cache_key(symbol: str, timeframe_minutes: int, build_kwargs: Mapping[str, Any]) -> tuple:
+        """``(symbol, tf, *every build_htf_context argument the caller sets)``.
+
+        A cached context is a function of the stored (symbol, tf) frame and
+        exactly these arguments, so two callers share an entry only when a
+        fresh build would give them the same context. Until 2026-09-23 the
+        key held only the prior-day/week and FVG flags, so a caller with
+        different pivot/level/tolerance/EMA/flip settings was served a
+        context built with another caller's.
+        """
         return (
             str(symbol).upper().strip(),
             int(timeframe_minutes),
-            bool(use_prior_day_high_low),
-            bool(use_prior_week_high_low),
-            bool(include_fair_value_gaps),
-            int(fair_value_gap_max_per_side),
-            round(float(fair_value_gap_min_atr_mult), 6),
-            round(float(fair_value_gap_min_pct), 6),
+            *(
+                (name, round(value, 6) if isinstance(value, float) else value)
+                for name, value in sorted(build_kwargs.items())
+            ),
         )
 
     @staticmethod
@@ -399,6 +413,10 @@ class MarketDataStore:
         frequency 30m and resampled to 60m. At the 60m boundary, both 30m
         constituents of the just-closed 60m bar are already complete on the
         broker side, so a single fetch + resample produces the closed bar.
+        Boundaries are ``resample_bars``' own (``session_bucket_floor``): in
+        the regular session 60m bars close at XX:30, and a clock floor
+        refetched at XX:00, half a bar before each one closed, leaving the
+        newest 60m bar out of every context for 30 minutes.
 
         A 10-second settle buffer is applied so we don't fetch at exactly
         ``:30:00`` — gives the broker time to aggregate the just-closed bar.
@@ -408,10 +426,9 @@ class MarketDataStore:
         if last is None:
             return True
         tf_min = max(1, int(timeframe_minutes))
-        bucket = f"{tf_min}min"
-        last_bucket = pd.Timestamp(last).floor(bucket)
+        last_bucket = session_bucket_floor(last, tf_min)
         now = now_et()
-        now_bucket = pd.Timestamp(now).floor(bucket)
+        now_bucket = session_bucket_floor(now, tf_min)
         if now_bucket <= last_bucket:
             return False
         settle_buffer = timedelta(seconds=10)
@@ -438,15 +455,51 @@ class MarketDataStore:
         return combined[~combined.index.duplicated(keep="last")]
 
     @staticmethod
+    def _htf_window_start(end: datetime, lookback_days: int) -> pd.Timestamp:
+        """Oldest bar an HTF frame keeps: ``lookback_days`` (at least 5)
+        before ``end``, or the start of the prior W-FRI week when that is
+        earlier.
+
+        ``prior_week_levels`` takes PWH/PWL from the last complete W-FRI week
+        in the frame. A plain 10-day window from ``end`` starts inside that
+        week from Thursday on and loses its whole Monday by Friday, so
+        PWH/PWL silently described Tue-Fri (fixed 2026-09-23). The current
+        week is the one holding ``latest_session_date(end)``, the date the
+        builders pass ``prior_week_levels`` as ``as_of``: a weekend or holiday
+        ``end`` counts from the trading day before it. Rolling back weekends
+        only put a holiday Monday in the new week while the builders still
+        read Friday's, and the trim cut their prior week down to its last
+        afternoon.
+        """
+        tz = get_runtime_timezone_name()
+        end_ts = pd.Timestamp(end).tz_convert(tz)
+        session_day = pd.Timestamp(latest_session_date(end_ts))
+        prior_week_start = (session_day.to_period("W-FRI") - 1).start_time.tz_localize(tz)
+        return min(end_ts - pd.Timedelta(days=max(5, int(lookback_days))), prior_week_start)
+
+    @staticmethod
     def _trim_frame_to_days(frame: pd.DataFrame, end: datetime, lookback_days: int) -> pd.DataFrame:
-        if frame is None or frame.empty:
+        if frame.empty:
             return frame
-        cutoff = end - timedelta(days=max(5, int(lookback_days)))
-        try:
-            trimmed = frame.loc[frame.index >= cutoff]
-        except Exception:
-            trimmed = frame
-        return trimmed.copy() if trimmed is not None else frame
+        return frame.loc[frame.index >= MarketDataStore._htf_window_start(end, lookback_days)].copy()
+
+    @staticmethod
+    def _completed_bars(frame: pd.DataFrame, bar_minutes: int, requested_at: datetime) -> pd.DataFrame:
+        """``frame`` without the bar still forming at ``requested_at``.
+
+        Bars are labelled at their start, so bar T is complete once its
+        bucket has ended (``session_bucket_ends``: ``T + bar_minutes``, or the
+        session boundary that cuts a 60m bar short). price_history requested up to "now"
+        returns the bar that opened seconds earlier (the HTF refresh runs
+        about 10 s into each bucket, the 09:15 prewarm 3 s into the minute),
+        and it used to be stored as if complete: a near-zero-range 15m bar
+        confirming pivots, cutting ATR by ~7% and setting breakout flags and
+        HTF structure for a whole bucket, and a 3-second 09:15 1m bar that
+        nothing ever replaced (2026-09-23).
+        """
+        if frame.empty:
+            return frame
+        return frame[session_bucket_ends(frame.index, int(bar_minutes)) <= pd.Timestamp(requested_at)]
 
     @staticmethod
     def _htf_incremental_start(
@@ -478,41 +531,20 @@ class MarketDataStore:
             return None
         return max(last_dt - timedelta(minutes=overlap_minutes), min_start)
 
-    def fetch_htf_context(
-        self,
-        symbol: str,
-        *,
-        timeframe_minutes: int,
-        lookback_days: int = 60,
-        pivot_span: int = 2,
-        max_levels_per_side: int = 6,
-        atr_tolerance_mult: float = 0.35,
-        pct_tolerance: float = 0.0030,
-        stop_buffer_atr_mult: float = 0.25,
-        ema_fast_span: int = 50,
-        ema_slow_span: int = 200,
-        flip_confirmation_bars: int = 1,
-        use_prior_day_high_low: bool = True,
-        use_prior_week_high_low: bool = True,
-        include_fair_value_gaps: bool = True,
-        fair_value_gap_max_per_side: int = 4,
-        fair_value_gap_min_atr_mult: float = 0.05,
-        fair_value_gap_min_pct: float = 0.0005,
-    ) -> HTFContext | None:
-        if not self.is_support_resistance_symbol(symbol):
-            return None
+    def _refresh_htf_frame(self, symbol: str, timeframe_minutes: int, lookback_days: int) -> None:
+        """Fetch the (symbol, tf) HTF frame from Schwab and store it.
+
+        The stored frame holds completed bars only (``_completed_bars``) and
+        only bars inside the 07:00-20:00 equity stream window
+        (``equity_stream_window_bars``, on the base bars before any resample),
+        both applied before the merge so the
+        next incremental fetch's 4 h overlap replaces the dropped forming bar
+        with its completed version. Storing a new frame object is what makes
+        every HTF context rebuild (see ``get_htf_context``); this method
+        builds none itself.
+        """
         tf = max(1, int(timeframe_minutes))
         key = self._htf_key(symbol, tf)
-        cache_key = self._htf_context_cache_key(
-            symbol,
-            tf,
-            use_prior_day_high_low=bool(use_prior_day_high_low),
-            use_prior_week_high_low=bool(use_prior_week_high_low),
-            include_fair_value_gaps=bool(include_fair_value_gaps),
-            fair_value_gap_max_per_side=int(fair_value_gap_max_per_side),
-            fair_value_gap_min_atr_mult=float(fair_value_gap_min_atr_mult),
-            fair_value_gap_min_pct=float(fair_value_gap_min_pct),
-        )
         with self._lock:
             cached_frame = self.history_htf.get(key)
         base_freq = self._direct_history_frequency(tf)
@@ -525,7 +557,14 @@ class MarketDataStore:
         )
         incremental_refresh = start is not None
         if start is None:
-            start = end - timedelta(days=max(5, int(lookback_days)))
+            start = self._htf_window_start(end, int(lookback_days)).to_pydatetime()
+        # Fetch from a bucket start. A 60m bucket starts on the hour outside
+        # the regular session and on the half hour inside it, so the 4 h
+        # overlap before the last stored label could land mid-bucket: the
+        # refetch then built that bucket from its second 30m bar alone, and
+        # the merge (newest copy wins) replaced the complete bar with the half
+        # for good -- later refreshes never reach back that far.
+        start = session_bucket_floor(start, tf).to_pydatetime()
         mode = "incremental" if incremental_refresh else "full"
         LOG.info("Fetching %sm HTF price_history for %s from %s to %s (base=%sm mode=%s)", tf, symbol, start, end, base_freq, mode)
         payload, source_symbol = self._fetch_price_history_payload_with_aliases(
@@ -539,50 +578,66 @@ class MarketDataStore:
         )
         if str(source_symbol).upper().strip() != str(symbol).upper().strip():
             LOG.debug("Resolved HTF price_history alias for %s via %s", symbol, source_symbol)
-        candles = payload.get("candles", [])
-        df = self._history_candles_to_frame(candles)
+        df = equity_stream_window_bars(self._history_candles_to_frame(payload.get("candles", [])))
         if base_freq != tf and not df.empty:
             df = resample_bars(df, f"{tf}min")
+        df = self._completed_bars(df, tf, end)
         if incremental_refresh and cached_frame is not None and not cached_frame.empty:
             df = self._merge_htf_frames(cached_frame, df)
         else:
             df = self._ohlcv_columns(df)
         df = self._trim_frame_to_days(df, end, int(lookback_days))
         df = ensure_standard_indicator_frame(df)
+        with self._lock:
+            self.history_htf[key] = df
+            # Stamped with ``end``, the time the bars were cut at, not the
+            # clock after the response: a refresh requested at 09:59:59 and
+            # answered after 10:00 holds nothing past 09:30, and stamped in
+            # the 10:00 bucket it told should_refresh_htf_context the 09:45
+            # bar was in, keeping it out of every context until 10:15.
+            self.last_htf_refresh[key] = end
+            self.sr_cache.pop(key, None)
+        self._invalidate_cycle_htf(symbol, tf)
+
+    def _htf_context_from_stored_frame(
+        self,
+        symbol: str,
+        timeframe_minutes: int,
+        cache_key: tuple,
+        build_kwargs: Mapping[str, Any],
+    ) -> HTFContext | None:
+        """The context for ``cache_key``, rebuilt from the stored frame (no
+        API call) when the cached one was built from an older frame, for an
+        earlier session date or on the other side of the session open/close;
+        None while no frame has been stored for (symbol, tf)."""
+        key = self._htf_key(symbol, timeframe_minutes)
+        with self._lock:
+            frame = self.history_htf.get(key)
+            entry = self.htf_cache.get(cache_key)
+        if frame is None:
+            return None
+        as_of = latest_session_date(now_et())
+        session_open = indicator_session_open()
+        if entry is not None and entry.frame is frame and entry.as_of == as_of and entry.session_open == session_open:
+            return entry.context
         current = None
         merged = self.get_merged(symbol, with_indicators=False)
         if merged is not None and not merged.empty:
             current = float(merged.iloc[-1].close)
         sr_cfg = getattr(self.config, "support_resistance", None)
         ctx = build_htf_context(
-            df,
+            frame,
             current_price=current,
-            timeframe_minutes=tf,
-            pivot_span=int(pivot_span),
-            max_levels_per_side=int(max_levels_per_side),
-            atr_tolerance_mult=float(atr_tolerance_mult),
-            pct_tolerance=float(pct_tolerance),
+            timeframe_minutes=int(timeframe_minutes),
             same_side_min_gap_atr_mult=float(getattr(sr_cfg, "same_side_min_gap_atr_mult", 0.10) or 0.10),
             same_side_min_gap_pct=float(getattr(sr_cfg, "same_side_min_gap_pct", 0.0015) or 0.0015),
             fallback_reference_max_drift_atr_mult=float(getattr(sr_cfg, "fallback_reference_max_drift_atr_mult", 1.0) or 1.0),
             fallback_reference_max_drift_pct=float(getattr(sr_cfg, "fallback_reference_max_drift_pct", 0.01) or 0.01),
-            stop_buffer_atr_mult=float(stop_buffer_atr_mult),
-            ema_fast_span=int(ema_fast_span),
-            ema_slow_span=int(ema_slow_span),
-            flip_confirmation_bars=int(flip_confirmation_bars),
-            use_prior_day_high_low=bool(use_prior_day_high_low),
-            use_prior_week_high_low=bool(use_prior_week_high_low),
-            include_fair_value_gaps=bool(include_fair_value_gaps),
-            fair_value_gap_max_per_side=int(fair_value_gap_max_per_side),
-            fair_value_gap_min_atr_mult=float(fair_value_gap_min_atr_mult),
-            fair_value_gap_min_pct=float(fair_value_gap_min_pct),
+            as_of=as_of,
+            **build_kwargs,
         )
         with self._lock:
-            self.history_htf[key] = df
-            self.htf_cache[cache_key] = ctx
-            self.last_htf_refresh[key] = now_et()
-            self.sr_cache.pop(key, None)
-        self._invalidate_cycle_htf(symbol, tf)
+            self.htf_cache[cache_key] = _HTFCacheEntry(frame, as_of, session_open, ctx)
         return ctx
 
     def prefetch_htf_contexts(
@@ -619,7 +674,7 @@ class MarketDataStore:
         LOG.info("Prefetching HTF context timeframe=%sm symbols=%s", int(timeframe_minutes), ",".join(stale_symbols))
         for symbol in stale_symbols:
             try:
-                self.fetch_htf_context(
+                self.get_htf_context(
                     symbol,
                     timeframe_minutes=int(timeframe_minutes),
                     lookback_days=int(lookback_days),
@@ -631,6 +686,7 @@ class MarketDataStore:
                     ema_fast_span=int(ema_fast_span),
                     ema_slow_span=int(ema_slow_span),
                     flip_confirmation_bars=int(flip_confirmation_bars),
+                    allow_refresh=True,
                     use_prior_day_high_low=bool(use_prior_day_high_low),
                     use_prior_week_high_low=bool(use_prior_week_high_low),
                     include_fair_value_gaps=bool(include_fair_value_gaps),
@@ -663,60 +719,78 @@ class MarketDataStore:
         fair_value_gap_min_atr_mult: float = 0.05,
         fair_value_gap_min_pct: float = 0.0005,
     ) -> HTFContext | None:
-        cache_key = self._htf_context_cache_key(
-            symbol,
-            timeframe_minutes,
-            use_prior_day_high_low=bool(use_prior_day_high_low),
-            use_prior_week_high_low=bool(use_prior_week_high_low),
-            include_fair_value_gaps=bool(include_fair_value_gaps),
-            fair_value_gap_max_per_side=int(fair_value_gap_max_per_side),
-            fair_value_gap_min_atr_mult=float(fair_value_gap_min_atr_mult),
-            fair_value_gap_min_pct=float(fair_value_gap_min_pct),
-        )
+        """HTF context for ``symbol`` built from its stored (symbol, tf) frame.
+
+        The frame is fetched at most once per HTF bar, by the first read with
+        ``allow_refresh`` after the boundary (``should_refresh_htf_context``);
+        ``lookback_days`` sizes that fetch. Every read then gets a context
+        built from the frame currently stored, rebuilt without an API call
+        the first time its cache key is read after the frame changed.
+
+        Until 2026-09-23 a fetch rebuilt only the fetching caller's cache key
+        but stamped the refresh clock every key shares, so every other key
+        kept its first build: top_tier's configured-FVG context (strategy FVG
+        scoring, runner eligibility, the dashboard's HTF FVG/divergence
+        overlays and trend label) was the ~09:15 premarket build all session,
+        because the engine's default-FVG S/R refresh won every boundary.
+
+        The HTF RSI divergence knobs are global: they are read here, from
+        ``technical_levels``, not passed by the caller, so every strategy,
+        the prefetch and the dashboard build the same divergence
+        (2026-09-24). Until then no caller passed them, and every build ran
+        with divergence on and a 6-bar age whatever the config said.
+
+        The HTF pairs its pivots with the LTF's thresholds
+        (``divergence_pivot_lookback``, ``divergence_min_price_move_pct``,
+        ``divergence_rsi_min_delta``) and its own age limit
+        (``htf_divergence_max_age_bars``). Until 2026-09-25 the thresholds
+        were the builder's defaults, so retuning them moved only the LTF
+        divergence; every preset ships those defaults (4 / 0.0015 / 2.5), so
+        no build changes. ``divergence_rsi_length`` stays LTF-only: the HTF
+        reads its frame's ``rsi14``.
+        """
+        tf = max(1, int(timeframe_minutes))
+        tl_cfg = self.config.technical_levels
+        build_kwargs: dict[str, Any] = {
+            "pivot_span": int(pivot_span),
+            "max_levels_per_side": int(max_levels_per_side),
+            "atr_tolerance_mult": float(atr_tolerance_mult),
+            "pct_tolerance": float(pct_tolerance),
+            "stop_buffer_atr_mult": float(stop_buffer_atr_mult),
+            "ema_fast_span": int(ema_fast_span),
+            "ema_slow_span": int(ema_slow_span),
+            "flip_confirmation_bars": int(flip_confirmation_bars),
+            "use_prior_day_high_low": bool(use_prior_day_high_low),
+            "use_prior_week_high_low": bool(use_prior_week_high_low),
+            "include_fair_value_gaps": bool(include_fair_value_gaps),
+            "fair_value_gap_max_per_side": int(fair_value_gap_max_per_side),
+            "fair_value_gap_min_atr_mult": float(fair_value_gap_min_atr_mult),
+            "fair_value_gap_min_pct": float(fair_value_gap_min_pct),
+            # In build_kwargs, so they are part of the cache key. On with the
+            # LTF divergence's switches (technical_levels.enabled and
+            # divergence_enabled); a configured age of 0 is honoured, and so
+            # is a configured 0 threshold (the builder clamps each the way
+            # the LTF builder does).
+            "divergence_enabled": bool(tl_cfg.enabled and tl_cfg.divergence_enabled),
+            "divergence_max_age_bars": int(tl_cfg.htf_divergence_max_age_bars),
+            "divergence_pivot_lookback": int(tl_cfg.divergence_pivot_lookback),
+            "divergence_min_price_move_pct": float(tl_cfg.divergence_min_price_move_pct),
+            "divergence_rsi_min_delta": float(tl_cfg.divergence_rsi_min_delta),
+        }
+        cache_key = self._htf_context_cache_key(symbol, tf, build_kwargs)
         with self._lock:
             if self._cycle_active and cache_key in self._cycle_htf_context_cache:
                 return self._cycle_htf_context_cache[cache_key]
-            cached = self.htf_cache.get(cache_key)
-        if cached is not None and (not allow_refresh or not self.should_refresh_htf_context(symbol, timeframe_minutes)):
-            with self._lock:
-                if self._cycle_active:
-                    self._cycle_htf_context_cache[cache_key] = cached
-            return cached
-        if not allow_refresh:
-            with self._lock:
-                if self._cycle_active:
-                    self._cycle_htf_context_cache[cache_key] = cached
-            return cached
-        try:
-            ctx = self.fetch_htf_context(
-                symbol,
-                timeframe_minutes=timeframe_minutes,
-                lookback_days=lookback_days,
-                pivot_span=pivot_span,
-                max_levels_per_side=max_levels_per_side,
-                atr_tolerance_mult=atr_tolerance_mult,
-                pct_tolerance=pct_tolerance,
-                stop_buffer_atr_mult=stop_buffer_atr_mult,
-                ema_fast_span=ema_fast_span,
-                ema_slow_span=ema_slow_span,
-                flip_confirmation_bars=flip_confirmation_bars,
-                use_prior_day_high_low=bool(use_prior_day_high_low),
-                use_prior_week_high_low=bool(use_prior_week_high_low),
-                include_fair_value_gaps=bool(include_fair_value_gaps),
-                fair_value_gap_max_per_side=int(fair_value_gap_max_per_side),
-                fair_value_gap_min_atr_mult=float(fair_value_gap_min_atr_mult),
-                fair_value_gap_min_pct=float(fair_value_gap_min_pct),
-            )
-            with self._lock:
-                if self._cycle_active:
-                    self._cycle_htf_context_cache[cache_key] = ctx
-            return ctx
-        except Exception as exc:
-            LOG.warning("HTF context refresh failed for %s (%sm): %s", symbol, timeframe_minutes, exc)
-            with self._lock:
-                if self._cycle_active:
-                    self._cycle_htf_context_cache[cache_key] = cached
-            return cached
+        if allow_refresh and self.is_support_resistance_symbol(symbol) and self.should_refresh_htf_context(symbol, tf):
+            try:
+                self._refresh_htf_frame(symbol, tf, int(lookback_days))
+            except Exception as exc:
+                LOG.warning("HTF frame refresh failed for %s (%sm): %s", symbol, tf, exc)
+        ctx = self._htf_context_from_stored_frame(symbol, tf, cache_key, build_kwargs)
+        with self._lock:
+            if self._cycle_active:
+                self._cycle_htf_context_cache[cache_key] = ctx
+        return ctx
 
 
     def get_fair_value_gap_context(
@@ -858,30 +932,28 @@ class MarketDataStore:
         flip_confirmation_bars: int = 1,
         allow_refresh: bool = True,
     ) -> pd.DataFrame | None:
-        key = self._htf_key(symbol, timeframe_minutes)
+        """Copy of the stored (symbol, tf) HTF frame: completed bars built
+        from 07:00-20:00 bars only (see ``_refresh_htf_frame``). A refresh
+        due at this read goes through ``get_htf_context`` with these level
+        parameters, so it also primes the context they describe."""
+        if allow_refresh and self.should_refresh_htf_context(symbol, timeframe_minutes):
+            self.get_htf_context(
+                symbol,
+                timeframe_minutes=timeframe_minutes,
+                lookback_days=lookback_days,
+                pivot_span=pivot_span,
+                max_levels_per_side=max_levels_per_side,
+                atr_tolerance_mult=atr_tolerance_mult,
+                pct_tolerance=pct_tolerance,
+                stop_buffer_atr_mult=stop_buffer_atr_mult,
+                ema_fast_span=ema_fast_span,
+                ema_slow_span=ema_slow_span,
+                flip_confirmation_bars=flip_confirmation_bars,
+                allow_refresh=True,
+            )
         with self._lock:
-            frame = self.history_htf.get(key)
-        if frame is not None and not getattr(frame, "empty", True) and (not allow_refresh or not self.should_refresh_htf_context(symbol, timeframe_minutes)):
-            return frame.copy()
-        if not allow_refresh:
-            return frame.copy() if frame is not None else None
-        self.get_htf_context(
-            symbol,
-            timeframe_minutes=timeframe_minutes,
-            lookback_days=lookback_days,
-            pivot_span=pivot_span,
-            max_levels_per_side=max_levels_per_side,
-            atr_tolerance_mult=atr_tolerance_mult,
-            pct_tolerance=pct_tolerance,
-            stop_buffer_atr_mult=stop_buffer_atr_mult,
-            ema_fast_span=ema_fast_span,
-            ema_slow_span=ema_slow_span,
-            flip_confirmation_bars=flip_confirmation_bars,
-            allow_refresh=allow_refresh,
-        )
-        with self._lock:
-            refreshed = self.history_htf.get(key)
-        return refreshed.copy() if refreshed is not None else None
+            frame = self.history_htf.get(self._htf_key(symbol, timeframe_minutes))
+        return frame.copy() if frame is not None else None
 
     def _stream_history_due(self, symbol: str) -> bool:
         now = now_et()
@@ -1036,6 +1108,20 @@ class MarketDataStore:
                 return True
             return False
 
+        # History fetched before the stream's first bar cannot reach it: a
+        # bar is complete only after it closes. The stream opens with the
+        # entry/management window (09:30) while the prewarm fetched at 09:15
+        # and nothing refetched a warm frame, so 09:15-09:28 was missing
+        # every day (and on a multi-day run the whole premarket). One fetch
+        # cut after the first bar started closes the hole; its cut time
+        # (fetch_history stamps ``end``) then passes this check for good
+        # (2026-09-23).
+        first_bar = self._stream_first_bar_time.get(cache_key)
+        last_history = self.last_history_refresh.get(cache_key)
+        if first_bar is not None and history_due and (last_history is None or pd.Timestamp(last_history) < first_bar):
+            self._log_stream_health(symbol, f"price_history predates the first CHART_EQUITY bar {first_bar:%H:%M}; backfilling the gap", level=logging.INFO)
+            return True
+
         last_stream = self.last_stream_update.get(cache_key)
         if last_stream is not None:
             stream_age_seconds = (now - last_stream).total_seconds()
@@ -1066,8 +1152,7 @@ class MarketDataStore:
         )
         if str(source_symbol).upper().strip() != str(symbol).upper().strip():
             LOG.debug("Resolved price_history alias for %s via %s", symbol, source_symbol)
-        candles = payload.get("candles", [])
-        df = self._history_candles_to_frame(candles)
+        df = self._completed_bars(self._history_candles_to_frame(payload.get("candles", [])), 1, end)
         fetched_at = now_et()
         if not df.empty:
             latest_bar = pd.Timestamp(df.index[-1])
@@ -1083,9 +1168,15 @@ class MarketDataStore:
             self.history[cache_key] = self._retain_window(self._merge_frames(self.history.get(cache_key), df), keep_rows)
             if cache_key in self.live:
                 self.live[cache_key] = self._retain_window(self.live[cache_key], keep_rows)
-            self.last_history_refresh[cache_key] = fetched_at
+            # ``end``, the time the bars were cut at, is what the frame
+            # covers. The clock after the response can have passed a minute
+            # boundary the cut did not: a poll requested at 11:04:59.5 and
+            # answered at 11:05:00.7 holds bars through 11:03, and stamped
+            # 11:05:00.7 it satisfied the first-bar backfill check for an
+            # 11:05 first stream bar, so 11:04 was never fetched.
+            self.last_history_refresh[cache_key] = end
             if df.empty:
-                self.last_empty_history_refresh[cache_key] = fetched_at
+                self.last_empty_history_refresh[cache_key] = end
             else:
                 self.last_empty_history_refresh.pop(cache_key, None)
             self.merge_stats[cache_key].history_rows = len(self.history[cache_key])
@@ -1094,7 +1185,7 @@ class MarketDataStore:
         # entries and called _invalidate_cycle_htf when the 1m frame healed,
         # under the (incorrect) premise that "1m heal -> HTF must rebuild
         # against the healed 1m frame". HTF data is *not* derived from the
-        # 1m stream — fetch_htf_context calls Schwab REST price_history at
+        # 1m stream — _refresh_htf_frame calls Schwab REST price_history at
         # base_freq (5/15/30m for the supported HTFs) and resamples to the
         # target tf. A 1m stream stale has no bearing on HTF freshness.
         # Popping last_htf_refresh defeated the bar-aligned gate every time
@@ -1292,11 +1383,7 @@ class MarketDataStore:
                 if self._cycle_active:
                     self._cycle_sr_cache[cycle_key] = cached
             return cached
-        flip_1m = 0
-        flip_5m = 0
-        if normalized_mode == "trading":
-            flip_1m = max(0, int(getattr(cfg, "trading_flip_confirmation_1m_bars", 2) or 2))
-            flip_5m = max(0, int(getattr(cfg, "trading_flip_confirmation_5m_bars", 1) or 1))
+        flip_1m, flip_5m = flip_confirmation_bars(cfg) if normalized_mode == "trading" else (0, 0)
         ctx = build_support_resistance_context(
             frame,
             current_price=current_price,
@@ -1879,6 +1966,7 @@ class MarketDataStore:
             with self._lock:
                 self.stream_start_requested_at = now_et()
                 self._stream_seen_symbols.clear()
+                self._stream_first_bar_time.clear()
             LOG.info("Starting Schwab stream for symbols: %s", symbols)
             self.stream.start(receiver=self.on_stream_message)
         wanted = set(symbols)
@@ -1888,6 +1976,7 @@ class MarketDataStore:
             for stale_symbol in sorted(current - wanted):
                 self.last_stream_update.pop(stale_symbol, None)
                 self.last_stream_bar_time.pop(stale_symbol, None)
+                self._stream_first_bar_time.pop(stale_symbol, None)
         add = sorted(wanted - current)
         remove = sorted(current - wanted)
         if add:
@@ -1912,6 +2001,7 @@ class MarketDataStore:
             self.stream_symbols.clear()
             self.stream_start_requested_at = None
             self._stream_seen_symbols.clear()
+            self._stream_first_bar_time.clear()
 
     def on_stream_message(self, message: str) -> None:
         try:
@@ -1956,6 +2046,7 @@ class MarketDataStore:
                 self.last_stream_bar_time[cache_key] = bar_ts
                 if cache_key not in self._stream_seen_symbols:
                     self._stream_seen_symbols.add(cache_key)
+                    self._stream_first_bar_time[cache_key] = bar_ts
                     LOG.info("CHART_EQUITY first candle received: %s", cache_key)
                 if self.stream_start_requested_at is not None and self.stream_symbols and self._stream_seen_symbols.issuperset(self.stream_symbols):
                     self.stream_start_requested_at = None
@@ -2035,16 +2126,25 @@ class MarketDataStore:
             frame = self.history.get(self._symbol_key(symbol))
         return None if frame is None else frame.copy()
 
-    def get_merged(self, symbol: str, timeframe: str | None = None, with_indicators: bool = True, span_scale: float = 1.0) -> pd.DataFrame:
+    def get_merged(
+        self,
+        symbol: str,
+        timeframe: str | None = None,
+        with_indicators: bool = True,
+        span_scale: float = 1.0,
+        ema_spans: tuple[int, int] | None = None,
+    ) -> pd.DataFrame:
         cache_key = self._symbol_key(symbol)
         tf = str(timeframe or "1min")
         # Base (OHLCV-only) cache is span-independent and stays shared. The
-        # enriched cache is keyed by span_scale so a caller asking for stretched
-        # indicators (top_tier's 1m LTF passes span_scale=5) gets its own entry
-        # without clobbering the canonical span_scale=1.0 frame the engine bars,
-        # dashboard, and other strategies read.
+        # enriched cache is keyed by span_scale and the resolved EMA spans so a
+        # caller asking for stretched indicators or its own EMAs (top_tier's 1m
+        # LTF: span_scale 5, ltf_ema_*_span) gets its own entry without
+        # clobbering the canonical frame the engine bars, dashboard, and other
+        # strategies read. Resolving None keeps an explicit canonical request
+        # (9/20 at scale 1) on that same entry.
         base_key = (cache_key, tf, False)
-        indicator_key = (cache_key, tf, True, float(span_scale))
+        indicator_key = (cache_key, tf, True, float(span_scale), resolve_ema_spans(span_scale, ema_spans))
         with self._lock:
             if self._cycle_active:
                 cached = self._cycle_merged_cache.get(indicator_key if with_indicators else base_key)
@@ -2061,7 +2161,7 @@ class MarketDataStore:
                 self._cycle_merged_cache[base_key] = merged.copy()
         if not with_indicators:
             return merged.copy()
-        enriched = ensure_standard_indicator_frame(merged, span_scale=span_scale)
+        enriched = ensure_standard_indicator_frame(merged, span_scale=span_scale, ema_spans=ema_spans)
         with self._lock:
             if self._cycle_active:
                 self._cycle_merged_cache[indicator_key] = enriched.copy()

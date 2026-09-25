@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import math
 from typing import Iterable
@@ -14,9 +14,14 @@ from .utils import (
     atr_value,
     ensure_ohlcv_frame,
     ensure_standard_indicator_frame,
+    get_runtime_indicator_mode,
+    get_session_indicator_window,
+    indicator_session_mask,
+    indicator_session_open,
     indicator_span_scale,
     resolve_current_price,
     scaled_span,
+    session_price_scale,
     talib_obv,
 )
 
@@ -74,6 +79,10 @@ class TechnicalLevelsContext:
         "fib_bearish_500",
         "fib_bearish_618",
         "fib_bearish_786",
+        # nearest_*_extension is the next extension price has NOT reached
+        # (the target cap); *_extension_distance_pct is the distance to the
+        # closest extension on EITHER side (the near-extension penalty), so
+        # a close just through the 1.272 still reads as at the stall level.
         "nearest_bullish_extension",
         "nearest_bullish_extension_ratio",
         "bullish_extension_distance_pct",
@@ -399,6 +408,65 @@ def _line_direction(slope: float, tol: float) -> str:
     return "flat"
 
 
+def _shift_line(line: TechnicalLine | None, offset: int) -> TechnicalLine | None:
+    """The same line in a frame with ``offset`` more rows in front: the same
+    prices at the same bars, so start/end move by ``offset`` and the
+    intercept by -slope x offset. current_value is a price and stays."""
+    if line is None:
+        return None
+    return replace(
+        line,
+        start_pos=line.start_pos + offset,
+        end_pos=line.end_pos + offset,
+        intercept=line.intercept - line.slope * offset,
+    )
+
+
+def _shift_channel(channel: ChannelContext, offset: int) -> ChannelContext:
+    return replace(
+        channel,
+        lower_line=_shift_line(channel.lower_line, offset),
+        upper_line=_shift_line(channel.upper_line, offset),
+        mid_line=_shift_line(channel.mid_line, offset),
+    )
+
+
+_DIVERGENCE_FIELDS: tuple[str, ...] = (
+    "bullish_rsi_divergence",
+    "bearish_rsi_divergence",
+    "bullish_obv_divergence",
+    "bearish_obv_divergence",
+    "bullish_hidden_rsi_divergence",
+    "bearish_hidden_rsi_divergence",
+    "bullish_hidden_obv_divergence",
+    "bearish_hidden_obv_divergence",
+)
+
+
+def _shift_divergence(match: DivergenceMatch | None, offset: int) -> DivergenceMatch | None:
+    """``match`` with its pivot positions moved ``offset`` bars into the
+    caller's frame. The age is kept: it is a count of bars (session bars
+    under the session clock) closed since ``b``, which does not depend on
+    where the frame starts."""
+    if match is None:
+        return None
+    return DivergenceMatch(
+        kind=match.kind,
+        direction=match.direction,
+        indicator=match.indicator,
+        pivot_a_pos=match.pivot_a_pos + offset,
+        pivot_a_ts=match.pivot_a_ts,
+        pivot_a_price=match.pivot_a_price,
+        pivot_a_indicator=match.pivot_a_indicator,
+        pivot_b_pos=match.pivot_b_pos + offset,
+        pivot_b_ts=match.pivot_b_ts,
+        pivot_b_price=match.pivot_b_price,
+        pivot_b_indicator=match.pivot_b_indicator,
+        indicator_delta=match.indicator_delta,
+        age_bars=match.age_bars,
+    )
+
+
 def _build_best_line(
     points: Iterable[tuple[int, pd.Timestamp, float]],
     *,
@@ -406,64 +474,101 @@ def _build_best_line(
     current_pos: int,
     tolerance: float,
     min_touches: int,
-    max_candidates: int = 7,
+    closes: np.ndarray,
+    break_buffer: float,
 ) -> TechnicalLine | None:
-    pts = sorted([(int(pos), ts, float(price)) for pos, ts, price in points], key=lambda x: x[0])
-    if len(pts) < 2:
+    """The best line through two of ``points`` (pivot lows for a support,
+    highs for a resistance): most touches, then longest span (up to 40 bars),
+    then most recent last touch.
+
+    Every point passed is a candidate -- the caller's lookback window is the
+    only bound. Until 2026-09-23 only the last 7 pivots were kept, which on
+    1m bars covered 40-95 bars, so ``trendline_lookback_bars`` /
+    ``channel_lookback_bars`` (120) never bound anything: over 53,780
+    replayed evaluations no line started more than 93 bars back. The pair
+    search is vectorised so the whole window costs no more than the 7-pivot
+    loop did; the arithmetic and the first-best-wins tie order are the loop's.
+
+    ``closes`` is the close of every bar of the frame ``points`` index, and
+    ``break_buffer`` the distance ``trendline_break_*`` needs a close beyond
+    the line: together they decide when a broken line is spent (below).
+    """
+    pts = sorted(((int(pos), float(price)) for pos, _ts, price in points), key=lambda item: item[0])
+    n = len(pts)
+    if n < 2:
         return None
-    pts = pts[-max_candidates:]
-    best: tuple[float, TechnicalLine] | None = None
+    pos = np.fromiter((p for p, _y in pts), dtype=np.float64, count=n)
+    price = np.fromiter((y for _p, y in pts), dtype=np.float64, count=n)
+    first, second = np.triu_indices(n, k=1)
+    distinct = pos[second] > pos[first]
+    first, second = first[distinct], second[distinct]
+    if first.size == 0:
+        return None
+    slope = (price[second] - price[first]) / (pos[second] - pos[first])
+    intercept = price[first] - (slope * pos[first])
+    # One row per candidate pair, one column per point: the line's value at
+    # each point. A pair only ever judges the points from its first one on.
+    line_px = (slope[:, None] * pos[None, :]) + intercept[:, None]
+    in_span = np.arange(n)[None, :] >= first[:, None]
+    touch = in_span & (np.abs(price[None, :] - line_px) <= tolerance)
+    touches = touch.sum(axis=1)
+    last_touch = np.where(touch, pos[None, :], -np.inf).max(axis=1)
+    # A line price has cut straight through is not support or resistance,
+    # however many other pivots it touches. Counting touches alone accepted
+    # a "support" with a pivot low 11 points below it in the middle of its
+    # span. Only the span BETWEEN the first point and the last touch is
+    # checked: a pivot through the line after its last touch is a break --
+    # information that `trendline_break_*` exists to report -- not proof the
+    # line was never valid.
+    if kind == "support":
+        through = price[None, :] < line_px - tolerance
+    else:
+        through = price[None, :] > line_px + tolerance
+    inside = in_span & (pos[None, :] > pos[first][:, None]) & (pos[None, :] < last_touch[:, None])
+    # A line is spent once it has broken and the break has held: a close
+    # beyond it by the break buffer after its last touch (the bar that raises
+    # trendline_break_*), then a pivot on its far side at or after that close.
+    # A spent line no longer keeps winning on touches and re-raising its
+    # break for as long as it stays in the window -- which, once the 7-pivot
+    # cap went (2026-09-23), could be the whole lookback. A far-side pivot
+    # with no decisive close before it (a wick, a dip that closed inside the
+    # buffer) is not a break, and does not retire the line: judged on pivots
+    # alone, such a wick spent the line without the flag ever firing, and the
+    # real break that followed raised nothing.
+    bars = np.arange(int(pos.min()), int(current_pos) + 1)
+    bar_close = np.asarray(closes, dtype=np.float64)[bars]
+    bar_line = (slope[:, None] * bars[None, :]) + intercept[:, None]
+    if kind == "support":
+        decisive = bar_close[None, :] < bar_line - float(break_buffer)
+    else:
+        decisive = bar_close[None, :] > bar_line + float(break_buffer)
+    decisive &= bars[None, :] > last_touch[:, None]
+    first_break = np.where(decisive, bars[None, :], np.inf).min(axis=1)
+    held_beyond = through & (pos[None, :] > last_touch[:, None]) & (pos[None, :] >= first_break[:, None])
+    eligible = (
+        (touches >= int(min_touches))
+        & ~(through & inside).any(axis=1)
+        & ~held_beyond.any(axis=1)
+    )
+    if not eligible.any():
+        return None
+    span = np.maximum(1.0, last_touch - pos[first])
+    recency = 1.0 / np.maximum(1.0, float(current_pos) - last_touch + 1.0)
+    score = (touches * 3.0) + np.minimum(2.0, span / 20.0) + recency
+    best = int(np.argmax(np.where(eligible, score, -np.inf)))
+    best_slope = float(slope[best])
+    best_intercept = float(intercept[best])
     slope_tol = max(1e-9, tolerance / max(10.0, float(max(1, current_pos))))
-    for i in range(len(pts) - 1):
-        p1, _, y1 = pts[i]
-        for j in range(i + 1, len(pts)):
-            p2, _, y2 = pts[j]
-            if p2 <= p1:
-                continue
-            slope = (y2 - y1) / float(p2 - p1)
-            intercept = y1 - (slope * float(p1))
-            touches = 0
-            last_touch_pos = p2
-            for pos, _ts, price in pts[i:]:
-                line_px = _line_value(slope, intercept, pos)
-                if abs(price - line_px) <= tolerance:
-                    touches += 1
-                    last_touch_pos = pos
-            if touches < int(min_touches):
-                continue
-            # A line price has cut straight through is not support or
-            # resistance, however many other pivots it touches. Counting
-            # touches alone accepted a "support" with a pivot low 11 points
-            # below it in the middle of its span. Only the span BETWEEN the
-            # first point and the last touch is checked: a pivot through the
-            # line after its last touch is a break -- information that
-            # `trendline_break_*` exists to report -- not proof the line was
-            # never valid.
-            if any(
-                (price < _line_value(slope, intercept, pos) - tolerance) if kind == "support"
-                else (price > _line_value(slope, intercept, pos) + tolerance)
-                for pos, _ts, price in pts[i:]
-                if p1 < pos < last_touch_pos
-            ):
-                continue
-            current_value = _line_value(slope, intercept, current_pos)
-            direction = _line_direction(slope, slope_tol)
-            line = TechnicalLine(
-                kind=kind,
-                slope=float(slope),
-                intercept=float(intercept),
-                touches=int(touches),
-                start_pos=int(p1),
-                end_pos=int(last_touch_pos),
-                current_value=float(current_value),
-                direction=direction,
-            )
-            span = max(1, line.end_pos - line.start_pos)
-            recency = 1.0 / max(1.0, float(current_pos - line.end_pos + 1))
-            score = float(touches) * 3.0 + min(2.0, span / 20.0) + recency
-            if best is None or score > best[0]:
-                best = (score, line)
-    return best[1] if best is not None else None
+    return TechnicalLine(
+        kind=kind,
+        slope=best_slope,
+        intercept=best_intercept,
+        touches=int(touches[best]),
+        start_pos=int(pos[first[best]]),
+        end_pos=int(last_touch[best]),
+        current_value=_line_value(best_slope, best_intercept, current_pos),
+        direction=_line_direction(best_slope, slope_tol),
+    )
 
 
 def _line_has_material_slope_over_span(
@@ -548,8 +653,15 @@ def _build_channel(
         return ChannelContext(valid=False)
 
     if frame is not None and not frame.empty:
-        eval_start = max(overlap_start, len(frame) - min(40, len(frame)))
-        eval_end = min(current_pos, len(frame) - 1)
+        # The channel is judged on the 40 closes BEFORE the current bar, and
+        # the current close is then read against it (position_pct outside
+        # [0, 1] is a break). Until 2026-09-23 the current bar was part of
+        # the test, so a close decisively through a line voided the channel
+        # on that very bar: channel_breakdown_exit / channel_breakout_exit
+        # could fire on a close 0.10-0.34% beyond the line and never on one
+        # further out -- the reverse of what an exit on a break is for.
+        eval_end = min(current_pos, len(frame) - 1) - 1
+        eval_start = max(overlap_start, eval_end - 39)
         if eval_end <= eval_start:
             return ChannelContext(valid=False)
         break_tolerance = max(float(tolerance) * 1.35, current_price * 0.0015)
@@ -689,6 +801,23 @@ def _anchored_vwap(frame: pd.DataFrame, start_pos: int) -> float | None:
     return float((typical * vol_arr).sum() / vol_sum)
 
 
+def _latest_session_start_pos(frame: pd.DataFrame, *, from_rth_open: bool) -> int:
+    """Position in ``frame`` (non-empty, time-ordered) of the latest
+    session's first bar.
+
+    With ``from_rth_open`` that is the 09:30 open once a regular-hours bar
+    exists, and the day's first bar before then (pre-market); without it,
+    the day's first bar.
+    """
+    index_dt = pd.DatetimeIndex(frame.index)
+    last = index_dt[-1]
+    if from_rth_open:
+        rth_open = int(index_dt.searchsorted(last.replace(hour=9, minute=30, second=0, microsecond=0, nanosecond=0)))
+        if rth_open < len(index_dt):
+            return rth_open
+    return int(index_dt.searchsorted(last.normalize()))
+
+
 def _session_open_anchored_vwap(frame: pd.DataFrame) -> float | None:
     """VWAP anchored at the latest session's 09:30 open (or its first bar,
     when no RTH bar exists yet), computed over the frame as passed.
@@ -701,20 +830,13 @@ def _session_open_anchored_vwap(frame: pd.DataFrame) -> float | None:
     session VWAP it read 0.00 ATR off at 11:15, 3.4 ATR (median) at 12:00 and
     6.1 at 13:30, with a 20.9 ATR worst case -- and it drives
     ``anchored_vwap_loss_exit``.
+
+    Always the 09:30 open, whatever the session-indicator window: thin
+    pre-market volume would otherwise skew the anchor.
     """
     if frame is None or frame.empty:
         return None
-    index_dt = pd.DatetimeIndex(frame.index)
-    on_last_day = np.asarray(index_dt.normalize() == index_dt[-1].normalize())
-    # Prefer the 09:30 open over the pre-market start so thin pre-market
-    # volume does not skew the anchor.
-    after_open = on_last_day & np.asarray((index_dt.hour * 60 + index_dt.minute) >= 9 * 60 + 30)
-    positions = np.flatnonzero(after_open)
-    if positions.size == 0:
-        positions = np.flatnonzero(on_last_day)
-    if positions.size == 0:
-        return None
-    return _anchored_vwap(frame, int(positions[0]))
+    return _anchored_vwap(frame, _latest_session_start_pos(frame, from_rth_open=True))
 
 
 # NOTE: divergence detection moved to ``levels_shared.find_divergence``
@@ -963,7 +1085,7 @@ def build_technical_levels_context(
     trendline_lookback_bars: int = 120,
     trendline_min_touches: int = 3,
     trendline_atr_tolerance_mult: float = 0.35,
-    trendline_breakout_buffer_atr_mult: float = 0.15,
+    trendline_breakout_buffer_atr_mult: float = 0.65,
     channel_lookback_bars: int = 120,
     channel_min_touches: int = 3,
     channel_atr_tolerance_mult: float = 0.35,
@@ -1061,11 +1183,54 @@ def build_technical_levels_context(
     # below can cut off -- keep a handle on the untrimmed frame for it.
     session_frame = frame
     frame = frame.tail(max(tail_requirements)).copy()
+    # Everything below works in the trimmed frame's positions. Every position
+    # published on ctx -- trendline / channel start_pos, end_pos and
+    # intercept, divergence pivots -- is shifted by frame_offset into the
+    # caller's frame, where index 0 is its first row (the frame as normalised
+    # above, which is the caller's own for any sorted, de-duplicated frame
+    # with complete OHLC -- every caller's). Until 2026-09-23 they were
+    # published in trimmed positions (0-279 on top_tier's frame), and the
+    # dashboard drew them against bars numbered in the full 800-1,300 bar
+    # frame: all 877 lines checked were drawn as zero-length stubs at the
+    # chart's left edge, and the ones that passed its focus filter stretched
+    # the y-axis up to 12x.
+    frame_offset = len(session_frame) - len(frame)
+    # Trendlines and channels never reach back past the current session's
+    # first bar: the 09:30 open under the
+    # "rth" session-indicator window (the day's first bar before the open),
+    # the day's first bar under "extended". Their windows are bar counts and
+    # the line geometry is bar positions, so until 2026-09-23 a 120-bar
+    # window at 09:45 reached into the pre-market and the prior session, and
+    # the 11-17 hours between yesterday's last bar and today's first counted
+    # as ONE bar. Lines fitted on yesterday's pivots were projected across the
+    # gap, and the overnight move then read as a trendline break at the open
+    # (AMD, TSM and COP on 2026-07-29 at 09:30); between 09:35 and 11:30 about
+    # 31% of the support lines that anchor stops started before 09:30.
+    #
+    # The fib and anchored-VWAP impulses are NOT session-bounded: they are
+    # anchored to prices, not slopes, so bar spacing across the overnight break
+    # does not distort them, and bounding them starved the 5m presets
+    # (peer_confirmed_*) of every fib cap and AVWAP anchor until mid-morning.
+    # What they must not do is anchor on a thin pre/post-market print, so with
+    # session indicators on only session-bar pivots can end an impulse. The
+    # filter runs on the raw pivots, BEFORE _reduced_pivots merges each run of
+    # same-kind pivots into its extreme: filtered after, a premarket extreme
+    # took the session pivot it had absorbed down with it, and a genuine
+    # session impulse (an open double-bottom's RTH higher low) was lost.
+    session_start_pos = max(
+        0,
+        _latest_session_start_pos(session_frame, from_rth_open=get_session_indicator_window() == "rth") - frame_offset,
+    )
     close = resolve_current_price(frame, current_price)
     needs_atr = bool(impulse_context_enabled or trendline_enabled or channel_enabled or atr_context_enabled)
     atr = atr_value(frame) if needs_atr else max(close * 0.0015 if close > 0 else 0.0, 0.0)
 
-    base_pivots_needed = bool(fib_enabled or trendline_enabled or channel_enabled or divergence_enabled)
+    # AVWAP at the base span shares the base pivots; it used to be left out
+    # of this test, so AVWAP on its own never got an impulse anchor.
+    base_pivots_needed = bool(
+        fib_enabled or trendline_enabled or channel_enabled or divergence_enabled
+        or (anchored_vwap_enabled and avwap_pivot_span == base_pivot_span)
+    )
     if base_pivots_needed:
         # Compute pivots ONCE and share between _reduced_pivots and the downstream
         # code that also needs raw (highs, lows). Previously _reduced_pivots
@@ -1078,9 +1243,23 @@ def build_technical_levels_context(
         highs = []
         lows = []
 
-    avwap_impulse_pivots = pivots
+    in_session = indicator_session_mask(frame.index) if get_runtime_indicator_mode() else None
+
+    def _impulse_pivots(span_highs, span_lows, span):
+        if in_session is None:
+            return _reduced_pivots(frame, span, highs=span_highs, lows=span_lows)
+        return _reduced_pivots(
+            frame,
+            span,
+            highs=[p for p in span_highs if in_session[int(p[0])]],
+            lows=[p for p in span_lows if in_session[int(p[0])]],
+        )
+
+    fib_impulse_pivots = _impulse_pivots(highs, lows, base_pivot_span) if in_session is not None else pivots
+    avwap_impulse_pivots = fib_impulse_pivots
     if anchored_vwap_enabled and avwap_pivot_span != base_pivot_span:
-        avwap_impulse_pivots = _reduced_pivots(frame, avwap_pivot_span)
+        avwap_highs, avwap_lows = _pivot_points(frame, avwap_pivot_span)
+        avwap_impulse_pivots = _impulse_pivots(avwap_highs, avwap_lows, avwap_pivot_span)
 
     ctx = TechnicalLevelsContext(current_price=close)
 
@@ -1146,11 +1325,23 @@ def build_technical_levels_context(
         # Nominal length, same contract as adx_length / bollinger_length: the
         # shared rsi14 column is a 14 x span_scale RSI.
         rsi_nominal = max(5, int(divergence_rsi_length))
-        if rsi_nominal == 14:
+        if rsi_nominal == 14 and "rsi14" in frame.columns:
             rsi_series = display_rsi_series
         else:
-            rsi_series = _build_rsi(frame["close"].astype(float),
-                                    scaled_span(rsi_nominal, span_scale))
+            # Divergence compares pivot prices on the gap-free session scale
+            # (session_price_scale, below), so its RSI has to be computed on
+            # that scale too -- the stitched session closes the rsi14 column
+            # is built from. On raw all-hours closes the overnight gap sat
+            # inside the RSI but not in the prices: at length 21, ADBE
+            # 2026-09-23 09:35 read a raw higher low as a bullish divergence.
+            closes = frame["close"].astype(float)
+            rsi_len = scaled_span(rsi_nominal, span_scale)
+            if get_runtime_indicator_mode():
+                in_session = indicator_session_mask(frame.index)
+                stitched = pd.Series(closes.to_numpy() * session_price_scale(frame), index=frame.index)[in_session]
+                rsi_series = _build_rsi(stitched, rsi_len).reindex(frame.index)
+            else:
+                rsi_series = _build_rsi(closes, rsi_len)
 
     if anchored_vwap_enabled:
         ctx.anchored_vwap_open = _session_open_anchored_vwap(session_frame)
@@ -1173,61 +1364,106 @@ def build_technical_levels_context(
         last_bar_pos = max(0, len(frame) - 1)
         lookback = max(2, int(divergence_pivot_lookback))
         max_age = max(0, int(divergence_max_age_bars))
+        # With session indicators on, the rsi14 / obv columns hold the
+        # session-only series on session bars and the all-hours series on the
+        # others (utils.add_indicators). A pivot pair straddling the two would
+        # compare different indicators, so only session-bar pivots are paired
+        # (2026-09-23).
+        #
+        # Their age is counted in session bars too, while the clock is inside
+        # the session (utils.indicator_session_open, 2026-09-24). Counted in
+        # every bar, the pre/post-market bars between yesterday's last session
+        # pivot and today's open aged it out before the open: at 09:33 a 1m
+        # pivot at 15:57 is 5 session bars old, but 83 bars old on a name
+        # printing a 1m bar every 5 minutes outside RTH. The gate is the
+        # clock, not the frame's last bar, as for utils.latest_atr14: at
+        # 09:30 the last completed bar is still a premarket one. A reader
+        # outside the session (premarket) keeps the all-bar age its own bars
+        # run on.
+        #
+        # On 1m frames this only reaches yesterday's pivots while they are
+        # still inside the trimmed tail (``tail_requirements``): with the
+        # default lookbacks (120 bars) a name printing a bar every 2 minutes
+        # or less outside RTH has trimmed them away by the open. A 5m frame
+        # (at most 78 extended-hours bars overnight) and the untrimmed HTF
+        # frames keep them.
+        bar_clock: np.ndarray | None = None
+        if get_runtime_indicator_mode():
+            in_session = indicator_session_mask(frame.index)
+            div_highs = [p for p in highs if in_session[int(p[0])]]
+            div_lows = [p for p in lows if in_session[int(p[0])]]
+            if indicator_session_open():
+                bar_clock = np.cumsum(in_session)
+        else:
+            div_highs, div_lows = highs, lows
+        # ...and their prices are compared on the gap-free scale those
+        # series were computed on (find_divergence's price_scale).
+        price_scale = session_price_scale(frame)
 
         # Regular divergence: pivot pair where price extends but indicator
         # weakens. Reversal-likely setup. Lows for bullish, highs for bearish.
         ctx.bullish_rsi_divergence = find_divergence(
-            lows, rsi_series, kind="regular", direction="bullish",
+            div_lows, rsi_series, kind="regular", direction="bullish",
             indicator_name="rsi", price_move_frac=price_move_frac,
             indicator_delta=rsi_delta, pivot_lookback=lookback,
             max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            price_scale=price_scale, bar_clock=bar_clock,
         )
         ctx.bearish_rsi_divergence = find_divergence(
-            highs, rsi_series, kind="regular", direction="bearish",
+            div_highs, rsi_series, kind="regular", direction="bearish",
             indicator_name="rsi", price_move_frac=price_move_frac,
             indicator_delta=rsi_delta, pivot_lookback=lookback,
             max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            price_scale=price_scale, bar_clock=bar_clock,
         )
         ctx.bullish_obv_divergence = find_divergence(
-            lows, obv_series, kind="regular", direction="bullish",
+            div_lows, obv_series, kind="regular", direction="bullish",
             indicator_name="obv", price_move_frac=price_move_frac,
             indicator_delta=obv_delta, pivot_lookback=lookback,
             max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            price_scale=price_scale, bar_clock=bar_clock,
         )
         ctx.bearish_obv_divergence = find_divergence(
-            highs, obv_series, kind="regular", direction="bearish",
+            div_highs, obv_series, kind="regular", direction="bearish",
             indicator_name="obv", price_move_frac=price_move_frac,
             indicator_delta=obv_delta, pivot_lookback=lookback,
             max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            price_scale=price_scale, bar_clock=bar_clock,
         )
 
         # Hidden divergence: opposite price/indicator alignment to regular.
         # Continuation-likely setup. Bullish hidden = price prints HL but
         # indicator prints LL (in an uptrend). Mirror for bearish.
         ctx.bullish_hidden_rsi_divergence = find_divergence(
-            lows, rsi_series, kind="hidden", direction="bullish",
+            div_lows, rsi_series, kind="hidden", direction="bullish",
             indicator_name="rsi", price_move_frac=price_move_frac,
             indicator_delta=rsi_delta, pivot_lookback=lookback,
             max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            price_scale=price_scale, bar_clock=bar_clock,
         )
         ctx.bearish_hidden_rsi_divergence = find_divergence(
-            highs, rsi_series, kind="hidden", direction="bearish",
+            div_highs, rsi_series, kind="hidden", direction="bearish",
             indicator_name="rsi", price_move_frac=price_move_frac,
             indicator_delta=rsi_delta, pivot_lookback=lookback,
             max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            price_scale=price_scale, bar_clock=bar_clock,
         )
         ctx.bullish_hidden_obv_divergence = find_divergence(
-            lows, obv_series, kind="hidden", direction="bullish",
+            div_lows, obv_series, kind="hidden", direction="bullish",
             indicator_name="obv", price_move_frac=price_move_frac,
             indicator_delta=obv_delta, pivot_lookback=lookback,
             max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            price_scale=price_scale, bar_clock=bar_clock,
         )
         ctx.bearish_hidden_obv_divergence = find_divergence(
-            highs, obv_series, kind="hidden", direction="bearish",
+            div_highs, obv_series, kind="hidden", direction="bearish",
             indicator_name="obv", price_move_frac=price_move_frac,
             indicator_delta=obv_delta, pivot_lookback=lookback,
             max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            price_scale=price_scale, bar_clock=bar_clock,
         )
+        for field_name in _DIVERGENCE_FIELDS:
+            setattr(ctx, field_name, _shift_divergence(getattr(ctx, field_name), frame_offset))
 
         # Counter-divergence bias is the regular-pattern summary (used by
         # the existing entry filter). Hidden divergences are continuation
@@ -1251,12 +1487,12 @@ def build_technical_levels_context(
     bearish_impulse: tuple[int, int, float, float] | None = None
     avwap_bullish_impulse: tuple[int, int, float, float] | None = None
     avwap_bearish_impulse: tuple[int, int, float, float] | None = None
-    if fib_enabled and pivots:
+    if fib_enabled and fib_impulse_pivots:
         fib_min_impulse = max(atr * fib_min_impulse_mult, close * 0.005)
         fib_start_pos = max(0, len(frame) - fib_lookback)
         max_fib_impulse_age_bars = max(12, min(max(1, fib_lookback - 1), fib_lookback // 3))
         bullish_impulse = _last_impulse_segment(
-            pivots,
+            fib_impulse_pivots,
             "bullish",
             min_range=fib_min_impulse,
             lookback_start_pos=fib_start_pos,
@@ -1264,7 +1500,7 @@ def build_technical_levels_context(
             max_end_age_bars=max_fib_impulse_age_bars,
         )
         bearish_impulse = _last_impulse_segment(
-            pivots,
+            fib_impulse_pivots,
             "bearish",
             min_range=fib_min_impulse,
             lookback_start_pos=fib_start_pos,
@@ -1303,6 +1539,10 @@ def build_technical_levels_context(
 
     if fib_enabled:
         selected_fib_anchor: tuple[float, float] | None = None
+        # Distance to the next extension not yet reached -- what picks the
+        # impulse when both directions have one.
+        bull_next_gap = math.inf
+        bear_next_gap = math.inf
         if bullish_impulse is not None:
             low_pos, _high_pos, low, high = bullish_impulse
             rng = max(0.0, high - low)
@@ -1316,12 +1556,20 @@ def build_technical_levels_context(
                 ctx.fib_bullish_618 = float(high - (rng * 0.618))
                 ctx.fib_bullish_786 = float(high - (rng * 0.786))
                 bull_candidates = [(1.272, ctx.fib_bullish_1272), (1.618, ctx.fib_bullish_1618)]
-                above = [(ratio, px) for ratio, px in bull_candidates if px is not None and px > close]
+                above = [(ratio, px) for ratio, px in bull_candidates if px > close]
                 if above:
                     ratio, px = min(above, key=lambda item: item[1])
                     ctx.nearest_bullish_extension = float(px)
                     ctx.nearest_bullish_extension_ratio = float(ratio)
-                    ctx.bullish_extension_distance_pct = max(0.0, (float(px) - close) / close) if close > 0 else None
+                    if close > 0:
+                        bull_next_gap = (float(px) - close) / close
+                # Proximity to the stall zone, on EITHER side: until
+                # 2026-09-23 only extensions above the close counted, so a
+                # LONG 0.05% under the 1.272 took the full near-extension
+                # penalty and one 0.05% over it took none (767 of 13,905
+                # near-extension evaluations went unpenalised that way).
+                if close > 0:
+                    ctx.bullish_extension_distance_pct = min(abs(px - close) for _ratio, px in bull_candidates) / close
         if bearish_impulse is not None:
             high_pos, _low_pos, high, low = bearish_impulse
             rng = max(0.0, high - low)
@@ -1335,12 +1583,15 @@ def build_technical_levels_context(
                 ctx.fib_bearish_618 = float(low + (rng * 0.618))
                 ctx.fib_bearish_786 = float(low + (rng * 0.786))
                 bear_candidates = [(1.272, ctx.fib_bearish_1272), (1.618, ctx.fib_bearish_1618)]
-                below = [(ratio, px) for ratio, px in bear_candidates if px is not None and px < close]
+                below = [(ratio, px) for ratio, px in bear_candidates if px < close]
                 if below:
                     ratio, px = max(below, key=lambda item: item[1])
                     ctx.nearest_bearish_extension = float(px)
                     ctx.nearest_bearish_extension_ratio = float(ratio)
-                    ctx.bearish_extension_distance_pct = max(0.0, (close - float(px)) / close) if close > 0 else None
+                    if close > 0:
+                        bear_next_gap = (close - float(px)) / close
+                if close > 0:
+                    ctx.bearish_extension_distance_pct = min(abs(px - close) for _ratio, px in bear_candidates) / close
         if bullish_impulse is not None and bearish_impulse is None:
             ctx.fib_direction = "bullish"
             _low_pos, _high_pos, low, high = bullish_impulse
@@ -1350,9 +1601,7 @@ def build_technical_levels_context(
             _high_pos, _low_pos, high, low = bearish_impulse
             selected_fib_anchor = (float(low), float(high))
         elif bullish_impulse is not None and bearish_impulse is not None:
-            bull_gap = ctx.bullish_extension_distance_pct if ctx.bullish_extension_distance_pct is not None else math.inf
-            bear_gap = ctx.bearish_extension_distance_pct if ctx.bearish_extension_distance_pct is not None else math.inf
-            if bull_gap <= bear_gap:
+            if bull_next_gap <= bear_next_gap:
                 ctx.fib_direction = "bullish"
                 _low_pos, _high_pos, low, high = bullish_impulse
                 selected_fib_anchor = (float(low), float(high))
@@ -1383,15 +1632,42 @@ def build_technical_levels_context(
     raw_resistance_line: TechnicalLine | None = None
     trendline_params: tuple | None = None
 
+    # Tolerances and the breakout buffer are ATR multiples, nothing else.
+    # Until 2026-09-23 each also had a percent-of-price floor (0.25% for the
+    # touch tolerance, 0.10% for the buffer). The ATR term only wins above an
+    # ATR of 0.71% / 0.67% of price, and top_tier's 1m ATR never gets there
+    # (median 0.13%), so the floors decided every evaluation (74,033 of
+    # 74,033 replayed): the touch band was ~2 ATR wide instead of the
+    # configured 0.35, 61.5% of lines counted EVERY candidate pivot as a
+    # touch -- min_touches discriminated nothing -- and the three *_mult knobs
+    # changed nothing (1,844 of 1,848 contexts on 2026-09-22 identical at
+    # 0.10 / 0.35 / 0.70). ATR alone, with this module's other 2026-09-23
+    # fixes, over 14,616 evaluations on seven archived sessions at the then
+    # 0.15 break buffer: 6.2% of lines touch every candidate (was 60.3%),
+    # break flags fire on 12.8% of evaluations (was 16-17%), respected flags
+    # on 4.1% (was 15-17%), and the three multipliers now change 1,614 of
+    # those 1,848 contexts. The shipped buffer is 0.65 ATR (0.30 on 5m), the
+    # old 0.10% floor at the median: break flags are rarer than those 12.8%
+    # and respected flags commoner than 4.1%.
+    # They multiply atr_value = max(ATR14, 0.15% of price). On 1m large caps
+    # that floor decides ~70-80% of builds, so there the break buffer is
+    # 0.0975% and the touch tolerance 0.0525% of price at the shipped 0.65 /
+    # 0.35; they scale with volatility only above it.
+    # The break buffer the trendline flags use, which also decides when a
+    # broken line (trendline or channel edge) is spent (_build_best_line).
+    break_buffer = atr * float(trendline_breakout_buffer_atr_mult)
+    closes = frame["close"].to_numpy(dtype=float)
     if trendline_enabled:
         trendline_lookback = max(10, int(trendline_lookback_bars))
-        trendline_start_pos = max(0, len(frame) - trendline_lookback)
+        trendline_start_pos = max(len(frame) - trendline_lookback, session_start_pos)
         trendline_lows = [pt for pt in lows if pt[0] >= trendline_start_pos]
         trendline_highs = [pt for pt in highs if pt[0] >= trendline_start_pos]
-        tl_tol = max(atr * float(trendline_atr_tolerance_mult), close * 0.0025)
+        tl_tol = atr * float(trendline_atr_tolerance_mult)
         tl_touches = max(2, int(trendline_min_touches))
-        raw_support_line = _build_best_line(trendline_lows, kind="support", current_pos=current_pos, tolerance=tl_tol, min_touches=tl_touches)
-        raw_resistance_line = _build_best_line(trendline_highs, kind="resistance", current_pos=current_pos, tolerance=tl_tol, min_touches=tl_touches)
+        raw_support_line = _build_best_line(trendline_lows, kind="support", current_pos=current_pos, tolerance=tl_tol,
+                                            min_touches=tl_touches, closes=closes, break_buffer=break_buffer)
+        raw_resistance_line = _build_best_line(trendline_highs, kind="resistance", current_pos=current_pos, tolerance=tl_tol,
+                                               min_touches=tl_touches, closes=closes, break_buffer=break_buffer)
         trendline_params = (trendline_lookback, tl_tol, tl_touches)
         support_line = raw_support_line
         resistance_line = raw_resistance_line
@@ -1399,9 +1675,32 @@ def build_technical_levels_context(
             support_line = None
         if not _trendline_has_material_slope(resistance_line, current_pos=current_pos, tolerance=tl_tol):
             resistance_line = None
-        ctx.support_trendline = support_line
-        ctx.resistance_trendline = resistance_line
-        buffer = max(atr * float(trendline_breakout_buffer_atr_mult), close * 0.0010)
+        buffer = break_buffer
+        # The two lines are built independently, and until 2026-09-23 nothing
+        # compared them. Once a converging pair reaches its apex the support
+        # sits at or above the resistance, and a close between them read as a
+        # break of BOTH (XLB 2026-07-28 10:52: support 52.566 over resistance
+        # 52.422, close 52.51 -- trendline_break_exit for a LONG and for a
+        # SHORT on the same bar, and the break bonus on both sides). The flags
+        # below read four zones off the pair: below support - buffer, within
+        # [-1, +1.5] buffers of support, within [-1.5, +1] of resistance, and
+        # above resistance + buffer. A crossed pair, or one less than half a
+        # buffer wide (where a break and the opposite line's respected band
+        # overlap), has converged into its apex and bounds nothing, so both
+        # lines go. A wider pair keeps its lines -- they anchor stops and
+        # targets -- and the only overlap left, a close inside both respected
+        # bands of a channel under 3 buffers wide, sets neither respected flag
+        # (below). The first version dropped every pair within 3 buffers:
+        # sized at the then 0.15 ATR buffer, at 0.65 that took 29% of all
+        # pairs (1.95 ATR), almost none of them crossed (2.7%), widening and
+        # parallel channels included.
+        if support_line is not None and resistance_line is not None and (
+            resistance_line.current_value - support_line.current_value < buffer * 0.5
+        ):
+            support_line = None
+            resistance_line = None
+        ctx.support_trendline = _shift_line(support_line, frame_offset)
+        ctx.resistance_trendline = _shift_line(resistance_line, frame_offset)
         if support_line is not None:
             support_value = float(support_line.current_value)
             ctx.support_distance_pct = max(0.0, abs(close - support_value) / close) if close > 0 else None
@@ -1412,33 +1711,43 @@ def build_technical_levels_context(
             ctx.resistance_distance_pct = max(0.0, abs(resistance_value - close) / close) if close > 0 else None
             ctx.resistance_respected = resistance_value + buffer >= close >= resistance_value - (buffer * 1.5)
             ctx.trendline_break_up = close > resistance_value + buffer
+        if ctx.support_respected and ctx.resistance_respected:
+            # A close inside both respected bands of a narrow channel: neither
+            # line is the one price is holding.
+            ctx.support_respected = False
+            ctx.resistance_respected = False
 
     if channel_enabled:
         channel_lookback = max(10, int(channel_lookback_bars))
-        channel_start_pos = max(0, len(frame) - channel_lookback)
-        channel_tol = max(atr * float(channel_atr_tolerance_mult), close * 0.0025)
+        channel_start_pos = max(len(frame) - channel_lookback, session_start_pos)
+        channel_tol = atr * float(channel_atr_tolerance_mult)
         channel_touches = max(2, int(channel_min_touches))
         channel_params = (channel_lookback, channel_tol, channel_touches)
         if trendline_params is not None and channel_params == trendline_params:
             # Same lookback+tolerance+touches as trendline → reuse the lines we
             # already computed. Saves 2 full _build_best_line calls per context
-            # build (each of which is O(k²) over up to 7 candidate pivots).
+            # build.
             channel_support = raw_support_line
             channel_resistance = raw_resistance_line
         else:
             channel_lows = [pt for pt in lows if pt[0] >= channel_start_pos]
             channel_highs = [pt for pt in highs if pt[0] >= channel_start_pos]
-            channel_support = _build_best_line(channel_lows, kind="support", current_pos=current_pos, tolerance=channel_tol, min_touches=channel_touches)
-            channel_resistance = _build_best_line(channel_highs, kind="resistance", current_pos=current_pos, tolerance=channel_tol, min_touches=channel_touches)
+            channel_support = _build_best_line(channel_lows, kind="support", current_pos=current_pos, tolerance=channel_tol,
+                                               min_touches=channel_touches, closes=closes, break_buffer=break_buffer)
+            channel_resistance = _build_best_line(channel_highs, kind="resistance", current_pos=current_pos, tolerance=channel_tol,
+                                                  min_touches=channel_touches, closes=closes, break_buffer=break_buffer)
         channel_min_gap_abs = max(atr * float(channel_min_gap_atr_mult), close * float(channel_min_gap_pct), channel_tol)
-        ctx.channel = _build_channel(
-            channel_support,
-            channel_resistance,
-            frame=frame,
-            current_price=close,
-            current_pos=current_pos,
-            tolerance=channel_tol,
-            parallel_slope_frac=float(channel_parallel_slope_frac),
-            min_gap_abs=float(channel_min_gap_abs),
+        ctx.channel = _shift_channel(
+            _build_channel(
+                channel_support,
+                channel_resistance,
+                frame=frame,
+                current_price=close,
+                current_pos=current_pos,
+                tolerance=channel_tol,
+                parallel_slope_frac=float(channel_parallel_slope_frac),
+                min_gap_abs=float(channel_min_gap_abs),
+            ),
+            frame_offset,
         )
     return ctx

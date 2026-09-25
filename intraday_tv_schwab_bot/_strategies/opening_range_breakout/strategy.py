@@ -19,6 +19,7 @@ from ..shared import (
     time,
     timedelta,
 )
+from ..shared_entry import EntryContexts, EntryProposal, RetestTrigger
 from ..strategy_base import BaseStrategy
 
 _ET_ZONE = ZoneInfo("America/New_York")
@@ -26,7 +27,35 @@ _ET_ZONE = ZoneInfo("America/New_York")
 LOG = logging.getLogger(__name__)
 _VALID_ORB_WATCHLIST_MODES = {"none", "premarket", "early_session"}
 
+# The pending reasons an FVG retest of the opening-range trigger may clear:
+# price not through the trigger yet, or through it but stretched (the
+# anti-chase exhaustion checks). Until 2026-09-24 two passes cleared them --
+# the own reasons first, the exhaustion ones only once nothing else was
+# pending -- and one pass over the union decides the same.
+_RETEST_DEFERRABLE = frozenset({
+    "no_orb_breakout",
+    "too_extended_from_vwap_atr",
+    "too_extended_from_ema9_atr",
+    "upper_wick_rejection",
+    "expansion_bar_too_large",
+})
+
+
 class ORBStrategy(BaseStrategy):
+    """Long-only opening-range breakout (microcap_gap_orb inherits it).
+
+    One LONG proposal per candidate (style / family ``orb``): the setup's own
+    blockers and the anti-chase exhaustion checks are its pending reasons,
+    and an FVG retest of the opening-range trigger may clear the breakout /
+    exhaustion ones. The stop is the opening-range low, the target a 2.0R
+    (2.5R on a strong, structure-confirmed break) measured move. Every
+    shared_entry knob -- the vetoes, the refinement, the retest stop anchor,
+    the score terms -- is applied by ``self.entry_policy.admit``. The
+    ``orb`` family puts the entry under the exit side's ORB grace
+    (``support_resistance.orb_entry_exit_grace_minutes``), which until
+    2026-09-24 covered only top_tier's ORB regime.
+    """
+
     strategy_name = 'opening_range_breakout'
 
     @classmethod
@@ -88,16 +117,12 @@ class ORBStrategy(BaseStrategy):
             last = after.iloc[-1]
             trigger = or_high * (1.0 + buffer_pct)
             ctx = self._chart_context(frame)
-            sr_ctx = self._sr_context(c.symbol, frame, data)
             ms_ctx = self._structure_context(frame, "ltf")
-            tech_ctx = self._technical_context(frame)
             last_close = _safe_float(last["close"])
-            htf_ctx = self._default_htf_context_for_score(c.symbol, data)
             pattern_ok = bool(ctx.matched_bullish_continuation or ctx.matched_bullish_reversal) or ctx.bias_score >= 0.0
             last_vwap = _safe_float(last["vwap"], last_close)
             last_ema9 = _safe_float(last["ema9"], last_close)
             last_ema20 = _safe_float(last["ema20"], last_close)
-            retest_plan = self._continuation_fvg_retest_plan(Side.LONG, c.symbol, frame, data, trigger_level=trigger, breakout_active=bool(last_close > trigger), close=last_close, vwap=last_vwap, ema9=last_ema9)
             if last_close <= trigger:
                 reasons.append(_reason_with_values("no_orb_breakout", current=last_close, required=trigger, op=">", digits=4))
             if last_close <= last_vwap:
@@ -106,61 +131,53 @@ class ORBStrategy(BaseStrategy):
                 reasons.append(_reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
             if not pattern_ok:
                 reasons.append("chart_pattern_not_supportive")
-            if not reasons and self._shared_entry_enabled("use_opposing_chart_filter", True) and self._blocks_bullish_entry(ctx):
-                reasons.append("chart_pattern_opposed")
-            reasons = self._apply_continuation_zone_retest_plans(reasons, [retest_plan], deferrable_prefixes={"no_orb_breakout", "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large"})
-            if not reasons:
-                reasons.extend(self._entry_exhaustion_reasons(Side.LONG, frame, close=last_close, vwap=last_vwap, ema9=last_ema9))
-                reasons = self._apply_continuation_zone_retest_plans(reasons, [retest_plan], deferrable_prefixes={"too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large"})
-            if not reasons:
-                divergence_reason = self._dual_counter_divergence_reason(Side.LONG, tech_ctx)
-                if divergence_reason:
-                    reasons.append(divergence_reason)
-            if not reasons:
-                stop = or_low
-                # Adaptive target RR: base 2.0, extended to 2.5 when the
-                # breakout is visibly strong (>1.5% above trigger) AND HTF
-                # structure bias confirms bullish. Non-restrictive — never
-                # TIGHTENS the target, only lets strong breakouts run farther.
-                base_rr = 2.0
-                preview_breakout_pct = max(0.0, (last_close - trigger) / trigger) if trigger > 0 else 0.0
-                preview_ms_bias = getattr(ms_ctx, "bias", "neutral")
-                if preview_breakout_pct >= 0.015 and preview_ms_bias == "bullish":
-                    base_rr = 2.5
-                target = last_close + (last_close - stop) * base_rr
-                if self._blocks_bullish_structure_entry(ms_ctx):
-                    reasons.append(self._bullish_structure_block_reason(ms_ctx))
-                elif self._blocks_bullish_sr_entry(sr_ctx):
-                    reasons.append(self._bullish_sr_block_reason(sr_ctx))
-                else:
-                    stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx, frame)
-                    stop, target = self._refine_bullish_technical_levels(last_close, stop, target, tech_ctx, frame)
-                    stop = self._apply_retest_stop_anchor(Side.LONG, last_close, stop, retest_plan)
-                    breakout_pct = max(0.0, (last_close - trigger) / trigger) if trigger > 0 else 0.0
-                    ms_bias = getattr(ms_ctx, "bias", "neutral")
-                    structure_bonus = 0.75 if ms_bias == "bullish" else 0.0
-                    pattern_bonus = 0.35 if ctx.matched_bullish_continuation else 0.15 if ctx.matched_bullish_reversal else 0.0
-                    adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
-                    fvg_adjustments = self._fvg_entry_adjustment_components(Side.LONG, c.symbol, frame, data)
-                    fvg_continuation_bias = float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0)
-                    runner_allowed = bool(fvg_continuation_bias >= 0.35 and (ctx.matched_bullish_continuation or ms_bias == "bullish"))
-                    management = self._adaptive_management_components(Side.LONG, last_close, stop, target, style="breakout", runner_allowed=runner_allowed, continuation_bias=fvg_continuation_bias)
-                    final_priority_score = float(c.activity_score) + (breakout_pct * 200.0) + structure_bonus + pattern_bonus + adjustments["entry_context_adjustment"] + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
-                    metadata = self._build_signal_metadata(
-                        entry_price=last_close,
-                        chart_ctx=ctx, ms_ctx=ms_ctx, sr_ctx=sr_ctx, tech_ctx=tech_ctx,
-                        adjustments=adjustments, fvg_adjustments=fvg_adjustments,
-                        management=management, retest_plan=retest_plan,
-                        final_priority_score=final_priority_score,
-                        leading={"or_high": or_high, "or_low": or_low},
-                    )
-                    reason = "smallcap_orb_fvg_retest" if str(retest_plan.get("status", "none") or "none") == "allow" else "smallcap_orb_breakout"
-                    if ctx.matched_bullish_continuation:
-                        reason += f":{'+'.join(sorted(ctx.matched_bullish_continuation))}"
-                    out.append(Signal(symbol=c.symbol, strategy=self.strategy_name, side=Side.LONG, reason=reason, stop_price=stop, target_price=target, metadata=metadata))
-                    self._record_entry_decision(c.symbol, "signal", [reason])
-                    continue
-            self._record_entry_decision(c.symbol, "skipped", reasons or ["no_setup"])
+            reasons.extend(self._entry_exhaustion_reasons(Side.LONG, frame, close=last_close, vwap=last_vwap, ema9=last_ema9))
+            breakout_pct = max(0.0, (last_close - trigger) / trigger) if trigger > 0 else 0.0
+            ms_bias = getattr(ms_ctx, "bias", "neutral")
+            # Adaptive target RR: base 2.0, extended to 2.5 when the
+            # breakout is visibly strong (>1.5% above trigger) AND HTF
+            # structure bias confirms bullish. Non-restrictive — never
+            # TIGHTENS the target, only lets strong breakouts run farther.
+            base_rr = 2.5 if breakout_pct >= 0.015 and ms_bias == "bullish" else 2.0
+            proposal = EntryProposal(
+                candidate=c,
+                direction=Side.LONG,
+                style="orb",
+                style_family="orb",
+                close=last_close,
+                stop=or_low,
+                target=last_close + (last_close - or_low) * base_rr,
+                gate_frame=frame,
+                sr_frame=frame,
+                level_frame=frame,
+                data=data,
+                pending_reasons=tuple(reasons),
+                deferrable=_RETEST_DEFERRABLE,
+                retest=RetestTrigger(trigger, bool(last_close > trigger), last_vwap, last_ema9),
+                contexts=EntryContexts(ms=ms_ctx, chart=ctx),
+            )
+            admitted = self.entry_policy.admit(proposal)
+            if admitted is None:
+                refusal = self._consume_build_failure_payload(c.symbol, proposal.style)
+                self._record_entry_decision(c.symbol, "skipped", refusal["reasons"])
+                continue
+            structure_bonus = 0.75 if ms_bias == "bullish" else 0.0
+            pattern_bonus = 0.35 if ctx.matched_bullish_continuation else 0.15 if ctx.matched_bullish_reversal else 0.0
+            fvg_continuation_bias = float(admitted.fvg["fvg_continuation_bias"])
+            runner_allowed = bool(fvg_continuation_bias >= 0.35 and (ctx.matched_bullish_continuation or ms_bias == "bullish"))
+            management = self._adaptive_management_components(
+                Side.LONG, last_close, admitted.stop, admitted.target,
+                style="breakout", runner_allowed=runner_allowed, continuation_bias=fvg_continuation_bias,
+            )
+            strategy_score = float(c.activity_score) + (breakout_pct * 200.0) + structure_bonus + pattern_bonus
+            reason = "smallcap_orb_fvg_retest" if admitted.admitted_via_retest else "smallcap_orb_breakout"
+            if ctx.matched_bullish_continuation:
+                reason += f":{'+'.join(sorted(ctx.matched_bullish_continuation))}"
+            out.append(self.entry_policy.emit(
+                admitted, reason=reason, strategy_score=strategy_score, management=management, target=admitted.target,
+                metadata={"or_high": or_high, "or_low": or_low},
+            ))
+            self._record_entry_decision(c.symbol, "signal", [reason])
         return out
 
     def should_force_flatten(self, position: Position) -> bool:

@@ -38,28 +38,23 @@ The entry does not trigger just because price is down from the highs. The strate
 
 So the setup is really: **strong day -> orderly pullback -> reversal evidence -> reclaim of short-term control**.
 
-### 4. It still passes through shared safety filters
+### 4. It still passes through the shared entry stage
 
-Even when the local reversal logic looks good, the trade can still be blocked by the shared context layers:
+Even when the local reversal logic looks good, the trade can still be blocked. The setup goes to the shared entry stage (`_strategies/shared_entry.py`) as one LONG proposal of style and family `reversal`, with the local conditions above as its pending reasons, and every `shared_entry` knob the preset switches on applies to it exactly as it does to every other strategy:
 
-- opposing chart-pattern filter
-- 1-minute market-structure veto
-- support/resistance veto
-- technical-level refinements
-- FVG-based context adjustments
+- the vetoes: market structure, support/resistance, broken level, opposing chart pattern, dual RSI+OBV counter-divergence, opposing candle cluster
+- the support/resistance, then technical-level, stop/target refinement (bounded by `min_target_rr` and `min_stop_atr_mult`)
+- the score terms: technical, S/R proximity, HTF divergence and FVG
+
+A skipped candidate's decision lists every blocker, the local ones first. Until 2026-09-24 the strategy called only some of these itself: the chart filter ran only when nothing else was pending, the structure and S/R vetoes as an either/or, and the dual-divergence and candle vetoes never reached it.
 
 That is why a name can look visually interesting but still be skipped: the strategy is trying to avoid buying late-day bounces directly into poor structure or nearby resistance.
 
 ### 5. Stop, target, and management
 
-The initial stop starts under the recent three-bar low. The first target points back toward the session-high area, capped by the default target logic if needed. After that, the signal is refined by:
+The initial stop starts under the recent three-bar low. The first target points back toward the session-high area, capped at `min(2%, risk.default_target_pct)` above the close. The shared stage refines both sides as above; the strategy then adds adaptive management in the `reversal` style.
 
-- support/resistance
-- technical levels
-- FVG context
-- adaptive management metadata
-
-Because this is a **reversal-style** setup, the strategy does not automatically treat it like a full continuation runner. It is more conservative than a trend-following breakout system.
+Because this is a **reversal-style** setup, the strategy does not automatically treat it like a full continuation runner: the runner stays off and the management leans on the FVG reversal bias. It is more conservative than a trend-following breakout system. Its own priority (`strategy_priority_score`: screener strength, the bounce, pattern quality) plus the shared context terms (`shared_context_score`) is the `final_priority_score` the gatekeeper ranks on, and the signal is stamped `entry_style_family: reversal`.
 
 ### 6. What a good setup looks like
 

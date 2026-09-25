@@ -30,8 +30,9 @@ import logging
 import numpy as np
 import pandas as pd
 
+from .levels_shared import session_segment_ids
 from .support_resistance import _pivot_points
-from .utils import ensure_ohlcv_frame, ensure_standard_indicator_frame
+from .utils import ensure_ohlcv_frame, ensure_standard_indicator_frame, latest_atr14
 
 LOG = logging.getLogger(__name__)
 
@@ -260,12 +261,20 @@ def _detect_order_blocks_loose(
     in price units (typically 0.75 × ATR). Without this, every minor
     8-bar high triggers OB hunting and small noise OBs displace
     legitimate ones in the post-cap top-K.
+
+    The lookback window, the breakout bar and the OB candle must share one
+    ET session (``session_segment_ids``). The frames hold no 20:00-07:00
+    bars, so until 2026-09-23 a morning gap printed a "new high" against the
+    prior evening's closes and the evening's last bearish candle became the
+    block, its thrust measured across the unobserved night -- the same seam
+    that minted fair-value gaps (htf_levels._detect_fair_value_gaps).
     """
     bullish_raw: list[OrderBlock] = []
     bearish_raw: list[OrderBlock] = []
     n = len(frame)
     if n < (new_high_lookback + 2):
         return bullish_raw, bearish_raw
+    segments = session_segment_ids(frame.index)
     high_arr = frame["high"].to_numpy(dtype=float, copy=False)
     low_arr = frame["low"].to_numpy(dtype=float, copy=False)
     open_arr = frame["open"].to_numpy(dtype=float, copy=False)
@@ -278,6 +287,8 @@ def _detect_order_blocks_loose(
         else ""
     )
     for idx in range(new_high_lookback, n):
+        if segments[idx - new_high_lookback] != segments[idx]:
+            continue
         current_close = float(close_arr[idx])
         # Bullish OB: this bar prints a new local-high close vs prior N closes
         prior_close_max = max(close_arr[max(0, idx - new_high_lookback):idx].tolist() or [current_close])
@@ -285,7 +296,7 @@ def _detect_order_blocks_loose(
             # Walk back up to max_distance_back bars to find last bearish candle
             for back in range(1, min(idx + 1, max_distance_back + 1)):
                 k = idx - back
-                if k < 0:
+                if k < 0 or segments[k] != segments[idx]:
                     break
                 if close_arr[k] < open_arr[k]:  # bearish
                     lower = float(low_arr[k])
@@ -337,7 +348,7 @@ def _detect_order_blocks_loose(
         if current_close < prior_close_min - eps:
             for back in range(1, min(idx + 1, max_distance_back + 1)):
                 k = idx - back
-                if k < 0:
+                if k < 0 or segments[k] != segments[idx]:
                     break
                 if close_arr[k] > open_arr[k]:  # bullish
                     lower = float(low_arr[k])
@@ -391,12 +402,20 @@ def _detect_order_blocks_strict(
     by an inch). For a real OB we want the BoS bar to have moved a
     meaningful distance from the OB candle's close — typically
     0.75 × ATR.
+
+    The swings come from ``_pivot_points``, whose windows stay inside one ET
+    session. The break may come in a later session -- yesterday's swing high
+    taken out today is a real break -- but the OB candle must share the
+    breakout bar's session: walking back across the unobserved night would
+    make the prior evening's candle the block and measure its thrust across
+    the gap (the seam the loose detector also closes, 2026-09-23).
     """
     bullish_raw: list[OrderBlock] = []
     bearish_raw: list[OrderBlock] = []
     n = len(frame)
     if n < (pivot_span * 2 + 4):
         return bullish_raw, bearish_raw
+    segments = session_segment_ids(frame.index)
     swing_highs, swing_lows = _pivot_points(frame, pivot_span)
     high_arr = frame["high"].to_numpy(dtype=float, copy=False)
     low_arr = frame["low"].to_numpy(dtype=float, copy=False)
@@ -422,7 +441,7 @@ def _detect_order_blocks_strict(
             continue
         for back in range(1, max_distance_back + 1):
             k = bos_idx - back
-            if k <= swing_idx:
+            if k <= swing_idx or segments[k] != segments[bos_idx]:
                 break
             if close_arr[k] < open_arr[k]:
                 lower = float(low_arr[k])
@@ -467,7 +486,7 @@ def _detect_order_blocks_strict(
             continue
         for back in range(1, max_distance_back + 1):
             k = bos_idx - back
-            if k <= swing_idx:
+            if k <= swing_idx or segments[k] != segments[bos_idx]:
                 break
             if close_arr[k] > open_arr[k]:
                 lower = float(low_arr[k])
@@ -559,12 +578,9 @@ def build_order_block_context(
         except Exception:
             current_price = 0.0
     ref_close = float(current_price or 0.0)
-    atr_fallback = max(ref_close * 0.0015, 0.01)
-    if "atr14" in base.columns:
-        atr_clean = base["atr14"].dropna()
-        atr = float(atr_clean.iloc[-1]) if not atr_clean.empty else atr_fallback
-    else:
-        atr = atr_fallback
+    atr = latest_atr14(base)
+    if atr is None:
+        atr = max(ref_close * 0.0015, 0.01)
     min_size = max(float(atr) * float(min_block_atr_mult), float(ref_close) * float(min_block_pct), 1e-8)
     min_thrust = max(float(atr) * float(min_thrust_atr_mult), 1e-8)
     eps = max(min_size * 0.05, ref_close * 1e-6, 1e-8)

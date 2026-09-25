@@ -36,7 +36,7 @@ from typing import Any, Callable, Mapping
 import pandas as pd
 
 from .audit_logger import AuditLogger
-from .config import BotConfig
+from .config import BotConfig, flip_confirmation_bars
 from .dashboard_cache import DashboardCache
 from .data_feed import MarketDataStore
 from .execution import BracketCancel, SchwabExecutor
@@ -45,6 +45,7 @@ from .models import (
     ASSET_TYPE_OPTION_SINGLE,
     ASSET_TYPE_OPTION_VERTICAL,
     OPTION_ASSET_TYPES,
+    ExitDecision,
     Position,
     Side,
 )
@@ -57,8 +58,10 @@ from .position_metrics import (
 )
 from .risk import RiskManager
 from ._sr_ladder import _select_next_distinct_level, _sr_effective_side_tolerance
+from ._strategies.registry import is_option_strategy
+from ._strategies.shared_exit import SharedExitPolicy, partial_exit_qty
 from ._strategies.strategy_base import BaseStrategy
-from .broker_positions import active_broker_bracket, order_result_needs_broker_recheck
+from .broker_positions import active_broker_bracket, order_result_needs_broker_recheck, working_exit_outstanding_qty
 from .support_resistance import zone_flip_confirmed
 from .utils import TRADEFLOW_LEVEL, append_management_adjustment as _append_adjustment, now_et
 
@@ -115,6 +118,9 @@ class PositionManager:
         self.audit = audit
         self.account = account
         self.strategy = strategy
+        # Every shared_exit knob, for every strategy; the strategy only adds
+        # its own exits through strategy_exit_signal (see shared_exit.py).
+        self.exit_policy = SharedExitPolicy(config, strategy)
         self.dashboard_cache = dashboard_cache
         self.positions = positions
         self._save_reconcile_metadata = save_reconcile_metadata
@@ -273,6 +279,9 @@ class PositionManager:
     def initialize_position_diagnostics(position: Position, mark_price: float, underlying_price: float | None = None) -> None:
         meta = position.metadata if isinstance(position.metadata, dict) else {}
         ts = now_et().isoformat()
+        meta['initial_qty'] = int(position.qty)
+        meta['diag_best_unrealized_pnl_per_unit'] = 0.0
+        meta['diag_worst_unrealized_pnl_per_unit'] = 0.0
         meta['diag_best_unrealized_pnl'] = 0.0
         meta['diag_worst_unrealized_pnl'] = 0.0
         meta['diag_best_unrealized_ts'] = ts
@@ -288,13 +297,25 @@ class PositionManager:
 
     @staticmethod
     def _update_position_diagnostics(position: Position, mark_price: float, underlying_price: float | None = None) -> None:
+        """Track the trade's best / worst excursion and the marks the exit
+        side compares against.
+
+        The excursion is tracked PER UNIT and reported in dollars at the
+        trade's full size, ``initial_qty`` (the largest quantity it has held,
+        so a late entry fill counts). Until 2026-09-24 it was dollars at the
+        CURRENT quantity, so after a scale-out the peak was measured on a
+        mix of sizes, while the session report divides it by the initial
+        risk times the lifecycle's full quantity.
+        """
         meta = position.metadata if isinstance(position.metadata, dict) else {}
         if position.side.value == 'LONG':
-            unrealized = (float(mark_price) - float(position.entry_price)) * int(position.qty)
+            unrealized = float(mark_price) - float(position.entry_price)
         else:
-            unrealized = (float(position.entry_price) - float(mark_price)) * int(position.qty)
-        best = float(meta.get('diag_best_unrealized_pnl', 0.0))
-        worst = float(meta.get('diag_worst_unrealized_pnl', 0.0))
+            unrealized = float(position.entry_price) - float(mark_price)
+        initial_qty = max(int(meta.get('initial_qty') or 0), int(position.qty))
+        meta['initial_qty'] = initial_qty
+        best = float(meta.get('diag_best_unrealized_pnl_per_unit', 0.0))
+        worst = float(meta.get('diag_worst_unrealized_pnl_per_unit', 0.0))
         ts = now_et().isoformat()
         # The exit signal runs on the UNDERLYING's frame. For an option these
         # are what it compares against: the premium it is holding at (for R)
@@ -305,17 +326,21 @@ class PositionManager:
             meta['underlying_high_since_entry'] = max(underlying, float(meta.get('underlying_high_since_entry', underlying)))
             meta['underlying_low_since_entry'] = min(underlying, float(meta.get('underlying_low_since_entry', underlying)))
         if unrealized > best:
-            meta['diag_best_unrealized_pnl'] = unrealized
+            best = unrealized
+            meta['diag_best_unrealized_pnl_per_unit'] = best
             meta['diag_best_unrealized_ts'] = ts
             meta['diag_best_mark_price'] = float(mark_price)
             if underlying_price is not None:
                 meta['diag_best_underlying_price'] = float(underlying_price)
         if unrealized < worst:
-            meta['diag_worst_unrealized_pnl'] = unrealized
+            worst = unrealized
+            meta['diag_worst_unrealized_pnl_per_unit'] = worst
             meta['diag_worst_unrealized_ts'] = ts
             meta['diag_worst_mark_price'] = float(mark_price)
             if underlying_price is not None:
                 meta['diag_worst_underlying_price'] = float(underlying_price)
+        meta['diag_best_unrealized_pnl'] = best * initial_qty
+        meta['diag_worst_unrealized_pnl'] = worst * initial_qty
 
     @staticmethod
     def underlying_price_for_position(position: Position, bars, default: float | None = None) -> float | None:
@@ -760,8 +785,7 @@ class PositionManager:
         level_buffer = float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0)
         stop_buffer = max(level_buffer, zone_width * 0.25, close * 0.0005)
         eps = max(level_buffer * 0.15, close * 0.0001, 1e-6)
-        confirm_1m = max(0, int(getattr(getattr(self.config, "support_resistance", None), "trading_flip_confirmation_1m_bars", 2) or 2))
-        confirm_5m = max(0, int(getattr(getattr(self.config, "support_resistance", None), "trading_flip_confirmation_5m_bars", 1) or 1))
+        confirm_1m, confirm_5m = flip_confirmation_bars(self.config.support_resistance)
         current_target = safe_float(position.target_price, None)
         if position.side == Side.LONG:
             rung_confirmed = zone_flip_confirmed("resistance", lower, upper, flip_frame=frame, confirm_1m_bars=confirm_1m, confirm_5m_bars=confirm_5m, fallback_bar=None, eps=eps)
@@ -896,6 +920,38 @@ class PositionManager:
     # cancel them before the engine markets out for its own reasons.
     # ------------------------------------------------------------------
 
+    def _register_closed_position(self, key: str, position: Position, realized: float, exit_price: float,
+                                  bars) -> None:
+        """Hand a fully closed position to the risk manager: its realized
+        P&L, the re-entry cooldown (keyed on the ORDER side) and the
+        same-level retry block's record.
+
+        The record is ``RiskManager.same_level_anchor`` of the position -- an
+        option's UNDERLYING direction and price at entry, never its premium
+        or order side (2026-09-25) -- scaled by the underlying's ATR at exit
+        (the block zone is sized in ATR so cheap and high-priced names get
+        proportional thresholds) and logged with the underlying's price at
+        exit, so the record sits in one price space. No ATR yet (warm-up) or
+        no readable level: the block skips this exit.
+        """
+        management_symbol = str(position.metadata.get("underlying") or position.symbol)
+        frame = bars.get(management_symbol) if bars else None
+        exit_atr = (
+            safe_float(frame.iloc[-1].get("atr14"), None)
+            if (frame is not None and not frame.empty and "atr14" in frame.columns)
+            else None
+        )
+        level_exit = (
+            self.underlying_price_for_position(position, bars) if is_option_strategy(position.strategy)
+            else float(exit_price)
+        )
+        self.risk.register_exit(
+            management_symbol, realized, additional_symbol=key, side=position.side,
+            level=RiskManager.same_level_anchor(position.strategy, position.side, position.metadata,
+                                                position.entry_price),
+            exit_price=level_exit, atr=exit_atr,
+        )
+
     def _book_broker_exit(self, key: str, position: Position, exit_qty: int, exit_price: float,
                           reason: str, bars, *, result_message: str, attempt_status: str,
                           fill_price_estimated: bool) -> float:
@@ -903,8 +959,6 @@ class PositionManager:
         bracket child that filled, or an exit order that filled after its
         submit call returned -- mirroring the manage_positions tail. Returns
         the realized P&L of the slice."""
-        management_symbol = str(position.metadata.get("underlying") or position.symbol)
-        management_frame = bars.get(management_symbol)
         exit_context = self._position_exit_context(position, reason, exit_price, exit_price, None, bars)
         exited_position = copy.copy(position)
         exited_position.qty = int(exit_qty)
@@ -929,16 +983,7 @@ class PositionManager:
             broker_recovered=True, fill_price_estimated=fill_price_estimated,
         ))
         if final_exit:
-            exit_atr = (
-                safe_float(management_frame.iloc[-1].get("atr14"), None)
-                if (management_frame is not None and not management_frame.empty and "atr14" in management_frame.columns)
-                else None
-            )
-            self.risk.register_exit(
-                management_symbol, realized, additional_symbol=key, side=position.side,
-                entry_price=float(position.entry_price), exit_price=float(exit_price),
-                atr=exit_atr,
-            )
+            self._register_closed_position(key, position, realized, float(exit_price), bars)
             self.positions.pop(key, None)
         else:
             self.risk.register_realized_pnl(realized)
@@ -1105,15 +1150,90 @@ class PositionManager:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _track_working_exit(position: Position, result, reason: str, booked_qty: int) -> None:
+    def _track_working_exit(position: Position, result, decision: ExitDecision, booked_qty: int, requested_qty: int,
+                            *, bracket_cancelled: bool) -> None:
         if isinstance(position.metadata, dict):
             position.metadata["working_exit_order"] = {
                 "order_id": str(result.order_id),
-                "reason": str(reason),
+                "reason": str(decision.reason),
                 "message": str(result.message),
                 "booked_qty": int(booked_qty),
+                "requested_qty": int(requested_qty),
+                # A scale-out's one-shot marker rides with the order, so the
+                # cycle that books its fill records it (see _record_exit_marker).
+                "family": str(decision.family),
+                "marker": decision.marker,
+                # The bracket came down to send this order: the cycle that
+                # settles it re-protects whatever is still held (see
+                # _exit_order_in_flight). A full exit too: when it dies part
+                # filled, its remainder is only retried if the family that
+                # decided it fires again, and a chart or CHoCH trigger often
+                # does not (2026-09-24). A retry cancels that bracket again,
+                # which is churn, never a double fill.
+                "reprotect": bool(bracket_cancelled),
                 "since": now_et().isoformat(),
             }
+
+    @staticmethod
+    def _broker_bracket_down(position: Position) -> bool:
+        """True when the position tracks a live broker bracket that is not
+        active: cancelled to send an exit, or never established. Its
+        remaining shares have no resting stop until they are re-protected.
+        False for a dry-run (simulated) bracket and for a position that has
+        none (bracket mode off, an option)."""
+        bracket = position.metadata.get("bracket") if isinstance(position.metadata, dict) else None
+        return isinstance(bracket, dict) and not bracket.get("simulated") and not bracket.get("active")
+
+    def _reprotect_remainder(self, position: Position, qty: int | None = None) -> None:
+        """Resting broker protection, at the current engine levels, for the
+        ``qty`` shares of a position no exit order covers (default: all of
+        it) after its bracket was cancelled to send an exit.
+
+        The bracket the position still tracks goes along as
+        ``known_bracket``: a live one -- the remainder bracket placed beside
+        a working slice, here or by a startup restore (which sizes it the
+        same way since 2026-09-25), or a full-size one a resize could not
+        shrink -- is adopted and resized to ``qty``. Submitting fresh beside
+        it orphaned the old OCO, and both sold when the stop traded
+        (2026-09-24)."""
+        reprotected = self.executor.ensure_position_protected(
+            str(position.metadata.get("underlying") or position.symbol),
+            int(position.qty) if qty is None else int(qty), position.side, float(position.entry_price),
+            float(position.stop_price), position.target_price,
+            known_bracket=active_broker_bracket(position),
+        )
+        if reprotected is not None:
+            position.metadata["bracket"] = reprotected
+
+    def _reprotect_beside_working_order(self, position: Position, outstanding_qty: int) -> None:
+        """Re-protect the shares a working exit order does not cover.
+
+        While a scale-out slice works the position is skipped (see
+        _exit_order_in_flight), so the shares outside it had neither the
+        bracket, cancelled to send the slice, nor an engine stop evaluation
+        (2026-09-24). The resting stop covers only ``position.qty -
+        outstanding_qty``, so it and the order never sell the same shares.
+        A full exit covers every share and gets nothing here."""
+        uncovered = int(position.qty) - int(outstanding_qty)
+        if uncovered > 0:
+            self._reprotect_remainder(position, uncovered)
+
+    @staticmethod
+    def _record_exit_marker(position: Position, family: str, marker: dict[str, Any] | None, status: str) -> None:
+        """Append a one-shot exit marker to ``metadata['<family>_exits']``.
+
+        The exit policy skips any trigger already recorded there, so a
+        scale-out fires once per trigger rather than on every cycle the
+        trigger stays live. ``status`` is ``booked`` once a slice filled, or
+        ``below_one_unit`` when the slice rounded to nothing and the trigger
+        is spent without an order. Persisted with the rest of the metadata.
+        """
+        if marker is None or not isinstance(position.metadata, dict):
+            return
+        markers = position.metadata.setdefault(f"{family}_exits", [])
+        if any(isinstance(m, dict) and all(m.get(k) == v for k, v in marker.items()) for m in markers):
+            return
+        markers.append({**marker, "status": status, "at": now_et().isoformat()})
 
     def _exit_order_in_flight(self, key: str, position: Position, last_price: float | None, bars,
                               order_states: dict[str, Any]) -> bool:
@@ -1124,7 +1244,10 @@ class PositionManager:
         booked from it, so a partial booked at submit time is not counted
         twice. A live LIMIT exit is re-cancelled each cycle so a fresh,
         repriced exit can follow; a live MARKET exit is the most aggressive
-        order there is and is left to fill.
+        order there is and is left to fill -- unless the shares a working
+        scale-out slice does not cover hit a risk exit
+        (_working_slice_remainder_exit), which cancels it so the full exit
+        can follow once it settles.
         """
         record = position.metadata.get("working_exit_order") if isinstance(position.metadata, dict) else None
         if not isinstance(record, dict):
@@ -1137,6 +1260,8 @@ class PositionManager:
         if state is None:
             state = self.executor.order_state(order_id)
         if state is None:
+            if self._working_slice_remainder_exit(key, position, record, last_price):
+                self._cancel_working_exit(key, order_id)
             self.audit.log_cycle(
                 f"exit_gate:{key}", "exit_order_unresolved",
                 f"Exit held {key}: state of working exit order {order_id} unavailable this cycle",
@@ -1167,17 +1292,59 @@ class PositionManager:
             )
             if key not in self.positions:
                 return True
+            self._record_exit_marker(position, str(record.get("family") or ""), record.get("marker"), "booked")
         if state.get("is_filled") or state.get("is_terminal_failure"):
             position.metadata.pop("working_exit_order", None)
+            if record.get("reprotect"):
+                # The order is settled and the position is still held. The
+                # submit-time path re-protects a booked exit's remainder;
+                # this is that step for an order that was left working, whose
+                # remainder otherwise kept no broker bracket for the rest of
+                # the trade (2026-09-24). A bracket placed beside a working
+                # slice is adopted and resized to what is held.
+                self._reprotect_remainder(position)
             self._save_reconcile_metadata()
             return False
-        if str(state.get("order_type") or "") != "MARKET":
-            cancel_ok, cancel_msg = self.executor.cancel_working_order(order_id)
-            if not cancel_ok:
-                LOG.warning("Working exit %s for %s still live; cancel unconfirmed (%s)", order_id, key, cancel_msg)
+        remainder_exit = self._working_slice_remainder_exit(key, position, record, last_price)
+        if remainder_exit or str(state.get("order_type") or "") != "MARKET":
+            self._cancel_working_exit(key, order_id)
         self.audit.log_cycle(
             f"exit_gate:{key}", "exit_order_working",
             f"Exit held {key}: exit order {order_id} is still working at the broker",
+            interval=60.0, level=TRADEFLOW_LEVEL,
+        )
+        return True
+
+    def _cancel_working_exit(self, key: str, order_id: str) -> None:
+        cancel_ok, cancel_msg = self.executor.cancel_working_order(order_id)
+        if not cancel_ok:
+            LOG.warning("Working exit %s for %s still live; cancel unconfirmed (%s)", order_id, key, cancel_msg)
+
+    def _working_slice_remainder_exit(self, key: str, position: Position, record: dict[str, Any],
+                                      last_price: float | None) -> bool:
+        """The engine's risk check on the shares a working scale-out slice
+        does not cover. True when it wants the position out.
+
+        The position is otherwise skipped while its slice works, so those
+        shares' stop went unevaluated for as long as the order stayed live
+        -- a halt, a LIMIT slice whose cancel keeps failing, an order-state
+        lookup that keeps failing (2026-09-24). The caller cancels the slice;
+        the cycle that settles it sends the full exit. A full exit's order
+        covers every share and is not checked. In bracket mode the resting
+        stop placed beside the slice owns the stop exit, so the risk check
+        leaves it to the broker (see risk.update_position)."""
+        outstanding = working_exit_outstanding_qty(position)
+        if last_price is None or outstanding >= int(position.qty):
+            return False
+        risk_exit, risk_reason = self.risk.update_position(position, float(last_price))
+        if not risk_exit:
+            return False
+        LOG.log(TRADEFLOW_LEVEL, "%s: %s on the %s share(s) outside working exit %s; cancelling it",
+                key, risk_reason, int(position.qty) - outstanding, record.get("order_id"))
+        self.audit.log_cycle(
+            f"exit_gate:{key}", f"working_slice_cancelled:{risk_reason}",
+            f"Exit {key}: {risk_reason} on the remainder; cancelling working exit {record.get('order_id')} "
+            "so the full exit follows once it settles",
             interval=60.0, level=TRADEFLOW_LEVEL,
         )
         return True
@@ -1219,12 +1386,14 @@ class PositionManager:
             # prevent stale adjustments from persisting when price is unavailable.
             if isinstance(position.metadata, dict):
                 position.metadata["management_adjustments"] = []
-            should_exit, reason = False, "hold"
+            decision: ExitDecision | None = None
             if last_price is not None:
                 self._sr_flip_management_confirmed(position, management_frame, float(last_price))
                 self._adaptive_ladder_management(position, management_frame, float(last_price))
                 self._update_position_diagnostics(position, last_price, underlying_price)
-                should_exit, reason = self.risk.update_position(position, last_price)
+                risk_exit, risk_reason = self.risk.update_position(position, last_price)
+                if risk_exit:
+                    decision = ExitDecision(risk_reason, "risk")
                 # Push any level the managers just moved onto the resting
                 # broker children, before the exit decision below can cancel
                 # them. No-op outside `replace` sync mode.
@@ -1248,29 +1417,43 @@ class PositionManager:
                             "source_level": safe_float(adj.get("source_level"), None),
                             "last_price": safe_float(last_price, None),
                         })
-            if not should_exit:
-                should_exit, reason = self.strategy.position_exit_signal(position, bars, data=self.data)
+            if decision is None:
+                decision = self.exit_policy.decide(position, bars, data=self.data)
             if self.strategy.should_force_flatten(position):
                 if not position.metadata.get("_force_flatten_logged"):
                     LOG.warning("Force flatten triggered for %s qty=%s side=%s", key, position.qty, position.side.value)
                     position.metadata["_force_flatten_logged"] = True
-                # Force flatten guarantees the exit but must not RELABEL one
+                # Force flatten guarantees a FULL exit but must not RELABEL one
                 # that a real level already triggered. This ran
                 # unconditionally, so every stop or target that fired inside
                 # the force-flatten window was recorded as "force_flatten" —
                 # inflating that bucket and hollowing out `stop` / `target` in
-                # the per_exit_reason table the tuning is read from. Either
-                # branch leaves should_exit True, so the guarantee holds.
-                if not should_exit:
-                    should_exit, reason = True, "force_flatten"
-            if not should_exit:
+                # the per_exit_reason table the tuning is read from. A pending
+                # scale-out is not a full exit, so it is upgraded (2026-09-24).
+                if decision is None or decision.is_partial:
+                    decision = ExitDecision("force_flatten", "force_flatten")
+            if decision is None:
+                continue
+            reason = decision.reason
+            requested_qty = partial_exit_qty(int(position.qty), decision.fraction)
+            if requested_qty < 1:
+                # A 1-lot option or a 1-share position cannot scale out. The
+                # trigger is spent, so it does not re-fire every cycle.
+                self._record_exit_marker(position, decision.family, decision.marker, "below_one_unit")
+                self._save_reconcile_metadata()
+                self.audit.log_cycle(
+                    f"exit_gate:{key}", f"{decision.family}_below_one_unit",
+                    f"Exit held {key}: {reason} sizes to under one unit of qty={position.qty}",
+                    interval=60.0, level=TRADEFLOW_LEVEL,
+                )
                 continue
             exit_context = self._position_exit_context(position, reason, last_price, underlying_price, market_snapshot, bars)
+            exit_context["exit_family"] = decision.family
             if not self.executor.can_close_position_now(position, _now):
                 self.audit.log_cycle(
                     f"exit_gate:{key}",
                     f"session_closed:{reason}",
-                    f"Exit deferred {key} qty={position.qty} reason={reason} because market session is closed",
+                    f"Exit deferred {key} qty={requested_qty} reason={reason} because market session is closed",
                     interval=60.0,
                     level=TRADEFLOW_LEVEL,
                 )
@@ -1278,7 +1461,13 @@ class PositionManager:
             # The engine has decided to exit for a reason the broker cannot see
             # (peak giveback, time stop, CHoCH, force flatten). Tear down the
             # resting protection FIRST: leaving it live means the market-out and
-            # the resting stop both fill, taking the strategy net short.
+            # the resting stop both fill, taking the strategy net short. A
+            # scale-out goes the same way -- cancel, close the slice, then
+            # re-protect what is left (below): at once when the slice books,
+            # beside it when it is left working (only the shares it does not
+            # cover), and in full when it never reached the broker. The
+            # slice and a resting stop never cover the same shares, so
+            # nothing double-fills.
             open_bracket = active_broker_bracket(position)
             if open_bracket is not None:
                 cancel = self.executor.cancel_bracket(open_bracket)
@@ -1290,7 +1479,7 @@ class PositionManager:
                         "deferring exit to avoid a double fill", key, reason, cancel.message,
                     )
                     self.audit.log_structured("EXIT_CONTEXT", {
-                        **exit_context, "symbol": key, "qty": int(position.qty),
+                        **exit_context, "symbol": key, "qty": int(requested_qty),
                         "result_message": f"bracket_cancel_failed:{cancel.message}",
                         "attempt_status": "deferred_bracket_cancel_failed",
                     })
@@ -1298,37 +1487,63 @@ class PositionManager:
                 self._book_bracket_cancel_fills(key, position, open_bracket, cancel, last_price, bars)
                 if key not in self.positions:
                     continue
-            result = self.executor.close_position(position, data=self.data, market_snapshot=market_snapshot)
-            if not result.ok:
+                # A child that filled before the cancel shrank the position.
+                requested_qty = min(requested_qty, int(position.qty))
+            result = self.executor.close_position(position, requested_qty, data=self.data, market_snapshot=market_snapshot)
+            # The remainder is owed a resting stop when this cycle cancelled
+            # the bracket, or an earlier one left it down (2026-09-24): an
+            # attempt that failed before reaching the broker used to leave
+            # the bracket cancelled, and the retry that booked the slice then
+            # saw no bracket and re-protected nothing.
+            reprotect_owed = open_bracket is not None or self._broker_bracket_down(position)
+            # ok=True with filled_qty=0 filled nothing, so it is settled as the
+            # unfilled attempt it is (2026-09-25). Its own branch tracked
+            # nothing and re-protected nothing: the bracket this cycle
+            # cancelled stayed down unless the deciding family fired again,
+            # and an order that reached the broker was never settled from its
+            # fill record.
+            nothing_filled = result.filled_qty is not None and int(result.filled_qty) <= 0
+            if not result.ok or nothing_filled:
                 if result.order_id and (result.may_still_be_working or order_result_needs_broker_recheck(result.message)):
                     # The order reached the broker and its outcome is not
                     # settled: it may be live, or have filled shares the result
                     # does not report. Track it and settle from its own fill
                     # record next cycle; sending another exit meanwhile is how
                     # a halted market-out fills twice.
-                    self._track_working_exit(position, result, reason, booked_qty=0)
+                    self._track_working_exit(position, result, decision, booked_qty=0, requested_qty=requested_qty,
+                                             bracket_cancelled=reprotect_owed)
+                    if reprotect_owed:
+                        self._reprotect_beside_working_order(position, requested_qty)
                     self._save_reconcile_metadata()
                     LOG.log(TRADEFLOW_LEVEL, "Exit order %s for %s unsettled (%s); tracking it", result.order_id, key, result.message)
-                    self.audit.log_structured("EXIT_CONTEXT", {**exit_context, "symbol": key, "qty": int(position.qty), "result_message": result.message, "attempt_status": "tracking_unsettled_order"})
+                    self.audit.log_structured("EXIT_CONTEXT", {**exit_context, "symbol": key, "qty": int(requested_qty), "result_message": result.message, "attempt_status": "tracking_unsettled_order"})
                     continue
-                LOG.log(TRADEFLOW_LEVEL, "Exit attempt %s qty=%s reason=%s result=%s", key, position.qty, reason, result.message)
-                self.audit.log_structured("EXIT_CONTEXT", {**exit_context, "symbol": key, "qty": int(position.qty), "result_message": result.message, "attempt_status": "not_filled"})
+                if reprotect_owed and not order_result_needs_broker_recheck(result.message):
+                    # The order never reached the broker (a rejected submit, a
+                    # stale quote), so nothing of it can fill: put back the
+                    # protection this cycle tore down. A retry cancels it
+                    # again -- churn, never a double fill. One that reached
+                    # it with no id to track (live_missing_order_id) may
+                    # still fill, so a resting stop beside it could sell the
+                    # same shares twice; the engine stop keeps owning it.
+                    self._reprotect_remainder(position)
+                    self._save_reconcile_metadata()
+                attempt_status = "not_filled" if not result.ok else "filled_qty_zero"
+                LOG.log(TRADEFLOW_LEVEL, "Exit attempt %s qty=%s reason=%s result=%s status=%s", key, requested_qty, reason, result.message, attempt_status)
+                self.audit.log_structured("EXIT_CONTEXT", {**exit_context, "symbol": key, "qty": int(requested_qty), "result_message": result.message, "attempt_status": attempt_status})
                 continue
             if result.filled_qty is None:
-                # No fill quantity reported (e.g., live broker that didn't return filled_qty) — assume full exit
-                exit_qty = position.qty
+                # No fill quantity reported (e.g., live broker that didn't
+                # return filled_qty) — assume the order filled as sent. That is
+                # the REQUESTED quantity: assuming position.qty booked a
+                # scale-out as the whole position closed.
+                exit_qty = requested_qty
             else:
-                filled_qty = int(result.filled_qty or 0)
-                if filled_qty <= 0:
-                    # Broker reported an ok=True result but zero shares actually filled — treat as failed exit
-                    LOG.log(TRADEFLOW_LEVEL, "Exit returned ok but filled_qty=0 for %s reason=%s result=%s", key, reason, result.message)
-                    self.audit.log_structured("EXIT_CONTEXT", {**exit_context, "symbol": key, "qty": int(position.qty), "filled_qty": 0, "result_message": result.message, "attempt_status": "filled_qty_zero"})
-                    continue
-                exit_qty = max(1, min(position.qty, filled_qty))
-            if exit_qty < position.qty:
-                LOG.log(TRADEFLOW_LEVEL, "Partial exit %s requested_qty=%s filled_qty=%s reason=%s result=%s", key, position.qty, exit_qty, reason, result.message)
+                exit_qty = max(1, min(requested_qty, int(result.filled_qty)))
+            if exit_qty < requested_qty:
+                LOG.log(TRADEFLOW_LEVEL, "Partial exit %s requested_qty=%s filled_qty=%s reason=%s result=%s", key, requested_qty, exit_qty, reason, result.message)
             else:
-                LOG.log(TRADEFLOW_LEVEL, "Exit %s qty=%s reason=%s result=%s", key, position.qty, reason, result.message)
+                LOG.log(TRADEFLOW_LEVEL, "Exit %s qty=%s of %s reason=%s result=%s", key, exit_qty, position.qty, reason, result.message)
             exit_price_value = result.fill_price if result.fill_price is not None else last_price
             if exit_price_value is None:
                 # The shares are GONE -- skipping the booking to "retry next
@@ -1357,50 +1572,34 @@ class PositionManager:
                 fill_price_estimated=fill_price_estimated,
                 broker_recovered=False,
             )
-            self.audit.log_structured("EXIT_CONTEXT", {**exit_context, "symbol": key, "qty": int(exit_qty), "filled_qty": int(exit_qty), "remaining_qty_after_exit": remaining_qty_after_exit, "result_message": result.message, "fill_price": float(exit_price), "realized_pnl": float(realized), "attempt_status": "filled"})
+            self.audit.log_structured("EXIT_CONTEXT", {**exit_context, "symbol": key, "qty": int(exit_qty), "requested_qty": int(requested_qty), "filled_qty": int(exit_qty), "remaining_qty_after_exit": remaining_qty_after_exit, "result_message": result.message, "fill_price": float(exit_price), "realized_pnl": float(realized), "attempt_status": "filled"})
             self.audit.log_structured("TRADE_SUMMARY", self._trade_summary_payload(exited_position, exit_price, realized, reason, final_exit=final_exit, remaining_qty_after_exit=remaining_qty_after_exit, broker_recovered=False, fill_price_estimated=fill_price_estimated))
             if exit_qty >= position.qty:
-                # ATR from management frame feeds the same-level retry block:
-                # the block zone is sized in ATR so small cheap stocks and
-                # high-priced names use proportional thresholds. None when
-                # the frame has no atr14 column yet (warmup); block skipped.
-                exit_atr = safe_float(management_frame.iloc[-1].get("atr14"), None) if (management_frame is not None and not management_frame.empty and "atr14" in management_frame.columns) else None
-                self.risk.register_exit(
-                    str(position.metadata.get("underlying") or key),
-                    realized,
-                    additional_symbol=key,
-                    side=position.side,
-                    entry_price=float(position.entry_price),
-                    exit_price=exit_price,
-                    atr=exit_atr,
-                )
+                self._register_closed_position(key, position, realized, exit_price, bars)
                 del self.positions[key]
                 self._save_reconcile_metadata()
             else:
                 self.risk.register_realized_pnl(realized)
                 position.qty -= exit_qty
+                self._record_exit_marker(position, decision.family, decision.marker, "booked")
+                if isinstance(position.metadata, dict):
+                    position.metadata["qty"] = position.qty
                 if result.may_still_be_working:
                     # Partial fill whose cancel never confirmed: the remainder
                     # may still fill. Track it so this cycle's slice is not
-                    # followed by a second exit for the same shares.
-                    self._track_working_exit(position, result, reason, booked_qty=exit_qty)
-                if isinstance(position.metadata, dict):
-                    position.metadata["qty"] = position.qty
-                    if open_bracket is not None and not result.may_still_be_working:
-                        # The exit only partially filled and we cancelled the
-                        # bracket to get here, so the remaining shares are now
-                        # unprotected. Re-establish protection at the current
-                        # engine levels, sized to what is left -- unless the
-                        # exit's remainder may still be live, in which case a
-                        # resting stop beside it would sell the same shares
-                        # twice; the engine-side stop covers them meanwhile.
-                        reprotected = self.executor.ensure_position_protected(
-                            str(position.metadata.get("underlying") or position.symbol),
-                            int(position.qty), position.side, float(position.entry_price),
-                            float(position.stop_price), position.target_price,
-                        )
-                        if reprotected is not None:
-                            position.metadata["bracket"] = reprotected
+                    # followed by a second exit for the same shares, and
+                    # re-protect only the shares the order does not cover (a
+                    # scale-out's); the rest is re-protected once it settles.
+                    self._track_working_exit(position, result, decision, booked_qty=exit_qty, requested_qty=requested_qty,
+                                             bracket_cancelled=reprotect_owed)
+                    if reprotect_owed:
+                        self._reprotect_beside_working_order(position, requested_qty - exit_qty)
+                elif reprotect_owed:
+                    # A scale-out, or an exit that only partially filled, with
+                    # the bracket down -- cancelled this cycle or an earlier
+                    # one: re-establish protection at the current engine
+                    # levels, sized to what is left.
+                    self._reprotect_remainder(position)
                 self.positions[key] = position
                 self._save_reconcile_metadata()
 

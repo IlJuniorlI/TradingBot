@@ -29,6 +29,7 @@ import logging
 import time
 from collections.abc import Mapping
 from dataclasses import asdict
+from datetime import datetime
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
@@ -38,12 +39,20 @@ import copy
 
 from .candles import detect_candle_context, detect_per_bar_candle_patterns
 from .chart_patterns import analyze_chart_pattern_context
-from .config import DashboardChartConfig, DashboardChartingConfig, htf_structure_event_lookback
+from .config import DashboardChartConfig, DashboardChartingConfig, flip_confirmation_bars, htf_structure_event_lookback
 from .htf_levels import summarize_htf_trend
 from .models import Side
 from .support_resistance import analyze_market_structure, zone_flip_confirmed
 from .technical_levels import build_technical_levels_context
-from .utils import now_et, resample_bars
+from .utils import (
+    ensure_standard_indicator_frame,
+    equity_stream_window_bars,
+    now_et,
+    resample_bars,
+    htf_ema_spans,
+    ltf_ema_spans,
+    session_bucket_ends,
+)
 from ._sr_ladder import _collapse_price_ladder, _sr_effective_side_tolerance
 
 if TYPE_CHECKING:
@@ -124,6 +133,14 @@ def dashboard_quote_exchange(quote: Mapping[str, Any] | None) -> str | None:
 
 
 def dashboard_technical_line_payload(line: Any) -> dict[str, Any] | None:
+    """A trendline / channel edge for the chart. Its positions (start_pos,
+    end_pos, and the intercept at position 0) are in the coordinate space of
+    the frame handed to ``build_technical_levels_context`` -- the dashboard
+    hands it the chart's own frame, so they are the chart bars' abs_index
+    and ``slope * abs_index + intercept`` at the newest bar is
+    ``current_value``. Until 2026-09-23 they were positions in the builder's
+    internal 120-280 bar tail, and every line drew as a zero-length stub at
+    the chart's left edge."""
     if line is None:
         return None
     try:
@@ -396,6 +413,9 @@ def dashboard_bars_from_frame(
         bars.append({
             "ts": idx.isoformat() if hasattr(idx, "isoformat") else str(idx),
             "abs_index": tail_offset + rel_idx,
+            # True only on a chart's still-forming last bucket, which
+            # chart_payload marks; every bar built here is complete.
+            "in_progress": False,
             "open": dashboard_safe_float(row.get("open")),
             "high": dashboard_safe_float(row.get("high")),
             "low": dashboard_safe_float(row.get("low")),
@@ -426,6 +446,68 @@ def dashboard_bars_from_frame(
             "candles_bearish": candles_bearish,
         })
     return bars
+
+
+# TA-Lib's candle functions read at most 14 bars before the bar they score
+# (CDLBREAKAWAY, CDLLADDERBOTTOM, CDLMATHOLD and CDLRISEFALL3METHODS; the
+# custom tweezers read 1), so a per-bar pattern map fed this many bars ahead
+# of the ones it shows scores every shown bar exactly as a full-history run
+# does. Until 2026-09-23 the snapshot fed TA-Lib only its 48 shown bars and the
+# chart only its 90/360: on 2026-09-18/21/22 (10 symbols x 6 times) 1,836 of
+# 24,840 shown bars carried different tags than a 400-bar run, all in the
+# oldest bars of the window, and the snapshot's starved tags overwrote the
+# chart's on the newest 48 bars. 12 extra bars already matched on every bar.
+_CANDLE_PATTERN_WARMUP_BARS = 14
+
+# Key-level zone kinds for a level price has crossed: broken_* once the flip
+# is confirmed, pending_* while it is not. Each is drawn as its own zone, in
+# its flipped role once confirmed and marked pending until then.
+_FLIP_CANDIDATE_LEVEL_KINDS = frozenset({
+    "broken_htf_support",
+    "broken_htf_resistance",
+    "pending_htf_support",
+    "pending_htf_resistance",
+})
+
+
+def dashboard_htf_chart_frame(
+    completed: pd.DataFrame | None,
+    minute_frame: pd.DataFrame | None,
+    *,
+    timeframe_minutes: int,
+    now: datetime,
+) -> tuple[pd.DataFrame | None, pd.Timestamp | None]:
+    """The HTF chart's frame, and the start of its still-forming bucket (None
+    when every bucket in it is complete).
+
+    ``completed`` is the stored HTF frame: completed bars only, refreshed once
+    per bucket, so on its own the chart ends at the last bucket completed
+    before that refresh. The buckets after it are built here from the live 1m
+    frame -- cut to the 07:00-20:00 window like the stored bars, then
+    resampled on the same session grid -- and the one holding ``now`` is
+    the forming bucket. Until 2026-09-23 the chart plotted the stored frame
+    as-is, whose last row was the bucket Schwab returned seconds after it
+    opened, drawn as if complete and frozen at that stub for the whole
+    bucket.
+    """
+    if completed is None or completed.empty or minute_frame is None or minute_frame.empty:
+        return completed, None
+    ohlcv = ["open", "high", "low", "close", "volume"]
+    completed_end = session_bucket_ends(completed.index[-1:], int(timeframe_minutes))[0]
+    after = minute_frame.loc[minute_frame.index >= completed_end, ohlcv]
+    if after.empty:
+        return completed, None
+    after = equity_stream_window_bars(after)
+    if after.empty:
+        return completed, None
+    buckets = resample_bars(after, f"{int(timeframe_minutes)}min")
+    if buckets.empty:
+        return completed, None
+    frame = ensure_standard_indicator_frame(pd.concat([completed[ohlcv], buckets[ohlcv]]))
+    last_start = pd.Timestamp(buckets.index[-1])
+    last_end = session_bucket_ends(buckets.index[-1:], int(timeframe_minutes))[0]
+    forming = last_start if last_end > pd.Timestamp(now) else None
+    return frame, forming
 
 
 def dashboard_structure_event_label(ms_ctx: Any) -> str:
@@ -579,6 +661,29 @@ class DashboardCache:
         params = getattr(self.strategy, "params", {}) or {}
         return int(params.get("htf_lookback_days", fallback))
 
+    def _chart_htf_level_request(self) -> dict[str, Any]:
+        """Level arguments of the HTF context the chart's HTF FVGs and RSI
+        divergence lines are drawn from: the strategy's own HTF build
+        (``dashboard_level_context_spec``, which its level zones use and
+        which matches the context its HTF divergence score reads), else
+        support_resistance. Until 2026-09-24 it was support_resistance with
+        EMA 50/200 whatever the strategy: the peer family scores divergence
+        on ``htf_pivot_span``, so a preset changing it would chart
+        divergences the score did not apply (and miss ones it did)."""
+        sr_cfg = self.config.support_resistance
+        spec = self.strategy.dashboard_level_context_spec() if self.strategy is not None else None
+        spec = spec if isinstance(spec, dict) else {}
+        default_fast, default_slow = htf_ema_spans({})
+        return {
+            "pivot_span": int(spec.get("pivot_span", sr_cfg.pivot_span)),
+            "max_levels_per_side": int(spec.get("max_levels_per_side", sr_cfg.max_levels_per_side)),
+            "atr_tolerance_mult": float(spec.get("atr_tolerance_mult", sr_cfg.atr_tolerance_mult)),
+            "pct_tolerance": float(spec.get("pct_tolerance", sr_cfg.pct_tolerance)),
+            "stop_buffer_atr_mult": float(spec.get("stop_buffer_atr_mult", sr_cfg.stop_buffer_atr_mult)),
+            "ema_fast_span": int(spec.get("ema_fast_span", default_fast)),
+            "ema_slow_span": int(spec.get("ema_slow_span", default_slow)),
+        }
+
     def _active_ltf_minutes(self) -> int:
         """LTF (lower timeframe / trigger frame). Strategies with a distinct
         intraday trigger candle declare `params.ltf_minutes` (e.g.
@@ -586,6 +691,55 @@ class DashboardCache:
         defaults to 1-minute streamed bars."""
         params = getattr(self.strategy, "params", {}) or {}
         return int(params.get("ltf_minutes", 1))
+
+    def _per_bar_candle_map(self, frame: pd.DataFrame, shown_bars: int) -> dict[Any, dict[str, list[str]]]:
+        """Per-bar candle tags for the last ``shown_bars`` bars of ``frame``,
+        each scored with full TA-Lib context (``_CANDLE_PATTERN_WARMUP_BARS``).
+        The snapshot and the chart payload both use it, so the snapshot bars
+        the client merges over the chart's carry the chart's tags."""
+        return detect_per_bar_candle_patterns(
+            frame,
+            bullish_allowed=self.config.candles.bullish_patterns,
+            bearish_allowed=self.config.candles.bearish_patterns,
+            lookback=int(shown_bars) + _CANDLE_PATTERN_WARMUP_BARS,
+        )
+
+    def _apply_strategy_ltf_emas(
+        self,
+        symbol: str,
+        frame: pd.DataFrame,
+        bars: list[dict[str, Any]],
+        *,
+        timeframe: str,
+    ) -> tuple[int, int]:
+        """Put the strategy's own LTF fast/slow EMA on ``bars`` (the tail of
+        ``frame``, a ``timeframe`` frame) and return the two spans.
+
+        The strategy reads ema9/ema20 off ``get_merged(timeframe,
+        span_scale=ltf_indicator_span_scale, ema_spans=ltf_ema_spans(params))``:
+        on top_tier's 1m LTF that is a 45/100-bar EMA (its
+        ltf_ema_fast_span / ltf_ema_slow_span) that restarts on each session's
+        first RTH bar. Until 2026-09-23 the chart drew a continuous 45/100 EWM across the
+        prior day and premarket instead (the opposite stack to the bot's on 93
+        of 480 bars between 09:30 and 10:30 across 8 symbols on 2026-09-22),
+        and the snapshot bars, merged over the chart's newest 48, carried the
+        native 9/20 -- so the lines labelled EMA45/EMA100 turned into EMA9/20
+        partway along the chart. The snapshot and the chart both go through
+        here.
+        """
+        params = getattr(self.strategy, "params", {}) or {}
+        scale = float(params.get("ltf_indicator_span_scale", 1.0))
+        spans = ltf_ema_spans(params)
+        # The frame the caller built is canonical (scale 1, EMA 9/20); fetch
+        # the strategy's own whenever either differs.
+        if bars and (scale != 1.0 or spans != (9, 20)):
+            scaled = self.data.get_merged(symbol, timeframe=timeframe, with_indicators=True,
+                                          span_scale=scale, ema_spans=spans)
+            emas = scaled[["ema9", "ema20"]].reindex(frame.index[-len(bars):])
+            for bar, fast, slow in zip(bars, emas["ema9"], emas["ema20"]):
+                bar["ema9"] = dashboard_safe_float(fast)
+                bar["ema20"] = dashboard_safe_float(slow)
+        return spans
 
     def htf_trend(self, symbol: str, *, allow_refresh: bool = True) -> dict[str, Any]:
         tf = self._active_htf_minutes()
@@ -708,18 +862,12 @@ class DashboardCache:
         # Per-bar candle pattern map (completion-bar only, tier cascade).
         # Drives the tooltip's "Candle Patterns (this bar)" section. Computed
         # before bars are built so each bar dict can carry its own matched
-        # patterns. lookback passed as snapshot_max_bars() so every visible
-        # bar in the snapshot tooltip has coverage (not just the last 30).
+        # patterns, for every bar the snapshot carries.
         snapshot_bars_count = self.snapshot_max_bars()
         snapshot_per_bar_candles: dict[Any, dict[str, list[str]]] = {}
         if frame is not None and not frame.empty:
             try:
-                snapshot_per_bar_candles = detect_per_bar_candle_patterns(
-                    frame,
-                    bullish_allowed=self.config.candles.bullish_patterns,
-                    bearish_allowed=self.config.candles.bearish_patterns,
-                    lookback=snapshot_bars_count,
-                )
+                snapshot_per_bar_candles = self._per_bar_candle_map(frame, snapshot_bars_count)
             except Exception:
                 self.log_component_failure(
                     "per_bar_candles",
@@ -732,6 +880,11 @@ class DashboardCache:
             max_bars=snapshot_bars_count,
             per_bar_candles=snapshot_per_bar_candles,
         )
+        # Snapshot bars are 1m bars; they are the strategy's LTF bars (and are
+        # merged into the LTF chart) only when its LTF is 1m.
+        snapshot_ema_spans = (9, 20)
+        if bars and self._active_ltf_minutes() == 1:
+            snapshot_ema_spans = self._apply_strategy_ltf_emas(symbol, frame, bars, timeframe="1min")
         latest_bar: dict[str, Any] = bars[-1] if bars else {}
         session_total_volume: float | None = None
         if frame is not None and not frame.empty:
@@ -863,17 +1016,14 @@ class DashboardCache:
             tech_frame = frame
         tech_ctx = None  # Stays None when tech_frame is empty (warmup path) or build_technical_levels_context raises; downstream readers (technical_payload, divergence_lines) all guard on `tech_ctx is not None`.
         if tech_frame is not None and not tech_frame.empty:
-            frame_for_analysis = tech_frame.copy()
-            for col in ("open", "high", "low", "close", "volume"):
-                if col in frame_for_analysis.columns:
-                    frame_for_analysis[col] = pd.to_numeric(frame_for_analysis[col], errors="coerce")
-            frame_for_analysis = frame_for_analysis.dropna(subset=[col for col in ("open", "high", "low", "close") if col in frame_for_analysis.columns]).copy()
-
             tl_cfg = self.config.technical_levels
             sr_cfg = self.config.support_resistance
             try:
+                # tech_frame itself, not a filtered copy: the lines come back
+                # positioned in the frame passed, and tech_frame is the frame
+                # the LTF chart's bars (and their abs_index) are cut from.
                 tech_ctx = build_technical_levels_context(
-                    frame_for_analysis,
+                    tech_frame,
                     current_price=current_price,
                     pivot_span=int(getattr(sr_cfg, "structure_ltf_pivot_span", getattr(sr_cfg, "pivot_span", 2)) or 2),
                     fib_lookback_bars=int(getattr(tl_cfg, "fib_lookback_bars", 120) or 120),
@@ -884,7 +1034,7 @@ class DashboardCache:
                     trendline_lookback_bars=int(getattr(tl_cfg, "trendline_lookback_bars", 120) or 120),
                     trendline_min_touches=int(getattr(tl_cfg, "trendline_min_touches", 3) or 3),
                     trendline_atr_tolerance_mult=float(getattr(tl_cfg, "trendline_atr_tolerance_mult", 0.35) or 0.35),
-                    trendline_breakout_buffer_atr_mult=float(getattr(tl_cfg, "trendline_breakout_buffer_atr_mult", 0.15) or 0.15),
+                    trendline_breakout_buffer_atr_mult=float(getattr(tl_cfg, "trendline_breakout_buffer_atr_mult", 0.65)),
                     channel_lookback_bars=int(getattr(tl_cfg, "channel_lookback_bars", 120) or 120),
                     channel_min_touches=int(getattr(tl_cfg, "channel_min_touches", 3) or 3),
                     channel_atr_tolerance_mult=float(getattr(tl_cfg, "channel_atr_tolerance_mult", 0.35) or 0.35),
@@ -898,11 +1048,15 @@ class DashboardCache:
                     adx_length=int(getattr(tl_cfg, "adx_length", 14) or 14),
                     obv_ema_length=int(getattr(tl_cfg, "obv_ema_length", 20) or 20),
                     divergence_rsi_length=int(getattr(tl_cfg, "divergence_rsi_length", 14) or 14),
-                    divergence_rsi_min_delta=float(getattr(tl_cfg, "divergence_rsi_min_delta", 2.0) or 2.0),
+                    # As configured, as the strategy and the HTF build read
+                    # them: `or <default>` drew a configured 0 at the default
+                    # (2026-09-25), and a null fails the build.
+                    divergence_rsi_min_delta=float(tl_cfg.divergence_rsi_min_delta),
                     divergence_obv_min_volume_frac=float(getattr(tl_cfg, "divergence_obv_min_volume_frac", 0.50) or 0.50),
-                    divergence_pivot_lookback=int(getattr(tl_cfg, "divergence_pivot_lookback", 4) or 4),
-                    divergence_max_age_bars=int(getattr(tl_cfg, "divergence_max_age_bars", 8) or 8),
-                    divergence_min_price_move_pct=float(getattr(tl_cfg, "divergence_min_price_move_pct", 0.0015) or 0.0015),
+                    divergence_pivot_lookback=int(tl_cfg.divergence_pivot_lookback),
+                    # As configured: `or 8` drew a configured 0 at age 8 (2026-09-24).
+                    divergence_max_age_bars=int(tl_cfg.divergence_max_age_bars),
+                    divergence_min_price_move_pct=float(tl_cfg.divergence_min_price_move_pct),
                     fib_enabled=bool(getattr(tl_cfg, "fib_enabled", True)),
                     channel_enabled=bool(getattr(tl_cfg, "channel_enabled", True)),
                     trendline_enabled=bool(getattr(tl_cfg, "trendline_enabled", True)),
@@ -1025,6 +1179,8 @@ class DashboardCache:
             resistance_prices=zone_resistance_prices,
             broken_support_price=dashboard_safe_float((sr_row or {}).get("broken_support")),
             broken_resistance_price=dashboard_safe_float((sr_row or {}).get("broken_resistance")),
+            pending_support_price=dashboard_safe_float((sr_row or {}).get("pending_support")),
+            pending_resistance_price=dashboard_safe_float((sr_row or {}).get("pending_resistance")),
             allow_htf_refresh=allow_refresh,
         )
         htf_fair_value_gaps: list[dict[str, Any]] = []
@@ -1045,13 +1201,7 @@ class DashboardCache:
                     symbol,
                     timeframe_minutes=self._active_htf_minutes(),
                     lookback_days=self._active_htf_lookback_days(),
-                    pivot_span=int(getattr(self.config.support_resistance, "pivot_span", 2) or 2),
-                    max_levels_per_side=int(getattr(self.config.support_resistance, "max_levels_per_side", 3) or 3),
-                    atr_tolerance_mult=float(getattr(self.config.support_resistance, "atr_tolerance_mult", 0.60) or 0.60),
-                    pct_tolerance=float(getattr(self.config.support_resistance, "pct_tolerance", 0.0030) or 0.0030),
-                    stop_buffer_atr_mult=float(getattr(self.config.support_resistance, "stop_buffer_atr_mult", 0.25) or 0.25),
-                    ema_fast_span=50,
-                    ema_slow_span=200,
+                    **self._chart_htf_level_request(),
                     allow_refresh=allow_refresh,
                     use_prior_day_high_low=bool(getattr(self.config.support_resistance, "use_prior_day_high_low", True)),
                     use_prior_week_high_low=bool(getattr(self.config.support_resistance, "use_prior_week_high_low", True)),
@@ -1250,6 +1400,8 @@ class DashboardCache:
                 "next_resistance": next_resistance,
                 "broken_support": dashboard_safe_float((sr_row or {}).get("broken_support")),
                 "broken_resistance": dashboard_safe_float((sr_row or {}).get("broken_resistance")),
+                "pending_support": dashboard_safe_float((sr_row or {}).get("pending_support")),
+                "pending_resistance": dashboard_safe_float((sr_row or {}).get("pending_resistance")),
                 "key_level_zones": key_level_zones,
                 "htf_fair_value_gaps": htf_fair_value_gaps,
                 "ltf_fair_value_gaps": ltf_fair_value_gaps,
@@ -1261,6 +1413,10 @@ class DashboardCache:
             "technicals": technical_payload,
             "position_markers": position_markers,
             "recent_trades": dashboard_recent_trade_markers(self.account, symbol),
+            # Spans of the snapshot bars' ema9 / ema20, for labelling them
+            # before (or without) a chart payload.
+            "ema_fast_span": snapshot_ema_spans[0],
+            "ema_slow_span": snapshot_ema_spans[1],
         }
 
         payload = {
@@ -1306,6 +1462,8 @@ class DashboardCache:
         resistance_prices: list[float] | None = None,
         broken_support_price: float | None = None,
         broken_resistance_price: float | None = None,
+        pending_support_price: float | None = None,
+        pending_resistance_price: float | None = None,
         allow_htf_refresh: bool = True,
     ) -> list[dict[str, Any]]:
         """Build strategy-specific dashboard level zones (support + resistance
@@ -1316,32 +1474,45 @@ class DashboardCache:
         try:
             level_ctx = strategy_obj.dashboard_level_context_spec() or {}
         except Exception:
-            level_ctx = {}
+            # Reported, not replaced by the generic 60m / 60-day build below:
+            # that build refreshes a key nothing else keeps, so every symbol
+            # fetched from Schwab each hour on a spec error.
+            self.log_component_failure("level_context_spec", "Level-context spec failed for %s", symbol)
+            return []
         if not isinstance(level_ctx, dict):
             level_ctx = {}
 
-        support_anchor_prices = [float(price) for price in (support_prices or []) if dashboard_safe_float(price) not in (None, 0.0)]
-        resistance_anchor_prices = [float(price) for price in (resistance_prices or []) if dashboard_safe_float(price) not in (None, 0.0)]
-        broken_support_anchor = dashboard_safe_float(broken_support_price)
-        broken_resistance_anchor = dashboard_safe_float(broken_resistance_price)
-        if broken_resistance_anchor not in (None, 0.0):
-            support_anchor_prices.append(float(broken_resistance_anchor))
-        if broken_support_anchor not in (None, 0.0):
-            resistance_anchor_prices.append(float(broken_support_anchor))
-
-        def _dedupe_prices(values: list[float]) -> list[float]:
-            deduped: list[float] = []
+        # Generic-fallback anchors from the S/R row, each tagged with its role
+        # and the S/R builder's own verdict on its flip: the nearest levels
+        # hold their role, broken_* flipped on the builder's trading-mode
+        # confirmation, pending_* have been crossed with the flip still
+        # unconfirmed (they keep their original role). Until 2026-09-23 every
+        # support anchor was tagged nearest_htf_support, so a confirmed
+        # breakout-retest level drew as an ordinary "HS · Original" support,
+        # and pending levels were not drawn at all. A flipped or pending level
+        # is listed ahead of a plain one at the same price, which it labels
+        # more precisely.
+        def _anchors(entries: list[tuple[float | None, str, bool]]) -> list[tuple[float, str, bool]]:
+            deduped: list[tuple[float, str, bool]] = []
             seen: set[float] = set()
-            for value in values:
-                rounded = round(float(value), 4)
-                if rounded <= 0 or rounded in seen:
+            for price, kind_name, flip_confirmed in entries:
+                value = dashboard_safe_float(price)
+                if value is None or round(value, 4) <= 0 or round(value, 4) in seen:
                     continue
-                seen.add(rounded)
-                deduped.append(float(value))
+                seen.add(round(value, 4))
+                deduped.append((value, kind_name, flip_confirmed))
             return deduped
 
-        support_anchor_prices = _dedupe_prices(support_anchor_prices)
-        resistance_anchor_prices = _dedupe_prices(resistance_anchor_prices)
+        support_anchors = _anchors([
+            (broken_resistance_price, "broken_htf_resistance", True),
+            (pending_support_price, "pending_htf_support", False),
+            *((price, "nearest_htf_support", False) for price in (support_prices or [])),
+        ])
+        resistance_anchors = _anchors([
+            (broken_support_price, "broken_htf_support", True),
+            (pending_resistance_price, "pending_htf_resistance", False),
+            *((price, "nearest_htf_resistance", False) for price in (resistance_prices or [])),
+        ])
 
         close = dashboard_safe_float(current_price)
         if close is None and frame is not None and not frame.empty:
@@ -1453,17 +1624,15 @@ class DashboardCache:
             selected_short_price = None
 
         allow_level_fallback = bool(getattr(strategy_obj, "dashboard_allow_generic_level_fallback", lambda: False)())
-        if allow_level_fallback and not long_candidates and support_anchor_prices:
+        if allow_level_fallback and not long_candidates and support_anchors:
             long_candidates = [
-                {"kind": "nearest_htf_support", "price": float(price), "touches": 1, "level_score": 0.0, "source_priority": 0.0}
-                for price in support_anchor_prices
-                if dashboard_safe_float(price) not in (None, 0.0)
+                {"kind": kind_name, "price": price, "touches": 1, "level_score": 0.0, "source_priority": 0.0, "builder_flip_confirmed": flip_confirmed}
+                for price, kind_name, flip_confirmed in support_anchors
             ]
-        if allow_level_fallback and not short_candidates and resistance_anchor_prices:
+        if allow_level_fallback and not short_candidates and resistance_anchors:
             short_candidates = [
-                {"kind": "nearest_htf_resistance", "price": float(price), "touches": 1, "level_score": 0.0, "source_priority": 0.0}
-                for price in resistance_anchor_prices
-                if dashboard_safe_float(price) not in (None, 0.0)
+                {"kind": kind_name, "price": price, "touches": 1, "level_score": 0.0, "source_priority": 0.0, "builder_flip_confirmed": flip_confirmed}
+                for price, kind_name, flip_confirmed in resistance_anchors
             ]
 
         def _candidate_zone_payload(side: Side, candidate: dict[str, Any]) -> dict[str, Any] | None:
@@ -1507,12 +1676,16 @@ class DashboardCache:
                 "engine_level_score": float(candidate.get("level_score", 0.0) or 0.0),
                 "passes_min_level_score": bool(float(candidate.get("level_score", 0.0) or 0.0) >= float(min_level_score)),
                 "selected_for_entry": bool(selected_anchor_price is not None and abs(float(price) - float(selected_anchor_price)) <= float(selected_zone_match_tolerance)),
+                # The S/R builder's verdict on a generic-fallback level's flip;
+                # absent on a strategy's own candidates, whose flips the zone
+                # check below decides.
+                "builder_flip_confirmed": candidate.get("builder_flip_confirmed"),
             }
 
         support_zones = [zone for zone in (_candidate_zone_payload(Side.LONG, candidate) for candidate in long_candidates) if zone is not None]
         resistance_zones = [zone for zone in (_candidate_zone_payload(Side.SHORT, candidate) for candidate in short_candidates) if zone is not None]
 
-        # Use trading-mode flip confirmation (2 bars 1m OR 1 bar 5m) so the
+        # Use trading-mode flip confirmation (flip_confirmation_bars) so the
         # chart's zone classification matches what position management and
         # strategy entries see. The previous code used loose dashboard mode
         # (1m_bars=1, 5m_bars=0) for snappier visual feedback, but that meant
@@ -1520,8 +1693,7 @@ class DashboardCache:
         # as flipped — confusing when the dashboard sidebar (which already
         # uses trading mode via `sr_row()`) and the chart disagreed about
         # the same level.
-        zone_flip_1m = max(0, int(getattr(sr_cfg, "trading_flip_confirmation_1m_bars", 2) or 2)) if sr_cfg is not None else 2
-        zone_flip_5m = max(0, int(getattr(sr_cfg, "trading_flip_confirmation_5m_bars", 1) or 1)) if sr_cfg is not None else 1
+        zone_flip_1m, zone_flip_5m = flip_confirmation_bars(self.config.support_resistance)
         fallback_bar = None
         if frame is not None and not frame.empty:
             try:
@@ -1542,9 +1714,9 @@ class DashboardCache:
             kind_name = _zone_level_kind(zone)
             if not kind_name or _is_fvg_zone(zone):
                 return None
-            if kind_name == "broken_htf_support":
+            if kind_name in {"broken_htf_support", "pending_htf_support"}:
                 return "support"
-            if kind_name == "broken_htf_resistance":
+            if kind_name in {"broken_htf_resistance", "pending_htf_resistance"}:
                 return "resistance"
             if kind_name in {"prior_day_low", "prior_week_low"} or kind_name.endswith("_low"):
                 return "support"
@@ -1571,18 +1743,24 @@ class DashboardCache:
             if flipped_kind is None:
                 return zone
             level_kind = _zone_level_kind(zone)
-            lower = float(zone.get("lower", 0.0) or 0.0)
-            upper = float(zone.get("upper", 0.0) or 0.0)
-            confirmed = zone_flip_confirmed(
-                original_kind,
-                lower,
-                upper,
-                flip_frame=frame,
-                confirm_1m_bars=zone_flip_1m,
-                confirm_5m_bars=zone_flip_5m,
-                fallback_bar=fallback_bar,
-                eps=zone_eps,
-            )
+            builder_verdict = zone.get("builder_flip_confirmed")
+            if builder_verdict is None:
+                confirmed = zone_flip_confirmed(
+                    original_kind,
+                    float(zone.get("lower", 0.0) or 0.0),
+                    float(zone.get("upper", 0.0) or 0.0),
+                    flip_frame=frame,
+                    confirm_1m_bars=zone_flip_1m,
+                    confirm_5m_bars=zone_flip_5m,
+                    fallback_bar=fallback_bar,
+                    eps=zone_eps,
+                )
+            else:
+                # The builder confirmed (broken_*) or has yet to confirm
+                # (pending_*, nearest) this flip on the level price; the
+                # zone-edge check above answers a different question and
+                # could relabel a confirmed breakout-retest level as pending.
+                confirmed = bool(builder_verdict)
             sources = list(zone.get("sources", []) or [])
             zone["original_kind"] = str(original_kind)
             zone["confirmed_flip"] = False
@@ -1590,33 +1768,19 @@ class DashboardCache:
             zone["pending_flip"] = False
             zone["pending_state"] = ""
             zone["flip_target_kind"] = ""
-            if level_kind == "broken_htf_support":
+            if level_kind in _FLIP_CANDIDATE_LEVEL_KINDS:
                 if confirmed:
-                    zone["kind"] = "resistance"
+                    zone["kind"] = flipped_kind
                     zone["confirmed_flip"] = True
                     zone["flip_state"] = "confirmed_flip"
-                    zone["sources"] = list(dict.fromkeys([*sources, "confirmed_broken_support_zone"]))
+                    zone["sources"] = list(dict.fromkeys([*sources, f"confirmed_broken_{original_kind}_zone"]))
                 else:
-                    zone["kind"] = "support"
+                    zone["kind"] = original_kind
                     zone["flip_state"] = "pending_flip"
                     zone["pending_flip"] = True
-                    zone["pending_state"] = "pending_break"
-                    zone["flip_target_kind"] = "resistance"
-                    zone["sources"] = list(dict.fromkeys([*sources, "pending_broken_support"]))
-                return zone
-            if level_kind == "broken_htf_resistance":
-                if confirmed:
-                    zone["kind"] = "support"
-                    zone["confirmed_flip"] = True
-                    zone["flip_state"] = "confirmed_flip"
-                    zone["sources"] = list(dict.fromkeys([*sources, "confirmed_broken_resistance_zone"]))
-                else:
-                    zone["kind"] = "resistance"
-                    zone["flip_state"] = "pending_flip"
-                    zone["pending_flip"] = True
-                    zone["pending_state"] = "pending_reclaim"
-                    zone["flip_target_kind"] = "support"
-                    zone["sources"] = list(dict.fromkeys([*sources, "pending_broken_resistance"]))
+                    zone["pending_state"] = "pending_break" if original_kind == "support" else "pending_reclaim"
+                    zone["flip_target_kind"] = flipped_kind
+                    zone["sources"] = list(dict.fromkeys([*sources, f"pending_broken_{original_kind}"]))
                 return zone
             if confirmed:
                 zone["kind"] = flipped_kind
@@ -1635,7 +1799,7 @@ class DashboardCache:
             return (
                 1.0 if bool(zone.get("selected_for_entry", False)) else 0.0,
                 1.0 if not bool(zone.get("pending_flip", False)) else 0.0,
-                1.0 if level_kind.startswith("broken_htf_") else 0.0,
+                1.0 if level_kind in _FLIP_CANDIDATE_LEVEL_KINDS else 0.0,
                 float(zone.get("engine_level_score", 0.0) or 0.0),
                 float(zone.get("score", 0.0) or 0.0),
                 float(int(zone.get("touches", 0) or 0)),
@@ -1668,15 +1832,23 @@ class DashboardCache:
         support_zones = [item for item in all_zones if str(item.get("kind")) == "support"]
         resistance_zones = [item for item in all_zones if str(item.get("kind")) == "resistance"]
 
+        # Overlapping support / resistance zones split the gap at its
+        # midpoint. Only a support BELOW a resistance is such a pair: a
+        # pending level is drawn in its original role on the far side of
+        # price (a pending support above a nearer resistance), and trimming
+        # that crossed pair collapsed both zones, the strategy's own nearest
+        # level included, to zero width (2026-09-23).
         for support in support_zones:
             support_price = float(support.get("price", 0.0) or 0.0)
             for resistance in resistance_zones:
                 resistance_price = float(resistance.get("price", 0.0) or 0.0)
+                if support_price >= resistance_price:
+                    continue
                 support_upper = float(support.get("upper", 0.0) or 0.0)
                 resistance_lower = float(resistance.get("lower", 0.0) or 0.0)
                 if support_upper < resistance_lower:
                     continue
-                midpoint = (support_price + max(resistance_price, support_price)) / 2.0 if resistance_price <= support_price else (support_price + resistance_price) / 2.0
+                midpoint = (support_price + resistance_price) / 2.0
                 support_half_width = max(0.0, min(float(support.get("zone_half_width", 0.0) or 0.0), midpoint - support_price))
                 resistance_half_width = max(0.0, min(float(resistance.get("zone_half_width", 0.0) or 0.0), resistance_price - midpoint))
                 support["lower"] = max(0.0, support_price - support_half_width)
@@ -1714,9 +1886,16 @@ class DashboardCache:
                 display_zones.append(opposite_candidates[0])
             display_zones = sorted(display_zones, key=lambda item: (float(item["price"]), item["kind"]))
         else:
-            nearest_support = sorted([item for item in ordered if str(item.get("kind", "") or "") == "support"], key=lambda item: abs(float(item.get("price", 0.0) or 0.0) - float(close)))
-            nearest_resistance = sorted([item for item in ordered if str(item.get("kind", "") or "") == "resistance"], key=lambda item: abs(float(item.get("price", 0.0) or 0.0) - float(close)))
-            display_zones = []
+            # The nearest plain zone of each kind, plus every broken / pending
+            # level as its own zone. A flipped level no longer competes with
+            # the nearest one for the single support / resistance slot (until
+            # 2026-09-23 the S/R row folded a broken resistance into the
+            # support ladder, so the zone drawn was whichever of the two was
+            # nearer, not the level the strategy reads).
+            plain_zones = [item for item in ordered if _zone_level_kind(item) not in _FLIP_CANDIDATE_LEVEL_KINDS]
+            nearest_support = sorted([item for item in plain_zones if str(item.get("kind", "") or "") == "support"], key=lambda item: abs(float(item.get("price", 0.0) or 0.0) - float(close)))
+            nearest_resistance = sorted([item for item in plain_zones if str(item.get("kind", "") or "") == "resistance"], key=lambda item: abs(float(item.get("price", 0.0) or 0.0) - float(close)))
+            display_zones = [item for item in ordered if _zone_level_kind(item) in _FLIP_CANDIDATE_LEVEL_KINDS]
             if nearest_support:
                 display_zones.append(nearest_support[0])
             if nearest_resistance:
@@ -1758,8 +1937,7 @@ class DashboardCache:
             return None
         current_price = price if price is not None else self.symbol_price(symbol)
         # mode="trading" gives the sidebar the same flip-confirmation
-        # strictness (trading_flip_confirmation_1m_bars=2,
-        # trading_flip_confirmation_5m_bars=1) that position management,
+        # strictness (config.flip_confirmation_bars) that position management,
         # the chart's zone-flip detection, and the entry gatekeeper all
         # use. A single "trading" mode means the sidebar / chart /
         # gatekeeper / strategy agree on which side of a level price is
@@ -1785,41 +1963,23 @@ class DashboardCache:
             display_price = None
         state = "neutral"
 
-        def _valid_level(level: Any) -> Any | None:
-            if level is None:
-                return None
-            try:
-                return level if float(level.price) > 0 else None
-            except Exception:
-                return None
-
-        display_support = _valid_level(ctx.nearest_support)
-        display_resistance = _valid_level(ctx.nearest_resistance)
-        if display_price is not None and display_price <= 0:
-            display_price = None
-        if display_price is not None:
-            if display_support is not None and float(display_support.price) > float(display_price):
-                display_support = None
-            if display_resistance is not None and float(display_resistance.price) < float(display_price):
-                display_resistance = None
-        if display_support is not None and display_resistance is not None and float(display_resistance.price) <= float(display_support.price):
-            display_support = None
-            display_resistance = None
-
-        support_distance_pct = ctx.support_distance_pct if display_support is not None else None
-        if support_distance_pct is None and display_price is not None and display_support is not None and display_price > 0:
-            support_distance_pct = abs(display_price - float(display_support.price)) / display_price
-        resistance_distance_pct = ctx.resistance_distance_pct if display_resistance is not None else None
-        if resistance_distance_pct is None and display_price is not None and display_resistance is not None and display_price > 0:
-            resistance_distance_pct = abs(float(display_resistance.price) - display_price) / display_price
-
-        support_distance_atr = ctx.support_distance_atr if display_support is not None else None
-        resistance_distance_atr = ctx.resistance_distance_atr if display_resistance is not None else None
+        def _level_price(level: Any) -> float | None:
+            return None if level is None else float(level.price)
 
         trend_row = self.htf_trend(symbol, allow_refresh=allow_refresh)
         htf_trend_bias = "neutral"
+        # The strategy's own HTF trend -- the read its gates and scores use --
+        # when it has one; the generic 50/200 read below only for the rest.
+        own_trend = None
+        own_trend_hook = getattr(self.strategy, "dashboard_htf_trend", None)
+        trend_price = display_price if display_price is not None else float(getattr(ctx, "current_price", 0.0) or 0.0)
+        if callable(own_trend_hook) and self.data is not None and trend_price:
+            try:
+                own_trend = own_trend_hook(symbol, self.data, trend_price, allow_refresh=allow_refresh)
+            except Exception:
+                LOG.debug("Failed to read the strategy's HTF trend for %s; using the generic read.", symbol, exc_info=True)
         try:
-            if self.data is not None:
+            if self.data is not None and own_trend is None:
                 sr_cfg = getattr(self.config, "support_resistance", None)
                 if sr_cfg is not None:
                     htf_ctx = self.data.get_htf_context(
@@ -1846,7 +2006,10 @@ class DashboardCache:
             LOG.debug("Failed to read HTF trend bias context for %s; falling back to summarize_htf_trend().", symbol, exc_info=True)
         trend_state = str(trend_row.get("state", "neutral") or "neutral").strip().lower()
         trend_label = str(trend_row.get("label", "—") or "—")
-        if htf_trend_bias in {"bullish", "bearish"}:
+        if own_trend is not None:
+            trend_state = str(own_trend.get("state", "neutral") or "neutral").strip().lower()
+            trend_label = str(own_trend.get("label", "—") or "—")
+        elif htf_trend_bias in {"bullish", "bearish"}:
             trend_state = htf_trend_bias
             trend_label = "Bullish" if htf_trend_bias == "bullish" else "Bearish"
         ms_ctx = getattr(ctx, "market_structure", None)
@@ -1873,76 +2036,6 @@ class DashboardCache:
         elif ctx.breakdown_below_support and not bearish_conflict:
             state = "breakdown_watch"
 
-        support_prices = [float(round(lv.price, 4)) for lv in ctx.supports if getattr(lv, "price", None) is not None and float(lv.price) > 0]
-        resistance_prices = [float(round(lv.price, 4)) for lv in ctx.resistances if getattr(lv, "price", None) is not None and float(lv.price) > 0]
-        if ctx.broken_resistance is not None:
-            broken_resistance_price = float(round(ctx.broken_resistance.price, 4))
-            if broken_resistance_price > 0:
-                support_prices.append(broken_resistance_price)
-        if ctx.broken_support is not None:
-            broken_support_price = float(round(ctx.broken_support.price, 4))
-            if broken_support_price > 0:
-                resistance_prices.append(broken_support_price)
-
-        ladder_eps = 1e-4
-        ladder_reference_price = display_price
-        if ladder_reference_price is None:
-            try:
-                candidate_price = current_price if current_price is not None else getattr(ctx, "current_price", None)
-                if candidate_price is not None and float(candidate_price) > 0:
-                    ladder_reference_price = float(candidate_price)
-            except Exception:
-                ladder_reference_price = None
-        ladder_min_gap = _sr_effective_side_tolerance(self.config, ladder_reference_price, sr_ctx=ctx)
-
-        def _dedupe_sorted_prices(values: list[float], *, reverse: bool) -> list[float]:
-            return _collapse_price_ladder(values, reverse=reverse, min_gap=ladder_eps)
-
-        def _collapse_ladder_prices(values: list[float], *, reverse: bool) -> list[float]:
-            return _collapse_price_ladder(values, reverse=reverse, min_gap=ladder_min_gap)
-
-        support_prices = _dedupe_sorted_prices(support_prices, reverse=True)
-        resistance_prices = _dedupe_sorted_prices(resistance_prices, reverse=False)
-        raw_support_prices = list(support_prices)
-        raw_resistance_prices = list(resistance_prices)
-        support_anchor_prices = list(raw_support_prices)
-        resistance_anchor_prices = list(raw_resistance_prices)
-
-        if display_price is not None and display_price > 0:
-            display_price_value = float(display_price)
-            filtered_support_prices = [price for price in support_anchor_prices if price <= display_price_value + ladder_eps]
-            filtered_resistance_prices = [price for price in resistance_anchor_prices if price >= display_price_value - ladder_eps]
-            if not filtered_support_prices and raw_support_prices:
-                fallback_supports = [price for price in raw_support_prices if price <= display_price_value + ladder_eps]
-                if fallback_supports:
-                    filtered_support_prices = [max(fallback_supports)]
-            if not filtered_resistance_prices and raw_resistance_prices:
-                fallback_resistances = [price for price in raw_resistance_prices if price >= display_price_value - ladder_eps]
-                if fallback_resistances:
-                    filtered_resistance_prices = [min(fallback_resistances)]
-        else:
-            filtered_support_prices = list(support_anchor_prices)
-            filtered_resistance_prices = list(resistance_anchor_prices)
-
-        support_prices = [price for price in filtered_support_prices if all(abs(price - other) > ladder_eps for other in filtered_resistance_prices)]
-        resistance_prices = [price for price in filtered_resistance_prices if all(abs(price - other) > ladder_eps for other in support_prices)]
-
-        if display_support is not None:
-            support_prices.append(float(round(display_support.price, 4)))
-        if display_resistance is not None:
-            resistance_prices.append(float(round(display_resistance.price, 4)))
-
-        support_prices = _collapse_ladder_prices(_dedupe_sorted_prices(support_prices, reverse=True), reverse=True)
-        resistance_prices = _collapse_ladder_prices(_dedupe_sorted_prices(resistance_prices, reverse=False), reverse=False)
-
-        nearest_support_price = support_prices[0] if support_prices else (float(display_support.price) if display_support else None)
-        nearest_resistance_price = resistance_prices[0] if resistance_prices else (float(display_resistance.price) if display_resistance else None)
-        if nearest_support_price is not None and nearest_resistance_price is not None and float(nearest_resistance_price) <= float(nearest_support_price):
-            support_prices = [price for price in support_anchor_prices if price < float(nearest_resistance_price) - ladder_eps]
-            resistance_prices = [price for price in resistance_anchor_prices if price > float(nearest_support_price) + ladder_eps]
-            nearest_support_price = support_prices[0] if support_prices else None
-            nearest_resistance_price = resistance_prices[0] if resistance_prices else None
-
         htf_min_active = self._active_htf_minutes()
         timeframe_minutes = int(getattr(ctx, "timeframe_minutes", htf_min_active) or htf_min_active)
         symbol_key = str(symbol or "").upper().strip()
@@ -1959,12 +2052,24 @@ class DashboardCache:
             "price": display_price,
             "htf_refresh_token": htf_refresh.isoformat() if htf_refresh is not None else None,
             "side_tolerance": dashboard_safe_float(getattr(ctx, "side_tolerance", None)),
-            "nearest_support": nearest_support_price,
-            "nearest_resistance": nearest_resistance_price,
-            "support_distance_pct": None if support_distance_pct is None else float(support_distance_pct),
-            "resistance_distance_pct": None if resistance_distance_pct is None else float(resistance_distance_pct),
-            "support_distance_atr": None if support_distance_atr is None else float(support_distance_atr),
-            "resistance_distance_atr": None if resistance_distance_atr is None else float(resistance_distance_atr),
+            # The strategy's own levels, as it reads them (2026-09-23): the
+            # nearest support / resistance and their distances are ctx's, the
+            # ladders are ctx's (nearest first), and broken / pending levels
+            # travel in their own fields for the chart to draw as their own
+            # zones. Until then the row folded broken_resistance into the
+            # support ladder (broken_support into the resistance one) and
+            # published the NEAREST price of the result, while ctx keeps the
+            # STRONGEST member of each side_tolerance group: in 11% of
+            # archived samples the sidebar and top_tier's support zone showed
+            # another level than sr_ctx.nearest_support (AAPL 2026-09-22 10:05:
+            # 338.58 drawn, 338.42 used by the strategy), next to a distance
+            # measured to the strategy's level.
+            "nearest_support": _level_price(ctx.nearest_support),
+            "nearest_resistance": _level_price(ctx.nearest_resistance),
+            "support_distance_pct": ctx.support_distance_pct,
+            "resistance_distance_pct": ctx.resistance_distance_pct,
+            "support_distance_atr": ctx.support_distance_atr,
+            "resistance_distance_atr": ctx.resistance_distance_atr,
             "breakout_above_resistance": bool(ctx.breakout_above_resistance),
             "breakdown_below_support": bool(ctx.breakdown_below_support),
             "near_support": bool(ctx.near_support),
@@ -1978,10 +2083,12 @@ class DashboardCache:
             "structure_last_low_label": getattr(ms_ctx, "last_low_label", None) if ms_ctx is not None else None,
             "bias_score": float(ctx.bias_score),
             "state": state,
-            "supports": support_prices,
-            "resistances": resistance_prices,
-            "broken_support": float(ctx.broken_support.price) if ctx.broken_support and float(ctx.broken_support.price) > 0 else None,
-            "broken_resistance": float(ctx.broken_resistance.price) if ctx.broken_resistance and float(ctx.broken_resistance.price) > 0 else None,
+            "supports": [float(level.price) for level in ctx.supports],
+            "resistances": [float(level.price) for level in ctx.resistances],
+            "broken_support": _level_price(ctx.broken_support),
+            "broken_resistance": _level_price(ctx.broken_resistance),
+            "pending_support": _level_price(ctx.pending_support),
+            "pending_resistance": _level_price(ctx.pending_resistance),
         }
 
     def snapshot_should_bypass_cache(self, symbol: str, *, allow_refresh: bool) -> bool:
@@ -2126,9 +2233,12 @@ class DashboardCache:
                 LOG.debug("Failed to attach chart-pattern payload to dashboard response; returning partial payload.", exc_info=True)
         return payload
 
-    def current_structure_overlay(self, frame: pd.DataFrame | None, *, timeframe_minutes: int) -> dict[str, Any]:
+    def current_structure_overlay(self, frame: pd.DataFrame | None, *, timeframe_minutes: int,
+                                  last_bar_forming: bool = False) -> dict[str, Any]:
         """Build the market-structure overlay payload (CHOCH/BOS event, age,
-        level) from ``frame`` at the given timeframe.
+        level) from ``frame`` at the given timeframe. ``last_bar_forming``:
+        ``frame``'s last bar is a bucket still trading, which confirms no
+        pivot (as in the strategy's ``_structure_context``).
 
         Calls ``analyze_market_structure`` directly instead of building a
         full ``SupportResistanceContext`` — the overlay only consumes
@@ -2140,6 +2250,9 @@ class DashboardCache:
         payload: dict[str, Any] = {
             "event": "—",
             "age_bars": None,
+            # Start timestamp of the bar the event fired on, so the chart can
+            # mark it on the matching bar whatever bars it has merged since.
+            "event_ts": None,
             "level": None,
             "bias": "neutral",
             "pivot_bias": "neutral",
@@ -2199,6 +2312,7 @@ class DashboardCache:
                 ),
                 min_range_atr_mult=float(getattr(sr_cfg, "structure_min_range_atr_mult", 1.5) or 0.0),
                 min_pivot_gap_bars=overlay_gap_bars,
+                last_bar_forming=last_bar_forming,
             )
         except Exception:
             self.log_component_failure(
@@ -2225,6 +2339,7 @@ class DashboardCache:
         payload.update({
             "event": event,
             "age_bars": age,
+            "event_ts": None if age is None else frame_for_analysis.index[len(frame_for_analysis) - 1 - age].isoformat(),
             "level": level,
             "bias": str(getattr(ms_ctx, "bias", "neutral") or "neutral"),
             "pivot_bias": str(getattr(ms_ctx, "pivot_bias", "neutral") or "neutral"),
@@ -2258,33 +2373,78 @@ class DashboardCache:
         else:
             timeframe_minutes = ltf_min
             timeframe_label = f"{ltf_min}m" if ltf_min > 1 else "1m"
+        # ``frame`` is what the chart plots, and ``forming_start`` the start
+        # of its still-forming last bucket (None when every bar is complete).
+        # ``completed_frame`` is ``frame`` without that bucket: the per-bar
+        # candle tags are read from it, so every bar drawn as complete is
+        # tagged and the forming one is not. ``context_frame`` is what the
+        # chart patterns and structure overlay read. On the LTF chart that is
+        # ``frame``, forming bucket included, because the strategy reads them
+        # off that same frame (get_merged resamples the live 1m stream and
+        # keeps the partial bucket). The chart patterns read the forming
+        # bucket like any other bar; the structure overlay reads its close
+        # and breaks but confirms no pivot with it, as the strategy's
+        # _structure_context has since 2026-09-25. On the HTF chart it is
+        # ``completed_frame``: the strategy's HTF contexts read completed
+        # buckets only, and no strategy reads chart patterns off HTF bars --
+        # there they describe the bars drawn. ``minute_frame`` is the 1m
+        # frame the payload is current as of: its newest bar is
+        # ``source_bar_ts``, which the client compares with the snapshot's
+        # newest bar to know when this payload is stale.
+        frame: pd.DataFrame | None = None
+        stored_frame: pd.DataFrame | None = None
+        minute_frame: pd.DataFrame | None = None
+        forming_start: pd.Timestamp | None = None
         if resolved_mode == "htf" and symbol_key:
             # HTTP handler path: only read cached HTF data, never trigger a
             # Schwab fetch here. Forcing a refresh from the HTTP thread races
-            # with the engine's per-cycle prefetch (data_feed.fetch_htf_context
-            # runs under self._lock on the engine thread) and risks rate-limit
+            # with the engine's per-cycle prefetch (the HTF frame refresh runs
+            # under self._lock on the engine thread) and risks rate-limit
             # hits. If the cache is empty, return an empty chart — the next
             # engine cycle will populate it and the next poll will render.
-            frame = self.data.get_htf_frame(
+            stored_frame = self.data.get_htf_frame(
                 symbol_key,
                 timeframe_minutes=htf_min,
                 lookback_days=self._active_htf_lookback_days(),
                 allow_refresh=False,
+            )
+            minute_frame = self.data.get_merged(symbol_key, with_indicators=False)
+            frame, forming_start = dashboard_htf_chart_frame(
+                stored_frame,
+                minute_frame,
+                timeframe_minutes=htf_min,
+                now=now_et(),
             )
         elif symbol_key:
             # LTF path: when ltf_min is 1 fetch the streaming 1m frame
             # directly (no resample); for ltf_min > 1 (e.g. 5-min trigger
             # candles) get_merged resamples 1m -> ltf via resample_bars.
             if ltf_min > 1:
+                # The 1m frame first: a stream bar landing between the two
+                # reads then makes the payload name the OLDER bar, and the
+                # client refetches once the snapshot shows the new one. Read
+                # second, source_bar_ts could name a minute the plotted
+                # bucket does not hold, and nothing would ask again.
+                minute_frame = self.data.get_merged(symbol_key, with_indicators=False)
                 frame = self.data.get_merged(symbol_key, timeframe=f"{ltf_min}min", with_indicators=True)
+                # The resampled frame keeps the partial last bucket. Until
+                # 2026-09-23 it was drawn as complete and candle-tagged off
+                # its first minutes (AAPL 09-22 10:03: a 3-minute 10:00 5m bar
+                # tagged CDLHAMMER; complete, it tags as a bearish marubozu).
+                if frame is not None and not frame.empty and session_bucket_ends(frame.index[-1:], ltf_min)[0] > pd.Timestamp(now_et()):
+                    forming_start = pd.Timestamp(frame.index[-1])
             else:
                 frame = self.data.get_merged(symbol_key, with_indicators=True)
-        else:
-            frame = None
+                minute_frame = frame
+        completed_frame = frame.iloc[:-1] if frame is not None and forming_start is not None else frame
+        context_frame = frame if resolved_mode == "ltf" else completed_frame
+        source_bar_ts = minute_frame.index[-1].isoformat() if minute_frame is not None and not minute_frame.empty else None
         htf_refresh = self.data.last_htf_refresh.get((symbol_key, timeframe_minutes)) if resolved_mode == "htf" and symbol_key else None
         frame_signature = (
             dashboard_frame_signature(frame),
             htf_refresh.isoformat() if htf_refresh is not None else None,
+            source_bar_ts,
+            forming_start.isoformat() if forming_start is not None else None,
         )
         cache_key = (symbol_key, resolved_mode, capped_bars)
         with self.lock:
@@ -2307,19 +2467,17 @@ class DashboardCache:
                 cached_payload = dict(cache_entry["payload"])
                 cached_payload["last_update"] = now_et().isoformat()
                 return cached_payload
-        # Per-bar candle pattern map for the tooltip's per-bar candle section.
-        # See dashboard_bars_from_frame docstring + detect_per_bar_candle_patterns.
-        # lookback is sized to capped_bars so every visible chart bar gets
-        # pattern coverage (not just the last 30 — the snapshot default).
+        # Per-bar candle pattern map for the tooltip's per-bar candle section,
+        # for every chart bar (see dashboard_bars_from_frame docstring +
+        # detect_per_bar_candle_patterns). Read from completed_frame, so the
+        # forming bucket gets none and every other bar is scored -- on the
+        # HTF chart that includes the buckets completed since the stored
+        # frame's last refresh, which until 2026-09-23 were drawn untagged
+        # until it ran (at least 10 s into each bucket).
         chart_per_bar_candles: dict[Any, dict[str, list[str]]] = {}
-        if frame is not None and not frame.empty:
+        if completed_frame is not None and not completed_frame.empty:
             try:
-                chart_per_bar_candles = detect_per_bar_candle_patterns(
-                    frame,
-                    bullish_allowed=self.config.candles.bullish_patterns,
-                    bearish_allowed=self.config.candles.bearish_patterns,
-                    lookback=capped_bars,
-                )
+                chart_per_bar_candles = self._per_bar_candle_map(completed_frame, capped_bars)
             except Exception:
                 self.log_component_failure(
                     "per_bar_candles",
@@ -2332,64 +2490,71 @@ class DashboardCache:
             max_bars=capped_bars,
             per_bar_candles=chart_per_bar_candles,
         )
+        forming_ends_at: str | None = None
+        if forming_start is not None:
+            # The forming bucket is the plotted frame's last row. Its end goes
+            # on the payload: the client refetches once it has passed, since
+            # a bucket whose last minutes print nothing brings no newer 1m
+            # bar (the LTF chart's only other refetch trigger) and would stay
+            # drawn as forming until the next trade.
+            bars[-1]["in_progress"] = True
+            forming_ends_at = session_bucket_ends(frame.index[-1:], timeframe_minutes)[0].isoformat()
         # Default EMA spans rendered on the chart (matches what
         # `ensure_standard_indicator_frame` populates as ema9/ema20 columns).
         ema_fast_span = 9
         ema_slow_span = 20
-        # In HTF mode, override the bars' ema9 / ema20 values with the
-        # strategy's configured HTF EMAs (e.g. peer_confirmed_key_levels uses
-        # ema_fast_span=34 / ema_slow_span=200 for HTF trend bias). This
-        # keeps the chart faithful to what the strategy actually evaluates
-        # at the HTF — not a different default-span EMA that the strategy
-        # never looks at. Field names stay `ema9` / `ema20` for renderer
-        # compatibility, but the legend uses the labels in this payload.
+        # In HTF mode, draw the HTF EMAs the strategy reads, not the frame's
+        # session-reset ema9 / ema20 it never looks at. Field names stay
+        # `ema9` / `ema20` for renderer compatibility; the legend uses the
+        # spans in this payload.
+        #  * A strategy whose HTF trend reads frame columns directly names
+        #    them (zero_dte: the continuous ema9_all / ema20_all).
+        #  * Otherwise, when the strategy declares htf_ema_fast_span /
+        #    htf_ema_slow_span, the continuous EWM of those spans that
+        #    build_htf_context computes -- also at 9/20, which until
+        #    2026-09-24 skipped the override -- blanked, like the bot's own
+        #    value, while the stored frame is too short for it (the bot's
+        #    ema_slow is None under `span` bars, its ema_fast under
+        #    max(5, span // 3)).
         if resolved_mode == "htf" and frame is not None and not getattr(frame, "empty", True):
             params = getattr(self.strategy, "params", {}) or {}
-            htf_fast = max(1, int(params.get("htf_ema_fast_span", ema_fast_span) or ema_fast_span))
-            htf_slow = max(1, int(params.get("htf_ema_slow_span", ema_slow_span) or ema_slow_span))
-            if htf_fast != ema_fast_span or htf_slow != ema_slow_span:
-                try:
+            columns_hook = getattr(self.strategy, "dashboard_htf_ema_columns", None)
+            columns = columns_hook() if callable(columns_hook) else None
+            try:
+                tail = frame.tail(len(bars))
+                if columns is not None:
+                    fast_col, slow_col = columns
+                    for bar, (_idx, row) in zip(bars, tail.iterrows()):
+                        bar["ema9"] = dashboard_safe_float(row.get(fast_col))
+                        bar["ema20"] = dashboard_safe_float(row.get(slow_col))
+                elif "htf_ema_fast_span" in params or "htf_ema_slow_span" in params:
+                    htf_fast, htf_slow = htf_ema_spans(params)
+                    built_from = len(stored_frame) if stored_frame is not None else len(frame)
+                    fast_ok = built_from >= max(5, htf_fast // 3)
+                    slow_ok = built_from >= htf_slow
                     ema_fast_series = frame["close"].ewm(span=htf_fast, adjust=False).mean()
                     ema_slow_series = frame["close"].ewm(span=htf_slow, adjust=False).mean()
-                    tail = frame.tail(len(bars))
                     for bar, (idx, _row) in zip(bars, tail.iterrows()):
-                        try:
-                            bar["ema9"] = float(ema_fast_series.loc[idx])
-                            bar["ema20"] = float(ema_slow_series.loc[idx])
-                        except (KeyError, ValueError, TypeError):
-                            pass
+                        bar["ema9"] = dashboard_safe_float(ema_fast_series.loc[idx]) if fast_ok else None
+                        bar["ema20"] = dashboard_safe_float(ema_slow_series.loc[idx]) if slow_ok else None
                     ema_fast_span = htf_fast
                     ema_slow_span = htf_slow
-                except Exception:
-                    LOG.debug("Failed to compute HTF strategy EMAs for %s; chart falls back to default ema9/ema20.", symbol_key, exc_info=True)
-        # In LTF mode, when the strategy stretches its LTF indicator spans
-        # (top_tier_adaptive runs a 1m LTF with ltf_indicator_span_scale=5 so
-        # its ema9/ema20 are effectively 45/100), redraw the chart EMAs at the
-        # same spans. Otherwise the compact chart's get_merged frame carries the
-        # default 9/20 EMAs the bot never looks at. Spans default to base×scale
-        # so this stays correct even if ltf_ema_fast/slow_span aren't set.
-        elif resolved_mode == "ltf" and frame is not None and not getattr(frame, "empty", True):
-            params = getattr(self.strategy, "params", {}) or {}
-            scale = float(params.get("ltf_indicator_span_scale", 1.0) or 1.0)
-            ltf_fast = max(1, int(params.get("ltf_ema_fast_span", round(ema_fast_span * scale)) or round(ema_fast_span * scale)))
-            ltf_slow = max(1, int(params.get("ltf_ema_slow_span", round(ema_slow_span * scale)) or round(ema_slow_span * scale)))
-            if ltf_fast != ema_fast_span or ltf_slow != ema_slow_span:
-                try:
-                    ema_fast_series = frame["close"].ewm(span=ltf_fast, adjust=False).mean()
-                    ema_slow_series = frame["close"].ewm(span=ltf_slow, adjust=False).mean()
-                    tail = frame.tail(len(bars))
-                    for bar, (idx, _row) in zip(bars, tail.iterrows()):
-                        try:
-                            bar["ema9"] = float(ema_fast_series.loc[idx])
-                            bar["ema20"] = float(ema_slow_series.loc[idx])
-                        except (KeyError, ValueError, TypeError):
-                            pass
-                    ema_fast_span = ltf_fast
-                    ema_slow_span = ltf_slow
-                except Exception:
-                    LOG.debug("Failed to compute LTF strategy EMAs for %s; chart falls back to default ema9/ema20.", symbol_key, exc_info=True)
-        pattern_payload = self.current_pattern_payload(frame)
-        structure_overlay = self.current_structure_overlay(frame, timeframe_minutes=timeframe_minutes)
+            except Exception:
+                LOG.debug("Failed to compute HTF strategy EMAs for %s; chart falls back to default ema9/ema20.", symbol_key, exc_info=True)
+        # In LTF mode, draw the EMAs the strategy reads off its LTF frame (for
+        # top_tier_adaptive's 1m LTF at ltf_indicator_span_scale 5, the
+        # session-reset EMA45 / EMA100), exactly as the snapshot bars merged
+        # over these carry them.
+        elif resolved_mode == "ltf" and bars:
+            ema_fast_span, ema_slow_span = self._apply_strategy_ltf_emas(symbol_key, frame, bars, timeframe=f"{ltf_min}min")
+        pattern_payload = self.current_pattern_payload(context_frame)
+        # Rendered on the chart as the event marker + reference level line
+        # (until 2026-09-23 it was computed per payload and never drawn).
+        structure_overlay = self.current_structure_overlay(
+            context_frame,
+            timeframe_minutes=timeframe_minutes,
+            last_bar_forming=forming_start is not None and resolved_mode == "ltf",
+        )
         chart_config_profile = asdict(self.chart_profile("compact"))
         chart_config_expanded = asdict(self.chart_profile("expanded"))
         payload = {
@@ -2404,6 +2569,8 @@ class DashboardCache:
             "ema_slow_span": ema_slow_span,
             "htf_refresh_token": htf_refresh.isoformat() if htf_refresh is not None else None,
             "last_bar_ts": str(bars[-1].get("ts")) if bars else None,
+            "source_bar_ts": source_bar_ts,
+            "forming_ends_at": forming_ends_at,
             "last_update": now_et().isoformat(),
             "patterns": pattern_payload,
             "structure_overlay": structure_overlay,

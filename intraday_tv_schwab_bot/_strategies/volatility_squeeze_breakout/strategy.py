@@ -11,9 +11,46 @@ from ..shared import (
     math,
     pd,
 )
+from ..shared_entry import EntryContexts, EntryProposal, RetestTrigger
 from ..strategy_base import BaseStrategy
 
+# The pending reasons an FVG retest of the squeeze box edge may clear, per
+# side: no break of the box yet, a weak trigger bar, or the anti-chase
+# exhaustion checks (the wick check is side-specific). Until 2026-09-24 two
+# passes cleared them -- the own reasons first, the exhaustion ones only
+# once nothing else was pending -- and one pass over the union decides the
+# same.
+_RETEST_DEFERRABLE = {
+    Side.LONG: frozenset({
+        "weak_bar_close", "no_squeeze_breakout",
+        "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large",
+    }),
+    Side.SHORT: frozenset({
+        "weak_bar_close", "no_squeeze_breakdown",
+        "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "lower_wick_rejection", "expansion_bar_too_large",
+    }),
+}
+
+# The three target tiers, weakest first (2026-05-14).
+_TIERS = ("standard", "runner", "premium")
+
+
 class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
+    """Breakout of a volatility compression box, either side.
+
+    Per candidate one proposal per side (style / family ``vol_squeeze``;
+    SHORT only with ``risk.allow_short``): the squeeze and side blockers and
+    the anti-chase exhaustion checks are its pending reasons, and an FVG
+    retest of the box edge may clear the break / trigger-bar / exhaustion
+    ones. The stop sits a compression-scaled buffer beyond the far side of
+    the box (at least ``default_stop_pct`` away), the target at the tier's
+    R:R (standard / runner / premium by breakout quality). Every
+    shared_entry knob -- the vetoes, the refinement, the retest stop anchor,
+    the score terms -- is applied by ``self.entry_policy.admit``; a side it
+    refuses leaves the other side to win, and when both survive the higher
+    ``final_priority_score`` (shared terms included) takes the candidate.
+    """
+
     strategy_name = 'volatility_squeeze_breakout'
 
     def required_history_bars(self, symbol: str | None = None, positions: dict[str, Position] | None = None) -> int:
@@ -33,6 +70,33 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
             return float(clean.median())
         except Exception:
             return float(fallback)
+
+    @staticmethod
+    def _refined_tier(close: float, risk: float, target: float, tier_rrs: tuple[float, float, float], requested: int) -> tuple[str, float]:
+        """The tier label and target R:R the ADMITTED target delivers.
+
+        The breakout quality requests a tier (``requested``, an index into
+        ``_TIERS``); its R:R times ``risk`` -- the proposal's own stop
+        distance, the unit the tiers are defined in -- sets the proposal's
+        target, and the shared refinement may then cap that target at a
+        level. The R:R is the admitted target's distance in that unit (the
+        requested tier's R:R unless a level capped it), and the label is the
+        highest tier up to the requested one that it still reaches (the
+        weakest when none; the cap keeps a tier that shares its R:R with a
+        higher one from being promoted). It is deliberately not measured
+        against the refined stop: the refinement may pull the stop far in
+        without moving the target, and that realized R:R (routinely 10R and
+        more) says nothing about which tier the target still reaches. Until
+        2026-09-24 both were stamped from the requested tier, so a
+        premium-quality break whose target a resistance capped at 2R was
+        still logged as a 3.2R premium trade.
+        """
+        achieved = abs(float(target) - float(close)) / float(risk)
+        label = _TIERS[0]
+        for index in range(requested + 1):
+            if achieved >= tier_rrs[index] - 1e-9:
+                label = _TIERS[index]
+        return label, achieved
 
     def entry_signals(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], client=None, data=None) -> list[Signal]:
         self._reset_entry_decisions()
@@ -56,7 +120,15 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
         target_rr = max(1.0, float(self.params.get("target_rr", 2.05)))
         runner_enabled = bool(self.params.get("runner_enabled", True))
         runner_target_rr = max(target_rr, float(self.params.get("runner_target_rr", target_rr + 0.35)))
+        premium_target_rr = max(runner_target_rr, float(self.params.get("premium_target_rr", 3.2)))
+        tier_rrs = (target_rr, runner_target_rr, premium_target_rr)
+        # Set tiered_targets_enabled false to revert to the 2-tier behavior.
+        tiered_targets_enabled = bool(self.params.get("tiered_targets_enabled", True)) and runner_enabled
+        tier_atr_floor = float(self.params.get("tier_atr_expansion_floor", 1.25))
+        tier_vol_floor = float(self.params.get("tier_volume_ratio_floor", 1.50))
+        tier_close_floor = float(self.params.get("tier_close_position_floor", 0.78))
         allow_short = bool(self.config.risk.allow_short)
+        sides = (Side.LONG, Side.SHORT) if allow_short else (Side.LONG,)
         history_bars = max(min_bars, squeeze_lookback + baseline_bars + 25)
 
         for c in candidates:
@@ -120,11 +192,9 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
             width_ratio = (box_width_pct / baseline_width_pct) if baseline_width_pct > 0 else math.inf
 
             ctx = self._chart_context(frame)
-            sr_ctx = self._sr_context(c.symbol, frame, data)
             ms_ctx = self._structure_context(frame, "ltf")
             tech_ctx = self._technical_context(frame)
-            htf_ctx = self._default_htf_context_for_score(c.symbol, data)
-            metadata = {
+            squeeze_meta = {
                 "squeeze_breakout_high": breakout_high,
                 "squeeze_breakout_low": breakout_low,
                 "squeeze_range": box_range,
@@ -135,11 +205,9 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 "breakout_volume_ratio": breakout_volume_ratio,
                 "compression_rising_lows": bool(rising_lows_ok),
                 "compression_falling_highs": bool(falling_highs_ok),
-                **self._chart_lists(ctx),
-                **self._structure_lists(ms_ctx, prefix="msltf"),
-                **self._sr_lists(sr_ctx),
-                **self._technical_lists(tech_ctx),
             }
+            atr_expansion_mult_val = _safe_float(getattr(tech_ctx, "atr_expansion_mult", None), 0.0)
+            bollinger_squeeze_flag = bool(getattr(tech_ctx, "bollinger_squeeze", False))
 
             compression_ok = bool(
                 box_range_pct <= max_range_pct
@@ -148,216 +216,150 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 and (
                     width_ratio <= max_width_ratio
                     or box_width_pct <= (max_width_pct * 0.70)
-                    or bool(getattr(tech_ctx, "bollinger_squeeze", False))
+                    or bollinger_squeeze_flag
                 )
             )
             if not compression_ok:
                 reasons.append(_reason_with_values("no_valid_squeeze", current=box_range_pct, required=max_range_pct, op="<=", digits=4, extras={"range_atr": (box_range_atr, "<=", max_range_atr), "width_pct": (box_width_pct, "<=", max_width_pct), "width_ratio": (width_ratio, "<=", max_width_ratio)}))
             if breakout_volume_ratio < min_breakout_volume_ratio:
                 reasons.append(_reason_with_values("breakout_volume_too_light", current=breakout_volume_ratio, required=min_breakout_volume_ratio, op=">=", digits=4))
-            if _safe_float(getattr(tech_ctx, "atr_expansion_mult", None), 0.0) < min_atr_expansion_mult:
-                reasons.append(_reason_with_values("no_atr_expansion", current=_safe_float(getattr(tech_ctx, "atr_expansion_mult", None), 0.0), required=min_atr_expansion_mult, op=">=", digits=4))
-            if prefer_bollinger_flag and not bool(getattr(tech_ctx, "bollinger_squeeze", False)) and box_width_pct > max_width_pct * 0.90:
+            if atr_expansion_mult_val < min_atr_expansion_mult:
+                reasons.append(_reason_with_values("no_atr_expansion", current=atr_expansion_mult_val, required=min_atr_expansion_mult, op=">=", digits=4))
+            if prefer_bollinger_flag and not bollinger_squeeze_flag and box_width_pct > max_width_pct * 0.90:
                 reasons.append("bollinger_squeeze_not_confirmed")
+            # Compression-aware stop buffer: for TIGHT squeezes (narrow
+            # box_range_pct), using pure ATR can over-widen the stop. Scale
+            # the buffer by the compression width — tighter squeezes get a
+            # proportionally tighter stop beyond the box, wider squeezes keep
+            # the ATR floor.
+            stop_buffer = max(atr * 0.12, last_close * 0.0010, box_range_pct * last_close * 0.22)
 
             signals: list[Signal] = []
-            shared_reasons = list(reasons)
-
-            long_reasons = list(shared_reasons)
-            bullish_breakout = last_close >= breakout_high * (1.0 + breakout_buffer_pct)
-            bullish_avwap = max(_safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0), _safe_float(getattr(tech_ctx, "anchored_vwap_bullish_impulse", None), 0.0))
-            long_retest_plan = self._continuation_fvg_retest_plan(Side.LONG, c.symbol, frame, data, trigger_level=breakout_high, breakout_active=bool(bullish_breakout), close=last_close, vwap=last_vwap, ema9=last_ema9)
-            if day_strength < min_change:
-                long_reasons.append(_reason_with_values("weak_day_strength", current=day_strength, required=min_change, op=">=", digits=4))
-            if require_vwap_alignment and last_close <= last_vwap:
-                long_reasons.append(_reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
-            if last_ema9 < last_ema20:
-                long_reasons.append(_reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
-            if require_avwap_alignment and bullish_avwap > 0 and last_close <= bullish_avwap:
-                long_reasons.append(_reason_with_values("below_bullish_avwap", current=last_close, required=bullish_avwap, op=">", digits=4))
-            if not rising_lows_ok:
-                long_reasons.append("pressure_not_building_up")
-            if not bullish_breakout:
-                long_reasons.append(_reason_with_values("no_squeeze_breakout", current=last_close, required=breakout_high * (1.0 + breakout_buffer_pct), op=">=", digits=4))
-            if close_pos < min_close_pos:
-                long_reasons.append(_reason_with_values("weak_bar_close", current=close_pos, required=min_close_pos, op=">=", digits=4))
-            if not long_reasons and self._shared_entry_enabled("use_opposing_chart_filter", True) and self._blocks_bullish_entry(ctx):
-                long_reasons.append("chart_pattern_opposed")
-            long_reasons = self._apply_continuation_zone_retest_plans(long_reasons, [long_retest_plan], deferrable_prefixes={"weak_bar_close", "no_squeeze_breakout", "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large"})
-            if not long_reasons:
-                long_reasons.extend(self._entry_exhaustion_reasons(Side.LONG, frame, close=last_close, vwap=last_vwap, ema9=last_ema9))
-                long_reasons = self._apply_continuation_zone_retest_plans(long_reasons, [long_retest_plan], deferrable_prefixes={"too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large"})
-            if not long_reasons:
-                divergence_reason = self._dual_counter_divergence_reason(Side.LONG, tech_ctx)
-                if divergence_reason:
-                    long_reasons.append(divergence_reason)
-            if not long_reasons:
-                # Compression-aware stop anchor: for TIGHT squeezes (narrow
-                # box_range_pct), using pure ATR can over-widen the stop.
-                # Scale the stop buffer by the compression width — tighter
-                # squeezes get a proportionally tighter stop below the box,
-                # wider squeezes keep the ATR floor.
-                stop_buffer = max(atr * 0.12, last_close * 0.0010, box_range_pct * last_close * 0.22)
-                stop = breakout_low - stop_buffer
-                stop = min(stop, last_close * (1.0 - self.config.risk.default_stop_pct))
-                risk_per_share = max(0.01, last_close - stop)
+            side_reasons: dict[Side, list[str]] = {}
+            for side in sides:
+                long = side == Side.LONG
+                side_blockers = list(reasons)
+                if long:
+                    trigger_level = breakout_high
+                    breakout_fired = last_close >= breakout_high * (1.0 + breakout_buffer_pct)
+                    bullish_avwap = max(_safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0), _safe_float(getattr(tech_ctx, "anchored_vwap_bullish_impulse", None), 0.0))
+                    if day_strength < min_change:
+                        side_blockers.append(_reason_with_values("weak_day_strength", current=day_strength, required=min_change, op=">=", digits=4))
+                    if require_vwap_alignment and last_close <= last_vwap:
+                        side_blockers.append(_reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
+                    if last_ema9 < last_ema20:
+                        side_blockers.append(_reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
+                    if require_avwap_alignment and bullish_avwap > 0 and last_close <= bullish_avwap:
+                        side_blockers.append(_reason_with_values("below_bullish_avwap", current=last_close, required=bullish_avwap, op=">", digits=4))
+                    if not rising_lows_ok:
+                        side_blockers.append("pressure_not_building_up")
+                    if not breakout_fired:
+                        side_blockers.append(_reason_with_values("no_squeeze_breakout", current=last_close, required=breakout_high * (1.0 + breakout_buffer_pct), op=">=", digits=4))
+                    if close_pos < min_close_pos:
+                        side_blockers.append(_reason_with_values("weak_bar_close", current=close_pos, required=min_close_pos, op=">=", digits=4))
+                    stop = min(breakout_low - stop_buffer, last_close * (1.0 - self.config.risk.default_stop_pct))
+                    bos_active = bool(getattr(ms_ctx, "bos_up", False))
+                    # Strong quality needs the bar to close in its top
+                    # (1 - tier_close_floor) for a LONG.
+                    strong_close = close_pos >= tier_close_floor
+                else:
+                    trigger_level = breakout_low
+                    breakout_fired = last_close <= breakout_low * (1.0 - breakout_buffer_pct)
+                    bearish_avwap_vals = [v for v in [_safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0), _safe_float(getattr(tech_ctx, "anchored_vwap_bearish_impulse", None), 0.0)] if v > 0]
+                    bearish_avwap = min(bearish_avwap_vals) if bearish_avwap_vals else 0.0
+                    if day_strength > -min_change:
+                        side_blockers.append(_reason_with_values("weak_day_weakness", current=day_strength, required=-min_change, op="<=", digits=4))
+                    if require_vwap_alignment and last_close >= last_vwap:
+                        side_blockers.append(_reason_with_values("above_vwap", current=last_close, required=last_vwap, op="<", digits=4))
+                    if last_ema9 > last_ema20:
+                        side_blockers.append(_reason_with_values("ema9_above_ema20", current=last_ema9, required=last_ema20, op="<=", digits=4))
+                    if require_avwap_alignment and 0 < bearish_avwap <= last_close:
+                        side_blockers.append(_reason_with_values("above_bearish_avwap", current=last_close, required=bearish_avwap, op="<", digits=4))
+                    if not falling_highs_ok:
+                        side_blockers.append("pressure_not_building_down")
+                    if not breakout_fired:
+                        side_blockers.append(_reason_with_values("no_squeeze_breakdown", current=last_close, required=breakout_low * (1.0 - breakout_buffer_pct), op="<=", digits=4))
+                    if close_pos > (1.0 - min_close_pos):
+                        side_blockers.append(_reason_with_values("weak_bar_close", current=1.0 - close_pos, required=min_close_pos, op=">=", digits=4))
+                    stop = max(breakout_high + stop_buffer, last_close * (1.0 + self.config.risk.default_stop_pct))
+                    bos_active = bool(getattr(ms_ctx, "bos_down", False))
+                    # ... and in its bottom (1 - tier_close_floor) for a SHORT.
+                    strong_close = close_pos <= (1.0 - tier_close_floor)
+                side_blockers.extend(self._entry_exhaustion_reasons(side, frame, close=last_close, vwap=last_vwap, ema9=last_ema9))
                 # 3-tier target structure (2026-05-14): standard / runner /
-                # premium. Standard catches the bulk of qualifying setups
-                # at a realistic target. Runner extends when the breakout
-                # passes higher quality thresholds (ATR + volume + bar
-                # body all strong). Premium extends further when ALL of
-                # runner-quality + active BoS-up event + Bollinger squeeze
-                # flag agree — the setup is exceptionally aligned and
-                # deserves more runway. Toggle via `tiered_targets_enabled`.
-                tiered_targets_enabled = bool(self.params.get("tiered_targets_enabled", True)) and runner_enabled
-                tier_atr_floor = float(self.params.get("tier_atr_expansion_floor", 1.25))
-                tier_vol_floor = float(self.params.get("tier_volume_ratio_floor", 1.50))
-                tier_close_floor = float(self.params.get("tier_close_position_floor", 0.78))
-                premium_target_rr_val = max(runner_target_rr, float(self.params.get("premium_target_rr", 3.2)))
-                atr_expansion_mult_val = _safe_float(getattr(tech_ctx, "atr_expansion_mult", None), 0.0)
-                bos_up_active = bool(getattr(ms_ctx, "bos_up", False))
-                bollinger_squeeze_flag = bool(getattr(tech_ctx, "bollinger_squeeze", False))
+                # premium. Standard catches the bulk of qualifying setups at a
+                # realistic target. Runner extends when the breakout passes
+                # higher quality thresholds (ATR + volume + bar body all
+                # strong). Premium extends further when ALL of runner-quality
+                # + an active BoS event in the side's direction + the
+                # Bollinger squeeze flag agree — the setup is exceptionally
+                # aligned and deserves more runway.
                 strong_quality = (
                     atr_expansion_mult_val >= tier_atr_floor
                     and breakout_volume_ratio >= tier_vol_floor
-                    and close_pos >= tier_close_floor
+                    and strong_close
                 )
-                if tiered_targets_enabled and strong_quality and bos_up_active and bollinger_squeeze_flag:
-                    effective_target_rr = premium_target_rr_val
-                    squeeze_tier_label = "premium"
+                if tiered_targets_enabled and strong_quality and bos_active and bollinger_squeeze_flag:
+                    requested_tier = 2
                 elif runner_enabled and (
-                    bos_up_active
+                    bos_active
                     or atr_expansion_mult_val >= (min_atr_expansion_mult + 0.12)
                     or (tiered_targets_enabled and strong_quality)
                 ):
-                    effective_target_rr = runner_target_rr
-                    squeeze_tier_label = "runner"
+                    requested_tier = 1
                 else:
-                    effective_target_rr = target_rr
-                    squeeze_tier_label = "standard"
-                target = last_close + risk_per_share * effective_target_rr
-                if self._blocks_bullish_structure_entry(ms_ctx):
-                    long_reasons.append(self._bullish_structure_block_reason(ms_ctx))
-                elif self._blocks_bullish_sr_entry(sr_ctx):
-                    long_reasons.append(self._bullish_sr_block_reason(sr_ctx))
-                else:
-                    stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx, frame)
-                    stop, target = self._refine_bullish_technical_levels(last_close, stop, target, tech_ctx, frame)
-                    stop = self._apply_retest_stop_anchor(Side.LONG, last_close, stop, long_retest_plan)
-                    adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
-                    fvg_adjustments = self._fvg_entry_adjustment_components(Side.LONG, c.symbol, frame, data)
-                    management = self._adaptive_management_components(Side.LONG, last_close, stop, target, style="trend", runner_allowed=bool(runner_enabled), continuation_bias=float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0))
-                    final_priority_score = float(c.activity_score) + (0.45 if bool(getattr(tech_ctx, "bollinger_squeeze", False)) else 0.0) + max(0.0, 1.0 - min(1.0, width_ratio)) + max(0.0, breakout_volume_ratio - 1.0) + (0.35 if bool(getattr(ms_ctx, "bos_up", False)) else 0.0) + adjustments["entry_context_adjustment"] + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
-                    reason = "volatility_squeeze_breakout_long"
-                    meta = {
-                        **metadata,
-                        "final_priority_score": round(final_priority_score, 4),
-                        "squeeze_tier_label": squeeze_tier_label,
-                        "squeeze_effective_target_rr": round(float(effective_target_rr), 4),
-                        **adjustments, **fvg_adjustments, **management,
-                    }
-                    signals.append(Signal(symbol=c.symbol, strategy=self.strategy_name, side=Side.LONG, reason=reason, stop_price=float(stop), target_price=float(target), metadata=meta))
-
-            short_reasons = list(shared_reasons)
-            bearish_breakout = last_close <= breakout_low * (1.0 - breakout_buffer_pct)
-            bearish_avwap_vals = [v for v in [_safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0), _safe_float(getattr(tech_ctx, "anchored_vwap_bearish_impulse", None), 0.0)] if v > 0]
-            bearish_avwap = min(bearish_avwap_vals) if bearish_avwap_vals else 0.0
-            short_retest_plan = self._continuation_fvg_retest_plan(Side.SHORT, c.symbol, frame, data, trigger_level=breakout_low, breakout_active=bool(bearish_breakout), close=last_close, vwap=last_vwap, ema9=last_ema9)
-            if not allow_short:
-                short_reasons.append("shorts_disabled")
-            if day_strength > -min_change:
-                short_reasons.append(_reason_with_values("weak_day_weakness", current=day_strength, required=-min_change, op="<=", digits=4))
-            if require_vwap_alignment and last_close >= last_vwap:
-                short_reasons.append(_reason_with_values("above_vwap", current=last_close, required=last_vwap, op="<", digits=4))
-            if last_ema9 > last_ema20:
-                short_reasons.append(_reason_with_values("ema9_above_ema20", current=last_ema9, required=last_ema20, op="<=", digits=4))
-            if require_avwap_alignment and 0 < bearish_avwap <= last_close:
-                short_reasons.append(_reason_with_values("above_bearish_avwap", current=last_close, required=bearish_avwap, op="<", digits=4))
-            if not falling_highs_ok:
-                short_reasons.append("pressure_not_building_down")
-            if not bearish_breakout:
-                short_reasons.append(_reason_with_values("no_squeeze_breakdown", current=last_close, required=breakout_low * (1.0 - breakout_buffer_pct), op="<=", digits=4))
-            if close_pos > (1.0 - min_close_pos):
-                short_reasons.append(_reason_with_values("weak_bar_close", current=1.0 - close_pos, required=min_close_pos, op=">=", digits=4))
-            if not short_reasons and self._shared_entry_enabled("use_opposing_chart_filter", True) and self._blocks_bearish_entry(ctx):
-                short_reasons.append("chart_pattern_opposed")
-            short_reasons = self._apply_continuation_zone_retest_plans(short_reasons, [short_retest_plan], deferrable_prefixes={"weak_bar_close", "no_squeeze_breakdown", "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "lower_wick_rejection", "expansion_bar_too_large"})
-            if not short_reasons:
-                short_reasons.extend(self._entry_exhaustion_reasons(Side.SHORT, frame, close=last_close, vwap=last_vwap, ema9=last_ema9))
-                short_reasons = self._apply_continuation_zone_retest_plans(short_reasons, [short_retest_plan], deferrable_prefixes={"too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "lower_wick_rejection", "expansion_bar_too_large"})
-            if not short_reasons:
-                divergence_reason = self._dual_counter_divergence_reason(Side.SHORT, tech_ctx)
-                if divergence_reason:
-                    short_reasons.append(divergence_reason)
-            if not short_reasons:
-                # Symmetric compression-aware stop for SHORT side.
-                stop_buffer_short = max(atr * 0.12, last_close * 0.0010, box_range_pct * last_close * 0.22)
-                stop = breakout_high + stop_buffer_short
-                stop = max(stop, last_close * (1.0 + self.config.risk.default_stop_pct))
-                risk_per_share = max(0.01, stop - last_close)
-                # 3-tier target structure (2026-05-14): mirror of LONG side.
-                # Strong-quality requires close_pos in the LOWER 22% of bar
-                # for SHORT (i.e., 1.0 - tier_close_floor); BoS-down event
-                # + Bollinger squeeze qualify for premium tier.
-                tiered_targets_enabled_s = bool(self.params.get("tiered_targets_enabled", True)) and runner_enabled
-                tier_atr_floor_s = float(self.params.get("tier_atr_expansion_floor", 1.25))
-                tier_vol_floor_s = float(self.params.get("tier_volume_ratio_floor", 1.50))
-                tier_close_floor_s = float(self.params.get("tier_close_position_floor", 0.78))
-                premium_target_rr_short = max(runner_target_rr, float(self.params.get("premium_target_rr", 3.2)))
-                atr_expansion_mult_val_s = _safe_float(getattr(tech_ctx, "atr_expansion_mult", None), 0.0)
-                bos_down_active = bool(getattr(ms_ctx, "bos_down", False))
-                bollinger_squeeze_flag_s = bool(getattr(tech_ctx, "bollinger_squeeze", False))
-                strong_quality_short = (
-                    atr_expansion_mult_val_s >= tier_atr_floor_s
-                    and breakout_volume_ratio >= tier_vol_floor_s
-                    and close_pos <= (1.0 - tier_close_floor_s)  # bar closed near LOW
+                    requested_tier = 0
+                risk_per_share = max(0.01, (last_close - stop) if long else (stop - last_close))
+                reward = risk_per_share * tier_rrs[requested_tier]
+                proposal = EntryProposal(
+                    candidate=c,
+                    direction=side,
+                    style="vol_squeeze",
+                    style_family="vol_squeeze",
+                    close=last_close,
+                    stop=stop,
+                    target=(last_close + reward) if long else (last_close - reward),
+                    gate_frame=frame,
+                    sr_frame=frame,
+                    level_frame=frame,
+                    data=data,
+                    pending_reasons=tuple(side_blockers),
+                    deferrable=_RETEST_DEFERRABLE[side],
+                    retest=RetestTrigger(trigger_level, bool(breakout_fired), last_vwap, last_ema9),
+                    contexts=EntryContexts(ms=ms_ctx, tech=tech_ctx, chart=ctx),
                 )
-                if tiered_targets_enabled_s and strong_quality_short and bos_down_active and bollinger_squeeze_flag_s:
-                    effective_target_rr = premium_target_rr_short
-                    squeeze_tier_label = "premium"
-                elif runner_enabled and (
-                    bos_down_active
-                    or atr_expansion_mult_val_s >= (min_atr_expansion_mult + 0.12)
-                    or (tiered_targets_enabled_s and strong_quality_short)
-                ):
-                    effective_target_rr = runner_target_rr
-                    squeeze_tier_label = "runner"
-                else:
-                    effective_target_rr = target_rr
-                    squeeze_tier_label = "standard"
-                target = last_close - risk_per_share * effective_target_rr
-                if self._blocks_bearish_structure_entry(ms_ctx):
-                    short_reasons.append(self._bearish_structure_block_reason(ms_ctx))
-                elif self._blocks_bearish_sr_entry(sr_ctx):
-                    short_reasons.append(self._bearish_sr_block_reason(sr_ctx))
-                else:
-                    stop, target = self._refine_bearish_sr_levels(last_close, stop, target, sr_ctx, frame)
-                    stop, target = self._refine_bearish_technical_levels(last_close, stop, target, tech_ctx, frame)
-                    stop = self._apply_retest_stop_anchor(Side.SHORT, last_close, stop, short_retest_plan)
-                    adjustments = self._entry_adjustment_components(Side.SHORT, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
-                    fvg_adjustments = self._fvg_entry_adjustment_components(Side.SHORT, c.symbol, frame, data)
-                    management = self._adaptive_management_components(Side.SHORT, last_close, stop, target, style="trend", runner_allowed=bool(runner_enabled), continuation_bias=float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0))
-                    final_priority_score = float(c.activity_score) + (0.45 if bool(getattr(tech_ctx, "bollinger_squeeze", False)) else 0.0) + max(0.0, 1.0 - min(1.0, width_ratio)) + max(0.0, breakout_volume_ratio - 1.0) + (0.35 if bool(getattr(ms_ctx, "bos_down", False)) else 0.0) + adjustments["entry_context_adjustment"] + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
-                    reason = "volatility_squeeze_breakout_short"
-                    meta = {
-                        **metadata,
-                        "final_priority_score": round(final_priority_score, 4),
+                admitted = self.entry_policy.admit(proposal)
+                if admitted is None:
+                    side_reasons[side] = self._consume_build_failure_payload(c.symbol, proposal.style)["reasons"]
+                    continue
+                squeeze_tier_label, effective_target_rr = self._refined_tier(last_close, risk_per_share, admitted.target, tier_rrs, requested_tier)
+                management = self._adaptive_management_components(
+                    side, last_close, admitted.stop, admitted.target,
+                    style="trend", runner_allowed=bool(runner_enabled), continuation_bias=float(admitted.fvg["fvg_continuation_bias"]),
+                )
+                strategy_score = float(c.activity_score) + (0.45 if bollinger_squeeze_flag else 0.0) + max(0.0, 1.0 - min(1.0, width_ratio)) + max(0.0, breakout_volume_ratio - 1.0) + (0.35 if bos_active else 0.0)
+                signals.append(self.entry_policy.emit(
+                    admitted,
+                    reason=f"volatility_squeeze_breakout_{'long' if long else 'short'}",
+                    strategy_score=strategy_score,
+                    management=management,
+                    target=admitted.target,
+                    metadata={
+                        **squeeze_meta,
                         "squeeze_tier_label": squeeze_tier_label,
                         "squeeze_effective_target_rr": round(float(effective_target_rr), 4),
-                        **adjustments, **fvg_adjustments, **management,
-                    }
-                    signals.append(Signal(symbol=c.symbol, strategy=self.strategy_name, side=Side.SHORT, reason=reason, stop_price=float(stop), target_price=float(target), metadata=meta))
+                    },
+                ))
 
             if not signals:
-                reason_stream = list(long_reasons) if not allow_short else (list(long_reasons) + list(short_reasons))
-                merged: list[str] = []
-                for token in reason_stream:
-                    if token and token not in merged:
-                        merged.append(token)
-                self._record_entry_decision(c.symbol, "skipped", merged or ["no_setup"])
+                # Every refused side's blockers, LONG first (the decision
+                # record de-duplicates the ones both sides share).
+                self._record_entry_decision(c.symbol, "skipped", [token for side in sides for token in side_reasons[side]])
                 continue
 
-            best = max(signals, key=lambda sig: (float(sig.metadata.get("final_priority_score", 0.0) or 0.0), float(sig.metadata.get("breakout_volume_ratio", breakout_volume_ratio) or breakout_volume_ratio)))
+            # The side pick stays on final_priority_score, which carries the
+            # shared context terms: they chose the side before 2026-09-24 too.
+            best = max(signals, key=lambda sig: (float(sig.metadata["final_priority_score"]), float(sig.metadata["breakout_volume_ratio"])))
             out.append(best)
             self._record_entry_decision(c.symbol, "signal", [best.reason])
         return out

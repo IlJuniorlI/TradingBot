@@ -2,9 +2,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from datetime import date, datetime, timedelta
 from typing import Literal, TypeVar, overload
 
+import numpy as np
 import pandas as pd
+
+from .utils import (
+    EQUITY_EARLY_CLOSE,
+    EQUITY_RTH_CLOSE,
+    EQUITY_RTH_OPEN,
+    is_weekday_session_day,
+    us_equity_early_close_days,
+)
 
 
 TLevel = TypeVar("TLevel")
@@ -54,6 +64,14 @@ def pivot_points(
     so the pivot-detection semantics can't drift between the two builders
     (the kind of bug we debugged through the AMD/INTC support-list
     mismatch).
+
+    The whole window must lie in ONE ET session (``session_segment_ids``).
+    The frames hold no 20:00-07:00 bars, so until 2026-09-23 a 19:45 bar was
+    "confirmed" as a swing high by the next morning's 07:00/07:15 bars, eleven
+    hours of unobserved trading later -- QCOM's 195.88 post-market print on
+    2026-09-21 became the HTF resistance, the HH structure reference and a
+    LONG's target that way. A bar at a session edge has no observed
+    neighbours on one side, so it is never a pivot.
     """
     highs: list = []
     lows: list = []
@@ -73,7 +91,10 @@ def pivot_points(
         else low_col.astype(float).tolist()
     )
     idxs = list(frame.index)
+    segments = session_segment_ids(frame.index)
     for i in range(span, len(frame) - span):
+        if segments[i - span] != segments[i + span]:
+            continue
         hi = highs_arr[i]
         lo = lows_arr[i]
         hi_window = highs_arr[i - span : i + span + 1]
@@ -89,11 +110,11 @@ def cluster_levels(
     points: Iterable[tuple[pd.Timestamp, float]],
     kind: str,
     tolerance: float,
-    max_levels: int,
     *,
     level_factory: Callable[..., TLevel],
 ) -> list[TLevel]:
-    """Cluster pivot points by price proximity and return ranked ``TLevel``s.
+    """Cluster pivot points by price proximity and return EVERY cluster,
+    ranked by score.
 
     Time-aware recency scoring: each cluster's score is
     ``effective_touches + persistence_bonus`` where
@@ -109,6 +130,16 @@ def cluster_levels(
     SupportResistanceLevel — both have the same field shape). This is the
     single source of truth for cluster scoring so a fix landing here
     propagates to every consumer (HTF and LTF SR contexts).
+
+    No count cap. Until 2026-09-23 the builders kept the top
+    ``2 * max_levels_per_side`` clusters by score here, BEFORE knowing which
+    side of price each one sits on: a fresh single-touch swing scores 1.0 and
+    lost to any older multi-touch cluster, so after a gap or trend day the
+    level nearest price was cut and every survivor sat on the far side
+    (AVGO 2026-05-28: nearest resistance 430.40 at 1.1-1.4 ATR instead of
+    427.96 at 0.0-0.6 ATR, flipping the long clearance gate). The builders
+    now keep the nearest ``max_levels_per_side`` per side after the side
+    split (``_collapse_same_side_levels``).
     """
     ordered = sorted([(ts, float(price)) for ts, price in points], key=lambda x: x[1])
     if not ordered:
@@ -156,7 +187,7 @@ def cluster_levels(
             )
         )
     levels.sort(key=lambda lv: (lv.score, lv.touches), reverse=True)
-    return levels[: max(1, int(max_levels))]
+    return levels
 
 
 def confirm_by_bars(
@@ -221,14 +252,16 @@ def clone_level(
     )
 
 
-def extend_unique_levels(dest: list, additions: list) -> None:
-    """Append unseen levels from ``additions`` to ``dest`` in place.
+def extend_unique_levels(dest: list, additions: list) -> list:
+    """Append unseen levels from ``additions`` to ``dest`` in place, and
+    return the ones appended.
 
     Uniqueness key is ``(source, round(price, 8), kind)``. Pure duck-typing
     on the level attributes; no factory required. Replaces the per-module
     ``_extend_unique_levels`` helpers that previously duplicated the same
     body across htf_levels and support_resistance.
     """
+    appended: list = []
     seen = {
         (
             str(getattr(level, "source", "pivot") or "pivot"),
@@ -246,7 +279,9 @@ def extend_unique_levels(dest: list, additions: list) -> None:
         if key in seen:
             continue
         dest.append(level)
+        appended.append(level)
         seen.add(key)
+    return appended
 
 
 def frame_extreme_side_levels(
@@ -254,7 +289,6 @@ def frame_extreme_side_levels(
     *,
     side: str,
     tolerance: float,
-    max_levels: int,
     level_factory: Callable[..., TLevel],
 ) -> list[TLevel]:
     """Build a single-cluster fallback level from the frame's extreme bar.
@@ -268,10 +302,10 @@ def frame_extreme_side_levels(
     if str(side).strip().lower() == "support":
         pos = int(frame["low"].astype(float).values.argmin())
         point = (pd.Timestamp(frame.index[pos]), float(frame["low"].iloc[pos]))
-        return cluster_levels([point], "support", tolerance, max_levels, level_factory=level_factory)
+        return cluster_levels([point], "support", tolerance, level_factory=level_factory)
     pos = int(frame["high"].astype(float).values.argmax())
     point = (pd.Timestamp(frame.index[pos]), float(frame["high"].iloc[pos]))
-    return cluster_levels([point], "resistance", tolerance, max_levels, level_factory=level_factory)
+    return cluster_levels([point], "resistance", tolerance, level_factory=level_factory)
 
 
 def cluster_levels_by_tolerance(levels: list[TLevel], tolerance: float) -> list[list[TLevel]]:
@@ -430,47 +464,112 @@ def session_dates(index: pd.Index) -> pd.Index:
     return pd.Index(session_datetime_index(index).date)
 
 
-def loc_frame(frame: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
-    result = frame.loc[mask]
-    if isinstance(result, pd.DataFrame):
-        return result
-    return pd.DataFrame(columns=frame.columns)
+def session_segment_ids(index: pd.Index) -> np.ndarray:
+    """Run id per bar that advances at every change of ET session date.
+
+    The bar frames hold only the 07:00-20:00 ET stream window, so two
+    neighbouring bars on different ET dates are separated by trading nobody
+    observed. Detectors that compare neighbouring bars -- pivots,
+    fair-value-gap triplets, order blocks -- require their window to lie
+    inside one run.
+
+    The boundary is the ET date, not a time step. Within a session a thin
+    name routinely prints no bar for minutes, and a minute without a trade is
+    not missing data: nothing traded. Archived 1m bars (2026-05..09) show
+    2-13% of pre/post-market steps longer than 2 minutes and same-day steps
+    up to 209 minutes, so a "step > 2 x timeframe" rule would have dropped
+    real extended-hours pivots. Every step across an ET date is at least
+    11 hours (19:59 -> 07:00).
+    """
+    if len(index) == 0:
+        return np.zeros(0, dtype=np.int64)
+    days = session_datetime_index(index).normalize().to_numpy()
+    changes = np.concatenate(([0], (days[1:] != days[:-1]).astype(np.int64)))
+    return np.cumsum(changes)
 
 
-def prior_day_levels(frame: pd.DataFrame) -> tuple[float | None, float | None]:
+def latest_session_date(now: datetime) -> date:
+    """The ET date of ``now``, rolled back to the latest trading day on or
+    before it (a Saturday resolves to Friday, a holiday Monday to Friday).
+
+    The builders pass this as ``as_of`` to ``prior_day_levels`` /
+    ``prior_week_levels`` when the caller gives none."""
+    stamp = pd.Timestamp(now)
+    day = (stamp.tz_convert(_SESSION_TZ) if stamp.tzinfo is not None else stamp).date()
+    while not is_weekday_session_day(day):
+        day -= timedelta(days=1)
+    return day
+
+
+def _rth_bar_mask(session_index: pd.DatetimeIndex) -> np.ndarray:
+    """Bars that START inside a trading day's regular session: 09:30 up to
+    16:00 ET, or 13:00 on an early-close day. ``session_index`` is already
+    ET-local (``session_datetime_index``)."""
+    if len(session_index) == 0:
+        return np.zeros(0, dtype=bool)
+    days = session_index.normalize()
+    close_minute_by_day: dict[pd.Timestamp, int] = {}
+    for day in days.unique():
+        session_day = day.date()
+        if not is_weekday_session_day(session_day):
+            close_minute_by_day[day] = -1
+            continue
+        close = EQUITY_EARLY_CLOSE if session_day in us_equity_early_close_days(session_day.year) else EQUITY_RTH_CLOSE
+        close_minute_by_day[day] = close.hour * 60 + close.minute
+    close_minutes = np.asarray(days.map(close_minute_by_day), dtype=np.int64)
+    minutes = np.asarray(session_index.hour * 60 + session_index.minute, dtype=np.int64)
+    open_minute = EQUITY_RTH_OPEN.hour * 60 + EQUITY_RTH_OPEN.minute
+    return (minutes >= open_minute) & (minutes < close_minutes)
+
+
+def prior_day_levels(frame: pd.DataFrame, as_of: date, *, regular_session_only: bool = True) -> tuple[float | None, float | None]:
+    """High/low of the regular session of the last trading day before ``as_of``
+    (of all its bars with ``regular_session_only=False``: microcap_pm_breakout
+    floors its premarket high on the prior day's post-market too).
+
+    Two changes on 2026-09-23. (1) The session day is the caller's ``as_of``
+    (the builders use the clock's session date), not the date of the frame's
+    last bar. The frame never holds the most recent night, so one fetched
+    before a symbol's first print of the day ended at yesterday's 19:45 bar:
+    "today" became yesterday and PDH/PDL came from two sessions back -- wrong
+    on 53 of 53 archived symbol-days in that state, median PDH error 1.37%,
+    max 15.4% (ARM 2026-09-22: 276.50 instead of 327.02). (2) Only 09:30-16:00
+    bars count. The ET calendar-date bucket took extended hours and whatever
+    overnight prints the fetch happened to hold (PDH sat above the RTH high on
+    25 of 81 symbol-days, PDL below the RTH low on 28), so the level depended
+    on restart timing and was not the conventional PDH/PDL the dashboard labels.
+    """
     if frame is None or frame.empty:
         return None, None
-    df = frame.copy()
-    # Classify bars by ET session date, not UTC date — see session_dates().
-    day_key: pd.Series = pd.Series(session_dates(df.index), index=df.index)
-    current_day = day_key.iloc[-1]
-    prior = loc_frame(df, day_key < current_day)
-    if prior.empty:
-        return None, None
-    prior_day_key: pd.Series = pd.Series(session_dates(prior.index), index=prior.index)
-    last_day = prior_day_key.iloc[-1]
-    prior_day = loc_frame(prior, prior_day_key == last_day)
-    if prior_day.empty:
-        return None, None
-    return float(prior_day["high"].max()), float(prior_day["low"].min())
-
-
-def prior_week_levels(frame: pd.DataFrame) -> tuple[float | None, float | None]:
-    if frame is None or frame.empty:
-        return None, None
-    # Bucket by ET session week; see session_datetime_index() for why UTC
-    # bucketing misclassifies Fri post-market bars during EST.
     session_index = session_datetime_index(frame.index)
-    week_key: pd.Series = pd.Series(session_index.to_period("W-FRI"), index=frame.index)
-    current_week = week_key.iloc[-1]
-    prior = loc_frame(frame, week_key < current_week)
-    if prior.empty:
+    days = session_index.normalize()
+    eligible = np.asarray(days < pd.Timestamp(as_of), dtype=bool)
+    if regular_session_only:
+        eligible &= _rth_bar_mask(session_index)
+    if not eligible.any():
         return None, None
-    prior_week = week_key.loc[week_key < current_week].iloc[-1]
-    prior_frame = loc_frame(frame, week_key == prior_week)
-    if prior_frame.empty:
+    last_day = days[eligible].max()
+    bars = frame.loc[eligible & np.asarray(days == last_day, dtype=bool)]
+    return float(bars["high"].max()), float(bars["low"].min())
+
+
+def prior_week_levels(frame: pd.DataFrame, as_of: date) -> tuple[float | None, float | None]:
+    """High/low of the regular sessions of the last W-FRI week before the one
+    holding ``as_of``. Same two rules as ``prior_day_levels``: a Monday
+    premarket frame ends on Friday, so keying the week off the last bar made
+    "prior week" two weeks back until the first Monday print, and extended /
+    overnight bars no longer count. Weeks are ET-bucketed (see
+    ``session_datetime_index``)."""
+    if frame is None or frame.empty:
         return None, None
-    return float(prior_frame["high"].max()), float(prior_frame["low"].min())
+    session_index = session_datetime_index(frame.index)
+    weeks = session_index.to_period("W-FRI")
+    eligible = _rth_bar_mask(session_index) & np.asarray(weeks < pd.Period(as_of, freq="W-FRI"), dtype=bool)
+    if not eligible.any():
+        return None, None
+    last_week = weeks[eligible].max()
+    bars = frame.loc[eligible & np.asarray(weeks == last_week, dtype=bool)]
+    return float(bars["high"].max()), float(bars["low"].min())
 
 
 # ---------------------------------------------------------------------------
@@ -493,9 +592,11 @@ def prior_week_levels(frame: pd.DataFrame) -> tuple[float | None, float | None]:
 #       HH. Continuation in a downtrend.
 #
 # ``b`` is always the most recent pivot (and must be within
-# ``max_age_bars``); ``a`` is the nearest earlier pivot, within
-# ``pivot_lookback``, that satisfies the price half of the pattern, and a
-# pivot in between that contradicts it means there is no divergence. See
+# ``max_age_bars``, counted on the caller's bar clock -- session bars while
+# session indicators are on and the clock is inside the session); ``a`` is
+# the nearest earlier pivot, within ``pivot_lookback``, that satisfies the
+# price half of the pattern, and a pivot in between that contradicts it
+# means there is no divergence. See
 # ``find_divergence`` for why it is the nearest and not merely any.
 # ---------------------------------------------------------------------------
 
@@ -512,6 +613,15 @@ class DivergenceMatch:
     can read pivot positions, indicator values, and freshness without
     re-deriving them. ``__slots__`` keeps memory footprint tight when many
     contexts hold these — typically 8 fields per TechnicalLevelsContext.
+
+    ``age_bars`` is how many bars have closed since ``b``, counted on the
+    ``bar_clock`` ``find_divergence`` was given. The builders pass the
+    session-bar clock while session indicators are on and the clock is
+    inside the session (``utils.indicator_session_open``), so it is SESSION
+    bars there: the overnight between yesterday's last pivot and today's
+    open is not part of the age. Without a clock (session indicators off, or
+    a reader outside the session) it is every bar. The pivot positions are
+    frame positions either way.
     """
 
     __slots__ = (
@@ -699,9 +809,34 @@ def find_divergence(
     pivot_lookback: int,
     max_age_bars: int,
     last_bar_pos: int,
+    price_scale: np.ndarray | None = None,
+    bar_clock: np.ndarray | None,
 ) -> DivergenceMatch | None:
     """Divergence between the latest swing and the swing it is measured
     against, or None.
+
+    ``bar_clock`` (one value per bar of the frame the pivot positions index,
+    non-decreasing) is what ``b``'s age is counted on: ``clock[last_bar_pos]
+    - clock[pos_b]``. None counts every bar (``last_bar_pos - pos_b``). It
+    has no default, so no caller falls back to the all-bar age by leaving it
+    out. The builders pass ``np.cumsum`` of the indicator session mask while
+    session indicators are on and the clock is inside the session
+    (``utils.indicator_session_open``), so the age is session bars. Until
+    2026-09-24 it was always every bar: with pivots paired only on session
+    bars, the post- and pre-market bars aged yesterday's last session pivot
+    past the limit overnight. On the divergence-age study's symbol-days with
+    a dense overnight tape (447 over 27 sessions on 60m, 554 over 29 on 15m)
+    the 60m HTF divergence read on none of the minutes from 09:30 to 11:00;
+    on session-bar age it reads on 23.6% of RTH minutes instead of 10.4%
+    (15m: 16.4% instead of 14.6%).
+
+    ``price_scale`` (``utils.session_price_scale`` of the frame the pivot
+    positions index) puts the pivot prices on the scale the indicator was
+    computed on before they are compared; the match still reports the raw
+    prices. The session rsi14 / obv are stitched across the overnight gap,
+    so compared raw a gap alone made a "higher high" the RSI never saw: 371
+    of 571 cross-session HTF RSI divergences over 10 archived sessions were
+    the gap (2026-09-23).
 
     ``points`` is a list of ``(pos, ts, price)`` tuples -- pivot lows for
     bullish patterns, pivot highs for bearish ones.
@@ -738,18 +873,26 @@ def find_divergence(
     candidates = points[-pivot_lookback:]
     if len(candidates) < 2:
         return None
+    def _on_scale(pos: int, price: float) -> float:
+        return float(price) * (float(price_scale[int(pos)]) if price_scale is not None else 1.0)
+
     pos_b, ts_b, price_b = candidates[-1]
-    age = max(0, int(last_bar_pos) - int(pos_b))
+    if bar_clock is None:
+        age = max(0, int(last_bar_pos) - int(pos_b))
+    else:
+        age = max(0, int(bar_clock[int(last_bar_pos)]) - int(bar_clock[int(pos_b)]))
     if age > max_age_bars:
         return None
     ind_b = _pivot_indicator_value(indicator, pos_b)
     if ind_b is None:
         return None
+    cmp_b = _on_scale(pos_b, price_b)
     for pos_a, ts_a, price_a in reversed(candidates[:-1]):
-        if _contradicts(kind=kind, direction=direction, price_a=float(price_a), price_b=float(price_b)):
+        cmp_a = _on_scale(pos_a, price_a)
+        if _contradicts(kind=kind, direction=direction, price_a=cmp_a, price_b=cmp_b):
             return None
-        if not _price_condition(kind=kind, direction=direction, price_a=float(price_a),
-                                price_b=float(price_b), price_move_frac=float(price_move_frac)):
+        if not _price_condition(kind=kind, direction=direction, price_a=cmp_a,
+                                price_b=cmp_b, price_move_frac=float(price_move_frac)):
             continue
         ind_a = _pivot_indicator_value(indicator, pos_a)
         if ind_a is None:
@@ -757,8 +900,8 @@ def find_divergence(
         matched, delta = _qualifies(
             kind=kind,
             direction=direction,
-            price_a=float(price_a),
-            price_b=float(price_b),
+            price_a=cmp_a,
+            price_b=cmp_b,
             ind_a=ind_a,
             ind_b=ind_b,
             price_move_frac=float(price_move_frac),

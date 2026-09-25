@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import re
+import sys
 from pathlib import Path
 from textwrap import dedent
 from typing import Any
@@ -15,6 +17,19 @@ ROOT = Path(__file__).resolve().parents[1]
 STRATEGIES_DIR = ROOT / "intraday_tv_schwab_bot" / "_strategies"
 CONFIGS_DIR = ROOT / "configs"
 CANONICAL_TEMPLATE = CONFIGS_DIR / "config.example.yaml"
+
+# The script runs from a checkout (python scripts/scaffold_strategy_plugin.py),
+# not an installed package; a scaffolded preset's shared sections are read
+# from the config dataclasses themselves.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from intraday_tv_schwab_bot.config import (  # noqa: E402
+    RiskConfig,
+    SharedEntryLogicConfig,
+    SharedExitLogicConfig,
+    SupportResistanceConfig,
+)
 
 
 def _snake_case(value: str) -> str:
@@ -41,12 +56,12 @@ def _default_class_stem(name: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Shared FVG entry-adjustment param defaults. Declared explicitly in scaffolded
-# manifests so later customization that calls _fvg_entry_adjustment_components
-# (directly, or via _build_bullish_reversal_signal) reads documented manifest
-# values instead of strategy_base hardcoded fallbacks. Defaults mirror
-# BaseStrategy._fvg_entry_adjustment_components in strategy_base.py — search
-# for that method to verify if you tune them (line numbers drift as the file
-# grows).
+# manifests so the FVG score term the shared entry policy computes for every
+# admitted proposal reads documented manifest values instead of hardcoded
+# fallbacks. Defaults mirror
+# SharedEntryPolicy._fvg_entry_adjustment_components in
+# _strategies/shared_entry.py — search for that method to verify if you tune
+# them (line numbers drift as the file grows).
 _FVG_PARAMS = {
     "htf_fvg_entry_weight": 0.55,
     "ltf_fvg_entry_weight": 0.35,
@@ -186,10 +201,24 @@ def _stock_strategy_py(name: str, class_stem: str) -> str:
             insufficient_bars_reason,
             pd,
         )
+        from ..shared_entry import EntryProposal
         from ..strategy_base import BaseStrategy
 
 
         class {class_stem}Strategy(BaseStrategy):
+            """Stock strategy scaffold.
+
+            Every entry goes through the shared entry stage: build an
+            ``EntryProposal`` from the setup, ``self.entry_policy.admit`` it
+            (it applies every shared_entry knob -- the structure / S/R /
+            chart / candle / divergence vetoes, the stop/target refinement,
+            the score terms -- and records a refusal under the proposal's
+            style), then ``self.entry_policy.emit`` the Signal. A strategy
+            never builds a Signal itself and never reads config.shared_entry
+            (tests/test_shared_knob_contract.py). See
+            _strategies/mean_reversion for a worked example.
+            """
+
             strategy_name = {name!r}
 
             def entry_signals(
@@ -204,7 +233,7 @@ def _stock_strategy_py(name: str, class_stem: str) -> str:
                 out: list[Signal] = []
                 min_bars = int(self.params.get("min_bars", 40) or 40)
                 min_rvol = float(self.params.get("min_rvol", 1.5) or 1.5)
-                allow_short = bool(getattr(self.config.risk, "allow_short", False))
+                allow_short = bool(self.config.risk.allow_short)
 
                 for candidate in candidates:
                     if candidate.symbol in positions:
@@ -226,48 +255,63 @@ def _stock_strategy_py(name: str, class_stem: str) -> str:
                     rvol = _safe_float(candidate.metadata.get("relative_volume_10d_calc"), 0.0)
                     day_strength = _safe_float(candidate.metadata.get("change_from_open"), 0.0)
 
+                    side = Side.SHORT if (allow_short and close < vwap and day_strength < 0) else Side.LONG
+                    # The setup's own blockers. They are the proposal's
+                    # pending reasons, so a refusal lists them together with
+                    # every shared veto that fired.
+                    reasons: list[str] = []
                     if rvol < min_rvol:
-                        self._record_entry_decision(candidate.symbol, "skipped", ["rvol_too_low"])
+                        reasons.append("rvol_too_low")
+                    if side == Side.LONG and not (close > vwap and day_strength > 0):
+                        reasons.append("no_setup")
+
+                    proposal = EntryProposal(
+                        candidate=candidate,
+                        direction=side,
+                        style="trend",
+                        style_family="trend",
+                        close=close,
+                        stop=close * (0.995 if side == Side.LONG else 1.005),
+                        target=close * (1.010 if side == Side.LONG else 0.990),
+                        gate_frame=frame,
+                        sr_frame=frame,
+                        level_frame=frame,
+                        data=data,
+                        pending_reasons=tuple(reasons),
+                    )
+                    admitted = self.entry_policy.admit(proposal)
+                    if admitted is None:
+                        refusal = self._consume_build_failure_payload(candidate.symbol, proposal.style)
+                        self._record_entry_decision(candidate.symbol, "skipped", refusal["reasons"])
                         continue
 
-                    long_ok = close > vwap and day_strength > 0
-                    short_ok = allow_short and close < vwap and day_strength < 0
-                    if not long_ok and not short_ok:
-                        self._record_entry_decision(candidate.symbol, "skipped", ["no_setup"])
-                        continue
-
-                    side = Side.LONG if long_ok else Side.SHORT
-                    stop = close * (0.995 if side == Side.LONG else 1.005)
-                    target = close * (1.010 if side == Side.LONG else 0.990)
-                    setup_quality_score = 1.0
-                    execution_quality_score = 0.0
-                    activity_weight = 0.15
-                    selection_quality_score = setup_quality_score + execution_quality_score
-                    final_priority_score = selection_quality_score + (float(candidate.activity_score) * activity_weight)
-                    signal = Signal(
-                        symbol=candidate.symbol,
-                        strategy=self.strategy_name,
-                        side=side,
+                    # Management and score come from the ADMITTED levels (the
+                    # policy may have refined the stop and target).
+                    management = self._adaptive_management_components(
+                        side,
+                        close,
+                        admitted.stop,
+                        admitted.target,
+                        style="trend",
+                        runner_allowed=False,
+                        continuation_bias=float(admitted.fvg["fvg_continuation_bias"]),
+                    )
+                    # The strategy's own priority, without the shared score
+                    # terms: emit adds them (final_priority_score).
+                    strategy_score = 1.0 + float(candidate.activity_score) * 0.15
+                    signal = self.entry_policy.emit(
+                        admitted,
                         reason={name!r},
-                        stop_price=stop,
-                        target_price=target,
+                        strategy_score=strategy_score,
+                        management=management,
+                        target=admitted.target,
                         metadata={{
-                            # entry_price is required by risk.py::_signal_entry_price —
-                            # without it the same-level block + fib-pullback override
-                            # short-circuit and never fire for this strategy.
-                            "entry_price": close,
                             "rvol": rvol,
                             "day_strength": day_strength,
                             "activity_score": float(candidate.activity_score),
-                            "setup_quality_score": setup_quality_score,
-                            "execution_quality_score": execution_quality_score,
-                            "final_priority_score": round(final_priority_score, 4),
-                            "selection_quality_score": round(selection_quality_score, 4),
-                            "ltf_score": 1.0,
-                            "regime_score": 1.0,
                         }},
                     )
-                    self._record_entry_decision(candidate.symbol, "signal", ["long_setup" if side == Side.LONG else "short_setup"])
+                    self._record_entry_decision(candidate.symbol, "signal", [signal.reason])
                     out.append(signal)
                 return out
 
@@ -379,9 +423,16 @@ def _option_strategy_py(name: str, class_stem: str) -> str:
                 """Option entry logic. Loop over candidates (which are
                 underlyings, e.g. SPY/QQQ/IWM from options.underlyings),
                 read bars[candidate.symbol] for the underlying's frame,
-                gate on whatever regime/structure logic you want, and
-                emit Signal objects with option-specific metadata
-                (asset_type, strike, expiry, contract symbol, etc.).
+                gate on whatever regime logic you want, then hand each
+                style to the shared entry stage as a PREMIUM proposal
+                (``EntryProposal(..., direction=<the underlying's market
+                direction>, stop=None, target=None, level_frame=None,
+                gate_frame=sr_frame=<the underlying frame>)``) BEFORE the
+                contract / chain work, and build the Signal with
+                ``self.entry_policy.emit(admitted, ..., order_side=<the
+                spread's order side>, premium_stop=<premium stop>,
+                target=<premium target>, metadata=<option metadata:
+                asset_type, strike, expiry, contract symbol, etc.>)``.
 
                 See _strategies/zero_dte_etf_options/strategy.py for a
                 fully-fleshed working example with regime confirmation,
@@ -409,7 +460,9 @@ def _option_strategy_py(name: str, class_stem: str) -> str:
                     #      Schwab client (delta target, OI/vol filters,
                     #      bid-ask spread)
                     #   3. build_single_option_order / build_vertical_order
-                    #   4. emit Signal with full option metadata
+                    #   4. self.entry_policy.admit(premium proposal) before
+                    #      step 2, then self.entry_policy.emit(...) with the
+                    #      full option metadata
                     self._record_entry_decision(underlying, "skipped", ["not_yet_implemented"])
                 return out
 
@@ -565,11 +618,34 @@ def _full_config_yaml(name: str, plugin_type: str) -> str:
     # block — option strategies actively read it.
     if plugin_type == "stock":
         template.pop("options", None)
+    _reset_shared_knobs(template)
     header = (
         f"# Full runnable preset scaffolded from configs/config.example.yaml for {name}.\n"
+        "# Its shared_entry / shared_exit sections, risk.time_stop_minutes and\n"
+        "# support_resistance.entry_proximity_scoring_enabled are the config dataclass defaults.\n"
         "# Put SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_ACCOUNT_HASH, SCHWAB_ENCRYPTION_KEY, and TRADINGVIEW_SESSIONID in a .env file at the repo root (see .env.example).\n"
     )
     return header + yaml.safe_dump(template, sort_keys=False)
+
+
+def _reset_shared_knobs(template: dict[str, Any]) -> None:
+    """Give a scaffolded preset the dataclass defaults of the knobs
+    config.example.yaml carries at peer_confirmed_htf_pivots parity.
+
+    Since 2026-09-24 every preset states what its strategy effectively ran,
+    and the example runs htf_pivots: several entry vetoes, the S/R proximity
+    score, the time stop and the structure / chart / candle exits are off
+    there, so a new plugin cloned from it silently took a peer strategy's
+    choices. The shared_entry / shared_exit sections are replaced whole (a
+    key their dataclass does not know would fail at load anyway); the two
+    knobs that live in other sections are reset in place.
+    """
+    template["shared_entry"] = dataclasses.asdict(SharedEntryLogicConfig())
+    template["shared_exit"] = dataclasses.asdict(SharedExitLogicConfig())
+    template.setdefault("risk", {})["time_stop_minutes"] = RiskConfig().time_stop_minutes
+    template.setdefault("support_resistance", {})["entry_proximity_scoring_enabled"] = (
+        SupportResistanceConfig().entry_proximity_scoring_enabled
+    )
 
 
 def scaffold_plugin(name: str, class_stem: str | None, plugin_type: str, *, force: bool) -> Path:

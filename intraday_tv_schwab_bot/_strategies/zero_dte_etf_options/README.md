@@ -40,7 +40,7 @@ Before placing a trade, the strategy checks things like:
 - entry cutoff times
 - quote freshness and stability
 - sufficient underlying bars
-- support/resistance clearance in the intended direction
+- the shared entry vetoes (see "Shared entry stage" below): the LTF market structure against the trade's direction (shipped on), and S/R clearance, opposing chart / candle patterns, a dual RSI+OBV counter-divergence and a nearby broken level when their `shared_entry` knobs are switched on
 
 That prevents it from forcing a spread when the market state or option market is not supportive.
 
@@ -50,7 +50,7 @@ Even if the underlying looks perfect, the spread still has to be tradeable. The 
 
 So the actual sequence is:
 
-**underlying regime -> style decision -> contract filtering -> spread quality validation -> signal**
+**underlying regime -> style decision -> shared entry stage -> contract filtering -> spread quality validation -> signal**
 
 ### 5. How risk is expressed
 
@@ -179,7 +179,8 @@ Common parameter families:
   - `fvg_context_weight_scale`
 - Credit-spread quality gates (credit_spread style only — long-option style ignores these):
   - `credit_distance_gate_enabled`, `min_credit_distance_atr`: rejects entries where the short strike is within N×ATR of the **current spot**.
-  - `credit_pivot_buffer_gate_enabled`, `min_short_strike_pivot_buffer_atr`: rejects entries where the short strike is within N×ATR of the **recent market-structure pivot** (LTF/HTF `reference_high` for bear call; `reference_low` for bull put). Catches the "short sitting ON the recent high" failure mode the distance gate misses. Added 2026-05-21 after a same-day post-mortem showed both bearish credit entries at 11:13 had cushion < 1 ATR and stopped within 30s.
+  - `credit_pivot_buffer_gate_enabled`, `min_short_strike_pivot_buffer_atr`: rejects entries where the short strike is within N×ATR of the **outermost recent market-structure pivot** — the higher of the LTF/HTF `reference_high` for a bear call, the lower of the LTF/HTF `reference_low` for a bull put, read from `_regime_confirm`'s `regime['metrics']` (the same dict the signal stamps as `regime_metrics`). Skips when the references or the ATR are unavailable. Catches the "short sitting ON the recent high" failure mode the distance gate misses. Added 2026-05-21 after a same-day post-mortem showed both bearish credit entries at 11:13 had cushion < 1 ATR and stopped within 30s.
+    **Fixed 2026-09-25; ships disabled in every preset.** Until then it read the references from the top level of the regime result, found none and never fired. Enabled, it would refuse ~32 of 38 fixture-replay credit entries and 4 of the 8 live ones (2026-05-20..22), so enable it only after a dry-run.
 - Adaptive strike width (credit_spread style only):
   - `adaptive_width_enabled`, `adaptive_width_max_scale`: scale `strike_width_by_symbol` with current_atr / 20-bar median atr, capped at max_scale. Width is snapped to whole dollars so the hedge target always lands on a real strike on the SPY/QQQ/IWM chain.
 - Option-chain caching:
@@ -192,6 +193,47 @@ General behavior:
 - Raising the HTF bonus/penalty makes HTF alignment matter more.
 - Raising `fvg_context_weight_scale` makes one-minute and HTF FVG context matter more to the regime score.
 - Tightening the trend-extension caps reduces late chase entries.
+
+## Shared entry stage (2026-09-24)
+
+Every `shared_entry` knob is applied by the shared entry stage
+(`_strategies/shared_entry.py`, `SharedEntryPolicy`), the same one every
+strategy uses; the strategy no longer reads any of them itself.
+
+- **When.** Each style that triggers (ORB debit, trend debit, midday credit)
+  hands a *premium* proposal to `entry_policy.admit` before the option chain is
+  read (`_admit_premium_entry`), so a refused entry never costs a chain fetch.
+  A premium proposal has no price stop or target: the premium stop / target are
+  set once the contracts are picked and go to `emit`, which builds the signal.
+- **Which direction.** The proposal carries the underlying's MARKET direction,
+  not the order side: a bull call debit is LONG, a bear put debit SHORT (both
+  bought), a bull put credit LONG and a bear call credit SHORT (both sold). The
+  vetoes and score terms therefore read the side the trade needs the underlying
+  to go; `emit` refuses a signal whose `metadata.direction` contradicts it.
+- **Vetoes.** `use_structure_filter` (shipped on; the LTF market structure of
+  the underlying's frame) now vetoes each debit style in the shared stage. It used to sit in
+  `_regime_confirm`, which kept its scoring and the HTF structure-bias veto
+  (`htf_structure_bearish` / `htf_structure_bullish`). The manifest exempts
+  `midday_credit_spread` from the structure veto
+  (`capabilities.shared_entry.exemptions`), because the range regime was never
+  structure-gated. The other vetoes (`use_sr_filter`, `use_opposing_chart_filter`,
+  `use_opposing_candle_filter`, `use_dual_divergence_veto`,
+  `use_broken_level_guard`) ship off here and reach every style when switched on.
+  A refusal is recorded under its shared token, with every blocker listed
+  (`market_structure_bearish(...)`, `too_close_to_htf_resistance(...)`, ...).
+  When the LTF structure disagrees but no style triggers, the decision now reads
+  the style reason (`no_style_trigger`, ...) instead of the structure veto.
+- **Scores and ranking.** The FVG regime term reads `use_fvg_context` through
+  `entry_policy.fvg_regime_scores` (the zero shape when it is off). The signal's
+  own priority is `strategy_priority_score` (`_option_strategy_score`: activity
+  + 100 x the traded regime's score + 40 x its margin over the runner-up), and the
+  manifest ranks on it (`signal_priority.primary_field`, shared weight 0).
+  `final_priority_score` is that plus the shared context score (the FVG entry
+  term with the shipped knobs), for the logs only.
+- **Not here.** No refinement, R:R or stop checks (premium proposals skip
+  them); no divergence-only entries (`capabilities.shared_entry.divergence_entry:
+  false`). The signal is stamped `entry_style_family` `option_debit` /
+  `option_credit`.
 
 ## Files in this folder
 
@@ -249,3 +291,23 @@ exposure from +55% to +36% of budget. Set to 0.0 to disable.
 ends at 15:15, which reads as though force flatten could never fire. It does —
 `cycle_gate._positions_management_actionable` drops the window entirely whenever
 positions are open, so management runs as long as `can_close_position_now` holds.
+
+## Same-level retry block on an option (2026-09-25)
+
+`risk.same_level_block_minutes` blocks a same-direction re-entry near the level
+the last trade on the underlying already tried. For an option signal it now keys
+on the **underlying**: the market direction (`metadata['direction']`, bullish* /
+bearish*) and the underlying's price at entry (`underlying_entry`), measured
+against `same_level_block_atr_mult` x the underlying's ATR at exit. Until then it
+compared the contract's premium (dollars per contract, in $1 steps) with that
+ATR, so it fired only on an exact premium match whatever the underlying did, and
+it matched on the ORDER side, so it blocked a flip between two credit spreads (both
+sold) and missed the same bullish bet through a credit spread and then a debit.
+The fib-pullback override never applies to an option.
+
+The preset ships `same_level_block_minutes: 0` (parity): the old block never
+fired on an option in the archive (0 refusals over 2026-05-18..22), and the
+corrected one at 30 / 0.3 would not have fired either. The 20-minute candidate
+cooldown already covers the underlying in both directions after an exit.
+Setting it back to 30 turns the corrected block on for the first time, a
+go-live decision for a beta dry-run.

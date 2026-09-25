@@ -9,9 +9,25 @@ from ..shared import (
     _safe_float,
     pd,
 )
+from ..shared_entry import EntryProposal
 from ..strategy_base import BaseStrategy
 
 class PairsResidualStrategy(BaseStrategy):
+    """Relative-value entries on the traded leg of a configured pair.
+
+    The z-score of the leg's rolling return residual against its reference
+    picks the side; the leg's own chart then has to carry the trade. One
+    proposal per candidate on the leg's frame (style / family ``pairs``,
+    ``EntryProposal.symbol`` = the leg): a z-score past ``max_zscore_entry``
+    and the exhaustion checks are its pending reasons, the stop / target the
+    ``risk.default_stop_pct`` / ``default_target_pct`` defaults, and every
+    shared_entry knob -- the vetoes, the S/R and technical refinement, the
+    score terms -- is applied by ``self.entry_policy.admit``. With no side
+    ready (below ``zscore_entry``, side or shorts not allowed) the skip is
+    recorded without a proposal. The manifest turns the divergence-only
+    entries off: a pair trade needs its z-score.
+    """
+
     strategy_name = 'pairs_residual'
 
     def required_history_bars(self, symbol: str | None = None, positions: dict[str, Position] | None = None) -> int:
@@ -96,85 +112,73 @@ class PairsResidualStrategy(BaseStrategy):
                     reasons.append("shorts_disabled")
                 else:
                     reasons.append(f"side_preference_blocked({side_pref})")
-            last_close = _safe_float(last["close"])
-            sr_ctx = self._sr_context(symbol, left, data)
-            ms_ctx = self._structure_context(left, "ltf")
-            tech_ctx = self._technical_context(left)
-            htf_ctx = self._default_htf_context_for_score(symbol, data)
             if long_ready:
-                if self._blocks_bullish_structure_entry(ms_ctx):
-                    reasons.append(self._bullish_structure_block_reason(ms_ctx))
-                if not reasons:
-                    last_vwap = _safe_float(last.get("vwap"), last_close)
-                    last_ema9 = _safe_float(last.get("ema9"), last_close)
-                    reasons.extend(self._entry_exhaustion_reasons(Side.LONG, left, close=last_close, vwap=last_vwap, ema9=last_ema9))
-                if not reasons:
-                    stop = last_close * (1.0 - self.config.risk.default_stop_pct)
-                    target = last_close * (1.0 + self.config.risk.default_target_pct)
-                    stop, target = self._refine_bullish_sr_levels(last_close, stop, target, sr_ctx, left)
-                    stop, target = self._refine_bullish_technical_levels(last_close, stop, target, tech_ctx, left)
-                    structure_bonus = 0.75 if getattr(ms_ctx, "bias", "neutral") == "bullish" else 0.0
-                    if bool(getattr(ms_ctx, "bos_up", False)) and self._structure_event_recent(getattr(ms_ctx, "bos_up_age_bars", None)):
-                        structure_bonus += 0.5
-                    adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
-                    fvg_adjustments = self._fvg_entry_adjustment_components(Side.LONG, symbol, left, data)
-                    # Slightly widened runner gate: allow runners up to 1.9x
-                    # the entry threshold when continuation bias is moderate
-                    # (0.20+) and HTF structure agrees. This lets extended
-                    # residual setups run longer without changing the entry
-                    # gate — no new entries, just smarter exits on already-
-                    # selected pairs.
-                    fvg_cont_bias = float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0)
-                    runner_allowed = bool(abs(z) <= (entry_z * 1.9) and fvg_cont_bias >= 0.20 and getattr(ms_ctx, "bias", "neutral") == "bullish")
-                    management = self._adaptive_management_components(Side.LONG, last_close, stop, target, style="pairs", runner_allowed=runner_allowed, continuation_bias=fvg_cont_bias)
-                    final_priority_score = (abs(z) * 100.0) + (float(candidate.activity_score) * 0.25) + structure_bonus + adjustments["entry_context_adjustment"] + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
-                    reason = f"relative_strength_z={z:.2f}"
-                    metadata = self._build_signal_metadata(
-                        entry_price=last_close,
-                        ms_ctx=ms_ctx, sr_ctx=sr_ctx, tech_ctx=tech_ctx,
-                        adjustments=adjustments, fvg_adjustments=fvg_adjustments,
-                        management=management,
-                        final_priority_score=final_priority_score,
-                        leading={"benchmark": reference, "zscore": z, "side_preference": side_pref},
-                    )
-                    out.append(Signal(symbol=symbol, strategy=self.strategy_name, side=Side.LONG, reason=reason, stop_price=stop, target_price=target, reference_symbol=reference, pair_id=f"{symbol}:{reference}", metadata=metadata))
-                    self._record_entry_decision(symbol, "signal", [reason])
-                    continue
+                side = Side.LONG
             elif short_ready:
-                if self._blocks_bearish_structure_entry(ms_ctx):
-                    reasons.append(self._bearish_structure_block_reason(ms_ctx))
-                if not reasons:
-                    last_vwap = _safe_float(last.get("vwap"), last_close)
-                    last_ema9 = _safe_float(last.get("ema9"), last_close)
-                    reasons.extend(self._entry_exhaustion_reasons(Side.SHORT, left, close=last_close, vwap=last_vwap, ema9=last_ema9))
-                if not reasons:
-                    stop = last_close * (1.0 + self.config.risk.default_stop_pct)
-                    target = last_close * (1.0 - self.config.risk.default_target_pct)
-                    stop, target = self._refine_bearish_sr_levels(last_close, stop, target, sr_ctx, left)
-                    stop, target = self._refine_bearish_technical_levels(last_close, stop, target, tech_ctx, left)
-                    structure_bonus = 0.75 if getattr(ms_ctx, "bias", "neutral") == "bearish" else 0.0
-                    if bool(getattr(ms_ctx, "bos_down", False)) and self._structure_event_recent(getattr(ms_ctx, "bos_down_age_bars", None)):
-                        structure_bonus += 0.5
-                    adjustments = self._entry_adjustment_components(Side.SHORT, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
-                    fvg_adjustments = self._fvg_entry_adjustment_components(Side.SHORT, symbol, left, data)
-                    # Symmetric SHORT-side runner widening (see LONG branch above).
-                    fvg_cont_bias = float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0)
-                    runner_allowed = bool(abs(z) <= (entry_z * 1.9) and fvg_cont_bias >= 0.20 and getattr(ms_ctx, "bias", "neutral") == "bearish")
-                    management = self._adaptive_management_components(Side.SHORT, last_close, stop, target, style="pairs", runner_allowed=runner_allowed, continuation_bias=fvg_cont_bias)
-                    final_priority_score = (abs(z) * 100.0) + (float(candidate.activity_score) * 0.25) + structure_bonus + adjustments["entry_context_adjustment"] + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
-                    reason = f"relative_weakness_z={z:.2f}"
-                    metadata = self._build_signal_metadata(
-                        entry_price=last_close,
-                        ms_ctx=ms_ctx, sr_ctx=sr_ctx, tech_ctx=tech_ctx,
-                        adjustments=adjustments, fvg_adjustments=fvg_adjustments,
-                        management=management,
-                        final_priority_score=final_priority_score,
-                        leading={"benchmark": reference, "zscore": z, "side_preference": side_pref},
-                    )
-                    out.append(Signal(symbol=symbol, strategy=self.strategy_name, side=Side.SHORT, reason=reason, stop_price=stop, target_price=target, reference_symbol=reference, pair_id=f"{symbol}:{reference}", metadata=metadata))
-                    self._record_entry_decision(symbol, "signal", [reason])
-                    continue
-            self._record_entry_decision(symbol, "skipped", reasons)
+                side = Side.SHORT
+            else:
+                self._record_entry_decision(symbol, "skipped", reasons)
+                continue
+            long = side == Side.LONG
+            last_close = _safe_float(last["close"])
+            reasons.extend(self._entry_exhaustion_reasons(
+                side, left, close=last_close,
+                vwap=_safe_float(last.get("vwap"), last_close), ema9=_safe_float(last.get("ema9"), last_close),
+            ))
+            stop_pct = self.config.risk.default_stop_pct
+            target_pct = self.config.risk.default_target_pct
+            proposal = EntryProposal(
+                candidate=candidate,
+                direction=side,
+                style="pairs",
+                style_family="pairs",
+                close=last_close,
+                stop=last_close * (1.0 - stop_pct) if long else last_close * (1.0 + stop_pct),
+                target=last_close * (1.0 + target_pct) if long else last_close * (1.0 - target_pct),
+                gate_frame=left,
+                sr_frame=left,
+                level_frame=left,
+                data=data,
+                pending_reasons=tuple(reasons),
+                symbol=symbol,
+            )
+            admitted = self.entry_policy.admit(proposal)
+            if admitted is None:
+                refusal = self._consume_build_failure_payload(symbol, proposal.style)
+                self._record_entry_decision(symbol, "skipped", refusal["reasons"])
+                continue
+            ms_ctx = admitted.ms
+            trend = "bullish" if long else "bearish"
+            structure_bonus = 0.75 if getattr(ms_ctx, "bias", "neutral") == trend else 0.0
+            bos, bos_age = ("bos_up", "bos_up_age_bars") if long else ("bos_down", "bos_down_age_bars")
+            if bool(getattr(ms_ctx, bos, False)) and self._structure_event_recent(getattr(ms_ctx, bos_age, None)):
+                structure_bonus += 0.5
+            # Slightly widened runner gate: allow runners up to 1.9x
+            # the entry threshold when continuation bias is moderate
+            # (0.20+) and HTF structure agrees. This lets extended
+            # residual setups run longer without changing the entry
+            # gate — no new entries, just smarter exits on already-
+            # selected pairs.
+            fvg_cont_bias = float(admitted.fvg["fvg_continuation_bias"])
+            runner_allowed = bool(abs(z) <= (entry_z * 1.9) and fvg_cont_bias >= 0.20 and getattr(ms_ctx, "bias", "neutral") == trend)
+            management = self._adaptive_management_components(side, last_close, admitted.stop, admitted.target, style="pairs", runner_allowed=runner_allowed, continuation_bias=fvg_cont_bias)
+            # final_priority_score = this + the shared context score (emit),
+            # the same total as before 2026-09-24.
+            strategy_score = (abs(z) * 100.0) + (float(candidate.activity_score) * 0.25) + structure_bonus
+            reason = f"relative_strength_z={z:.2f}" if long else f"relative_weakness_z={z:.2f}"
+            out.append(
+                self.entry_policy.emit(
+                    admitted,
+                    reason=reason,
+                    strategy_score=strategy_score,
+                    management=management,
+                    target=admitted.target,
+                    metadata={"benchmark": reference, "zscore": z, "side_preference": side_pref},
+                    reference_symbol=reference,
+                    pair_id=f"{symbol}:{reference}",
+                )
+            )
+            self._record_entry_decision(symbol, "signal", [reason])
         return out
 
     def should_force_flatten(self, position: Position) -> bool:

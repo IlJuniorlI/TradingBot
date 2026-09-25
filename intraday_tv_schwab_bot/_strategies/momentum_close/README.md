@@ -32,41 +32,32 @@ This is a true **continuation** model, not a dip-buying model.
 
 ### 3. It actively tries not to chase bad breakouts
 
-A big part of the strategy is not the breakout itself, but the quality control around it:
+A big part of the strategy is not the breakout itself, but the quality control around it. The anti-chase exhaustion checks (extension from VWAP / EMA9 in ATR, upper-wick rejection, an oversized expansion bar) join the setup's own blockers above as the pending reasons of one LONG proposal (style and family `momentum`), which the strategy hands to the shared entry stage (`_strategies/shared_entry.py`). There:
 
-- anti-chase exhaustion checks
-- wick / expansion-bar checks
-- optional FVG retest deferment logic
-- divergence checks from the technical layer
-- opposing chart-pattern filter
+- an FVG retest of the breakout level (`use_fvg_context`, the `anti_chase_fvg_retest_*` knobs) can clear the not-yet-broken and stretched reasons; the entry then comes in as `smallcap_breakout_fvg_retest`
+- every `shared_entry` veto the preset switches on applies, also to a retest entry: market structure, support/resistance, broken level, opposing chart pattern, dual RSI+OBV counter-divergence, opposing candle cluster
+
+A skipped candidate's decision lists every blocker, the strategy's own first. Until 2026-09-24 the strategy called these itself: the chart filter ran only while nothing else was pending (so an entry the retest admitted never met it), structure and S/R were an either/or, and the candle veto and the broken-level guard never reached it.
 
 So if the breakout is already stretched, messy, or too one-sided, the strategy can defer or block it instead of blindly buying the push.
 
 ### 4. If the setup is valid, it anchors the trade to breakout structure
 
-The initial stop comes from a mix of:
+The initial stop sits under the recent swing low (8% of ATR below it), never wider than `risk.default_stop_pct`; the initial target is `risk.default_target_pct` away. The shared stage then refines both (support/resistance, then technical levels, bounded by `min_target_rr` and `min_stop_atr_mult`). On a retest entry it pulls the stop to the retest zone's anchor, held at least `min_stop_atr_mult` ATR from entry (since 2026-09-24; the anchor used to bypass that floor).
 
-- recent breakout structure lows
-- the default stop framework
-- optional FVG retest anchoring if the setup is being treated as a better-quality retest entry
-
-The initial target starts from the default target framework, then gets refined by:
-
-- support/resistance
-- technical levels
-- FVG context
-- adaptive management metadata
+Adaptive management runs in the `momentum` style. The runner needs an FVG continuation bias of at least 0.35 plus a bullish continuation pattern or bullish structure.
 
 ### 5. Signal strength and management
 
-The signal-strength score is built from:
+The strategy's own priority (`strategy_priority_score`) is built from:
 
 - the original screener score
 - recent momentum (`ret15`)
 - how far the breakout is past the trigger
 - structure bonuses
 - chart-pattern bonuses
-- shared context adjustments
+
+The shared context terms (technical, S/R proximity, HTF divergence, FVG) are added on top (`shared_context_score`); their sum is the `final_priority_score` the gatekeeper ranks on. The signal is stamped `entry_style_family: momentum`.
 
 That means the strategy prefers **clean, expanding breakouts** over marginal ones that barely poke above the level.
 

@@ -119,6 +119,39 @@ class Signal:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class ExitDecision:
+    """What the exit pipeline decided for one position this cycle.
+
+    ``family`` names who decided -- ``risk`` (stop / target / trail /
+    peak-giveback), a shared exit family (``time_stop``, ``chart_pattern``,
+    ``structure_choch``, ...), ``strategy`` (a strategy's own
+    ``strategy_exit_signal``), ``divergence_partial`` or ``force_flatten``.
+    ``fraction`` is the share of the CURRENT quantity to close; below 1.0 it
+    is a scale-out, which the position manager sizes with a floor and holds
+    when that rounds to zero units. ``marker`` is the one-shot record the
+    manager appends to ``metadata['<family>_exits']`` once the slice books,
+    so the same trigger cannot scale the position out on every cycle.
+
+    Until 2026-09-24 exits were a ``(should_exit, reason)`` tuple and every
+    exit closed the whole position, so a partial-close decision had no way
+    to be expressed.
+    """
+
+    reason: str
+    family: str
+    fraction: float = 1.0
+    marker: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if not 0.0 < float(self.fraction) <= 1.0:
+            raise ValueError(f"ExitDecision.fraction must be in (0, 1], got {self.fraction!r} ({self.reason})")
+
+    @property
+    def is_partial(self) -> bool:
+        return self.fraction < 1.0
+
+
 @dataclass(slots=True)
 class PairDefinition:
     symbol: str

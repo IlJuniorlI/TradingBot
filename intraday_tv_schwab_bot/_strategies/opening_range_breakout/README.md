@@ -39,27 +39,24 @@ So the entry is not just “price touched OR high.” It is **breakout plus dire
 
 ### 4. It uses anti-chase logic heavily
 
-Because ORB setups can get crowded fast, the strategy runs them through several quality filters:
+Because ORB setups can get crowded fast, the anti-chase exhaustion checks (extension from VWAP / EMA9 in ATR, upper-wick rejection, an oversized expansion bar) join the setup's own blockers as the pending reasons of one LONG proposal (style and family `orb`), which the strategy hands to the shared entry stage (`_strategies/shared_entry.py`). There:
 
-- opposing chart-pattern filter
-- FVG retest deferment logic
-- exhaustion / extension checks
-- divergence checks
-- 1-minute structure filter
-- support/resistance veto
+- an FVG retest of the opening-range trigger (`use_fvg_context`, the `anti_chase_fvg_retest_*` knobs) can clear the not-yet-broken and stretched reasons; the entry then comes in as `smallcap_orb_fvg_retest`
+- every `shared_entry` veto the preset switches on applies, also to a retest entry: market structure (1-minute), support/resistance, broken level, opposing chart pattern, dual RSI+OBV counter-divergence, opposing candle cluster
+
+A skipped candidate's decision lists every blocker, the strategy's own first. Until 2026-09-24 the strategy called these itself: the chart filter ran only while nothing else was pending (so an entry the retest admitted never met it), structure and S/R were an either/or, and the candle veto and the broken-level guard never reached it.
 
 This is one of the main reasons an apparent ORB can still be skipped: the code is trying to separate clean opening expansion from low-quality chasing.
 
 ### 5. How the trade is framed
 
-The opening-range low is the natural initial stop anchor. The first target starts from a reward-to-risk projection off the breakout. Then the strategy refines stop and target using:
+The opening-range low is the initial stop. The first target is a 2.0R measured move off the entry, 2.5R when the break is more than 1.5% past the trigger and the 1-minute structure is bullish. The shared stage then refines both (support/resistance, then technical levels, bounded by `min_target_rr` and `min_stop_atr_mult`); on a retest entry it pulls the stop to the retest zone's anchor, held at least `min_stop_atr_mult` ATR from entry (since 2026-09-24; the anchor used to bypass that floor).
 
-- support/resistance
-- technical levels
-- FVG context
-- adaptive management metadata
+Adaptive management runs in the `breakout` style. If the FVG continuation bias is at least 0.35 and a bullish continuation pattern or bullish structure agrees, the trade is also marked for runner-style management.
 
-If the FVG continuation context is strong enough, the strategy can also mark the trade as a better candidate for runner-style management.
+The strategy's own priority (`strategy_priority_score`: screener score, break distance past the trigger, structure and pattern bonuses) plus the shared context terms (`shared_context_score`) is the `final_priority_score` the gatekeeper ranks on.
+
+The signal is stamped `entry_style_family: orb`, which puts the position under the exit side's ORB grace (`support_resistance.orb_entry_exit_grace_minutes`: the structure exits hold for the first minutes of the trade). Until 2026-09-24 that grace covered only top_tier's ORB regime.
 
 ### 6. What a good setup looks like
 

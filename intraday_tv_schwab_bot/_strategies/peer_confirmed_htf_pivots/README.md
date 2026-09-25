@@ -66,28 +66,24 @@ After the pivot-family logic, the strategy still requires:
 
 That keeps it from taking a pivot setup just because the single chart looks good. The broader neighborhood still has to support the idea.
 
-### 6. It still uses shared anti-chase and veto logic
+### 6. Its own blockers, then the shared entry stage
 
-Even after the family is chosen, the trade can still be blocked by:
+Even after the family is chosen, the trade can still be blocked by its own gates:
 
 - trigger-quality thresholds
 - total-score thresholds
-- pivot-distance rules
+- pivot-distance and zone-flip rules
 - exhaustion / extension checks
-- structure vetoes
-- optional S/R vetoes
-- FVG context rules
+
+Since 2026-09-24 those blockers go, with the proposed stop and target, to the shared entry stage (`shared_entry.SharedEntryPolicy`), like every strategy's setup. It refuses on them and on every `shared_entry` veto the YAML switches on in one pass — structure (`use_structure_filter`; the manifest exempts `pivot_rejection`, `capabilities.shared_entry.exemptions`), S/R (`use_sr_filter`, which replaced this strategy's `use_sr_veto` param), chart, candle, dual divergence, broken level — and records every blocker under the side's key with the gate snapshots and the near-miss payload. The vetoes and the structure / technical / chart / candle contexts read the 5m trigger frame; S/R is built on the 1m frame. So the refinement's stop floor (`shared_entry.min_stop_atr_mult`) is in 5m ATR, while the broken-level guard's `broken_level_min_clearance_atr` and the divergence entry candidates read the 1m S/R frame, the frame top_tier's thresholds were set on (a 1m ATR is roughly half a 5m one).
 
 That is why this strategy can be aggressive around pivots without turning into a blind breakout-chase system.
 
 ### 7. How the trade is framed
 
-The stop is anchored to the chosen support / resistance battleground with ATR buffering. The first target now starts from the **next opposing S/R level** when that gives enough room, and only falls back to reward-to-risk expansion logic when needed. It can then be refined by:
+The stop is anchored to the chosen support / resistance battleground with ATR buffering. The first target now starts from the **next opposing S/R level** when that gives enough room, and only falls back to reward-to-risk expansion logic when needed. The shared entry stage can then refine both (`shared_entry.use_sr_stop_target_refinement` / `use_technical_stop_target_refinement`), and the management reads the refined levels and the FVG term's continuation bias; the runner still keys on the strategy's own total score.
 
-- support/resistance
-- technical levels
-- FVG context
-- adaptive / runner management
+The signal carries `regime` = the pivot family (`pivot_reclaim` / `pivot_rejection` / `pivot_continuation`), `entry_style_family: pivot`, the structure fields as `msltf_*` (`ms_ltf_*` until 2026-09-24), `strategy_priority_score` (the total score plus the activity term), `shared_context_score` (the FVG and HTF divergence terms — the latter on this family's 60m context — plus any entry-context term the YAML switches on) and `final_priority_score` = the two added. `selection_quality_score` equals `final_priority_score`, as before; the gatekeeper ranks on `ltf_score + 0.5 × shared_context_score` (manifest `signal_priority.shared_score_weight`, user decision 3), then the manifest's tail.
 
 So the pivot is not just an entry reference. It is also the core anchor for the trade’s risk structure.
 
@@ -139,13 +135,13 @@ Strategy-specific knobs:
   - `min_ltf_close_position`, `min_ltf_volume_ratio`, `min_adx14`
   - `max_reclaim_distance_from_pivot_atr`, `max_rejection_distance_from_pivot_atr`, `max_continuation_distance_from_pivot_atr`
   - `entry_exhaustion_filter_enabled`, `max_entry_vwap_extension_atr`, `max_entry_ema9_extension_atr`, `max_entry_bar_range_atr`, `max_entry_upper_wick_frac`, `max_entry_lower_wick_frac`
-  - `use_sr_veto` (disabled by default so the strategy stays anchored to the HTF pivot model rather than generic S/R vetoes)
+  - the S/R veto is `shared_entry.use_sr_filter` (off in the preset, so the strategy stays anchored to the HTF pivot model); `use_sr_veto` was retired on 2026-09-24 and a preset still carrying it fails at load
 - R:R and adaptive management:
   - `min_rr`, `target_rr`, `stop_buffer_atr_mult`
   - `strong_setup_runner_enabled`, `adaptive_breakeven_rr`, `adaptive_profit_lock_rr`, `adaptive_profit_lock_stop_rr`, `adaptive_runner_trigger_rr`
 - Screener shaping:
   - `screener_contrarian_bias_threshold_pct`, `screener_activity_move_sweet_spot_pct`, `screener_activity_move_cap_pct`, `screener_relative_volume_cap`
-- Context overlays — fair-value-gap (FVG) entry adjustment knobs (read by `strategy_base._fvg_entry_adjustment_components`, gated by `shared_entry.use_fvg_context`). All shipped per-strategy in this strategy's `manifest.json`:
+- Context overlays — fair-value-gap (FVG) entry adjustment knobs (read by the shared entry stage, `shared_entry.SharedEntryPolicy._fvg_entry_adjustment_components`, gated by `shared_entry.use_fvg_context`). All shipped per-strategy in this strategy's `manifest.json`:
   - `htf_fvg_entry_weight`, `ltf_fvg_entry_weight` — multipliers applied to the HTF and 1-minute FVG bull/bear scores when computing the entry adjustment.
   - `opposing_fvg_entry_penalty_mult` — multiplier on the opposing-direction FVG penalty (1.0 = full penalty; lower = more tolerant of trades against an active gap).
   - `fvg_runner_rr_bonus` — extra R:R credit when the trade direction aligns with a same-direction continuation FVG.
@@ -186,7 +182,6 @@ Current package defaults:
 | `min_peer_score`                               | `2`                                             |
 | `enable_macro_confirmation`                    | `true`                                          |
 | `require_macro_agreement_count`                | `1`                                             |
-| `use_sr_veto`                                  | `false`                                         |
 | `dollar_symbol`                                | `NYICDX`                                        |
 | `bond_symbol`                                  | `TLT`                                           |
 | `volatility_symbol`                            | `VIX`                                           |

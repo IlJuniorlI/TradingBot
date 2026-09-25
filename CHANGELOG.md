@@ -9,6 +9,1106 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The `shared_entry` and `shared_exit` knobs are global: one entry stage
+  and one exit policy for every strategy.** *2026-09-24* — every shared knob
+  now acts on every strategy whose preset sets it, and no strategy has to
+  call anything to get it.
+
+  Until now each strategy called the knob helpers it chose to, so most knobs
+  did nothing for most strategies. `peer_confirmed_key_levels` reached three
+  of them. The reversal strategies never met the dual-divergence veto, and
+  only `top_tier_adaptive` met the candle filter. `microcap_pm_breakout` and
+  both 0DTE strategies never met a score term. Several strategies had
+  re-implemented a knob under a param of their own, and a
+  `strategy_logic_default` hook let any strategy rewrite any knob. On the
+  exit side, the peer family's `position_exit_signal` override silently
+  dropped the time stop and five exit families whatever the YAML said.
+
+  **Entries: `_strategies/shared_entry.py`.** `SharedEntryPolicy`, built by
+  `BaseStrategy.__init__` as `self.entry_policy`, is the only reader of
+  `config.shared_entry`. A strategy keeps its setup logic, alternatives and
+  selection. For each alternative it builds an `EntryProposal`: the market
+  direction, style, style family, close, stop and target, the frame each
+  read is pinned to, its own blockers as pending reasons, and an optional
+  FVG / order-block `RetestTrigger`. It hands the proposal to `admit`, which
+  runs, in order:
+  - the raw R:R gate a builder asks for;
+  - the contexts on the pinned frames;
+  - the retest admission;
+  - every switched-on veto in `VETO_GATES` order (structure, S/R, broken
+    level, chart, dual divergence, candle), minus any the manifest exempts
+    for the style. All of them are evaluated, so a refusal lists every
+    blocker;
+  - the S/R then the technical refinement, and the retest stop anchor;
+  - the score terms and the optional `min_shared_context_score` floor.
+
+  `emit` builds the `Signal` from the admitted levels. It is the only
+  `Signal(...)` in the code base. It stamps `entry_style_family`, `regime`,
+  `strategy_priority_score`, `shared_context_score`, `final_priority_score`
+  (their sum), `entry_price` and the `shared_entry_*` fields. `rank_key`
+  ranks the gatekeeper's signals, and `divergence_entries` builds the opt-in
+  divergence-only entries.
+
+  **Exits: `_strategies/shared_exit.py`.** `SharedExitPolicy`, owned by the
+  position manager, is the only reader of `config.shared_exit`. Each cycle
+  it runs, in order:
+  - the shared families in `EXIT_FAMILY_GATES` order: time stop, chart
+    pattern, candle pattern, CHoCH, bias structure, technical, S/R loss.
+    Each family sits behind one table row of gates (R gate, hold grace, ORB
+    grace, post-entry pivots, post-entry event, bar range, tape) instead of
+    a 240-line method;
+  - the strategy's own `strategy_exit_signal` hook (the peer ladder
+    defence, the microcap blowoff guard);
+  - the divergence scale-out, last so any full exit wins.
+
+  Exits are `models.ExitDecision(reason, family, fraction, marker)`.
+
+  **A strategy's only say is declarative**, in its manifest, validated at
+  load:
+  - `capabilities.shared_entry`: `exemptions: {style: [gates]}` and
+    `divergence_entry: false`;
+  - `capabilities.signal_priority`: `primary_field`, `shared_score_weight`,
+    `rank_unit_field`, `metadata_fields`.
+
+  Shipped exemptions: top_tier / small_cap_squeeze `{orb: [structure, sr]}`,
+  htf_pivots `{pivot_rejection: [structure]}`, and zero_dte_etf_options
+  `{midday_credit_spread: [structure]}`. 2026-09-25 added range / pullback /
+  sr_scalp (structure) to both top_tier-engine manifests and vwap_reclaim
+  (S/R) to top_tier's (see Changed). Divergence-only entries are off for
+  pairs_residual and both 0DTE strategies.
+
+  **Enforced by tests.** `tests/test_shared_knob_contract.py` (256) fails any
+  module that:
+  - reads either section outside the two policies;
+  - constructs a `Signal` or `AdmittedEntry`;
+  - uses a helper that moved into the policy;
+  - rewrites what `emit` built (`dataclasses.replace`, assigning
+    `.stop_price` / `.target_price`);
+  - reaches into the policy's privates.
+
+  `BaseStrategy.__init_subclass__` raises `TypeError` for
+  `position_exit_signal`, `shared_exit_signal`, `strategy_logic_default` and
+  `signal_priority_key`. `tests/test_knob_reach_matrix.py` (425) switches
+  every veto, the score floor, the five score terms, both refinements and
+  every exit family on and off for all 17 strategies, and runs a
+  divergence-only entry end to end through every capable one. Per-area tests:
+  - `test_shared_entry_policy.py` (144) and `test_shared_exit_policy.py` (89);
+  - `test_partial_exit.py` (38) and `test_divergence_session_age.py` (46);
+  - `test_peer_shared_entry.py` (65), `test_breakout_conversions.py` (133),
+    `test_shared_entry_microcap_pairs.py` (67) and
+    `test_zero_dte_shared_entry.py` (41);
+  - `test_preset_parity.py` (68).
+
+  The rank order is pinned against the real pre-change ranker
+  (`tests/fixtures/rank_golden/`). Full suite: 4146 passed.
+
+  **Replayed against the pre-change tree**, per strategy family. Every
+  difference found is one of the intended changes below:
+  - top_tier: 0 decision changes; 324 refusals record a different primary
+    reason.
+  - Breakout family: every decision difference over 3,800 runs is an
+    intended one (the chart veto on retest-admitted entries, the anchor
+    re-clamp, the vol_squeeze tier).
+  - Peers: identical once the divergence clock is held fixed.
+  - 0DTE: 0 unexplained differences over 10,080 decisions.
+
+  Docs: the root README's `shared_entry` / `shared_exit` sections (every
+  knob, the stage order, the ranking, a per-strategy wiring table),
+  `_strategies/README.md` (the author contract) and
+  `configs/README_PRESETS.md` (the preset matrix).
+
+- **Partial closes.** *2026-09-24* — an exit decision can close part of a
+  position. `ExitDecision.fraction` below 1 is a scale-out of the current
+  quantity:
+  - The position manager sizes the slice with a floor
+    (`shared_exit.partial_exit_qty`). A 1-lot option or 1-share position
+    cannot scale out, so the trigger is spent without an order. The product
+    is rounded to 9 places before the floor, so 100 x 0.29 closes 29, not
+    28.
+  - It cancels a resting broker bracket first, then sends
+    `execution.close_position(position, qty)`. `qty` is now required; the
+    method always sent the whole quantity before.
+  - It books the slice as a partial leg (`per_partial_exit_reason` in the
+    session report).
+  - It re-protects the remainder at the broker at the current engine
+    levels: at once when the slice books, and in full when the slice never
+    reached the broker (a rejected submit, a stale quote), since nothing of
+    it can fill. One that reached the broker with no order id to track may
+    still fill, so the engine stop keeps owning that position.
+  - A slice left working at the broker (a halt, an unconfirmed cancel):
+    the shares it does not cover are re-protected at once, and everything
+    still held once it settles. The re-protect adopts and resizes a live
+    bracket (the one placed beside the slice, or the one a restart put on
+    the position; since 2026-09-25 a restart sizes that one to the shares
+    outside the slice, see Fixed) instead of stacking a second OCO on it.
+    While the slice works, the engine still runs its risk check on the
+    shares outside it; a risk exit cancels the slice, and the cycle that
+    settles it sends the full exit. Before, the position was skipped until
+    the slice settled, and settled without re-protecting the remainder,
+    which then had no broker bracket for the rest of the trade.
+  - A full exit that part-fills with its cancel unconfirmed and then dies
+    re-protects what it left the same way. Before, that remainder had no
+    broker bracket unless the family that decided the exit fired again.
+  - It records the decision's one-shot marker in
+    `metadata['<family>_exits']`.
+
+  Force flatten turns a pending scale-out into a full exit. The divergence
+  scale-out is the only shipped user, and it is off in every preset.
+
+- **Divergence entries and the divergence scale-out are wired centrally,
+  and ship off.** *2026-09-24* — the opt-in divergence triggers were helpers
+  no strategy called, so `use_divergence_entry_signal` and
+  `use_divergence_exit_signal` did nothing. Both now run for every strategy
+  when switched on; both are `false` in every preset.
+
+  **Entry side.**
+  - The stage reads one candidate per side, once per symbol per cycle. A
+    candidate on a proposal's own side adds `divergence_entry_score_bump`;
+    one only on the other side is stamped as a conflict. Before, only the
+    better side was kept, so a SHORT the strategy could not take hid a
+    valid LONG.
+  - A symbol the strategy produced no signal for may take a divergence-only
+    entry, which passes every veto, the refinement and the score floor and
+    always ranks behind every strategy signal (`rank_key` tier 0).
+  - It never opens a symbol the strategy skipped before evaluating a setup.
+    `shared_entry.DIVERGENCE_INELIGIBLE_REASONS` lists those tokens: not its
+    symbol, outside its window, too few bars (`insufficient_*`), top_tier's
+    macro / earnings blackouts, `shorts_disabled`, and the relative-strength
+    sector skips.
+  - The candidate's latest pivot must be in the reader's current session.
+    With the new session clock, yesterday's closing divergences are young at
+    09:30, and a stop anchored across the gap is not a structural stop.
+    Recency is 1 - age / max age instead of / 8, OBV divergences are read,
+    and a hidden divergence needs the HTF EMAs aligned.
+  - The stop buffer is `support_resistance.stop_buffer_atr_mult`; it was read
+    from a `technical_levels` key that does not exist. A capped target must
+    still clear `min_target_rr`.
+  - pairs_residual and both 0DTE strategies opt out in their manifests.
+    `microcap_pm_breakout` stays capable, which its README documents.
+
+  **Exit side.** The latest pivot must have closed after the entry: a
+  divergence already on the chart when the trade was taken used to scale it
+  out on its first in-profit cycle. It fires once per divergence pivot,
+  whichever indicator saw it. RSI and OBV share their price pivots, so the
+  old per-indicator key closed 75% of the position at the default fraction.
+  "Counter" is judged against the trade's market direction, so a bull put
+  spread watches for a bearish divergence.
+
+- **New config surface.** *2026-09-24*
+  - `shared_entry.use_broken_level_guard` (default and every preset `false`),
+    with `broken_level_min_clearance_pct` (0.0025) and
+    `broken_level_min_clearance_atr` (0.72), moved from top_tier (see
+    Changed).
+  - `shared_entry.min_shared_context_score` (default `null`): an optional
+    floor on an entry's shared score, refused as `shared_context_below_min`.
+  - `shared_entry.min_target_rr` / `min_stop_atr_mult` accept `null`, and `0`
+    now switches them off; a configured `0` used to read as the default.
+  - `technical_levels.htf_divergence_max_age_bars` (default 6; see Changed).
+  - `peer_confirmed_key_levels` / `_1m` param `require_peer_target_clearance`
+    (default `true`).
+  - Manifest `capabilities.shared_entry` and `capabilities.signal_priority`
+    (`shared_score_weight`, `rank_unit_field`).
+
+- **The audit logs keep the shared stamps.** *2026-09-24* —
+  `EntryGatekeeper.structured_metadata_snapshot` now keeps
+  `entry_style_family`, `strategy_priority_score`, `shared_context_score`,
+  `entry_context_adjustment`, `technical_entry_adjustment` and
+  `entry_source`, and the `shared_entry_*`, `divergence_entry_*` and
+  `anti_chase_ob_retest_*` prefixes, so `events.jsonl` can answer which
+  gates ran, which were exempt and what the shared score was.
+
+### Changed
+
+- **What the shared stage changed, per strategy family.** *2026-09-24*
+
+  **top_tier_adaptive / small_cap_squeeze** (small_cap subclasses top_tier)
+  - `_finalize_signal` keeps top_tier's own gates in their order: Fix D,
+    stretched / technical bias, ORB 5m follow-through, HTF bias / pivot, HTF
+    EMA, and the ORB opposing-level block, now keyed on `regime == "orb"`.
+    It then proposes with style = family = the regime.
+  - The refusal payload carries every blocker, but top_tier's decision log
+    still records one reason per (side, regime) attempt. Only the recorded
+    primary can differ from before: the raw R:R gates and the broken-level
+    guard now report after top_tier's own gates, the candle veto before the
+    exhaustion check, and the ORB opposing block reports its own token
+    (`long_orb_opposing_resistance_within_<mult>atr`).
+  - The raw R:R gates moved into `admit`: `orb_measured_move_exhausted`, and
+    `stop_floor_kills_rr` when sr_scalp's floor widened the stop. The
+    sr_scalp token lost `bound_by=` / `pierce_atr=` / `rr=`.
+  - The chart veto now reaches top_tier and is on in its preset (a flip,
+    below). The dual-divergence and candle vetoes are honoured (off in both
+    presets).
+  - The ORB structure / S/R bypass is the manifest exemption, keyed on the
+    regime rather than the window clock. It is inert in both presets
+    (`disable_orb_regime: true`).
+  - A refined stop on the wrong side of entry is refused by `admit`
+    (`stop_on_wrong_side`) instead of by the gatekeeper.
+  - New stamps: `entry_style_family` (the regime) and `regime_rank_unit`.
+    `orb_window_entry` is now "family is orb".
+
+  **Peers**
+  - `peer_confirmed_key_levels` / `_1m` gate on their LTF (5m; 1m for
+    `_1m`), build S/R on the 1m frame, and score FVGs on the 1m frame as
+    before (`zone_frame`).
+  - key_levels' AND target clearance is now `require_peer_target_clearance`
+    (true), no longer riding on `use_sr_filter`.
+  - The key_levels ladder is re-qualified at `min_rr` from the refined stop
+    and capped at the refined target. New refusal token:
+    `no_qualifying_target_rr_after_refine:<rr>`. With both refinements off,
+    as in the parity presets, the ladder is unchanged.
+  - key_levels builds structure / technical / chart / candle contexts on its
+    5m LTF, which it never built before.
+  - `peer_confirmed_htf_pivots` / `_trend_continuation` gate on their 5m LTF
+    with S/R on the 1m frame. Their structure fields are `msltf_*` (were
+    `ms_ltf_*`). htf_pivots' `pivot_rejection` exemption from the structure
+    veto is now the manifest's, and it builds its 60m HTF context before
+    `admit` for every evaluated side.
+  - All four record every blocker of a refusal, shared vetoes included.
+  - Stamps: `regime` `key_level` / the pivot family / `trend_continuation`;
+    families `peer` / `pivot` / `continuation` (no exit grace).
+  - The peers now meet every exit family their YAML switches on; the presets
+    keep what the old override ran (see the preset bullet). The ladder
+    defence moved to `strategy_exit_signal`.
+
+  **momentum_close, opening_range_breakout, microcap_gap_orb,
+  rth_trend_pullback, volatility_squeeze_breakout**
+  - Their own blockers and the anti-chase exhaustion checks are one
+    proposal's pending reasons. One FVG-retest pass over the union replaces
+    the two old passes.
+  - Every veto the preset switches on runs; structure and S/R are no longer
+    an either/or. The candle veto and the broken-level guard now reach them
+    (off in their presets).
+  - The chart veto now also meets a retest-admitted entry. It used to run
+    only while nothing else was pending, and in the replay 6 rth and 3
+    vol_squeeze signals are now refused with `chart_pattern_opposed`.
+  - The retest stop anchor is re-clamped by `min_stop_atr_mult`: 20 / 31 /
+    31 / 100 / 31 replayed signals got a wider stop, with target, reason and
+    score unchanged.
+  - `volatility_squeeze_breakout`'s `squeeze_tier_label` /
+    `squeeze_effective_target_rr` describe the admitted target, in units of
+    the proposal's own risk. A capped target drops to the highest tier it
+    still reaches (runner to standard on 85 of 202 replayed signals); this
+    supersedes the 2026-05-14 semantics. Its SHORT is not proposed when
+    `risk.allow_short` is false.
+  - rth_trend_pullback's LONG and SHORT bodies are one side-parametrized
+    path.
+
+  **mean_reversion, closing_reversal** (the reference conversions)
+  - Their own reasons and every veto are recorded together: the chart filter
+    no longer needs "no other reason", and structure / S/R are no longer an
+    elif.
+  - The dual-divergence veto, the candle veto and the broken-level guard
+    reach them (dual off in their parity presets).
+  - `final_priority_score` is unchanged.
+
+  **microcap_pm_breakout**
+  - One LONG proposal, style `pm_breakout`, family `breakout`, on its 1m
+    frame. The decision-1 vetoes judge it: structure, chart, candle and dual
+    divergence, none of which reached it before.
+  - The 2c/3c candle gate is a non-deferrable pending reason. The decision
+    is the same, and the refusal lists every blocker. When it blocks, a
+    waiting / rejecting retest plan's own reason is not in the refusal.
+  - The PMH stop is the proposal's `stop_resolver`, with the shared retest
+    anchor off. The refusal is the plain `stop_above_entry`.
+  - It now stamps `final_priority_score` (activity + shared). It still ranks
+    on `strategy_priority_score` alone.
+
+  **pairs_residual**
+  - Every read is on the traded leg's frame and symbol; the reference is used
+    only for the z-score, `reference_symbol` and `pair_id`.
+  - Every shared veto reaches it when switched on; the preset keeps only
+    structure, as before. The exhaustion checks always run for the ready
+    side, and every blocker is recorded.
+  - Divergence-only entries are off in the manifest.
+  - `final_priority_score` is unchanged.
+
+  **zero_dte_etf_options / zero_dte_etf_long_options**
+  - Every style is admitted as a PREMIUM proposal, in the underlying's
+    market direction (a bull put credit is LONG), before the chain is read.
+    `emit` refuses an option whose `metadata['direction']` disagrees.
+  - ZO's LTF structure veto moved from `_regime_confirm` into the stage, per
+    style; `midday_credit_spread` is exempt through the manifest. Signals
+    are unchanged. When no style fires, the logged reason is now the
+    style's own instead of `market_structure_*`.
+  - ZO's regime FVG term reads `use_fvg_context` through
+    `entry_policy.fvg_regime_scores`. `_attach_option_final_priority_score`,
+    which rewrote the signal with `replace`, is gone. Its score is emit's
+    `strategy_priority_score` and the rank primary.
+  - ZL's ORB path meets `use_structure_filter` / `use_sr_filter` (both on)
+    instead of `orb_apply_*_veto`. Its tokens lose the `orb_long_option_`
+    prefix, and structure and S/R are recorded together; it is no longer an
+    elif. The trend style's own blockers are recorded before the shared
+    vetoes.
+  - Both loops record every blocker of a style's refusal. Families:
+    `option_debit` / `option_credit` / `option_long`.
+
+- **Presets: parity first, then three user-decision flips.** *2026-09-24* —
+  with every knob global, a preset that said `true` for a knob its strategy
+  never read would have switched that knob on. Every preset (and
+  `config.example.yaml` / `config.yaml`) was first rewritten to what its
+  strategy EFFECTIVELY ran: a knob it never read is `false`, and a value the
+  peer override forced replaces the YAML's.
+  - The four peers ship `risk.time_stop_minutes: 0` and their structure /
+    chart / candle exits off.
+  - The dual-divergence veto is off where it was never read: top_tier,
+    small_cap_squeeze, mean_reversion, closing_reversal, pairs_residual, the
+    peers and the 0DTE strategies.
+  - `microcap_gap_orb`'s candle veto is off; its old `true` was never read.
+  - The 0DTE presets ship the technical, HTF-divergence and S/R-proximity
+    terms and both refinements off (the FVG term stays on).
+
+  Then three flips, each switching on a veto the strategy never met:
+  - `top_tier_adaptive`: `use_opposing_chart_filter: true`. The chart veto
+    alone blocked 0 (logged) to 2 (rebuilt) of 162 replayed entries, both
+    losers, -2.0R.
+  - `peer_confirmed_key_levels`: `use_structure_filter: true`, and only
+    that. It blocked 6 of 13 entries on the 5m LTF it reads (2 on 1m, 3 in
+    the logged track), and every one with a realized result was a loser.
+  - `microcap_pm_breakout`: structure, chart, candle and dual-divergence
+    vetoes `true`. Together they removed 4 realized trades worth -3.2R (3
+    worth -3.6R after the lookahead correction), all from one session.
+    Every replayed entry was at or after 09:58, so the flip is unmeasured
+    on the premarket entries its 07:00 window mostly takes; the candle veto
+    now abstains on single prints (see Fixed). `use_sr_filter` stays
+    `false`: its OR clearance blocked 40-60% of the strategy's entries with
+    no edge.
+
+  `small_cap_squeeze` and `peer_confirmed_key_levels_1m` stay at parity.
+  `tests/test_preset_parity.py` pins the whole matrix, and
+  `configs/README_PRESETS.md` tabulates it.
+
+- **Signal ranking weighs the shared score: top_tier / small_cap_squeeze
+  1.0, peers 0.5.** *2026-09-24*
+  - One ranker, `SharedEntryPolicy.rank_key`, replaced three: the
+    gatekeeper's generic key, top_tier's `signal_priority_key` override and
+    the peers' manifest tuple. With weights at 0 it reproduces their orders
+    exactly, ties included.
+  - The weights are a user decision. top_tier / small_cap_squeeze rank on
+    `regime_score_normalized + 1.0 x shared_context_score x
+    regime_rank_unit`, where `regime_rank_unit = 1 / (ceiling - floor)` (the
+    floor including a SHORT's premium). A shared point therefore moves a
+    signal exactly as far as a raw regime point.
+  - The peers rank on `ltf_score + 0.5 x shared_context_score`, then their
+    tail; htf_pivots' and trend_continuation's side picks use the same key.
+  - Until now the entry-context and FVG terms only broke near-ties there.
+  - microcap_pm and the 0DTE strategies keep `strategy_priority_score` with
+    weight 0 and no `final_priority_score` tiebreak. Everyone else keeps the
+    default `final_priority_score`, which already contains the shared terms.
+
+- **The ORB and pullback exit graces are global.** *2026-09-24* — they key
+  on the `entry_style_family` the entry stamps, not on `orb_window_entry` /
+  `regime == "pullback"`, which only top_tier stamped.
+  - `opening_range_breakout` and `microcap_gap_orb` entries now get the ORB
+    grace (20 / 25 minutes in their presets).
+  - `rth_trend_pullback` entries get the pullback grace: max(10, 15) = 15
+    minutes in its preset.
+  - A position that was open across the upgrade restart has no
+    `entry_style_family` and gets neither grace. It also loses its recorded
+    MFE / MAE once. Positions are intraday, so this is a clean break with no
+    shim.
+
+- **The broken-level guard is a global knob, and ships off.** *2026-09-24*
+  - top_tier's `reject_entry_near_broken_level` is now
+    `shared_entry.use_broken_level_guard`, a veto every strategy meets when
+    it is switched on. The percent clearance is still scaled by the
+    proposal's volatility scale.
+  - Its thresholds moved to `shared_entry`: 0.0035 / 0.90 in the top_tier
+    preset and 0.0025 / 0.72 in small_cap_squeeze and the code defaults.
+  - It is `false` in every preset. It existed only to keep entries clear of
+    the S/R-loss exit, which ships off. Over 09-17..09-23 it blocked about
+    3.5 setups per session. On a +2R / -1R bracket, the 139 archived blocked
+    setups (04-24..09-23) did no worse than real fills (-0.09R against
+    -0.04R, difference CI [-0.37, +0.30]); the 57 it alone blocked made
+    +0.18R. 110 of 138 closed back through the level within 30 minutes.
+
+- **The divergence age counts session bars, and the HTF divergence knobs are
+  global.** *2026-09-24*
+  - While session indicators are on and the wall clock is inside the
+    session-indicator window (new `utils.indicator_session_open()`, also
+    used by `latest_atr14`), the divergence age counts session bars only. A
+    premarket reader keeps the all-bar age. Yesterday's closing pivots
+    therefore stay live at the open.
+  - On symbol-days with a dense overnight tape, the 60m HTF divergence read
+    on 0% of the 09:30-11:00 minutes and now reads on 23.6% of RTH minutes
+    instead of 10.4% (15m: 16.4% instead of 14.6%). `divergence_max_age_bars`
+    (LTF 8) and the HTF age (6) are not retuned.
+  - New `technical_levels.htf_divergence_max_age_bars` (6, the old hardcoded
+    value). `technical_levels.enabled` / `divergence_enabled` now switch HTF
+    divergence off too. The data feed reads all three once in its HTF
+    context build, for every strategy and the dashboard, as part of the
+    cache key; no strategy passes them.
+  - The HTF context cache rebuilds across the session open / close.
+  - `levels_shared.find_divergence` takes `bar_clock` as a required keyword.
+  - The peers' 60m reads now carry into the late morning. Watch
+    `htf_divergence_adjustment` on peer entries in the next dry-run.
+
+- **The scaffold starts a new preset from the code defaults of the shared
+  knobs.** *2026-09-24* — `config.example.yaml` runs
+  `peer_confirmed_htf_pivots`, so its `shared_entry` / `shared_exit`
+  sections, `risk.time_stop_minutes` and
+  `support_resistance.entry_proximity_scoring_enabled` are now that
+  strategy's parity values. `scripts/scaffold_strategy_plugin.py` still
+  clones the example but writes the dataclass defaults for those. The
+  scaffolded `strategy.py` proposes / admits / emits and passes the contract
+  test. A `--strategy <other>` run against the example still inherits them;
+  its header says so.
+
+- **rth_trend_pullback / volatility_squeeze_breakout: the same-level retry
+  block stays off.** *2026-09-24*
+  - `emit` stamps `entry_price` on every price-level signal. These two never
+    stamped it, so `risk.same_level_block_minutes` (30 in their YAML) never
+    reached them.
+  - For parity their presets now ship `same_level_block_minutes: 0`, and
+    every replayed signal gets the same block result as before.
+  - Turning it on is a go-live decision for a beta dry-run.
+
+- **The 0DTE presets ship two fixed-but-never-fired blocks off.**
+  *2026-09-25* — both were on in the YAML and neither ever fired. Both are
+  fixed now (see Fixed), so shipping them on would switch them on for the
+  first time:
+  - `zero_dte_etf_options` and `zero_dte_etf_long_options`:
+    `risk.same_level_block_minutes: 0` (was 30).
+  - `zero_dte_etf_options`: `options.credit_pivot_buffer_gate_enabled:
+    false` (was `true`). `config.example.yaml` and the dataclass default
+    were already `false`.
+  - Turning either on is a go-live decision for a beta dry-run.
+    `tests/test_preset_parity.py` and `tests/test_zero_dte_shared_entry.py`
+    pin the shipped values.
+
+- **top_tier's `vwap_reclaim` is exempt from the S/R veto;
+  small_cap_squeeze's is not.** *2026-09-25* — a user decision on what
+  was listed under Known issues. `top_tier_adaptive`'s manifest adds
+  `vwap_reclaim: [sr]` to `capabilities.shared_entry.exemptions`.
+  `small_cap_squeeze`'s manifest keeps the veto on vwap_reclaim. No preset
+  value changes: `use_sr_filter` stays on in both.
+  - Why: vwap_reclaim enters on the bar that closes back across VWAP after
+    a flush, and on a large cap that bar sits right next to an HTF level.
+    The veto reads it in one of two ways. It can see a pending level
+    (crossed, flip unconfirmed), which always blocks; that rule dates from
+    2026-09-23 and has never run live. Or it can find the bar inside the
+    0.25% / 0.72 ATR minimum clearance. Nothing is broken: the clearance
+    math, the pending rule and the side logic do what they are coded to
+    do.
+  - Evidence, current code on the study tape: the veto refused all 13
+    vwap_reclaim entries of 09-21..09-23 (11 winners, 2 losers, +7.56R).
+    With the out-of-sample 09-24 session added, it refused 15 of 16 (11
+    winners, 4 losers, +6.74R), which left the regime effectively off.
+    The live bot on H: has neither the pending branch nor the session S/R
+    ATR, and it traded all 16 for +6.94R.
+  - Of the 16, 7 were pending-branch blocks (+3.04R) and 8 were
+    nearest-level blocks (+3.71R). The live code makes every nearest-level
+    block on the same tape.
+  - The earlier "level-code drift" explanation was wrong. The rebuilt
+    levels differ from the logged ones because the replay tape is 3-6 days
+    deep with no bars before 07:00, while the live REST frame is 10 days
+    deep.
+  - The veto still helps the other regimes: over 174 archived top_tier
+    entries it blocked -14.95R outside vwap_reclaim. So only vwap_reclaim
+    is exempt.
+  - In small_cap_squeeze it refused only vwap_reclaim losers (3 of 8 in
+    June, -2.45R), so that manifest keeps it. Exempting both would have
+    pooled +4.29R.
+  - Only the veto is skipped. The S/R stop / target refinement, the ladder
+    rungs, and the structure and chart vetoes still apply to vwap_reclaim.
+    Its signals record `sr` in `shared_entry_gates_exempted`.
+  - Options not taken: an `sr_pending` veto token so that only the pending
+    branch could be exempted (+3.04R), or taking the pending branch out of
+    the veto everywhere (about 0R net).
+  - Caveat: 4 sessions and 16 entries, 9 of them on 09-23. Watch
+    vwap_reclaim in the next dry-run.
+  - Tests: `tests/test_top_tier_megacap.py` checks two LONG reclaims, one
+    just back over a pending resistance and one 0.1 ATR under the nearest
+    resistance. top_tier admits both, while its pullback control is still
+    refused and the structure veto still reaches vwap_reclaim.
+    small_cap_squeeze refuses both. Both manifests are pinned.
+
+- **top_tier_adaptive and small_cap_squeeze exempt range / pullback /
+  sr_scalp from the structure veto.** *2026-09-25* — a user decision on
+  what was listed under Known issues. Both manifests add
+  `range: [structure]`, `pullback: [structure]` and
+  `sr_scalp: [structure]`. `trend`, `momentum`, `vol_squeeze` and
+  `vwap_reclaim` keep the veto, and `orb` keeps `[structure, sr]`. No
+  preset value changes: `use_structure_filter` stays on in both.
+  - Why: the veto works as coded, but it amounts to "refuse a LONG whenever
+    the 5m bias is bearish". Every block was bias-only, and that bias is
+    mostly a location reading. `_resolve_structure_bias` checks the
+    midpoint of the last swing range before the swing labels, so an HH /
+    HL uptrend that pulls back into the lower part of its last swing reads
+    bearish.
+  - Range and pullback enter against the short-term swing by design. The
+    engine already treats them that way: Fix D exempts range and sr_scalp
+    as mean reversion, and the structure exit gives pullback its own grace.
+  - Evidence: over 162 archived top_tier entries the veto blocked 20 worth
+    +7.43R (18 with a result, across 7 sessions). They averaged +0.41R,
+    against -0.14R for the entries it kept (CI of the difference [+0.22,
+    +0.80]).
+  - 12 of the 20 blocks came from the midpoint step, and in 7 of those the
+    swing labels agreed with the trade. By regime: range 7 (+2.18R),
+    pullback 6 (+4.23R), vol_squeeze 5 (-0.82R), trend 1, and vwap_reclaim
+    1 (a rebuild artifact).
+  - Effect: blocks go from 20 to 7. That releases 13 entries worth +6.41R,
+    but only 8 of them (about +2.1R) are not also refused by the S/R or
+    chart veto.
+  - Live proxy: about 35 of the 50 post-Fix-D structure refusal episodes
+    in H:'s `decisions.csv` are released (32 range, 3 sr_scalp).
+  - Caveat: 19 of the 20 blocks predate Fix D (2026-05-27), when the 1m
+    structure made the veto nearly inert; the 5m resample made it decisive.
+    The post-Fix-D live evidence is a crude path proxy (n=50, CI crossing
+    0).
+  - small_cap_squeeze mirrors the exemption. It is inert there, because
+    the preset runs none of the three regimes.
+  - Options not taken: a labels-only veto (shared code, so it changes every
+    strategy; blocks 20 -> 13), or a veto only on an active opposing BoS /
+    CHoCH (0 of 162 blocks).
+  - Tests: `tests/test_top_tier_megacap.py` checks HH / HL labels with a
+    bearish bias against a LONG, and the mirror against a SHORT, in both
+    strategies. Range, pullback and sr_scalp are admitted with `structure`
+    in `shared_entry_gates_exempted`, and the other four regimes are
+    refused. The queue fall-through tests and the top_tier /
+    small_cap_squeeze scenarios of `tests/test_knob_reach_matrix.py` now
+    use a regime the veto still reaches.
+
+### Removed
+
+- **Breaking: renamed and retired config keys fail at load.** *2026-09-24* —
+  a stale YAML fails at load with the replacement named, rather than
+  silently doing nothing.
+  - `shared_entry.use_divergence_filter` is now `use_dual_divergence_veto`.
+    It was always the hard RSI+OBV veto; the LTF counter-divergence
+    penalties its name and docs claimed belong to
+    `use_technical_entry_adjustment`.
+  - `shared_entry.use_htf_divergence_filter` is now
+    `use_htf_divergence_score`; it is a score term and never blocked.
+  - `technical_levels.divergence_block_dual_counter` is removed; the veto is
+    `use_dual_divergence_veto` alone.
+  - Strategy params, checked against `strategies.<name>.params`
+    (`config._RETIRED_STRATEGY_PARAMS`):
+    - top_tier_adaptive / small_cap_squeeze: `orb_bypass_structure_entry`
+      and `orb_bypass_sr_entry` (now the manifest exemption),
+      `reject_entry_near_broken_level`, and
+      `broken_level_min_clearance_pct` / `_atr` (now `shared_entry.*`);
+    - peer_confirmed_htf_pivots / _trend_continuation: `use_sr_veto` (now
+      `shared_entry.use_sr_filter`);
+    - zero_dte_etf_long_options: `orb_apply_structure_veto` /
+      `orb_apply_sr_veto` (now the shared structure / S/R vetoes).
+  - `test_param_declaration_drift` also forbids a manifest from declaring a
+    retired param.
+
+- **Breaking: the strategy plugin API.** *2026-09-24*
+  - `strategy_logic_default`, `signal_priority_key`, `position_exit_signal`
+    and `shared_exit_signal` are reserved; defining one raises `TypeError`
+    at import. Strategy exits go in `strategy_exit_signal`, and ranking goes
+    in the manifest.
+  - The shared-entry helpers left `BaseStrategy` for the policy: the veto
+    predicates and reasons, the refinement passes, the retest plans and
+    stop anchor, the score terms, the divergence candidate,
+    `_build_signal_metadata`, `_build_bullish_reversal_signal`,
+    `_target_meets_min_rr`, `_clamp_refined_stop`, `_shared_entry_enabled`,
+    `_shared_entry_value`. A strategy builds signals only through
+    `entry_policy.emit`.
+  - Signal-metadata and token changes:
+    - HP / TC structure fields are `msltf_*`;
+    - sr_scalp's `stop_floor_kills_rr` token lost `bound_by` / `pierce_atr`
+      / `rr`;
+    - microcap_pm's `stop_above_entry` has no values;
+    - ZL's ORB tokens lost the `orb_long_option_` prefix.
+  - `execution.close_position` takes a required `qty`, and
+    `levels_shared.find_divergence` a required `bar_clock`.
+
+### Fixed
+
+- **top_tier's Fix G lets a first ladder rung sit on the nearest level.**
+  *2026-09-25* — both top_tier_adaptive and small_cap_squeeze ship
+  `adaptive_ladder` mode. In that mode Fix G (`reject_target_beyond_sr`)
+  refused every laddered trend entry, so trend traded only as a trail
+  runner: in top_tier since 1.0.0, and in small_cap_squeeze since it
+  shipped. The cause is how the rungs are built. The rung builder draws
+  them from the S/R list that `nearest_resistance` / `nearest_support`
+  heads, so rung 1 always sat at or past the nearest level. The target /
+  S/R ratio was therefore at least 1.00, above `target_max_sr_ratio` (0.7
+  top_tier, 0.8 small_cap_squeeze).
+  - A first rung ON the nearest opposing level now passes (top_tier
+    `_finalize_signal`, with a 1e-6 tolerance for the builder's
+    `round(price, 6)`). That rung is the ladder's own take-profit at that
+    level, and the ladder manages it.
+  - A first rung past a nearer level is still refused (ratio above 1.00).
+    That nearer level did not qualify as a rung because its R:R was under
+    `ladder_min_target_rr`.
+  - Unchanged: non-ladder mode, runners (no target), and the range /
+    pullback exemptions. No preset changes, and Fix G stays on.
+  - Live evidence (`decisions.csv`, 04-27 to 09-21): there were 25 Fix G
+    episodes (top_tier 19, small_cap 6), and every one had a ratio of 1.00
+    or more. The 10 at exactly 1.00 (top_tier 8, small_cap 2) would now
+    trade.
+  - Replay: 1 more top_tier trend entry in 11 sessions (NVDA 09-24 10:25
+    SHORT, which the replay walk stopped out at -1R). Laddered small_cap
+    trend signals on the synthetic tapes go from 0 to 12.
+  - The outcome evidence is thin and mixed, so watch trend entries in the
+    next dry-run. At-level proxy walks give top_tier +0.29R (n=7) with an
+    ATR stop and -0.03R (n=8) with a 1% stop; small_cap's XOS was -1R.
+  - Correction: the COST 2026-04-24 09:56 LONG that motivated Fix G was a
+    trail runner with no target. Its only resistance, 1014.94, sat under
+    the 1.2R rung floor, so Fix G never covered its own incident (see Known
+    issues).
+  - Tests: `tests/test_knob_reach_matrix.py`, long and short through the
+    real rung builder.
+
+- **LTF market structure no longer confirms pivots with the still-forming
+  bucket.** *2026-09-25* — top_tier_adaptive and small_cap_squeeze resample
+  the 1m stream to 5m for their LTF structure
+  (`structure_ltf_timeframe_minutes: 5`), and the peers read `get_merged`'s
+  native 5m LTF frame. Both frames keep the partial last bucket, and it
+  could serve as a pivot's right-hand neighbour. A pivot could therefore be
+  confirmed by 1-4 minutes of a 5m bar and be gone when the bar closed: 9
+  of the 32 pivots the forming bucket confirmed at a top_tier entry had
+  vanished by then.
+  - `analyze_market_structure(..., last_bar_forming=False)` leaves the last
+    bar out of the pivot search only. The close, the ATR and the BoS /
+    CHoCH crosses still read the whole frame, so a break on the forming
+    bucket counts at once.
+  - `BaseStrategy._structure_context` sets the flag with the dashboard's
+    clock test: the last bar's bucket ends after now. The bar length is the
+    resample's, otherwise the new `utils.frame_bar_minutes` (the smallest
+    positive label step). Using the smallest step means a thin 1m name's
+    completed last bar is never read as forming. A frame of completed 1m
+    bars is unaffected, and a tz-naive index is read as ET wall time.
+  - A step into a label that opens a session segment (09:30, the close,
+    20:00) does not count toward that length, because the grid cuts the
+    bucket before it short. A native 60m frame steps 09:00 -> 09:30, and
+    the plain smallest step would read it as 30m and call its forming
+    bucket complete halfway through. No preset runs a 60m (or 45m / 90m)
+    native LTF.
+  - The dashboard's 5m LTF structure overlay does the same
+    (`DashboardCache.current_structure_overlay(..., last_bar_forming=...)`).
+    Its chart patterns still read the forming bucket, as the strategy's do.
+  - Effect: 4 of 162 archived top_tier entry verdicts change (3 unblocked,
+    1 newly blocked; net about +0.26R, which is noise). An exit replay of
+    194 top_tier / small_cap trades (24 sessions, 4,176 management bars)
+    changed 0 exits. The structure context differs on 15.6% of those bars,
+    but no exit decision does. The peers' entry-side effect is unmeasured.
+    This fix does not address the +7.43R the 5m structure veto blocks (see
+    Changed: the range / pullback / sr_scalp exemption).
+  - `_structure_context` now reads the clock. A test tape that ends after
+    the wall clock sees its last 5m bucket as forming unless the test
+    freezes `strategy_base.now_et`.
+  - The structure veto's same-side-BoS escape is unchanged on both sides.
+    Its LONG clause could not fire while the resolver read every close
+    through an inverted reference pair bullish; the inverted-pair fix
+    below makes it reachable, in the mirror of the SHORT case.
+  - Tests: `tests/test_structure_forming_bucket.py`.
+
+- **zero_dte_etf_options' credit pivot-buffer gate works, and ships off.**
+  *2026-09-25* — it never fired, although the preset shipped
+  `credit_pivot_buffer_gate_enabled: true`. It read the
+  `msltf_` / `mshtf_reference_*` pivots from the top level of
+  `_regime_confirm`'s result, but they live under `regime['metrics']`.
+  - It now reads them from `regime['metrics']`, the dict the signal stamps
+    as `regime_metrics`.
+  - It refuses a short strike within `min_short_strike_pivot_buffer_atr` x
+    ATR of the OUTERMOST pivot: the higher of the LTF / HTF reference highs
+    for a bear call, the lower of the reference lows for a bull put. The
+    refusal reason is
+    `midday_credit_spread_unavailable(reason=short_strike_too_close_to_pivot(...))`.
+  - The preset now ships `false` (see Changed), so nothing changes under
+    any preset.
+  - If enabled, it would refuse 32 of the 38 credit entries in the fixture
+    replay; in 29 of them the short sits between spot and the outer pivot.
+    It would also refuse 4 of the 8 live ones (2026-05-20..22, net -$22,
+    including a +$40 target winner). Enable it only after a dry-run.
+  - The dead `regime.get("reasons", [])` read in its `entry_signals` is
+    removed. `_regime_confirm` sets only `reason`, which already joins
+    every reason, so there is no behaviour change.
+
+- **The same-level retry block keys an option on its underlying.**
+  *2026-09-25* — two defects in one path.
+  - Units: for an option the block compared premiums (dollars per
+    contract, in $1 steps) with `same_level_block_atr_mult` x the
+    underlying's ATR ($0.06-$0.23 in the archive). It therefore fired only
+    on an exact premium match, whatever the underlying did.
+  - Side: it matched on the ORDER side. That blocked a flip between two
+    credit spreads (both are sold) and missed the same bullish bet made
+    first through a credit spread and then through a debit.
+  - `RiskManager.same_level_anchor(strategy, side, metadata, price)` now
+    gives the (direction, level) the block keys on. It reads a signal and
+    the position it became the same way:
+    - an equity: its side and entry;
+    - an option: its market direction (`metadata['direction']`, bullish* /
+      bearish*) and the underlying's price at entry (`underlying_entry`).
+  - The record logs the underlying's close at exit, so the whole record
+    sits in the underlying's price space. When no level can be read, the
+    block skips; the cooldown still applies.
+  - `register_exit(..., level=(Side, price))` replaces `entry_price=` (a
+    clean break). `side=` still keys the cooldown on the order side. Every
+    exit registers through `PositionManager._register_closed_position`, and
+    the persisted `RecentExitRecord` schema is unchanged.
+  - Both option presets now ship `risk.same_level_block_minutes: 0` (see
+    Changed). The old block never fired on an option in the archive (0
+    `same_level_retry_block` refusals over 2026-05-18..22). The corrected
+    one at 30 / 0.3 would not have fired either: two of the re-entries were
+    flips, and the other two sat 0.46 and 0.49 ATR from the prior entry.
+  - The 20-minute candidate cooldown already blocks the underlying in both
+    directions, because zero_dte candidates carry no directional bias.
+  - Equities are unchanged: their anchor is (side, entry), as before. A new
+    test pins that the block works for rth_trend_pullback /
+    volatility_squeeze_breakout if it is switched on; both ship 0.
+  - The block's comments in `config.py` and the 15 equity presets said it
+    fired after a stop-out or losing exit and keyed on the prior stop or
+    fill. It records every exit and keys on the prior entry; the comments
+    now say so. The `_fib_pullback_override` docstring no longer calls an
+    option's entry its premium: it is the underlying's, and the override
+    stays off for options because their side is the order side.
+  - Tests: `tests/test_option_same_level_block.py`.
+
+- **A restart while an exit order is still working at the broker.**
+  *2026-09-25* — six edges on one path. All are latent under the shipped
+  dry-run presets: a simulated exit leaves no order to track, the
+  session-boundary settle is skipped in dry run, and bracket mode is off by
+  default.
+  - The session-boundary re-reconcile booked fills of a position's own
+    tracked working exit as `closed_outside_bot`, at the last mark. The
+    next cycle booked them again from the order's record and dropped a
+    position the broker still held. The settle now nets those fills out,
+    and the manager books them once, at the broker fill price, under the
+    exit's reason. A position whose order state cannot be read stays
+    tracked.
+  - A restored position's own working exit counted as a foreign order.
+    `working_orders_present` then blocked every entry for the session, and
+    "clear them" meant cancelling the position's own exit. The position now
+    owns that order.
+  - A snapshot order the reconcile itself retired counted as foreign too.
+    That covers a child the restore REPLACED with a resize, and the bracket
+    the session-boundary settle cancelled for a position partly closed
+    outside the bot. The settle case restores nothing (a tracked symbol is
+    skipped), so the filter now runs whenever foreign orders remain, not
+    only after a restore. One `fetch_order_states` call drops REPLACED,
+    terminal and filled orders. That listing looks back 8 hours while the
+    snapshot covers `startup_order_lookback_days`, so an id it does not
+    return (a stop entered before an overnight hold) is read with
+    `order_details`; read as live, it stayed foreign. An order whose state
+    cannot be read, from the listing or on its own, is kept.
+  - `restore_hybrid`'s metadata match needed the broker quantity to equal
+    the saved one. If the working exit sold shares while the bot was down,
+    the position fell back to `restore_basic` defaults and lost the order,
+    its one-shot marker and the slice's P&L. The match now bridges the gap
+    with the order's unbooked fills and restores at the saved quantity. The
+    first cycle books the fills.
+  - In bracket mode, the restore protected the full quantity beside a
+    working slice, so the resting stop plus the order covered more shares
+    than were held. A stop that triggered while the order worked left the
+    position net short. Beside a working full exit, it placed a fresh
+    full-size OCO. The restore now protects only the shares outside the
+    slice (the manager's `_reprotect_beside_working_order` sizing) and
+    places nothing beside a full exit. That sizing holds while the order is
+    live. An exit order that died while the bot was down (cancelled in the
+    app, a DAY order that expired) covers only its unbooked fills, so the
+    shares it no longer covers get the stop at once rather than a cycle
+    later. An order whose state cannot be read counts as live.
+  - An exit result with `ok=True` and `filled_qty=0` skipped the not-filled
+    routing. It neither tracked the order nor re-protected, so the bracket
+    cancelled that cycle stayed down. It is now settled as the unfilled
+    attempt it is (EXIT_CONTEXT `attempt_status: filled_qty_zero`). Today's
+    executor cannot produce this result, because it sets `ok` only on a
+    fill.
+  - New helper `broker_positions.working_exit_outstanding_qty`, shared by
+    the manager's risk check beside a slice and by the restore.
+  - `restore_basic`, which has no saved metadata, still cannot see a
+    working exit (see Known issues).
+
+- **The HTF divergence reads the configured thresholds.** *2026-09-25* —
+  `MarketDataStore.get_htf_context` passed `build_htf_context` only
+  `enabled`, `divergence_enabled` and `htf_divergence_max_age_bars`. The
+  HTF RSI divergence therefore always used the builder's defaults for
+  `divergence_pivot_lookback`, `divergence_min_price_move_pct` and
+  `divergence_rsi_min_delta`, and retuning them moved only the LTF
+  divergence.
+  - The data feed now passes all three from `technical_levels`, with no
+    `or` fallback; the builder clamps them the way the LTF builder does.
+    They are part of the HTF cache key.
+  - No build changes: all 19 configs load 4 / 0.0015 / 2.5, which are the
+    builder defaults.
+  - `divergence_rsi_length` stays LTF-only; the HTF reads its frame's
+    `rsi14`.
+
+- **The shared FVG score term uses the strategy's HTF EMA spans.**
+  *2026-09-25* — it built its HTF context from
+  `support_resistance.ema_fast_span` / `ema_slow_span`. Those fields do not
+  exist, so it always asked for 50/200.
+  - It now uses `htf_ema_spans(params)`. Its request equals
+    `_default_htf_context_for_score`'s except for the FVG arguments.
+  - FVG lists and scores are unchanged, because FVG detection never reads
+    the EMAs. They were identical on the fixture 60m frames.
+  - The cache key is unchanged for the 50/200 presets. The peers' key
+    (34/200) moves from EMA 50 to 34, with the same number of entry-path
+    HTF builds.
+  - Side effect: while the dashboard shows a `peer_confirmed_htf_pivots`
+    symbol, its generic sidebar HTF read (hard-coded 50/200) no longer
+    shares the FVG term's build. That is about one extra ~6 ms HTF build
+    per symbol per 60m bar. This comes from reading the code and was not
+    measured.
+
+- **An inverted reference pair resolves to its later break.** *2026-09-25*
+  — `_resolve_structure_bias` tested a close through the reference high
+  before one through the reference low. Both hold only on an inverted pair
+  (the reference low two breakout buffers or more above the reference
+  high), so every close through both read bullish, whichever way price had
+  gone.
+  - Where the pair comes from: a pivot needs neighbours in its own session,
+    so a gap's first bar is never one. After a gap up the first swing low
+    forms above the old reference high before any high confirms; after a
+    gap down, the mirror.
+  - A gap up that then broke its first swing low (a BoS down) read bullish,
+    and so did its exact mirror image, a gap down that broke its first swing
+    high. The second reading is right, the first is not: the tilt was a
+    one-sided bullish one.
+  - The later of the two breaks (the smaller BoS age) now decides. A price
+    passed in that is through a reference the frame's last close is not
+    through counts as the newer break. Equal ages decide nothing, and the
+    rest of the resolver runs.
+  - The structure veto's same-side-BoS escape can only matter on such a
+    pair, where the bias is the later break and the earlier one can still
+    be fresh. Both of its clauses are unchanged. Until this fix only the
+    SHORT one could fire; the LONG one is now reachable in the mirror case.
+  - Effect, all on archived tapes: 0 of the 162 top_tier entry verdicts
+    change (no entry had an inverted pair). Over every completed 5m bucket
+    of 691 symbol-days (67,891 bars, the top_tier / small_cap_squeeze LTF
+    structure params), 21 bars had a close through both references, and 17
+    of them now read bearish instead of bullish. All 17 were premarket
+    (GOOG, INTC, MRVL, PLTR). The SHORT escape fired on 13 bars before the
+    fix, all of them among those 17, and on none after it; the LONG one
+    fires on none. On the 15m HTF structure, 4 of 23,329 bars had a close
+    through both and 2 flip, both at 09:45 (AAPL 07-28, INTC 05-11).
+  - Tests: `tests/test_structure_forming_bucket.py` (the gap up and its
+    mirror, a mirror-symmetry property of the resolver, the escape on both
+    sides).
+
+- **An adopted stop older than the order listing is read and resized.**
+  *2026-09-25* — `execution._adoptable_protection` read each child's state
+  from the account_orders listing only, which looks back 8 hours. A stop
+  entered before an overnight hold is not in it. It was adopted with no
+  size, so `ensure_position_protected` never resized it: `restore_basic`
+  left a 10-share stop resting against 7 held shares, which would have sold
+  3 more than were held when it triggered. Latent: bracket mode ships off.
+  - A child the listing does not return (or every child, when the listing
+    fails) is now read with `order_state` (`order_details`), the same
+    fallback `startup_reconciler._drop_retired_orders` uses. A dead stop
+    is no longer adopted, and a dead target is dropped from the adopted
+    ids.
+  - A stop neither read returns is still adopted, never stacked on, but its
+    size is unknown, and an unknown size is now re-issued at the position's
+    size (fail closed). If that replace fails too, the bracket stays active
+    with `state: qty_unverified` and `qty: None`, and the error is logged.
+  - Tests: `tests/test_sweep_fixes.py` (`TestAdoptionBeyondTheOrderListing`,
+    including `restore_basic` end to end).
+
+- **Leftovers of the 2026-09-25 fixes.** *2026-09-25* — latent under every
+  preset.
+  - The LTF divergence readers (`strategy_base._technical_context` and the
+    dashboard's LTF build) read `divergence_rsi_min_delta`,
+    `divergence_pivot_lookback` and `divergence_min_price_move_pct` as
+    `x or <default>`, so a configured 0 meant the default, while the HTF
+    build honours it. They are read None-aware now: 0 is honoured and only
+    null falls back. No preset sets any of them to 0.
+  - `zero_dte_etf_options._htf_fvg_context_request` (inherited by
+    zero_dte_etf_long_options) read the missing
+    `support_resistance.ema_fast_span` / `ema_slow_span`, so it always asked
+    for EMA 50/200. It resolves the strategy's spans with `htf_ema_spans`
+    now. zero_dte declares no HTF spans, so it asks for 50/200 either way,
+    and the prefetch still warms the same cache key.
+  - `zero_dte_etf_long_options` dropped its dead
+    `regime.get("reasons", [])` read in `entry_signals`, as
+    zero_dte_etf_options did. `_regime_confirm` sets only `reason`.
+  - Tests: `tests/test_shared_entry_policy.py`,
+    `tests/test_fix_dashboard_charting.py`, `tests/test_htf_ema_knobs.py`,
+    `tests/test_zero_dte_shared_entry.py`.
+
+- **Dashboard: a divergence line whose older pivot is off the chart keeps
+  its slope.** *2026-09-25* — `drawDivergenceLine` put a `pivot_a` older
+  than the chart's first bar on bar 0. The line then started at the left
+  edge at a slope the divergence never had. A line with both pivots
+  off-window left a lone "RSI ÷" label on bar 0.
+  - `pivot_a` is now placed `pivot_b.pos - pivot_a.pos` bars before
+    `pivot_b` and keeps its price. The line is clipped to the plot, and the
+    label sits at the midpoint of the visible part.
+  - A line is not drawn when its `pivot_b` is off-window too, or when the
+    positions cannot place `pivot_a` left of the window.
+  - Since the 09-24 session-bar age, a divergence can pair yesterday's
+    pivots at the open. On the peers' 90-bar 5m chart, 92 of 245 line-reads
+    between 09:30 and 10:29 had an off-window `pivot_a`; the other charts
+    had 0 of 503.
+
+- **The exit tape no longer vetoes every exit on a first session bar, a
+  zero-range bar or a NaN reference.** *2026-09-24* — each of these read as
+  a veto in both directions:
+  - On the first bar of the indicator session (09:30, or 07:00 for an
+    extended preset) the session EMAs equal the close. That bar now reads
+    `ema9_all` / `ema20_all`, and the session VWAP, which that bar alone
+    defines, abstains.
+  - A zero-range bar's close position (0.5, which fails both 0.46 and 0.54)
+    abstains.
+  - A NaN reference used to fall back to the close; it abstains too.
+  - If every enabled term abstains, the tape confirms nothing.
+  - The `candle_pattern` family holds when any of the last 3 bars is a
+    single print (the new `bar_range` gate, the same window as the entry
+    candle veto, `helpers.CANDLE_PATTERN_WINDOW_BARS`). TA-Lib reads a
+    single print as a doji / white candle,
+    so thin tape builds TRISTAR, DOJISTAR, HARAMI, HIKKAKE or
+    GAPSIDESIDEWHITE by itself; the old 0.5 veto hid that. Without the gate,
+    a candle exit would fire on about 6.5-10% of premarket zero-range bars.
+  - These are correctness fixes; no measured P&L effect. The exposure is in
+    extended hours: zero-range bars were 10 of 113 held minutes for
+    small_cap_squeeze and 0.13% for top_tier.
+
+- **The entry candle veto abstains on single prints.** *2026-09-24* — a
+  single-print bar (high == low) is the artifact the exit side's `bar_range`
+  gate holds on (above): TA-Lib reads it as a doji / white candle. The entry
+  veto had no such guard, and it ships on for `microcap_pm_breakout`, whose
+  07:00-10:25 window is mostly premarket. On 34 archived small-cap
+  symbol-days its LONG veto fired on 19.6% of premarket minutes, and 246 of
+  those 609 vetoes (40%) matched only TRISTAR / GAPSIDESIDEWHITE /
+  HARAMICROSS-type patterns with a single print among the last 3 bars. The
+  veto now abstains when any of the gate frame's last 3 bars is a single
+  print or has an unreadable high / low (`helpers._bars_have_range`), and the
+  signal carries `shared_entry_candle_abstained: zero_range`. Three bars, not
+  the last one: the veto was rarer when only the last bar was flat, so the
+  artifact sits in the pattern window. In RTH only 16 of 321 vetoes were
+  artifact-only.
+
+- **The engine pre-warms only the contexts its bars frames are read for.**
+  *2026-09-24* — every context-builder call was recorded for
+  `_prime_cycle_context_cache`, which then built that context on every
+  watchlist symbol's 1m frame each cycle. The caches key on the frame
+  object, so a build on any other frame (the peers' 5m LTF, key_levels_1m's
+  `get_merged` copy) never read the pre-warm. `admit`'s builds on
+  key_levels' LTF registered the chart and technical contexts: a few ms per
+  symbol per cycle that nothing read. htf_pivots and trend_continuation
+  already paid for unused 1m builds. The engine now hands the strategy the
+  cycle's bars frames first (`BaseStrategy.set_prewarm_frames`), and only a
+  build on one of them registers. The context caches are also reset every
+  cycle when nothing is observed; every entry pins its frame.
+
+- **The CHoCH exit needs a CHoCH that happened after entry — and no other
+  gate.** *2026-09-24* — it read a CHoCH from the last
+  `structure_event_lookback_bars` bars without asking when it happened, so
+  a LONG opened within six bars after a 1m CHoCH down exited on its first
+  weak-tape cycle. The event must now close after the entry. CHoCH is an
+  ungated structural stop-tightener: it fires below about -0.4R on roughly
+  0.5-1.3% of positions, and the study measured it neutral on 5m structure
+  and slightly negative on 1m structure. No candidate guard had a
+  measurable effect (an R floor, post-entry pivots, the hold or ORB grace;
+  the grace was -5.1R [-15.3, +5.3] on 1m breakout entries), so it has
+  none. The "a true CHoCH is a reversal signal" rationale was rewritten
+  everywhere.
+
+- **Structure events and pivots are judged by when their bar CLOSED.**
+  *2026-09-24* — bars are labelled at their start, so a CHoCH, BoS or pivot
+  on the bar the entry filled in read as pre-entry for as long as price
+  stayed through the level. That window was up to 5 minutes on a 5m
+  structure frame. The new `shared_exit.bar_closed_after` is used by the
+  CHoCH / BoS post-entry checks, the pivot guard and the divergence
+  scale-out. The pivot guard now counts `MarketStructureContext.pivot_times`
+  closed after entry; it used to compare against an entry-time count only
+  some strategies stamped, so for the peer family it could never open.
+
+- **The S/R-loss exit could never fire; it is reachable now and ships
+  off.** *2026-09-24* — it sat behind `discretionary_exit_min_r`, but it
+  fires only with price through a level on the ADVERSE side of entry (R < 0
+  by construction), so it was dead in every preset. It is now exempt from
+  the R gate, keeping its adverse-side, underlying-entry and tape guards. A
+  full replay (26 sessions, 235 positions) fired it on 13, all
+  top_tier_adaptive, at a median -0.72R. Against today's management (time
+  stop, peak giveback) it cost -0.43R per firing, CI [-0.85, -0.05], and
+  -5.58R in total. Every variant tried was negative too: a 5-20 minute
+  grace, a 0.25-0.75R loss cap, no tape confirmation. So
+  `use_sr_loss_exit` is `false` in every preset and as the code default; in
+  effect it is a tighter stop at about -0.7R. It had been live only for
+  zero_dte_etf_options' credit verticals (R on the premium mark), the one
+  preset where turning it off changed behaviour.
+
+- **Configured zeros are honoured.** *2026-09-24*
+  - The score terms' weights and thresholds were read as
+    `float(x or default)`, so a `0` meant the default.
+    `config.small_cap_squeeze.yaml`'s three zeroed extension penalties
+    (`atr_stretch_penalty`, `bollinger_entry_penalty_outer_band`,
+    `entry_penalty_near_extension`) were inert and still docked up to 0.75
+    from a stretched entry. They now score 0; no other preset zeroes one of
+    these keys.
+  - The same fix applies to `min_target_rr`, `min_stop_atr_mult`,
+    `divergence_exit_partial_frac` / `_min_age_bars` (a 0 fraction used to
+    close half the position) and `divergence_max_age_bars` (strategy_base
+    and the dashboard read `or 8`).
+
+- **The peer ladder's structure-fail exit fired on HTF breaks from before
+  the entry.** *2026-09-24* — it now needs an HTF CHoCH / BoS whose bar
+  closed after the entry. Expect fewer `ladder_structure_fail_*` exits right
+  after entries taken against an existing HTF break.
+
+- **The retest stop anchor bypassed the stop floor.** *2026-09-24* — it was
+  applied after the `min_stop_atr_mult` clamp and could put a stop 0.05%
+  from entry. It is re-clamped now (see Changed, breakout family).
+
+- **The fib-pullback override could lift a same-level block for an
+  option.** *2026-09-24* — option signals began carrying the underlying's
+  `tech_fib_anchor_*` stamps when their entries moved onto the shared
+  stage, and `risk._fib_pullback_override` compared those underlying prices
+  with the option's premium. It could only fire on an underlying priced
+  near the premium, such as IWM. It now never applies to an option signal,
+  which restores the old behaviour.
+
+### Known issues
+
+These were found during the 2026-09-24 change and its 2026-09-25 follow-up
+and were deliberately left unchanged. Each one needs a decision.
+
+- **What the S/R veto read is not logged.** `_sr_lists` records neither
+  the pending level nor the S/R ATR in ENTRY_CONTEXT. That is part of why
+  the vwap_reclaim blocks (see Changed, 2026-09-25) looked like levels the
+  bot never logged. Logging both would let the next dry run be replayed
+  faithfully.
+  - The pending check is memoryless: a flip confirmed earlier in the
+    session goes back to pending on any retest. AVGO 09-23 SHORT, 11
+    minutes after its flip, is the one case in the study; a "since the
+    last cross" rule would change only that entry.
+- **Fix G never judges a trail runner.** A trend entry with no qualifying
+  rung trades as a runner with no target, and Fix G is inert for it. That
+  includes the COST 2026-04-24 geometry that motivated it. Covering runners
+  would be a new block, so it has not been added.
+- **`restore_basic` cannot see a working exit order.** It has no saved
+  metadata, and the working-order snapshot (`extract_working_orders`)
+  carries no quantities. The order therefore counts as foreign and blocks
+  entries until someone clears it. In bracket mode the restore also
+  protects the full broker quantity beside a working slice.
+  `restore_hybrid` handles both (see Fixed).
+- **Performance of the lazy 5m context builds (measured 2026-09-25; no
+  change needed).** `admit` builds its contexts whichever knobs are on,
+  because `emit` stamps their lists. key_levels, htf_pivots and
+  trend_continuation gate on a 5m LTF that the engine's 1m pre-warm never
+  primes.
+  - Test setup: real 09-24 tapes with 6 tradables and 4 peers.
+  - A lazy build costs about 7-8 ms per candidate on a 208-bar 5m frame,
+    and about 10 ms on key_levels_1m's 1m frame.
+  - key_levels builds only for a proposal that reaches `admit`.
+  - trend_continuation spends a median 48 ms of a 398 ms `entry_signals`,
+    and htf_pivots 43 ms of 556 ms. Most of that is their own
+    per-candidate structure and technical builds, which predate 09-24.
+  - The bigger cost is the 5m frame enrichment, at about 20 ms per symbol
+    per cycle.
+  - The work is GIL-bound. `_prime_cycle_context_cache`'s docstring
+    assumes the builders release the GIL, but a 4-worker pool was slower
+    than serial for both the builders and the enrichment.
+  - A pre-warm would only move the cost out of `entry_signals`, and it
+    would build for every watchlist symbol instead of only the candidates.
+    So none is worth building.
+- **Leftovers of the 2026-09-25 fixes.** They are latent under every
+  preset.
+  - The shared score's HTF context (`_default_htf_context_for_score`) and
+    the FVG term still make two builds. The score context passes no FVG
+    arguments, so it uses the builder's FVG defaults (4 / 0.05 / 0.0005)
+    instead of the configured 3 / 0.06 / 0.0006.
+  - Merging those two builds needs a single request builder. Before that,
+    check that nothing reads HTF FVGs off top_tier's `htf_ctx`.
+
+### Added
+
 - **A skipped entry decision now records which regime it came from.**
   *2026-09-19* — `decisions.csv` carries a `family` column sourced from
   `entry_gatekeeper._decision_entry_family`, which reads
@@ -440,6 +1540,441 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Key levels, channels, trendlines and the dashboard charts: the levels
+  review.** *2026-09-23* — one pass over the S/R and HTF builders, the
+  technical lines, the session indicator overlay, the HTF feed and the
+  dashboard charting. Every fix is pinned by a test that fails with the fix
+  reverted (`tests/test_fix_htf_feed.py`, `test_fix_key_levels.py`,
+  `test_fix_indicator_overlay.py`, `test_fix_technical_lines.py`,
+  `test_fix_dashboard_charting.py`, `test_fix_strategy_consumers.py`).
+
+  **HTF feed**
+  - The stored HTF frame holds completed bars only. It was fetched ~10 s into
+    each bucket and kept the bar that had just opened as if complete: for a
+    whole bucket that near-zero-range bar confirmed pivots, cut ATR ~7% and
+    set the breakout flags and HTF structure bias (98.3% of replayed
+    refreshes stored one; now 0%).
+  - No overnight (20:00-07:00) bar is stored. Schwab's price_history lags a
+    day on them, so PDH/PDL, pivots, ATR and the HTF chart depended on which
+    nights a fetch happened to hold. The window is applied to the base bars,
+    before resampling.
+  - Bars coarser than 30 minutes are laid out per session segment
+    (`utils.session_bucket_bounds`): buckets start at 04:00, 09:30, the close
+    (16:00, 13:00 on early closes) and 20:00, and a segment's last bucket is
+    cut short at the next boundary. The 60m grid is 07:00, 08:00, 09:00 (to
+    09:30), 09:30 ... 15:30 (to 16:00), 16:00 ... 19:00, as charting
+    platforms draw it; 1/5/15/30m bars are unchanged. On one 09:30 grid the
+    60m bar labelled 15:30 held 15:30-16:29, so post-market prints set the
+    60m PDH/PDL of every peer_confirmed preset and counted as regular-session
+    in the session indicators; the first premarket bar was labelled 06:30,
+    outside the stream window; and lengths that do not divide an hour
+    drifted an hour off the local grid across a DST change. A bar is
+    complete when its bucket ends (`utils.session_bucket_ends`), so the
+    short 15:30 bar is stored at 16:00, not 16:30, and an incremental
+    refetch starts on a bucket boundary (starting mid-bucket, it rebuilt a
+    stored bar from half its source bars and replaced the whole one).
+  - The HTF refresh gate uses the bars' own boundaries
+    (`utils.session_bucket_floor`). A clock floor refetched 60m frames at
+    XX:00, half a bar before each regular-session bar closed, so the newest
+    60m bar was missing from every context for 30 minutes.
+  - Every HTF context is rebuilt when the stored frame changes (a configured-
+    FVG context equalled a fresh build on 3.7% of replayed reads; now 100%),
+    and when the session date changes, so a dashboard read after midnight no
+    longer serves yesterday's prior day/week until the prewarm.
+    `fetch_htf_context` is removed.
+  - PWH/PWL keep the whole prior week: the trim reaches back to the start of
+    the prior W-FRI week, measured from the same session date the builders
+    use, so a holiday Monday (Labor Day) no longer cuts it to its Friday.
+  - The daily 09:15-09:28 hole in every 1m frame is backfilled, and the
+    minute still forming at a history fetch is not stored.
+  - `trading_flip_confirmation_1m_bars` / `_5m_bars`: 0 turns that frame's
+    gate off (readers turned it back into the default); at least one must be
+    above 0 (with both off the adaptive ladder's rung check could never
+    confirm); negatives are rejected at load. `config.flip_confirmation_bars`
+    is the only reader.
+
+  **Levels**
+  - `pending_support` / `pending_resistance` on the S/R and HTF contexts: the
+    nearest level price has crossed whose flip is unconfirmed, in its
+    original role. Such a level used to be in no list at all until the flip
+    confirmed (11-16% of real-bar checkpoints). `nearest_support` stays at or
+    below price and `nearest_resistance` at or above it, now also on the
+    prior-day fallback path, where a gap morning's PDH came out as a
+    resistance below price (8 of 5,712 real-bar builds; now 0): every
+    partition, and the broken-level test, is against `close`, and the
+    fallback reference price only picks which prior levels stand in for a
+    side. A side left empty takes the prior-day/week levels, then the frame
+    extreme if those are across price too (with prior levels on, a gap past
+    them used to leave the side empty), and a confirmed-lost support between
+    price and the old reference is `broken_support` again. A fallback level
+    the side already holds is not added a second time (its copies merged
+    into doubled touches and score).
+  - No cluster cap before the side split: the fresh swing nearest price is no
+    longer cut after gaps and trend days (nearest support changes at 12.1% of
+    samples, resistance at 7.2%, almost always to a nearer level).
+  - Pivots, FVG triplets and order blocks stay inside one ET session. A gap
+    spanning the night was in the HTF FVG lists at 29-37% of checkpoints.
+    **Policy change to dry-run before live:** bars at a session edge can no
+    longer be pivots; nearest S/R moves by more than 0.25 ATR at 12-16% of
+    checkpoints and the 0.72-ATR clearance verdict flips at 6-11%.
+  - Prior day/week are the regular sessions (09:30-16:00, 13:00 on early
+    closes) before the session date (`as_of`, default the clock's), not the
+    calendar days before the frame's last bar: a premarket frame served the
+    session before yesterday (53 of 53 archived symbol-days in that state),
+    and extended-hours prints moved PDH/PDL. `microcap_pm_breakout` keeps the
+    prior day's extended-session high as its PMH floor
+    (`prior_day_levels(..., regular_session_only=False)`), since an
+    after-hours spike is the level its premarket breakout has to clear.
+  - FVG `last_seen` is the last bar that traded into the gap, or the bar that
+    completed it; it was always the frame's last bar, so recency decay never
+    applied. On the 1m LTF the nearest gap's recency is now a median 0.32
+    (was ~0.95; 49% at the 0.30 floor), which lowers top_tier's LTF
+    `fvg_entry_adjustment` and continuation bias.
+
+  **Session indicators** (`use_rth_session_indicators`)
+  - ATR / DI / ADX / RSI / OBV / Bollinger are one session-only series across
+    all sessions in the frame, stitched gap-neutral, instead of today's bars
+    alone switched on once today had enough bars: no premarket dilution, no
+    mid-session step (old steps up to x1.32), no RSI series change at 13:00.
+    Returns (`ret1/5/15`) stay all-hours: stitched, they chained today's move
+    onto yesterday's close (ret15 flipped sign on 30% of symbol-days at 09:35).
+  - The S/R, HTF, FVG and order-block ATR reads the latest session bar while
+    the clock is in the session (`utils.latest_atr14`): from 09:30 to 09:44
+    the 15m frame's last completed bar is the 09:15 premarket bucket, whose
+    all-hours ATR ran a median 0.82x of the session ATR. A premarket reader
+    keeps its own bars' ATR.
+  - HTF and 1m divergences pair session pivots only; a pair crossing the
+    session edge compared two different RSI/OBV series (49.7% of HTF RSI
+    divergences).
+  - Behaviour change (421 archived symbol-days): 1m atr14 -6.6% at 09:35 and
+    -22% at 09:45, -1.5% at 10:30, unchanged from 13:00; 15m S/R ATR +15% at
+    09:45. On the span-5 LTF the share of symbol-days with ADX >= 18
+    (top_tier's `min_adx14`) goes 22% -> 10% at 09:35, 23% -> 13% at 09:45,
+    24% -> 16% at 10:00 and 26% -> 20% at 10:30; the verdict flips on 23-28%
+    of symbol-days through 10:44 (15% at 11:30), the +DI/-DI sign on 13-27%,
+    and RSI moves a median 2-5 points through 11:30.
+
+  **Trendlines and channels**
+  - A crossed support/resistance line pair, or one under half a break buffer
+    wide, is dropped; a crossed pair raised both break flags on one bar. A
+    close inside both respected bands of a narrow channel sets neither
+    respected flag.
+  - Trendline and channel windows start at the current session's first bar;
+    at the open they counted the overnight gap as one bar and read it as a
+    break. Fib and anchored-VWAP impulses skip extended-hours pivots instead
+    of being session-bounded, so 5m presets keep them from the open; the
+    pivots are filtered before same-kind runs are merged, so a premarket
+    extreme no longer takes the session pivot it absorbed down with it. On
+    the 5m LTF presets (the peer_confirmed family) trendlines and channels
+    need today's pivots and are absent for roughly the first hour.
+    Anchored VWAP enabled on its own gets its impulse (base pivots were only
+    found when fib, lines, channels or divergence were on).
+  - Line and divergence positions index the frame passed in (the dashboard
+    drew every line as a zero-length stub).
+  - The tolerances and the break buffer lose their own percent floors,
+    which decided all 74,033 replayed evaluations; they are multiples of
+    `atr_value` = max(ATR14, 0.15% of price), whose floor still decides
+    ~70-80% of 1m large-cap bars.
+    `trendline_breakout_buffer_atr_mult` defaults to 0.65 (was 0.15, which
+    on large caps never applied), reproducing the old 0.10% floor at the
+    median on 1m bars; the 5m presets use 0.30. The small-cap presets keep
+    0.15 -- small_cap_squeeze and microcap_* (ATR ~2.6% of price, 0.15 x ATR
+    beat the floor on 99.9% of their bars) and the $2-$20 screener presets
+    momentum_close, mean_reversion, closing_reversal and
+    opening_range_breakout (0.15 x ATR at the median on their screener's own
+    candidates) -- so it already was their buffer. Every reader takes the configured value as is;
+    all three used to turn a configured 0 into 0.15. The exit reader
+    (channel break, anchored-VWAP loss) keeps its 0.10%-of-price floor on
+    top of it.
+  - The channel-break exit fires on a decisive break (the breaking bar used
+    to void the channel). The channel edge penalty and alignment bonus apply
+    only inside the channel.
+  - No 7-pivot cap. A broken line is spent once a close has cleared the
+    break buffer after its last touch and a pivot has then formed on its far
+    side: it retires instead of re-raising its break for the whole lookback.
+    A wick or a dip that closed inside the buffer does not retire it, so the
+    decisive close that follows still raises `trendline_break_*`.
+  - The near-extension penalty counts an extension just crossed.
+
+  **Dashboard charts**
+  - Lines and channels draw in the chart's coordinates over their own span.
+    LTF EMAs are the strategy's own (see the `ltf_ema_fast_span` /
+    `ltf_ema_slow_span` entry below: knobs of those names used to move only
+    the chart).
+  - Candle tags get 14 bars of TA-Lib warmup. Payloads carry
+    `source_bar_ts`; the client refetches once per new bar, one request at a
+    time, and a request that never settles is aborted after
+    max(15 s, 5 polls) so the chart keeps refreshing.
+  - The HTF chart continues past the stored frame with buckets from the live
+    1m bars, from where the last stored bucket ends, the forming one flagged
+    `in_progress`. A chart payload for a view whose timeframe has since
+    changed is dropped (an HTF payload in flight when the view was reopened
+    in LTF switched the chart back).
+  - The structure overlay is drawn. Client bars are keyed by time; cached
+    bars follow a server renumbering, and bars with no overlap and an older
+    numbering are dropped instead of mixed. Trade markers sit on the bar
+    holding the fill. FVGs/order blocks are filtered to the visible window
+    before the per-direction cap.
+  - `sr_row` publishes the strategy's nearest levels unchanged; broken and
+    pending levels are their own zones. A pending level beyond the nearest
+    one no longer squashes both zones to zero width.
+  - The key-level zones' HTF build falls back to `support_resistance.*` for
+    every level parameter a strategy does not declare as `htf_*` (it fell
+    back to 60 days / 6 levels / 0.35 ATR, a build top_tier never traded on).
+
+  **Strategies**
+  - S/R clearance reads the pending level: a short under an unconfirmed-lost
+    support or a long over an unconfirmed-broken resistance is blocked (238
+    longs and 123 shorts of 4,144 archived samples were waved through). The
+    block reasons report the same clearance, in `zero_dte_etf_options` /
+    `zero_dte_etf_long_options` too, whose stale copies of the old reasons
+    are removed. The breakout/breakdown escapes on the too-close check are
+    removed: they required `nearest_*` on the wrong side of price, which the
+    builders never report. `breakdown_below_support` /
+    `breakout_above_resistance` still block only a side with no level on it
+    (unchanged, and nearly never: a level stood on that side for 1,825 of
+    1,840 / 2,811 of 2,890 archived flag checkpoints); such a block now says
+    so (`htf_breakdown_below_support(...)`) instead of `too_close_to_htf_*`.
+    A study of the flags as a full entry gate found no edge: over 26,447
+    archived RTH checkpoints (15 sessions), among entries already passing
+    the HTF-bias and clearance gates, flagged vs unflagged differed by
+    -0.02 R (LONG) and -0.04 R (SHORT) with 95% CIs spanning 0, while the
+    gate would have blocked 36% / 45% of them; on the 69 realized top_tier
+    trades the flagged ones did better. So it stays off. Only breaks at most
+    30 minutes old hinted at an effect (-0.11 R, CI crossing 0), so the S/R
+    context now carries `breakout_age_minutes` / `breakdown_age_minutes`
+    (minutes since price last traded at the broken level), logged with every
+    entry as `sr_breakout_age_minutes` / `sr_breakdown_age_minutes`, to test
+    it on future sessions. Nothing blocks on them.
+  - The flags no longer switch off the near-support / near-resistance
+    terms: the S/R `bias_score` (+/-0.35), the entry proximity bonus and
+    penalty, and zero_dte_etf_options' S/R and candle-at-level scores. The
+    flags describe a broken level on the far side of price; `near_*` the
+    level on price's own side. With a flag set on about half of all
+    checkpoints, an unrelated old level had been dropping these terms.
+  - sr_scalp builds off the zone price is testing (end-to-end through
+    `_finalize_signal`); the S/R proximity score counts a pending level as
+    near; peer_confirmed_htf_pivots' battleground and dashboard candidates
+    include it.
+  - One close-position bound for exit tape confirmation (the per-call
+    `close_pos_threshold` was dead). The session archive holds the stored HTF
+    frame (`bars/htf_{N}m/`).
+- **Chart patterns, their dashboard display, and a second review of the
+  09-23 changes.** *2026-09-23* — each fix is pinned by a test that fails with
+  it reverted (`tests/test_fix_chart_patterns.py`, plus additions to
+  `test_fix_indicator_overlay.py`, `test_fix_technical_lines.py`,
+  `test_fix_htf_feed.py`, `test_fix_dashboard_charting.py` and
+  `test_regime_call_outcomes.py`).
+
+  **Chart patterns**
+  - A reversal's confirming bar must point the pattern's way. The body test
+    was abs(close - open) >= 0.28 of the range, so a red bar closing on its
+    low confirmed a double/triple bottom or an inverse H&S, and a green bar a
+    top: 202 of 904 archived reversal fires (22%), each one feeding the
+    opposing-chart entry filter of six strategies (MU 09-22 12:40 blocked
+    longs on a green bar's "double top").
+  - `_find_pivots` counts a tied extreme as one pivot, at its first bar -- the
+    rule `levels_shared.pivot_points` adopted on 09-22. A tie dropped both
+    bars, and the alternation merge then swallowed the opposite pivot between
+    them (AMZN 09-21 12:56 paired two highs across a plateau into a double
+    top); 87 opposing-filter decisions over 09-21/22 change.
+  - Detection and the still-valid checks read the current ET session only.
+    Before ~09:30 a window reached back into the prior evening: NVDA 09-21
+    07:14 fired a bullish flag whose pole was the weekend gap.
+  - The memo cache writes and clears an entry and its frame pin under one
+    lock. A thread switch between the two clears let another worker's entry
+    outlive its pin, so a recycled address could be served a dead frame's
+    `_atr_pct` / `_mean_range`.
+  - strategy_base's chart / structure / technical context caches keep each
+    keyed frame alive for the cycle. peer_confirmed builds a fresh frame copy
+    per candidate; a later candidate could take a freed copy's id and, with
+    the same length and last bar, be served its context (NFLX got AAPL's once
+    in 728 copies).
+  - microcap_pm_breakout's 2c/3c confirmation detects its own TA-Lib candle
+    set. It intersected that set with the chart-pattern names, which never
+    overlap, so the gate never passed and the strategy could not enter.
+  - small_cap_squeeze preset comments: chart patterns only add a same-side
+    score bonus in this engine, and `use_opposing_chart_filter` is not read
+    by it.
+
+  **Dashboard**
+  - A 5m LTF chart marks its forming bucket `in_progress` and leaves it
+    untagged; it was drawn as complete and tagged off its first minutes (AAPL
+    09-22 10:03: CDLHAMMER; complete, a bearish marubozu). Its patterns still
+    read the forming bucket, as the strategy does. A payload with a forming
+    bucket carries `forming_ends_at`, and the client refetches once that has
+    passed: a bucket whose last minutes print nothing brings no newer 1m bar,
+    the LTF chart's only other refetch trigger.
+  - The HTF chart tags, and reads its patterns and structure overlay from,
+    every bucket drawn as complete, including those completed since the
+    stored frame's last refresh, which for at least 10 s into each bucket
+    were drawn untagged and left out.
+  - Re-expanding a panel left in HTF mode drops the HTF view; the LTF chart
+    showed its patterns, overlay and EMA spans over mixed 15m/1m bars. The
+    poll-driven chart sync takes patterns and overlay from the entry the bars
+    came from, not from the state of the previously selected symbol.
+
+  **Other**
+  - Divergence compares pivot prices on the scale the session RSI / OBV were
+    computed on (`utils.session_price_scale`): 371 of 571 cross-session HTF
+    RSI divergences over 10 sessions were the overnight gap.
+  - HTF and 1m refreshes are stamped with the time the bars were cut at.
+    Stamped after the response, a refresh answered across a boundary claimed
+    a bar it did not hold: the HTF 09:45 bar stayed out of every context
+    until 10:15, and the 1m minute before the stream's first bar was never
+    backfilled.
+  - `regime_call_outcomes` reads every reason on a row, not just `primary`:
+    an unqualified side is logged first, so a row where the other side
+    qualified was dropped. A signal that was built and then blocked by an
+    engine gate (`max_positions`, `correlation_concentration`, ...) is a call
+    too. 09-22 re-read: 5,624 calls (not 2,613), 50.0% right.
+  - data_feed's schwabdev fallback stub is removed: utils imports schwabdev
+    unconditionally, so the stub could never run.
+  - README: default windows match the manifests (top_tier's manifest opens
+    at 09:45, the preset at 09:35; peer_confirmed_key_levels closes entries
+    at 15:15, _1m at 15:20), all eight top_tier regimes are listed, and
+    `disable_orb_window` spans opening-range end -> `orb_end_time`.
+- **`ltf_ema_fast_span` / `ltf_ema_slow_span` set the LTF EMAs the entry
+  scoring reads.** *2026-09-23* — top_tier_adaptive and small_cap_squeeze.
+  Knobs of these names existed until today, but only the dashboard read them
+  (to draw a line), so changing them moved the chart and not the bot; the
+  only way to change the EMAs the bot scores on was
+  `ltf_indicator_span_scale`, which also stretches ATR, ADX, RSI, Bollinger
+  and the returns, and every stop and threshold calibrated on them. They now
+  set the ema9 / ema20 columns of the strategy's LTF frame and nothing else
+  (`add_indicators(ema_spans=...)`, through `get_merged`, its per-cycle cache
+  and `_resampled_frame`); the side-decision EMA vote and the trend /
+  pullback / range / vol_squeeze / momentum / vwap_reclaim scores read them,
+  and the compact chart and the snapshot bars draw the same lines (also at
+  span scale 1, where the chart used to skip its fetch). Declared at their
+  current values -- 45 / 100 in top_tier, 9 / 20 in small_cap_squeeze -- so
+  nothing trades differently; a bad pair (fast >= slow, not a whole number
+  of bars) fails at strategy construction. Once declared,
+  `ltf_indicator_span_scale` no longer moves the LTF EMAs. Unchanged: exits,
+  the ema9-extension gate, the stretch gate and peer/ETF index confirmation
+  read the base 1m frame's native EMA9 / EMA20, as they always have.
+- **`htf_ema_fast_span` / `htf_ema_slow_span` drive top_tier, and the HTF
+  trend readers agree with what each strategy trades on.** *2026-09-24*
+  - top_tier's HTF context hard-coded EMA 50/200 and it read no HTF EMA, so
+    the two knobs only drew the HTF chart. The context is now built on them
+    (on the strategy's own HTF, `htf_minutes`), and top_tier can trade on
+    the HTF EMA trend -- the peer strategies' 2-of-3 vote of close vs the
+    fast EMA, fast vs slow, and the context's trend bias:
+    `require_htf_ema_alignment` blocks an entry against it
+    (`htf_ema_trend_<bias>`) on the sides it names -- `enabled` / `true`
+    (both), `long_only`, `short_only`, or `disabled` / `false`; anything
+    else fails at construction, naming the key -- and
+    `htf_ema_alignment_score` adds (aligned) or subtracts (opposed) that
+    much to every scored regime of the side before it has to clear its
+    floor. Both follow the ORB-window HTF bypass and ship OFF: over 21
+    archived top_tier sessions the trend separated qualified LONG
+    checkpoints (+0.28 R aligned vs opposed, CI clear of 0) but not SHORTs
+    (-0.14 R, the afternoon -0.50 R) -- hence a mode rather than a bool,
+    `long_only` being what that evidence points at -- and realized trades
+    ran the other way in every variant; the entries a gate would block were
+    mostly the reversal (vwap_reclaim / range) entries. Entry and trade logs
+    carry `htf_ema_trend` / `_votes` / `_bonus` for a dry-run A/B.
+  - The scoring HTF context (`_default_htf_context_for_score`: top_tier's,
+    and the HTF divergence score of the strategies that take the
+    support_resistance defaults) is built on the strategy's own HTF
+    (`htf_minutes` / `htf_lookback_days`), the frame the engine refreshes,
+    not the support_resistance timeframe. For every strategy but one the
+    two are the same frame; peer_confirmed_htf_pivots (60m) asked for a 15m
+    frame nothing stored, so its HTF RSI divergence score
+    (`shared_entry.use_htf_divergence_filter`: +0.20 aligned, -0.25 counter,
+    +0.10 hidden) was 0 on every cycle. It now reads the 60m family context
+    its peer votes use and its prefetch warms, adds the adjustment to
+    `final_priority_score` -- which ranks its signals (side, then slot) and
+    gates nothing -- and records it as `htf_divergence_adjustment`, which the
+    entry and trade logs keep (`htf_divergence_` prefix).
+  - The dashboard's HTF FVGs and RSI divergence lines come from the
+    strategy's own HTF level build (`dashboard_level_context_spec`, the one
+    its level zones use), not a support_resistance build with EMA 50/200.
+    For the peer family that is the very context its divergence score reads
+    (one cache entry), so a preset changing `htf_pivot_span` no longer
+    charts divergences the score does not apply.
+  - One resolver (`utils.htf_ema_spans`, default 50/200) for every HTF EMA
+    consumer: the strategies' HTF contexts, the peer prefetch, the
+    dashboard's HTF chart and level zones (they fell back to 50/200, 34/200
+    and 9/20). A bad pair fails at strategy construction, naming the key; it
+    used to be swallowed by the HTF context builder -- no HTF context, so no
+    EMA gate and no HTF divergence -- without a word. small_cap_squeeze
+    declares the spans it reads.
+  - The dashboard sidebar's HTF trend is the strategy's own read
+    (`dashboard_htf_trend`): the peer family's EMA vote, top_tier's, and
+    zero_dte's `summarize_htf_trend`. It was always a 50/200 context of its
+    own, so on a peer preset (34/200) it could say "Bullish" while the
+    strategy's HTF gate read neutral and blocked the long.
+    peer_confirmed_htf_pivots, which trades on no HTF EMA trend of its own,
+    keeps the generic read.
+  - The HTF chart draws the EMAs the strategy reads: zero_dte's continuous
+    `ema9_all` / `ema20_all` (it drew the session-reset ema9 / ema20 its gate
+    never reads, different on every RTH bar), declared spans also at 9/20
+    (skipped before), and blank where the stored frame is too short for the
+    bot to compute them (it drew an EMA200 the bot did not have).
+  - A level-zone spec error is logged and gives no zones, instead of a
+    generic 60m / 60-day build that fetched from Schwab each hour.
+  - peer_confirmed_trend_continuation's `directional_vote_edge` is the net
+    HTF vote FOR the signal's side, as key_levels ranks (it was the absolute
+    difference: with no HTF gate there, a short against a 3v0 bullish HTF
+    took the maximum ranking credit); htf_pivots' too (the same on every
+    signal its peer gate passes).
+  - The peer strategies' and zero_dte's prefetch warm the HTF context their
+    entry path reads (the peer prefetch left out the FVG arguments, zero_dte
+    passed only the timeframe, so every prefetched context was a separate
+    cache entry no decision read).
+  - `require_htf_bias_alignment` is no longer declared by the
+    trend_continuation and htf_pivots presets: only key_levels reads it.
+- **Final bug pass over the 09-23 batch.** *2026-09-23* — seven reviewers (the
+  data layer, level builders, strategy consumers, dashboard, chart patterns
+  and report, config/docs, and a runtime replay of this tree against the last
+  commit on archived sessions), every finding reproduced independently before
+  it counted. Each code fix is pinned by a test that fails with it reverted.
+  - The crossed-trendline guard dropped every pair within 3 break buffers.
+    Sized at the old 0.15 ATR buffer, at 0.65 that is 1.95 ATR: 29% of the
+    replayed pairs lost both lines (stop anchor, target cap, break exit,
+    respected bonuses), almost none of them crossed (2.7%) and some of them
+    the very channel the channel builder accepted. Only a crossed pair or
+    one under half a buffer wide is dropped now; a close inside both
+    respected bands of a narrower channel sets neither respected flag.
+  - microcap_pm_breakout: a retest the FVG / order-block plan admitted below
+    the PMH kept the PMH as its stop floor, which the anchor helper then
+    clamped to 0.05% under the fill (DXST 06-02 10:24, XOS 06-03 08:26: a
+    full-size position stopped out on the next bar, above the structural
+    stop). It now takes max(anchor, entry x (1 - default_stop_pct)), and is
+    refused with no anchor below the entry.
+  - The four $2-$20 screener presets (momentum_close, mean_reversion,
+    closing_reversal, opening_range_breakout) keep the 0.15 trendline
+    buffer the small-cap presets keep: they had been given the large-cap
+    0.65, 3-4x the move on their screener's own candidates. Their
+    `bollinger_squeeze_width_pct` is 0.011, the p25 on those candidates:
+    the large-cap 0.0025 they carried since 09-22 was never reached, so the
+    squeeze never fired (momentum_close has the bands off; its value is
+    inert).
+  - With `divergence_rsi_length` other than 14 the divergence RSI was built
+    on raw all-hours closes while the pivot prices are compared on the
+    gap-free session scale; it is now built on that scale too. No preset
+    sets another length.
+  - The session report's gate attribution scores every gate on a row, not
+    just `primary`: behind the other side's unqualified reason, the gate
+    that stopped a qualified build was never scored, and a signal an engine
+    gate blocked was filed under the signal's name (`max_positions` and
+    `correlation_concentration` never appeared). Reasons are split at the
+    commas outside their parentheses.
+  - The 5m LTF chart payload reads the 1m frame before the 5m one, so
+    `source_bar_ts` can never name a minute its plotted bucket lacks.
+  - `options.min_underlying_price` is enforced before the chain is fetched
+    (`underlying_below_min_price`); it was documented and set in every
+    options preset but read by nothing. SPY and QQQ are far above it.
+  - Docs: tolerances and the break buffer multiply `atr_value` = max(ATR14,
+    0.15% of price), whose floor decides ~70-80% of 1m large-cap bars (not
+    "pure ATR multiples"); the unused divergence-entry knobs are marked as
+    such; the overnight-gap note (the HTF chart holds no overnight bars);
+    the session-archive layout; top_tier's regime lists and index gate
+    (vwap_reclaim); small_cap_squeeze's regime set and its ladder, which
+    never scales out; README_STRATEGY_START_TIMES rows now match the presets;
+    the tied-pivot test now has the low-before-the-top shape that actually
+    lost a low.
 - **top_tier: an expired armed retest took its market fallback only by
   coincidence.** *2026-09-23* — at expiry the fallback re-ran the builder's
   fresh-N-bar-extreme check, which asks whether THIS bar is a new extreme. A
@@ -586,10 +2121,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     four premarket minutes into the open. And since everything downstream
     reads a timestamp as a bar START (the RTH mask behind session VWAP/EMA,
     session-open helpers, the ORB follow-through gate), an end-labelled
-    premarket bar counted as RTH. Bars are now `[T, T + rule)` labelled `T`,
-    the broker's own convention, anchored on the 09:30 open (clock bars for
-    5/15/30m, session hours for 60m); completion is `T + tf <= now` for
-    every frame, and the `time_label` / `source_bar_minutes` attrs are gone.
+    premarket bar counted as RTH. Bars are now labelled at their START `T`,
+    the broker's own convention (clock bars for 5/15/30m; coarser bars
+    follow the session grid in the levels-review entry above, whose last
+    bucket in a segment is short), and a bar is complete when its bucket
+    ends (`utils.session_bucket_ends`). The `time_label` /
+    `source_bar_minutes` attrs are gone.
     This moves top_tier's 5m LTF structure bars by one minute.
   - **Partial exits vanished from every report.** The EOD report,
     `trades.csv`, the manifest and the account snapshot kept only final

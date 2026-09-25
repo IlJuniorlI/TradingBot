@@ -38,6 +38,12 @@
     "htf_minutes": 15,
     "min_ltf_bars": 15,
     "ltf_indicator_span_scale": 1,
+    "ltf_ema_fast_span": 9,
+    "ltf_ema_slow_span": 20,
+    "htf_ema_fast_span": 50,
+    "htf_ema_slow_span": 200,
+    "require_htf_ema_alignment": "disabled",
+    "htf_ema_alignment_score": 0.0,
     "disable_orb_regime": true,
     "disable_sr_scalp_regime": true,
     "disable_trend_regime": false,
@@ -70,7 +76,6 @@
     "reject_oversized_entry_bar": false,
     "reject_tech_bias_contradiction": false,
     "require_entry_confirmation_bar": true,
-    "reject_entry_near_broken_level": true,
     "reject_target_beyond_sr": true,
     "reject_range_during_squeeze": true,
     "min_trend_score": 3.0,
@@ -112,5 +117,29 @@
     "max_same_correlation_group_same_direction": 0,
     "volatility_scaled_thresholds": false,
     "armed_retest_enabled": false
+  },
+  "capabilities": {
+    "shared_entry": {
+      "exemptions": {
+        "orb": [
+          "structure",
+          "sr"
+        ],
+        "range": [
+          "structure"
+        ],
+        "pullback": [
+          "structure"
+        ],
+        "sr_scalp": [
+          "structure"
+        ]
+      }
+    },
+    "signal_priority": {
+      "primary_field": "regime_score_normalized",
+      "shared_score_weight": 1.0,
+      "rank_unit_field": "regime_rank_unit"
+    }
   }
 }

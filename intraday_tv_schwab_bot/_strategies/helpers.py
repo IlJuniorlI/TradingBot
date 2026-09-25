@@ -182,6 +182,30 @@ def _bar_close_position(frame: pd.DataFrame) -> float:
     return (_safe_float(last["close"]) - low) / (high - low)
 
 
+# The window a candle read is judged on for single prints: the span of the
+# patterns single prints build on their own (TRISTAR and GAPSIDESIDEWHITE are
+# three bars, HARAMI / HARAMICROSS two). The entry candle veto abstains and the
+# exit candle_pattern family holds unless every bar in it traded a range.
+CANDLE_PATTERN_WINDOW_BARS = 3
+
+
+def _bars_have_range(frame: pd.DataFrame | None, n: int) -> bool:
+    """Did every one of the last ``n`` bars trade a range (high > low)?
+
+    False on an empty frame and on an unreadable high / low. A single print
+    (high == low) is not a candle, whatever TA-Lib names it: thin tape
+    builds doji / white-candle patterns (TRISTAR, GAPSIDESIDEWHITE,
+    HARAMICROSS) out of single prints alone. Both candle readers -- the entry
+    veto and the exit candle_pattern family -- check the last
+    ``CANDLE_PATTERN_WINDOW_BARS`` bars with this."""
+    if frame is None or frame.empty or "high" not in frame.columns or "low" not in frame.columns:
+        return False
+    tail = frame.iloc[-max(1, int(n)):]
+    high = pd.to_numeric(tail["high"], errors="coerce")
+    low = pd.to_numeric(tail["low"], errors="coerce")
+    return bool((high > low).all())
+
+
 def _bar_wick_fractions(frame: pd.DataFrame) -> tuple[float, float, float, float]:
     """Decompose the latest bar into (upper_wick_frac, lower_wick_frac,
     body_frac, bar_range). The first three are fractions of bar range

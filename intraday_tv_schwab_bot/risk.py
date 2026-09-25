@@ -38,6 +38,12 @@ class RecentExitRecord:
     alternated win/loss/win/loss/loss through one price for three hours.
     Kept in a list (not a dict keyed by symbol) so multiple exits on the same
     symbol within the window all participate in the check.
+
+    ``side`` and ``entry_price`` are ``RiskManager.same_level_anchor``: for
+    an option the UNDERLYING's market direction and its price at entry, and
+    ``exit_price`` the underlying's price at exit, so every field sits in the
+    price space of ``atr`` (the underlying's). Until 2026-09-25 an option was
+    recorded by its premium and its order side.
     """
     symbol: str
     side: Side
@@ -247,14 +253,16 @@ class RiskManager:
 
         Persisting HERE rather than only in ``register_exit`` matters: a
         PARTIAL exit books P&L through this method directly and never reaches
-        ``register_exit`` (see position_manager's ``remaining_qty <= 0``
-        branches). Under ``adaptive_ladder`` — the live management mode —
-        every rung is a partial, so persisting only on full exits would have
-        left the bulk of a day's realized P&L unrecoverable after a restart,
-        which is precisely the hole the state store exists to close.
-        ``register_exit`` persists again once it has also updated the cooldown
-        and same-level log; an extra sqlite write per exit is not worth
-        avoiding.
+        ``register_exit`` -- a broker fill of part of an exit order or of a
+        bracket child, and a deliberate scale-out (the shared divergence
+        partial exit, ``ExitDecision.fraction < 1``). Persisting only on full
+        exits would leave those slices' P&L unrecoverable after a restart,
+        which is precisely the hole the state store exists to close. (The
+        ``adaptive_ladder`` rungs are NOT partials: they move the stop and
+        target and never scale out -- this docstring said otherwise until
+        2026-09-24.) ``register_exit`` persists again once it has also
+        updated the cooldown and same-level log; an extra sqlite write per
+        exit is not worth avoiding.
         """
         self._reset_if_new_session()
         self.state.realized_pnl += float(pnl)
@@ -267,20 +275,21 @@ class RiskManager:
         *,
         additional_symbol: str | None = None,
         side: "Side | None" = None,
-        entry_price: float | None = None,
+        level: "tuple[Side, float] | None" = None,
         exit_price: float | None = None,
         atr: float | None = None,
     ) -> None:
         """Record an exit: update realized_pnl, cooldown, and recent-exit log.
 
-        ``side`` — when provided, drives direction-aware cooldown. Callers that
-        still pass only symbol/pnl get both-direction cooldown for backward
-        compatibility.
-        ``entry_price`` + ``atr`` — when provided, a ``RecentExitRecord`` is
+        ``side`` — when provided, drives direction-aware cooldown (the ORDER
+        side, which is what ``can_open`` checks). Callers that pass only
+        symbol/pnl get both-direction cooldown.
+        ``level`` + ``atr`` — when provided, a ``RecentExitRecord`` is
         appended so ``can_open`` can enforce the same-level retry block.
-        ``entry_price`` is the LEVEL the block keys off (the price already
-        tried); ``exit_price`` is carried for logging only. Every exit is
-        recorded, win or loss.
+        ``level`` is ``same_level_anchor`` of the closed position: the
+        direction and the price already tried (an option's are the
+        underlying's). ``exit_price`` is carried for logging only, in the same
+        price space. Every exit is recorded, win or loss.
         """
         self.register_realized_pnl(pnl)
         key = self._symbol_key(symbol)
@@ -309,18 +318,20 @@ class RiskManager:
         else:
             _apply(now_et() + timedelta(minutes=self.config.risk.cooldown_minutes))
 
-        # Record the exit for the same-level retry block. Needs the ENTRY price
-        # (the level being re-tried) and an ATR to scale the tolerance;
-        # callers without them pass None and the block skips this exit.
-        # Every exit is recorded regardless of P&L — see RecentExitRecord for
-        # why the old loser-only rule could not catch a repeat sequence.
-        if side is not None and entry_price is not None and atr is not None:
+        # Record the exit for the same-level retry block. Needs the LEVEL (the
+        # direction and entry price being re-tried) and an ATR to scale the
+        # tolerance; callers without them pass None and the block skips this
+        # exit. Every exit is recorded regardless of P&L — see
+        # RecentExitRecord for why the old loser-only rule could not catch a
+        # repeat sequence.
+        if level is not None and atr is not None:
+            level_side, level_price = level
             try:
                 record = RecentExitRecord(
                     symbol=key,
-                    side=side,
-                    entry_price=float(entry_price),
-                    exit_price=float(exit_price) if exit_price is not None else float(entry_price),
+                    side=level_side,
+                    entry_price=float(level_price),
+                    exit_price=float(exit_price) if exit_price is not None else float(level_price),
                     atr=max(1e-6, float(atr)),
                     timestamp=now_et(),
                 )
@@ -476,9 +487,9 @@ class RiskManager:
             return False, "cooldown"
         if raw_key and raw_key != signal.symbol and self.is_symbol_on_cooldown(raw_key, signal.side):
             return False, "cooldown"
-        # Same-level retry block: if a same-side stopout on this symbol is
+        # Same-level retry block: if a same-direction exit on this symbol is
         # recent AND the current entry candidate is within N*ATR of that
-        # prior stop, block unless the fib-pullback override applies.
+        # exit's entry level, block unless the fib-pullback override applies.
         blocked, block_reason = self._same_level_block_check(signal)
         if blocked:
             return False, block_reason
@@ -489,12 +500,14 @@ class RiskManager:
     def _same_level_block_check(self, signal: Signal) -> tuple[bool, str]:
         """Enforce the same-level retry block with a fib-pullback exception.
 
-        Returns ``(blocked, reason)``. Iterates recent stopouts; a record
+        Returns ``(blocked, reason)``. Iterates recent exits; a record
         blocks the signal iff:
           - same symbol (or its underlying key)
-          - same side
+          - same direction (``same_level_anchor``: an option's market
+            direction, never its order side)
           - within ``same_level_block_minutes`` of the prior exit
-          - |signal_entry - prior ENTRY| <= same_level_block_atr_mult * atr
+          - |signal level - prior level| <= same_level_block_atr_mult * atr,
+            the level being the entry price (an option's underlying's)
 
         If all four hold, the fib-pullback check runs: if the signal's entry
         price is inside the [0.5, 0.786] retracement band of the swing
@@ -510,14 +523,16 @@ class RiskManager:
         meta = signal.metadata if isinstance(signal.metadata, dict) else {}
         raw_key = meta.get("position_key") if isinstance(meta, dict) else None
         raw_key_norm = self._symbol_key(raw_key) if raw_key else None
-        signal_entry = self._signal_entry_price(signal)
-        if signal_entry is None or signal_entry <= 0:
+        anchor = self.same_level_anchor(signal.strategy, signal.side, signal.metadata,
+                                        self._signal_entry_price(signal))
+        if anchor is None:
             return False, "ok"
+        signal_side, signal_entry = anchor
         cutoff = now_et() - timedelta(minutes=window_minutes)
         for record in reversed(self.state.recent_exits):
             if record.timestamp < cutoff:
                 continue
-            if record.side != signal.side:
+            if record.side != signal_side:
                 continue
             if record.symbol != key and record.symbol != (raw_key_norm or key):
                 continue
@@ -542,6 +557,38 @@ class RiskManager:
                 return False, "ok"
             return True, "same_level_retry_block"
         return False, "ok"
+
+    @staticmethod
+    def same_level_anchor(strategy: str, side: Side, metadata: Any, price: Any) -> tuple[Side, float] | None:
+        """The (direction, price level) the same-level retry block keys on,
+        read the same way from a signal and from the position it became.
+
+        An equity: its side and ``price`` (the signal's intended entry, the
+        position's fill). An option: the UNDERLYING's market direction
+        (``metadata['direction']``, bullish* / bearish*) and the underlying's
+        price at entry (``metadata['underlying_entry']``, stamped by every
+        option signal builder and carried onto the position). Its premium is
+        not a level -- the ATR the block scales by is the underlying's -- and
+        its side is the ORDER side: a bear put debit is bought and a bull put
+        credit sold, so matching on it blocked flips and missed the same bet
+        through a different structure (fixed 2026-09-25). None when the level
+        cannot be read; the block then skips.
+        """
+        if is_option_strategy(strategy):
+            meta = metadata if isinstance(metadata, dict) else {}
+            market = str(meta.get("direction") or "").strip().lower()
+            if market.startswith("bullish"):
+                side = Side.LONG
+            elif market.startswith("bearish"):
+                side = Side.SHORT
+            else:
+                return None
+            price = meta.get("underlying_entry")
+        try:
+            value = float(price)
+        except (TypeError, ValueError):
+            return None
+        return (side, value) if math.isfinite(value) and value > 0 else None
 
     @staticmethod
     def _signal_entry_price(signal: Signal) -> float | None:
@@ -573,11 +620,19 @@ class RiskManager:
         expect a bullish swing (low→high) with pullback DOWN; for SHORT we
         expect a bearish swing (high→low) with pullback UP.
 
-        Keys are ``tech_``-prefixed because the shared
-        ``strategy_base._technical_lists(ctx, prefix="tech")`` helper
-        stamps the fib anchors onto every strategy's signal metadata under
-        that namespace.
+        Keys are ``tech_``-prefixed because the shared entry stage stamps the
+        ``_technical_lists(ctx, prefix="tech")`` of the frame a proposal was
+        gated on onto every signal it emits.
+
+        Never for an option signal. Its side is the ORDER side (a bull put
+        credit spread is sold), so the direction check against the swing
+        means nothing for it and could lift a legitimate block. The caller
+        passes the underlying's entry (``same_level_anchor``, 2026-09-25), the
+        same price space as the anchors. Option signals started carrying the
+        anchors when their entries moved onto the shared stage (2026-09-24).
         """
+        if is_option_strategy(signal.strategy):
+            return False
         meta = signal.metadata if isinstance(signal.metadata, dict) else {}
         try:
             anchor_low = float(meta.get("tech_fib_anchor_low"))

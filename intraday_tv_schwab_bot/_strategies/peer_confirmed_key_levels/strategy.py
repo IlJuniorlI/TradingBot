@@ -14,9 +14,14 @@ from ..shared import (
     _safe_float,
     _session_open_price,
     _side_prefixed_reasons,
+    htf_ema_spans,
     pd,
 )
+from ..shared_entry import EntryProposal
+from ..shared_exit import ExitTape, bar_closed_after
 from ..strategy_base import BaseStrategy
+from ...config import flip_confirmation_bars
+from ...models import ExitDecision
 from ...support_resistance import zone_flip_confirmed
 
 class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
@@ -76,12 +81,6 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
     def _confirmation_universe(self) -> list[str]:
         return self._dedupe_symbols(self._tradable_symbols() + self._peer_symbols())
 
-
-    def strategy_logic_default(self, section: str, key: str, default: Any) -> Any:
-        if section == "shared_exit" and key in {"use_chart_pattern_exit", "use_structure_exit", "use_sr_loss_exit"}:
-            return False
-        return default
-
     def should_force_flatten(self, position: Position) -> bool:
         return self._configurable_stock_force_flatten(position)
 
@@ -93,17 +92,40 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         width = max(float(zone_width or 0.0), 0.0)
         return float(price) - width, float(price) + width
 
-    def _ladder_exit_signal(self, position: Position, frame: pd.DataFrame, close: float, ema9: float, ema20: float, vwap: float, data=None) -> tuple[bool, str]:
+    def _ladder_exit_signal(self, position: Position, frame: pd.DataFrame, tape: ExitTape, data=None) -> ExitDecision | None:
+        """The adaptive-ladder defence: the defended zone flipped, or HTF
+        structure broke against the trade with price through its EMA / VWAP
+        references.
+
+        The references are the shared exit tape's (2026-09-24), so the first
+        session bar reads the all-hours EMAs -- the session-reset ones equal
+        the close there, which vetoed the structure-fail exit -- and a
+        reference with no value is left out rather than standing in as the
+        close. With no reference at all it holds.
+
+        The structure break must have happened after entry: its HTF bar
+        closed after the fill. Freshness alone
+        (``htf_structure_event_lookback_bars``: 8 60m bars in the key-levels
+        preset, a whole session) let a break the entry was taken against
+        count, so a LONG opened after a morning HTF CHoCH-down exited on its
+        first cycle with the close under its references -- the defect the
+        shared CHoCH exit had (2026-09-24). The HTF frame holds completed
+        bars, so an event bar that closed after the fill is one the entry
+        never saw.
+        """
         if self._trade_management_mode() != "adaptive_ladder":
-            return False, "hold"
+            return None
         metadata = position.metadata if isinstance(position.metadata, dict) else {}
         if not bool(metadata.get("ladder_management_enabled")):
-            return False, "hold"
+            return None
         defense_price = _optional_float(metadata.get("ladder_defense_price"))
         if defense_price is None or defense_price <= 0:
-            return False, "hold"
+            return None
+        close = tape.close
+        refs = tape.refs()
         defense_zone_width = max(0.0, _optional_float(metadata.get("ladder_defense_zone_width"), 0.0) or 0.0)
         symbol = str(metadata.get("underlying") or position.symbol)
+        htf_minutes = int(self.params.get("htf_minutes", 60))
         sr_ctx = None
         if data is not None and hasattr(data, "get_support_resistance"):
             try:
@@ -112,7 +134,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                     current_price=close,
                     flip_frame=frame,
                     mode="trading",
-                    timeframe_minutes=int(self.params.get("htf_minutes", 60)),
+                    timeframe_minutes=htf_minutes,
                     lookback_days=int(self.params.get("htf_lookback_days", 60)),
                     use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
                     use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
@@ -126,24 +148,34 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             close * 0.0005,
         )
         eps = max(float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0) * 0.15, close * 0.0001, 1e-6)
-        confirm_1m = max(0, int(self._support_resistance_setting("trading_flip_confirmation_1m_bars", 2) or 2))
-        confirm_5m = max(0, int(self._support_resistance_setting("trading_flip_confirmation_5m_bars", 1) or 1))
+        # Through the shared reader: `int(value or 2)` turned a configured 0
+        # (that frame's gate off) back into the default (2026-09-23).
+        confirm_1m, confirm_5m = flip_confirmation_bars(self.config.support_resistance)
         lower, upper = self._ladder_bounds(defense_price, defense_zone_width)
+        ms = getattr(sr_ctx, "market_structure", None)
+
+        def _broke_after_entry(direction: str) -> bool:
+            # A fresh HTF CHoCH or BoS in `direction` whose bar closed after the fill.
+            return ms is not None and any(
+                self._active_structure_break(bool(getattr(ms, f"{event}_{direction}", False)),
+                                             getattr(ms, f"{event}_{direction}_age_bars", None), htf=True)
+                and bar_closed_after(getattr(ms, f"{event}_{direction}_ts", None), position.entry_time, htf_minutes)
+                for event in ("choch", "bos")
+            )
+
         if position.side == Side.LONG:
             zone_lost = zone_flip_confirmed("support", lower, upper, flip_frame=frame, confirm_1m_bars=confirm_1m, confirm_5m_bars=confirm_5m, fallback_bar=None, eps=eps)
             if zone_lost and close <= lower - buffer:
-                return True, f"ladder_support_lost:{defense_price:.4f}"
-            ms = getattr(sr_ctx, "market_structure", None)
-            if ms is not None and (self._active_structure_break(bool(getattr(ms, "choch_down", False)), getattr(ms, "choch_down_age_bars", None), htf=True) or self._active_structure_break(bool(getattr(ms, "bos_down", False)), getattr(ms, "bos_down_age_bars", None), htf=True)) and close < min(ema9, ema20, vwap):
-                return True, f"ladder_structure_fail_long:{defense_price:.4f}"
+                return ExitDecision(f"ladder_support_lost:{defense_price:.4f}", "strategy")
+            if _broke_after_entry("down") and refs and close < min(refs):
+                return ExitDecision(f"ladder_structure_fail_long:{defense_price:.4f}", "strategy")
         else:
             zone_lost = zone_flip_confirmed("resistance", lower, upper, flip_frame=frame, confirm_1m_bars=confirm_1m, confirm_5m_bars=confirm_5m, fallback_bar=None, eps=eps)
             if zone_lost and close >= upper + buffer:
-                return True, f"ladder_resistance_lost:{defense_price:.4f}"
-            ms = getattr(sr_ctx, "market_structure", None)
-            if ms is not None and (self._active_structure_break(bool(getattr(ms, "choch_up", False)), getattr(ms, "choch_up_age_bars", None), htf=True) or self._active_structure_break(bool(getattr(ms, "bos_up", False)), getattr(ms, "bos_up_age_bars", None), htf=True)) and close > max(ema9, ema20, vwap):
-                return True, f"ladder_structure_fail_short:{defense_price:.4f}"
-        return False, "hold"
+                return ExitDecision(f"ladder_resistance_lost:{defense_price:.4f}", "strategy")
+            if _broke_after_entry("up") and refs and close > max(refs):
+                return ExitDecision(f"ladder_structure_fail_short:{defense_price:.4f}", "strategy")
+        return None
 
     @staticmethod
     def _round_number_hit(price: float, tolerance_pct: float) -> bool:
@@ -171,40 +203,38 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
     def _level_score_raw_htf_weight(self) -> float:
         return self._clamp_weight(self.params.get("level_score_raw_htf_weight", 0.65), 0.60)
 
-    @staticmethod
-    def _htf_bias(htf: HTFContext, close: float) -> tuple[str, int, int]:
-        bull = 0
-        bear = 0
-        ema_fast = _optional_float(getattr(htf, "ema_fast", None))
-        ema_slow = _optional_float(getattr(htf, "ema_slow", None))
-        if ema_fast is not None:
-            if close > ema_fast:
-                bull += 1
-            elif close < ema_fast:
-                bear += 1
-        if ema_fast is not None and ema_slow is not None:
-            if ema_fast > ema_slow:
-                bull += 1
-            elif ema_fast < ema_slow:
-                bear += 1
-        trend_bias = str(getattr(htf, "trend_bias", "neutral"))
-        if trend_bias == "bullish":
-            bull += 1
-        elif trend_bias == "bearish":
-            bear += 1
-        return "bullish" if bull >= 2 else ("bearish" if bear >= 2 else "neutral"), bull, bear
+    def _symbol_htf_request(self) -> dict[str, Any]:
+        """The HTF context this strategy family trades on -- the symbol's own,
+        each peer's and the prefetch's. One definition, so the three share
+        the data feed's cache entry: until 2026-09-24 the prefetch left out
+        the FVG arguments and warmed a context no decision read."""
+        fast, slow = htf_ema_spans(self.params)
+        return {
+            "timeframe_minutes": int(self.params.get("htf_minutes", 60)),
+            "lookback_days": int(self.params.get("htf_lookback_days", 60)),
+            "pivot_span": int(self.params.get("htf_pivot_span", 2)),
+            "max_levels_per_side": int(self.params.get("htf_max_levels_per_side", 6)),
+            "atr_tolerance_mult": float(self.params.get("htf_atr_tolerance_mult", 0.35)),
+            "pct_tolerance": float(self.params.get("htf_pct_tolerance", 0.0030)),
+            "stop_buffer_atr_mult": float(self.params.get("htf_stop_buffer_atr_mult", 0.25)),
+            "ema_fast_span": fast,
+            "ema_slow_span": slow,
+            "use_prior_day_high_low": bool(self._support_resistance_setting("use_prior_day_high_low", True)),
+            "use_prior_week_high_low": bool(self._support_resistance_setting("use_prior_week_high_low", True)),
+        }
+
+    def dashboard_htf_trend(self, symbol: str, data, price: float, *, allow_refresh: bool = True) -> dict[str, str] | None:
+        """The HTF EMA trend key_levels' gate (and trend_continuation's
+        score) read, off the same context they read it from."""
+        if data is None or not price:
+            return None
+        htf = self._htf_context(symbol, data, current_price=float(price), allow_refresh=allow_refresh,
+                                **self._symbol_htf_request())
+        return self._htf_trend_row(*self._htf_bias(htf, float(price)))
 
     def _peer_signal(self, symbol: str, bars: dict[str, pd.DataFrame], data) -> dict[str, Any]:
         universe = self._confirmation_universe()
-        tf = int(self.params.get("htf_minutes", 60))
-        lookback_days = int(self.params.get("htf_lookback_days", 60))
-        pivot_span = int(self.params.get("htf_pivot_span", 2))
-        max_lvls = int(self.params.get("htf_max_levels_per_side", 6))
-        atr_tol = float(self.params.get("htf_atr_tolerance_mult", 0.35))
-        pct_tol = float(self.params.get("htf_pct_tolerance", 0.0030))
-        stop_atr = float(self.params.get("htf_stop_buffer_atr_mult", 0.25))
-        ema_fast_span = int(self.params.get("htf_ema_fast_span", 50))
-        ema_slow_span = int(self.params.get("htf_ema_slow_span", 200))
+        htf_request = self._symbol_htf_request()
         score = 0
         bullish = 0
         bearish = 0
@@ -218,22 +248,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 continue
             close = _safe_float(frame.iloc[-1]["close"])
             ltf = self._resampled_frame(frame, int(self.params.get("ltf_minutes", 5)), symbol=peer, data=data)
-            htf = self._htf_context(
-                peer,
-                data,
-                timeframe_minutes=tf,
-                lookback_days=lookback_days,
-                pivot_span=pivot_span,
-                max_levels_per_side=max_lvls,
-                atr_tolerance_mult=atr_tol,
-                pct_tolerance=pct_tol,
-                stop_buffer_atr_mult=stop_atr,
-                ema_fast_span=ema_fast_span,
-                ema_slow_span=ema_slow_span,
-                current_price=close,
-                use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
-                use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
-            )
+            htf = self._htf_context(peer, data, current_price=close, **htf_request)
             bull_votes = 0
             bear_votes = 0
             ema_fast = _optional_float(getattr(htf, "ema_fast", None))
@@ -995,7 +1010,14 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         last5 = ltf.iloc[-1]
         atr = _safe_float(last5.get("atr14"), _optional_float(getattr(htf, "atr14", None)) or max(close * 0.0015, 0.01))
         target_clearance = self._peer_target_clearance(side, close, htf, atr)
-        if self._shared_entry_enabled("use_sr_filter", True) and bool(self._support_resistance_setting("enabled", True)) and target_clearance is not None:
+        # key_levels' own clearance check: the NEAREST HTF key level in the
+        # trade's direction must clear BOTH support_resistance.entry_min_
+        # clearance_pct and _atr before the setup is worth taking. It rode on
+        # shared_entry.use_sr_filter until 2026-09-24; that knob is now the
+        # shared S/R veto every strategy meets (an OR of the two clearances
+        # against the S/R context), so this AND check is the strategy's own
+        # param. The S/R section switch still turns it off with the rest.
+        if bool(self.params.get("require_peer_target_clearance", True)) and bool(self._support_resistance_setting("enabled", True)) and target_clearance is not None:
             min_clearance_pct = float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038))
             min_clearance_atr = float(self._support_resistance_setting("entry_min_clearance_atr", 0.85))
             clearance_pct = float(target_clearance["clearance_pct"])
@@ -1018,20 +1040,42 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         if not qualifying_target_levels:
             self._set_build_failure(c.symbol, failure_style, f"no_qualifying_target_rr:{rr_required:.2f}")
             return None
-        target_selection_index = 0
-        target = float(qualifying_target_levels[target_selection_index]["price"])
-        strong_vote_edge = (bull_votes - bear_votes) if side == Side.LONG else (bear_votes - bull_votes)
+        strong_vote_edge = self._side_vote_edge(side, bull_votes, bear_votes)
         directional_peer_score = peer_score if side == Side.LONG else -peer_score
         strong_setup_trigger_min = max(0.0, float(self.params.get("strong_setup_min_ltf_score", 3.2)))
         strong_setup_peer_min = _discrete_score_threshold(self.params.get("strong_setup_min_peer_score", 2), 3, minimum=0)
         strong_setup = bool(self.params.get("strong_setup_runner_enabled", True)) and ltf_score >= strong_setup_trigger_min and float(level["level_score"]) >= float(self.params.get("strong_setup_min_level_score", 3.4)) and abs(peer_score) >= strong_setup_peer_min and strong_vote_edge >= int(self.params.get("strong_setup_min_htf_vote_edge", 1))
         target_offset = max(0, int(self.params.get("strong_setup_target_level_offset", 1)))
-        if strong_setup and len(qualifying_target_levels) > target_offset:
-            target_selection_index = int(target_offset)
-            target = float(qualifying_target_levels[target_selection_index]["price"])
-        fvg_adjustments = self._fvg_entry_adjustment_components(side, c.symbol, frame, data)
-        runner_allowed = bool(strong_setup or float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0) >= 0.40)
-        management = self._adaptive_management_components(side, close, stop, target, style="peer", runner_allowed=runner_allowed, continuation_bias=float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0), strong_setup=strong_setup)
+        # The shared entry stage (2026-09-24). It gates on the 5m LTF the
+        # setup was read on (amendment 4) and builds S/R on the 1m frame;
+        # the FVG term and the runner's continuation bias stay on the 1m
+        # frame, where this strategy has always read them. The proposal's
+        # target is the FARTHEST qualifying rung: the refinement may only
+        # cap it, and the ladder keeps every rung up to the cap -- proposing
+        # the selected rung would cut the ladder's farther rungs off.
+        admitted = self.entry_policy.admit(EntryProposal(
+            candidate=c, direction=side, style="key_level", style_family="peer",
+            close=close, stop=stop, target=float(qualifying_target_levels[-1]["price"]),
+            gate_frame=ltf, sr_frame=frame, level_frame=ltf, zone_frame=frame, data=data,
+            htf_ctx=htf, failure_key=failure_style,
+        ))
+        if admitted is None:
+            return None
+        # The ladder is priced from the refined stop: re-qualify the rungs at
+        # min_rr from it, none past the (possibly capped) refined target.
+        target_cap = float(admitted.target)
+        qualifying_target_levels = [
+            item for item in self._qualifying_target_levels(side, close, float(admitted.stop), htf, atr, rr_required)
+            if (float(item["price"]) <= target_cap if side == Side.LONG else float(item["price"]) >= target_cap)
+        ]
+        if not qualifying_target_levels:
+            self._set_build_failure(c.symbol, failure_style, f"no_qualifying_target_rr_after_refine:{rr_required:.2f}")
+            return None
+        target_selection_index = int(target_offset) if strong_setup and len(qualifying_target_levels) > target_offset else 0
+        target = float(qualifying_target_levels[target_selection_index]["price"])
+        continuation_bias = float(admitted.fvg["fvg_continuation_bias"])
+        runner_allowed = bool(strong_setup or continuation_bias >= 0.40)
+        management = self._adaptive_management_components(side, close, float(admitted.stop), target, style="peer", runner_allowed=runner_allowed, continuation_bias=continuation_bias, strong_setup=strong_setup)
         macro_agreement_count = long_agree if side == Side.LONG else short_agree
         source_priority = float(level.get("source_priority", self._peer_level_source_priority(str(level.get("kind") or ""))) or 0.0)
         level_selection_score = float(level.get("selection_score", 0.0) or 0.0)
@@ -1050,34 +1094,34 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         # we reach this ranking code, abs(peer_score) is equivalent to
         # directional_peer_score for the chosen side — safely monotonic with
         # "how strongly peers agree with this direction".
-        # HTF RSI divergence confluence — folds the HTF-aligned bonus / counter
-        # penalty / hidden bonus into the strategy's score. Gated by
-        # shared_entry.use_htf_divergence_filter and behaves as a no-op when
-        # htf has no divergence detected on either side. Doesn't touch sr_ctx
-        # / tech_ctx — only HTF, since that's what's already in scope here
-        # without paying the build cost for the other contexts.
-        htf_divergence_adjustment = self._htf_divergence_adjustment(side, htf)
-        final_priority_score = (
+        # The strategy's own score. emit adds the shared context score on
+        # top: the FVG term and the HTF RSI divergence term (read off this
+        # strategy's own HTF context, handed to admit as htf_ctx) -- the two
+        # this sum carried itself until 2026-09-24 -- plus any other shared
+        # score term the YAML switches on.
+        strategy_score = (
             float(level["level_score"])
             + float(trigger["score"])
             + (abs(peer_score) * 0.25)
-            + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
             + source_priority_bonus
             + htf_vote_bonus
             + macro_bonus
             + clearance_bonus
             + strong_setup_bonus
-            + htf_divergence_adjustment
             + (float(c.activity_score) * activity_weight)
         )
-        selection_quality_score = final_priority_score + (level_selection_score * 0.20)
+        # final_priority_score + 0.20 x the level's selection score, as it
+        # was: the side pick and the rank tail read it.
+        selection_quality_score = strategy_score + float(admitted.shared_context_score) + (level_selection_score * 0.20)
         reason = f"peer_confirmed_key_level_{'long' if side == Side.LONG else 'short'}"
-        metadata = self._build_signal_metadata(
-            entry_price=close,
-            fvg_adjustments=fvg_adjustments,
+        return self.entry_policy.emit(
+            admitted,
+            reason=reason,
+            strategy_score=strategy_score,
             management=management,
-            final_priority_score=final_priority_score,
-            leading={
+            target=target,
+            ladder_meta=self._ladder_management_metadata(side, level, qualifying_target_levels, target_selection_index),
+            metadata={
                 "level_kind": str(level["kind"]),
                 "level_price": float(level["price"]),
                 "level_score": float(level["level_score"]),
@@ -1128,7 +1172,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 "activity_score": float(c.activity_score),
                 "activity_score_weight": float(activity_weight),
                 "setup_quality_score": round(float(level["level_score"]) + float(trigger["score"]) + (abs(peer_score) * 0.25), 4),
-                "execution_quality_score": round(float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0) + source_priority_bonus + htf_vote_bonus + macro_bonus + clearance_bonus + strong_setup_bonus, 4),
+                "execution_quality_score": round(float(admitted.fvg["fvg_entry_adjustment"]) + source_priority_bonus + htf_vote_bonus + macro_bonus + clearance_bonus + strong_setup_bonus, 4),
                 "macro_score": round(float(macro_bonus), 4),
                 "selection_quality_score": float(selection_quality_score),
                 "regime_score": float(level["level_score"]),
@@ -1141,13 +1185,9 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 "runner_quality_score": 1 if strong_setup else 0,
                 "runner_target_applied": bool(strong_setup and len(qualifying_target_levels) > target_offset),
                 "qualifying_target_count": int(len(qualifying_target_levels)),
-            },
-            extras={
-                **self._ladder_management_metadata(side, level, qualifying_target_levels, target_selection_index),
                 **self._htf_lists(htf),
             },
         )
-        return Signal(symbol=c.symbol, strategy=self._active_strategy_name(), side=side, reason=reason, stop_price=float(stop), target_price=float(target), metadata=metadata)
 
     def prefetch_entry_market_data(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], data=None) -> None:
         if data is None or not hasattr(data, "prefetch_htf_contexts"):
@@ -1161,52 +1201,24 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         ]
         if not universe:
             return
-        data.prefetch_htf_contexts(
-            universe,
-            timeframe_minutes=int(self.params.get("htf_minutes", 60)),
-            lookback_days=int(self.params.get("htf_lookback_days", 60)),
-            pivot_span=int(self.params.get("htf_pivot_span", 2)),
-            max_levels_per_side=int(self.params.get("htf_max_levels_per_side", 6)),
-            atr_tolerance_mult=float(self.params.get("htf_atr_tolerance_mult", 0.35)),
-            pct_tolerance=float(self.params.get("htf_pct_tolerance", 0.0030)),
-            stop_buffer_atr_mult=float(self.params.get("htf_stop_buffer_atr_mult", 0.25)),
-            ema_fast_span=int(self.params.get("htf_ema_fast_span", 50)),
-            ema_slow_span=int(self.params.get("htf_ema_slow_span", 200)),
-            use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
-            use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
-        )
+        data.prefetch_htf_contexts(universe, **self._symbol_htf_request(), **self._htf_fvg_request())
 
-    def position_exit_signal(self, position: Position, bars: dict[str, pd.DataFrame], data=None) -> tuple[bool, str]:
-        symbol = str(position.metadata.get("underlying") or position.symbol)
-        frame = bars.get(symbol)
-        if frame is None or frame.empty:
-            return False, "hold"
-        last = frame.iloc[-1]
-        close = _safe_float(last["close"])
-        ema9 = _safe_float(last["ema9"], close) if "ema9" in frame.columns else close
-        ema20 = _safe_float(last["ema20"], close) if "ema20" in frame.columns else close
-        vwap = _safe_float(last["vwap"], close) if "vwap" in frame.columns else close
-        should_exit, reason = self._ladder_exit_signal(position, frame, close, ema9, ema20, vwap, data=data)
-        if should_exit:
-            return should_exit, reason
-        direction = self._direction_token(position)
-        close_pos = _bar_close_position(frame)
-        return self._technical_exit_signal(direction, frame, close, ema9, ema20, vwap, close_pos, position)
+    def strategy_exit_signal(self, position: Position, bars: dict[str, pd.DataFrame], tape: ExitTape, data=None) -> ExitDecision | None:
+        # Only the ladder defence is peer-specific. The technical exits this
+        # override used to run itself -- and the time stop, chart, candle,
+        # structure and S/R exits it skipped -- are the shared families, which
+        # now run first for every peer as its own YAML configures them
+        # (2026-09-24). Only the reason label can differ when a shared family
+        # and the ladder would both fire on the same cycle.
+        frame = bars[str(position.metadata.get("underlying") or position.symbol)]
+        return self._ladder_exit_signal(position, frame, tape, data=data)
 
     def entry_signals(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], client=None, data=None) -> list[Signal]:
         self._reset_entry_decisions()
         out: list[Signal] = []
         min_level_score = float(self.params.get("min_level_score", 2.9))
         allow_short = bool(self.config.risk.allow_short)
-        tf = int(self.params.get("htf_minutes", 60))
-        lookback_days = int(self.params.get("htf_lookback_days", 60))
-        pivot_span = int(self.params.get("htf_pivot_span", 2))
-        max_lvls = int(self.params.get("htf_max_levels_per_side", 6))
-        atr_tol = float(self.params.get("htf_atr_tolerance_mult", 0.35))
-        pct_tol = float(self.params.get("htf_pct_tolerance", 0.0030))
-        stop_atr = float(self.params.get("htf_stop_buffer_atr_mult", 0.25))
-        ema_fast_span = int(self.params.get("htf_ema_fast_span", 50))
-        ema_slow_span = int(self.params.get("htf_ema_slow_span", 200))
+        htf_request = self._symbol_htf_request()
         ltf_min = int(self.params.get("ltf_minutes", 5))
         min_bars = int(self.params.get("min_bars", 80))
         min_ltf_bars = int(self.params.get("min_ltf_bars", 18))
@@ -1229,22 +1241,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_ltf_bars", 0 if ltf is None else len(ltf), min_ltf_bars)])
                 continue
             close = _safe_float(frame.iloc[-1]["close"])
-            htf = self._htf_context(
-                c.symbol,
-                data,
-                timeframe_minutes=tf,
-                lookback_days=lookback_days,
-                pivot_span=pivot_span,
-                max_levels_per_side=max_lvls,
-                atr_tolerance_mult=atr_tol,
-                pct_tolerance=pct_tol,
-                stop_buffer_atr_mult=stop_atr,
-                ema_fast_span=ema_fast_span,
-                ema_slow_span=ema_slow_span,
-                current_price=close,
-                use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
-                use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
-            )
+            htf = self._htf_context(c.symbol, data, current_price=close, **htf_request)
             symbol_peer_ctx = self._peer_signal(c.symbol, bars, data)
             short_side_enabled = bool(allow_short)
             long_level = self._select_level(Side.LONG, close, ltf, htf)
@@ -1271,10 +1268,11 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 if long_level is None and short_level is None:
                     reasons.append("price_not_in_htf_zone")
                 else:
-                    long_failure = self._consume_build_failure(c.symbol, self._failure_style_name(Side.LONG))
-                    short_failure = self._consume_build_failure(c.symbol, self._failure_style_name(Side.SHORT))
-                    for side, failure in ((Side.LONG, long_failure), (Side.SHORT, short_failure)):
-                        for token in _side_prefixed_reasons(side, [failure] if failure else []):
+                    # Every blocker of each side: a shared-entry refusal
+                    # lists all of them (2026-09-24), its own gates one.
+                    for side in (Side.LONG, Side.SHORT):
+                        failure = self._consume_build_failure_payload(c.symbol, self._failure_style_name(side))
+                        for token in _side_prefixed_reasons(side, failure["reasons"] if failure else []):
                             if token and token not in reasons:
                                 reasons.append(token)
                     if not reasons:

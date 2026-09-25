@@ -154,7 +154,7 @@ class SmallCapSqueezeScreener(BaseStrategyScreener):
         # screen, so after merging two screens and re-sorting, the ranks are
         # stale AND duplicated — three candidates can all claim rank 2.
         # `rank` is the final tiebreak in
-        # entry_gatekeeper._signal_priority_key and is what the dashboard
+        # shared_entry.SharedEntryPolicy.rank_key and is what the dashboard
         # candidate card and the audit log's `candidate_rank` display.
         for position, candidate in enumerate(ranked, start=1):
             candidate.rank = position

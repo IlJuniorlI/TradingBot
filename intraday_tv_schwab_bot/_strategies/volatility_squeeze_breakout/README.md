@@ -44,31 +44,31 @@ The short side mirrors that logic with bearish alignment and a break below the s
 
 ### 4. It still tries to avoid low-quality expansion bars
 
-Even after the breakout condition is met, the strategy can block the trade because of:
+Even after the breakout condition is met, the strategy can block the trade. The anti-chase exhaustion checks (extension from VWAP / EMA9 in ATR, the side's wick rejection, an oversized expansion bar) join the squeeze and side blockers as the pending reasons of one proposal per side (style and family `vol_squeeze`; the short side only with `risk.allow_short`), which the strategy hands to the shared entry stage (`_strategies/shared_entry.py`). There:
 
-- anti-chase / exhaustion filters
-- FVG retest deferment logic
-- opposing chart-pattern filters
-- technical divergence checks
-- structure or S/R vetoes
+- an FVG retest of the box edge (`use_fvg_context`, the `anti_chase_fvg_retest_*` knobs) can clear the missing-break, weak-bar and stretched reasons
+- every `shared_entry` veto the preset switches on applies, also to a retest entry: market structure, support/resistance, broken level, opposing chart pattern, dual RSI+OBV counter-divergence, opposing candle cluster
+
+A side the stage refuses leaves the other side to win. When both sides are refused, the decision lists the long side's blockers, then the short side's. Until 2026-09-24 the strategy called these itself: the chart filter ran only while nothing else was pending (so an entry the retest admitted never met it), structure and S/R were an either/or, and the candle veto and the broken-level guard never reached it.
 
 This matters because squeeze breakouts often fail by triggering late after the easy part of the move is gone.
 
 ### 5. How the trade is framed
 
-The stop is anchored beyond the breakout box with ATR and risk-floor protection. The target starts from reward-to-risk and can extend in stronger runner cases. Then both are refined by:
+The stop sits a compression-scaled buffer beyond the far side of the box, at least `risk.default_stop_pct` away. The breakout quality requests a target tier: `standard` (`target_rr`), `runner` (`runner_target_rr`: a break of structure, ATR expansion 0.12 over the minimum, or strong quality) or `premium` (`premium_target_rr`: strong quality plus a break of structure plus the Bollinger squeeze flag). The shared stage then refines both levels (support/resistance, then technical levels, bounded by `min_target_rr` and `min_stop_atr_mult`); on a retest entry it pulls the stop to the retest zone's anchor, held at least `min_stop_atr_mult` ATR from entry.
 
-- support/resistance
-- technical levels
-- FVG context
-- adaptive management metadata
+`squeeze_tier_label` and `squeeze_effective_target_rr` describe the ADMITTED target: the R:R is its distance from entry in units of the proposal's own risk (the unit the tiers are defined in), so it is the requested tier's R:R unless a level capped the target, and the label is the highest tier up to the requested one that R:R still reaches (`standard` when none). They deliberately ignore a stop the refinement pulled in: that realized R:R routinely reads 10R and more and says nothing about which tier the target still reaches. Both are log-only. Until 2026-09-24 both were the requested tier's, so a premium break whose target a resistance capped at 2R was logged as a 3.2R premium trade.
 
-The signal-strength score rewards things like:
+The strategy's own priority (`strategy_priority_score`) rewards:
 
 - tighter compression
 - stronger breakout volume
-- clear structure support
-- better context alignment
+- the Bollinger squeeze flag
+- a break of structure in the side's direction
+
+The shared context terms (`shared_context_score`) are added on top; their sum is the `final_priority_score`, which also picks the side when both survive.
+
+The signal also carries `entry_price`, which the shared stage stamps on every signal since 2026-09-24 and which `risk.py`'s same-level retry block needs. This strategy never stamped one before, so the block never reached it and the preset's 30 minutes were inert; the preset ships `risk.same_level_block_minutes: 0` to keep that (parity). Turning the block on for this strategy is a separate go-live decision, for a beta dry-run.
 
 ### 6. What a strong setup looks like
 

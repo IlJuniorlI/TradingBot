@@ -63,11 +63,14 @@ const appState = {
     emaFastSpan: null,
     emaSlowSpan: null,
     htfRefreshToken: null,
+    sourceBarTs: null,
+    formingEndsAt: null,
     pinnedBarId: null,
     refreshRafId: 0,
     pendingForceRefresh: false,
     stateLastUpdate: null,
     isLoading: false,
+    inFlight: false,
     cache: new Map(),
   },
   compactChart: {
@@ -82,10 +85,13 @@ const appState = {
     emaFastSpan: null,
     emaSlowSpan: null,
     htfRefreshToken: null,
+    sourceBarTs: null,
+    formingEndsAt: null,
     patterns: {},
     structureOverlay: {},
     stateLastUpdate: null,
     isLoading: false,
+    inFlight: false,
     cache: new Map(),
   },
 };
@@ -536,30 +542,29 @@ function chartLtfIsOneMinute(data = appState.data, symbol = appState.selectedSym
   // get_merged with no timeframe arg). When the active strategy declares
   // params.ltf_minutes > 1 (e.g. peer_confirmed_key_levels uses 5m), the
   // /api/chart LTF payload returns 5m bars resampled by data_feed.get_merged.
-  // Merging the 1m snapshot bars into the 5m cache would overwrite the 5m
-  // candles by colliding abs_index keys, "rewinding" the chart to whatever
-  // the 1m streaming window covers. So this gate must return true ONLY when
+  // Merging the 1m snapshot bars into the 5m cache would interleave 1m
+  // candles with the 5m ones (and overwrite each 5m candle with the 1m bar
+  // sharing its start). So this gate must return true ONLY when
   // ltf_minutes == 1.
   const label = String(currentLtfTimeframeLabel(data, symbol) || '').trim().toLowerCase();
   return label === '1m';
 }
 
+// A bar is identified and ordered by its start time. abs_index (the bar's
+// position in the server's merged frame) is not an identity: the server
+// drops the oldest rows when it trims that frame, which renumbers every bar.
+// Until 2026-09-23 bars were keyed and sorted by abs_index, so after a trim
+// the new bars (low numbers) sorted before the cached ones (high numbers)
+// and slice(-maxBars) threw them away -- the chart froze.
 function chartBarIdentity(bar, fallbackIndex = -1) {
-  const absIndex = numOrNull(bar?.abs_index);
-  if (absIndex !== null) return `a:${absIndex}`;
-  const ts = String(bar?.ts || '').trim();
-  if (ts) return `t:${ts}`;
+  const millis = Date.parse(bar?.ts || '');
+  if (Number.isFinite(millis)) return `t:${millis}`;
   if (fallbackIndex >= 0) return `i:${fallbackIndex}`;
   return null;
 }
 
 function compareChartBars(left, right) {
-  const leftAbs = numOrNull(left?.abs_index);
-  const rightAbs = numOrNull(right?.abs_index);
-  if (leftAbs !== null || rightAbs !== null) {
-    return (leftAbs ?? Number.NEGATIVE_INFINITY) - (rightAbs ?? Number.NEGATIVE_INFINITY);
-  }
-  return String(left?.ts || '').localeCompare(String(right?.ts || ''));
+  return Date.parse(left?.ts || '') - Date.parse(right?.ts || '');
 }
 
 function chartBarsSignature(bars) {
@@ -635,7 +640,46 @@ function mergeChartBars(existingBars, incomingBars, maxBars) {
     if (!key) return;
     merged.set(key, bar);
   });
-  (Array.isArray(incomingBars) ? incomingBars : []).forEach((bar, idx) => {
+  const incoming = Array.isArray(incomingBars) ? incomingBars : [];
+  // The incoming bars carry the server's current numbering. If a bar both
+  // sides hold is numbered differently, the server trimmed its frame since
+  // the existing bars were fetched: move every existing bar by the same
+  // offset so abs_index (which trendlines and LTF FVG anchors are placed by)
+  // stays one numbering across the merged bars.
+  let absShift = 0;
+  let overlap = false;
+  for (let idx = 0; idx < incoming.length; idx += 1) {
+    const previous = merged.get(chartBarIdentity(incoming[idx], idx));
+    const incomingAbs = numOrNull(incoming[idx]?.abs_index);
+    const previousAbs = numOrNull(previous?.abs_index);
+    if (incomingAbs !== null && previousAbs !== null) {
+      absShift = incomingAbs - previousAbs;
+      overlap = true;
+      break;
+    }
+  }
+  if (!overlap && incoming.length && merged.size) {
+    // No bar on both sides to measure the shift by (a stall longer than the
+    // snapshot window, then a repair fetch). A later incoming bar numbered
+    // at or below the newest existing one means the server renumbered in
+    // between: keep the incoming bars alone rather than mix two numberings,
+    // which placed trendline and FVG anchors wrong for that render
+    // (2026-09-23).
+    const lastExisting = Array.from(merged.values()).sort(compareChartBars).pop();
+    const firstIncoming = [...incoming].sort(compareChartBars)[0];
+    const lastAbs = numOrNull(lastExisting?.abs_index);
+    const firstAbs = numOrNull(firstIncoming?.abs_index);
+    if (lastAbs !== null && firstAbs !== null && compareChartBars(firstIncoming, lastExisting) > 0 && firstAbs <= lastAbs) {
+      merged.clear();
+    }
+  }
+  if (absShift !== 0) {
+    merged.forEach((bar, key) => {
+      const abs = numOrNull(bar?.abs_index);
+      if (abs !== null) merged.set(key, { ...bar, abs_index: abs + absShift });
+    });
+  }
+  incoming.forEach((bar, idx) => {
     const key = chartBarIdentity(bar, idx);
     if (!key) return;
     const previous = merged.get(key) || {};
@@ -651,9 +695,9 @@ function syncExpandedChartFromBaseSnapshot(data = appState.data) {
   if (expandedChartTimeframeMode() !== 'ltf') return false;
   const symbol = String(appState.selectedSymbol || '').toUpperCase();
   if (!symbol) return false;
-  // Snapshot.bars are 1m streaming bars. For ltf_minutes > 1 they'd collide
-  // with the resampled chart cache via abs_index — bail out and let the
-  // /api/chart fetch keep the cache fresh instead.
+  // Snapshot.bars are 1m streaming bars. For ltf_minutes > 1 they'd corrupt
+  // the resampled chart cache (see chartLtfIsOneMinute) — bail out and let
+  // the /api/chart fetch keep the cache fresh instead.
   if (!chartLtfIsOneMinute(data, symbol)) return false;
   const snapshot = activeSnapshotMap(data).get(symbol) || null;
   const baseBars = Array.isArray(snapshot?.bars) ? snapshot.bars : [];
@@ -661,32 +705,17 @@ function syncExpandedChartFromBaseSnapshot(data = appState.data) {
   const maxBars = expandedChartMaxBars(data);
   const sourceKey = expandedChartSourceKey(symbol, maxBars, data);
   const cached = appState.expandedChart.cache.get(sourceKey) || null;
-  const currentBars = (
+  const sourceEntry = (
     String(appState.expandedChart.symbol || '').toUpperCase() === symbol &&
     Array.isArray(appState.expandedChart.bars) &&
     appState.expandedChart.bars.length
-  ) ? appState.expandedChart.bars : (Array.isArray(cached?.bars) ? cached.bars : []);
+  ) ? appState.expandedChart : cached;
+  const currentBars = Array.isArray(sourceEntry?.bars) ? sourceEntry.bars : [];
   if (!currentBars.length) return false;
   const mergedBars = mergeChartBars(currentBars, baseBars, maxBars);
   if (!mergedBars.length) return false;
   const changed = chartBarsSignature(mergedBars) !== chartBarsSignature(currentBars);
   const mode = expandedChartTimeframeMode();
-  // Preserve patterns/structureOverlay from the existing chart cache
-  // when the state snapshot doesn't carry them. The state-level snapshot
-  // payload (snapshot.chart) NEVER includes `patterns` — that field is
-  // only populated by /api/chart fetches via ensureExpandedChartBars.
-  // Without this fallback, every state poll wipes
-  // appState.expandedChart.patterns to {} for expanded LTF view (this
-  // function only runs for LTF, see line ~664), causing the tooltip
-  // pattern section to render empty until the next /api/chart fetch
-  // re-populates them. Compact version (syncCompactChartFromBaseSnapshot
-  // line ~740) already does this.
-  const existingPatterns = (cached && typeof cached === 'object' ? cached.patterns : null)
-    || appState.expandedChart.patterns
-    || {};
-  const existingStructureOverlay = (cached && typeof cached === 'object' ? cached.structureOverlay : null)
-    || appState.expandedChart.structureOverlay
-    || {};
   const cacheEntry = {
     bars: mergedBars,
     lastBarTs: safe(mergedBars[mergedBars.length - 1]?.ts),
@@ -694,9 +723,19 @@ function syncExpandedChartFromBaseSnapshot(data = appState.data) {
     maxBars,
     timeframeMode: mode,
     timeframeLabel: expandedChartTimeframeLabel(data, mode),
-    patterns: snapshot?.chart?.patterns || existingPatterns,
-    structureOverlay: snapshot?.chart?.structure_overlay || existingStructureOverlay,
+    // Only /api/chart payloads carry patterns / structure overlay (the state
+    // snapshot never does), so they come from the entry the bars came from:
+    // they describe those bars. Taken from appState instead, a symbol switch
+    // could pair another symbol's patterns with this one's bars.
+    patterns: sourceEntry.patterns || {},
+    structureOverlay: sourceEntry.structureOverlay || {},
     htfRefreshToken: null,
+    emaFastSpan: sourceEntry.emaFastSpan ?? null,
+    emaSlowSpan: sourceEntry.emaSlowSpan ?? null,
+    // Still the chart payload's: merging snapshot bars into its bars does
+    // not refresh its patterns / structure overlay (remoteChartCacheNeedsRefresh).
+    sourceBarTs: sourceEntry.sourceBarTs || null,
+    formingEndsAt: sourceEntry.formingEndsAt || null,
     stateLastUpdate: safe(data?.last_update),
     updatedAt: Date.now(),
   };
@@ -709,6 +748,10 @@ function syncExpandedChartFromBaseSnapshot(data = appState.data) {
   appState.expandedChart.lastBarTs = cacheEntry.lastBarTs;
   appState.expandedChart.timeframeLabel = cacheEntry.timeframeLabel;
   appState.expandedChart.htfRefreshToken = cacheEntry.htfRefreshToken || null;
+  appState.expandedChart.emaFastSpan = cacheEntry.emaFastSpan;
+  appState.expandedChart.emaSlowSpan = cacheEntry.emaSlowSpan;
+  appState.expandedChart.sourceBarTs = cacheEntry.sourceBarTs;
+  appState.expandedChart.formingEndsAt = cacheEntry.formingEndsAt;
   appState.expandedChart.patterns = cacheEntry.patterns || {};
   appState.expandedChart.structureOverlay = cacheEntry.structureOverlay || {};
   appState.expandedChart.stateLastUpdate = cacheEntry.stateLastUpdate || safe(appState.data?.last_update);
@@ -729,12 +772,13 @@ function syncCompactChartFromBaseSnapshot(data = appState.data) {
   const maxBars = compactChartMaxBars(data);
   const sourceKey = compactChartSourceKey(symbol, maxBars, 'ltf');
   const cached = appState.compactChart.cache.get(sourceKey) || null;
-  const currentBars = (
+  const sourceEntry = (
     String(appState.compactChart.symbol || '').toUpperCase() === symbol
     && normalizedExpandedChartTimeframeMode(appState.compactChart.timeframeMode) === 'ltf'
     && Array.isArray(appState.compactChart.bars)
     && appState.compactChart.bars.length
-  ) ? appState.compactChart.bars : (Array.isArray(cached?.bars) ? cached.bars : []);
+  ) ? appState.compactChart : cached;
+  const currentBars = Array.isArray(sourceEntry?.bars) ? sourceEntry.bars : [];
   if (!currentBars.length) return false;
   const mergedBars = mergeChartBars(currentBars, baseBars, maxBars);
   if (!mergedBars.length) return false;
@@ -747,9 +791,19 @@ function syncCompactChartFromBaseSnapshot(data = appState.data) {
     maxBars,
     timeframeMode: 'ltf',
     timeframeLabel: expandedChartTimeframeLabel(data, 'ltf'),
-    patterns: snapshot?.chart?.patterns || appState.compactChart.patterns || {},
-    structureOverlay: snapshot?.chart?.structure_overlay || appState.compactChart.structureOverlay || {},
+    // From the bars' own entry (see syncExpandedChartFromBaseSnapshot). Until
+    // 2026-09-23 they came from appState.compactChart, which still holds the
+    // previous symbol when syncSelectedSymbol switches symbols without a
+    // reset: its patterns and structure level were drawn on the new symbol
+    // and written into its cache entry.
+    patterns: sourceEntry.patterns || {},
+    structureOverlay: sourceEntry.structureOverlay || {},
     htfRefreshToken: null,
+    emaFastSpan: sourceEntry.emaFastSpan ?? null,
+    emaSlowSpan: sourceEntry.emaSlowSpan ?? null,
+    // Still the chart payload's (see syncExpandedChartFromBaseSnapshot).
+    sourceBarTs: sourceEntry.sourceBarTs || null,
+    formingEndsAt: sourceEntry.formingEndsAt || null,
     stateLastUpdate: safe(data?.last_update),
     updatedAt: Date.now(),
   };
@@ -762,6 +816,10 @@ function syncCompactChartFromBaseSnapshot(data = appState.data) {
   appState.compactChart.lastBarTs = cacheEntry.lastBarTs;
   appState.compactChart.timeframeLabel = cacheEntry.timeframeLabel;
   appState.compactChart.htfRefreshToken = null;
+  appState.compactChart.emaFastSpan = cacheEntry.emaFastSpan;
+  appState.compactChart.emaSlowSpan = cacheEntry.emaSlowSpan;
+  appState.compactChart.sourceBarTs = cacheEntry.sourceBarTs;
+  appState.compactChart.formingEndsAt = cacheEntry.formingEndsAt;
   appState.compactChart.patterns = cacheEntry.patterns || {};
   appState.compactChart.structureOverlay = cacheEntry.structureOverlay || {};
   appState.compactChart.stateLastUpdate = cacheEntry.stateLastUpdate || safe(data?.last_update);
@@ -801,8 +859,7 @@ function currentChartBars(snapshot) {
       && compact.sourceKey === targetSourceKey;
     // Only merge the snapshot's 1m streaming bars when the LTF chart is
     // itself 1m-grained — see chartLtfIsOneMinute. For ltf_minutes > 1 the
-    // 1m bars would collide on abs_index and overwrite the resampled
-    // candles.
+    // 1m bars would corrupt the resampled candles.
     const mergeBaseBarsAllowed = compactMode === 'ltf' && baseBars.length && chartLtfIsOneMinute(appState.data, targetSymbol);
     if (compactMatchesTarget) {
       if (!mergeBaseBarsAllowed) return compactBars;
@@ -844,8 +901,8 @@ function currentChartBars(snapshot) {
     return cachedExpandedBars.length ? cachedExpandedBars : [];
   }
   // Same 1m-only merge gate as the compact branch above. For HTF mode or
-  // an LTF > 1m, the snapshot's 1m bars would collide with the chart's
-  // resampled candles via abs_index and corrupt the visible window.
+  // an LTF > 1m, the snapshot's 1m bars would corrupt the chart's
+  // resampled candles.
   if (targetMode !== 'ltf' || !baseBars.length || !chartLtfIsOneMinute(appState.data, targetSymbol)) return expanded.bars;
   return mergeChartBars(expanded.bars, baseBars, targetMaxBars);
 }
@@ -884,16 +941,7 @@ function setExpandedChartTimeframeMode(mode) {
   }
   appState.expandedChart.timeframeMode = next;
   appState.expandedChart.isLoading = true;
-  appState.expandedChart.bars = null;
-  appState.expandedChart.sourceKey = null;
-  appState.expandedChart.lastBarTs = null;
-  appState.expandedChart.timeframeLabel = null;
-  appState.expandedChart.emaFastSpan = null;
-  appState.expandedChart.emaSlowSpan = null;
-  appState.expandedChart.htfRefreshToken = null;
-  appState.expandedChart.patterns = {};
-  appState.expandedChart.structureOverlay = {};
-  appState.expandedChart.pinnedBarId = null;
+  clearExpandedChartView();
   if (appState.data) renderSelectedSymbol();
   else renderChartTimeframeToggle();
   if (appState.mainPanelExpanded) scheduleExpandedChartRefresh(true);
@@ -908,9 +956,10 @@ function cancelScheduledExpandedChartRefresh() {
   appState.expandedChart.pendingForceRefresh = false;
 }
 
-function resetExpandedChartCache() {
-  cancelScheduledExpandedChartRefresh();
-  appState.expandedChart.symbol = null;
+// Drops the expanded chart's current view -- its bars and everything read
+// off them -- keeping its symbol and cache. For a timeframe change: the view
+// belongs to the mode it was fetched in.
+function clearExpandedChartView() {
   appState.expandedChart.bars = null;
   appState.expandedChart.sourceKey = null;
   appState.expandedChart.lastBarTs = null;
@@ -918,10 +967,18 @@ function resetExpandedChartCache() {
   appState.expandedChart.emaFastSpan = null;
   appState.expandedChart.emaSlowSpan = null;
   appState.expandedChart.htfRefreshToken = null;
+  appState.expandedChart.sourceBarTs = null;
+  appState.expandedChart.formingEndsAt = null;
   appState.expandedChart.patterns = {};
   appState.expandedChart.structureOverlay = {};
-  appState.expandedChart.stateLastUpdate = null;
   appState.expandedChart.pinnedBarId = null;
+}
+
+function resetExpandedChartCache() {
+  cancelScheduledExpandedChartRefresh();
+  appState.expandedChart.symbol = null;
+  clearExpandedChartView();
+  appState.expandedChart.stateLastUpdate = null;
   appState.expandedChart.isLoading = false;
   pruneExpandedChartCache();
 }
@@ -991,12 +1048,51 @@ function pruneCompactChartCache({ preserveSourceKey = null } = {}) {
 
 function remoteChartCacheNeedsRefresh(entry, data = appState.data, timeframeMode = 'ltf') {
   if (!entry || !Array.isArray(entry.bars) || !entry.bars.length) return true;
+  // A chart payload is current as of the newest 1m bar it was built from
+  // (source_bar_ts). Once the snapshot has a newer one, the payload's chart
+  // patterns, structure overlay and (HTF) forming bucket are stale. Until
+  // 2026-09-23 only the HTF token was checked, and a 1m LTF chart -- whose
+  // bars are kept current by merging snapshot bars -- fetched /api/chart once
+  // per symbol selection: its "Chart Patterns (latest)" stayed whatever they
+  // were at selection, for hours.
+  const symbol = String(entry?.symbol || appState.selectedSymbol || '').toUpperCase();
+  const snapshotBars = activeSnapshotMap(data).get(symbol)?.bars;
+  const newestSnapshotMillis = Array.isArray(snapshotBars) && snapshotBars.length
+    ? Date.parse(snapshotBars[snapshotBars.length - 1]?.ts || '')
+    : Number.NaN;
+  const entrySourceMillis = Date.parse(entry?.sourceBarTs || '');
+  if (Number.isFinite(newestSnapshotMillis) && !(entrySourceMillis >= newestSnapshotMillis)) return true;
+  // A payload built while its last bucket was forming is stale once that
+  // bucket has ended (forming_ends_at): a bucket whose last minutes print
+  // nothing brings no newer 1m bar, and the 5m LTF chart kept it dimmed and
+  // untagged as forming until the next trade.
+  const formingEndMillis = Date.parse(entry?.formingEndsAt || '');
+  if (Number.isFinite(formingEndMillis) && Date.now() >= formingEndMillis) return true;
   const normalizedMode = normalizedExpandedChartTimeframeMode(timeframeMode);
   if (normalizedMode !== 'htf') return false;
-  const currentToken = currentHtfRefreshToken(data, entry?.symbol || appState.selectedSymbol);
+  const currentToken = currentHtfRefreshToken(data, symbol);
   const entryToken = String(entry?.htfRefreshToken || '').trim();
   if (currentToken || entryToken) return currentToken !== entryToken;
   return false;
+}
+
+// A chart request that never settles would hold its view's inFlight flag
+// forever: every non-forced poll then returns early and that chart stops
+// refreshing until a symbol or mode change forces a fetch. Abort it after a
+// few polls so the finally block clears the flag and the next poll retries
+// (2026-09-23).
+const CHART_FETCH_TIMEOUT_MS = Math.max(15000, REFRESH_MS * 5);
+
+async function fetchChartPayload(symbol, maxBars, timeframeMode) {
+  const abortCtl = new AbortController();
+  const timeoutId = setTimeout(() => abortCtl.abort(), CHART_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(`/api/chart?symbol=${encodeURIComponent(symbol)}&bars=${encodeURIComponent(maxBars)}&timeframe=${encodeURIComponent(timeframeMode)}&ts=${Date.now()}`, { cache: 'no-store', signal: abortCtl.signal });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.json();
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 async function ensureCompactChartBars(force = false) {
@@ -1025,6 +1121,8 @@ async function ensureCompactChartBars(force = false) {
     appState.compactChart.emaFastSpan = cached.emaFastSpan ?? null;
     appState.compactChart.emaSlowSpan = cached.emaSlowSpan ?? null;
     appState.compactChart.htfRefreshToken = cached.htfRefreshToken || null;
+    appState.compactChart.sourceBarTs = cached.sourceBarTs || null;
+    appState.compactChart.formingEndsAt = cached.formingEndsAt || null;
     appState.compactChart.patterns = cached.patterns || {};
     appState.compactChart.structureOverlay = cached.structureOverlay || {};
     appState.compactChart.stateLastUpdate = cached.stateLastUpdate || safe(appState.data?.last_update);
@@ -1032,20 +1130,30 @@ async function ensureCompactChartBars(force = false) {
     if (appState.data) renderSelectedSymbol();
     return cached.bars;
   }
+  // One request at a time. The chart now refetches once per new bar, from a
+  // renderApp every REFRESH_MS: a poll must not supersede (and so discard)
+  // a request still in flight, or a server slower than one poll would never
+  // land a payload.
+  if (!force && appState.compactChart.inFlight) return null;
   const requestSeq = (appState.compactChart.requestSeq || 0) + 1;
   appState.compactChart.requestSeq = requestSeq;
   appState.compactChart.isLoading = true;
+  appState.compactChart.inFlight = true;
   if (appState.data) renderSelectedSymbol();
-  let res;
+  let payload;
   try {
-    res = await fetch(`/api/chart?symbol=${encodeURIComponent(symbol)}&bars=${encodeURIComponent(maxBars)}&timeframe=${encodeURIComponent(timeframeMode)}&ts=${Date.now()}`, { cache: 'no-store' });
+    payload = await fetchChartPayload(symbol, maxBars, timeframeMode);
   } catch (err) {
     if (appState.compactChart.requestSeq === requestSeq) appState.compactChart.isLoading = false;
     throw err;
+  } finally {
+    if (appState.compactChart.requestSeq === requestSeq) appState.compactChart.inFlight = false;
   }
-  if (!res.ok) throw new Error('HTTP ' + res.status);
-  const payload = await res.json();
-  if (appState.mainPanelExpanded || appState.compactChart.requestSeq !== requestSeq || String(appState.selectedSymbol || '').toUpperCase() !== symbol) {
+  // A payload for a view that has since changed (panel, symbol or timeframe)
+  // is dropped: the one-in-flight guard lets a poll return without bumping
+  // requestSeq, so a stale response could otherwise land on the new view.
+  if (appState.mainPanelExpanded || appState.compactChart.requestSeq !== requestSeq || String(appState.selectedSymbol || '').toUpperCase() !== symbol
+    || compactChartTimeframeMode(appState.data) !== timeframeMode) {
     if (appState.compactChart.requestSeq === requestSeq) appState.compactChart.isLoading = false;
     return null;
   }
@@ -1063,6 +1171,8 @@ async function ensureCompactChartBars(force = false) {
     emaFastSpan: Number(payload?.ema_fast_span) || null,
     emaSlowSpan: Number(payload?.ema_slow_span) || null,
     htfRefreshToken: String(payload?.htf_refresh_token || currentHtfRefreshToken(appState.data, symbol) || '').trim() || null,
+    sourceBarTs: payload?.source_bar_ts || null,
+    formingEndsAt: payload?.forming_ends_at || null,
     patterns: payload?.patterns || {},
     structureOverlay: payload?.structure_overlay || {},
     stateLastUpdate: safe(appState.data?.last_update),
@@ -1078,6 +1188,8 @@ async function ensureCompactChartBars(force = false) {
   appState.compactChart.emaFastSpan = cacheEntry.emaFastSpan;
   appState.compactChart.emaSlowSpan = cacheEntry.emaSlowSpan;
   appState.compactChart.htfRefreshToken = cacheEntry.htfRefreshToken;
+  appState.compactChart.sourceBarTs = cacheEntry.sourceBarTs;
+  appState.compactChart.formingEndsAt = cacheEntry.formingEndsAt;
   appState.compactChart.patterns = cacheEntry.patterns || {};
   appState.compactChart.structureOverlay = cacheEntry.structureOverlay || {};
   appState.compactChart.stateLastUpdate = cacheEntry.stateLastUpdate;
@@ -1095,6 +1207,8 @@ function resetCompactChartCache() {
   appState.compactChart.emaFastSpan = null;
   appState.compactChart.emaSlowSpan = null;
   appState.compactChart.htfRefreshToken = null;
+  appState.compactChart.sourceBarTs = null;
+  appState.compactChart.formingEndsAt = null;
   appState.compactChart.patterns = {};
   appState.compactChart.structureOverlay = {};
   appState.compactChart.stateLastUpdate = null;
@@ -1126,6 +1240,8 @@ async function ensureExpandedChartBars(force = false) {
       appState.expandedChart.emaFastSpan = cached.emaFastSpan ?? null;
       appState.expandedChart.emaSlowSpan = cached.emaSlowSpan ?? null;
       appState.expandedChart.htfRefreshToken = cached.htfRefreshToken || null;
+      appState.expandedChart.sourceBarTs = cached.sourceBarTs || null;
+      appState.expandedChart.formingEndsAt = cached.formingEndsAt || null;
       appState.expandedChart.patterns = cached.patterns || {};
       appState.expandedChart.structureOverlay = cached.structureOverlay || {};
       appState.expandedChart.stateLastUpdate = cached.stateLastUpdate || safe(appState.data?.last_update);
@@ -1134,20 +1250,26 @@ async function ensureExpandedChartBars(force = false) {
       return cached.bars;
     }
   }
+  // One request at a time (see ensureCompactChartBars).
+  if (!force && appState.expandedChart.inFlight) return null;
   const requestSeq = (appState.expandedChart.requestSeq || 0) + 1;
   appState.expandedChart.requestSeq = requestSeq;
   appState.expandedChart.isLoading = true;
+  appState.expandedChart.inFlight = true;
   if (appState.data) renderSelectedSymbol();
-  let res;
+  let payload;
   try {
-    res = await fetch(`/api/chart?symbol=${encodeURIComponent(symbol)}&bars=${encodeURIComponent(maxBars)}&timeframe=${encodeURIComponent(timeframeMode)}&ts=${Date.now()}`, { cache: 'no-store' });
+    payload = await fetchChartPayload(symbol, maxBars, timeframeMode);
   } catch (err) {
     if (appState.expandedChart.requestSeq === requestSeq) appState.expandedChart.isLoading = false;
     throw err;
+  } finally {
+    if (appState.expandedChart.requestSeq === requestSeq) appState.expandedChart.inFlight = false;
   }
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const payload = await res.json();
-  if (!appState.mainPanelExpanded || appState.expandedChart.requestSeq !== requestSeq || String(appState.selectedSymbol || '').toUpperCase() !== symbol) {
+  // As in ensureCompactChartBars: an HTF payload still in flight when the
+  // user reopened the view in LTF used to land and switch the chart back.
+  if (!appState.mainPanelExpanded || appState.expandedChart.requestSeq !== requestSeq || String(appState.selectedSymbol || '').toUpperCase() !== symbol
+    || expandedChartTimeframeMode() !== timeframeMode) {
     if (appState.expandedChart.requestSeq === requestSeq) appState.expandedChart.isLoading = false;
     return null;
   }
@@ -1165,6 +1287,8 @@ async function ensureExpandedChartBars(force = false) {
     emaFastSpan: Number(payload?.ema_fast_span) || null,
     emaSlowSpan: Number(payload?.ema_slow_span) || null,
     htfRefreshToken: String(payload?.htf_refresh_token || currentHtfRefreshToken(appState.data, symbol) || '').trim() || null,
+    sourceBarTs: payload?.source_bar_ts || null,
+    formingEndsAt: payload?.forming_ends_at || null,
     patterns: payload?.patterns || {},
     structureOverlay: payload?.structure_overlay || {},
     stateLastUpdate: safe(appState.data?.last_update),
@@ -1180,6 +1304,8 @@ async function ensureExpandedChartBars(force = false) {
   appState.expandedChart.emaFastSpan = cacheEntry.emaFastSpan;
   appState.expandedChart.emaSlowSpan = cacheEntry.emaSlowSpan;
   appState.expandedChart.htfRefreshToken = cacheEntry.htfRefreshToken;
+  appState.expandedChart.sourceBarTs = cacheEntry.sourceBarTs;
+  appState.expandedChart.formingEndsAt = cacheEntry.formingEndsAt;
   appState.expandedChart.patterns = cacheEntry.patterns || {};
   appState.expandedChart.structureOverlay = cacheEntry.structureOverlay || {};
   appState.expandedChart.stateLastUpdate = cacheEntry.stateLastUpdate;
@@ -1239,6 +1365,8 @@ function setSelectedSymbol(symbol) {
       appState.compactChart.lastBarTs = cached.lastBarTs || null;
       appState.compactChart.timeframeLabel = cached.timeframeLabel || expandedChartTimeframeLabel(appState.data, timeframeMode);
       appState.compactChart.htfRefreshToken = cached.htfRefreshToken || null;
+      appState.compactChart.sourceBarTs = cached.sourceBarTs || null;
+      appState.compactChart.formingEndsAt = cached.formingEndsAt || null;
       appState.compactChart.patterns = cached.patterns || {};
       appState.compactChart.structureOverlay = cached.structureOverlay || {};
       appState.compactChart.stateLastUpdate = cached.stateLastUpdate || safe(appState.data?.last_update);
@@ -1304,6 +1432,12 @@ function setMainPanelExpanded(expanded) {
   }
   if (next) {
     lockExpandedSidePanelHeights();
+    // Expanding always opens the LTF view. A view left in HTF mode goes with
+    // its mode, as on a timeframe toggle: until 2026-09-23 it was kept, so
+    // the LTF chart drew the HTF payload's patterns, structure overlay and
+    // EMA spans, over 15m bars merged with the 1m snapshot bars, until the
+    // LTF fetch landed.
+    if (expandedChartTimeframeMode() !== 'ltf') clearExpandedChartView();
     appState.expandedChart.timeframeMode = 'ltf';
     appState.expandedChart.isLoading = true;
     renderChartTimeframeToggle(appState.data);
@@ -1858,15 +1992,16 @@ function renderSelectedSymbol() {
   document.getElementById('detail-resistance').textContent = fmtNum(nearestResistance, 2);
   document.getElementById('detail-vwap').textContent = fmtNum(bar.vwap, 2);
   document.getElementById('detail-bias-score').textContent = fmtNum(sr.bias_score, 2);
-  // EMA labels are dynamic — chart-endpoint payload's ema_fast_span /
-  // ema_slow_span tell us whether we're rendering the strategy's HTF EMAs
-  // (e.g. 34/200 for peer_confirmed_key_levels in HTF mode) or the default
-  // 9/20. The spans live on appState.expandedChart / compactChart (captured
-  // when /api/chart payloads arrive); snapshot.chart is the levels meta
-  // payload built in dashboard_cache.py:1086 and never carries them.
+  // EMA labels are dynamic. The active chart payload's spans come first
+  // (appState.expandedChart / compactChart, captured when /api/chart payloads
+  // arrive): the strategy's HTF EMAs in HTF mode (e.g. 34/200 for
+  // peer_confirmed_key_levels), its own LTF EMAs in LTF mode
+  // (scaled_span(9 / 20, ltf_indicator_span_scale), e.g. 45/100 for
+  // top_tier). Until a payload lands the bars are the snapshot's, whose
+  // spans travel on snapshot.chart.ema_fast_span / ema_slow_span.
   const activeEmaSource = appState.mainPanelExpanded ? appState.expandedChart : appState.compactChart;
-  const emaFastSpan = Math.max(1, Number(activeEmaSource?.emaFastSpan) || 9);
-  const emaSlowSpan = Math.max(1, Number(activeEmaSource?.emaSlowSpan) || 20);
+  const emaFastSpan = Math.max(1, Number(activeEmaSource?.emaFastSpan) || Number(snapshot?.chart?.ema_fast_span) || 9);
+  const emaSlowSpan = Math.max(1, Number(activeEmaSource?.emaSlowSpan) || Number(snapshot?.chart?.ema_slow_span) || 20);
   const emaFastLabel = `EMA${emaFastSpan}`;
   const emaSlowLabel = `EMA${emaSlowSpan}`;
   document.getElementById('detail-ema-fast-label').textContent = emaFastLabel;
@@ -2001,22 +2136,22 @@ function drawSelectedChart(snapshot) {
     return Number(line.slope) * Number(absIndex) + Number(line.intercept);
   }
 
-  function nearestIndexForTs(ts, barsInput) {
-    if (!ts || !barsInput.length) return null;
-    const target = Date.parse(ts);
+  // Index of the bar holding ts: bars are labelled at their start, so bar i
+  // spans [ts_i, ts_i + one bar). null when ts falls outside every charted
+  // bar. Until 2026-09-23 this took the bar with the nearest start (a 10:10:40
+  // exit went on the 10:11 bar, a 10:24:30 trade on the 15m chart's 10:30
+  // bar) and never returned null, so a trade before the first visible bar
+  // was drawn on bar 0.
+  function containingIndexForTs(ts) {
+    const target = Date.parse(ts || '');
     if (!Number.isFinite(target)) return null;
-    let bestIdx = null;
-    let bestGap = Number.POSITIVE_INFINITY;
-    barsInput.forEach((bar, idx) => {
-      const barTs = Date.parse(bar.ts);
-      if (!Number.isFinite(barTs)) return;
-      const gap = Math.abs(barTs - target);
-      if (gap < bestGap) {
-        bestGap = gap;
-        bestIdx = idx;
-      }
-    });
-    return bestIdx;
+    const barMillis = inferredBarMinutes() * 60000;
+    for (let idx = bars.length - 1; idx >= 0; idx -= 1) {
+      const barTs = Date.parse(bars[idx]?.ts || '');
+      if (!Number.isFinite(barTs) || barTs > target) continue;
+      return target < barTs + barMillis ? idx : null;
+    }
+    return null;
   }
 
   function uniqPatternList(values) {
@@ -2224,19 +2359,28 @@ function drawSelectedChart(snapshot) {
   };
   // HTF FVG/OB items are anything whose timeframe label isn't the LTF label
   // (defensive — items in `levels.htf_*` lists are HTF by design, but the
-  // filter sanity-checks against accidentally including LTF items).
-  const htfFairValueGaps = isLtfChart ? [] : normalizeDashboardFvgs(levels.htf_fair_value_gaps, 1).filter(gap => {
-    const timeframe = String(gap?.timeframe || '').trim().toLowerCase();
-    return !!timeframe && timeframe !== ltfTimeframeLabel;
-  });
-  const ltfFairValueGaps = isHtfChart ? [] : normalizeDashboardFvgs(levels.ltf_fair_value_gaps, 1).filter(ltfVisibilityFilter);
+  // filter sanity-checks against accidentally including LTF items) that
+  // formed inside the visible window: the box is anchored at first_seen, so
+  // an older item would be drawn from bar 0 as if it formed there.
+  const htfVisibilityFilter = (item) => {
+    const timeframe = String(item?.timeframe || '').trim().toLowerCase();
+    if (!timeframe || timeframe === ltfTimeframeLabel) return false;
+    const startMillis = Date.parse(item?.first_seen || '');
+    if (!Number.isFinite(startMillis)) return false;
+    if (Number.isFinite(firstBarMillis) && startMillis < firstBarMillis) return false;
+    if (Number.isFinite(lastBarMillis) && startMillis > lastBarMillis) return false;
+    return true;
+  };
+  // Visibility first, then one item per direction. Until 2026-09-23 the cap
+  // came first: the nearest item was kept and then dropped when it was off
+  // the chart, hiding a visible one of the same direction.
+  const visibleZoneItems = (items, visibilityFilter) => normalizeDashboardFvgs((Array.isArray(items) ? items : []).filter(visibilityFilter), 1);
+  const htfFairValueGaps = isLtfChart ? [] : visibleZoneItems(levels.htf_fair_value_gaps, htfVisibilityFilter);
+  const ltfFairValueGaps = isHtfChart ? [] : visibleZoneItems(levels.ltf_fair_value_gaps, ltfVisibilityFilter);
   // Order blocks share the FVG payload shape but render with dashed stroke
   // + minimal fill so they're visually distinguishable from FVGs.
-  const htfOrderBlocks = isLtfChart ? [] : normalizeDashboardFvgs(levels.htf_order_blocks, 1).filter(ob => {
-    const timeframe = String(ob?.timeframe || '').trim().toLowerCase();
-    return !!timeframe && timeframe !== ltfTimeframeLabel;
-  });
-  const ltfOrderBlocks = isHtfChart ? [] : normalizeDashboardFvgs(levels.ltf_order_blocks, 1).filter(ltfVisibilityFilter);
+  const htfOrderBlocks = isLtfChart ? [] : visibleZoneItems(levels.htf_order_blocks, htfVisibilityFilter);
+  const ltfOrderBlocks = isHtfChart ? [] : visibleZoneItems(levels.ltf_order_blocks, ltfVisibilityFilter);
   // Divergence trendlines: LTF lines render only on LTF chart, HTF lines
   // only on HTF chart. Each line is a {pivot_a, pivot_b, kind, direction,
   // indicator, age_bars, timeframe} payload from DivergenceMatch.to_payload().
@@ -2270,18 +2414,15 @@ function drawSelectedChart(snapshot) {
   const highs = bars.map(bar => Number(bar.high));
   const lows = bars.map(bar => Number(bar.low));
 
-  // Backend tells us which EMA spans the bars carry. In HTF mode the chart
-  // values are the strategy's htf_ema_fast/slow (e.g. 34/200 for
-  // peer_confirmed_key_levels); in LTF mode they're the default 9/20.
-  // The spans live on the chart-endpoint payload (appState.expandedChart /
-  // compactChart), NOT on snapshot.chart — `snapshot.chart` is the
-  // levels/technicals meta-payload built in dashboard_cache.py:1086 and
-  // never carries ema_fast_span/ema_slow_span. Reading from the active
-  // chart cache is what makes the HTF legend show EMA34 / EMA200 instead
-  // of the LTF default 9 / 20.
+  // Backend tells us which EMA spans the bars carry: the strategy's
+  // htf_ema_fast/slow in HTF mode (e.g. 34/200 for
+  // peer_confirmed_key_levels), its own LTF EMAs in LTF mode
+  // (scaled_span(9 / 20, ltf_indicator_span_scale)). The active chart
+  // payload's spans come first; until one lands the bars are the
+  // snapshot's, whose spans travel on snapshot.chart (chart here).
   const activeChartCache = isExpandedView ? appState.expandedChart : appState.compactChart;
-  const chartEmaFastSpan = Math.max(1, Number(activeChartCache?.emaFastSpan) || 9);
-  const chartEmaSlowSpan = Math.max(1, Number(activeChartCache?.emaSlowSpan) || 20);
+  const chartEmaFastSpan = Math.max(1, Number(activeChartCache?.emaFastSpan) || Number(chart.ema_fast_span) || 9);
+  const chartEmaSlowSpan = Math.max(1, Number(activeChartCache?.emaSlowSpan) || Number(chart.ema_slow_span) || 20);
   const seriesDefs = [];
   if (show('show_moving_averages', true)) {
     seriesDefs.push({ key: 'ema9', label: `EMA${chartEmaFastSpan}`, color: '#44e7ff', width: 2.0 });
@@ -2375,12 +2516,12 @@ function drawSelectedChart(snapshot) {
   }
   // Channels and trendlines are computed against the LTF frame in
   // dashboard_cache.py (build_technical_levels_context fed by tech_frame
-  // at _active_ltf_minutes). The line.slope/intercept were fit against
-  // LTF abs_index values. On the HTF chart the bars carry HTF abs_index
-  // values, so lineValueAt(line, bars[i].abs_index) projects to garbage
-  // prices — the line ends up "in empty space" detached from the bars.
-  // Gate the rendering to LTF-only (mirrors the divergence-lines
-  // isLtfChart/isHtfChart gating at lines 2144-2145).
+  // at _active_ltf_minutes), and their start_pos / end_pos / intercept are
+  // positions in that frame: the LTF chart bars' abs_index. On the HTF chart
+  // the bars carry HTF abs_index values, so lineValueAt(line, bars[i].abs_index)
+  // projects to garbage prices — the line ends up "in empty space" detached
+  // from the bars. Gate the rendering to LTF-only (mirrors the
+  // divergence-lines isLtfChart/isHtfChart gating above).
   const diagonalLines = [];
   if (isLtfChart && show('show_channel', false) && technicals.channel && technicals.channel.valid) {
     const lowerLine = technicals.channel.lower_line || null;
@@ -2481,10 +2622,27 @@ function drawSelectedChart(snapshot) {
     return hi >= overlayMinY && lo <= overlayMaxY;
   }
 
-  function isDiagonalLineInFocus(line) {
-    if (!line) return false;
-    const startValue = lineValueAt(line, visibleAbsStart);
-    const endValue = lineValueAt(line, visibleAbsEnd);
+  // A diagonal line is evaluated -- for the focus test, the y-range and the
+  // drawing alike -- only over the bars it is drawn across: from its first
+  // pivot (or the first visible bar) to the newest bar, where the bot reads
+  // its current_value. Channel edges share the channel's range. Until
+  // 2026-09-23 the focus test and y-range read each line at the first
+  // visible bar, i.e. extrapolated up to ~300 bars back before its first
+  // pivot (median 1.95x, worst 12.8x y-span stretch on 2026-09-22), while
+  // the drawing stopped at the line's last touch (end_pos).
+  function diagonalLineRange(item) {
+    if (item?.useChannelRange) return channelRenderRange;
+    const startAbs = Math.max(visibleAbsStart, numOrNull(item?.line?.start_pos) ?? visibleAbsStart);
+    const startIdx = firstIndexAtOrAfterAbs(startAbs);
+    if (startIdx === null) return null;
+    return { startAbs, endAbs: visibleAbsEnd, startIdx, endIdx: bars.length - 1 };
+  }
+
+  function isDiagonalLineInFocus(item) {
+    const range = diagonalLineRange(item);
+    if (!item?.line || !range) return false;
+    const startValue = lineValueAt(item.line, range.startAbs);
+    const endValue = lineValueAt(item.line, range.endAbs);
     if (numOrNull(startValue) === null || numOrNull(endValue) === null) return false;
     const lo = Math.min(Number(startValue), Number(endValue));
     const hi = Math.max(Number(startValue), Number(endValue));
@@ -2501,57 +2659,31 @@ function drawSelectedChart(snapshot) {
     return null;
   }
 
-  function lastIndexAtOrBeforeAbs(absIndex) {
-    const target = numOrNull(absIndex);
-    if (target === null) return null;
-    for (let idx = bars.length - 1; idx >= 0; idx -= 1) {
-      const abs = numOrNull(bars[idx]?.abs_index);
-      if (abs !== null && Number(abs) <= Number(target)) return idx;
-    }
-    return null;
-  }
-
+  // The channel band: from where both edges exist to the newest bar.
+  // channel.valid is the bot's verdict on that span; until 2026-09-23 the band
+  // also stopped at the earlier edge's last touch and at the first close
+  // outside it, so it never reached the bar the bot reads it on.
   function resolveChannelRenderRange(channelCtx) {
     const upperLine = channelCtx?.upper_line || null;
     const lowerLine = channelCtx?.lower_line || null;
     if (!upperLine || !lowerLine || !bars.length) return null;
-    const startCandidates = [numOrNull(upperLine.start_pos), numOrNull(lowerLine.start_pos), visibleAbsStart]
-      .filter(value => value !== null)
-      .map(value => Number(value));
-    const endCandidates = [numOrNull(upperLine.end_pos), numOrNull(lowerLine.end_pos), visibleAbsEnd]
-      .filter(value => value !== null)
-      .map(value => Number(value));
-    if (!startCandidates.length || !endCandidates.length) return null;
-    const startAbs = Math.max(...startCandidates);
-    let endAbs = Math.min(...endCandidates);
-    if (!Number.isFinite(startAbs) || !Number.isFinite(endAbs) || endAbs < startAbs) return null;
-    for (let idx = 0; idx < bars.length; idx += 1) {
-      const bar = bars[idx];
-      const abs = numOrNull(bar?.abs_index);
-      if (abs === null) continue;
-      const absNum = Number(abs);
-      if (absNum < startAbs || absNum > visibleAbsEnd) continue;
-      const upperValue = lineValueAt(upperLine, absNum);
-      const lowerValue = lineValueAt(lowerLine, absNum);
-      const closeValue = numOrNull(bar?.close);
-      if (numOrNull(upperValue) === null || numOrNull(lowerValue) === null || closeValue === null) continue;
-      const upperBound = Math.max(Number(upperValue), Number(lowerValue));
-      const lowerBound = Math.min(Number(upperValue), Number(lowerValue));
-      if (Number(closeValue) > upperBound || Number(closeValue) < lowerBound) {
-        endAbs = Math.min(endAbs, absNum);
-        break;
-      }
-    }
+    const startAbs = Math.max(
+      visibleAbsStart,
+      numOrNull(upperLine.start_pos) ?? visibleAbsStart,
+      numOrNull(lowerLine.start_pos) ?? visibleAbsStart,
+    );
     const startIdx = firstIndexAtOrAfterAbs(startAbs);
-    const endIdx = lastIndexAtOrBeforeAbs(endAbs);
-    if (startIdx === null || endIdx === null || endIdx < startIdx) return null;
-    return { startAbs, endAbs, startIdx, endIdx };
+    if (startIdx === null) return null;
+    return { startAbs, endAbs: visibleAbsEnd, startIdx, endIdx: bars.length - 1 };
   }
 
+  const channelUpperLine = technicals.channel?.upper_line || null;
+  const channelLowerLine = technicals.channel?.lower_line || null;
+  const channelRenderRange = resolveChannelRenderRange(technicals.channel);
   const visibleHorizontalLines = horizontalLines.filter(line => isValueInFocus(line?.value));
   const visibleMarkerLines = markerLines.filter(line => isValueInFocus(line?.value));
   const visibleKeyLevelZones = keyLevelZones.filter(zone => isZoneInFocus(zone?.lower, zone?.upper));
-  const visibleDiagonalLines = diagonalLines.filter(item => isDiagonalLineInFocus(item?.line));
+  const visibleDiagonalLines = diagonalLines.filter(item => isDiagonalLineInFocus(item));
   const keyLevelFocusPrice = numOrNull(snapshot?.quote?.last ?? bars[bars.length - 1]?.close ?? snapshot?.support_resistance?.price);
   const prioritizedVisibleKeyLevelZones = visibleKeyLevelZones.slice().sort((a, b) => {
     const selectedDelta = Number(!!b?.selected_for_entry) - Number(!!a?.selected_for_entry);
@@ -2565,9 +2697,16 @@ function drawSelectedChart(snapshot) {
     if (aDist !== bDist) return aDist - bDist;
     return Number(aPrice ?? 0) - Number(bPrice ?? 0);
   });
-  const channelUpperLine = technicals.channel?.upper_line || null;
-  const channelLowerLine = technicals.channel?.lower_line || null;
-  const channelRenderRange = resolveChannelRenderRange(technicals.channel);
+  // The chart payload's structure event (CHOCH / BOS on this chart's own
+  // bars): a marker on the bar it fired on and the reference level it broke,
+  // drawn from that bar to the right edge. Until 2026-09-23 the payload was
+  // computed for every chart and never drawn.
+  const structureEventText = String(activeStructureOverlay.event || '').trim();
+  const structureEventLevel = numOrNull(activeStructureOverlay.level);
+  const structureEventIdx = structureEventLevel !== null && show('show_support_resistance', true)
+    ? containingIndexForTs(activeStructureOverlay.event_ts)
+    : null;
+  const showStructureEvent = structureEventIdx !== null && isValueInFocus(structureEventLevel);
   const channelUpperValues = channelUpperLine && channelRenderRange
     ? bars.map((bar, idx) => (idx >= channelRenderRange.startIdx && idx <= channelRenderRange.endIdx)
       ? lineValueAt(channelUpperLine, Number(bar.abs_index))
@@ -2589,11 +2728,13 @@ function drawSelectedChart(snapshot) {
     if (upper !== null) rangeValues.push(Number(upper));
   });
   visibleDiagonalLines.forEach(item => {
-    const startValue = lineValueAt(item.line, visibleAbsStart);
-    const endValue = lineValueAt(item.line, visibleAbsEnd);
+    const range = diagonalLineRange(item);
+    const startValue = lineValueAt(item.line, range.startAbs);
+    const endValue = lineValueAt(item.line, range.endAbs);
     if (numOrNull(startValue) !== null) rangeValues.push(startValue);
     if (numOrNull(endValue) !== null) rangeValues.push(endValue);
   });
+  if (showStructureEvent) rangeValues.push(structureEventLevel);
   const maxY = Math.max(...rangeValues);
   const minY = Math.min(...rangeValues);
   const span = Math.max(maxY - minY, 0.01);
@@ -3166,7 +3307,7 @@ function drawSelectedChart(snapshot) {
         const fill = String(gap?.direction || '').toLowerCase() === 'bullish'
           ? 'rgba(76, 214, 128, 0.14)'
           : 'rgba(255, 92, 92, 0.14)';
-        const timedRange = resolveTimedZoneRange(gap?.first_seen, null, 8, 8);
+        const timedRange = resolveTimedZoneRange(gap?.first_seen, null, 8, 8, { requireVisibleStart: true });
         if (!timedRange) return;
         drawTimedZone(timedRange.startIdx, timedRange.endIdx, upper, lower, fill);
       });
@@ -3200,7 +3341,7 @@ function drawSelectedChart(snapshot) {
         const isBullish = String(ob?.direction || '').toLowerCase() === 'bullish';
         const fill = isBullish ? 'rgba(76, 214, 128, 0.06)' : 'rgba(255, 92, 92, 0.06)';
         const stroke = isBullish ? 'rgba(76, 214, 128, 0.85)' : 'rgba(255, 92, 92, 0.85)';
-        const timedRange = resolveTimedZoneRange(ob?.first_seen, null, 8, 8);
+        const timedRange = resolveTimedZoneRange(ob?.first_seen, null, 8, 8, { requireVisibleStart: true });
         if (!timedRange) return;
         drawTimedDashedZone(timedRange.startIdx, timedRange.endIdx, upper, lower, fill, stroke, 1.4, [6, 4]);
       });
@@ -3227,7 +3368,19 @@ function drawSelectedChart(snapshot) {
     // indicator, age_bars}. Draw a line connecting pivot_a -> pivot_b on the
     // price chart, color-coded by direction (green=bullish/red=bearish), with
     // dashed stroke for hidden divergence vs solid for regular. Small label
-    // at midpoint identifies indicator + kind.
+    // at the midpoint of the drawn part identifies indicator + kind.
+    //
+    // A pivot_a older than the window's first bar is placed by its bar gap
+    // to pivot_b (pivot_b.pos - pivot_a.pos: both index the frame the
+    // context was built on, which the chart's bars are cut from) and the
+    // line is clipped to the plot, so it enters from the left edge at its
+    // true slope (2026-09-25). Until then the lookup took the first bar at
+    // or after pivot_a, bar 0, and drew the line from there at a slope the
+    // divergence never had; since the 09-24 session-bar age a divergence
+    // can pair yesterday's pivots at the open, and on the peers' 90-bar 5m
+    // chart ~38% of the 09:30-10:30 lines did. A line whose pivot_b is
+    // off-window too, or whose positions cannot place pivot_a left of the
+    // window (the frames disagree), is not drawn.
     function drawDivergenceLine(line, opts = {}) {
       if (!line || !line.pivot_a || !line.pivot_b) return;
       const tsA = line.pivot_a.ts;
@@ -3238,9 +3391,10 @@ function drawSelectedChart(snapshot) {
       const millisA = Date.parse(tsA || '');
       const millisB = Date.parse(tsB || '');
       if (!Number.isFinite(millisA) || !Number.isFinite(millisB)) return;
+      const firstMillis = Date.parse(bars[0]?.ts || '');
+      if (Number.isFinite(firstMillis) && millisB < firstMillis) return;
+      const aBeforeWindow = Number.isFinite(firstMillis) && millisA < firstMillis;
       // Find bar index for each pivot by walking bars[] and matching ts.
-      // Both pivots must be within the visible window for the line to render
-      // (otherwise the line goes off-screen at one end).
       let idxA = -1;
       let idxB = -1;
       for (let i = 0; i < bars.length; i += 1) {
@@ -3249,7 +3403,14 @@ function drawSelectedChart(snapshot) {
         if (idxA < 0 && barTs >= millisA) idxA = i;
         if (idxB < 0 && barTs >= millisB) { idxB = i; break; }
       }
-      if (idxA < 0 || idxB < 0) return;
+      if (idxB < 0) return;
+      if (aBeforeWindow) {
+        const span = Number(line.pivot_b.pos) - Number(line.pivot_a.pos);
+        if (!Number.isFinite(span) || span <= idxB) return;
+        idxA = idxB - span;
+      } else if (idxA < 0) {
+        return;
+      }
       const direction = String(line?.direction || '').toLowerCase();
       const kind = String(line?.kind || '').toLowerCase();
       const indicator = String(line?.indicator || '').toLowerCase();
@@ -3260,10 +3421,17 @@ function drawSelectedChart(snapshot) {
         ? `rgba(76, 214, 128, ${baseAlpha})`
         : `rgba(255, 92, 92, ${baseAlpha})`;
       const xA = xFor(idxA);
-      const yA = yFor(clamp(priceA, minY, maxY));
+      // Off-window, pivot_a keeps its price: clamping it into the visible
+      // range would bend the slope the clip is there to keep.
+      const yA = yFor(aBeforeWindow ? priceA : clamp(priceA, minY, maxY));
       const xB = xFor(idxB);
       const yB = yFor(clamp(priceB, minY, maxY));
       ctx.save();
+      if (aBeforeWindow) {
+        ctx.beginPath();
+        ctx.rect(pad.left, pad.top, plotW, plotH);
+        ctx.clip();
+      }
       ctx.strokeStyle = stroke;
       ctx.lineWidth = opts.lineWidth || (indicator === 'obv' ? 1.0 : 1.5);
       if (isHidden) ctx.setLineDash([5, 4]);
@@ -3272,9 +3440,18 @@ function drawSelectedChart(snapshot) {
       ctx.lineTo(xB, yB);
       ctx.stroke();
       if (isHidden) ctx.setLineDash([]);
-      // Label at midpoint, if there's room
-      const midX = (xA + xB) / 2;
-      const midY = (yA + yB) / 2;
+      // Label at the midpoint of the part drawn inside the plot: from where
+      // the line enters the plot (an off-window pivot_a is left of it, and
+      // can be above or below it too) to pivot_b.
+      let enterT = 0;
+      if (aBeforeWindow) {
+        const plotBottom = pad.top + plotH;
+        if (xA < pad.left && xB > xA) enterT = Math.max(enterT, (pad.left - xA) / (xB - xA));
+        if (yA < pad.top && yB > yA) enterT = Math.max(enterT, (pad.top - yA) / (yB - yA));
+        if (yA > plotBottom && yB < yA) enterT = Math.max(enterT, (plotBottom - yA) / (yB - yA));
+      }
+      const midX = (xA + (xB - xA) * enterT + xB) / 2;
+      const midY = (yA + (yB - yA) * enterT + yB) / 2;
       const labelText = indicator === 'rsi'
         ? (isHidden ? 'RSI hid' : 'RSI ÷')
         : (isHidden ? 'OBV hid' : 'OBV ÷');
@@ -3331,6 +3508,9 @@ function drawSelectedChart(snapshot) {
       const lowY = yFor(bar.low);
       const rising = Number(bar.close) >= Number(bar.open);
       const isHover = idx === activeIndex;
+      // A still-forming HTF bucket (built from the live 1m bars) is drawn
+      // faded, so it does not read as a completed bar.
+      ctx.globalAlpha = bar.in_progress === true ? 0.45 : 1;
       ctx.strokeStyle = rising ? '#6ce3a2' : '#ff6b82';
       ctx.lineWidth = isHover ? 2.2 : 1.4;
       ctx.beginPath();
@@ -3341,6 +3521,7 @@ function drawSelectedChart(snapshot) {
       const bodyTop = Math.min(openY, closeY);
       const bodyH = Math.max(2, Math.abs(closeY - openY));
       ctx.fillRect(x - candleW / 2, bodyTop, candleW, bodyH);
+      ctx.globalAlpha = 1;
       if (isHover) {
         ctx.strokeStyle = '#cfe8ff';
         ctx.lineWidth = 1.1;
@@ -3440,19 +3621,7 @@ function drawSelectedChart(snapshot) {
 
     visibleDiagonalLines.forEach(item => {
       const line = item.line;
-      if (!line) return;
-      const startAbs = item.useChannelRange && channelRenderRange
-        ? channelRenderRange.startAbs
-        : Math.max(visibleAbsStart, numOrNull(line.start_pos) ?? visibleAbsStart);
-      const endAbs = item.useChannelRange && channelRenderRange
-        ? channelRenderRange.endAbs
-        : Math.max(startAbs, Math.min(visibleAbsEnd, numOrNull(line.end_pos) ?? visibleAbsEnd));
-      const startIdx = item.useChannelRange && channelRenderRange
-        ? channelRenderRange.startIdx
-        : clamp(Math.round(startAbs - visibleAbsStart), 0, bars.length - 1);
-      const endIdx = item.useChannelRange && channelRenderRange
-        ? channelRenderRange.endIdx
-        : clamp(Math.round(endAbs - visibleAbsStart), 0, bars.length - 1);
+      const { startIdx, endIdx } = diagonalLineRange(item);
       const startVal = lineValueAt(line, Number(bars[startIdx].abs_index));
       const endVal = lineValueAt(line, Number(bars[endIdx].abs_index));
       if (numOrNull(startVal) === null || numOrNull(endVal) === null) return;
@@ -3485,17 +3654,54 @@ function drawSelectedChart(snapshot) {
     });
     // Key-level zones stay on-chart only; omit their extra legend chips to reduce clutter.
 
+    if (showStructureEvent) {
+      const eventUp = structureEventText.includes('↑');
+      const eventColor = eventUp ? '#56d98a' : '#ff6f86';
+      const eventBar = bars[structureEventIdx];
+      const eventX = xFor(structureEventIdx);
+      const levelY = yFor(structureEventLevel);
+      ctx.save();
+      ctx.setLineDash([2, 3]);
+      ctx.strokeStyle = eventColor;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(eventX - (slotW / 2), levelY);
+      ctx.lineTo(width - pad.right, levelY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // Triangle past the event bar's extreme, pointing the way price broke.
+      const baseY = eventUp ? yFor(eventBar.high) - 4 : yFor(eventBar.low) + 4;
+      const tipY = eventUp ? baseY - 7 : baseY + 7;
+      ctx.fillStyle = eventColor;
+      ctx.beginPath();
+      ctx.moveTo(eventX, tipY);
+      ctx.lineTo(eventX - 5, baseY);
+      ctx.lineTo(eventX + 5, baseY);
+      ctx.closePath();
+      ctx.fill();
+      ctx.font = '10px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = eventUp ? 'bottom' : 'top';
+      ctx.fillText(structureEventText, eventX, eventUp ? tipY - 2 : tipY + 2);
+      ctx.restore();
+      legendChips.push(`<span class="legend-chip"><span class="swatch" style="background:${eventColor};"></span>${escapeHtml(structureEventText)} ${fmtNum(structureEventLevel, 2)}</span>`);
+    }
+
     if (show('show_trade_markers', true)) {
       const eventMarkers = [];
-      const entryIdx = nearestIndexForTs(positionMarkers.entry_time, bars);
+      const entryIdx = containingIndexForTs(positionMarkers.entry_time);
       if (entryIdx !== null) {
         eventMarkers.push({ idx: entryIdx, kind: 'entry', side: safe(positionMarkers.side).toUpperCase(), color: '#8cf4ff' });
       }
       recentTrades.slice(0, 6).forEach(trade => {
-        const entryTradeIdx = nearestIndexForTs(trade.entry_time, bars);
-        const exitTradeIdx = nearestIndexForTs(trade.exit_time, bars);
+        const entryTradeIdx = containingIndexForTs(trade.entry_time);
+        const exitTradeIdx = containingIndexForTs(trade.exit_time);
+        const exitPrice = numOrNull(trade.exit_price);
         if (entryTradeIdx !== null) eventMarkers.push({ idx: entryTradeIdx, kind: 'entry', side: safe(trade.side).toUpperCase() });
-        if (exitTradeIdx !== null) eventMarkers.push({ idx: exitTradeIdx, kind: 'exit', side: safe(trade.side).toUpperCase(), y: yFor(bars[exitTradeIdx].close) });
+        // At the fill price, not the bar's close.
+        if (exitTradeIdx !== null && exitPrice !== null) {
+          eventMarkers.push({ idx: exitTradeIdx, kind: 'exit', side: safe(trade.side).toUpperCase(), y: clamp(yFor(exitPrice), pad.top, height - pad.bottom) });
+        }
       });
       const drawDiamondMarker = (marker) => {
         const bar = bars[marker.idx] || null;
@@ -3638,6 +3844,7 @@ function drawSelectedChart(snapshot) {
             <div class="tt-kv"><span>Trend</span><strong>${escapeHtml(prettyLabel(structureTrend || 'neutral'))}</strong></div>
             <div class="tt-kv"><span>Bias</span><strong>${escapeHtml(prettyLabel(structureBias || 'neutral'))}</strong></div>
             <div class="tt-kv"><span>Event</span><strong>${escapeHtml(structureEvent || '—')}</strong></div>
+            <div class="tt-kv"><span>Chart Event</span><strong>${escapeHtml(structureEventText || '—')}</strong></div>
           </div>
         </div>
       `);
@@ -3691,8 +3898,10 @@ function drawSelectedChart(snapshot) {
       //      dashboard_cache.py, completion-bar only, with tier cascade).
       //      Multi-bar patterns appear ONLY on their completion bar.
       //   2. "Chart Patterns (latest)" — global from patterns.chart_*
-      //      (single detection across the latest 30 bars in the frame).
-      //      Same payload regardless of which bar is hovered.
+      //      (one detection over the last chart_patterns.lookback_bars bars
+      //      of the payload's frame, cut to the current session), the same
+      //      whichever bar is hovered; the chartFallback tags below are the
+      //      hovered bar's own.
       // The candleFallback / chartFallback heuristics are indicator-derived
       // body-flow / EMA-stack reads (not formal patterns), included
       // alongside their per-bar / global counterparts to preserve the
@@ -3771,7 +3980,7 @@ function drawSelectedChart(snapshot) {
     if (!tooltipHtml) {
       tooltipHtml = `
       <div class="tt-head">
-        <span>${escapeHtml(snapshot.symbol)} · ${escapeHtml(fmtChartTs(bar.ts))}</span>
+        <span>${escapeHtml(snapshot.symbol)} · ${escapeHtml(fmtChartTs(bar.ts))}${bar.in_progress === true ? ' · forming' : ''}</span>
         <span class="${delta === null ? '' : (delta >= 0 ? 'good' : 'bad')}">${delta === null ? '—' : fmtPct(deltaPct, 2)}</span>
       </div>
       <div class="tt-grid">
@@ -4239,9 +4448,11 @@ async function refresh() {
     try {
       renderApp();
       pruneExpandedChartCache();
-      if (appState.mainPanelExpanded && (!Array.isArray(appState.expandedChart.bars) || !appState.expandedChart.bars.length)) {
-        scheduleExpandedChartRefresh(false);
-      }
+      // Every poll, as renderApp does for the compact chart: the fetch is
+      // skipped unless the payload is stale (remoteChartCacheNeedsRefresh).
+      // Until 2026-09-23 this ran only while the expanded chart had no bars,
+      // so an expanded HTF chart never refreshed after it loaded.
+      if (appState.mainPanelExpanded) scheduleExpandedChartRefresh(false);
     } catch (renderErr) {
       console.error('Dashboard render failed', renderErr);
       renderDisconnected('Dashboard render failed: ' + renderErr);

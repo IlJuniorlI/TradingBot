@@ -60,10 +60,11 @@ risk:
   # Direction-aware cooldown: a LONG exit only blocks same-direction
   # re-entries; SHORTs remain available to capture genuine reversals.
   cooldown_direction_aware: true
-  # Same-level retry block: after a losing exit, same-direction re-entry
-  # on the same symbol is blocked within same_level_block_atr_mult * ATR
-  # of the prior fill for same_level_block_minutes minutes. A fib-pullback
-  # entry (retrace to 0.5-0.786 of the swing) overrides the block.
+  # Same-level retry block: after any exit (win or loss), same-direction
+  # re-entry on the same symbol is blocked for same_level_block_minutes
+  # minutes when the new entry sits within same_level_block_atr_mult * ATR
+  # of the prior ENTRY. A fib-pullback entry (retrace to 0.5-0.786 of the
+  # swing) overrides the block.
   same_level_block_minutes: 30
   # 2026-07-29: was 0.3. On META that is $0.14 — so the three SHORTs at
   # 593.05 / 593.82 / 593.17 on 07-28 (13:55, 14:20, 14:39, all stopped
@@ -119,8 +120,9 @@ runtime:
   # Per-session VWAP/EMA reset window. "rth" anchors the reset to RTH
   # 09:30-16:00 (the strategy trades RTH only). In "rth" mode the pre-market
   # entry fallthrough in _allowed_regimes is disabled (it is gated on
-  # "extended"), so the first entry of the day is the ORB breakout once the
-  # opening range has formed — see entry_windows below. Set "extended" to
+  # "extended"). With disable_orb_regime: true there is no opening-range
+  # carve-out: the first entry comes from the normal regime mix once
+  # entry_windows opens (09:35); sr_scalp still waits for orb_end_time. Set "extended" to
   # anchor the reset to the 07:00-20:00 equity stream and enable pre/post-market
   # trading (also widen the entry/management/screener windows + populate
   # extended_hours_tradable).
@@ -390,7 +392,15 @@ technical_levels:
   trendline_lookback_bars: 120
   trendline_min_touches: 3
   trendline_atr_tolerance_mult: 0.35
-  trendline_breakout_buffer_atr_mult: 0.15
+  # 2026-09-23: was 0.15, which never applied -- a 0.10%-of-price floor
+  # always won. With the floor gone (CT-4) this ATR multiple IS the buffer;
+  # 0.65 matches the old effective buffer at the median on 1m bars
+  # (0.10% of price / atr_value, archived RTH decisions: 0.667), so breaks
+  # fire where they did on a typical tape. The ATR is atr_value =
+  # max(ATR14, 0.15% of price), so the buffer scales with volatility only
+  # once ATR14 passes 0.15% of price (on 1m large caps that floor decides
+  # ~70-80% of bars, giving 0.0975% of price at 0.65).
+  trendline_breakout_buffer_atr_mult: 0.65
   adx_enabled: true
   adx_length: 14
   adx_min_strength: 18.0
@@ -461,28 +471,40 @@ technical_levels:
   entry_bonus_trendline_respect: 0.2
   entry_penalty_near_extension: 0.4
 
-# Shared entry-side toggles — each is read across strategies that opt in.
+# Shared entry knobs. Global since 2026-09-24: each one acts on every strategy
+# through the shared entry stage; a value marked "parity" is what this
+# strategy effectively did before (a knob it never read was off).
 shared_entry:
   use_fvg_context: true
-  use_divergence_filter: true
+  # Veto an entry when RSI AND OBV both diverge against it.
+  use_dual_divergence_veto: false  # parity: this strategy never read it before 2026-09-24
   use_technical_entry_adjustment: true
   use_technical_stop_target_refinement: true
   use_structure_filter: true
   use_sr_filter: true
   use_sr_stop_target_refinement: true
-  # HTF divergence multi-timeframe confluence (alongside use_divergence_filter
-  # which gates LTF counter-divergence penalties).
-  use_htf_divergence_filter: true
+  # HTF RSI divergence SCORE term (+aligned / -counter / +hidden, the
+  # technical_levels.htf_divergence_* weights); it never blocks. The LTF
+  # counter-divergence penalties are part of use_technical_entry_adjustment.
+  use_htf_divergence_score: true
   # Divergence as a primary entry trigger (off by default). When enabled,
   # any strategy can fire a secondary entry signal on a confirmed divergence
-  # at S/R confluence. See _divergence_entry_candidate in strategy_base.py.
+  # at S/R confluence. See _divergence_entry_candidate in _strategies/shared_entry.py.
   use_divergence_entry_signal: false
   divergence_entry_min_age_bars: 0
   divergence_entry_require_sr_confluence: true
   divergence_entry_score_floor: 1.5
   divergence_entry_score_bump: 0.20
-  use_opposing_chart_filter: true
+  use_opposing_chart_filter: true  # 2026-09-24 flip: inert before; replay blocks 0-2 of 162 entries (both losers, -2.0R)
   use_opposing_candle_filter: false
+  # VETO an entry within broken_level_min_clearance_pct (scaled by the symbol's
+  # volatility) or _atr of a confirmed broken level beyond it. Moved here from
+  # params.reject_entry_near_broken_level (2026-09-24) with this preset's
+  # thresholds; it ships off: it existed to keep entries clear of the
+  # S/R-loss exit (off), and the setups it alone blocked did no worse than fills.
+  use_broken_level_guard: false
+  broken_level_min_clearance_pct: 0.0035
+  broken_level_min_clearance_atr: 0.90
   # R:R floor for the TARGET side of the refinement pipeline.
   min_target_rr: 1.0
   # Floor on how far refinement may pull the STOP toward entry, in ATR14.
@@ -505,7 +527,7 @@ shared_exit:
   use_anchored_vwap_loss: true
   use_chart_pattern_exit: false
   use_structure_exit: true
-  use_sr_loss_exit: true
+  use_sr_loss_exit: false  # ships off in every preset (2026-09-24), see config.example.yaml
   # Counter-direction REGULAR divergence forming on a held position.
   # Hidden divergence is continuation context and never triggers exit.
   use_divergence_exit_signal: false
@@ -522,14 +544,18 @@ shared_exit:
   bearish_close_position_loose_min: 0.62
   use_candle_pattern_exit: false
   # Minimum open profit (R) before the discretionary exit families may fire:
-  # bias-based structure exits, the technical exits (trendline / channel /
-  # bollinger / anchored-VWAP) and the S/R break exits. None of them carried
-  # an R condition, so they were acting as an arbitrary tightened stop:
-  # 2026-05-12..29 they closed 19 of 48 trades at a median MFE of 0.09-0.29R
-  # for -$831 combined, and among trades whose stop sat beyond 4 ATR, 0 of 22
-  # ever reached that stop — a discretionary exit always got there first.
-  # Below this threshold the protective stop governs the trade. CHoCH exits
-  # stay exempt (a real change-of-character is reversal, not noise).
+  # bias-based structure exits and the technical exits (trendline / channel /
+  # bollinger / anchored-VWAP). None of them carried an R condition, so they
+  # were acting as an arbitrary tightened stop: 2026-05-12..29 they closed 19
+  # of 48 trades at a median MFE of 0.09-0.29R for -$831 combined, and among
+  # trades whose stop sat beyond 4 ATR, 0 of 22 ever reached that stop — a
+  # discretionary exit always got there first. Below this threshold the
+  # protective stop governs the trade. CHoCH was always exempt: it is an
+  # ungated structural stop-tightener (typically below about -0.4R, on
+  # roughly 0.5-1.3% of positions; neutral on 5m structure, slightly
+  # negative on 1m). The S/R-break exit is exempt since 2026-09-24: it fires
+  # only on the losing side of entry, so the gate had kept it dead (it ships
+  # off anyway, see use_sr_loss_exit).
   discretionary_exit_min_r: 0.5
 
 # Per-strategy windows and parameter blocks.
@@ -612,17 +638,32 @@ strategies:
       # Neutral HTF bias never blocks. Prevents counter-trend entries when
       # a symbol's HTF structure is pinned against the trade direction.
       require_htf_bias_alignment: true
+      # HTF EMA trend (htf_ema_fast_span / htf_ema_slow_span below): the peer
+      # strategies' 2-of-3 vote -- close vs the fast EMA, fast vs slow, the
+      # HTF context's trend bias, on the strategy's own HTF (htf_minutes).
+      # require_htf_ema_alignment blocks an entry against it
+      # (htf_ema_trend_<bias>) on the sides it names: enabled / true (both),
+      # long_only, short_only, or disabled / false (neither).
+      # htf_ema_alignment_score adds (aligned) or subtracts (opposed) that
+      # much to every scored regime of the side before it has to clear its
+      # floor. Both follow the ORB-window HTF bypass. Wired 2026-09-24 and
+      # shipped OFF: over 21 archived sessions the trend helped qualified
+      # longs but not shorts (long_only is the mode that evidence points
+      # at), and realized trades ran the other way; a gate would mostly
+      # block the reversal entries.
+      require_htf_ema_alignment: disabled
+      htf_ema_alignment_score: 0.0
 
       # ORB-window bypasses (range-end to orb_end_time). Early session has
       # stale HTF pivots + unstabilized VWAP/EMA; the ORB regime's range-break
-      # proves direction. These apply to the ORB regime in-window. (The
+      # proves direction. These apply to the ORB regime in-window; its structure
+      # and S/R entry vetoes are exempt through the manifest
+      # (capabilities.shared_entry.exemptions, 2026-09-24). (The
       # index-confirmation / entry-confirmation-bar / stretched / tech-bias /
       # oversized-bar ORB bypasses were removed 2026-05-29 — the ORB regime
       # isn't in those gates' regime sets, so the bypasses were dead.)
       orb_bypass_htf_bias: true
       orb_bypass_exhaustion: true
-      orb_bypass_structure_entry: true     # opening dump -> LTF CHoCH_down blocks LONGs; ORB range-break proves direction
-      orb_bypass_sr_entry: true            # opening dump's breakdown_below_support lingers — skip during ORB
 
       # Bar requirements. 1m-LTF retune (2026-05-29): the strategy now trades on
       # a 1-minute LTF (was 5m) for finer entries/exits and to kill the "wait for
@@ -641,21 +682,22 @@ strategies:
       # add_indicators(span_scale=) for the strategy's private 1m LTF frame; the
       # shared 1m frame the engine/other strategies/dashboard read stays at 1.
       ltf_indicator_span_scale: 5
-      # LTF EMA spans — dashboard chart parity only (2026-05-29). The strategy's
-      # 1m LTF computes its fast/slow EMA at 9×5=45 / 20×5=100 via span_scale;
-      # these tell the compact (LTF) chart to draw the same 45/100 lines instead
-      # of the default 9/20, mirroring the HTF-chart parity pattern below. Entry
-      # logic is unaffected (it reads the span_scale'd ema9/ema20 columns).
+      # The LTF fast / slow EMAs the entry scoring reads (the side-decision
+      # EMA vote and the trend / pullback / range / vol_squeeze / momentum /
+      # vwap_reclaim scores), set on their own: changing them moves nothing
+      # else, while ltf_indicator_span_scale above still moves ATR / ADX / RSI
+      # / Bollinger / returns and no longer these EMAs. 45 / 100 = the 5m
+      # EMA9 / EMA20 horizon on 1m bars. Session-reset like every LTF EMA; the
+      # compact chart draws these same lines. Exits and the ema9-extension gate
+      # read the base 1m frame's native EMA9 / EMA20, not these. (Until
+      # 2026-09-23 knobs of these names existed but only the chart read them.)
       ltf_ema_fast_span: 45
       ltf_ema_slow_span: 100
-      # HTF EMA spans — dashboard chart parity only (2026-05-28). The
-      # strategy's HTF trend context already computes EMA 50/200 on the 15m
-      # frame (hardcoded in strategy_base._default_htf_context_for_score);
-      # without these params the dashboard HTF chart fell back to ema9/ema20
-      # (fast EMAs of the 15m bars), so the chart didn't match the bot.
-      # Setting them makes the HTF chart draw the same 50/200 the bot uses.
-      # Entry logic is unchanged — top_tier's HTF direction is structure-
-      # based (require_htf_bias_alignment), not an EMA cross.
+      # HTF EMA spans (15m bars): the HTF context's fast / slow EMA, and so
+      # the HTF EMA trend below, plus the lines the HTF chart and the sidebar
+      # trend show. Until 2026-09-24 the bot hard-coded 50/200 and read no
+      # HTF EMA; these two only drew the chart. The structure gate
+      # (require_htf_bias_alignment) is separate and does not read them.
       htf_ema_fast_span: 50
       htf_ema_slow_span: 200
 
@@ -936,15 +978,11 @@ strategies:
       # Afternoon: include range regime (mean-reversion on range-bound tapes).
       afternoon_include_range: true
 
-      # Broken-level proximity: reject entries where a broken SR level sits
-      # too close on the exit side (it becomes instant resistance/support).
-      reject_entry_near_broken_level: true
-      broken_level_min_clearance_pct: 0.0035   # HIGH_VOL: was 0.0025 — broken levels noisier; require ≥ 0.35% clearance
-      broken_level_min_clearance_atr: 0.90     # HIGH_VOL: was 0.72 — same logic, ≥ 0.90 ATR clearance
-
       # Target-inside-SR (CEILING): reject trend entries whose target
       # projects past nearest opposing SR. Complements entry_min_clearance_atr
-      # (FLOOR on SR clearance).
+      # (FLOOR on SR clearance). Ladder mode (2026-09-25): a first rung ON the
+      # nearest level passes (the ladder manages it); the ratio only bites on
+      # a rung past a nearer, unladdered level. Runners (no target) are exempt.
       reject_target_beyond_sr: true
       target_max_sr_ratio: 0.7                 # HIGH_VOL: was 0.8 — more conservative target placement (30% head-room); SR targets fail more in high vol
 
@@ -1021,8 +1059,9 @@ strategies:
       # Bollinger-squeeze breakout. Fires when the last N bars form a tight
       # box (range_pct + bb_width_pct both compressed) AND the current bar
       # breaks out of the box with confirming volume. Allowed in the
-      # primary window (orb_end -> midday_start) and the afternoon
-      # (13:00 -> no_new). Set `disable_vol_squeeze_regime: true` to opt out.
+      # primary window (orb_end -> midday_start), midday (added 2026-09-21)
+      # and the afternoon (13:00 -> no_new). Set
+      # `disable_vol_squeeze_regime: true` to opt out.
       #
       # 2026-05-14 tightening: session 14 entries, 3W/8L (27% wr), +$9.58
       # net. Without the TSLA $130 winner, regime was -$120 net. Cluster
@@ -1448,9 +1487,9 @@ strategies:
       # Every percent-of-price threshold below (default_stop_pct,
       # momentum_min_day_strength, sr_scalp_min_distance_pct,
       # relative_strength_block_threshold_pct,
-      # range_max_intraday_range_pct, vol_squeeze_max_range_pct,
-      # broken_level_min_clearance_pct) is multiplied by this symbol's
-      # 20-day ADR divided by `reference_adr_pct`. Without it one number is a
+      # range_max_intraday_range_pct, vol_squeeze_max_range_pct), and
+      # shared_entry.broken_level_min_clearance_pct above, is multiplied by
+      # this symbol's 20-day ADR divided by `reference_adr_pct`. Without it one number is a
       # different gate on every name: a 2.0% day-strength floor is roughly a
       # 0.6-sigma move on TSLA and a 2-sigma move on COST, which made the
       # momentum regime structurally a 5-name strategy, and a 1% stop is

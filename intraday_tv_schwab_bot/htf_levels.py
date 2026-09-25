@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import date
 import logging
 from typing import Iterable
 
@@ -19,17 +21,25 @@ from .levels_shared import (
     fallback_prior_side_levels,
     find_divergence,
     frame_extreme_side_levels as _frame_extreme_side_levels_shared,
+    latest_session_date,
     pivot_points,
     prior_day_levels as _prior_day_levels,
     prior_week_levels as _prior_week_levels,
     safe_reference_price_for_fallback as _safe_reference_price_for_fallback,
     same_side_min_gap_threshold as _same_side_min_gap_threshold,
+    session_segment_ids,
 )
 from .position_metrics import safe_float
 from .utils import (
     ensure_ohlcv_frame,
     ensure_standard_indicator_frame,
+    get_runtime_indicator_mode,
+    indicator_session_mask,
+    indicator_session_open,
+    latest_atr14,
     now_et,
+    session_price_scale,
+    session_bucket_ends,
     resolve_current_price,
 )
 
@@ -56,6 +66,9 @@ class HTFFairValueGap:
     upper: float
     midpoint: float
     size: float
+    # first_seen: the formation triplet's first bar. last_seen: the last
+    # completed bar that traded INTO the gap, or the triplet's last bar (the
+    # one that completed it) when none has (see _detect_fair_value_gaps).
     first_seen: str | None = None
     last_seen: str | None = None
     filled_pct: float = 0.0
@@ -82,6 +95,11 @@ class HTFContext:
     broken_resistance: HTFLevel | None = None
     nearest_resistance: HTFLevel | None = None
     broken_support: HTFLevel | None = None
+    # The nearest support price has crossed below / resistance crossed above
+    # whose flip is not yet confirmed, still in its original role -- the HTF
+    # twin of SupportResistanceContext.pending_*, with the same history.
+    pending_support: HTFLevel | None = None
+    pending_resistance: HTFLevel | None = None
     prior_day_high: float | None = None
     prior_day_low: float | None = None
     prior_week_high: float | None = None
@@ -200,14 +218,14 @@ def _pivot_points(frame: pd.DataFrame, span: int) -> tuple[list[tuple[pd.Timesta
     return pivot_points(frame, span, include_idx=False)
 
 
-def _cluster_levels(points: Iterable[tuple[pd.Timestamp, float]], kind: str, tolerance: float, max_levels: int) -> list[HTFLevel]:
+def _cluster_levels(points: Iterable[tuple[pd.Timestamp, float]], kind: str, tolerance: float) -> list[HTFLevel]:
     # Thin wrapper around the shared `cluster_levels` helper. The
     # time-aware recency scoring (effective_touches = touches *
     # recency_factor + persistence bonus) lives in levels_shared so it
     # can't drift between this module and support_resistance.py — when
     # we improved scoring in the AMD/INTC debug pass, having one source
     # of truth would have made the fix apply everywhere automatically.
-    return cluster_levels(points, kind, tolerance, max_levels, level_factory=HTFLevel)
+    return cluster_levels(points, kind, tolerance, level_factory=HTFLevel)
 
 def _clone_level(level: HTFLevel, kind: str, *, source: str | None = None) -> HTFLevel:
     # Thin factory-binding wrapper around the shared `clone_level` helper.
@@ -221,14 +239,12 @@ def _frame_extreme_side_levels(
     *,
     side: str,
     tolerance: float,
-    max_levels: int,
 ) -> list[HTFLevel]:
     # Thin factory-binding wrapper around `frame_extreme_side_levels`.
     return _frame_extreme_side_levels_shared(
         frame,
         side=side,
         tolerance=tolerance,
-        max_levels=max_levels,
         level_factory=HTFLevel,
     )
 
@@ -288,6 +304,34 @@ def _collapse_same_side_levels(
     return selected[: max(1, int(max_levels))]
 
 
+def _pending_level(
+    candidates: list[HTFLevel],
+    *,
+    side: str,
+    close: float,
+    broken: HTFLevel | None,
+    tolerance: float,
+) -> HTFLevel | None:
+    """The nearest ``side`` candidate price has crossed while its flip is
+    unconfirmed: a support now above ``close`` or a resistance below it.
+    ``candidates`` is everything the partition against ``close`` dropped. A
+    level within ``tolerance`` of the confirmed flip on that side
+    (``broken``) is the same zone, already flipped. Mirrors
+    support_resistance._pending_level."""
+    crossed = list(candidates)
+    if broken is not None:
+        crossed = [lv for lv in crossed if abs(float(lv.price) - float(broken.price)) > max(float(tolerance), 1e-9)]
+    if not crossed:
+        return None
+    return _collapse_same_side_levels(
+        crossed,
+        tolerance,
+        close,
+        reverse=(side != "support"),
+        max_levels=1,
+    )[0]
+
+
 
 def _completed_htf_frame(frame: pd.DataFrame, timeframe_minutes: int) -> pd.DataFrame:
     if frame is None or frame.empty:
@@ -307,58 +351,57 @@ def _completed_htf_frame(frame: pd.DataFrame, timeframe_minutes: int) -> pd.Data
         else:
             now_ts = et_now.tz_localize(None)
         # Every frame is labelled at bar START -- the broker's and
-        # `resample_bars`' alike -- so bar T is complete once T + tf has
-        # passed. Not `T < now.floor(tf)`: that holds only for clock-aligned
-        # bars, and 60m bars are anchored on the 09:30 open (10:30 would read
-        # complete at 11:00, half an hour early).
+        # `resample_bars`' alike -- so bar T is complete once its bucket has
+        # ended: T + tf, or the session boundary that cuts a 60m bar short
+        # (15:30 ends at 16:00). Not `T < now.floor(tf)`: that holds only for
+        # clock-aligned bars, and regular-session 60m bars start at XX:30.
         tf = max(1, int(timeframe_minutes))
-        completed = base[base.index + pd.Timedelta(minutes=tf) <= now_ts]
+        completed = base[session_bucket_ends(base.index, tf) <= now_ts]
         return completed if isinstance(completed, pd.DataFrame) else pd.DataFrame(columns=base.columns)
     except Exception:
         return frame.iloc[:-1].copy() if len(frame) > 1 else pd.DataFrame(columns=frame.columns)
 
 
-def _htf_flip_confirmed(
+def _htf_flip_checker(
     frame: pd.DataFrame,
-    level_price: float,
     *,
     timeframe_minutes: int,
     confirm_bars: int,
-    direction: str,
     eps: float,
-) -> bool:
-    completed = _completed_htf_frame(frame, timeframe_minutes)
-    if direction == "reclaim":
-        return confirm_by_bars(completed, "low", "above", level_price, int(confirm_bars or 0), float(eps))
-    return confirm_by_bars(completed, "high", "below", level_price, int(confirm_bars or 0), float(eps))
+) -> Callable[[float, str], bool]:
+    """Return ``check(level_price, direction)``: is the level's flip active?
 
+    With ``confirm_bars > 0``, ``"reclaim"`` needs the last ``confirm_bars``
+    completed HTF lows above the level and ``"loss"`` the matching highs below
+    it; with 0 the frame's last bar decides. The completed frame is cut ONCE
+    per build: each level used to copy and cut the whole frame again, and
+    removing the pre-split cluster cap on 2026-09-23 multiplied the levels.
+    """
+    bars = max(0, int(confirm_bars or 0))
+    tol = float(eps)
+    if bars > 0:
+        completed = _completed_htf_frame(frame, timeframe_minutes)
 
-def _htf_flip_active(
-    frame: pd.DataFrame,
-    level_price: float,
-    *,
-    timeframe_minutes: int,
-    confirm_bars: int,
-    direction: str,
-    eps: float,
-) -> bool:
-    if int(confirm_bars or 0) > 0:
-        return _htf_flip_confirmed(
-            frame,
-            level_price,
-            timeframe_minutes=int(timeframe_minutes),
-            confirm_bars=int(confirm_bars),
-            direction=str(direction),
-            eps=float(eps),
-        )
-    if frame is None or frame.empty:
-        return False
-    last_bar = frame.iloc[-1]
-    last_low = float(last_bar.get("low", 0.0) or 0.0)
-    last_high = float(last_bar.get("high", 0.0) or 0.0)
-    if str(direction).strip().lower() == "reclaim":
-        return last_low > float(level_price) + float(eps)
-    return last_high < float(level_price) - float(eps)
+        def confirmed(level_price: float, direction: str) -> bool:
+            if direction == "reclaim":
+                return confirm_by_bars(completed, "low", "above", level_price, bars, tol)
+            return confirm_by_bars(completed, "high", "below", level_price, bars, tol)
+
+        return confirmed
+    last_low = last_high = None
+    if frame is not None and not frame.empty:
+        last_bar = frame.iloc[-1]
+        last_low = float(last_bar.get("low", 0.0) or 0.0)
+        last_high = float(last_bar.get("high", 0.0) or 0.0)
+
+    def last_bar_beyond(level_price: float, direction: str) -> bool:
+        if last_low is None or last_high is None:
+            return False
+        if direction == "reclaim":
+            return last_low > float(level_price) + tol
+        return last_high < float(level_price) - tol
+
+    return last_bar_beyond
 
 
 
@@ -459,12 +502,9 @@ def _detect_fair_value_gaps(
     if completed.empty or len(completed) < 3:
         return [], [], None, None
     ref_close = resolve_current_price(completed, current_price)
-    atr_fallback = max(ref_close * 0.0015, 0.01)
-    if "atr14" in completed.columns:
-        atr_clean = completed["atr14"].dropna()
-        atr = float(atr_clean.iloc[-1]) if not atr_clean.empty else atr_fallback
-    else:
-        atr = atr_fallback
+    atr = latest_atr14(completed)
+    if atr is None:
+        atr = max(ref_close * 0.0015, 0.01)
     min_gap_size = max(float(atr) * float(min_gap_atr_mult), float(ref_close) * float(min_gap_pct), 1e-8)
     eps = max(min_gap_size * 0.05, ref_close * 1e-6, 1e-8)
     bullish_raw: list[HTFFairValueGap] = []
@@ -494,11 +534,38 @@ def _detect_fair_value_gaps(
     high_arr = high_col.to_numpy() if high_col is not None else None
     low_arr = low_col.to_numpy() if low_col is not None else None
     index_values = completed.index
-    last_index_label = index_values[-1] if n > 0 else None
-    last_seen_str = last_index_label.isoformat() if hasattr(last_index_label, "isoformat") else str(last_index_label) if last_index_label is not None else ""
+    # A triplet must lie inside one ET session. The frames hold no 20:00-07:00
+    # bars, so until 2026-09-23 [D-1 19:30, D-1 19:45, D 07:00] and its
+    # neighbours registered any overnight move as an "unfilled" gap that the
+    # 24/5 session had in fact traded through -- in the HTF lists at 31% of
+    # archived RTH checkpoints and the nearest, scored gap at 15% (AMZN
+    # 2026-09-18: bullish 250.65-252.36 anchored 09-17 19:30 moved the LONG
+    # fvg_entry_adjustment from 0.0 to +0.17). The 1m frame had the same seam
+    # at 19:59 -> 07:00 every day.
+    segments = session_segment_ids(index_values)
+
+    def _stamp(pos: int) -> str:
+        label = index_values[pos]
+        return label.isoformat() if hasattr(label, "isoformat") else str(label)
+
+    def _last_touch(pos: int, touched: np.ndarray) -> str:
+        """Last completed bar after the formation triplet ending at ``pos``
+        that traded into the gap (``touched`` flags every bar that did), or
+        the triplet's last bar, the one that completed the gap, when none
+        has: stamped at its first bar, a brand-new gap started its recency
+        decay two bars old. Until 2026-09-23 every gap's last_seen was the
+        frame's last bar, so _score_fvg_context's recency decay never
+        applied: a gap 460 HTF bars old (AMZN, first seen 2026-09-17 19:30)
+        scored recency 0.93, the same as one formed an hour earlier, instead
+        of decaying to the 0.30 floor."""
+        hits = np.flatnonzero(touched[pos + 1:])
+        return _stamp(pos + 1 + int(hits[-1])) if hits.size else _stamp(pos)
+
     for idx in range(2, n):
         if high_arr is None or low_arr is None:
             break
+        if segments[idx - 2] != segments[idx]:
+            continue
         # No NaN substitution. ensure_ohlcv_frame above has already dropped
         # NaN OHLC rows, and a NaN that did get here fails both comparisons
         # below and yields no gap -- the safe outcome. The old guard replaced
@@ -522,7 +589,6 @@ def _detect_fair_value_gaps(
                 if min_low_after > lower + eps:
                     fill_top = min(upper, max(lower, min_low_after))
                     filled_pct = max(0.0, min(1.0, (upper - fill_top) / max(size, 1e-9)))
-                    anchor_ts = index_values[idx - 2]
                     bullish_raw.append(
                         HTFFairValueGap(
                             direction="bullish",
@@ -530,8 +596,8 @@ def _detect_fair_value_gaps(
                             upper=upper,
                             midpoint=(lower + upper) / 2.0,
                             size=size,
-                            first_seen=anchor_ts.isoformat() if hasattr(anchor_ts, "isoformat") else str(anchor_ts),
-                            last_seen=last_seen_str,
+                            first_seen=_stamp(idx - 2),
+                            last_seen=_last_touch(idx, low_arr < upper),
                             filled_pct=filled_pct,
                         )
                     )
@@ -548,7 +614,6 @@ def _detect_fair_value_gaps(
                 if max_high_after < upper - eps:
                     fill_top = min(upper, max(lower, max_high_after))
                     filled_pct = max(0.0, min(1.0, (fill_top - lower) / max(size, 1e-9)))
-                    anchor_ts = index_values[idx - 2]
                     bearish_raw.append(
                         HTFFairValueGap(
                             direction="bearish",
@@ -556,8 +621,8 @@ def _detect_fair_value_gaps(
                             upper=upper,
                             midpoint=(lower + upper) / 2.0,
                             size=size,
-                            first_seen=anchor_ts.isoformat() if hasattr(anchor_ts, "isoformat") else str(anchor_ts),
-                            last_seen=last_seen_str,
+                            first_seen=_stamp(idx - 2),
+                            last_seen=_last_touch(idx, high_arr > lower),
                             filled_pct=filled_pct,
                         )
                     )
@@ -634,18 +699,18 @@ def build_htf_context(
     divergence_max_age_bars: int = 6,
     divergence_min_price_move_pct: float = 0.0015,
     divergence_rsi_min_delta: float = 2.5,
+    as_of: date | None = None,
 ) -> HTFContext:
+    # ``as_of`` is the session date the prior day/week are measured back from;
+    # None means the clock's (``latest_session_date(now_et())``).
     frame = ensure_standard_indicator_frame(ensure_ohlcv_frame(frame))
     if frame.empty:
         return empty_htf_context(float(current_price or 0.0), timeframe_minutes=timeframe_minutes)
 
     close = resolve_current_price(frame, current_price)
-    atr_fallback = max(close * 0.0015, 0.01)
-    if "atr14" in frame.columns:
-        atr_clean = frame["atr14"].dropna()
-        atr = float(atr_clean.iloc[-1]) if not atr_clean.empty else atr_fallback
-    else:
-        atr = atr_fallback
+    atr = latest_atr14(frame)
+    if atr is None:
+        atr = max(close * 0.0015, 0.01)
     tolerance = max(atr * float(atr_tolerance_mult), close * float(pct_tolerance))
     same_side_min_gap = _same_side_min_gap_threshold(
         atr,
@@ -663,13 +728,14 @@ def build_htf_context(
     collapse_tolerance = max(float(tolerance), float(same_side_min_gap))
 
     highs, lows = _pivot_points(frame, int(pivot_span))
-    pivot_resistances = _cluster_levels(highs, "resistance", tolerance, int(max_levels_per_side * 2)) if highs else []
-    pivot_supports = _cluster_levels(lows, "support", tolerance, int(max_levels_per_side * 2)) if lows else []
+    pivot_resistances = _cluster_levels(highs, "resistance", tolerance) if highs else []
+    pivot_supports = _cluster_levels(lows, "support", tolerance) if lows else []
 
     include_prior_day = bool(use_prior_day_high_low)
     include_prior_week = bool(use_prior_week_high_low)
-    prior_day_high, prior_day_low = _prior_day_levels(frame) if include_prior_day else (None, None)
-    prior_week_high, prior_week_low = _prior_week_levels(frame) if include_prior_week else (None, None)
+    session_day = as_of if as_of is not None else latest_session_date(now_et())
+    prior_day_high, prior_day_low = _prior_day_levels(frame, session_day) if include_prior_day else (None, None)
+    prior_week_high, prior_week_low = _prior_week_levels(frame, session_day) if include_prior_week else (None, None)
 
     # Prior-day/week levels are FALLBACKS, not always-on candidates. Earlier
     # commit e4abfb1 unconditionally merged them next to pivot-derived levels
@@ -681,14 +747,13 @@ def build_htf_context(
     # symmetric design (used by support_resistance.build_support_resistance_context)
     # is restored: pivots are the primary source; prior_day/week levels
     # only enter the candidate pool when one side comes back empty after
-    # pivot detection. The "second-chance" path further down (see
-    # `if not support_candidates:` below) covers the strong-directional case
-    # by re-injecting prior levels with the safe fallback_reference_price as
-    # the side filter — that's where they belong.
+    # pivot detection. The "second-chance" pass further down covers the
+    # strong-directional case by re-injecting them -- that's where they
+    # belong. The fallback reference price only picks which prior levels
+    # stand in for a side; every partition and the broken-level test are
+    # against ``close`` (see support_resistance.build_support_resistance_context).
     support_references: list[HTFLevel] = list(pivot_supports)
     resistance_references: list[HTFLevel] = list(pivot_resistances)
-    support_filter_price = close
-    resistance_filter_price = close
     if not support_references:
         support_references = _fallback_prior_side_levels(
             side="support",
@@ -700,11 +765,9 @@ def build_htf_context(
             prior_week_high=prior_week_high,
             prior_week_low=prior_week_low,
         )
-        if support_references:
-            support_filter_price = fallback_reference_price
-        else:
+        if not support_references:
             min_low_pos = int(frame["low"].astype(float).values.argmin())
-            support_references = _cluster_levels([(pd.Timestamp(frame.index[min_low_pos]), float(frame["low"].iloc[min_low_pos]))], "support", tolerance, int(max_levels_per_side * 2))
+            support_references = _cluster_levels([(pd.Timestamp(frame.index[min_low_pos]), float(frame["low"].iloc[min_low_pos]))], "support", tolerance)
     if not resistance_references:
         resistance_references = _fallback_prior_side_levels(
             side="resistance",
@@ -716,118 +779,85 @@ def build_htf_context(
             prior_week_high=prior_week_high,
             prior_week_low=prior_week_low,
         )
-        if resistance_references:
-            resistance_filter_price = fallback_reference_price
-        else:
+        if not resistance_references:
             max_high_pos = int(frame["high"].astype(float).values.argmax())
-            resistance_references = _cluster_levels([(pd.Timestamp(frame.index[max_high_pos]), float(frame["high"].iloc[max_high_pos]))], "resistance", tolerance, int(max_levels_per_side * 2))
+            resistance_references = _cluster_levels([(pd.Timestamp(frame.index[max_high_pos]), float(frame["high"].iloc[max_high_pos]))], "resistance", tolerance)
 
     eps = max(abs(float(close)) * 1e-6, 1e-8)
-    flip_bars = max(0, int(flip_confirmation_bars or 0))
     flip_eps = max(abs(close) * 1e-6, 1e-8)
+    flip_active = _htf_flip_checker(
+        frame,
+        timeframe_minutes=int(timeframe_minutes),
+        confirm_bars=int(flip_confirmation_bars or 0),
+        eps=flip_eps,
+    )
 
     support_candidates: list[HTFLevel] = []
     resistance_candidates: list[HTFLevel] = []
 
     for level in support_references:
-        if _htf_flip_active(
-            frame,
-            float(level.price),
-            timeframe_minutes=int(timeframe_minutes),
-            confirm_bars=flip_bars,
-            direction="loss",
-            eps=flip_eps,
-        ):
+        if flip_active(float(level.price), "loss"):
             resistance_candidates.append(_clone_level(level, "resistance", source="broken_htf_support"))
         else:
             support_candidates.append(_clone_level(level, "support"))
 
     for level in resistance_references:
-        if _htf_flip_active(
-            frame,
-            float(level.price),
-            timeframe_minutes=int(timeframe_minutes),
-            confirm_bars=flip_bars,
-            direction="reclaim",
-            eps=flip_eps,
-        ):
+        if flip_active(float(level.price), "reclaim"):
             support_candidates.append(_clone_level(level, "support", source="broken_htf_resistance"))
         else:
             resistance_candidates.append(_clone_level(level, "resistance"))
 
-    support_candidates = [lv for lv in support_candidates if float(lv.price) <= float(support_filter_price) + eps]
-    resistance_candidates = [lv for lv in resistance_candidates if float(lv.price) >= float(resistance_filter_price) - eps]
+    # Candidates beyond their side of price keep their role while the flip is
+    # unconfirmed -- they are the pending_support / pending_resistance pool.
+    supports_beyond: list[HTFLevel] = []
+    resistances_beyond: list[HTFLevel] = []
 
-    if not support_candidates:
-        second_chance_support_refs = _fallback_prior_side_levels(
-            side="support",
-            current_price=fallback_reference_price,
-            include_prior_day=include_prior_day,
-            include_prior_week=include_prior_week,
-            prior_day_high=prior_day_high,
-            prior_day_low=prior_day_low,
-            prior_week_high=prior_week_high,
-            prior_week_low=prior_week_low,
-        )
-        if second_chance_support_refs:
-            support_filter_price = fallback_reference_price
-        else:
-            second_chance_support_refs = _frame_extreme_side_levels(
-                frame,
-                side="support",
-                tolerance=tolerance,
-                max_levels=int(max_levels_per_side * 2),
-            )
-        extend_unique_levels(support_references, second_chance_support_refs)
-        for level in second_chance_support_refs:
-            if _htf_flip_active(
-                frame,
-                float(level.price),
-                timeframe_minutes=int(timeframe_minutes),
-                confirm_bars=flip_bars,
-                direction="loss",
-                eps=flip_eps,
-            ):
-                resistance_candidates.append(_clone_level(level, "resistance", source="broken_htf_support"))
+    def _partition_by_close() -> None:
+        nonlocal support_candidates, resistance_candidates
+        supports_beyond.extend(lv for lv in support_candidates if float(lv.price) > float(close) + eps)
+        resistances_beyond.extend(lv for lv in resistance_candidates if float(lv.price) < float(close) - eps)
+        support_candidates = [lv for lv in support_candidates if float(lv.price) <= float(close) + eps]
+        resistance_candidates = [lv for lv in resistance_candidates if float(lv.price) >= float(close) - eps]
+
+    _partition_by_close()
+
+    # A side left empty takes the prior-day/week levels, then, if those are
+    # all across price too, the frame extreme (as in
+    # support_resistance.build_support_resistance_context).
+    for side in ("support", "resistance"):
+        for source in ("prior", "extreme"):
+            if support_candidates if side == "support" else resistance_candidates:
+                break
+            if source == "prior":
+                refs = _fallback_prior_side_levels(
+                    side=side,
+                    current_price=fallback_reference_price,
+                    include_prior_day=include_prior_day,
+                    include_prior_week=include_prior_week,
+                    prior_day_high=prior_day_high,
+                    prior_day_low=prior_day_low,
+                    prior_week_high=prior_week_high,
+                    prior_week_low=prior_week_low,
+                )
             else:
-                support_candidates.append(_clone_level(level, "support"))
-
-    if not resistance_candidates:
-        second_chance_resistance_refs = _fallback_prior_side_levels(
-            side="resistance",
-            current_price=fallback_reference_price,
-            include_prior_day=include_prior_day,
-            include_prior_week=include_prior_week,
-            prior_day_high=prior_day_high,
-            prior_day_low=prior_day_low,
-            prior_week_high=prior_week_high,
-            prior_week_low=prior_week_low,
-        )
-        if second_chance_resistance_refs:
-            resistance_filter_price = fallback_reference_price
-        else:
-            second_chance_resistance_refs = _frame_extreme_side_levels(
-                frame,
-                side="resistance",
-                tolerance=tolerance,
-                max_levels=int(max_levels_per_side * 2),
-            )
-        extend_unique_levels(resistance_references, second_chance_resistance_refs)
-        for level in second_chance_resistance_refs:
-            if _htf_flip_active(
-                frame,
-                float(level.price),
-                timeframe_minutes=int(timeframe_minutes),
-                confirm_bars=flip_bars,
-                direction="reclaim",
-                eps=flip_eps,
-            ):
-                support_candidates.append(_clone_level(level, "support", source="broken_htf_resistance"))
-            else:
-                resistance_candidates.append(_clone_level(level, "resistance"))
-
-    support_candidates = [lv for lv in support_candidates if float(lv.price) <= float(support_filter_price) + eps]
-    resistance_candidates = [lv for lv in resistance_candidates if float(lv.price) >= float(resistance_filter_price) - eps]
+                refs = _frame_extreme_side_levels(frame, side=side, tolerance=tolerance)
+            if not refs:
+                continue
+            # A ref already among the side's references (the frame extreme
+            # when it is a pivot cluster, a prior level that was the first
+            # fallback) is already a candidate: adding it again doubled its
+            # touches and score when the copies merged.
+            added = extend_unique_levels(support_references if side == "support" else resistance_references, refs)
+            for level in added:
+                if side == "support" and flip_active(float(level.price), "loss"):
+                    resistance_candidates.append(_clone_level(level, "resistance", source="broken_htf_support"))
+                elif side == "resistance" and flip_active(float(level.price), "reclaim"):
+                    support_candidates.append(_clone_level(level, "support", source="broken_htf_resistance"))
+                elif side == "support":
+                    support_candidates.append(_clone_level(level, "support"))
+                else:
+                    resistance_candidates.append(_clone_level(level, "resistance"))
+            _partition_by_close()
     supports = _collapse_same_side_levels(support_candidates, collapse_tolerance, close, reverse=True, max_levels=int(max_levels_per_side))
     resistances = _collapse_same_side_levels(resistance_candidates, collapse_tolerance, close, reverse=False, max_levels=int(max_levels_per_side))
 
@@ -835,15 +865,8 @@ def build_htf_context(
     broken_resistance_candidates = [
         _clone_level(lv, "support", source="broken_htf_resistance")
         for lv in resistance_references
-        if lv.price <= resistance_filter_price + eps
-        and _htf_flip_active(
-            frame,
-            float(lv.price),
-            timeframe_minutes=int(timeframe_minutes),
-            confirm_bars=flip_bars,
-            direction="reclaim",
-            eps=flip_eps,
-        )
+        if lv.price <= close + eps
+        and flip_active(float(lv.price), "reclaim")
     ]
     broken_resistance_levels = _collapse_same_side_levels(
         broken_resistance_candidates,
@@ -857,15 +880,8 @@ def build_htf_context(
     broken_support_candidates = [
         _clone_level(lv, "resistance", source="broken_htf_support")
         for lv in support_references
-        if lv.price >= support_filter_price - eps
-        and _htf_flip_active(
-            frame,
-            float(lv.price),
-            timeframe_minutes=int(timeframe_minutes),
-            confirm_bars=flip_bars,
-            direction="loss",
-            eps=flip_eps,
-        )
+        if lv.price >= close - eps
+        and flip_active(float(lv.price), "loss")
     ]
     broken_support_levels = _collapse_same_side_levels(
         broken_support_candidates,
@@ -875,6 +891,20 @@ def build_htf_context(
         max_levels=int(max_levels_per_side),
     )
     broken_support = broken_support_levels[0] if broken_support_levels else None
+    pending_support = _pending_level(
+        supports_beyond,
+        side="support",
+        close=close,
+        broken=broken_support,
+        tolerance=collapse_tolerance,
+    )
+    pending_resistance = _pending_level(
+        resistances_beyond,
+        side="resistance",
+        close=close,
+        broken=broken_resistance,
+        tolerance=collapse_tolerance,
+    )
 
     ema_fast = float(frame["close"].ewm(span=int(ema_fast_span), adjust=False).mean().iloc[-1]) if len(frame) >= max(5, int(ema_fast_span) // 3) else None
     ema_slow = float(frame["close"].ewm(span=int(ema_slow_span), adjust=False).mean().iloc[-1]) if len(frame) >= int(ema_slow_span) else None
@@ -915,8 +945,13 @@ def build_htf_context(
 
     # HTF RSI divergence — multi-timeframe confluence signal. Uses
     # include_idx=True pivots so the shared find_divergence can pull RSI
-    # values at exact pivot positions and tag age in HTF bars. RSI series is
+    # values at exact pivot positions and tag age in HTF bars (session bars
+    # under the session clock, below). RSI series is
     # whatever ensure_standard_indicator_frame populated under "rsi14".
+    # The thresholds and the switch arrive from technical_levels through the
+    # data feed (MarketDataStore.get_htf_context, 2026-09-25 for the
+    # thresholds); the signature defaults are the values every preset
+    # ships, for the callers that build a context directly.
     bullish_rsi_div: DivergenceMatch | None = None
     bearish_rsi_div: DivergenceMatch | None = None
     bullish_hidden_rsi_div: DivergenceMatch | None = None
@@ -925,6 +960,36 @@ def build_htf_context(
         rsi_series = frame["rsi14"].astype(float)
         if not rsi_series.dropna().empty:
             highs_idx, lows_idx = pivot_points(frame, int(pivot_span), include_idx=True)
+            # rsi14 is the session-only series on session bars and the
+            # all-hours one elsewhere (utils.add_indicators); pair only
+            # session-bar pivots so both ends read the same RSI. Until
+            # 2026-09-23 a 15m pivot pair straddling the old 13:00 switch
+            # compared two different RSIs (KLZ-M2).
+            #
+            # Their age is counted in session bars too, while the clock is
+            # inside the session (utils.indicator_session_open, 2026-09-24).
+            # Counted in every bar, the 16:00-20:00 and pre-market buckets
+            # aged yesterday's last session pivot past the limit before the
+            # open: on a tape printing every bucket the last 60m session
+            # bucket (15:30) is 7 bars old by 09:30 (16:00-19:00, 07:00-
+            # 09:00), and on the divergence-age study's symbol-days with a
+            # dense overnight tape the 60m divergence read on none of the
+            # minutes from 09:30 to 11:00. The gate is the clock, not the
+            # frame's last bar, as for utils.latest_atr14: until the first
+            # session bucket closes (09:45 on 15m, 10:30 on 60m) the frame
+            # still ends on a pre-market bucket, and a last-bar gate kept the
+            # all-bar age through exactly the minutes this is for. A reader
+            # outside the session (premarket) keeps the all-bar age.
+            bar_clock: np.ndarray | None = None
+            if get_runtime_indicator_mode():
+                in_session = indicator_session_mask(frame.index)
+                highs_idx = [p for p in highs_idx if in_session[int(p[0])]]
+                lows_idx = [p for p in lows_idx if in_session[int(p[0])]]
+                if indicator_session_open():
+                    bar_clock = np.cumsum(in_session)
+            # ...and compare their prices on the gap-free scale that RSI was
+            # computed on (find_divergence's price_scale).
+            price_scale = session_price_scale(frame)
             last_bar_pos = max(0, len(frame) - 1)
             lookback = max(2, int(divergence_pivot_lookback))
             max_age = max(0, int(divergence_max_age_bars))
@@ -935,24 +1000,28 @@ def build_htf_context(
                 indicator_name="rsi", price_move_frac=move_frac,
                 indicator_delta=rsi_delta, pivot_lookback=lookback,
                 max_age_bars=max_age, last_bar_pos=last_bar_pos,
+                price_scale=price_scale, bar_clock=bar_clock,
             )
             bearish_rsi_div = find_divergence(
                 highs_idx, rsi_series, kind="regular", direction="bearish",
                 indicator_name="rsi", price_move_frac=move_frac,
                 indicator_delta=rsi_delta, pivot_lookback=lookback,
                 max_age_bars=max_age, last_bar_pos=last_bar_pos,
+                price_scale=price_scale, bar_clock=bar_clock,
             )
             bullish_hidden_rsi_div = find_divergence(
                 lows_idx, rsi_series, kind="hidden", direction="bullish",
                 indicator_name="rsi", price_move_frac=move_frac,
                 indicator_delta=rsi_delta, pivot_lookback=lookback,
                 max_age_bars=max_age, last_bar_pos=last_bar_pos,
+                price_scale=price_scale, bar_clock=bar_clock,
             )
             bearish_hidden_rsi_div = find_divergence(
                 highs_idx, rsi_series, kind="hidden", direction="bearish",
                 indicator_name="rsi", price_move_frac=move_frac,
                 indicator_delta=rsi_delta, pivot_lookback=lookback,
                 max_age_bars=max_age, last_bar_pos=last_bar_pos,
+                price_scale=price_scale, bar_clock=bar_clock,
             )
 
     return HTFContext(
@@ -964,6 +1033,8 @@ def build_htf_context(
         broken_resistance=broken_resistance,
         nearest_resistance=nearest_resistance,
         broken_support=broken_support,
+        pending_support=pending_support,
+        pending_resistance=pending_resistance,
         prior_day_high=prior_day_high,
         prior_day_low=prior_day_low,
         prior_week_high=prior_week_high,

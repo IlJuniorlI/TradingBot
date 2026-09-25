@@ -49,27 +49,26 @@ This is not a “buy because it dipped” system. It is a **buy because the tren
 
 ### 4. Anti-chase and FVG retest logic matter here too
 
-Because continuation entries can easily become chase entries, this strategy also uses:
+Because continuation entries can easily become chase entries, the anti-chase exhaustion checks (extension from VWAP / EMA9 in ATR, the side's wick rejection, an oversized expansion bar) join the setup's own blockers as the pending reasons of one proposal on the candidate's side (style and family `pullback`), which the strategy hands to the shared entry stage (`_strategies/shared_entry.py`). There:
 
-- continuation FVG retest planning / deferment
-- exhaustion checks
-- opposing chart-pattern filters
-- technical divergence filters
-- structure and S/R vetoes
+- an FVG retest of the re-expansion trigger (`use_fvg_context`, the `anti_chase_fvg_retest_*` knobs) can clear the missing-trigger, stretched and weak-bar reasons; the entry then comes in as `rth_trend_pullback_<side>_fvg_retest`
+- every `shared_entry` veto the preset switches on applies, also to a retest entry: market structure, support/resistance, broken level, opposing chart pattern, dual RSI+OBV counter-divergence, opposing candle cluster
+
+A skipped candidate's decision lists every blocker, the strategy's own first. Until 2026-09-24 the strategy called these itself: the chart filter ran only while nothing else was pending (so an entry the retest admitted never met it), structure and S/R were an either/or, and the candle veto and the broken-level guard never reached it.
 
 That is why a trend-looking chart can still be skipped: the strategy wants the pullback-and-restart pattern, not just a visually strong name.
 
 ### 5. How the trade is framed
 
-The stop is anchored to the pullback structure or nearby support/resistance with a default risk floor. The target starts from reward-to-risk and can extend when the trend is especially strong.
+The stop is anchored beyond the pullback extreme and the VWAP / EMA20 support (resistance for a short), at least `risk.default_stop_pct` away. The target is `target_rr` times that risk, `strong_trend_target_rr` when the structure bias, a break of structure and a continuation pattern all agree with the side.
 
-Then the trade is refined using:
+The shared stage then refines both (support/resistance, then technical levels, bounded by `min_target_rr` and `min_stop_atr_mult`); on a retest entry it pulls the stop to the retest zone's anchor, held at least `min_stop_atr_mult` ATR from entry (since 2026-09-24; the anchor used to bypass that floor). Adaptive management runs in the `trend` style, with the runner open to a strong-trend target or an FVG continuation bias of at least 0.35 when the structure bias agrees.
 
-- support/resistance
-- technical levels
-- chart-pattern context
-- FVG continuation bias
-- adaptive management metadata
+The strategy's own priority (`strategy_priority_score`: screener score, the side's `ret5` / `ret15`, structure and pattern bonuses) plus the shared context terms (`shared_context_score`) is the `final_priority_score` the gatekeeper ranks on.
+
+The signal is stamped `entry_style_family: pullback`, which gives the position the exit side's longer pullback structure grace (`support_resistance.structure_exit_grace_minutes_pullback`). Until 2026-09-24 that grace covered only top_tier's pullback regime.
+
+The signal also carries `entry_price`, which the shared stage stamps on every signal since 2026-09-24 and which `risk.py`'s same-level retry block needs. This strategy never stamped one before, so the block never reached it and the preset's 30 minutes were inert; the preset ships `risk.same_level_block_minutes: 0` to keep that (parity). Turning the block on for this strategy is a separate go-live decision, for a beta dry-run.
 
 ### 6. What a strong setup looks like
 

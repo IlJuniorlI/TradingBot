@@ -1037,9 +1037,16 @@ class IntradayBot:
 
         Auto-detect: each context builder records its call signature in
         `BaseStrategy._observed_contexts` (a class-level set of tuples like
-        `("structure", "ltf")`). On cycle 1 the set is empty and this method
-        is a no-op — the strategy runs lazy. From cycle 2 onward, only the
-        contexts the strategy actually invokes are pre-warmed, in parallel
+        `("structure", "ltf")`) -- but only for a call on one of THIS
+        cycle's bars frames, which this method hands the strategy first
+        (`set_prewarm_frames`). The caches key on id(frame), so a build on
+        any other frame (the peers' 5m LTF, key_levels_1m's get_merged copy)
+        could never read what this pre-warm puts on the 1m bars frames; until
+        2026-09-24 such calls were recorded too, and key_levels paid a chart
+        and technical build per watchlist symbol per cycle that nothing read.
+        On cycle 1 the set is empty and nothing is pre-warmed — the strategy
+        runs lazy. From cycle 2 onward, only the contexts the strategy
+        actually invokes on its bars frames are pre-warmed, in parallel
         across the watchlist via `_parallel_symbol_map`. New code paths
         that hit a previously-unseen context register on first invocation
         and join the pre-warm set thereafter (self-healing).
@@ -1047,6 +1054,14 @@ class IntradayBot:
         Cache writes inside each builder are guarded by per-cache RLocks,
         so distinct workers writing distinct keys don't race.
         """
+        self.strategy.set_prewarm_frames(bars.values())
+        # Cycle-boundary reset — owned by the engine now, NOT by entry_signals.
+        # Strategies still call _reset_entry_decisions() at the top of
+        # entry_signals(), but that method no longer touches the 3 context
+        # caches the engine just (or is about to) pre-warm. It runs whether or
+        # not anything is observed: every entry pins its frame, and a
+        # strategy whose builds are all on non-bars frames observes nothing.
+        self.strategy.reset_context_caches()
         # Snapshot the observed set so workers iterating it can't trip on
         # a concurrent mutation if a builder happens to record a previously-
         # unseen tuple mid-cycle. In practice, pre-warm only replays known
@@ -1058,11 +1073,6 @@ class IntradayBot:
         symbols = [symbol for symbol, frame in bars.items() if frame is not None and not frame.empty]
         if not symbols:
             return
-        # Cycle-boundary reset — owned by the engine now, NOT by entry_signals.
-        # Strategies still call _reset_entry_decisions() at the top of
-        # entry_signals(), but that method no longer touches the 3 context
-        # caches the engine just (or is about to) pre-warm.
-        self.strategy.reset_context_caches()
 
         def _warm(symbol: str) -> Any:
             frame = bars.get(symbol)

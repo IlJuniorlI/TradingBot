@@ -78,6 +78,17 @@
     "fvg_context_weight_scale": 0.9
   },
   "capabilities": {
+    "signal_priority": {
+      "primary_field": "strategy_priority_score"
+    },
+    "shared_entry": {
+      "exemptions": {
+        "midday_credit_spread": [
+          "structure"
+        ]
+      },
+      "divergence_entry": false
+    },
     "dashboard": {
       "tradable_symbols_source": "options.underlyings"
     },

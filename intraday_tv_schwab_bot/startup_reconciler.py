@@ -45,7 +45,13 @@ from typing import Any, Callable
 
 from schwabdev import Client
 
-from .broker_positions import active_broker_bracket, broker_position_side_qty, extract_broker_positions, extract_working_orders
+from .broker_positions import (
+    active_broker_bracket,
+    broker_position_side_qty,
+    extract_broker_positions,
+    extract_working_orders,
+    working_exit_outstanding_qty,
+)
 from .config import BotConfig
 from .data_feed import MarketDataStore
 from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side
@@ -222,11 +228,20 @@ class StartupReconciler:
                 continue
             if position.side != side:
                 continue
-            if int(position.qty) != int(qty):
-                continue
             if position.strategy != self.config.strategy:
                 continue
             if abs(float(position.entry_price) - float(entry_price)) > tolerance:
+                continue
+            held_when_saved = int(qty)
+            if int(position.qty) != held_when_saved and working_exit_outstanding_qty(position):
+                # Its working exit order sold shares while the bot was down.
+                # They are this position's, booked from the order's own fill
+                # record by the first cycle; strict equality lost the metadata
+                # (levels, marker, the order) to a restore_basic (2026-09-25).
+                # A gap the order does not explain, or an order whose state
+                # cannot be read, still does not match.
+                held_when_saved += self._unbooked_working_exit_fills(position) or 0
+            if int(position.qty) != held_when_saved:
                 continue
             return str(key), position
         return None
@@ -247,9 +262,24 @@ class StartupReconciler:
         as ``known_bracket``: its child ids are the ones the bot last tracked,
         so a stop replaced before the restart is adopted instead of being read
         as dead (its original, off the parent, is REPLACED) and stacked on.
+
+        A restored working exit order (a slice or a full exit left working
+        before the restart) still sells its outstanding shares, so the
+        resting stop covers only the rest, as the manager's
+        ``_reprotect_beside_working_order`` sizes it; a full exit still
+        working covers every share and gets nothing beside it (2026-09-25).
+        Protecting the full quantity rested stop + order above what was held,
+        and a stop that triggered while the order worked sold the position
+        net short. See ``_working_exit_covered_qty`` for an order that
+        settled while the bot was down.
         """
         metadata = position.metadata if isinstance(position.metadata, dict) else None
         if metadata is None:
+            return
+        uncovered = int(position.qty) - self._working_exit_covered_qty(position)
+        if uncovered <= 0:
+            # A live full exit: its settle re-protects whatever it leaves.
+            metadata.pop("bracket", None)
             return
         stale = metadata.get("bracket") if isinstance(metadata.get("bracket"), dict) else None
         parent_order_id = stale.get("parent_order_id") if stale else None
@@ -257,7 +287,7 @@ class StartupReconciler:
         try:
             refreshed = self.executor.ensure_position_protected(
                 str(metadata.get("underlying") or position.symbol),
-                int(position.qty), position.side, float(position.entry_price),
+                uncovered, position.side, float(position.entry_price),
                 float(position.stop_price), position.target_price,
                 parent_order_id=str(parent_order_id) if parent_order_id else None,
                 known_bracket=known,
@@ -299,6 +329,48 @@ class StartupReconciler:
         side, qty, _ = broker_position_side_qty(held.get(symbol.upper().strip()))
         return int(qty) if side == position.side else 0
 
+    def _working_exit_order_state(self, position: Position) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+        """The position's tracked working exit record and the order's broker
+        state row (None when it cannot be read), or None when it tracks no
+        working exit order."""
+        record = position.metadata.get("working_exit_order") if isinstance(position.metadata, dict) else None
+        if not isinstance(record, dict):
+            return None
+        return record, self.executor.order_state(str(record.get("order_id") or ""))
+
+    def _unbooked_working_exit_fills(self, position: Position) -> int | None:
+        """Shares the position's own working exit order filled that are not
+        booked yet (0 when it tracks none), or None when its state cannot be
+        read. PositionManager._exit_order_in_flight books them next cycle."""
+        tracked = self._working_exit_order_state(position)
+        if tracked is None:
+            return 0
+        record, state = tracked
+        if state is None:
+            return None
+        return max(0, int(state.get("filled_qty") or 0) - int(record.get("booked_qty") or 0))
+
+    def _working_exit_covered_qty(self, position: Position) -> int:
+        """Shares of *position* that a resting stop must leave to its working
+        exit order.
+
+        While the order is live, that is everything it may still sell
+        (``working_exit_outstanding_qty``, the manager's sizing beside a
+        slice). Once it has settled -- filled, or cancelled or expired while
+        the bot was down -- it is only its fills not booked yet, which have
+        already left the account. Reading the saved record alone left the
+        shares a dead order no longer covered without a broker stop until the
+        first cycle settled it (2026-09-25). An unreadable state reads as
+        live."""
+        outstanding = working_exit_outstanding_qty(position)
+        tracked = self._working_exit_order_state(position) if outstanding > 0 else None
+        if tracked is None:
+            return outstanding
+        record, state = tracked
+        if state is None or not (state.get("is_filled") or state.get("is_terminal_failure")):
+            return outstanding
+        return max(0, int(state.get("filled_qty") or 0) - int(record.get("booked_qty") or 0))
+
     def _settle_positions_closed_at_broker(self, raw_positions: list[dict[str, Any]]) -> None:
         """Stop managing what the broker no longer holds.
 
@@ -316,6 +388,11 @@ class StartupReconciler:
         closed position opens a new one when it triggers. Not registered with
         the risk manager: the close happened outside this session.
 
+        Fills of the position's own working exit order are not an outside
+        close: the manager books them from the order's record next cycle, so
+        they are netted out here, and a position whose order cannot be read
+        is left tracked (2026-09-25).
+
         Skipped in dry-run: those positions are simulated and never reach the
         broker, so the account holding none of them says nothing -- reading
         it as a close wiped every paper position held into a new session.
@@ -329,17 +406,28 @@ class StartupReconciler:
             if remaining is None:
                 LOG.warning("Broker rows for %s do not read as its position; leaving it tracked", key)
                 continue
-            if remaining >= int(position.qty):
+            unbooked = self._unbooked_working_exit_fills(position)
+            if unbooked is None:
+                LOG.warning("%s: its working exit order's fills cannot be read; leaving it tracked", key)
                 continue
-            closed_qty = int(position.qty) - int(remaining)
+            # What the broker holds once the manager books the position's own
+            # working exit fills (next cycle, from the order's fill record).
+            # Those are not closed outside the bot: booking them here too
+            # counted them twice and dropped a position the broker still held
+            # (2026-09-25).
+            expected = int(position.qty) - unbooked
+            if remaining >= expected:
+                continue
+            closed_qty = expected - int(remaining)
+            kept = int(remaining) + unbooked
             mark = self.account.last_prices.get(position.symbol)
             exit_price = float(mark) if mark is not None and float(mark) > 0 else float(position.entry_price)
             exited = copy.copy(position)
             exited.qty = closed_qty
             self.account.record_exit(
                 exited, exit_price, "closed_outside_bot",
-                final_exit=remaining <= 0,
-                remaining_qty_after_exit=int(remaining),
+                final_exit=kept <= 0,
+                remaining_qty_after_exit=kept,
                 fill_price_estimated=True,
                 broker_recovered=True,
             )
@@ -349,19 +437,20 @@ class StartupReconciler:
                 if not leftover.ok:
                     LOG.error("Could not confirm %s's resting bracket is down (%s) -- check the broker",
                               key, leftover.message)
-            if remaining <= 0:
+            if kept <= 0:
                 self.positions.pop(key, None)
                 LOG.warning("%s qty=%s is no longer held at the broker; closed outside the bot, "
                             "booked at the last mark %.4f (estimated)", key, closed_qty, exit_price)
             else:
-                position.qty = int(remaining)
+                position.qty = kept
                 if isinstance(position.metadata, dict):
-                    position.metadata["qty"] = int(remaining)
+                    position.metadata["qty"] = kept
                     if bracket is not None:
                         position.metadata.pop("bracket", None)
                         self._reprotect_restored_position(position, [])
                 LOG.warning("%s: broker holds %s of %s; %s closed outside the bot, booked at the last "
-                            "mark %.4f (estimated)", key, remaining, remaining + closed_qty, closed_qty, exit_price)
+                            "mark %.4f (estimated); %s left to book from its working exit order",
+                            key, remaining, expected, closed_qty, exit_price, unbooked)
             changed = True
         if changed:
             self._save_reconcile_metadata()
@@ -393,9 +482,16 @@ class StartupReconciler:
         return None
 
     def _foreign_working_orders(self, working_orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Working orders no restored position owns as its resting protection."""
+        """Working orders no restored position owns: its resting protection,
+        or the exit order it left working before the restart (settled from
+        its own fill record by the first management cycle). Counting that
+        exit as foreign blocked every entry for the session, and "clear
+        them" meant cancelling the position's own exit (2026-09-25)."""
         owned: set[str] = set()
         for position in self.positions.values():
+            record = position.metadata.get("working_exit_order") if isinstance(position.metadata, dict) else None
+            if isinstance(record, dict) and record.get("order_id"):
+                owned.add(str(record["order_id"]))
             bracket = position.metadata.get("bracket") if isinstance(position.metadata, dict) else None
             if not isinstance(bracket, dict) or not bracket.get("active"):
                 continue
@@ -404,6 +500,33 @@ class StartupReconciler:
                     owned.add(str(bracket[key]))
             owned.update(str(oid) for oid in (bracket.get("child_order_ids") or []) if oid)
         return [order for order in working_orders if str(order.get("orderId")) not in owned]
+
+    def _drop_retired_orders(self, orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The startup-snapshot orders still live now. A restore that resizes
+        an adopted child replaces it, and the session-boundary settle cancels
+        the bracket of a position closed outside the bot: the old ids read
+        REPLACED or CANCELED at the broker but are still in the snapshot, and
+        counting them as foreign blocked every entry for the session
+        (2026-09-25).
+
+        The listing covers only its lookback (8 hours), while the snapshot
+        covers ``startup_order_lookback_days``, so an id it does not return
+        (a stop entered before an overnight hold, or hours before the
+        restart) is read on its own with ``order_details``. Reading the
+        missing id as live kept it foreign. Unreadable state keeps an order
+        (fail closed)."""
+        states = self.executor.fetch_order_states()
+        if states is None:
+            return orders
+        live: list[dict[str, Any]] = []
+        for order in orders:
+            order_id = str(order.get("orderId"))
+            state = states.get(order_id)
+            if state is None:
+                state = self.executor.order_state(order_id)
+            if state is None or not (state.get("is_terminal_failure") or state.get("is_filled")):
+                live.append(order)
+        return live
 
     def _restore_broker_positions(self, positions: list[dict[str, Any]], *, use_metadata: bool,
                                   working_orders: list[dict[str, Any]]) -> tuple[int, int]:
@@ -486,7 +609,10 @@ class StartupReconciler:
                     symbol=symbol,
                     strategy=self.config.strategy,
                     side=side,
-                    qty=qty,
+                    # The saved quantity: any gap to the broker's is the
+                    # working exit's unbooked fills, which the first cycle
+                    # books from the order's record (2026-09-25).
+                    qty=int(matched.qty),
                     entry_price=entry_price,
                     entry_time=matched.entry_time,
                     stop_price=float(stop_price),
@@ -632,8 +758,15 @@ class StartupReconciler:
                     # A restored position's own resting protection is not a
                     # foreign order. Counting it blocked every entry for the
                     # rest of the session in bracket mode -- and "clear them"
-                    # meant stripping the position's stop.
+                    # meant stripping the position's stop. Nor is a snapshot
+                    # order this reconcile retired: a child the restore
+                    # resized, or the bracket the settle cancelled. The settle
+                    # runs with nothing restored (a tracked symbol is
+                    # skipped), so the filter no longer waits on a restore
+                    # (2026-09-25).
                     foreign_orders = self._foreign_working_orders(working_orders)
+                    if foreign_orders:
+                        foreign_orders = self._drop_retired_orders(foreign_orders)
                     self.result["foreign_working_orders"] = foreign_orders
                     self.result["restored_positions"] = restored
                     self.result["skipped_restore_positions"] = skipped

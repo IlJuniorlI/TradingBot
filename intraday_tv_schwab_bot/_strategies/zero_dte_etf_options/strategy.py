@@ -35,6 +35,7 @@ from ..shared import (
     empty_market_structure_context,
     equity_session_state,
     filter_contracts,
+    htf_ema_spans,
     net_credit_dollars,
     net_price_frac_of_width,
     net_debit_dollars,
@@ -42,7 +43,6 @@ from ..shared import (
     parse_hhmm,
     parse_option_chain,
     pd,
-    replace,
     single_option_price_bounds,
     summarize_htf_trend,
     time,
@@ -50,9 +50,25 @@ from ..shared import (
     vertical_limit_price,
     vertical_price_bounds,
 )
+from ..shared_entry import AdmittedEntry, EntryContexts, EntryProposal
 from ..strategy_base import BaseStrategy
 
 class ZeroDteEtfOptionsStrategy(BaseStrategy):
+    """0DTE ETF verticals routed by the underlying's regime.
+
+    ``_regime_confirm`` classifies the underlying (bullish / bearish trend,
+    range) and vetoes on its own terms (VIX, chop, index disagreement, the
+    HTF trend and HTF structure bias). Each style that triggers -- ORB debit,
+    trend debit, midday credit -- then hands a PREMIUM proposal to
+    ``self.entry_policy.admit`` before any chain work
+    (``_admit_premium_entry``): the underlying's frame, its MARKET direction
+    (a bull put credit spread is LONG), no price stop / target. Every
+    shared_entry veto and score term is applied there (the manifest exempts
+    ``midday_credit_spread`` from the structure veto: its range regime was
+    never structure-gated); the builder picks the contracts and ``emit``
+    builds the signal on the order side with the premium stop / target.
+    """
+
     strategy_name = 'zero_dte_etf_options'
 
     def required_history_bars(self, symbol: str | None = None, positions: dict[str, Position] | None = None) -> int:
@@ -216,40 +232,15 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         ]
         if not symbols:
             return
-        data.prefetch_htf_contexts(
-            symbols,
-            timeframe_minutes=self._htf_minutes(),
-            lookback_days=self._htf_lookback_days(),
-        )
+        # The context the entry path reads (_htf_fvg_request below), so the
+        # prefetch warms it; with only the timeframe it built a default-level
+        # context no decision read (until 2026-09-24).
+        data.prefetch_htf_contexts(symbols, **self._htf_fvg_context_request(), **self._htf_fvg_request())
 
     @staticmethod
     def _safe_pct(value: Any) -> float:
         pct = _safe_float(value, 0.0)
         return pct / 100.0 if abs(pct) > 1.0 else pct
-
-    def _bullish_sr_block_reason(self, sr_ctx) -> str:
-        return _reason_with_values(
-            "too_close_to_htf_resistance",
-            current=sr_ctx.resistance_distance_pct,
-            required=float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)),
-            op=">",
-            digits=4,
-            extras={
-                "clearance_atr": (sr_ctx.resistance_distance_atr, ">", float(self._support_resistance_setting("entry_min_clearance_atr", 0.85))),
-            },
-        )
-
-    def _bearish_sr_block_reason(self, sr_ctx) -> str:
-        return _reason_with_values(
-            "too_close_to_htf_support",
-            current=sr_ctx.support_distance_pct,
-            required=float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)),
-            op=">",
-            digits=4,
-            extras={
-                "clearance_atr": (sr_ctx.support_distance_atr, ">", float(self._support_resistance_setting("entry_min_clearance_atr", 0.85))),
-            },
-        )
 
     @classmethod
     def insufficient_bars_reason(cls, name: str, current: Any, required: Any) -> str:
@@ -291,7 +282,45 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return 0.0
         return max(0.0, float(recent["high"].max()) - float(recent["low"].min())) / ref
 
-    def _htf_trend_context(self, symbol: str, data) -> dict[str, Any]:
+    def _htf_fvg_context_request(self) -> dict[str, Any]:
+        """The level arguments of the HTF context the entry path reads for
+        its FVGs (shared with the prefetch, which has to warm this one).
+
+        The EMA spans are the strategy's own, resolved by ``htf_ema_spans``
+        as every other HTF-EMA consumer does. Until 2026-09-25 they were
+        read from ``support_resistance.ema_fast_span`` / ``ema_slow_span``,
+        fields that do not exist, so the request was always 50/200 whatever
+        ``htf_ema_*_span`` said (zero_dte declares neither, so 50/200 is
+        what it asks for either way)."""
+        ema_fast_span, ema_slow_span = htf_ema_spans(self.params)
+        return {
+            "timeframe_minutes": self._htf_minutes(),
+            "lookback_days": self._htf_lookback_days(),
+            "pivot_span": int(self._support_resistance_setting("pivot_span", 2) or 2),
+            "max_levels_per_side": int(self._support_resistance_setting("max_levels_per_side", 6) or 6),
+            "atr_tolerance_mult": float(self._support_resistance_setting("atr_tolerance_mult", 0.35) or 0.35),
+            "pct_tolerance": float(self._support_resistance_setting("pct_tolerance", 0.0030) or 0.0030),
+            "stop_buffer_atr_mult": float(self._support_resistance_setting("stop_buffer_atr_mult", 0.25) or 0.25),
+            "ema_fast_span": ema_fast_span,
+            "ema_slow_span": ema_slow_span,
+            "use_prior_day_high_low": bool(self._support_resistance_setting("use_prior_day_high_low", True)),
+            "use_prior_week_high_low": bool(self._support_resistance_setting("use_prior_week_high_low", True)),
+        }
+
+    def dashboard_htf_trend(self, symbol: str, data, price: float, *, allow_refresh: bool = True) -> dict[str, str] | None:
+        """The HTF trend the entry gate reads: ``_htf_trend_context``
+        (``summarize_htf_trend`` on the continuous ema9_all / ema20_all)."""
+        summary = self._htf_trend_context(symbol, data, allow_refresh=allow_refresh)
+        if not bool(summary.get("available")):
+            return {"state": "neutral", "label": "—"}
+        return {"state": str(summary.get("state", "neutral")), "label": str(summary.get("label", "—"))}
+
+    def dashboard_htf_ema_columns(self) -> tuple[str, str] | None:
+        """``summarize_htf_trend`` reads the continuous (all-hours) EMAs, not
+        the session-reset ema9 / ema20 the chart drew until 2026-09-24."""
+        return ("ema9_all", "ema20_all")
+
+    def _htf_trend_context(self, symbol: str, data, *, allow_refresh: bool = True) -> dict[str, Any]:
         p = self.params
         sr_cfg = getattr(self.config, "support_resistance", None)
         if data is None or not hasattr(data, "get_htf_frame"):
@@ -302,6 +331,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             symbol,
             timeframe_minutes=htf_tf,
             lookback_days=lookback_days,
+            allow_refresh=allow_refresh,
         )
         min_bars = int(p.get("htf_min_bars", 20))
         summary = summarize_htf_trend(
@@ -657,46 +687,14 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         if use_htf_confirmation and require_htf_alignment and not htf_available:
             reasons.append(str(htf_ctx.get("reason") or "insufficient_htf_bars"))
 
-        htf_fvg_ctx = self._htf_context(
-            underlying,
-            data,
-            timeframe_minutes=self._htf_minutes(),
-            lookback_days=self._htf_lookback_days(),
-            pivot_span=int(self._support_resistance_setting("pivot_span", 2) or 2),
-            max_levels_per_side=int(self._support_resistance_setting("max_levels_per_side", 6) or 6),
-            atr_tolerance_mult=float(self._support_resistance_setting("atr_tolerance_mult", 0.35) or 0.35),
-            pct_tolerance=float(self._support_resistance_setting("pct_tolerance", 0.0030) or 0.0030),
-            stop_buffer_atr_mult=float(self._support_resistance_setting("stop_buffer_atr_mult", 0.25) or 0.25),
-            ema_fast_span=int(self._support_resistance_setting("ema_fast_span", 50) or 50),
-            ema_slow_span=int(self._support_resistance_setting("ema_slow_span", 200) or 200),
-            current_price=u_close,
-            use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
-            use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
-        )
+        htf_fvg_ctx = self._htf_context(underlying, data, current_price=u_close, **self._htf_fvg_context_request())
         fvg_ltf_ctx = self._ltf_fvg_context(underlying, u, data)
-        use_fvg_context = self._shared_entry_enabled("use_fvg_context", True)
         fvg_context_weight_scale = max(0.0, float(p.get("fvg_context_weight_scale", 0.9) or 0.0))
-        # Disabled-state fallback must mirror the FULL shape that
-        # _score_fvg_context returns when use_fvg_context is True (see
-        # strategy_base.py::_score_fvg_context). The entry_context
-        # metadata stamping at the bottom of this method reads
-        # ``nearest_bullish`` / ``nearest_bearish`` unconditionally —
-        # a partial fallback dict caused a KeyError("nearest_bullish")
-        # that propagated up to engine._publish_state and rendered as
-        # "Error: 'nearest_bullish'" in the status banner. Empty dicts
-        # for the two nearest_* fields are safe: the downstream
-        # ``.get("state", "none")`` / ``.get("midpoint")`` calls
-        # gracefully resolve to the disabled-state values.
-        _disabled_fvg_score = {
-            "bull_score": 0.0,
-            "bear_score": 0.0,
-            "directional_pressure": 0.0,
-            "timeframe_minutes": 0,
-            "nearest_bullish": {},
-            "nearest_bearish": {},
-        }
-        htf_fvg_score = self._score_fvg_context(u_close, htf_fvg_ctx, timeframe_minutes=getattr(htf_fvg_ctx, "timeframe_minutes", self._htf_minutes())) if use_fvg_context else dict(_disabled_fvg_score)
-        fvg_ltf_score = self._score_fvg_context(u_close, fvg_ltf_ctx, timeframe_minutes=self._ltf_minutes()) if use_fvg_context else dict(_disabled_fvg_score)
+        # shared_entry.use_fvg_context is the entry policy's to read
+        # (2026-09-24): with it off both scores come back as the zero shape,
+        # nearest_bullish / nearest_bearish included, which the metrics
+        # stamping below reads unconditionally.
+        htf_fvg_score, fvg_ltf_score = self.entry_policy.fvg_regime_scores(u_close, htf_fvg_ctx, fvg_ltf_ctx)
 
         bull_score = 0.0
         bear_score = 0.0
@@ -717,10 +715,13 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         bull_score -= 1.0 if u_flip_count > int(p.get("chop_flip_max_for_trend", 3)) else 0.0
         bull_score -= 1.0 if u_range_pct > float(p.get("chaos_intraday_range_pct", 0.016)) else 0.0
         bull_score += sr_weight if sr_ctx.breakout_above_resistance else 0.0
-        bull_score += sr_weight * 0.40 if sr_ctx.near_support and not sr_ctx.breakdown_below_support else 0.0
-        bull_score -= sr_weight * 0.45 if sr_ctx.near_resistance and not sr_ctx.breakout_above_resistance else 0.0
+        # near_* is the level on price's own side; the breakdown / breakout
+        # flags are about a broken level on the far side, so they no longer
+        # switch the near terms off (2026-09-23).
+        bull_score += sr_weight * 0.40 if sr_ctx.near_support else 0.0
+        bull_score -= sr_weight * 0.45 if sr_ctx.near_resistance else 0.0
         bull_score += candle_weight * bullish_candle_scale if bullish_candle_confirm and u_vwap_dist >= -candle_anchor else 0.0
-        bull_score += candle_sr_weight * bullish_candle_scale if bullish_candle_confirm and sr_ctx.near_support and not sr_ctx.breakdown_below_support else 0.0
+        bull_score += candle_sr_weight * bullish_candle_scale if bullish_candle_confirm and sr_ctx.near_support else 0.0
         bull_score += candle_trend_follow_weight * bullish_candle_scale if bullish_candle_confirm and pattern_ctx.matched_bullish_continuation else 0.0
         bull_score -= candle_weight * bearish_candle_scale if bearish_candle_confirm else 0.0
         bull_score -= candle_mixed_penalty if mixed_candles else 0.0
@@ -742,10 +743,10 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         bear_score -= 1.0 if u_flip_count > int(p.get("chop_flip_max_for_trend", 3)) else 0.0
         bear_score -= 1.0 if u_range_pct > float(p.get("chaos_intraday_range_pct", 0.016)) else 0.0
         bear_score += sr_weight if sr_ctx.breakdown_below_support else 0.0
-        bear_score += sr_weight * 0.40 if sr_ctx.near_resistance and not sr_ctx.breakout_above_resistance else 0.0
-        bear_score -= sr_weight * 0.45 if sr_ctx.near_support and not sr_ctx.breakdown_below_support else 0.0
+        bear_score += sr_weight * 0.40 if sr_ctx.near_resistance else 0.0
+        bear_score -= sr_weight * 0.45 if sr_ctx.near_support else 0.0
         bear_score += candle_weight * bearish_candle_scale if bearish_candle_confirm and u_vwap_dist <= candle_anchor else 0.0
-        bear_score += candle_sr_weight * bearish_candle_scale if bearish_candle_confirm and sr_ctx.near_resistance and not sr_ctx.breakout_above_resistance else 0.0
+        bear_score += candle_sr_weight * bearish_candle_scale if bearish_candle_confirm and sr_ctx.near_resistance else 0.0
         bear_score += candle_trend_follow_weight * bearish_candle_scale if bearish_candle_confirm and pattern_ctx.matched_bearish_continuation else 0.0
         bear_score -= candle_weight * bullish_candle_scale if bullish_candle_confirm else 0.0
         bear_score -= candle_mixed_penalty if mixed_candles else 0.0
@@ -863,21 +864,19 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                     )
                 )
 
+        # The HTF structure bias is the regime's own veto. The LTF structure
+        # veto that followed it here left on 2026-09-24: each style's premium
+        # proposal meets it in the shared entry stage (shared_entry.
+        # use_structure_filter), on this same frame and in the regime's
+        # direction; the manifest exempts midday_credit_spread, as the range
+        # regime was never structure-gated.
         if not no_trade and sr_cfg is not None and bool(getattr(sr_cfg, "structure_enabled", True)):
-            if regime == "bullish_trend":
-                if mshtf_ctx.bias == "bearish":
-                    no_trade = True
-                    reasons.append(f"htf_structure_bearish(tf={self._htf_minutes()}m,last_high={mshtf_ctx.last_high_label},last_low={mshtf_ctx.last_low_label})")
-                elif self._blocks_bullish_structure_entry(ms_ltf_ctx):
-                    no_trade = True
-                    reasons.append(self._bullish_structure_block_reason(ms_ltf_ctx))
-            elif regime == "bearish_trend":
-                if mshtf_ctx.bias == "bullish":
-                    no_trade = True
-                    reasons.append(f"htf_structure_bullish(tf={self._htf_minutes()}m,last_high={mshtf_ctx.last_high_label},last_low={mshtf_ctx.last_low_label})")
-                elif self._blocks_bearish_structure_entry(ms_ltf_ctx):
-                    no_trade = True
-                    reasons.append(self._bearish_structure_block_reason(ms_ltf_ctx))
+            if regime == "bullish_trend" and mshtf_ctx.bias == "bearish":
+                no_trade = True
+                reasons.append(f"htf_structure_bearish(tf={self._htf_minutes()}m,last_high={mshtf_ctx.last_high_label},last_low={mshtf_ctx.last_low_label})")
+            elif regime == "bearish_trend" and mshtf_ctx.bias == "bullish":
+                no_trade = True
+                reasons.append(f"htf_structure_bullish(tf={self._htf_minutes()}m,last_high={mshtf_ctx.last_high_label},last_low={mshtf_ctx.last_low_label})")
 
         return {
             "ok": True,
@@ -886,6 +885,10 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             "regime": regime,
             "no_trade": no_trade or regime == "no_trade",
             "reason": ",".join(reasons) if reasons else regime,
+            # The contexts the regime was scored on, for the premium
+            # proposals (the S/R context of this frame, its LTF structure and
+            # chart contexts): admit gates on the same reads.
+            "entry_contexts": EntryContexts(sr=sr_ctx, ms=ms_ltf_ctx, chart=pattern_ctx),
             "scores": scores,
             "metrics": {
                 "underlying_vwap_dist": u_vwap_dist,
@@ -986,6 +989,19 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         self._set_cached_option_chain(symbol, contracts)
         return contracts
 
+    def _underlying_below_min_price(self, underlying: str, style: str, last_underlying: float) -> bool:
+        """``options.min_underlying_price``, which the README documents as an
+        option-universe filter and every preset set, was read by nothing
+        until 2026-09-23. Checked before the chain is fetched."""
+        floor = float(self.optcfg.min_underlying_price)
+        if float(last_underlying) >= floor:
+            return False
+        self._set_build_failure(
+            underlying, style,
+            _reason_with_values("underlying_below_min_price", current=last_underlying, required=floor, op=">=", digits=2),
+        )
+        return True
+
     def _fetch_filtered_contracts(self, client, symbol: str, put_call: str) -> list[OptionContract]:
         contracts = self._fetch_raw_option_chain(client, symbol)
         filtered = filter_contracts(
@@ -1069,7 +1085,11 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 return None
         return bid, ask, mid
 
-    def _long_option_style_gate(self, symbol: str, bullish: bool, frame: pd.DataFrame, regime: dict[str, Any], data) -> list[str]:
+    def _long_option_style_gate(self, bullish: bool, frame: pd.DataFrame, regime: dict[str, Any]) -> list[str]:
+        """zero_dte_etf_long_options' own trend-entry blockers (conviction,
+        score gap, extension, spike). They are the premium proposal's pending
+        reasons: the structure and S/R vetoes this gate also ran until
+        2026-09-24 are the shared entry stage's, recorded with them."""
         p = self.params
         reasons: list[str] = []
         if frame is None or frame.empty:
@@ -1100,13 +1120,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         if (top_score - second_score) < min_style_gap:
             reasons.append(_reason_with_values("trend_long_option_score_gap_too_small", current=top_score - second_score, required=min_style_gap, op=">=", digits=2))
 
-        sr_ctx = self._sr_context(symbol, frame, data)
-        ms_ctx = self._structure_context(frame, "ltf")
         if bullish:
-            if self._blocks_bullish_structure_entry(ms_ctx):
-                reasons.append(self._bullish_structure_block_reason(ms_ctx))
-            if self._blocks_bullish_sr_entry(sr_ctx):
-                reasons.append(self._bullish_sr_block_reason(sr_ctx))
             if vwap_dist > max_vwap_extension:
                 reasons.append(_reason_with_values("trend_long_option_too_extended_from_vwap", current=vwap_dist, required=max_vwap_extension, op="<=", digits=4))
             if ema_gap > max_ema_extension:
@@ -1116,10 +1130,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             if last_ret15 > max_ret15:
                 reasons.append(_reason_with_values("trend_long_option_already_extended", current=last_ret15, required=max_ret15, op="<=", digits=4))
         else:
-            if self._blocks_bearish_structure_entry(ms_ctx):
-                reasons.append(self._bearish_structure_block_reason(ms_ctx))
-            if self._blocks_bearish_sr_entry(sr_ctx):
-                reasons.append(self._bearish_sr_block_reason(sr_ctx))
             if vwap_dist < -max_vwap_extension:
                 reasons.append(_reason_with_values("trend_long_option_too_extended_from_vwap", current=abs(vwap_dist), required=max_vwap_extension, op="<=", digits=4))
             if ema_gap < -max_ema_extension:
@@ -1205,11 +1215,17 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         return latest_contract
 
     @staticmethod
-    def _option_final_priority_score(candidate: Candidate, regime: dict[str, Any], *, bullish: bool | None = None, rangeish: bool = False) -> float:
+    def _option_strategy_score(candidate: Candidate, regime: dict[str, Any], primary_key: str) -> float:
+        """The option signal's own priority -- emit's ``strategy_score``,
+        which the manifest ranks on (``strategy_priority_score``): activity
+        plus the score of the regime the style trades (``primary_key``:
+        bullish_trend / bearish_trend / range) and its margin over the
+        runner-up. It was stamped over the built signal's
+        final_priority_score until 2026-09-24; emit now adds the shared
+        terms to it for that stamp, and they never rank these strategies."""
         scores = regime.get("scores") if isinstance(regime, dict) else None
         if not isinstance(scores, dict):
             scores = {}
-        primary_key = "range" if rangeish else ("bullish_trend" if bullish else "bearish_trend")
         primary = _safe_float(scores.get(primary_key), 0.0)
         alternatives = [
             _safe_float(scores.get("bullish_trend"), 0.0),
@@ -1222,12 +1238,58 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         base = _safe_float(candidate.activity_score, 0.0)
         return round(base + (primary * 100.0) + (margin * 40.0), 4)
 
-    def _attach_option_final_priority_score(self, signal: Signal, candidate: Candidate, regime: dict[str, Any], *, bullish: bool | None = None, rangeish: bool = False) -> Signal:
-        meta = dict(signal.metadata) if isinstance(signal.metadata, dict) else {}
-        meta["final_priority_score"] = self._option_final_priority_score(candidate, regime, bullish=bullish, rangeish=rangeish)
-        return replace(signal, metadata=meta)
+    def _admit_premium_entry(
+        self,
+        candidate: Candidate,
+        bullish: bool,
+        frame: pd.DataFrame,
+        data,
+        last_underlying: float,
+        style: str,
+        family: str,
+        regime: dict[str, Any],
+        *,
+        pending_reasons: tuple[str, ...] | list[str] = (),
+    ) -> AdmittedEntry | None:
+        """An option style's pass through the shared entry stage, BEFORE any
+        chain work: a premium proposal (no price stop / target; the premium
+        levels are set once the contracts are picked and go to ``emit``) on
+        the underlying's frame, in the underlying's MARKET direction -- a
+        bull put credit spread is sold but is a LONG proposal -- so every
+        veto and score term reads the side the trade needs the underlying to
+        go. ``pending_reasons`` are the style's own blockers. A refusal is
+        recorded under ``style``, every blocker in it, for
+        ``_consume_style_failure``."""
+        return self.entry_policy.admit(EntryProposal(
+            candidate=candidate,
+            direction=Side.LONG if bullish else Side.SHORT,
+            style=style,
+            style_family=family,
+            close=float(last_underlying),
+            stop=None,
+            target=None,
+            gate_frame=frame,
+            sr_frame=frame,
+            level_frame=None,
+            data=data,
+            pending_reasons=tuple(pending_reasons),
+            contexts=regime.get("entry_contexts") if isinstance(regime, dict) else None,
+        ))
 
-    def _build_debit_spread_signal(self, underlying: str, bullish: bool, client, data, last_underlying: float, style: str, confirm_index: str | None, regime: dict[str, Any]) -> Signal | None:
+    def _consume_style_failure(self, symbol: str, style: str) -> list[str]:
+        """Every blocker a style's build recorded -- the shared stage's
+        refusal lists all of them, the first primary -- or
+        ``<style>_unavailable`` when it recorded none."""
+        payload = self._consume_build_failure_payload(symbol, style)
+        return list(payload["reasons"]) if payload and payload.get("reasons") else [f"{style}_unavailable"]
+
+    def _build_debit_spread_signal(self, candidate: Candidate, bullish: bool, client, data, frame: pd.DataFrame, last_underlying: float, style: str, confirm_index: str | None, regime: dict[str, Any]) -> Signal | None:
+        underlying = candidate.symbol
+        admitted = self._admit_premium_entry(candidate, bullish, frame, data, last_underlying, style, "option_debit", regime)
+        if admitted is None:
+            return None
+        if self._underlying_below_min_price(underlying, style, last_underlying):
+            return None
         put_call = "CALL" if bullish else "PUT"
         contracts = self._fetch_filtered_contracts(client, underlying, put_call)
         if not contracts:
@@ -1316,9 +1378,27 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             "short_leg": asdict(short_leg),
             "order_spec": build_vertical_order(long_leg, short_leg, Side.LONG, qty=1, limit_price=entry_limit),
         }
-        return Signal(symbol=underlying, strategy=self.strategy_name, side=Side.LONG, reason=f"{style}_{'bull' if bullish else 'bear'}", stop_price=stop, target_price=target, reference_symbol=confirm_index, metadata=metadata)
+        # A debit spread is bought whichever way it points: the order side is
+        # LONG, the proposal's (the underlying's) direction bullish / bearish.
+        return self.entry_policy.emit(
+            admitted,
+            reason=f"{style}_{'bull' if bullish else 'bear'}",
+            strategy_score=self._option_strategy_score(candidate, regime, "bullish_trend" if bullish else "bearish_trend"),
+            management={},
+            target=target,
+            metadata=metadata,
+            order_side=Side.LONG,
+            reference_symbol=confirm_index,
+            premium_stop=stop,
+        )
 
-    def _build_credit_spread_signal(self, underlying: str, bullish: bool, client, data, last_underlying: float, style: str, confirm_index: str | None, regime: dict[str, Any]) -> Signal | None:
+    def _build_credit_spread_signal(self, candidate: Candidate, bullish: bool, client, data, frame: pd.DataFrame, last_underlying: float, style: str, confirm_index: str | None, regime: dict[str, Any]) -> Signal | None:
+        underlying = candidate.symbol
+        admitted = self._admit_premium_entry(candidate, bullish, frame, data, last_underlying, style, "option_credit", regime)
+        if admitted is None:
+            return None
+        if self._underlying_below_min_price(underlying, style, last_underlying):
+            return None
         put_call = "PUT" if bullish else "CALL"
         contracts = self._fetch_filtered_contracts(client, underlying, put_call)
         all_contracts = self._get_cached_option_chain(underlying) or []
@@ -1367,26 +1447,32 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                     return None
         # Credit pivot-buffer gate (2026-05-21) — reject if the short
         # strike is within ``min_short_strike_pivot_buffer_atr * atr`` of
-        # the most recent market-structure pivot. For bear_call we use
-        # max(LTF reference_high, HTF reference_high) as the
-        # nearest-resistance proxy; the short must sit at least
-        # ``buffer * atr`` ABOVE that. For bull_put we use
-        # min(reference_low, reference_low) and the short must sit at
-        # least ``buffer * atr`` BELOW. Without this gate a short can
-        # land essentially AT the recent pivot (observed 2026-05-21:
-        # SPY short 741 / pivot 740.62, QQQ short 712 / pivot 711.89)
-        # and stop out within 30s on resistance_break_exit / breakdown.
-        # The existing credit_distance_gate above measures from current
-        # spot, which can pass even when the short is AT the pivot.
-        # Skips silently when references or ATR are unavailable (early
-        # session, no pivots) — never blocks the build for missing data.
+        # the recent market-structure pivots. The references are the
+        # ``msltf_`` / ``mshtf_reference_*`` keys _regime_confirm puts in
+        # ``regime['metrics']`` (the same dict the signal stamps as
+        # regime_metrics, so a post-mortem sees what the gate saw). The
+        # pivot used is the OUTERMOST one: for bear_call
+        # max(LTF reference_high, HTF reference_high), and the short must
+        # sit at least ``buffer * atr`` ABOVE it; for bull_put
+        # min(LTF reference_low, HTF reference_low), and the short must
+        # sit at least ``buffer * atr`` BELOW it. Without this gate a
+        # short can land essentially AT the recent pivot (observed
+        # 2026-05-21: SPY short 741 / pivot 740.62, QQQ short 712 / pivot
+        # 711.89) and stop out within 30s on resistance_break_exit /
+        # breakdown. The existing credit_distance_gate above measures
+        # from current spot, which can pass even when the short is AT
+        # the pivot. Skips silently when references or ATR are
+        # unavailable (early session, no pivots) — never blocks the
+        # build for missing data. Until 2026-09-25 it read the references
+        # from the regime's top level, found none and never fired.
         if getattr(self.optcfg, "credit_pivot_buffer_gate_enabled", False):
             underlying_atr = getattr(self, "_underlying_atr_cache", {}).get(underlying)
             if underlying_atr is not None and underlying_atr > 0 and math.isfinite(underlying_atr):
                 buffer_mult = float(getattr(self.optcfg, "min_short_strike_pivot_buffer_atr", 1.0))
+                regime_metrics = regime.get("metrics") or {}
                 ref_levels: list[float] = []
                 for key in (("mshtf_reference_high", "msltf_reference_high") if not bullish else ("mshtf_reference_low", "msltf_reference_low")):
-                    raw = regime.get(key)
+                    raw = regime_metrics.get(key)
                     if raw is None:
                         continue
                     try:
@@ -1525,7 +1611,20 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             "short_leg": asdict(short_leg),
             "order_spec": build_vertical_order(short_leg, long_leg, Side.SHORT, qty=1, limit_price=entry_limit),
         }
-        return Signal(symbol=underlying, strategy=self.strategy_name, side=Side.SHORT, reason=f"{style}_{'bull' if bullish else 'bear'}", stop_price=stop, target_price=target, reference_symbol=confirm_index, metadata=metadata)
+        # A credit spread is sold whichever way it leans: the order side is
+        # SHORT, the proposal's direction LONG for a bull put, SHORT for a
+        # bear call.
+        return self.entry_policy.emit(
+            admitted,
+            reason=f"{style}_{'bull' if bullish else 'bear'}",
+            strategy_score=self._option_strategy_score(candidate, regime, "range"),
+            management={},
+            target=target,
+            metadata=metadata,
+            order_side=Side.SHORT,
+            reference_symbol=confirm_index,
+            premium_stop=stop,
+        )
 
     def entry_signals(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], client=None, data=None) -> list[Signal]:
         self._reset_entry_decisions()
@@ -1576,7 +1675,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             regime = self._regime_confirm(c, bars, data)
             if not regime.get("ok") or regime.get("no_trade"):
                 reasons.append(str(regime.get("reason") or "regime_blocked"))
-                reasons.extend([str(r) for r in regime.get("reasons", []) if str(r)])
                 self._record_entry_decision(c.symbol, "skipped", reasons)
                 continue
             confirm_index = regime.get("confirm_index")
@@ -1610,20 +1708,20 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 if not opening.empty:
                     if bullish and last_close > _safe_float(or_high) * (1.0 + buffer_pct) and last_close > last_vwap:
                         attempted_style = True
-                        sig = self._build_debit_spread_signal(c.symbol, True, client, data, last_close, "orb_debit_spread", confirm_index, regime)
+                        sig = self._build_debit_spread_signal(c, True, client, data, frame, last_close, "orb_debit_spread", confirm_index, regime)
                         if sig:
-                            out.append(self._attach_option_final_priority_score(sig, c, regime, bullish=True, rangeish=False))
+                            out.append(sig)
                             self._record_entry_decision(c.symbol, "signal", [sig.reason])
                             continue
-                        reasons.append(self._consume_build_failure(c.symbol, "orb_debit_spread") or "orb_debit_spread_unavailable")
+                        reasons.extend(self._consume_style_failure(c.symbol, "orb_debit_spread"))
                     if bearish and last_close < _safe_float(or_low) * (1.0 - buffer_pct) and last_close < last_vwap:
                         attempted_style = True
-                        sig = self._build_debit_spread_signal(c.symbol, False, client, data, last_close, "orb_debit_spread", confirm_index, regime)
+                        sig = self._build_debit_spread_signal(c, False, client, data, frame, last_close, "orb_debit_spread", confirm_index, regime)
                         if sig:
-                            out.append(self._attach_option_final_priority_score(sig, c, regime, bullish=False, rangeish=False))
+                            out.append(sig)
                             self._record_entry_decision(c.symbol, "signal", [sig.reason])
                             continue
-                        reasons.append(self._consume_build_failure(c.symbol, "orb_debit_spread") or "orb_debit_spread_unavailable")
+                        reasons.extend(self._consume_style_failure(c.symbol, "orb_debit_spread"))
 
             if trend_enabled and trend_window and (bullish or bearish):
                 # Trend momentum quality filter — reject if ATR isn't expanding
@@ -1645,30 +1743,30 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                         reasons.append(f"trend_momentum_filter(atr_exp={atr_expansion:.3f}<{min_atr_exp},vol_ratio={volume_ratio:.3f}<{min_vol_ratio})")
                 if momentum_ok and bullish and last_ret5 >= trend_min_ret5:
                     attempted_style = True
-                    sig = self._build_debit_spread_signal(c.symbol, True, client, data, last_close, "trend_debit_spread", confirm_index, regime)
+                    sig = self._build_debit_spread_signal(c, True, client, data, frame, last_close, "trend_debit_spread", confirm_index, regime)
                     if sig:
-                        out.append(self._attach_option_final_priority_score(sig, c, regime, bullish=True, rangeish=False))
+                        out.append(sig)
                         self._record_entry_decision(c.symbol, "signal", [sig.reason])
                         continue
-                    reasons.append(self._consume_build_failure(c.symbol, "trend_debit_spread") or "trend_debit_spread_unavailable")
+                    reasons.extend(self._consume_style_failure(c.symbol, "trend_debit_spread"))
                 if momentum_ok and bearish and last_ret5 <= -trend_min_ret5:
                     attempted_style = True
-                    sig = self._build_debit_spread_signal(c.symbol, False, client, data, last_close, "trend_debit_spread", confirm_index, regime)
+                    sig = self._build_debit_spread_signal(c, False, client, data, frame, last_close, "trend_debit_spread", confirm_index, regime)
                     if sig:
-                        out.append(self._attach_option_final_priority_score(sig, c, regime, bullish=False, rangeish=False))
+                        out.append(sig)
                         self._record_entry_decision(c.symbol, "signal", [sig.reason])
                         continue
-                    reasons.append(self._consume_build_failure(c.symbol, "trend_debit_spread") or "trend_debit_spread_unavailable")
+                    reasons.extend(self._consume_style_failure(c.symbol, "trend_debit_spread"))
 
             if credit_enabled and credit_window and rangeish:
                 attempted_style = True
                 bullish_credit = last_close >= last_vwap
-                sig = self._build_credit_spread_signal(c.symbol, bullish_credit, client, data, last_close, "midday_credit_spread", confirm_index, regime)
+                sig = self._build_credit_spread_signal(c, bullish_credit, client, data, frame, last_close, "midday_credit_spread", confirm_index, regime)
                 if sig:
-                    out.append(self._attach_option_final_priority_score(sig, c, regime, bullish=bullish_credit, rangeish=True))
+                    out.append(sig)
                     self._record_entry_decision(c.symbol, "signal", [sig.reason])
                     continue
-                reasons.append(self._consume_build_failure(c.symbol, "midday_credit_spread") or "midday_credit_spread_unavailable")
+                reasons.extend(self._consume_style_failure(c.symbol, "midday_credit_spread"))
 
             final_reasons = reasons or ([
                 _no_style_trigger_reason(

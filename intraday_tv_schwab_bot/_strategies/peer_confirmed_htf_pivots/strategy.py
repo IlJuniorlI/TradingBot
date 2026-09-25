@@ -16,11 +16,12 @@ from ..shared import (
     _optional_float,
     _reason_with_values,
     _safe_float,
-    _side_prefixed_reason,
     _side_prefixed_reasons,
     pd,
 )
 from ..peer_confirmed_key_levels.strategy import PeerConfirmedKeyLevelsStrategy
+from ..shared_entry import EntryContexts, EntryProposal
+from ...config import flip_confirmation_bars
 from ...support_resistance import zone_flip_confirmed
 
 
@@ -85,6 +86,13 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
             return 2.25
         return 1.9
 
+    def dashboard_htf_trend(self, symbol: str, data, price: float, *, allow_refresh: bool = True) -> dict[str, str] | None:
+        """None: this strategy trades on no HTF EMA trend of the symbol's own
+        (its HTF read is the S/R market-structure bias, which the sidebar
+        shows as structure); the family's EMA vote reaches it only through
+        other symbols' peer votes."""
+        return None
+
     def _macro_allows(self, side: Side, macro_ctx: dict[str, Any]) -> bool:
         if not bool(self.params.get("enable_macro_confirmation", True)):
             return True
@@ -95,15 +103,6 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         if side == Side.LONG:
             return int(macro_ctx.get("long_agree", 0) or 0) >= required
         return int(macro_ctx.get("short_agree", 0) or 0) >= required
-
-    def _use_sr_veto(self) -> bool:
-        return bool(self.params.get("use_sr_veto", False))
-
-    def _blocks_bullish_sr_entry(self, sr_ctx) -> bool:
-        return super()._blocks_bullish_sr_entry(sr_ctx) if self._use_sr_veto() else False
-
-    def _blocks_bearish_sr_entry(self, sr_ctx) -> bool:
-        return super()._blocks_bearish_sr_entry(sr_ctx) if self._use_sr_veto() else False
 
     def dashboard_overlay_candidates(
         self,
@@ -140,14 +139,18 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                 "zone_width": round(zone_width, 4),
             }
 
+        # The pending level (crossed, flip unconfirmed) is the one price is
+        # at; nearest_* never holds it (see _sr_battleground).
         if side == Side.LONG:
             primary = _candidate(getattr(htf, "broken_resistance", None), _optional_float(getattr(htf, "reference_low", None)), "bullish_sr_support")
             secondary = _candidate(getattr(htf, "nearest_support", None), _optional_float(getattr(htf, "reference_low", None)), "bullish_sr_support")
+            pending = _candidate(getattr(htf, "pending_support", None), None, "bullish_sr_support")
         else:
             primary = _candidate(getattr(htf, "broken_support", None), _optional_float(getattr(htf, "reference_high", None)), "bearish_sr_resistance")
             secondary = _candidate(getattr(htf, "nearest_resistance", None), _optional_float(getattr(htf, "reference_high", None)), "bearish_sr_resistance")
+            pending = _candidate(getattr(htf, "pending_resistance", None), None, "bearish_sr_resistance")
 
-        candidates = [item for item in [primary, secondary] if item is not None]
+        candidates = [item for item in [primary, secondary, pending] if item is not None]
         deduped: list[dict[str, Any]] = []
         seen: set[float] = set()
         for candidate in candidates:
@@ -242,8 +245,9 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         }
         if original_kind is None:
             return state
-        confirm_1m = max(0, int(self._support_resistance_setting("trading_flip_confirmation_1m_bars", 2) or 2))
-        confirm_5m = max(0, int(self._support_resistance_setting("trading_flip_confirmation_5m_bars", 1) or 1))
+        # Through the shared reader: `int(value or 2)` turned a configured 0
+        # (that frame's gate off) back into the default (2026-09-23).
+        confirm_1m, confirm_5m = flip_confirmation_bars(self.config.support_resistance)
         lower = float(price) - max(float(zone_width or 0.0), 0.0)
         upper = float(price) + max(float(zone_width or 0.0), 0.0)
         confirmed_flip = zone_flip_confirmed(
@@ -356,13 +360,22 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                 "battleground_score": round(float(battleground_score), 4),
             })
 
+        # A support price has pierced (a resistance it has poked above) whose
+        # flip is unconfirmed is reported as pending_*, never as nearest_*:
+        # without it the battleground was the NEXT level down (up) while price
+        # sat on this one. It scores like the nearest_* candidates: a
+        # pivot-sourced level carries no zone-state adjustment (its kind is
+        # the source, "pivot"), a prior-day/week one scores as an intact
+        # original zone until the loss (reclaim) confirms.
         if side == Side.LONG:
             _append(getattr(sr_ctx, "broken_resistance", None), "broken_resistance", "flip_support", flip=True)
+            _append(getattr(sr_ctx, "pending_support", None), "support", "support")
             _append(getattr(sr_ctx, "nearest_support", None), "support", "support")
             for level in (getattr(sr_ctx, "supports", []) or [])[:3]:
                 _append(level, "support", "support")
         else:
             _append(getattr(sr_ctx, "broken_support", None), "broken_support", "flip_resistance", flip=True)
+            _append(getattr(sr_ctx, "pending_resistance", None), "resistance", "resistance")
             _append(getattr(sr_ctx, "nearest_resistance", None), "resistance", "resistance")
             for level in (getattr(sr_ctx, "resistances", []) or [])[:3]:
                 _append(level, "resistance", "resistance")
@@ -1006,13 +1019,15 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         # once per side in the entry_signals loop below.
         if sr_ctx is None:
             sr_ctx = self._sr_context(candidate.symbol, frame, data)
+        # Where every failure of this side is recorded -- its own gates' and
+        # the shared entry stage's -- and where entry_signals consumes them.
+        failure_key = f"peer_confirmed_htf_pivots_{side.value.lower()}"
         regime = self._regime_signal(side, ltf, sr_ctx)
         pivot_price = _optional_float(regime.get("pivot_price"))
         if pivot_price is None or pivot_price <= 0:
-            failure_style = f"peer_confirmed_htf_pivots_{side.value.lower()}"
             self._set_build_failure(
                 candidate.symbol,
-                failure_style,
+                failure_key,
                 "missing_htf_pivot",
                 reasons=["missing_htf_pivot"],
                 details={
@@ -1025,8 +1040,6 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                         "entry_family": self._entry_family(),
                         "gates": [_gate_snapshot("pivot_price", passed=False, note="missing_htf_pivot")],
                     },
-                    "primary_blocker": "missing_htf_pivot",
-                    "all_blockers": ["missing_htf_pivot"],
                 },
             )
             return None
@@ -1054,21 +1067,26 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         regime_diagnostics = list(dict.fromkeys(str(reason) for reason in regime.get("reasons", []) if str(reason)))
         family_diagnostics = list(dict.fromkeys(str(reason) for reason in family_payload.get("reasons", []) if str(reason)))
         selected_family_pass = bool(family_payload.get("selected_pass", not family_diagnostics))
-        hard_reasons: list[str] = []
+        # This setup's own blockers. They go to the shared entry stage with
+        # the proposal, which refuses on them and on every switched-on veto
+        # at once (the structure veto: shared_entry.use_structure_filter,
+        # which the manifest exempts pivot_rejection from; the S/R veto:
+        # use_sr_filter, which replaced params.use_sr_veto on 2026-09-24).
+        pending_reasons: list[str] = []
 
         min_regime_score = _score_threshold(self.params.get("min_regime_score", 4.0), 4.0, minimum=1.0)
         min_ltf_score = _score_threshold(self.params.get("min_ltf_score", 2.5), 2.5, minimum=1.0)
         regime_score = float(regime.get("score", 0.0) or 0.0)
         ltf_score = float(family_payload.get("score", 0.0) or 0.0)
         if regime_score < min_regime_score:
-            hard_reasons.append(_reason_with_values("weak_regime_score", current=regime_score, required=min_regime_score, op=">=", digits=4))
+            pending_reasons.append(_reason_with_values("weak_regime_score", current=regime_score, required=min_regime_score, op=">=", digits=4))
         if not selected_family_pass:
             if family_diagnostics:
-                hard_reasons.extend(family_diagnostics)
+                pending_reasons.extend(family_diagnostics)
             else:
-                hard_reasons.append("selected_entry_family_failed")
+                pending_reasons.append("selected_entry_family_failed")
         if ltf_score < min_ltf_score:
-            hard_reasons.append(_reason_with_values("weak_ltf_score", current=ltf_score, required=min_ltf_score, op=">=", digits=4))
+            pending_reasons.append(_reason_with_values("weak_ltf_score", current=ltf_score, required=min_ltf_score, op=">=", digits=4))
 
         min_peer_agreement = max(0, int(self.params.get("min_peer_agreement", 2)))
         min_peer_score = max(0, int(self.params.get("min_peer_score", 2)))
@@ -1086,23 +1104,23 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         if peer_agreement >= min_peer_agreement:
             total_score += 1.0
         else:
-            hard_reasons.append(_reason_with_values("weak_peer_agreement", current=peer_agreement, required=min_peer_agreement, op=">=", digits=2))
+            pending_reasons.append(_reason_with_values("weak_peer_agreement", current=peer_agreement, required=min_peer_agreement, op=">=", digits=2))
         if directional_peer_score >= min_peer_score:
             total_score += 0.75
         else:
-            hard_reasons.append(_reason_with_values("weak_peer_score", current=directional_peer_score, required=min_peer_score, op=">=", digits=2))
+            pending_reasons.append(_reason_with_values("weak_peer_score", current=directional_peer_score, required=min_peer_score, op=">=", digits=2))
         macro_bonus = max(0.0, float(self.params.get("macro_bonus", 0.75)))
         macro_miss_penalty = max(0.0, float(self.params.get("macro_miss_penalty", 0.28)))
         macro_aligned = self._macro_allows(side, macro_ctx)
         if macro_aligned:
             total_score += macro_bonus
         elif family_key == "pivot_continuation":
-            hard_reasons.append("macro_not_aligned")
+            pending_reasons.append("macro_not_aligned")
         else:
             total_score -= macro_miss_penalty
         min_total_score = _score_threshold(self.params.get("min_total_score", 5.0), 5.0, minimum=1.0)
         if total_score < min_total_score:
-            hard_reasons.append(_reason_with_values("weak_total_score", current=total_score, required=min_total_score, op=">=", digits=4))
+            pending_reasons.append(_reason_with_values("weak_total_score", current=total_score, required=min_total_score, op=">=", digits=4))
         if family_key == "pivot_reclaim":
             max_distance = max(0.1, float(self.params.get("max_reclaim_distance_from_pivot_atr", 0.85)))
         elif family_key == "pivot_rejection":
@@ -1110,27 +1128,14 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         else:
             max_distance = max(0.1, float(self.params.get("max_continuation_distance_from_pivot_atr", 1.35)))
         if distance_atr > max_distance:
-            hard_reasons.append(_reason_with_values("too_far_from_pivot_atr", current=distance_atr, required=max_distance, op="<=", digits=4))
+            pending_reasons.append(_reason_with_values("too_far_from_pivot_atr", current=distance_atr, required=max_distance, op="<=", digits=4))
         if pivot_zone_original_kind:
             if pivot_flip_candidate and not pivot_zone_confirmed_flip:
-                hard_reasons.append("unconfirmed_flipped_pivot_zone")
+                pending_reasons.append("unconfirmed_flipped_pivot_zone")
             elif not pivot_zone_trade_alignment:
-                hard_reasons.append("pivot_zone_flipped_against_trade")
+                pending_reasons.append("pivot_zone_flipped_against_trade")
 
-        hard_reasons.extend(self._entry_exhaustion_reasons(side, ltf, close=close, vwap=float(regime["vwap"]), ema9=float(regime["ema9"])))
-
-        if tech_ctx is None:
-            tech_ctx = self._technical_context(ltf)
-        if side == Side.LONG:
-            if family_key != "pivot_rejection" and self._blocks_bullish_structure_entry(ms_ltf):
-                hard_reasons.append(self._bullish_structure_block_reason(ms_ltf))
-            if self._blocks_bullish_sr_entry(sr_ctx):
-                hard_reasons.append(self._bullish_sr_block_reason(sr_ctx))
-        else:
-            if family_key != "pivot_rejection" and self._blocks_bearish_structure_entry(ms_ltf):
-                hard_reasons.append(self._bearish_structure_block_reason(ms_ltf))
-            if self._blocks_bearish_sr_entry(sr_ctx):
-                hard_reasons.append(self._bearish_sr_block_reason(sr_ctx))
+        pending_reasons.extend(self._entry_exhaustion_reasons(side, ltf, close=close, vwap=float(regime["vwap"]), ema9=float(regime["ema9"])))
 
         gate_snapshots = [
             _gate_snapshot("regime_score", passed=regime_score >= min_regime_score, current=round(regime_score, 4), required=min_regime_score, op=">="),
@@ -1171,37 +1176,6 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
             "family_diagnostics": family_diagnostics,
         }
 
-        if hard_reasons:
-            failure_style = f"peer_confirmed_htf_pivots_{side.value.lower()}"
-            self._set_build_failure(
-                candidate.symbol,
-                failure_style,
-                hard_reasons[0],
-                reasons=hard_reasons,
-                details={
-                    "entry_family": family_key,
-                    "peer_universe": list(peer_ctx.get("universe", [])),
-                    "peer_details": dict(peer_ctx.get("details", {})),
-                    "peer_bullish": int(peer_ctx.get("bullish", 0) or 0),
-                    "peer_bearish": int(peer_ctx.get("bearish", 0) or 0),
-                    "peer_score": int(peer_ctx.get("score", 0) or 0),
-                    "macro_details": dict(macro_ctx.get("details", {})),
-                    "macro_long_agree": int(macro_ctx.get("long_agree", 0) or 0),
-                    "macro_short_agree": int(macro_ctx.get("short_agree", 0) or 0),
-                    "family_eval": list(family_payload.get("family_eval", [])),
-                    "side_eval": side_eval,
-                    "primary_blocker": hard_reasons[0],
-                    "all_blockers": list(hard_reasons),
-                    "near_miss_blockers": near_miss_blockers,
-                    "decision_summary": {
-                        "side": side.value,
-                        "entry_family": family_key,
-                        "primary_blocker": hard_reasons[0],
-                    },
-                },
-            )
-            return None
-
         stop_buffer_atr = max(0.05, float(self.params.get("stop_buffer_atr_mult", 0.52)))
         expansion_price = _optional_float(regime.get("expansion_price"))
         target_level_price = _optional_float(regime.get("target_level_price"))
@@ -1219,8 +1193,6 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                     target = expansion_target
             if target is None:
                 target = close + (risk_per_share * max(float(self.params.get("target_rr", 2.0)), float(self.params.get("min_rr", 1.65))))
-            stop, target = self._refine_bullish_sr_levels(close, stop, target, sr_ctx, ltf)
-            stop, target = self._refine_bullish_technical_levels(close, stop, target, tech_ctx, ltf)
         else:
             stop = max(raw_stop_anchor, pivot_price) + zone_width + (atr * stop_buffer_atr)
             stop = max(stop, close * (1.0 + float(self.config.risk.default_stop_pct)))
@@ -1233,40 +1205,69 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
             if target is None:
                 target = close - (risk_per_share * max(float(self.params.get("target_rr", 2.0)), float(self.params.get("min_rr", 1.65))))
                 target = max(0.01, target)
-            stop, target = self._refine_bearish_sr_levels(close, stop, target, sr_ctx, ltf)
-            stop, target = self._refine_bearish_technical_levels(close, stop, target, tech_ctx, ltf)
 
-        fvg_adjustments = self._fvg_entry_adjustment_components(side, candidate.symbol, ltf, data)
+        # The shared entry stage (2026-09-24): the vetoes, the refinement
+        # and the score terms, gated on the 5m LTF the setup was read on
+        # (amendment 4) with S/R on the 1m frame. The style is the pivot
+        # family, so the manifest's pivot_rejection exemption from the
+        # structure veto applies; a refusal lands under this side's failure
+        # key with the gate snapshots and the near-miss payload. The HTF
+        # divergence score term reads this family's own HTF context -- the
+        # 60m one its peer votes use and the prefetch warms
+        # (_symbol_htf_request) -- so the strategy has one HTF read. Until
+        # 2026-09-24 it asked for the support_resistance timeframe (15m), a
+        # frame nothing stored for this 60m strategy, so the context was None
+        # on every cycle and the term was always 0.
+        admitted = self.entry_policy.admit(EntryProposal(
+            candidate=candidate, direction=side, style=family_key, style_family="pivot",
+            close=close, stop=stop, target=target,
+            gate_frame=ltf, sr_frame=frame, level_frame=ltf, data=data,
+            pending_reasons=tuple(pending_reasons),
+            htf_ctx=self._htf_context(candidate.symbol, data, current_price=float(close), **self._symbol_htf_request()),
+            contexts=EntryContexts(sr=sr_ctx, ms=ms_ltf, tech=tech_ctx),
+            failure_details={
+                "entry_family": family_key,
+                "peer_universe": list(peer_ctx.get("universe", [])),
+                "peer_details": dict(peer_ctx.get("details", {})),
+                "peer_bullish": int(peer_ctx.get("bullish", 0) or 0),
+                "peer_bearish": int(peer_ctx.get("bearish", 0) or 0),
+                "peer_score": int(peer_ctx.get("score", 0) or 0),
+                "macro_details": dict(macro_ctx.get("details", {})),
+                "macro_long_agree": int(macro_ctx.get("long_agree", 0) or 0),
+                "macro_short_agree": int(macro_ctx.get("short_agree", 0) or 0),
+                "family_eval": list(family_payload.get("family_eval", [])),
+                "side_eval": side_eval,
+                "near_miss_blockers": near_miss_blockers,
+            },
+            failure_key=failure_key,
+        ))
+        if admitted is None:
+            return None
         runner_allowed = bool(self.params.get("strong_setup_runner_enabled", True)) and total_score >= (min_total_score + 1)
         management = self._adaptive_management_components(
             side,
             close,
-            stop,
-            target,
+            float(admitted.stop),
+            admitted.target,
             style="pivot",
             runner_allowed=runner_allowed,
-            continuation_bias=float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0),
+            continuation_bias=float(admitted.fvg["fvg_continuation_bias"]),
             strong_setup=runner_allowed,
         )
         activity_weight = max(0.0, float(self.params.get("activity_score_weight", 0.18)))
-        execution_quality_score = float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
-        # HTF RSI divergence confluence — pull HTF context from the data feed
-        # cache (cheap; bot already builds HTF for this strategy elsewhere)
-        # and fold the multi-timeframe divergence adjustment into the final
-        # score. Gated by shared_entry.use_htf_divergence_filter.
-        htf_for_div = self._default_htf_context_for_score(candidate.symbol, data)
-        htf_divergence_adjustment = self._htf_divergence_adjustment(side, htf_for_div) if htf_for_div is not None else 0.0
-        final_priority_score = total_score + execution_quality_score + htf_divergence_adjustment + (float(candidate.activity_score) * activity_weight)
+        execution_quality_score = float(admitted.fvg["fvg_entry_adjustment"])
+        # The strategy's own score; emit adds the shared context score (the
+        # FVG and HTF divergence terms this sum carried until 2026-09-24,
+        # plus any other shared score term the YAML switches on).
+        strategy_score = total_score + (float(candidate.activity_score) * activity_weight)
         source_priority = self._family_preference_source_priority(family_key)
-        metadata = self._build_signal_metadata(
-            entry_price=float(close),
-            chart_ctx=self._chart_context(ltf),
-            ms_ctx=ms_ltf, sr_ctx=sr_ctx, tech_ctx=tech_ctx,
-            fvg_adjustments=fvg_adjustments,
+        return self.entry_policy.emit(
+            admitted,
+            reason=f"peer_confirmed_htf_pivots_{family_key}_{side.value.lower()}",
+            strategy_score=strategy_score,
             management=management,
-            final_priority_score=final_priority_score,
-            ms_prefix="ms_ltf",
-            leading={
+            target=admitted.target,
+            metadata={
                 "activity_score": float(candidate.activity_score),
                 "setup_quality_score": round(total_score, 4),
                 "execution_quality_score": round(execution_quality_score, 4),
@@ -1334,22 +1335,18 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                     "primary_blocker": None,
                 },
                 "trend_htf_bias": str(regime.get("htf_bias", "neutral")),
-                "directional_vote_edge": float(abs(int(peer_ctx.get("bullish", 0) or 0) - int(peer_ctx.get("bearish", 0) or 0))),
+                # Peer votes FOR this side net of those against, as key_levels
+                # ranks (side-aware since 2026-09-24; the peer-agreement gate
+                # made the old absolute difference equal to it on every signal
+                # that passed).
+                "directional_vote_edge": float(self._side_vote_edge(
+                    side, int(peer_ctx.get("bullish", 0) or 0), int(peer_ctx.get("bearish", 0) or 0))),
                 "runner_quality_score": 1.0 if runner_allowed else 0.0,
                 "execution_headroom_score": round(max(0.0, max_distance - distance_atr), 4),
                 "source_quality_score": float(source_priority),
-                "selection_quality_score": round(final_priority_score, 4),
+                # = final_priority_score, as it was: the rank tail reads it.
+                "selection_quality_score": round(strategy_score + float(admitted.shared_context_score), 4),
             },
-        )
-        reason = f"peer_confirmed_htf_pivots_{family_key}_{side.value.lower()}"
-        return Signal(
-            symbol=candidate.symbol,
-            strategy=self.strategy_name,
-            side=side,
-            reason=reason,
-            stop_price=float(stop),
-            target_price=float(target),
-            metadata=metadata,
         )
 
     def entry_signals(
@@ -1407,7 +1404,6 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
             fail_reasons: list[str] = []
             side_eval: dict[str, Any] = {}
             family_eval: dict[str, Any] = {}
-            all_blockers: list[str] = []
             near_miss_blockers: dict[str, Any] = {}
             # Build side-agnostic contexts ONCE per candidate; passed into each
             # per-side builder to avoid rebuilding them when both LONG and SHORT
@@ -1435,12 +1431,12 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                     side_key = side_value.lower()
                     side_eval[side_key] = failure_payload.get("details", {}).get("side_eval") if isinstance(failure_payload.get("details"), dict) else None
                     family_eval[side_key] = failure_payload.get("details", {}).get("family_eval") if isinstance(failure_payload.get("details"), dict) else None
-                    for blocker in failure_payload.get("details", {}).get("all_blockers", []) if isinstance(failure_payload.get("details"), dict) else []:
-                        token = _side_prefixed_reason(side, str(blocker))
-                        if token and token not in all_blockers:
-                            all_blockers.append(token)
                     for key, value in (failure_payload.get("details", {}).get("near_miss_blockers", {}) if isinstance(failure_payload.get("details"), dict) else {}).items():
                         near_miss_blockers[f"{side_key}.{key}"] = value
+                    # The refusal's full list: this side's own blockers, then
+                    # the shared vetoes. It is also the decision's
+                    # all_blockers -- the details were written before the
+                    # shared entry stage ran, so they cannot carry the vetoes.
                     prefixed = _side_prefixed_reasons(side, failure_payload.get("reasons") or [failure_payload.get("primary_reason") or f"{side.value.lower()}_setup_not_ready"])
                     for token in prefixed:
                         if token not in fail_reasons:
@@ -1455,25 +1451,10 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                         fail_reasons.append(token)
             if valid_signals:
                 def _signal_key(sig: Signal) -> tuple[float, ...]:
-                    meta = sig.metadata if isinstance(sig.metadata, dict) else {}
-                    strength = float(meta.get("final_priority_score", 0.0) or 0.0)
+                    # The gatekeeper's rank key (the manifest's
+                    # signal_priority), then the screener's preferred side.
                     preferred_side_bonus = 1.0 if candidate.directional_bias is not None and sig.side == candidate.directional_bias else 0.0
-                    custom_key = self.signal_priority_key(
-                        sig,
-                        candidate,
-                        metadata=meta,
-                        strength=strength,
-                        candidate_activity_score=float(candidate.activity_score),
-                        rank=float(candidate.rank),
-                    )
-                    if custom_key is not None:
-                        return tuple(custom_key) + (preferred_side_bonus,)
-                    return (
-                        float(meta.get("selection_quality_score", strength) or strength),
-                        float(meta.get("directional_peer_score", 0.0) or 0.0),
-                        float(meta.get("execution_headroom_score", 0.0) or 0.0),
-                        preferred_side_bonus,
-                    )
+                    return self.entry_policy.rank_key(sig, candidate) + (preferred_side_bonus,)
                 signal = max(valid_signals, key=_signal_key)
                 out.append(signal)
                 meta = signal.metadata if isinstance(signal.metadata, dict) else {}
@@ -1490,7 +1471,6 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                     },
                 )
             else:
-                blockers = all_blockers or list(fail_reasons)
                 self._record_entry_decision(
                     candidate.symbol,
                     "skipped",
@@ -1501,11 +1481,11 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                         "side_eval": side_eval,
                         "family_eval": family_eval,
                         "evaluated_sides": evaluated_sides,
-                        "primary_blocker": blockers[0] if blockers else None,
-                        "all_blockers": blockers,
+                        "primary_blocker": fail_reasons[0] if fail_reasons else None,
+                        "all_blockers": list(fail_reasons),
                         "near_miss_blockers": near_miss_blockers,
                         "decision_summary": {
-                            "primary_blocker": blockers[0] if blockers else None,
+                            "primary_blocker": fail_reasons[0] if fail_reasons else None,
                             "evaluated_sides": evaluated_sides,
                         },
                     },

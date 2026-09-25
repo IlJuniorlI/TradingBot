@@ -26,6 +26,12 @@ unchanged.
 - lower minimum R:R and softer peer gate for earlier participation
 - heavier weight on 1-minute FVG continuation context
 
+It meets the shared entry stage exactly as the base does (2026-09-24): with a
+1-minute trigger frame, the vetoes, the technical / chart / candle contexts and
+the FVG term all read the 1-minute frame. `require_peer_target_clearance: true`
+and `shared_score_weight: 0.5` as in the base; the preset keeps every shared
+veto off (parity).
+
 ## Core defaults
 
 - Entry windows: `[["07:05", "15:40"]]`

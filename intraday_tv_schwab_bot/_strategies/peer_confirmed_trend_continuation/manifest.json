@@ -92,7 +92,6 @@
     "opposing_fvg_active_penalty": 0.12,
     "invalidated_opposing_fvg_bonus": 0.1,
     "same_direction_fvg_invalidated_penalty": 0.102,
-    "use_sr_veto": false,
     "activity_score_weight": 0.12,
     "macro_bonus": 0.7,
     "macro_miss_penalty": 0.3,
@@ -161,8 +160,9 @@
       "require_hybrid_metadata": false
     },
     "signal_priority": {
+      "primary_field": "ltf_score",
+      "shared_score_weight": 0.5,
       "metadata_fields": [
-        "ltf_score",
         "regime_score",
         "directional_peer_score",
         "directional_vote_edge",

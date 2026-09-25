@@ -90,6 +90,21 @@ def active_broker_bracket(position: Any) -> dict[str, Any] | None:
     return bracket
 
 
+def working_exit_outstanding_qty(position: Any) -> int:
+    """Shares the position's tracked working exit order may still sell: what
+    it asked for less what is already booked from it. 0 when none is tracked.
+
+    Shared by ``PositionManager`` (the risk check on the shares outside a
+    working slice) and ``StartupReconciler`` (the restore re-protect,
+    2026-09-25) so a resting stop and the order never cover the same shares.
+    """
+    meta = getattr(position, "metadata", None)
+    record = meta.get("working_exit_order") if isinstance(meta, dict) else None
+    if not isinstance(record, dict):
+        return 0
+    return max(0, int(record.get("requested_qty") or 0) - int(record.get("booked_qty") or 0))
+
+
 def order_result_needs_broker_recheck(message: Any) -> bool:
     """True when a failed order REACHED the broker, so some of it may have filled.
 

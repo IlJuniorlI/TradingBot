@@ -58,6 +58,9 @@ class TradeRecord:
     # have them and the aggregator should handle None gracefully.
     regime: str | None = None
     initial_risk_per_unit: float | None = None   # abs(entry - initial_stop)
+    # MFE / MAE in $ at the trade's FULL size (metadata initial_qty), on
+    # every slice -- they are excursions of the trade, not of the slice, and
+    # the session report divides them by initial risk x the folded quantity.
     max_favorable_pnl: float | None = None       # peak unrealized PnL (MFE in $)
     max_adverse_pnl: float | None = None         # trough unrealized PnL (MAE in $)
     entry_slippage_pct: float | None = None      # |fill - signal| / signal
@@ -77,6 +80,13 @@ class TradeRecord:
     # are indistinguishable in trades.csv.
     armed_retest_status: str | None = None
     armed_retest_waited_minutes: float | None = None
+    # Reasons of the slices that closed PART of the trade before its final
+    # exit, oldest first -- a scale-out (divergence_partial_exit:...) or a
+    # broker partial fill. Set on the folded lifecycle record; ``reason`` is
+    # the final slice's. Without it a trade that scaled out read in
+    # per_exit_reason and trades.csv as if it had only ever exited once
+    # (2026-09-24).
+    partial_exit_reasons: tuple[str, ...] = ()
 
 
 def closed_trade_lifecycles(trades: Iterable[Any]) -> list[Any]:
@@ -93,9 +103,11 @@ def closed_trade_lifecycles(trades: Iterable[Any]) -> list[Any]:
     Slices group by ``lifecycle_id`` (position key + entry time). A
     lifecycle with no final slice is still open and is left out. Quantities
     and P&L sum; entry and exit prices are quantity-weighted; the reason,
-    exit time and diagnostics are the final slice's. A single-slice trade is
-    returned as-is. Output follows the input order of each lifecycle's first
-    appearance -- newest first for ``PaperAccount.trades``.
+    exit time and diagnostics are the final slice's, and the earlier
+    slices' reasons are kept, oldest first, in ``partial_exit_reasons``. A
+    single-slice trade is returned as-is. Output follows the input order of
+    each lifecycle's first appearance -- newest first for
+    ``PaperAccount.trades``.
     """
     groups: dict[Any, list[Any]] = {}
     for trade in trades:
@@ -112,6 +124,14 @@ def closed_trade_lifecycles(trades: Iterable[Any]) -> list[Any]:
         qty = sum(int(t.qty) for t in group)
         entry_price = sum(float(t.entry_price) * int(t.qty) for t in group) / qty
         exit_price = sum(float(t.exit_price) * int(t.qty) for t in group) / qty
+        partials = [t for t in group if t is not final]
+        try:
+            partials.sort(key=lambda t: t.exit_time)
+        except TypeError:
+            # A slice with an unreadable exit_time (see
+            # PaperAccount._trade_to_dict) must not cost the report: keep
+            # the input order.
+            pass
         closed.append(dataclasses.replace(
             final,
             qty=qty,
@@ -124,6 +144,7 @@ def closed_trade_lifecycles(trades: Iterable[Any]) -> list[Any]:
             remaining_qty_after_exit=0,
             fill_price_estimated=any(bool(t.fill_price_estimated) for t in group),
             broker_recovered=any(bool(t.broker_recovered) for t in group),
+            partial_exit_reasons=tuple(str(t.reason) for t in partials),
         ))
     return closed
 

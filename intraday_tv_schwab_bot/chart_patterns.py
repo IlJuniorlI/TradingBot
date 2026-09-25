@@ -4,10 +4,13 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 import logging
+import threading
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+from .levels_shared import session_segment_ids
 
 
 LOG = logging.getLogger(__name__)
@@ -59,11 +62,17 @@ _CHART_HELPER_CACHE: dict[tuple, Any] = {}
 # be recycled while the cache still holds an entry for it.
 _CHART_CACHE_KEEPALIVE: dict[int, pd.DataFrame] = {}
 
+# Makes "an entry exists => its frame is pinned" hold across threads: every
+# write to the two dicts (an entry and its pin, or clearing both) happens
+# under it, so no reader can ever see one half without the other.
+_CHART_CACHE_LOCK = threading.Lock()
+
 
 def _cache_put(frame: pd.DataFrame, key: tuple, value: Any) -> Any:
     """Memoize ``value`` under ``key`` and pin ``frame`` for the call's life."""
-    _CHART_CACHE_KEEPALIVE[id(frame)] = frame
-    _CHART_HELPER_CACHE[key] = value
+    with _CHART_CACHE_LOCK:
+        _CHART_CACHE_KEEPALIVE[id(frame)] = frame
+        _CHART_HELPER_CACHE[key] = value
     return value
 
 
@@ -75,24 +84,24 @@ def _clear_chart_cache() -> None:
     is what makes recycled ids safe again: the cache entries that named
     those addresses are gone in the same breath.
 
-    The ORDER below is load-bearing. Entries go first, pins second, so the
-    window between the two calls has no entry that could be read against a
-    freed address. Reversed, that window would drop the pins while the
-    entries naming them were still live — exactly the state the keepalive
-    exists to prevent.
-
-    This is also why the shared module-level cache survives the engine's
-    precompute pool (engine._prime_cycle_contexts fans chart contexts across
-    threads, and analyze_chart_pattern_context runs outside
-    strategy_base's own chart lock). A worker clearing the dict discards
-    other workers' memoized values, which costs recomputation but cannot
-    corrupt: each worker's `finally` runs before its own frames become
-    garbage, so no entry outlives the frame it names. Measured across 25
-    parallel passes over 60 frames with 8 workers: zero disagreements with
-    the serial result.
+    Both clears run under ``_CHART_CACHE_LOCK``, the lock every
+    ``_cache_put`` takes. The cache is shared by threads: the engine's
+    precompute pool fans chart contexts across workers
+    (engine._prime_cycle_contexts) and the dashboard thread runs its own,
+    all outside strategy_base's chart lock. Without the lock a thread switch
+    between the two clears let another worker's ``_cache_put`` land in
+    between: its entry survived the first clear and its pin was dropped by
+    the second, so the frame it named -- often a temporary like
+    ``_pivot_order``'s ``frame.tail(10)`` -- could be freed and a later frame
+    at the same address served its ``_atr_pct`` / ``_mean_range`` (review
+    2026-09-23: 13 of 336 unforced four-worker clears had a put land in that
+    window). Under the lock an entry and its pin are always written and
+    dropped together. One worker's clear still discards the others'
+    memoized values; that costs a recomputation, never a wrong value.
     """
-    _CHART_HELPER_CACHE.clear()
-    _CHART_CACHE_KEEPALIVE.clear()
+    with _CHART_CACHE_LOCK:
+        _CHART_HELPER_CACHE.clear()
+        _CHART_CACHE_KEEPALIVE.clear()
 
 
 def _clean_price_frame(frame: pd.DataFrame | None) -> pd.DataFrame:
@@ -343,12 +352,13 @@ def _bar_close_position(frame: pd.DataFrame, idx: int = -1) -> float:
     return (float(row.close) - low) / (high - low)
 
 
-def _body_fraction(frame: pd.DataFrame, idx: int = -1) -> float:
+def _signed_body_fraction(frame: pd.DataFrame, idx: int = -1) -> float:
+    """(close - open) / range: positive for a green bar, negative for red."""
     if frame is None or frame.empty:
         return 0.0
     row = frame.iloc[idx]
     rng = max(float(row.high) - float(row.low), 1e-9)
-    return abs(float(row.close) - float(row.open)) / rng
+    return (float(row.close) - float(row.open)) / rng
 
 
 def _recent_move(frame: pd.DataFrame, bars: int = 3) -> float:
@@ -435,15 +445,27 @@ def _find_pivots(frame: pd.DataFrame, order: int | None = None) -> list[tuple[st
     lows = frame["low"].to_numpy(dtype=np.float64, copy=False).tolist()
     prominence = max(_mean_range(frame) * 0.05, abs(_close(frame)) * _pct(frame, 0.0005))
     raw: list[tuple[str, int, float]] = []
+    # levels_shared.pivot_points' tie rule: a bar is a pivot when it holds
+    # its window's extreme and no LEFT-half bar ties it, so a run of bars
+    # sharing the extreme is ONE pivot, at its first bar; prominence is
+    # measured against the neighbours that differ from it. Until 2026-09-23
+    # a tie disqualified both bars (max(neighbours) == the extreme), the
+    # swing vanished, and the alternation merge below then swallowed the
+    # opposite pivot between its neighbours -- AMZN 09-21 12:56 paired two
+    # highs across a plateau above the first "top" into a double top.
     for idx in range(order, len(frame) - order):
+        hi = highs[idx]
+        lo = lows[idx]
         hi_window = highs[idx - order: idx + order + 1]
         lo_window = lows[idx - order: idx + order + 1]
-        hi_neighbors = hi_window[:order] + hi_window[order + 1:]
-        lo_neighbors = lo_window[:order] + lo_window[order + 1:]
-        if highs[idx] >= max(hi_window) and highs[idx] > max(hi_neighbors) + prominence:
-            raw.append(("H", idx, highs[idx]))
-        if lows[idx] <= min(lo_window) and lows[idx] < min(lo_neighbors) - prominence:
-            raw.append(("L", idx, lows[idx]))
+        if hi == max(hi_window) and hi not in hi_window[:order]:
+            below = [h for h in hi_window if h < hi]
+            if below and hi > max(below) + prominence:
+                raw.append(("H", idx, hi))
+        if lo == min(lo_window) and lo not in lo_window[:order]:
+            above = [v for v in lo_window if v > lo]
+            if above and lo < min(above) - prominence:
+                raw.append(("L", idx, lo))
     raw.sort(key=lambda item: item[1])
     if not raw:
         return _cache_put(frame, key, [])
@@ -505,7 +527,11 @@ def _bullish_reversal_breakout_ready(frame: pd.DataFrame, level: float, tol: flo
     trend_ok = (close >= _ema(frame, "ema9") * (1.0 - _pct(frame, 0.006))
                 or close >= _ema(frame, "vwap") * (1.0 - _pct(frame, 0.002)))
     reclaim_ok = close >= level - tol * 0.35
-    candle_ok = close_pos >= 0.52 or _body_fraction(frame) >= 0.28
+    # The body alternative must point the pattern's way. Until 2026-09-23 it
+    # was abs(body), so a red bar closing on its low "confirmed" a bullish
+    # reversal: 22% of archived reversal fires sat on a bar moving against
+    # the pattern, and each one fed the opposing-chart entry filter.
+    candle_ok = close_pos >= 0.52 or _signed_body_fraction(frame) >= 0.28
     volume_ok = _has_volume_expansion(frame, ratio=1.03)
     return bool(reclaim_ok and directional and trend_ok and candle_ok and volume_ok)
 
@@ -519,7 +545,7 @@ def _bearish_reversal_breakdown_ready(frame: pd.DataFrame, level: float, tol: fl
     trend_ok = (close <= _ema(frame, "ema9") * (1.0 + _pct(frame, 0.006))
                 or close <= _ema(frame, "vwap") * (1.0 + _pct(frame, 0.002)))
     reclaim_ok = close <= level + tol * 0.35
-    candle_ok = close_pos <= 0.48 or _body_fraction(frame) >= 0.28
+    candle_ok = close_pos <= 0.48 or _signed_body_fraction(frame) <= -0.28
     volume_ok = _has_volume_expansion(frame, ratio=1.03)
     return bool(reclaim_ok and directional and trend_ok and candle_ok and volume_ok)
 
@@ -912,14 +938,41 @@ def _normalize_allowed_patterns(allowed_patterns: Iterable[str] | None, bullish:
     return selected
 
 
+def _current_session(frame: pd.DataFrame, bars: int) -> pd.DataFrame:
+    """The last ``bars`` bars, cut back to the latest ET session date.
+
+    The frames hold only the 07:00-20:00 ET stream window, so a window that
+    reaches back past today's first bar joins the prior evening to this
+    morning across hours (a weekend) nobody observed. Until 2026-09-23 the
+    detectors read such windows before ~09:30: NVDA 09-21 07:14 fired a
+    bullish flag whose "pole" was the weekend gap, and ARM 09-21 07:00 a
+    double bottom built from Friday post-market bars broken by Monday's gap
+    bar. Same boundary as ``levels_shared.session_segment_ids``, which the
+    level builders' pivots already respect.
+    """
+    f = _tail(frame, bars)
+    if len(f) < 2 or not isinstance(f.index, pd.DatetimeIndex):
+        return f
+    segments = session_segment_ids(f.index)
+    if segments[0] == segments[-1]:
+        return f
+    key = ("_current_session", id(f))
+    cached = _CHART_HELPER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out = f.iloc[int(np.searchsorted(segments, segments[-1])):].copy()
+    out.attrs[_CHART_CLEAN_SENTINEL] = True
+    return _cache_put(f, key, out)
+
+
 def detect_bullish_chart_patterns(frame: pd.DataFrame, allowed_patterns: Iterable[str] | None = None, lookback_bars: int = 40) -> set[str]:
-    f = _tail(frame, max(lookback_bars, 12))
+    f = _current_session(frame, max(lookback_bars, 12))
     allowed = _normalize_allowed_patterns(allowed_patterns, bullish=True)
     return {name for name in allowed if BULLISH_CHART_PATTERN_REGISTRY[name](f)} if allowed else set()
 
 
 def detect_bearish_chart_patterns(frame: pd.DataFrame, allowed_patterns: Iterable[str] | None = None, lookback_bars: int = 40) -> set[str]:
-    f = _tail(frame, max(lookback_bars, 12))
+    f = _current_session(frame, max(lookback_bars, 12))
     allowed = _normalize_allowed_patterns(allowed_patterns, bullish=False)
     return {name for name in allowed if BEARISH_CHART_PATTERN_REGISTRY[name](f)} if allowed else set()
 
@@ -998,7 +1051,9 @@ def analyze_chart_pattern_context(
     lookback_bars: int = 40,
 ) -> ChartPatternContext:
     try:
-        clean_frame = _clean_price_frame(frame)
+        # Everything below -- detection and the still-valid checks -- reads
+        # the current session's bars only (see _current_session).
+        clean_frame = _current_session(_clean_price_frame(frame), max(lookback_bars, 12))
         bullish_detected = detect_bullish_chart_patterns(clean_frame, allowed_patterns=bullish_allowed, lookback_bars=lookback_bars)
         bearish_detected = detect_bearish_chart_patterns(clean_frame, allowed_patterns=bearish_allowed, lookback_bars=lookback_bars)
         bullish, invalidated_bullish = _filter_active_patterns(clean_frame, bullish_detected, bullish=True)

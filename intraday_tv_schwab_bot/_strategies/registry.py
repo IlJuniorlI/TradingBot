@@ -6,11 +6,13 @@ from copy import deepcopy
 from functools import lru_cache
 from importlib import import_module
 import json
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from ..utils import parse_hhmm
 from .plugin_api import StrategyManifest
+from .shared_entry import VETO_GATES
 
 if TYPE_CHECKING:
     from ..config import BotConfig
@@ -69,6 +71,8 @@ _VALID_WATCHLIST_OBJECT_SOURCES = {
     "positions.metadata",
     "positions.metadata_list",
 }
+_VALID_SHARED_ENTRY_KEYS = {"exemptions", "divergence_entry"}
+_VALID_SIGNAL_PRIORITY_KEYS = {"primary_field", "shared_score_weight", "rank_unit_field", "metadata_fields"}
 
 
 def _validate_non_empty_string_list(value: object, *, field_name: str, manifest_path: Path) -> list[str]:
@@ -111,6 +115,86 @@ def _validate_watchlist_source(source: object, *, field_name: str, manifest_path
         return
     if kind == 'params.keys' and not keys:
         raise ValueError(f"{manifest_path}: '{field_name}.keys' must not be empty")
+
+
+def _validate_shared_entry_capability(raw: object, *, manifest_path: Path) -> None:
+    """``capabilities.shared_entry``: how the strategy takes part in the
+    shared entry stage (``shared_entry.SharedEntryPolicy``).
+
+    - ``exemptions``: ``{style: [gate, ...]}`` -- the vetoes the policy skips
+      for proposals of that style, from the closed set ``VETO_GATES``. The
+      only way a strategy opts a style out of a global veto (2026-09-24);
+      the strategy_logic_default hook and the per-strategy veto params it
+      replaced are gone.
+    - ``divergence_entry``: false keeps the opt-in divergence-only entries
+      away from the strategy (default true).
+    """
+    if not isinstance(raw, dict):
+        raise TypeError(f"{manifest_path}: 'capabilities.shared_entry' must be an object")
+    unknown = sorted(set(raw) - _VALID_SHARED_ENTRY_KEYS)
+    if unknown:
+        raise ValueError(f"{manifest_path}: unsupported 'capabilities.shared_entry' keys: {', '.join(unknown)}")
+    exemptions = raw.get("exemptions")
+    if exemptions is not None:
+        if not isinstance(exemptions, dict):
+            raise TypeError(f"{manifest_path}: 'capabilities.shared_entry.exemptions' must be an object mapping a style to gates")
+        for style, gates in exemptions.items():
+            if not str(style).strip():
+                raise TypeError(f"{manifest_path}: 'capabilities.shared_entry.exemptions' keys must be non-empty style tokens")
+            field_name = f"capabilities.shared_entry.exemptions.{style}"
+            names = _validate_non_empty_string_list(gates, field_name=field_name, manifest_path=manifest_path)
+            if not names:
+                raise ValueError(f"{manifest_path}: '{field_name}' must name at least one gate")
+            unknown_gates = sorted(set(names) - set(VETO_GATES))
+            if unknown_gates:
+                raise ValueError(f"{manifest_path}: '{field_name}' names unknown gates {unknown_gates}; valid: {list(VETO_GATES)}")
+            if len(set(names)) != len(names):
+                raise ValueError(f"{manifest_path}: '{field_name}' repeats a gate")
+    divergence_entry = raw.get("divergence_entry")
+    if divergence_entry is not None and not isinstance(divergence_entry, bool):
+        raise TypeError(f"{manifest_path}: 'capabilities.shared_entry.divergence_entry' must be a boolean")
+
+
+def _validate_signal_priority_capability(raw: object, *, manifest_path: Path) -> None:
+    """``capabilities.signal_priority``: the strategy's rank key
+    (``shared_entry.SharedEntryPolicy.rank_key``) -- ``primary_field``
+    (default ``final_priority_score``), ``shared_score_weight`` (>= 0,
+    default 0), ``rank_unit_field`` (only with a positive weight) and the
+    ``metadata_fields`` tail. A field may appear once."""
+    if not isinstance(raw, dict):
+        raise TypeError(f"{manifest_path}: 'capabilities.signal_priority' must be an object")
+    unknown = sorted(set(raw) - _VALID_SIGNAL_PRIORITY_KEYS)
+    if unknown:
+        raise ValueError(f"{manifest_path}: unsupported 'capabilities.signal_priority' keys: {', '.join(unknown)}")
+    for key in ("primary_field", "rank_unit_field"):
+        value = raw.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise TypeError(f"{manifest_path}: 'capabilities.signal_priority.{key}' must be a non-empty string")
+    weight = raw.get("shared_score_weight")
+    if weight is not None:
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(float(weight)):
+            raise TypeError(f"{manifest_path}: 'capabilities.signal_priority.shared_score_weight' must be a number")
+        if float(weight) < 0:
+            raise ValueError(f"{manifest_path}: 'capabilities.signal_priority.shared_score_weight' must be >= 0")
+    if raw.get("rank_unit_field") is not None and not float(weight or 0.0) > 0:
+        raise ValueError(
+            f"{manifest_path}: 'capabilities.signal_priority.rank_unit_field' scales the shared score, "
+            "so it needs a positive shared_score_weight"
+        )
+    fields: list[str] = []
+    metadata_fields = raw.get("metadata_fields")
+    if metadata_fields is not None:
+        fields = _validate_non_empty_string_list(
+            metadata_fields,
+            field_name="capabilities.signal_priority.metadata_fields",
+            manifest_path=manifest_path,
+        )
+    primary = raw.get("primary_field", "final_priority_score")
+    if len(set(fields)) != len(fields) or primary in fields:
+        raise ValueError(
+            f"{manifest_path}: 'capabilities.signal_priority' names a field twice "
+            f"(primary_field {primary!r}, metadata_fields {fields})"
+        )
 
 
 def _coerce_capabilities(raw: object, *, manifest_path: Path) -> dict[str, object]:
@@ -215,17 +299,12 @@ def _coerce_capabilities(raw: object, *, manifest_path: Path) -> dict[str, objec
         hybrid = restore.get("require_hybrid_metadata")
         if hybrid is not None and not isinstance(hybrid, bool):
             raise TypeError(f"{manifest_path}: 'capabilities.startup_restore.require_hybrid_metadata' must be a boolean")
+    shared_entry = out.get("shared_entry")
+    if shared_entry is not None:
+        _validate_shared_entry_capability(shared_entry, manifest_path=manifest_path)
     signal_priority = out.get("signal_priority")
     if signal_priority is not None:
-        if not isinstance(signal_priority, dict):
-            raise TypeError(f"{manifest_path}: 'capabilities.signal_priority' must be an object")
-        metadata_fields = signal_priority.get("metadata_fields")
-        if metadata_fields is not None:
-            _validate_non_empty_string_list(
-                metadata_fields,
-                field_name="capabilities.signal_priority.metadata_fields",
-                manifest_path=manifest_path,
-            )
+        _validate_signal_priority_capability(signal_priority, manifest_path=manifest_path)
     history = out.get("history")
     if history is not None:
         if not isinstance(history, dict):

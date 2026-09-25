@@ -53,19 +53,15 @@ This is the key balance of the strategy: **aggressive enough to join continuatio
 
 ### 5. Shared vetoes still matter
 
-Even with a good trend and a good pullback, the trade can still be blocked by:
-
-- support/resistance vetoes if enabled
-- structure vetoes
-- anti-chase / extension rules
-- FVG / continuation retest deferment logic
-- technical divergence checks
+Even with a good trend and a good pullback, the trade can still be blocked by its own anti-chase / extension, score and peer rules — and, since 2026-09-24, by the shared entry stage (`shared_entry.SharedEntryPolicy`) every strategy's setup goes through. It refuses on the strategy's own blockers and on every `shared_entry` veto the YAML switches on in one pass — structure (`use_structure_filter`), S/R (`use_sr_filter`, which replaced this strategy's `use_sr_veto` param), chart, candle, dual divergence, broken level — and records every blocker under the side's key with the gate snapshots and the near-miss payload. The vetoes and the structure / technical / chart / candle contexts read the 5m trigger frame; S/R is built on the 1m frame. So the refinement's stop floor (`shared_entry.min_stop_atr_mult`) is in 5m ATR, while the broken-level guard's `broken_level_min_clearance_atr` and the divergence entry candidates read the 1m S/R frame, the frame top_tier's thresholds were set on (a 1m ATR is roughly half a 5m one).
 
 So the strategy is continuation-first, but still disciplined about not entering at the worst possible location.
 
 ### 6. Stops, targets, and management
 
-The stop is anchored to the pullback structure with ATR buffering. The target starts from reward-to-risk logic and can extend for stronger continuation setups. Shared adaptive management can then give the stronger trends more room when the context supports it.
+The stop is anchored to the pullback structure with ATR buffering. The target starts from reward-to-risk logic and can extend for stronger continuation setups. The shared entry stage can refine both (`shared_entry.use_sr_stop_target_refinement` / `use_technical_stop_target_refinement`), and shared adaptive management — on the refined levels and the FVG term's continuation bias — can then give the stronger trends more room when the context supports it.
+
+The signal carries `regime: trend_continuation`, `entry_style_family: continuation`, the structure fields as `msltf_*` (`ms_ltf_*` until 2026-09-24), `strategy_priority_score` (the total score plus the activity term), `shared_context_score` (the entry-context and FVG terms — its `execution_quality_score` — with the HTF divergence term on this strategy's own HTF context) and `final_priority_score` = the two added, the same total as before (this strategy always summed the entry-context terms). `selection_quality_score` equals `final_priority_score`; the gatekeeper ranks on `ltf_score + 0.5 × shared_context_score` (manifest `signal_priority.shared_score_weight`, user decision 3), then the manifest's tail.
 
 ### 7. What a strong setup looks like
 
@@ -115,7 +111,7 @@ Strategy-specific knobs:
   - `strong_setup_runner_enabled`, `adaptive_breakeven_rr`, `adaptive_profit_lock_rr`, `adaptive_profit_lock_stop_rr`, `adaptive_runner_trigger_rr`
 - Context overlays:
   - `htf_fvg_entry_weight`, `ltf_fvg_entry_weight`, `opposing_fvg_entry_penalty_mult`, `fvg_runner_rr_bonus`
-  - `use_sr_veto` (disabled by default so the strategy does not hard-block on S/R proximity)
+  - the S/R veto is `shared_entry.use_sr_filter` (off in the preset, so the strategy does not hard-block on S/R proximity); `use_sr_veto` was retired on 2026-09-24 and a preset still carrying it fails at load
 
 Also uses these shared stock groups:
 
@@ -173,7 +169,6 @@ Current package defaults:
 | `ltf_fvg_entry_weight`     | `0.16`                                    |
 | `opposing_fvg_entry_penalty_mult` | `1.0`                                     |
 | `fvg_runner_rr_bonus`             | `0.12`                                    |
-| `use_sr_veto`                     | `false`                                   |
 | `activity_score_weight`           | `0.12`                                    |
 | `macro_bonus`                     | `0.7`                                     |
 | `macro_miss_penalty`              | `0.3`                                     |

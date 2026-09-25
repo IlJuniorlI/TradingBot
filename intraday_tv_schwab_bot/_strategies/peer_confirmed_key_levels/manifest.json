@@ -70,6 +70,7 @@
     "require_macro_agreement_count": 1,
     "require_macro_net_bias": true,
     "require_htf_bias_alignment": true,
+    "require_peer_target_clearance": true,
     "dollar_symbol": "NYICDX",
     "bond_symbol": "TLT",
     "volatility_symbol": "VIX",
@@ -111,8 +112,9 @@
       "require_hybrid_metadata": false
     },
     "signal_priority": {
+      "primary_field": "ltf_score",
+      "shared_score_weight": 0.5,
       "metadata_fields": [
-        "ltf_score",
         "regime_score",
         "directional_peer_score",
         "directional_vote_edge",

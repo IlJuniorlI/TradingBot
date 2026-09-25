@@ -12,24 +12,15 @@ from ..shared import (
     insufficient_bars_reason,
     _reason_with_values,
     _safe_float,
-    _side_prefixed_reason,
     _side_prefixed_reasons,
     pd,
 )
 from ..peer_confirmed_key_levels.strategy import PeerConfirmedKeyLevelsStrategy
+from ..shared_entry import EntryContexts, EntryProposal
 
 
 class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
     strategy_name = 'peer_confirmed_trend_continuation'
-
-    def _use_sr_veto(self) -> bool:
-        return bool(self.params.get("use_sr_veto", False))
-
-    def _blocks_bullish_sr_entry(self, sr_ctx) -> bool:
-        return super()._blocks_bullish_sr_entry(sr_ctx) if self._use_sr_veto() else False
-
-    def _blocks_bearish_sr_entry(self, sr_ctx) -> bool:
-        return super()._blocks_bearish_sr_entry(sr_ctx) if self._use_sr_veto() else False
 
     def dashboard_overlay_candidates(self, side: Side, close: float, ltf: pd.DataFrame, htf: HTFContext) -> list[dict[str, Any]] | None:
         if ltf is None or ltf.empty:
@@ -296,25 +287,14 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
         close = _safe_float(ltf.iloc[-1].get("close"), 0.0)
         if close <= 0:
             return None
-        htf = self._htf_context(
-            c.symbol,
-            data,
-            timeframe_minutes=int(self.params.get("htf_minutes", 60)),
-            lookback_days=int(self.params.get("htf_lookback_days", 60)),
-            pivot_span=int(self.params.get("htf_pivot_span", 2)),
-            max_levels_per_side=int(self.params.get("htf_max_levels_per_side", 6)),
-            atr_tolerance_mult=float(self.params.get("htf_atr_tolerance_mult", 0.35)),
-            pct_tolerance=float(self.params.get("htf_pct_tolerance", 0.0030)),
-            stop_buffer_atr_mult=float(self.params.get("htf_stop_buffer_atr_mult", 0.25)),
-            ema_fast_span=int(self.params.get("htf_ema_fast_span", 34)),
-            ema_slow_span=int(self.params.get("htf_ema_slow_span", 200)),
-            current_price=close,
-            use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
-            use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
-        )
+        htf = self._htf_context(c.symbol, data, current_price=close, **self._symbol_htf_request())
         trend = self._trend_signal(side, ltf, htf)
         trigger = self._pullback_trigger_signal(side, ltf, close=trend["close"], ema9=trend["ema9"], ema20=trend["ema20"], atr=trend["atr"])
-        hard_reasons: list[str] = []
+        # This setup's own blockers. They go to the shared entry stage with
+        # the proposal, which refuses on them and on every switched-on veto
+        # at once (the S/R veto: shared_entry.use_sr_filter, which replaced
+        # params.use_sr_veto on 2026-09-24).
+        pending_reasons: list[str] = []
         diagnostics: list[str] = []
         total_score = float(trend.get("score", 0.0) or 0.0)
         total_score += float(trigger.get("score", 0.0) or 0.0)
@@ -336,7 +316,7 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
         else:
             diagnostics.append(_reason_with_values("weak_peer_score", current=directional_peer_score, required=min_peer_score, op=">=", digits=2))
         if peer_agreement < min_peer_agreement:
-            hard_reasons.append(_reason_with_values("weak_peer_agreement", current=peer_agreement, required=min_peer_agreement, op=">=", digits=2))
+            pending_reasons.append(_reason_with_values("weak_peer_agreement", current=peer_agreement, required=min_peer_agreement, op=">=", digits=2))
 
         macro_bonus = max(0.0, float(self.params.get("macro_bonus", 0.70)))
         macro_miss_penalty = max(0.0, float(self.params.get("macro_miss_penalty", 0.30)))
@@ -352,9 +332,9 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
         min_total = _score_threshold(self.params.get("min_total_score", 5.5), 5.5, minimum=1.0)
         min_ltf_score = _score_threshold(self.params.get("min_ltf_score", 2.5), 2.5, minimum=1.0)
         if float(trigger.get("score", 0.0) or 0.0) < min_ltf_score:
-            hard_reasons.append(_reason_with_values("weak_ltf_score", current=float(trigger.get("score", 0.0) or 0.0), required=min_ltf_score, op=">=", digits=4))
+            pending_reasons.append(_reason_with_values("weak_ltf_score", current=float(trigger.get("score", 0.0) or 0.0), required=min_ltf_score, op=">=", digits=4))
 
-        hard_reasons.extend(self._entry_exhaustion_reasons(side, ltf, close=trend["close"], vwap=trend["vwap"], ema9=trend["ema9"]))
+        pending_reasons.extend(self._entry_exhaustion_reasons(side, ltf, close=trend["close"], vwap=trend["vwap"], ema9=trend["ema9"]))
 
         extension_from_vwap_atr = max(0.0, abs(trend["close"] - trend["vwap"]) / max(trend["atr"], 1e-9))
         extension_from_ema9_atr = max(0.0, abs(trend["close"] - trend["ema9"]) / max(trend["atr"], 1e-9))
@@ -369,12 +349,12 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             total_score -= extension_penalty
             diagnostics.append(f"extension_penalty:{extension_penalty:.4f}")
         if extension_from_vwap_atr > (max_vwap_ext * extension_hard_cap_mult):
-            hard_reasons.append(_reason_with_values("too_extended_from_vwap_atr", current=extension_from_vwap_atr, required=max_vwap_ext * extension_hard_cap_mult, op="<=", digits=4))
+            pending_reasons.append(_reason_with_values("too_extended_from_vwap_atr", current=extension_from_vwap_atr, required=max_vwap_ext * extension_hard_cap_mult, op="<=", digits=4))
         if extension_from_ema9_atr > (max_ema9_ext * extension_hard_cap_mult):
-            hard_reasons.append(_reason_with_values("too_extended_from_ema9_atr", current=extension_from_ema9_atr, required=max_ema9_ext * extension_hard_cap_mult, op="<=", digits=4))
+            pending_reasons.append(_reason_with_values("too_extended_from_ema9_atr", current=extension_from_ema9_atr, required=max_ema9_ext * extension_hard_cap_mult, op="<=", digits=4))
 
         if total_score < min_total:
-            hard_reasons.append(_reason_with_values("weak_total_score", current=total_score, required=min_total, op=">=", digits=4))
+            pending_reasons.append(_reason_with_values("weak_total_score", current=total_score, required=min_total, op=">=", digits=4))
 
         gate_snapshots = [
             _gate_snapshot("trend_score", passed=float(trend.get("score", 0.0) or 0.0) > 0.0, current=round(float(trend.get("score", 0.0) or 0.0), 4), required=0.0, op=">"),
@@ -399,49 +379,6 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             "diagnostics": diagnostics,
         }
 
-        # Accept pre-built contexts from the caller to avoid rebuilding them
-        # once per side. The entry_signals loop builds these once per candidate
-        # and passes them in; the fallbacks here cover direct callers.
-        if sr_ctx is None:
-            sr_ctx = self._sr_context(c.symbol, frame, data)
-        if ms_ctx is None:
-            ms_ctx = self._structure_context(ltf, "ltf")
-        if tech_ctx is None:
-            tech_ctx = self._technical_context(ltf)
-        if side == Side.LONG:
-            if self._blocks_bullish_structure_entry(ms_ctx):
-                hard_reasons.append(self._bullish_structure_block_reason(ms_ctx))
-            if self._blocks_bullish_sr_entry(sr_ctx):
-                hard_reasons.append(self._bullish_sr_block_reason(sr_ctx))
-        else:
-            if self._blocks_bearish_structure_entry(ms_ctx):
-                hard_reasons.append(self._bearish_structure_block_reason(ms_ctx))
-            if self._blocks_bearish_sr_entry(sr_ctx):
-                hard_reasons.append(self._bearish_sr_block_reason(sr_ctx))
-
-        if hard_reasons:
-            self._set_build_failure(
-                c.symbol,
-                failure_style,
-                hard_reasons[0],
-                reasons=hard_reasons,
-                details={
-                    "peer_universe": list(peer_ctx.get("universe", [])),
-                    "peer_details": dict(peer_ctx.get("details", {})),
-                    "peer_bullish": int(peer_ctx.get("bullish", 0) or 0),
-                    "peer_bearish": int(peer_ctx.get("bearish", 0) or 0),
-                    "peer_score": int(peer_ctx.get("score", 0) or 0),
-                    "macro_details": dict(macro_ctx.get("details", {})),
-                    "macro_long_agree": int(macro_ctx.get("long_agree", 0) or 0),
-                    "macro_short_agree": int(macro_ctx.get("short_agree", 0) or 0),
-                    "side_eval": side_eval,
-                    "primary_blocker": hard_reasons[0],
-                    "all_blockers": list(hard_reasons),
-                    "near_miss_blockers": near_miss_blockers,
-                },
-            )
-            return None
-
         stop_buffer_atr = max(0.05, float(self.params.get("stop_buffer_atr_mult", 0.50)))
         if side == Side.LONG:
             stop = float(trigger.get("stop_anchor", trend["close"])) - (trend["atr"] * stop_buffer_atr)
@@ -450,8 +387,6 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             risk_per_share = max(0.01, trend["close"] - stop)
             target_rr = max(float(self.params.get("target_rr", 2.05)), float(self.params.get("min_rr", 1.8)))
             target = trend["close"] + (risk_per_share * target_rr)
-            stop, target = self._refine_bullish_sr_levels(trend["close"], stop, target, sr_ctx, ltf)
-            stop, target = self._refine_bullish_technical_levels(trend["close"], stop, target, tech_ctx, ltf)
         else:
             stop = float(trigger.get("stop_anchor", trend["close"])) + (trend["atr"] * stop_buffer_atr)
             stop = max(stop, trend["ema20"] + (trend["atr"] * 0.1))
@@ -459,34 +394,61 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             risk_per_share = max(0.01, stop - trend["close"])
             target_rr = max(float(self.params.get("target_rr", 2.05)), float(self.params.get("min_rr", 1.8)))
             target = max(0.01, trend["close"] - (risk_per_share * target_rr))
-            stop, target = self._refine_bearish_sr_levels(trend["close"], stop, target, sr_ctx, ltf)
-            stop, target = self._refine_bearish_technical_levels(trend["close"], stop, target, tech_ctx, ltf)
 
-        adjustments = self._entry_adjustment_components(side, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf)
-        fvg_adjustments = self._fvg_entry_adjustment_components(side, c.symbol, ltf, data)
+        # The shared entry stage (2026-09-24): the vetoes, the refinement and
+        # the score terms, gated on the 5m LTF the setup was read on
+        # (amendment 4) with S/R on the 1m frame, the entry-context score's
+        # HTF divergence term on this strategy's own HTF context. A refusal
+        # lands under this side's failure key with the gate snapshots and the
+        # near-miss payload.
+        admitted = self.entry_policy.admit(EntryProposal(
+            candidate=c, direction=side, style="trend_continuation", style_family="continuation",
+            close=float(trend["close"]), stop=stop, target=target,
+            gate_frame=ltf, sr_frame=frame, level_frame=ltf, data=data,
+            pending_reasons=tuple(pending_reasons),
+            htf_ctx=htf,
+            contexts=EntryContexts(sr=sr_ctx, ms=ms_ctx, tech=tech_ctx),
+            failure_details={
+                "peer_universe": list(peer_ctx.get("universe", [])),
+                "peer_details": dict(peer_ctx.get("details", {})),
+                "peer_bullish": int(peer_ctx.get("bullish", 0) or 0),
+                "peer_bearish": int(peer_ctx.get("bearish", 0) or 0),
+                "peer_score": int(peer_ctx.get("score", 0) or 0),
+                "macro_details": dict(macro_ctx.get("details", {})),
+                "macro_long_agree": int(macro_ctx.get("long_agree", 0) or 0),
+                "macro_short_agree": int(macro_ctx.get("short_agree", 0) or 0),
+                "side_eval": side_eval,
+                "near_miss_blockers": near_miss_blockers,
+            },
+            failure_key=failure_style,
+        ))
+        if admitted is None:
+            return None
         runner_allowed = bool(self.params.get("strong_setup_runner_enabled", True)) and total_score >= (min_total + 1)
         management = self._adaptive_management_components(
             side,
             trend["close"],
-            stop,
-            target,
+            float(admitted.stop),
+            admitted.target,
             style="trend",
             runner_allowed=runner_allowed,
-            continuation_bias=float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0),
+            continuation_bias=float(admitted.fvg["fvg_continuation_bias"]),
             strong_setup=runner_allowed,
         )
         activity_weight = max(0.0, float(self.params.get("activity_score_weight", 0.12)))
-        execution_quality_score = float(adjustments.get("entry_context_adjustment", 0.0) or 0.0) + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
-        final_priority_score = total_score + execution_quality_score + (float(c.activity_score) * activity_weight)
-        metadata = self._build_signal_metadata(
-            entry_price=float(trend["close"]),
-            chart_ctx=self._chart_context(ltf),
-            ms_ctx=ms_ctx, sr_ctx=sr_ctx, tech_ctx=tech_ctx,
-            adjustments=adjustments, fvg_adjustments=fvg_adjustments,
+        # What this strategy calls its execution quality -- the entry-context
+        # and FVG terms -- is the shared context score now; emit adds it to
+        # the strategy's own score, so final_priority_score is total +
+        # execution + activity as it was before 2026-09-24.
+        execution_quality_score = float(admitted.shared_context_score)
+        strategy_score = total_score + (float(c.activity_score) * activity_weight)
+        return self.entry_policy.emit(
+            admitted,
+            reason="peer_confirmed_trend_continuation_long" if side == Side.LONG else "peer_confirmed_trend_continuation_short",
+            strategy_score=strategy_score,
             management=management,
-            final_priority_score=final_priority_score,
-            ms_prefix="ms_ltf",
-            leading={
+            target=admitted.target,
+            metadata={
                 "activity_score": float(c.activity_score),
                 "setup_quality_score": round(total_score, 4),
                 "execution_quality_score": round(execution_quality_score, 4),
@@ -519,15 +481,19 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
                 "trigger_volume_ratio": float(trigger.get("trigger_volume_ratio", 0.0) or 0.0),
                 "countertrend_volume_ratio": float(trigger.get("countertrend_volume_ratio", 0.0) or 0.0),
                 "trend_htf_bias": str(trend.get("htf_bias", "neutral")),
-                "directional_vote_edge": float(abs(int(trend.get("htf_bull_votes", 0) or 0) - int(trend.get("htf_bear_votes", 0) or 0))),
+                # HTF votes FOR this side net of those against, as key_levels
+                # ranks. Until 2026-09-24 it was the absolute difference, and
+                # with no HTF hard gate here a short against a 3v0 bullish HTF
+                # took the maximum ranking credit.
+                "directional_vote_edge": float(self._side_vote_edge(
+                    side, int(trend.get("htf_bull_votes", 0) or 0), int(trend.get("htf_bear_votes", 0) or 0))),
                 "runner_quality_score": 1.0 if runner_allowed else 0.0,
                 "execution_headroom_score": round(float(max(0.0, min(max_vwap_ext - extension_from_vwap_atr, max_ema9_ext - extension_from_ema9_atr))), 4),
                 "source_quality_score": 0.0,
-                "selection_quality_score": round(final_priority_score, 4),
+                # = final_priority_score, as it was: the rank tail reads it.
+                "selection_quality_score": round(strategy_score + execution_quality_score, 4),
             },
         )
-        reason = "peer_confirmed_trend_continuation_long" if side == Side.LONG else "peer_confirmed_trend_continuation_short"
-        return Signal(symbol=c.symbol, strategy=self.strategy_name, side=side, reason=reason, stop_price=float(stop), target_price=float(target), metadata=metadata)
 
     def entry_signals(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], client=None, data=None) -> list[Signal]:
         self._reset_entry_decisions()
@@ -562,7 +528,6 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             valid_signals: list[Signal] = []
             fail_reasons: list[str] = []
             side_eval: dict[str, Any] = {}
-            all_blockers: list[str] = []
             near_miss_blockers: dict[str, Any] = {}
             # Build side-agnostic contexts ONCE per candidate; pass them into each
             # per-side builder so we don't recompute market-structure / technical
@@ -589,12 +554,12 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
                     side_key = side_value.lower()
                     if isinstance(failure_payload.get("details"), dict):
                         side_eval[side_key] = failure_payload.get("details", {}).get("side_eval")
-                        for blocker in failure_payload.get("details", {}).get("all_blockers", []):
-                            token = _side_prefixed_reason(side, str(blocker))
-                            if token and token not in all_blockers:
-                                all_blockers.append(token)
                         for key, value in failure_payload.get("details", {}).get("near_miss_blockers", {}).items():
                             near_miss_blockers[f"{side_key}.{key}"] = value
+                    # The refusal's full list: this side's own blockers, then
+                    # the shared vetoes. It is also the decision's
+                    # all_blockers -- the details were written before the
+                    # shared entry stage ran, so they cannot carry the vetoes.
                     for token in _side_prefixed_reasons(side, failure_payload.get("reasons") or [failure_payload.get("primary_reason") or f"{side.value.lower()}_setup_not_ready"]):
                         if token not in fail_reasons:
                             fail_reasons.append(token)
@@ -608,32 +573,16 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
                         fail_reasons.append(token)
             if valid_signals:
                 def _signal_key(sig: Signal) -> tuple[float, ...]:
-                    meta = sig.metadata if isinstance(sig.metadata, dict) else {}
-                    strength = float(meta.get("final_priority_score", 0.0) or 0.0)
+                    # The gatekeeper's rank key (the manifest's
+                    # signal_priority), then the screener's preferred side.
                     preferred_side_bonus = 1.0 if c.directional_bias is not None and sig.side == c.directional_bias else 0.0
-                    custom_key = self.signal_priority_key(
-                        sig,
-                        c,
-                        metadata=meta,
-                        strength=strength,
-                        candidate_activity_score=float(c.activity_score),
-                        rank=float(c.rank),
-                    )
-                    if custom_key is not None:
-                        return tuple(custom_key) + (preferred_side_bonus,)
-                    return (
-                        float(meta.get("selection_quality_score", strength) or strength),
-                        float(meta.get("directional_peer_score", 0.0) or 0.0),
-                        float(meta.get("execution_headroom_score", 0.0) or 0.0),
-                        preferred_side_bonus,
-                    )
+                    return self.entry_policy.rank_key(sig, c) + (preferred_side_bonus,)
                 signal = max(valid_signals, key=_signal_key)
                 out.append(signal)
                 meta = signal.metadata if isinstance(signal.metadata, dict) else {}
                 signal_details = {"side_eval": side_eval or meta.get("side_eval"), "peer_universe": meta.get("peer_universe"), "evaluated_sides": evaluated_sides}
                 self._record_entry_decision(c.symbol, "signal", [signal.reason], details=signal_details)
             else:
-                blockers = all_blockers or list(fail_reasons)
-                skip_details = {"side_eval": side_eval, "peer_universe": list(peer_ctx.get("universe", [])), "peer_details": dict(peer_ctx.get("details", {})), "evaluated_sides": evaluated_sides, "primary_blocker": blockers[0] if blockers else None, "all_blockers": blockers, "near_miss_blockers": near_miss_blockers}
+                skip_details = {"side_eval": side_eval, "peer_universe": list(peer_ctx.get("universe", [])), "peer_details": dict(peer_ctx.get("details", {})), "evaluated_sides": evaluated_sides, "primary_blocker": fail_reasons[0] if fail_reasons else None, "all_blockers": list(fail_reasons), "near_miss_blockers": near_miss_blockers}
                 self._record_entry_decision(c.symbol, "skipped", fail_reasons or ["no_setup"], details=skip_details)
         return out

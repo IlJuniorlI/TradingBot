@@ -47,26 +47,28 @@ The strategy also blocks entries if the z-score is **too** extreme, so it is not
 
 ### 4. Directional structure still matters
 
-Even though the entry is based on pair divergence, the actual traded symbol still has to pass the normal context filters:
+Even though the entry is based on pair divergence, the actual traded symbol still has to pass the normal context filters. The side the z-score picks becomes one proposal to the shared entry stage (`entry_policy.admit`, `_strategies/shared_entry.py`; style and family `pairs`), built on the traded leg alone: every context, veto, refinement and score term reads the leg's 1-minute frame and the leg's symbol, never the reference's. The setup's own blocker (z-score too extended) and the exhaustion checks are its pending reasons, and the refusal records them together with every veto that fired. With neither side ready (z-score below the threshold, side or shorts not allowed) the skip is recorded without a proposal.
 
-- bullish/bearish 1-minute structure filter
+- the `shared_entry` vetoes the preset switches on: the shipped `config.pairs_residual.yaml` runs the structure filter (`use_structure_filter`) only; S/R, broken-level, chart, dual-divergence and candle vetoes are off
 - exhaustion checks
-- support/resistance refinement
-- technical-level refinement
-- FVG context adjustments
+- support/resistance refinement (`use_sr_stop_target_refinement`)
+- technical-level refinement (`use_technical_stop_target_refinement`)
+- the shared score terms (FVG, technical, S/R proximity, HTF divergence)
 
 So this is not a pure statistical-arbitrage bot. It is closer to **relative-strength timing with single-name execution discipline**.
 
+The manifest turns the shared divergence-only entries off (`capabilities.shared_entry.divergence_entry: false`): a pair trade needs its z-score, so `use_divergence_entry_signal` never opens a leg on a divergence alone.
+
 ### 5. Stop, target, and management
 
-The initial stop/target start from the shared stock-risk defaults for the traded symbol. Then they are refined through the normal S/R and technical layers.
+The initial stop/target start from the shared stock-risk defaults for the traded symbol (`risk.default_stop_pct` / `default_target_pct`). The shared stage then refines them through the S/R and technical layers, and the management, runner and signal read the refined levels. The signal carries the reference as `reference_symbol` and `pair_id` = `<leg>:<reference>`.
 
-Signal strength is influenced by:
+Signal strength (`final_priority_score`, the rank) is:
 
-- the absolute z-score
-- the screener focus score
-- structure bonuses
-- context adjustments
+- the absolute z-score × 100
+- the screener focus score × 0.25
+- structure bonuses (the leg's structure bias, a recent break of structure)
+- plus the shared context score (`shared_context_score`: FVG and entry-context terms), stamped separately since 2026-09-24; the total is unchanged
 
 Runner behavior is only enabled when the z-score is still tradable rather than already too stretched, and when the continuation/FVG context supports it.
 

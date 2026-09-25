@@ -6,6 +6,7 @@ import os
 import sys
 import time as _monotonic_time
 from collections import deque
+from collections.abc import Mapping
 from threading import Lock, RLock
 from urllib.parse import urlsplit
 from datetime import date as date_cls, datetime, time, timedelta
@@ -743,6 +744,106 @@ def ensure_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 
 _SESSION_BIN_OFFSET = pd.Timedelta(hours=EQUITY_RTH_OPEN.hour, minutes=EQUITY_RTH_OPEN.minute)
+_PREMARKET_OPEN_MINUTE = EQUITY_PREMARKET_START.hour * 60 + EQUITY_PREMARKET_START.minute
+_RTH_OPEN_MINUTE = EQUITY_RTH_OPEN.hour * 60 + EQUITY_RTH_OPEN.minute
+_RTH_CLOSE_MINUTE = EQUITY_RTH_CLOSE.hour * 60 + EQUITY_RTH_CLOSE.minute
+_EARLY_CLOSE_MINUTE = EQUITY_EARLY_CLOSE.hour * 60 + EQUITY_EARLY_CLOSE.minute
+_STREAM_END_MINUTE = EQUITY_STREAM_END.hour * 60 + EQUITY_STREAM_END.minute
+
+
+def _rule_minutes(rule: str) -> float:
+    return pd.Timedelta(pd.tseries.frequencies.to_offset(rule)).total_seconds() / 60.0
+
+
+def _on_the_open_grid(minutes: float) -> bool:
+    """Whether ``minutes``-long buckets anchored on 09:30 already start on
+    every session boundary (00:00, 04:00, 09:30, 13:00/16:00, 20:00): every
+    length that divides 30 minutes."""
+    return minutes > 0 and (30.0 / minutes).is_integer()
+
+
+def session_bucket_bounds(index: pd.DatetimeIndex | pd.Index, minutes: float) -> tuple[pd.DatetimeIndex, pd.DatetimeIndex]:
+    """``(starts, ends)`` of the ``minutes``-long bucket each timestamp of
+    ``index`` falls in, on the grid ``resample_bars`` aggregates to.
+
+    Buckets are laid out from the start of each ET session segment -- 00:00,
+    the 04:00 premarket, the 09:30 open, the close (16:00, 13:00 on an
+    early-close day) and 20:00 -- and the last bucket of a segment ends at the
+    next boundary. So no bar mixes regular-session and extended-hours prints:
+    the 60m grid is 07:00, 08:00, 09:00 (to 09:30), 09:30 ... 15:30 (to
+    16:00), 16:00 ... 19:00, as charting platforms draw it. Every length that
+    divides 30 minutes is the plain 09:30-anchored grid, unchanged.
+
+    Until 2026-09-23 every length ran on one 09:30 grid, so the 60m bar
+    labelled 15:30 held 15:30-16:29: the post-market set 60m PDH/PDL and
+    counted as regular-session in the session indicators, and the premarket
+    bar labelled 06:30 held 07:00-07:29 under a label outside the stream
+    window. The grid was also anchored on the frame's first day and stepped
+    in absolute time, so a length that does not divide 60 drifted an hour off
+    the local grid across a DST change.
+
+    A tz-naive index is read as ET wall time. Offsets are taken in wall
+    time within one segment, which a DST change (02:00) can only split in the
+    00:00-04:00 overnight segment.
+    """
+    idx = pd.DatetimeIndex(index)
+    step = float(minutes)
+    if step <= 0:
+        raise ValueError(f"bucket length must be positive, got {minutes!r}")
+    if len(idx) == 0:
+        return idx, idx
+    step_ns = int(round(step * _MINUTE_NS))
+    if _on_the_open_grid(step):
+        offset = np.mod(_wall_ns(idx) - _RTH_OPEN_MINUTE * _MINUTE_NS, step_ns)
+        starts = idx - pd.to_timedelta(offset, unit="ns")
+        return starts, starts + pd.Timedelta(step_ns, unit="ns")
+    wall, seg_start, seg_end = _session_segments(idx)
+    bucket_start = seg_start + ((wall - seg_start) // step_ns) * step_ns
+    bucket_end = np.minimum(bucket_start + step_ns, seg_end)
+    starts = idx - pd.to_timedelta(wall - bucket_start, unit="ns")
+    return starts, starts + pd.to_timedelta(bucket_end - bucket_start, unit="ns")
+
+
+_MINUTE_NS = 60_000_000_000
+
+
+def _wall_ns(idx: pd.DatetimeIndex) -> np.ndarray:
+    """Each timestamp's local (runtime-zone) wall-clock time of day, in
+    nanoseconds. Read off the naive local clock: elapsed time since local
+    midnight is an hour off the wall clock all day on a DST Sunday."""
+    local = idx.tz_convert(get_runtime_timezone_name()).tz_localize(None) if idx.tz is not None else idx
+    return (local - local.normalize()).to_numpy(dtype="timedelta64[ns]").astype(np.int64)
+
+
+def _session_segments(idx: pd.DatetimeIndex) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per timestamp, in integer nanoseconds since its local midnight: the
+    wall time, and the start and end of the session segment holding it
+    (``session_bucket_bounds``). Integers throughout: float minutes lose the
+    sub-second part of a clock reading (11:00:10 floored to 10:29:59.999...).
+    """
+    minute = _MINUTE_NS
+    local = idx.tz_convert(get_runtime_timezone_name()) if idx.tz is not None else idx
+    day = local.normalize()
+    wall = _wall_ns(idx)
+    close = np.full(len(idx), _RTH_CLOSE_MINUTE * minute, dtype=np.int64)
+    dates = np.asarray(day.date)
+    for session_day in set(dates.tolist()):
+        if session_day in us_equity_early_close_days(int(session_day.year)):
+            close[dates == session_day] = _EARLY_CLOSE_MINUTE * minute
+    # Each row's segment boundaries; a bar's segment runs from the last one
+    # at or before it to the first one after it.
+    bounds = np.column_stack([
+        np.zeros(len(idx), dtype=np.int64),
+        np.full(len(idx), _PREMARKET_OPEN_MINUTE * minute, dtype=np.int64),
+        np.full(len(idx), _RTH_OPEN_MINUTE * minute, dtype=np.int64),
+        close,
+        np.full(len(idx), _STREAM_END_MINUTE * minute, dtype=np.int64),
+        np.full(len(idx), 1440 * minute, dtype=np.int64),
+    ])
+    at_or_before = bounds <= wall[:, None]
+    seg_start = np.where(at_or_before, bounds, np.iinfo(np.int64).min).max(axis=1)
+    seg_end = np.where(at_or_before, np.iinfo(np.int64).max, bounds).min(axis=1)
+    return wall, seg_start, seg_end
 
 
 def resample_bars(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -751,10 +852,12 @@ def resample_bars(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
     The same convention as the source bars (Schwab price_history candles,
     CHART_EQUITY) and the broker's own coarser bars, so every consumer reads
     a timestamp the same way whatever frame it came from: bar ``T`` holds the
-    source bars starting in ``[T, T + rule)`` and is complete at
-    ``T + rule``. Buckets are anchored on the 09:30 session open: identical to
-    clock buckets for every rule that divides 30 minutes (5/15/30m match the
-    broker's bars) and session hours (09:30, 10:30, ...) for 60m.
+    source bars starting in ``[T, end)`` where ``end`` is
+    ``session_bucket_bounds``' bucket end (``T + rule`` except for a
+    segment's last, shorter bucket). Buckets are laid out per ET session
+    segment (see ``session_bucket_bounds``): identical to clock buckets for
+    every rule that divides 30 minutes (5/15/30m match the broker's bars), and
+    for 60m 09:30, 10:30, ... 15:30 (to 16:00) in the regular session.
 
     Until 2026-09-22 this ran ``closed="right", label="right"``: the source
     bar starting AT the label joined the bucket, so the 5m bar labelled 09:35
@@ -768,10 +871,98 @@ def resample_bars(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
     frame = ensure_ohlcv_frame(frame)
     if frame.empty:
         return frame
-    agg = frame.resample(rule, label="left", closed="left", origin="start_day", offset=_SESSION_BIN_OFFSET).agg(
-        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    )
+    agg_spec = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    minutes = _rule_minutes(rule)
+    if _on_the_open_grid(minutes):
+        agg = frame.resample(rule, label="left", closed="left", origin="start_day", offset=_SESSION_BIN_OFFSET).agg(agg_spec)
+    else:
+        starts, _ends = session_bucket_bounds(frame.index, minutes)
+        agg = frame[list(agg_spec)].groupby(starts).agg(agg_spec)
+        agg.index = pd.DatetimeIndex(agg.index, name=frame.index.name)
     return agg.dropna(subset=["open", "high", "low", "close"])
+
+
+def session_bucket_floor(ts: datetime | pd.Timestamp, minutes: int) -> pd.Timestamp:
+    """Start of the ``minutes`` bucket holding ``ts`` on ``resample_bars``'
+    grid (``session_bucket_bounds``). A clock floor put regular-session 60m
+    boundaries on the hour, half a bar from the XX:30 bars it gates."""
+    starts, _ends = session_bucket_bounds(pd.DatetimeIndex([pd.Timestamp(ts)]), max(1, int(minutes)))
+    return starts[0]
+
+
+def session_bucket_ends(index: pd.DatetimeIndex | pd.Index, minutes: int) -> pd.DatetimeIndex:
+    """When each bar of a ``minutes`` frame labelled at ``index`` completes:
+    ``T + minutes``, or the session boundary that cuts a segment's last
+    bucket short (a 60m bar labelled 15:30 is complete at 16:00). Read from
+    the label itself, so a bar off ``resample_bars``' grid (a clock-aligned
+    11:00 60m bar) still ends an hour after it starts."""
+    idx = pd.DatetimeIndex(index)
+    length = max(1, int(minutes))
+    if len(idx) == 0 or _on_the_open_grid(length):
+        return idx + pd.Timedelta(minutes=length)
+    wall, _seg_start, seg_end = _session_segments(idx)
+    return idx + pd.to_timedelta(np.minimum(seg_end - wall, length * _MINUTE_NS), unit="ns")
+
+
+def frame_bar_minutes(index: pd.DatetimeIndex | pd.Index) -> int:
+    """Bar length, in whole minutes, of a frame labelled at ``index``: its
+    smallest positive label step. The smallest, not the typical one: a thin
+    name prints no bar for minutes at a time (2-13% of extended-hours 1m
+    steps run longer than 2 minutes), and reading such a 1m frame as 2m would
+    call its completed last bar still forming. Any two consecutive minutes in
+    the frame give 1. With no step to read (fewer than two labels) it is the
+    canonical 1m stream.
+
+    A step into a label that opens a session segment (09:30, the close,
+    20:00; ``session_bucket_bounds``) is left out: the bucket before it is
+    its segment's last, which the grid cuts short. A native 60m frame steps
+    09:00 -> 09:30 and 15:30 -> 16:00, so the plain smallest step would read
+    it as 30m and call a forming bucket complete halfway through
+    (2026-09-25). When every step is such a step, they all count."""
+    idx = pd.DatetimeIndex(index)
+    if len(idx) < 2:
+        return 1
+    steps = np.asarray((idx[1:] - idx[:-1]).total_seconds())
+    positive = np.unique(steps[steps > 0])
+    if len(positive) == 0:
+        return 1
+    # A day has five segment opens, so a step length more steps share than
+    # the frame's days allow cannot be only steps into one. The segment read
+    # runs only on the few labels left: over a whole 1m frame it cost ~3 ms
+    # per structure build.
+    max_opens = 5 * ((idx[-1] - idx[0]).days + 2)
+    for step in positive:
+        at_step = steps == step
+        if int(at_step.sum()) > max_opens:
+            return max(1, int(round(float(step) / 60.0)))
+        wall, seg_start, _seg_end = _session_segments(idx[1:][at_step])
+        if bool((wall != seg_start).any()):
+            return max(1, int(round(float(step) / 60.0)))
+    return max(1, int(round(float(positive[0]) / 60.0)))
+
+
+def equity_stream_window_bars(frame: pd.DataFrame) -> pd.DataFrame:
+    """The bars of ``frame`` that start inside the 07:00-20:00 equity
+    stream window.
+
+    HTF frames are fetched with extended hours, and Schwab's price_history
+    lags about a trading day on overnight (20:00-07:00) bars: every older
+    night came back, the latest never did, and a full refetch after a
+    restart brought back a night an incremental run never had. So PDH/PDL,
+    pivots, ATR and the HTF chart all depended on which nights happened to be
+    in the frame. Since 2026-09-23 no overnight bar is ever stored.
+
+    Apply it to SOURCE bars, before ``resample_bars``: a bucket that
+    straddles 07:00 (a 120m bucket from 06:00) holds in-window bars under a
+    label outside the window, so windowing the buckets would drop them.
+    """
+    if frame.empty:
+        return frame
+    local = pd.DatetimeIndex(frame.index).tz_convert(get_runtime_timezone_name())
+    minute_of_day = local.hour * 60 + local.minute
+    window_open = EQUITY_STREAM_START.hour * 60 + EQUITY_STREAM_START.minute
+    window_close = EQUITY_STREAM_END.hour * 60 + EQUITY_STREAM_END.minute
+    return frame[(minute_of_day >= window_open) & (minute_of_day < window_close)]
 
 
 STANDARD_INDICATOR_COLUMNS: tuple[str, ...] = (
@@ -812,31 +1003,36 @@ def has_standard_indicator_columns(frame: pd.DataFrame) -> bool:
     return frame is not None and not frame.empty and all(col in frame.columns for col in STANDARD_INDICATOR_COLUMNS)
 
 
-def ensure_standard_indicator_frame(frame: pd.DataFrame, *, span_scale: float = 1.0) -> pd.DataFrame:
+def ensure_standard_indicator_frame(
+    frame: pd.DataFrame,
+    *,
+    span_scale: float = 1.0,
+    ema_spans: tuple[int, int] | None = None,
+) -> pd.DataFrame:
     # Fast path: if the frame already carries every standard indicator column,
     # it was produced by add_indicators() upstream which itself calls
     # ensure_ohlcv_frame internally. Re-running ensure_ohlcv_frame here on the
     # hot path (copy + sort + 5x to_numeric + dropna + reorder) is the single
     # biggest overhead in build_technical_levels_context / analyze_market_structure
     # when the frame is already clean. Skip it by trusting the indicator marker.
-    # Only the span_scale == 1.0 caller may take it: a caller asking for
-    # stretched spans must (re)compute, because it has no way to tell from the
-    # column names whether existing columns already carry the scale it wants.
+    # Only a caller asking for the canonical columns (span_scale 1.0, EMAs
+    # 9/20) may take it: a caller asking for stretched spans or other EMA
+    # spans must (re)compute, because it has no way to tell from the column
+    # names whether existing columns already carry what it wants.
     #
     # Note what this does NOT do: a frame stretched upstream keeps its stretched
-    # columns here even though the default argument asks for canonical ones.
-    # That is relied on — top_tier_adaptive's technical context is meant to read
-    # its span_scale=5 LTF columns, and build_technical_levels_context calls
-    # this with the default. Read INDICATOR_SPAN_SCALE_ATTR (via
-    # indicator_span_scale) rather than assuming the returned frame is native.
-    if span_scale == 1.0 and frame is not None and not frame.empty and has_standard_indicator_columns(frame):
+    # columns here even though the default arguments ask for canonical ones.
+    # Read INDICATOR_SPAN_SCALE_ATTR (via indicator_span_scale) rather than
+    # assuming the returned frame is native.
+    canonical = span_scale == 1.0 and resolve_ema_spans(1.0, ema_spans) == (9, 20)
+    if canonical and frame is not None and not frame.empty and has_standard_indicator_columns(frame):
         return frame
     cleaned = ensure_ohlcv_frame(frame)
     if cleaned.empty:
         return cleaned
-    if span_scale == 1.0 and has_standard_indicator_columns(cleaned):
+    if canonical and has_standard_indicator_columns(cleaned):
         return cleaned
-    return add_indicators(cleaned, span_scale=span_scale)
+    return add_indicators(cleaned, span_scale=span_scale, ema_spans=ema_spans)
 
 
 FloatArray = npt.NDArray[np.float64]
@@ -860,6 +1056,41 @@ def scaled_span(base: int, span_scale: float) -> int:
     length must use the same rounding, or the two paths disagree by a bar.
     """
     return max(1, int(round(int(base) * float(span_scale))))
+
+
+def resolve_ema_spans(span_scale: float, ema_spans: tuple[int, int] | None = None) -> tuple[int, int]:
+    """The (fast, slow) spans of the ema9 / ema20 columns: ``ema_spans`` when
+    given, else the nominal 9 / 20 stretched by ``span_scale``."""
+    if ema_spans is None:
+        return scaled_span(9, span_scale), scaled_span(20, span_scale)
+    fast, slow = ema_spans
+    return int(fast), int(slow)
+
+
+def ltf_ema_spans(params: Any) -> tuple[int, int]:
+    """The EMA spans a strategy's LTF frame carries in its ema9 / ema20
+    columns: ``ltf_ema_fast_span`` / ``ltf_ema_slow_span`` when declared,
+    else 9 / 20 stretched by ``ltf_indicator_span_scale``. The strategy and
+    the dashboard both resolve them here, so the chart draws the EMAs the
+    strategy scores on.
+
+    Until 2026-09-23 the only way to change them was
+    ``ltf_indicator_span_scale``, which also moves ATR, ADX, RSI, Bollinger
+    and the returns (and the stops and thresholds calibrated on them).
+    """
+    params = params if isinstance(params, Mapping) else {}
+    scale = float(params.get("ltf_indicator_span_scale", 1.0))
+    default_fast, default_slow = resolve_ema_spans(scale)
+    spans = []
+    for key, default in (("ltf_ema_fast_span", default_fast), ("ltf_ema_slow_span", default_slow)):
+        raw = params.get(key, default)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or float(raw) != int(raw) or int(raw) < 1:
+            raise ValueError(f"{key} must be a whole number of bars >= 1, got {raw!r}")
+        spans.append(int(raw))
+    fast, slow = spans
+    if fast >= slow:
+        raise ValueError(f"ltf_ema_fast_span ({fast}) must be shorter than ltf_ema_slow_span ({slow})")
+    return fast, slow
 
 
 def indicator_span_scale(frame: pd.DataFrame | None) -> float:
@@ -945,7 +1176,154 @@ def talib_bbands(
     )
 
 
-def add_indicators(frame: pd.DataFrame, *, span_scale: float = 1.0) -> pd.DataFrame:
+def _session_stitch_factor(
+    open_: FloatArray,
+    close: FloatArray,
+    day_ns: npt.NDArray[np.int64],
+) -> FloatArray:
+    """Per-bar multiplier that stitches consecutive sessions into one series
+    with the overnight gaps taken out.
+
+    ``open_``, ``close`` and ``day_ns`` (each bar's session day) describe the
+    session bars only, in time order. Every bar of a session is multiplied by
+    the product of the gap ratios (next session's first open / this session's
+    last close) of all LATER sessions, so each session's last close lands
+    exactly on the next session's first open and the latest session keeps
+    factor 1. The first bar of a session then has true range high - low and
+    an open-to-close change, as it had in the today-only overlay this
+    replaced: a whole overnight gap inside one 1m bar's true range would
+    otherwise inflate the 1m ATR (stops, sizing) for the first hour.
+
+    Multiplicative, not additive: an additive shift after a large gap-down
+    can drive older prices negative. Every indicator built on the stitched
+    series is either scale-invariant (RSI, DI/ADX, returns, %B, z-score, OBV
+    direction) or linear in price (ATR, band levels), and dividing a linear
+    one by its bar's own factor yields exactly what the stitch gives when
+    that bar's session is the latest, so past bars keep their values when a
+    new session opens.
+    """
+    n = len(close)
+    starts = np.flatnonzero(np.r_[True, day_ns[1:] != day_ns[:-1]])
+    ratios = np.ones(len(starts), dtype=np.float64)
+    ratios[1:] = open_[starts[1:]] / close[starts[1:] - 1]
+    later = np.r_[np.cumprod(ratios[::-1])[::-1][1:], 1.0]
+    return np.repeat(later, np.diff(np.r_[starts, n]))
+
+
+def session_price_scale(frame: pd.DataFrame) -> npt.NDArray[np.float64]:
+    """Per-bar multiplier that puts each bar's prices on the scale the
+    session TA-Lib columns were computed on: the gap-free stitch
+    (``_session_stitch_factor``) on session bars, 1.0 on the others (which
+    carry the all-hours series) and everywhere while session indicators are
+    off. Same mask and factor as ``add_indicators``, so ``price * scale``
+    at a session bar is the price its rsi14 / obv were computed from.
+
+    Anything that compares prices ACROSS sessions against those indicators
+    (divergence pivots) must compare on this scale: raw, an overnight gap
+    alone reads as a higher high or lower low that the gap-free RSI never
+    saw. Only ratios between bars matter, and a ratio depends only on the
+    gaps between them, so any frame holding both bars gives the same one.
+    """
+    scale = np.ones(len(frame), dtype=np.float64)
+    if frame.empty or not get_runtime_indicator_mode():
+        return scale
+    index_dt = pd.DatetimeIndex(frame.index)
+    pos = np.flatnonzero(indicator_session_mask(index_dt))
+    if len(pos):
+        scale[pos] = _session_stitch_factor(
+            _to_float64_array(frame["open"])[pos],
+            _to_float64_array(frame["close"])[pos],
+            index_dt.normalize().asi8[pos],
+        )
+    return scale
+
+
+def indicator_session_mask(index: pd.Index) -> npt.NDArray[np.bool_]:
+    """The bars ``add_indicators`` treats as session bars: RTH (09:30-16:00)
+    by default, the 07:00-20:00 equity stream window when
+    ``equity_session_indicator_window`` is "extended".
+
+    They anchor the per-session VWAP/EMA reset and, with
+    ``use_rth_session_indicators`` on, carry the session-only TA-Lib series;
+    the other bars carry the all-hours one. A consumer comparing indicator
+    values across bars (divergence pivots) needs this mask to keep to one
+    series.
+    """
+    predicate = _indicator_session_predicate()
+    return np.fromiter((predicate(ts) for ts in pd.DatetimeIndex(index)), dtype=bool, count=len(index))
+
+
+def _indicator_session_predicate():
+    return is_equity_stream_session if get_session_indicator_window() == "extended" else is_regular_equity_session
+
+
+def indicator_session_open() -> bool:
+    """Whether a reader is inside the session right now: session indicators
+    are on and the clock (``now_et``) is inside their window (RTH, or
+    07:00-20:00 under "extended").
+
+    Readers that switch to the session-only series in the session and keep
+    the all-hours one outside it (``latest_atr14``, the divergence age in
+    the technical and HTF builders) gate on this, not on their frame's last
+    bar: an HTF frame's last completed bucket is still a premarket one until
+    09:45 (15m) or 10:30 (60m), and a reader already in the session must
+    not read it as a premarket reader would (2026-09-24). Reads ``now_et``
+    through this module, so a test pinning ``utils.now_et`` pins it.
+    """
+    return get_runtime_indicator_mode() and _indicator_session_predicate()(now_et())
+
+
+def latest_atr14(frame: pd.DataFrame) -> float | None:
+    """The frame's current ``atr14``: at its latest bar, or at its latest
+    SESSION bar while session indicators are on and the clock is inside the
+    session. None when the frame has no ``atr14`` value.
+
+    With session indicators on, atr14 is the session-only series on session
+    bars and the all-hours one elsewhere (``add_indicators``). An RTH reader
+    whose frame ends outside the session must not take the thin all-hours
+    value: from 09:30 to 09:44 the 15m frame's last completed bar is the
+    09:15 premarket bucket, whose all-hours atr14 ran a median 0.82x (p10
+    0.57x) of the session ATR it switches to at 09:45 (2026-09-23). A
+    premarket reader keeps the all-hours value its own bars carry, not
+    yesterday's close.
+    """
+    if frame is None or frame.empty or "atr14" not in frame.columns:
+        return None
+    series = frame["atr14"]
+    if indicator_session_open():
+        in_session = indicator_session_mask(frame.index)
+        if in_session.any():
+            series = series[in_session]
+    clean = series.dropna()
+    return float(clean.iloc[-1]) if not clean.empty else None
+
+
+def htf_ema_spans(params: Any) -> tuple[int, int]:
+    """The (fast, slow) EMA spans of a strategy's HTF context:
+    ``htf_ema_fast_span`` / ``htf_ema_slow_span``, default 50 / 200. Every
+    consumer -- the strategy's HTF contexts, its prefetch, the dashboard's HTF
+    chart and level zones -- resolves them here, so none of them can fall
+    back to a different default than the others (until 2026-09-24 they fell
+    back to 50/200, 34/200 and 9/20)."""
+    params = params if isinstance(params, Mapping) else {}
+    spans = []
+    for key, default in (("htf_ema_fast_span", 50), ("htf_ema_slow_span", 200)):
+        raw = params.get(key, default)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or float(raw) != int(raw) or int(raw) < 1:
+            raise ValueError(f"{key} must be a whole number of bars >= 1, got {raw!r}")
+        spans.append(int(raw))
+    fast, slow = spans
+    if fast >= slow:
+        raise ValueError(f"htf_ema_fast_span ({fast}) must be shorter than htf_ema_slow_span ({slow})")
+    return fast, slow
+
+
+def add_indicators(
+    frame: pd.DataFrame,
+    *,
+    span_scale: float = 1.0,
+    ema_spans: tuple[int, int] | None = None,
+) -> pd.DataFrame:
     # Reject a nonsensical scale here, where the offending value is still in
     # hand. Every span collapses to max(1, ...) below, so a zero or negative
     # scale used to surface as "TA_BBANDS function failed with error code 2:
@@ -978,10 +1356,12 @@ def add_indicators(frame: pd.DataFrame, *, span_scale: float = 1.0) -> pd.DataFr
     # indicators behave like the old 5m frame (ema9->45, ema20->100, atr14->70,
     # rsi14->70, bb20->100, ret5->25, ret15->75). The column NAMES keep their
     # nominal numeric suffix; the EFFECTIVE span is suffix x span_scale.
+    # ``ema_spans`` sets the ema9 / ema20 spans on their own (a strategy's
+    # ltf_ema_fast_span / ltf_ema_slow_span); nothing else follows it, and
+    # obv_ema20 keeps its own span.
     def _span(base: int) -> int:
         return scaled_span(base, span_scale)
-    ema_fast_span = _span(9)
-    ema_slow_span = _span(20)
+    ema_fast_span, ema_slow_span = resolve_ema_spans(span_scale, ema_spans)
     bb_length = _span(20)
     bb_warmup_min = max(2, bb_length // 2)
     atr_period = _span(14)
@@ -1005,21 +1385,10 @@ def add_indicators(frame: pd.DataFrame, *, span_scale: float = 1.0) -> pd.DataFr
     out["ema20_all"] = talib_ema(close, span=ema_slow_span)
 
     index_dt = pd.DatetimeIndex(out.index)
-    # Session mask for the per-session VWAP/EMA reset. Defaults to the RTH
-    # (09:30-16:00) session; switches to the 07:00-20:00 equity stream window
-    # when the runtime opts into extended-session indicators (strategies that
-    # trade pre/post market). Variable name kept as rth_mask — it is the
-    # "session" mask downstream regardless of which window defines it.
-    _session_predicate = (
-        is_equity_stream_session
-        if get_session_indicator_window() == "extended"
-        else is_regular_equity_session
-    )
-    rth_mask = pd.Series(
-        [_session_predicate(ts) for ts in index_dt],
-        index=out.index,
-        dtype=bool,
-    )
+    # Session mask for the per-session VWAP/EMA reset and the TA-Lib session
+    # overlay below. Variable name kept as rth_mask — it is the "session"
+    # mask downstream regardless of which window defines it.
+    rth_mask = pd.Series(indicator_session_mask(index_dt), index=out.index, dtype=bool)
     rth_volume = volume.where(rth_mask, 0.0)
     rth_tpv = tpv.where(rth_mask, 0.0)
     rth_cum_vol = rth_volume.groupby(session_keys).cumsum().replace(0, math.nan)
@@ -1105,76 +1474,102 @@ def add_indicators(frame: pd.DataFrame, *, span_scale: float = 1.0) -> pd.DataFr
     out["ret5"] = close.pct_change(ret_fast_period)
     out["ret15"] = close.pct_change(ret_slow_period)
 
-    # --- RTH session-reset overlay for TA-Lib indicators ---
-    # When use_rth_session_indicators is enabled, recompute indicators using
-    # only today's RTH bars.  Each indicator group activates independently
-    # once enough RTH bars exist for its lookback period.  Before that
-    # threshold, the all-hours values above are used as-is (no wasted
-    # computation).  This eliminates pre-market contamination from the signal
-    # indicators while keeping all-hours values for chart display on non-RTH
-    # bars.
+    # --- Session overlay for the TA-Lib indicators ---
+    # When use_rth_session_indicators is enabled, every session bar (RTH, or
+    # the 07:00-20:00 stream window in "extended" mode) carries indicators
+    # computed over session bars ALONE, across every session in the frame,
+    # with the overnight gaps stitched out (_session_stitch_factor). Non-
+    # session bars keep the all-hours values above: chart display, and the
+    # premarket reads of strategies that trade outside the session window.
+    # The column therefore holds two series, and anything comparing values
+    # ACROSS bars (divergence pivots) must keep to one (indicator_session_mask).
+    #
+    # Until 2026-09-23 this recomputed from TODAY's session bars only and
+    # switched each indicator on once today held enough bars for its
+    # lookback. Before the switch the column was the all-hours series, thinned
+    # by quiet pre/post-market bars (the 15m S/R ATR ran ~0.8-0.9x a multi-day
+    # RTH ATR all morning); at the switch it stepped (median x1.11 for the 15m
+    # atr14 at the 13:15 decision, x1.26 for the 1m atr14 at 09:45, x1.32 for
+    # the span-5 LTF atr70 at 10:41, over 17 archived sessions), moving every
+    # ATR-denominated threshold with no change in the market. The
+    # 15m rsi14 changed series mid-afternoon, so an HTF divergence pivot pair
+    # straddling the switch compared two different RSIs, and obv sat on
+    # today's RTH-only cumsum while obv_ema20 was still the all-hours EMA.
+    # Seeded from prior sessions, the series has nothing left to warm up, so
+    # nothing switches. Only a frame holding fewer session bars than a
+    # lookback keeps all-hours values on those leading bars, where the
+    # stitched series is still NaN.
     if get_runtime_indicator_mode():
-        last_day = index_dt[-1].normalize()
-        today_rth = out[rth_mask & (index_dt.normalize() == last_day)]
-        n_rth = len(today_rth)
+        session_pos = np.flatnonzero(rth_mask.to_numpy())
+        if len(session_pos):
+            s_index = out.index[session_pos]
+            factor = _session_stitch_factor(
+                _to_float64_array(out["open"])[session_pos],
+                _to_float64_array(close)[session_pos],
+                index_dt.normalize().asi8[session_pos],
+            )
+            s_h = _to_float64_array(high)[session_pos] * factor
+            s_l = _to_float64_array(low)[session_pos] * factor
+            s_c = _to_float64_array(close)[session_pos] * factor
+            s_close = pd.Series(s_c, index=s_index, dtype=float)
+            # ATR and the band levels are linear in price: dividing by the
+            # bar's factor puts them back on that bar's own price level.
+            unscale = pd.Series(factor, index=s_index, dtype=float)
 
-        def _overlay(col: str, rth_series: pd.Series) -> None:
-            """Overlay RTH values onto the main frame, preserving the all-hours
-            fallback for bars where the RTH computation produces NaN (leading
-            lookback period)."""
-            valid = rth_series.dropna()
-            if not valid.empty:
-                out.loc[valid.index, col] = valid
+            def _overlay(columns: dict[str, pd.Series], anchor: pd.Series) -> None:
+                """Write ``columns`` onto the session bars where ``anchor`` is
+                valid. Columns read against each other (obv vs obv_ema20, the
+                band family) share one anchor so no bar pairs a stitched value
+                with an all-hours one."""
+                valid = anchor.notna().to_numpy()
+                pos = session_pos[valid]
+                for col, series in columns.items():
+                    values = out[col].to_numpy(dtype=np.float64, copy=True)
+                    values[pos] = series.to_numpy(dtype=np.float64)[valid]
+                    out[col] = values
 
-        if n_rth >= 2:
-            rth_close = today_rth["close"].astype(float)
-            rth_high = today_rth["high"].astype(float)
-            rth_low = today_rth["low"].astype(float)
-            rth_volume = today_rth["volume"].fillna(0.0).astype(float)
+            s_obv = _series_from_talib(s_index, ta.OBV(s_c, _to_float64_array(volume)[session_pos]))
+            s_obv_ema = talib_ema(s_obv, span=obv_ema_span)
+            s_plus_di = _series_from_talib(s_index, ta.PLUS_DI(s_h, s_l, s_c, timeperiod=di_period))
+            s_minus_di = _series_from_talib(s_index, ta.MINUS_DI(s_h, s_l, s_c, timeperiod=di_period))
+            # Returns are NOT overlaid. They are price-true momentum ("how far
+            # did price move over the last N bars"), and on contiguous session
+            # bars the all-hours pct_change already equals a session-only one;
+            # at the open it measures against the real premarket prices, which
+            # is what the old today-only overlay produced too. Stitching them
+            # would compare today's opening bars with yesterday's close with the
+            # gap divided out -- a move that never happened.
+            for col, series in (
+                ("obv_delta5", s_obv.diff(obv_delta_period)),
+                ("atr14", _series_from_talib(s_index, ta.ATR(s_h, s_l, s_c, timeperiod=atr_period)) / unscale),
+                ("adx14", _series_from_talib(s_index, ta.ADX(s_h, s_l, s_c, timeperiod=di_period))),
+                ("rsi14", _series_from_talib(s_index, ta.RSI(s_c, timeperiod=rsi_period))),
+            ):
+                _overlay({col: series}, series)
+            _overlay({"obv": s_obv, "obv_ema20": s_obv_ema}, s_obv_ema)
+            _overlay({"plus_di14": s_plus_di, "minus_di14": s_minus_di}, s_plus_di)
 
-            # Returns — clean from bar 2 onward
-            _overlay("ret1", rth_close.pct_change())
-            if n_rth >= ret_fast_period:
-                _overlay("ret5", rth_close.pct_change(ret_fast_period))
-            if n_rth >= ret_slow_period:
-                _overlay("ret15", rth_close.pct_change(ret_slow_period))
-
-            # OBV — clean from bar 2 onward
-            rth_obv = _series_from_talib(today_rth.index, ta.OBV(_to_float64_array(rth_close), _to_float64_array(rth_volume)))
-            _overlay("obv", rth_obv)
-            if n_rth >= obv_ema_span:
-                _overlay("obv_ema20", talib_ema(rth_obv, span=obv_ema_span))
-            _overlay("obv_delta5", rth_obv.diff(obv_delta_period))
-
-            # ATR, DI, RSI — clean from atr_period bars onward; ADX needs ~2x
-            if n_rth >= atr_period:
-                rth_h = _to_float64_array(rth_high)
-                rth_l = _to_float64_array(rth_low)
-                rth_c = _to_float64_array(rth_close)
-                _overlay("atr14", _series_from_talib(today_rth.index, ta.ATR(rth_h, rth_l, rth_c, timeperiod=atr_period)))
-                _overlay("plus_di14", _series_from_talib(today_rth.index, ta.PLUS_DI(rth_h, rth_l, rth_c, timeperiod=di_period)))
-                _overlay("minus_di14", _series_from_talib(today_rth.index, ta.MINUS_DI(rth_h, rth_l, rth_c, timeperiod=di_period)))
-                _overlay("adx14", _series_from_talib(today_rth.index, ta.ADX(rth_h, rth_l, rth_c, timeperiod=di_period)))
-                _overlay("rsi14", _series_from_talib(today_rth.index, ta.RSI(_to_float64_array(rth_close), timeperiod=rsi_period)))
-
-            # Bollinger Bands — clean from bb_length bars onward
-            if n_rth >= bb_length:
-                r_upper, r_middle, r_lower = ta.BBANDS(
-                    _to_float64_array(rth_close), timeperiod=bb_length,
-                    nbdevup=2.0, nbdevdn=2.0, matype=ta.MA_Type.SMA,
-                )
-                rth_bb_mid = _series_from_talib(today_rth.index, r_middle)
-                rth_bb_upper = _series_from_talib(today_rth.index, r_upper)
-                rth_bb_lower = _series_from_talib(today_rth.index, r_lower)
-                rth_bb_width = rth_bb_upper - rth_bb_lower
-                _overlay("bb_mid", rth_bb_mid)
-                _overlay("bb_upper", rth_bb_upper)
-                _overlay("bb_lower", rth_bb_lower)
-                _overlay("bb_width", rth_bb_width)
-                _overlay("bb_width_pct", rth_bb_width / rth_bb_mid.replace(0.0, math.nan))
-                _overlay("bb_percent_b", (rth_close - rth_bb_lower) / rth_bb_width.replace(0.0, math.nan))
-                rth_std = rth_close.rolling(bb_length, min_periods=bb_warmup_min).std(ddof=0)
-                _overlay("bb_zscore", (rth_close - rth_bb_mid) / rth_std.replace(0.0, math.nan))
+            s_upper, s_middle, s_lower = ta.BBANDS(
+                s_c, timeperiod=bb_length,
+                nbdevup=2.0, nbdevdn=2.0, matype=ta.MA_Type.SMA,
+            )
+            s_bb_mid = _series_from_talib(s_index, s_middle)
+            s_bb_upper = _series_from_talib(s_index, s_upper)
+            s_bb_lower = _series_from_talib(s_index, s_lower)
+            s_bb_width = s_bb_upper - s_bb_lower
+            s_std = s_close.rolling(bb_length, min_periods=bb_warmup_min).std(ddof=0)
+            _overlay(
+                {
+                    "bb_mid": s_bb_mid / unscale,
+                    "bb_upper": s_bb_upper / unscale,
+                    "bb_lower": s_bb_lower / unscale,
+                    "bb_width": s_bb_width / unscale,
+                    "bb_width_pct": s_bb_width / s_bb_mid.replace(0.0, math.nan),
+                    "bb_percent_b": (s_close - s_bb_lower) / s_bb_width.replace(0.0, math.nan),
+                    "bb_zscore": (s_close - s_bb_mid) / s_std.replace(0.0, math.nan),
+                },
+                s_bb_mid,
+            )
 
     return out
 
@@ -1212,11 +1607,7 @@ def atr_value(frame: pd.DataFrame) -> float:
         return 0.0
     if "atr14" not in frame.columns:
         frame = ensure_standard_indicator_frame(frame)
-    atr = 0.0
-    if "atr14" in frame.columns:
-        atr_clean = frame["atr14"].dropna()
-        if not atr_clean.empty:
-            atr = float(atr_clean.iloc[-1])
+    atr = latest_atr14(frame) or 0.0
     close = float(frame.iloc[-1]["close"]) if not frame.empty else 0.0
     return max(atr, close * 0.0015 if close > 0 else 0.0)
 

@@ -6,7 +6,7 @@ from copy import deepcopy
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
@@ -323,11 +323,14 @@ class RiskConfig:
     # each stopped out on structure, net -$94. A direction-aware cooldown
     # still lets the bot flip short if genuine bearish reversal develops.
     cooldown_direction_aware: bool = True
-    # Same-level retry block: after a stop-out, block *same-direction* re-entry
-    # on the same symbol within same_level_block_atr_mult * ATR of the prior
-    # stop price for same_level_block_minutes minutes. Prevents the NVDA-style
-    # breakout-chase pattern. Fib-pullback entries (see _fib_pullback_override)
-    # can override the block.
+    # Same-level retry block: after any exit, win or loss, block
+    # *same-direction* re-entry on the same symbol for
+    # same_level_block_minutes minutes while the new entry sits within
+    # same_level_block_atr_mult * ATR of the prior ENTRY, the level already
+    # tried (an option's direction and entry are its underlying's; see
+    # RiskManager.same_level_anchor). Prevents the NVDA-style breakout-chase
+    # pattern. For an equity, a fib-pullback entry (see
+    # _fib_pullback_override) overrides the block. 0 minutes = off.
     same_level_block_minutes: int = 30
     same_level_block_atr_mult: float = 0.3
     # --- Entry slippage / realized-risk controls (2026-09-18) ---
@@ -458,11 +461,14 @@ class RuntimeConfig:
     history_lookback_minutes: int = 390
     use_extended_hours_history: bool = True
     use_rth_session_indicators: bool = True
-    # Which session window the per-session VWAP/EMA/TA-Lib indicator reset
-    # keys off (only when use_rth_session_indicators is true). "rth" = the
-    # 09:30-16:00 regular session (default). "extended" = the 07:00-20:00
-    # equity stream window, for strategies that enter pre/post market
-    # (top_tier_adaptive extended-hours mode). Leave "rth" for every
+    # Which session window the session indicators key off (only when
+    # use_rth_session_indicators is true). VWAP/EMA reset at each session's
+    # open; the TA-Lib columns (ATR/RSI/ADX/OBV...) do not reset: on session
+    # bars they are one session-only series stitched across sessions
+    # (gap-neutral), and bars outside the window keep the all-hours series.
+    # "rth" = the 09:30-16:00 regular session (default). "extended" = the
+    # 07:00-20:00 equity stream window, for strategies that enter pre/post
+    # market (top_tier_adaptive extended-hours mode). Leave "rth" for every
     # RTH-only strategy.
     equity_session_indicator_window: str = "rth"
     warmup_minutes: int = 90
@@ -501,12 +507,15 @@ class RuntimeConfig:
     # securities like KNRX 2026-04-29: 457 wasted 401 retries) without
     # blacklisting on transient hiccups.
     max_consecutive_quote_failures: int = 5
-    # When True, on session shutdown the engine writes a per-day archive
-    # to {log_dir}/sessions/{YYYY-MM-DD}/ containing: bars/{SYMBOL}.csv for
-    # every active watchlist symbol (RTH only, with indicators), trades.csv
-    # filtered to the day, and manifest.json with strategy + summary stats.
-    # Useful for trade audits and post-session analysis. Disable to save
-    # disk space if running without dashboard/analysis needs.
+    # When True, the engine writes a per-day archive to
+    # {log_dir}/sessions/{YYYY-MM-DD}/ (once per ET trading day after 20:00,
+    # and again on shutdown) containing bars/1m/{SYMBOL}.csv (the full merged
+    # 1m frame with indicators, extended hours and warmup included),
+    # bars/{N}m/ resamples for ltf/htf minutes above 1, bars/htf_{N}m/ (the
+    # stored HTF frame levels are built from), trades.csv filtered to the
+    # day, decisions.csv and manifest.json with strategy + summary stats; see
+    # session_report.export_session_archive for the full list. Disable to
+    # save disk space if running without dashboard/analysis needs.
     export_session_archive: bool = True
 
 
@@ -829,44 +838,67 @@ class SupportResistanceConfig:
     # proportionally lower when enabling (e.g. 6 1m-bars -> 3 5m-bars to
     # keep BOS/CHoCH event freshness near the original ~15-30 min).
     structure_ltf_timeframe_minutes: int = 0
-    # Grace window post-entry during which 1m structure-based exits
+    # Grace window post-entry during which the bias-based structure exits
     # (structure_bearish_exit:EQL/LL/HL, structure_bullish_exit:HH/LH) are
     # suppressed. An EQL pivot forming in the first few minutes after entry
     # is noise, not reversal — session 2026-04-17 had 1W/12T on structure
-    # exits, net -$354. CHoCH exits and SR-break exits still fire in the
-    # grace window (those are genuine reversal signals, not minor pivots).
+    # exits, net -$354. The CHoCH exit and the S/R-break exit are not
+    # graced: the CHoCH exit only needs a CHoCH that happened after entry
+    # (see shared_exit.EXIT_FAMILY_GATES; the 2026-09-24 study found no
+    # guard, this grace included, with a measurable effect on it).
     structure_exit_grace_minutes: int = 10
-    # Minimum new 1m pivots formed AFTER entry before structure exits can
-    # fire. If msltf_pivot_count at exit-check time - at-entry time is
-    # below this, exit is suppressed. Complements the time-grace by
-    # requiring at least some actual structure to form.
+    # Minimum new LTF-structure pivots formed AFTER entry before the bias-
+    # based structure exits can fire: pivots whose bar closed after the
+    # entry, counted from MarketStructureContext.pivot_times (2026-09-24;
+    # it used to compare a rolling-window pivot count against one stamped
+    # at entry, which most strategies never stamped). Complements the
+    # time-grace by requiring at least some actual structure to form. The
+    # CHoCH exit is exempt.
     structure_exit_min_post_entry_pivots: int = 2
-    # Extended grace window for the PULLBACK regime specifically. Pullback
+    # Extended grace window for PULLBACK entries specifically. Pullback
     # entries are designed to enter into LTF chop (buy the dip on a bullish
     # HTF) — the first EQL/LL pivot 10 min in is almost always noise, not
     # a reversal. Session 2026-05-14 AMD pullback was killed at 10.2m via
     # structure_bearish_exit:EQL; price recovered above the target shortly
-    # after. Applies only when position.metadata.regime == "pullback".
-    # Set to a value <= structure_exit_grace_minutes to disable the override.
+    # after. Applies when position.metadata.entry_style_family == "pullback"
+    # (stamped at entry; it keyed on top_tier's regime == "pullback" until
+    # 2026-09-24), as max(this, structure_exit_grace_minutes), so a value
+    # <= structure_exit_grace_minutes disables the override.
     structure_exit_grace_minutes_pullback: int = 15
     # When True, structure_bearish_exit / structure_bullish_exit (the bias-
     # based bias-flip exits, NOT CHoCH) additionally require an active
     # BoS event in the matching direction (bos_down for long-exit, bos_up
-    # for short-exit). Without this gate, bias flips on a single EQL/HH
-    # pivot — a noisy, weak signal that aborts otherwise-healthy pullback
-    # trades. With BoS confirmation we require price to have actually
-    # broken below a prior swing low (or above for short exits), a far
-    # stronger reversal signal. CHoCH exits are unaffected (already strong).
+    # for short-exit) that happened after entry. Without this gate, bias
+    # flips on a single EQL/HH pivot — a noisy, weak signal that aborts
+    # otherwise-healthy pullback trades. With BoS confirmation we require
+    # price to have actually broken below a prior swing low (or above for
+    # short exits). The CHoCH exit is unaffected.
     structure_exit_require_bos_confirmation: bool = True
-    # Extended grace window for positions opened during the ORB window
-    # (09:35-orb_end). ORB pullbacks often look like bearish structure
-    # breaks / bearish chart patterns but continue higher afterward.
-    # 2026-04-24: 5 of 6 ORB entries lost via pullback-driven exits
-    # (INTC at 2.0m, AMD at 11.2m via structure_bearish_exit:HL, etc).
-    # When set > 0, suppresses both structure_bearish/bullish_exit AND
-    # chart_pattern_exit for the first N minutes of ORB-window trades.
-    # CHoCH exits still fire (genuine trend reversals). Set 0 to disable.
+    # Extended grace window for opening-range entries
+    # (position.metadata.entry_style_family == "orb": top_tier's ORB regime,
+    # opening_range_breakout, microcap_gap_orb; until 2026-09-24 it keyed on
+    # orb_window_entry, which only top_tier stamped). ORB pullbacks often
+    # look like bearish structure breaks / bearish chart patterns but
+    # continue higher afterward. 2026-04-24: 5 of 6 ORB entries lost via
+    # pullback-driven exits (INTC at 2.0m, AMD at 11.2m via
+    # structure_bearish_exit:HL, etc). When set > 0, suppresses both
+    # structure_bearish/bullish_exit AND chart_pattern_exit for the first N
+    # minutes of the trade. The CHoCH exit is not graced (see
+    # structure_exit_grace_minutes). Set 0 to disable.
     orb_entry_exit_grace_minutes: int = 20
+
+
+def flip_confirmation_bars(sr_cfg: SupportResistanceConfig) -> tuple[int, int]:
+    """``(bars_1m, bars_5m)`` for the dual-frame level-flip confirmation.
+
+    Either frame confirming a flip is enough; 0 switches that frame's gate
+    off, so ``(0, 1)`` confirms on 5m bars only and ``(2, 0)`` on 1m only.
+    Until 2026-09-23 every reader spelled this ``int(value or 2)`` /
+    ``int(value or 1)``, which turned a configured 0 back into the default
+    and made the single-frame modes impossible to configure. The one place
+    these two knobs are read; ``load_config`` rejects negatives.
+    """
+    return int(sr_cfg.trading_flip_confirmation_1m_bars), int(sr_cfg.trading_flip_confirmation_5m_bars)
 
 
 @dataclass(slots=True)
@@ -891,7 +923,17 @@ class TechnicalLevelsConfig:
     trendline_lookback_bars: int = 120
     trendline_min_touches: int = 3
     trendline_atr_tolerance_mult: float = 0.35
-    trendline_breakout_buffer_atr_mult: float = 0.15
+    # ATR multiple a close must clear past a trendline to count as a break.
+    # 0.65 (was 0.15, 2026-09-23): on large caps the old value never applied,
+    # because a 0.10%-of-price floor always won; 0.65 reproduces that floor
+    # at the median on 1m bars. The ATR is atr_value = max(ATR14, 0.15% of
+    # price), so the buffer scales with volatility only above that floor,
+    # which decides ~70-80% of 1m large-cap bars. The 5m presets use 0.30.
+    # The small-cap presets (small_cap_squeeze, microcap_*, and the $2-$20
+    # screener presets momentum_close, mean_reversion, closing_reversal,
+    # opening_range_breakout) keep 0.15, which on their tape was already the
+    # buffer.
+    trendline_breakout_buffer_atr_mult: float = 0.65
     adx_enabled: bool = True
     adx_length: int = 14
     adx_min_strength: float = 18.0
@@ -915,14 +957,35 @@ class TechnicalLevelsConfig:
     divergence_rsi_length: int = 14
     divergence_rsi_min_delta: float = 2.5
     divergence_obv_min_volume_frac: float = 0.65
+    # Counter-direction LTF divergence penalties on the entry score. They are
+    # terms of shared_entry.use_technical_entry_adjustment (with the hidden
+    # bonuses below), not of any divergence knob. The dual RSI+OBV counter
+    # divergence VETO is shared_entry.use_dual_divergence_veto; its old second
+    # switch here, divergence_block_dual_counter, was removed 2026-09-24.
     divergence_counter_rsi_penalty: float = 0.12
     divergence_counter_obv_penalty: float = 0.10
-    divergence_block_dual_counter: bool = True
     # Multi-pivot detection (added with the levels_shared.find_divergence
     # refactor): walk the last N pivots and return the most recent qualifying
     # pair, gated by max-age in bars so stale divergences don't dominate.
+    # divergence_pivot_lookback, divergence_min_price_move_pct and
+    # divergence_rsi_min_delta are shared by the LTF and the HTF divergence:
+    # the data feed passes them to every HTF build, in its cache key, since
+    # 2026-09-25 (until then the HTF used the builder's defaults, which every
+    # preset matches, so no build changed). divergence_rsi_length is
+    # LTF-only; the HTF reads its frame's rsi14.
     divergence_pivot_lookback: int = 4
     divergence_max_age_bars: int = 8
+    # The same limit for the HTF RSI divergence (HTFContext.*_rsi_divergence,
+    # scored by shared_entry.use_htf_divergence_score and drawn by the
+    # dashboard), in
+    # HTF bars. Both ages count session bars only while session indicators
+    # are on and the clock is inside the session, so yesterday's last pivots
+    # stay live across the overnight. The data feed reads this, enabled,
+    # divergence_enabled and the three shared thresholds named above once
+    # in its HTF context build, for every strategy and the dashboard alike
+    # (they are part of its cache key); until 2026-09-24 every HTF build
+    # used 6 with divergence always on. 6 is that value, not a retune.
+    htf_divergence_max_age_bars: int = 6
     divergence_min_price_move_pct: float = 0.0015
     # Hidden divergence (continuation pattern) — same-direction bonus on the
     # entry score. Bullish hidden div on a LONG entry: bonus. Bearish hidden
@@ -931,7 +994,8 @@ class TechnicalLevelsConfig:
     divergence_hidden_bonus_rsi: float = 0.10
     divergence_hidden_bonus_obv: float = 0.08
     # HTF (multi-timeframe) divergence confluence — read from
-    # HTFContext.{bullish,bearish}_rsi_divergence by _htf_divergence_adjustment.
+    # HTFContext.{bullish,bearish}_rsi_divergence by the shared entry policy's
+    # HTF divergence score term (shared_entry.use_htf_divergence_score).
     # _rsi suffix because HTF divergence is RSI-only (OBV is volume-driven
     # and HTF resampling smears the signal — htf_levels.build_htf_context
     # intentionally skips HTF OBV computation).
@@ -958,30 +1022,99 @@ class TechnicalLevelsConfig:
 
 @dataclass(slots=True)
 class SharedEntryLogicConfig:
+    """The shared entry knobs. Global since 2026-09-24: every strategy hands
+    each candidate entry to ``_strategies/shared_entry.SharedEntryPolicy``
+    (``admit`` / ``emit``), the ONLY reader of this section, so a knob acts on
+    every strategy whose YAML sets it -- no strategy calls a knob helper or
+    can rewrite a knob. Until then each strategy called the helpers it chose
+    to, so most knobs silently did nothing for most strategies (key_levels
+    read three of them), and a ``strategy_logic_default`` hook let a strategy
+    rewrite any of them. A strategy exempts one of its styles from a veto
+    only by declaring it in its manifest
+    (``capabilities.shared_entry.exemptions``).
+
+    The policy's order per proposal: the raw R:R gate a builder asked for;
+    the FVG / order-block retest admission of deferrable reasons; the vetoes
+    (structure, S/R, broken level, chart, dual divergence, candle -- all of
+    them evaluated, so every blocker is logged); the S/R then technical
+    stop/target refinement; the score terms.
+    """
+
+    # FVG context: the retest admission of deferrable entry reasons (the
+    # anti-chase FVG plan), the fvg_entry_adjustment score term and the
+    # continuation / reversal bias the strategies feed their runner and
+    # management; zero_dte reads its regime FVG scores through the policy.
     use_fvg_context: bool = True
-    use_divergence_filter: bool = True
-    use_htf_divergence_filter: bool = True
-    # Divergence as a primary entry trigger (off by default). When enabled,
-    # any strategy can fire a secondary entry signal on a confirmed
-    # divergence at S/R confluence. Primary strategy signal still wins on
-    # conflicts; bonus if both fire same direction. Stops anchor to the
-    # divergence pivot; targets to the nearest opposing S/R level (capped
-    # by min_rr * risk).
+    # VETO an entry when RSI AND OBV both diverge against it on the entry
+    # frame. Renamed from use_divergence_filter (2026-09-24): the old name
+    # and the docs claimed it also drove the LTF counter-divergence
+    # penalties, which belong to use_technical_entry_adjustment. Its old
+    # second switch, technical_levels.divergence_block_dual_counter, is gone.
+    use_dual_divergence_veto: bool = True
+    # The HTF RSI divergence SCORE term: +htf_divergence_aligned_bonus_rsi
+    # for an aligned HTF divergence, -htf_divergence_counter_penalty_rsi for a
+    # counter one, +htf_divergence_hidden_bonus_rsi for a same-side hidden one
+    # (technical_levels). It never blocks. Renamed from
+    # use_htf_divergence_filter (2026-09-24), which it never was. The HTF
+    # divergences are None whenever technical_levels.enabled or
+    # divergence_enabled is off, so the term needs no other switch.
+    use_htf_divergence_score: bool = True
+    # Divergence as an entry trigger of its own (off in every preset). With
+    # it on, a candidate the strategy produced no signal for may enter on a
+    # confirmed LTF RSI/OBV divergence (regular = reversal, hidden =
+    # continuation, the hidden one only with the HTF EMAs aligned) at S/R
+    # confluence whose latest pivot is in the current session. It passes
+    # through every veto, the refinement and min_shared_context_score like
+    # any entry, and always ranks behind the strategy's own signals. When
+    # the strategy's own proposal and a divergence agree on direction, the
+    # proposal's shared score gains divergence_entry_score_bump; when they
+    # disagree the proposal wins and is only stamped with the conflict. The
+    # stop sits support_resistance.stop_buffer_atr_mult ATR beyond the
+    # divergence pivot; the target is min_target_rr * risk, and an opposing
+    # S/R level inside that distance refuses the candidate (with
+    # min_target_rr off the target is the opposing level, or none: a
+    # runner). A symbol the strategy skipped before evaluating a setup (not
+    # its symbol, outside its window, too few bars) is never entered on a
+    # divergence. A strategy opts out in its manifest
+    # (capabilities.shared_entry.divergence_entry: false: pairs_residual,
+    # the two zero_dte strategies).
     use_divergence_entry_signal: bool = False
     divergence_entry_min_age_bars: int = 0
     divergence_entry_require_sr_confluence: bool = True
     divergence_entry_score_floor: float = 1.5
     divergence_entry_score_bump: float = 0.20
+    # The technical score term: channel / trendline / Bollinger / ADX /
+    # anchored-VWAP / ATR / OBV terms and the LTF divergence penalties and
+    # hidden-divergence bonuses (technical_levels.divergence_*).
     use_technical_entry_adjustment: bool = True
     use_technical_stop_target_refinement: bool = True
+    # VETO an entry against the LTF market structure (a fresh opposing CHoCH,
+    # or an opposing bias without a fresh same-side BoS), on the frame the
+    # strategy declares as its gate frame.
     use_structure_filter: bool = True
+    # VETO an entry pressed against the HTF S/R level ahead of it (inside
+    # support_resistance.entry_min_clearance_pct OR _atr) or through a broken
+    # level with none on its own side.
     use_sr_filter: bool = True
     use_sr_stop_target_refinement: bool = True
+    # VETO an entry within broken_level_min_clearance_pct (scaled by the
+    # proposal's volatility scale) or broken_level_min_clearance_atr of a
+    # confirmed BROKEN level beyond it (broken_support under a LONG,
+    # broken_resistance over a SHORT). Moved out of top_tier_adaptive
+    # (reject_entry_near_broken_level, 2026-09-24), where it existed to keep
+    # an entry clear of the S/R-loss exit's trigger; that exit ships off, and
+    # the setups the guard alone blocked did no worse than real fills, so it
+    # ships off in every preset too. The thresholds are top_tier's.
+    use_broken_level_guard: bool = False
+    broken_level_min_clearance_pct: float = 0.0025
+    broken_level_min_clearance_atr: float = 0.72
+    # VETO an entry against an opposing chart pattern. Runs after the retest
+    # admission (2026-09-24): it used to run only when no other reason was
+    # pending, so an entry the FVG retest admitted never met it.
     use_opposing_chart_filter: bool = True
-    # Block entries when opposing-direction candle patterns cluster above
+    # VETO an entry when the opposing-direction candle cluster reaches
     # candles.opposing_net_score_threshold. Uses the cached candle context
-    # (no extra ta-lib calls). See `_directional_candle_signal` entry block
-    # in top_tier_adaptive/strategy.py.
+    # (no extra ta-lib calls). Until 2026-09-24 only top_tier read it.
     use_opposing_candle_filter: bool = False
     # Minimum risk-to-reward floor enforced by the SR/technical-level
     # target refinement pipeline. When a refine pass would cap the target
@@ -989,8 +1122,11 @@ class SharedEntryLogicConfig:
     # rejected and the strategy's original target is kept. Protects
     # against the "$0.10 target" bug where nearby S/R levels collapse R:R
     # toward zero. Default 1.0 = require at least 1:1 R:R after any
-    # refinement.
-    min_target_rr: float = 1.0
+    # refinement. 0 or null switches the floor off (a positive reward is
+    # still required); until 2026-09-24 a configured 0 read as 1.0. Also
+    # the raw R:R gate a builder can ask for (top_tier's orb and sr_scalp)
+    # and the divergence entry's target floor.
+    min_target_rr: float | None = 1.0
     # Floor on how far the SR/technical refinement pipeline may pull a stop
     # TOWARD entry, in ATR14 units. min_target_rr cannot police this: pulling
     # the stop in RAISES reward/risk, so the R:R guard never binds on the
@@ -1001,7 +1137,14 @@ class SharedEntryLogicConfig:
     # pinned exactly to `nearest_support - level_buffer`, a median 2x (worst
     # 10x) tighter than the builder floor. The floor only refuses to TIGHTEN;
     # a builder that deliberately set a stop inside this distance keeps it.
-    min_stop_atr_mult: float = 1.5
+    # Since 2026-09-24 it also bounds the FVG / order-block retest stop
+    # anchor, which used to pull a stop to 0.05% from entry past it. 0 or
+    # null switches the floor off.
+    min_stop_atr_mult: float | None = 1.5
+    # Optional floor on the proposal's shared score (entry_context_adjustment
+    # + fvg_entry_adjustment + the divergence bump): an entry below it is
+    # refused as shared_context_below_min. null = no floor (as shipped).
+    min_shared_context_score: float | None = None
 
 
 @dataclass(slots=True)
@@ -1024,19 +1167,35 @@ class SharedExitLogicConfig:
     # cached candle context — no extra ta-lib calls.
     use_candle_pattern_exit: bool = False
     use_structure_exit: bool = True
-    use_sr_loss_exit: bool = True
+    # Exit on a confirmed break (broken_support / broken_resistance) of a
+    # level on the ADVERSE side of entry, with the tape confirming. Until
+    # 2026-09-24 it sat behind discretionary_exit_min_r, which it can never
+    # pass (price is through a level beyond entry, so R < 0), so it was dead
+    # in every preset; it is exempt now and reachable. It ships OFF, in
+    # every preset and as the code default: a full replay (26 sessions, 235
+    # positions) fired it on 13 positions, all top_tier_adaptive, at a
+    # median -0.72R, and against today's management (time stop, peak
+    # giveback) it cost -0.43R per firing, CI [-0.85, -0.05]. Every variant
+    # tried (a 5-20 min grace, a 0.25-0.75R loss cap, no tape confirmation)
+    # was negative too. Turning it on is in effect a tighter stop at about
+    # -0.7R.
+    use_sr_loss_exit: bool = False
     # Minimum open profit (in initial-risk R units) before the discretionary
-    # exit families may fire: bias-based structure exits, the technical
-    # exits (trendline / channel / bollinger / anchored-VWAP), and the S/R
-    # break exits. Below this threshold the protective stop governs the
-    # trade. These families carry no R condition of their own — only grace
-    # windows and tape confirmation — so they were cutting trades that had
-    # barely moved: over 2026-05-12..29 they closed 19 of 48 top_tier_adaptive
+    # exit families may fire: the bias-based structure exits and the
+    # technical exits (trendline / channel / bollinger / anchored-VWAP).
+    # Below this threshold the protective stop governs the trade. These
+    # families carry no R condition of their own — only grace windows and
+    # tape confirmation — so they were cutting trades that had barely
+    # moved: over 2026-05-12..29 they closed 19 of 48 top_tier_adaptive
     # trades at a median MFE of 0.09-0.29R for -$831 combined, and in the
     # widest-stop bucket 0 of 22 trades ever reached their stop because a
-    # discretionary exit got there first. CHoCH exits are exempt — a true
-    # change-of-character is a reversal signal, not noise. Set to 0 to
-    # restore the un-gated behaviour.
+    # discretionary exit got there first. The CHoCH exit is exempt, as it
+    # always was (an ungated structural stop-tightener, typically below about
+    # -0.4R). The S/R-break exit is exempt since 2026-09-24: for an equity it
+    # fires only on the losing side of entry, so the gate had kept it dead;
+    # an option's R is on its premium mark (see
+    # shared_exit.EXIT_FAMILY_GATES). Set to 0 to restore the un-gated
+    # behaviour.
     discretionary_exit_min_r: float = 0.5
     # Divergence exit (counter-direction REGULAR divergence forms while
     # holding). LONG + new bearish RSI/OBV div -> consider partial close.
@@ -1256,6 +1415,64 @@ _PERCENT_PARAM_NAMES = {
 _TRADE_MANAGEMENT_MODE_VALUES = {"adaptive", "adaptive_ladder", "sr_flip", "none"}
 
 
+# Keys removed from a config section, with what replaced them. A YAML still
+# carrying one fails at load with the replacement named, instead of a bare
+# "unexpected keyword argument" (or, for a key a dataclass would have
+# swallowed, silently doing nothing): the knob's old behaviour no longer
+# exists, so running on it would trade a config the operator never wrote.
+_RETIRED_SECTION_KEYS: dict[str, dict[str, str]] = {
+    "shared_entry": {
+        "use_divergence_filter": "renamed to shared_entry.use_dual_divergence_veto (2026-09-24)",
+        "use_htf_divergence_filter": "renamed to shared_entry.use_htf_divergence_score (2026-09-24)",
+    },
+    "technical_levels": {
+        "divergence_block_dual_counter": (
+            "removed 2026-09-24; the dual RSI+OBV divergence veto is "
+            "shared_entry.use_dual_divergence_veto alone"
+        ),
+    },
+}
+
+
+# Strategy params a strategy no longer reads, per strategy, with what
+# replaced them; checked against the preset's strategies.<name>.params. Each
+# strategy's entry is added as it moves onto the shared entry stage
+# (2026-09-24): its own veto / bypass params became shared_entry knobs or
+# manifest exemptions (capabilities.shared_entry.exemptions).
+_RETIRED_STRATEGY_PARAMS: dict[str, dict[str, str]] = {
+    # small_cap_squeeze runs the top_tier_adaptive engine (it subclasses it),
+    # so the two retire the same params.
+    **{name: {
+        "orb_bypass_structure_entry": (
+            "replaced by the manifest exemption capabilities.shared_entry.exemptions "
+            "{orb: [structure, sr]} (2026-09-24)"
+        ),
+        "orb_bypass_sr_entry": (
+            "replaced by the manifest exemption capabilities.shared_entry.exemptions "
+            "{orb: [structure, sr]} (2026-09-24)"
+        ),
+        "reject_entry_near_broken_level": "replaced by shared_entry.use_broken_level_guard (2026-09-24)",
+        "broken_level_min_clearance_pct": "replaced by shared_entry.broken_level_min_clearance_pct (2026-09-24)",
+        "broken_level_min_clearance_atr": "replaced by shared_entry.broken_level_min_clearance_atr (2026-09-24)",
+    } for name in ("top_tier_adaptive", "small_cap_squeeze")},
+    # The ORB path's own vetoes; the premium proposals of both styles now meet
+    # the shared structure / S/R vetoes.
+    "zero_dte_etf_long_options": {
+        "orb_apply_structure_veto": "replaced by shared_entry.use_structure_filter (2026-09-24)",
+        "orb_apply_sr_veto": "replaced by shared_entry.use_sr_filter (2026-09-24)",
+    },
+    # The switch that kept the shared S/R veto off for these two; the veto is
+    # the global shared_entry.use_sr_filter now.
+    **{name: {
+        "use_sr_veto": "replaced by shared_entry.use_sr_filter (2026-09-24)",
+    } for name in ("peer_confirmed_htf_pivots", "peer_confirmed_trend_continuation")},
+}
+
+
+def _reject_retired_keys(config_path: Path, section: str, raw: Mapping[str, Any], retired: Mapping[str, str]) -> None:
+    stale = [f"{section}.{key}: {hint}" for key, hint in retired.items() if key in raw]
+    if stale:
+        raise ValueError(f"{config_path}: retired config keys -- " + "; ".join(stale))
 
 
 def _normalize_trade_management_mode(value: Any) -> str:
@@ -1410,6 +1627,26 @@ def _validate_runtime_config(runtime: RuntimeConfig, config_path: Path) -> None:
         errors.append(f"runtime.prewarm_before_windows_minutes must be >= 0, got {runtime.prewarm_before_windows_minutes}")
     if errors:
         raise ValueError(f"{config_path}: invalid runtime configuration:\n  " + "\n  ".join(errors))
+
+
+def _validate_support_resistance_config(sr: SupportResistanceConfig, config_path: Path) -> None:
+    """Reject flip-confirmation bar counts below 0, and both at 0. 0 is valid
+    for one frame (that frame's gate is off, see ``flip_confirmation_bars``);
+    a negative count has no meaning and would read as "never confirms" deep
+    inside confirm_by_bars. With both off the readers disagreed: the S/R
+    builders fell back to the last HTF bar, while the adaptive ladder's rung
+    check has no fallback bar and could never confirm, so its stop was never
+    promoted."""
+    errors: list[str] = []
+    names = ("trading_flip_confirmation_1m_bars", "trading_flip_confirmation_5m_bars")
+    for name in names:
+        value = getattr(sr, name)
+        if int(value) < 0:
+            errors.append(f"support_resistance.{name} must be >= 0, got {value}")
+    if all(int(getattr(sr, name)) == 0 for name in names):
+        errors.append("support_resistance: at least one of trading_flip_confirmation_1m_bars / _5m_bars must be > 0")
+    if errors:
+        raise ValueError(f"{config_path}: invalid support_resistance configuration:\n  " + "\n  ".join(errors))
 
 
 def _validate_execution_config(execution: EquityExecutionConfig, risk: RiskConfig, config_path: Path) -> None:
@@ -1626,12 +1863,16 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     events_raw = dict(raw.get("events", {}) or {})
     shared_entry_raw = dict(raw.get("shared_entry", {}) or {})
     shared_exit_raw = dict(raw.get("shared_exit", {}) or {})
+    for section, section_raw in (("shared_entry", shared_entry_raw), ("technical_levels", technical_levels_raw)):
+        _reject_retired_keys(config_path, section, section_raw, _RETIRED_SECTION_KEYS[section])
     options_raw = _normalize_options_config(raw.get("options", {}))
 
     strategies = _strategy_defaults()
 
     for key, value in (raw.get("strategies", {}) or {}).items():
         name = normalize_strategy_name(key)
+        _reject_retired_keys(config_path, f"strategies.{name}.params", value.get("params", {}) or {},
+                             _RETIRED_STRATEGY_PARAMS.get(name, {}))
         base = strategies[name]
         merged_params = deepcopy(base.params)
         merged_params.update(deepcopy(value.get("params", {}) or {}))
@@ -1677,6 +1918,9 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
             "(e.g. SPY, QQQ) under the options section."
         )
 
+    support_resistance_cfg = SupportResistanceConfig(**support_resistance_raw)
+    _validate_support_resistance_config(support_resistance_cfg, config_path)
+
     return BotConfig(
         strategy=strategy,
         schwab=SchwabConfig(**schwab_raw),
@@ -1695,7 +1939,7 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
         execution=execution_cfg,
         candles=CandlesConfig(**candles_raw),
         chart_patterns=ChartPatternsConfig(**chart_patterns_raw),
-        support_resistance=SupportResistanceConfig(**support_resistance_raw),
+        support_resistance=support_resistance_cfg,
         technical_levels=TechnicalLevelsConfig(**technical_levels_raw),
         events=EventsConfig(**events_raw),
         shared_entry=SharedEntryLogicConfig(**shared_entry_raw),

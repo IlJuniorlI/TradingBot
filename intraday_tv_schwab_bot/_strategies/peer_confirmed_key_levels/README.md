@@ -63,7 +63,15 @@ After the local level/trigger logic, the strategy checks the surrounding context
 
 Those checks are not just dashboard cosmetics. They are real gating conditions. A stock can be sitting on a good hourly zone and still be skipped because its peer basket or macro basket is not agreeing strongly enough.
 
-### 6. Stop, target, and ladder behavior
+### 6. The shared entry stage
+
+Every side that passes these gates — plus key_levels' own target-clearance check, `require_peer_target_clearance` below — is handed to the shared entry stage (`shared_entry.SharedEntryPolicy`, 2026-09-24), like every strategy's setup. It runs the `shared_entry` vetoes the YAML switches on (structure, S/R, chart, candle, dual divergence, broken level), the S/R and technical stop/target refinement, and the score terms (the FVG term, the HTF RSI divergence term on this strategy's own 60m context, and the entry-context terms). Its frames: the vetoes and the structure / technical / chart / candle contexts read the 5m trigger frame the setup was read on, S/R is built on the 1m frame, and the FVG term — and the runner's continuation bias — read the 1m frame, as this strategy always has. Two ATRs follow from that: the refinement's stop floor (`shared_entry.min_stop_atr_mult`) is in ATR of the 5m trigger frame the stop is priced on, while the broken-level guard's `broken_level_min_clearance_atr` — like the divergence entry candidates — reads the 1m S/R frame, the frame top_tier's thresholds were set on (a 1m ATR is roughly half a 5m one). A refusal lists every blocker under the side's `long.` / `short.` prefix. Until 2026-09-24 key_levels reached three of those knobs (the FVG term, the HTF divergence term and `use_sr_filter`, which gated its own clearance check); the preset keeps the others off for parity except `use_structure_filter` (user decision: on).
+
+- `require_peer_target_clearance` (default `true`): the NEAREST HTF key level in the trade's direction must clear BOTH `support_resistance.entry_min_clearance_pct` and `entry_min_clearance_atr` (5m ATR), else the side is refused as `too_close_to_overhead_resistance` / `too_close_to_nearby_support`. It rode on `shared_entry.use_sr_filter` until 2026-09-24; that knob is the shared S/R veto (either clearance, against the S/R context) now. `support_resistance.enabled: false` still turns it off.
+
+The signal carries `regime: key_level`, `entry_style_family: peer`, `strategy_priority_score` (the strategy's own sum), `shared_context_score` and `final_priority_score` = the two added — the total it summed itself before, as long as the YAML keeps the entry-context score terms off (the preset does). `selection_quality_score` is still `final_priority_score + 0.20 × the level's selection score`; the gatekeeper ranks on `ltf_score + 0.5 × shared_context_score` (manifest `signal_priority.shared_score_weight`, user decision 3), then the manifest's tail.
+
+### 7. Stop, target, and ladder behavior
 
 This strategy is especially strong in post-entry management because it knows the surrounding hourly ladder. It can:
 
@@ -71,10 +79,13 @@ This strategy is especially strong in post-entry management because it knows the
 - target the next qualifying level(s)
 - emit rung metadata for `adaptive_ladder` management
 - ratchet stops behind defended levels as the trade progresses
+- exit on the ladder defence (its `strategy_exit_signal` hook, after every shared exit held): the defended zone flipped (`ladder_support_lost` / `ladder_resistance_lost`), or an HTF CHoCH / BoS against the trade with the close through every EMA / VWAP reference that has a value (`ladder_structure_fail_long` / `_short`). The break must have happened after entry — its `htf_minutes` bar closed after the fill. Until 2026-09-24 any break still inside `htf_structure_event_lookback_bars` counted, a whole session of 60m bars, so a trade taken against a morning CHoCH exited on its first cycle with the close under its references.
+
+The strategy proposes its stop and the FARTHEST qualifying rung as the target; the shared refinement may pull the stop in and cap the target. The rungs are then re-qualified from the refined stop at `min_rr` — none past the refined target (`no_qualifying_target_rr_after_refine` when none is left) — so the ladder's R multiples are the traded stop's, and the signal targets the first rung (or the strong-setup offset rung).
 
 That makes it more structurally anchored than simple percent-stop / percent-target systems.
 
-### 7. What a strong setup looks like
+### 8. What a strong setup looks like
 
 The best key-level setup usually looks like:
 
@@ -108,6 +119,7 @@ Strategy-specific knobs:
   - Stronger signals are prioritized lexicographically by trigger quality, level quality, peer confirmation, vote edge, and clearance before smaller additive bonuses are allowed to break ties.
 - Zone, score, and R:R:
   - `zone_atr_mult`, `zone_pct`, `min_level_score`, `min_ltf_score`, `min_rr`, `stop_buffer_atr_mult`
+  - `require_peer_target_clearance` (the AND target clearance, section 6)
   - `ltf_quality_bonus_enabled`, `ltf_quality_max_bonus`, `ltf_reclaim_quality_bonus_cap`, `ltf_zone_interaction_bonus_cap`, `ltf_candle_quality_bonus_cap`, `ltf_volume_quality_bonus_cap`, `ltf_range_expansion_bonus_cap`
 - Peer confirmation:
   - `min_peer_agreement`, `min_peer_score`
@@ -160,6 +172,7 @@ Current package defaults:
 | `min_peer_score`                     | `2`                                       |
 | `enable_macro_confirmation`          | `true`                                    |
 | `require_macro_agreement_count`      | `1`                                       |
+| `require_peer_target_clearance`      | `true`                                    |
 | `dollar_symbol`                      | `NYICDX`                                  |
 | `bond_symbol`                        | `TLT`                                     |
 | `volatility_symbol`                  | `VIX`                                     |

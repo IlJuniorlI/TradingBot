@@ -142,11 +142,14 @@ candles:
     - bearish_2c
     - bearish_3c
 
-# Higher-level chart-pattern detection and entry/exit filters. lookback_bars is
-# in base-1m bars (= 32 min). The bearish set is kept for the opposing-chart
-# entry filter (don't long into a forming top) and pattern-based exit context.
-# If dry-run shows the opposing-chart filter blocking valid squeeze longs, set
-# shared_entry.use_opposing_chart_filter: false rather than emptying these.
+# Higher-level chart-pattern detection. lookback_bars is in base-1m bars
+# (= 32 min). In this engine (top_tier's) chart patterns only SCORE: a matched
+# same-side pattern adds +0.35 (continuation) or +0.15 (reversal) to the
+# entry score. Nothing blocks on them: shared_entry.use_opposing_chart_filter
+# is false here (parity; the engine never read it before 2026-09-24) and
+# use_chart_pattern_exit is off.
+# Long-only, so the bearish set changes no decision; it only feeds the
+# dashboard's pattern tooltip.
 chart_patterns:
   enabled: true
   lookback_bars: 32
@@ -172,9 +175,9 @@ chart_patterns:
     - bearish_symmetrical_triangle
 
 # Dashboard server, charting, and HTTPS settings. compact_chart_timeframe: ltf
-# draws the 1m LTF the strategy trades on. No ltf_ema_*/htf_ema_* span overrides
-# here: at ltf_indicator_span_scale 1 the LTF EMAs are native 9/20 (the chart
-# default), so the chart already matches the bot.
+# draws the 1m LTF the strategy trades on, with the strategy's own LTF EMAs
+# (ltf_ema_fast_span / ltf_ema_slow_span, 9 / 20). The HTF chart draws the HTF
+# EMAs the strategy's HTF EMA trend reads (htf_ema_fast_span / _slow_span).
 dashboard:
   enabled: true
   host: 127.0.0.1
@@ -254,7 +257,7 @@ support_resistance:
   timeframe_minutes: 15
   lookback_days: 10
   pivot_span: 2
-  max_levels_per_side: 4           # 4 (vs default 3) = more ladder rungs for the hybrid scale-out
+  max_levels_per_side: 4           # 4 (vs default 3) = more ladder rungs: more stop/target steps
   atr_tolerance_mult: 0.6
   pct_tolerance: 0.003
   same_side_min_gap_atr_mult: 0.1
@@ -269,8 +272,9 @@ support_resistance:
   # ATR / 0.38%, stricter even than top_tier's 0.72 / 0.25%). A squeeze trades
   # INTO and THROUGH levels, so the default clearance would reject exactly the
   # near-resistance breakout entries this strategy exists to take. The
-  # reject_target_beyond_sr + reject_entry_near_broken_level strategy params
-  # still guard against buying a hard ceiling.
+  # reject_target_beyond_sr strategy param still guards against buying a
+  # hard ceiling (the broken-level guard, shared_entry.use_broken_level_guard,
+  # ships off since 2026-09-24).
   entry_min_clearance_atr: 0.55
   entry_min_clearance_pct: 0.0020
   entry_proximity_scoring_enabled: true
@@ -339,6 +343,11 @@ technical_levels:
   trendline_lookback_bars: 120
   trendline_min_touches: 3
   trendline_atr_tolerance_mult: 0.35
+  # 2026-09-23: kept at 0.15. The large-cap presets moved to 0.65 because a
+  # 0.10%-of-price floor used to decide their buffer; on small-cap tape (ATR
+  # a median 2.6% of price) 0.15 x ATR beat that floor on 99.9% of bars
+  # (small_cap_squeeze archive 06-01..03), so 0.15 IS the buffer this preset
+  # has always used. 0.65 made breaks need a 4.3x larger move here.
   trendline_breakout_buffer_atr_mult: 0.15
   adx_enabled: true
   adx_length: 14
@@ -402,26 +411,35 @@ technical_levels:
   # entries chasing blow-off tops.
   entry_penalty_near_extension: 0.0
 
-# Shared entry-side toggles. Mirrors top_tier (the divergence/structure/SR/FVG
-# filters and technical entry adjustment all on). use_opposing_chart_filter is
-# the one most likely to over-block an always-extended squeezer — flip it off
-# here if dry-run shows it rejecting valid longs.
+# Shared entry knobs. Global since 2026-09-24: each one acts on this strategy
+# through the shared entry stage. Values are what the top_tier engine
+# effectively did before ("parity"): it never read the dual-divergence or
+# the chart veto, so both are off; the broken-level guard ships off.
 shared_entry:
   use_fvg_context: true
-  use_divergence_filter: true
+  # Veto an entry when RSI AND OBV both diverge against it.
+  use_dual_divergence_veto: false  # parity: this strategy never read it before 2026-09-24
   use_technical_entry_adjustment: true
   use_technical_stop_target_refinement: true
   use_structure_filter: true
   use_sr_filter: true
   use_sr_stop_target_refinement: true
-  use_htf_divergence_filter: true
+  use_htf_divergence_score: true
   use_divergence_entry_signal: false
   divergence_entry_min_age_bars: 0
   divergence_entry_require_sr_confluence: true
   divergence_entry_score_floor: 1.5
   divergence_entry_score_bump: 0.20
-  use_opposing_chart_filter: true
+  use_opposing_chart_filter: false  # parity: this strategy never read it before 2026-09-24
   use_opposing_candle_filter: false
+  # VETO an entry within broken_level_min_clearance_pct (scaled by the symbol's
+  # volatility) or _atr of a confirmed broken level beyond it. Moved here from
+  # params.reject_entry_near_broken_level (2026-09-24) with this preset's
+  # thresholds; it ships off: it existed to keep entries clear of the
+  # S/R-loss exit (off), and the setups it alone blocked did no worse than fills.
+  use_broken_level_guard: false
+  broken_level_min_clearance_pct: 0.0025
+  broken_level_min_clearance_atr: 0.72
   # R:R floor for the TARGET side of the SR/technical refinement pipeline.
   min_target_rr: 1.0
   # Floor on how far refinement may pull the STOP toward entry, in ATR14.
@@ -443,7 +461,7 @@ shared_exit:
   use_anchored_vwap_loss: true
   use_chart_pattern_exit: false
   use_structure_exit: true
-  use_sr_loss_exit: true
+  use_sr_loss_exit: false  # ships off in every preset (2026-09-24), see config.example.yaml
   use_divergence_exit_signal: false
   divergence_exit_partial_frac: 0.5
   divergence_exit_min_age_bars: 1
@@ -458,10 +476,14 @@ shared_exit:
   bearish_close_position_loose_min: 0.62
   use_candle_pattern_exit: false
   # Minimum open profit (R) before the discretionary exit families may fire:
-  # bias structure exits, the technical exits (trendline / channel /
-  # bollinger / anchored-VWAP) and the S/R break exits. None carry an R
-  # condition of their own, so below this threshold they act as an arbitrary
-  # tightened stop; the protective stop governs instead. CHoCH stays exempt.
+  # bias structure exits and the technical exits (trendline / channel /
+  # bollinger / anchored-VWAP). None carry an R condition of their own, so
+  # below this threshold they act as an arbitrary tightened stop; the
+  # protective stop governs instead. CHoCH was always exempt: it is an
+  # ungated structural stop-tightener (typically below about -0.4R, on
+  # roughly 0.5-1.3% of positions). The S/R-break exit is exempt since
+  # 2026-09-24 (it fires only on the losing side of entry, so the gate had
+  # kept it dead; it ships off anyway).
   # R-denominated, so it ports across price ranges. NOTE: this preset's
   # ladder is deliberately LATER than top_tier's (breakeven 1.2 vs 0.6) —
   # this gate sits well below it and does not interact.
@@ -562,11 +584,25 @@ strategies:
       extended_hours_tradable_all: true
 
       # ===================== Timeframe (1m LTF) =====================
-      # span_scale 1 = native 1m indicators (9/20 EMA, 14 ATR) — responsive and
+      # span_scale 1 = native 1m indicators (14 ATR, ...) — responsive and
       # tighter ATR stops, which suits fast squeeze scalps. Raise toward 3-5 to
       # smooth the signals and widen the ATR-based stops (PRIMARY tuning knob).
+      # The LTF EMAs the entry scoring reads are set on their own by
+      # ltf_ema_fast_span / ltf_ema_slow_span (9 / 20 = native), so the span
+      # scale no longer moves them; raise these to smooth the EMA votes alone.
+      # Exits read the base 1m frame's native EMA9 / EMA20.
       ltf_minutes: 1
       ltf_indicator_span_scale: 1
+      ltf_ema_fast_span: 9
+      ltf_ema_slow_span: 20
+      # HTF EMA trend inputs (15m): read by the inherited top_tier HTF EMA
+      # gate / score term (both off here) and drawn on the HTF chart.
+      # require_htf_ema_alignment: enabled / true, long_only, short_only or
+      # disabled / false.
+      htf_ema_fast_span: 50
+      htf_ema_slow_span: 200
+      require_htf_ema_alignment: disabled
+      htf_ema_alignment_score: 0.0
       min_bars: 20
       min_ltf_bars: 15
 
@@ -598,9 +634,10 @@ strategies:
       directional_bias_min_day_strength: 0.5
 
       # ===================== Hybrid scalp + runner management =====================
-      # Scale out at S/R rungs via the adaptive ladder; trail the remaining runner
-      # with peak-giveback (loose for high-conviction squeeze days so big moves get
-      # room to extend).
+      # The adaptive ladder steps the stop and target up through the S/R rungs;
+      # it never sells part of the position, so the whole position rides to one
+      # exit (the last rung clears the target, and peak-giveback -- loose on
+      # high-conviction squeeze days so big moves get room to extend -- trails it).
       # 2026-06-01 dry-run retune: the original 0.6R break-even / 1.1R profit-lock /
       # 0.5R lock moved the stop up so early that routine mid-squeeze pullbacks
       # (these names breathe 15-25% intra-move) stopped runners out at ~1R while
@@ -650,8 +687,6 @@ strategies:
       trailing_bias_majority_threshold: 0.7
       # -- entry gates
       activity_score_weight: 0.12
-      broken_level_min_clearance_atr: 0.72
-      broken_level_min_clearance_pct: 0.0025
       entry_bar_body_max_atr_mult: 1.4
       entry_bar_range_max_atr_mult: 1.8
       stretched_atr_mult_max: 1.1
@@ -694,8 +729,6 @@ strategies:
       orb_bypass_relative_strength: true
       orb_bypass_screener_bias: true
       orb_bypass_side_decision: true
-      orb_bypass_sr_entry: true
-      orb_bypass_structure_entry: true
       orb_max_range_atr_mult: 4.0
       orb_min_range_atr_mult: 0.5
       orb_opposing_sr_atr_mult: 0.5

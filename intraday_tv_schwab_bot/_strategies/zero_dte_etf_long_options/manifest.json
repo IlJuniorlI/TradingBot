@@ -30,8 +30,6 @@
     "orb_opening_window_start": "09:30",
     "orb_opening_window_end": "09:34",
     "orb_opening_min_bars": 3,
-    "orb_apply_structure_veto": true,
-    "orb_apply_sr_veto": true,
     "trend_start_time": "10:05",
     "trend_end_time": "13:30",
     "no_new_entries_after": "13:45",
@@ -86,6 +84,12 @@
     "fvg_context_weight_scale": 0.9
   },
   "capabilities": {
+    "signal_priority": {
+      "primary_field": "strategy_priority_score"
+    },
+    "shared_entry": {
+      "divergence_entry": false
+    },
     "dashboard": {
       "tradable_symbols_source": "options.underlyings"
     },

@@ -37,6 +37,7 @@ Before building the option signal, the strategy can skip the trade because of:
 - an existing open option tied to the same underlying
 - insufficient underlying bars
 - regime classification failure
+- the shared entry vetoes, on both styles (see "Shared entry stage" below): the LTF market structure against the trade's direction and a crowded S/R level (both shipped on), plus the chart / candle / divergence / broken-level vetoes when their `shared_entry` knobs are switched on
 
 That is by design. It wants the underlying day type to be right first, then the option implementation second.
 
@@ -96,8 +97,6 @@ Current code defaults:
 | `orb_opening_window_start`           | `09:30`              |
 | `orb_opening_window_end`             | `09:34`              |
 | `orb_opening_min_bars`               | `3`                  |
-| `orb_apply_structure_veto`           | `true`               |
-| `orb_apply_sr_veto`                  | `true`               |
 | `trend_start_time`                   | `10:05`              |
 | `trend_end_time`                     | `13:30`              |
 | `no_new_entries_after`               | `13:45`              |
@@ -159,9 +158,7 @@ Common parameter families:
   - `orb_start_time`, `orb_end_time`, `orb_opening_window_start`, `orb_opening_window_end`, `orb_opening_min_bars`, `trend_start_time`, `trend_end_time`, `no_new_entries_after`
   - The **trading window** (`orb_start_time` → `orb_end_time`) determines when ORB entries are eligible to fire. The **opening window** (`orb_opening_window_start` → `orb_opening_window_end`) determines the bars used to derive `or_high` / `or_low` — the levels the breakout is measured against. Default keeps the legacy behaviour (09:30-09:34 opening, 09:35-10:05 trading) but the two are decoupled — extending the trading window without extending the opening window means later breakouts are measured against an unchanging early-session reference.
   - `orb_opening_min_bars` (default `3`) requires at least N bars in the opening window before deriving or_high/or_low. Guards against the degenerate case where a single 09:34 bar is treated as the "opening range."
-- ORB structural / SR vetoes:
-  - `orb_apply_structure_veto` (default `true`): blocks bullish ORB entries when the LTF market structure is bearish (`_blocks_bullish_structure_entry`); mirror for bearish ORB entries. Mirrors the structural vetoes applied to trend-window entries via `_long_option_style_gate`. Set `false` to restore the pre-2026-05-14 "fire on any breakout that clears or_high/or_low" behaviour.
-  - `orb_apply_sr_veto` (default `true`): blocks ORB entries trapped against the wrong side of broken SR levels (`_blocks_bullish_sr_entry` / `_blocks_bearish_sr_entry`).
+- Structure / S/R vetoes (both styles): `shared_entry.use_structure_filter` and `shared_entry.use_sr_filter` (both `true` in the preset). They replaced the ORB path's `orb_apply_structure_veto` / `orb_apply_sr_veto` params on 2026-09-24; a preset that still sets either fails at load, naming its replacement. Set both knobs `false` for the pre-2026-05-14 "fire on any breakout that clears or_high/or_low" behaviour (that also drops them from the trend style, which always ran them).
 - Minimum data:
   - `min_bars`, `min_confirm_bars`, `trend_vwap_lookback`, `flip_lookback`, `range_lookback`
 - Live tape filters (replace legacy TV cumulative RVOL — 2026-05-14):
@@ -200,9 +197,49 @@ General behavior:
 - Raising `fvg_context_weight_scale` makes one-minute and HTF FVG context matter more to the regime score.
 - Tightening the trend-extension caps reduces late chase entries.
 
+## Shared entry stage (2026-09-24)
+
+Every `shared_entry` knob is applied by the shared entry stage
+(`_strategies/shared_entry.py`, `SharedEntryPolicy`); the strategy no longer
+reads any of them itself.
+
+- Both styles hand a *premium* proposal (family `option_long`, the underlying's
+  frame, no price stop / target) to `entry_policy.admit` in
+  `_build_single_option_signal`, before the chain is read. The proposal's
+  direction is the underlying's: a long call is LONG, a long put SHORT, while
+  both orders are buys (`emit(order_side=LONG)`), so the vetoes read the side
+  the trade needs the underlying to go.
+- The ORB path's own structure / S/R vetoes are gone. They were an `elif`, with
+  an `orb_long_option_` prefix on the reason, so a structure veto hid an S/R one.
+  The shared vetoes are recorded under their shared tokens, every blocker
+  listed (`market_structure_bearish(...)`, `too_close_to_htf_resistance(...)`).
+- The trend style's own blockers (`_long_option_style_gate`: conviction, score
+  gap, VWAP / EMA extension, 5 / 15-bar spike) are the proposal's pending
+  reasons. A refusal lists them first, then the shared vetoes. The gate itself
+  no longer runs the structure / S/R checks.
+- The regime engine is the parent's: its LTF structure veto moved into the
+  stage, its HTF structure-bias veto stays (see `zero_dte_etf_options/README.md`).
+- Ranking is on `strategy_priority_score` (activity + the traded regime's score
+  and margin), with shared weight 0. `final_priority_score` adds the shared
+  context score (the FVG entry term with the shipped knobs), for the logs only.
+  No divergence-only entries (`capabilities.shared_entry.divergence_entry: false`).
+
 ## Files in this folder
 
 - `manifest.json` defines the plugin registration metadata.
 - `configs/config.zero_dte_etf_long_options.yaml` is the matching top-level tuned preset for this strategy.
 - `screener.py` builds the candidate list for this strategy.
 - `strategy.py` contains the actual entry / exit logic.
+
+## Same-level retry block on an option (2026-09-25)
+
+`risk.same_level_block_minutes` keys an option signal on the **underlying**: its
+market direction (`metadata['direction']`) and its price at entry
+(`underlying_entry`), against `same_level_block_atr_mult` x the underlying's ATR
+at exit. Until then it compared premiums with that ATR, so it could only fire on
+an exact premium match. Every long call and long put is BOUGHT, so the old
+order-side match could never tell a call from a put; the direction now does
+(a long call is bullish, a long put bearish). The preset ships
+`same_level_block_minutes: 0` (parity: the old block never fired on an option in
+the archive); turning it on is a go-live decision for a beta dry-run. See
+`zero_dte_etf_options/README.md` for the detail.

@@ -7,7 +7,8 @@ aggregates closed trades along five axes to support strategy/config tuning:
   * per-regime        — how each setup type performed (trend/pullback/range/...)
   * per-symbol        — catches concentration issues and high-variance tickers
   * per-exit-reason   — surfaces leaky exit mechanisms (phantom stops, tight targets)
-  * per-hour          — identifies dead zones in the trading day
+  * per-partial-exit-reason — what each scale-out / partial-fill slice booked
+  * per-hour         — identifies dead zones in the trading day
   * MAE / MFE         — max adverse / favorable excursion in R-multiples
   * post-stop run     — how far price ran the trade's way AFTER the stop,
                         i.e. how much of a correctly-called move a shakeout cost
@@ -17,8 +18,8 @@ aggregates closed trades along five axes to support strategy/config tuning:
 
 All aggregate sections are emitted both in the human log (fixed-width tables)
 and inside the SESSION_REPORT structured JSON payload (under top-level keys
-``per_regime``, ``per_symbol``, ``per_exit_reason``, ``per_hour``,
-``mae_mfe``, ``post_stop_continuation``, ``filter_rejections``) so
+``per_regime``, ``per_symbol``, ``per_exit_reason``, ``per_partial_exit_reason``,
+``per_hour``, ``mae_mfe``, ``post_stop_continuation``, ``filter_rejections``) so
 downstream tooling can parse them without re-scraping.
 """
 from __future__ import annotations
@@ -89,6 +90,7 @@ def _trade_csv_row(trade: TradeRecord, session_date: str) -> dict[str, Any]:
         "entry_risk_overage_frac": _round_opt(trade.entry_risk_overage_frac, 6),
         "armed_retest_status": trade.armed_retest_status,
         "armed_retest_waited_minutes": _round_opt(trade.armed_retest_waited_minutes, 2),
+        "partial_exit_reasons": "|".join(trade.partial_exit_reasons),
     }
 
 
@@ -169,15 +171,26 @@ def _per_symbol(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
     return {symbol: _summarize_group(group) for symbol, group in _group_by(trades, lambda t: t.symbol).items()}
 
 
-def _per_exit_reason(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
+def _exit_reason_bucket(reason: str) -> str:
     # Strip any parameterization off the reason string so
     # "resistance_break_exit:311.5900" and "resistance_break_exit:313.00"
     # roll up into "resistance_break_exit".
-    def _normalize(reason: str) -> str:
-        base = str(reason or "unknown").split(":", 1)[0].strip()
-        return base or "unknown"
+    base = str(reason or "unknown").split(":", 1)[0].strip()
+    return base or "unknown"
 
-    return {reason: _summarize_group(group) for reason, group in _group_by(trades, lambda t: _normalize(t.reason)).items()}
+
+def _per_exit_reason(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
+    """Closed trades by the reason of their FINAL exit."""
+    return {reason: _summarize_group(group) for reason, group in _group_by(trades, lambda t: _exit_reason_bucket(t.reason)).items()}
+
+
+def _per_partial_exit_reason(slices: list[TradeRecord]) -> dict[str, dict[str, Any]]:
+    """Partial-exit SLICES by their own reason: what each scale-out (and each
+    broker partial fill) booked. A folded trade reports only its final
+    reason, so without this a divergence scale-out never appeared in the
+    exit tables at all (2026-09-24)."""
+    partials = [t for t in slices if bool(t.partial_exit)]
+    return {reason: _summarize_group(group) for reason, group in _group_by(partials, lambda t: _exit_reason_bucket(t.reason)).items()}
 
 
 def _per_hour(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
@@ -849,6 +862,9 @@ def write_session_report(
                 return False
 
         closed = [t for t in closed_trade_lifecycles(trades) if _closed_today(t)]
+        # The slices that closed part of a trade today, whether or not the
+        # rest of it has closed yet: their P&L is realized today.
+        partial_slices = [t for t in trades if bool(t.partial_exit) and _closed_today(t)]
 
         # --- Log summary ---
         wins = sum(1 for t in closed if t.realized_pnl > 0)
@@ -886,6 +902,7 @@ def write_session_report(
         per_entry_path = _per_entry_path(closed)
         per_symbol = _per_symbol(closed)
         per_exit_reason = _per_exit_reason(closed)
+        per_partial_exit_reason = _per_partial_exit_reason(partial_slices)
         per_hour = _per_hour(closed)
         mae_mfe = _mae_mfe_summary(closed)
         filter_rejections = _filter_rejection_summary(skip_counts)
@@ -900,6 +917,8 @@ def write_session_report(
             _log_group_table("Per entry path", per_entry_path, key_label="entry_path")
             _log_group_table("Per symbol", per_symbol, key_label="symbol")
             _log_group_table("Per exit reason", per_exit_reason, key_label="exit_reason")
+            if per_partial_exit_reason:
+                _log_group_table("Per partial exit reason", per_partial_exit_reason, key_label="partial_exit_reason")
             _log_group_table("Per hour (entry)", per_hour, key_label="hour_et")
             _log_mae_mfe(mae_mfe)
             _log_post_stop_continuation(post_stop)
@@ -923,6 +942,7 @@ def write_session_report(
             "per_entry_path": per_entry_path,
             "per_symbol": per_symbol,
             "per_exit_reason": per_exit_reason,
+            "per_partial_exit_reason": per_partial_exit_reason,
             "per_hour": per_hour,
             "mae_mfe": mae_mfe,
             "post_stop_continuation": post_stop,
@@ -1280,6 +1300,25 @@ def _forward_baseline(
     }
 
 
+def _reason_tokens(reasons: str) -> list[str]:
+    """A decision's comma-joined ``reasons`` split into its reasons: at the
+    commas outside parentheses, since a reason's detail
+    (``(trend=1.0,pb=0.0)``, ``(group=ai_hardware,n=2)``) holds commas."""
+    tokens: list[str] = []
+    depth = 0
+    start = 0
+    for pos, char in enumerate(reasons):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            tokens.append(reasons[start:pos])
+            start = pos + 1
+    tokens.append(reasons[start:])
+    return [token.strip() for token in tokens if token.strip()]
+
+
 def _reason_side(primary: str) -> str | None:
     """``LONG`` / ``SHORT`` when a skip reason names the side it stopped
     (``long_build_failed_...``, ``build_failed_short_...``), else None."""
@@ -1312,6 +1351,15 @@ def _gate_attribution(
     of 60 does not mean 60% of those trades would have won — the stop might
     have been hit first. Read it as "the gate blocked a move", not "the gate
     blocked a winner".
+
+    Every gate on a row is scored, not only ``primary``: top_tier logs an
+    unqualified side ahead of every build, so on a row where one side was
+    unqualified the gate that stopped the other side's qualified build sat in
+    ``reasons`` (2026-09-21: 267 minutes of long trend blocks by the
+    confirmation-bar gate never scored, at the opposite edge to the counted
+    ones). Each side-prefixed build reason after ``primary`` is scored too;
+    a row led by a built signal (``top_tier_range_long,max_positions``) is
+    scored under the engine gate that blocked it, on the signal's side.
 
     Reasons are normalised through ``_normalize_skip_reason``, so the numeric
     detail that fragments `session_skip_counts` into hundreds of near-
@@ -1361,12 +1409,6 @@ def _gate_attribution(
                 primary = str(row.get("primary", "") or "").strip()
                 if not primary or primary == "none":
                     continue
-                reason = _normalize_skip_reason(primary)
-                key = (symbol, ts.replace(second=0), reason)
-                if key in seen:
-                    continue
-                seen.add(key)
-
                 # Which way was the bot about to trade? The reason's own side
                 # when it names one -- `short_build_failed_...` is the SHORT
                 # build this gate stopped. `side_pref` is the CANDIDATE's
@@ -1376,19 +1418,41 @@ def _gate_attribution(
                 # in the wrong direction. It stands in only for reasons that
                 # name no side. Without a side there is no "favourable"
                 # direction and the row cannot be scored.
-                side = _reason_side(primary) or str(row.get("side_pref", "") or "").strip().upper()
-                if side not in {"LONG", "SHORT"}:
-                    continue
-
-                blocked[reason] += 1
+                side_pref = str(row.get("side_pref", "") or "").strip().upper()
+                tokens = _reason_tokens(str(row.get("reasons", "") or "")) or [primary]
+                lowered = primary.lower()
+                built = None if _BUILD_FAILED_SIDE_RE.match(lowered) else _ENTERED_REGIME_RE.search(lowered)
+                if built is not None:
+                    signal_side = built.group("side").upper()
+                    gates = [(token, signal_side) for token in tokens[1:]] or [(primary, signal_side)]
+                else:
+                    gates = [(primary, _reason_side(primary))] + [
+                        (token, _reason_side(token)) for token in tokens[1:]
+                        if _BUILD_FAILED_SIDE_RE.match(token.lower())
+                    ]
                 family = str(row.get("family", "") or "none").strip() or "none"
-                families[reason][family] += 1
+                excursion: tuple[float, float, float] | None = None
+                excursion_read = False
+                for token, token_side in gates:
+                    reason = _normalize_skip_reason(token)
+                    key = (symbol, ts.replace(second=0), reason)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    side = token_side or side_pref
+                    if side not in {"LONG", "SHORT"}:
+                        continue
 
-                excursion = _forward_excursion_atr(rows, ts, window_minutes)
-                if excursion is None:
-                    unevaluated[reason] += 1
-                    continue
-                scored.append((reason, side, excursion))
+                    blocked[reason] += 1
+                    families[reason][family] += 1
+
+                    if not excursion_read:
+                        excursion = _forward_excursion_atr(rows, ts, window_minutes)
+                        excursion_read = True
+                    if excursion is None:
+                        unevaluated[reason] += 1
+                        continue
+                    scored.append((reason, side, excursion))
 
         if not blocked:
             return {}
@@ -1517,38 +1581,56 @@ _ENTERED_REGIME_RE = re.compile(
 )
 
 
-def _qualified_regime_call(row: dict[str, Any]) -> tuple[str, int] | None:
-    """``(regime, direction)`` when *row* records a regime that QUALIFIED on
-    a side, else None. Direction is +1 LONG / -1 SHORT.
+def _qualified_regime_calls(row: dict[str, Any]) -> list[tuple[str, int]]:
+    """Every ``(regime, direction)`` *row* records as QUALIFIED on a side.
+    Direction is +1 LONG / -1 SHORT.
 
     The multi-regime equity strategies (top_tier_adaptive and its subclass)
     never emit ``ambiguous_regime``: every regime that clears its score floor
     joins a build queue, and the call is visible as that regime's build
     failing on a side (``long_build_failed_trend_...``, or the older
-    ``build_failed_short_pullback_...`` shape) or as the entry itself
-    (``top_tier_trend_long``). A reason with no regime in it
-    (``no_fresh_breakout``) falls back to the row's ``family`` -- the regime
-    that came closest. ``unqualified_no_qualifying_regime`` is not a call.
+    ``build_failed_short_pullback_...`` shape) or as the signal it built
+    (``top_tier_trend_long``) -- entered, or blocked afterwards by an engine
+    gate, which the gatekeeper logs as a skip with the signal's reason first
+    (``top_tier_range_long,max_positions``). ``unqualified_no_qualifying_regime``
+    is not a call.
+
+    A skipped row's calls are all its ``reasons``, not just ``primary``: an
+    unqualified side is logged ahead of every build, so on a row where one
+    side was unqualified and the other side's regime qualified and failed a
+    later gate, ``primary`` is the non-call. Until 2026-09-23 only
+    ``primary`` was read, which saw 2,613 of the 5,624 calls on 2026-09-22.
+
+    A build reason with no regime in it (``no_fresh_breakout``) falls back to
+    the row's ``family``, which names the first regime in the build queue --
+    the one the FIRST build reason belongs to (the queue is tried in order,
+    one reason per regime). A later regime-less reason names no regime this
+    row records, so it is not counted.
     """
     primary = str(row.get("primary", "") or "").strip().lower()
-    action = str(row.get("action", "") or "").strip().lower()
-    if action == "entered":
+    if not _BUILD_FAILED_SIDE_RE.match(primary):
         m = _ENTERED_REGIME_RE.search(primary)
+        if m:
+            return [(m.group("regime"), 1 if m.group("side") == "long" else -1)]
+    if str(row.get("action", "") or "").strip().lower() == "entered":
+        return []
+    reasons = str(row.get("reasons", "") or row.get("primary", "") or "")
+    family = str(row.get("family", "") or "").strip().lower()
+    calls: list[tuple[str, int]] = []
+    first_build = True
+    for token in _reason_tokens(reasons.lower()):
+        m = _BUILD_FAILED_SIDE_RE.match(token)
         if not m:
-            return None
-        return m.group("regime"), (1 if m.group("side") == "long" else -1)
-    m = _BUILD_FAILED_SIDE_RE.match(primary)
-    if not m:
-        return None
-    side = m.group("side_a") or m.group("side_b")
-    rest = m.group("rest")
-    regime = next((name for name in _QUALIFIED_REGIME_NAMES if rest.startswith(name + "_") or rest == name), None)
-    if regime is None:
-        family = str(row.get("family", "") or "").strip().lower()
-        regime = family if family in _QUALIFIED_REGIME_NAMES else None
-    if regime is None:
-        return None
-    return regime, (1 if side == "long" else -1)
+            continue
+        side = m.group("side_a") or m.group("side_b")
+        rest = m.group("rest")
+        regime = next((name for name in _QUALIFIED_REGIME_NAMES if rest.startswith(name + "_") or rest == name), None)
+        if regime is None and first_build and family in _QUALIFIED_REGIME_NAMES:
+            regime = family
+        first_build = False
+        if regime is not None:
+            calls.append((regime, 1 if side == "long" else -1))
+    return calls
 
 
 def _regime_call_outcomes(archive_root: Path) -> dict[str, Any]:
@@ -1566,8 +1648,8 @@ def _regime_call_outcomes(archive_root: Path) -> dict[str, Any]:
       * ``ambiguous_regime(top=...)`` skips (0DTE options) -- the top
         regime; ``bullish_trend`` / ``bearish_trend`` are directional,
         any other top is recorded as non-directional.
-      * a regime that QUALIFIED on a side (top_tier_adaptive and its
-        subclass) -- see ``_qualified_regime_call``. Until 2026-09-23 only
+      * every regime that QUALIFIED on a side (top_tier_adaptive and its
+        subclass) -- see ``_qualified_regime_calls``. Until 2026-09-23 only
         the first source was read, so every top_tier manifest reported 0
         calls: a measurement that could not see the strategy, not a
         strategy that made no calls.
@@ -1613,24 +1695,23 @@ def _regime_call_outcomes(archive_root: Path) -> dict[str, Any]:
                     if m:
                         top = m.group("top")
                         direction = 1 if top == "bullish_trend" else -1 if top == "bearish_trend" else 0
-                        source = "ambiguous_regime"
+                        found = [(top, direction, "ambiguous_regime")]
                     else:
-                        qualified = _qualified_regime_call(row)
-                        if qualified is None:
-                            continue
-                        top, direction = qualified
-                        source = "qualified_regime"
+                        found = [(top, direction, "qualified_regime") for top, direction in _qualified_regime_calls(row)]
+                    if not found:
+                        continue
                     ts_raw = row.get("timestamp", "").strip('"').split(",")[0]
                     try:
                         ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
                     except ValueError:
                         continue
-                    key = (sym, ts.replace(second=0), top, direction)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    sources[source] += 1
-                    calls.append({"ts": ts, "sym": sym, "top": top, "direction": direction})
+                    for top, direction, source in found:
+                        key = (sym, ts.replace(second=0), top, direction)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        sources[source] += 1
+                        calls.append({"ts": ts, "sym": sym, "top": top, "direction": direction})
         except OSError:
             return {}
 
@@ -1702,15 +1783,26 @@ def export_session_archive(
     ``{log_dir}/sessions/{YYYY-MM-DD}/`` for post-session analysis.
 
     Contents:
-    - ``bars/{N}m/{SYMBOL}.csv`` — full merged frame (history + live,
-      warmup + pre-market + RTH + post-market) with all indicators for
-      every active watchlist symbol. One subfolder per timeframe actually
-      used by the strategy: always ``1m`` plus ``ltf_minutes``
-      and ``htf_minutes`` if they're set and > 1. For
-      top_tier_adaptive that's ``bars/1m/``, ``bars/5m/``, ``bars/15m/``.
-      The full frame is written so debuggers can reconstruct the bot's
-      view at any moment in the session — indicators like 15m ema20 need
-      5+ hours of warmup bars that filtering to today would drop.
+    - ``bars/{N}m/{SYMBOL}.csv`` — the full merged 1m frame (history +
+      live, warmup + pre-market + RTH + post-market) with all indicators
+      for every active watchlist symbol, plus its resample to
+      ``ltf_minutes`` and ``htf_minutes`` when they're set and > 1. For
+      top_tier_adaptive that's ``bars/1m/`` and ``bars/15m/``. The full
+      frame is written so debuggers can reconstruct the bot's view at any
+      moment in the session — indicators like 15m ema20 need 5+ hours of
+      warmup bars that filtering to today would drop. A resampled
+      ``bars/{N}m`` is what LTF triggers and the resample-based LTF
+      contexts read; it is NOT the frame the HTF levels are built from
+      (it only spans the days the 1m history covers).
+    - ``bars/htf_{N}m/{SYMBOL}.csv`` — the stored HTF frame
+      (``data.get_htf_frame``: Schwab's native N-minute series over the
+      HTF lookback, completed bars only) that S/R levels, HTF levels, HTF
+      market structure (``mshtf_*``) and HTF fair-value gaps are built
+      from. N is the strategy's HTF: ``params.htf_minutes``, else
+      ``support_resistance.timeframe_minutes``. Until 2026-09-23 it was
+      not archived and ``bars/15m`` was described as that frame, so an
+      HTF level could not be traced to the bars that made it after the
+      session.
     - ``trades.csv`` — today's trades filtered from the cumulative
       trades.csv (entry/exit/PnL/MFE/MAE per trade).
     - ``bot_{YYYY-MM-DD}.log`` — copy of the daily log file (original
@@ -1742,7 +1834,9 @@ def export_session_archive(
         Recorded in manifest for later auditability.
     data
         DataFeed instance — used via ``data.get_merged(symbol, timeframe)``
-        to pull the merged history+live frame for each symbol.
+        to pull the merged history+live frame for each symbol, and via
+        ``data.get_htf_frame(..., allow_refresh=False)`` for the stored HTF
+        frame (never a Schwab fetch from the exporter).
     account
         PaperAccount (or live account tracker). Used to read
         ``account.realized_pnl`` and ``account.trades`` so closed-position
@@ -1804,7 +1898,8 @@ def export_session_archive(
 
     # Determine which timeframes to export. Always include 1m. If the
     # active strategy uses a different trigger or HTF timeframe, include
-    # those too — they're what the bot actually computed signals from.
+    # its resample of the 1m frame too (the HTF levels come from the
+    # stored HTF frame instead, exported to bars/htf_{N}m below).
     # Skip any timeframe that's effectively 1m (≤1) or duplicates 1m.
     timeframes_min: set[int] = {1}
     strategy_params = getattr(strategy, "params", {}) or {}
@@ -1856,6 +1951,43 @@ def export_session_archive(
                 skipped += 1
         bars_written_by_tf[tf_label] = written
         bars_skipped_by_tf[tf_label] = skipped
+
+    # The stored HTF frame, per symbol: the series S/R levels, HTF levels,
+    # mshtf structure and HTF FVGs are built from. The resampled bars/{N}m
+    # above is not it -- it spans only the days the 1m history covers
+    # (09-21 07:00 onward in the 09-22 AAPL archive, against a 10-day HTF
+    # lookback) -- so without this folder an HTF level could not be traced
+    # to the bar that made it (2026-09-23). allow_refresh=False: the
+    # exporter reads what the bot held and never fetches. The HTF minutes
+    # resolve as in BaseStrategy._htf_minutes.
+    htf_default = int(getattr(getattr(config, "support_resistance", None), "timeframe_minutes", 15))
+    htf_minutes = int(strategy_params.get("htf_minutes", htf_default)) if isinstance(strategy_params, dict) else htf_default
+    htf_label = f"htf_{htf_minutes}m"
+    htf_dir = bars_dir / htf_label
+    try:
+        htf_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        LOG.warning("Could not create HTF frame dir %s: %s", htf_dir, exc)
+    else:
+        written = 0
+        skipped = 0
+        for symbol in sorted(symbols):
+            try:
+                frame = data.get_htf_frame(symbol, timeframe_minutes=htf_minutes, allow_refresh=False) if data is not None else None
+            except Exception as exc:
+                LOG.warning("Could not read the HTF frame for %s/%s: %s", symbol, htf_label, exc)
+                frame = None
+            if frame is None or frame.empty:
+                skipped += 1
+                continue
+            try:
+                frame.to_csv(htf_dir / f"{symbol}.csv", index_label="timestamp")
+                written += 1
+            except Exception as exc:
+                LOG.warning("Could not write HTF frame CSV for %s/%s: %s", symbol, htf_label, exc)
+                skipped += 1
+        bars_written_by_tf[htf_label] = written
+        bars_skipped_by_tf[htf_label] = skipped
 
     # Aggregate counts for the manifest summary.
     bars_written = sum(bars_written_by_tf.values())

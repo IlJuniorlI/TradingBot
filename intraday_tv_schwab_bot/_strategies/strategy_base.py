@@ -9,13 +9,11 @@ from .helpers import (
     _bar_close_position,
     _bar_wick_fractions,
     _dashboard_zone_width_from_policy,
-    _detail_fields,
     _normalize_symbol_list,
     _normalize_symbol_list_details,
     _optional_float,
     _optional_int,
     _position_strategy_matches,
-    _reason_prefix,
     _reason_with_values,
     _safe_float,
 )
@@ -26,7 +24,9 @@ from ..order_blocks import (
     empty_order_block_context,
 )
 from .rvol import effective_relative_volume, relative_volume_gate_threshold
-from ..models import OPTION_ASSET_TYPES
+from .shared_entry import SharedEntryPolicy
+from ..models import OPTION_ASSET_TYPES, ExitDecision
+from ..utils import frame_bar_minutes, session_bucket_ends
 from .shared import (
     Any,
     Candidate,
@@ -47,6 +47,7 @@ from .shared import (
     ensure_standard_indicator_frame,
     empty_fvg_context,
     empty_htf_context,
+    htf_ema_spans,
     empty_market_structure_context,
     empty_support_resistance_context,
     empty_technical_levels_context,
@@ -58,6 +59,7 @@ from .shared import (
 
 if TYPE_CHECKING:
     from ..config import BotConfig
+    from .shared_exit import ExitTape
 
 
 class BaseStrategy:
@@ -73,7 +75,8 @@ class BaseStrategy:
     # Auto-detected set of context-builder calls the strategy has made over
     # its lifetime. Each entry is a tuple `(name, *args)` — e.g. `("chart",)`,
     # `("structure", "ltf")`, `("technical",)`. Populated lazily on first
-    # invocation of each builder. The engine reads this set every cycle
+    # invocation of each builder ON ONE OF THE CYCLE'S BARS FRAMES (see
+    # _observe_context). The engine reads this set every cycle
     # (after _prime_cycle_support_cache) to drive _prime_cycle_context_cache,
     # which pre-warms the observed contexts in parallel via
     # _parallel_symbol_map. Cycle 1 is lazy (set is empty); cycles 2+ benefit.
@@ -81,8 +84,41 @@ class BaseStrategy:
     # classes don't cross-contaminate.
     _observed_contexts: ClassVar[set[tuple]] = set()
 
+    # The shared exit families belong to shared_exit.SharedExitPolicy, which
+    # the position manager owns; a strategy adds its own exits through
+    # strategy_exit_signal. Until 2026-09-24 the pipeline was a BaseStrategy
+    # method any subclass could override, and the peer family's override
+    # silently dropped the time stop and five exit families (see
+    # shared_exit.py). The entry side is the same: the shared entry stage is
+    # shared_entry.SharedEntryPolicy (self.entry_policy), the gatekeeper
+    # ranks with its rank_key, and the knob-rewriting hook
+    # strategy_logic_default is gone. Defining any of these names now fails
+    # at import, so an out-of-tree plugin cannot quietly opt out of the
+    # global knobs.
+    _RESERVED_NAMES: ClassVar[dict[str, str]] = {
+        "position_exit_signal": (
+            "shared exits are decided by shared_exit.SharedExitPolicy for every strategy and cannot be "
+            "overridden -- put strategy-only exits in strategy_exit_signal()"
+        ),
+        "shared_exit_signal": (
+            "shared exits are decided by shared_exit.SharedExitPolicy for every strategy and cannot be "
+            "overridden -- put strategy-only exits in strategy_exit_signal()"
+        ),
+        "strategy_logic_default": (
+            "a strategy cannot rewrite a shared_entry / shared_exit knob; set it in the preset YAML, or "
+            "exempt a style from a veto in the manifest (capabilities.shared_entry.exemptions)"
+        ),
+        "signal_priority_key": (
+            "signals are ranked by shared_entry.SharedEntryPolicy.rank_key; declare the ranking in the "
+            "manifest (capabilities.signal_priority)"
+        ),
+    }
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
+        for name, why in BaseStrategy._RESERVED_NAMES.items():
+            if name in cls.__dict__:
+                raise TypeError(f"{cls.__name__} defines {name}(); {why}")
         cls._observed_contexts = set()
 
     @classmethod
@@ -150,6 +186,11 @@ class BaseStrategy:
                 f"{self.__class__.__name__}.strategy_name={self.strategy_name!r} does not match active config strategy {config.strategy!r}"
             )
         self.params = config.active_strategy.params
+        # A bad htf_ema_fast_span / htf_ema_slow_span fails here, naming the
+        # key: every HTF-EMA consumer resolves them through htf_ema_spans, and
+        # the HTF context builders swallow errors (a bad pair used to turn
+        # into "no HTF context" -- no EMA gate, no HTF divergence -- silently).
+        htf_ema_spans(self.params)
         self._manifest = None
         try:
             from .registry import get_plugin
@@ -163,9 +204,10 @@ class BaseStrategy:
         self._entry_decisions: dict[str, dict[str, Any]] = {}
         self._build_failures: dict[tuple[str, str], dict[str, Any]] = {}
         self._candle_context_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
-        self._technical_context_cache: dict[tuple[Any, ...], Any] = {}
-        self._structure_context_cache: dict[tuple[Any, ...], Any] = {}
-        self._chart_context_cache: dict[tuple[Any, ...], Any] = {}
+        # Values are (frame, ctx): see _technical_context_cache_key.
+        self._technical_context_cache: dict[tuple[Any, ...], tuple[pd.DataFrame | None, Any]] = {}
+        self._structure_context_cache: dict[tuple[Any, ...], tuple[pd.DataFrame | None, Any]] = {}
+        self._chart_context_cache: dict[tuple[Any, ...], tuple[pd.DataFrame | None, Any]] = {}
         # Locks protect the 3 context dicts when the engine pre-warms them
         # in parallel via _parallel_symbol_map. Different worker threads
         # write distinct cache_keys, but the dict mutations themselves still
@@ -174,9 +216,14 @@ class BaseStrategy:
         self._chart_context_lock = RLock()
         self._structure_context_lock = RLock()
         self._technical_context_lock = RLock()
-
-    def strategy_logic_default(self, section: str, key: str, default: Any) -> Any:
-        return default
+        # id -> frame of this cycle's bars frames, the only frames the
+        # engine pre-warms (set_prewarm_frames). A builder records its call
+        # in _observed_contexts only for one of them. Holding the frames keeps
+        # their ids from being handed to another frame mid-cycle.
+        self._prewarm_frames: dict[int, pd.DataFrame] = {}
+        # The shared entry stage: the only reader of config.shared_entry
+        # (see shared_entry.py). Built last -- it reads the manifest.
+        self.entry_policy = SharedEntryPolicy(self)
 
     @staticmethod
     def _effective_relative_volume(symbol: str, raw_relative_volume: object, params: dict[str, Any] | None = None, *, cap_default: float = 2.5, standard_floor: float = 0.5, dollar_volume: object = None) -> float:
@@ -388,33 +435,6 @@ class BaseStrategy:
     def requires_hybrid_startup_restore_metadata(self) -> bool:
         return bool(self._capability("startup_restore.require_hybrid_metadata", False))
 
-    def signal_priority_key(
-        self,
-        signal: Signal,
-        candidate: Candidate | None,
-        *,
-        metadata: dict[str, Any],
-        strength: float,
-        candidate_activity_score: float,
-        rank: float,
-    ) -> tuple[float, ...] | None:
-        _ = signal, candidate
-        metadata_fields = self._capability("signal_priority.metadata_fields", None)
-        if not isinstance(metadata_fields, list) or not metadata_fields:
-            return None
-        out: list[float] = []
-        for raw_field in metadata_fields:
-            field = str(raw_field or "").strip()
-            if not field:
-                continue
-            fallback = None
-            if field == "selection_quality_score":
-                priority_tiebreak = _optional_float(metadata.get("selection_quality_score"))
-                fallback = priority_tiebreak if priority_tiebreak is not None else strength
-            out.append(float(_safe_float(metadata.get(field), fallback if fallback is not None else 0.0) or 0.0))
-        out.extend((float(strength), float(candidate_activity_score), -float(rank)))
-        return tuple(out)
-
     def dashboard_candidate_limit(self, default_limit: int) -> int:
         mode = str(self._capability("dashboard.candidate_limit_mode", "default") or "default").strip().lower()
         if mode == "tradable_count":
@@ -431,17 +451,24 @@ class BaseStrategy:
         return bool(self._capability("dashboard.allow_generic_level_fallback", False))
 
     def dashboard_level_context_spec(self) -> dict[str, Any] | None:
+        """The HTF level build the dashboard's key-level zones use. A level
+        parameter the strategy does not declare as ``htf_*`` comes from
+        ``support_resistance``, the values it trades on; until 2026-09-23 it
+        fell back to 60m / 60 days / 6 levels / 0.35 ATR, so top_tier's zones
+        (and every other preset without htf_* params) were a build the
+        strategy never used."""
         params = self.params if isinstance(self.params, dict) else {}
+        sr_cfg = self.config.support_resistance
         spec = {
-            "timeframe_minutes": max(1, int(params.get("htf_minutes", 60) or 60)),
-            "lookback_days": max(1, int(params.get("htf_lookback_days", 60) or 60)),
-            "pivot_span": max(1, int(params.get("htf_pivot_span", 2) or 2)),
-            "max_levels_per_side": max(1, int(params.get("htf_max_levels_per_side", 6) or 6)),
-            "atr_tolerance_mult": float(params.get("htf_atr_tolerance_mult", 0.35) or 0.35),
-            "pct_tolerance": float(params.get("htf_pct_tolerance", 0.0030) or 0.0030),
-            "stop_buffer_atr_mult": float(params.get("htf_stop_buffer_atr_mult", 0.25) or 0.25),
-            "ema_fast_span": max(1, int(params.get("htf_ema_fast_span", 50) or 50)),
-            "ema_slow_span": max(1, int(params.get("htf_ema_slow_span", 200) or 200)),
+            "timeframe_minutes": max(1, self._htf_minutes()),
+            "lookback_days": max(1, self._htf_lookback_days()),
+            "pivot_span": max(1, int(params.get("htf_pivot_span", sr_cfg.pivot_span))),
+            "max_levels_per_side": max(1, int(params.get("htf_max_levels_per_side", sr_cfg.max_levels_per_side))),
+            "atr_tolerance_mult": float(params.get("htf_atr_tolerance_mult", sr_cfg.atr_tolerance_mult)),
+            "pct_tolerance": float(params.get("htf_pct_tolerance", sr_cfg.pct_tolerance)),
+            "stop_buffer_atr_mult": float(params.get("htf_stop_buffer_atr_mult", sr_cfg.stop_buffer_atr_mult)),
+            "ema_fast_span": htf_ema_spans(params)[0],
+            "ema_slow_span": htf_ema_spans(params)[1],
             "ltf_minutes": max(1, int(params.get("ltf_minutes", 5) or 5)),
             "min_level_score": float(params.get("min_level_score", 4.0) or 4.0),
             "level_round_number_tolerance_pct": float(params.get("level_round_number_tolerance_pct", 0.0020) or 0.0020),
@@ -554,116 +581,12 @@ class BaseStrategy:
         except Exception:
             return 0
 
-    def _strategy_logic_default(self, section: str, key: str, default: Any) -> Any:
-        return self.strategy_logic_default(section, key, default)
-
-    def _shared_entry_enabled(self, key: str, default: bool = True) -> bool:
-        cfg = getattr(self.config, "shared_entry", None)
-        base = getattr(cfg, key, default) if cfg is not None else default
-        return bool(self._strategy_logic_default("shared_entry", key, base))
-
-    def _shared_entry_value(self, key: str, default: Any) -> Any:
-        cfg = getattr(self.config, "shared_entry", None)
-        base = getattr(cfg, key, default) if cfg is not None else default
-        return self._strategy_logic_default("shared_entry", key, base)
-
-    def _target_meets_min_rr(self, side: Side, close: float, stop: float, target: float | None) -> bool:
-        """Return True if (close, stop, target) clears shared_entry.min_target_rr.
-
-        Used by the SR/technical refinement pipeline as a floor check so
-        capping the target never silently destroys R:R below the
-        configured threshold. Returns True when there's no target to test
-        (None) so callers can use this as a one-line guard:
-            if self._target_meets_min_rr(side, close, stop, proposed):
-                target = proposed
-        """
-        if target is None:
-            return True
-        try:
-            close_v = float(close)
-            stop_v = float(stop)
-            target_v = float(target)
-        except (TypeError, ValueError):
-            return True
-        if side == Side.LONG:
-            risk = close_v - stop_v
-            reward = target_v - close_v
-        else:
-            risk = stop_v - close_v
-            reward = close_v - target_v
-        if risk <= 0 or reward <= 0:
-            return False
-        try:
-            min_rr = float(self._shared_entry_value("min_target_rr", 1.0) or 1.0)
-        except (TypeError, ValueError):
-            min_rr = 1.0
-        return (reward / risk) >= max(0.0, min_rr)
-
     @staticmethod
     def _frame_atr14(frame: pd.DataFrame | None, close: float) -> float:
         """ATR14 from the last bar of ``frame``, with a price-scaled fallback."""
         if frame is not None and not frame.empty and "atr14" in frame.columns:
             return _safe_float(frame.iloc[-1]["atr14"], close * 0.0015)
         return max(close * 0.0015, 0.01)
-
-    def _clamp_refined_stop(self, close: float, incoming_stop: float,
-                            proposed_stop: float, atr: float) -> float:
-        """Bound how far the refinement pipeline may pull a stop toward entry.
-
-        Both refinement passes (SR levels, technical levels) move the stop
-        TOWARD entry whenever a support/resistance level or trendline sits
-        inside the strategy's structural stop, and neither had a floor. A
-        level a few cents from entry therefore produced a few-cent stop,
-        silently overriding the ``default_stop_pct`` backstop the builder
-        applied a few lines earlier.
-
-        ``_target_meets_min_rr`` cannot police this — tightening the stop
-        RAISES reward/risk, so the R:R guard that protects the target cap
-        never binds on the stop side. The floor has to be absolute, so it is
-        expressed in ATR: refinement may not pull the stop closer to entry
-        than ``shared_entry.min_stop_atr_mult`` ATR.
-
-        An over-tight proposal is clamped BACK TO that distance rather than
-        discarded. Discarding would revert to the builder's stop, and the
-        builder backstop is a flat ``default_stop_pct`` — a percentage floor
-        applied regardless of the symbol's volatility. On a quiet name that
-        is enormous in ATR terms (COP 2026-05-14: 1% of price = 6.8 ATR,
-        one logged case reached 11 ATR), which would blow R out far enough
-        that nothing downstream priced in R — breakeven, profit-lock, runner,
-        peak-giveback, ``shared_exit.discretionary_exit_min_r`` — could ever
-        arm. Clamping keeps the stop volatility-scaled and keeps R in the
-        band the management ladder is tuned for.
-
-        The clamp never WIDENS past the incoming stop. A builder that
-        deliberately chose a stop tighter than the floor (range / sr_scalp
-        anchor to level geometry, momentum caps at ``default_stop_pct``)
-        keeps it exactly. Both callers pass a ``proposed_stop`` already on
-        the tightening side of ``incoming_stop``, so its sign relative to
-        ``close`` identifies the trade direction.
-        """
-        try:
-            min_atr_mult = float(self._shared_entry_value("min_stop_atr_mult", 1.5) or 0.0)
-        except (TypeError, ValueError):
-            min_atr_mult = 1.5
-        close_v, proposed_v = float(close), float(proposed_stop)
-        if min_atr_mult <= 0 or atr <= 0:
-            return proposed_v
-        incoming_distance = abs(close_v - float(incoming_stop))
-        proposed_distance = abs(close_v - proposed_v)
-        floor_distance = min(incoming_distance, min_atr_mult * float(atr))
-        if proposed_distance >= floor_distance:
-            return proposed_v
-        return close_v - floor_distance if proposed_v < close_v else close_v + floor_distance
-
-    def _shared_exit_enabled(self, key: str, default: bool = True) -> bool:
-        cfg = getattr(self.config, "shared_exit", None)
-        base = getattr(cfg, key, default) if cfg is not None else default
-        return bool(self._strategy_logic_default("shared_exit", key, base))
-
-    def _shared_exit_value(self, key: str, default: Any) -> Any:
-        cfg = getattr(self.config, "shared_exit", None)
-        base = getattr(cfg, key, default) if cfg is not None else default
-        return self._strategy_logic_default("shared_exit", key, base)
 
     def _technical_level_setting(self, key: str, default: Any) -> Any:
         cfg = getattr(self.config, "technical_levels", None)
@@ -726,40 +649,6 @@ class BaseStrategy:
         adjusted_cutoff = time(adjusted_minutes // 60, adjusted_minutes % 60)
         return now_dt.time() >= adjusted_cutoff
 
-    def _shared_exit_tape_confirm(
-        self,
-        direction: str,
-        *,
-        close: float,
-        ema9: float,
-        ema20: float,
-        vwap: float,
-        close_pos: float,
-        close_pos_threshold: float,
-    ) -> bool:
-        conditions: list[bool] = []
-        if direction == "bullish":
-            if self._shared_exit_enabled("confirm_with_ema9", True):
-                conditions.append(close < ema9)
-            if self._shared_exit_enabled("confirm_with_ema20", True):
-                conditions.append(close < ema20)
-            if self._shared_exit_enabled("confirm_with_vwap", True):
-                conditions.append(close < vwap)
-            if self._shared_exit_enabled("confirm_with_close_position", True):
-                threshold = float(self._shared_exit_value("bullish_close_position_max", close_pos_threshold))
-                conditions.append(close_pos <= threshold)
-        else:
-            if self._shared_exit_enabled("confirm_with_ema9", True):
-                conditions.append(close > ema9)
-            if self._shared_exit_enabled("confirm_with_ema20", True):
-                conditions.append(close > ema20)
-            if self._shared_exit_enabled("confirm_with_vwap", True):
-                conditions.append(close > vwap)
-            if self._shared_exit_enabled("confirm_with_close_position", True):
-                threshold = float(self._shared_exit_value("bearish_close_position_min", close_pos_threshold))
-                conditions.append(close_pos >= threshold)
-        return all(conditions) if conditions else True
-
     def _reset_entry_decisions(self) -> None:
         # Per-cycle decision tracking. Called at the start of every strategy's
         # entry_signals(). Does NOT touch the chart/structure/technical context
@@ -770,6 +659,7 @@ class BaseStrategy:
         self._entry_decisions = {}
         self._build_failures = {}
         self._candle_context_cache = {}
+        self.entry_policy.reset_cycle()
 
     def reset_context_caches(self) -> None:
         """Cycle-boundary cache cleanup for the three pre-warmed context caches.
@@ -777,8 +667,9 @@ class BaseStrategy:
         Public API for the engine. Called inside `_prime_cycle_context_cache`
         before the parallel dispatch populates caches for the new cycle's
         frames. Without this reset the caches would grow unboundedly across
-        the session (one entry per (symbol, timeframe) per cycle). Frame-id
-        cache keys would never falsely collide, but memory would.
+        the session (one entry per (symbol, timeframe) per cycle), and every
+        entry pins its frame (see _technical_context_cache_key), so this is
+        also what lets the cycle's frames go.
         """
         with self._chart_context_lock:
             self._chart_context_cache = {}
@@ -786,6 +677,25 @@ class BaseStrategy:
             self._structure_context_cache = {}
         with self._technical_context_lock:
             self._technical_context_cache = {}
+
+    def set_prewarm_frames(self, frames: Iterable[pd.DataFrame | None]) -> None:
+        """Public API for the engine: this cycle's bars frames, the ones
+        `_prime_cycle_context_cache` pre-warms. Called before the pre-warm
+        every cycle. A context built on any other frame -- the peers' 5m LTF,
+        key_levels_1m's get_merged copy, a test tape -- is not recorded in
+        `_observed_contexts` (see `_observe_context`)."""
+        self._prewarm_frames = {id(frame): frame for frame in frames if frame is not None}
+
+    def _observe_context(self, frame: pd.DataFrame | None, entry: tuple) -> None:
+        """Record a builder call for the engine's pre-warm, only when it was
+        made on a frame the pre-warm is handed. The caches key on id(frame),
+        so a context pre-warmed on the 1m bars frame is never read by a
+        build on another frame. Until 2026-09-24 every call was recorded:
+        admit's builds on key_levels' 5m LTF registered ('chart',) and
+        ('technical',), and from then on the engine built both on every
+        watchlist symbol's 1m frame each cycle, and nothing read them."""
+        if frame is not None and self._prewarm_frames.get(id(frame)) is frame:
+            type(self)._observed_contexts.add(entry)
 
     def prime_cycle_contexts(self, frame: pd.DataFrame, observed: Iterable[tuple]) -> None:
         """Pre-warm the strategy's context caches for one symbol's frame.
@@ -916,20 +826,21 @@ class BaseStrategy:
         return {"primary_reason": str(payload), "reasons": [str(payload)]}
 
     def _chart_context(self, frame: pd.DataFrame):
-        # Per-cycle cache keyed like _technical_context — id(frame) separates
-        # symbols; length+last-bar markers guard against id-reuse after GC.
-        # Records the call signature in _observed_contexts so the engine can
-        # pre-warm this context in parallel for next cycle's watchlist.
-        type(self)._observed_contexts.add(("chart",))
+        # Per-cycle cache keyed like _technical_context (see
+        # _technical_context_cache_key). Records the call signature in
+        # _observed_contexts (on a bars frame only, see _observe_context) so
+        # the engine can pre-warm this context in parallel for next cycle's
+        # watchlist.
+        self._observe_context(frame, ("chart",))
         cache_key = self._technical_context_cache_key(frame)
         with self._chart_context_lock:
             cached = self._chart_context_cache.get(cache_key)
             if cached is not None:
-                return cached
+                return cached[1]
         if not bool(self._chart_pattern_setting("enabled", True)):
             ctx = analyze_chart_pattern_context(frame, bullish_allowed=[], bearish_allowed=[], lookback_bars=0)
             with self._chart_context_lock:
-                self._chart_context_cache[cache_key] = ctx
+                self._chart_context_cache[cache_key] = (frame, ctx)
             return ctx
         cfg = getattr(self.config, "chart_patterns", None)
         bullish_allowed = list(getattr(cfg, "bullish_patterns", []))
@@ -942,7 +853,7 @@ class BaseStrategy:
             lookback_bars=lookback_bars,
         )
         with self._chart_context_lock:
-            self._chart_context_cache[cache_key] = ctx
+            self._chart_context_cache[cache_key] = (frame, ctx)
         return ctx
 
     @staticmethod
@@ -1015,107 +926,6 @@ class BaseStrategy:
             return "bearish"
         return "bullish" if position.side == Side.LONG else "bearish"
 
-    def _build_bullish_reversal_signal(
-        self,
-        *,
-        candidate: Candidate,
-        frame: pd.DataFrame,
-        data: Any,
-        reason: str,
-        matched_patterns: set[str],
-        bullish_candle_score: float,
-        bullish_candle_net_score: float,
-        bullish_candle_anchor_pattern: str | None,
-        bullish_candle_anchor_bars: int,
-        chart_ctx: Any,
-        sr_ctx: Any,
-        ms_ctx: Any,
-        tech_ctx: Any,
-        stop: float,
-        target: float,
-        extra_priority: float = 0.0,
-        management_style: str = "reversal",
-        htf_ctx: Any = None,
-    ) -> Signal:
-        last_close = _safe_float(frame.iloc[-1]["close"])
-        adjustments = self._entry_adjustment_components(Side.LONG, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
-        fvg_adjustments = self._fvg_entry_adjustment_components(Side.LONG, candidate.symbol, frame, data)
-        management = self._adaptive_management_components(
-            Side.LONG,
-            last_close,
-            stop,
-            target,
-            style=management_style,
-            runner_allowed=False,
-            continuation_bias=float(fvg_adjustments.get("fvg_reversal_bias", 0.0) or 0.0),
-        )
-        # Multiplier bumped 0.60 -> 0.75 (2026-05-12) to compensate for the
-        # candle-pattern tier cascade in candles.py:_detect_side_patterns_cached
-        # which suppresses overlapping shorter-tier patterns (1C marubozus on a
-        # 2C engulfing bar, 1C readings on the 3rd bar of a 3C morning star).
-        # Removing that noise made anchor weights cleaner but cut the typical
-        # ``bullish_candle_net_score`` ceiling by ~0.25 because the corroboration
-        # bonus is now capped within a single tier. 0.60 -> 0.75 restores the
-        # previous max priority contribution (3C anchor: 0.60 * 1.25 = 0.75
-        # pre-cascade -> 0.75 * 1.00 = 0.75 post-cascade) without disturbing
-        # the threshold-based gates (opposing_net_score_threshold, etc.)
-        # which use net_score directly without the 0.75 multiplier.
-        candle_priority = 0.75 * float(bullish_candle_net_score)
-        final_priority_score = (
-            float(candidate.activity_score)
-            + float(extra_priority)
-            + candle_priority
-            + adjustments["entry_context_adjustment"]
-            + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
-        )
-        metadata = self._build_signal_metadata(
-            entry_price=last_close,
-            chart_ctx=chart_ctx, ms_ctx=ms_ctx, sr_ctx=sr_ctx, tech_ctx=tech_ctx,
-            adjustments=adjustments, fvg_adjustments=fvg_adjustments,
-            management=management,
-            final_priority_score=final_priority_score,
-            leading={
-                "matched_bullish_patterns": sorted(matched_patterns),
-                "bullish_candle_score": round(float(bullish_candle_score), 4),
-                "bullish_candle_net_score": round(float(bullish_candle_net_score), 4),
-                "bullish_candle_anchor_pattern": bullish_candle_anchor_pattern,
-                "bullish_candle_anchor_bars": int(bullish_candle_anchor_bars),
-            },
-        )
-        return Signal(
-            symbol=candidate.symbol,
-            strategy=self.strategy_name,
-            side=Side.LONG,
-            reason=reason,
-            stop_price=stop,
-            target_price=target,
-            metadata=metadata,
-        )
-
-    def _bullish_sr_block_reason(self, sr_ctx) -> str:
-        return _reason_with_values(
-            "too_close_to_htf_resistance",
-            current=sr_ctx.resistance_distance_pct,
-            required=float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)),
-            op=">",
-            digits=4,
-            extras={
-                "clearance_atr": (sr_ctx.resistance_distance_atr, ">", float(self._support_resistance_setting("entry_min_clearance_atr", 0.85))),
-            },
-        )
-
-    def _bearish_sr_block_reason(self, sr_ctx) -> str:
-        return _reason_with_values(
-            "too_close_to_htf_support",
-            current=sr_ctx.support_distance_pct,
-            required=float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)),
-            op=">",
-            digits=4,
-            extras={
-                "clearance_atr": (sr_ctx.support_distance_atr, ">", float(self._support_resistance_setting("entry_min_clearance_atr", 0.85))),
-            },
-        )
-
     def _entry_exhaustion_reasons(self, side: Side, frame: pd.DataFrame | None, *, close: float, vwap: float, ema9: float) -> list[str]:
         if frame is None or frame.empty:
             return []
@@ -1155,366 +965,6 @@ class BaseStrategy:
             if (bar_range / atr) > max_bar_range_atr and (vwap_ext_atr > max_vwap_ext_atr * 0.75 or ema9_ext_atr > max_ema9_ext_atr * 0.75):
                 reasons.append(_reason_with_values("expansion_bar_too_large", current=(bar_range / atr), required=max_bar_range_atr, op="<=", digits=4))
         return reasons
-
-    @staticmethod
-    def _apply_retest_stop_anchor(side: Side, close: float, stop: float, plan: dict[str, Any] | None) -> float:
-        if not plan or str(plan.get("status", "none") or "none").strip().lower() != "allow":
-            return float(stop)
-        anchor = _optional_float(plan.get("stop_anchor"))
-        if anchor is None:
-            return float(stop)
-        if side == Side.LONG:
-            candidate = max(float(stop), float(anchor))
-            return min(candidate, float(close) * 0.9995)
-        candidate = min(float(stop), float(anchor))
-        return max(candidate, float(close) * 1.0005)
-
-    def _continuation_fvg_retest_plan(
-        self,
-        side: Side,
-        symbol: str,
-        frame: pd.DataFrame | None,
-        data=None,
-        *,
-        trigger_level: float,
-        breakout_active: bool,
-        close: float,
-        vwap: float,
-        ema9: float,
-    ) -> dict[str, Any]:
-        out: dict[str, Any] = {
-            "status": "none",
-            "reason": None,
-            "stop_anchor": None,
-            "metadata": {
-                "anti_chase_fvg_retest_enabled": bool(self.params.get("anti_chase_fvg_retest_enabled", True)),
-                "anti_chase_fvg_retest_status": "none",
-            },
-        }
-        if frame is None or frame.empty:
-            return out
-        if not bool(self.params.get("anti_chase_fvg_retest_enabled", True)):
-            return out
-        if not bool(self._shared_entry_enabled("use_fvg_context", True)):
-            return out
-        close = float(close or 0.0)
-        if close <= 0:
-            return out
-        fvg_ctx = self._ltf_fvg_context(symbol, frame, data)
-        same_gap = getattr(fvg_ctx, "nearest_bullish_fvg", None) if side == Side.LONG else getattr(fvg_ctx, "nearest_bearish_fvg", None)
-        opposing_gap = getattr(fvg_ctx, "nearest_bearish_fvg", None) if side == Side.LONG else getattr(fvg_ctx, "nearest_bullish_fvg", None)
-        same_info = self._fvg_gap_state(same_gap, close)
-        opposing_info = self._fvg_gap_state(opposing_gap, close)
-        same_state = str(same_info.get("state", "none") or "none").strip().lower()
-        opposing_state = str(opposing_info.get("state", "none") or "none").strip().lower()
-        lower = _optional_float(same_info.get("lower"))
-        upper = _optional_float(same_info.get("upper"))
-        midpoint = _optional_float(same_info.get("midpoint"))
-        size = max(1e-8, float(_optional_float(same_info.get("size"), 0.0) or 0.0))
-        same_distance_pct = _optional_float(same_info.get("distance_pct"), 1.0)
-        opposing_distance_pct = _optional_float(opposing_info.get("distance_pct"))
-        max_gap_distance_pct = max(0.0002, float(self.params.get("anti_chase_fvg_retest_max_gap_distance_pct", 0.0030)))
-        max_opposing_distance_pct = max(0.0002, float(self.params.get("anti_chase_fvg_retest_max_opposing_distance_pct", 0.0020)))
-        lookback_bars = max(2, int(self.params.get("anti_chase_fvg_retest_lookback_bars", 5)))
-        min_close_pos_raw = self.params.get("anti_chase_fvg_retest_min_close_position")
-        if min_close_pos_raw is None:
-            min_close_pos_raw = self.params.get("min_bar_close_position", 0.60)
-        min_close_pos = min(0.95, max(0.05, float(min_close_pos_raw)))
-        stop_buffer_gap_frac = max(0.0, float(self.params.get("anti_chase_fvg_retest_stop_buffer_gap_frac", 0.14)))
-        trigger_tolerance_pct = max(0.0, float(self.params.get("anti_chase_fvg_retest_trigger_tolerance_pct", 0.0012)))
-        touch_tolerance = max(size * 0.20, abs(close) * max_gap_distance_pct * 0.25, 1e-8)
-        invalidation_tolerance = max(size * 0.18, abs(close) * 1e-6, 1e-8)
-        # Edge-tolerance lets a bar that bounces *just above* a bullish FVG
-        # upper bound (or just below a bearish FVG lower bound) without
-        # penetrating the zone still qualify as a touch. Some reversals
-        # respect the FVG boundary as support without filling the gap;
-        # historically the strict touched_zone check missed those. Default
-        # 0.0 = preserve existing strict behavior. A value of e.g. 0.003
-        # = 0.3% of close treats near-edge reversals as valid retests.
-        edge_tolerance = max(0.0, abs(close) * float(self.params.get("anti_chase_fvg_edge_tolerance_pct", 0.0) or 0.0))
-        # Trend-MA reclaim gate: by default the confirming bar's close must
-        # also be above min(VWAP, EMA9) for longs (or below max for shorts).
-        # On microcap squeeze names that gap 50%+ and pull back hard into
-        # earlier FVGs, VWAP/EMA9 lag well above the retest zone, so the
-        # gate blocks exactly the deep-retest entries the strategy wants.
-        # Setting this to True drops the trend-MA reclaim and keeps only the
-        # FVG-midpoint reclaim + bar_confirm shape check. Default False
-        # preserves prior behavior for every other strategy.
-        skip_trend_reclaim = bool(self.params.get("anti_chase_fvg_retest_skip_vwap_ema9_reclaim", False))
-        direction_label = "bullish" if side == Side.LONG else "bearish"
-        out["metadata"].update(
-            {
-                "anti_chase_fvg_retest_side": direction_label,
-                "anti_chase_fvg_retest_same_state": same_state,
-                "anti_chase_fvg_retest_opposing_state": opposing_state,
-                "anti_chase_fvg_retest_same_midpoint": midpoint,
-                "anti_chase_fvg_retest_same_lower": lower,
-                "anti_chase_fvg_retest_same_upper": upper,
-                "anti_chase_fvg_retest_same_distance_pct": same_distance_pct,
-                "anti_chase_fvg_retest_opposing_distance_pct": opposing_distance_pct,
-                "anti_chase_fvg_retest_trigger_level": float(trigger_level or 0.0),
-            }
-        )
-        if lower is None or upper is None or midpoint is None or same_state not in {"active", "validated"}:
-            if same_state == "invalidated":
-                out["status"] = "reject"
-                out["reason"] = f"{direction_label}_fvg_retest_rejected({_detail_fields(detail='same_direction_gap_invalidated', midpoint=midpoint or 0.0)})"
-                out["metadata"]["anti_chase_fvg_retest_status"] = out["status"]
-            return out
-        in_gap = lower - touch_tolerance <= close <= upper + touch_tolerance
-        if not in_gap and (same_distance_pct is None or float(same_distance_pct) > max_gap_distance_pct):
-            return out
-        recent = frame.tail(lookback_bars + 1)
-        prior = recent.iloc[:-1]
-        if side == Side.LONG:
-            impulse_seen = bool(breakout_active)
-            if not impulse_seen and trigger_level > 0 and not prior.empty:
-                impulse_seen = float(prior["close"].max()) >= (float(trigger_level) * (1.0 - trigger_tolerance_pct))
-        else:
-            impulse_seen = bool(breakout_active)
-            if not impulse_seen and trigger_level > 0 and not prior.empty:
-                impulse_seen = float(prior["close"].min()) <= (float(trigger_level) * (1.0 + trigger_tolerance_pct))
-        if not impulse_seen:
-            return out
-        opposing_blocked = bool(opposing_state in {"active", "validated"} and opposing_distance_pct is not None and float(opposing_distance_pct) <= max_opposing_distance_pct)
-        if opposing_blocked:
-            out["status"] = "reject"
-            out["reason"] = f"{direction_label}_fvg_retest_rejected({_detail_fields(detail='opposing_gap_too_close', opposing_distance_pct=opposing_distance_pct or 0.0)})"
-            out["metadata"]["anti_chase_fvg_retest_status"] = out["status"]
-            return out
-        last = frame.iloc[-1]
-        bar_low = _safe_float(last.get("low"), close)
-        bar_high = _safe_float(last.get("high"), close)
-        close_pos = _bar_close_position(frame)
-        touched_zone = bar_low <= (upper + touch_tolerance + edge_tolerance) and bar_high >= (lower - touch_tolerance - edge_tolerance)
-        if side == Side.LONG:
-            respected_zone = bar_low >= (lower - invalidation_tolerance)
-            reclaimed = close >= (midpoint - touch_tolerance)
-            if not skip_trend_reclaim:
-                reclaimed = reclaimed and close >= min(float(vwap or close), float(ema9 or close))
-            bar_confirm = close_pos >= min_close_pos
-            stop_anchor = max(0.01, lower - (size * stop_buffer_gap_frac))
-        else:
-            respected_zone = bar_high <= (upper + invalidation_tolerance)
-            reclaimed = close <= (midpoint + touch_tolerance)
-            if not skip_trend_reclaim:
-                reclaimed = reclaimed and close <= max(float(vwap or close), float(ema9 or close))
-            bar_confirm = close_pos <= (1.0 - min_close_pos)
-            stop_anchor = upper + (size * stop_buffer_gap_frac)
-        out["metadata"]["anti_chase_fvg_retest_recent_impulse"] = bool(impulse_seen)
-        out["metadata"]["anti_chase_fvg_retest_touched_zone"] = bool(touched_zone)
-        out["metadata"]["anti_chase_fvg_retest_respected_zone"] = bool(respected_zone)
-        out["metadata"]["anti_chase_fvg_retest_bar_confirm"] = bool(bar_confirm)
-        if touched_zone and respected_zone and reclaimed and bar_confirm:
-            out["status"] = "allow"
-            out["stop_anchor"] = float(stop_anchor)
-            out["metadata"].update(
-                {
-                    "anti_chase_fvg_retest_status": "allow",
-                    "anti_chase_fvg_retest_confirmed": True,
-                    "anti_chase_fvg_retest_stop_anchor": float(stop_anchor),
-                }
-            )
-            return out
-        out["status"] = "wait"
-        out["reason"] = f"wait_for_{direction_label}_fvg_retest({_detail_fields(state=same_state, midpoint=midpoint, trigger=trigger_level, distance_pct=same_distance_pct or 0.0)})"
-        out["metadata"]["anti_chase_fvg_retest_status"] = out["status"]
-        return out
-
-    def _continuation_ob_retest_plan(
-        self,
-        side: Side,
-        symbol: str,
-        frame: pd.DataFrame | None,
-        data=None,
-        *,
-        trigger_level: float,
-        breakout_active: bool,
-        close: float,
-        vwap: float,
-        ema9: float,
-    ) -> dict[str, Any]:
-        """Order-block retest plan, parallel to `_continuation_fvg_retest_plan`.
-
-        Returns the same {status, reason, metadata, stop_anchor} dict shape so
-        it composes with `_apply_continuation_zone_retest_plans`. Reuses the
-        same `anti_chase_fvg_retest_*` knobs for confirmation thresholds — the
-        user-stated convention is "same rules for confirm" between FVG and OB.
-        Disabled by default; opt in via `support_resistance.ltf_order_blocks_enabled`.
-        """
-        out: dict[str, Any] = {"status": "none", "reason": None, "metadata": {}, "stop_anchor": None}
-        if frame is None or frame.empty:
-            return out
-        if not bool(self._support_resistance_setting("ltf_order_blocks_enabled", False)):
-            return out
-        close = float(close or 0.0)
-        if close <= 0:
-            return out
-        ob_ctx = self._ltf_order_block_context(symbol, frame, data)
-        same_ob = getattr(ob_ctx, "nearest_bullish_ob", None) if side == Side.LONG else getattr(ob_ctx, "nearest_bearish_ob", None)
-        opposing_ob = getattr(ob_ctx, "nearest_bearish_ob", None) if side == Side.LONG else getattr(ob_ctx, "nearest_bullish_ob", None)
-        same_info = self._fvg_gap_state(same_ob, close)
-        opposing_info = self._fvg_gap_state(opposing_ob, close)
-        same_state = str(same_info.get("state", "none") or "none").strip().lower()
-        opposing_state = str(opposing_info.get("state", "none") or "none").strip().lower()
-        lower = _optional_float(same_info.get("lower"))
-        upper = _optional_float(same_info.get("upper"))
-        midpoint = _optional_float(same_info.get("midpoint"))
-        size = max(1e-8, float(_optional_float(same_info.get("size"), 0.0) or 0.0))
-        same_distance_pct = _optional_float(same_info.get("distance_pct"), 1.0)
-        opposing_distance_pct = _optional_float(opposing_info.get("distance_pct"))
-        max_gap_distance_pct = max(0.0002, float(self.params.get("anti_chase_fvg_retest_max_gap_distance_pct", 0.0030)))
-        max_opposing_distance_pct = max(0.0002, float(self.params.get("anti_chase_fvg_retest_max_opposing_distance_pct", 0.0020)))
-        lookback_bars = max(2, int(self.params.get("anti_chase_fvg_retest_lookback_bars", 5)))
-        min_close_pos_raw = self.params.get("anti_chase_fvg_retest_min_close_position")
-        if min_close_pos_raw is None:
-            min_close_pos_raw = self.params.get("min_bar_close_position", 0.60)
-        min_close_pos = min(0.95, max(0.05, float(min_close_pos_raw)))
-        stop_buffer_gap_frac = max(0.0, float(self.params.get("anti_chase_fvg_retest_stop_buffer_gap_frac", 0.14)))
-        trigger_tolerance_pct = max(0.0, float(self.params.get("anti_chase_fvg_retest_trigger_tolerance_pct", 0.0012)))
-        touch_tolerance = max(size * 0.20, abs(close) * max_gap_distance_pct * 0.25, 1e-8)
-        invalidation_tolerance = max(size * 0.18, abs(close) * 1e-6, 1e-8)
-        edge_tolerance = max(0.0, abs(close) * float(self.params.get("anti_chase_fvg_edge_tolerance_pct", 0.0) or 0.0))
-        skip_trend_reclaim = bool(self.params.get("anti_chase_fvg_retest_skip_vwap_ema9_reclaim", False))
-        direction_label = "bullish" if side == Side.LONG else "bearish"
-        out["metadata"].update(
-            {
-                "anti_chase_ob_retest_side": direction_label,
-                "anti_chase_ob_retest_same_state": same_state,
-                "anti_chase_ob_retest_opposing_state": opposing_state,
-                "anti_chase_ob_retest_same_midpoint": midpoint,
-                "anti_chase_ob_retest_same_lower": lower,
-                "anti_chase_ob_retest_same_upper": upper,
-                "anti_chase_ob_retest_same_distance_pct": same_distance_pct,
-                "anti_chase_ob_retest_opposing_distance_pct": opposing_distance_pct,
-                "anti_chase_ob_retest_trigger_level": float(trigger_level or 0.0),
-                "anti_chase_ob_retest_mode": str(getattr(ob_ctx, "mode", "loose") or "loose"),
-            }
-        )
-        if lower is None or upper is None or midpoint is None or same_state not in {"active", "validated"}:
-            if same_state == "invalidated":
-                out["status"] = "reject"
-                out["reason"] = f"{direction_label}_ob_retest_rejected({_detail_fields(detail='same_direction_block_invalidated', midpoint=midpoint or 0.0)})"
-                out["metadata"]["anti_chase_ob_retest_status"] = out["status"]
-            return out
-        in_zone = lower - touch_tolerance <= close <= upper + touch_tolerance
-        if not in_zone and (same_distance_pct is None or float(same_distance_pct) > max_gap_distance_pct):
-            return out
-        recent = frame.tail(lookback_bars + 1)
-        prior = recent.iloc[:-1]
-        if side == Side.LONG:
-            impulse_seen = bool(breakout_active)
-            if not impulse_seen and trigger_level > 0 and not prior.empty:
-                impulse_seen = float(prior["close"].max()) >= (float(trigger_level) * (1.0 - trigger_tolerance_pct))
-        else:
-            impulse_seen = bool(breakout_active)
-            if not impulse_seen and trigger_level > 0 and not prior.empty:
-                impulse_seen = float(prior["close"].min()) <= (float(trigger_level) * (1.0 + trigger_tolerance_pct))
-        if not impulse_seen:
-            return out
-        opposing_blocked = bool(opposing_state in {"active", "validated"} and opposing_distance_pct is not None and float(opposing_distance_pct) <= max_opposing_distance_pct)
-        if opposing_blocked:
-            out["status"] = "reject"
-            out["reason"] = f"{direction_label}_ob_retest_rejected({_detail_fields(detail='opposing_block_too_close', opposing_distance_pct=opposing_distance_pct or 0.0)})"
-            out["metadata"]["anti_chase_ob_retest_status"] = out["status"]
-            return out
-        last = frame.iloc[-1]
-        bar_low = _safe_float(last.get("low"), close)
-        bar_high = _safe_float(last.get("high"), close)
-        close_pos = _bar_close_position(frame)
-        touched_zone = bar_low <= (upper + touch_tolerance + edge_tolerance) and bar_high >= (lower - touch_tolerance - edge_tolerance)
-        if side == Side.LONG:
-            respected_zone = bar_low >= (lower - invalidation_tolerance)
-            reclaimed = close >= (midpoint - touch_tolerance)
-            if not skip_trend_reclaim:
-                reclaimed = reclaimed and close >= min(float(vwap or close), float(ema9 or close))
-            bar_confirm = close_pos >= min_close_pos
-            stop_anchor = max(0.01, lower - (size * stop_buffer_gap_frac))
-        else:
-            respected_zone = bar_high <= (upper + invalidation_tolerance)
-            reclaimed = close <= (midpoint + touch_tolerance)
-            if not skip_trend_reclaim:
-                reclaimed = reclaimed and close <= max(float(vwap or close), float(ema9 or close))
-            bar_confirm = close_pos <= (1.0 - min_close_pos)
-            stop_anchor = upper + (size * stop_buffer_gap_frac)
-        out["metadata"]["anti_chase_ob_retest_recent_impulse"] = bool(impulse_seen)
-        out["metadata"]["anti_chase_ob_retest_touched_zone"] = bool(touched_zone)
-        out["metadata"]["anti_chase_ob_retest_respected_zone"] = bool(respected_zone)
-        out["metadata"]["anti_chase_ob_retest_bar_confirm"] = bool(bar_confirm)
-        if touched_zone and respected_zone and reclaimed and bar_confirm:
-            out["status"] = "allow"
-            out["stop_anchor"] = float(stop_anchor)
-            out["metadata"].update(
-                {
-                    "anti_chase_ob_retest_status": "allow",
-                    "anti_chase_ob_retest_confirmed": True,
-                    "anti_chase_ob_retest_stop_anchor": float(stop_anchor),
-                }
-            )
-            return out
-        out["status"] = "wait"
-        out["reason"] = f"wait_for_{direction_label}_ob_retest({_detail_fields(state=same_state, midpoint=midpoint, trigger=trigger_level, distance_pct=same_distance_pct or 0.0)})"
-        out["metadata"]["anti_chase_ob_retest_status"] = out["status"]
-        return out
-
-    @staticmethod
-    def _apply_continuation_zone_retest_plans(
-        reasons: list[str],
-        plans: list[dict[str, Any] | None],
-        *,
-        deferrable_prefixes: set[str],
-    ) -> list[str]:
-        """Combine multiple retest plans (e.g. FVG + OB) with OR logic.
-
-        - If ANY plan returns ``status="allow"`` and all current reasons are
-          deferrable, clear the reasons (entry can fire).
-        - Otherwise prefer "wait" reasons over "reject" reasons (waiting
-          could still resolve in a later bar).
-        - Plans with ``status="none"`` (no zone available) are ignored.
-        - When called with a single-plan list, behavior matches the prior
-          ``_apply_continuation_fvg_retest_plan`` (now removed) exactly:
-          allow on the only plan clears deferrable reasons; wait/reject
-          replaces with the plan reason; none returns reasons unchanged.
-        """
-        if not reasons or not plans:
-            return reasons
-        engaged = [
-            (p, str(p.get("status", "none") or "none").strip().lower())
-            for p in plans
-            if p
-        ]
-        engaged = [(p, s) for p, s in engaged if s != "none"]
-        if not engaged:
-            return reasons
-        deferred = [reason for reason in reasons if _reason_prefix(reason) in deferrable_prefixes]
-        other = [reason for reason in reasons if _reason_prefix(reason) not in deferrable_prefixes]
-        if not deferred or other:
-            return reasons
-        if any(s == "allow" for _p, s in engaged):
-            return []
-        wait_plans = [p for p, s in engaged if s == "wait" and (str(p.get("reason") or "").strip())]
-        if wait_plans:
-            return [str(wait_plans[0]["reason"]).strip()]
-        reject_plans = [p for p, s in engaged if s == "reject" and (str(p.get("reason") or "").strip())]
-        if reject_plans:
-            return [str(reject_plans[0]["reason"]).strip()]
-        return reasons
-
-    @staticmethod
-    def _blocks_bullish_entry(ctx) -> bool:
-        return bool(
-            ctx.matched_bearish_reversal
-            or ctx.bias_score <= -0.75
-            or (len(ctx.matched_bearish_continuation) >= 2 and not ctx.matched_bullish_continuation)
-        )
-
-    @staticmethod
-    def _blocks_bearish_entry(ctx) -> bool:
-        return bool(
-            ctx.matched_bullish_reversal
-            or ctx.bias_score >= 0.75
-            or (len(ctx.matched_bullish_continuation) >= 2 and not ctx.matched_bearish_continuation)
-        )
 
     def _htf_minutes(self) -> int:
         """HTF (higher timeframe) for SR detection. Strategies declare via
@@ -1582,6 +1032,12 @@ class BaseStrategy:
             "sr_resistance_distance_atr": None if ctx.resistance_distance_atr is None else float(ctx.resistance_distance_atr),
             "sr_breakout_above_resistance": bool(ctx.breakout_above_resistance),
             "sr_breakdown_below_support": bool(ctx.breakdown_below_support),
+            # Shadow log for the fresh-break gate hypothesis: how long ago
+            # price last traded at the broken level (see
+            # SupportResistanceContext.breakout_age_minutes). Nothing blocks
+            # on these.
+            "sr_breakout_age_minutes": getattr(ctx, "breakout_age_minutes", None),
+            "sr_breakdown_age_minutes": getattr(ctx, "breakdown_age_minutes", None),
             "sr_near_support": bool(ctx.near_support),
             "sr_near_resistance": bool(ctx.near_resistance),
             "sr_bias_score": float(ctx.bias_score),
@@ -1591,13 +1047,19 @@ class BaseStrategy:
         }
 
     def _default_htf_context_for_score(self, symbol: str, data):
-        """Fetch HTF context with the bot's standard support_resistance defaults.
+        """The HTF context a strategy scores on: its own HTF frame
+        (``_htf_minutes`` / ``_htf_lookback_days``, the frame the engine
+        refreshes), the support_resistance level settings, and its HTF EMA
+        spans. It never refreshes.
 
-        Used by strategies that don't otherwise need a customized HTF
-        context but want HTF RSI divergence to flow into their entry
-        scoring via _entry_adjustment_components(htf_ctx=...). Strategies
-        that already build a custom HTF context (peer_confirmed_*) should
-        pass that one instead.
+        The shared entry policy scores a proposal's HTF RSI divergence on it
+        when the proposal brings no HTF context of its own
+        (``EntryProposal.htf_ctx``), and top_tier reads its HTF EMA trend
+        from it. Until 2026-09-24 it was built on the
+        support_resistance timeframe: with an htf_minutes of its own a
+        strategy asked for a frame nothing stored, so the context was None
+        on every cycle (peer_confirmed_htf_pivots' HTF divergence score was
+        always 0 that way).
 
         Returns ``None`` if HTF data isn't available — the score path is
         defensive (None ctx -> zero adjustment).
@@ -1607,18 +1069,23 @@ class BaseStrategy:
         sr_cfg = getattr(self.config, "support_resistance", None)
         if sr_cfg is None:
             return None
+        ema_fast_span, ema_slow_span = htf_ema_spans(self.params)
         try:
             return data.get_htf_context(
                 symbol,
-                timeframe_minutes=int(getattr(sr_cfg, "timeframe_minutes", 60) or 60),
-                lookback_days=int(getattr(sr_cfg, "lookback_days", 60) or 60),
+                timeframe_minutes=int(self._htf_minutes()),
+                lookback_days=int(self._htf_lookback_days()),
                 pivot_span=int(getattr(sr_cfg, "pivot_span", 2) or 2),
                 max_levels_per_side=int(getattr(sr_cfg, "max_levels_per_side", 6) or 6),
                 atr_tolerance_mult=float(getattr(sr_cfg, "atr_tolerance_mult", 0.35) or 0.35),
                 pct_tolerance=float(getattr(sr_cfg, "pct_tolerance", 0.0030) or 0.0030),
                 stop_buffer_atr_mult=float(getattr(sr_cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
-                ema_fast_span=50,
-                ema_slow_span=200,
+                # The strategy's own HTF EMA spans: top_tier trades on this
+                # context's EMA trend (require_htf_ema_alignment /
+                # htf_ema_alignment_score). Until 2026-09-24 50/200 was
+                # hard-coded here whatever htf_ema_*_span said.
+                ema_fast_span=ema_fast_span,
+                ema_slow_span=ema_slow_span,
                 use_prior_day_high_low=bool(getattr(sr_cfg, "use_prior_day_high_low", True)),
                 use_prior_week_high_low=bool(getattr(sr_cfg, "use_prior_week_high_low", True)),
                 allow_refresh=False,
@@ -1643,6 +1110,7 @@ class BaseStrategy:
         current_price: float | None = None,
         use_prior_day_high_low: bool = True,
         use_prior_week_high_low: bool = True,
+        allow_refresh: bool = True,
     ) -> HTFContext:
         if data is None or not hasattr(data, "get_htf_context"):
             return empty_htf_context(current_price or 0.0, timeframe_minutes=timeframe_minutes)
@@ -1659,14 +1127,101 @@ class BaseStrategy:
             ema_slow_span=ema_slow_span,
             use_prior_day_high_low=bool(use_prior_day_high_low),
             use_prior_week_high_low=bool(use_prior_week_high_low),
-            include_fair_value_gaps=bool(self._support_resistance_setting("htf_fair_value_gaps_enabled", True)),
-            fair_value_gap_max_per_side=int(self._support_resistance_setting("fair_value_gap_max_per_side", 4) or 4),
-            fair_value_gap_min_atr_mult=float(self._support_resistance_setting("fair_value_gap_min_atr_mult", 0.05) or 0.05),
-            fair_value_gap_min_pct=float(self._support_resistance_setting("fair_value_gap_min_pct", 0.0005) or 0.0005),
+            allow_refresh=bool(allow_refresh),
+            **self._htf_fvg_request(),
         )
         if ctx is None:
             return empty_htf_context(current_price or 0.0, timeframe_minutes=timeframe_minutes)
         return ctx
+
+    def _htf_fvg_request(self) -> dict[str, Any]:
+        """The FVG arguments ``_htf_context`` builds every context with. They
+        are part of the data feed's context cache key, so a prefetch meant to
+        warm a context the strategy reads has to pass them too."""
+        return {
+            "include_fair_value_gaps": bool(self._support_resistance_setting("htf_fair_value_gaps_enabled", True)),
+            "fair_value_gap_max_per_side": int(self._support_resistance_setting("fair_value_gap_max_per_side", 4) or 4),
+            "fair_value_gap_min_atr_mult": float(self._support_resistance_setting("fair_value_gap_min_atr_mult", 0.05) or 0.05),
+            "fair_value_gap_min_pct": float(self._support_resistance_setting("fair_value_gap_min_pct", 0.0005) or 0.0005),
+        }
+
+    @staticmethod
+    def _htf_bias(htf: HTFContext | None, close: float) -> tuple[str, int, int]:
+        """The HTF EMA trend: close vs the fast EMA, the fast vs the slow EMA
+        and the context's trend bias each vote; 2 of 3 decide. Returns
+        ``(bias, bull_votes, bear_votes)``."""
+        bull = 0
+        bear = 0
+        ema_fast = _optional_float(getattr(htf, "ema_fast", None))
+        ema_slow = _optional_float(getattr(htf, "ema_slow", None))
+        if ema_fast is not None:
+            if close > ema_fast:
+                bull += 1
+            elif close < ema_fast:
+                bear += 1
+        if ema_fast is not None and ema_slow is not None:
+            if ema_fast > ema_slow:
+                bull += 1
+            elif ema_fast < ema_slow:
+                bear += 1
+        trend_bias = str(getattr(htf, "trend_bias", "neutral"))
+        if trend_bias == "bullish":
+            bull += 1
+        elif trend_bias == "bearish":
+            bear += 1
+        return "bullish" if bull >= 2 else ("bearish" if bear >= 2 else "neutral"), bull, bear
+
+    @staticmethod
+    def _htf_ema_alignment_sides(value: Any) -> frozenset[Side]:
+        """The sides ``require_htf_ema_alignment`` gates: ``enabled`` / true
+        both, ``long_only`` LONG, ``short_only`` SHORT, ``disabled`` / false
+        neither. Anything else raises, naming the key. The mode exists
+        because the trend's evidence is one-sided: over 21 archived top_tier
+        sessions it separated LONG outcomes and not SHORT ones."""
+        if isinstance(value, bool):
+            return frozenset({Side.LONG, Side.SHORT}) if value else frozenset()
+        mode = str(value).strip().lower()
+        modes = {
+            "enabled": frozenset({Side.LONG, Side.SHORT}),
+            "true": frozenset({Side.LONG, Side.SHORT}),
+            "long_only": frozenset({Side.LONG}),
+            "short_only": frozenset({Side.SHORT}),
+            "disabled": frozenset(),
+            "false": frozenset(),
+        }
+        if mode not in modes:
+            raise ValueError(
+                "require_htf_ema_alignment must be enabled / true, disabled / false, long_only or short_only, "
+                f"got {value!r}"
+            )
+        return modes[mode]
+
+    @staticmethod
+    def _side_vote_edge(side: Side, bullish: int, bearish: int) -> int:
+        """Votes FOR ``side`` net of those against it: the
+        ``directional_vote_edge`` the entry gatekeeper ranks signals on."""
+        net = int(bullish) - int(bearish)
+        return net if side == Side.LONG else -net
+
+    @staticmethod
+    def _htf_trend_row(bias: str, bull: int, bear: int) -> dict[str, str]:
+        label = "Bullish" if bias == "bullish" else ("Bearish" if bias == "bearish" else "—")
+        return {"state": bias, "label": label, "votes": f"{bull}v{bear}"}
+
+    def dashboard_htf_trend(self, symbol: str, data, price: float, *, allow_refresh: bool = True) -> dict[str, str] | None:
+        """The HTF trend the dashboard sidebar shows: ``{"state", "label"}``
+        from the same read the strategy's decisions use, or None when the
+        strategy has none (the sidebar then shows its generic read). Until
+        2026-09-24 the sidebar always used a 50/200 context of its own, so on
+        a peer_confirmed preset (34/200) it could say "Bullish" while the
+        strategy's HTF gate read neutral and blocked the long."""
+        return None
+
+    def dashboard_htf_ema_columns(self) -> tuple[str, str] | None:
+        """Frame columns the dashboard's HTF chart draws as the fast / slow
+        EMA when the strategy's HTF trend reads them directly (zero_dte), or
+        None for the default (the strategy's htf_ema_*_span when declared)."""
+        return None
 
     @staticmethod
     def _htf_lists(ctx: HTFContext) -> dict[str, Any]:
@@ -1876,26 +1431,30 @@ class BaseStrategy:
         symbol: str | None = None,
         data=None,
         span_scale: float = 1.0,
+        ema_spans: tuple[int, int] | None = None,
     ) -> pd.DataFrame | None:
         # span_scale stretches every indicator lookback so a fine timeframe can
         # carry a coarser timeframe's wall-clock horizon (top_tier's 1m LTF uses
-        # span_scale=5). Default 1.0 = canonical spans, unchanged for every other
-        # caller. The merged-frame cache keys the enriched frame by span_scale,
-        # so a scaled request never collides with the shared span_scale=1.0 frame.
+        # span_scale=5); ema_spans sets the ema9 / ema20 spans on their own
+        # (ltf_ema_fast_span / ltf_ema_slow_span). Defaults = canonical spans,
+        # unchanged for every other caller. The merged-frame cache keys the
+        # enriched frame by both, so such a request never collides with the
+        # shared canonical frame.
         if frame is None or frame.empty:
             return None
         tf = max(1, int(timeframe_minutes))
         if data is not None and symbol and hasattr(data, "get_merged"):
             try:
-                cached = data.get_merged(str(symbol), timeframe=f"{tf}min", with_indicators=True, span_scale=span_scale)
+                cached = data.get_merged(str(symbol), timeframe=f"{tf}min", with_indicators=True,
+                                         span_scale=span_scale, ema_spans=ema_spans)
                 if cached is not None and not cached.empty:
                     return cached
             except Exception:
                 LOG.debug("Failed to load cached %s-minute merged frame for %s; resampling from base frame.", tf, symbol, exc_info=True)
         if tf <= 1:
-            return ensure_standard_indicator_frame(frame.copy(), span_scale=span_scale)
+            return ensure_standard_indicator_frame(frame.copy(), span_scale=span_scale, ema_spans=ema_spans)
         out = resample_bars(frame, f"{tf}min")
-        return ensure_standard_indicator_frame(out, span_scale=span_scale)
+        return ensure_standard_indicator_frame(out, span_scale=span_scale, ema_spans=ema_spans)
 
     def _structure_context(self, frame: pd.DataFrame | None, timeframe: str = "ltf"):
         # Per-cycle cache. Timeframe goes in the key because the pivot_span /
@@ -1903,24 +1462,26 @@ class BaseStrategy:
         # the structure_ltf_* overrides via `_is_ltf_token`). All strategy
         # call sites pass "ltf" so the analysis tracks the strategy's
         # `params.ltf_minutes` (default 1m). Records (name, timeframe) so
-        # the engine pre-warms the right variant.
+        # the engine pre-warms the right variant (on a bars frame only, see
+        # _observe_context).
         timeframe_token = str(timeframe).lower()
-        type(self)._observed_contexts.add(("structure", timeframe_token))
+        self._observe_context(frame, ("structure", timeframe_token))
         frame_key = self._technical_context_cache_key(frame)
         cache_key = (frame_key, timeframe_token)
         with self._structure_context_lock:
             cached = self._structure_context_cache.get(cache_key)
             if cached is not None:
-                return cached
+                return cached[1]
         current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
         if frame is None or frame.empty or not bool(self._support_resistance_setting("structure_enabled", True)):
             empty_ctx = empty_market_structure_context(current_price)
             with self._structure_context_lock:
-                self._structure_context_cache[cache_key] = empty_ctx
+                self._structure_context_cache[cache_key] = (frame, empty_ctx)
             return empty_ctx
         pivot_span = int(self._support_resistance_setting("pivot_span", 2) or 2)
         is_ltf_analysis = self._is_ltf_token(timeframe_token)
         analysis_frame = frame
+        bar_minutes: int | None = None
         if is_ltf_analysis:
             pivot_span = int(self._support_resistance_setting("structure_ltf_pivot_span", max(2, pivot_span)) or max(2, pivot_span))
             # Fix D (2026-05-27): optionally resample the LTF structure frame
@@ -1932,7 +1493,21 @@ class BaseStrategy:
                 resampled = self._resampled_frame(frame, ltf_tf_min)
                 if resampled is not None and not resampled.empty:
                     analysis_frame = resampled
+                    bar_minutes = ltf_tf_min
                     current_price = _safe_float(analysis_frame.iloc[-1]["close"], current_price)
+        if bar_minutes is None:
+            bar_minutes = frame_bar_minutes(analysis_frame.index)
+        # The resample keeps the still-forming last bucket, and so does a
+        # peer's native 5m LTF frame (get_merged resamples the live 1m
+        # stream). Its first minutes must not confirm a pivot (2026-09-25,
+        # see analyze_market_structure). The same clock test as the
+        # dashboard's forming bucket and data_feed._completed_bars; a frame of
+        # completed 1m bars never reads as forming. A tz-naive index is ET
+        # wall time (session_bucket_bounds).
+        last_end = session_bucket_ends(analysis_frame.index[-1:], bar_minutes)[0]
+        now = pd.Timestamp(now_et())
+        if last_end.tzinfo is None:
+            now = now.tz_localize(None)
         pct_tolerance = float(self._support_resistance_setting("pct_tolerance", 0.0030) or 0.0030)
         if is_ltf_analysis:
             pct_tolerance *= 0.60
@@ -1948,9 +1523,10 @@ class BaseStrategy:
             structure_event_max_age_bars=structure_event_max_age_bars,
             min_range_atr_mult=float(self._support_resistance_setting("structure_min_range_atr_mult", 1.5) or 0.0),
             min_pivot_gap_bars=int(self._support_resistance_setting("structure_min_pivot_gap_bars", 0) or 0),
+            last_bar_forming=bool(last_end > now),
         )
         with self._structure_context_lock:
-            self._structure_context_cache[cache_key] = ctx
+            self._structure_context_cache[cache_key] = (frame, ctx)
         return ctx
 
     @staticmethod
@@ -1988,10 +1564,22 @@ class BaseStrategy:
 
     @staticmethod
     def _technical_context_cache_key(frame: pd.DataFrame | None) -> tuple[Any, ...]:
-        """Per-cycle cache key. `id(frame)` is the primary discriminator —
-        each symbol has its own DataFrame in `bars[...]`. `len` + last-bar
-        timestamp guard against id-reuse if a frame is GC'd and a new one
-        gets the same id (not possible mid-cycle, but cheap insurance)."""
+        """Per-cycle cache key for the chart / structure / technical caches.
+        `id(frame)` is the discriminator: each symbol has its own DataFrame.
+
+        An id only names a LIVE object -- CPython hands a freed frame's
+        address to the next allocation -- so every cache entry stores its
+        frame as ``(frame, ctx)``: while the entry exists the frame cannot be
+        freed, and no other frame can arrive with its id. Until 2026-09-23
+        the entries held only the ctx, and the peer_confirmed strategies
+        build a fresh ``get_merged(...).copy()`` per candidate that dies at
+        the next rebind: over 728 such 5m copies on 09-22, 21 took a freed
+        frame's id and one (NFLX after AAPL at 13:40) matched its whole
+        key, which serves AAPL's context for NFLX -- `len` and the last-bar
+        stamp cannot tell symbols apart, because every 5m frame in a cycle
+        ends on the same bucket and liquid names share a length. They stay
+        in the key to catch a frame grown in place (`frame.loc[ts] = ...`).
+        """
         if frame is None or frame.empty:
             return ("empty",)
         last_idx = frame.index[-1]
@@ -2002,19 +1590,19 @@ class BaseStrategy:
         return id(frame), len(frame), last_marker
 
     def _technical_context(self, frame: pd.DataFrame | None) -> TechnicalLevelsContext:
-        type(self)._observed_contexts.add(("technical",))
+        self._observe_context(frame, ("technical",))
         cache_key = self._technical_context_cache_key(frame)
         with self._technical_context_lock:
             cached = self._technical_context_cache.get(cache_key)
             if cached is not None:
-                return cached
+                return cached[1]
         current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
         cfg = getattr(self.config, "technical_levels", None)
         sr_cfg = getattr(self.config, "support_resistance", None)
         if frame is None or frame.empty or not bool(self._technical_level_setting("enabled", True)):
             empty_ctx = empty_technical_levels_context(current_price)
             with self._technical_context_lock:
-                self._technical_context_cache[cache_key] = empty_ctx
+                self._technical_context_cache[cache_key] = (frame, empty_ctx)
             return empty_ctx
         pivot_span = int(self._support_resistance_setting("structure_ltf_pivot_span", self._support_resistance_setting("pivot_span", 2)) or 2) if sr_cfg is not None else 2
         ctx = build_technical_levels_context(
@@ -2029,7 +1617,7 @@ class BaseStrategy:
             trendline_lookback_bars=int(self._technical_level_setting("trendline_lookback_bars", 120) or 120),
             trendline_min_touches=int(self._technical_level_setting("trendline_min_touches", 3) or 3),
             trendline_atr_tolerance_mult=float(self._technical_level_setting("trendline_atr_tolerance_mult", 0.35) or 0.35),
-            trendline_breakout_buffer_atr_mult=float(self._technical_level_setting("trendline_breakout_buffer_atr_mult", 0.15) or 0.15),
+            trendline_breakout_buffer_atr_mult=float(self._technical_level_setting("trendline_breakout_buffer_atr_mult", 0.65)),
             channel_lookback_bars=int(self._technical_level_setting("channel_lookback_bars", 120) or 120),
             channel_min_touches=int(self._technical_level_setting("channel_min_touches", 3) or 3),
             channel_atr_tolerance_mult=float(self._technical_level_setting("channel_atr_tolerance_mult", 0.35) or 0.35),
@@ -2043,11 +1631,19 @@ class BaseStrategy:
             adx_length=int(self._technical_level_setting("adx_length", 14) or 14),
             obv_ema_length=int(self._technical_level_setting("obv_ema_length", 20) or 20),
             divergence_rsi_length=int(self._technical_level_setting("divergence_rsi_length", 14) or 14),
-            divergence_rsi_min_delta=float(self._technical_level_setting("divergence_rsi_min_delta", 2.0) or 2.0),
+            # The three thresholds the HTF divergence shares are read as
+            # configured, as the HTF build (data_feed.get_htf_context) reads
+            # them: a configured 0 is honoured (the builder clamps it) and a
+            # null raises on both timeframes alike. `or <default>` read a 0
+            # as the default here and in the dashboard's LTF build until
+            # 2026-09-25.
+            divergence_rsi_min_delta=float(self._technical_level_setting("divergence_rsi_min_delta", 2.5)),
             divergence_obv_min_volume_frac=float(getattr(cfg, "divergence_obv_min_volume_frac", 0.50) or 0.50),
-            divergence_pivot_lookback=int(self._technical_level_setting("divergence_pivot_lookback", 4) or 4),
-            divergence_max_age_bars=int(self._technical_level_setting("divergence_max_age_bars", 8) or 8),
-            divergence_min_price_move_pct=float(self._technical_level_setting("divergence_min_price_move_pct", 0.0015) or 0.0015),
+            divergence_pivot_lookback=int(self._technical_level_setting("divergence_pivot_lookback", 4)),
+            # No `or 8`: a configured 0 (only a divergence ending on the
+            # last bar) is honoured (2026-09-24).
+            divergence_max_age_bars=int(self._technical_level_setting("divergence_max_age_bars", 8)),
+            divergence_min_price_move_pct=float(self._technical_level_setting("divergence_min_price_move_pct", 0.0015)),
             fib_enabled=bool(self._technical_level_setting("fib_enabled", True)),
             channel_enabled=bool(self._technical_level_setting("channel_enabled", True)),
             trendline_enabled=bool(self._technical_level_setting("trendline_enabled", True)),
@@ -2059,7 +1655,7 @@ class BaseStrategy:
             bollinger_enabled=bool(self._technical_level_setting("bollinger_enabled", True)),
         )
         with self._technical_context_lock:
-            self._technical_context_cache[cache_key] = ctx
+            self._technical_context_cache[cache_key] = (frame, ctx)
         return ctx
 
     def _technical_lists(self, ctx, prefix: str = "tech") -> dict[str, Any]:
@@ -2154,676 +1750,6 @@ class BaseStrategy:
         }
         return out
 
-    def _build_signal_metadata(
-        self,
-        *,
-        # Intended-entry price keys. Any that are provided are stamped
-        # onto signal.metadata with the canonical key names that
-        # ``risk.py::_signal_entry_price`` reads. Equity strategies
-        # typically pass ``entry_price=last_close`` (market-on-close);
-        # limit-order strategies pass ``limit_price``; option strategies
-        # stamp all three via their own builder because the option
-        # contract's mid/limit/mark matter separately.
-        #
-        # Without at least one of these set, the same-level retry block
-        # and the fib-pullback override in risk.py short-circuit to "ok"
-        # because ``_signal_entry_price`` returns None — the gates exist
-        # but never fire.
-        entry_price: float | None = None,
-        limit_price: float | None = None,
-        mark_price_hint: float | None = None,
-        # Component contexts. Pass None to skip that block entirely (e.g.
-        # pairs_residual passes chart_ctx=None because it doesn't use
-        # chart patterns).
-        chart_ctx: Any = None,
-        ms_ctx: Any = None,
-        sr_ctx: Any = None,
-        tech_ctx: Any = None,
-        # Sub-dict blocks. None or empty is skipped. `retest_plan` is read
-        # as ``retest_plan.get("metadata", {})`` to match the existing
-        # call-site idiom.
-        adjustments: dict[str, Any] | None = None,
-        fvg_adjustments: dict[str, Any] | None = None,
-        management: dict[str, Any] | None = None,
-        retest_plan: dict[str, Any] | None = None,
-        ladder_meta: dict[str, Any] | None = None,
-        # Score convenience. ``final_priority_score=None`` skips the stamp
-        # (use case: rth_trend_pullback stamps the score later in a
-        # follow-up metadata.update). ``score_key`` and ``score_round``
-        # are overridable for strategies that name their score differently
-        # or want more/less precision.
-        final_priority_score: float | None = None,
-        score_key: str = "final_priority_score",
-        score_round: int = 4,
-        # Prefixes passed to the component-list helpers. ``ms_prefix``
-        # defaults to "msltf" (the de-facto LTF-aware call-site convention) rather
-        # than the "ms" default on ``_structure_lists`` itself.
-        ms_prefix: str = "msltf",
-        tech_prefix: str = "tech",
-        # Caller-supplied leading keys (stamped FIRST — lowest
-        # precedence, so shared-block keys overwrite collisions). Use for
-        # strategy-specific identifying keys: e.g. ORB uses
-        # ``{"or_high": ..., "or_low": ...}``, pairs_residual uses
-        # ``{"benchmark": ..., "zscore": ...}``.
-        leading: dict[str, Any] | None = None,
-        # Caller-supplied trailing extras (stamped LAST — highest
-        # precedence, used to override any shared-block key). This is the
-        # escape hatch: if a strategy needs to monkey-patch a key that
-        # one of the component lists would set, drop it in ``extras``.
-        extras: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Build the signal.metadata dict shared across strategies.
-
-        Merge order (later keys overwrite earlier keys on collision):
-
-        1. ``entry_price``/``limit_price``/``mark_price_hint``   (if provided)
-        2. ``leading``                               (caller-specific prepend)
-        3. ``score_key: round(final_priority_score, score_round)``
-        4. ``adjustments``
-        5. ``fvg_adjustments``
-        6. ``management``
-        7. ``retest_plan.get("metadata", {})``
-        8. ``ladder_meta``
-        9. ``_chart_lists(chart_ctx)``               (if ``chart_ctx`` not None)
-        10. ``_structure_lists(ms_ctx, prefix=ms_prefix)`` (if ``ms_ctx`` not None)
-        11. ``_sr_lists(sr_ctx)``                    (if ``sr_ctx`` not None)
-        12. ``_technical_lists(tech_ctx, prefix=tech_prefix)`` (if ``tech_ctx`` not None)
-        13. ``extras``                               (caller-specific override slot)
-
-        Every default argument is keyword-only and overrideable per call.
-        Strategies that build metadata incrementally (e.g. rth_trend_pullback,
-        volatility_squeeze_breakout) can still use this helper for the final
-        assembly and ``dict.update`` the result as needed.
-        """
-        out: dict[str, Any] = {}
-        if entry_price is not None:
-            out["entry_price"] = float(entry_price)
-        if limit_price is not None:
-            out["limit_price"] = float(limit_price)
-        if mark_price_hint is not None:
-            out["mark_price_hint"] = float(mark_price_hint)
-        if leading:
-            out.update(leading)
-        if final_priority_score is not None:
-            out[score_key] = round(float(final_priority_score), score_round)
-        if adjustments:
-            out.update(adjustments)
-        if fvg_adjustments:
-            out.update(fvg_adjustments)
-        if management:
-            out.update(management)
-        if retest_plan:
-            retest_meta = retest_plan.get("metadata", {}) if isinstance(retest_plan, dict) else {}
-            if retest_meta:
-                out.update(retest_meta)
-        if ladder_meta:
-            out.update(ladder_meta)
-        if chart_ctx is not None:
-            out.update(self._chart_lists(chart_ctx))
-        if ms_ctx is not None:
-            out.update(self._structure_lists(ms_ctx, prefix=ms_prefix))
-        if sr_ctx is not None:
-            out.update(self._sr_lists(sr_ctx))
-        if tech_ctx is not None:
-            out.update(self._technical_lists(tech_ctx, prefix=tech_prefix))
-        if extras:
-            out.update(extras)
-        return out
-
-    def _dual_counter_divergence_reason(self, side: Side, tech_ctx) -> str | None:
-        if not self._shared_entry_enabled("use_divergence_filter", True):
-            return None
-        if not bool(self._technical_level_setting("enabled", True)) or not bool(self._technical_level_setting("divergence_enabled", True)):
-            return None
-        if not bool(self._technical_level_setting("divergence_block_dual_counter", True)):
-            return None
-        if side == Side.LONG and getattr(tech_ctx, "bearish_rsi_divergence", None) is not None and getattr(tech_ctx, "bearish_obv_divergence", None) is not None:
-            return "dual_counter_divergence(rsi=bearish,obv=bearish)"
-        if side == Side.SHORT and getattr(tech_ctx, "bullish_rsi_divergence", None) is not None and getattr(tech_ctx, "bullish_obv_divergence", None) is not None:
-            return "dual_counter_divergence(rsi=bullish,obv=bullish)"
-        return None
-
-    def _divergence_entry_candidate(
-        self,
-        side: Side,
-        close: float,
-        ltf: pd.DataFrame | None,
-        sr_ctx,
-        tech_ctx,
-    ) -> dict[str, Any] | None:
-        """Shared opt-in entry candidate driven by RSI divergence at S/R.
-
-        When ``shared_entry.use_divergence_entry_signal`` is ``True``, any
-        strategy can invoke this from its signal pipeline to surface a
-        divergence-driven entry. Returns ``None`` if no valid candidate
-        exists, otherwise a dict with ``trigger_level``, ``stop``, ``target``,
-        ``score``, ``reason``, ``kind``, ``indicator``, ``age_bars``.
-
-        Selection rules:
-        - LONG: regular bullish RSI div at HTF support (or near sr_ctx
-          nearest_support / broken_resistance), OR hidden bullish RSI div
-          when HTF EMA fast > slow (uptrend continuation).
-        - SHORT: mirror.
-        - SR confluence requirement (config-gated): the divergence pivot
-          must be within ``sr_ctx.level_buffer`` of an aligned S/R level.
-        - Score = (ind_delta_normalized) + (recency_bonus where 0 age = full)
-          + (S/R confluence bonus). Returned only if score >=
-          ``divergence_entry_score_floor``.
-
-        Stop: deeper of the divergence pivot price ± atr * stop_buffer or
-        the nearest swing low/high.
-        Target: nearest opposing S/R level, or close + (close - stop) *
-        target_rr (whichever is closer / cheaper risk-wise).
-        """
-        if not self._shared_entry_enabled("use_divergence_entry_signal", False):
-            return None
-        if tech_ctx is None or ltf is None or len(ltf) == 0:
-            return None
-        require_sr = bool(self._shared_entry_value("divergence_entry_require_sr_confluence", True))
-        score_floor = float(self._shared_entry_value("divergence_entry_score_floor", 1.5) or 1.5)
-        min_age = max(0, int(self._shared_entry_value("divergence_entry_min_age_bars", 0) or 0))
-        max_age = max(min_age, int(self._technical_level_setting("divergence_max_age_bars", 8) or 8))
-
-        # Pick the most relevant divergence for the side. Regular divergence
-        # (reversal context) takes priority over hidden (continuation) when
-        # both fire — the strategy author can always disable one via config.
-        if side == Side.LONG:
-            primary = getattr(tech_ctx, "bullish_rsi_divergence", None)
-            hidden = getattr(tech_ctx, "bullish_hidden_rsi_divergence", None)
-        else:
-            primary = getattr(tech_ctx, "bearish_rsi_divergence", None)
-            hidden = getattr(tech_ctx, "bearish_hidden_rsi_divergence", None)
-
-        match = primary or hidden
-        if match is None:
-            return None
-        age = int(getattr(match, "age_bars", 0) or 0)
-        # Reject too-fresh (< min_age, may not have completed forming) or
-        # too-stale (> max_age, signal lost relevance) divergences.
-        if age < min_age or age > max_age:
-            return None
-
-        pivot_price = float(getattr(match, "pivot_b_price", 0.0) or 0.0)
-        if pivot_price <= 0:
-            return None
-
-        # ATR for stop sizing.
-        atr_val = _safe_float(ltf.iloc[-1].get("atr14"), max(close * 0.0015, 0.01))
-        stop_buffer = atr_val * float(self._technical_level_setting("stop_buffer_atr_mult", 0.25) or 0.25)
-
-        # SR confluence check: divergence pivot must be near an aligned level.
-        confluence_bonus = 0.0
-        confluence_level: float | None = None
-        if sr_ctx is not None:
-            buffer = max(float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0), atr_val * 0.30, close * 0.0015)
-            if side == Side.LONG:
-                candidates = []
-                ns = getattr(sr_ctx, "nearest_support", None)
-                if ns is not None and getattr(ns, "price", None):
-                    candidates.append(float(ns.price))
-                br = getattr(sr_ctx, "broken_resistance", None)
-                if br is not None and getattr(br, "price", None):
-                    candidates.append(float(br.price))
-            else:
-                candidates = []
-                nr = getattr(sr_ctx, "nearest_resistance", None)
-                if nr is not None and getattr(nr, "price", None):
-                    candidates.append(float(nr.price))
-                bs = getattr(sr_ctx, "broken_support", None)
-                if bs is not None and getattr(bs, "price", None):
-                    candidates.append(float(bs.price))
-            for level_price in candidates:
-                if abs(pivot_price - level_price) <= buffer:
-                    confluence_bonus += 0.5
-                    confluence_level = level_price
-                    break
-        if require_sr and confluence_level is None:
-            return None
-
-        # Score: indicator delta (normalized) + recency + confluence
-        ind_delta = float(getattr(match, "indicator_delta", 0.0) or 0.0)
-        ind_score = min(1.0, ind_delta / 5.0)  # RSI delta of 5+ saturates
-        age = int(getattr(match, "age_bars", 0) or 0)
-        recency_score = max(0.0, 1.0 - (age / 8.0))
-        kind_str = str(getattr(match, "kind", "regular") or "regular")
-        kind_bonus = 0.5 if kind_str == "regular" else 0.3
-        score = ind_score + recency_score + kind_bonus + confluence_bonus
-        if score < score_floor:
-            return None
-
-        # Stop anchor: pivot price minus a buffer for LONG, plus for SHORT.
-        if side == Side.LONG:
-            stop = pivot_price - stop_buffer
-        else:
-            stop = pivot_price + stop_buffer
-
-        # Target anchor: nearest opposing-side level or RR-floor target.
-        target_rr = float(self._shared_entry_value("min_target_rr", 1.5) or 1.5)
-        risk = abs(close - stop)
-        if risk <= 0:
-            return None
-        rr_target = close + (risk * target_rr) if side == Side.LONG else close - (risk * target_rr)
-        target: float | None = rr_target
-        if sr_ctx is not None:
-            if side == Side.LONG:
-                opp = getattr(sr_ctx, "nearest_resistance", None)
-                if opp is not None and getattr(opp, "price", None):
-                    opp_p = float(opp.price)
-                    if opp_p > close:
-                        target = min(rr_target, opp_p)
-            else:
-                opp = getattr(sr_ctx, "nearest_support", None)
-                if opp is not None and getattr(opp, "price", None):
-                    opp_p = float(opp.price)
-                    if opp_p < close:
-                        target = max(rr_target, opp_p)
-
-        return {
-            "source": "shared_divergence_entry",
-            "trigger_level": float(pivot_price),
-            "stop": float(stop),
-            "target": float(target) if target is not None else None,
-            "score": float(score),
-            "reason": f"divergence_entry({kind_str}_{side.value.lower()}_{getattr(match, 'indicator', 'rsi')}_age{age}b)",
-            "kind": kind_str,
-            "indicator": str(getattr(match, "indicator", "rsi")),
-            "age_bars": age,
-            "confluence_level": confluence_level,
-        }
-
-    def _divergence_exit_signal(
-        self,
-        side: Side,
-        in_profit: bool,
-        tech_ctx,
-    ) -> tuple[str, float] | None:
-        """Shared opt-in exit signal driven by counter-direction REGULAR
-        divergence forming on a held position.
-
-        When ``shared_exit.use_divergence_exit_signal`` is ``True``, any
-        strategy can invoke this from its exit pipeline. Returns
-        ``(reason, partial_frac)`` if a counter divergence has formed and
-        the freshness/profit gates pass, ``None`` otherwise.
-
-        Hidden divergence is continuation context and never triggers exit.
-        Same-side regular divergence likewise doesn't trigger exit (it's
-        confluence, not a warning).
-        """
-        if not self._shared_exit_enabled("use_divergence_exit_signal", False):
-            return None
-        if tech_ctx is None:
-            return None
-        partial = max(0.0, min(1.0, float(self._shared_exit_value("divergence_exit_partial_frac", 0.5) or 0.5)))
-        min_age = max(0, int(self._shared_exit_value("divergence_exit_min_age_bars", 1) or 1))
-        max_age = max(min_age, int(self._technical_level_setting("divergence_max_age_bars", 8) or 8))
-        require_profit = bool(self._shared_exit_value("divergence_exit_require_in_profit", True))
-        if require_profit and not in_profit:
-            return None
-
-        if side == Side.LONG:
-            counter = getattr(tech_ctx, "bearish_rsi_divergence", None)
-            counter_obv = getattr(tech_ctx, "bearish_obv_divergence", None)
-            label = "bearish"
-        else:
-            counter = getattr(tech_ctx, "bullish_rsi_divergence", None)
-            counter_obv = getattr(tech_ctx, "bullish_obv_divergence", None)
-            label = "bullish"
-
-        match = counter or counter_obv
-        if match is None:
-            return None
-        age = int(getattr(match, "age_bars", 0) or 0)
-        # Reject too-fresh (< min_age, premature exit before pivot completes)
-        # or too-stale (> max_age, divergence already played out) divergences.
-        if age < min_age or age > max_age:
-            return None
-
-        indicator = str(getattr(match, "indicator", "rsi"))
-        return f"shared_divergence_exit({label}_{indicator}_age{age}b)", partial
-
-    def _technical_entry_adjustment(self, side: Side, tech_ctx) -> float:
-        if not self._shared_entry_enabled("use_technical_entry_adjustment", True):
-            return 0.0
-        if not bool(self._technical_level_setting("enabled", True)):
-            return 0.0
-        bonus = 0.0
-        channel_bonus = float(self._technical_level_setting("entry_bonus_channel_alignment", 0.25) or 0.25)
-        trendline_bonus = float(self._technical_level_setting("entry_bonus_trendline_respect", 0.25) or 0.25)
-        bollinger_midband_bonus = float(self._technical_level_setting("bollinger_entry_bonus_midband", 0.18) or 0.18)
-        bollinger_outer_penalty = float(self._technical_level_setting("bollinger_entry_penalty_outer_band", 0.22) or 0.22)
-        extension_penalty = float(self._technical_level_setting("entry_penalty_near_extension", 0.35) or 0.35)
-        near_extension = float(self._technical_level_setting("fib_near_extension_pct", 0.0060) or 0.0060)
-        near_edge = float(self._technical_level_setting("channel_near_edge_pct", 0.18) or 0.18)
-        channel = getattr(tech_ctx, "channel", None)
-        position_pct = getattr(channel, "position_pct", None)
-        bb_mid = getattr(tech_ctx, "bollinger_mid", None)
-        bb_upper = getattr(tech_ctx, "bollinger_upper", None)
-        bb_lower = getattr(tech_ctx, "bollinger_lower", None)
-        bb_pct = getattr(tech_ctx, "bollinger_percent_b", None)
-        bb_squeeze = bool(getattr(tech_ctx, "bollinger_squeeze", False))
-        price = _safe_float(getattr(tech_ctx, "current_price", None), 0.0)
-        adx = getattr(tech_ctx, "adx", None)
-        dmi_bias = str(getattr(tech_ctx, "dmi_bias", "neutral") or "neutral")
-        adx_rising = bool(getattr(tech_ctx, "adx_rising", False))
-        adx_min = float(self._technical_level_setting("adx_min_strength", 18.0) or 18.0)
-        adx_bonus = float(self._technical_level_setting("adx_entry_bonus", 0.22) or 0.22)
-        adx_rising_bonus = float(self._technical_level_setting("adx_rising_bonus", 0.10) or 0.10)
-        adx_weak_penalty = float(self._technical_level_setting("adx_weak_penalty", 0.12) or 0.12)
-        open_avwap = getattr(tech_ctx, "anchored_vwap_open", None)
-        bull_avwap = getattr(tech_ctx, "anchored_vwap_bullish_impulse", None)
-        bear_avwap = getattr(tech_ctx, "anchored_vwap_bearish_impulse", None)
-        avwap_bonus = float(self._technical_level_setting("anchored_vwap_entry_bonus", 0.20) or 0.20)
-        avwap_penalty = float(self._technical_level_setting("anchored_vwap_entry_penalty", 0.18) or 0.18)
-        atr_expansion = getattr(tech_ctx, "atr_expansion_mult", None)
-        atr_expand_min = float(self._technical_level_setting("atr_expansion_min_mult", 0.80) or 0.80)
-        atr_expand_bonus = float(self._technical_level_setting("atr_expansion_bonus", 0.14) or 0.14)
-        atr_stretch_max = float(self._technical_level_setting("atr_stretch_penalty_mult", 2.80) or 2.80)
-        atr_stretch_penalty = float(self._technical_level_setting("atr_stretch_penalty", 0.18) or 0.18)
-        stretch_vwap = getattr(tech_ctx, "atr_stretch_vwap_mult", None)
-        stretch_ema20 = getattr(tech_ctx, "atr_stretch_ema20_mult", None)
-        obv_bias = str(getattr(tech_ctx, "obv_bias", "neutral") or "neutral")
-        obv_bonus = float(self._technical_level_setting("obv_entry_bonus", 0.12) or 0.12)
-        obv_penalty = float(self._technical_level_setting("obv_entry_penalty", 0.10) or 0.10)
-        div_rsi_penalty = float(self._technical_level_setting("divergence_counter_rsi_penalty", 0.12) or 0.12)
-        div_obv_penalty = float(self._technical_level_setting("divergence_counter_obv_penalty", 0.10) or 0.10)
-        div_hidden_rsi_bonus = float(self._technical_level_setting("divergence_hidden_bonus_rsi", 0.10) or 0.10)
-        div_hidden_obv_bonus = float(self._technical_level_setting("divergence_hidden_bonus_obv", 0.08) or 0.08)
-        divergence_enabled = bool(self._technical_level_setting("divergence_enabled", True))
-        if side == Side.LONG:
-            if bool(self._technical_level_setting("trendline_enabled", True)):
-                if bool(getattr(tech_ctx, "support_respected", False)):
-                    bonus += trendline_bonus
-                if bool(getattr(tech_ctx, "trendline_break_up", False)):
-                    bonus += trendline_bonus * 0.8
-            if bool(self._technical_level_setting("channel_enabled", True)) and bool(getattr(channel, "valid", False)) and position_pct is not None:
-                if str(getattr(channel, "bias", "neutral")) == "bullish" and float(position_pct) <= 0.60:
-                    bonus += channel_bonus
-                if float(position_pct) >= 1.0 - near_edge:
-                    bonus -= channel_bonus
-            if bool(self._technical_level_setting("fib_enabled", True)):
-                dist = getattr(tech_ctx, "bullish_extension_distance_pct", None)
-                if dist is not None and float(dist) <= near_extension:
-                    bonus -= extension_penalty
-            if bool(self._technical_level_setting("bollinger_enabled", True)) and bb_mid is not None and bb_upper is not None and bb_lower is not None and price > 0:
-                if price >= float(bb_mid) and (bb_pct is None or float(bb_pct) <= 0.82):
-                    bonus += bollinger_midband_bonus
-                if price >= float(bb_upper) or (bb_pct is not None and float(bb_pct) >= 0.96):
-                    bonus -= bollinger_outer_penalty
-                if bb_squeeze and bool(getattr(tech_ctx, "trendline_break_up", False)):
-                    bonus += bollinger_midband_bonus * 0.5
-            if bool(self._technical_level_setting("adx_enabled", True)) and adx is not None:
-                if dmi_bias == "bullish" and float(adx) >= adx_min:
-                    bonus += adx_bonus
-                    if adx_rising:
-                        bonus += adx_rising_bonus
-                elif float(adx) < adx_min * 0.8 and not bb_squeeze:
-                    bonus -= adx_weak_penalty
-            if bool(self._technical_level_setting("anchored_vwap_enabled", True)) and price > 0:
-                if open_avwap is not None and price >= float(open_avwap):
-                    bonus += avwap_bonus * 0.6
-                elif open_avwap is not None:
-                    bonus -= avwap_penalty * 0.6
-                if bull_avwap is not None and price >= float(bull_avwap):
-                    bonus += avwap_bonus
-                elif bull_avwap is not None:
-                    bonus -= avwap_penalty
-            if bool(self._technical_level_setting("atr_context_enabled", True)):
-                if atr_expansion is not None and float(atr_expansion) >= atr_expand_min and (stretch_vwap is None or float(stretch_vwap) <= atr_stretch_max):
-                    bonus += atr_expand_bonus
-                if stretch_vwap is not None and float(stretch_vwap) >= atr_stretch_max:
-                    bonus -= atr_stretch_penalty
-                if stretch_ema20 is not None and float(stretch_ema20) >= atr_stretch_max:
-                    bonus -= atr_stretch_penalty * 0.75
-            if bool(self._technical_level_setting("obv_enabled", True)):
-                if obv_bias == "bullish":
-                    bonus += obv_bonus
-                elif obv_bias == "bearish":
-                    bonus -= obv_penalty
-            if divergence_enabled:
-                # Counter-direction REGULAR divergence -> reversal warning,
-                # penalize a LONG entry. Hidden divergence in same direction
-                # -> continuation, bonus.
-                if getattr(tech_ctx, "bearish_rsi_divergence", None) is not None:
-                    bonus -= div_rsi_penalty
-                if getattr(tech_ctx, "bearish_obv_divergence", None) is not None:
-                    bonus -= div_obv_penalty
-                if getattr(tech_ctx, "bullish_hidden_rsi_divergence", None) is not None:
-                    bonus += div_hidden_rsi_bonus
-                if getattr(tech_ctx, "bullish_hidden_obv_divergence", None) is not None:
-                    bonus += div_hidden_obv_bonus
-        else:
-            if bool(self._technical_level_setting("trendline_enabled", True)):
-                if bool(getattr(tech_ctx, "resistance_respected", False)):
-                    bonus += trendline_bonus
-                if bool(getattr(tech_ctx, "trendline_break_down", False)):
-                    bonus += trendline_bonus * 0.8
-            if bool(self._technical_level_setting("channel_enabled", True)) and bool(getattr(channel, "valid", False)) and position_pct is not None:
-                if str(getattr(channel, "bias", "neutral")) == "bearish" and float(position_pct) >= 0.40:
-                    bonus += channel_bonus
-                if float(position_pct) <= near_edge:
-                    bonus -= channel_bonus
-            if bool(self._technical_level_setting("fib_enabled", True)):
-                dist = getattr(tech_ctx, "bearish_extension_distance_pct", None)
-                if dist is not None and float(dist) <= near_extension:
-                    bonus -= extension_penalty
-            if bool(self._technical_level_setting("bollinger_enabled", True)) and bb_mid is not None and bb_upper is not None and bb_lower is not None and price > 0:
-                if price <= float(bb_mid) and (bb_pct is None or float(bb_pct) >= 0.18):
-                    bonus += bollinger_midband_bonus
-                if price <= float(bb_lower) or (bb_pct is not None and float(bb_pct) <= 0.04):
-                    bonus -= bollinger_outer_penalty
-                if bb_squeeze and bool(getattr(tech_ctx, "trendline_break_down", False)):
-                    bonus += bollinger_midband_bonus * 0.5
-            if bool(self._technical_level_setting("adx_enabled", True)) and adx is not None:
-                if dmi_bias == "bearish" and float(adx) >= adx_min:
-                    bonus += adx_bonus
-                    if adx_rising:
-                        bonus += adx_rising_bonus
-                elif float(adx) < adx_min * 0.8 and not bb_squeeze:
-                    bonus -= adx_weak_penalty
-            if bool(self._technical_level_setting("anchored_vwap_enabled", True)) and price > 0:
-                if open_avwap is not None and price <= float(open_avwap):
-                    bonus += avwap_bonus * 0.6
-                elif open_avwap is not None:
-                    bonus -= avwap_penalty * 0.6
-                if bear_avwap is not None and price <= float(bear_avwap):
-                    bonus += avwap_bonus
-                elif bear_avwap is not None:
-                    bonus -= avwap_penalty
-            if bool(self._technical_level_setting("atr_context_enabled", True)):
-                if atr_expansion is not None and float(atr_expansion) >= atr_expand_min and (stretch_vwap is None or float(stretch_vwap) <= atr_stretch_max):
-                    bonus += atr_expand_bonus
-                if stretch_vwap is not None and float(stretch_vwap) >= atr_stretch_max:
-                    bonus -= atr_stretch_penalty
-                if stretch_ema20 is not None and float(stretch_ema20) >= atr_stretch_max:
-                    bonus -= atr_stretch_penalty * 0.75
-            if bool(self._technical_level_setting("obv_enabled", True)):
-                if obv_bias == "bearish":
-                    bonus += obv_bonus
-                elif obv_bias == "bullish":
-                    bonus -= obv_penalty
-            if divergence_enabled:
-                # Counter-direction REGULAR divergence -> reversal warning,
-                # penalize a SHORT entry. Hidden divergence in same direction
-                # -> continuation, bonus.
-                if getattr(tech_ctx, "bullish_rsi_divergence", None) is not None:
-                    bonus -= div_rsi_penalty
-                if getattr(tech_ctx, "bullish_obv_divergence", None) is not None:
-                    bonus -= div_obv_penalty
-                if getattr(tech_ctx, "bearish_hidden_rsi_divergence", None) is not None:
-                    bonus += div_hidden_rsi_bonus
-                if getattr(tech_ctx, "bearish_hidden_obv_divergence", None) is not None:
-                    bonus += div_hidden_obv_bonus
-        return float(bonus)
-
-    def _sr_entry_adjustment_components(self, side: Side, sr_ctx) -> dict[str, float]:
-        out = {
-            "sr_directional_bias": 0.0,
-            "sr_bias_component": 0.0,
-            "sr_favorable_proximity_score": 0.0,
-            "sr_opposing_proximity_score": 0.0,
-            "sr_entry_adjustment": 0.0,
-        }
-        if not bool(self._support_resistance_setting("entry_proximity_scoring_enabled", True)):
-            return out
-        if not bool(self._support_resistance_setting("enabled", True)):
-            return out
-        if sr_ctx is None:
-            return out
-        try:
-            raw_bias = _safe_float(getattr(sr_ctx, "bias_score", 0.0), 0.0)
-            directional_bias = raw_bias if side == Side.LONG else -raw_bias
-            bias_weight = max(0.0, float(self._support_resistance_setting("entry_bias_score_weight", 0.60) or 0.60))
-            favorable_bonus = max(0.0, float(self._support_resistance_setting("entry_favorable_proximity_bonus", 0.35) or 0.35))
-            opposing_penalty = max(0.0, float(self._support_resistance_setting("entry_opposing_proximity_penalty", 0.35) or 0.35))
-            proximity_window_atr = max(0.05, float(self._support_resistance_setting("proximity_atr_mult", 0.75) or 0.75))
-            bias_component = directional_bias * bias_weight
-
-            if side == Side.LONG:
-                favorable_near = bool(getattr(sr_ctx, "near_support", False)) and not bool(getattr(sr_ctx, "breakdown_below_support", False))
-                favorable_dist = _optional_float(getattr(sr_ctx, "support_distance_atr", None))
-                opposing_near = bool(getattr(sr_ctx, "near_resistance", False)) and not bool(getattr(sr_ctx, "breakout_above_resistance", False))
-                opposing_dist = _optional_float(getattr(sr_ctx, "resistance_distance_atr", None))
-            else:
-                favorable_near = bool(getattr(sr_ctx, "near_resistance", False)) and not bool(getattr(sr_ctx, "breakout_above_resistance", False))
-                favorable_dist = _optional_float(getattr(sr_ctx, "resistance_distance_atr", None))
-                opposing_near = bool(getattr(sr_ctx, "near_support", False)) and not bool(getattr(sr_ctx, "breakdown_below_support", False))
-                opposing_dist = _optional_float(getattr(sr_ctx, "support_distance_atr", None))
-
-            def _proximity_score(dist_atr: float | None) -> float:
-                if dist_atr is None:
-                    return 0.0
-                return max(0.0, min(1.0, 1.0 - (float(dist_atr) / proximity_window_atr)))
-
-            favorable_score = favorable_bonus * _proximity_score(favorable_dist) if favorable_near else 0.0
-            opposing_score = opposing_penalty * _proximity_score(opposing_dist) if opposing_near else 0.0
-            total = bias_component + favorable_score - opposing_score
-            out.update({
-                "sr_directional_bias": round(directional_bias, 4),
-                "sr_bias_component": round(bias_component, 4),
-                "sr_favorable_proximity_score": round(favorable_score, 4),
-                "sr_opposing_proximity_score": round(opposing_score, 4),
-                "sr_entry_adjustment": round(total, 4),
-            })
-        except Exception:
-            return out
-        return out
-
-    def _entry_adjustment_components(self, side: Side, sr_ctx=None, tech_ctx=None, htf_ctx=None) -> dict[str, float]:
-        sr_fields = self._sr_entry_adjustment_components(side, sr_ctx)
-        tech_adjustment = round(self._technical_entry_adjustment(side, tech_ctx), 4) if tech_ctx is not None else 0.0
-        htf_div_adjustment = round(self._htf_divergence_adjustment(side, htf_ctx), 4) if htf_ctx is not None else 0.0
-        total = round(float(sr_fields.get("sr_entry_adjustment", 0.0)) + tech_adjustment + htf_div_adjustment, 4)
-        return {
-            **sr_fields,
-            "technical_entry_adjustment": tech_adjustment,
-            "htf_divergence_adjustment": htf_div_adjustment,
-            "entry_context_adjustment": total,
-        }
-
-    def _htf_divergence_adjustment(self, side: Side, htf_ctx) -> float:
-        """Multi-timeframe divergence confluence adjustment.
-
-        HTF same-direction divergence (regular bullish for LONG, regular
-        bearish for SHORT) signals a higher-timeframe reversal aligned with
-        the trade — bonus. Counter-direction HTF divergence (regular bullish
-        for SHORT, regular bearish for LONG) signals a HTF reversal AGAINST
-        the trade — penalty. HTF hidden divergence in trade direction signals
-        HTF continuation aligned with the trade — small bonus.
-        """
-        if not self._shared_entry_enabled("use_htf_divergence_filter", True):
-            return 0.0
-        if htf_ctx is None:
-            return 0.0
-        bonus_aligned = float(self._technical_level_setting("htf_divergence_aligned_bonus_rsi", 0.20) or 0.20)
-        penalty_counter = float(self._technical_level_setting("htf_divergence_counter_penalty_rsi", 0.25) or 0.25)
-        bonus_hidden = float(self._technical_level_setting("htf_divergence_hidden_bonus_rsi", 0.10) or 0.10)
-        bonus = 0.0
-        if side == Side.LONG:
-            if getattr(htf_ctx, "bullish_rsi_divergence", None) is not None:
-                bonus += bonus_aligned
-            if getattr(htf_ctx, "bearish_rsi_divergence", None) is not None:
-                bonus -= penalty_counter
-            if getattr(htf_ctx, "bullish_hidden_rsi_divergence", None) is not None:
-                bonus += bonus_hidden
-        else:
-            if getattr(htf_ctx, "bearish_rsi_divergence", None) is not None:
-                bonus += bonus_aligned
-            if getattr(htf_ctx, "bullish_rsi_divergence", None) is not None:
-                bonus -= penalty_counter
-            if getattr(htf_ctx, "bearish_hidden_rsi_divergence", None) is not None:
-                bonus += bonus_hidden
-        return float(bonus)
-
-    def _refine_bullish_technical_levels(self, close: float, stop: float, target: float | None, tech_ctx, frame: pd.DataFrame | None):
-        if not self._shared_entry_enabled("use_technical_stop_target_refinement", True):
-            return float(stop), (None if target is None else float(target))
-        if not bool(self._technical_level_setting("enabled", True)):
-            return float(stop), (None if target is None else float(target))
-        atr = self._frame_atr14(frame, close)
-        buffer = max(atr * 0.12, close * 0.0010)
-        if bool(self._technical_level_setting("stop_use_trendline", True)) and getattr(tech_ctx, "support_trendline", None) is not None:
-            support_value = _safe_float(getattr(tech_ctx.support_trendline, "current_value", None), 0.0)
-            trend_stop = support_value - buffer
-            if 0 < trend_stop < close:
-                stop = self._clamp_refined_stop(
-                    close, stop, max(float(stop), float(trend_stop)), atr,
-                )
-        if target is not None:
-            risk = max(close - float(stop), buffer)
-            caps: list[float] = []
-            if bool(self._technical_level_setting("target_use_fib", True)) and getattr(tech_ctx, "nearest_bullish_extension", None) is not None:
-                caps.append(float(tech_ctx.nearest_bullish_extension) - buffer)
-            channel_ctx = getattr(tech_ctx, "channel", None)
-            if bool(self._technical_level_setting("target_use_channel", True)) and bool(getattr(channel_ctx, "valid", False)) and getattr(channel_ctx, "upper", None) is not None:
-                caps.append(float(getattr(channel_ctx, "upper")) - buffer)
-            if bool(self._technical_level_setting("target_use_bollinger", True)) and getattr(tech_ctx, "bollinger_upper", None) is not None and not bool(getattr(tech_ctx, "bollinger_squeeze", False)):
-                caps.append(float(tech_ctx.bollinger_upper) - buffer)
-            if bool(self._technical_level_setting("target_use_trendline", True)) and getattr(tech_ctx, "resistance_trendline", None) is not None and not bool(getattr(tech_ctx, "trendline_break_up", False)):
-                caps.append(float(tech_ctx.resistance_trendline.current_value) - buffer)
-            valid = [cap for cap in caps if cap > close + max(buffer, risk * 0.35)]
-            if valid:
-                proposed_target = min(float(target), min(valid))
-                # R:R floor: don't let a tech level crush reward below the
-                # configured min_target_rr. Falls back to the un-capped
-                # target when the cap would harm the trade.
-                if self._target_meets_min_rr(Side.LONG, close, stop, proposed_target):
-                    target = proposed_target
-        return float(stop), (None if target is None else float(target))
-
-    def _refine_bearish_technical_levels(self, close: float, stop: float, target: float | None, tech_ctx, frame: pd.DataFrame | None):
-        if not self._shared_entry_enabled("use_technical_stop_target_refinement", True):
-            return float(stop), (None if target is None else float(target))
-        if not bool(self._technical_level_setting("enabled", True)):
-            return float(stop), (None if target is None else float(target))
-        atr = self._frame_atr14(frame, close)
-        buffer = max(atr * 0.12, close * 0.0010)
-        if bool(self._technical_level_setting("stop_use_trendline", True)) and getattr(tech_ctx, "resistance_trendline", None) is not None:
-            resistance_value = _safe_float(getattr(tech_ctx.resistance_trendline, "current_value", None), 0.0)
-            trend_stop = resistance_value + buffer
-            if trend_stop > close:
-                stop = self._clamp_refined_stop(
-                    close, stop, min(float(stop), float(trend_stop)), atr,
-                )
-        if target is not None:
-            risk = max(float(stop) - close, buffer)
-            caps: list[float] = []
-            if bool(self._technical_level_setting("target_use_fib", True)) and getattr(tech_ctx, "nearest_bearish_extension", None) is not None:
-                caps.append(float(tech_ctx.nearest_bearish_extension) + buffer)
-            channel_ctx = getattr(tech_ctx, "channel", None)
-            if bool(self._technical_level_setting("target_use_channel", True)) and bool(getattr(channel_ctx, "valid", False)) and getattr(channel_ctx, "lower", None) is not None:
-                caps.append(float(getattr(channel_ctx, "lower")) + buffer)
-            if bool(self._technical_level_setting("target_use_bollinger", True)) and getattr(tech_ctx, "bollinger_lower", None) is not None and not bool(getattr(tech_ctx, "bollinger_squeeze", False)):
-                caps.append(float(tech_ctx.bollinger_lower) + buffer)
-            if bool(self._technical_level_setting("target_use_trendline", True)) and getattr(tech_ctx, "support_trendline", None) is not None and not bool(getattr(tech_ctx, "trendline_break_down", False)):
-                caps.append(float(tech_ctx.support_trendline.current_value) + buffer)
-            valid = [cap for cap in caps if cap < close - max(buffer, risk * 0.35)]
-            if valid:
-                proposed_target = max(float(target), max(valid))
-                # R:R floor — see comment on the bullish twin above.
-                if self._target_meets_min_rr(Side.SHORT, close, stop, proposed_target):
-                    target = proposed_target
-        return float(stop), (None if target is None else float(target))
-
     @staticmethod
     def _position_r_multiple(position: Position, close: float) -> float | None:
         """Open profit at ``close`` in initial-risk (R) units.
@@ -2892,136 +1818,6 @@ class BaseStrategy:
             _optional_float(meta.get("underlying_low_since_entry"), entry),
         )
 
-    def _discretionary_exit_allowed(self, position: Position, close: float) -> bool:
-        """Gate for the exit families that carry no R condition of their own.
-
-        Bias-based structure exits, the technical exits, and the S/R break
-        exits are all pattern reads on the tape: they fire on a pivot label,
-        a trendline touch, an anchored-VWAP cross. None of them ask whether
-        the trade has earned anything yet, so on a trade still hovering
-        around entry they act as an arbitrary tightened stop. Measured over
-        2026-05-12..29 they closed 19 of 48 top_tier_adaptive trades at a
-        median MFE of 0.09-0.29R for -$831 — and in the widest-stop bucket
-        0 of 22 trades ever reached their protective stop, because one of
-        these got there first.
-
-        Below ``shared_exit.discretionary_exit_min_r`` the protective stop
-        governs the trade and these exits stay silent. CHoCH exits are not
-        routed through here — a genuine change-of-character is a reversal
-        signal rather than noise — nor are the stop, target, time-stop,
-        peak-giveback or trailing paths, which have their own R logic.
-        """
-        try:
-            min_r = float(self._shared_exit_value("discretionary_exit_min_r", 0.5) or 0.0)
-        except (TypeError, ValueError):
-            min_r = 0.5
-        if min_r <= 0:
-            return True
-        current_r = self._position_r_multiple(position, close)
-        if current_r is None:
-            return True
-        return current_r >= min_r
-
-    def _technical_exit_signal(self, direction: str, frame: pd.DataFrame, close: float, ema9: float, ema20: float, vwap: float, close_pos: float, position: Position) -> tuple[bool, str]:
-        if not self._shared_exit_enabled("use_technical_exit", True):
-            return False, "hold"
-        # Every branch below (trendline / channel / bollinger / anchored-VWAP)
-        # is a discretionary tape read; gate the whole family in one place.
-        if not self._discretionary_exit_allowed(position, close):
-            return False, "hold"
-        if not bool(self._technical_level_setting("enabled", True)):
-            return False, "hold"
-        tech_ctx = self._technical_context(frame)
-        atr = self._frame_atr14(frame, close)
-        buffer = max(atr * float(self._technical_level_setting("trendline_breakout_buffer_atr_mult", 0.15) or 0.15), close * 0.0010)
-        if direction == "bullish":
-            weak_tape = self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.48)
-            if bool(getattr(tech_ctx, "trendline_break_down", False)) and self._shared_exit_enabled("use_trendline_break", True) and weak_tape:
-                support_value = _safe_float(getattr(getattr(tech_ctx, "support_trendline", None), "current_value", None), close)
-                return True, f"trendline_break_exit:{support_value:.4f}"
-            channel_ctx = getattr(tech_ctx, "channel", None)
-            if bool(getattr(channel_ctx, "valid", False)) and getattr(channel_ctx, "lower", None) is not None and self._shared_exit_enabled("use_channel_break", True):
-                lower = float(getattr(channel_ctx, "lower"))
-                tape_ok = self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.45)
-                if close <= lower - buffer and tape_ok:
-                    return True, f"channel_breakdown_exit:{lower:.4f}"
-            if bool(getattr(tech_ctx, "bollinger_upper_reject", False)) and self._shared_exit_enabled("use_bollinger_reject", True):
-                tape_ok = self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.52)
-                if tape_ok:
-                    upper = _safe_float(getattr(tech_ctx, "bollinger_upper", None), close)
-                    return True, f"bollinger_upper_reject_exit:{upper:.4f}"
-            if self._shared_exit_enabled("use_anchored_vwap_loss", True):
-                open_avwap = _safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0)
-                bull_avwap = _safe_float(getattr(tech_ctx, "anchored_vwap_bullish_impulse", None), 0.0)
-                avwap_floor = max(open_avwap, bull_avwap)
-                # Armed-guard: the position must have traded at-or-above
-                # avwap_floor + buffer at some point since entry. Without
-                # this, a LONG entered below the floor (common when the
-                # bullish-impulse AVWAP sits above current price) triggers
-                # an instant "loss" exit on the next tick — observed on
-                # AMZN 2026-04-24 10:59 (13-second exit, -$3.99). Mirrors
-                # how trail_armed requires a favorable move before arming.
-                # Buffer tightens the armed threshold so a one-tick poke
-                # right at the floor doesn't arm the exit prematurely.
-                highest_price, _lowest = self._underlying_extremes(position)
-                avwap_armed = avwap_floor > 0 and highest_price is not None and highest_price >= avwap_floor + buffer
-                tape_ok = self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.48)
-                # 2-bar confirmation (2026-05-29). A single 1m close below the
-                # anchored-VWAP floor is normal continuation noise in a trending
-                # stock; AVGO 2026-05-29 12:09 LONG exited at 439.50 on one
-                # such dip while AVGO closed at 446.67 (-$17 realized vs +$183
-                # unrealized continuation). Require the PRIOR bar to also have
-                # closed below floor-buffer so a one-bar noise dip can't fire
-                # the exit. Disable via shared_exit.anchored_vwap_exit_require_two_bar_confirm.
-                two_bar = bool(self._shared_exit_enabled("anchored_vwap_exit_require_two_bar_confirm", True))
-                prior_confirms = True
-                if two_bar and frame is not None and len(frame) >= 2:
-                    prior_close = _safe_float(frame.iloc[-2].get("close"), close)
-                    prior_confirms = prior_close < avwap_floor - buffer
-                if avwap_floor > 0 and avwap_armed and close < avwap_floor - buffer and tape_ok and prior_confirms:
-                    return True, f"anchored_vwap_loss_exit:{avwap_floor:.4f}"
-        else:
-            weak_tape = self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.52)
-            if bool(getattr(tech_ctx, "trendline_break_up", False)) and self._shared_exit_enabled("use_trendline_break", True) and weak_tape:
-                resistance_value = _safe_float(getattr(getattr(tech_ctx, "resistance_trendline", None), "current_value", None), close)
-                return True, f"trendline_break_exit:{resistance_value:.4f}"
-            channel_ctx = getattr(tech_ctx, "channel", None)
-            if bool(getattr(channel_ctx, "valid", False)) and getattr(channel_ctx, "upper", None) is not None and self._shared_exit_enabled("use_channel_break", True):
-                upper = float(getattr(channel_ctx, "upper"))
-                tape_ok = self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.55)
-                if close >= upper + buffer and tape_ok:
-                    return True, f"channel_breakout_exit:{upper:.4f}"
-            if bool(getattr(tech_ctx, "bollinger_lower_reject", False)) and self._shared_exit_enabled("use_bollinger_reject", True):
-                tape_ok = self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.48)
-                if tape_ok:
-                    lower = _safe_float(getattr(tech_ctx, "bollinger_lower", None), close)
-                    return True, f"bollinger_lower_reject_exit:{lower:.4f}"
-            if self._shared_exit_enabled("use_anchored_vwap_loss", True):
-                open_avwap = _safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0)
-                bear_avwap = _safe_float(getattr(tech_ctx, "anchored_vwap_bearish_impulse", None), 0.0)
-                avwap_ceiling = min(px for px in [open_avwap, bear_avwap] if px > 0) if any(px > 0 for px in [open_avwap, bear_avwap]) else 0.0
-                # Mirror of the bullish armed-guard. Require the position
-                # to have traded at-or-below avwap_ceiling - buffer at some
-                # point since entry. Without this, a SHORT entered with
-                # price already near the AVWAP ceiling triggers an instant
-                # reclaim exit on the next tick — observed on META
-                # 2026-04-24 09:35 (55-second exit, -$68.86).
-                _highest, lowest_price = self._underlying_extremes(position)
-                avwap_armed = avwap_ceiling > 0 and lowest_price is not None and lowest_price <= avwap_ceiling - buffer
-                tape_ok = self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.52)
-                # 2-bar confirmation (2026-05-29). Mirror of the LONG branch:
-                # require the PRIOR bar to also have closed above ceiling+buffer
-                # so a one-bar noise spike can't fire the exit in a SHORT that
-                # is still working. Disable via shared_exit.anchored_vwap_exit_require_two_bar_confirm.
-                two_bar = bool(self._shared_exit_enabled("anchored_vwap_exit_require_two_bar_confirm", True))
-                prior_confirms = True
-                if two_bar and frame is not None and len(frame) >= 2:
-                    prior_close = _safe_float(frame.iloc[-2].get("close"), close)
-                    prior_confirms = prior_close > avwap_ceiling + buffer
-                if avwap_ceiling > 0 and avwap_armed and close > avwap_ceiling + buffer and tape_ok and prior_confirms:
-                    return True, f"anchored_vwap_reclaim_exit:{avwap_ceiling:.4f}"
-        return False, "hold"
-
     def _structure_event_recent(self, age_bars: int | None, *, htf: bool = False) -> bool:
         """Is a BOS/CHoCH ``age_bars`` old still fresh? ``age_bars`` is in the
         bars of the structure it came from, so pass ``htf=True`` for the S/R
@@ -3038,269 +1834,6 @@ class BaseStrategy:
 
     def _active_structure_break(self, flag: bool, age_bars: int | None, *, htf: bool = False) -> bool:
         return bool(flag) and self._structure_event_recent(age_bars, htf=htf)
-
-    @staticmethod
-    def _fvg_gap_state(gap: Any, current_price: float) -> dict[str, Any]:
-        lower = _optional_float(getattr(gap, "lower", None))
-        upper = _optional_float(getattr(gap, "upper", None))
-        midpoint = _optional_float(getattr(gap, "midpoint", None))
-        size = _optional_float(getattr(gap, "size", None))
-        filled_pct = max(0.0, min(1.0, _optional_float(getattr(gap, "filled_pct", None), 0.0) or 0.0))
-        direction = str(getattr(gap, "direction", "")).strip().lower()
-        if lower is None or upper is None or midpoint is None or size is None or size <= 0:
-            return {"state": "none", "direction": direction or "unknown", "distance": None, "distance_pct": None, "filled_pct": filled_pct}
-        close = float(current_price or 0.0)
-        eps = max(float(size) * 0.05, abs(close) * 1e-6, 1e-8)
-        if close < lower:
-            distance = float(lower - close)
-        elif close > upper:
-            distance = float(close - upper)
-        else:
-            distance = 0.0
-        if direction == "bullish":
-            state = "invalidated" if close < lower - eps else ("active" if close <= upper + eps else "validated")
-        elif direction == "bearish":
-            state = "invalidated" if close > upper + eps else ("active" if close >= lower - eps else "validated")
-        else:
-            state = "active" if lower - eps <= close <= upper + eps else "validated"
-        return {
-            "state": state,
-            "direction": direction or "unknown",
-            "lower": float(lower),
-            "upper": float(upper),
-            "midpoint": float(midpoint),
-            "size": float(size),
-            "filled_pct": filled_pct,
-            "distance": float(distance),
-            "distance_pct": float(distance / max(abs(close), 1e-9)) if close else None,
-        }
-
-    def _score_fvg_context(self, current_price: float, ctx: Any, *, timeframe_minutes: int) -> dict[str, Any]:
-        close = float(current_price or 0.0)
-        tf = max(1, int(timeframe_minutes or 1))
-        is_htf = tf > 1
-        valid_base = 0.37 if is_htf else 0.22
-        active_base = 0.24 if is_htf else 0.15
-        invalid_base = 0.42 if is_htf else 0.26
-        proximity_floor = abs(close) * (0.0060 if is_htf else 0.0030)
-        half_life_bars = 10.0 if is_htf else 14.0
-        min_recency_factor = 0.30
-
-        def _gap_recency_factor(gap: Any) -> float:
-            stamp = getattr(gap, "last_seen", None) or getattr(gap, "first_seen", None)
-            if not stamp:
-                return 1.0
-            try:
-                seen = pd.Timestamp(stamp)
-                if seen.tzinfo is not None:
-                    seen = seen.tz_convert(None)
-                current = pd.Timestamp(now_et())
-                if current.tzinfo is not None:
-                    current = current.tz_convert(None)
-                age_seconds = max(0.0, float((current - seen).total_seconds()))
-            except Exception:
-                return 1.0
-            age_bars = age_seconds / max(float(tf) * 60.0, 60.0)
-            factor = 0.5 ** (age_bars / max(half_life_bars, 1.0))
-            return float(max(min_recency_factor, min(1.0, factor)))
-
-        def _score_gap(gap: Any) -> tuple[float, float, dict[str, Any]]:
-            info = self._fvg_gap_state(gap, close)
-            state = str(info.get("state", "none"))
-            direction = str(info.get("direction", "unknown"))
-            size = _optional_float(info.get("size"), 0.0) or 0.0
-            distance = _optional_float(info.get("distance"), 0.0) or 0.0
-            fill = max(0.0, min(1.0, _optional_float(info.get("filled_pct"), 0.0) or 0.0))
-            if state == "none" or direction not in {"bullish", "bearish"}:
-                return 0.0, 0.0, info
-            distance_limit = max(float(size) * 2.5, float(proximity_floor), 1e-8)
-            closeness = max(0.0, 1.0 - (float(distance) / distance_limit))
-            if closeness <= 0.0:
-                info["closeness"] = 0.0
-                info["recency_factor"] = 0.0
-                return 0.0, 0.0, info
-            fill_damp = 1.0 - (0.35 * fill if state != "invalidated" else 0.0)
-            recency_factor = _gap_recency_factor(gap)
-            base = invalid_base if state == "invalidated" else (valid_base if state == "validated" else active_base)
-            magnitude = float(base) * float(closeness) * float(fill_damp) * float(recency_factor)
-            bull = 0.0
-            bear = 0.0
-            if direction == "bullish":
-                if state == "invalidated":
-                    bear += magnitude
-                    bull -= magnitude * 0.80
-                else:
-                    bull += magnitude
-                    bear -= magnitude * 0.80
-            elif direction == "bearish":
-                if state == "invalidated":
-                    bull += magnitude
-                    bear -= magnitude * 0.80
-                else:
-                    bear += magnitude
-                    bull -= magnitude * 0.80
-            info["closeness"] = float(closeness)
-            info["recency_factor"] = float(recency_factor)
-            info["score_magnitude"] = float(magnitude)
-            return bull, bear, info
-
-        bull_score = 0.0
-        bear_score = 0.0
-        nearest_bullish = getattr(ctx, "nearest_bullish_fvg", None)
-        nearest_bearish = getattr(ctx, "nearest_bearish_fvg", None)
-        bull_pos, bear_neg, bullish_info = _score_gap(nearest_bullish)
-        bull_score += bull_pos
-        bear_score += bear_neg
-        bull_neg, bear_pos, bearish_info = _score_gap(nearest_bearish)
-        bull_score += bull_neg
-        bear_score += bear_pos
-        directional_pressure = max(0.0, bull_score, bear_score)
-        return {
-            "bull_score": float(bull_score),
-            "bear_score": float(bear_score),
-            "directional_pressure": float(directional_pressure),
-            "timeframe_minutes": tf,
-            "nearest_bullish": bullish_info,
-            "nearest_bearish": bearish_info,
-        }
-
-    def _fvg_entry_adjustment_components(self, side: Side, symbol: str, frame: pd.DataFrame | None, data=None) -> dict[str, Any]:
-        out: dict[str, Any] = {
-            "fvg_context_enabled": False,
-            "fvg_entry_adjustment": 0.0,
-            "fvg_same_direction_score": 0.0,
-            "fvg_opposing_score": 0.0,
-            "fvg_continuation_bias": 0.0,
-            "fvg_reversal_bias": 0.0,
-            "fvg_same_direction_label": "bullish" if side == Side.LONG else "bearish",
-            "fvg_opposing_label": "bearish" if side == Side.LONG else "bullish",
-        }
-        if frame is None or frame.empty or not bool(self._shared_entry_enabled("use_fvg_context", True)):
-            return out
-        close = _safe_float(frame.iloc[-1].get("close"), 0.0)
-        if close <= 0:
-            return out
-        htf_ctx = self._htf_context(
-            symbol,
-            data,
-            timeframe_minutes=self._htf_minutes(),
-            lookback_days=self._htf_lookback_days(),
-            pivot_span=int(self._support_resistance_setting("pivot_span", 2) or 2),
-            max_levels_per_side=int(self._support_resistance_setting("max_levels_per_side", 6) or 6),
-            atr_tolerance_mult=float(self._support_resistance_setting("atr_tolerance_mult", 0.35) or 0.35),
-            pct_tolerance=float(self._support_resistance_setting("pct_tolerance", 0.0030) or 0.0030),
-            stop_buffer_atr_mult=float(self._support_resistance_setting("stop_buffer_atr_mult", 0.25) or 0.25),
-            ema_fast_span=int(self._support_resistance_setting("ema_fast_span", 50) or 50),
-            ema_slow_span=int(self._support_resistance_setting("ema_slow_span", 200) or 200),
-            current_price=close,
-            use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
-            use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
-        )
-        fvg_ltf_ctx = self._ltf_fvg_context(symbol, frame, data)
-        htf_score = self._score_fvg_context(close, htf_ctx, timeframe_minutes=getattr(htf_ctx, "timeframe_minutes", self._htf_minutes()))
-        fvg_ltf_score = self._score_fvg_context(close, fvg_ltf_ctx, timeframe_minutes=self._ltf_minutes())
-        htf_weight = max(0.0, float(self.params.get("htf_fvg_entry_weight", 0.55)))
-        ltf_fvg_weight = max(0.0, float(self.params.get("ltf_fvg_entry_weight", 0.35)))
-        opposing_mult = max(0.50, float(self.params.get("opposing_fvg_entry_penalty_mult", 1.00)))
-        same_validated_bonus = float(self.params.get("same_direction_fvg_validated_bonus", 0.15))
-        same_active_bonus = float(self.params.get("same_direction_fvg_active_bonus", 0.12))
-        opposing_validated_penalty = float(self.params.get("opposing_fvg_validated_penalty", 0.15))
-        opposing_active_penalty = float(self.params.get("opposing_fvg_active_penalty", 0.12))
-        invalidated_opposing_bonus = float(self.params.get("invalidated_opposing_fvg_bonus", 0.10))
-        # Same-direction invalidated penalty. Defaults to opposing_active_penalty * 0.85
-        # so callers that don't configure it explicitly get exactly the same behavior
-        # as before — a ~15% discount relative to an active opposing-direction gap,
-        # because a filled continuation gap is a weaker bearish signal than a live one.
-        same_invalidated_penalty = float(self.params.get("same_direction_fvg_invalidated_penalty", opposing_active_penalty * 0.85))
-
-        if side == Side.LONG:
-            same_htf = float(htf_score.get("bull_score", 0.0) or 0.0)
-            opposing_htf = float(htf_score.get("bear_score", 0.0) or 0.0)
-            same_ltf = float(fvg_ltf_score.get("bull_score", 0.0) or 0.0)
-            opposing_ltf = float(fvg_ltf_score.get("bear_score", 0.0) or 0.0)
-            same_htf_info = dict(htf_score.get("nearest_bullish", {}) or {})
-            opposing_htf_info = dict(htf_score.get("nearest_bearish", {}) or {})
-            same_ltf_info = dict(fvg_ltf_score.get("nearest_bullish", {}) or {})
-            opposing_ltf_info = dict(fvg_ltf_score.get("nearest_bearish", {}) or {})
-        else:
-            same_htf = float(htf_score.get("bear_score", 0.0) or 0.0)
-            opposing_htf = float(htf_score.get("bull_score", 0.0) or 0.0)
-            same_ltf = float(fvg_ltf_score.get("bear_score", 0.0) or 0.0)
-            opposing_ltf = float(fvg_ltf_score.get("bull_score", 0.0) or 0.0)
-            same_htf_info = dict(htf_score.get("nearest_bearish", {}) or {})
-            opposing_htf_info = dict(htf_score.get("nearest_bullish", {}) or {})
-            same_ltf_info = dict(fvg_ltf_score.get("nearest_bearish", {}) or {})
-            opposing_ltf_info = dict(fvg_ltf_score.get("nearest_bullish", {}) or {})
-
-        raw_same = (same_htf * htf_weight) + (same_ltf * ltf_fvg_weight)
-        raw_opposing = ((opposing_htf * htf_weight) + (opposing_ltf * ltf_fvg_weight)) * opposing_mult
-        state_bonus = 0.0
-        continuation_bias = 0.0
-        reversal_bias = 0.0
-
-        def _apply_state(info: dict[str, Any], *, same_direction: bool, weight: float) -> None:
-            nonlocal state_bonus, continuation_bias, reversal_bias
-            state = str(info.get("state", "none") or "none").strip().lower()
-            if state == "none":
-                return
-            if same_direction:
-                if state == "validated":
-                    state_bonus += same_validated_bonus * weight
-                    continuation_bias += 0.35 * weight
-                elif state == "active":
-                    state_bonus += same_active_bonus * weight
-                    continuation_bias += 0.24 * weight
-                elif state == "invalidated":
-                    # Same-direction gap has been filled — weaker continuation signal.
-                    # Uses its own parameter now, but the default preserves the
-                    # historical opposing_active_penalty * 0.85 behavior.
-                    state_bonus -= same_invalidated_penalty * weight
-            else:
-                if state == "validated":
-                    state_bonus -= opposing_validated_penalty * weight
-                elif state == "active":
-                    state_bonus -= opposing_active_penalty * weight
-                elif state == "invalidated":
-                    state_bonus += invalidated_opposing_bonus * weight
-                    continuation_bias += 0.08 * weight
-                    reversal_bias += 0.18 * weight
-
-        _apply_state(same_htf_info, same_direction=True, weight=htf_weight)
-        _apply_state(same_ltf_info, same_direction=True, weight=ltf_fvg_weight)
-        _apply_state(opposing_htf_info, same_direction=False, weight=htf_weight)
-        _apply_state(opposing_ltf_info, same_direction=False, weight=ltf_fvg_weight)
-
-        entry_adjustment = round(raw_same - raw_opposing + state_bonus, 4)
-        continuation_bias = round(max(0.0, raw_same + continuation_bias + max(0.0, state_bonus)), 4)
-        reversal_bias = round(max(0.0, reversal_bias), 4)
-        out.update(
-            {
-                "fvg_context_enabled": True,
-                "fvg_entry_adjustment": entry_adjustment,
-                "fvg_same_direction_score": round(raw_same, 4),
-                "fvg_opposing_score": round(raw_opposing, 4),
-                "fvg_state_bonus": round(state_bonus, 4),
-                "fvg_continuation_bias": continuation_bias,
-                "fvg_reversal_bias": reversal_bias,
-                "htf_fvg_bull_score": round(float(htf_score.get("bull_score", 0.0) or 0.0), 4),
-                "htf_fvg_bear_score": round(float(htf_score.get("bear_score", 0.0) or 0.0), 4),
-                "fvg_ltf_bull_score": round(float(fvg_ltf_score.get("bull_score", 0.0) or 0.0), 4),
-                "fvg_ltf_bear_score": round(float(fvg_ltf_score.get("bear_score", 0.0) or 0.0), 4),
-                "htf_fvg_same_state": str(same_htf_info.get("state", "none") or "none"),
-                "htf_fvg_opposing_state": str(opposing_htf_info.get("state", "none") or "none"),
-                "fvg_ltf_same_state": str(same_ltf_info.get("state", "none") or "none"),
-                "fvg_ltf_opposing_state": str(opposing_ltf_info.get("state", "none") or "none"),
-                "htf_fvg_same_midpoint": _optional_float(same_htf_info.get("midpoint")),
-                "htf_fvg_opposing_midpoint": _optional_float(opposing_htf_info.get("midpoint")),
-                "fvg_ltf_same_midpoint": _optional_float(same_ltf_info.get("midpoint")),
-                "fvg_ltf_opposing_midpoint": _optional_float(opposing_ltf_info.get("midpoint")),
-                "htf_fvg_same_distance_pct": _optional_float(same_htf_info.get("distance_pct")),
-                "htf_fvg_opposing_distance_pct": _optional_float(opposing_htf_info.get("distance_pct")),
-                "fvg_ltf_same_distance_pct": _optional_float(same_ltf_info.get("distance_pct")),
-                "fvg_ltf_opposing_distance_pct": _optional_float(opposing_ltf_info.get("distance_pct")),
-            }
-        )
-        return out
 
     def _adaptive_management_components(
         self,
@@ -3332,7 +1865,7 @@ class BaseStrategy:
         # relies on trail + structure for exit. Under those conditions a
         # trade that goes immediately against us never reaches the normal
         # 0.9R breakeven threshold, so it has ZERO protection except
-        # structure exits (which this refactor gates, see position_exit_signal).
+        # structure exits (which this refactor gates, see shared_exit.EXIT_FAMILY_GATES).
         # Lower the BE arm to 0.5R in runner mode so a LONG that pokes +0.5R
         # and then reverses gets stopped out flat instead of full-R. 2026-04-17
         # NVDA 11:57 entry never reached +0.5R and got chewed up by EQL
@@ -3567,430 +2100,17 @@ class BaseStrategy:
         ladder_meta = self._ladder_metadata(side, rungs, float(stop), float(close), atr_val)
         return first_target, ladder_meta
 
-    def _blocks_bullish_structure_entry(self, ms_ctx) -> bool:
-        if not self._shared_entry_enabled("use_structure_filter", True):
-            return False
-        if not bool(self._support_resistance_setting("structure_enabled", True)):
-            return False
-        if self._active_structure_break(bool(getattr(ms_ctx, "choch_down", False)), getattr(ms_ctx, "choch_down_age_bars", None)):
-            return True
-        active_bos_up = self._active_structure_break(bool(getattr(ms_ctx, "bos_up", False)), getattr(ms_ctx, "bos_up_age_bars", None))
-        return bool(getattr(ms_ctx, "bias", "neutral") == "bearish" and not active_bos_up)
+    def strategy_exit_signal(self, position: Position, bars: dict[str, pd.DataFrame], tape: ExitTape, data=None) -> ExitDecision | None:
+        """This strategy's OWN exits -- the default holds.
 
-    def _blocks_bearish_structure_entry(self, ms_ctx) -> bool:
-        if not self._shared_entry_enabled("use_structure_filter", True):
-            return False
-        if not bool(self._support_resistance_setting("structure_enabled", True)):
-            return False
-        if self._active_structure_break(bool(getattr(ms_ctx, "choch_up", False)), getattr(ms_ctx, "choch_up_age_bars", None)):
-            return True
-        active_bos_down = self._active_structure_break(bool(getattr(ms_ctx, "bos_down", False)), getattr(ms_ctx, "bos_down_age_bars", None))
-        return bool(getattr(ms_ctx, "bias", "neutral") == "bullish" and not active_bos_down)
-
-    def _bullish_structure_block_reason(self, ms_ctx) -> str:
-        lookback = int(self._support_resistance_setting("structure_event_lookback_bars", 6) or 6)
-        return (
-            f"market_structure_bearish(bias={getattr(ms_ctx, 'bias', 'neutral')},"
-            f"last_high={getattr(ms_ctx, 'last_high_label', 'na')},"
-            f"last_low={getattr(ms_ctx, 'last_low_label', 'na')},"
-            f"choch_down_age={getattr(ms_ctx, 'choch_down_age_bars', 'na')},"
-            f"max_age={lookback})"
-        )
-
-    def _bearish_structure_block_reason(self, ms_ctx) -> str:
-        lookback = int(self._support_resistance_setting("structure_event_lookback_bars", 6) or 6)
-        return (
-            f"market_structure_bullish(bias={getattr(ms_ctx, 'bias', 'neutral')},"
-            f"last_high={getattr(ms_ctx, 'last_high_label', 'na')},"
-            f"last_low={getattr(ms_ctx, 'last_low_label', 'na')},"
-            f"choch_up_age={getattr(ms_ctx, 'choch_up_age_bars', 'na')},"
-            f"max_age={lookback})"
-        )
-
-    def _blocks_bullish_sr_entry(self, sr_ctx) -> bool:
-        if not self._shared_entry_enabled("use_sr_filter", True):
-            return False
-        if not bool(self._support_resistance_setting("enabled", True)):
-            return False
-
-        # Pull common values once so both the breakdown-flag branch and the
-        # too-close-to-resistance branch can use them.
-        nearest_sup = getattr(sr_ctx, "nearest_support", None)
-        nearest_sup_price = float(getattr(nearest_sup, "price", 0.0) or 0.0) if nearest_sup is not None else 0.0
-        nearest_res = getattr(sr_ctx, "nearest_resistance", None)
-        nearest_res_price = float(getattr(nearest_res, "price", 0.0) or 0.0) if nearest_res is not None else 0.0
-        current_price = float(getattr(sr_ctx, "current_price", 0.0) or 0.0)
-
-        # Breakdown-flag branch with reclaim escape hatch (added 2026-05-13).
-        # ``breakdown_below_support`` can linger after support was reclaimed
-        # — the SR engine doesn't always clear it until the next pivot. For
-        # mean-reversion / reclaim setups (e.g. sr_scalp LONG near support
-        # that just got broken and recovered), an unconditional block was
-        # killing legitimate entries. Symmetric with the actively_above
-        # escape in the too-close branch below.
-        if bool(sr_ctx.breakdown_below_support):
-            actively_above_support = bool(0 < nearest_sup_price < current_price)
-            if not actively_above_support:
-                return True
-
-        dist_pct = sr_ctx.resistance_distance_pct
-        dist_atr = sr_ctx.resistance_distance_atr
-        too_close = False
-        if dist_pct is not None and dist_pct <= float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)):
-            too_close = True
-        if dist_atr is not None and dist_atr <= float(self._support_resistance_setting("entry_min_clearance_atr", 0.85)):
-            too_close = True
-        # Breakout escape hatch: only bypass the clearance filter when
-        # price is ACTIVELY above the current nearest resistance — i.e.
-        # we're riding through the broken level, not after the SR engine
-        # has advanced ``nearest_resistance`` to the next wall and we've
-        # pulled back below it. 2026-04-20 logs showed META/INTC/TSLA
-        # LONG'd at 0.06-0.5 ATR below their new nearest resistance while
-        # ``breakout_above_resistance`` was still True from an earlier
-        # break — the entries were approaching the next wall, not riding.
-        actively_above = bool(
-            sr_ctx.breakout_above_resistance
-            and 0 < nearest_res_price < current_price
-        )
-        return bool(too_close and not actively_above)
-
-    def _blocks_bearish_sr_entry(self, sr_ctx) -> bool:
-        if not self._shared_entry_enabled("use_sr_filter", True):
-            return False
-        if not bool(self._support_resistance_setting("enabled", True)):
-            return False
-
-        # Pull common values once so both the breakout-flag branch and the
-        # too-close-to-support branch can use them.
-        nearest_sup = getattr(sr_ctx, "nearest_support", None)
-        nearest_sup_price = float(getattr(nearest_sup, "price", 0.0) or 0.0) if nearest_sup is not None else 0.0
-        nearest_res = getattr(sr_ctx, "nearest_resistance", None)
-        nearest_res_price = float(getattr(nearest_res, "price", 0.0) or 0.0) if nearest_res is not None else 0.0
-        current_price = float(getattr(sr_ctx, "current_price", 0.0) or 0.0)
-
-        # Breakout-flag branch with rejection escape hatch (added 2026-05-13).
-        # ``breakout_above_resistance`` can linger after price was rejected
-        # back below resistance — for failure-of-breakout / fade-the-rip
-        # setups (e.g. sr_scalp SHORT near resistance after a failed
-        # break-and-rejection), an unconditional block was killing
-        # legitimate entries. Symmetric with the breakdown escape above.
-        if bool(sr_ctx.breakout_above_resistance):
-            actively_below_resistance = bool(0 < current_price < nearest_res_price)
-            if not actively_below_resistance:
-                return True
-
-        dist_pct = sr_ctx.support_distance_pct
-        dist_atr = sr_ctx.support_distance_atr
-        too_close = False
-        if dist_pct is not None and dist_pct <= float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)):
-            too_close = True
-        if dist_atr is not None and dist_atr <= float(self._support_resistance_setting("entry_min_clearance_atr", 0.85)):
-            too_close = True
-        # Breakdown escape hatch: only bypass when price is actively BELOW
-        # the current nearest support (riding through the broken level),
-        # not when a stale breakdown flag lingers after a bounce back
-        # above. Symmetric with the bullish path above.
-        actively_below = bool(
-            sr_ctx.breakdown_below_support
-            and 0 < current_price < nearest_sup_price
-        )
-        return bool(too_close and not actively_below)
-
-    def _refine_bullish_sr_levels(self, close: float, stop: float, target: float | None, sr_ctx, frame: pd.DataFrame | None):
-        if not self._shared_entry_enabled("use_sr_stop_target_refinement", True):
-            return float(stop), (None if target is None else float(target))
-        level_buffer = float(sr_ctx.level_buffer or 0.0)
-        if sr_ctx.nearest_support and close > float(sr_ctx.nearest_support.price):
-            support_stop = float(sr_ctx.nearest_support.price) - level_buffer
-            if support_stop < close:
-                stop = self._clamp_refined_stop(
-                    close, stop, max(float(stop), support_stop),
-                    self._frame_atr14(frame, close),
-                )
-        if target is not None and sr_ctx.nearest_resistance and close < float(sr_ctx.nearest_resistance.price):
-            capped_target = max(close * 1.001, float(sr_ctx.nearest_resistance.price) - level_buffer)
-            proposed_target = min(float(target), capped_target)
-            # R:R floor: only accept the cap if the resulting reward is still
-            # tradeable. Without this guard, a nearby resistance can crush
-            # R:R toward zero ($0.10 targets, etc.).
-            if self._target_meets_min_rr(Side.LONG, close, stop, proposed_target):
-                target = proposed_target
-        return float(stop), (None if target is None else float(target))
-
-    def _refine_bearish_sr_levels(self, close: float, stop: float, target: float | None, sr_ctx, frame: pd.DataFrame | None):
-        if not self._shared_entry_enabled("use_sr_stop_target_refinement", True):
-            return float(stop), (None if target is None else float(target))
-        level_buffer = float(sr_ctx.level_buffer or 0.0)
-        if sr_ctx.nearest_resistance and close < float(sr_ctx.nearest_resistance.price):
-            resistance_stop = float(sr_ctx.nearest_resistance.price) + level_buffer
-            if resistance_stop > close:
-                stop = self._clamp_refined_stop(
-                    close, stop, min(float(stop), resistance_stop),
-                    self._frame_atr14(frame, close),
-                )
-        if target is not None and sr_ctx.nearest_support and close > float(sr_ctx.nearest_support.price):
-            capped_target = min(close * 0.999, float(sr_ctx.nearest_support.price) + level_buffer)
-            proposed_target = max(float(target), capped_target)
-            # R:R floor — see comment on the bullish twin above.
-            if self._target_meets_min_rr(Side.SHORT, close, stop, proposed_target):
-                target = proposed_target
-        return float(stop), (None if target is None else float(target))
-
-    def position_exit_signal(self, position: Position, bars: dict[str, pd.DataFrame], data=None) -> tuple[bool, str]:
-        chart_cfg = getattr(self.config, "chart_patterns", None)
-        symbol = str(position.metadata.get("underlying") or position.symbol)
-        frame = bars.get(symbol)
-        # Time-stop: if the position has been held longer than
-        # ``config.risk.time_stop_minutes`` AND absolute return since entry
-        # is below ``time_stop_min_return_pct``, scratch it. Frees the slot
-        # for an active setup. 2026-04-17 META held 223 min for +$0.16 on
-        # EQL exit — exactly what this gate now prevents.
-        try:
-            time_stop_minutes = int(getattr(self.config.risk, "time_stop_minutes", 0) or 0)
-        except Exception:
-            time_stop_minutes = 0
-        if time_stop_minutes > 0:
-            try:
-                held_minutes = max(0.0, (now_et() - position.entry_time).total_seconds() / 60.0)
-            except Exception:
-                held_minutes = 0.0
-            if held_minutes >= time_stop_minutes:
-                # "Gone nowhere" is judged on the frame's own instrument: for
-                # an option, the underlying since entry. Its premium against
-                # the underlying's close was never under the threshold, so the
-                # time stop could not scratch an option.
-                entry = self._underlying_entry_price(position) or 0.0
-                last_close: float | None = None
-                if frame is not None and not frame.empty and "close" in frame.columns:
-                    last_close = _optional_float(frame.iloc[-1]["close"], None)
-                if entry > 0 and last_close is not None:
-                    return_pct = abs((float(last_close) - entry) / entry)
-                    min_return_pct = float(getattr(self.config.risk, "time_stop_min_return_pct", 0.003) or 0.0)
-                    if return_pct < min_return_pct:
-                        return True, f"time_stop:{int(held_minutes)}m"
-        # ORB-entry grace window — suppresses chart_pattern and non-CHoCH
-        # structure exits for the first N minutes of trades entered during
-        # the ORB window. Pullbacks early in an ORB-entry trade often
-        # present as bearish structure/chart signals but continue higher
-        # once the opening flush resolves. See SupportResistanceConfig.
-        # orb_entry_exit_grace_minutes for motivation + 2026-04-24 data.
-        orb_entry = bool(position.metadata.get("orb_window_entry")) if isinstance(position.metadata, dict) else False
-        orb_grace_minutes = int(self._support_resistance_setting("orb_entry_exit_grace_minutes", 20) or 0)
-        try:
-            orb_hold_minutes = max(0.0, (now_et() - position.entry_time).total_seconds() / 60.0)
-        except Exception:
-            orb_hold_minutes = 0.0
-        orb_grace_active = orb_entry and orb_grace_minutes > 0 and orb_hold_minutes < orb_grace_minutes
-
-        chart_enabled = (
-            chart_cfg is not None
-            and bool(self._chart_pattern_setting("enabled", True))
-            and self._shared_exit_enabled("use_chart_pattern_exit", False)
-            and not orb_grace_active
-        )
-        if frame is None or frame.empty:
-            return False, "hold"
-        # Only chart-pattern needs min_bars; other exit paths self-handle short frames.
-        min_bars = max(12, int(self._chart_pattern_setting("lookback_bars", 32)) // 2) if chart_enabled else 0
-        last = frame.iloc[-1]
-        close = _safe_float(last["close"])
-        ema9 = _safe_float(last["ema9"], close) if "ema9" in frame.columns else close
-        ema20 = _safe_float(last["ema20"], close) if "ema20" in frame.columns else close
-        vwap = _safe_float(last["vwap"], close) if "vwap" in frame.columns else close
-        direction = self._direction_token(position)
-        close_pos = _bar_close_position(frame)
-
-        if chart_enabled and len(frame) >= min_bars:
-            ctx = self._chart_context(frame)
-            if direction == "bullish":
-                opposing_reversal = sorted(ctx.matched_bearish_reversal)
-                opposing_cont = sorted(ctx.matched_bearish_continuation)
-                strong_opposing = bool(opposing_reversal) or (bool(opposing_cont) and ctx.bias_score <= -0.65)
-                reversal_tape_weak = bool(opposing_reversal) and self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.52)
-                continuation_tape_weak = (
-                    self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.48)
-                    or (
-                        self._shared_exit_enabled("confirm_with_close_position", True)
-                        and close_pos <= float(self._shared_exit_value("bullish_close_position_loose_max", 0.40))
-                        and ((not self._shared_exit_enabled("confirm_with_ema9", True)) or close < ema9)
-                        and ((not self._shared_exit_enabled("confirm_with_vwap", True)) or close < vwap)
-                    )
-                )
-                if strong_opposing and (reversal_tape_weak or continuation_tape_weak):
-                    opposing = opposing_reversal + [p for p in opposing_cont if p not in opposing_reversal]
-                    return True, f"chart_pattern_exit:{'+'.join(opposing)}"
-            else:
-                opposing_reversal = sorted(ctx.matched_bullish_reversal)
-                opposing_cont = sorted(ctx.matched_bullish_continuation)
-                strong_opposing = bool(opposing_reversal) or (bool(opposing_cont) and ctx.bias_score >= 0.65)
-                reversal_tape_weak = bool(opposing_reversal) and self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.48)
-                continuation_tape_weak = (
-                    self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.52)
-                    or (
-                        self._shared_exit_enabled("confirm_with_close_position", True)
-                        and close_pos >= float(self._shared_exit_value("bearish_close_position_loose_min", 0.60))
-                        and ((not self._shared_exit_enabled("confirm_with_ema9", True)) or close > ema9)
-                        and ((not self._shared_exit_enabled("confirm_with_vwap", True)) or close > vwap)
-                    )
-                )
-                if strong_opposing and (reversal_tape_weak or continuation_tape_weak):
-                    opposing = opposing_reversal + [p for p in opposing_cont if p not in opposing_reversal]
-                    return True, f"chart_pattern_exit:{'+'.join(opposing)}"
-
-        # Candle-pattern exit — mirrors the chart-pattern block above but
-        # keyed on the candle context (detect_candle_context). That context
-        # is @lru_cache'd AND cached per-strategy in self._candle_context_cache,
-        # so this is free when the trigger frame has already been analyzed
-        # for entry/scoring on the same cycle. Opt-in via
-        # shared_exit.use_candle_pattern_exit; threshold is
-        # candles.opposing_net_score_threshold (0.70 = "solid" tier default).
-        if self._shared_exit_enabled("use_candle_pattern_exit", False):
-            candle_ctx = self._candle_context(frame)
-            threshold = float(self._candles_setting("opposing_net_score_threshold", 0.70))
-            if direction == "bullish":
-                opposing_net = float(candle_ctx.get("bearish_candle_net_score", 0.0) or 0.0)
-                opposing_matches = list(candle_ctx.get("matched_bearish_candles", []) or [])
-                tape_weak = self._shared_exit_tape_confirm(
-                    "bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap,
-                    close_pos=close_pos, close_pos_threshold=0.48,
-                )
-            else:
-                opposing_net = float(candle_ctx.get("bullish_candle_net_score", 0.0) or 0.0)
-                opposing_matches = list(candle_ctx.get("matched_bullish_candles", []) or [])
-                tape_weak = self._shared_exit_tape_confirm(
-                    "bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap,
-                    close_pos=close_pos, close_pos_threshold=0.52,
-                )
-            if opposing_net >= threshold and tape_weak and opposing_matches:
-                joined = "+".join(sorted(opposing_matches)[:3])
-                return True, f"candle_pattern_exit:{joined}"
-
-        ms_ctx = self._structure_context(frame, "ltf")
-        # Grace-window gate: a minor EQL/LL pivot forming in the first few
-        # minutes after entry is noise, not reversal — session 2026-04-17
-        # was 1W / 12T on structure exits (net -$354). Suppress the bias-
-        # based structure exits (structure_bearish_exit:EQL/LL/HL,
-        # structure_bullish_exit:HH/LH) during the grace window AND until
-        # a minimum number of new pivots have formed post-entry. CHoCH
-        # exits (true trend change) still fire — they are genuine reversal
-        # signals, not minor pivots.
-        #
-        # Two additional gates layered here (2026-05-14):
-        #   1. Pullback regime gets an extended grace window (default 15m
-        #      vs 10m global) — pullback by design enters into LTF chop,
-        #      so the first EQL is almost always noise. AMD 14:36 LONG was
-        #      killed at hold=10.2m via structure_bearish_exit:EQL; price
-        #      recovered past target shortly after.
-        #   2. BoS confirmation: even after grace expires, the bias-flip
-        #      exit additionally requires an active BoS event in the
-        #      matching direction. EQL/HH alone is just a pivot label;
-        #      BoS-down means price actually broke below a prior swing
-        #      low — a far stronger reversal signal.
-        try:
-            hold_minutes = max(0.0, (now_et() - position.entry_time).total_seconds() / 60.0)
-        except Exception:
-            hold_minutes = 0.0
-        meta = position.metadata if isinstance(position.metadata, dict) else {}
-        # Pullback regime gets an extended grace window — the regime is
-        # designed to enter into LTF chop (buy the dip), so the first EQL
-        # pivot is almost always noise. Falls back to the global grace if
-        # the pullback override is <= the global value or not configured.
-        global_grace = int(self._support_resistance_setting("structure_exit_grace_minutes", 10))
-        position_regime = str(meta.get("regime", "") or "")
-        if position_regime == "pullback":
-            pullback_grace = int(self._support_resistance_setting("structure_exit_grace_minutes_pullback", 15))
-            grace_minutes = max(global_grace, pullback_grace)
-        else:
-            grace_minutes = global_grace
-        min_post_entry_pivots = int(self._support_resistance_setting("structure_exit_min_post_entry_pivots", 2))
-        pivot_count_now = int(getattr(ms_ctx, "pivot_count", 0) or 0)
-        # msltf_pivot_count is stamped into signal.metadata at entry-signal
-        # build time via _structure_lists(..., prefix="msltf") and then frozen
-        # onto position.metadata — it's never overwritten during management,
-        # so reading it here yields the entry-time pivot count.
-        pivot_count_at_entry = int(meta.get("msltf_pivot_count", pivot_count_now) or 0)
-        post_entry_pivots = max(0, pivot_count_now - pivot_count_at_entry)
-        # ORB-entry grace extends the suppression of non-CHoCH structure
-        # exits for positions entered during the ORB window; OR'd with the
-        # existing time/pivot gates so the stricter of the two wins.
-        # The R gate joins the existing time/pivot/ORB gates: below
-        # shared_exit.discretionary_exit_min_r a bias flip is not worth
-        # abandoning the protective stop for. CHoCH exits are checked before
-        # this flag is consulted and stay exempt.
-        structure_exit_gated = (
-            hold_minutes < grace_minutes
-            or post_entry_pivots < min_post_entry_pivots
-            or orb_grace_active
-            or not self._discretionary_exit_allowed(position, close)
-        )
-        # BoS-confirmation gate: when enabled, bias-based structure exits
-        # additionally require an active BoS event (bos_down for long-exit,
-        # bos_up for short-exit). Without this, a single EQL/HH pivot can
-        # flip bias and abort an otherwise-healthy trade. With it, the bot
-        # waits for actual structural break (price below a prior swing low,
-        # or above for shorts). CHoCH exits remain unaffected.
-        require_bos_confirmation = bool(self._support_resistance_setting("structure_exit_require_bos_confirmation", True))
-        if self._shared_exit_enabled("use_structure_exit", True) and bool(self._support_resistance_setting("structure_enabled", True)):
-            if direction == "bullish":
-                if bool(getattr(ms_ctx, "choch_down", False)) and self._structure_event_recent(getattr(ms_ctx, "choch_down_age_bars", None)) and self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.48):
-                    return True, f"structure_choch_down_exit:{getattr(ms_ctx, 'choch_down_age_bars', 'na')}"
-                if not structure_exit_gated and getattr(ms_ctx, "bias", "neutral") == "bearish" and self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.42):
-                    bos_ok = (
-                        not require_bos_confirmation
-                        or (bool(getattr(ms_ctx, "bos_down", False)) and self._structure_event_recent(getattr(ms_ctx, "bos_down_age_bars", None)))
-                    )
-                    if bos_ok:
-                        return True, f"structure_bearish_exit:{getattr(ms_ctx, 'last_low_label', 'na')}"
-            else:
-                if bool(getattr(ms_ctx, "choch_up", False)) and self._structure_event_recent(getattr(ms_ctx, "choch_up_age_bars", None)) and self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.52):
-                    return True, f"structure_choch_up_exit:{getattr(ms_ctx, 'choch_up_age_bars', 'na')}"
-                if not structure_exit_gated and getattr(ms_ctx, "bias", "neutral") == "bullish" and self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.58):
-                    bos_ok = (
-                        not require_bos_confirmation
-                        or (bool(getattr(ms_ctx, "bos_up", False)) and self._structure_event_recent(getattr(ms_ctx, "bos_up_age_bars", None)))
-                    )
-                    if bos_ok:
-                        return True, f"structure_bullish_exit:{getattr(ms_ctx, 'last_high_label', 'na')}"
-
-        triggered, reason = self._technical_exit_signal(direction, frame, close, ema9, ema20, vwap, close_pos, position)
-        if triggered:
-            return True, reason
-
-        if (
-            self._shared_exit_enabled("use_sr_loss_exit", True)
-            and bool(self._support_resistance_setting("enabled", True))
-            and self._discretionary_exit_allowed(position, close)
-        ):
-            sr_ctx = self._sr_context(symbol, frame, data)
-            level_buffer = float(sr_ctx.level_buffer or 0.0)
-            # The level has to sit beyond ENTRY, both on the underlying's
-            # scale; an option's premium entry would compare a $500 level to
-            # a $1.20 debit. No recorded underlying entry: no opinion.
-            entry_price = self._underlying_entry_price(position)
-            if entry_price is None:
-                return False, "hold"
-            if direction == "bullish":
-                # Only fire on a CONFIRMED break event from the SR engine
-                # (broken_support), not a positional proximity check. Also
-                # require the level to be BELOW entry — broken_support is
-                # session-scoped and may persist from a pre-entry break,
-                # which would otherwise trigger the exit on the first
-                # management cycle after entry (same-bar phantom exit bug).
-                support_level = sr_ctx.broken_support
-                if support_level is not None:
-                    support_price = float(support_level.price)
-                    if support_price < entry_price and close <= support_price - level_buffer and self._shared_exit_tape_confirm("bullish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.45):
-                        return True, f"support_break_exit:{support_price:.4f}"
-            if direction == "bearish":
-                # Mirror of the bullish branch above: require an actual
-                # broken_resistance event AND that the level sat above
-                # the short entry (a ceiling that we bet would hold).
-                resistance_level = sr_ctx.broken_resistance
-                if resistance_level is not None:
-                    resistance_price = float(resistance_level.price)
-                    if resistance_price > entry_price and close >= resistance_price + level_buffer and self._shared_exit_tape_confirm("bearish", close=close, ema9=ema9, ema20=ema20, vwap=vwap, close_pos=close_pos, close_pos_threshold=0.55):
-                        return True, f"resistance_break_exit:{resistance_price:.4f}"
-        return False, "hold"
+        Called by ``shared_exit.SharedExitPolicy`` only after every shared
+        exit family held, with the tape it already read for the position
+        (the last bar of ``bars[underlying or symbol]``), so a hook reads
+        the same references the shared families judged. A full exit returns
+        ``ExitDecision(reason, "strategy")``. The shared families
+        themselves cannot be overridden (see ``__init_subclass__``).
+        """
+        return None
 
     def active_watchlist(self, candidates: list[Candidate], positions: dict[str, Position]) -> set[str]:
         configured = self._watchlist_symbols_from_capabilities("active", candidates, positions)

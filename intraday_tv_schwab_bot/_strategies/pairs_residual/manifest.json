@@ -60,6 +60,9 @@
     "dashboard": {
       "tradable_symbols_source": "pairs.symbols"
     },
+    "shared_entry": {
+      "divergence_entry": false
+    },
     "startup_restore": {
       "eligible_symbols_source": "dashboard_tradable_symbols",
       "require_hybrid_metadata": true

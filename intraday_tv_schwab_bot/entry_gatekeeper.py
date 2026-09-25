@@ -367,6 +367,12 @@ class EntryGatekeeper:
             # Volatility widening factor stamped by Tier 2a / early-session
             # widening — useful for slicing trade outcomes by widening tier.
             'vol_widening_factor',
+            # The shared entry stage's stamps (2026-09-24): the style family
+            # the exit graces key on, the strategy's own priority vs the
+            # shared score terms added to it, and where the entry came from
+            # (a divergence-only entry) -- what a knob A/B needs afterwards.
+            'entry_style_family', 'strategy_priority_score', 'shared_context_score',
+            'entry_context_adjustment', 'technical_entry_adjustment', 'entry_source',
         }
         include_prefixes = (
             'fvg_', 'htf_fvg_', 'adaptive_', 'anti_chase_fvg_retest_',
@@ -377,6 +383,19 @@ class EntryGatekeeper:
             # Signal and then dropped here, and the A/B the feature exists to
             # settle cannot be measured after the fact.
             'armed_retest_',
+            # HTF EMA trend at entry (htf_ema_trend / _votes / _bonus,
+            # 2026-09-24) -- what a dry-run A/B of require_htf_ema_alignment
+            # and htf_ema_alignment_score needs after the fact.
+            'htf_ema_',
+            # HTF RSI divergence score term where a strategy records it
+            # (peer_confirmed_htf_pivots' htf_divergence_adjustment, live
+            # since 2026-09-24): ranking-only, so it is invisible in the logs
+            # without this.
+            'htf_divergence_',
+            # The gates the shared entry stage applied / exempted, whether a
+            # retest admitted the entry, and the divergence confirmation or
+            # conflict (2026-09-24).
+            'shared_entry_', 'divergence_entry_', 'anti_chase_ob_retest_',
             'msltf_', 'mshtf_', 'sr_', 'tech_', 'matched_', 'chart_pattern_',
             'decision_', 'gate_', 'peak_giveback_', 'orb_',
         )
@@ -530,58 +549,6 @@ class EntryGatekeeper:
                 "filled_qty": int(getattr(result, "filled_qty", 0) or 0) if getattr(result, "filled_qty", None) is not None else None,
             })
         return {k: v for k, v in payload.items() if v is not None}
-
-    def _signal_priority_key(self, signal, candidate: Candidate | None) -> tuple[float, ...]:
-        meta = dict(signal.metadata or {})
-        explicit_strength = safe_float(meta.get("final_priority_score"), None)
-        priority_tiebreak = safe_float(meta.get("selection_quality_score"), None)
-        candidate_activity_score = float(candidate.activity_score) if candidate is not None else 0.0
-        strength = float(explicit_strength) if explicit_strength is not None else candidate_activity_score
-        rank = float(candidate.rank) if candidate is not None else 9_999.0
-        secondary = candidate_activity_score
-        tertiary = 0.0
-        strategy_obj = getattr(self, "strategy", None)
-        if strategy_obj is not None:
-            try:
-                custom_key = strategy_obj.signal_priority_key(
-                    signal,
-                    candidate,
-                    metadata=meta,
-                    strength=strength,
-                    candidate_activity_score=candidate_activity_score,
-                    rank=rank,
-                )
-            except Exception:
-                custom_key = None
-            if custom_key is not None:
-                return tuple(float(item) for item in custom_key)
-        priority_fields = (
-            "ltf_score",
-            "regime_score",
-            "directional_peer_score",
-            "peer_score",
-            "directional_vote_edge",
-            "runner_quality_score",
-            "execution_headroom_score",
-            "source_quality_score",
-            "selection_quality_score",
-        )
-        if any(field in meta for field in priority_fields):
-            directional_peer_score = meta.get("directional_peer_score", meta.get("peer_score"))
-            return (
-                float(safe_float(meta.get("ltf_score"), 0.0) or 0.0),
-                float(safe_float(meta.get("regime_score"), 0.0) or 0.0),
-                float(safe_float(directional_peer_score, 0.0) or 0.0),
-                float(safe_float(meta.get("directional_vote_edge"), 0.0) or 0.0),
-                float(safe_float(meta.get("runner_quality_score"), 0.0) or 0.0),
-                float(safe_float(meta.get("execution_headroom_score"), 0.0) or 0.0),
-                float(safe_float(meta.get("source_quality_score"), 0.0) or 0.0),
-                float(safe_float(meta.get("selection_quality_score"), priority_tiebreak if priority_tiebreak is not None else strength) or 0.0),
-                strength,
-                candidate_activity_score,
-                -rank,
-            )
-        return strength, secondary, tertiary, -rank
 
     # ------------------------------------------------------------------
     # Entry orders whose outcome the submit call could not settle.
@@ -998,7 +965,17 @@ class EntryGatekeeper:
         candidate_by_symbol = {c.symbol: c for c in candidates_for_signals}
         self.strategy.prefetch_entry_market_data(candidates_for_signals, bars, self.positions, data=self.data)
         signals = self.strategy.entry_signals(candidates_for_signals, bars, self.positions, client=self.client, data=self.data)
-        signals = sorted(signals, key=lambda signal: self._signal_priority_key(signal, candidate_by_symbol.get(signal.symbol)), reverse=True)
+        policy = self.strategy.entry_policy
+        # The opt-in divergence-only entries (shared_entry.use_divergence_
+        # entry_signal) for the candidates the strategy did not signal. They
+        # record their decisions on the strategy, so the decisions are pulled
+        # after them.
+        signals = signals + policy.divergence_entries(candidates_for_signals, bars, self.positions,
+                                                      primaries=signals, data=self.data)
+        # One ranker for every strategy (shared_entry.SharedEntryPolicy.rank_key,
+        # declared per strategy in the manifest's signal_priority); until
+        # 2026-09-24 this module had its own generic key plus two overrides.
+        signals = sorted(signals, key=lambda signal: policy.rank_key(signal, candidate_by_symbol.get(signal.symbol)), reverse=True)
         decision_map = self.strategy.pull_entry_decisions() if hasattr(self.strategy, "pull_entry_decisions") else {}
         finalized: set[str] = set()
         for signal in signals:

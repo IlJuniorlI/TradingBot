@@ -33,10 +33,12 @@ from ..shared import (
     EQUITY_STREAM_START,
     equity_session_state,
     get_session_indicator_window,
+    ltf_ema_spans,
     now_et,
     parse_hhmm,
     pd,
 )
+from ..shared_entry import EntryContexts, EntryProposal
 from ..strategy_base import BaseStrategy
 from ...daily_stats import SymbolDailyStats, build_symbol_stats, volatility_scale
 
@@ -158,6 +160,34 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # that has since been swept is worse than re-deriving it.
         self._armed_retests: dict[str, dict[str, Any]] = {}
         self._validate_orb_window()
+        # A bad ltf_ema_fast_span / ltf_ema_slow_span or
+        # require_htf_ema_alignment fails here, naming the key, rather than on
+        # the first entry cycle.
+        ltf_ema_spans(self.params)
+        self._htf_ema_gated_sides()
+
+    def _htf_ema_gated_sides(self) -> frozenset[Side]:
+        return self._htf_ema_alignment_sides(self.params.get("require_htf_ema_alignment", "disabled"))
+
+    def _htf_ema_score_term(self, side: Side, bias: str, in_orb_window: bool) -> float:
+        """``htf_ema_alignment_score`` added to (aligned) or taken from
+        (opposed) a side's regime scores; 0 inside the ORB-window HTF
+        bypass, like the gate."""
+        weight = float(self.params.get("htf_ema_alignment_score", 0.0))
+        if not weight or (bool(self.params.get("orb_bypass_htf_bias", True)) and in_orb_window):
+            return 0.0
+        if (side == Side.LONG and bias == "bullish") or (side == Side.SHORT and bias == "bearish"):
+            return weight
+        if (side == Side.LONG and bias == "bearish") or (side == Side.SHORT and bias == "bullish"):
+            return -weight
+        return 0.0
+
+    def dashboard_htf_trend(self, symbol: str, data, price: float, *, allow_refresh: bool = True) -> dict[str, str] | None:
+        """The HTF EMA trend the gate and score read, off the same context
+        (``_default_htf_context_for_score``, which never refreshes)."""
+        if data is None or not price:
+            return None
+        return self._htf_trend_row(*self._htf_bias(self._default_htf_context_for_score(symbol, data), float(price)))
 
     def _validate_orb_window(self) -> None:
         """Fail loudly when the opening range cannot finish before the ORB
@@ -557,28 +587,25 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             return 0.0
         return max(0.0, min(1.0, (float(score) - float(threshold)) / headroom))
 
-    def signal_priority_key(self, signal, candidate, *, metadata, strength,
-                            candidate_activity_score, rank):
-        """Rank competing signals by normalised regime score.
+    @staticmethod
+    def _regime_rank_unit(regime: str, threshold: float) -> float:
+        """What one raw score point is worth on *regime*'s normalised scale:
+        ``1 / (ceiling - threshold)``, the slope of ``_normalized_regime_score``.
 
-        The gatekeeper's generic path sorts on raw ``regime_score``, which is
-        not comparable across this strategy's regimes (see
-        ``_normalized_regime_score``) — so with more signals than free
-        position slots, slots went to whichever regime's scorer had the
-        highest ceiling rather than to the best setup. ``final_priority_score``
-        — which carries the structure / pattern / candle / S/R / FVG quality
-        work — only ever acted as a tiebreak between identical raw scores.
-
-        Ordering here: normalised regime score, then ``final_priority_score``,
-        then screener activity, then candidate rank.
+        Stamped as ``regime_rank_unit`` next to ``regime_score_normalized``
+        (2026-09-24): the manifest's ``signal_priority`` adds the shared
+        entry-context score -- raw final-priority points -- to the normalised
+        regime score through it (``shared_score_weight`` x score x unit), so a
+        shared point moves a signal exactly as far as the same point added to
+        its raw regime score would (unclamped). 0.0 where the normalised
+        score degenerates (unknown regime, threshold at or above the
+        ceiling): no headroom, so no shared term either.
         """
-        _ = signal, candidate
-        return (
-            float(_safe_float(metadata.get("regime_score_normalized"), 0.0) or 0.0),
-            float(strength),
-            float(candidate_activity_score),
-            -float(rank),
-        )
+        ceiling = REGIME_SCORE_CEILINGS.get(regime)
+        if ceiling is None:
+            return 0.0
+        headroom = float(ceiling) - float(threshold)
+        return 1.0 / headroom if headroom > 0.0 else 0.0
 
     # ------------------------------------------------------------------
     # Side asymmetry
@@ -1450,7 +1477,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         Components (max 5.0):
           * +0.5  base (regime in play)
           * +2.0  price is at/just off the HOLDING entry-side zone — the
-                  nearest support (LONG) / resistance (SHORT), OR a confirmed
+                  nearest support (LONG) / resistance (SHORT) or the pending
+                  one whose zone price has wicked into, OR a confirmed
                   flip level (LONG: close just above broken_resistance ;
                   SHORT: close just below broken_support). No level
                   interaction => base only (won't qualify).
@@ -1467,10 +1495,14 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         res = getattr(sr_ctx, "nearest_resistance", None)
         bres = getattr(sr_ctx, "broken_resistance", None)
         bsup = getattr(sr_ctx, "broken_support", None)
+        psup = getattr(sr_ctx, "pending_support", None)
+        pres = getattr(sr_ctx, "pending_resistance", None)
         sup_px = float(getattr(sup, "price", 0.0) or 0.0) if sup is not None else 0.0
         res_px = float(getattr(res, "price", 0.0) or 0.0) if res is not None else 0.0
         bres_px = float(getattr(bres, "price", 0.0) or 0.0) if bres is not None else 0.0
         bsup_px = float(getattr(bsup, "price", 0.0) or 0.0) if bsup is not None else 0.0
+        psup_px = float(getattr(psup, "price", 0.0) or 0.0) if psup is not None else 0.0
+        pres_px = float(getattr(pres, "price", 0.0) or 0.0) if pres is not None else 0.0
 
         zone_hw = max(
             float(self.params.get("zone_atr_mult", 0.20)) * atr,
@@ -1489,12 +1521,14 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         proximity_hit = False
         flip_hit = False
         if side == Side.LONG:
-            if _near_support(sup_px):
+            # The pending support (dipped under, loss unconfirmed) is the zone
+            # a bounce wicks into; see _build_sr_scalp_signal.
+            if _near_support(sup_px) or _near_support(psup_px):
                 proximity_hit = True
             if 0.0 < bres_px < close and _near_support(bres_px):
                 flip_hit = True
         else:
-            if _near_resistance(res_px):
+            if _near_resistance(res_px) or _near_resistance(pres_px):
                 proximity_hit = True
             if bsup_px > 0.0 and close < bsup_px and _near_resistance(bsup_px):
                 flip_hit = True
@@ -1511,8 +1545,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             if wick >= 0.30:
                 score += 1.0
 
-        if 0.0 < sup_px < res_px:
-            inner_gap = (res_px - zone_hw) - (sup_px + zone_hw)
+        # Room is measured from the zone the setup leans on: a pending level
+        # that price is inside of sits nearer the target than the next level
+        # beyond it, so it bounds the ride, as in the builder.
+        lower_px = psup_px if (side == Side.LONG and _near_support(psup_px)) else sup_px
+        upper_px = pres_px if (side == Side.SHORT and _near_resistance(pres_px)) else res_px
+        if 0.0 < lower_px < upper_px:
+            inner_gap = (upper_px - zone_hw) - (lower_px + zone_hw)
             required_gap = max(
                 self._pct_param("sr_scalp_min_distance_pct", 0.008, vol_scale) * close,
                 float(self.params.get("sr_scalp_min_distance_atr", 2.5)) * atr,
@@ -1679,10 +1718,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         The window is BOUNDED AT BOTH ENDS: ``[opening-range end, orb_end]``,
         and it does not exist at all when ``disable_orb_regime`` is set.
 
-        This drives every ``orb_bypass_*`` flag (HTF bias, structure, S/R,
-        exhaustion, side decision, relative strength, screener bias) — seven
-        gates that are relaxed on the argument that the opening range-break
-        is its own directional proof. An open-ended "before orb_end" reading
+        This drives every ``orb_bypass_*`` flag (HTF bias, exhaustion, side
+        decision, relative strength, screener bias) — gates that are relaxed
+        on the argument that the opening range-break is its own directional
+        proof. (The shared structure and S/R vetoes are skipped for the orb
+        regime by the manifest exemption ``{orb: [structure, sr]}`` since
+        2026-09-24; the regime exists only inside this window.) An
+        open-ended "before orb_end" reading
         hands those bypasses to entries that have no ORB thesis behind them:
         with ``equity_session_indicator_window: extended`` the whole
         pre-market session qualifies, and with ``disable_orb_regime: true``
@@ -1700,7 +1742,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         midday_end_time, afternoon_start_time, no_new_entries_after) — no
         hard-coded times.
 
-        Seven regimes:
+        Eight regimes:
           - orb: true Opening Range Breakout. The opening range forms over
             the first ``orb_range_minutes`` of RTH (09:30 →); the ORB regime
             is the ONLY regime allowed in the window from range-end →
@@ -1725,6 +1767,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             distance gate (``sr_scalp_min_distance_pct`` /
             ``sr_scalp_min_distance_atr``) rejects when the HTF zones are
             too close to be worth the round-trip.
+          - vwap_reclaim: momentum-family reclaim of session VWAP after a
+            flush. Allowed wherever momentum is.
 
         "Post-ORB" above for vol_squeeze and momentum assumes the ORB regime
         is on. With ``disable_orb_regime`` there is no ORB window: the primary
@@ -1735,10 +1779,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         Each regime has its own opt-out knob via params:
           disable_trend_regime / disable_pullback_regime /
           disable_range_regime / disable_vol_squeeze_regime /
-          disable_momentum_regime / disable_sr_scalp_regime.
+          disable_momentum_regime / disable_sr_scalp_regime /
+          disable_vwap_reclaim_regime / disable_orb_regime.
 
-        The opening window (09:30 → orb_end_time) has a separate whole-window
-        opt-out (``disable_orb_window``) that skips the ORB window entirely
+        The ORB window (opening-range end → orb_end_time) has a separate
+        whole-window opt-out (``disable_orb_window``) that skips it entirely
         — different from ``orb_bypass_*`` flags (which loosen filters
         within the ORB window). Use this when the opening 30 minutes
         are too whippy and you'd rather start trading at ``orb_end_time``.
@@ -2266,9 +2311,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         or_high + buffer) — a failed breakout returns through the range.
         Target: a measured move — the range height projected from the broken
         edge (``orb_target_range_mult`` × range, default 1.5×). The shared
-        ``_finalize_signal`` then caps the target to nearby HTF levels and
-        enforces the min R:R floor. Range size is sanity-bounded so noise
-        ranges (too tight) and untradeable ranges (too wide) are skipped."""
+        entry stage (``_finalize_signal`` -> ``entry_policy.admit``) first
+        refuses a measured move that no longer clears the min R:R floor, then
+        caps the target to nearby HTF levels. Range size is sanity-bounded so
+        noise ranges (too tight) and untradeable ranges (too wide) are
+        skipped."""
         or_high, or_low = self._opening_range(frame)
         if or_high is None or or_low is None or or_high <= or_low:
             self._set_build_failure(c.symbol, "orb", "orb_no_opening_range")
@@ -2321,18 +2368,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # nothing traded, but a builder should not emit a structurally invalid
         # setup for a downstream guard to catch. When the measured move is
         # already exhausted the ORB thesis is simply spent — reject, the same
-        # way sr_scalp rejects when its zone gap cannot pay for its stop.
-        if not self._target_meets_min_rr(side, close, stop, target):
-            risk = abs(close - stop)
-            reward = (target - close) if side == Side.LONG else (close - target)
-            self._set_build_failure(
-                c.symbol, "orb",
-                f"{'long' if side == Side.LONG else 'short'}_orb_measured_move_exhausted("
-                f"close={close:.4f},target={target:.4f},reward={reward:.4f},risk={risk:.4f})",
-            )
-            return None
-
-        return self._finalize_signal(c, side, close, stop, target, "orb", regime_score, frame, data, vol_scale=vol_scale)
+        # way sr_scalp rejects when its zone gap cannot pay for its stop. The
+        # check is the shared entry stage's raw R:R gate (2026-09-24: it was a
+        # builder-local min_target_rr read), refused as
+        # `<side>_orb_measured_move_exhausted(...)` on the RAW levels before
+        # any refinement could move them.
+        return self._finalize_signal(c, side, close, stop, target, "orb", regime_score, frame, data,
+                                     vol_scale=vol_scale, raw_rr_gate="orb_measured_move_exhausted")
 
     @staticmethod
     def _pullback_leg_context(
@@ -2865,7 +2907,9 @@ class TopTierAdaptiveStrategy(BaseStrategy):
 
         Uses the bot's existing S/R machinery — NO strategy-local level
         creation. Level prices come from ``sr_ctx.nearest_support`` /
-        ``nearest_resistance`` / ``broken_resistance`` / ``broken_support``;
+        ``nearest_resistance`` / ``broken_resistance`` / ``broken_support``
+        and, for a zone price has wicked into past its level while the flip
+        is unconfirmed, ``pending_support`` / ``pending_resistance``;
         zone bands from ``zone_atr_mult*atr`` / ``zone_pct*close`` (max);
         stop nudge from ``sr_ctx.level_buffer × vol_widening``.
 
@@ -2890,10 +2934,14 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         res = getattr(sr_ctx, "nearest_resistance", None)
         bres = getattr(sr_ctx, "broken_resistance", None)
         bsup = getattr(sr_ctx, "broken_support", None)
+        psup = getattr(sr_ctx, "pending_support", None)
+        pres = getattr(sr_ctx, "pending_resistance", None)
         sup_px = float(getattr(sup, "price", 0.0) or 0.0) if sup is not None else 0.0
         res_px = float(getattr(res, "price", 0.0) or 0.0) if res is not None else 0.0
         bres_px = float(getattr(bres, "price", 0.0) or 0.0) if bres is not None else 0.0
         bsup_px = float(getattr(bsup, "price", 0.0) or 0.0) if bsup is not None else 0.0
+        psup_px = float(getattr(psup, "price", 0.0) or 0.0) if psup is not None else 0.0
+        pres_px = float(getattr(pres, "price", 0.0) or 0.0) if pres is not None else 0.0
 
         # Zone band half-width — bot's existing zone construction (same
         # formula as the dashboard's key_level_zones via
@@ -2905,7 +2953,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         )
         proximity_buffer = float(self.params.get("sr_scalp_max_distance_from_zone_atr", 0.5)) * atr
         # Stop nudge — bot's existing ``sr_ctx.level_buffer`` (same buffer the
-        # _refine_*_sr_levels paths use). Scales with vol_widening (Tier 2a).
+        # shared entry stage's S/R stop refinement uses). Scales with
+        # vol_widening (Tier 2a).
         level_buffer = float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0) * vol_widening * self._side_stop_buffer_mult(side)
         if level_buffer <= 0.0:
             level_buffer = max(atr * 0.05, 0.01) * vol_widening
@@ -2922,9 +2971,18 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # (continuation). Prefer the higher (more immediate) floor. The
             # proximity bounds below enforce "holding" (close stays above the
             # floor zone low), so no separate broken-through guard is needed.
+            #
+            # A bounce that wicks into the LOWER half of the support zone has
+            # crossed the level, and until the loss confirms the builder
+            # reports it as ``pending_support`` (above close), never as
+            # nearest_support (2026-09-23). Reading nearest_support alone made
+            # the zone's lower half unreachable: the test below compared close
+            # with the next support DOWN and rejected the setup exactly when
+            # price was testing the level.
             floor_px = 0.0
-            if sup_px > 0.0 and (sup_px - zone_half_width) < close <= (sup_px + zone_half_width + proximity_buffer):
-                floor_px = sup_px
+            for level_px in (sup_px, psup_px):
+                if level_px > floor_px and (level_px - zone_half_width) < close <= (level_px + zone_half_width + proximity_buffer):
+                    floor_px = level_px
             if 0.0 < bres_px < close <= (bres_px + zone_half_width + proximity_buffer) and bres_px > floor_px:
                 floor_px = bres_px
             if floor_px <= 0.0:
@@ -2956,9 +3014,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # (continuation). Prefer the lower (more immediate) ceiling. The
             # proximity bounds below enforce "holding" (close stays below the
             # ceiling zone high), so no separate broken-through guard is needed.
+            # A rejection that pokes into the UPPER half of the resistance
+            # zone reads the ``pending_resistance`` (below close), mirroring
+            # the LONG floor.
             ceil_px = 0.0
-            if res_px > 0.0 and (res_px - zone_half_width - proximity_buffer) <= close < (res_px + zone_half_width):
-                ceil_px = res_px
+            for level_px in (res_px, pres_px):
+                if level_px > 0.0 and (ceil_px <= 0.0 or level_px < ceil_px) and (level_px - zone_half_width - proximity_buffer) <= close < (level_px + zone_half_width):
+                    ceil_px = level_px
             if bsup_px > 0.0 and (bsup_px - zone_half_width - proximity_buffer) <= close < bsup_px and (ceil_px <= 0.0 or bsup_px < ceil_px):
                 ceil_px = bsup_px
             if ceil_px <= 0.0:
@@ -3026,43 +3088,51 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         else:
             pierce_stop = entry_level + pierce + level_buffer
             floored = max(stop, pierce_stop, close + atr_floor if atr_floor > 0 else stop)
-        if floored != stop:
-            bound_by = "pierce" if floored == pierce_stop else "atr"
-            stop = floored
-            # Widening the stop costs R:R, and sr_scalp cannot extend its
-            # reward to compensate — the target IS the opposing zone. When the
-            # zone gap can no longer pay for the tape's noise the setup simply
-            # isn't tradeable, so reject instead of taking a sub-floor R:R.
-            if not self._target_meets_min_rr(side, close, stop, target):
-                risk = abs(close - stop)
-                reward = abs(target - close)
-                self._set_build_failure(
-                    c.symbol, "sr_scalp",
-                    f"{'long' if side == Side.LONG else 'short'}_stop_floor_kills_rr("
-                    f"bound_by={bound_by},pierce_atr={(pierce / atr) if atr > 0 else 0.0:.2f},"
-                    f"risk={risk:.4f},reward={reward:.4f},"
-                    f"rr={(reward / risk) if risk > 0 else 0.0:.2f})",
-                )
-                return None
+        # Widening the stop costs R:R, and sr_scalp cannot extend its reward to
+        # compensate — the target IS the opposing zone. When the zone gap can
+        # no longer pay for the tape's noise the setup simply isn't tradeable,
+        # so reject instead of taking a sub-floor R:R: the shared entry
+        # stage's raw R:R gate, asked for only when the floor moved the stop
+        # (2026-09-24: it was a builder-local min_target_rr read; the refusal
+        # `<side>_stop_floor_kills_rr(close,target,reward,risk)` no longer
+        # names what bound the stop -- a pierce or the ATR backstop).
+        raw_rr_gate = "stop_floor_kills_rr" if floored != stop else None
+        stop = floored
 
-        return self._finalize_signal(c, side, close, stop, target, "sr_scalp", regime_score, frame, data, vol_scale=vol_scale)
+        return self._finalize_signal(c, side, close, stop, target, "sr_scalp", regime_score, frame, data,
+                                     vol_scale=vol_scale, raw_rr_gate=raw_rr_gate)
 
     def _finalize_signal(self, c: Candidate, side: Side, close: float, stop: float,
                          target: float, regime: str, regime_score: float,
-                         frame: pd.DataFrame, data=None, vol_scale: float = 1.0) -> Signal | None:
-        """Apply shared gates (structure, S/R, exhaustion, chart patterns) and
-        build the final Signal with adaptive management metadata."""
+                         frame: pd.DataFrame, data=None, vol_scale: float = 1.0,
+                         raw_rr_gate: str | None = None) -> Signal | None:
+        """Run top_tier's own gates, hand the entry to the shared entry stage,
+        then build the ladder / runner / management on the levels it admitted
+        and emit the Signal.
+
+        Order: the top_tier-only gates (Fix D, stretched / tech bias, the ORB
+        5m follow-through, HTF bias / pivot, HTF EMA, the ORB opposing-level
+        block) -> ``entry_policy.admit`` (the raw R:R gate the builder asked
+        for with ``raw_rr_gate``, the switched-on shared vetoes minus the
+        manifest's exemptions for the regime, the S/R and technical stop /
+        target refinement, the shared score terms) -> entry exhaustion ->
+        bonuses, ladder, trail runner, Fix G, management -> ``emit``. Every
+        refusal lands under ``regime`` (the proposal's style), which the
+        queue loop in ``entry_signals`` consumes before falling through to
+        the next regime. The broken-level guard that sat here until
+        2026-09-24 (``reject_entry_near_broken_level``) is the shared
+        ``shared_entry.use_broken_level_guard`` veto now.
+        """
         sr_ctx = self._sr_context(c.symbol, frame, data)
         ms_ctx = self._structure_context(frame, "ltf")
         tech_ctx = self._technical_context(frame)
         ctx = self._chart_context(frame)
         htf_ctx = self._default_htf_context_for_score(c.symbol, data)
 
-        # Single ORB-window flag reused by all _finalize_signal ORB-bypasses
-        # (Fix D, HTF bias, ORB 5m follow-through, structure entry, SR entry,
-        # exhaustion, entered_in_orb_window metadata). Computed once here to
-        # avoid duplicate now_et() calls with potential clock-skew at the
-        # 10:05 boundary.
+        # Single ORB-window flag reused by the _finalize_signal ORB-bypasses
+        # (HTF bias, HTF EMA, ORB 5m follow-through, exhaustion). Computed
+        # once here to avoid duplicate now_et() calls with potential
+        # clock-skew at the 10:05 boundary.
         orb_end = self.params.get("orb_end_time", "10:05")
         in_orb_window = self._in_orb_window(now_et().time())
 
@@ -3204,48 +3274,6 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     )
                     return None
 
-        # Entry-side mirror of resistance_break_exit / support_break_exit
-        # in strategy_base.position_exit_signal. Those exits fire on
-        # bar-close through sr_ctx.broken_resistance (SHORT) or
-        # broken_support (LONG). If entry happens right below/above such
-        # a level, the exit triggers on the first reclaim and the trade
-        # never had head-room. Thresholds mirror the HTF S/R entry gate
-        # (_bearish_sr_block_reason): require both pct and ATR clearance
-        # so the stop and exit are separated by a non-trivial band.
-        if bool(self.params.get("reject_entry_near_broken_level", True)):
-            min_pct = self._pct_param("broken_level_min_clearance_pct", 0.0025, vol_scale)
-            min_atr = float(self.params.get("broken_level_min_clearance_atr", 0.72))
-            atr_local = _safe_float(
-                frame.iloc[-1].get("atr14") if (frame is not None and not frame.empty and "atr14" in frame.columns) else None,
-                max(close * 0.0015, 0.01),
-            )
-            if side == Side.SHORT:
-                broken_res = getattr(sr_ctx, "broken_resistance", None)
-                res_price = float(getattr(broken_res, "price", 0.0) or 0.0) if broken_res is not None else 0.0
-                if res_price > close:
-                    pct = (res_price - close) / max(close, 1e-9)
-                    atr_dist = (res_price - close) / max(atr_local, 1e-9)
-                    if pct <= min_pct or atr_dist <= min_atr:
-                        self._set_build_failure(
-                            c.symbol, regime,
-                            f"short_near_broken_resistance(level={res_price:.4f},"
-                            f"pct={pct:.4f}<={min_pct:.4f},atr={atr_dist:.2f}<={min_atr:.2f})",
-                        )
-                        return None
-            else:
-                broken_sup = getattr(sr_ctx, "broken_support", None)
-                sup_price = float(getattr(broken_sup, "price", 0.0) or 0.0) if broken_sup is not None else 0.0
-                if 0.0 < sup_price < close:
-                    pct = (close - sup_price) / max(close, 1e-9)
-                    atr_dist = (close - sup_price) / max(atr_local, 1e-9)
-                    if pct <= min_pct or atr_dist <= min_atr:
-                        self._set_build_failure(
-                            c.symbol, regime,
-                            f"long_near_broken_support(level={sup_price:.4f},"
-                            f"pct={pct:.4f}<={min_pct:.4f},atr={atr_dist:.2f}<={min_atr:.2f})",
-                        )
-                        return None
-
         # HTF bias alignment filter. The higher-timeframe market-structure
         # context (usually 15m) is attached to sr_ctx.market_structure.
         # Two layers:
@@ -3352,75 +3380,105 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                         )
                         return None
 
-        # ORB-window bypasses for 1m structure and S/R blocks. Both signals
-        # are backward-looking from the opening action: a 9:30 dump candle
-        # registers as CHoCH_down on the 1m chart and flips
-        # `breakdown_below_support` to true, blocking LONG entries for
-        # several bars even after the recovery. The trend regime's own
-        # fresh-breakout gate (`close > recent LTF highs`) already proves
-        # direction during the ORB window. After the window, these checks
-        # resume normally.
-        orb_structure_bypass = bool(self.params.get("orb_bypass_structure_entry", True)) and in_orb_window
-        orb_sr_bypass = bool(self.params.get("orb_bypass_sr_entry", True)) and in_orb_window
-        # Narrow the SR bypass: it still bypasses the noisy "close to level"
-        # checks that the ORB bypass exists to suppress, BUT re-engages when
-        # the *opposing* level (resistance for LONG, support for SHORT) is
-        # dangerously close — within orb_opposing_sr_atr_mult * ATR. 2026-04-17
-        # NFLX was shorted at 95.26 with support that had just broken at 95.90,
-        # 0.64 away; AAPL was long'd at 269.61 with resistance 268.54 just
-        # above (false break). These are exactly the "entry into the teeth
-        # of opposing level" trades that the bypass shouldn't let through.
-        orb_opposing_atr_mult = float(self.params.get("orb_opposing_sr_atr_mult", 0.5) or 0.0)
-        atr_for_orb = _safe_float(
+        # HTF EMA trend (htf_ema_fast_span / htf_ema_slow_span on the HTF
+        # context): the peer strategies' 2-of-3 vote -- close vs the fast
+        # EMA, fast vs slow, the context's trend bias. Wired 2026-09-24; until
+        # then top_tier read no HTF EMA and the two span knobs only drew the
+        # dashboard's HTF chart. require_htf_ema_alignment blocks an entry
+        # against it here -- on both sides, long_only / short_only, or
+        # neither -- following the ORB-window HTF bypass like the structure
+        # gate above; htf_ema_alignment_score acts earlier, on the regime
+        # scores in entry_signals (the bonus recorded below is the one applied
+        # there).
+        htf_ema_bias, htf_ema_bull, htf_ema_bear = self._htf_bias(htf_ctx, close)
+        htf_ema_opposed = (
+            (side == Side.LONG and htf_ema_bias == "bearish")
+            or (side == Side.SHORT and htf_ema_bias == "bullish")
+        )
+        if side in self._htf_ema_gated_sides() and htf_ema_opposed and not orb_htf_bypass:
+            self._set_build_failure(
+                c.symbol, regime,
+                f"htf_ema_trend_{htf_ema_bias}(votes={htf_ema_bull}v{htf_ema_bear})",
+            )
+            return None
+        htf_ema_bonus = self._htf_ema_score_term(side, htf_ema_bias, in_orb_window)
+
+        # ORB opposing-level block. The orb regime is exempt from the shared
+        # structure and S/R vetoes (manifest capabilities.shared_entry.
+        # exemptions {orb: [structure, sr]}; the params orb_bypass_structure_
+        # entry / orb_bypass_sr_entry until 2026-09-24): both read backward
+        # from the opening action -- a 9:30 dump candle registers as
+        # CHoCH_down on the 1m chart and flips `breakdown_below_support`,
+        # blocking LONG entries for several bars even after the recovery --
+        # and the range break is its own directional proof. The exemption must
+        # not wave through an entry into the teeth of the OPPOSING level
+        # (resistance for a LONG, support for a SHORT) within
+        # orb_opposing_sr_atr_mult * ATR. 2026-04-17 NFLX was shorted at 95.26
+        # with support that had just broken at 95.90, 0.64 away; AAPL was
+        # long'd at 269.61 with resistance 268.54 just above (false break).
+        # Both are PENDING levels -- crossed, flip unconfirmed -- which the
+        # builder reports as ``pending_support`` / ``pending_resistance``,
+        # never as nearest_*. Until 2026-09-23 this check read nearest_*
+        # alone, so neither example could trip it; a pending opposing level
+        # now always blocks. Keyed on the regime since 2026-09-24 (it rode
+        # the in-window S/R bypass): the orb regime exists only inside the
+        # ORB window, and the exemption this block backstops keys on it too.
+        frame_atr = _safe_float(
             frame.iloc[-1].get("atr14") if (frame is not None and not frame.empty and "atr14" in frame.columns) else None,
             max(close * 0.0015, 0.01),
         )
-        opposing_sr_block = False
-        if orb_sr_bypass and orb_opposing_atr_mult > 0 and atr_for_orb > 0:
-            threshold = orb_opposing_atr_mult * atr_for_orb
+        orb_opposing_atr_mult = float(self.params.get("orb_opposing_sr_atr_mult", 0.5) or 0.0)
+        if regime == "orb" and orb_opposing_atr_mult > 0 and frame_atr > 0:
+            threshold = orb_opposing_atr_mult * frame_atr
             if side == Side.LONG:
+                opposing_sr_block = getattr(sr_ctx, "pending_resistance", None) is not None
                 nearest_res = getattr(sr_ctx, "nearest_resistance", None)
                 if nearest_res is not None:
                     res_price = float(getattr(nearest_res, "price", 0.0) or 0.0)
                     if res_price > 0 and 0 <= (res_price - close) <= threshold:
                         opposing_sr_block = True
+                if opposing_sr_block:
+                    self._set_build_failure(c.symbol, regime, f"long_orb_opposing_resistance_within_{orb_opposing_atr_mult:.2f}atr")
+                    return None
             else:
+                opposing_sr_block = getattr(sr_ctx, "pending_support", None) is not None
                 nearest_sup = getattr(sr_ctx, "nearest_support", None)
                 if nearest_sup is not None:
                     sup_price = float(getattr(nearest_sup, "price", 0.0) or 0.0)
-                    # Only count supports BELOW entry (proper floor); a support
-                    # that sits above entry is a recently-broken level acting
-                    # differently and handled by the SR engine's "breakdown" state.
+                    # A support above entry is either pending (above) or a
+                    # confirmed break (broken_support), which a SHORT rides.
                     if sup_price > 0 and 0 <= (close - sup_price) <= threshold:
                         opposing_sr_block = True
-        effective_sr_bypass = orb_sr_bypass and not opposing_sr_block
-        if side == Side.LONG:
-            if not orb_structure_bypass and self._blocks_bullish_structure_entry(ms_ctx):
-                self._set_build_failure(c.symbol, regime, self._bullish_structure_block_reason(ms_ctx))
-                return None
-            if not effective_sr_bypass and self._blocks_bullish_sr_entry(sr_ctx):
-                self._set_build_failure(c.symbol, regime, self._bullish_sr_block_reason(sr_ctx))
-                return None
-            if opposing_sr_block:
-                self._set_build_failure(c.symbol, regime, f"long_orb_opposing_resistance_within_{orb_opposing_atr_mult:.2f}atr")
-                return None
-            stop, target = self._refine_bullish_sr_levels(close, stop, target, sr_ctx, frame)
-            stop, target = self._refine_bullish_technical_levels(close, stop, target, tech_ctx, frame)
-        else:
-            if not orb_structure_bypass and self._blocks_bearish_structure_entry(ms_ctx):
-                self._set_build_failure(c.symbol, regime, self._bearish_structure_block_reason(ms_ctx))
-                return None
-            if not effective_sr_bypass and self._blocks_bearish_sr_entry(sr_ctx):
-                self._set_build_failure(c.symbol, regime, self._bearish_sr_block_reason(sr_ctx))
-                return None
-            if opposing_sr_block:
-                self._set_build_failure(c.symbol, regime, f"short_orb_opposing_support_within_{orb_opposing_atr_mult:.2f}atr")
-                return None
-            stop, target = self._refine_bearish_sr_levels(close, stop, target, sr_ctx, frame)
-            stop, target = self._refine_bearish_technical_levels(close, stop, target, tech_ctx, frame)
+                if opposing_sr_block:
+                    self._set_build_failure(c.symbol, regime, f"short_orb_opposing_support_within_{orb_opposing_atr_mult:.2f}atr")
+                    return None
 
-        # Entry exhaustion check — skipped during the ORB window because
-        # VWAP and EMA9 haven't equilibrated after the open. A sharp
+        # The shared entry stage (2026-09-24; each of these used to be a
+        # helper call here, and the dual divergence veto never ran): the raw
+        # R:R gate a builder asked for, the switched-on vetoes (structure,
+        # S/R, broken level, chart, dual divergence, candle -- all of them
+        # evaluated, so the refusal payload lists every blocker, of which the
+        # queue loop's decision log keeps the primary; the manifest exempts
+        # orb from the first two, and since 2026-09-25 range / pullback /
+        # sr_scalp from the structure veto and -- top_tier's manifest only --
+        # vwap_reclaim from the S/R veto), the S/R then technical stop / target
+        # refinement, and the entry-context / FVG score terms. It reuses the
+        # contexts the gates above read, on the same 1m frame.
+        admitted = self.entry_policy.admit(EntryProposal(
+            candidate=c, direction=side, style=regime, style_family=regime,
+            close=close, stop=stop, target=target,
+            gate_frame=frame, sr_frame=frame, level_frame=frame, data=data,
+            raw_rr_gate=raw_rr_gate, htf_ctx=htf_ctx,
+            contexts=EntryContexts(sr=sr_ctx, ms=ms_ctx, tech=tech_ctx, chart=ctx),
+            vol_scale=vol_scale,
+        ))
+        if admitted is None:
+            return None
+        stop, target = admitted.stop, admitted.target
+
+        # Entry exhaustion check — after the refinement, as it always ran;
+        # skipped during the ORB window because VWAP and EMA9 haven't
+        # equilibrated after the open. A sharp
         # V-reversal (e.g. TSLA 2026-04-15 open dump $367→$362 then run
         # to $394) artificially depresses VWAP, making the recovery look
         # "extended" when it's really the trend establishing itself.
@@ -3436,44 +3494,24 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 return None
 
         # Scoring
+        ms_ctx = admitted.ms
         structure_bonus = 0.75 if getattr(ms_ctx, "bias", "neutral") == ("bullish" if side == Side.LONG else "bearish") else 0.0
         if side == Side.LONG and getattr(ms_ctx, "bos_up", False) and self._structure_event_recent(getattr(ms_ctx, "bos_up_age_bars", None)):
             structure_bonus += 0.5
         elif side == Side.SHORT and getattr(ms_ctx, "bos_down", False) and self._structure_event_recent(getattr(ms_ctx, "bos_down_age_bars", None)):
             structure_bonus += 0.5
+        chart_ctx = admitted.chart
         if side == Side.LONG:
-            pattern_bonus = 0.35 if ctx.matched_bullish_continuation else (0.15 if ctx.matched_bullish_reversal else 0.0)
+            pattern_bonus = 0.35 if chart_ctx.matched_bullish_continuation else (0.15 if chart_ctx.matched_bullish_reversal else 0.0)
         else:
-            pattern_bonus = 0.35 if ctx.matched_bearish_continuation else (0.15 if ctx.matched_bearish_reversal else 0.0)
+            pattern_bonus = 0.35 if chart_ctx.matched_bearish_continuation else (0.15 if chart_ctx.matched_bearish_reversal else 0.0)
 
-        # Candle pattern confirmation on the trigger frame.
-        # directional_candle_signal returns opposite_score/opposite_net_score
-        # from the SAME @lru_cache'd context — no extra ta-lib calls.
-        # _candle_context slices internally to CANDLE_CONTEXT_BARS so TA-Lib
-        # has enough context to initialize its internal state.
-        candle_signal = self._directional_candle_signal(frame, side)
-        # Entry filter: reject when the opposing-direction candle cluster is
-        # at or above candles.opposing_net_score_threshold (default 0.70 =
-        # "solid" tier). Mirrors shared_exit.use_candle_pattern_exit on the
-        # entry side.
-        if self._shared_entry_enabled("use_opposing_candle_filter", False):
-            opposing_net = float(candle_signal.get("opposite_net_score", 0.0) or 0.0)
-            threshold = float(self._candles_setting("opposing_net_score_threshold", 0.70))
-            if opposing_net >= threshold:
-                # _candle_context is cached per strategy instance — second
-                # call on same frame returns the stored dict, no detection.
-                cc = self._candle_context(frame)
-                opp_prefix = "bearish" if side == Side.LONG else "bullish"
-                opp_matches = ",".join(
-                    str(m) for m in sorted(cc.get(f"matched_{opp_prefix}_candles", []) or [])[:3]
-                )
-                self._set_build_failure(
-                    c.symbol, regime,
-                    f"{'long' if side == Side.LONG else 'short'}_opposing_candle"
-                    f"(net_score={opposing_net:.2f}>={threshold:.2f},"
-                    f"matches={opp_matches or 'na'})",
-                )
-                return None
+        # Candle pattern confirmation on the trigger frame -- the directional
+        # signal admit read for the shared opposing-candle veto
+        # (use_opposing_candle_filter, which moved there from here on
+        # 2026-09-24), from the SAME cached candle context: no extra TA-Lib
+        # calls.
+        candle_signal = admitted.candle_signal
         candle_bonus = 0.0
         candle_confirmed = bool(candle_signal.get("confirmed"))
         if candle_confirmed:
@@ -3485,22 +3523,16 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             else:
                 candle_bonus = 0.10
 
-        adjustments = self._entry_adjustment_components(side, sr_ctx=sr_ctx, tech_ctx=tech_ctx, htf_ctx=htf_ctx)
-        fvg_adjustments = self._fvg_entry_adjustment_components(side, c.symbol, frame, data)
-        fvg_cont_bias = float(fvg_adjustments.get("fvg_continuation_bias", 0.0) or 0.0)
+        fvg_cont_bias = float(admitted.fvg["fvg_continuation_bias"])
         runner_allowed = bool(fvg_cont_bias >= 0.35 and structure_bonus >= 0.75)
 
-        # Apply adaptive_ladder rungs when configured. The helper falls back
-        # to the original target when ladder mode isn't active, the regime
-        # opts out (range), or no qualifying rungs exist — so this call is
-        # safe to make unconditionally.
-        atr_for_ladder = _safe_float(
-            frame.iloc[-1].get("atr14") if (frame is not None and not frame.empty and "atr14" in frame.columns) else None,
-            max(close * 0.0015, 0.01),
-        )
+        # Apply adaptive_ladder rungs when configured, from the refined stop.
+        # The helper falls back to the admitted target when ladder mode isn't
+        # active, the regime opts out (range), or no qualifying rungs exist —
+        # so this call is safe to make unconditionally.
         target, ladder_meta = self._apply_ladder_if_enabled(
             side, close, stop, target,
-            regime=regime, sr_ctx=sr_ctx, atr=atr_for_ladder,
+            regime=regime, sr_ctx=admitted.sr, atr=frame_atr,
         )
         # Trail-runner: in adaptive_ladder mode, when no qualifying rungs
         # exist for a trend/pullback entry, drop the fixed target so the
@@ -3515,10 +3547,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             runner_allowed = False
 
         # Fix G — CEILING on target extension past nearest opposing SR;
-        # complements entry_min_clearance_atr (FLOOR on SR clearance).
-        # Placement invariant: runs AFTER ladder + runner override so
-        # `target` is the trade's FINAL take-profit (None in runner mode →
-        # gate inert). Trend-only: range targets ARE opposing SR by design.
+        # complements entry_min_clearance_atr (FLOOR on SR clearance). It
+        # refuses a take-profit that only pays if price punches through an
+        # opposing level the trade does not manage. Placement invariant:
+        # runs AFTER ladder + runner override so `target` is the trade's
+        # FINAL take-profit -- None in runner mode (gate inert; runners
+        # trail out), the first rung in ladder mode, the refined target
+        # otherwise. Trend-only: range targets ARE opposing SR by design.
         if (
             regime == "trend"
             and target is not None
@@ -3527,7 +3562,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             target_max_sr_ratio = float(self.params.get("target_max_sr_ratio", 0.8))
             tgt = float(target)
             if side == Side.LONG:
-                near = getattr(sr_ctx, "nearest_resistance", None)
+                near = getattr(admitted.sr, "nearest_resistance", None)
                 level_price = float(getattr(near, "price", 0.0) or 0.0)
                 valid = level_price > close
                 dist_to_sr = level_price - close if valid else 0.0
@@ -3535,13 +3570,27 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 level_name = "resistance"
                 reason_prefix = "long_target_beyond_resistance"
             else:
-                near = getattr(sr_ctx, "nearest_support", None)
+                near = getattr(admitted.sr, "nearest_support", None)
                 level_price = float(getattr(near, "price", 0.0) or 0.0)
                 valid = 0.0 < level_price < close
                 dist_to_sr = close - level_price if valid else 0.0
                 dist_to_target = close - tgt
                 level_name = "support"
                 reason_prefix = "short_target_beyond_support"
+            # A first ladder rung ON the nearest level is the ladder's own
+            # take-profit at that level, and the ladder manages it (zone-flip
+            # stop promotion and the next rung; a strong push suppresses the
+            # target exit). The rung builder draws from the list nearest_*
+            # heads, so rung 1 sits at or past the nearest level and the
+            # ratio is >= 1.00 by construction: at the shipped 0.7 / 0.8
+            # ratios this gate refused every laddered trend entry until
+            # 2026-09-25, and trend traded only as a trail runner. A nearest
+            # level under ladder_min_target_rr that rung 1 skipped is still
+            # an unmanaged level short of the target, and the ratio still
+            # refuses it. The tolerance covers the rung builder's
+            # round(price, 6).
+            if valid and ladder_meta and abs(tgt - level_price) <= 1e-6:
+                valid = False
             if valid and dist_to_target > dist_to_sr * target_max_sr_ratio:
                 ratio = dist_to_target / dist_to_sr
                 self._set_build_failure(
@@ -3555,31 +3604,33 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             side, close, stop, target, style=regime,
             runner_allowed=runner_allowed, continuation_bias=fvg_cont_bias,
         )
+        # The strategy's own priority. emit adds the shared entry-context and
+        # FVG terms (shared_context_score) to make final_priority_score, the
+        # same sum this built itself until 2026-09-24.
         activity_weight = float(self.params.get("activity_score_weight", 0.12))
-        final_priority_score = (
+        strategy_score = (
             regime_score
             + (float(c.activity_score) * activity_weight)
             + structure_bonus
             + pattern_bonus
             + candle_bonus
-            + adjustments["entry_context_adjustment"]
-            + float(fvg_adjustments.get("fvg_entry_adjustment", 0.0) or 0.0)
         )
 
         reason = f"top_tier_{regime}_{'long' if side == Side.LONG else 'short'}"
-        # Tag entries that used an ORB-window bypass so post-session analysis
-        # can slice performance by ORB vs post-ORB entries. 2026-04-17 ORB
-        # entries were 1W/4T (-$120); post-ORB 10:05-11:00 window was 2W/5T
-        # (+$126) thanks to TSLA. Without an explicit tag we reconstruct from
-        # entry timestamps, which conflates 10:00-10:05 edge cases.
-        entered_in_orb_window = bool(in_orb_window)
-        metadata = self._build_signal_metadata(
-            entry_price=close,
-            chart_ctx=ctx, ms_ctx=ms_ctx, sr_ctx=sr_ctx, tech_ctx=tech_ctx,
-            adjustments=adjustments, fvg_adjustments=fvg_adjustments,
-            management=management, ladder_meta=ladder_meta,
-            final_priority_score=final_priority_score,
-            leading={
+        # emit stamps entry_style_family (the regime) and orb_window_entry
+        # (the orb family) -- the tag post-session analysis slices ORB vs
+        # post-ORB entries by (2026-04-17 ORB entries were 1W/4T (-$120); the
+        # post-ORB 10:05-11:00 window 2W/5T (+$126) thanks to TSLA). It was
+        # the ORB-window flag until 2026-09-24; the orb regime is the only
+        # one the window allows, so the two agree.
+        return self.entry_policy.emit(
+            admitted,
+            reason=reason,
+            strategy_score=strategy_score,
+            management=management,
+            target=target,
+            ladder_meta=ladder_meta or None,
+            metadata={
                 "regime": regime,
                 "regime_score": round(regime_score, 4),
                 "structure_bonus": round(structure_bonus, 4),
@@ -3589,15 +3640,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 "candle_tier": candle_signal.get("confirm_tier"),
                 "candle_anchor": candle_signal.get("anchor_pattern"),
                 "candle_matches": candle_signal.get("matches", []),
-                "orb_window_entry": entered_in_orb_window,
                 "orb_end_time": str(orb_end),
+                "htf_ema_trend": htf_ema_bias,
+                "htf_ema_votes": f"{htf_ema_bull}v{htf_ema_bear}",
+                "htf_ema_bonus": round(htf_ema_bonus, 4),
             },
-        )
-        return Signal(
-            symbol=c.symbol, strategy=self.strategy_name, side=side,
-            reason=reason, stop_price=float(stop),
-            target_price=None if target is None else float(target),
-            metadata=metadata,
         )
 
     # ------------------------------------------------------------------
@@ -3617,11 +3664,15 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         min_bars = int(self.params.get("min_bars", 60) or 60)
         ltf_min = max(1, int(self.params.get("ltf_minutes", 5)))
         # Indicator-span stretch for the LTF frame. With a 1m LTF, span_scale=5
-        # makes ema9/ema20/atr14/adx14/rsi14/ret5/ret15 behave like the old 5m
-        # frame (ema9->45, atr14->70, ...) so entry/exit logic keeps its 5m
-        # wall-clock horizons while acting on finer 1m bars/closes. Default 1.0
-        # leaves the canonical spans untouched.
+        # makes atr14/adx14/rsi14/ret5/ret15 behave like the old 5m frame
+        # (atr14->70, ...) so entry scoring keeps its 5m wall-clock horizons
+        # while acting on finer 1m bars/closes. Default 1.0 leaves the
+        # canonical spans untouched. The LTF EMAs are set on their own by
+        # ltf_ema_fast_span / ltf_ema_slow_span (default: 9 / 20 x span_scale).
+        # Exits and the ema9-extension gate read the base 1m frame's native
+        # EMA9 / EMA20, not these.
         ltf_span_scale = float(self.params.get("ltf_indicator_span_scale", 1.0))
+        ltf_ema_pair = ltf_ema_spans(self.params)
         min_ltf_bars = int(self.params.get("min_ltf_bars", 15))
         allow_short = bool(self.config.risk.allow_short)
         now_t = now_et().time()
@@ -3631,10 +3682,12 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 self._record_entry_decision(c.symbol, "skipped", ["outside_entry_window"])
             return out
         # ORB window flag — consumed by the surviving orb_bypass_* gates
-        # (htf_bias / structure / sr / exhaustion / screener_bias /
-        # side_decision / relative_strength), all of which apply to the orb
-        # regime at the open when their inputs (15m structure, sector-ETF
-        # VWAP, etc.) are still stale. The orb regime is not in the index-
+        # (htf_bias / exhaustion / screener_bias / side_decision /
+        # relative_strength), all of which apply to the orb regime at the
+        # open when their inputs (15m structure, sector-ETF VWAP, etc.) are
+        # still stale. (The structure / S/R bypasses are the manifest's
+        # shared_entry exemption for the orb regime since 2026-09-24.) The
+        # orb regime is not in the index-
         # confirmation / confirmation-bar regime sets, so it never hits those
         # gates — the old orb_bypass_index_confirmation / _entry_confirmation_bar
         # companions were removed (2026-05-29).
@@ -3705,7 +3758,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)])
                 continue
 
-            ltf = self._resampled_frame(frame, ltf_min, symbol=c.symbol, data=data, span_scale=ltf_span_scale)
+            ltf = self._resampled_frame(frame, ltf_min, symbol=c.symbol, data=data, span_scale=ltf_span_scale,
+                                        ema_spans=ltf_ema_pair)
             if ltf is None or ltf.empty or len(ltf) < min_ltf_bars:
                 self._record_entry_decision(c.symbol, "skipped", ["missing_ltf_context"])
                 continue
@@ -3714,6 +3768,12 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # AAPL → XLK, XOM → XLE, FCX → XLB, etc. Falls back to
             # ``index_symbols`` when no sector mapping exists for the symbol.
             index_ok_by_side = {side: self._index_confirms(side, c.symbol, bars, data) for side in sides_to_evaluate}
+            # The HTF EMA trend, read once per candidate for the score term
+            # below (the gate reads the same context in _finalize_signal).
+            htf_ema_read = (
+                self._htf_bias(self._default_htf_context_for_score(c.symbol, data), _safe_float(ltf.iloc[-1]["close"]))
+                if float(self.params.get("htf_ema_alignment_score", 0.0)) else ("neutral", 0, 0)
+            )
             idx_neutral = self._index_neutral(c.symbol, bars)
 
             last = ltf.iloc[-1]
@@ -3933,6 +3993,16 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             min_sr_scalp = float(self.params.get("min_sr_scalp_score", 3.5))
             min_orb = float(self.params.get("min_orb_score", 3.5))
             min_vwap_reclaim = float(self.params.get("min_vwap_reclaim_score", 3.5))
+            thresholds = {
+                "trend": min_trend,
+                "pullback": min_pullback,
+                "range": min_range,
+                "vol_squeeze": min_vol_squeeze,
+                "momentum": min_momentum,
+                "sr_scalp": min_sr_scalp,
+                "orb": min_orb,
+                "vwap_reclaim": min_vwap_reclaim,
+            }
 
             # tech_ctx is built ONCE per candidate (per-frame @lru_cache makes
             # repeated calls O(1)). Used by vol_squeeze scoring AND by
@@ -4072,23 +4142,26 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     for mr_regime in MEAN_REVERSION_REGIMES:
                         scores[mr_regime] = max(0.0, scores[mr_regime] - mr_bias_penalty)
 
+                # htf_ema_alignment_score: the HTF EMA trend moves every scored
+                # regime of this side before it has to clear its floor, so it
+                # can decide whether and which regime builds. (Added to the
+                # final priority score, as first wired, it could only reorder
+                # signals tied on normalised regime score.) A regime that
+                # scored 0 found no setup and gets nothing.
+                htf_ema_term = self._htf_ema_score_term(side, htf_ema_read[0], in_orb_window)
+                if htf_ema_term:
+                    for regime_name, regime_value in scores.items():
+                        if regime_value > 0.0:
+                            scores[regime_name] = max(0.0, regime_value + htf_ema_term)
+
                 # Per-side BUILD ORDER: list of qualifying regimes in score
                 # order. A regime qualifies if it's in allowed_regimes AND
-                # its post-penalty score meets its own min_*_score threshold.
+                # its post-penalty score meets its own min_*_score threshold
+                # (``thresholds`` above).
                 # The build phase iterates ACROSS sides AND regimes in
                 # cross-side score order so no regime blocks another (within
                 # OR across sides). Both sides' qualifiers compete in the
                 # same flat queue.
-                thresholds = {
-                    "trend": min_trend,
-                    "pullback": min_pullback,
-                    "range": min_range,
-                    "vol_squeeze": min_vol_squeeze,
-                    "momentum": min_momentum,
-                    "sr_scalp": min_sr_scalp,
-                    "orb": min_orb,
-                    "vwap_reclaim": min_vwap_reclaim,
-                }
                 # Ordering uses the NORMALISED score — how far into its own
                 # headroom a regime scored — not the raw one. Raw scores are
                 # not comparable across regimes because each scorer has a
@@ -4410,11 +4483,23 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     # ``_ladder_indices_still_aligned``.
                     if isinstance(sig.metadata, dict):
                         sig.metadata["confirmation_indices"] = list(self._indices_for_symbol(c.symbol))
-                        # Cross-regime-comparable score. ``signal_priority_key``
-                        # ranks competing signals on this when there are more
-                        # signals than free position slots; the raw
-                        # ``regime_score`` next to it stays for reporting.
+                        # Cross-regime-comparable score: the manifest's
+                        # signal_priority.primary_field, so the shared entry
+                        # policy's rank_key ranks competing signals on it when
+                        # there are more signals than free position slots
+                        # (raw regime scores are on per-regime scales; see
+                        # _normalized_regime_score). The raw ``regime_score``
+                        # next to it stays for reporting.
                         sig.metadata["regime_score_normalized"] = round(float(regime_norm), 4)
+                        # ...and its rank_unit_field (2026-09-24): rank_key
+                        # adds shared_score_weight x shared_context_score x
+                        # this to it, i.e. the shared terms at the scale of a
+                        # raw point of this regime's score over the floor it
+                        # was normalised against (a SHORT's includes the
+                        # premium, as above; an expired arm carries the score
+                        # it armed with, normalised against this same floor).
+                        floor = thresholds[regime_name] + self._short_score_premium(side)
+                        sig.metadata["regime_rank_unit"] = round(self._regime_rank_unit(regime_name, floor), 6)
                         stats = self._symbol_daily_stats(c.symbol, data)
                         if stats is not None:
                             if stats.has_scale:

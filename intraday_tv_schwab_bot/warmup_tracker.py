@@ -142,6 +142,11 @@ class WarmupTracker:
                 else:
                     should_fetch = self.data.should_refresh_history(symbol)
             else:
+                # Prewarm: a warm frame is not refetched while the stream is
+                # off, so it ends where the prewarm fetch did (09:14 for a
+                # 09:15 prewarm). The gap up to the stream's first bar is
+                # closed by should_backfill_stream_symbol once streaming
+                # starts (2026-09-23; it used to stay open all day).
                 should_fetch = (not history_has_rows) and self.data.should_refresh_history(symbol)
         return should_fetch, required_bars
 

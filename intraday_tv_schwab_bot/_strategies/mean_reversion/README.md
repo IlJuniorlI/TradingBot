@@ -38,28 +38,23 @@ After the pullback check, the strategy asks whether the stock is actually bounci
 
 So the entry is only valid once the pullback starts to **resolve upward**, not while the dip is still unfolding.
 
-### 4. Shared context can still veto the setup
+### 4. The shared entry stage can still veto the setup
 
-If the local reversal conditions pass, the trade still goes through the shared context stack:
+The setup is handed to the shared entry stage (`_strategies/shared_entry.py`) as one LONG proposal of style and family `reversal`, with the local conditions above as its pending reasons. Every `shared_entry` knob the preset switches on applies to it exactly as it does to every other strategy:
 
-- opposing chart-pattern filter
-- 1-minute structure filter
-- support/resistance filter
-- technical-level refinement
-- FVG-based entry adjustments
+- the vetoes: market structure, support/resistance, broken level, opposing chart pattern, dual RSI+OBV counter-divergence, opposing candle cluster
+- the support/resistance, then technical-level, stop/target refinement (bounded by `min_target_rr` and `min_stop_atr_mult`)
+- the score terms: technical, S/R proximity, HTF divergence and FVG
+
+A skipped candidate's decision lists every blocker, the local ones first. Until 2026-09-24 the strategy called only some of these itself: the chart filter ran only when nothing else was pending, the structure and S/R vetoes as an either/or, and the dual-divergence and candle vetoes never reached it.
 
 That helps keep the strategy from buying strong names that are technically rebounding but still pressing into bad context.
 
 ### 5. How the trade is framed
 
-The initial stop starts under the recent short-term swing low. The first target points back toward the recent high area. After that, the strategy refines both sides of the trade using:
+The initial stop starts under the last three bars' low. The first target points back toward the recent high area (at least `risk.default_target_pct` away). The shared stage refines both sides as above; the strategy then adds adaptive management in the `reversal` style (no runner, leaning on the FVG reversal bias).
 
-- support/resistance
-- technical levels
-- FVG context
-- adaptive management metadata
-
-Its signal strength is built from the screener strength, the shallowness of the pullback, pattern quality, and shared context adjustments.
+Its own priority (`strategy_priority_score`) is built from the screener strength, the shallowness of the pullback and pattern quality. The shared context terms are added on top (`shared_context_score`), and their sum is the `final_priority_score` the gatekeeper ranks on. The signal is stamped `entry_style_family: reversal`.
 
 ### 6. What a good setup looks like
 

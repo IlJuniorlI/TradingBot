@@ -25,6 +25,18 @@ from ..shared import (
 from ..zero_dte_etf_options.strategy import ZeroDteEtfOptionsStrategy
 
 class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
+    """0DTE long calls / puts on the inherited regime engine.
+
+    Both styles -- ORB and trend -- hand a premium proposal (family
+    ``option_long``, the underlying's direction) to the shared entry stage
+    before the chain is read, so shared_entry.use_structure_filter /
+    use_sr_filter veto both the same way; the trend style's own extension
+    and conviction blockers (``_long_option_style_gate``) ride along as the
+    proposal's pending reasons. The ORB path's own switches
+    (``orb_apply_structure_veto`` / ``orb_apply_sr_veto``) were retired on
+    2026-09-24.
+    """
+
     strategy_name = 'zero_dte_etf_long_options'
 
     def required_history_bars(self, symbol: str | None = None, positions: dict[str, Position] | None = None) -> int:
@@ -32,7 +44,15 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
         if capability_bars is not None:
             return capability_bars
         return max(0, int(self.params.get("min_bars", 90)))
-    def _build_single_option_signal(self, underlying: str, bullish: bool, client, data, last_underlying: float, style: str, confirm_index: str | None, regime: dict[str, Any]) -> Signal | None:
+
+    def _build_single_option_signal(self, candidate: Candidate, bullish: bool, client, data, frame: pd.DataFrame, last_underlying: float, style: str, confirm_index: str | None, regime: dict[str, Any], *, pending_reasons: tuple[str, ...] | list[str] = ()) -> Signal | None:
+        underlying = candidate.symbol
+        admitted = self._admit_premium_entry(candidate, bullish, frame, data, last_underlying, style, "option_long", regime,
+                                             pending_reasons=pending_reasons)
+        if admitted is None:
+            return None
+        if self._underlying_below_min_price(underlying, style, last_underlying):
+            return None
         put_call = "CALL" if bullish else "PUT"
         contracts = self._fetch_filtered_contracts(client, underlying, put_call)
         if not contracts:
@@ -98,7 +118,19 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             "option_leg": asdict(contract),
             "order_spec": build_single_option_order(contract, qty=1, limit_price=entry_limit),
         }
-        return Signal(symbol=underlying, strategy=self.strategy_name, side=Side.LONG, reason=f"{style}_{'bull' if bullish else 'bear'}", stop_price=stop, target_price=target, reference_symbol=confirm_index, metadata=metadata)
+        # A long put is bought too: the order side is LONG, the proposal's
+        # (the underlying's) direction bullish / bearish.
+        return self.entry_policy.emit(
+            admitted,
+            reason=f"{style}_{'bull' if bullish else 'bear'}",
+            strategy_score=self._option_strategy_score(candidate, regime, "bullish_trend" if bullish else "bearish_trend"),
+            management={},
+            target=target,
+            metadata=metadata,
+            order_side=Side.LONG,
+            reference_symbol=confirm_index,
+            premium_stop=stop,
+        )
 
     def entry_signals(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], client=None, data=None) -> list[Signal]:
         self._reset_entry_decisions()
@@ -135,7 +167,6 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             regime = self._regime_confirm(c, bars, data)
             if not regime.get("ok") or regime.get("no_trade"):
                 reasons.append(str(regime.get("reason") or "regime_blocked"))
-                reasons.extend([str(r) for r in regime.get("reasons", []) if str(r)])
                 self._record_entry_decision(c.symbol, "skipped", reasons)
                 continue
             confirm_index = regime.get("confirm_index")
@@ -186,53 +217,30 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
 
             if orb_enabled and orb_window and (bullish or bearish):
                 if opening_ready:
-                    # B1 fix: optional structural / SR vetoes on the ORB
-                    # entry path. Default ON because long premium with
-                    # bearish HTF structure or trapped between broken
-                    # SR levels bleeds theta even on a clean breakout.
-                    # Toggle off via orb_apply_structure_veto / orb_apply
-                    # _sr_veto for users who want the legacy "fire on
-                    # any breakout" behaviour.
-                    orb_structure_veto = bool(self.params.get("orb_apply_structure_veto", True))
-                    orb_sr_veto = bool(self.params.get("orb_apply_sr_veto", True))
-                    ms_ctx = None
-                    sr_ctx = None
-                    if orb_structure_veto:
-                        ms_ctx = self._structure_context(frame, "ltf")
-                    if orb_sr_veto:
-                        sr_ctx = self._sr_context(c.symbol, frame, data)
+                    # Long premium against the LTF structure, or crowding an
+                    # S/R level, bleeds theta even on a clean breakout. Since
+                    # 2026-09-24 those vetoes are the shared entry stage's
+                    # (shared_entry.use_structure_filter / use_sr_filter on the
+                    # premium proposal the builder admits), recorded under
+                    # their shared tokens; they replace
+                    # params.orb_apply_structure_veto / orb_apply_sr_veto,
+                    # and a veto no longer hides the other one.
                     if bullish and last_close > _safe_float(or_high) * (1.0 + buffer_pct) and last_close > last_vwap:
-                        veto_reason = None
-                        if orb_structure_veto and ms_ctx is not None and self._blocks_bullish_structure_entry(ms_ctx):
-                            veto_reason = f"orb_long_option_{self._bullish_structure_block_reason(ms_ctx)}"
-                        elif orb_sr_veto and sr_ctx is not None and self._blocks_bullish_sr_entry(sr_ctx):
-                            veto_reason = f"orb_long_option_{self._bullish_sr_block_reason(sr_ctx)}"
-                        if veto_reason:
-                            reasons.append(veto_reason)
-                        else:
-                            attempted_style = True
-                            sig = self._build_single_option_signal(c.symbol, True, client, data, last_close, "orb_long_option", confirm_index, regime)
-                            if sig:
-                                out.append(self._attach_option_final_priority_score(sig, c, regime, bullish=True, rangeish=False))
-                                self._record_entry_decision(c.symbol, "signal", [sig.reason])
-                                continue
-                            reasons.append(self._consume_build_failure(c.symbol, "orb_long_option") or "orb_long_option_unavailable")
+                        attempted_style = True
+                        sig = self._build_single_option_signal(c, True, client, data, frame, last_close, "orb_long_option", confirm_index, regime)
+                        if sig:
+                            out.append(sig)
+                            self._record_entry_decision(c.symbol, "signal", [sig.reason])
+                            continue
+                        reasons.extend(self._consume_style_failure(c.symbol, "orb_long_option"))
                     if bearish and last_close < _safe_float(or_low) * (1.0 - buffer_pct) and last_close < last_vwap:
-                        veto_reason = None
-                        if orb_structure_veto and ms_ctx is not None and self._blocks_bearish_structure_entry(ms_ctx):
-                            veto_reason = f"orb_long_option_{self._bearish_structure_block_reason(ms_ctx)}"
-                        elif orb_sr_veto and sr_ctx is not None and self._blocks_bearish_sr_entry(sr_ctx):
-                            veto_reason = f"orb_long_option_{self._bearish_sr_block_reason(sr_ctx)}"
-                        if veto_reason:
-                            reasons.append(veto_reason)
-                        else:
-                            attempted_style = True
-                            sig = self._build_single_option_signal(c.symbol, False, client, data, last_close, "orb_long_option", confirm_index, regime)
-                            if sig:
-                                out.append(self._attach_option_final_priority_score(sig, c, regime, bullish=False, rangeish=False))
-                                self._record_entry_decision(c.symbol, "signal", [sig.reason])
-                                continue
-                            reasons.append(self._consume_build_failure(c.symbol, "orb_long_option") or "orb_long_option_unavailable")
+                        attempted_style = True
+                        sig = self._build_single_option_signal(c, False, client, data, frame, last_close, "orb_long_option", confirm_index, regime)
+                        if sig:
+                            out.append(sig)
+                            self._record_entry_decision(c.symbol, "signal", [sig.reason])
+                            continue
+                        reasons.extend(self._consume_style_failure(c.symbol, "orb_long_option"))
 
             if trend_enabled and trend_window and (bullish or bearish):
                 momentum_ok = True
@@ -250,30 +258,26 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
                     if atr_expansion < min_atr_exp or volume_ratio < min_vol_ratio:
                         momentum_ok = False
                         reasons.append(f"trend_momentum_filter(atr_exp={atr_expansion:.3f}<{min_atr_exp},vol_ratio={volume_ratio:.3f}<{min_vol_ratio})")
+                # The style gate's own blockers are the proposal's pending
+                # reasons: a refusal lists them first, then every shared veto.
                 if momentum_ok and bullish and last_ret5 >= trend_min_ret5:
                     attempted_style = True
-                    style_reasons = self._long_option_style_gate(c.symbol, True, frame, regime, data)
-                    if not style_reasons:
-                        sig = self._build_single_option_signal(c.symbol, True, client, data, last_close, "trend_long_option", confirm_index, regime)
-                        if sig:
-                            out.append(self._attach_option_final_priority_score(sig, c, regime, bullish=True, rangeish=False))
-                            self._record_entry_decision(c.symbol, "signal", [sig.reason])
-                            continue
-                        reasons.append(self._consume_build_failure(c.symbol, "trend_long_option") or "trend_long_option_unavailable")
-                    else:
-                        reasons.extend(style_reasons)
+                    sig = self._build_single_option_signal(c, True, client, data, frame, last_close, "trend_long_option", confirm_index, regime,
+                                                           pending_reasons=self._long_option_style_gate(True, frame, regime))
+                    if sig:
+                        out.append(sig)
+                        self._record_entry_decision(c.symbol, "signal", [sig.reason])
+                        continue
+                    reasons.extend(self._consume_style_failure(c.symbol, "trend_long_option"))
                 if momentum_ok and bearish and last_ret5 <= -trend_min_ret5:
                     attempted_style = True
-                    style_reasons = self._long_option_style_gate(c.symbol, False, frame, regime, data)
-                    if not style_reasons:
-                        sig = self._build_single_option_signal(c.symbol, False, client, data, last_close, "trend_long_option", confirm_index, regime)
-                        if sig:
-                            out.append(self._attach_option_final_priority_score(sig, c, regime, bullish=False, rangeish=False))
-                            self._record_entry_decision(c.symbol, "signal", [sig.reason])
-                            continue
-                        reasons.append(self._consume_build_failure(c.symbol, "trend_long_option") or "trend_long_option_unavailable")
-                    else:
-                        reasons.extend(style_reasons)
+                    sig = self._build_single_option_signal(c, False, client, data, frame, last_close, "trend_long_option", confirm_index, regime,
+                                                           pending_reasons=self._long_option_style_gate(False, frame, regime))
+                    if sig:
+                        out.append(sig)
+                        self._record_entry_decision(c.symbol, "signal", [sig.reason])
+                        continue
+                    reasons.extend(self._consume_style_failure(c.symbol, "trend_long_option"))
 
             final_reasons = reasons or ([
                 _no_style_trigger_reason(

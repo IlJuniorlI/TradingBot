@@ -1101,8 +1101,9 @@ class SchwabExecutor:
         Without it, the children are read off ``parent_order_id``.
 
         An adopted child resting a different share count than ``qty`` (sized to
-        the requested entry, not the fill) is resized, and the levels recorded
-        are the ones the broker actually holds.
+        the requested entry, not the fill), or one whose size cannot be read,
+        is resized, and the levels recorded are the ones the broker actually
+        holds.
 
         Returns the bracket state dict, or None when bracket mode is off.
         """
@@ -1128,15 +1129,19 @@ class SchwabExecutor:
         if existing is not None:
             resting_qty = existing.pop("resting_qty", None)
             adopted = {**base, **existing, "active": True, "state": "adopted"}
-            if resting_qty is not None and int(resting_qty) != int(qty):
-                adopted["qty"] = int(resting_qty)
+            # A size that could not be read is re-issued at ``qty`` too (fail
+            # closed, 2026-09-25): the stop may rest more shares than are
+            # held. Until then an unread size was trusted, so restore_basic
+            # left a 10-share stop resting against 7 held shares.
+            if resting_qty is None or int(resting_qty) != int(qty):
+                adopted["qty"] = None if resting_qty is None else int(resting_qty)
                 resized, msg = self.resize_bracket_children(adopted, symbol, side, int(qty), entry_price, session)
                 if not resized:
-                    adopted["state"] = "qty_mismatch"
+                    adopted["state"] = "qty_mismatch" if resting_qty is not None else "qty_unverified"
                     LOG.error(
                         "Adopted protection for %s rests %s shares against a %s-share position and could not "
-                        "be resized (%s) -- the resting exit would flip the position on trigger",
-                        symbol, resting_qty, qty, msg,
+                        "be resized (%s) -- a resting exit larger than the position would flip it on trigger",
+                        symbol, "an unknown number of" if resting_qty is None else resting_qty, qty, msg,
                     )
             return adopted
         replacement = self.submit_protective_oco(
@@ -1156,9 +1161,16 @@ class SchwabExecutor:
                               known_bracket: dict[str, Any] | None) -> dict[str, Any] | None:
         """Child ids (plus what they rest) of protection still working, or None.
 
-        No state row for the stop means account_orders failed or the order
-        aged out of the lookback: it is treated as still working and adopted,
-        rather than risk stacking a second protective order on a live one.
+        Each child's state comes from the account_orders listing or, when
+        the listing does not return it (it failed, or the order is older
+        than its 8-hour lookback: a stop entered before an overnight hold),
+        from ``order_state``, as ``startup_reconciler._drop_retired_orders``
+        reads a missing id (2026-09-25). Until then a missing stop was
+        adopted with no size, so ``ensure_position_protected`` never resized
+        it. A stop neither read returns is still adopted, rather than risk
+        stacking a second protective order on a live one, with its size
+        unknown (``resting_qty`` None), which ``ensure_position_protected``
+        re-issues at the position's size.
         """
         if isinstance(known_bracket, dict) and known_bracket.get("stop_order_id"):
             ids: dict[str, Any] = {
@@ -1174,7 +1186,12 @@ class SchwabExecutor:
         if not stop_id:
             return None
         states = self.fetch_order_states() or {}
-        stop_state = states.get(str(stop_id))
+
+        def _state(order_id: Any) -> dict[str, Any] | None:
+            listed = states.get(str(order_id))
+            return listed if listed is not None else self.order_state(str(order_id))
+
+        stop_state = _state(stop_id)
         if stop_state is not None and (stop_state.get("is_filled") or stop_state.get("is_terminal_failure")):
             return None
         adopted = dict(ids)
@@ -1185,7 +1202,7 @@ class SchwabExecutor:
                 adopted["stop_price"] = float(stop_state["stop_price"])
         target_id = ids.get("target_order_id")
         if target_id:
-            target_state = states.get(str(target_id))
+            target_state = _state(target_id)
             if target_state is not None and (target_state.get("is_filled") or target_state.get("is_terminal_failure")):
                 adopted["target_order_id"] = None
                 adopted["child_order_ids"] = [oid for oid in adopted.get("child_order_ids") or [] if oid != str(target_id)]
@@ -1683,7 +1700,15 @@ class SchwabExecutor:
             return self._is_regular_options_session(ts)
         return self._equity_session(ts) is not None
 
-    def close_position(self, position: Position, data=None, market_snapshot: Any | None = None) -> OrderResult:
+    def close_position(self, position: Position, qty: int, data=None, market_snapshot: Any | None = None) -> OrderResult:
+        """Close ``qty`` units of ``position`` -- all of it, or a scale-out slice.
+
+        ``qty`` is required: until 2026-09-24 this always sent ``position.qty``,
+        so a partial exit could not be expressed at all. It is the caller's
+        sized request, already clamped to the position.
+        """
+        if not 1 <= int(qty) <= int(position.qty):
+            raise ValueError(f"close_position qty {qty!r} outside 1..{position.qty} for {position.symbol}")
         asset_type = position.metadata.get("asset_type")
         if asset_type == ASSET_TYPE_OPTION_VERTICAL:
             first_symbol = str(position.metadata.get("long_leg_symbol") or "")
@@ -1695,7 +1720,7 @@ class SchwabExecutor:
             if data and (not q1 or not q2 or not data.quotes_are_fresh([first_symbol, second_symbol], self.config.options.max_quote_age_seconds)):
                 return OrderResult(ok=False, order_id=None, raw=None, message="close_missing_or_stale_quotes", simulated=self.config.schwab.dry_run)
             limit_price = close_limit_price_from_metadata(position.metadata, q1, q2, mode=self.config.options.vertical_limit_mode)
-            spec = build_vertical_close_order(position.metadata, position.qty, limit_price=limit_price)
+            spec = build_vertical_close_order(position.metadata, int(qty), limit_price=limit_price)
             if self.config.schwab.dry_run:
                 return self._simulate_vertical_fill(spec, position.metadata, data, refresh_quotes=False, allow_natural_fill=True)
             return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0)
@@ -1707,12 +1732,12 @@ class SchwabExecutor:
             if data and (not q or not data.quotes_are_fresh([symbol], self.config.options.max_quote_age_seconds)):
                 return OrderResult(ok=False, order_id=None, raw=None, message="close_missing_or_stale_quotes", simulated=self.config.schwab.dry_run)
             limit_price = close_single_option_limit_from_metadata(position.metadata, q, mode=self.config.options.option_limit_mode)
-            spec = build_single_option_close_order(position.metadata, position.qty, limit_price=limit_price)
+            spec = build_single_option_close_order(position.metadata, int(qty), limit_price=limit_price)
             if self.config.schwab.dry_run:
                 return self._simulate_single_option_fill(spec, position.metadata, data, refresh_quotes=False, allow_natural_fill=True)
             return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0)
         intent = self.order_intent_for_exit(position.side)
-        return self.submit_equity_exit(position.symbol, position.qty, intent, data=data, market_snapshot=market_snapshot)
+        return self.submit_equity_exit(position.symbol, int(qty), intent, data=data, market_snapshot=market_snapshot)
 
     @staticmethod
     def _build_order(request: OrderRequest) -> dict[str, Any]:
