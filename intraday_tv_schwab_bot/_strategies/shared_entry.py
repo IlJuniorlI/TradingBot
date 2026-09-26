@@ -56,7 +56,8 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 
 from ..models import Candidate, Position, Side, Signal
-from ..utils import htf_ema_spans, now_et
+from ..indicators import htf_ema_spans
+from .. import sessions
 from .helpers import (
     CANDLE_PATTERN_WINDOW_BARS,
     _bar_close_position,
@@ -1064,7 +1065,7 @@ class SharedEntryPolicy:
         OBV divergence for ``side`` on ``tech_ctx`` whose age is inside
         [``divergence_entry_min_age_bars``, ``technical_levels.divergence_
         max_age_bars``], whose latest pivot is in the CURRENT session (the
-        reader's date, ``now_et``; a frame whose last bar is not in it has
+        reader's date, ``sessions.now_et``; a frame whose last bar is not in it has
         no candidate), and -- a hidden one -- with the HTF EMAs aligned
         (``_hidden_divergence_aligned``). Yesterday's pivots are refused
         outright rather than compared across the overnight gap: since the
@@ -1109,7 +1110,7 @@ class SharedEntryPolicy:
         # The reader's session, not the frame's last bar: at 09:30 a name
         # with no premarket prints still ends yesterday, and its closing
         # divergence would pass as "current" and open at yesterday's close.
-        now = now_et()
+        now = sessions.now_et()
         session_day = now.date()
         if _local_date(frame.index[-1], now.tzinfo) != session_day:
             return None
@@ -2234,7 +2235,7 @@ class SharedEntryPolicy:
                 seen = pd.Timestamp(stamp)
                 if seen.tzinfo is not None:
                     seen = seen.tz_convert(None)
-                current = pd.Timestamp(now_et())
+                current = pd.Timestamp(sessions.now_et())
                 if current.tzinfo is not None:
                     current = current.tz_convert(None)
                 age_seconds = max(0.0, float((current - seen).total_seconds()))

@@ -17,21 +17,16 @@ from .levels_shared import (
     extend_unique_levels,
     fallback_prior_side_levels,
     frame_extreme_side_levels as _frame_extreme_side_levels_shared,
-    latest_session_date,
     pivot_points,
     prior_day_levels as _prior_day_levels,
     prior_week_levels as _prior_week_levels,
     safe_reference_price_for_fallback as _safe_reference_price_for_fallback,
     same_side_min_gap_threshold as _same_side_min_gap_threshold,
 )
-from .utils import (
-    atr_value,
-    ensure_ohlcv_frame,
-    ensure_standard_indicator_frame,
-    now_et,
-    resample_bars,
-    resolve_current_price,
-)
+from .sessions import latest_session_date
+from .bars import ensure_ohlcv_frame, resample_bars, resolve_current_price
+from .indicators import atr_with_floor, ensure_standard_indicator_frame
+from . import sessions
 
 
 LOG = logging.getLogger(__name__)
@@ -372,7 +367,7 @@ def analyze_market_structure(
     if frame.empty:
         return empty_market_structure_context(float(current_price or 0.0))
     close = resolve_current_price(frame, current_price)
-    atr = atr_value(frame)
+    atr = atr_with_floor(frame, float(frame["close"].iloc[-1]))
     eq_tol = max(atr * float(eq_atr_mult), close * float(pct_tolerance))
     # ``last_bar_forming``: the last bar is a bucket still trading (a 5m
     # resample of the 1m stream holds 1-4 minutes of its bucket 4 minutes in
@@ -728,11 +723,11 @@ def _reconcile_flipped_levels(
 
 
 def _completed_1m_bars(flip_frame: pd.DataFrame | None) -> pd.DataFrame:
-    """The flip frame's 1m bars that have completed at ``now_et()``."""
+    """The flip frame's 1m bars that have completed at ``sessions.now_et()``."""
     base = ensure_ohlcv_frame(flip_frame if flip_frame is not None else pd.DataFrame())
     if base.empty:
         return base
-    return base[base.index < pd.Timestamp(now_et()).floor("1min")]
+    return base[base.index < pd.Timestamp(sessions.now_et()).floor("1min")]
 
 
 def _minutes_since_level_touch(completed_1m: pd.DataFrame, level: float, *, price_above: bool) -> float | None:
@@ -753,7 +748,7 @@ def _completed_flip_frames(flip_frame: pd.DataFrame | None) -> tuple[pd.DataFram
     completed_1m = _completed_1m_bars(flip_frame)
     if completed_1m.empty:
         return completed_1m, pd.DataFrame(columns=completed_1m.columns)
-    one_min_cutoff = pd.Timestamp(now_et()).floor("1min")
+    one_min_cutoff = pd.Timestamp(sessions.now_et()).floor("1min")
     completed_5m = resample_bars(completed_1m, "5min")
     if not completed_5m.empty:
         # A 5m bar labelled T holds the 1m bars starting T .. T+4 (see
@@ -1066,12 +1061,12 @@ def build_support_resistance_context(
     as_of: date | None = None,
 ) -> SupportResistanceContext:
     # ``as_of`` is the session date the prior day/week are measured back from;
-    # None means the clock's (``latest_session_date(now_et())``).
+    # None means the clock's (``latest_session_date(sessions.now_et())``).
     frame = ensure_standard_indicator_frame(frame)
     if frame.empty:
         return empty_support_resistance_context(float(current_price or 0.0), timeframe_minutes=timeframe_minutes)
     close = resolve_current_price(frame, current_price)
-    atr = atr_value(frame)
+    atr = atr_with_floor(frame, float(frame["close"].iloc[-1]))
     merge_tol = max(atr * float(atr_tolerance_mult), close * float(pct_tolerance))
     same_side_min_gap = _same_side_min_gap_threshold(
         atr,
@@ -1095,7 +1090,7 @@ def build_support_resistance_context(
 
     include_prior_day = bool(use_prior_day_high_low)
     include_prior_week = bool(use_prior_week_high_low)
-    session_day = as_of if as_of is not None else latest_session_date(now_et())
+    session_day = as_of if as_of is not None else latest_session_date(sessions.now_et())
     prior_day_high, prior_day_low = _prior_day_levels(frame, session_day) if include_prior_day else (None, None)
     prior_week_high, prior_week_low = _prior_week_levels(frame, session_day) if include_prior_week else (None, None)
 

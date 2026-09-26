@@ -18,6 +18,8 @@ from threading import RLock, Thread
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from .serialization import atomic_write_text
+
 LOG = logging.getLogger(__name__)
 
 
@@ -375,10 +377,7 @@ class DashboardServer:
             if state_signature == self._last_state_signature:
                 return
             pretty_serialized = json.dumps(safe_payload, indent=2, default=str, allow_nan=False)
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-            tmp_path.write_text(pretty_serialized, encoding="utf-8")
-            tmp_path.replace(self.state_path)
+            atomic_write_text(self.state_path, pretty_serialized)
             self._last_state_signature = state_signature
         except Exception as exc:
             LOG.warning("Dashboard publish failed: %s", exc, exc_info=True)

@@ -9,9 +9,9 @@ from ..shared import (
     _reason_with_values,
     _safe_float,
     _same_day_mask,
-    now_et,
     pd,
 )
+from ... import sessions
 from ..shared_entry import EntryContexts, EntryProposal
 from ..strategy_base import BaseStrategy
 
@@ -45,7 +45,7 @@ class MeanReversionStrategy(BaseStrategy):
                 continue
             last = frame.iloc[-1]
             last_close = _safe_float(last["close"])
-            session_frame = frame[_same_day_mask(frame, now_et().date())]
+            session_frame = frame[_same_day_mask(frame, sessions.now_et().date())]
             recent20 = session_frame.tail(20)
             recent3 = frame.tail(3)
             day_strength = _safe_float(c.metadata.get("change_from_open"), 0.0)

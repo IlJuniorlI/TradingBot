@@ -16,12 +16,12 @@ from ..shared import (
     build_single_option_order,
     build_single_option_position_label,
     choose_by_delta,
-    now_et,
     parse_hhmm,
     pd,
     single_option_dollars,
     single_option_limit_price,
 )
+from ... import sessions
 from ..zero_dte_etf_options.strategy import ZeroDteEtfOptionsStrategy
 
 class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
@@ -142,7 +142,7 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
         out: list[Signal] = []
         self._underlying_atr_cache.clear()
         self._underlying_ref_atr_cache.clear()
-        now_dt = now_et()
+        now_dt = sessions.now_et()
         blackout_reason = self._option_entry_block_reason(now_dt)
         if blackout_reason:
             for c in candidates:
@@ -187,7 +187,7 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             orb_end_time = str(self.params.get("orb_end_time", "10:05"))
             opening_window_start = str(self.params.get("orb_opening_window_start", "09:30"))
             opening_window_end = str(self.params.get("orb_opening_window_end", "09:34"))
-            opening = frame[_same_day_mask(frame, now_et().date())].between_time(opening_window_start, opening_window_end)
+            opening = frame[_same_day_mask(frame, sessions.now_et().date())].between_time(opening_window_start, opening_window_end)
             regime_name = str(regime.get("regime") or "unknown")
             bullish = regime_name == "bullish_trend"
             bearish = regime_name == "bearish_trend"

@@ -29,7 +29,7 @@ from .models import Candidate, Position, Side
 from ._strategies.registry import option_strategy_names
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
-from .position_metrics import safe_float
+from .numeric import safe_float
 from .position_store import ReconcileMetadataStore, SessionRiskStateStore
 from .risk import RiskManager
 from .screener_client import TradingViewScreenerClient
@@ -39,7 +39,9 @@ from ._strategies.registry import build_strategy
 from ._strategies.strategy_base import BaseStrategy
 from .session_report import export_session_archive, write_session_report
 from .schwab_api import SchwabdevApiUsageTracker, register_schwab_api_tracker
-from .utils import EQUITY_STREAM_END, TRADEFLOW_LEVEL, equity_session_state, now_et, setup_logging
+from .log_setup import TRADEFLOW_LEVEL, setup_logging
+from .sessions import EQUITY_STREAM_END, equity_session_state
+from . import sessions
 
 LOG = logging.getLogger(__name__)
 
@@ -109,7 +111,7 @@ class IntradayBot:
         )
         self.positions: dict[str, Position] = {}
         self.reconcile_metadata_store = ReconcileMetadataStore(config.runtime.startup_reconcile_metadata_db_path)
-        self.started_at = now_et()
+        self.started_at = sessions.now_et()
         self.last_candidates: list[Candidate] = []
         self.last_watchlist: list[str] = []
         self.last_quote_watchlist: list[str] = []
@@ -296,7 +298,7 @@ class IntradayBot:
         # A successful startup reconcile counts as today's reconcile: the
         # session-boundary reconcile in `_maybe_session_reconcile` won't fire
         # again until the ET date rolls over. A failed one is retried there.
-        self._reconcile_broker(now_et().date())
+        self._reconcile_broker(sessions.now_et().date())
         LOG.info("Starting bot with strategy=%s dry_run=%s", self.config.strategy, self.config.schwab.dry_run)
         risk_budget_dollars = float(
             self.config.risk.max_notional_per_trade * self.config.risk.risk_per_trade_frac_of_notional
@@ -376,7 +378,7 @@ class IntradayBot:
                 if escalation_message is not None:
                     LOG.critical("%s", escalation_message)
                     status_message = escalation_message
-                now = now_et()
+                now = sessions.now_et()
                 gate_state = self.cycle_gate.evaluate(now, self.config.active_strategy.schedule())
                 self._publish_state(
                     now,
@@ -388,7 +390,7 @@ class IntradayBot:
                     gate_state=gate_state,
                 )
             if auto_exit and not self.positions:
-                now = now_et()
+                now = sessions.now_et()
                 now_t = now.time()
                 session = equity_session_state(now)
                 if not session.is_trading_day:
@@ -483,7 +485,7 @@ class IntradayBot:
         retrying = self._reconcile_failures > 0
         if not retrying and not bool(getattr(self.config.runtime, "session_reconcile_on_resume", True)):
             return
-        now = now_et()
+        now = sessions.now_et()
         state = equity_session_state(
             now,
             extended_hours_enabled=bool(self.config.execution.extended_hours_enabled),
@@ -571,7 +573,7 @@ class IntradayBot:
         fires shortly after midnight, and counts collected on day N+1
         accumulate from zero through to ~8pm day N+1's archive.
         """
-        today = now_et().date()
+        today = sessions.now_et().date()
         last = self._last_skip_counts_reset_date
         if last is None:
             self._last_skip_counts_reset_date = today
@@ -613,7 +615,7 @@ class IntradayBot:
         """
         if not bool(self.config.runtime.export_session_archive):
             return
-        now = now_et()
+        now = sessions.now_et()
         state = equity_session_state(
             now,
             extended_hours_enabled=bool(self.config.execution.extended_hours_enabled),
@@ -717,7 +719,7 @@ class IntradayBot:
         if idle <= base:
             return base
         state = equity_session_state(
-            now_et(),
+            sessions.now_et(),
             extended_hours_enabled=bool(self.config.execution.extended_hours_enabled),
         )
         # Stream available: fast cycle — live ticks + order session both
@@ -787,7 +789,7 @@ class IntradayBot:
                 # An overwrite is fine — the freshest snapshot wins,
                 # and the daily fire on a subsequent trading day still
                 # uses date inequality (today != last) to gate.
-                self._last_session_archive_date = now_et().date()
+                self._last_session_archive_date = sessions.now_et().date()
             except Exception as exc:
                 # Archive export is a debug aid — never let it crash shutdown.
                 LOG.warning("Session archive export failed: %s", exc, exc_info=True)
@@ -816,7 +818,7 @@ class IntradayBot:
 
         self.data.begin_cycle()
         try:
-            now = now_et()
+            now = sessions.now_et()
             schedule = self.config.active_strategy.schedule()
             gate_state = self.cycle_gate.evaluate(now, schedule)
             if gate_state.screening_active:

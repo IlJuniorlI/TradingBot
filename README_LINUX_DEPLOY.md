@@ -408,7 +408,7 @@ basic auth, Cloudflare Access, or oauth2-proxy.
 
 ### Clock sync is critical
 
-The bot computes ET session boundaries via `now_et()`. A clock that's
+The bot computes ET session boundaries via `sessions.now_et()`. A clock that's
 even a minute off can miss the 7am ET stream-open boundary.
 
 ```bash
@@ -428,7 +428,7 @@ sudo systemctl enable --now chrony
 
 ### Log rotation is automatic
 
-`_ETDailyFileHandler` (in `utils.py`) rolls `.logs/bot_YYYY-MM-DD.log` at
+`_ETDailyFileHandler` (in `log_setup.py`) rolls `.logs/bot_YYYY-MM-DD.log` at
 midnight ET, every 30s check during emit. **Don't add `logrotate` for
 that file** — it'll race with the bot's open handle. journald has its
 own rotation governed by `/etc/systemd/journald.conf`.

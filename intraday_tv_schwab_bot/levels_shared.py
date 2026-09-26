@@ -2,19 +2,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from datetime import date, datetime, timedelta
+from datetime import date
 from typing import Literal, TypeVar, overload
 
 import numpy as np
 import pandas as pd
 
-from .utils import (
-    EQUITY_EARLY_CLOSE,
-    EQUITY_RTH_CLOSE,
-    EQUITY_RTH_OPEN,
-    is_weekday_session_day,
-    us_equity_early_close_days,
-)
+from .sessions import session_datetime_index, session_mask, session_segment_ids
 
 
 TLevel = TypeVar("TLevel")
@@ -433,90 +427,6 @@ def safe_reference_price_for_fallback(
     return last_close if abs(live_price - last_close) > max_drift else live_price
 
 
-_SESSION_TZ = "America/New_York"
-
-
-def datetime_index(index: pd.Index) -> pd.DatetimeIndex:
-    if isinstance(index, pd.DatetimeIndex):
-        return index
-    return pd.DatetimeIndex(index)
-
-
-def session_datetime_index(index: pd.Index) -> pd.DatetimeIndex:
-    """ET-session-localized DatetimeIndex.
-
-    Converts to ``America/New_York`` and then strips tz so that ``.date`` and
-    ``.to_period('W-FRI')`` bucket bars by the ET trading day/week. Required
-    for prior-day / prior-week computation because a plain UTC-date bucketing
-    would misclassify, e.g., a Mon 7:00 PM ET post-market bar during EST as
-    belonging to Tuesday (because 7 PM ET EST = 00:00 UTC the next day).
-
-    A tz-naive input is returned unchanged (assumed to already be ET-local).
-    """
-    dt_index = datetime_index(index)
-    if dt_index.tz is None:
-        return dt_index
-    return dt_index.tz_convert(_SESSION_TZ).tz_localize(None)
-
-
-def session_segment_ids(index: pd.Index) -> np.ndarray:
-    """Run id per bar that advances at every change of ET session date.
-
-    The bar frames hold only the 07:00-20:00 ET stream window, so two
-    neighbouring bars on different ET dates are separated by trading nobody
-    observed. Detectors that compare neighbouring bars -- pivots,
-    fair-value-gap triplets, order blocks -- require their window to lie
-    inside one run.
-
-    The boundary is the ET date, not a time step. Within a session a thin
-    name routinely prints no bar for minutes, and a minute without a trade is
-    not missing data: nothing traded. Archived 1m bars (2026-05..09) show
-    2-13% of pre/post-market steps longer than 2 minutes and same-day steps
-    up to 209 minutes, so a "step > 2 x timeframe" rule would have dropped
-    real extended-hours pivots. Every step across an ET date is at least
-    11 hours (19:59 -> 07:00).
-    """
-    if len(index) == 0:
-        return np.zeros(0, dtype=np.int64)
-    days = session_datetime_index(index).normalize().to_numpy()
-    changes = np.concatenate(([0], (days[1:] != days[:-1]).astype(np.int64)))
-    return np.cumsum(changes)
-
-
-def latest_session_date(now: datetime) -> date:
-    """The ET date of ``now``, rolled back to the latest trading day on or
-    before it (a Saturday resolves to Friday, a holiday Monday to Friday).
-
-    The builders pass this as ``as_of`` to ``prior_day_levels`` /
-    ``prior_week_levels`` when the caller gives none."""
-    stamp = pd.Timestamp(now)
-    day = (stamp.tz_convert(_SESSION_TZ) if stamp.tzinfo is not None else stamp).date()
-    while not is_weekday_session_day(day):
-        day -= timedelta(days=1)
-    return day
-
-
-def _rth_bar_mask(session_index: pd.DatetimeIndex) -> np.ndarray:
-    """Bars that START inside a trading day's regular session: 09:30 up to
-    16:00 ET, or 13:00 on an early-close day. ``session_index`` is already
-    ET-local (``session_datetime_index``)."""
-    if len(session_index) == 0:
-        return np.zeros(0, dtype=bool)
-    days = session_index.normalize()
-    close_minute_by_day: dict[pd.Timestamp, int] = {}
-    for day in days.unique():
-        session_day = day.date()
-        if not is_weekday_session_day(session_day):
-            close_minute_by_day[day] = -1
-            continue
-        close = EQUITY_EARLY_CLOSE if session_day in us_equity_early_close_days(session_day.year) else EQUITY_RTH_CLOSE
-        close_minute_by_day[day] = close.hour * 60 + close.minute
-    close_minutes = np.asarray(days.map(close_minute_by_day), dtype=np.int64)
-    minutes = np.asarray(session_index.hour * 60 + session_index.minute, dtype=np.int64)
-    open_minute = EQUITY_RTH_OPEN.hour * 60 + EQUITY_RTH_OPEN.minute
-    return (minutes >= open_minute) & (minutes < close_minutes)
-
-
 def prior_day_levels(frame: pd.DataFrame, as_of: date, *, regular_session_only: bool = True) -> tuple[float | None, float | None]:
     """High/low of the regular session of the last trading day before ``as_of``
     (of all its bars with ``regular_session_only=False``: microcap_pm_breakout
@@ -540,7 +450,7 @@ def prior_day_levels(frame: pd.DataFrame, as_of: date, *, regular_session_only: 
     days = session_index.normalize()
     eligible = np.asarray(days < pd.Timestamp(as_of), dtype=bool)
     if regular_session_only:
-        eligible &= _rth_bar_mask(session_index)
+        eligible &= session_mask(session_index, "rth")
     if not eligible.any():
         return None, None
     last_day = days[eligible].max()
@@ -559,7 +469,7 @@ def prior_week_levels(frame: pd.DataFrame, as_of: date) -> tuple[float | None, f
         return None, None
     session_index = session_datetime_index(frame.index)
     weeks = session_index.to_period("W-FRI")
-    eligible = _rth_bar_mask(session_index) & np.asarray(weeks < pd.Period(as_of, freq="W-FRI"), dtype=bool)
+    eligible = session_mask(session_index, "rth") & np.asarray(weeks < pd.Period(as_of, freq="W-FRI"), dtype=bool)
     if not eligible.any():
         return None, None
     last_week = weeks[eligible].max()
@@ -612,7 +522,7 @@ class DivergenceMatch:
     ``age_bars`` is how many bars have closed since ``b``, counted on the
     ``bar_clock`` ``find_divergence`` was given. The builders pass the
     session-bar clock while session indicators are on and the clock is
-    inside the session (``utils.indicator_session_open``), so it is SESSION
+    inside the session (``indicators.indicator_session_open``), so it is SESSION
     bars there: the overnight between yesterday's last pivot and today's
     open is not part of the age. Without a clock (session indicators off, or
     a reader outside the session) it is every bar. The pivot positions are
@@ -816,7 +726,7 @@ def find_divergence(
     has no default, so no caller falls back to the all-bar age by leaving it
     out. The builders pass ``np.cumsum`` of the indicator session mask while
     session indicators are on and the clock is inside the session
-    (``utils.indicator_session_open``), so the age is session bars. Until
+    (``indicators.indicator_session_open``), so the age is session bars. Until
     2026-09-24 it was always every bar: with pivots paired only on session
     bars, the post- and pre-market bars aged yesterday's last session pivot
     past the limit overnight. On the divergence-age study's symbol-days with
@@ -825,7 +735,7 @@ def find_divergence(
     on session-bar age it reads on 23.6% of RTH minutes instead of 10.4%
     (15m: 16.4% instead of 14.6%).
 
-    ``price_scale`` (``utils.session_price_scale`` of the frame the pivot
+    ``price_scale`` (``indicators.session_price_scale`` of the frame the pivot
     positions index) puts the pivot prices on the scale the indicator was
     computed on before they are compared; the match still reports the raw
     prices. The session rsi14 / obv are stitched across the overnight gap,

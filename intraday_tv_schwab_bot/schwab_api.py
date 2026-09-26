@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 from schwabdev import Client as SchwabClient
 
-from .utils import now_et
+from . import sessions
 
 LOG = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ class SchwabdevApiUsageTracker:
     _MAX_WINDOW_SECONDS = 30 * 60
 
     def __init__(self) -> None:
-        self.started_at = now_et()
+        self.started_at = sessions.now_et()
         self.total_calls = 0
         self.last_call_at: Optional[datetime] = None
         self.method_counts: dict[str, int] = {}
@@ -47,7 +47,7 @@ class SchwabdevApiUsageTracker:
 
     def record_call(self, method_name: str) -> None:
         name = str(method_name or 'unknown')
-        now = now_et()
+        now = sessions.now_et()
         with self._lock:
             self.total_calls += 1
             self.last_call_at = now
@@ -72,7 +72,7 @@ class SchwabdevApiUsageTracker:
         return count
 
     def snapshot(self, now: Optional[datetime] = None) -> dict[str, Any]:
-        current = now or now_et()
+        current = now or sessions.now_et()
         with self._lock:
             self._prune(current)
             elapsed_minutes = max(

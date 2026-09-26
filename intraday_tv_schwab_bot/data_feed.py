@@ -19,10 +19,20 @@ from schwabdev import Client, Stream
 from .config import BotConfig, flip_confirmation_bars, htf_structure_event_lookback
 from .support_resistance import SupportResistanceContext, build_support_resistance_context
 from .htf_levels import HTFContext, FairValueGapContext, build_fair_value_gap_context, build_htf_context, empty_fvg_context
-from .levels_shared import latest_session_date
 from .order_blocks import OrderBlockContext, build_order_block_context, empty_order_block_context
+from .numeric import first_float, safe_float
 from .schwab_api import call_schwab_client, call_schwab_json, response_ok
-from .utils import EQUITY_STREAM_HISTORY_REFRESH_READY, ensure_ohlcv_frame, ensure_standard_indicator_frame, equity_stream_window_bars, floor_minute, get_runtime_timezone_name, indicator_session_open, is_equity_stream_session, is_regular_equity_session, is_weekday_session_day, now_et, resample_bars, resolve_ema_spans, session_bucket_ends, session_bucket_floor
+from .bars import ensure_ohlcv_frame, equity_stream_window_bars, floor_minute, resample_bars, session_bucket_ends, session_bucket_floor
+from .indicators import ensure_standard_indicator_frame, indicator_session_open, resolve_ema_spans
+from . import sessions
+from .sessions import (
+    EQUITY_STREAM_HISTORY_REFRESH_READY,
+    EXCHANGE_TZ,
+    is_equity_stream_session,
+    is_regular_equity_session,
+    is_weekday_session_day,
+    latest_session_date,
+)
 
 LOG = logging.getLogger(__name__)
 STREAMABLE_EQUITY_RE = re.compile(r"^[A-Z]{1,6}$")
@@ -66,7 +76,7 @@ class MergeStats:
 class _HTFCacheEntry(NamedTuple):
     """An HTF context, the ``history_htf`` frame object it was built from,
     the session date its prior day/week were measured back from, and whether
-    it was built inside the session (``utils.indicator_session_open``).
+    it was built inside the session (``indicators.indicator_session_open``).
 
     ``get_htf_context`` serves ``context`` only while ``frame`` IS still the
     stored frame (identity, not equality), ``as_of`` is still the latest
@@ -143,7 +153,7 @@ class MarketDataStore:
         self._stream_first_bar_time: dict[str, pd.Timestamp] = {}
         self.last_stream_health_log: dict[str, datetime] = {}
         self._lock = RLock()
-        self.started_at = now_et()
+        self.started_at = sessions.now_et()
         self._forced_premarket_history_refresh_date: dict[str, date] = {}
         self._cycle_active = False
         # Keys: base OHLCV = (symbol, tf, False); enriched =
@@ -202,7 +212,7 @@ class MarketDataStore:
 
     def should_refresh_history(self, symbol: str) -> bool:
         key = self._symbol_key(symbol)
-        now = now_et()
+        now = sessions.now_et()
         last = self.last_history_refresh.get(key)
         if last is None:
             return True
@@ -221,7 +231,7 @@ class MarketDataStore:
         if last is None:
             return True
         ttl = max(1.0, float(self.config.runtime.quote_cache_seconds))
-        return (now_et() - last).total_seconds() >= ttl
+        return (sessions.now_et() - last).total_seconds() >= ttl
 
     @staticmethod
     def normalize_context_symbol(symbol: str) -> str:
@@ -428,7 +438,7 @@ class MarketDataStore:
             return True
         tf_min = max(1, int(timeframe_minutes))
         last_bucket = session_bucket_floor(last, tf_min)
-        now = now_et()
+        now = sessions.now_et()
         now_bucket = session_bucket_floor(now, tf_min)
         if now_bucket <= last_bucket:
             return False
@@ -472,10 +482,9 @@ class MarketDataStore:
         read Friday's, and the trim cut their prior week down to its last
         afternoon.
         """
-        tz = get_runtime_timezone_name()
-        end_ts = pd.Timestamp(end).tz_convert(tz)
+        end_ts = pd.Timestamp(end).tz_convert(EXCHANGE_TZ)
         session_day = pd.Timestamp(latest_session_date(end_ts))
-        prior_week_start = (session_day.to_period("W-FRI") - 1).start_time.tz_localize(tz)
+        prior_week_start = (session_day.to_period("W-FRI") - 1).start_time.tz_localize(EXCHANGE_TZ)
         return min(end_ts - pd.Timedelta(days=max(5, int(lookback_days))), prior_week_start)
 
     @staticmethod
@@ -549,7 +558,7 @@ class MarketDataStore:
         with self._lock:
             cached_frame = self.history_htf.get(key)
         base_freq = self._direct_history_frequency(tf)
-        end = now_et()
+        end = sessions.now_et()
         start = self._htf_incremental_start(
             cached_frame,
             end=end,
@@ -617,7 +626,7 @@ class MarketDataStore:
             entry = self.htf_cache.get(cache_key)
         if frame is None:
             return None
-        as_of = latest_session_date(now_et())
+        as_of = latest_session_date(sessions.now_et())
         session_open = indicator_session_open()
         if entry is not None and entry.frame is frame and entry.as_of == as_of and entry.session_open == session_open:
             return entry.context
@@ -957,7 +966,7 @@ class MarketDataStore:
         return frame.copy() if frame is not None else None
 
     def _stream_history_due(self, symbol: str) -> bool:
-        now = now_et()
+        now = sessions.now_et()
         key = self._symbol_key(symbol)
         last = self.last_history_refresh.get(key)
         if last is None:
@@ -966,7 +975,7 @@ class MarketDataStore:
         return (now - last).total_seconds() >= interval
 
     def _stream_log_due(self, symbol: str) -> bool:
-        now = now_et()
+        now = sessions.now_et()
         key = self._symbol_key(symbol)
         last = self.last_stream_health_log.get(key)
         if last is None:
@@ -978,7 +987,7 @@ class MarketDataStore:
         if not self._stream_log_due(symbol):
             return
         key = self._symbol_key(symbol)
-        self.last_stream_health_log[key] = now_et()
+        self.last_stream_health_log[key] = sessions.now_et()
         LOG.log(level, "%s [%s]", message, key)
 
     def _stream_stale_after_seconds(self) -> int:
@@ -1014,19 +1023,19 @@ class MarketDataStore:
             return None
         latest = max(candidates)
         if latest.tzinfo is None:
-            latest = latest.tz_localize(get_runtime_timezone_name())
+            latest = latest.tz_localize(EXCHANGE_TZ)
         return latest
 
     def _latest_cached_bar_age_seconds(self, symbol: str, now: datetime | None = None) -> float | None:
         latest = self._latest_cached_bar_timestamp(symbol)
         if latest is None:
             return None
-        reference = now if now is not None else now_et()
+        reference = now if now is not None else sessions.now_et()
         latest_dt = latest.to_pydatetime() if hasattr(latest, "to_pydatetime") else latest
         return max(0.0, (reference - latest_dt).total_seconds())
 
     def _is_fresh_stream_bar_timestamp(self, ts: pd.Timestamp, *, now: datetime | None = None) -> bool:
-        reference = now if now is not None else now_et()
+        reference = now if now is not None else sessions.now_et()
         ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
         age_seconds = max(0.0, (reference - ts_dt).total_seconds())
         return age_seconds <= float(self._stream_stale_after_seconds())
@@ -1034,7 +1043,7 @@ class MarketDataStore:
     def live_entry_bar_status(self, symbol: str, *, now: datetime | None = None) -> dict[str, object]:
         """Return whether a symbol has a fresh live 1m stream bar suitable for entries."""
         key = self._symbol_key(symbol)
-        reference = now if now is not None else now_et()
+        reference = now if now is not None else sessions.now_et()
         requires_live_entry_bar = self.is_streamable_equity(key) and self.is_equity_stream_session(reference)
         stale_after = float(self._stream_stale_after_seconds())
         with self._lock:
@@ -1047,7 +1056,7 @@ class MarketDataStore:
         if last_stream_bar_time is not None:
             bar_ts = pd.Timestamp(last_stream_bar_time)
             if bar_ts.tzinfo is None:
-                bar_ts = bar_ts.tz_localize(get_runtime_timezone_name())
+                bar_ts = bar_ts.tz_localize(EXCHANGE_TZ)
             bar_dt = bar_ts.to_pydatetime() if hasattr(bar_ts, "to_pydatetime") else bar_ts
             age_seconds = max(0.0, (reference - bar_dt).total_seconds())
         ready = True
@@ -1087,7 +1096,7 @@ class MarketDataStore:
         if cache_key not in self.stream_symbols:
             return False
 
-        now = now_et()
+        now = sessions.now_et()
         if not self.is_equity_stream_session(now):
             return False
         connect_timeout = max(5, int(self.config.runtime.stream_connect_timeout_seconds))
@@ -1139,7 +1148,7 @@ class MarketDataStore:
     def fetch_history(self, symbol: str, lookback_minutes: int | None = None) -> pd.DataFrame:
         cache_key = self._symbol_key(symbol)
         lookback = lookback_minutes or self.config.runtime.history_lookback_minutes
-        end = now_et()
+        end = sessions.now_et()
         start = end - timedelta(minutes=lookback)
         LOG.info("Fetching price_history for %s from %s to %s", symbol, start, end)
         payload, source_symbol = self._fetch_price_history_payload_with_aliases(
@@ -1154,11 +1163,11 @@ class MarketDataStore:
         if str(source_symbol).upper().strip() != str(symbol).upper().strip():
             LOG.debug("Resolved price_history alias for %s via %s", symbol, source_symbol)
         df = self._completed_bars(self._history_candles_to_frame(payload.get("candles", [])), 1, end)
-        fetched_at = now_et()
+        fetched_at = sessions.now_et()
         if not df.empty:
             latest_bar = pd.Timestamp(df.index[-1])
             if latest_bar.tzinfo is None:
-                latest_bar = latest_bar.tz_localize(get_runtime_timezone_name())
+                latest_bar = latest_bar.tz_localize(EXCHANGE_TZ)
             latest_bar_age_seconds = max(0.0, (fetched_at - latest_bar.to_pydatetime()).total_seconds())
             if self.is_regular_session(fetched_at) and latest_bar_age_seconds >= float(self._stream_stale_after_seconds()):
                 self._log_stream_health(symbol, f"price_history latest 1m bar stale for {latest_bar_age_seconds:.0f}s after repair fetch", level=logging.INFO)
@@ -1217,12 +1226,12 @@ class MarketDataStore:
         mis-typed symbol does not retry on every cycle.
         """
         key = self._symbol_key(symbol)
-        today = now_et().date()
+        today = sessions.now_et().date()
         with self._lock:
             if self.last_daily_refresh.get(key) == today:
                 cached = self.daily_history.get(key)
                 return None if cached is None else cached.copy()
-        end = now_et()
+        end = sessions.now_et()
         start = end - timedelta(days=max(1, int(calendar_days)))
         try:
             payload, source_symbol = self._fetch_price_history_payload_with_aliases(
@@ -1461,7 +1470,7 @@ class MarketDataStore:
             count = self._consecutive_quote_failures.get(sym, 0) + 1
             self._consecutive_quote_failures[sym] = count
             if count >= failure_threshold and sym not in self._quote_blacklist:
-                self._quote_blacklist[sym] = now_et()
+                self._quote_blacklist[sym] = sessions.now_et()
                 LOG.warning(
                     "Blacklisting %s from quote refresh after %d consecutive failures (last: %s); will retry on bot restart",
                     sym, failure_threshold, exc,
@@ -1695,7 +1704,7 @@ class MarketDataStore:
                 cached = self.quote_cache.get(symbol)
                 last_refresh = self.last_quote_refresh.get(symbol)
                 if cached is not None and last_refresh is not None and min_force_interval_seconds is not None:
-                    age = (now_et() - last_refresh).total_seconds()
+                    age = (sessions.now_et() - last_refresh).total_seconds()
                     if age < max(0.0, float(min_force_interval_seconds)):
                         out[symbol] = cached
                         cached_hits += 1
@@ -1741,7 +1750,7 @@ class MarketDataStore:
                     fetched = {request_to_original.get(req, req): payload for req, payload in raw_fetched.items()}
                 else:
                     fetched = raw_fetched
-            fetched_at = now_et()
+            fetched_at = sessions.now_et()
             for symbol, quote_payload in fetched.items():
                 normalized = self._normalize_quote(symbol, quote_payload)
                 normalized["fetched_at"] = fetched_at
@@ -1753,7 +1762,7 @@ class MarketDataStore:
             fallback_targets = [symbol for symbol in chunk if symbol not in fetched]
             fallback_results, fallback_failed = self._parallel_quote_fetch(fallback_targets)
             for symbol, normalized in fallback_results.items():
-                fetched_at = now_et()
+                fetched_at = sessions.now_et()
                 normalized["fetched_at"] = fetched_at
                 with self._lock:
                     self.quote_cache[symbol] = normalized
@@ -1768,7 +1777,7 @@ class MarketDataStore:
 
         alias_results, alias_failed = self._parallel_quote_fetch(alias_pending)
         for symbol, normalized in alias_results.items():
-            fetched_at = now_et()
+            fetched_at = sessions.now_et()
             normalized["fetched_at"] = fetched_at
             with self._lock:
                 self.quote_cache[symbol] = normalized
@@ -1854,16 +1863,16 @@ class MarketDataStore:
         if fetched_at is None:
             return None
         try:
-            return max(0.0, (now_et() - fetched_at).total_seconds())
+            return max(0.0, (sessions.now_et() - fetched_at).total_seconds())
         except Exception:
             return None
 
     def quotes_are_fresh(self, symbols: Iterable[str], max_age_seconds: float) -> bool:
-        # Single lock acquire + single now_et() call, plus early exit on first
+        # Single lock acquire + single sessions.now_et() call, plus early exit on first
         # stale symbol. Avoids N deepcopies + N lock acquires from the prior
         # implementation that called quote_age_seconds() per symbol.
         limit = float(max_age_seconds)
-        current = now_et()
+        current = sessions.now_et()
         with self._lock:
             for symbol in symbols:
                 quote = self.quote_cache.get(self._symbol_key(str(symbol)))
@@ -1885,40 +1894,21 @@ class MarketDataStore:
         payload = payload or {}
         quote = payload.get("quote") if isinstance(payload.get("quote"), dict) else payload
         reference = payload.get("reference") if isinstance(payload.get("reference"), dict) else {}
-
-        def _first_float(*values) -> float:
-            for value in values:
-                if value in (None, ""):
-                    continue
-                try:
-                    return float(value)
-                except (TypeError, ValueError):
-                    continue
-            return 0.0
-
-        def _first_optional_float(*values) -> float | None:
-            for value in values:
-                if value in (None, ""):
-                    continue
-                try:
-                    return float(value)
-                except (TypeError, ValueError):
-                    continue
-            return None
-
-        bid = _first_float(quote.get("bidPrice"), quote.get("bid"), quote.get("bidPriceInDouble"))
-        ask = _first_float(quote.get("askPrice"), quote.get("ask"), quote.get("askPriceInDouble"))
-        mark = _first_float(quote.get("mark"), quote.get("markPrice"), quote.get("lastPrice"), quote.get("closePrice"))
-        last = _first_float(quote.get("lastPrice"), quote.get("last"), mark)
+        bid = first_float(quote, "bidPrice", "bid", "bidPriceInDouble", default=0.0)
+        ask = first_float(quote, "askPrice", "ask", "askPriceInDouble", default=0.0)
+        mark = first_float(quote, "mark", "markPrice", "lastPrice", "closePrice", default=0.0)
+        last = first_float(quote, "lastPrice", "last", default=mark)
         mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else (mark or last)
-        total_volume = _first_float(
-            quote.get("totalVolume"),
-            quote.get("total_volume"),
-            quote.get("regularMarketVolume"),
-            quote.get("tradeVolume"),
-            quote.get("volume"),
-            quote.get("totalVolumeTraded"),
-            quote.get("accumulatedVolume"),
+        total_volume = first_float(
+            quote,
+            "totalVolume",
+            "total_volume",
+            "regularMarketVolume",
+            "tradeVolume",
+            "volume",
+            "totalVolumeTraded",
+            "accumulatedVolume",
+            default=0.0,
         )
         return {
             "symbol": symbol,
@@ -1927,10 +1917,10 @@ class MarketDataStore:
             "mid": mid,
             "mark": mark,
             "last": last,
-            "close": _first_optional_float(quote.get("closePrice")),
-            "open": _first_optional_float(quote.get("openPrice")),
-            "net_change": _first_optional_float(quote.get("netChange")),
-            "percent_change": _first_optional_float(quote.get("netPercentChangeInDouble"), quote.get("percentChange")),
+            "close": first_float(quote, "closePrice"),
+            "open": first_float(quote, "openPrice"),
+            "net_change": first_float(quote, "netChange"),
+            "percent_change": first_float(quote, "netPercentChangeInDouble", "percentChange"),
             "total_volume": total_volume,
             "description": payload.get("description") or reference.get("description"),
             "raw": payload,
@@ -1941,7 +1931,7 @@ class MarketDataStore:
         if not candles:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
         df = pd.DataFrame.from_records(candles)
-        timestamps = pd.DatetimeIndex(pd.to_datetime(df["datetime"], unit="ms", utc=True)).tz_convert(get_runtime_timezone_name())
+        timestamps = pd.DatetimeIndex(pd.to_datetime(df["datetime"], unit="ms", utc=True)).tz_convert(EXCHANGE_TZ)
         df["timestamp"] = timestamps
         df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"})
         df = df.set_index(df["timestamp"].map(floor_minute)).drop(columns=["timestamp", "datetime"], errors="ignore")
@@ -1956,7 +1946,7 @@ class MarketDataStore:
             return
         if not self.stream.active:
             with self._lock:
-                self.stream_start_requested_at = now_et()
+                self.stream_start_requested_at = sessions.now_et()
                 self._stream_seen_symbols.clear()
                 self._stream_first_bar_time.clear()
             LOG.info("Starting Schwab stream for symbols: %s", symbols)
@@ -2004,7 +1994,7 @@ class MarketDataStore:
         data = payload.get("data") or []
         if not data:
             return
-        received_at = now_et()
+        received_at = sessions.now_et()
         # Parse and merge outside the lock to avoid blocking the main bot loop.
         parsed_updates: list[tuple[str, pd.DataFrame, pd.Timestamp]] = []
         stale_symbols: list[tuple[str, pd.Timestamp]] = []
@@ -2045,15 +2035,6 @@ class MarketDataStore:
                 self._invalidate_cycle_symbol(cache_key)
 
     @staticmethod
-    def _safe_stream_float(value: Any, default: float = 0.0) -> float:
-        """Convert a stream field to float, rejecting NaN/Infinity."""
-        try:
-            f = float(value)
-            return f if math.isfinite(f) else default
-        except (TypeError, ValueError):
-            return default
-
-    @staticmethod
     def _chart_item_to_row(item: dict) -> tuple[str, pd.Timestamp, dict] | None:
         symbol = item.get("key") or item.get("0")
         ts_ms = item.get("7") or item.get("Chart Time")
@@ -2063,15 +2044,14 @@ class MarketDataStore:
         sym = str(symbol).upper().strip()
         if not STREAMABLE_EQUITY_RE.match(sym):
             return None
-        ts = floor_minute(pd.to_datetime(int(ts_ms), unit="ms", utc=True).tz_convert(get_runtime_timezone_name()))
-        _sf = MarketDataStore._safe_stream_float
+        ts = floor_minute(pd.to_datetime(int(ts_ms), unit="ms", utc=True).tz_convert(EXCHANGE_TZ))
         row = {
-            "sequence": _sf(item.get("1", 0.0)),
-            "open": _sf(item.get("2", 0.0)),
-            "high": _sf(item.get("3", 0.0)),
-            "low": _sf(item.get("4", 0.0)),
-            "close": _sf(item.get("5", 0.0)),
-            "volume": _sf(item.get("6", 0.0)),
+            "sequence": safe_float(item.get("1", 0.0), 0.0, finite=True),
+            "open": safe_float(item.get("2", 0.0), 0.0, finite=True),
+            "high": safe_float(item.get("3", 0.0), 0.0, finite=True),
+            "low": safe_float(item.get("4", 0.0), 0.0, finite=True),
+            "close": safe_float(item.get("5", 0.0), 0.0, finite=True),
+            "volume": safe_float(item.get("6", 0.0), 0.0, finite=True),
             "source": "stream",
         }
         return sym, ts, row

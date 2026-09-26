@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""Pure position-metric helpers extracted from ``IntradayBot``.
+"""Pure position-metric helpers extracted from ``IntradayBot``, and the
+capped management-adjustment log a position's metadata carries.
 
 These are ``@staticmethod`` helpers with no engine-side dependencies — just
 :class:`~intraday_tv_schwab_bot.models.Position` inputs and scalar math. Moved
@@ -11,31 +12,6 @@ from __future__ import annotations
 from typing import Any
 
 from .models import Position, Side
-
-
-def safe_float(value: Any, default: float | None = None) -> float | None:
-    """NaN-safe float coercion with a default fallback.
-
-    Previously triplicated as ``@staticmethod _safe_float`` on
-    ``IntradayBot`` / ``PositionManager`` / ``EntryGatekeeper`` /
-    ``StartupReconciler``. Collapsed to this module-level function so all
-    callers share a single implementation.
-
-    IMPORTANT: ``float(float('nan'))`` does NOT raise, so a naive
-    try/except does not catch NaN. Downstream comparisons like
-    ``x >= threshold`` silently return False for NaN, which means a
-    single NaN from an indicator warmup bar can silently skip logic
-    (e.g. ``PositionManager._sr_flip_management_confirmed``'s
-    ``_momentum_ok`` gate). Uses the ``x == x`` idiom (False for NaN) to
-    coerce NaN to ``default``.
-    """
-    try:
-        if value is None:
-            return default
-        number = float(value)
-    except (TypeError, ValueError):
-        return default
-    return number if number == number else default
 
 
 def position_unrealized_at_price(position: Position, price: float | None) -> float | None:
@@ -95,3 +71,18 @@ def exit_reason_details(reason: str) -> dict[str, Any]:
         "exit_reason_family": family,
         "exit_trigger_level": trigger_level,
     }
+
+
+_MAX_MANAGEMENT_ADJUSTMENTS = 200
+
+
+def append_management_adjustment(meta: dict, entry: dict) -> None:
+    """Append a management adjustment to position metadata with a size cap.
+
+    Keeps the most recent ``_MAX_MANAGEMENT_ADJUSTMENTS`` entries so the list
+    doesn't grow without bound on very active trades.
+    """
+    adjustments = meta.setdefault("management_adjustments", [])
+    adjustments.append(entry)
+    if len(adjustments) > _MAX_MANAGEMENT_ADJUSTMENTS:
+        del adjustments[: len(adjustments) - _MAX_MANAGEMENT_ADJUSTMENTS]

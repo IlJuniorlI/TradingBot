@@ -43,9 +43,8 @@ except ImportError:  # pragma: no cover — yaml is a hard dep elsewhere
 
 from .paper_account import PaperAccount, TradeRecord, closed_trade_lifecycles
 from .models import Position
-from .utils import now_et
-
-from .utils import atomic_write_text as _atomic_write_text
+from . import sessions
+from .serialization import atomic_write_text
 
 LOG = logging.getLogger(__name__)
 
@@ -818,11 +817,11 @@ def write_session_report(
     # were populated. The linter flags a "might be referenced before
     # assignment" otherwise.
     closed: list = []
-    session_date: str = now_et().date().isoformat()
+    session_date: str = sessions.now_et().date().isoformat()
     try:
         performance = account.capture_snapshot(positions)
         trades = list(account.trades)
-        today = now_et().date()
+        today = sessions.now_et().date()
         session_date = today.isoformat()
 
         # Scoped to the SESSION, not the account. `account.realized_pnl` is a
@@ -1864,7 +1863,7 @@ def export_session_archive(
     """
     import shutil
 
-    session_date = now_et().date()
+    session_date = sessions.now_et().date()
     log_dir_path = Path(str(log_dir or ".logs"))
     archive_root = log_dir_path / "sessions" / session_date.isoformat()
     bars_dir = archive_root / "bars"
@@ -2062,7 +2061,7 @@ def export_session_archive(
                     continue
                 exit_date = None
                 try:
-                    exit_date = exit_time.astimezone(now_et().tzinfo).date()
+                    exit_date = exit_time.astimezone(sessions.now_et().tzinfo).date()
                 except Exception:
                     LOG.debug("Could not normalize exit_time for trade %s; falling back to naive date()", trade, exc_info=True)
                     # Naive datetime case — fall back to direct .date()
@@ -2118,7 +2117,7 @@ def export_session_archive(
             snapshot = account.capture_snapshot(positions or {})
             # capture_snapshot returns a dict; serialize via json (default=str
             # to handle datetimes inside equity curve points).
-            _atomic_write_text(
+            atomic_write_text(
                 archive_root / "account_snapshot.json",
                 json.dumps(snapshot, indent=2, default=str),
             )
@@ -2139,7 +2138,7 @@ def export_session_archive(
         events = _extract_structured_events(extraction_src)
         if events:
             events_path = archive_root / "events.jsonl"
-            _atomic_write_text(
+            atomic_write_text(
                 events_path,
                 "".join(json.dumps(ev, default=str) + "\n" for ev in events),
             )
@@ -2162,7 +2161,7 @@ def export_session_archive(
             writer.writeheader()
             for row in decisions:
                 writer.writerow({c: row.get(c, "") for c in cols})
-            _atomic_write_text(decisions_path, buf.getvalue())
+            atomic_write_text(decisions_path, buf.getvalue())
             decisions_written = len(decisions)
     except Exception as exc:
         LOG.warning("Could not extract decisions log: %s", exc)
@@ -2185,7 +2184,7 @@ def export_session_archive(
         "session_date": session_date.isoformat(),
         "strategy": str(strategy_name),
         "dry_run": bool(dry_run),
-        "exported_at": now_et().isoformat(),
+        "exported_at": sessions.now_et().isoformat(),
         "timeframes_exported": [f"{tf}m" for tf in timeframes_sorted],
         "symbols_exported": bars_written,
         "symbols_skipped": bars_skipped,
@@ -2206,7 +2205,7 @@ def export_session_archive(
     }
     manifest_path = archive_root / "manifest.json"
     try:
-        _atomic_write_text(
+        atomic_write_text(
             manifest_path,
             json.dumps(manifest, indent=2, default=str),
         )

@@ -335,10 +335,10 @@ def _option_strategy_py(name: str, class_stem: str) -> str:
             _safe_float,
             _session_open_price,
             insufficient_bars_reason,
-            now_et,
             pd,
         )
         from ..strategy_base import BaseStrategy
+        from ... import sessions
 
 
         class {class_stem}Strategy(BaseStrategy):
@@ -399,7 +399,7 @@ def _option_strategy_py(name: str, class_stem: str) -> str:
                     p = self.params
                     vwap_thresh = float(p.get("trend_vwap_distance_pct", 0.0016))
                     ema_thresh = float(p.get("trend_ema_gap_pct", 0.00075))
-                    session_day = now_et().date()
+                    session_day = sessions.now_et().date()
                     u_open = _session_open_price(frame, session_day, regular_session_only=True)
                     if u_open is None:
                         u_open = _session_open_price(frame, session_day, regular_session_only=False)

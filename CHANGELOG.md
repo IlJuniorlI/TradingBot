@@ -219,6 +219,125 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Every level builder floors its ATR the same way (refactor cut B6).**
+  *2026-09-26* — `indicators.atr_with_floor(frame, price, *, floor_pct=0.0015,
+  abs_floor=0.0)` = max(the frame's current ATR, `price` x 0.15%,
+  `abs_floor`) replaces `atr_value` and the three hand-rolled
+  "floor only a missing ATR" copies. Support/resistance and the technical
+  levels are unchanged (the frame's last close, no absolute floor). The HTF
+  context, the fair-value-gap detector (HTF and LTF) and the order blocks
+  now floor at 0.15% of the live price and $0.01 even when an ATR exists:
+  before, a quiet name's ATR under 0.15% of price was used raw. At the
+  shipped settings this moves the published HTF `atr14` on quiet frames
+  (the SPY 15m snapshot's `atr14` goes from 0.52 to 1.05); the FVG size is
+  unchanged above $1 because its percent term already won, and order blocks
+  (off in every preset) measure thrust on the floored ATR. On a name whose
+  HTF ATR is under a cent the $0.01 floor also moves the HTF `level_buffer`
+  (below $2.50) and the level-clustering tolerance (below about $1.17-$2,
+  by the tolerance multiple), so the published HTF supports / resistances of
+  such names can change. Most strategies take entries and stops from the
+  support/resistance context, which is unchanged, but peer_confirmed_key_levels
+  (and the presets built on it) picks its entry levels, stops and target
+  rungs from the HTF context, so on such names those can move too.
+
+- **One numeric coercion, `numeric.py` (refactor cut C15).** *2026-09-26* —
+  `safe_float(value, default=None, *, finite=False)`, `safe_int(value,
+  default=None)` and `first_float(mapping, *keys, default=None,
+  positive=False, finite=False)` replace the private copies:
+  `position_metrics.safe_float`, `SchwabExecutor._safe_float` / `_safe_int` /
+  `_quote_number`, `dashboard_cache.dashboard_safe_float`,
+  `candles._safe_float_token`, the paper account's `_opt_float`,
+  `MarketDataStore._safe_stream_float` (now `finite=True`) and the body of
+  `RiskManager._signal_entry_price`. None, blank strings, NaN (the string
+  `'nan'` included), `pd.NA` / `NaT` and unparseable values read as the
+  default; ±inf passes unless `finite`. The inputs that read differently
+  cannot reach these sites: an int too large for a float (now the default,
+  not an OverflowError), the string `'nan'` in the candle cache key
+  (`pd.to_numeric` + `dropna` remove it first), a quote or signal metadata
+  that is not a dict, and a value whose `float()` raises something other
+  than TypeError / ValueError / OverflowError (the catch-all copies returned
+  None; it now propagates). `tests/test_numeric.py` pins the semantics and
+  the sites whose copy had a shape of its own.
+
+- **`utils.py` is gone: bar frames live in `bars.py`, indicators in
+  `indicators.py` (refactor cut C14).** *2026-09-26* — `bars` holds
+  `ensure_ohlcv_frame`, `floor_minute`, the session bucket grid
+  (`session_bucket_bounds` / `_floor` / `_ends`), `resample_bars`,
+  `frame_bar_minutes`, `equity_stream_window_bars` and
+  `resolve_current_price`. `indicators` holds the process-wide
+  session-indicator mode and its setters, the standard indicator frame
+  (`ensure_standard_indicator_frame`, `has_standard_indicator_columns`,
+  `STANDARD_INDICATOR_COLUMNS`), EMA span scaling, the TA-Lib
+  wrappers, the session stitch and masks, `latest_atr14`, `atr_value` and
+  `add_indicators`. `build_schedule` moved to `config`, and
+  `append_management_adjustment` to `position_metrics` (the position
+  manager's `_append_adjustment` alias is gone). Every piece moved verbatim;
+  there is no alias or stub, so import from the new modules.
+  `resolve_current_price`'s debug line now logs under
+  `intraday_tv_schwab_bot.bars`. No behaviour changes.
+
+- **Logging setup has its own module, `log_setup.py`, and the atomic file
+  write is in `serialization.py` (refactor cut C13).** *2026-09-26* —
+  `setup_logging`, `TRADEFLOW_LEVEL`, the ET-dated daily file handler and the
+  colour console formatter moved out of `utils.py`. `log_setup.warn_once(key)`
+  (one process-wide set) replaces the private warn-once copies in
+  `_strategies/rvol.py` and `screener_client.py`. `atomic_write_text` moved to
+  `serialization.py`, and `DashboardServer.publish` writes its state file
+  through it instead of an inline copy. There is no alias: import them from
+  `intraday_tv_schwab_bot.log_setup` / `.serialization`. The startup
+  "Logging to …" line now logs under `intraday_tv_schwab_bot.log_setup`. The
+  unused `utils.TRADEFLOW` alias, `logging.TRADEFLOW` and `Logger.tradeflow()`
+  are gone; the level name is still registered on import.
+
+- **Session masks are vectorized (refactor cut C12).** *2026-09-26* —
+  `sessions.session_mask(index, window)` ("rth" or "extended") replaces the
+  per-bar `equity_session_state` loop behind `utils.indicator_session_mask`
+  and `levels_shared._rth_bar_mask` (the prior day / week filter), and
+  `indicator_session_open` reads the clock through the same mask.
+  `sessions.rth_close_minute(dates)` is the one early-close lookup, shared
+  with the bucket grid. Every index gets the same bars as before, each read
+  on its own wall clock (naive is ET); `tests/test_session_mask.py` keeps the
+  old loop as its oracle. About 10x faster: a 3,900-bar 1m frame's mask went
+  from 14.6 ms to 1.3 ms, and `add_indicators` from 54 ms to 35 ms.
+  `_indicator_session_predicate` is gone.
+
+- **The session calendar and helpers live in `sessions.py` too (refactor cut
+  C11).** *2026-09-26* — `parse_hhmm`, the NYSE holiday and early-close
+  calendar (`us_equity_market_holidays`, `us_equity_early_close_days`,
+  `is_weekday_session_day`), the `EQUITY_*` session times,
+  `EquitySessionState` / `equity_session_state` and its wrappers
+  (`is_regular_equity_session`, `is_equity_stream_session`,
+  `classify_equity_session`, `classify_tradingview_market_session`,
+  `equity_rth_open_at`, `equity_rth_close_at`, `previous_regular_close`) and
+  the `is_time_in_window` comparator moved out of `utils.py`, and `datetime_index`,
+  `session_datetime_index`, `session_segment_ids` and `latest_session_date`
+  out of `levels_shared.py`. There is no alias: import them by name from
+  `intraday_tv_schwab_bot.sessions`. `_strategies.shared` still re-exports
+  `parse_hhmm`, `equity_session_state`, `EQUITY_RTH_OPEN` and
+  `EQUITY_STREAM_START` until it is deleted. The technical levels' session
+  start reads the 09:30 open from `EQUITY_RTH_OPEN` instead of a literal. No
+  behaviour changes.
+
+- **The clock has one home, `sessions.py` (refactor cut C09).** *2026-09-26* —
+  `now_et`, `UTC`, `set_runtime_timezone` / `get_runtime_timezone_name` and
+  the runtime-timezone globals moved out of `utils.py` into the new
+  `intraday_tv_schwab_bot.sessions`. Every reader calls `sessions.now_et()`
+  through the module: no module binds the name, and `_strategies.shared` no
+  longer re-exports `now_et` (a plugin imports `from ... import sessions`).
+  There is no alias. No behaviour changes. The bracket reconcile's
+  `account_orders` window (`SchwabExecutor.fetch_order_states`), which read
+  the wall clock directly, now reads `sessions.now_et()` too (the same
+  instant, still sent as UTC).
+  - Tests pin the clock with `tests/support/clock.freeze_et(monkeypatch, at)`
+    or the `frozen_et(at)` block, which patch that one attribute, so a pin
+    reaches every reader. They replace the per-module `now_et` patches, the
+    `_clock` / `_frozen_clock` / `_stage_clock` / `_pin_clock` helpers and the
+    conftest loop. A pin must be a trading day unless the test says
+    `trading_day=False`.
+  - `tests/test_module_layering.py` now rejects any module other than
+    `sessions` holding its own reference to the clock, and any test that
+    patches or binds `now_et` outside `tests/support/clock.py`.
+
 - **The Schwab client wrapper has its own module, `schwab_api.py`.**
   *2026-09-25* — `call_schwab_client`, `SchwabdevApiUsageTracker`,
   `register_schwab_api_tracker` / `get_schwab_api_tracker` and the
@@ -595,6 +714,23 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `microcap_pm_breakout`'s screener `watchlist_mode`, a byte-identical copy of the one it inherits from `microcap_gap_orb` (which now answers the same calls);
   - `SchwabExecutor._EQUITY_WORKING_STATUSES`, `submit` and `submit_raw`.
 
+- **Breaking: `runtime.timezone` is retired; the bot's clock is always New York
+  (refactor cut C10).** *2026-09-26* — only the prior-day/week bucketing
+  was pinned to ET. Another `runtime.timezone` value made the clock and the
+  bar timestamps read that zone's wall time, so the session gates, the
+  stream window and bucket grid, the ORB opening range and every configured
+  HH:MM time (entry, management and screener windows, blackouts, time-decay
+  knobs) moved by the zone offset. `sessions.EXCHANGE_TZ` is now the one zone;
+  `set_runtime_timezone`, `get_runtime_timezone_name`,
+  `models.DEFAULT_RUNTIME_TZ`, `levels_shared._SESSION_TZ` and the ORB's
+  `_ET_ZONE` are gone, and `load_config` no longer writes a process-wide
+  zone. A config that still sets `runtime.timezone` (any value,
+  `America/New_York` included) fails at load with
+  `retired config keys -- runtime.timezone: ...`. Every shipped preset
+  dropped the line. **A local `configs/config.yaml` must drop it too before
+  the bot restarts on this version**, or the bot will not start; a config
+  that used another zone must also convert every configured time to ET.
+
 - **Breaking: renamed and retired config keys fail at load.** *2026-09-24* —
   a stale YAML fails at load with the replacement named, rather than
   silently doing nothing.
@@ -641,6 +777,26 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `levels_shared.find_divergence` a required `bar_clock`.
 
 ### Fixed
+
+- **Four numeric reads no longer mis-read NaN or float strings (refactor cut C16).**
+  *2026-09-26*
+  - A quote field that is NaN (Python's JSON parser accepts a bare `NaN`)
+    now falls through to the next key, as a missing one does. Before, a NaN
+    `bidPrice` became the bid, and a NaN mark or last became the mid.
+  - The entry snapshot drops a warm-up NaN `vwap` / `ema9` / `ema20` /
+    `ret5` / `ret15` instead of writing `NaN` into the ENTRY_CONTEXT JSON.
+  - Adaptive management read a NaN tier knob as NaN. A NaN breakeven offset
+    left the stop where it was but marked the tier armed, and a NaN runner
+    target turned a runner's missing target into NaN. A NaN knob now reads
+    as its default, so a NaN offset moves the stop to entry. A tier whose
+    candidate stop is infinite (an `.inf` offset) now neither moves the stop
+    nor arms; before, the stop went to ±inf and the position stopped out on
+    the same check.
+  - Option-chain counts sent as float strings (`"12.0"`) read as 12, not 0,
+    so the open-interest and volume floors no longer drop them; a
+    days-to-expiration of `"0.0"` reads as 0, not the -1 / 0 default.
+  - Tests: `tests/test_properties.py` (n7-n10) and
+    `tests/test_bug_regressions.py` (`TestPartialBreakevenTier2026_04_23`).
 
 - **A dry run no longer replaces a live broker order.** *2026-09-25* —
   `SchwabExecutor.replace_bracket_child` had no dry-run guard, unlike

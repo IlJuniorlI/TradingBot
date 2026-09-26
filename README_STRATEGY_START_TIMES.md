@@ -2,7 +2,7 @@
 
 This file explains **when the bot should usually be started for each strategy** based on the shipped top-level presets in `configs/config.<strategy>.yaml` and their current prewarm / window defaults.
 
-Times assume **America/New_York (ET)**, which is also the default `runtime.timezone`.
+Times are **America/New_York (ET)**, the bot's only clock.
 
 ## General rule
 

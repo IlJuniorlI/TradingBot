@@ -16,32 +16,28 @@ from .levels_shared import (
     cluster_levels,
     cluster_levels_by_tolerance,
     confirm_by_bars,
-    datetime_index as _datetime_index,
     extend_unique_levels,
     fallback_prior_side_levels,
     find_divergence,
     frame_extreme_side_levels as _frame_extreme_side_levels_shared,
-    latest_session_date,
     pivot_points,
     prior_day_levels as _prior_day_levels,
     prior_week_levels as _prior_week_levels,
     safe_reference_price_for_fallback as _safe_reference_price_for_fallback,
     same_side_min_gap_threshold as _same_side_min_gap_threshold,
-    session_segment_ids,
 )
-from .position_metrics import safe_float
-from .utils import (
-    ensure_ohlcv_frame,
+from .sessions import datetime_index, latest_session_date, session_segment_ids
+from .numeric import safe_float
+from .bars import ensure_ohlcv_frame, session_bucket_ends, resolve_current_price
+from .indicators import (
+    atr_with_floor,
     ensure_standard_indicator_frame,
     get_runtime_indicator_mode,
     indicator_session_mask,
     indicator_session_open,
-    latest_atr14,
-    now_et,
     session_price_scale,
-    session_bucket_ends,
-    resolve_current_price,
 )
+from . import sessions
 
 
 LOG = logging.getLogger(__name__)
@@ -338,14 +334,14 @@ def _completed_htf_frame(frame: pd.DataFrame, timeframe_minutes: int) -> pd.Data
         return pd.DataFrame(columns=getattr(frame, "columns", []))
     try:
         base = frame.copy()
-        idx = _datetime_index(base.index)
+        idx = datetime_index(base.index)
         base.index = idx
         # Anchor "now" in the ET trading timezone so the cutoff matches the
         # frame's ET-localized bar labels, even when the bot runs on a
         # non-ET server. Previously this used `pd.Timestamp.now()` as the
         # tz-naive fallback, which returns the SERVER's wall clock — off by
         # hours if the process isn't running on US Eastern.
-        et_now = pd.Timestamp(now_et())
+        et_now = pd.Timestamp(sessions.now_et())
         if idx.tz is not None:
             now_ts = et_now.tz_convert(idx.tz)
         else:
@@ -502,9 +498,7 @@ def _detect_fair_value_gaps(
     if completed.empty or len(completed) < 3:
         return [], [], None, None
     ref_close = resolve_current_price(completed, current_price)
-    atr = latest_atr14(completed)
-    if atr is None:
-        atr = max(ref_close * 0.0015, 0.01)
+    atr = atr_with_floor(completed, ref_close, abs_floor=0.01)
     min_gap_size = max(float(atr) * float(min_gap_atr_mult), float(ref_close) * float(min_gap_pct), 1e-8)
     eps = max(min_gap_size * 0.05, ref_close * 1e-6, 1e-8)
     bullish_raw: list[HTFFairValueGap] = []
@@ -702,15 +696,13 @@ def build_htf_context(
     as_of: date | None = None,
 ) -> HTFContext:
     # ``as_of`` is the session date the prior day/week are measured back from;
-    # None means the clock's (``latest_session_date(now_et())``).
+    # None means the clock's (``latest_session_date(sessions.now_et())``).
     frame = ensure_standard_indicator_frame(ensure_ohlcv_frame(frame))
     if frame.empty:
         return empty_htf_context(float(current_price or 0.0), timeframe_minutes=timeframe_minutes)
 
     close = resolve_current_price(frame, current_price)
-    atr = latest_atr14(frame)
-    if atr is None:
-        atr = max(close * 0.0015, 0.01)
+    atr = atr_with_floor(frame, close, abs_floor=0.01)
     tolerance = max(atr * float(atr_tolerance_mult), close * float(pct_tolerance))
     same_side_min_gap = _same_side_min_gap_threshold(
         atr,
@@ -733,7 +725,7 @@ def build_htf_context(
 
     include_prior_day = bool(use_prior_day_high_low)
     include_prior_week = bool(use_prior_week_high_low)
-    session_day = as_of if as_of is not None else latest_session_date(now_et())
+    session_day = as_of if as_of is not None else latest_session_date(sessions.now_et())
     prior_day_high, prior_day_low = _prior_day_levels(frame, session_day) if include_prior_day else (None, None)
     prior_week_high, prior_week_low = _prior_week_levels(frame, session_day) if include_prior_week else (None, None)
 
@@ -961,13 +953,13 @@ def build_htf_context(
         if not rsi_series.dropna().empty:
             highs_idx, lows_idx = pivot_points(frame, int(pivot_span), include_idx=True)
             # rsi14 is the session-only series on session bars and the
-            # all-hours one elsewhere (utils.add_indicators); pair only
+            # all-hours one elsewhere (indicators.add_indicators); pair only
             # session-bar pivots so both ends read the same RSI. Until
             # 2026-09-23 a 15m pivot pair straddling the old 13:00 switch
             # compared two different RSIs (KLZ-M2).
             #
             # Their age is counted in session bars too, while the clock is
-            # inside the session (utils.indicator_session_open, 2026-09-24).
+            # inside the session (indicators.indicator_session_open, 2026-09-24).
             # Counted in every bar, the 16:00-20:00 and pre-market buckets
             # aged yesterday's last session pivot past the limit before the
             # open: on a tape printing every bucket the last 60m session
@@ -975,7 +967,7 @@ def build_htf_context(
             # 09:00), and on the divergence-age study's symbol-days with a
             # dense overnight tape the 60m divergence read on none of the
             # minutes from 09:30 to 11:00. The gate is the clock, not the
-            # frame's last bar, as for utils.latest_atr14: until the first
+            # frame's last bar, as for indicators.latest_atr14: until the first
             # session bucket closes (09:45 on 15m, 10:30 on 60m) the frame
             # still ends on a pre-market bucket, and a last-bar gate kept the
             # all-bar age through exactly the minutes this is for. A reader

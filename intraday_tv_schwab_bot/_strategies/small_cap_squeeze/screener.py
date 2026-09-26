@@ -34,7 +34,8 @@ re-screen every cycle with no premarket lock. Ranked by gap% x clipped RVOL
 """
 from datetime import time
 
-from ..shared import Candidate, Side, now_et
+from ..shared import Candidate, Side
+from ... import sessions
 from ..screener_base import BaseStrategyScreener
 
 
@@ -102,7 +103,7 @@ class SmallCapSqueezeScreener(BaseStrategyScreener):
             ),
         )
         if self.watchlist_mode() == "premarket_lock_rth_live":
-            return self._merge_premarket_lock(rows, now_et())
+            return self._merge_premarket_lock(rows, sessions.now_et())
         return rows
 
     def _merge_premarket_lock(self, rows: list[Candidate], now) -> list[Candidate]:

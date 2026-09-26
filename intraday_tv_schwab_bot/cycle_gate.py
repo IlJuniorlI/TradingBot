@@ -27,7 +27,7 @@ from typing import Any
 from .config import BotConfig
 from .models import Position
 from ._strategies.registry import is_option_strategy
-from .utils import equity_session_state, is_weekday_session_day
+from .sessions import equity_session_state, is_weekday_session_day
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 

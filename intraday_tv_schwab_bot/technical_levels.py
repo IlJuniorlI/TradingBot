@@ -10,16 +10,16 @@ import numpy as np
 import pandas as pd
 
 from .levels_shared import DivergenceMatch, find_divergence, pivot_points
-from .utils import (
-    atr_value,
-    ensure_ohlcv_frame,
+from .sessions import EQUITY_RTH_OPEN
+from .bars import ensure_ohlcv_frame, resolve_current_price
+from .indicators import (
+    atr_with_floor,
     ensure_standard_indicator_frame,
     get_runtime_indicator_mode,
     get_session_indicator_window,
     indicator_session_mask,
     indicator_session_open,
     indicator_span_scale,
-    resolve_current_price,
     scaled_span,
     session_price_scale,
     talib_obv,
@@ -812,7 +812,7 @@ def _latest_session_start_pos(frame: pd.DataFrame, *, from_rth_open: bool) -> in
     index_dt = pd.DatetimeIndex(frame.index)
     last = index_dt[-1]
     if from_rth_open:
-        rth_open = int(index_dt.searchsorted(last.replace(hour=9, minute=30, second=0, microsecond=0, nanosecond=0)))
+        rth_open = int(index_dt.searchsorted(last.replace(hour=EQUITY_RTH_OPEN.hour, minute=EQUITY_RTH_OPEN.minute, second=0, microsecond=0, nanosecond=0)))
         if rth_open < len(index_dt):
             return rth_open
     return int(index_dt.searchsorted(last.normalize()))
@@ -1118,7 +1118,7 @@ def build_technical_levels_context(
     # frame already has the standard indicator columns — which implies it was
     # already normalized upstream by add_indicators. This was the single hottest
     # line in the profile.
-    from .utils import has_standard_indicator_columns
+    from .indicators import has_standard_indicator_columns
     if frame is not None and not frame.empty and has_standard_indicator_columns(frame):
         raw_frame = frame
     else:
@@ -1223,7 +1223,7 @@ def build_technical_levels_context(
     )
     close = resolve_current_price(frame, current_price)
     needs_atr = bool(impulse_context_enabled or trendline_enabled or channel_enabled or atr_context_enabled)
-    atr = atr_value(frame) if needs_atr else max(close * 0.0015 if close > 0 else 0.0, 0.0)
+    atr = atr_with_floor(frame, float(frame["close"].iloc[-1])) if needs_atr else 0.0
 
     # AVWAP at the base span shares the base pivots; it used to be left out
     # of this test, so AVWAP on its own never got an impulse anchor.
@@ -1366,17 +1366,17 @@ def build_technical_levels_context(
         max_age = max(0, int(divergence_max_age_bars))
         # With session indicators on, the rsi14 / obv columns hold the
         # session-only series on session bars and the all-hours series on the
-        # others (utils.add_indicators). A pivot pair straddling the two would
+        # others (indicators.add_indicators). A pivot pair straddling the two would
         # compare different indicators, so only session-bar pivots are paired
         # (2026-09-23).
         #
         # Their age is counted in session bars too, while the clock is inside
-        # the session (utils.indicator_session_open, 2026-09-24). Counted in
+        # the session (indicators.indicator_session_open, 2026-09-24). Counted in
         # every bar, the pre/post-market bars between yesterday's last session
         # pivot and today's open aged it out before the open: at 09:33 a 1m
         # pivot at 15:57 is 5 session bars old, but 83 bars old on a name
         # printing a 1m bar every 5 minutes outside RTH. The gate is the
-        # clock, not the frame's last bar, as for utils.latest_atr14: at
+        # clock, not the frame's last bar, as for indicators.latest_atr14: at
         # 09:30 the last completed bar is still a premarket one. A reader
         # outside the session (premarket) keeps the all-bar age its own bars
         # run on.
@@ -1649,7 +1649,7 @@ def build_technical_levels_context(
     # those 1,848 contexts. The shipped buffer is 0.65 ATR (0.30 on 5m), the
     # old 0.10% floor at the median: break flags are rarer than those 12.8%
     # and respected flags commoner than 4.1%.
-    # They multiply atr_value = max(ATR14, 0.15% of price). On 1m large caps
+    # They multiply atr_with_floor = max(ATR14, 0.15% of the frame close). On 1m large caps
     # that floor decides ~70-80% of builds, so there the break buffer is
     # 0.0975% and the touch tolerance 0.0525% of price at the shipped 0.65 /
     # 0.35; they scale with volatility only above it.

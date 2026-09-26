@@ -7,9 +7,6 @@ from enum import Enum
 from typing import Any
 
 
-DEFAULT_RUNTIME_TZ = "America/New_York"
-
-
 # Strategy identifiers now live with each plugin manifest/class rather than in a
 # central registry helper. Runtime models intentionally keep `strategy` typed as
 # plain strings so new plugins can be added without touching this module.

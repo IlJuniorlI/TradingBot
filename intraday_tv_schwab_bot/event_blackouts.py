@@ -30,7 +30,8 @@ from typing import Any
 import numpy as np
 import yaml
 
-from .utils import now_et, parse_hhmm
+from .sessions import parse_hhmm
+from . import sessions
 
 LOG = logging.getLogger(__name__)
 
@@ -195,7 +196,7 @@ class EventBlackoutCalendar:
         """First enabled macro window covering *now_dt* (and *symbol*, when the
         event carries a ``symbols`` list). ``None`` when nothing matches."""
         self._refresh_macro()
-        now_dt = now_dt or now_et()
+        now_dt = now_dt or sessions.now_et()
         today_iso = now_dt.date().isoformat()
         today_weekday = weekday_token(now_dt.weekday())
         now_t = now_dt.time()
@@ -238,7 +239,7 @@ class EventBlackoutCalendar:
         dates = self._earnings.get(key)
         if not dates:
             return None
-        today = (now_dt or now_et()).date()
+        today = (now_dt or sessions.now_et()).date()
         before = max(0, int(getattr(cfg, "earnings_block_sessions_before", 1) or 0))
         after = max(0, int(getattr(cfg, "earnings_block_sessions_after", 1) or 0))
         for event_date in sorted(dates):

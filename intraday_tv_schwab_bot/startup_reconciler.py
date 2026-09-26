@@ -62,12 +62,13 @@ from .config import BotConfig
 from .data_feed import MarketDataStore
 from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side
 from .paper_account import PaperAccount
-from .position_metrics import safe_float
+from .numeric import safe_float
 from .position_store import ReconcileMetadataStore
 from .risk import RiskManager
 from ._strategies.registry import is_option_strategy
 from ._strategies.strategy_base import BaseStrategy
-from .utils import UTC, now_et
+from . import sessions
+from .sessions import UTC
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -785,7 +786,7 @@ class StartupReconciler:
                     side=side,
                     qty=qty,
                     entry_price=entry_price,
-                    entry_time=now_et(),
+                    entry_time=sessions.now_et(),
                     stop_price=stop_price,
                     target_price=target_price,
                     trail_pct=trail_pct,
@@ -855,7 +856,7 @@ class StartupReconciler:
             # both in parallel to halve the boot-time stall that blocks the
             # engine from entering its first scan cycle. Each returns None
             # when the broker could not be read.
-            now = now_et()
+            now = sessions.now_et()
             from_ts = (now - timedelta(days=self.config.runtime.startup_order_lookback_days)).astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             to_ts = now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="bot-startup-reconcile") as pool:

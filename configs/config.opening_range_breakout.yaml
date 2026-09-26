@@ -69,7 +69,6 @@ risk:
 
 # Runtime cadence, streaming, reconciliation, and logging controls.
 runtime:
-  timezone: America/New_York
   loop_sleep_seconds: 2.0
   history_poll_seconds: 300
   quote_poll_seconds: 4

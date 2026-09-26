@@ -9,9 +9,9 @@ from ..shared import (
     _reason_with_values,
     _safe_float,
     _same_day_mask,
-    now_et,
     pd,
 )
+from ... import sessions
 from ..shared_entry import EntryContexts, EntryProposal
 from ..strategy_base import BaseStrategy
 
@@ -48,7 +48,7 @@ class ClosingReversalStrategy(BaseStrategy):
             day_strength = _safe_float(c.metadata.get("change_from_open"), 0.0)
             if day_strength < min_day_strength:
                 reasons.append(_reason_with_values("weak_day_strength", current=day_strength, required=min_day_strength, op=">=", digits=4))
-            session_frame = frame[_same_day_mask(frame, now_et().date())]
+            session_frame = frame[_same_day_mask(frame, sessions.now_et().date())]
             session_high = float(session_frame["high"].max()) if not session_frame.empty else 0.0
             if session_high <= 0:
                 reasons.append("invalid_session_high")

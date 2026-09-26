@@ -11,10 +11,11 @@ from threading import RLock
 from typing import Any, Iterable
 
 from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side
-from .utils import TRADEFLOW_LEVEL, now_et, register_tradeflow_logging_level
+from .numeric import first_float
+from .log_setup import TRADEFLOW_LEVEL
+from . import sessions
 
 LOG = logging.getLogger(__name__)
-register_tradeflow_logging_level()
 
 
 def _return_pct(side: Side, entry_price: float, last_or_exit_price: float) -> float:
@@ -185,7 +186,7 @@ class PaperAccount:
         self.peak_equity = float(starting_equity)
         self.max_drawdown = 0.0
         self._lock = RLock()
-        self.capture_snapshot({}, now_et())
+        self.capture_snapshot({}, sessions.now_et())
 
     def mark_prices(self, prices: dict[str, float]) -> None:
         with self._lock:
@@ -229,33 +230,14 @@ class PaperAccount:
             self.realized_pnl += realized
             self.realized_pnl_by_symbol[position.symbol] = self.realized_pnl_by_symbol.get(position.symbol, 0.0) + realized
             self.last_prices[position.symbol] = fill_price
-            exit_ts = now_et()
+            exit_ts = sessions.now_et()
             hold_minutes = max(0.0, (exit_ts - position.entry_time).total_seconds() / 60.0)
             metadata = position.metadata or {}
             # Pull diagnostic fields from metadata; all are optional so
             # trades from strategies that don't populate them stay valid.
-            def _opt_float(*keys: str) -> float | None:
-                """First non-None float from the given metadata keys.
-
-                Tries each key in order so we can read either the clean
-                name (initial_stop_price, entry_slippage_pct) or the
-                engine's prefixed diagnostic key (diag_best_unrealized_pnl,
-                diag_worst_unrealized_pnl). The engine writes MAE/MFE
-                under the diag_ prefix during management; we prefer the
-                clean name when set but fall back to the diag_ copy."""
-                for key in keys:
-                    try:
-                        value = metadata.get(key)
-                        if value is None:
-                            continue
-                        f = float(value)
-                        if f == f:  # NaN guard
-                            return f
-                    except (TypeError, ValueError):
-                        continue
-                return None
-
-            initial_stop = _opt_float("initial_stop_price")
+            # MAE/MFE prefer the clean key and fall back to the engine's
+            # diag_ copy written during management.
+            initial_stop = first_float(metadata, "initial_stop_price")
             initial_risk = (
                 abs(float(position.entry_price) - initial_stop)
                 if initial_stop is not None and initial_stop > 0
@@ -288,14 +270,14 @@ class PaperAccount:
                 armed_retest_status=(
                     str(metadata.get("armed_retest_status"))
                     if metadata.get("armed_retest_status") else None),
-                armed_retest_waited_minutes=_opt_float("armed_retest_waited_minutes"),
+                armed_retest_waited_minutes=first_float(metadata, "armed_retest_waited_minutes"),
                 initial_risk_per_unit=initial_risk,
-                max_favorable_pnl=_opt_float("best_unrealized_pnl", "diag_best_unrealized_pnl"),
-                max_adverse_pnl=_opt_float("worst_unrealized_pnl", "diag_worst_unrealized_pnl"),
-                entry_slippage_pct=_opt_float("entry_slippage_pct"),
-                realized_entry_risk=_opt_float("realized_entry_risk"),
-                entry_risk_budget=_opt_float("entry_risk_budget"),
-                entry_risk_overage_frac=_opt_float("entry_risk_overage_frac"),
+                max_favorable_pnl=first_float(metadata, "best_unrealized_pnl", "diag_best_unrealized_pnl"),
+                max_adverse_pnl=first_float(metadata, "worst_unrealized_pnl", "diag_worst_unrealized_pnl"),
+                entry_slippage_pct=first_float(metadata, "entry_slippage_pct"),
+                realized_entry_risk=first_float(metadata, "realized_entry_risk"),
+                entry_risk_budget=first_float(metadata, "entry_risk_budget"),
+                entry_risk_overage_frac=first_float(metadata, "entry_risk_overage_frac"),
             )
             # LIFO: newest trade at index 0 (consumers iterate from the left).
             self.trades.appendleft(trade)
@@ -466,7 +448,7 @@ class PaperAccount:
         }
 
     def capture_snapshot(self, positions: dict[str, Position], timestamp: datetime | None = None) -> dict[str, Any]:
-        ts = timestamp or now_et()
+        ts = timestamp or sessions.now_et()
         with self._lock:
             position_rows = [self._position_summary(position) for position in positions.values()]
             market_value = sum(row["market_value"] for row in position_rows)

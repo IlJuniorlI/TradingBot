@@ -102,7 +102,7 @@ The top-level blocks are:
 - `options`
 - `pairs`
 
-Times are interpreted in `runtime.timezone`, which defaults to `America/New_York`.
+All configured times (entry, management and screener windows, blackouts, HH:MM knobs) are New York (ET) wall-clock times; the bot trades US sessions only and has no timezone setting.
 
 Use the selected top-level config file as the single runtime source of truth. Shipped presets live under `configs/config.<strategy>.yaml`.
 
@@ -282,7 +282,6 @@ This block controls loop timing, quote/history refresh cadence, stream fallback 
 
 | Option                               | Code default                              |
 |--------------------------------------|-------------------------------------------|
-| `timezone`                           | `America/New_York`                        |
 | `loop_sleep_seconds`                 | `2.0`                                     |
 | `error_escalation_cycles`            | `10`                                      |
 | `history_poll_seconds`               | `300`                                     |
@@ -316,7 +315,6 @@ This block controls loop timing, quote/history refresh cadence, stream fallback 
 
 Behavior and valid values:
 
-- `timezone`: IANA timezone string. All configured times are interpreted in this timezone.
 - `loop_sleep_seconds`: base engine sleep between iterations.
 - `error_escalation_cycles`: the main loop backs off exponentially on errors and never gives up. After this many consecutive failed cycles it escalates to a CRITICAL log naming the open positions, and the dashboard status turns into an explicit alarm, so a sustained outage during the management window cannot pass as a throttled warning. At the capped 60s backoff, `10` is roughly ten minutes without management. `0` disables the escalation; the backoff is unaffected.
 - `history_poll_seconds`: cadence for history refreshes.
@@ -924,7 +922,7 @@ How the groups work:
 - Channels:
   - `channel_*` controls pivot channel detection, tolerance, and how near price must be to a channel edge.
 - Trend lines:
-  - `trendline_*` controls pivot trendline detection and breakout sensitivity. Tolerances and the break buffer are multiples of `atr_value` = max(ATR14, 0.15% of price), with no percent floor of their own; on 1m large caps that ATR floor decides ~70-80% of bars (a 0.0975%-of-price buffer at 0.65), so they scale with volatility only above it. The channel break tolerance keeps its own 0.15%-of-price floor. Trendline and channel windows start at the current session's first bar, so on 5m LTF frames they need today's pivots and are absent for roughly the first hour; fib and anchored-VWAP impulses skip extended-hours pivots instead.
+  - `trendline_*` controls pivot trendline detection and breakout sensitivity. Tolerances and the break buffer are multiples of `atr_with_floor` = max(ATR14, 0.15% of the frame close), with no percent floor of their own; on 1m large caps that ATR floor decides ~70-80% of bars (a 0.0975%-of-price buffer at 0.65), so they scale with volatility only above it. The channel break tolerance keeps its own 0.15%-of-price floor. Trendline and channel windows start at the current session's first bar, so on 5m LTF frames they need today's pivots and are absent for roughly the first hour; fib and anchored-VWAP impulses skip extended-hours pivots instead.
   - A broken line is spent once a close has cleared the break buffer after its last touch and a pivot has then formed on its far side; it retires instead of re-raising its break. A wick, or a dip that closed inside the buffer, does not retire it.
 - ADX / trend quality:
   - `adx_*` adds bonus/penalty based on trend strength and whether ADX is rising.
@@ -1162,7 +1160,7 @@ Scheduled-event blackouts shared by every strategy, equity and options alike. Mo
 Behavior:
 
 - `enabled`: master switch for both calendars.
-- `blackout_file` / `blackouts`: macro windows (CPI, FOMC, ...) from a YAML file and/or inline; both are loaded. Each row needs `start` and `end` (HH:MM, `runtime.timezone`) and can add `enabled`, `label`, `date` or `weekday`, `symbols`, `block_new_entries` (default `true`) and `force_flatten` (default `false`). `symbols: [...]` scopes a window to those tickers; without it the window applies to every symbol. The file is re-read when its mtime changes, so a blackout can be added to a running bot.
+- `blackout_file` / `blackouts`: macro windows (CPI, FOMC, ...) from a YAML file and/or inline; both are loaded. Each row needs `start` and `end` (HH:MM ET) and can add `enabled`, `label`, `date` or `weekday`, `symbols`, `block_new_entries` (default `true`) and `force_flatten` (default `false`). `symbols: [...]` scopes a window to those tickers; without it the window applies to every symbol. The file is re-read when its mtime changes, so a blackout can be added to a running bot.
 - `earnings_file` / `earnings`: per-symbol earnings dates, `{SYMBOL: [YYYY-MM-DD, ...]}`, from a file and/or inline; both are merged.
 - `earnings_block_sessions_before` / `earnings_block_sessions_after`: trading sessions either side of an earnings date that block new entries (the date itself is always blocked). Weekends are skipped; market holidays count as sessions, which errs toward blocking one day too many.
 
@@ -1287,7 +1285,7 @@ Behavior and valid values:
   - `options_breakeven_enabled` / `options_breakeven_mark_mult` / `options_breakeven_stop_mult`: when the option mark crosses `entry × options_breakeven_mark_mult`, ratchet the stop up to `entry × options_breakeven_stop_mult`. Locks a small protective gain on debit trades that go through their first push.
   - `options_profit_lock_enabled` / `options_profit_lock_mark_mult` / `options_profit_lock_stop_mult`: a second, looser ratchet that activates at a higher mark multiple and locks a larger fraction of the move. Stacks with `options_breakeven_*`.
 - Time-decay-aware stop/target scaling for debit trades:
-  - `debit_target_time_decay_enabled`: master toggle. When `true`, the debit target shrinks linearly between `debit_target_time_decay_start` and `debit_target_time_decay_end` (HH:MM in `runtime.timezone`), and the debit stop widens proportionally so theta-decayed trades aren't stopped on noise.
+  - `debit_target_time_decay_enabled`: master toggle. When `true`, the debit target shrinks linearly between `debit_target_time_decay_start` and `debit_target_time_decay_end` (HH:MM ET), and the debit stop widens proportionally so theta-decayed trades aren't stopped on noise.
   - `debit_target_time_decay_start` / `debit_target_time_decay_end`: scaling window. Outside this window, the standard `debit_target_mult` and `debit_stop_frac` apply unchanged.
   - `debit_target_time_decay_min_scale`: lower bound on the target scale at the end of the window (e.g. `0.70` = target collapses to 70% of `debit_target_mult` by `debit_target_time_decay_end`).
   - `debit_stop_time_decay_widen_factor`: how much the stop widens at the end of the window relative to the target shrink (e.g. `0.30` = stop loosens by 30% × the target shrink).

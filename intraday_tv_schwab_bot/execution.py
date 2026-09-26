@@ -23,9 +23,11 @@ from .models import (
     Position,
     Side,
 )
+from .numeric import first_float, safe_float, safe_int
 from .options_mode import build_single_option_close_order, build_vertical_close_order, close_limit_price_from_metadata, close_single_option_limit_from_metadata, contract_from_quote, single_option_price_bounds, vertical_price_bounds
+from . import sessions
+from .sessions import UTC, classify_equity_session, equity_session_state, is_regular_equity_session
 from .schwab_api import call_schwab_client, call_schwab_json, response_ok
-from .utils import classify_equity_session, equity_session_state, is_regular_equity_session
 
 LOG = logging.getLogger(__name__)
 
@@ -95,43 +97,6 @@ class SchwabExecutor:
         return 1.0
 
     @staticmethod
-    def _quote_number(quote: dict[str, Any] | None, *keys: str) -> float | None:
-        if not quote:
-            return None
-        for key in keys:
-            value = quote.get(key)
-            try:
-                number = float(value)
-            except Exception:
-                continue
-            if number > 0:
-                return number
-        return None
-
-    @staticmethod
-    def _safe_float(value: Any) -> float | None:
-        # Coerce NaN to None via the `number == number` idiom — `float(nan)`
-        # does not raise, and NaN silently fails downstream comparisons.
-        try:
-            if value is None:
-                return None
-            number = float(value)
-        except Exception:
-            return None
-        return number if number == number else None
-
-    @staticmethod
-    def _safe_int(value: Any) -> int | None:
-        try:
-            if value is None:
-                return None
-            if isinstance(value, bool):
-                return int(value)
-            return int(float(value))
-        except Exception:
-            return None
-
-    @staticmethod
     def _response_order_id(response) -> str | None:
         location = getattr(response, "headers", {}).get("Location", "") or ""
         order_id = str(location).split("/")[-1].strip()
@@ -149,7 +114,7 @@ class SchwabExecutor:
         if not isinstance(payload, dict):
             return None
         for key in ("remainingQuantity", "remainingQty", "leavesQuantity"):
-            value = cls._safe_int(payload.get(key))
+            value = safe_int(payload.get(key))
             if value is not None:
                 return max(0, value)
         return None
@@ -159,7 +124,7 @@ class SchwabExecutor:
         if not isinstance(payload, dict):
             return None
         for key in ("filledQuantity", "filledQty", "cumulativeQuantity", "executedQuantity"):
-            value = cls._safe_int(payload.get(key))
+            value = safe_int(payload.get(key))
             if value is not None:
                 return max(0, value)
         per_leg: dict[Any, int] = {}
@@ -169,7 +134,7 @@ class SchwabExecutor:
             for leg in activity.get("executionLegs") or []:
                 if not isinstance(leg, dict):
                     continue
-                qty = cls._safe_int(leg.get("quantity"))
+                qty = safe_int(leg.get("quantity"))
                 if qty is None:
                     continue
                 per_leg[leg.get("legId")] = per_leg.get(leg.get("legId"), 0) + max(0, qty)
@@ -181,10 +146,10 @@ class SchwabExecutor:
         # A vertical's executions arrive once per LEG: summing them counted
         # every spread twice. A spread unit is filled once every leg is, so
         # the order's fill is its least-filled leg, per unit of order quantity.
-        order_qty = cls._safe_float(payload.get("quantity"))
+        order_qty = safe_float(payload.get("quantity"))
         ratios: list[float] = []
         for leg in legs:
-            leg_qty = cls._safe_float(leg.get("quantity"))
+            leg_qty = safe_float(leg.get("quantity"))
             ratios.append(leg_qty / order_qty if leg_qty and order_qty and order_qty > 0 else 1.0)
         if set(per_leg) == {None}:
             # No legId on any execution: the pool holds every leg's shares.
@@ -205,8 +170,8 @@ class SchwabExecutor:
             for leg in activity.get("executionLegs") or []:
                 if not isinstance(leg, dict):
                     continue
-                px = cls._safe_float(leg.get("price"))
-                qty = cls._safe_float(leg.get("quantity"))
+                px = safe_float(leg.get("price"))
+                qty = safe_float(leg.get("quantity"))
                 if px is None or qty is None or px <= 0 or qty <= 0:
                     continue
                 notional, filled = out.get(leg.get("legId"), (0.0, 0.0))
@@ -226,11 +191,11 @@ class SchwabExecutor:
         order quantity; its magnitude is the debit paid or credit received.
         None when any leg has no attributable execution.
         """
-        order_qty = cls._safe_float(payload.get("quantity"))
+        order_qty = safe_float(payload.get("quantity"))
         net = 0.0
         for leg in legs:
             notional, filled = executions.get(leg.get("legId"), (0.0, 0.0))
-            leg_qty = cls._safe_float(leg.get("quantity"))
+            leg_qty = safe_float(leg.get("quantity"))
             if filled <= 0 or leg_qty is None or leg_qty <= 0:
                 return None
             ratio = leg_qty / order_qty if order_qty and order_qty > 0 else 1.0
@@ -255,7 +220,7 @@ class SchwabExecutor:
             filled = sum(value[1] for value in executions.values())
             return notional / filled
         for key in ("price", "filledPrice", "averagePrice"):
-            px = cls._safe_float(payload.get(key))
+            px = safe_float(payload.get(key))
             if px is not None and px > 0:
                 return px
         return None
@@ -300,9 +265,9 @@ class SchwabExecutor:
         max_age = max(1.0, float(self.config.runtime.quote_cache_seconds))
         if not data.quotes_are_fresh([symbol], max_age):
             return None
-        bid = self._quote_number(quote, "bid", "bidPrice")
-        ask = self._quote_number(quote, "ask", "askPrice")
-        last = self._quote_number(quote, "last", "lastPrice", "mark", "markPrice", "close", "closePrice")
+        bid = first_float(quote, "bid", "bidPrice", positive=True)
+        ask = first_float(quote, "ask", "askPrice", positive=True)
+        last = first_float(quote, "last", "lastPrice", "mark", "markPrice", "close", "closePrice", positive=True)
         return bid, ask, last
 
     @staticmethod
@@ -316,14 +281,14 @@ class SchwabExecutor:
         if market_snapshot is None:
             return None
         if isinstance(market_snapshot, tuple) and len(market_snapshot) == 3:
-            bid = self._quote_number({"v": market_snapshot[0]}, "v")
-            ask = self._quote_number({"v": market_snapshot[1]}, "v")
-            last = self._quote_number({"v": market_snapshot[2]}, "v")
+            bid = first_float({"v": market_snapshot[0]}, "v", positive=True)
+            ask = first_float({"v": market_snapshot[1]}, "v", positive=True)
+            last = first_float({"v": market_snapshot[2]}, "v", positive=True)
             return bid, ask, last
         if isinstance(market_snapshot, dict):
-            bid = self._quote_number(market_snapshot, "bid", "bidPrice")
-            ask = self._quote_number(market_snapshot, "ask", "askPrice")
-            last = self._quote_number(market_snapshot, "last", "lastPrice", "mark", "markPrice", "close", "closePrice", "mid")
+            bid = first_float(market_snapshot, "bid", "bidPrice", positive=True)
+            ask = first_float(market_snapshot, "ask", "askPrice", positive=True)
+            last = first_float(market_snapshot, "last", "lastPrice", "mark", "markPrice", "close", "closePrice", "mid", positive=True)
             return bid, ask, last
         return None
 
@@ -958,9 +923,9 @@ class SchwabExecutor:
                 # Shares still resting: what adoption compares against the
                 # position before it trusts a working child.
                 "remaining_qty": cls._equity_order_remaining_qty(node),
-                "leg_qty": cls._safe_int(legs[0].get("quantity")) if len(legs) == 1 else None,
-                "stop_price": cls._safe_float(node.get("stopPrice")),
-                "price": cls._safe_float(node.get("price")),
+                "leg_qty": safe_int(legs[0].get("quantity")) if len(legs) == 1 else None,
+                "stop_price": safe_float(node.get("stopPrice")),
+                "price": safe_float(node.get("price")),
             }
         cls._flatten_order_tree(node.get("childOrderStrategies"), out)
 
@@ -974,7 +939,7 @@ class SchwabExecutor:
         """
         if self.config.schwab.dry_run:
             return {}
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = sessions.now_et().astimezone(UTC)
         try:
             payload = call_schwab_json(
                 self.client, "account_orders", self.account_hash,

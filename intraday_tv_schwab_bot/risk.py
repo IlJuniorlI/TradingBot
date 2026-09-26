@@ -10,8 +10,10 @@ from typing import Any
 from .broker_positions import active_broker_bracket
 from .config import BotConfig
 from .models import ASSET_TYPE_EQUITY, OPTION_ASSET_TYPES, Position, Side, Signal
+from .numeric import first_float, safe_float
 from ._strategies.registry import is_option_strategy
-from .utils import append_management_adjustment, now_et
+from .position_metrics import append_management_adjustment
+from . import sessions
 
 LOG = logging.getLogger(__name__)
 
@@ -80,7 +82,7 @@ class RiskState:
     # as a per-day gate rather than a per-lifetime cap. Eager-initialized to
     # today's ET date so the field has a concrete `date` type and
     # `_reset_if_new_session` doesn't need a lazy-init branch.
-    session_date: date = field(default_factory=lambda: now_et().date())
+    session_date: date = field(default_factory=lambda: sessions.now_et().date())
 
 
 class RiskManager:
@@ -111,7 +113,7 @@ class RiskManager:
         reset still happens by itself.
         """
         self._state_store = store
-        today = now_et().date()
+        today = sessions.now_et().date()
         payload = None
         try:
             payload = store.load(today.isoformat())
@@ -217,7 +219,7 @@ class RiskManager:
         EITHER direction is on cooldown, the conservative fallback.
         """
         key = self._symbol_key(symbol)
-        now = now_et()
+        now = sessions.now_et()
         if side is not None:
             until = self.state.cooldown_until.get((key, side))
             return bool(until and now < until)
@@ -235,7 +237,7 @@ class RiskManager:
         ``RiskState`` to today's ET date, so there is no ``None`` initial
         state to handle here.
         """
-        current_date = now_et().date()
+        current_date = sessions.now_et().date()
         if current_date != self.state.session_date:
             if self.state.realized_pnl != 0.0:
                 LOG.info(
@@ -314,9 +316,9 @@ class RiskManager:
         if policy == "immediate":
             _apply(None)
         elif policy == "rest_of_day":
-            _apply((now_et() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0))
+            _apply((sessions.now_et() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0))
         else:
-            _apply(now_et() + timedelta(minutes=self.config.risk.cooldown_minutes))
+            _apply(sessions.now_et() + timedelta(minutes=self.config.risk.cooldown_minutes))
 
         # Record the exit for the same-level retry block. Needs the LEVEL (the
         # direction and entry price being re-tried) and an ATR to scale the
@@ -333,13 +335,13 @@ class RiskManager:
                     entry_price=float(level_price),
                     exit_price=float(exit_price) if exit_price is not None else float(level_price),
                     atr=max(1e-6, float(atr)),
-                    timestamp=now_et(),
+                    timestamp=sessions.now_et(),
                 )
                 self.state.recent_exits.append(record)
                 # Trim: keep only records within the block window (plus a small
                 # margin) to cap memory in pathological sessions.
                 window_minutes = max(1, int(getattr(self.config.risk, "same_level_block_minutes", 30)))
-                cutoff = now_et() - timedelta(minutes=window_minutes * 2)
+                cutoff = sessions.now_et() - timedelta(minutes=window_minutes * 2)
                 self.state.recent_exits = [r for r in self.state.recent_exits if r.timestamp >= cutoff]
             except Exception:
                 LOG.debug("Could not record exit for same-level block", exc_info=True)
@@ -528,7 +530,7 @@ class RiskManager:
         if anchor is None:
             return False, "ok"
         signal_side, signal_entry = anchor
-        cutoff = now_et() - timedelta(minutes=window_minutes)
+        cutoff = sessions.now_et() - timedelta(minutes=window_minutes)
         for record in reversed(self.state.recent_exits):
             if record.timestamp < cutoff:
                 continue
@@ -592,24 +594,7 @@ class RiskManager:
 
     @staticmethod
     def _signal_entry_price(signal: Signal) -> float | None:
-        meta = signal.metadata if isinstance(signal.metadata, dict) else {}
-        for key in ("entry_price", "limit_price", "mark_price_hint"):
-            raw = meta.get(key) if isinstance(meta, dict) else None
-            try:
-                if raw is None:
-                    continue
-                value = float(raw)
-            except (TypeError, ValueError):
-                continue
-            # math.isfinite rejects NaN and ±inf in one call. The previous
-            # idiom `0 < value == value` (chained comparison) relied on
-            # `NaN == NaN` being False to filter NaN, but it tripped
-            # PyCharm's "Comparison with self" warning and accepted +inf.
-            # isfinite reads cleanly and is also stricter — +inf is never
-            # a valid entry price either.
-            if math.isfinite(value) and value > 0:
-                return value
-        return None
+        return first_float(signal.metadata, "entry_price", "limit_price", "mark_price_hint", positive=True, finite=True)
 
     @staticmethod
     def _fib_pullback_override(signal: Signal, entry_price: float) -> bool:
@@ -1036,13 +1021,7 @@ class RiskManager:
         broker_owns_target = bracket is not None and bracket.get("target_order_id") is not None
 
         def _meta_float(key: str, default: float | None = None) -> float | None:
-            value = meta.get(key, default)
-            try:
-                if value is None:
-                    return default
-                return float(value)
-            except Exception:
-                return default
+            return safe_float(meta.get(key), default)
 
         if position.side == Side.LONG:
             if adaptive_enabled:
@@ -1055,35 +1034,38 @@ class RiskManager:
                 # gave back $32 despite a 0.56R peak. Arms a cheap early stop
                 # move at a lower RR gate than the main breakeven.
                 partial_breakeven_rr = _meta_float("adaptive_partial_breakeven_rr", None)
-                partial_breakeven_offset_r = _meta_float("adaptive_partial_breakeven_offset_r", 0.0) or 0.0
+                partial_breakeven_offset_r = _meta_float("adaptive_partial_breakeven_offset_r", 0.0)
                 if partial_breakeven_rr is not None and max_favorable_r >= partial_breakeven_rr:
                     candidate_stop = float(position.entry_price) + (float(partial_breakeven_offset_r) * initial_risk)
-                    if candidate_stop > float(position.stop_price):
-                        prior_stop = float(position.stop_price)
-                        position.stop_price = float(candidate_stop)
-                        if isinstance(meta, dict):
-                            append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "partial_breakeven", "from": prior_stop, "to": float(candidate_stop)})
-                    meta["adaptive_partial_breakeven_armed"] = True
+                    if math.isfinite(candidate_stop):
+                        if candidate_stop > float(position.stop_price):
+                            prior_stop = float(position.stop_price)
+                            position.stop_price = float(candidate_stop)
+                            if isinstance(meta, dict):
+                                append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "partial_breakeven", "from": prior_stop, "to": float(candidate_stop)})
+                        meta["adaptive_partial_breakeven_armed"] = True
                 breakeven_rr = _meta_float("adaptive_breakeven_rr", None)
-                breakeven_offset_r = _meta_float("adaptive_breakeven_offset_r", 0.0) or 0.0
+                breakeven_offset_r = _meta_float("adaptive_breakeven_offset_r", 0.0)
                 if breakeven_rr is not None and max_favorable_r >= breakeven_rr:
                     candidate_stop = float(position.entry_price) + (float(breakeven_offset_r) * initial_risk)
-                    if candidate_stop > float(position.stop_price):
-                        prior_stop = float(position.stop_price)
-                        position.stop_price = float(candidate_stop)
-                        if isinstance(meta, dict):
-                            append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "breakeven", "from": prior_stop, "to": float(candidate_stop)})
-                    meta["adaptive_breakeven_armed"] = True
+                    if math.isfinite(candidate_stop):
+                        if candidate_stop > float(position.stop_price):
+                            prior_stop = float(position.stop_price)
+                            position.stop_price = float(candidate_stop)
+                            if isinstance(meta, dict):
+                                append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "breakeven", "from": prior_stop, "to": float(candidate_stop)})
+                        meta["adaptive_breakeven_armed"] = True
                 profit_lock_rr = _meta_float("adaptive_profit_lock_rr", None)
                 profit_lock_stop_rr = _meta_float("adaptive_profit_lock_stop_rr", None)
                 if profit_lock_rr is not None and profit_lock_stop_rr is not None and max_favorable_r >= profit_lock_rr:
                     candidate_stop = float(position.entry_price) + (float(profit_lock_stop_rr) * initial_risk)
-                    if candidate_stop > float(position.stop_price):
-                        prior_stop = float(position.stop_price)
-                        position.stop_price = float(candidate_stop)
-                        if isinstance(meta, dict):
-                            append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "profit_lock", "from": prior_stop, "to": float(candidate_stop)})
-                    meta["adaptive_profit_lock_armed"] = True
+                    if math.isfinite(candidate_stop):
+                        if candidate_stop > float(position.stop_price):
+                            prior_stop = float(position.stop_price)
+                            position.stop_price = float(candidate_stop)
+                            if isinstance(meta, dict):
+                                append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "profit_lock", "from": prior_stop, "to": float(candidate_stop)})
+                        meta["adaptive_profit_lock_armed"] = True
                 runner_enabled = adaptive_runner_extension_enabled and bool(meta.get("adaptive_runner_extend_enabled", False))
                 runner_trigger_rr = _meta_float("adaptive_runner_trigger_rr", None)
                 runner_target_rr = _meta_float("adaptive_runner_target_rr", None)
@@ -1129,35 +1111,38 @@ class RiskManager:
                 # Mirror of the LONG partial_breakeven tier above — see comment
                 # at LONG branch for motivation.
                 partial_breakeven_rr = _meta_float("adaptive_partial_breakeven_rr", None)
-                partial_breakeven_offset_r = _meta_float("adaptive_partial_breakeven_offset_r", 0.0) or 0.0
+                partial_breakeven_offset_r = _meta_float("adaptive_partial_breakeven_offset_r", 0.0)
                 if partial_breakeven_rr is not None and max_favorable_r >= partial_breakeven_rr:
                     candidate_stop = float(position.entry_price) - (float(partial_breakeven_offset_r) * initial_risk)
-                    if candidate_stop < float(position.stop_price):
-                        prior_stop = float(position.stop_price)
-                        position.stop_price = float(candidate_stop)
-                        if isinstance(meta, dict):
-                            append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "partial_breakeven", "from": prior_stop, "to": float(candidate_stop)})
-                    meta["adaptive_partial_breakeven_armed"] = True
+                    if math.isfinite(candidate_stop):
+                        if candidate_stop < float(position.stop_price):
+                            prior_stop = float(position.stop_price)
+                            position.stop_price = float(candidate_stop)
+                            if isinstance(meta, dict):
+                                append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "partial_breakeven", "from": prior_stop, "to": float(candidate_stop)})
+                        meta["adaptive_partial_breakeven_armed"] = True
                 breakeven_rr = _meta_float("adaptive_breakeven_rr", None)
-                breakeven_offset_r = _meta_float("adaptive_breakeven_offset_r", 0.0) or 0.0
+                breakeven_offset_r = _meta_float("adaptive_breakeven_offset_r", 0.0)
                 if breakeven_rr is not None and max_favorable_r >= breakeven_rr:
                     candidate_stop = float(position.entry_price) - (float(breakeven_offset_r) * initial_risk)
-                    if candidate_stop < float(position.stop_price):
-                        prior_stop = float(position.stop_price)
-                        position.stop_price = float(candidate_stop)
-                        if isinstance(meta, dict):
-                            append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "breakeven", "from": prior_stop, "to": float(candidate_stop)})
-                    meta["adaptive_breakeven_armed"] = True
+                    if math.isfinite(candidate_stop):
+                        if candidate_stop < float(position.stop_price):
+                            prior_stop = float(position.stop_price)
+                            position.stop_price = float(candidate_stop)
+                            if isinstance(meta, dict):
+                                append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "breakeven", "from": prior_stop, "to": float(candidate_stop)})
+                        meta["adaptive_breakeven_armed"] = True
                 profit_lock_rr = _meta_float("adaptive_profit_lock_rr", None)
                 profit_lock_stop_rr = _meta_float("adaptive_profit_lock_stop_rr", None)
                 if profit_lock_rr is not None and profit_lock_stop_rr is not None and max_favorable_r >= profit_lock_rr:
                     candidate_stop = float(position.entry_price) - (float(profit_lock_stop_rr) * initial_risk)
-                    if candidate_stop < float(position.stop_price):
-                        prior_stop = float(position.stop_price)
-                        position.stop_price = float(candidate_stop)
-                        if isinstance(meta, dict):
-                            append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "profit_lock", "from": prior_stop, "to": float(candidate_stop)})
-                    meta["adaptive_profit_lock_armed"] = True
+                    if math.isfinite(candidate_stop):
+                        if candidate_stop < float(position.stop_price):
+                            prior_stop = float(position.stop_price)
+                            position.stop_price = float(candidate_stop)
+                            if isinstance(meta, dict):
+                                append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "profit_lock", "from": prior_stop, "to": float(candidate_stop)})
+                        meta["adaptive_profit_lock_armed"] = True
                 runner_enabled = adaptive_runner_extension_enabled and bool(meta.get("adaptive_runner_extend_enabled", False))
                 runner_trigger_rr = _meta_float("adaptive_runner_trigger_rr", None)
                 runner_target_rr = _meta_float("adaptive_runner_target_rr", None)

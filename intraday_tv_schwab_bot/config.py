@@ -24,7 +24,7 @@ from .chart_patterns import (
     chart_pattern_group_tokens,
     invalid_allowed_chart_patterns,
 )
-from .models import PairDefinition
+from .models import PairDefinition, StrategySchedule, Window
 from ._strategies.registry import (
     default_strategy_name,
     get_plugins,
@@ -33,7 +33,8 @@ from ._strategies.registry import (
     normalize_strategy_params as apply_strategy_param_normalizer,
     plugin_names,
 )
-from .utils import build_schedule, set_runtime_indicator_mode, set_session_indicator_window, set_runtime_timezone
+from .indicators import set_runtime_indicator_mode, set_session_indicator_window
+from .sessions import parse_hhmm
 
 LOG = logging.getLogger(__name__)
 
@@ -424,7 +425,6 @@ class RiskConfig:
 
 @dataclass(slots=True)
 class RuntimeConfig:
-    timezone: str = "America/New_York"
     loop_sleep_seconds: float = 2.0
     # --- Persistent-failure escalation (2026-09-18) ---
     # The main loop already backs off exponentially on errors and never gives
@@ -926,7 +926,7 @@ class TechnicalLevelsConfig:
     # ATR multiple a close must clear past a trendline to count as a break.
     # 0.65 (was 0.15, 2026-09-23): on large caps the old value never applied,
     # because a 0.10%-of-price floor always won; 0.65 reproduces that floor
-    # at the median on 1m bars. The ATR is atr_value = max(ATR14, 0.15% of
+    # at the median on 1m bars. The ATR is atr_with_floor = max(ATR14, 0.15% of
     # price), so the buffer scales with volatility only above that floor,
     # which decides ~70-80% of 1m large-cap bars. The 5m presets use 0.30.
     # The small-cap presets (small_cap_squeeze, microcap_*, and the $2-$20
@@ -1351,6 +1351,14 @@ class ZeroDteOptionsConfig:
     adaptive_width_max_scale: float = 1.5
 
 
+def build_schedule(entry: list[tuple[str, str]], manage: list[tuple[str, str]], screener: list[tuple[str, str]]) -> StrategySchedule:
+    return StrategySchedule(
+        entry_windows=[Window(parse_hhmm(a), parse_hhmm(b)) for a, b in entry],
+        management_windows=[Window(parse_hhmm(a), parse_hhmm(b)) for a, b in manage],
+        screener_windows=[Window(parse_hhmm(a), parse_hhmm(b)) for a, b in screener],
+    )
+
+
 @dataclass(slots=True)
 class StrategyConfig:
     name: str
@@ -1429,6 +1437,12 @@ _RETIRED_SECTION_KEYS: dict[str, dict[str, str]] = {
         "divergence_block_dual_counter": (
             "removed 2026-09-24; the dual RSI+OBV divergence veto is "
             "shared_entry.use_dual_divergence_veto alone"
+        ),
+    },
+    "runtime": {
+        "timezone": (
+            "removed 2026-09-26; the bot trades US sessions and every configured "
+            "time is America/New_York (sessions.EXCHANGE_TZ)"
         ),
     },
 }
@@ -1863,7 +1877,8 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     events_raw = dict(raw.get("events", {}) or {})
     shared_entry_raw = dict(raw.get("shared_entry", {}) or {})
     shared_exit_raw = dict(raw.get("shared_exit", {}) or {})
-    for section, section_raw in (("shared_entry", shared_entry_raw), ("technical_levels", technical_levels_raw)):
+    for section, section_raw in (("shared_entry", shared_entry_raw), ("technical_levels", technical_levels_raw),
+                                 ("runtime", runtime_raw)):
         _reject_retired_keys(config_path, section, section_raw, _RETIRED_SECTION_KEYS[section])
     options_raw = _normalize_options_config(raw.get("options", {}))
 
@@ -1899,7 +1914,6 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
 
     runtime_cfg = RuntimeConfig(**runtime_raw)
     _validate_runtime_config(runtime_cfg, config_path)
-    set_runtime_timezone(runtime_cfg.timezone)
     set_runtime_indicator_mode(runtime_cfg.use_rth_session_indicators)
     set_session_indicator_window(runtime_cfg.equity_session_indicator_window)
 

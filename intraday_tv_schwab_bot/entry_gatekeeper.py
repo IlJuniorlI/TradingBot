@@ -56,10 +56,11 @@ from .models import (
 from .options_mode import realized_max_loss_per_contract
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
-from .position_metrics import safe_float
+from .numeric import safe_float
 from .risk import RiskManager
 from ._strategies.strategy_base import BaseStrategy
-from .utils import TRADEFLOW_LEVEL, now_et
+from .log_setup import TRADEFLOW_LEVEL
+from . import sessions
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -118,10 +119,7 @@ class EntryGatekeeper:
         try:
             if frame is None or frame.empty or field not in frame.columns:
                 return default
-            value = frame.iloc[-1][field]
-            if value is None:
-                return default
-            return float(value)
+            return safe_float(frame.iloc[-1][field], default)
         except Exception:
             return default
 
@@ -137,7 +135,7 @@ class EntryGatekeeper:
     def _is_option_entry_retry_blocked(self, symbol: str, metadata: dict[str, Any] | None = None) -> bool:
         key = self._option_entry_retry_key(symbol, metadata)
         until = self._option_entry_retry_until.get(key)
-        current = now_et()
+        current = sessions.now_et()
         if until and current < until:
             return True
         if until and current >= until:
@@ -154,7 +152,7 @@ class EntryGatekeeper:
                 seconds = max(6.0, poll * 1.25)
             else:
                 seconds = max(10.0, poll * 2.0)
-        self._option_entry_retry_until[key] = now_et() + timedelta(seconds=max(1.0, float(seconds)))
+        self._option_entry_retry_until[key] = sessions.now_et() + timedelta(seconds=max(1.0, float(seconds)))
 
     def _clear_option_entry_retry_backoff(self, symbol: str, metadata: dict[str, Any] | None = None) -> None:
         key = self._option_entry_retry_key(symbol, metadata)
@@ -724,7 +722,7 @@ class EntryGatekeeper:
             side=signal.side,
             qty=int(qty),
             entry_price=float(entry_price),
-            entry_time=now_et(),
+            entry_time=sessions.now_et(),
             stop_price=float(stop_price),
             target_price=float(target_price) if target_price is not None else None,
             trail_pct=trail_pct,
@@ -835,7 +833,7 @@ class EntryGatekeeper:
             'skip_count': int(action_counts.get('skipped', 0)),
             'top_skip_reasons': {name: count for name, count in top_blockers},
             'skipped_symbols': skipped_symbols,
-            'updated_at': now_et().isoformat(),
+            'updated_at': sessions.now_et().isoformat(),
         }
         LOG.log(TRADEFLOW_LEVEL, 'Entry cycle summary strategy=%s candidates=%s actions=%s top_skips=%s', strategy_name, candidate_count, action_counts, summary['top_skip_reasons'] or 'none')
         self.audit.log_structured('ENTRY_CYCLE_SUMMARY', summary)
@@ -873,7 +871,7 @@ class EntryGatekeeper:
                 'reasons': list(cleaned),
                 'primary_reason': cleaned[0] if cleaned else None,
                 'secondary_reason': cleaned[1] if len(cleaned) > 1 else None,
-                'updated_at': now_et().isoformat(),
+                'updated_at': sessions.now_et().isoformat(),
             }
             if context_payload:
                 payload['context'] = context_payload
@@ -1113,7 +1111,7 @@ class EntryGatekeeper:
                     side=signal.side,
                     qty=qty_for_position,
                     entry_price=entry_price,
-                    entry_time=now_et(),
+                    entry_time=sessions.now_et(),
                     stop_price=stop_price,
                     target_price=target_price,
                     trail_pct=None,
@@ -1300,7 +1298,7 @@ class EntryGatekeeper:
                 side=signal.side,
                 qty=qty_for_position,
                 entry_price=entry_price,
-                entry_time=now_et(),
+                entry_time=sessions.now_et(),
                 stop_price=stop_price,
                 target_price=target_price,
                 trail_pct=self.stock_position_trail_pct(position_metadata),

@@ -34,7 +34,9 @@ from typing import TYPE_CHECKING, Any, Mapping
 import pandas as pd
 
 from ..models import ExitDecision, Position
-from ..utils import get_runtime_indicator_mode, now_et, session_bucket_ends
+from ..bars import session_bucket_ends
+from ..indicators import get_runtime_indicator_mode
+from .. import sessions
 from .helpers import CANDLE_PATTERN_WINDOW_BARS, _bars_have_range, _optional_float, _safe_float
 
 if TYPE_CHECKING:
@@ -261,7 +263,7 @@ class ExitTape:
 def bar_closed_after(label: Any, moment: Any, bar_minutes: int) -> bool:
     """Did the ``bar_minutes`` bar labelled ``label`` CLOSE after ``moment``?
 
-    Bars are labelled at their START (``utils.resample_bars``) and the
+    Bars are labelled at their START (``bars.resample_bars``) and the
     frames hold completed bars, so the entry never saw a bar that closed
     after its fill, even though that bar's label is earlier than the fill.
     Structure events, pivots and divergence pivots are judged against the
@@ -349,7 +351,7 @@ class SharedExitPolicy:
     @staticmethod
     def _hold_minutes(position: Position) -> float:
         try:
-            return max(0.0, (now_et() - position.entry_time).total_seconds() / 60.0)
+            return max(0.0, (sessions.now_et() - position.entry_time).total_seconds() / 60.0)
         except Exception:
             return 0.0
 

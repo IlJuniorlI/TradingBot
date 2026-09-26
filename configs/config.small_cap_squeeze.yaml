@@ -73,7 +73,6 @@ risk:
   peak_giveback_retain_3r_plus: 0.78
 
 runtime:
-  timezone: America/New_York
   loop_sleep_seconds: 2.0
   history_poll_seconds: 300
   quote_poll_seconds: 6

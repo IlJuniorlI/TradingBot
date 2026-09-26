@@ -7,8 +7,8 @@ const CHART_BADGE_IMAGES = IMAGE_ASSETS;
 // and all server-side bar timestamps are emitted as ET-localized
 // `pd.Timestamp.isoformat()`. Without forcing this, browsers in other
 // timezones would render bar labels in their local TZ, mislabeling the
-// market clock. If the bot ever supports non-US markets, plumb
-// `runtime.timezone` through `DASHBOARD_CONFIG` and read it here.
+// market clock. It matches the server's `sessions.EXCHANGE_TZ`; if that
+// ever changes, plumb it through `DASHBOARD_CONFIG` and read it here.
 const DASHBOARD_TIMEZONE = 'America/New_York';
 // Cached Intl.DateTimeFormat instances. Per-call `toLocaleString({timeZone:...})`
 // is significantly slower than reusing a pre-built formatter — each invocation

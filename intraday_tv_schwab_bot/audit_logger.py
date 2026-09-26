@@ -26,7 +26,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from .utils import TRADEFLOW_LEVEL
+from .log_setup import TRADEFLOW_LEVEL
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 

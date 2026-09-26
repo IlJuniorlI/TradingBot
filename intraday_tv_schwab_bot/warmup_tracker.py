@@ -39,7 +39,8 @@ from .data_feed import MarketDataStore
 from .models import Position
 from ._strategies import insufficient_bars_reason
 from ._strategies.strategy_base import BaseStrategy
-from .utils import equity_rth_open_at, is_regular_equity_session, is_weekday_session_day, now_et, previous_regular_close
+from .sessions import equity_rth_open_at, is_regular_equity_session, is_weekday_session_day, previous_regular_close
+from . import sessions
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -133,7 +134,7 @@ class WarmupTracker:
             if last_refresh is None:
                 should_fetch = True
             else:
-                age = (now_et() - last_refresh).total_seconds()
+                age = (sessions.now_et() - last_refresh).total_seconds()
                 should_fetch = age >= 10.0
         if context_refresh_active and not should_fetch:
             if streaming_active:
@@ -177,9 +178,9 @@ class WarmupTracker:
         try:
             if not ready and history_last is not None:
                 interval = float(self.config.runtime.history_poll_seconds)
-                if empty_last is not None and empty_last == history_last and not self.data.is_regular_session(now_et()):
+                if empty_last is not None and empty_last == history_last and not self.data.is_regular_session(sessions.now_et()):
                     interval = max(interval, 900.0)
-                retry_delay_seconds = max(0.0, interval - max(0.0, (now_et() - history_last).total_seconds()))
+                retry_delay_seconds = max(0.0, interval - max(0.0, (sessions.now_et() - history_last).total_seconds()))
                 next_retry_due = history_last + timedelta(seconds=max(interval, 0.0))
         except Exception:
             next_retry_due = None

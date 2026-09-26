@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .models import OrderIntent, Side
-from .position_metrics import safe_float
+from .numeric import safe_float, safe_int
 
 
 @dataclass(slots=True)
@@ -39,13 +39,6 @@ class OptionContract:
         return max(0.0, (self.ask - self.bid) / ref)
 
 
-def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
 def parse_option_chain(payload: dict[str, Any], only_dte: int | None = 0) -> list[OptionContract]:
     contracts: list[OptionContract] = []
     for root_key in ("callExpDateMap", "putExpDateMap"):
@@ -56,7 +49,7 @@ def parse_option_chain(payload: dict[str, Any], only_dte: int | None = 0) -> lis
                 dte = int(float(dte_txt))
             except Exception:
                 exp_date = str(exp_key)
-                dte = _safe_int(payload.get("daysToExpiration"), -1)
+                dte = safe_int(payload.get("daysToExpiration"), -1)
             if only_dte is not None and dte != only_dte:
                 continue
             for strike_key, entries in (strikes or {}).items():
@@ -73,8 +66,8 @@ def parse_option_chain(payload: dict[str, Any], only_dte: int | None = 0) -> lis
                             delta=(None if entry.get("delta") in (None, "NaN") else safe_float(entry.get("delta"))),
                             gamma=(None if entry.get("gamma") in (None, "NaN") else safe_float(entry.get("gamma"))),
                             theta=(None if entry.get("theta") in (None, "NaN") else safe_float(entry.get("theta"))),
-                            open_interest=_safe_int(entry.get("openInterest")),
-                            total_volume=_safe_int(entry.get("totalVolume") or entry.get("volume")),
+                            open_interest=safe_int(entry.get("openInterest"), 0),
+                            total_volume=safe_int(entry.get("totalVolume") or entry.get("volume"), 0),
                             days_to_expiration=dte,
                             in_the_money=bool(entry.get("inTheMoney", False)),
                         )
@@ -384,9 +377,9 @@ def contract_from_quote(symbol: str, quote: dict[str, Any] | None, fallback: dic
         delta=pick_greek("delta"),
         gamma=pick_greek("gamma"),
         theta=pick_greek("theta"),
-        open_interest=_safe_int(pick("open_interest", pick("openInterest", 0))),
-        total_volume=_safe_int(pick("total_volume", pick("totalVolume", pick("volume", 0)))),
-        days_to_expiration=_safe_int(pick("days_to_expiration", pick("daysToExpiration", 0))),
+        open_interest=safe_int(pick("open_interest", pick("openInterest", 0)), 0),
+        total_volume=safe_int(pick("total_volume", pick("totalVolume", pick("volume", 0))), 0),
+        days_to_expiration=safe_int(pick("days_to_expiration", pick("daysToExpiration", 0)), 0),
         in_the_money=bool(quote.get("in_the_money") if "in_the_money" in quote else (quote.get("inTheMoney") if "inTheMoney" in quote else fallback.get("in_the_money") or fallback.get("inTheMoney", False))),
     )
 

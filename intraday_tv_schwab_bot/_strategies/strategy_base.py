@@ -25,7 +25,7 @@ from ..order_blocks import (
 )
 from .shared_entry import SharedEntryPolicy
 from ..models import OPTION_ASSET_TYPES, ExitDecision
-from ..utils import frame_bar_minutes, session_bucket_ends
+from ..bars import frame_bar_minutes, session_bucket_ends
 from .shared import (
     Any,
     Candidate,
@@ -50,11 +50,11 @@ from .shared import (
     empty_market_structure_context,
     empty_support_resistance_context,
     empty_technical_levels_context,
-    now_et,
     pd,
     resample_bars,
     time,
 )
+from .. import sessions
 
 if TYPE_CHECKING:
     from ..config import BotConfig
@@ -632,7 +632,7 @@ class BaseStrategy:
         adjusted_minutes = max(0, cutoff_minutes - buffer)
         # On early-close days, clamp the flatten time so it fires before the
         # early close rather than hours after the market has already closed.
-        now_dt = now_et()
+        now_dt = sessions.now_et()
         state = equity_session_state(now_dt)
         if state.early_close:
             early_m = state.rth_close_time.hour * 60 + state.rth_close_time.minute - buffer
@@ -1496,7 +1496,7 @@ class BaseStrategy:
         # completed 1m bars never reads as forming. A tz-naive index is ET
         # wall time (session_bucket_bounds).
         last_end = session_bucket_ends(analysis_frame.index[-1:], bar_minutes)[0]
-        now = pd.Timestamp(now_et())
+        now = pd.Timestamp(sessions.now_et())
         if last_end.tzinfo is None:
             now = now.tz_localize(None)
         pct_tolerance = float(self._support_resistance_setting("pct_tolerance", 0.0030) or 0.0030)

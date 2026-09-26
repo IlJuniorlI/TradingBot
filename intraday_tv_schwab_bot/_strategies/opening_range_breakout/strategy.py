@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 import logging
 import math
-from zoneinfo import ZoneInfo
 
 from ..shared import (
     Candidate,
@@ -14,15 +13,14 @@ from ..shared import (
     _same_day_mask,
     _time_gte_mask,
     datetime,
-    now_et,
     pd,
     time,
     timedelta,
 )
+from ... import sessions
 from ..shared_entry import EntryContexts, EntryProposal, RetestTrigger
 from ..strategy_base import BaseStrategy
 
-_ET_ZONE = ZoneInfo("America/New_York")
 
 LOG = logging.getLogger(__name__)
 _VALID_ORB_WATCHLIST_MODES = {"none", "premarket", "early_session"}
@@ -82,13 +80,13 @@ class ORBStrategy(BaseStrategy):
             if frame is None or len(frame) < min_bars:
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)])
                 continue
-            day = now_et().date()
+            day = sessions.now_et().date()
             session = frame[_same_day_mask(frame, day)]
             if len(session) < opening_range_minutes + 2:
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("opening_range_incomplete", len(session), opening_range_minutes + 2)])
                 continue
             opening_start_time = time(9, 30)
-            after_start_time = (datetime.combine(day, opening_start_time, tzinfo=_ET_ZONE) + timedelta(minutes=max(0, opening_range_minutes))).time()
+            after_start_time = (datetime.combine(day, opening_start_time) + timedelta(minutes=max(0, opening_range_minutes))).time()
             times_series = session.index.to_series().map(lambda ts: ts.time())
             opening_mask = (times_series >= opening_start_time) & (times_series < after_start_time)
             opening = session[opening_mask.to_numpy()]

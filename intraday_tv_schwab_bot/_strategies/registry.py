@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from ..utils import parse_hhmm
+from ..sessions import parse_hhmm
 from .plugin_api import StrategyManifest
 from .shared_entry import VETO_GATES
 

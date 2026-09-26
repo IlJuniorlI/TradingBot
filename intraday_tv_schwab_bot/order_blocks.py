@@ -30,9 +30,10 @@ import logging
 import numpy as np
 import pandas as pd
 
-from .levels_shared import session_segment_ids
+from .sessions import session_segment_ids
 from .support_resistance import _pivot_points
-from .utils import ensure_ohlcv_frame, ensure_standard_indicator_frame, latest_atr14
+from .bars import ensure_ohlcv_frame
+from .indicators import atr_with_floor, ensure_standard_indicator_frame
 
 LOG = logging.getLogger(__name__)
 
@@ -578,9 +579,7 @@ def build_order_block_context(
         except Exception:
             current_price = 0.0
     ref_close = float(current_price or 0.0)
-    atr = latest_atr14(base)
-    if atr is None:
-        atr = max(ref_close * 0.0015, 0.01)
+    atr = atr_with_floor(base, ref_close, abs_floor=0.01)
     min_size = max(float(atr) * float(min_block_atr_mult), float(ref_close) * float(min_block_pct), 1e-8)
     min_thrust = max(float(atr) * float(min_thrust_atr_mult), 1e-8)
     eps = max(min_size * 0.05, ref_close * 1e-6, 1e-8)

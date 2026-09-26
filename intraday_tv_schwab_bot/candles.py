@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .numeric import safe_float
+
 try:
     import talib  # type: ignore
 except Exception:  # pragma: no cover - optional until pattern detection is used
@@ -221,18 +223,6 @@ def _normalize_allowed_patterns(allowed_patterns: Iterable[str] | None, bullish:
     return tuple(sorted(selected))
 
 
-def _safe_float_token(value: Any) -> float | None:
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-    try:
-        return float(value)
-    except Exception:
-        return None
-
-
 def _ohlc_frame_key(frame: pd.DataFrame | None, lookback: int = CANDLE_CONTEXT_BARS) -> tuple[tuple[float | None, float | None, float | None, float | None], ...]:
     if frame is None or frame.empty:
         return tuple()
@@ -249,10 +239,10 @@ def _ohlc_frame_key(frame: pd.DataFrame | None, lookback: int = CANDLE_CONTEXT_B
         open_, high_, low_, close_ = row
         out.append(
             (
-                _safe_float_token(open_),
-                _safe_float_token(high_),
-                _safe_float_token(low_),
-                _safe_float_token(close_),
+                safe_float(open_),
+                safe_float(high_),
+                safe_float(low_),
+                safe_float(close_),
             )
         )
     return tuple(out)
@@ -628,10 +618,10 @@ def detect_per_bar_candle_patterns(
         return {}
     frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...] = tuple(
         (
-            _safe_float_token(row[0]),
-            _safe_float_token(row[1]),
-            _safe_float_token(row[2]),
-            _safe_float_token(row[3]),
+            safe_float(row[0]),
+            safe_float(row[1]),
+            safe_float(row[2]),
+            safe_float(row[3]),
         )
         for row in subset.itertuples(index=False, name=None)
     )

@@ -10,23 +10,14 @@ import pandas as pd
 
 from ._strategies.registry import build_screener, normalize_strategy_name
 from .config import BotConfig
+from .log_setup import warn_once
 from .models import Candidate
-from .utils import classify_tradingview_market_session, now_et
+from .sessions import classify_tradingview_market_session
+from . import sessions
 
 LOG = logging.getLogger(__name__)
 
 __all__ = ["TradingViewScreenerClient"]
-
-# A misbehaving strategy callback fires once per candidate per cycle, so warn
-# once per process for each distinct cause instead of flooding the log.
-_WARNED: set[str] = set()
-
-
-def _warn_once(key: str) -> bool:
-    if key in _WARNED:
-        return False
-    _WARNED.add(key)
-    return True
 
 
 class TradingViewScreenerClient:
@@ -76,7 +67,7 @@ class TradingViewScreenerClient:
 
     def get_candidates(self, strategy: str) -> list[Candidate]:
         strategy = normalize_strategy_name(strategy)
-        now = now_et()
+        now = sessions.now_et()
         screener = self._build_screener(strategy)
         cached = self._cache.get(strategy)
         last = self._last_refresh.get(strategy)
@@ -138,7 +129,7 @@ class TradingViewScreenerClient:
 
     @classmethod
     def _active_market_session(cls, now: datetime | None = None) -> str:
-        ts = now or now_et()
+        ts = now or sessions.now_et()
         return classify_tradingview_market_session(ts)
 
     def _current_run_session(self) -> str | None:
@@ -387,7 +378,7 @@ class TradingViewScreenerClient:
             try:
                 directional_bias = directional_bias_fn(row) if directional_bias_fn else None
             except Exception:
-                if _warn_once(f"bias_fn:{strategy}"):
+                if warn_once(f"bias_fn:{strategy}"):
                     LOG.warning(
                         "directional_bias_fn raised for strategy %s; treating the "
                         "candidate as unbiased. Further occurrences are not logged.",
@@ -403,7 +394,7 @@ class TradingViewScreenerClient:
             try:
                 activity_score = float(activity_score_fn(row)) if activity_score_fn else 0.0
             except Exception:
-                if _warn_once(f"activity_fn:{strategy}"):
+                if warn_once(f"activity_fn:{strategy}"):
                     LOG.warning(
                         "activity_score_fn raised for strategy %s; falling back to "
                         "the screener's query order. Further occurrences are not logged.",

@@ -308,6 +308,8 @@ intraday_tv_schwab_bot/_strategies/my_new_strategy/
 
 Avoid `from ..shared import *`. Import only the names your plugin uses. Entries go through the shared entry stage (see the contract above); the strategy never constructs a `Signal` itself.
 
+Read the clock through its module: `from ... import sessions`, then `sessions.now_et()`. `_strategies/shared.py` does not re-export `now_et`, and a name bound with `from ... import now_et` would escape the tests' clock pin (`tests/support/clock.freeze_et`); `tests/test_module_layering.py` rejects it.
+
 
 ```python
 from ..shared import (

@@ -30,7 +30,7 @@
 #   * TA-Lib 0.8.0 requires TA-Lib C 0.8.1 — the cp311 win_amd64 wheel bundles
 #     it, so no separate native install was needed. Its behaviour changes
 #     (BBANDS default timeperiod 5 -> 20; APO/PPO default matype -> EMA) do
-#     not reach this codebase: both BBANDS call sites in utils.py pass
+#     not reach this codebase: both BBANDS call sites in indicators.py pass
 #     timeperiod/nbdevup/nbdevdn/matype explicitly, and APO/PPO are unused.
 #     The bot's whole TA-Lib surface is BBANDS, OBV, RSI, PLUS_DI, MINUS_DI,
 #     ATR, ADX, EMA, MA_Type. Indicator regression over 5 synthetic regimes x

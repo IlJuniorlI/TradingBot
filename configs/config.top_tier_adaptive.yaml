@@ -108,7 +108,6 @@ risk:
 
 # Runtime cadence, streaming, reconciliation, and logging controls.
 runtime:
-  timezone: America/New_York
   loop_sleep_seconds: 2.0
   history_poll_seconds: 300
   quote_poll_seconds: 6
@@ -395,8 +394,8 @@ technical_levels:
   # 2026-09-23: was 0.15, which never applied -- a 0.10%-of-price floor
   # always won. With the floor gone (CT-4) this ATR multiple IS the buffer;
   # 0.65 matches the old effective buffer at the median on 1m bars
-  # (0.10% of price / atr_value, archived RTH decisions: 0.667), so breaks
-  # fire where they did on a typical tape. The ATR is atr_value =
+  # (0.10% of price / atr_with_floor, archived RTH decisions: 0.667), so breaks
+  # fire where they did on a typical tape. The ATR is atr_with_floor =
   # max(ATR14, 0.15% of price), so the buffer scales with volatility only
   # once ATR14 passes 0.15% of price (on 1m large caps that floor decides
   # ~70-80% of bars, giving 0.0975% of price at 0.65).

@@ -38,7 +38,6 @@ from ..shared import (
     net_credit_dollars,
     net_price_frac_of_width,
     net_debit_dollars,
-    now_et,
     parse_hhmm,
     parse_option_chain,
     pd,
@@ -49,6 +48,7 @@ from ..shared import (
     vertical_limit_price,
     vertical_price_bounds,
 )
+from ... import sessions
 from ..shared_entry import AdmittedEntry, EntryContexts, EntryProposal
 from ...schwab_api import SchwabHTTPError, call_schwab_json
 from ..strategy_base import BaseStrategy
@@ -108,7 +108,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
 
     @staticmethod
     def _option_chain_cache_key(symbol: str) -> tuple[str, str]:
-        return str(symbol).upper().strip(), now_et().date().isoformat()
+        return str(symbol).upper().strip(), sessions.now_et().date().isoformat()
 
     def _get_cached_option_chain(self, symbol: str) -> list[OptionContract] | None:
         ttl = max(0, int(self.optcfg.option_chain_cache_seconds))
@@ -119,7 +119,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         if cached is None:
             return None
         fetched_at, contracts = cached
-        if (now_et() - fetched_at).total_seconds() > ttl:
+        if (sessions.now_et() - fetched_at).total_seconds() > ttl:
             self._option_chain_cache.pop(key, None)
             return None
         return list(contracts)
@@ -129,7 +129,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         failed_at = self._option_chain_read_failed_at.get(str(symbol).upper().strip())
         if ttl <= 0 or failed_at is None:
             return False
-        return (now_et() - failed_at).total_seconds() <= ttl
+        return (sessions.now_et() - failed_at).total_seconds() <= ttl
 
     def _set_cached_option_chain(self, symbol: str, contracts: list[OptionContract]) -> None:
         ttl = max(0, int(self.optcfg.option_chain_cache_seconds))
@@ -138,7 +138,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         key = self._option_chain_cache_key(symbol)
         if key in self._option_chain_cache:
             self._option_chain_cache.pop(key, None)
-        self._option_chain_cache[key] = (now_et(), list(contracts))
+        self._option_chain_cache[key] = (sessions.now_et(), list(contracts))
         max_entries = max(1, int(self.optcfg.option_chain_cache_max_entries))
         while len(self._option_chain_cache) > max_entries:
             oldest = next(iter(self._option_chain_cache))
@@ -165,7 +165,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         stop multipliers as theta decay accelerates through the 0DTE session."""
         if not getattr(self.optcfg, "debit_target_time_decay_enabled", False):
             return 1.0
-        now_t = now_et().time()
+        now_t = sessions.now_et().time()
         start = parse_hhmm(getattr(self.optcfg, "debit_target_time_decay_start", "10:30"))
         end = parse_hhmm(getattr(self.optcfg, "debit_target_time_decay_end", "14:00"))
         min_scale = max(0.10, float(getattr(self.optcfg, "debit_target_time_decay_min_scale", 0.70)))
@@ -184,7 +184,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         exposure on 0DTE contracts. NOT applied to credit short deltas."""
         if not getattr(self.optcfg, "delta_time_shift_enabled", False):
             return base_delta
-        now_t = now_et().time()
+        now_t = sessions.now_et().time()
         shift_start = parse_hhmm(getattr(self.optcfg, "delta_time_shift_start", "10:00"))
         if now_t <= shift_start:
             return base_delta
@@ -432,7 +432,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             p = self.params
             vwap_thresh = float(p.get("trend_vwap_distance_pct", 0.0016))
             ema_thresh = float(p.get("trend_ema_gap_pct", 0.00075))
-            session_day = now_et().date()
+            session_day = sessions.now_et().date()
             u_open = _session_open_price(frame, session_day, regular_session_only=True)
             if u_open is None:
                 u_open = _session_open_price(frame, session_day, regular_session_only=False)
@@ -477,7 +477,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         if frame is None or frame.empty:
             return None
         try:
-            session_day = now_et().date()
+            session_day = sessions.now_et().date()
             u_open = _session_open_price(frame, session_day, regular_session_only=True)
             if u_open is None:
                 u_open = _session_open_price(frame, session_day, regular_session_only=False)
@@ -517,7 +517,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         u_ema_gap = (u_ema9 - u_ema20) / max(u_close, 1.0)
         u_ret5 = _safe_float(last_u["ret5"], 0.0)
         u_ret15 = _safe_float(last_u["ret15"], 0.0)
-        session_day = now_et().date()
+        session_day = sessions.now_et().date()
         u_open = _session_open_price(u, session_day, regular_session_only=True)
         if u_open is None:
             u_open = _session_open_price(u, session_day, regular_session_only=False)
@@ -974,7 +974,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return cached
         if self._option_chain_read_failed_recently(symbol):
             return None
-        today = now_et().date()
+        today = sessions.now_et().date()
         # strikeCount=24 (was 12) — for 0DTE credit spreads the short leg
         # sits at ~0.20-0.30 delta (3-5 strikes OTM) and the hedge then
         # needs another 2-3 strikes further OTM. The previous 12-strike
@@ -995,7 +995,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             )
         except SchwabHTTPError as exc:
             LOG.warning("Option chain read failed for %s: %s", symbol, exc)
-            self._option_chain_read_failed_at[str(symbol).upper().strip()] = now_et()
+            self._option_chain_read_failed_at[str(symbol).upper().strip()] = sessions.now_et()
             return None
         self._option_chain_read_failed_at.pop(str(symbol).upper().strip(), None)
         contracts = parse_option_chain(payload, only_dte=0)
@@ -1661,7 +1661,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         # ATR caches for credit distance gate + adaptive width
         self._underlying_atr_cache.clear()
         self._underlying_ref_atr_cache.clear()
-        now_dt = now_et()
+        now_dt = sessions.now_et()
         blackout_reason = self._option_entry_block_reason(now_dt)
         if blackout_reason:
             for c in candidates:
@@ -1711,7 +1711,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             if "atr14" in frame.columns:
                 atr_series = frame["atr14"].dropna().tail(20)
                 self._underlying_ref_atr_cache[c.symbol] = float(atr_series.median()) if len(atr_series) >= 5 else 0.0
-            opening = frame[_same_day_mask(frame, now_et().date())].between_time("09:30", "09:34")
+            opening = frame[_same_day_mask(frame, sessions.now_et().date())].between_time("09:30", "09:34")
             regime_name = str(regime.get("regime") or "unknown")
             bullish = regime_name == "bullish_trend"
             bearish = regime_name == "bearish_trend"
@@ -1820,9 +1820,9 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         return out
 
     def should_force_flatten(self, position: Position) -> bool:
-        if self._event_calendar.force_flatten_event(now_dt=now_et()) is not None:
+        if self._event_calendar.force_flatten_event(now_dt=sessions.now_et()) is not None:
             return True
-        now_dt = now_et()
+        now_dt = sessions.now_et()
         flat_time = self.force_flat_time
         # On early-close days (Jul 3, Black Friday, Christmas Eve) the market
         # closes at 1:00 PM ET.  If the configured force_flatten_time is at or

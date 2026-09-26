@@ -29,21 +29,10 @@ import logging
 from collections.abc import Mapping
 from typing import Any, Iterable, cast
 
-from ..position_metrics import safe_float
+from ..log_setup import warn_once
+from ..numeric import safe_float
 
 LOG = logging.getLogger(__name__)
-
-# Misconfiguration warnings fire from a per-symbol hot path, so emit each
-# distinct one once per process instead of once per symbol per cycle.
-_WARNED: set[str] = set()
-
-
-def _warn_once(key: str) -> bool:
-    if key in _WARNED:
-        return False
-    _WARNED.add(key)
-    return True
-
 
 DEFAULT_BENCHMARK_RVOL_SYMBOLS: tuple[str, ...] = (
     "SPY",
@@ -255,7 +244,7 @@ def effective_relative_volume(
         # cap alone applies and the value discriminates again up to the
         # ceiling. The cap is the deliberate ceiling; the floor is a
         # don't-score-too-low nicety, so the floor is the one to yield.
-        if _warn_once(f"floor_gt_cap:{profile}"):
+        if warn_once(f"floor_gt_cap:{profile}"):
             LOG.warning(
                 "rvol_score_floor for profile '%s' (%.2f) exceeds rvol_score_cap "
                 "(%.2f). Ignoring the floor — as configured the volume term would "

@@ -42,17 +42,12 @@ from .chart_patterns import analyze_chart_pattern_context
 from .config import DashboardChartConfig, DashboardChartingConfig, flip_confirmation_bars, htf_structure_event_lookback
 from .htf_levels import summarize_htf_trend
 from .models import Side
+from .numeric import safe_float
 from .support_resistance import analyze_market_structure, zone_flip_confirmed
 from .technical_levels import build_technical_levels_context
-from .utils import (
-    ensure_standard_indicator_frame,
-    equity_stream_window_bars,
-    now_et,
-    resample_bars,
-    htf_ema_spans,
-    ltf_ema_spans,
-    session_bucket_ends,
-)
+from .bars import equity_stream_window_bars, resample_bars, session_bucket_ends
+from .indicators import ensure_standard_indicator_frame, htf_ema_spans, ltf_ema_spans
+from . import sessions
 from ._sr_ladder import _collapse_price_ladder, _sr_effective_side_tolerance
 
 if TYPE_CHECKING:
@@ -215,16 +210,6 @@ def dashboard_fvg_anchor_abs_index(frame: pd.DataFrame | None, first_seen: Any) 
         return None
 
 
-def dashboard_safe_float(value: Any) -> float | None:
-    try:
-        if value is None:
-            return None
-        out = float(value)
-        return out if out == out else None
-    except Exception:
-        return None
-
-
 def dashboard_cache_json_signature(value: Any) -> str:
     try:
         return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"), ensure_ascii=False)
@@ -253,10 +238,10 @@ def dashboard_frame_signature(frame: pd.DataFrame | None) -> tuple[Any, ...]:
             int(len(frame)),
             _ts(first_idx),
             _ts(last_idx),
-            dashboard_safe_float(last_row.get("close")) if hasattr(last_row, "get") else None,
-            dashboard_safe_float(last_row.get("high")) if hasattr(last_row, "get") else None,
-            dashboard_safe_float(last_row.get("low")) if hasattr(last_row, "get") else None,
-            dashboard_safe_float(last_row.get("volume")) if hasattr(last_row, "get") else None,
+            safe_float(last_row.get("close")) if hasattr(last_row, "get") else None,
+            safe_float(last_row.get("high")) if hasattr(last_row, "get") else None,
+            safe_float(last_row.get("low")) if hasattr(last_row, "get") else None,
+            safe_float(last_row.get("volume")) if hasattr(last_row, "get") else None,
         )
     except Exception:
         return int(len(frame)), None, None, None, None, None, None
@@ -281,7 +266,7 @@ def dashboard_recent_trade_markers(account: Any, symbol: str) -> list[dict[str, 
     key = str(symbol or "").upper().strip()
     if not key:
         return out
-    today = now_et().date()
+    today = sessions.now_et().date()
     for trade in list(getattr(account, "trades", [])):
         if str(getattr(trade, "symbol", "") or "").upper().strip() != key:
             continue
@@ -302,12 +287,12 @@ def dashboard_recent_trade_markers(account: Any, symbol: str) -> list[dict[str, 
                 "symbol": key,
                 "side": str(getattr(trade, "side", "") or ""),
                 "qty": int(getattr(trade, "qty", 0) or 0),
-                "entry_price": dashboard_safe_float(getattr(trade, "entry_price", None)),
-                "exit_price": dashboard_safe_float(getattr(trade, "exit_price", None)),
+                "entry_price": safe_float(getattr(trade, "entry_price", None)),
+                "exit_price": safe_float(getattr(trade, "exit_price", None)),
                 "entry_time": entry_time.isoformat() if entry_time is not None else None,
                 "exit_time": exit_time.isoformat() if exit_time is not None else None,
-                "realized_pnl": dashboard_safe_float(getattr(trade, "realized_pnl", None)),
-                "return_pct": dashboard_safe_float(getattr(trade, "return_pct", None)),
+                "realized_pnl": safe_float(getattr(trade, "realized_pnl", None)),
+                "return_pct": safe_float(getattr(trade, "return_pct", None)),
                 "reason": str(getattr(trade, "reason", "") or ""),
             })
         except Exception:
@@ -380,12 +365,12 @@ def dashboard_bars_from_frame(
     tail_offset = max(0, len(frame) - len(tail))
     per_bar_candles = per_bar_candles or {}
     for rel_idx, (idx, row) in enumerate(tail.iterrows()):
-        close_val = dashboard_safe_float(row.get("close"))
-        atr14 = dashboard_safe_float(row.get("atr14"))
-        plus_di = dashboard_safe_float(row.get("plus_di14"))
-        minus_di = dashboard_safe_float(row.get("minus_di14"))
-        obv = dashboard_safe_float(row.get("obv"))
-        obv_ema = dashboard_safe_float(row.get("obv_ema20"))
+        close_val = safe_float(row.get("close"))
+        atr14 = safe_float(row.get("atr14"))
+        plus_di = safe_float(row.get("plus_di14"))
+        minus_di = safe_float(row.get("minus_di14"))
+        obv = safe_float(row.get("obv"))
+        obv_ema = safe_float(row.get("obv_ema20"))
         # DMI bias: bullish if +DI > -DI, bearish if -DI > +DI, else neutral.
         # None when either reading is unavailable (warmup bars).
         if plus_di is not None and minus_di is not None:
@@ -416,26 +401,26 @@ def dashboard_bars_from_frame(
             # True only on a chart's still-forming last bucket, which
             # chart_payload marks; every bar built here is complete.
             "in_progress": False,
-            "open": dashboard_safe_float(row.get("open")),
-            "high": dashboard_safe_float(row.get("high")),
-            "low": dashboard_safe_float(row.get("low")),
+            "open": safe_float(row.get("open")),
+            "high": safe_float(row.get("high")),
+            "low": safe_float(row.get("low")),
             "close": close_val,
-            "volume": dashboard_safe_float(row.get("volume")),
-            "ema9": dashboard_safe_float(row.get("ema9")),
-            "ema20": dashboard_safe_float(row.get("ema20")),
-            "vwap": dashboard_safe_float(row.get("vwap")),
+            "volume": safe_float(row.get("volume")),
+            "ema9": safe_float(row.get("ema9")),
+            "ema20": safe_float(row.get("ema20")),
+            "vwap": safe_float(row.get("vwap")),
             "atr14": atr14,
             "atr_pct": (atr14 / close_val) if atr14 is not None and close_val not in (None, 0.0) else None,
-            "ret1": dashboard_safe_float(row.get("ret1")),
-            "ret5": dashboard_safe_float(row.get("ret5")),
-            "ret15": dashboard_safe_float(row.get("ret15")),
-            "bb_mid": dashboard_safe_float(row.get("bb_mid")),
-            "bb_upper": dashboard_safe_float(row.get("bb_upper")),
-            "bb_lower": dashboard_safe_float(row.get("bb_lower")),
-            "bb_width_pct": dashboard_safe_float(row.get("bb_width_pct")),
-            "bb_percent_b": dashboard_safe_float(row.get("bb_percent_b")),
-            "bb_zscore": dashboard_safe_float(row.get("bb_zscore")),
-            "adx": dashboard_safe_float(row.get("adx14")),
+            "ret1": safe_float(row.get("ret1")),
+            "ret5": safe_float(row.get("ret5")),
+            "ret15": safe_float(row.get("ret15")),
+            "bb_mid": safe_float(row.get("bb_mid")),
+            "bb_upper": safe_float(row.get("bb_upper")),
+            "bb_lower": safe_float(row.get("bb_lower")),
+            "bb_width_pct": safe_float(row.get("bb_width_pct")),
+            "bb_percent_b": safe_float(row.get("bb_percent_b")),
+            "bb_zscore": safe_float(row.get("bb_zscore")),
+            "adx": safe_float(row.get("adx14")),
             "plus_di": plus_di,
             "minus_di": minus_di,
             "dmi_bias": dmi_bias,
@@ -737,8 +722,8 @@ class DashboardCache:
                                           span_scale=scale, ema_spans=spans)
             emas = scaled[["ema9", "ema20"]].reindex(frame.index[-len(bars):])
             for bar, fast, slow in zip(bars, emas["ema9"], emas["ema20"]):
-                bar["ema9"] = dashboard_safe_float(fast)
-                bar["ema20"] = dashboard_safe_float(slow)
+                bar["ema9"] = safe_float(fast)
+                bar["ema20"] = safe_float(slow)
         return spans
 
     def htf_trend(self, symbol: str, *, allow_refresh: bool = True) -> dict[str, Any]:
@@ -899,40 +884,40 @@ class DashboardCache:
                         session_volume_numeric_values = pd.to_numeric(session_volume_series, errors="coerce")
                         session_volume_numeric = pd.Series(session_volume_numeric_values, copy=False)
                         session_volume = session_volume_numeric.fillna(0.0).sum()
-                        session_total_volume = dashboard_safe_float(session_volume)
+                        session_total_volume = safe_float(session_volume)
             except Exception:
                 session_total_volume = None
 
-        quote_last = dashboard_safe_float(quote.get("last")) if quote_is_fresh else None
-        quote_bid = dashboard_safe_float(quote.get("bid")) if quote_is_fresh else None
-        quote_ask = dashboard_safe_float(quote.get("ask")) if quote_is_fresh else None
-        quote_mark = dashboard_safe_float(quote.get("mark")) if quote_is_fresh else None
-        quote_mid = dashboard_safe_float(quote.get("mid")) if quote_is_fresh else None
-        quote_open = dashboard_safe_float(quote.get("open"))
-        quote_close = dashboard_safe_float(quote.get("close"))
-        quote_total_volume = dashboard_safe_float(quote.get("total_volume")) if quote_is_fresh else None
-        # data_feed._build_quote_dict assigns percent_change / net_change via
-        # _first_optional_float which yields None (not 0.0) when both Schwab
-        # fields are absent, so a 0.0 here is always a real flat-session
-        # reading rather than a sentinel.
-        cached_percent_change = dashboard_safe_float(quote.get("percent_change"))
-        cached_net_change = dashboard_safe_float(quote.get("net_change"))
-        candidate_percent_change = dashboard_safe_float((candidate_row or {}).get("change_from_open"))
-        candidate_close = dashboard_safe_float((candidate_row or {}).get("close"))
-        regular_session_active = self.data.is_regular_session(now_et())
+        quote_last = safe_float(quote.get("last")) if quote_is_fresh else None
+        quote_bid = safe_float(quote.get("bid")) if quote_is_fresh else None
+        quote_ask = safe_float(quote.get("ask")) if quote_is_fresh else None
+        quote_mark = safe_float(quote.get("mark")) if quote_is_fresh else None
+        quote_mid = safe_float(quote.get("mid")) if quote_is_fresh else None
+        quote_open = safe_float(quote.get("open"))
+        quote_close = safe_float(quote.get("close"))
+        quote_total_volume = safe_float(quote.get("total_volume")) if quote_is_fresh else None
+        # data_feed._normalize_quote reads percent_change / net_change with
+        # numeric.first_float, which yields None (not 0.0) when both Schwab
+        # fields are absent or NaN, so a 0.0 here is always a real
+        # flat-session reading rather than a sentinel.
+        cached_percent_change = safe_float(quote.get("percent_change"))
+        cached_net_change = safe_float(quote.get("net_change"))
+        candidate_percent_change = safe_float((candidate_row or {}).get("change_from_open"))
+        candidate_close = safe_float((candidate_row or {}).get("close"))
+        regular_session_active = self.data.is_regular_session(sessions.now_et())
         display_total_volume = quote_total_volume
         if display_total_volume is None:
             display_total_volume = session_total_volume
         last_price = quote_last
         if last_price is None:
-            last_price = dashboard_safe_float(latest_bar.get("close"))
+            last_price = safe_float(latest_bar.get("close"))
         display_close = quote_close
         if not regular_session_active and candidate_close is not None:
             display_close = candidate_close
         if display_close is None and candidate_close is not None:
             display_close = candidate_close
         if display_close is None and len(bars) >= 2:
-            display_close = dashboard_safe_float(bars[-2].get("close"))
+            display_close = safe_float(bars[-2].get("close"))
         session_reference_close = quote_close
         if not regular_session_active and candidate_percent_change is not None:
             percent_change = candidate_percent_change
@@ -950,28 +935,28 @@ class DashboardCache:
 
         current_price = last_price
         if current_price is None:
-            current_price = dashboard_safe_float((sr_row or {}).get("price"))
+            current_price = safe_float((sr_row or {}).get("price"))
         if current_price is None:
-            current_price = dashboard_safe_float(latest_bar.get("close"))
+            current_price = safe_float(latest_bar.get("close"))
 
         support_prices: list[float] = []
         resistance_prices: list[float] = []
         next_support = None
         next_resistance = None
-        ladder_min_gap = dashboard_safe_float((sr_row or {}).get("side_tolerance")) or _sr_effective_side_tolerance(self.config, current_price)
+        ladder_min_gap = safe_float((sr_row or {}).get("side_tolerance")) or _sr_effective_side_tolerance(self.config, current_price)
         technical_payload: dict[str, Any] = {}
         nearest_support = None
         nearest_resistance = None
         if sr_row:
-            nearest_support = dashboard_safe_float(sr_row.get("nearest_support"))
-            nearest_resistance = dashboard_safe_float(sr_row.get("nearest_resistance"))
+            nearest_support = safe_float(sr_row.get("nearest_support"))
+            nearest_resistance = safe_float(sr_row.get("nearest_resistance"))
 
             support_prices = sorted(
-                [float(v) for v in (sr_row.get("supports") or []) if dashboard_safe_float(v) not in (None, 0.0)],
+                [float(v) for v in (sr_row.get("supports") or []) if safe_float(v) not in (None, 0.0)],
                 reverse=True,
             )
             resistance_prices = sorted(
-                [float(v) for v in (sr_row.get("resistances") or []) if dashboard_safe_float(v) not in (None, 0.0)]
+                [float(v) for v in (sr_row.get("resistances") or []) if safe_float(v) not in (None, 0.0)]
             )
 
             if nearest_support is not None:
@@ -1077,36 +1062,36 @@ class DashboardCache:
             if tech_ctx is not None:
                 technical_payload = {
                     "fib_direction": str(getattr(tech_ctx, "fib_direction", "neutral") or "neutral"),
-                    "fib_bullish_1272": dashboard_safe_float(getattr(tech_ctx, "fib_bullish_1272", None)),
-                    "fib_bullish_1618": dashboard_safe_float(getattr(tech_ctx, "fib_bullish_1618", None)),
-                    "fib_bearish_1272": dashboard_safe_float(getattr(tech_ctx, "fib_bearish_1272", None)),
-                    "fib_bearish_1618": dashboard_safe_float(getattr(tech_ctx, "fib_bearish_1618", None)),
-                    "fib_bullish_382": dashboard_safe_float(getattr(tech_ctx, "fib_bullish_382", None)),
-                    "fib_bullish_500": dashboard_safe_float(getattr(tech_ctx, "fib_bullish_500", None)),
-                    "fib_bullish_618": dashboard_safe_float(getattr(tech_ctx, "fib_bullish_618", None)),
-                    "fib_bullish_786": dashboard_safe_float(getattr(tech_ctx, "fib_bullish_786", None)),
-                    "fib_bearish_382": dashboard_safe_float(getattr(tech_ctx, "fib_bearish_382", None)),
-                    "fib_bearish_500": dashboard_safe_float(getattr(tech_ctx, "fib_bearish_500", None)),
-                    "fib_bearish_618": dashboard_safe_float(getattr(tech_ctx, "fib_bearish_618", None)),
-                    "fib_bearish_786": dashboard_safe_float(getattr(tech_ctx, "fib_bearish_786", None)),
-                    "anchored_vwap_open": dashboard_safe_float(getattr(tech_ctx, "anchored_vwap_open", None)),
-                    "anchored_vwap_bullish_impulse": dashboard_safe_float(getattr(tech_ctx, "anchored_vwap_bullish_impulse", None)),
-                    "anchored_vwap_bearish_impulse": dashboard_safe_float(getattr(tech_ctx, "anchored_vwap_bearish_impulse", None)),
+                    "fib_bullish_1272": safe_float(getattr(tech_ctx, "fib_bullish_1272", None)),
+                    "fib_bullish_1618": safe_float(getattr(tech_ctx, "fib_bullish_1618", None)),
+                    "fib_bearish_1272": safe_float(getattr(tech_ctx, "fib_bearish_1272", None)),
+                    "fib_bearish_1618": safe_float(getattr(tech_ctx, "fib_bearish_1618", None)),
+                    "fib_bullish_382": safe_float(getattr(tech_ctx, "fib_bullish_382", None)),
+                    "fib_bullish_500": safe_float(getattr(tech_ctx, "fib_bullish_500", None)),
+                    "fib_bullish_618": safe_float(getattr(tech_ctx, "fib_bullish_618", None)),
+                    "fib_bullish_786": safe_float(getattr(tech_ctx, "fib_bullish_786", None)),
+                    "fib_bearish_382": safe_float(getattr(tech_ctx, "fib_bearish_382", None)),
+                    "fib_bearish_500": safe_float(getattr(tech_ctx, "fib_bearish_500", None)),
+                    "fib_bearish_618": safe_float(getattr(tech_ctx, "fib_bearish_618", None)),
+                    "fib_bearish_786": safe_float(getattr(tech_ctx, "fib_bearish_786", None)),
+                    "anchored_vwap_open": safe_float(getattr(tech_ctx, "anchored_vwap_open", None)),
+                    "anchored_vwap_bullish_impulse": safe_float(getattr(tech_ctx, "anchored_vwap_bullish_impulse", None)),
+                    "anchored_vwap_bearish_impulse": safe_float(getattr(tech_ctx, "anchored_vwap_bearish_impulse", None)),
                     "anchored_vwap_bias": str(getattr(tech_ctx, "anchored_vwap_bias", "neutral") or "neutral"),
-                    "adx": dashboard_safe_float(getattr(tech_ctx, "adx", None)),
-                    "plus_di": dashboard_safe_float(getattr(tech_ctx, "plus_di", None)),
-                    "minus_di": dashboard_safe_float(getattr(tech_ctx, "minus_di", None)),
+                    "adx": safe_float(getattr(tech_ctx, "adx", None)),
+                    "plus_di": safe_float(getattr(tech_ctx, "plus_di", None)),
+                    "minus_di": safe_float(getattr(tech_ctx, "minus_di", None)),
                     "dmi_bias": str(getattr(tech_ctx, "dmi_bias", "neutral") or "neutral"),
                     "adx_rising": bool(getattr(tech_ctx, "adx_rising", False)),
-                    "atr14": dashboard_safe_float(getattr(tech_ctx, "atr14", None)),
-                    "atr_pct": dashboard_safe_float(getattr(tech_ctx, "atr_pct", None)),
-                    "atr_expansion_mult": dashboard_safe_float(getattr(tech_ctx, "atr_expansion_mult", None)),
-                    "atr_stretch_vwap_mult": dashboard_safe_float(getattr(tech_ctx, "atr_stretch_vwap_mult", None)),
-                    "atr_stretch_ema20_mult": dashboard_safe_float(getattr(tech_ctx, "atr_stretch_ema20_mult", None)),
-                    "obv": dashboard_safe_float(getattr(tech_ctx, "obv", None)),
-                    "obv_ema": dashboard_safe_float(getattr(tech_ctx, "obv_ema", None)),
+                    "atr14": safe_float(getattr(tech_ctx, "atr14", None)),
+                    "atr_pct": safe_float(getattr(tech_ctx, "atr_pct", None)),
+                    "atr_expansion_mult": safe_float(getattr(tech_ctx, "atr_expansion_mult", None)),
+                    "atr_stretch_vwap_mult": safe_float(getattr(tech_ctx, "atr_stretch_vwap_mult", None)),
+                    "atr_stretch_ema20_mult": safe_float(getattr(tech_ctx, "atr_stretch_ema20_mult", None)),
+                    "obv": safe_float(getattr(tech_ctx, "obv", None)),
+                    "obv_ema": safe_float(getattr(tech_ctx, "obv_ema", None)),
                     "obv_bias": str(getattr(tech_ctx, "obv_bias", "neutral") or "neutral"),
-                    "rsi14": dashboard_safe_float(getattr(tech_ctx, "rsi14", None)),
+                    "rsi14": safe_float(getattr(tech_ctx, "rsi14", None)),
                     "bullish_rsi_divergence": getattr(tech_ctx, "bullish_rsi_divergence", None) is not None,
                     "bearish_rsi_divergence": getattr(tech_ctx, "bearish_rsi_divergence", None) is not None,
                     "bullish_obv_divergence": getattr(tech_ctx, "bullish_obv_divergence", None) is not None,
@@ -1116,22 +1101,22 @@ class DashboardCache:
                     "bullish_hidden_obv_divergence": getattr(tech_ctx, "bullish_hidden_obv_divergence", None) is not None,
                     "bearish_hidden_obv_divergence": getattr(tech_ctx, "bearish_hidden_obv_divergence", None) is not None,
                     "counter_divergence_bias": str(getattr(tech_ctx, "counter_divergence_bias", "neutral") or "neutral"),
-                    "bollinger_mid": dashboard_safe_float(getattr(tech_ctx, "bollinger_mid", None)),
-                    "bollinger_upper": dashboard_safe_float(getattr(tech_ctx, "bollinger_upper", None)),
-                    "bollinger_lower": dashboard_safe_float(getattr(tech_ctx, "bollinger_lower", None)),
-                    "bollinger_width_pct": dashboard_safe_float(getattr(tech_ctx, "bollinger_width_pct", None)),
-                    "bollinger_percent_b": dashboard_safe_float(getattr(tech_ctx, "bollinger_percent_b", None)),
-                    "bollinger_zscore": dashboard_safe_float(getattr(tech_ctx, "bollinger_zscore", None)),
+                    "bollinger_mid": safe_float(getattr(tech_ctx, "bollinger_mid", None)),
+                    "bollinger_upper": safe_float(getattr(tech_ctx, "bollinger_upper", None)),
+                    "bollinger_lower": safe_float(getattr(tech_ctx, "bollinger_lower", None)),
+                    "bollinger_width_pct": safe_float(getattr(tech_ctx, "bollinger_width_pct", None)),
+                    "bollinger_percent_b": safe_float(getattr(tech_ctx, "bollinger_percent_b", None)),
+                    "bollinger_zscore": safe_float(getattr(tech_ctx, "bollinger_zscore", None)),
                     "bollinger_squeeze": bool(getattr(tech_ctx, "bollinger_squeeze", False)),
                     "bollinger_upper_reject": bool(getattr(tech_ctx, "bollinger_upper_reject", False)),
                     "bollinger_lower_reject": bool(getattr(tech_ctx, "bollinger_lower_reject", False)),
                     "channel": {
                         "valid": bool(getattr(getattr(tech_ctx, "channel", None), "valid", False)),
                         "bias": str(getattr(getattr(tech_ctx, "channel", None), "bias", "neutral") or "neutral"),
-                        "lower": dashboard_safe_float(getattr(getattr(tech_ctx, "channel", None), "lower", None)),
-                        "upper": dashboard_safe_float(getattr(getattr(tech_ctx, "channel", None), "upper", None)),
-                        "mid": dashboard_safe_float(getattr(getattr(tech_ctx, "channel", None), "mid", None)),
-                        "position_pct": dashboard_safe_float(getattr(getattr(tech_ctx, "channel", None), "position_pct", None)),
+                        "lower": safe_float(getattr(getattr(tech_ctx, "channel", None), "lower", None)),
+                        "upper": safe_float(getattr(getattr(tech_ctx, "channel", None), "upper", None)),
+                        "mid": safe_float(getattr(getattr(tech_ctx, "channel", None), "mid", None)),
+                        "position_pct": safe_float(getattr(getattr(tech_ctx, "channel", None), "position_pct", None)),
                         "lower_line": dashboard_technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "lower_line", None)),
                         "upper_line": dashboard_technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "upper_line", None)),
                         "mid_line": dashboard_technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "mid_line", None)),
@@ -1151,22 +1136,22 @@ class DashboardCache:
             "asset_type": asset_type or None,
             "show_underlying_lines": allows_underlying_markers,
             "side": (position_row or {}).get("side"),
-            "entry": dashboard_safe_float((position_row or {}).get("entry_price")) if allows_underlying_markers else None,
-            "stop": dashboard_safe_float((position_row or {}).get("stop_price")) if allows_underlying_markers else None,
-            "target": dashboard_safe_float((position_row or {}).get("target_price")) if allows_underlying_markers else None,
+            "entry": safe_float((position_row or {}).get("entry_price")) if allows_underlying_markers else None,
+            "stop": safe_float((position_row or {}).get("stop_price")) if allows_underlying_markers else None,
+            "target": safe_float((position_row or {}).get("target_price")) if allows_underlying_markers else None,
             # Breakeven is in underlying-price units for both stocks (from entry)
             # and options (via metadata['breakeven_underlying']), so it's safe to
             # draw on the underlying chart regardless of asset_type.
-            "breakeven": dashboard_safe_float((position_row or {}).get("breakeven")),
+            "breakeven": safe_float((position_row or {}).get("breakeven")),
             "entry_time": (position_row or {}).get("entry_time"),
             # Option-specific: strikes in underlying-price units. Drawn on the
             # underlying chart when asset_type starts with OPTION_ because the
             # bot's stop_price/target_price are in OPTION-price units and can't
             # be plotted on the underlying's axis.
             "option_type": (position_row or {}).get("option_type") if is_option else None,
-            "long_strike": dashboard_safe_float((position_row or {}).get("long_strike")) if is_option else None,
-            "short_strike": dashboard_safe_float((position_row or {}).get("short_strike")) if is_option else None,
-            "option_strike": dashboard_safe_float((position_row or {}).get("option_strike")) if is_option else None,
+            "long_strike": safe_float((position_row or {}).get("long_strike")) if is_option else None,
+            "short_strike": safe_float((position_row or {}).get("short_strike")) if is_option else None,
+            "option_strike": safe_float((position_row or {}).get("option_strike")) if is_option else None,
         }
 
         zone_support_prices = [nearest_support] if nearest_support not in (None, 0.0) else []
@@ -1177,10 +1162,10 @@ class DashboardCache:
             current_price,
             support_prices=zone_support_prices,
             resistance_prices=zone_resistance_prices,
-            broken_support_price=dashboard_safe_float((sr_row or {}).get("broken_support")),
-            broken_resistance_price=dashboard_safe_float((sr_row or {}).get("broken_resistance")),
-            pending_support_price=dashboard_safe_float((sr_row or {}).get("pending_support")),
-            pending_resistance_price=dashboard_safe_float((sr_row or {}).get("pending_resistance")),
+            broken_support_price=safe_float((sr_row or {}).get("broken_support")),
+            broken_resistance_price=safe_float((sr_row or {}).get("broken_resistance")),
+            pending_support_price=safe_float((sr_row or {}).get("pending_support")),
+            pending_resistance_price=safe_float((sr_row or {}).get("pending_resistance")),
             allow_htf_refresh=allow_refresh,
         )
         htf_fair_value_gaps: list[dict[str, Any]] = []
@@ -1392,16 +1377,16 @@ class DashboardCache:
             "levels": {
                 "nearest_support": nearest_support,
                 "nearest_resistance": nearest_resistance,
-                "support_distance_pct": dashboard_safe_float((sr_row or {}).get("support_distance_pct")),
-                "resistance_distance_pct": dashboard_safe_float((sr_row or {}).get("resistance_distance_pct")),
+                "support_distance_pct": safe_float((sr_row or {}).get("support_distance_pct")),
+                "resistance_distance_pct": safe_float((sr_row or {}).get("resistance_distance_pct")),
                 "supports": support_prices,
                 "resistances": resistance_prices,
                 "next_support": next_support,
                 "next_resistance": next_resistance,
-                "broken_support": dashboard_safe_float((sr_row or {}).get("broken_support")),
-                "broken_resistance": dashboard_safe_float((sr_row or {}).get("broken_resistance")),
-                "pending_support": dashboard_safe_float((sr_row or {}).get("pending_support")),
-                "pending_resistance": dashboard_safe_float((sr_row or {}).get("pending_resistance")),
+                "broken_support": safe_float((sr_row or {}).get("broken_support")),
+                "broken_resistance": safe_float((sr_row or {}).get("broken_resistance")),
+                "pending_support": safe_float((sr_row or {}).get("pending_support")),
+                "pending_resistance": safe_float((sr_row or {}).get("pending_resistance")),
                 "key_level_zones": key_level_zones,
                 "htf_fair_value_gaps": htf_fair_value_gaps,
                 "ltf_fair_value_gaps": ltf_fair_value_gaps,
@@ -1496,7 +1481,7 @@ class DashboardCache:
             deduped: list[tuple[float, str, bool]] = []
             seen: set[float] = set()
             for price, kind_name, flip_confirmed in entries:
-                value = dashboard_safe_float(price)
+                value = safe_float(price)
                 if value is None or round(value, 4) <= 0 or round(value, 4) in seen:
                     continue
                 seen.add(round(value, 4))
@@ -1514,9 +1499,9 @@ class DashboardCache:
             *((price, "nearest_htf_resistance", False) for price in (resistance_prices or [])),
         ])
 
-        close = dashboard_safe_float(current_price)
+        close = safe_float(current_price)
         if close is None and frame is not None and not frame.empty:
-            close = dashboard_safe_float(frame.iloc[-1].get("close"))
+            close = safe_float(frame.iloc[-1].get("close"))
         if close is None or close <= 0:
             return []
 
@@ -1576,11 +1561,11 @@ class DashboardCache:
         atr = None
         try:
             if ltf is not None and not ltf.empty:
-                atr = dashboard_safe_float(ltf.iloc[-1].get("atr14"))
+                atr = safe_float(ltf.iloc[-1].get("atr14"))
         except Exception:
             atr = None
         if atr is None:
-            atr = dashboard_safe_float(getattr(htf, "atr14", None))
+            atr = safe_float(getattr(htf, "atr14", None))
         if atr is None or atr <= 0:
             atr = max(float(close) * 0.0015, 0.01)
         min_level_score = float(level_ctx.get("min_level_score", 4.0) or 4.0)
@@ -1612,8 +1597,8 @@ class DashboardCache:
                         short_candidates = list(strategy_obj.dashboard_candidate_levels(float(close), htf, Side.SHORT) or [])
                     selected_long = strategy_obj.dashboard_select_level(Side.LONG, float(close), ltf, htf)
                     selected_short = strategy_obj.dashboard_select_level(Side.SHORT, float(close), ltf, htf)
-                    selected_long_price = dashboard_safe_float((selected_long or {}).get("price")) if isinstance(selected_long, dict) else None
-                    selected_short_price = dashboard_safe_float((selected_short or {}).get("price")) if isinstance(selected_short, dict) else None
+                    selected_long_price = safe_float((selected_long or {}).get("price")) if isinstance(selected_long, dict) else None
+                    selected_short_price = safe_float((selected_short or {}).get("price")) if isinstance(selected_short, dict) else None
                 else:
                     long_candidates = list(strategy_obj.dashboard_candidate_levels(float(close), htf, Side.LONG) or [])
                     short_candidates = list(strategy_obj.dashboard_candidate_levels(float(close), htf, Side.SHORT) or [])
@@ -1636,7 +1621,7 @@ class DashboardCache:
             ]
 
         def _candidate_zone_payload(side: Side, candidate: dict[str, Any]) -> dict[str, Any] | None:
-            price = dashboard_safe_float(candidate.get("price"))
+            price = safe_float(candidate.get("price"))
             if price is None or price <= 0:
                 return None
             zone_kind = "support" if side == Side.LONG else "resistance"
@@ -1649,8 +1634,8 @@ class DashboardCache:
             except Exception:
                 zone_half_width = float(base_zone_half_width)
             zone_half_width = max(float(zone_half_width), 0.01)
-            raw_lower = dashboard_safe_float(candidate.get("zone_lower"))
-            raw_upper = dashboard_safe_float(candidate.get("zone_upper"))
+            raw_lower = safe_float(candidate.get("zone_lower"))
+            raw_upper = safe_float(candidate.get("zone_upper"))
             if raw_lower is not None and raw_upper is not None and raw_upper >= raw_lower:
                 zone_lower = float(raw_lower)
                 zone_upper = float(raw_upper)
@@ -2051,7 +2036,7 @@ class DashboardCache:
             "ltf_timeframe": f"{ltf_min}m",
             "price": display_price,
             "htf_refresh_token": htf_refresh.isoformat() if htf_refresh is not None else None,
-            "side_tolerance": dashboard_safe_float(getattr(ctx, "side_tolerance", None)),
+            "side_tolerance": safe_float(getattr(ctx, "side_tolerance", None)),
             # The strategy's own levels, as it reads them (2026-09-23): the
             # nearest support / resistance and their distances are ctx's, the
             # ladders are ctx's (nearest first), and broken / pending levels
@@ -2138,11 +2123,11 @@ class DashboardCache:
             history_refresh.isoformat() if history_refresh is not None else None,
             stream_refresh.isoformat() if stream_refresh is not None else None,
             htf_refresh.isoformat() if htf_refresh is not None else None,
-            dashboard_safe_float(quote_body.get("last")) if isinstance(quote_body, Mapping) else None,
-            dashboard_safe_float(quote_body.get("bid")) if isinstance(quote_body, Mapping) else None,
-            dashboard_safe_float(quote_body.get("ask")) if isinstance(quote_body, Mapping) else None,
-            dashboard_safe_float(quote_body.get("mark")) if isinstance(quote_body, Mapping) else None,
-            dashboard_safe_float(quote_body.get("total_volume")) if isinstance(quote_body, Mapping) else None,
+            safe_float(quote_body.get("last")) if isinstance(quote_body, Mapping) else None,
+            safe_float(quote_body.get("bid")) if isinstance(quote_body, Mapping) else None,
+            safe_float(quote_body.get("ask")) if isinstance(quote_body, Mapping) else None,
+            safe_float(quote_body.get("mark")) if isinstance(quote_body, Mapping) else None,
+            safe_float(quote_body.get("total_volume")) if isinstance(quote_body, Mapping) else None,
             dashboard_cache_json_signature(sr_row or {}),
             dashboard_cache_json_signature(candidate_row or {}),
             dashboard_cache_json_signature(position_row or {}),
@@ -2227,7 +2212,7 @@ class DashboardCache:
                 payload["chart_bullish_continuation"] = sorted(list(getattr(chart_ctx, "matched_bullish_continuation", set()) or []))
                 payload["chart_bearish_reversal"] = sorted(list(getattr(chart_ctx, "matched_bearish_reversal", set()) or []))
                 payload["chart_bearish_continuation"] = sorted(list(getattr(chart_ctx, "matched_bearish_continuation", set()) or []))
-                payload["chart_bias_score"] = dashboard_safe_float(getattr(chart_ctx, "bias_score", None))
+                payload["chart_bias_score"] = safe_float(getattr(chart_ctx, "bias_score", None))
                 payload["chart_regime_hint"] = str(getattr(chart_ctx, "regime_hint", "neutral") or "neutral")
             except Exception:
                 LOG.debug("Failed to attach chart-pattern payload to dashboard response; returning partial payload.", exc_info=True)
@@ -2266,7 +2251,7 @@ class DashboardCache:
         frame_for_analysis = frame_for_analysis.dropna(subset=[col for col in ("open", "high", "low", "close") if col in frame_for_analysis.columns]).copy()
         if frame_for_analysis.empty:
             return payload
-        close_val = dashboard_safe_float(frame_for_analysis["close"].iloc[-1])
+        close_val = safe_float(frame_for_analysis["close"].iloc[-1])
         if close_val is None:
             return payload
         try:
@@ -2326,16 +2311,16 @@ class DashboardCache:
         level = None
         if event == "CHOCH↑":
             age = int(getattr(ms_ctx, "choch_up_age_bars", 0) or 0)
-            level = dashboard_safe_float(getattr(ms_ctx, "reference_high", None))
+            level = safe_float(getattr(ms_ctx, "reference_high", None))
         elif event == "CHOCH↓":
             age = int(getattr(ms_ctx, "choch_down_age_bars", 0) or 0)
-            level = dashboard_safe_float(getattr(ms_ctx, "reference_low", None))
+            level = safe_float(getattr(ms_ctx, "reference_low", None))
         elif event == "BOS↑":
             age = int(getattr(ms_ctx, "bos_up_age_bars", 0) or 0)
-            level = dashboard_safe_float(getattr(ms_ctx, "reference_high", None))
+            level = safe_float(getattr(ms_ctx, "reference_high", None))
         elif event == "BOS↓":
             age = int(getattr(ms_ctx, "bos_down_age_bars", 0) or 0)
-            level = dashboard_safe_float(getattr(ms_ctx, "reference_low", None))
+            level = safe_float(getattr(ms_ctx, "reference_low", None))
         payload.update({
             "event": event,
             "age_bars": age,
@@ -2413,7 +2398,7 @@ class DashboardCache:
                 stored_frame,
                 minute_frame,
                 timeframe_minutes=htf_min,
-                now=now_et(),
+                now=sessions.now_et(),
             )
         elif symbol_key:
             # LTF path: when ltf_min is 1 fetch the streaming 1m frame
@@ -2431,7 +2416,7 @@ class DashboardCache:
                 # 2026-09-23 it was drawn as complete and candle-tagged off
                 # its first minutes (AAPL 09-22 10:03: a 3-minute 10:00 5m bar
                 # tagged CDLHAMMER; complete, it tags as a bearish marubozu).
-                if frame is not None and not frame.empty and session_bucket_ends(frame.index[-1:], ltf_min)[0] > pd.Timestamp(now_et()):
+                if frame is not None and not frame.empty and session_bucket_ends(frame.index[-1:], ltf_min)[0] > pd.Timestamp(sessions.now_et()):
                     forming_start = pd.Timestamp(frame.index[-1])
             else:
                 frame = self.data.get_merged(symbol_key, with_indicators=True)
@@ -2465,7 +2450,7 @@ class DashboardCache:
                 # advancing while the underlying frame_signature is
                 # unchanged.
                 cached_payload = dict(cache_entry["payload"])
-                cached_payload["last_update"] = now_et().isoformat()
+                cached_payload["last_update"] = sessions.now_et().isoformat()
                 return cached_payload
         # Per-bar candle pattern map for the tooltip's per-bar candle section,
         # for every chart bar (see dashboard_bars_from_frame docstring +
@@ -2525,8 +2510,8 @@ class DashboardCache:
                 if columns is not None:
                     fast_col, slow_col = columns
                     for bar, (_idx, row) in zip(bars, tail.iterrows()):
-                        bar["ema9"] = dashboard_safe_float(row.get(fast_col))
-                        bar["ema20"] = dashboard_safe_float(row.get(slow_col))
+                        bar["ema9"] = safe_float(row.get(fast_col))
+                        bar["ema20"] = safe_float(row.get(slow_col))
                 elif "htf_ema_fast_span" in params or "htf_ema_slow_span" in params:
                     htf_fast, htf_slow = htf_ema_spans(params)
                     built_from = len(stored_frame) if stored_frame is not None else len(frame)
@@ -2535,8 +2520,8 @@ class DashboardCache:
                     ema_fast_series = frame["close"].ewm(span=htf_fast, adjust=False).mean()
                     ema_slow_series = frame["close"].ewm(span=htf_slow, adjust=False).mean()
                     for bar, (idx, _row) in zip(bars, tail.iterrows()):
-                        bar["ema9"] = dashboard_safe_float(ema_fast_series.loc[idx]) if fast_ok else None
-                        bar["ema20"] = dashboard_safe_float(ema_slow_series.loc[idx]) if slow_ok else None
+                        bar["ema9"] = safe_float(ema_fast_series.loc[idx]) if fast_ok else None
+                        bar["ema20"] = safe_float(ema_slow_series.loc[idx]) if slow_ok else None
                     ema_fast_span = htf_fast
                     ema_slow_span = htf_slow
             except Exception:
@@ -2571,7 +2556,7 @@ class DashboardCache:
             "last_bar_ts": str(bars[-1].get("ts")) if bars else None,
             "source_bar_ts": source_bar_ts,
             "forming_ends_at": forming_ends_at,
-            "last_update": now_et().isoformat(),
+            "last_update": sessions.now_et().isoformat(),
             "patterns": pattern_payload,
             "structure_overlay": structure_overlay,
             "chart_config": {

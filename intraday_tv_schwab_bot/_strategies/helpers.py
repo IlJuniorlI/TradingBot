@@ -30,7 +30,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 from ..models import Position, Side
-from ..utils import now_et
+from .. import sessions
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
     Always returns ``float`` (not ``Optional[float]``). For an
     optional-float helper use ``_optional_float``. The canonical
-    NaN-safe helper for the wider bot is ``position_metrics.safe_float``;
+    NaN-safe helper for the wider bot is ``numeric.safe_float``;
     this implementation mirrors it for use inside strategy code that
     already has a 0.0 default contract.
     """
@@ -254,7 +254,7 @@ def _session_open_price(
     bar sits at/after the cutoff (e.g. the regular session hasn't started)."""
     if frame is None or frame.empty:
         return None
-    target_day = day or now_et().date()
+    target_day = day or sessions.now_et().date()
     same_day = frame[_same_day_mask(frame, target_day)]
     if same_day.empty:
         return None

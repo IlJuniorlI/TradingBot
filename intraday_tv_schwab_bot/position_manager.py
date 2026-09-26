@@ -50,12 +50,13 @@ from .models import (
     Position,
     Side,
 )
+from .numeric import safe_float
 from .paper_account import PaperAccount
 from .position_metrics import (
+    append_management_adjustment,
     exit_reason_details,
     position_return_pct_at_price,
     position_unrealized_at_price,
-    safe_float,
 )
 from .risk import RiskManager
 from ._sr_ladder import _select_next_distinct_level, _sr_effective_side_tolerance
@@ -64,7 +65,8 @@ from ._strategies.shared_exit import SharedExitPolicy, partial_exit_qty
 from ._strategies.strategy_base import BaseStrategy
 from .broker_positions import active_broker_bracket, order_result_needs_broker_recheck, working_exit_outstanding_qty
 from .support_resistance import zone_flip_confirmed
-from .utils import TRADEFLOW_LEVEL, append_management_adjustment as _append_adjustment, now_et
+from .log_setup import TRADEFLOW_LEVEL
+from . import sessions
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -289,7 +291,7 @@ class PositionManager:
     @staticmethod
     def initialize_position_diagnostics(position: Position, mark_price: float, underlying_price: float | None = None) -> None:
         meta = position.metadata if isinstance(position.metadata, dict) else {}
-        ts = now_et().isoformat()
+        ts = sessions.now_et().isoformat()
         meta['initial_qty'] = int(position.qty)
         meta['diag_best_unrealized_pnl_per_unit'] = 0.0
         meta['diag_worst_unrealized_pnl_per_unit'] = 0.0
@@ -327,7 +329,7 @@ class PositionManager:
         meta['initial_qty'] = initial_qty
         best = float(meta.get('diag_best_unrealized_pnl_per_unit', 0.0))
         worst = float(meta.get('diag_worst_unrealized_pnl_per_unit', 0.0))
-        ts = now_et().isoformat()
+        ts = sessions.now_et().isoformat()
         # The exit signal runs on the UNDERLYING's frame. For an option these
         # are what it compares against: the premium it is holding at (for R)
         # and how far the underlying itself has travelled since entry.
@@ -387,7 +389,7 @@ class PositionManager:
             'side': position.side.value,
             'qty': int(position.qty),
             'entry_time': position.entry_time.isoformat(),
-            'exit_time': now_et().isoformat(),
+            'exit_time': sessions.now_et().isoformat(),
             'entry_price': float(position.entry_price),
             'exit_price': float(exit_price),
             'realized_pnl': float(realized),
@@ -452,7 +454,7 @@ class PositionManager:
         current_price = safe_float(mark_price, None)
         current_unrealized = position_unrealized_at_price(position, current_price)
         return_pct = position_return_pct_at_price(position, current_price)
-        hold_minutes = max(0.0, (now_et() - position.entry_time).total_seconds() / 60.0)
+        hold_minutes = max(0.0, (sessions.now_et() - position.entry_time).total_seconds() / 60.0)
         stop_distance = None
         target_distance = None
         if current_price is not None and stop_price is not None:
@@ -615,7 +617,7 @@ class PositionManager:
                     position.stop_price = float(candidate_stop)
                     if isinstance(position.metadata, dict):
                         position.metadata["sr_flip_stop_source"] = float(flipped_support.price)
-                        _append_adjustment(position.metadata,{"manager": "sr_flip", "kind": "stop", "reason": "flipped_support", "from": prior_stop, "to": float(candidate_stop), "source_level": float(flipped_support.price)})
+                        append_management_adjustment(position.metadata,{"manager": "sr_flip", "kind": "stop", "reason": "flipped_support", "from": prior_stop, "to": float(candidate_stop), "source_level": float(flipped_support.price)})
             target_level = _select_next_distinct_level(getattr(sr_ctx, 'resistances', None), float(flipped_support.price) if flipped_support is not None else None, above=True, minimum_gap=structural_gap) if flipped_support is not None else None
             if target_level is None and flipped_support is None:
                 target_level = sr_ctx.nearest_resistance
@@ -627,7 +629,7 @@ class PositionManager:
                     position.target_price = float(candidate_target)
                     if isinstance(position.metadata, dict):
                         position.metadata["sr_flip_target_source"] = float(target_level.price)
-                        _append_adjustment(position.metadata,{"manager": "sr_flip", "kind": "target", "reason": "next_resistance", "from": prior_target, "to": float(candidate_target), "source_level": float(target_level.price), "structural_gap": float(structural_gap)})
+                        append_management_adjustment(position.metadata,{"manager": "sr_flip", "kind": "target", "reason": "next_resistance", "from": prior_target, "to": float(candidate_target), "source_level": float(target_level.price), "structural_gap": float(structural_gap)})
         else:
             flipped_resistance = sr_ctx.broken_support
             if flipped_resistance is not None:
@@ -637,7 +639,7 @@ class PositionManager:
                     position.stop_price = float(candidate_stop)
                     if isinstance(position.metadata, dict):
                         position.metadata["sr_flip_stop_source"] = float(flipped_resistance.price)
-                        _append_adjustment(position.metadata,{"manager": "sr_flip", "kind": "stop", "reason": "flipped_resistance", "from": prior_stop, "to": float(candidate_stop), "source_level": float(flipped_resistance.price)})
+                        append_management_adjustment(position.metadata,{"manager": "sr_flip", "kind": "stop", "reason": "flipped_resistance", "from": prior_stop, "to": float(candidate_stop), "source_level": float(flipped_resistance.price)})
             target_level = _select_next_distinct_level(getattr(sr_ctx, 'supports', None), float(flipped_resistance.price) if flipped_resistance is not None else None, above=False, minimum_gap=structural_gap) if flipped_resistance is not None else None
             if target_level is None and flipped_resistance is None:
                 target_level = sr_ctx.nearest_support
@@ -649,7 +651,7 @@ class PositionManager:
                     position.target_price = float(candidate_target)
                     if isinstance(position.metadata, dict):
                         position.metadata["sr_flip_target_source"] = float(target_level.price)
-                        _append_adjustment(position.metadata,{"manager": "sr_flip", "kind": "target", "reason": "next_support", "from": prior_target, "to": float(candidate_target), "source_level": float(target_level.price), "structural_gap": float(structural_gap)})
+                        append_management_adjustment(position.metadata,{"manager": "sr_flip", "kind": "target", "reason": "next_support", "from": prior_target, "to": float(candidate_target), "source_level": float(target_level.price), "structural_gap": float(structural_gap)})
 
     def _ladder_indices_still_aligned(
         self,
@@ -836,7 +838,7 @@ class PositionManager:
             if reference_price > candidate_stop > float(position.stop_price):
                 prior_stop = float(position.stop_price)
                 position.stop_price = float(candidate_stop)
-                _append_adjustment(meta,{"manager": "adaptive_ladder", "kind": "stop", "reason": "promoted_support", "from": prior_stop, "to": float(candidate_stop), "source_level": float(rung_price)})
+                append_management_adjustment(meta,{"manager": "adaptive_ladder", "kind": "stop", "reason": "promoted_support", "from": prior_stop, "to": float(candidate_stop), "source_level": float(rung_price)})
             meta["ladder_defense_price"] = float(rung_price)
             meta["ladder_defense_zone_width"] = float(zone_width)
             meta["ladder_defense_kind"] = str(current.get("kind") or "target")
@@ -865,14 +867,14 @@ class PositionManager:
                 if current_target is None or candidate_target > float(current_target) + rung_gap:
                     prior_target = float(current_target) if current_target is not None else None
                     position.target_price = float(candidate_target)
-                    _append_adjustment(meta,{"manager": "adaptive_ladder", "kind": "target", "reason": "next_rung", "from": prior_target, "to": float(candidate_target), "source_level": float(candidate_target)})
+                    append_management_adjustment(meta,{"manager": "adaptive_ladder", "kind": "target", "reason": "next_rung", "from": prior_target, "to": float(candidate_target), "source_level": float(candidate_target)})
                 meta["ladder_active_index"] = int(next_index)
                 meta["ladder_final_rung_cleared"] = False
             else:
                 if current_target is not None:
                     prior_target = float(current_target)
                     position.target_price = None
-                    _append_adjustment(meta,{"manager": "adaptive_ladder", "kind": "target", "reason": "final_rung_runner", "from": prior_target, "to": None, "source_level": float(rung_price)})
+                    append_management_adjustment(meta,{"manager": "adaptive_ladder", "kind": "target", "reason": "final_rung_runner", "from": prior_target, "to": None, "source_level": float(rung_price)})
                 meta["ladder_final_rung_cleared"] = True
                 meta["adaptive_ladder_suppress_target_exit"] = False
         else:
@@ -897,7 +899,7 @@ class PositionManager:
             if reference_price < candidate_stop < float(position.stop_price):
                 prior_stop = float(position.stop_price)
                 position.stop_price = float(candidate_stop)
-                _append_adjustment(meta,{"manager": "adaptive_ladder", "kind": "stop", "reason": "promoted_resistance", "from": prior_stop, "to": float(candidate_stop), "source_level": float(rung_price)})
+                append_management_adjustment(meta,{"manager": "adaptive_ladder", "kind": "stop", "reason": "promoted_resistance", "from": prior_stop, "to": float(candidate_stop), "source_level": float(rung_price)})
             meta["ladder_defense_price"] = float(rung_price)
             meta["ladder_defense_zone_width"] = float(zone_width)
             meta["ladder_defense_kind"] = str(current.get("kind") or "target")
@@ -910,14 +912,14 @@ class PositionManager:
                 if current_target is None or candidate_target < float(current_target) - rung_gap:
                     prior_target = float(current_target) if current_target is not None else None
                     position.target_price = float(candidate_target)
-                    _append_adjustment(meta,{"manager": "adaptive_ladder", "kind": "target", "reason": "next_rung", "from": prior_target, "to": float(candidate_target), "source_level": float(candidate_target)})
+                    append_management_adjustment(meta,{"manager": "adaptive_ladder", "kind": "target", "reason": "next_rung", "from": prior_target, "to": float(candidate_target), "source_level": float(candidate_target)})
                 meta["ladder_active_index"] = int(next_index)
                 meta["ladder_final_rung_cleared"] = False
             else:
                 if current_target is not None:
                     prior_target = float(current_target)
                     position.target_price = None
-                    _append_adjustment(meta,{"manager": "adaptive_ladder", "kind": "target", "reason": "final_rung_runner", "from": prior_target, "to": None, "source_level": float(rung_price)})
+                    append_management_adjustment(meta,{"manager": "adaptive_ladder", "kind": "target", "reason": "final_rung_runner", "from": prior_target, "to": None, "source_level": float(rung_price)})
                 meta["ladder_final_rung_cleared"] = True
                 meta["adaptive_ladder_suppress_target_exit"] = False
 
@@ -1282,7 +1284,7 @@ class PositionManager:
         for adjustment in self.executor.sync_bracket_levels(
             bracket, symbol, position.side, int(position.qty), entry_price, float(position.stop_price), engine_target,
         ):
-            _append_adjustment(position.metadata, adjustment)
+            append_management_adjustment(position.metadata, adjustment)
 
     # ------------------------------------------------------------------
     # Exit orders whose outcome the submit call could not settle.
@@ -1317,7 +1319,7 @@ class PositionManager:
                 # does not (2026-09-24). A retry cancels that bracket again,
                 # which is churn, never a double fill.
                 "reprotect": bool(bracket_cancelled),
-                "since": now_et().isoformat(),
+                "since": sessions.now_et().isoformat(),
             }
 
     @staticmethod
@@ -1379,7 +1381,7 @@ class PositionManager:
         markers = position.metadata.setdefault(f"{family}_exits", [])
         if any(isinstance(m, dict) and all(m.get(k) == v for k, v in marker.items()) for m in markers):
             return
-        markers.append({**marker, "status": status, "at": now_et().isoformat()})
+        markers.append({**marker, "status": status, "at": sessions.now_et().isoformat()})
 
     def _exit_order_in_flight(self, key: str, position: Position, last_price: float | None, bars,
                               order_states: dict[str, Any]) -> bool:

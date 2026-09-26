@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .levels_shared import session_segment_ids
+from .sessions import session_segment_ids
 
 
 LOG = logging.getLogger(__name__)
@@ -118,7 +118,7 @@ def _clean_price_frame(frame: pd.DataFrame | None) -> pd.DataFrame:
     # This was the dominant cost at the top of every analyze_chart_pattern_context
     # call because strategies pass frames built by add_indicators().
     try:
-        from .utils import has_standard_indicator_columns
+        from .indicators import has_standard_indicator_columns
         if has_standard_indicator_columns(frame):
             if frame_attrs is not None:
                 frame_attrs[_CHART_CLEAN_SENTINEL] = True
@@ -947,7 +947,7 @@ def _current_session(frame: pd.DataFrame, bars: int) -> pd.DataFrame:
     detectors read such windows before ~09:30: NVDA 09-21 07:14 fired a
     bullish flag whose "pole" was the weekend gap, and ARM 09-21 07:00 a
     double bottom built from Friday post-market bars broken by Monday's gap
-    bar. Same boundary as ``levels_shared.session_segment_ids``, which the
+    bar. Same boundary as ``sessions.session_segment_ids``, which the
     level builders' pivots already respect.
     """
     f = _tail(frame, bars)
