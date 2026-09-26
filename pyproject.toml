@@ -39,8 +39,10 @@ dev = [
 [project.scripts]
 intraday-tv-schwab-bot = "intraday_tv_schwab_bot.cli:main"
 
+# The version file is package data: intraday_tv_schwab_bot.__version__ reads
+# the same file, so the wheel's metadata and the imported package agree.
 [tool.setuptools.dynamic]
-version = { file = "version.txt" }
+version = { file = "intraday_tv_schwab_bot/VERSION" }
 
 [tool.setuptools.packages.find]
 include = ["intraday_tv_schwab_bot*"]
@@ -48,6 +50,7 @@ exclude = ["tests*", "scripts*", "theme_previews*"]
 
 [tool.setuptools.package-data]
 intraday_tv_schwab_bot = [
+    "VERSION",
     "_strategies/*/manifest.json",
     "_strategies/*/README.md",
     "dashboard_assets/*",

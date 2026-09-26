@@ -3,9 +3,14 @@
 
 A skip reason is a name with optional detail in parentheses,
 ``name(required>=X,current=Y,...)``; an exit reason is a code with optional
-detail after a colon, ``code:detail``. The strategies, the entry stage and the
-warm-up tracker format them here, and the report and the entry stage read
-them back through :func:`reason_head` and :func:`exit_reason_code`.
+detail after a colon, ``code:detail``. A strategy that builds both sides
+prefixes the side a skip reason belongs to, ``long.name(...)``; other
+reasons spell the side into the name (``long_no_fresh_breakout``, see
+:func:`reason_side`). The strategies, the entry stage and the warm-up tracker
+format them here, and the report and the entry stage read them back through
+:func:`reason_head`, :func:`exit_reason_code`, :func:`split_side_prefix` and
+:func:`reason_side`; every tally of skip reasons buckets one under
+:func:`reason_gate`.
 """
 from __future__ import annotations
 
@@ -54,13 +59,18 @@ def bool_token(value: Any) -> str:
     return "true" if bool(value) else "false"
 
 
+def _side_prefix(side: Side) -> str:
+    """``long.`` / ``short.``: the head a side-prefixed reason carries."""
+    return f"{side.value.lower()}."
+
+
 def side_prefixed_reason(side: Side, reason: str) -> str:
     """Ensure ``reason`` starts with ``{side.value.lower()}.`` prefix.
     Idempotent. Empty reason passes through unchanged."""
     token = str(reason or "").strip()
     if not token:
         return token
-    prefix = f"{side.value.lower()}."
+    prefix = _side_prefix(side)
     return token if token.startswith(prefix) else f"{prefix}{token}"
 
 
@@ -122,6 +132,37 @@ def insufficient_bars_reason(name: str, current: Any, required: Any) -> str:
     return reason_with_values(name, current=current, required=required, op=">=", digits=0)
 
 
+def split_side_prefix(reason: Any) -> tuple[Side | None, str]:
+    """A reason's side and the rest, the reverse of
+    :func:`side_prefixed_reason`: ``long.no_setup`` -> ``(Side.LONG,
+    'no_setup')``. The reason is stripped first; one with no side prefix
+    reads ``(None, reason)``."""
+    text = str(reason or "").strip()
+    for side in Side:
+        prefix = _side_prefix(side)
+        if text.startswith(prefix):
+            return side, text[len(prefix):]
+    return None, text
+
+
+def reason_side(reason: Any) -> Side | None:
+    """The side a skip reason stopped, or None when it names none. The bot
+    spells it three ways: ``long.`` / ``short.`` (:func:`side_prefixed_reason`,
+    every blocker of a side the peer family refused), ``long_`` / ``short_``
+    (``long_no_fresh_breakout``, top_tier's ``long_build_failed_...``) and
+    ``build_failed_long_`` / ``build_failed_short_`` (top_tier's build
+    failure whose tag was already side-tagged). Case is ignored."""
+    text = str(reason or "").strip().lower()
+    prefixed, _rest = split_side_prefix(text)
+    if prefixed is not None:
+        return prefixed
+    for side in Side:
+        name = side.value.lower()
+        if text.startswith((f"{name}_", f"build_failed_{name}_")):
+            return side
+    return None
+
+
 def reason_head(reason: Any) -> str:
     """A skip reason's name: the text before its first ``(``, stripped
     (``long_no_fresh_breakout(close=248.7250<=recent_high=248.8099)`` ->
@@ -137,3 +178,17 @@ def exit_reason_code(reason: Any) -> str | None:
     (``resistance_break_exit:311.5900`` -> ``resistance_break_exit``); None
     when there is none."""
     return str(reason or "").split(":", 1)[0].strip() or None
+
+
+def reason_gate(reason: Any) -> str:
+    """The gate a skip reason names, the one key every tally of skip reasons
+    buckets it under (the session report's filter rejections and gate
+    attribution, the entry stage's cycle summary): the reason without its
+    ``long.`` / ``short.`` side prefix (:func:`split_side_prefix`), cut at
+    the first ``(`` or ``:`` that opens its detail
+    (``long.htf_bias_not_bullish:neutral(2v1)`` -> ``htf_bias_not_bullish``,
+    ``long_level_score_below_min:2.50<2.90`` ->
+    ``long_level_score_below_min``). A side spelled into the name, as
+    there, is part of the gate. ``'none'`` when nothing names one."""
+    _side, name = split_side_prefix(reason)
+    return exit_reason_code(reason_head(name)) or "none"

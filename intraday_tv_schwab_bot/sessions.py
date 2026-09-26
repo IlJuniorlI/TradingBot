@@ -35,18 +35,37 @@ def parse_hhmm(value: object) -> time:
 
     Accepts canonical ``"HH:MM"`` strings, ``datetime.time`` objects, and
     integer values that can appear when YAML parses unquoted ``HH:MM`` as
-    sexagesimal minutes (for example ``14:15`` -> ``855``).
+    sexagesimal minutes (for example ``14:15`` -> ``855``). Anything else
+    raises ``ValueError`` naming the value. Until 2026-09-26 a blank or
+    colon-less string failed as "not enough values to unpack", and an
+    infinity or a field past a C int ("2147483648:00") as ``OverflowError``.
     """
     if isinstance(value, time):
         return value
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        ivalue = int(value)
-        if 0 <= ivalue < 24 * 60:
+        # The range check comes first: int() of a NaN or an infinity raises
+        # its own error, and the infinity's is not a ValueError.
+        if 0 <= value < 24 * 60:
+            ivalue = int(value)
             return time(hour=ivalue // 60, minute=ivalue % 60)
         raise ValueError(f"Invalid HH:MM numeric value: {value!r}")
-    text = str(value).strip()
-    hh, mm = text.split(":", 1)
-    return time(hour=int(hh), minute=int(mm))
+    try:
+        hh, mm = str(value).strip().split(":", 1)
+        return time(hour=int(hh), minute=int(mm))
+    except (ValueError, OverflowError) as exc:
+        # time() raises OverflowError, not ValueError, for a field past a C
+        # int ("2147483648:00").
+        raise ValueError(f"Invalid HH:MM time: {value!r}") from exc
+
+
+def is_hhmm(value: object) -> bool:
+    """Whether ``parse_hhmm`` reads *value*: the load- and construction-time
+    checks that name a bad time's key ask this."""
+    try:
+        parse_hhmm(value)
+    except ValueError:
+        return False
+    return True
 
 
 @lru_cache(maxsize=32)

@@ -41,6 +41,7 @@ from .config import BotConfig
 from .dashboard_cache import DashboardCache
 from .data_feed import MarketDataStore
 from .execution import BracketCancel, SchwabExecutor
+from .indicators import bar_posture
 from .models import (
     ASSET_TYPE_EQUITY,
     ASSET_TYPE_OPTION_SINGLE,
@@ -663,17 +664,29 @@ class PositionManager:
         """Re-check at target-hit time whether at least one of the trade's
         confirmation indices is STILL aligned with the trade direction.
 
-        Same close>vwap + ema9>=ema20 check (mirror for SHORT) that the
-        entry-side ``_index_confirms`` does — applied again at suppress
-        decision so a sector reversal can short-circuit the adaptive-
-        ladder wait window. If the broader sector tape has flipped
-        against the trade since entry, the trade's apparent strength is
-        divergent and target-exit should fire instead of waiting for the
-        multi-bar zone flip.
+        Each index's latest 1m bar is read with the posture test the
+        entry-side ``_index_confirms`` uses (``indicators.bar_posture``),
+        again at the suppress decision, so a sector reversal can
+        short-circuit the adaptive-ladder wait window. If the broader sector
+        tape has flipped against the trade since entry, the trade's apparent
+        strength is divergent and target-exit should fire instead of waiting
+        for the multi-bar zone flip. The reference is session VWAP, where
+        the entry side reads the leg's anchored VWAP under
+        ``leg_anchored_confirmation``. Until 2026-09-26 it wrote the test
+        out and read a NaN EMA as no posture, where the entry side stands
+        the close in.
 
         Returns True if no ``indices`` are configured (no extra gate —
         treats the alignment check as inert for legacy positions /
-        strategies that don't stamp ``confirmation_indices`` at entry).
+        strategies that don't stamp ``confirmation_indices`` at entry, and
+        for a strategy with no index symbols, which stamps an empty list:
+        small_cap_squeeze). This layer only vetoes the suppress when the
+        tape the trade leaned on has turned; with no index there is no tape
+        to turn, and the breakout-strength and rung checks decide alone.
+        A stamped index with no bars is skipped, and when none can be read
+        the answer is False, so the target exit fires. Until 2026-09-26
+        small_cap_squeeze stamped SPY / QQQ, which it never streams, so its
+        target exit was never suppressed.
         """
         if not indices:
             return True
@@ -689,20 +702,7 @@ class PositionManager:
                 continue
             if frame is None or len(frame) == 0:
                 continue
-            try:
-                last = frame.iloc[-1]
-                close = float(last.get("close") or 0.0)
-                vwap_raw = last.get("vwap")
-                vwap = float(vwap_raw) if vwap_raw is not None else close
-                ema9_raw = last.get("ema9")
-                ema9 = float(ema9_raw) if ema9_raw is not None else close
-                ema20_raw = last.get("ema20")
-                ema20 = float(ema20_raw) if ema20_raw is not None else close
-            except (TypeError, ValueError, AttributeError):
-                continue
-            if side == Side.LONG and close > vwap and ema9 >= ema20:
-                return True
-            if side == Side.SHORT and close < vwap and ema9 <= ema20:
+            if bar_posture(frame.iloc[-1]) == side:
                 return True
         return False
 
@@ -723,9 +723,9 @@ class PositionManager:
           LONG:  close >= target  AND  (close - low) / (high - low) >= ``close_pos_min``
           SHORT: close <= target  AND  (high - close) / (high - low) >= ``close_pos_min``
 
-        ``close_pos_min`` default 0.55 means the close has to land in the
-        upper 55% of the bar's intra-bar range (for LONG). Doji / wick-top
-        prints don't qualify.
+        ``close_pos_min`` default 0.55 means the close has to land at least
+        55% of the way up the bar's intra-bar range, its upper 45% (for LONG;
+        down, for SHORT). Doji / wick-top prints don't qualify.
 
         Returns False on insufficient data — caller treats False as "not
         strong enough to suppress" and lets the normal target-exit fire.
@@ -1715,14 +1715,18 @@ class PositionManager:
                 LOG.log(TRADEFLOW_LEVEL, "Partial exit %s requested_qty=%s filled_qty=%s reason=%s result=%s", key, requested_qty, exit_qty, reason, result.message)
             else:
                 LOG.log(TRADEFLOW_LEVEL, "Exit %s qty=%s of %s reason=%s result=%s", key, exit_qty, position.qty, reason, result.message)
-            exit_price_value = result.fill_price if result.fill_price is not None else last_price
-            if exit_price_value is None:
+            # A fill price or mark that is not a finite number reads as
+            # missing (2026-09-26). A NaN one booked NaN P&L into the account
+            # and the risk manager's realized total, and the daily-loss check
+            # never fired again that session.
+            fill_price = safe_float(result.fill_price, finite=True)
+            exit_price = fill_price if fill_price is not None else safe_float(last_price, finite=True)
+            if exit_price is None:
                 # The shares are GONE -- skipping the booking to "retry next
                 # cycle" sent a second exit for them. Book at entry, flagged
                 # estimated, so the quantity is right and P&L reads flat.
                 LOG.error("Exit fill price unavailable for %s after a filled close_position(); booking at entry price (estimated)", key)
-                exit_price_value = float(position.entry_price)
-            exit_price = float(exit_price_value)
+                exit_price = float(position.entry_price)
             # Exit slippage: how far the fill was from the intended level
             if isinstance(position.metadata, dict):
                 if reason == "stop":
@@ -1732,7 +1736,7 @@ class PositionManager:
             exited_position = copy.copy(position)
             exited_position.qty = exit_qty
             remaining_qty_after_exit = max(0, int(position.qty) - int(exit_qty))
-            fill_price_estimated = result.fill_price is None
+            fill_price_estimated = fill_price is None
             final_exit = exit_qty >= position.qty
             realized = self.account.record_exit(
                 exited_position,

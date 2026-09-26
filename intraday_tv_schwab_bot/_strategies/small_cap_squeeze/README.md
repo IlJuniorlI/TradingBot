@@ -44,7 +44,7 @@ opening-range carve-out is removed too, so the open trades the continuation mix
 continuously — entries run **08:05 → 11:50** with no gap.
 
 ### 3. What's removed vs top_tier_adaptive
-- **No index/ETF confirmation** (`require_index_confirmation: false`, empty `index_symbols`).
+- **No index/ETF confirmation** (`require_index_confirmation: false`, empty `index_symbols`). The empty list means no index ETF anywhere: none is streamed, no sector beta is computed, and the adaptive ladder's index re-check has nothing to read, so a strong push through a rung waits for the zone flip on the rung's own evidence. Until 2026-09-26 the engine read the empty list as SPY / QQQ, which this strategy never streams: the re-check found no bars, so a target tag always exited at the rung.
 - **No sector support** — empty `sector_groups` / `sector_index_map`, so the sector concentration guard no-ops.
 - **No relative-strength gate** (`relative_strength_block_threshold_pct: 0`).
 - **No HTF-structure gating** (`require_htf_bias_alignment: false`) — squeezes break prior structure.

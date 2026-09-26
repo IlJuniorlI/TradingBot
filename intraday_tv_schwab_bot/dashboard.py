@@ -332,7 +332,7 @@ class DashboardServer:
         # though Python classes are callable. Standard typeshed friction; the
         # runtime construction is correct (this is exactly how the stdlib
         # `http.server.HTTPServer` example wires up handlers).
-        self.httpd = ReusableThreadingHTTPServer((self.host, self.port), handler)  # type: ignore[arg-type]
+        httpd = ReusableThreadingHTTPServer((self.host, self.port), handler)  # type: ignore[arg-type]
         if self.https:
             if not self.ssl_certfile:
                 raise ValueError("dashboard.https is enabled but dashboard.ssl_certfile is not set")
@@ -345,13 +345,18 @@ class DashboardServer:
             # accept() so concurrent clients can handshake in parallel on
             # their worker threads (see Handler.setup below). Without this,
             # one slow handshake stalls every other incoming connection.
-            self.httpd.socket = ctx.wrap_socket(
-                self.httpd.socket,
+            httpd.socket = ctx.wrap_socket(
+                httpd.socket,
                 server_side=True,
                 do_handshake_on_connect=False,
             )
-        self.thread = Thread(target=self.httpd.serve_forever, name="dashboard-server", daemon=True)
-        self.thread.start()
+        thread = Thread(target=httpd.serve_forever, name="dashboard-server", daemon=True)
+        thread.start()
+        # Kept only once it serves: `shutdown()` waits for `serve_forever` to
+        # acknowledge, so `stop()` after a start that raised before the thread
+        # ran (a stop signal at start-up) would wait forever.
+        self.httpd = httpd
+        self.thread = thread
         LOG.info("Dashboard listening at %s", self.url)
 
     def stop(self) -> None:

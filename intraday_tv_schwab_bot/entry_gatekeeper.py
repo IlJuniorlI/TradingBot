@@ -57,6 +57,7 @@ from .options_mode import realized_max_loss_per_contract
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .numeric import safe_float
+from .reasons import reason_gate
 from .risk import RiskManager
 from .log_setup import TRADEFLOW_LEVEL
 from . import sessions
@@ -194,13 +195,13 @@ class EntryGatekeeper:
             target = max(entry_value + 0.01, target)
             metadata["entry_price"] = entry_value
             metadata["max_loss_per_contract"] = entry_value
-            width = float(metadata.get("strike_width_dollars") or 0.0)
+            width = safe_float(metadata.get("strike_width_dollars"), 0.0, finite=True)
             if width > 0:
                 metadata["max_profit_per_contract"] = max(0.0, width - entry_value)
             return stop, target, metadata
         if asset_type == ASSET_TYPE_OPTION_VERTICAL and signal.side.value == "SHORT":
-            width = float(metadata.get("strike_width_dollars") or 0.0)
-            adjusted_max_loss = max(0.0, width - entry_value) if width > 0 else float(metadata.get("max_loss_per_contract") or 0.0)
+            width = safe_float(metadata.get("strike_width_dollars"), 0.0, finite=True)
+            adjusted_max_loss = max(0.0, width - entry_value) if width > 0 else safe_float(metadata.get("max_loss_per_contract"), 0.0, finite=True)
             stop = min(width, entry_value * float(self.config.options.credit_stop_mult)) if width > 0 else entry_value * float(self.config.options.credit_stop_mult)
             stop = max(entry_value + 0.01, stop)
             target = entry_value * float(self.config.options.credit_target_frac)
@@ -229,18 +230,17 @@ class EntryGatekeeper:
 
     @staticmethod
     def _entry_levels_valid(side, entry_price: float, stop_price: float, target_price: float | None) -> tuple[bool, str | None]:
-        try:
-            entry = float(entry_price)
-            stop = float(stop_price)
-        except Exception:
-            return False, "invalid_entry_or_stop"
-        if entry <= 0 or stop <= 0:
+        # A level that is not a finite number is invalid. A NaN fails every
+        # comparison below, so a NaN entry, stop or target passed them all:
+        # the order went out, or the sizing floor raised (2026-09-26).
+        entry = safe_float(entry_price, finite=True)
+        stop = safe_float(stop_price, finite=True)
+        if entry is None or stop is None or entry <= 0 or stop <= 0:
             return False, "invalid_entry_or_stop"
         target = None
         if target_price is not None:
-            try:
-                target = float(target_price)
-            except Exception:
+            target = safe_float(target_price, finite=True)
+            if target is None:
                 return False, "invalid_target"
         if str(side.value if hasattr(side, "value") else side).upper() == "LONG":
             if stop >= entry:
@@ -576,7 +576,9 @@ class EntryGatekeeper:
             "asset_type": asset_type,
             "preview_entry_price": float(preview_entry_price),
             "booked_qty": int(booked_qty),
-            "booked_price": safe_float(result.fill_price, None) if booked_qty > 0 else None,
+            # Read as the booking read it (2026-09-26): an infinite fill
+            # priced the late slice at 0.0001 or at inf.
+            "booked_price": safe_float(result.fill_price, finite=True) if booked_qty > 0 else None,
             "message": str(result.message),
         }
         LOG.warning(
@@ -758,21 +760,6 @@ class EntryGatekeeper:
         return f"{strategy_name}:{symbol}"
 
     @staticmethod
-    def _decision_reason_key(reason: Any) -> str:
-        token = str(reason or '').strip()
-        if not token:
-            return 'none'
-        if '.' in token:
-            head, tail = token.split('.', 1)
-            if head in {'long', 'short'}:
-                token = tail
-        if '(' in token:
-            token = token.split('(', 1)[0]
-        if ':' in token:
-            token = token.split(':', 1)[0]
-        return token or 'none'
-
-    @staticmethod
     def _decision_context_marker(context: Mapping[str, Any] | None, details: Mapping[str, Any] | None = None) -> str | None:
         for source in (context, details):
             if not isinstance(source, Mapping):
@@ -821,7 +808,12 @@ class EntryGatekeeper:
                 if isinstance(reasons, (list, tuple)):
                     seen: set[str] = set()
                     for reason in reasons:
-                        key = self._decision_reason_key(reason)
+                        # The gate, whichever side it stopped and whatever
+                        # its detail: `long.market_structure_bearish(matrix)`
+                        # and `order_failed:rejected` tally as
+                        # `market_structure_bearish` and `order_failed`, the
+                        # session report's key too.
+                        key = reason_gate(reason)
                         if key in seen:
                             continue
                         seen.add(key)
@@ -850,7 +842,18 @@ class EntryGatekeeper:
         force: bool = False,
         context: dict[str, Any] | None = None,
         details: dict[str, Any] | None = None,
+        market_side: Side | None = None,
     ) -> bool:
+        """Record one entry decision: the dashboard's payload, the skip
+        tally and the ``Decision`` log line the session archive's
+        ``decisions.csv`` is scraped from. ``market_side`` marks a decision
+        about a signal the strategy built, with the way it bets on the
+        symbol (``RiskManager.market_side``: an option's underlying
+        direction, not its order side). The signal's reason is then the
+        first of ``reasons``, followed on a skip by the engine gate that
+        refused it (``max_positions``, ``order_failed:...``), which the
+        session report's gate attribution scores on that side whatever the
+        signal is called."""
         cleaned: list[str] = []
         for item in reasons or []:
             token = str(item or "").strip()
@@ -902,13 +905,14 @@ class EntryGatekeeper:
             decision_log_level = logging.DEBUG
         LOG.log(
             decision_log_level,
-            'Decision symbol=%s strategy=%s action=%s primary=%s secondary=%s side_pref=%s family=%s reasons=%s',
+            'Decision symbol=%s strategy=%s action=%s primary=%s secondary=%s side_pref=%s market_side=%s family=%s reasons=%s',
             symbol,
             strategy_name,
             action,
             primary_reason,
             secondary_reason or 'none',
             side_pref or 'none',
+            market_side.value if market_side is not None else 'none',
             entry_family or 'none',
             ','.join(cleaned) if cleaned else 'none',
         )
@@ -992,18 +996,19 @@ class EntryGatekeeper:
         finalized: set[str] = set()
         for signal in signals:
             finalized.add(signal.symbol)
+            signal_market_side = RiskManager.market_side(signal.strategy, signal.side, signal.metadata)
             if self._is_startup_reconcile_entry_blocked(signal.symbol):
-                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "startup_reconcile_ignored_open_position"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)})
+                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "startup_reconcile_ignored_open_position"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
                 continue
             if self.has_unsettled_entry(signal.symbol):
                 # An earlier entry order for this symbol may still be live or
                 # hold unbooked fills; a second one could double the position.
-                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "entry_order_unsettled"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)})
+                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "entry_order_unsettled"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
                 continue
             allowed, reason = self.risk.can_open(signal, self.positions)
             if not allowed:
                 LOG.log(TRADEFLOW_LEVEL, "Skipping %s %s: %s", signal.symbol, signal.reason, reason)
-                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, reason], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)})
+                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, reason], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
                 continue
             asset_type = signal.metadata.get("asset_type")
             if asset_type in OPTION_ASSET_TYPES and self._is_option_entry_retry_blocked(signal.symbol, signal.metadata):
@@ -1013,19 +1018,20 @@ class EntryGatekeeper:
                     "skipped",
                     [signal.reason, "entry_retry_backoff"],
                     context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)},
+                    market_side=signal_market_side,
                 )
                 continue
             if asset_type in OPTION_ASSET_TYPES:
-                preview_entry_price = float(signal.metadata.get("entry_price") or 0.0)
+                preview_entry_price = safe_float(signal.metadata.get("entry_price"), 0.0, finite=True)
                 levels_ok, levels_reason = self._entry_levels_valid(signal.side, preview_entry_price, signal.stop_price, signal.target_price)
                 if not levels_ok:
-                    self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, levels_reason or "invalid_levels"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, preview_entry_price)})
+                    self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, levels_reason or "invalid_levels"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, preview_entry_price)}, market_side=signal_market_side)
                     continue
-                max_loss = float(signal.metadata.get("max_loss_per_contract") or 0.0)
+                max_loss = safe_float(signal.metadata.get("max_loss_per_contract"), 0.0, finite=True)
                 qty = self.risk.size_option_position(max_loss)
                 if qty <= 0:
                     LOG.log(TRADEFLOW_LEVEL, "Skipping %s, option qty <= 0", signal.symbol)
-                    self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "option_qty_zero"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty, preview_entry_price), **self._risk_snapshot(signal, preview_entry_price, qty)})
+                    self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "option_qty_zero"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty, preview_entry_price), **self._risk_snapshot(signal, preview_entry_price, qty)}, market_side=signal_market_side)
                     continue
                 raw_spec = self._scaled_order_spec(signal.metadata["order_spec"], qty)
                 if asset_type == ASSET_TYPE_OPTION_VERTICAL:
@@ -1035,7 +1041,7 @@ class EntryGatekeeper:
                 filled_qty = int(result.filled_qty or 0) if result.ok else 0
                 if result.ok and filled_qty <= 0:
                     LOG.warning("Option entry %s ok=True but filled_qty=%s — treating as unfilled", signal.metadata.get("position_key", signal.symbol), result.filled_qty)
-                    self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "filled_qty_zero"])
+                    self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "filled_qty_zero"], market_side=signal_market_side)
                     continue
                 qty_for_position = filled_qty if filled_qty > 0 else qty
                 if result.ok and filled_qty > 0 and filled_qty != qty:
@@ -1052,14 +1058,14 @@ class EntryGatekeeper:
                             position_key=str(signal.metadata.get("position_key") or signal.symbol),
                             asset_type=str(asset_type), preview_entry_price=preview_entry_price, booked_qty=0,
                         )
-                        self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_unsettled:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, preview_entry_price, result.message)})
+                        self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_unsettled:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, preview_entry_price, result.message)}, market_side=signal_market_side)
                         continue
                     if self.config.schwab.dry_run and str(result.message).startswith("dry_run_not_filled_"):
                         self._register_option_entry_retry_backoff(signal.symbol, signal.metadata)
-                    self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_failed:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, preview_entry_price, result.message), **self._risk_snapshot(signal, preview_entry_price, qty_for_position)})
+                    self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_failed:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, preview_entry_price, result.message), **self._risk_snapshot(signal, preview_entry_price, qty_for_position)}, market_side=signal_market_side)
                     continue
                 self._clear_option_entry_retry_backoff(signal.symbol, signal.metadata)
-                entry_price = float(result.fill_price if result.fill_price is not None else signal.metadata.get("entry_price") or 0.0)
+                entry_price = safe_float(result.fill_price, preview_entry_price, finite=True)
                 stop_price, target_price, position_metadata = self._materialize_option_position_levels(signal, entry_price)
                 levels_ok, levels_reason = self._entry_levels_valid(signal.side, entry_price, stop_price, target_price)
                 if not levels_ok:
@@ -1134,22 +1140,22 @@ class EntryGatekeeper:
                         preview_entry_price=preview_entry_price, booked_qty=qty_for_position,
                     )
                 self._save_reconcile_metadata()
-                self._log_entry_decision(signal.strategy, signal.symbol, "entered", [signal.reason])
+                self._log_entry_decision(signal.strategy, signal.symbol, "entered", [signal.reason], market_side=signal_market_side)
                 continue
 
             frame = bars.get(signal.symbol)
             if frame is None or frame.empty:
-                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "entry_frame_unavailable"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)})
+                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "entry_frame_unavailable"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
                 continue
             intent = self.executor.order_intent_for_entry(signal.side)
             preview = self.executor.preview_equity_entry(signal.symbol, intent, data=self.data)
             if preview is None:
-                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "entry_quote_unavailable"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)})
+                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "entry_quote_unavailable"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
                 continue
             entry_price = float(preview["limit_price"])
             levels_ok, levels_reason = self._entry_levels_valid(signal.side, entry_price, signal.stop_price, signal.target_price)
             if not levels_ok:
-                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, levels_reason or "invalid_levels"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, entry_price, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)})
+                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, levels_reason or "invalid_levels"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, entry_price, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)}, market_side=signal_market_side)
                 continue
             # Size against a stop distance padded by expected slippage, so an
             # adverse fill still lands inside the per-trade risk budget. The
@@ -1166,13 +1172,13 @@ class EntryGatekeeper:
                 qty = min(qty, self.risk.floor_discrete_units(remaining_notional, entry_price))
             if qty <= 0:
                 LOG.log(TRADEFLOW_LEVEL, "Skipping %s, qty <= 0 or max_total_notional reached", signal.symbol)
-                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "qty_zero_or_notional_limit"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty, entry_price, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent), **self._risk_snapshot(signal, entry_price, qty)})
+                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "qty_zero_or_notional_limit"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty, entry_price, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent), **self._risk_snapshot(signal, entry_price, qty)}, market_side=signal_market_side)
                 continue
             proposed_notional = entry_price * qty
             allowed, reason = self.risk.can_add_stock_notional(self.positions, proposed_notional)
             if not allowed:
                 LOG.log(TRADEFLOW_LEVEL, "Skipping %s %s: %s", signal.symbol, signal.reason, reason)
-                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, reason], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, entry_price, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)})
+                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, reason], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, entry_price, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)}, market_side=signal_market_side)
                 continue
             # side/stop/target are what turn this into a broker-side bracket:
             # when execution.bracket_orders_enabled is false the executor
@@ -1188,7 +1194,7 @@ class EntryGatekeeper:
             filled_qty = int(result.filled_qty or 0) if result.ok else 0
             if result.ok and filled_qty <= 0:
                 LOG.warning("Entry %s ok=True but filled_qty=%s — treating as unfilled", signal.symbol, result.filled_qty)
-                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "filled_qty_zero"])
+                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "filled_qty_zero"], market_side=signal_market_side)
                 continue
             qty_for_position = filled_qty if filled_qty > 0 else qty
             if result.ok and filled_qty > 0 and filled_qty != qty:
@@ -1203,12 +1209,15 @@ class EntryGatekeeper:
                         signal, result, position_key=signal.symbol, asset_type="EQUITY",
                         preview_entry_price=entry_price, booked_qty=0,
                     )
-                    self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_unsettled:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, entry_price, result_message=result.message, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)})
+                    self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_unsettled:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, entry_price, result_message=result.message, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)}, market_side=signal_market_side)
                     continue
-                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_failed:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, entry_price, result_message=result.message, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent), **self._risk_snapshot(signal, entry_price, qty_for_position)})
+                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_failed:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, entry_price, result_message=result.message, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent), **self._risk_snapshot(signal, entry_price, qty_for_position)}, market_side=signal_market_side)
                 continue
             signal_entry_price = float(entry_price)  # pre-fill intended price
-            entry_price = float(result.fill_price if result.fill_price is not None else entry_price)
+            # A fill price that is not a finite number books at the preview,
+            # as a missing one does; a NaN one booked the position at NaN
+            # (2026-09-26).
+            entry_price = safe_float(result.fill_price, signal_entry_price, finite=True)
             stop_price = float(signal.stop_price)
             target_price = safe_float(signal.target_price, None)
 
@@ -1321,7 +1330,7 @@ class EntryGatekeeper:
                     preview_entry_price=signal_entry_price, booked_qty=qty_for_position,
                 )
             self._save_reconcile_metadata()
-            self._log_entry_decision(signal.strategy, signal.symbol, "entered", [signal.reason])
+            self._log_entry_decision(signal.strategy, signal.symbol, "entered", [signal.reason], market_side=signal_market_side)
 
         for symbol, payload in decision_map.items():
             if symbol in finalized:

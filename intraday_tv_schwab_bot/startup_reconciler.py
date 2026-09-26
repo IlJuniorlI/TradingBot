@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from .broker_positions import (
     active_broker_bracket,
     broker_position_side_qty,
+    broker_quantity,
     working_exit_outstanding_qty,
 )
 from .config import BotConfig
@@ -129,11 +130,12 @@ class StartupReconciler:
             symbol = str(row.get("symbol") or "").upper().strip()
             if not symbol or symbol not in ignored:
                 continue
-            # A held broker row reads the way the settle reads it: a
-            # malformed quantity is not held, and neither is a row that is
-            # both long and short.
-            _side, qty, _avg = broker_position_side_qty(row)
-            if qty > 0:
+            # A held broker row reads the way the settle reads it: a row
+            # both long and short is not held, and one whose quantity cannot
+            # be read may be, as every symbol may be when the account read
+            # fails (2026-09-26; it read as not held).
+            _side, qty = broker_position_side_qty(row)
+            if qty is None or qty > 0:
                 blocked.add(symbol)
         return blocked
 
@@ -349,12 +351,15 @@ class StartupReconciler:
     @staticmethod
     def _broker_held_qty(position: Position, held: dict[str, dict[str, Any]]) -> int | None:
         """Units the broker holds of *position* (0 when none), or None when
-        its rows cannot be read as this position (vertical legs out of step)."""
+        its rows cannot be read as this position (a quantity that is not a
+        finite number, or vertical legs out of step)."""
         meta = position.metadata if isinstance(position.metadata, dict) else {}
         asset_type = str(meta.get("asset_type") or ASSET_TYPE_EQUITY).upper()
         if asset_type == ASSET_TYPE_OPTION_VERTICAL:
-            long_side, long_qty, _ = broker_position_side_qty(held.get(str(meta.get("long_leg_symbol") or "").upper().strip()))
-            short_side, short_qty, _ = broker_position_side_qty(held.get(str(meta.get("short_leg_symbol") or "").upper().strip()))
+            long_side, long_qty = broker_position_side_qty(held.get(str(meta.get("long_leg_symbol") or "").upper().strip()))
+            short_side, short_qty = broker_position_side_qty(held.get(str(meta.get("short_leg_symbol") or "").upper().strip()))
+            if long_qty is None or short_qty is None:
+                return None
             if long_qty <= 0 and short_qty <= 0:
                 return 0
             if long_side != Side.LONG or short_side != Side.SHORT or long_qty != short_qty:
@@ -364,7 +369,9 @@ class StartupReconciler:
             symbol = str(meta.get("option_symbol") or "")
         else:
             symbol = str(meta.get("underlying") or position.symbol)
-        side, qty, _ = broker_position_side_qty(held.get(symbol.upper().strip()))
+        side, qty = broker_position_side_qty(held.get(symbol.upper().strip()))
+        if qty is None:
+            return None
         return int(qty) if side == position.side else 0
 
     def _working_exit_order_state(self, position: Position) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
@@ -676,8 +683,15 @@ class StartupReconciler:
         for row in positions:
             symbol = str(row.get("symbol") or "").upper().strip()
             asset_type = str(row.get("assetType") or "").upper().strip()
-            long_qty = int(float(row.get("longQuantity") or 0) or 0)
-            short_qty = int(float(row.get("shortQuantity") or 0) or 0)
+            long_qty = broker_quantity(row.get("longQuantity"))
+            short_qty = broker_quantity(row.get("shortQuantity"))
+            if long_qty is None or short_qty is None:
+                # Fails the attempt, which is retried: skipping the row left
+                # what the broker holds unmanaged (2026-09-26).
+                raise ValueError(
+                    f"the broker position row for {symbol or '?'} holds an unreadable quantity "
+                    f"(longQuantity={row.get('longQuantity')!r}, shortQuantity={row.get('shortQuantity')!r})"
+                )
             qty = long_qty if long_qty > 0 else short_qty
             if not symbol or qty <= 0:
                 skipped += 1
@@ -704,7 +718,13 @@ class StartupReconciler:
                 skipped += 1
                 continue
             side = Side.LONG if long_qty > 0 else Side.SHORT
-            entry_price = max(0.01, float(row.get("averagePrice") or 0.0))
+            average_price = safe_float(row.get("averagePrice") or 0.0, finite=True)
+            if average_price is None:
+                # Fails the attempt too: a NaN one read as an entry of 0.01
+                # and an infinite one as an infinite entry (2026-09-26).
+                raise ValueError(f"the broker position row for {symbol} holds an unreadable averagePrice "
+                                 f"{row.get('averagePrice')!r}")
+            entry_price = max(0.01, average_price)
             matched_info = self._find_reconcile_metadata_match_with_key(metadata_positions, symbol, side, qty, entry_price) if use_metadata else None
             matched = matched_info[1] if matched_info is not None else None
             if matched_info is not None:

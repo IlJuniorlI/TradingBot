@@ -24,6 +24,7 @@ from .chart_patterns import (
     chart_pattern_group_tokens,
     invalid_allowed_chart_patterns,
 )
+from .event_blackouts import blackout_time_errors
 from .models import PairDefinition, StrategySchedule, Window
 from ._strategies.catalogue import (
     default_strategy_name,
@@ -34,7 +35,7 @@ from ._strategies.catalogue import (
 )
 from ._strategies.factory import normalize_strategy_params
 from .indicators import set_runtime_indicator_mode, set_session_indicator_window
-from .sessions import parse_hhmm
+from .sessions import is_hhmm, parse_hhmm
 from .symbols import normalize_symbol_list
 
 LOG = logging.getLogger(__name__)
@@ -1530,14 +1531,6 @@ def _normalize_pairs_config(values: Any) -> list[PairDefinition]:
     return out
 
 
-def _normalize_force_flatten_time(value: Any) -> str:
-    if isinstance(value, int) and 0 <= value < (24 * 60):
-        hh, mm = divmod(int(value), 60)
-        return f"{hh:02d}:{mm:02d}"
-    if value is None:
-        return "15:18"
-    return str(value).strip() or "15:18"
-
 def _normalize_options_config(raw: dict[str, Any]) -> dict[str, Any]:
     out = dict(raw or {})
     underlyings = normalize_symbol_list(out.get("underlyings"))
@@ -1553,7 +1546,6 @@ def _normalize_options_config(raw: dict[str, Any]) -> dict[str, Any]:
                 continue
             normalized_confirmation[underlying] = confirm_symbol
         out["confirmation_symbols"] = normalized_confirmation
-    out["force_flatten_time"] = _normalize_force_flatten_time(out.get("force_flatten_time", "15:18"))
     return out
 
 
@@ -1710,7 +1702,7 @@ def _validate_execution_config(execution: EquityExecutionConfig, risk: RiskConfi
 
 
 def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path) -> None:
-    """Plausibility checks for options sizing and quote-freshness.
+    """Plausibility checks for options sizing, quote-freshness and the times.
 
     max_quote_age_seconds was previously read via ``getattr(..., 10)``
     fallback in the engine before Phase 1 validators landed; validation
@@ -1724,8 +1716,54 @@ def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path)
         errors.append(f"options.max_contracts_per_trade must be >= 1, got {options.max_contracts_per_trade}")
     if options.underlyings is not None and not isinstance(options.underlyings, list):
         errors.append(f"options.underlyings must be a list of symbols, got {options.underlyings!r}")
+    # The times fail here, naming the key, instead of where they are read:
+    # force_flatten_time when an options strategy is built, the other three
+    # at their first read, mid-session. A blank force_flatten_time meant
+    # 15:18 until 2026-09-26 (a normalizer, removed as a silent fallback).
+    for name in ("force_flatten_time", "debit_target_time_decay_start", "debit_target_time_decay_end",
+                 "delta_time_shift_start"):
+        value = getattr(options, name)
+        if not is_hhmm(value):
+            errors.append(f"options.{name} must be an HH:MM time, got {value!r}")
     if errors:
         raise ValueError(f"{config_path}: invalid options configuration:\n  " + "\n  ".join(errors))
+
+
+def _validate_events_config(events: EventsConfig, config_path: Path) -> None:
+    """An inline blackout row's ``start`` / ``end`` must be an HH:MM time.
+
+    The calendar parses them only on the row's date, inside the entry and
+    (for the 0DTE strategies) force-flatten checks, so a typo waited for the
+    event itself. The ``blackout_file`` rows are checked when the strategy
+    builds its calendar (``event_blackouts.EventBlackoutCalendar``)."""
+    errors = blackout_time_errors(events.blackouts, "events.blackouts")
+    if errors:
+        raise ValueError(f"{config_path}: invalid events configuration:\n  " + "\n  ".join(errors))
+
+
+def _validate_strategy_windows(strategies: dict[str, "StrategyConfig"], config_path: Path) -> None:
+    """Each ``entry_windows`` / ``management_windows`` / ``screener_windows``
+    entry must be a ``[start, end]`` pair of HH:MM times.
+
+    The manifests' windows are checked when the catalogue loads; these are
+    the YAML overrides, which ``build_schedule`` parsed only in the engine's
+    first cycle (and again in its error handler, so the bot died there)."""
+    errors: list[str] = []
+    for name, cfg in strategies.items():
+        for field_name in ("entry_windows", "management_windows", "screener_windows"):
+            windows = getattr(cfg, field_name)
+            if not isinstance(windows, list | tuple):
+                errors.append(f"strategies.{name}.{field_name} must be a list of [start, end] windows, got {windows!r}")
+                continue
+            for index, window in enumerate(windows):
+                if isinstance(window, list | tuple) and len(window) == 2 and all(is_hhmm(end) for end in window):
+                    continue
+                errors.append(
+                    f"strategies.{name}.{field_name}[{index}] must be a [start, end] pair of HH:MM times, "
+                    f"got {window!r}"
+                )
+    if errors:
+        raise ValueError(f"{config_path}: invalid strategy windows:\n  " + "\n  ".join(errors))
 
 
 def _validate_sector_index_map(strategies: dict[str, "StrategyConfig"], config_path: Path) -> None:
@@ -1885,6 +1923,7 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
         )
 
     _validate_sector_index_map(strategies, config_path)
+    _validate_strategy_windows(strategies, config_path)
 
     active_base = strategies[strategy]
     strategies[strategy] = StrategyConfig(
@@ -1920,6 +1959,9 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     support_resistance_cfg = SupportResistanceConfig(**support_resistance_raw)
     _validate_support_resistance_config(support_resistance_cfg, config_path)
 
+    events_cfg = EventsConfig(**events_raw)
+    _validate_events_config(events_cfg, config_path)
+
     return BotConfig(
         strategy=strategy,
         schwab=SchwabConfig(**schwab_raw),
@@ -1940,7 +1982,7 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
         chart_patterns=ChartPatternsConfig(**chart_patterns_raw),
         support_resistance=support_resistance_cfg,
         technical_levels=TechnicalLevelsConfig(**technical_levels_raw),
-        events=EventsConfig(**events_raw),
+        events=events_cfg,
         shared_entry=SharedEntryLogicConfig(**shared_entry_raw),
         shared_exit=SharedExitLogicConfig(**shared_exit_raw),
         options=options_cfg,

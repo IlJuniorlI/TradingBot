@@ -104,6 +104,7 @@ Strategy-specific knobs:
 - Anti-chase / extension controls:
   - `max_extension_from_vwap_atr`, `max_extension_from_ema9_atr`, `extension_penalty_per_atr`, `extension_hard_cap_mult`
   - past `max_extension_from_*_atr` the score pays `extension_penalty_per_atr` per ATR; past that times `extension_hard_cap_mult` the side is refused as `too_extended_hard_cap_vwap_atr` / `too_extended_hard_cap_ema9_atr` (before 2026-09-26 it reused the base exhaustion filter's `too_extended_from_*_atr`, which `max_entry_*_extension_atr` still drives)
+  - both read the close's absolute distance from VWAP / EMA9 in ATR, so a close that far on the wrong side of the line (a LONG below it, a SHORT above) pays the same penalty and is refused too, as `wrong_side_hard_cap_vwap_atr` / `wrong_side_hard_cap_ema9_atr` (before 2026-09-26 under the `too_extended_hard_cap_*` tokens); the base exhaustion filter measures only the side's own direction
 - Peer and macro confirmation:
   - `min_peer_agreement`, `min_peer_score`
   - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`

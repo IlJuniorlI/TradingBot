@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from .models import Side
+from .numeric import safe_int
 
 
 def extract_broker_positions(payload: Any) -> list[dict[str, Any]]:
@@ -124,26 +125,32 @@ def order_result_needs_broker_recheck(message: Any) -> bool:
     )
 
 
-def broker_position_side_qty(row: dict[str, Any] | None) -> tuple[Side | None, int, float | None]:
+def broker_quantity(value: Any) -> int | None:
+    """A broker position row's quantity in whole units: 0 when it is absent
+    (None or an empty string), None when it is not a finite number (NaN,
+    ±inf, unparseable, a whitespace-only string included).
+
+    An unreadable quantity says nothing about what is held. Until 2026-09-26
+    it read as 0, so the settle booked a tracked position closed outside the
+    bot and cancelled its broker stop.
+    """
+    return safe_int(value or 0)
+
+
+def broker_position_side_qty(row: dict[str, Any] | None) -> tuple[Side | None, int | None]:
+    """The side and whole-unit quantity a broker position row holds.
+
+    ``(None, 0)`` for no row, a flat one or one both long and short;
+    ``(None, None)`` when either quantity cannot be read (``broker_quantity``).
+    """
     if not isinstance(row, dict):
-        return None, 0, None
-    try:
-        long_qty = int(float(row.get("longQuantity") or 0) or 0)
-    except Exception:
-        long_qty = 0
-    try:
-        short_qty = int(float(row.get("shortQuantity") or 0) or 0)
-    except Exception:
-        short_qty = 0
-    avg_price = None
-    try:
-        raw_avg = row.get("averagePrice")
-        if raw_avg is not None:
-            avg_price = float(raw_avg)
-    except Exception:
-        avg_price = None
+        return None, 0
+    long_qty = broker_quantity(row.get("longQuantity"))
+    short_qty = broker_quantity(row.get("shortQuantity"))
+    if long_qty is None or short_qty is None:
+        return None, None
     if long_qty > 0 >= short_qty:
-        return Side.LONG, long_qty, avg_price
+        return Side.LONG, long_qty
     if short_qty > 0 >= long_qty:
-        return Side.SHORT, short_qty, avg_price
-    return None, 0, avg_price
+        return Side.SHORT, short_qty
+    return None, 0

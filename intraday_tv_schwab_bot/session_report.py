@@ -42,9 +42,9 @@ except ImportError:  # pragma: no cover — yaml is a hard dep elsewhere
     _yaml = None  # type: ignore[assignment]
 
 from .paper_account import PaperAccount, TradeRecord, closed_trade_lifecycles
-from .models import Position
+from .models import Position, Side
 from . import sessions
-from .reasons import exit_reason_code, reason_head
+from .reasons import exit_reason_code, reason_gate, reason_side, split_side_prefix
 from .serialization import atomic_write_text
 
 LOG = logging.getLogger(__name__)
@@ -583,11 +583,17 @@ def _filter_rejection_summary(skip_counts: dict[str, int] | None) -> dict[str, A
     """Shape the engine's raw skip-count dict into a stable, sorted payload.
 
     Two views are emitted:
-      * ``top_reasons`` / ``all_reasons`` — grouped by normalized reason
-        (no parenthetical suffix). This is the view the operator reads
-        for day-over-day comparison.
+      * ``top_reasons`` / ``all_reasons`` — grouped by gate
+        (``reasons.reason_gate``: no ``long.`` / ``short.`` side prefix, no
+        ``(...)`` or ``:...`` detail), the key gate attribution and the
+        entry cycle summary use too. This is the view the operator reads
+        for day-over-day comparison. Until 2026-09-26 only the ``(`` detail
+        was cut, so every value of a ``:`` detail
+        (``long_level_score_below_min:2.50<2.90``) was a bucket of its own,
+        and the peer family's ``long.x`` / ``short.x`` two.
       * ``variants`` — the raw reasons as logged, preserved so a tuner
-        can inspect the full parameter distribution of a specific bucket.
+        can inspect the full parameter distribution (and the sides) of a
+        specific bucket.
     """
     if not skip_counts:
         return {"total_skips": 0, "top_reasons": [], "all_reasons": {}, "variants": {}}
@@ -596,7 +602,7 @@ def _filter_rejection_summary(skip_counts: dict[str, int] | None) -> dict[str, A
     normalized: dict[str, int] = {}
     variants: dict[str, dict[str, int]] = {}
     for reason, count in skip_counts.items():
-        bucket = reason_head(str(reason))
+        bucket = reason_gate(reason)
         normalized[bucket] = normalized.get(bucket, 0) + int(count)
         if bucket != reason:
             # Preserve the raw variant so tuning can see distributions.
@@ -1101,10 +1107,11 @@ def _extract_structured_events(log_path: Path) -> list[dict]:
 
 # Engine decision lines look like:
 #   "... Decision symbol=TSLA strategy=top_tier_adaptive action=skipped
-#    primary=... secondary=... side_pref=... family=... reasons=..."
+#    primary=... secondary=... side_pref=... market_side=... family=...
+#    reasons=..."
 # Reasons can contain spaces inside parens but the OTHER fields are
 # space-separated key=value (value has no spaces).
-_DECISION_FIELD_RE = re.compile(r"\b(symbol|strategy|action|primary|secondary|side_pref|family)=(\S+)")
+_DECISION_FIELD_RE = re.compile(r"\b(symbol|strategy|action|primary|secondary|side_pref|market_side|family)=(\S+)")
 _DECISION_LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})\b.*\bDecision\s+(.*)$")
 
 
@@ -1125,8 +1132,8 @@ def _extract_decisions(log_path: Path) -> list[dict]:
                 # can contain arbitrary 'key=value' fragments like
                 # 'last_high=na,last_low=HL') can't shadow the actual
                 # field values. None of today's reason strings include
-                # symbol/strategy/action/primary/secondary/side_pref/family
-                # tokens but a future skip reason could.
+                # symbol/strategy/action/primary/secondary/side_pref/
+                # market_side/family tokens but a future skip reason could.
                 reasons_idx = tail.find(" reasons=")
                 if reasons_idx >= 0:
                     head = tail[:reasons_idx]
@@ -1294,16 +1301,6 @@ def _reason_tokens(reasons: str) -> list[str]:
     return [token.strip() for token in tokens if token.strip()]
 
 
-def _reason_side(primary: str) -> str | None:
-    """``LONG`` / ``SHORT`` when a skip reason names the side it stopped
-    (``long_build_failed_...``, ``build_failed_short_...``), else None."""
-    lowered = primary.strip().lower()
-    for side in ("long", "short"):
-        if lowered.startswith(f"{side}_") or lowered.startswith(f"build_failed_{side}_"):
-            return side.upper()
-    return None
-
-
 def _gate_attribution(
     archive_root: Path, window_minutes: int = 30, min_samples: int = 20,
 ) -> dict[str, Any]:
@@ -1332,14 +1329,28 @@ def _gate_attribution(
     unqualified the gate that stopped the other side's qualified build sat in
     ``reasons`` (2026-09-21: 267 minutes of long trend blocks by the
     confirmation-bar gate never scored, at the opposite edge to the counted
-    ones). Each side-prefixed build reason after ``primary`` is scored too;
-    a row led by a built signal (``top_tier_range_long,max_positions``) is
-    scored under the engine gate that blocked it, on the signal's side.
+    ones). Each side-prefixed build reason after ``primary`` is scored too:
+    top_tier's (``short_build_failed_...``) and the peer family's, which lists
+    every blocker of each side it refused under that side's ``long.`` /
+    ``short.`` prefix (``reasons.side_prefixed_reasons``). A row about a
+    signal the strategy built, which the gatekeeper marks with the way the
+    signal bets on the symbol (``market_side``; an option's underlying
+    direction, not its order side), lists the signal's reason first and the
+    engine gate that refused it after (``peer_confirmed_key_level_long,
+    max_positions``): the gate is scored, on that side. Until
+    2026-09-26 only top_tier's signal names (``top_tier_range_long``) were
+    recognised, so every other strategy's refused signal was scored under
+    its own name, on the screener's side, and the gate never was.
 
-    Reasons are normalised through ``reasons.reason_head``, so the numeric
-    detail that fragments `session_skip_counts` into hundreds of near-
-    duplicates rolls up. Decisions are deduped by (symbol, minute, reason)
-    because one decision is logged repeatedly across a cycle.
+    Each reason is bucketed under its gate, ``reasons.reason_gate``: the key
+    the filter rejections and the entry cycle summary use, with no side
+    prefix and no ``(...)`` or ``:...`` detail, so the numeric detail that
+    fragments `session_skip_counts` into hundreds of near-duplicates rolls up
+    (until 2026-09-26 only the ``(`` detail was cut, and the peer family's
+    ``long.x`` / ``short.x`` were two gates). The side each block was scored
+    on is kept per gate in ``sides``. Decisions are deduped by (symbol,
+    minute, gate, side) because one decision is logged repeatedly across a
+    cycle.
 
     Returns {} on any I/O or parse failure — never crashes the archive write.
     """
@@ -1354,9 +1365,10 @@ def _gate_attribution(
         favourable: dict[str, list[float]] = defaultdict(list)
         adverse: dict[str, list[float]] = defaultdict(list)
         families: dict[str, Counter] = defaultdict(Counter)
+        sides: dict[str, Counter] = defaultdict(Counter)
         blocked = Counter()
         unevaluated = Counter()
-        seen: set[tuple[str, datetime, str]] = set()
+        seen: set[tuple[str, datetime, str, str]] = set()
         # (reason, side, excursion) -- scored after the baseline, which needs
         # the span of every decision first.
         scored: list[tuple[str, str, tuple[float, float, float]]] = []
@@ -1384,41 +1396,48 @@ def _gate_attribution(
                 primary = str(row.get("primary", "") or "").strip()
                 if not primary or primary == "none":
                     continue
-                # Which way was the bot about to trade? The reason's own side
-                # when it names one -- `short_build_failed_...` is the SHORT
-                # build this gate stopped. `side_pref` is the CANDIDATE's
-                # screener bias, and it disagrees with a side-prefixed reason
-                # on about a quarter of rows (2026-09-22: 2,065 `short_` rows
-                # carried side_pref=LONG); read first, it scored those blocks
-                # in the wrong direction. It stands in only for reasons that
-                # name no side. Without a side there is no "favourable"
-                # direction and the row cannot be scored.
+                # Which way was the bot about to trade? On a signal an engine
+                # gate refused, the way the signal bet (``market_side``).
+                # Otherwise the reason's own side when it names one
+                # (``reasons.reason_side``) --
+                # `short_build_failed_...` is the SHORT build this gate
+                # stopped, and so is the peer family's `short.<gate>`, a
+                # spelling read only since 2026-09-26 (a peer blocker took the
+                # screener's side until then, and on key_levels, whose
+                # candidates carry none, was dropped). `side_pref` is the
+                # CANDIDATE's screener bias, and it disagrees with a
+                # side-prefixed reason on about a quarter of rows (2026-09-22:
+                # 2,065 `short_` rows carried side_pref=LONG); read first, it
+                # scored those blocks in the wrong direction. It stands in
+                # only for reasons that name no side. Without a side there is
+                # no "favourable" direction and the row cannot be scored.
                 side_pref = str(row.get("side_pref", "") or "").strip().upper()
                 tokens = _reason_tokens(str(row.get("reasons", "") or "")) or [primary]
-                lowered = primary.lower()
-                built = None if _BUILD_FAILED_SIDE_RE.match(lowered) else _ENTERED_REGIME_RE.search(lowered)
-                if built is not None:
-                    signal_side = built.group("side").upper()
-                    gates = [(token, signal_side) for token in tokens[1:]] or [(primary, signal_side)]
+                market_side = str(row.get("market_side", "") or "").strip().upper()
+                if market_side in {"LONG", "SHORT"}:
+                    gates = [(token, Side(market_side)) for token in tokens[1:]]
                 else:
-                    gates = [(primary, _reason_side(primary))] + [
-                        (token, _reason_side(token)) for token in tokens[1:]
-                        if _BUILD_FAILED_SIDE_RE.match(token.lower())
+                    gates = [(primary, reason_side(primary))] + [
+                        (token, reason_side(token)) for token in tokens[1:]
+                        if _BUILD_FAILED_SIDE_RE.match(token.lower()) or split_side_prefix(token.lower())[0] is not None
                     ]
                 family = str(row.get("family", "") or "none").strip() or "none"
                 excursion: tuple[float, float, float] | None = None
                 excursion_read = False
                 for token, token_side in gates:
-                    reason = reason_head(token)
-                    key = (symbol, ts.replace(second=0), reason)
+                    side = token_side.value if token_side is not None else side_pref
+                    if side not in {"LONG", "SHORT"}:
+                        continue
+                    # One gate can stop both sides on a row (the peer
+                    # family's `long.x` and `short.x` are gate `x`): two blocks.
+                    reason = reason_gate(token)
+                    key = (symbol, ts.replace(second=0), reason, side)
                     if key in seen:
                         continue
                     seen.add(key)
-                    side = token_side or side_pref
-                    if side not in {"LONG", "SHORT"}:
-                        continue
 
                     blocked[reason] += 1
+                    sides[reason][side] += 1
                     families[reason][family] += 1
 
                     if not excursion_read:
@@ -1464,6 +1483,7 @@ def _gate_attribution(
             adv = adverse.get(reason, [])
             entry: dict[str, Any] = {
                 "blocked": int(count),
+                "sides": dict(sorted(sides[reason].items())),
                 "evaluated": len(nets),
                 "unevaluated": int(unevaluated.get(reason, 0)),
                 "regimes": dict(families[reason].most_common(4)),
@@ -1551,8 +1571,10 @@ _QUALIFIED_REGIME_NAMES = ("vwap_reclaim", "vol_squeeze", "sr_scalp", "pullback"
 _BUILD_FAILED_SIDE_RE = re.compile(
     r"^(?:(?P<side_a>long|short)_build_failed_|build_failed_(?P<side_b>long|short)_)(?P<rest>.*)$"
 )
-_ENTERED_REGIME_RE = re.compile(
-    r"(?:^|_)(?P<regime>" + "|".join(_QUALIFIED_REGIME_NAMES) + r")_(?P<side>long|short)$"
+# The reason of a signal top_tier built (and small_cap_squeeze, which
+# inherits the builder): `top_tier_{regime}_{side}`, whole.
+_TOP_TIER_SIGNAL_RE = re.compile(
+    r"^top_tier_(?P<regime>" + "|".join(_QUALIFIED_REGIME_NAMES) + r")_(?P<side>long|short)$"
 )
 
 
@@ -1568,7 +1590,10 @@ def _qualified_regime_calls(row: dict[str, Any]) -> list[tuple[str, int]]:
     (``top_tier_trend_long``) -- entered, or blocked afterwards by an engine
     gate, which the gatekeeper logs as a skip with the signal's reason first
     (``top_tier_range_long,max_positions``). ``unqualified_no_qualifying_regime``
-    is not a call.
+    is not a call. A signal is read by top_tier's own name for it: until
+    2026-09-26 any reason ending ``_<regime>_<side>`` was, so another
+    strategy's signal (``rth_trend_pullback_long``) counted as a top_tier
+    ``pullback`` call.
 
     A skipped row's calls are all its ``reasons``, not just ``primary``: an
     unqualified side is logged ahead of every build, so on a row where one
@@ -1583,10 +1608,9 @@ def _qualified_regime_calls(row: dict[str, Any]) -> list[tuple[str, int]]:
     row records, so it is not counted.
     """
     primary = str(row.get("primary", "") or "").strip().lower()
-    if not _BUILD_FAILED_SIDE_RE.match(primary):
-        m = _ENTERED_REGIME_RE.search(primary)
-        if m:
-            return [(m.group("regime"), 1 if m.group("side") == "long" else -1)]
+    m = _TOP_TIER_SIGNAL_RE.match(primary)
+    if m:
+        return [(m.group("regime"), 1 if m.group("side") == "long" else -1)]
     if str(row.get("action", "") or "").strip().lower() == "entered":
         return []
     reasons = str(row.get("reasons", "") or row.get("primary", "") or "")
@@ -2131,7 +2155,7 @@ def export_session_archive(
         if decisions:
             decisions_path = archive_root / "decisions.csv"
             cols = ["timestamp", "symbol", "strategy", "action", "primary",
-                    "secondary", "side_pref", "family", "reasons"]
+                    "secondary", "side_pref", "market_side", "family", "reasons"]
             buf = io.StringIO()
             writer = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
             writer.writeheader()

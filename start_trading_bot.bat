@@ -7,9 +7,14 @@
 @REM   5. Copy .env.example to .env and fill in your Schwab + TradingView creds
 @REM   6. Then double-click this file (or run it from a terminal) to start the bot
 @REM
-@REM Optional: pass --env C:\path\to\custom.env to override .env auto-discovery
-@REM (useful for multi-instance setups with different credentials).
+@REM Arguments are passed on to main.py after --config configs\config.yaml;
+@REM it runs from this folder, so relative paths resolve here:
+@REM   --env C:\path\to\custom.env  override .env auto-discovery, e.g. to run
+@REM                                several instances with different credentials
+@REM   --strategy <name>            override the strategy the config selects
+@REM   --config <path>              run another config (the last --config wins)
+@REM e.g. start_trading_bot.bat --config configs\config.small_cap_squeeze.yaml
 @REM ======================================================================
 cd /D "%~dp0"
 call .venv\Scripts\activate
-python main.py --config configs\config.yaml
+python main.py --config configs\config.yaml %*

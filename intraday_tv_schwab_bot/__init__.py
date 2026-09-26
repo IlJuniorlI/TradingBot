@@ -1,18 +1,10 @@
 # SPDX-License-Identifier: MIT
 from pathlib import Path as _Path
 
-
-def _read_version() -> str:
-    # version.txt lives at the repo root alongside this package.
-    candidate = _Path(__file__).resolve().parent.parent / "version.txt"
-    if candidate.exists():
-        try:
-            return candidate.read_text(encoding="utf-8").strip() or "0.0.0"
-        except Exception:
-            return "0.0.0"
-    return "0.0.0"
-
-
-__version__ = _read_version()
+# VERSION ships inside the package as package data, and pyproject.toml's
+# dynamic version reads the same file at build time, so a source checkout, an
+# editable install and a wheel all report the one version. A missing file is a
+# broken install and fails the import.
+__version__ = _Path(__file__).with_name("VERSION").read_text(encoding="utf-8").strip()
 
 __all__ = ["__version__"]

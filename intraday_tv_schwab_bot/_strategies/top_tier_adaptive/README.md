@@ -232,7 +232,7 @@ When the global trade-management mode is `adaptive_ladder`, top_tier replaces it
 - **Each rung has a confirmation zone** of width `ladder_zone_atr_mult * ATR` (default 0.5 × ATR). The engine waits for price to flip the rung — closing through it on multiple bars — before promoting the trade.
 - **On each confirmed rung**: stop advances up to the cleared zone (becoming the new defense), target advances to the next rung. The trade trails through structure rather than exiting at the first profit-take.
 - **Final rung cleared** → target is removed and the position runs as a runner with the trailing stop set by the most recently cleared zone.
-- **Tight-target paper-fill bug protection**: while price has touched the next rung but the zone hasn't flipped yet, target-hit exits are *suppressed* — the engine waits for structural confirmation instead of firing on transient ticks.
+- **Tight-target paper-fill bug protection**: while price has touched the next rung but the zone hasn't flipped yet, target-hit exits are *suppressed* — the engine waits for structural confirmation instead of firing on transient ticks. It suppresses only on a strong push (the last closed bar closes through the target at least 55% of the way up its range, down for a SHORT) while at least one of the trade's `confirmation_indices` (the ETFs `_indices_for_symbol` stamped at entry) still leans the trade's way; a turned index lets the target exit fire. A trade with no confirmation indices skips the index part.
 
 **Range regime is exempt from laddering.** The range thesis is "price oscillates between range_low and range_high" — laddering past range_high would chase a breakout that contradicts the entry. Range trades keep their single target at `range_high − buffer` and exit there.
 
@@ -303,7 +303,7 @@ Default windows:
 Strategy-specific knobs:
 
 - `tradable`: the fixed list of symbols to trade.
-- `index_symbols`: index ETFs streamed for directional confirmation. Default `SMH` / `IGV` / `XLK`, one per group. Must include every ETF referenced by `sector_index_map`.
+- `index_symbols`: index ETFs streamed for directional confirmation. Default `SMH` / `IGV` / `XLK`, one per group. Must include every ETF referenced by `sector_index_map`. An empty list means no index ETFs anywhere (small_cap_squeeze ships `[]`): nothing extra is streamed, an unmapped symbol has no ETF to confirm on, the relative-strength gate and the sector beta have no benchmark, and the adaptive ladder's index re-check is inert. Until 2026-09-26 the per-symbol lookup read an empty list as `SPY` / `QQQ`.
 - `sector_index_map`: group → list of index ETFs to consult for confirming trades on symbols in that group (default `ai_hardware: [SMH]`, `platforms: [XLK]`, `software: [IGV]`). Falls back to OR-ing across all `index_symbols` when a group has no mapping.
 - `require_index_confirmation`: gate trend/pullback/vol_squeeze/momentum/vwap_reclaim entries on index agreement. Range and sr_scalp are exempt (mean-reversion theses).
 - `leg_anchored_confirmation`: measure the index/peer agreement test AND `_decide_side`'s VWAP arm against the current leg's anchored VWAP instead of session VWAP. Default `false`; `true` in the shipped preset. See section 18.

@@ -47,7 +47,7 @@ from .support_resistance import analyze_market_structure, zone_flip_confirmed
 from .symbols import normalize_symbol_list
 from .technical_levels import build_technical_levels_context
 from .bars import equity_stream_window_bars, last_bucket_forming, resample_bars, session_bucket_ends
-from .indicators import ensure_standard_indicator_frame, htf_ema_spans, ltf_ema_spans
+from .indicators import ensure_standard_indicator_frame, htf_ema_spans, last_bar_atr, ltf_ema_spans
 from . import sessions
 from ._sr_ladder import _collapse_price_ladder, _sr_effective_side_tolerance
 
@@ -1526,29 +1526,15 @@ class DashboardCache:
             return []
 
         ltf_min = max(1, int(level_ctx.get("ltf_minutes", 5) or 5))
-        ltf = None
-        try:
-            if self.data is not None:
-                timeframe = "1min" if ltf_min <= 1 else f"{ltf_min}min"
-                ltf = self.data.get_merged(symbol, timeframe=timeframe, with_indicators=True)
-            elif frame is not None and not frame.empty:
-                if ltf_min <= 1:
-                    ltf = frame.copy()
-                else:
-                    ltf = resample_bars(frame, f"{ltf_min}min")
-        except Exception:
-            ltf = None
+        timeframe = "1min" if ltf_min <= 1 else f"{ltf_min}min"
+        ltf = self.data.get_merged(symbol, timeframe=timeframe, with_indicators=True)
 
-        atr = None
-        try:
-            if ltf is not None and not ltf.empty:
-                atr = safe_float(ltf.iloc[-1].get("atr14"))
-        except Exception:
-            atr = None
-        if atr is None:
-            atr = safe_float(getattr(htf, "atr14", None))
-        if atr is None or atr <= 0:
-            atr = max(float(close) * 0.0015, 0.01)
+        # The ATR key_levels' _select_level sizes its zones with, read by the
+        # same call so the overlay cannot drift from it. Until 2026-09-26 a
+        # hand-rolled copy read a zero, negative or -inf LTF ATR as 0.15% of
+        # the close and kept +inf, where the strategy uses a finite reading
+        # as read and the HTF ATR for an infinite one.
+        atr = last_bar_atr(ltf, close, fallback_atr=getattr(htf, "atr14", None))
         min_level_score = float(level_ctx.get("min_level_score", 4.0) or 4.0)
         tolerance_pct = float(level_ctx.get("level_round_number_tolerance_pct", 0.0020) or 0.0020)
         base_zone_half_width = max(
@@ -1565,7 +1551,7 @@ class DashboardCache:
 
         try:
             if strategy_obj is not None:
-                if ltf is not None and not ltf.empty:
+                if not ltf.empty:
                     overlay_long = strategy_obj.dashboard_overlay_candidates(Side.LONG, float(close), ltf, htf)
                     overlay_short = strategy_obj.dashboard_overlay_candidates(Side.SHORT, float(close), ltf, htf)
                     if overlay_long is not None:

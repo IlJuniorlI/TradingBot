@@ -570,6 +570,9 @@ strategies:
 
       # ===================== No confirmations / no sector =====================
       require_index_confirmation: false
+      # No index ETF anywhere: none streamed, no sector beta, and the adaptive
+      # ladder's index re-check is inert (until 2026-09-26 [] was read as
+      # SPY / QQQ, never streamed here, so every rung tag exited at target).
       index_symbols: []
       sector_groups: {}
       sector_index_map: {}

@@ -177,12 +177,11 @@ class RiskManager:
 
     @staticmethod
     def floor_discrete_units(budget: float, unit_cost: float) -> int:
-        try:
-            budget_value = float(budget)
-            unit_value = float(unit_cost)
-        except Exception:
-            return 0
-        if budget_value <= 0 or unit_value <= 0:
+        # No units unless both are finite numbers: math.floor raised on a NaN
+        # or infinite ratio, which ended the whole entry cycle (2026-09-26).
+        budget_value = safe_float(budget, finite=True)
+        unit_value = safe_float(unit_cost, finite=True)
+        if budget_value is None or unit_value is None or budget_value <= 0 or unit_value <= 0:
             return 0
         ratio = budget_value / unit_value
         return max(0, int(math.floor(ratio + 1e-9)))
@@ -561,31 +560,44 @@ class RiskManager:
         return False, "ok"
 
     @staticmethod
+    def market_side(strategy: str, side: Side, metadata: Any) -> Side | None:
+        """The way a signal, or the position it became, bets on its symbol's
+        price. An equity: its side. An option: the UNDERLYING's market
+        direction (``metadata['direction']``, bullish* / bearish*, stamped
+        by every option signal builder and carried onto the position), since
+        its side is the ORDER side: a bear put debit is bought and a bull put
+        credit sold. None when an option's direction cannot be read.
+        """
+        if not is_option_strategy(strategy):
+            return side
+        meta = metadata if isinstance(metadata, dict) else {}
+        market = str(meta.get("direction") or "").strip().lower()
+        if market.startswith("bullish"):
+            return Side.LONG
+        if market.startswith("bearish"):
+            return Side.SHORT
+        return None
+
+    @staticmethod
     def same_level_anchor(strategy: str, side: Side, metadata: Any, price: Any) -> tuple[Side, float] | None:
         """The (direction, price level) the same-level retry block keys on,
         read the same way from a signal and from the position it became.
 
-        An equity: its side and ``price`` (the signal's intended entry, the
-        position's fill). An option: the UNDERLYING's market direction
-        (``metadata['direction']``, bullish* / bearish*) and the underlying's
-        price at entry (``metadata['underlying_entry']``, stamped by every
-        option signal builder and carried onto the position). Its premium is
-        not a level -- the ATR the block scales by is the underlying's -- and
-        its side is the ORDER side: a bear put debit is bought and a bull put
-        credit sold, so matching on it blocked flips and missed the same bet
-        through a different structure (fixed 2026-09-25). None when the level
-        cannot be read; the block then skips.
+        The direction is ``market_side``. The level is an equity's ``price``
+        (the signal's intended entry, the position's fill) and an option's
+        underlying's price at entry (``metadata['underlying_entry']``,
+        stamped by every option signal builder and carried onto the
+        position). An option's premium is not a level -- the ATR the block
+        scales by is the underlying's -- and matching on its order side
+        blocked flips and missed the same bet through a different structure
+        (fixed 2026-09-25). None when either cannot be read; the block then
+        skips.
         """
+        side = RiskManager.market_side(strategy, side, metadata)
+        if side is None:
+            return None
         if is_option_strategy(strategy):
-            meta = metadata if isinstance(metadata, dict) else {}
-            market = str(meta.get("direction") or "").strip().lower()
-            if market.startswith("bullish"):
-                side = Side.LONG
-            elif market.startswith("bearish"):
-                side = Side.SHORT
-            else:
-                return None
-            price = meta.get("underlying_entry")
+            price = (metadata if isinstance(metadata, dict) else {}).get("underlying_entry")
         try:
             value = float(price)
         except (TypeError, ValueError):

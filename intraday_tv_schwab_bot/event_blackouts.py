@@ -30,7 +30,7 @@ from typing import Any
 import numpy as np
 import yaml
 
-from .sessions import is_time_in_window
+from .sessions import is_hhmm, is_time_in_window
 from . import sessions
 
 LOG = logging.getLogger(__name__)
@@ -66,6 +66,21 @@ def _resolve_path(path_value: str) -> Path:
     return next((c for c in candidates if c.exists()), candidates[0])
 
 
+def blackout_time_errors(rows: Any, where: str) -> list[str]:
+    """One message per macro-window row whose ``start`` or ``end`` is not an
+    HH:MM time, naming it ``{where}[index].start``. A row that is not a
+    mapping is skipped, as the calendar skips it."""
+    errors: list[str] = []
+    for index, row in enumerate(rows or []):
+        if not isinstance(row, dict):
+            continue
+        for key in ("start", "end"):
+            value = row.get(key)
+            if not is_hhmm(value):
+                errors.append(f"{where}[{index}].{key} must be an HH:MM time, got {value!r}")
+    return errors
+
+
 def _sessions_between(start: date, end: date) -> int:
     """Signed count of trading sessions from *start* to *end*, weekends
     excluded. Positive when *end* is after *start*.
@@ -99,6 +114,12 @@ class EventBlackoutCalendar:
         self._earnings: dict[str, set[date]] = {}
         self._macro_source: tuple[str, float | None] | None = None
         self._earnings_source: tuple[str, float | None] | None = None
+        # The blackout_file as it stands at startup is read here, so a time
+        # that does not parse fails naming its row rather than on the event's
+        # date (load_config checks the inline rows). A later edit is re-read
+        # on its mtime and is not checked: raising there would stop the entry
+        # cycle, and for the 0DTE strategies the force-flatten check.
+        self._refresh_macro(validate_file=True)
 
     # ------------------------------------------------------------------
     # Loading
@@ -129,11 +150,13 @@ class EventBlackoutCalendar:
             LOG.warning("Failed to load event calendar file %s: %s", chosen, exc)
             return []
 
-    def _refresh_macro(self) -> None:
+    def _refresh_macro(self, *, validate_file: bool = False) -> None:
         """Recompose ``_macro_events`` from the inline rows plus the file.
 
         The file is only re-parsed when its mtime moves; the inline rows are
         re-read every time, so a config change is always reflected.
+        ``validate_file`` (construction only) raises on a file row whose
+        ``start`` / ``end`` is not an HH:MM time.
         """
         cfg = self._events_cfg
         if cfg is None:
@@ -148,6 +171,10 @@ class EventBlackoutCalendar:
         if payload is not None:
             if isinstance(payload, dict):
                 payload = payload.get("events", [])
+            if validate_file:
+                errors = blackout_time_errors(payload, f"{_resolve_path(str(path_value))}: events")
+                if errors:
+                    raise ValueError("invalid events.blackout_file:\n  " + "\n  ".join(errors))
             self._macro_file_events = [dict(row) for row in (payload or []) if isinstance(row, dict)]
         self._macro_events = inline + self._macro_file_events
 
@@ -219,7 +246,7 @@ class EventBlackoutCalendar:
             end = event.get("end")
             if not start or not end:
                 continue
-            if is_time_in_window(now_t, str(start), str(end)):
+            if is_time_in_window(now_t, start, end):
                 return event
         return None
 

@@ -10,7 +10,6 @@ from ...options_mode import (
     build_single_option_position_label,
     clamp_long_premium_levels,
     choose_by_delta,
-    single_option_dollars,
     single_option_limit_price,
 )
 from ...bars import same_day_mask
@@ -34,6 +33,8 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
     """
 
     strategy_name = 'zero_dte_etf_long_options'
+    time_params = ("no_new_entries_after", "orb_start_time", "orb_end_time", "orb_opening_window_start",
+                   "orb_opening_window_end", "trend_start_time", "trend_end_time")
 
     def required_history_bars(self, symbol: str | None = None, positions: dict[str, Position] | None = None) -> int:
         capability_bars = self._manifest_required_history_bars()
@@ -129,7 +130,6 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             return None
         nat_bid, nat_ask, quoted_mid = market
         entry_limit = single_option_limit_price(contract, mode=self.optcfg.option_limit_mode, opening=True)
-        _, mark_mid = single_option_dollars(contract)
         if entry_limit <= 0:
             self._set_build_failure(underlying, style, "invalid_limit_price")
             return None
@@ -158,7 +158,7 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             "direction": "bullish" if bullish else "bearish",
             "option_type": put_call,
             "entry_price": entry_value,
-            "mark_price_hint": (quoted_mid * 100.0) if quoted_mid else mark_mid,
+            "mark_price_hint": quoted_mid * 100.0,
             "max_loss_per_contract": entry_value,
             "max_profit_per_contract": None,
             "breakeven_underlying": breakeven_underlying,
@@ -234,10 +234,14 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             # (the levels we trade the breakout against); the ORB window
             # defines WHEN we look for those breakouts. Defaults preserve
             # legacy behaviour (09:30-09:34 opening, 09:35-10:05 trading).
-            orb_start_time = str(self.params.get("orb_start_time", "09:35"))
-            orb_end_time = str(self.params.get("orb_end_time", "10:05"))
-            opening_window_start = str(self.params.get("orb_opening_window_start", "09:30"))
-            opening_window_end = str(self.params.get("orb_opening_window_end", "09:34"))
+            # No str() on these: YAML reads an unquoted 9:30 as the int 570,
+            # and pandas reads between_time("570", "574") as an empty window
+            # without raising, so the opening range never formed.
+            # is_time_in_window parses its own ends; between_time needs times.
+            orb_start_time = self.params.get("orb_start_time", "09:35")
+            orb_end_time = self.params.get("orb_end_time", "10:05")
+            opening_window_start = parse_hhmm(self.params.get("orb_opening_window_start", "09:30"))
+            opening_window_end = parse_hhmm(self.params.get("orb_opening_window_end", "09:34"))
             opening = frame[same_day_mask(frame, sessions.now_et().date())].between_time(opening_window_start, opening_window_end)
             regime_name = str(regime.get("regime") or "unknown")
             bullish = regime_name == "bullish_trend"

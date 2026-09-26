@@ -319,33 +319,20 @@ class PaperAccount:
 
         if asset_type == ASSET_TYPE_OPTION_VERTICAL:
             qty = int(position.qty)
-            per_contract_risk = float(metadata.get("max_loss_per_contract") or 0.0)
-            per_contract_reward = metadata.get("max_profit_per_contract")
+            per_contract_risk = safe_float(metadata.get("max_loss_per_contract"), 0.0, finite=True)
+            per_contract_reward = safe_float(metadata.get("max_profit_per_contract"), finite=True)
             _max_risk = per_contract_risk * qty if per_contract_risk > 0 else None
             if per_contract_reward is not None:
-                try:
-                    max_reward = float(per_contract_reward) * qty
-                except Exception:
-                    max_reward = None
-            be = metadata.get("breakeven_underlying")
-            if be is not None:
-                try:
-                    breakeven = float(be)
-                except Exception:
-                    breakeven = None
+                max_reward = per_contract_reward * qty
+            breakeven = safe_float(metadata.get("breakeven_underlying"), finite=True)
             spread_type = metadata.get("spread_type")
             if spread_type:
                 risk_label = str(spread_type)
         elif asset_type == ASSET_TYPE_OPTION_SINGLE:
             qty = int(position.qty)
-            per_contract_risk = float(metadata.get("max_loss_per_contract") or 0.0)
+            per_contract_risk = safe_float(metadata.get("max_loss_per_contract"), 0.0, finite=True)
             _max_risk = per_contract_risk * qty if per_contract_risk > 0 else None
-            be = metadata.get("breakeven_underlying")
-            if be is not None:
-                try:
-                    breakeven = float(be)
-                except Exception:
-                    breakeven = None
+            breakeven = safe_float(metadata.get("breakeven_underlying"), finite=True)
             risk_label = str(metadata.get("option_type") or "long_option").lower()
         else:
             # Use the TRADE's INITIAL stop/target for max_risk/max_reward so
@@ -374,12 +361,12 @@ class PaperAccount:
         if max_reward is None:
             # Prefer initial_target_price (stamped at entry, immutable);
             # fall back to current position.target_price for legacy
-            # positions or strategies that don't stamp the initial.
-            initial_target_raw = metadata.get("initial_target_price")
-            try:
-                target_for_reward = float(initial_target_raw) if initial_target_raw is not None else (float(position.target_price) if position.target_price is not None else None)
-            except (TypeError, ValueError):
-                target_for_reward = float(position.target_price) if position.target_price is not None else None
+            # positions or strategies that don't stamp the initial. One that
+            # is not a finite number reads as unstamped (2026-09-26): a NaN
+            # read as no reward at all, an infinity as an infinite one.
+            target_for_reward = safe_float(metadata.get("initial_target_price"), finite=True)
+            if target_for_reward is None:
+                target_for_reward = safe_float(position.target_price, finite=True)
             if target_for_reward is not None:
                 try:
                     entry_price = float(position.entry_price)
@@ -399,17 +386,11 @@ class PaperAccount:
         # time adaptive management ratchets the live stop/target. Without
         # this, ``adaptive_breakeven_rr`` collapsing stop to entry made
         # ``adverseSpan = 0`` and the bar fell back to the left-anchored
-        # P&L view with no Stop/Target labels.
-        initial_stop_payload = metadata.get("initial_stop_price")
-        initial_target_payload = metadata.get("initial_target_price")
-        try:
-            initial_stop_payload = float(initial_stop_payload) if initial_stop_payload is not None else None
-        except (TypeError, ValueError):
-            initial_stop_payload = None
-        try:
-            initial_target_payload = float(initial_target_payload) if initial_target_payload is not None else None
-        except (TypeError, ValueError):
-            initial_target_payload = None
+        # P&L view with no Stop/Target labels. A value that is not a finite
+        # number reads as missing; a NaN or ±inf went into the row as is
+        # (2026-09-26).
+        initial_stop_payload = safe_float(metadata.get("initial_stop_price"), finite=True)
+        initial_target_payload = safe_float(metadata.get("initial_target_price"), finite=True)
         return {
             "symbol": position.symbol,
             "strategy": position.strategy,

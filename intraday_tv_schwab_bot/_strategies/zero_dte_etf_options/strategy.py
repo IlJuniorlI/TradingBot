@@ -156,6 +156,8 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
     """
 
     strategy_name = 'zero_dte_etf_options'
+    time_params = ("no_new_entries_after", "orb_end_time", "trend_start_time", "trend_end_time",
+                   "credit_start_time", "credit_end_time")
 
     def required_history_bars(self, symbol: str | None = None, positions: dict[str, Position] | None = None) -> int:
         capability_bars = self._manifest_required_history_bars()
@@ -1155,6 +1157,9 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         return detail_fields(reason="invalid_spread_market", net_bid=bid, net_ask=ask, net_mid=mid)
 
     def _validate_spread_market(self, first_leg: OptionContract, second_leg: OptionContract) -> tuple[float, float, float] | None:
+        """(net bid, net ask, net mid) of a tradable vertical, else None.
+        A market it returns has a mid above zero (never NaN), which the
+        builders' ``mark_price_hint`` reads with no fallback."""
         bid, ask, mid = vertical_price_bounds(first_leg, second_leg)
         if ask <= 0 or mid <= 0:
             return None
@@ -1211,6 +1216,8 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         return pair
 
     def _validate_single_option_market(self, contract: OptionContract) -> tuple[float, float, float] | None:
+        """(bid, ask, mid) of a tradable single option, else None; as
+        ``_validate_spread_market``, a market it returns has a mid above zero."""
         bid, ask, mid = single_option_price_bounds(contract)
         if ask <= 0 or mid <= 0:
             return None
@@ -1346,7 +1353,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         if short_leg is None:
             self._set_build_failure(underlying, style, "no_hedge_leg_at_width")
             return None
-        entry_debit, mark_mid = net_debit_dollars(long_leg, short_leg)
+        entry_debit = net_debit_dollars(long_leg, short_leg)
         if entry_debit <= 0:
             self._set_build_failure(underlying, style, "non_positive_entry_debit")
             return None
@@ -1394,7 +1401,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             "entry_price": entry_value,
             "entry_price_points": entry_limit,
             "time_decay_scale": round(time_decay_scale, 4),
-            "mark_price_hint": (quoted_mid * 100.0) if quoted_mid else mark_mid,
+            "mark_price_hint": quoted_mid * 100.0,
             "max_loss_per_contract": entry_value,
             "max_profit_per_contract": max(0.0, width_dollars - entry_value),
             "strike_width_dollars": width_dollars,
@@ -1567,7 +1574,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 ),
             )
             return None
-        entry_credit, mark_mid, max_loss = net_credit_dollars(short_leg, long_leg)
+        entry_credit, max_loss = net_credit_dollars(short_leg, long_leg)
         if entry_credit <= 0 or max_loss <= 0:
             self._set_build_failure(
                 underlying,
@@ -1633,7 +1640,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             "entry_price": entry_credit_value,
             "entry_price_points": entry_limit,
             "entry_credit": entry_credit_value,
-            "mark_price_hint": (quoted_mid * 100.0) if quoted_mid else mark_mid,
+            "mark_price_hint": quoted_mid * 100.0,
             "max_loss_per_contract": adjusted_max_loss,
             "max_profit_per_contract": max(0.0, entry_credit_value),
             "strike_width_dollars": width_dollars,

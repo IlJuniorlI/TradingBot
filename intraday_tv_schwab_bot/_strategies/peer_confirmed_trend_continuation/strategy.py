@@ -334,10 +334,18 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
         if extension_penalty > 0:
             total_score -= extension_penalty
             diagnostics.append(f"extension_penalty:{extension_penalty:.4f}")
+        # The cap reads the absolute distance, so it also refuses a close that
+        # far on the wrong side of the line: a LONG below it, a SHORT above.
+        # That refusal is wrong_side_hard_cap_*; too_extended_hard_cap_* is a
+        # close stretched past the line on the side's own side. Until
+        # 2026-09-26 both were too_extended_hard_cap_*.
+        long = side == Side.LONG
         if extension_from_vwap_atr > (max_vwap_ext * extension_hard_cap_mult):
-            pending_reasons.append(reason_with_values("too_extended_hard_cap_vwap_atr", current=extension_from_vwap_atr, required=max_vwap_ext * extension_hard_cap_mult, op="<=", digits=4))
+            vwap_cap_reason = "too_extended_hard_cap_vwap_atr" if (trend["close"] > trend["vwap"]) == long else "wrong_side_hard_cap_vwap_atr"
+            pending_reasons.append(reason_with_values(vwap_cap_reason, current=extension_from_vwap_atr, required=max_vwap_ext * extension_hard_cap_mult, op="<=", digits=4))
         if extension_from_ema9_atr > (max_ema9_ext * extension_hard_cap_mult):
-            pending_reasons.append(reason_with_values("too_extended_hard_cap_ema9_atr", current=extension_from_ema9_atr, required=max_ema9_ext * extension_hard_cap_mult, op="<=", digits=4))
+            ema9_cap_reason = "too_extended_hard_cap_ema9_atr" if (trend["close"] > trend["ema9"]) == long else "wrong_side_hard_cap_ema9_atr"
+            pending_reasons.append(reason_with_values(ema9_cap_reason, current=extension_from_ema9_atr, required=max_ema9_ext * extension_hard_cap_mult, op="<=", digits=4))
 
         if total_score < min_total:
             pending_reasons.append(reason_with_values("weak_total_score", current=total_score, required=min_total, op=">=", digits=4))

@@ -381,8 +381,9 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             ret5 = safe_float(last.get("ret5"), 0.0)
             use_vwap = vwap is not None and volume is not None and volume > 0.0
             if use_vwap:
-                up = close > float(vwap) and ema9 >= ema20 and ret5 >= 0.0
-                down = close < float(vwap) and ema9 <= ema20 and ret5 <= 0.0
+                posture = bar_posture(last)
+                up = posture == Side.LONG and ret5 >= 0.0
+                down = posture == Side.SHORT and ret5 <= 0.0
             else:
                 # The RTH open _peer_signal votes on; with no bar today the
                 # close stands in, so the term cannot vote.

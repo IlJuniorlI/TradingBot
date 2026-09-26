@@ -146,10 +146,13 @@ class SchwabExecutor:
         # A vertical's executions arrive once per LEG: summing them counted
         # every spread twice. A spread unit is filled once every leg is, so
         # the order's fill is its least-filled leg, per unit of order quantity.
-        order_qty = safe_float(payload.get("quantity"))
+        # A quantity that is not a finite number reads as missing: an
+        # infinite order quantity made every ratio 0 and raised
+        # ZeroDivisionError (2026-09-26).
+        order_qty = safe_float(payload.get("quantity"), finite=True)
         ratios: list[float] = []
         for leg in legs:
-            leg_qty = safe_float(leg.get("quantity"))
+            leg_qty = safe_float(leg.get("quantity"), finite=True)
             ratios.append(leg_qty / order_qty if leg_qty and order_qty and order_qty > 0 else 1.0)
         if set(per_leg) == {None}:
             # No legId on any execution: the pool holds every leg's shares.
@@ -161,7 +164,9 @@ class SchwabExecutor:
         """``(notional, quantity)`` of an order's executions, per ``legId``.
 
         Executions carrying no ``legId`` pool under ``None``; a single-leg
-        order's executions need no attribution.
+        order's executions need no attribution. One whose price or quantity
+        is not a finite number is skipped, as a missing one is: an infinite
+        quantity read the fill price as NaN (2026-09-26).
         """
         out: dict[Any, tuple[float, float]] = {}
         for activity in payload.get("orderActivityCollection") or []:
@@ -170,8 +175,8 @@ class SchwabExecutor:
             for leg in activity.get("executionLegs") or []:
                 if not isinstance(leg, dict):
                     continue
-                px = safe_float(leg.get("price"))
-                qty = safe_float(leg.get("quantity"))
+                px = safe_float(leg.get("price"), finite=True)
+                qty = safe_float(leg.get("quantity"), finite=True)
                 if px is None or qty is None or px <= 0 or qty <= 0:
                     continue
                 notional, filled = out.get(leg.get("legId"), (0.0, 0.0))
@@ -189,13 +194,14 @@ class SchwabExecutor:
         entry price inherited the error. The net is the signed sum of the leg
         prices (buys add, sells subtract) scaled by each leg's ratio to the
         order quantity; its magnitude is the debit paid or credit received.
-        None when any leg has no attributable execution.
+        None when any leg has no attributable execution. A quantity that is
+        not a finite number reads as missing (2026-09-26).
         """
-        order_qty = safe_float(payload.get("quantity"))
+        order_qty = safe_float(payload.get("quantity"), finite=True)
         net = 0.0
         for leg in legs:
             notional, filled = executions.get(leg.get("legId"), (0.0, 0.0))
-            leg_qty = safe_float(leg.get("quantity"))
+            leg_qty = safe_float(leg.get("quantity"), finite=True)
             if filled <= 0 or leg_qty is None or leg_qty <= 0:
                 return None
             ratio = leg_qty / order_qty if order_qty and order_qty > 0 else 1.0
@@ -220,7 +226,7 @@ class SchwabExecutor:
             filled = sum(value[1] for value in executions.values())
             return notional / filled
         for key in ("price", "filledPrice", "averagePrice"):
-            px = safe_float(payload.get(key))
+            px = safe_float(payload.get(key), finite=True)
             if px is not None and px > 0:
                 return px
         return None
@@ -924,8 +930,10 @@ class SchwabExecutor:
                 # position before it trusts a working child.
                 "remaining_qty": cls._equity_order_remaining_qty(node),
                 "leg_qty": safe_int(legs[0].get("quantity")) if len(legs) == 1 else None,
-                "stop_price": safe_float(node.get("stopPrice")),
-                "price": safe_float(node.get("price")),
+                # Adopted over the bracket's own levels, so an infinite one
+                # reads as missing and the bracket keeps its own (2026-09-26).
+                "stop_price": safe_float(node.get("stopPrice"), finite=True),
+                "price": safe_float(node.get("price"), finite=True),
             }
         cls._flatten_order_tree(node.get("childOrderStrategies"), out)
 
@@ -1568,13 +1576,13 @@ class SchwabExecutor:
         if market is None:
             return OrderResult(ok=False, order_id=None, raw=spec, message="dry_run_missing_or_stale_quotes", simulated=True)
         bid, ask, mid = market
-        limit = float(spec.get("price") or 0.0)
+        limit = safe_float(spec.get("price"), 0.0, finite=True)
         if limit <= 0:
             return OrderResult(ok=False, order_id=None, raw=spec, message="dry_run_missing_limit_price", simulated=True)
         legs = spec.get("orderLegCollection") or []
-        spec_qty = int((legs[0] or {}).get("quantity") or 0) if legs else 0
+        spec_qty = safe_int((legs[0] or {}).get("quantity"), 0) if legs else 0
         if spec_qty <= 0:
-            spec_qty = int(metadata.get("qty", 1) or 1)
+            spec_qty = safe_int(safe_float(metadata.get("qty"), finite=True) or 1)
         attempts = max(0, int(self.config.options.dry_run_replace_attempts))
         step_frac = min(0.95, max(0.05, float(self.config.options.dry_run_step_frac)))
         order_type = str(spec.get("orderType") or "").upper()
@@ -1626,15 +1634,15 @@ class SchwabExecutor:
         if market is None:
             return OrderResult(ok=False, order_id=None, raw=spec, message="dry_run_missing_or_stale_quotes", simulated=True)
         bid, ask, mid = market
-        limit = float(spec.get("price") or 0.0)
+        limit = safe_float(spec.get("price"), 0.0, finite=True)
         if limit <= 0:
             return OrderResult(ok=False, order_id=None, raw=spec, message="dry_run_missing_limit_price", simulated=True)
         legs = spec.get("orderLegCollection") or []
         instruction = str((legs[0] or {}).get("instruction") or "") if legs else ""
         buy_side = instruction in {OrderIntent.BUY_TO_OPEN.value, OrderIntent.BUY_TO_CLOSE.value}
-        spec_qty = int((legs[0] or {}).get("quantity") or 0) if legs else 0
+        spec_qty = safe_int((legs[0] or {}).get("quantity"), 0) if legs else 0
         if spec_qty <= 0:
-            spec_qty = int(metadata.get("qty", 1) or 1)
+            spec_qty = safe_int(safe_float(metadata.get("qty"), finite=True) or 1)
         attempts = max(0, int(self.config.options.dry_run_replace_attempts))
         step_frac = min(0.95, max(0.05, float(self.config.options.dry_run_step_frac)))
         prices = [round(limit, 2)]

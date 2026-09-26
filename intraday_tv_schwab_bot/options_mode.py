@@ -40,6 +40,11 @@ class OptionContract:
 
 
 def parse_option_chain(payload: dict[str, Any], only_dte: int | None = 0) -> list[OptionContract]:
+    # Every field reads a finite number or its default. strike, mark and
+    # total_volume fall through to a second source (the strike key, last,
+    # volume) on 0, as before, and on a missing, NaN, infinite or unparseable
+    # value, or a zero sent as a string: a bare ``a or b`` kept a NaN, which is
+    # truthy, and any non-empty string, so a zero or unparseable one read 0.
     contracts: list[OptionContract] = []
     for root_key in ("callExpDateMap", "putExpDateMap"):
         exp_map = payload.get(root_key) or {}
@@ -59,15 +64,18 @@ def parse_option_chain(payload: dict[str, Any], only_dte: int | None = 0) -> lis
                             symbol=str(entry.get("symbol") or ""),
                             expiration=exp_date,
                             put_call=str(entry.get("putCall") or ("CALL" if root_key.startswith("call") else "PUT")),
-                            strike=safe_float(entry.get("strikePrice") or strike_key, 0.0),
-                            bid=safe_float(entry.get("bid"), 0.0),
-                            ask=safe_float(entry.get("ask"), 0.0),
-                            mark=safe_float(entry.get("mark") or entry.get("last"), 0.0),
-                            delta=(None if entry.get("delta") in (None, "NaN") else safe_float(entry.get("delta"))),
-                            gamma=(None if entry.get("gamma") in (None, "NaN") else safe_float(entry.get("gamma"))),
-                            theta=(None if entry.get("theta") in (None, "NaN") else safe_float(entry.get("theta"))),
+                            strike=(safe_float(entry.get("strikePrice"), finite=True)
+                                    or safe_float(strike_key, 0.0, finite=True)),
+                            bid=safe_float(entry.get("bid"), 0.0, finite=True),
+                            ask=safe_float(entry.get("ask"), 0.0, finite=True),
+                            mark=(safe_float(entry.get("mark"), finite=True)
+                                  or safe_float(entry.get("last"), 0.0, finite=True)),
+                            delta=safe_float(entry.get("delta"), finite=True),
+                            gamma=safe_float(entry.get("gamma"), finite=True),
+                            theta=safe_float(entry.get("theta"), finite=True),
                             open_interest=safe_int(entry.get("openInterest"), 0),
-                            total_volume=safe_int(entry.get("totalVolume") or entry.get("volume"), 0),
+                            total_volume=safe_int(safe_float(entry.get("totalVolume"), finite=True)
+                                                  or entry.get("volume"), 0),
                             days_to_expiration=dte,
                             in_the_money=bool(entry.get("inTheMoney", False)),
                         )
@@ -224,18 +232,15 @@ def build_position_label(underlying: str, style: str, side: Side, long_leg: Opti
     return f"{underlying} {style} {orient} {long_leg.expiration} {long_leg.strike:g}/{short_leg.strike:g} {long_leg.put_call[0]}"
 
 
-def net_debit_dollars(long_leg: OptionContract, short_leg: OptionContract) -> tuple[float, float]:
-    conservative = max(0.0, (long_leg.ask - short_leg.bid) * 100.0)
-    mid = max(0.0, (long_leg.mid - short_leg.mid) * 100.0)
-    return conservative, mid
+def net_debit_dollars(long_leg: OptionContract, short_leg: OptionContract) -> float:
+    return max(0.0, (long_leg.ask - short_leg.bid) * 100.0)
 
 
-def net_credit_dollars(short_leg: OptionContract, long_leg: OptionContract) -> tuple[float, float, float]:
+def net_credit_dollars(short_leg: OptionContract, long_leg: OptionContract) -> tuple[float, float]:
     conservative = max(0.0, (short_leg.bid - long_leg.ask) * 100.0)
-    mid = max(0.0, (short_leg.mid - long_leg.mid) * 100.0)
     width = abs(short_leg.strike - long_leg.strike) * 100.0
     max_loss = max(0.0, width - conservative)
-    return conservative, mid, max_loss
+    return conservative, max_loss
 
 
 def clamp_long_premium_levels(
@@ -276,22 +281,17 @@ def realized_max_loss_per_contract(metadata: dict[str, Any], fill_price_dollars:
     risks more than the sizing assumed.
 
     Returns ``None`` when the shape cannot be reconstructed — a credit spread
-    with no recorded strike width — so the caller can skip the check rather
-    than book a wrong number.
+    with no recorded strike width — or the fill or width is not a finite
+    positive number, so the caller can skip the check rather than book a
+    wrong number. A NaN width used to read as a max loss of 0.0.
     """
-    try:
-        fill = float(fill_price_dollars)
-    except (TypeError, ValueError):
-        return None
-    if not fill > 0:
+    fill = safe_float(fill_price_dollars, finite=True)
+    if fill is None or fill <= 0:
         return None
     style = str((metadata or {}).get("spread_style") or "").upper()
     if style == "CREDIT":
-        try:
-            width = float((metadata or {}).get("strike_width_dollars") or 0.0)
-        except (TypeError, ValueError):
-            return None
-        if width <= 0:
+        width = safe_float((metadata or {}).get("strike_width_dollars"), finite=True)
+        if width is None or width <= 0:
             return None
         return max(0.0, width - fill)
     # Debit verticals and single long options both risk exactly what they paid.
@@ -320,16 +320,15 @@ def net_price_frac_of_width(first_leg: OptionContract, second_leg: OptionContrac
     single dollar figure while widths differ per symbol, and at its shipped
     value it sat ABOVE every configured width, so it could not reject a quote
     implying a credit larger than the spread itself. This expresses the same
-    question structurally instead. Returns ``None`` when the width is
-    unusable.
+    question structurally instead. Returns ``None`` when the width or the
+    price is unusable; a NaN price used to come back as a NaN fraction, which
+    passes every cap comparison.
     """
     width = abs(float(first_leg.strike) - float(second_leg.strike))
-    if width <= 0:
+    price = safe_float(net_price, finite=True)
+    if width <= 0 or price is None:
         return None
-    try:
-        return float(net_price) / width
-    except (TypeError, ValueError):
-        return None
+    return price / width
 
 
 def vertical_limit_price(first_leg: OptionContract, second_leg: OptionContract, mode: str = "mid", *,
@@ -376,10 +375,11 @@ def contract_from_quote(symbol: str, quote: dict[str, Any] | None, fallback: dic
 
     def pick(*keys: str, default: float | None = None) -> float | None:
         # Key by key, the fresh quote first and then the fallback metadata; a
-        # missing, blank, NaN or unparseable value falls through to the next.
+        # missing, blank, NaN, infinite or unparseable value falls through to
+        # the next.
         for key in keys:
             for source in (quote, fallback):
-                number = first_float(source, key)
+                number = first_float(source, key, finite=True)
                 if number is not None:
                     return number
         return default
@@ -388,7 +388,8 @@ def contract_from_quote(symbol: str, quote: dict[str, Any] | None, fallback: dic
         symbol=symbol,
         expiration=str(fallback.get("expiration") or ""),
         put_call=str(fallback.get("put_call") or fallback.get("putCall") or "CALL"),
-        strike=safe_float(fallback.get("strike") or fallback.get("strikePrice"), 0.0),
+        strike=(safe_float(fallback.get("strike"), finite=True)
+                or safe_float(fallback.get("strikePrice"), 0.0, finite=True)),
         bid=pick("bid", default=0.0),
         ask=pick("ask", default=0.0),
         mark=pick("mark", "last", default=0.0),
@@ -461,12 +462,6 @@ def build_single_option_close_order(position_metadata: dict[str, Any], qty: int,
 def build_single_option_position_label(underlying: str, style: str, contract: OptionContract) -> str:
     orient = "CALL" if contract.put_call.upper() == "CALL" else "PUT"
     return f"{underlying} {style} {orient} {contract.expiration} {contract.strike:g}"
-
-
-def single_option_dollars(contract: OptionContract) -> tuple[float, float]:
-    conservative = max(0.0, float(contract.ask) * 100.0)
-    mid = max(0.0, float(contract.mid) * 100.0)
-    return conservative, mid
 
 
 def single_option_price_bounds(contract: OptionContract) -> tuple[float, float, float]:

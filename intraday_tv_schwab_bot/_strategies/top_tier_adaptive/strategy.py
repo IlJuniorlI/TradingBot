@@ -106,6 +106,8 @@ REGIME_SKIP_LABELS = {
 
 class TopTierAdaptiveStrategy(BaseStrategy):
     strategy_name = "top_tier_adaptive"
+    time_params = ("orb_end_time", "midday_start_time", "midday_end_time", "afternoon_start_time",
+                   "no_new_entries_after", "early_session_stop_widening_until")
 
     def __init__(self, config):
         super().__init__(config)
@@ -199,13 +201,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             return
         try:
             range_end = parse_hhmm(self._orb_range_end())
-            orb_end = parse_hhmm(str(self.params.get("orb_end_time", "10:05")))
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"top_tier_adaptive: cannot parse the ORB window "
-                f"(orb_range_minutes={self.params.get('orb_range_minutes')!r}, "
-                f"orb_end_time={self.params.get('orb_end_time')!r}): {exc}"
+                f"(orb_range_minutes={self.params.get('orb_range_minutes')!r}): {exc}"
             ) from exc
+        # BaseStrategy.__init__ has already checked orb_end_time (time_params).
+        orb_end = parse_hhmm(self.params.get("orb_end_time", "10:05"))
         if range_end >= orb_end:
             raise ValueError(
                 f"top_tier_adaptive: the opening range finishes at "
@@ -226,8 +228,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
     # ------------------------------------------------------------------
     def active_watchlist(self, candidates: list[Candidate], positions: dict[str, Position]) -> set[str]:
         symbols = super().active_watchlist(candidates, positions)
-        index_symbols = [str(s).upper().strip() for s in (self.params.get("index_symbols") or []) if str(s).strip()]
-        symbols.update(index_symbols)
+        symbols.update(self._index_symbols())
         return symbols
 
     # ------------------------------------------------------------------
@@ -258,6 +259,19 @@ class TopTierAdaptiveStrategy(BaseStrategy):
     # ------------------------------------------------------------------
     # Index confirmation
     # ------------------------------------------------------------------
+    def _index_symbols(self) -> list[str]:
+        """The universe-wide ``index_symbols``, upper-cased: the ETFs
+        ``active_watchlist`` streams and the fallback of
+        ``_indices_for_symbol``, read here once so the two cannot disagree.
+
+        An empty list means no index ETFs, and so does a missing key: a
+        loaded config always carries it (each manifest supplies its own list,
+        SMH / IGV / XLK for top_tier and none for small_cap_squeeze). Until
+        2026-09-26 ``_indices_for_symbol`` read an empty list as SPY / QQQ,
+        which were never streamed.
+        """
+        return [str(s).upper().strip() for s in (self.params.get("index_symbols") or []) if str(s).strip()]
+
     def _indices_for_symbol(self, symbol: str) -> list[str]:
         """Return the index ETFs to consult when confirming trades on
         *symbol*. Walks ``sector_groups`` to find which sector owns the
@@ -273,12 +287,14 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         sector-by-sector instead of forcing them to map all 11 GICS sectors
         upfront. Sectors without a map entry retain the broad-market
         confirmation path.
+
+        Empty when there are no index symbols (``index_symbols: []`` and no
+        mapping for the symbol): the ETF path of ``_index_confirms`` then
+        has nothing to agree, ``_index_neutral`` reads neutral, the
+        relative-strength gate and the sector beta have no benchmark, and
+        the adaptive ladder's index re-check is inert.
         """
-        fallback = [
-            str(s).upper().strip()
-            for s in (self.params.get("index_symbols") or ["SPY", "QQQ"])
-            if str(s).strip()
-        ]
+        fallback = self._index_symbols()
         sector_groups = self.params.get("sector_groups") or {}
         sector_index_map = self.params.get("sector_index_map") or {}
         if not sector_groups or not sector_index_map:
@@ -397,6 +413,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         **Sector ETF** (fallback). The original check — at least one mapped
         ETF leaning *side*. Used when the symbol has too few mapped peers to
         measure breadth (single-member sectors like healthcare/staples here).
+        A symbol with no index ETFs (``_indices_for_symbol`` empty) has
+        nothing to agree on this path, so it is not confirmed.
 
         Breadth exists because the ETF test is close to circular on a mega-cap
         universe: AAPL+MSFT+NVDA+AVGO are roughly 45% of XLK, GOOG+META about
@@ -1219,7 +1237,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
           * +0.5  the break is DECISIVE -- twice ``vol_squeeze_breakout_buffer_pct``
                   past the box edge rather than marginal.
           * +0.5  breakout volume is DECISIVE -- 1.5x the required ratio.
-          * +0.5  aligned with VWAP/EMA (cheap continuation confirmation).
+          * +0.5  aligned with VWAP/EMA (``indicators.bar_posture``, cheap
+                  continuation confirmation).
 
         Volume and bar-close position used to be independent +0.5 bonuses here
         while ``_build_vol_squeeze_signal`` rejected outright without them, and
@@ -1288,10 +1307,9 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             if q["close_pos_ok"]:
                 score += 0.5
 
-        # Alignment with VWAP/EMA (cheap continuation confirmation)
-        if side == Side.LONG and close > vwap and ema9 >= ema20:
-            score += 0.5
-        if side == Side.SHORT and close < vwap and ema9 <= ema20:
+        # Alignment with VWAP/EMA (cheap continuation confirmation): the
+        # shared posture test, read on the floats the entry loop resolved.
+        if bar_posture({"close": close, "vwap": vwap, "ema9": ema9, "ema20": ema20}) == side:
             score += 0.5
         return score
 
@@ -1629,12 +1647,14 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # --- Trigger 2: Early-session time-of-day widening ---
         time_factor = 1.0
         if current_time is not None and bool(self.params.get("early_session_stop_widening_enabled", True)):
-            try:
-                cutoff = parse_hhmm(str(self.params.get("early_session_stop_widening_until", "10:30")))
-                if current_time <= cutoff:
-                    time_factor = float(self.params.get("early_session_stop_widening_mult", 1.3))
-            except Exception:
-                pass
+            # No guard: the cutoff is checked at construction (time_params).
+            # Until 2026-09-26 an ``except Exception: pass`` here swallowed
+            # the ValueError of str()-ing an unquoted YAML time (10:30 is the
+            # int 630, and "630" does not parse), so with an unquoted cutoff
+            # the widening never applied.
+            cutoff = parse_hhmm(self.params.get("early_session_stop_widening_until", "10:30"))
+            if current_time <= cutoff:
+                time_factor = float(self.params.get("early_session_stop_widening_mult", 1.3))
 
         # Take the LARGER widening (not compound) so morning + ATR
         # expansion don't double-multiply into an unrealistic stop.
@@ -1703,7 +1723,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         """
         if bool(self.params.get("disable_orb_regime", False)):
             return False
-        return is_time_in_window(now_t, self._orb_range_end(), str(self.params.get("orb_end_time", "10:05")))
+        return is_time_in_window(now_t, self._orb_range_end(), self.params.get("orb_end_time", "10:05"))
 
     def _allowed_regimes(self, now_t) -> set[str]:
         """Return which regimes are allowed at the current time.
@@ -3101,7 +3121,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # (HTF bias, HTF EMA, ORB 5m follow-through, exhaustion). Computed
         # once here to avoid duplicate sessions.now_et() calls with potential
         # clock-skew at the 10:05 boundary.
-        orb_end = self.params.get("orb_end_time", "10:05")
+        orb_end = parse_hhmm(self.params.get("orb_end_time", "10:05"))
         in_orb_window = self._in_orb_window(sessions.now_et().time())
 
         # Fix D — reject stretched / contradicted entries before expensive
@@ -3605,7 +3625,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 "candle_tier": candle_signal.get("confirm_tier"),
                 "candle_anchor": candle_signal.get("anchor_pattern"),
                 "candle_matches": candle_signal.get("matches", []),
-                "orb_end_time": str(orb_end),
+                "orb_end_time": orb_end.strftime("%H:%M"),
                 "htf_ema_trend": htf_ema_bias,
                 "htf_ema_votes": f"{htf_ema_bull}v{htf_ema_bear}",
                 "htf_ema_bonus": round(htf_ema_bonus, 4),
@@ -4445,7 +4465,9 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     # the multi-bar zone-flip wait (target exits at the
                     # rung price instead of riding through a sector
                     # reversal). Read in
-                    # ``_ladder_indices_still_aligned``.
+                    # ``_ladder_indices_still_aligned``. With no index
+                    # symbols (small_cap_squeeze) the list is empty and the
+                    # re-check is inert.
                     if isinstance(sig.metadata, dict):
                         sig.metadata["confirmation_indices"] = list(self._indices_for_symbol(c.symbol))
                         # Cross-regime-comparable score: the manifest's

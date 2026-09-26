@@ -32,7 +32,7 @@ from ..htf_levels import (
     empty_htf_context,
 )
 from ..indicators import ensure_standard_indicator_frame, htf_ema_spans, last_bar_atr
-from ..sessions import equity_session_state
+from ..sessions import equity_session_state, is_hhmm
 from ..support_resistance import (
     analyze_market_structure,
     empty_market_structure_context,
@@ -61,6 +61,13 @@ class BaseStrategy:
     # "adaptive_ladder" and this flag is False, the engine logs a one-time
     # warning at startup so the user knows ladder mechanics are inactive.
     supports_adaptive_ladder: bool = True
+
+    # The params this strategy reads as HH:MM times. ``__init__`` checks each
+    # one the params carry, so a blank or malformed value fails at startup,
+    # naming the key, instead of at its first read -- for a window edge like
+    # ``afternoon_start_time``, mid-session. An absent key is not checked:
+    # its reader falls back to a literal default.
+    time_params: ClassVar[tuple[str, ...]] = ()
 
     # Auto-detected set of context-builder calls the strategy has made over
     # its lifetime. Each entry is a tuple `(name, *args)` — e.g. `("chart",)`,
@@ -180,6 +187,11 @@ class BaseStrategy:
         # the HTF context builders swallow errors (a bad pair used to turn
         # into "no HTF context" -- no EMA gate, no HTF divergence -- silently).
         htf_ema_spans(self.params)
+        for key in self.time_params:
+            if key in self.params and not is_hhmm(self.params[key]):
+                raise ValueError(
+                    f"strategies.{self.strategy_name}.params.{key} must be an HH:MM time, got {self.params[key]!r}"
+                )
         self._manifest = get_plugin(config.strategy)
         # Scheduled-event calendar (macro windows + per-symbol earnings),
         # shared by every strategy. Lazily re-reads its YAML sources when

@@ -205,9 +205,13 @@ Type=simple
 WorkingDirectory=%h/TradingBot
 ExecStart=%h/TradingBot/.venv/bin/python main.py --config configs/config.yaml
 
-# Clean shutdown: engine.py routes SIGTERM through KeyboardInterrupt so the
-# bot writes its session report + reconcile metadata + daily archive before
-# exiting. Give it 30s, then SIGKILL if it's still hung.
+# Clean shutdown: once the bot is built, SIGTERM, like Ctrl+C, takes it to
+# its shutdown wherever it lands (the start-up reconcile, a cycle, the sleep
+# between cycles): it stops the dashboard and the stream, writes the session
+# report (appending its closed trades to trades.csv) and the day's archive,
+# then exits 0. The reconcile metadata needs no shutdown step: it is saved
+# whenever the tracked positions change. Give it 30s, then SIGKILL if it's
+# still hung.
 KillSignal=SIGTERM
 TimeoutStopSec=30s
 
@@ -246,6 +250,16 @@ A few of these values to know about:
 - **`Type=simple`** is correct for our case (the bot is a foreground
   process that doesn't fork). `Type=notify` would require the bot to
   send sd_notify signals; we don't.
+- **`TimeoutStopSec=30s`** bounds the shutdown. The bot logs `Interrupted,
+  shutting down.` once the work the stop interrupted has unwound (a cycle's
+  thread pool first finishes its queued work, broker reads included) and
+  `Shutdown complete.` when the cleanup is done. Stop signals after the
+  first are ignored until then, since one would abandon the session report
+  half-written, and the log names any it ignored. A stop with no
+  `Shutdown complete.` in the journal means systemd SIGKILLed a shutdown
+  that ran past 30s (a hung broker read, a large archive export, a slow
+  stream stop): raise the timeout. In a terminal, a second Ctrl+C does
+  nothing while the bot shuts down; `kill -9` ends one that hangs.
 - **`Restart=on-failure`** restarts on crash but NOT on clean exit
   (Ctrl+C / `systemctl stop`). If you want restart on any exit, use
   `Restart=always` — but that re-starts after a clean `auto_exit_after_session`

@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import math
+import signal
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
@@ -61,6 +62,47 @@ RECONCILE_RETRY_MAX_SECONDS = 300.0
 # the first retry after a hold comes sooner, whatever failed before it, and
 # doubles only over the attempts that keep holding it.
 RECONCILE_SETTLE_RETRY_SECONDS = 10.0
+
+
+class _StopSignals:
+    """SIGINT and SIGTERM for the life of ``IntradayBot.run``.
+
+    The first one raises KeyboardInterrupt, so `kill <pid>` and `systemctl
+    stop` take the same shutdown path as Ctrl+C, and starts the hold: from
+    then on, until ``run`` returns, a signal is only recorded. A second one
+    used to raise inside the shutdown cleanup and abandon it half-done (the
+    session report half-appended to trades.csv); under systemd the SIGKILL at
+    `TimeoutStopSec` still ends a cleanup that hangs. The handler logs
+    nothing, since logging from a handler can re-enter a stream write it
+    interrupted, so ``run`` reports what it ignored once the cleanup is done.
+    """
+
+    def __init__(self) -> None:
+        self.held = False
+        self.ignored: list[str] = []
+        self._previous: dict[signal.Signals, Any] = {}
+
+    def __enter__(self) -> _StopSignals:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            try:
+                self._previous[signum] = signal.signal(signum, self._handle)
+            except ValueError:
+                LOG.debug("Could not install the %s handler (non-main thread?)", signum.name, exc_info=True)
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        for signum, previous in self._previous.items():
+            signal.signal(signum, previous)
+
+    def hold(self) -> None:
+        self.held = True
+
+    def _handle(self, signum: int, _frame: Any) -> None:
+        if self.held:
+            self.ignored.append(signal.Signals(signum).name)
+            return
+        self.held = True
+        raise KeyboardInterrupt()
 
 
 class IntradayBot:
@@ -278,16 +320,35 @@ class IntradayBot:
         return self.config.risk.trade_management_mode
 
     def run(self) -> None:
-        # Route SIGTERM through KeyboardInterrupt so `kill <pid>` hits the
-        # same clean-shutdown path as Ctrl+C.
-        import signal as _signal
-        def _raise_keyboard_interrupt(_sig, _frame):
-            raise KeyboardInterrupt()
-        if hasattr(_signal, "SIGTERM"):
+        """Start up, run cycles until a stop signal or the auto-exit, then
+        shut down once and return, so the process exits 0.
+
+        Only the cycle itself used to sit inside the `except
+        KeyboardInterrupt`. A signal anywhere else (start-up, the auto-exit
+        check, the housekeeping, the error path, and the inter-cycle sleep,
+        where the loop spends most of its time) raised out of ``run`` with a
+        traceback and skipped the cleanup, so no session report was written
+        (2026-09-26).
+        """
+        with _StopSignals() as stop_signals:
             try:
-                _signal.signal(_signal.SIGTERM, _raise_keyboard_interrupt)
-            except (ValueError, OSError):
-                LOG.debug("Could not install SIGTERM handler (non-main thread?)", exc_info=True)
+                self._start_up()
+                self._run_cycles()
+                # Still inside the try: a signal up to here raises and is
+                # caught below; from here on one is only recorded.
+                stop_signals.hold()
+            except KeyboardInterrupt:
+                # A KeyboardInterrupt the handler did not raise has not
+                # started the hold.
+                stop_signals.hold()
+                LOG.info("Interrupted, shutting down.")
+            self._shutdown_cleanup()
+            if stop_signals.ignored:
+                LOG.warning("Ignored %s during the shutdown", ", ".join(stop_signals.ignored))
+            LOG.info("Shutdown complete.")
+
+    def _start_up(self) -> None:
+        """The dashboard, the start-up reconcile and the start-up log lines."""
         if self.dashboard is not None:
             try:
                 self.dashboard.start()
@@ -344,6 +405,10 @@ class IntradayBot:
                 ",".join(styles) if styles else "none",
                 self.config.options.volatility_symbol,
             )
+
+    def _run_cycles(self) -> None:
+        """The cycle loop; returns when the auto-exit decides to stop, and
+        leaves the shutdown to ``run``."""
         auto_exit = bool(self.config.runtime.auto_exit_after_session)
         consecutive_errors = 0
         while True:
@@ -356,10 +421,6 @@ class IntradayBot:
                 self.step()
                 self.last_error = None
                 consecutive_errors = 0
-            except KeyboardInterrupt:
-                LOG.info("Interrupted, shutting down.")
-                self._shutdown_cleanup()
-                break
             except Exception as exc:
                 consecutive_errors += 1
                 self.last_error = str(exc)
@@ -399,8 +460,7 @@ class IntradayBot:
                 if not session.is_trading_day:
                     # Non-trading day (weekend/holiday) — exit immediately
                     LOG.info("Auto-exit: non-trading day, no open positions — shutting down")
-                    self._shutdown_cleanup()
-                    break
+                    return
                 schedule = self.config.active_strategy.schedule()
                 # Exit after the latest of: RTH close, management window end,
                 # entry window end, screener window end.  This respects
@@ -411,8 +471,7 @@ class IntradayBot:
                 exit_after = max(all_ends)
                 if now_t > exit_after:
                     LOG.info("Auto-exit: all windows closed at %s, no open positions — shutting down", exit_after.strftime("%H:%M"))
-                    self._shutdown_cleanup()
-                    break
+                    return
             self._maybe_export_session_archive()
             self._maybe_session_rollover_reset()
             self._maybe_prune_inactive_symbols()
@@ -738,7 +797,10 @@ class IntradayBot:
         """Three-step cleanup with per-step isolation so a failure in one
         (e.g. disk full during session report) doesn't skip the rest.
         Stop dashboard first so HTTP handlers can't reach into data_feed
-        state being torn down by stop_streaming."""
+        state being torn down by stop_streaming. ``run`` calls it once, with
+        stop signals held, wherever start-up or the loop stopped, so a step
+        must also cope with a start-up that never reached it (the stop calls
+        are no-ops then)."""
         if self.dashboard is not None:
             try:
                 self.dashboard.stop()
