@@ -993,6 +993,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The Linux deploy guide's systemd unit now starts the bot.** *2026-09-26*
+  — `README_LINUX_DEPLOY.md` ran `python -m intraday_tv_schwab_bot.main`,
+  but the package has no `main` module; the entry point is `main.py` at the
+  repo root. A unit copied from the guide failed on every start, and
+  `Restart=on-failure` retried it every 30s. The `ExecStart` line and the
+  `tmux` one-liner under "Quicker alternatives" now run
+  `.venv/bin/python main.py --config configs/config.yaml` from the repo root.
+
+- **The README's TA-Lib note matches the pin.** *2026-09-26* — it said
+  `requirements.txt` pins `TA-Lib==0.6.8` and that macOS and Linux need the
+  C library installed before `pip install`. The pin has been 0.8.0 since
+  2026-09-18, and its wheels bundle the C library on Windows, macOS and
+  Linux; only a build from source needs TA-Lib C 0.8.1 installed.
+
 - **`options.underlyings` must be a list (refactor cut C24).** *2026-09-26* —
   a YAML scalar (`underlyings: SPY`) used to load as `['S', 'P', 'Y']`: the
   config normalizer iterated the string, so the 0DTE screeners built three

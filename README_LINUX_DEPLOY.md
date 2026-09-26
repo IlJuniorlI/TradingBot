@@ -203,7 +203,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/TradingBot
-ExecStart=%h/TradingBot/.venv/bin/python -m intraday_tv_schwab_bot.main --config configs/config.yaml
+ExecStart=%h/TradingBot/.venv/bin/python main.py --config configs/config.yaml
 
 # Clean shutdown: engine.py routes SIGTERM through KeyboardInterrupt so the
 # bot writes its session report + reconcile metadata + daily archive before
@@ -507,7 +507,7 @@ reconcile metadata SQLite store.
 
 | Approach | Use case | Why not for production |
 |---|---|---|
-| `tmux new -d -s bot 'cd ~/TradingBot && .venv/bin/python -m intraday_tv_schwab_bot.main --config configs/config.yaml'` | Quick one-off testing | No auto-restart on crash; doesn't survive reboot |
+| `tmux new -d -s bot 'cd ~/TradingBot && .venv/bin/python main.py --config configs/config.yaml'` | Quick one-off testing | No auto-restart on crash; doesn't survive reboot |
 | `nohup ... &` + `disown` | Throwaway run | Loses stderr, no clean shutdown signal |
 | Docker / Podman | Already a container shop | Extra layer; bot already isolated via venv |
 | `supervisord` | Older systems without systemd | systemd is everywhere on modern Linux |

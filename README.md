@@ -52,7 +52,7 @@ Alternatively, `pip install -e .` consumes `pyproject.toml` and registers the
 `intraday-tv-schwab-bot` console script. The package version is pulled from
 `version.txt` at the repo root and exposed as `intraday_tv_schwab_bot.__version__`.
 
-`requirements.txt` pins `TA-Lib==0.6.8`, which backs the standard indicator and candlestick-pattern layer. On Windows, `pip install TA-Lib==0.6.8` is self-contained — the 0.6.x wheels on PyPI statically bundle the underlying C library (cp39–cp313, win_amd64). On macOS and Linux, install the native C library first (`brew install ta-lib` on macOS, `apt install libta-lib0-dev` on Debian/Ubuntu) before `pip install`.
+`requirements.txt` pins `TA-Lib==0.8.0`, which backs the standard indicator and candlestick-pattern layer. Its PyPI wheels (cp39–cp314 for Windows, macOS 13+ Intel and 14+ Apple Silicon, and glibc and musl Linux on x86_64 and aarch64) bundle the TA-Lib C library, so `pip install` needs no separate native install. Only a platform with no wheel builds from source, and that build needs TA-Lib C 0.8.1 installed first.
 
 Tests are maintained in a private source tree (not shipped with this repository).
 

@@ -16,7 +16,6 @@ from urllib.request import Request, urlopen
 import yaml
 
 USER_AGENT = "intraday-tv-schwab-bot-macro-sync/1.0"
-EASTERN = dt.timezone(dt.timedelta(hours=-5))
 
 # Repo root = parent of scripts/. Default output path is anchored here so the
 # generated blackout file lands next to config.yaml regardless of the caller's
