@@ -26,7 +26,7 @@ cooldown lookups before the strategy runs.
 """
 import logging
 
-from ..shared import Candidate, Side
+from ...models import Candidate, Side
 from ..screener_base import BaseStrategyScreener
 
 LOG = logging.getLogger(__name__)

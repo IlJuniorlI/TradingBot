@@ -32,10 +32,10 @@ by activity_score and capped to ``tradingview.max_candidates``. Set ``none`` to
 re-screen every cycle with no premarket lock. Ranked by gap% x clipped RVOL
 (gap dominates; RVOL bounded so a single print can't dominate). Bias always LONG.
 """
-from datetime import time
 
-from ..shared import Candidate, Side
+from ...models import Candidate, Side
 from ... import sessions
+from ...sessions import EQUITY_RTH_OPEN
 from ..screener_base import BaseStrategyScreener
 
 
@@ -126,7 +126,7 @@ class SmallCapSqueezeScreener(BaseStrategyScreener):
             locked = {}
             self._lock_date = now.date()
         fresh = {c.symbol: c for c in rows}
-        if now.time() < time(9, 30):
+        if now.time() < EQUITY_RTH_OPEN:
             # premarket: accumulate (fresh rows refresh/extend the locked set)
             locked.update(fresh)
             merged = dict(locked)

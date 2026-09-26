@@ -56,18 +56,12 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 
 from ..models import Candidate, Position, Side, Signal
-from ..indicators import htf_ema_spans
+from ..bars import CANDLE_PATTERN_WINDOW_BARS, bar_close_position, bars_have_range
+from ..indicators import htf_ema_spans, last_bar_atr
 from .. import sessions
-from .helpers import (
-    CANDLE_PATTERN_WINDOW_BARS,
-    _bar_close_position,
-    _bars_have_range,
-    _detail_fields,
-    _optional_float,
-    _reason_prefix,
-    _reason_with_values,
-    _safe_float,
-)
+from ..numeric import safe_float
+from ..reasons import detail_fields, reason_head, reason_with_values
+from .plugin_api import VETO_GATES
 
 if TYPE_CHECKING:
     from .strategy_base import BaseStrategy
@@ -87,10 +81,6 @@ STYLE_FAMILIES: frozenset[str] = frozenset({
     "continuation", "divergence", "option_debit", "option_credit", "option_long",
 })
 
-# The P3 vetoes, in evaluation (and reporting) order. A manifest exempts a
-# style from any of them: capabilities.shared_entry.exemptions {style: [gate]}.
-VETO_GATES: tuple[str, ...] = ("structure", "sr", "broken_level", "chart", "dual_divergence", "candle")
-
 # Retest zones a RetestTrigger may name; the FVG plan always comes first.
 RETEST_ZONES: frozenset[str] = frozenset({"fvg", "ob"})
 
@@ -103,7 +93,7 @@ _DIVERGENCE_STYLES = frozenset({"divergence_regular", "divergence_hidden"})
 # never evaluated a setup on: not its symbol, already held, outside its own
 # window or session, not enough or unusable data, a blackout, or every side it
 # would trade switched off -- plus every ``insufficient_*`` token
-# (helpers.insufficient_bars_reason). A divergence-only entry must not open
+# (reasons.insufficient_bars_reason). A divergence-only entry must not open
 # such a symbol either; it only gets the symbols the strategy looked at and
 # found no setup on (2026-09-24). The side skips count as the whole symbol,
 # not the one side: rth_trend_pullback records ``shorts_disabled`` when the
@@ -468,10 +458,10 @@ class SharedEntryPolicy:
     # 0.75 from a stretched entry. Only null (or NaN) falls back.
 
     def _technical_weight(self, key: str, default: float) -> float:
-        return _safe_float(self._technical_level_setting(key, default), default)
+        return safe_float(self._technical_level_setting(key, default), default)
 
     def _sr_weight(self, key: str, default: float) -> float:
-        return _safe_float(self._support_resistance_setting(key, default), default)
+        return safe_float(self._support_resistance_setting(key, default), default)
 
     # -- admit ---------------------------------------------------------------
 
@@ -540,9 +530,9 @@ class SharedEntryPolicy:
                 anchored = stop
                 for plan in plans:
                     anchored = self._apply_retest_stop_anchor(p.direction, close, anchored, plan)
-                stop = self._clamp_refined_stop(close, stop, anchored, strategy._frame_atr14(p.level_frame, close))
+                stop = self._clamp_refined_stop(close, stop, anchored, last_bar_atr(p.level_frame, close))
             if (stop >= close) if p.direction == Side.LONG else (stop <= close):
-                return self._refuse(p, [_reason_with_values(
+                return self._refuse(p, [reason_with_values(
                     "stop_on_wrong_side", current=stop, required=close,
                     op="<" if p.direction == Side.LONG else ">", digits=4,
                 )])
@@ -555,7 +545,7 @@ class SharedEntryPolicy:
             + float(fvg["fvg_entry_adjustment"])
             + (float(divergence["score_bump"]) if divergence is not None and divergence.get("confirmed") else 0.0)
         )
-        floor = _optional_float(self.config.shared_entry.min_shared_context_score)
+        floor = safe_float(self.config.shared_entry.min_shared_context_score)
         if floor is not None and shared_context_score < floor:
             return self._refuse(p, [f"shared_context_below_min(score={shared_context_score:.4f},min={floor:.4f})"])
         _MINTING.active = True
@@ -645,7 +635,7 @@ class SharedEntryPolicy:
                     reason = "chart_pattern_opposed"
             elif gate == "dual_divergence":
                 reason = self._dual_counter_divergence_reason(p.direction, tech)
-            elif not _bars_have_range(p.gate_frame, CANDLE_PATTERN_WINDOW_BARS):
+            elif not bars_have_range(p.gate_frame, CANDLE_PATTERN_WINDOW_BARS):
                 # A single print in the pattern window: TA-Lib reads it as a
                 # doji / white candle, so on thin premarket tape 40% of
                 # microcap_pm's LONG vetoes were TRISTAR / GAPSIDESIDEWHITE /
@@ -659,13 +649,6 @@ class SharedEntryPolicy:
                 blockers.append(reason)
         return blockers, tuple(applied), tuple(exempted), tuple(abstained)
 
-    @staticmethod
-    def _last_atr(frame: pd.DataFrame | None, close: float) -> float:
-        return _safe_float(
-            frame.iloc[-1].get("atr14") if (frame is not None and not frame.empty and "atr14" in frame.columns) else None,
-            max(close * 0.0015, 0.01),
-        )
-
     def _broken_level_reason(self, p: EntryProposal, sr_ctx) -> str | None:
         """A confirmed BROKEN level just beyond the entry (broken_support
         under a LONG, broken_resistance over a SHORT) inside either
@@ -676,7 +659,7 @@ class SharedEntryPolicy:
         close = float(p.close)
         min_pct = float(cfg.broken_level_min_clearance_pct) * float(p.vol_scale)
         min_atr = float(cfg.broken_level_min_clearance_atr)
-        atr = self._last_atr(p.sr_frame, close)
+        atr = last_bar_atr(p.sr_frame, close)
         if p.direction == Side.SHORT:
             broken = getattr(sr_ctx, "broken_resistance", None)
             level = float(getattr(broken, "price", 0.0) or 0.0) if broken is not None else 0.0
@@ -870,12 +853,12 @@ class SharedEntryPolicy:
         """
         meta = signal.metadata
         tier = 0.0 if meta.get("entry_source") == DIVERGENCE_ENTRY_SOURCE else 1.0
-        primary = _safe_float(meta.get(self._rank_primary_field), 0.0)
+        primary = safe_float(meta.get(self._rank_primary_field), 0.0)
         if self._rank_shared_weight:
-            unit = _safe_float(meta.get(self._rank_unit_field), 0.0) if self._rank_unit_field else 1.0
-            primary += self._rank_shared_weight * _safe_float(meta.get("shared_context_score"), 0.0) * unit
-        tail = tuple(_safe_float(meta.get(name), 0.0) for name in self._rank_tail_fields)
-        tiebreak = (_safe_float(meta.get("final_priority_score"), 0.0),) if self._rank_final_tiebreak else ()
+            unit = safe_float(meta.get(self._rank_unit_field), 0.0) if self._rank_unit_field else 1.0
+            primary += self._rank_shared_weight * safe_float(meta.get("shared_context_score"), 0.0) * unit
+        tail = tuple(safe_float(meta.get(name), 0.0) for name in self._rank_tail_fields)
+        tiebreak = (safe_float(meta.get("final_priority_score"), 0.0),) if self._rank_final_tiebreak else ()
         activity = float(candidate.activity_score) if candidate is not None else 0.0
         rank = float(candidate.rank) if candidate is not None else 9_999.0
         return (tier, primary, *tail, *tiebreak, activity, -rank)
@@ -907,7 +890,7 @@ class SharedEntryPolicy:
             return self._divergence_cache[key]
         found: dict[Side, dict[str, Any] | None] = {Side.LONG: None, Side.SHORT: None}
         if frame is not None and not frame.empty:
-            close = _safe_float(frame.iloc[-1].get("close"), 0.0)
+            close = safe_float(frame.iloc[-1].get("close"), 0.0)
             if close > 0:
                 sr = self.strategy._sr_context(symbol, frame, data)
                 tech = self.strategy._technical_context(frame)
@@ -996,7 +979,7 @@ class SharedEntryPolicy:
         an ``insufficient_*`` token)."""
         decision = self.strategy._entry_decisions.get(symbol) or {}
         for reason in decision.get("reasons") or ():
-            token = _reason_prefix(str(reason))
+            token = reason_head(str(reason))
             if token in DIVERGENCE_INELIGIBLE_REASONS or token.startswith("insufficient_"):
                 return True
         return False
@@ -1005,7 +988,7 @@ class SharedEntryPolicy:
         strategy = self.strategy
         side = found["side"]
         family = "reversal" if found["kind"] == "regular" else "continuation"
-        close = _safe_float(frame.iloc[-1].get("close"), 0.0)
+        close = safe_float(frame.iloc[-1].get("close"), 0.0)
         proposal = EntryProposal(
             candidate=candidate, direction=side, style=f"divergence_{found['kind']}", style_family=family,
             close=close, stop=float(found["stop"]), target=found["target"],
@@ -1023,7 +1006,7 @@ class SharedEntryPolicy:
         bias_key = "fvg_reversal_bias" if family == "reversal" else "fvg_continuation_bias"
         target, ladder_meta = strategy._apply_ladder_if_enabled(
             side, close, admitted.stop, admitted.target, regime="divergence",
-            sr_ctx=admitted.sr, atr=strategy._frame_atr14(frame, close),
+            sr_ctx=admitted.sr, atr=last_bar_atr(frame, close),
         )
         management = strategy._adaptive_management_components(
             side, close, admitted.stop, target, style=family, runner_allowed=False,
@@ -1052,8 +1035,8 @@ class SharedEntryPolicy:
         """A hidden divergence is a continuation read, so it needs the HTF
         trend it continues: the HTF fast EMA above the slow one for a LONG,
         below it for a SHORT. No HTF EMAs, no hidden entry."""
-        fast = _optional_float(getattr(htf_ctx, "ema_fast", None))
-        slow = _optional_float(getattr(htf_ctx, "ema_slow", None))
+        fast = safe_float(getattr(htf_ctx, "ema_fast", None))
+        slow = safe_float(getattr(htf_ctx, "ema_slow", None))
         if fast is None or slow is None:
             return False
         return fast > slow if side == Side.LONG else fast < slow
@@ -1135,7 +1118,7 @@ class SharedEntryPolicy:
             return None
         pivot_price = float(match.pivot_b_price)
         age = int(match.age_bars)
-        atr_val = _safe_float(frame.iloc[-1].get("atr14"), max(close * 0.0015, 0.01))
+        atr_val = last_bar_atr(frame, close)
 
         confluence_level: float | None = None
         if sr_ctx is not None:
@@ -1143,7 +1126,7 @@ class SharedEntryPolicy:
             names = ("nearest_support", "broken_resistance") if side == Side.LONG else ("nearest_resistance", "broken_support")
             for name in names:
                 level = getattr(sr_ctx, name, None)
-                level_price = _optional_float(getattr(level, "price", None))
+                level_price = safe_float(getattr(level, "price", None))
                 if level_price and abs(pivot_price - level_price) <= buffer:
                     confluence_level = level_price
                     break
@@ -1167,10 +1150,10 @@ class SharedEntryPolicy:
         if (stop >= close) if side == Side.LONG else (stop <= close):
             return None
         risk = abs(close - stop)
-        min_rr = _optional_float(cfg.min_target_rr)
+        min_rr = safe_float(cfg.min_target_rr)
         rr_target = None if min_rr is None or min_rr <= 0 else (close + risk * min_rr if side == Side.LONG else close - risk * min_rr)
         opposing = getattr(sr_ctx, "nearest_resistance" if side == Side.LONG else "nearest_support", None) if sr_ctx is not None else None
-        opposing_price = _optional_float(getattr(opposing, "price", None))
+        opposing_price = safe_float(getattr(opposing, "price", None))
         if opposing_price is not None and not ((opposing_price > close) if side == Side.LONG else (0 < opposing_price < close)):
             opposing_price = None
         if rr_target is None:
@@ -1233,7 +1216,7 @@ class SharedEntryPolicy:
             reward = close_v - target_v
         if risk <= 0 or reward <= 0:
             return False
-        min_rr = _optional_float(self.config.shared_entry.min_target_rr)
+        min_rr = safe_float(self.config.shared_entry.min_target_rr)
         if min_rr is None or min_rr <= 0:
             return True
         return (reward / risk) >= min_rr
@@ -1277,7 +1260,7 @@ class SharedEntryPolicy:
 
         ``min_stop_atr_mult`` 0 or null switches the floor off.
         """
-        min_atr_mult = _optional_float(self.config.shared_entry.min_stop_atr_mult)
+        min_atr_mult = safe_float(self.config.shared_entry.min_stop_atr_mult)
         close_v, proposed_v = float(close), float(proposed_stop)
         if min_atr_mult is None or min_atr_mult <= 0 or atr <= 0:
             return proposed_v
@@ -1292,7 +1275,7 @@ class SharedEntryPolicy:
     def _apply_retest_stop_anchor(side: Side, close: float, stop: float, plan: dict[str, Any] | None) -> float:
         if not plan or str(plan.get("status", "none") or "none").strip().lower() != "allow":
             return float(stop)
-        anchor = _optional_float(plan.get("stop_anchor"))
+        anchor = safe_float(plan.get("stop_anchor"))
         if anchor is None:
             return float(stop)
         if side == Side.LONG:
@@ -1339,12 +1322,12 @@ class SharedEntryPolicy:
         opposing_info = self._fvg_gap_state(opposing_gap, close)
         same_state = str(same_info.get("state", "none") or "none").strip().lower()
         opposing_state = str(opposing_info.get("state", "none") or "none").strip().lower()
-        lower = _optional_float(same_info.get("lower"))
-        upper = _optional_float(same_info.get("upper"))
-        midpoint = _optional_float(same_info.get("midpoint"))
-        size = max(1e-8, float(_optional_float(same_info.get("size"), 0.0) or 0.0))
-        same_distance_pct = _optional_float(same_info.get("distance_pct"), 1.0)
-        opposing_distance_pct = _optional_float(opposing_info.get("distance_pct"))
+        lower = safe_float(same_info.get("lower"))
+        upper = safe_float(same_info.get("upper"))
+        midpoint = safe_float(same_info.get("midpoint"))
+        size = max(1e-8, float(safe_float(same_info.get("size"), 0.0) or 0.0))
+        same_distance_pct = safe_float(same_info.get("distance_pct"), 1.0)
+        opposing_distance_pct = safe_float(opposing_info.get("distance_pct"))
         max_gap_distance_pct = max(0.0002, float(self.params.get("anti_chase_fvg_retest_max_gap_distance_pct", 0.0030)))
         max_opposing_distance_pct = max(0.0002, float(self.params.get("anti_chase_fvg_retest_max_opposing_distance_pct", 0.0020)))
         lookback_bars = max(2, int(self.params.get("anti_chase_fvg_retest_lookback_bars", 5)))
@@ -1390,7 +1373,7 @@ class SharedEntryPolicy:
         if lower is None or upper is None or midpoint is None or same_state not in {"active", "validated"}:
             if same_state == "invalidated":
                 out["status"] = "reject"
-                out["reason"] = f"{direction_label}_fvg_retest_rejected({_detail_fields(detail='same_direction_gap_invalidated', midpoint=midpoint or 0.0)})"
+                out["reason"] = f"{direction_label}_fvg_retest_rejected({detail_fields(detail='same_direction_gap_invalidated', midpoint=midpoint or 0.0)})"
                 out["metadata"]["anti_chase_fvg_retest_status"] = out["status"]
             return out
         in_gap = lower - touch_tolerance <= close <= upper + touch_tolerance
@@ -1411,13 +1394,13 @@ class SharedEntryPolicy:
         opposing_blocked = bool(opposing_state in {"active", "validated"} and opposing_distance_pct is not None and float(opposing_distance_pct) <= max_opposing_distance_pct)
         if opposing_blocked:
             out["status"] = "reject"
-            out["reason"] = f"{direction_label}_fvg_retest_rejected({_detail_fields(detail='opposing_gap_too_close', opposing_distance_pct=opposing_distance_pct or 0.0)})"
+            out["reason"] = f"{direction_label}_fvg_retest_rejected({detail_fields(detail='opposing_gap_too_close', opposing_distance_pct=opposing_distance_pct or 0.0)})"
             out["metadata"]["anti_chase_fvg_retest_status"] = out["status"]
             return out
         last = frame.iloc[-1]
-        bar_low = _safe_float(last.get("low"), close)
-        bar_high = _safe_float(last.get("high"), close)
-        close_pos = _bar_close_position(frame)
+        bar_low = safe_float(last.get("low"), close)
+        bar_high = safe_float(last.get("high"), close)
+        close_pos = bar_close_position(frame)
         touched_zone = bar_low <= (upper + touch_tolerance + edge_tolerance) and bar_high >= (lower - touch_tolerance - edge_tolerance)
         if side == Side.LONG:
             respected_zone = bar_low >= (lower - invalidation_tolerance)
@@ -1449,7 +1432,7 @@ class SharedEntryPolicy:
             )
             return out
         out["status"] = "wait"
-        out["reason"] = f"wait_for_{direction_label}_fvg_retest({_detail_fields(state=same_state, midpoint=midpoint, trigger=trigger_level, distance_pct=same_distance_pct or 0.0)})"
+        out["reason"] = f"wait_for_{direction_label}_fvg_retest({detail_fields(state=same_state, midpoint=midpoint, trigger=trigger_level, distance_pct=same_distance_pct or 0.0)})"
         out["metadata"]["anti_chase_fvg_retest_status"] = out["status"]
         return out
 
@@ -1489,12 +1472,12 @@ class SharedEntryPolicy:
         opposing_info = self._fvg_gap_state(opposing_ob, close)
         same_state = str(same_info.get("state", "none") or "none").strip().lower()
         opposing_state = str(opposing_info.get("state", "none") or "none").strip().lower()
-        lower = _optional_float(same_info.get("lower"))
-        upper = _optional_float(same_info.get("upper"))
-        midpoint = _optional_float(same_info.get("midpoint"))
-        size = max(1e-8, float(_optional_float(same_info.get("size"), 0.0) or 0.0))
-        same_distance_pct = _optional_float(same_info.get("distance_pct"), 1.0)
-        opposing_distance_pct = _optional_float(opposing_info.get("distance_pct"))
+        lower = safe_float(same_info.get("lower"))
+        upper = safe_float(same_info.get("upper"))
+        midpoint = safe_float(same_info.get("midpoint"))
+        size = max(1e-8, float(safe_float(same_info.get("size"), 0.0) or 0.0))
+        same_distance_pct = safe_float(same_info.get("distance_pct"), 1.0)
+        opposing_distance_pct = safe_float(opposing_info.get("distance_pct"))
         max_gap_distance_pct = max(0.0002, float(self.params.get("anti_chase_fvg_retest_max_gap_distance_pct", 0.0030)))
         max_opposing_distance_pct = max(0.0002, float(self.params.get("anti_chase_fvg_retest_max_opposing_distance_pct", 0.0020)))
         lookback_bars = max(2, int(self.params.get("anti_chase_fvg_retest_lookback_bars", 5)))
@@ -1526,7 +1509,7 @@ class SharedEntryPolicy:
         if lower is None or upper is None or midpoint is None or same_state not in {"active", "validated"}:
             if same_state == "invalidated":
                 out["status"] = "reject"
-                out["reason"] = f"{direction_label}_ob_retest_rejected({_detail_fields(detail='same_direction_block_invalidated', midpoint=midpoint or 0.0)})"
+                out["reason"] = f"{direction_label}_ob_retest_rejected({detail_fields(detail='same_direction_block_invalidated', midpoint=midpoint or 0.0)})"
                 out["metadata"]["anti_chase_ob_retest_status"] = out["status"]
             return out
         in_zone = lower - touch_tolerance <= close <= upper + touch_tolerance
@@ -1547,13 +1530,13 @@ class SharedEntryPolicy:
         opposing_blocked = bool(opposing_state in {"active", "validated"} and opposing_distance_pct is not None and float(opposing_distance_pct) <= max_opposing_distance_pct)
         if opposing_blocked:
             out["status"] = "reject"
-            out["reason"] = f"{direction_label}_ob_retest_rejected({_detail_fields(detail='opposing_block_too_close', opposing_distance_pct=opposing_distance_pct or 0.0)})"
+            out["reason"] = f"{direction_label}_ob_retest_rejected({detail_fields(detail='opposing_block_too_close', opposing_distance_pct=opposing_distance_pct or 0.0)})"
             out["metadata"]["anti_chase_ob_retest_status"] = out["status"]
             return out
         last = frame.iloc[-1]
-        bar_low = _safe_float(last.get("low"), close)
-        bar_high = _safe_float(last.get("high"), close)
-        close_pos = _bar_close_position(frame)
+        bar_low = safe_float(last.get("low"), close)
+        bar_high = safe_float(last.get("high"), close)
+        close_pos = bar_close_position(frame)
         touched_zone = bar_low <= (upper + touch_tolerance + edge_tolerance) and bar_high >= (lower - touch_tolerance - edge_tolerance)
         if side == Side.LONG:
             respected_zone = bar_low >= (lower - invalidation_tolerance)
@@ -1585,7 +1568,7 @@ class SharedEntryPolicy:
             )
             return out
         out["status"] = "wait"
-        out["reason"] = f"wait_for_{direction_label}_ob_retest({_detail_fields(state=same_state, midpoint=midpoint, trigger=trigger_level, distance_pct=same_distance_pct or 0.0)})"
+        out["reason"] = f"wait_for_{direction_label}_ob_retest({detail_fields(state=same_state, midpoint=midpoint, trigger=trigger_level, distance_pct=same_distance_pct or 0.0)})"
         out["metadata"]["anti_chase_ob_retest_status"] = out["status"]
         return out
 
@@ -1618,8 +1601,8 @@ class SharedEntryPolicy:
         engaged = [(p, s) for p, s in engaged if s != "none"]
         if not engaged:
             return reasons
-        deferred = [reason for reason in reasons if _reason_prefix(reason) in deferrable_prefixes]
-        other = [reason for reason in reasons if _reason_prefix(reason) not in deferrable_prefixes]
+        deferred = [reason for reason in reasons if reason_head(reason) in deferrable_prefixes]
+        other = [reason for reason in reasons if reason_head(reason) not in deferrable_prefixes]
         if not deferred or other:
             return reasons
         if any(s == "allow" for _p, s in engaged):
@@ -1731,7 +1714,7 @@ class SharedEntryPolicy:
             if support_stop < close:
                 stop = self._clamp_refined_stop(
                     close, stop, max(float(stop), support_stop),
-                    self.strategy._frame_atr14(frame, close),
+                    last_bar_atr(frame, close),
                 )
         if target is not None and sr_ctx.nearest_resistance and close < float(sr_ctx.nearest_resistance.price):
             capped_target = max(close * 1.001, float(sr_ctx.nearest_resistance.price) - level_buffer)
@@ -1752,7 +1735,7 @@ class SharedEntryPolicy:
             if resistance_stop > close:
                 stop = self._clamp_refined_stop(
                     close, stop, min(float(stop), resistance_stop),
-                    self.strategy._frame_atr14(frame, close),
+                    last_bar_atr(frame, close),
                 )
         if target is not None and sr_ctx.nearest_support and close > float(sr_ctx.nearest_support.price):
             capped_target = min(close * 0.999, float(sr_ctx.nearest_support.price) + level_buffer)
@@ -1774,7 +1757,7 @@ class SharedEntryPolicy:
         # Same clearance the check read: negative when price is above a
         # pending (unconfirmed-broken) resistance.
         dist_pct, dist_atr = _htf_clearance(sr_ctx, "resistance")
-        return _reason_with_values(
+        return reason_with_values(
             "too_close_to_htf_resistance",
             current=dist_pct,
             required=float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)),
@@ -1795,7 +1778,7 @@ class SharedEntryPolicy:
         # Same clearance the check read: negative when price is below a
         # pending (unconfirmed-lost) support.
         dist_pct, dist_atr = _htf_clearance(sr_ctx, "support")
-        return _reason_with_values(
+        return reason_with_values(
             "too_close_to_htf_support",
             current=dist_pct,
             required=float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)),
@@ -1819,10 +1802,10 @@ class SharedEntryPolicy:
             return float(stop), (None if target is None else float(target))
         if not bool(self._technical_level_setting("enabled", True)):
             return float(stop), (None if target is None else float(target))
-        atr = self.strategy._frame_atr14(frame, close)
+        atr = last_bar_atr(frame, close)
         buffer = max(atr * 0.12, close * 0.0010)
         if bool(self._technical_level_setting("stop_use_trendline", True)) and getattr(tech_ctx, "support_trendline", None) is not None:
-            support_value = _safe_float(getattr(tech_ctx.support_trendline, "current_value", None), 0.0)
+            support_value = safe_float(getattr(tech_ctx.support_trendline, "current_value", None), 0.0)
             trend_stop = support_value - buffer
             if 0 < trend_stop < close:
                 stop = self._clamp_refined_stop(
@@ -1855,10 +1838,10 @@ class SharedEntryPolicy:
             return float(stop), (None if target is None else float(target))
         if not bool(self._technical_level_setting("enabled", True)):
             return float(stop), (None if target is None else float(target))
-        atr = self.strategy._frame_atr14(frame, close)
+        atr = last_bar_atr(frame, close)
         buffer = max(atr * 0.12, close * 0.0010)
         if bool(self._technical_level_setting("stop_use_trendline", True)) and getattr(tech_ctx, "resistance_trendline", None) is not None:
-            resistance_value = _safe_float(getattr(tech_ctx.resistance_trendline, "current_value", None), 0.0)
+            resistance_value = safe_float(getattr(tech_ctx.resistance_trendline, "current_value", None), 0.0)
             trend_stop = resistance_value + buffer
             if trend_stop > close:
                 stop = self._clamp_refined_stop(
@@ -1904,7 +1887,7 @@ class SharedEntryPolicy:
         bb_lower = getattr(tech_ctx, "bollinger_lower", None)
         bb_pct = getattr(tech_ctx, "bollinger_percent_b", None)
         bb_squeeze = bool(getattr(tech_ctx, "bollinger_squeeze", False))
-        price = _safe_float(getattr(tech_ctx, "current_price", None), 0.0)
+        price = safe_float(getattr(tech_ctx, "current_price", None), 0.0)
         adx = getattr(tech_ctx, "adx", None)
         dmi_bias = str(getattr(tech_ctx, "dmi_bias", "neutral") or "neutral")
         adx_rising = bool(getattr(tech_ctx, "adx_rising", False))
@@ -2084,7 +2067,7 @@ class SharedEntryPolicy:
         if sr_ctx is None:
             return out
         try:
-            raw_bias = _safe_float(getattr(sr_ctx, "bias_score", 0.0), 0.0)
+            raw_bias = safe_float(getattr(sr_ctx, "bias_score", 0.0), 0.0)
             directional_bias = raw_bias if side == Side.LONG else -raw_bias
             bias_weight = max(0.0, self._sr_weight("entry_bias_score_weight", 0.60))
             favorable_bonus = max(0.0, self._sr_weight("entry_favorable_proximity_bonus", 0.35))
@@ -2106,8 +2089,8 @@ class SharedEntryPolicy:
             resistance_near = (
                 bool(getattr(sr_ctx, "near_resistance", False)) or getattr(sr_ctx, "pending_resistance", None) is not None
             )
-            support_dist = _optional_float(_htf_clearance(sr_ctx, "support")[1])
-            resistance_dist = _optional_float(_htf_clearance(sr_ctx, "resistance")[1])
+            support_dist = safe_float(_htf_clearance(sr_ctx, "support")[1])
+            resistance_dist = safe_float(_htf_clearance(sr_ctx, "resistance")[1])
             if side == Side.LONG:
                 favorable_near, favorable_dist = support_near, support_dist
                 opposing_near, opposing_dist = resistance_near, resistance_dist
@@ -2182,11 +2165,11 @@ class SharedEntryPolicy:
 
     @staticmethod
     def _fvg_gap_state(gap: Any, current_price: float) -> dict[str, Any]:
-        lower = _optional_float(getattr(gap, "lower", None))
-        upper = _optional_float(getattr(gap, "upper", None))
-        midpoint = _optional_float(getattr(gap, "midpoint", None))
-        size = _optional_float(getattr(gap, "size", None))
-        filled_pct = max(0.0, min(1.0, _optional_float(getattr(gap, "filled_pct", None), 0.0) or 0.0))
+        lower = safe_float(getattr(gap, "lower", None))
+        upper = safe_float(getattr(gap, "upper", None))
+        midpoint = safe_float(getattr(gap, "midpoint", None))
+        size = safe_float(getattr(gap, "size", None))
+        filled_pct = max(0.0, min(1.0, safe_float(getattr(gap, "filled_pct", None), 0.0) or 0.0))
         direction = str(getattr(gap, "direction", "")).strip().lower()
         if lower is None or upper is None or midpoint is None or size is None or size <= 0:
             return {"state": "none", "direction": direction or "unknown", "distance": None, "distance_pct": None, "filled_pct": filled_pct}
@@ -2249,9 +2232,9 @@ class SharedEntryPolicy:
             info = self._fvg_gap_state(gap, close)
             state = str(info.get("state", "none"))
             direction = str(info.get("direction", "unknown"))
-            size = _optional_float(info.get("size"), 0.0) or 0.0
-            distance = _optional_float(info.get("distance"), 0.0) or 0.0
-            fill = max(0.0, min(1.0, _optional_float(info.get("filled_pct"), 0.0) or 0.0))
+            size = safe_float(info.get("size"), 0.0) or 0.0
+            distance = safe_float(info.get("distance"), 0.0) or 0.0
+            fill = max(0.0, min(1.0, safe_float(info.get("filled_pct"), 0.0) or 0.0))
             if state == "none" or direction not in {"bullish", "bearish"}:
                 return 0.0, 0.0, info
             distance_limit = max(float(size) * 2.5, float(proximity_floor), 1e-8)
@@ -2318,7 +2301,7 @@ class SharedEntryPolicy:
         }
         if frame is None or frame.empty or not self.config.shared_entry.use_fvg_context:
             return out
-        close = _safe_float(frame.iloc[-1].get("close"), 0.0)
+        close = safe_float(frame.iloc[-1].get("close"), 0.0)
         if close <= 0:
             return out
         # Build parameters, not weights: a 0 there is no switch, so they keep
@@ -2441,14 +2424,14 @@ class SharedEntryPolicy:
                 "htf_fvg_opposing_state": str(opposing_htf_info.get("state", "none") or "none"),
                 "fvg_ltf_same_state": str(same_ltf_info.get("state", "none") or "none"),
                 "fvg_ltf_opposing_state": str(opposing_ltf_info.get("state", "none") or "none"),
-                "htf_fvg_same_midpoint": _optional_float(same_htf_info.get("midpoint")),
-                "htf_fvg_opposing_midpoint": _optional_float(opposing_htf_info.get("midpoint")),
-                "fvg_ltf_same_midpoint": _optional_float(same_ltf_info.get("midpoint")),
-                "fvg_ltf_opposing_midpoint": _optional_float(opposing_ltf_info.get("midpoint")),
-                "htf_fvg_same_distance_pct": _optional_float(same_htf_info.get("distance_pct")),
-                "htf_fvg_opposing_distance_pct": _optional_float(opposing_htf_info.get("distance_pct")),
-                "fvg_ltf_same_distance_pct": _optional_float(same_ltf_info.get("distance_pct")),
-                "fvg_ltf_opposing_distance_pct": _optional_float(opposing_ltf_info.get("distance_pct")),
+                "htf_fvg_same_midpoint": safe_float(same_htf_info.get("midpoint")),
+                "htf_fvg_opposing_midpoint": safe_float(opposing_htf_info.get("midpoint")),
+                "fvg_ltf_same_midpoint": safe_float(same_ltf_info.get("midpoint")),
+                "fvg_ltf_opposing_midpoint": safe_float(opposing_ltf_info.get("midpoint")),
+                "htf_fvg_same_distance_pct": safe_float(same_htf_info.get("distance_pct")),
+                "htf_fvg_opposing_distance_pct": safe_float(opposing_htf_info.get("distance_pct")),
+                "fvg_ltf_same_distance_pct": safe_float(same_ltf_info.get("distance_pct")),
+                "fvg_ltf_opposing_distance_pct": safe_float(opposing_ltf_info.get("distance_pct")),
             }
         )
         return out

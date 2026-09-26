@@ -51,7 +51,7 @@ from dataclasses import replace
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .broker_positions import (
     active_broker_bracket,
@@ -65,10 +65,12 @@ from .paper_account import PaperAccount
 from .numeric import safe_float
 from .position_store import ReconcileMetadataStore
 from .risk import RiskManager
-from ._strategies.registry import is_option_strategy
-from ._strategies.strategy_base import BaseStrategy
+from ._strategies.catalogue import is_option_strategy
 from . import sessions
 from .sessions import UTC
+
+if TYPE_CHECKING:
+    from ._strategies.strategy_base import BaseStrategy
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 

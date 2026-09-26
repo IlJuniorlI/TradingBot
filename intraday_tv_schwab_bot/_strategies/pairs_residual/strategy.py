@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: MIT
-from ..shared import (
-    Candidate,
-    Position,
-    Side,
-    Signal,
-    insufficient_bars_reason,
-    _reason_with_values,
-    _safe_float,
-    pd,
-)
+import pandas as pd
+
+from ...models import Candidate, Position, Side, Signal
+from ...numeric import safe_float
+from ...reasons import insufficient_bars_reason, reason_with_values
 from ..shared_entry import EntryProposal
 from ..strategy_base import BaseStrategy
 
@@ -66,7 +61,7 @@ class PairsResidualStrategy(BaseStrategy):
                     symbol,
                     "skipped",
                     [
-                        _reason_with_values(
+                        reason_with_values(
                             "insufficient_pair_bars",
                             current=min(0 if left is None else len(left), 0 if right is None else len(right)),
                             required=lookback,
@@ -104,10 +99,10 @@ class PairsResidualStrategy(BaseStrategy):
             long_ready = allow_long and z >= entry_z
             short_ready = allow_short and z <= -entry_z
             if abs(z) > max_entry_z:
-                reasons.append(_reason_with_values("relative_strength_too_extended", current=abs(z), required=max_entry_z, op="<=", digits=4))
+                reasons.append(reason_with_values("relative_strength_too_extended", current=abs(z), required=max_entry_z, op="<=", digits=4))
             elif not (long_ready or short_ready):
                 if abs(z) < entry_z:
-                    reasons.append(_reason_with_values("relative_strength_abs_below_threshold", current=abs(z), required=entry_z, op=">=", digits=4))
+                    reasons.append(reason_with_values("relative_strength_abs_below_threshold", current=abs(z), required=entry_z, op=">=", digits=4))
                 elif z <= -entry_z and not global_allow_short and side_pref in {"both", "short"}:
                     reasons.append("shorts_disabled")
                 else:
@@ -120,10 +115,10 @@ class PairsResidualStrategy(BaseStrategy):
                 self._record_entry_decision(symbol, "skipped", reasons)
                 continue
             long = side == Side.LONG
-            last_close = _safe_float(last["close"])
+            last_close = safe_float(last["close"], 0.0)
             reasons.extend(self._entry_exhaustion_reasons(
                 side, left, close=last_close,
-                vwap=_safe_float(last.get("vwap"), last_close), ema9=_safe_float(last.get("ema9"), last_close),
+                vwap=safe_float(last.get("vwap"), last_close), ema9=safe_float(last.get("ema9"), last_close),
             ))
             stop_pct = self.config.risk.default_stop_pct
             target_pct = self.config.risk.default_target_pct

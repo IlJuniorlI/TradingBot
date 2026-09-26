@@ -1,15 +1,10 @@
 # SPDX-License-Identifier: MIT
-from ..shared import (
-    Candidate,
-    Position,
-    Side,
-    Signal,
-    _bar_close_position,
-    insufficient_bars_reason,
-    _reason_with_values,
-    _safe_float,
-    pd,
-)
+import pandas as pd
+
+from ...models import Candidate, Position, Side, Signal
+from ...numeric import safe_float
+from ...reasons import insufficient_bars_reason, reason_with_values
+from ...bars import bar_close_position
 from ..shared_entry import EntryContexts, EntryProposal, RetestTrigger
 from ..strategy_base import BaseStrategy
 
@@ -86,27 +81,27 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), history_bars)])
                 continue
             last = frame.iloc[-1]
-            day_strength = _safe_float(c.metadata.get("change_from_open"), 0.0)
+            day_strength = safe_float(c.metadata.get("change_from_open"), 0.0)
             directional_bias = c.directional_bias if c.directional_bias in {Side.LONG, Side.SHORT} else (Side.LONG if day_strength >= 0 else Side.SHORT)
             recent = frame.tail(max(support_lookback + trigger_lookback + 1, trigger_lookback + 3))
             prior = recent.iloc[:-1]
             trigger_slice = prior.tail(max(2, trigger_lookback))
             support_slice = prior.tail(max(3, support_lookback))
             pullback_slice = prior.tail(max(3, trigger_lookback + 2))
-            last_close = _safe_float(last["close"])
-            last_vwap = _safe_float(last["vwap"], last_close)
-            last_ret5 = _safe_float(last["ret5"], 0.0)
-            last_ret15 = _safe_float(last["ret15"], 0.0)
-            last_ema9 = _safe_float(last["ema9"], last_close)
-            last_ema20 = _safe_float(last["ema20"], last_close)
+            last_close = safe_float(last["close"], 0.0)
+            last_vwap = safe_float(last["vwap"], last_close)
+            last_ret5 = safe_float(last["ret5"], 0.0)
+            last_ret15 = safe_float(last["ret15"], 0.0)
+            last_ema9 = safe_float(last["ema9"], last_close)
+            last_ema20 = safe_float(last["ema20"], last_close)
             extension_pct = abs((last_close / last_vwap) - 1.0) if last_vwap > 0 else 0.0
-            close_pos = _bar_close_position(frame)
-            trigger_high = _safe_float(trigger_slice["high"].max(), last_close)
-            trigger_low = _safe_float(trigger_slice["low"].min(), last_close)
-            support_low = _safe_float(support_slice["low"].min(), last_close)
-            resistance_high = _safe_float(support_slice["high"].max(), last_close)
-            pullback_low = _safe_float(pullback_slice["low"].min(), last_close)
-            pullback_high = _safe_float(pullback_slice["high"].max(), last_close)
+            close_pos = bar_close_position(frame)
+            trigger_high = safe_float(trigger_slice["high"].max(), last_close)
+            trigger_low = safe_float(trigger_slice["low"].min(), last_close)
+            support_low = safe_float(support_slice["low"].min(), last_close)
+            resistance_high = safe_float(support_slice["high"].max(), last_close)
+            pullback_low = safe_float(pullback_slice["low"].min(), last_close)
+            pullback_high = safe_float(pullback_slice["high"].max(), last_close)
             ctx = self._chart_context(frame)
             ms_ctx = self._structure_context(frame, "ltf")
             if directional_bias == Side.LONG:
@@ -116,23 +111,23 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                 trigger_fired = bool(self._structure_event_recent(getattr(ms_ctx, "bos_up_age_bars", None)) and getattr(ms_ctx, "bos_up", False)) or last_close > trigger_high
                 pullback_hold_ok = pullback_low >= (support_ref * (1.0 - support_hold_pct)) if support_ref > 0 else True
                 if day_strength < min_change:
-                    reasons.append(_reason_with_values("weak_day_strength", current=day_strength, required=min_change, op=">=", digits=4))
+                    reasons.append(reason_with_values("weak_day_strength", current=day_strength, required=min_change, op=">=", digits=4))
                 if last_close <= last_vwap:
-                    reasons.append(_reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
+                    reasons.append(reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
                 if last_ema9 < last_ema20:
-                    reasons.append(_reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
+                    reasons.append(reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
                 if last_ret5 < trend_min_ret5:
-                    reasons.append(_reason_with_values("weak_ret5", current=last_ret5, required=trend_min_ret5, op=">=", digits=4))
+                    reasons.append(reason_with_values("weak_ret5", current=last_ret5, required=trend_min_ret5, op=">=", digits=4))
                 if last_ret15 < trend_min_ret15:
-                    reasons.append(_reason_with_values("weak_ret15", current=last_ret15, required=trend_min_ret15, op=">=", digits=4))
+                    reasons.append(reason_with_values("weak_ret15", current=last_ret15, required=trend_min_ret15, op=">=", digits=4))
                 if extension_pct > max_extension:
-                    reasons.append(_reason_with_values("too_extended_from_vwap", current=extension_pct, required=max_extension, op="<=", digits=4))
+                    reasons.append(reason_with_values("too_extended_from_vwap", current=extension_pct, required=max_extension, op="<=", digits=4))
                 if not pullback_hold_ok:
-                    reasons.append(_reason_with_values("pullback_lost_support", current=pullback_low, required=support_ref * (1.0 - support_hold_pct), op=">=", digits=4))
+                    reasons.append(reason_with_values("pullback_lost_support", current=pullback_low, required=support_ref * (1.0 - support_hold_pct), op=">=", digits=4))
                 if not trigger_fired:
-                    reasons.append(_reason_with_values("no_reexpansion_trigger", current=last_close, required=trigger_high, op=">", digits=4))
+                    reasons.append(reason_with_values("no_reexpansion_trigger", current=last_close, required=trigger_high, op=">", digits=4))
                 if close_pos < min_bar_close_position:
-                    reasons.append(_reason_with_values("weak_bar_close", current=close_pos, required=min_bar_close_position, op=">=", digits=4))
+                    reasons.append(reason_with_values("weak_bar_close", current=close_pos, required=min_bar_close_position, op=">=", digits=4))
                 stop = min(pullback_low, support_ref * (1.0 - support_hold_pct)) if support_ref > 0 else pullback_low
                 stop = min(stop, last_close * (1.0 - self.config.risk.default_stop_pct))
                 risk_per_share = max(0.01, last_close - stop)
@@ -147,23 +142,23 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                 trigger_fired = bool(self._structure_event_recent(getattr(ms_ctx, "bos_down_age_bars", None)) and getattr(ms_ctx, "bos_down", False)) or last_close < trigger_low
                 pullback_hold_ok = pullback_high <= (support_ref * (1.0 + support_hold_pct)) if support_ref > 0 else True
                 if day_strength > -min_change:
-                    reasons.append(_reason_with_values("weak_day_weakness", current=day_strength, required=-min_change, op="<=", digits=4))
+                    reasons.append(reason_with_values("weak_day_weakness", current=day_strength, required=-min_change, op="<=", digits=4))
                 if last_close >= last_vwap:
-                    reasons.append(_reason_with_values("above_vwap", current=last_close, required=last_vwap, op="<", digits=4))
+                    reasons.append(reason_with_values("above_vwap", current=last_close, required=last_vwap, op="<", digits=4))
                 if last_ema9 > last_ema20:
-                    reasons.append(_reason_with_values("ema9_above_ema20", current=last_ema9, required=last_ema20, op="<=", digits=4))
+                    reasons.append(reason_with_values("ema9_above_ema20", current=last_ema9, required=last_ema20, op="<=", digits=4))
                 if last_ret5 > -trend_min_ret5:
-                    reasons.append(_reason_with_values("weak_ret5", current=last_ret5, required=-trend_min_ret5, op="<=", digits=4))
+                    reasons.append(reason_with_values("weak_ret5", current=last_ret5, required=-trend_min_ret5, op="<=", digits=4))
                 if last_ret15 > -trend_min_ret15:
-                    reasons.append(_reason_with_values("weak_ret15", current=last_ret15, required=-trend_min_ret15, op="<=", digits=4))
+                    reasons.append(reason_with_values("weak_ret15", current=last_ret15, required=-trend_min_ret15, op="<=", digits=4))
                 if extension_pct > max_extension:
-                    reasons.append(_reason_with_values("too_extended_from_vwap", current=extension_pct, required=max_extension, op="<=", digits=4))
+                    reasons.append(reason_with_values("too_extended_from_vwap", current=extension_pct, required=max_extension, op="<=", digits=4))
                 if not pullback_hold_ok:
-                    reasons.append(_reason_with_values("bounce_lost_resistance", current=pullback_high, required=support_ref * (1.0 + support_hold_pct), op="<=", digits=4))
+                    reasons.append(reason_with_values("bounce_lost_resistance", current=pullback_high, required=support_ref * (1.0 + support_hold_pct), op="<=", digits=4))
                 if not trigger_fired:
-                    reasons.append(_reason_with_values("no_reexpansion_trigger", current=last_close, required=trigger_low, op="<", digits=4))
+                    reasons.append(reason_with_values("no_reexpansion_trigger", current=last_close, required=trigger_low, op="<", digits=4))
                 if close_pos > (1.0 - min_bar_close_position):
-                    reasons.append(_reason_with_values("weak_bar_close", current=close_pos, required=1.0 - min_bar_close_position, op="<=", digits=4))
+                    reasons.append(reason_with_values("weak_bar_close", current=close_pos, required=1.0 - min_bar_close_position, op="<=", digits=4))
                 stop = max(pullback_high, support_ref * (1.0 + support_hold_pct)) if support_ref > 0 else pullback_high
                 stop = max(stop, last_close * (1.0 + self.config.risk.default_stop_pct))
                 risk_per_share = max(0.01, stop - last_close)

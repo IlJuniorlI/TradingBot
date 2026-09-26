@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: MIT
-from ..shared import Any, Candidate, LOG, Side
+import logging
+from typing import Any
+
+from ...models import Candidate, Side
 from ..screener_base import BaseStrategyScreener
 from ..rvol import rvol_profile_for_symbol
+
+LOG = logging.getLogger(__name__)
 
 
 class PeerConfirmedTrendContinuationScreener(BaseStrategyScreener):

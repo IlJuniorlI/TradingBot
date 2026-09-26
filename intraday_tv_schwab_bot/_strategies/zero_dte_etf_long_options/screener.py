@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: MIT
-from ..shared import (
-    Candidate,
-)
+from ...models import Candidate
 from ..screener_base import BaseStrategyScreener
 
 class ZeroDteEtfLongOptionsScreener(BaseStrategyScreener):

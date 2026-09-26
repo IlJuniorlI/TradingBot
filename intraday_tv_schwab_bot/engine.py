@@ -8,7 +8,7 @@ import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from schwabdev import Client
 import pandas as pd
@@ -22,11 +22,11 @@ from .dashboard_cache import (
 from .config import BotConfig
 from .cycle_gate import CycleGate, CycleGateState
 from .dashboard import DashboardServer
-from .data_feed import MarketDataStore, NON_STREAMABLE
+from .data_feed import MarketDataStore
 from .entry_gatekeeper import EntryGatekeeper
 from .execution import SchwabExecutor
 from .models import Candidate, Position, Side
-from ._strategies.registry import option_strategy_names
+from ._strategies.catalogue import option_strategy_names
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .numeric import safe_float
@@ -34,14 +34,17 @@ from .position_store import ReconcileMetadataStore, SessionRiskStateStore
 from .risk import RiskManager
 from .screener_client import TradingViewScreenerClient
 from .startup_reconciler import StartupReconciler
+from .symbols import NON_STREAMABLE
 from .warmup_tracker import WarmupTracker
-from ._strategies.registry import build_strategy
-from ._strategies.strategy_base import BaseStrategy
+from ._strategies.factory import build_strategy
 from .session_report import export_session_archive, write_session_report
 from .schwab_api import SchwabdevApiUsageTracker, register_schwab_api_tracker
 from .log_setup import TRADEFLOW_LEVEL, setup_logging
 from .sessions import EQUITY_STREAM_END, equity_session_state
 from . import sessions
+
+if TYPE_CHECKING:
+    from ._strategies.strategy_base import BaseStrategy
 
 LOG = logging.getLogger(__name__)
 

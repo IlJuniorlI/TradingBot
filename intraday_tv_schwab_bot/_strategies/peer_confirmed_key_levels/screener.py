@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
-from ..shared import (
-    Any,
-    Candidate,
-    LOG,
-)
+import logging
+from typing import Any
+
+from ...models import Candidate
 from ..screener_base import BaseStrategyScreener
 from ..rvol import rvol_profile_for_symbol
+
+LOG = logging.getLogger(__name__)
+
 
 class PeerConfirmedKeyLevelsScreener(BaseStrategyScreener):
     strategy_name = 'peer_confirmed_key_levels'

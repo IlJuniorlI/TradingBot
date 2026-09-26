@@ -17,26 +17,14 @@ from collections import deque
 from datetime import datetime
 from typing import Any
 
-from ..shared import (
-    Candidate,
-    Position,
-    Side,
-    Signal,
-    _bar_close_position,
-    _bar_wick_fractions,
-    insufficient_bars_reason,
-    _optional_float,
-    _safe_float,
-    _same_day_mask,
-    _session_open_price,
-    EQUITY_RTH_OPEN,
-    EQUITY_STREAM_START,
-    equity_session_state,
-    get_session_indicator_window,
-    ltf_ema_spans,
-    parse_hhmm,
-    pd,
-)
+import pandas as pd
+
+from ...bars import bar_close_position, bar_wick_fractions, rth_open_plus, same_day_mask, session_open_price
+from ...indicators import bar_posture, get_session_indicator_window, indicator_session_start, last_bar_atr, ltf_ema_spans
+from ...models import Candidate, Position, Side, Signal
+from ...sessions import EQUITY_RTH_OPEN, equity_session_state, is_time_in_window, parse_hhmm
+from ...numeric import safe_float
+from ...reasons import insufficient_bars_reason
 from ... import sessions
 from ..shared_entry import EntryContexts, EntryProposal
 from ..strategy_base import BaseStrategy
@@ -347,17 +335,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # strategy was still measuring from 09:30.
         #
         # Taken by POSITION: today's bars are a contiguous tail of a
-        # time-ordered frame, and `_same_day_mask` maps a Python lambda over
+        # time-ordered frame, and `same_day_mask` maps a Python lambda over
         # EVERY bar of the merged frame. This runs once per peer per side, so
         # on a 12-peer group that was ~15ms of per-candidate overhead for a
         # slice `searchsorted` does in microseconds. `tz=index.tz` covers
         # tz-aware and naive indexes identically.
         index = frame.index
-        session_start = (
-            EQUITY_STREAM_START if get_session_indicator_window() == "extended"
-            else EQUITY_RTH_OPEN
-        )
-        opened_at = pd.Timestamp(datetime.combine(sessions.now_et().date(), session_start), tz=index.tz)
+        opened_at = pd.Timestamp(datetime.combine(sessions.now_et().date(), indicator_session_start()), tz=index.tz)
         session = frame.iloc[index.searchsorted(opened_at):]
         if len(session) < 5:
             return None
@@ -384,9 +368,10 @@ class TopTierAdaptiveStrategy(BaseStrategy):
     def _frame_agrees(self, side: Side, frame: pd.DataFrame | None) -> bool | None:
         """Does *frame*'s latest bar lean *side*? ``None`` when unreadable.
 
-        The shared posture test — close vs a VWAP reference plus EMA9/EMA20
-        alignment — used for both the sector ETF and each sector peer so the
-        two confirmation paths answer the same question.
+        The shared posture test (``indicators.bar_posture``: close vs a VWAP
+        reference plus EMA9/EMA20 alignment), used for both the sector ETF
+        and each sector peer so the two confirmation paths answer the same
+        question.
 
         The reference is session VWAP, or the current leg's anchored VWAP
         when ``leg_anchored_confirmation`` is on and a leg is established
@@ -396,18 +381,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         """
         if frame is None or frame.empty:
             return None
-        last = frame.iloc[-1]
-        close = _safe_float(last["close"])
-        reference = None
-        if bool(self.params.get("leg_anchored_confirmation", False)):
-            reference = self._leg_anchor_vwap(frame)
-        if reference is None:
-            reference = _safe_float(last.get("vwap"), close)
-        ema9 = _safe_float(last.get("ema9"), close)
-        ema20 = _safe_float(last.get("ema20"), close)
-        if side == Side.LONG:
-            return bool(close > reference and ema9 >= ema20)
-        return bool(close < reference and ema9 <= ema20)
+        reference = self._leg_anchor_vwap(frame) if bool(self.params.get("leg_anchored_confirmation", False)) else None
+        return bar_posture(frame.iloc[-1], reference) == side
 
     def _index_confirms(self, side: Side, symbol: str, bars: dict[str, pd.DataFrame], _data=None) -> bool:
         """Return True when *symbol*'s sector tape agrees with *side*.
@@ -463,8 +438,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             if frame is None or frame.empty:
                 continue
             last = frame.iloc[-1]
-            close = _safe_float(last["close"])
-            vwap = _safe_float(last.get("vwap"), close)
+            close = safe_float(last["close"], 0.0)
+            vwap = safe_float(last.get("vwap"), close)
             if vwap > 0 and abs((close - vwap) / vwap) >= 0.0025:
                 return False
         return True
@@ -480,7 +455,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             if frame is None or frame.empty:
                 continue
             try:
-                close = _safe_float(frame.iloc[-1]["close"])
+                close = safe_float(frame.iloc[-1]["close"], 0.0)
             except Exception:
                 continue
             _, ds = self._compute_live_bias_and_day_strength(frame, close)
@@ -912,10 +887,10 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         extended-hours mode."""
         if frame is None or frame.empty:
             return None, None
-        today = frame[_same_day_mask(frame, sessions.now_et().date())]
+        today = frame[same_day_mask(frame, sessions.now_et().date())]
         if today.empty:
             return None, None
-        rth_open = parse_hhmm("09:30")
+        rth_open = EQUITY_RTH_OPEN
         # Via `_orb_range_end`, not a local recomputation. The same derivation
         # used to appear here, in `_orb_range_end` and in `_allowed_regimes`;
         # three copies of one rule is how the bot ends up forming the range
@@ -982,7 +957,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         min_trend = float(self.params.get("min_pullback_trend_score", 3.0))
         if trend_score < min_trend:
             return 0.0
-        session_ltf = ltf[_same_day_mask(ltf, sessions.now_et().date())]
+        session_ltf = ltf[same_day_mask(ltf, sessions.now_et().date())]
         score = 0.0
         touch_mult = float(self.params.get("pullback_ema_touch_atr_mult", 0.35))
         touch_dist = atr * touch_mult
@@ -992,7 +967,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             return 0.0
 
         if side == Side.LONG:
-            recent_low = _safe_float(recent["low"].min(), close)
+            recent_low = safe_float(recent["low"].min(), close)
             touched_ema20 = recent_low <= ema20 + touch_dist
             touched_vwap = recent_low <= vwap + touch_dist
             if touched_ema20 or touched_vwap:
@@ -1002,11 +977,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 score += 1.0
             if close > ema9:
                 score += 1.0
-            close_pos = _bar_close_position(session_ltf if not session_ltf.empty else ltf)
+            close_pos = bar_close_position(session_ltf if not session_ltf.empty else ltf)
             if close_pos >= 0.60:
                 score += 0.5
         else:
-            recent_high = _safe_float(recent["high"].max(), close)
+            recent_high = safe_float(recent["high"].max(), close)
             touched_ema20 = recent_high >= ema20 - touch_dist
             touched_vwap = recent_high >= vwap - touch_dist
             if touched_ema20 or touched_vwap:
@@ -1016,14 +991,14 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 score += 1.0
             if close < ema9:
                 score += 1.0
-            close_pos = _bar_close_position(session_ltf if not session_ltf.empty else ltf)
+            close_pos = bar_close_position(session_ltf if not session_ltf.empty else ltf)
             if close_pos <= 0.40:
                 score += 0.5
 
         # Volume expansion on current bar
         vol_src = session_ltf if not session_ltf.empty else ltf
-        vol = _safe_float(vol_src.iloc[-1].get("volume"), 0.0)
-        vol_mean = _safe_float(recent["volume"].mean(), 1.0)
+        vol = safe_float(vol_src.iloc[-1].get("volume"), 0.0)
+        vol_mean = safe_float(recent["volume"].mean(), 1.0)
         if vol_mean > 0 and vol / vol_mean >= 1.10:
             score += 0.5
         if adx >= float(self.params.get("min_adx14", 15.0)):
@@ -1042,8 +1017,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         scorer and a builder that derive the same geometry separately drift,
         and here they had drifted all the way apart (see ``_score_range``).
         """
-        range_high = _safe_float(recent["high"].max(), close)
-        range_low = _safe_float(recent["low"].min(), close)
+        range_high = safe_float(recent["high"].max(), close)
+        range_low = safe_float(recent["low"].min(), close)
         span = max(0.0, range_high - range_low)
         frac = float(self.params.get("range_entry_zone_frac", 0.35))
         if side == Side.LONG:
@@ -1113,7 +1088,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                   ``range_max_ema_gap_pct``.
         """
         lookback = max(8, int(self.params.get("range_lookback_bars", 20)))
-        session_frame = frame[_same_day_mask(frame, sessions.now_et().date())]
+        session_frame = frame[same_day_mask(frame, sessions.now_et().date())]
         recent = session_frame.tail(lookback)
         # Same floor the builder rejects on (`insufficient_range_bars`), so a
         # frame too short to define a range cannot qualify here either.
@@ -1133,13 +1108,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             return score
         if bool(self.params.get("range_require_prev_bar_confirmation", True)):
             # `recent` is at least 8 bars by the guard above, so iloc[-2] exists.
-            prev_close = _optional_float(recent.iloc[-2].get("close"), None)
+            prev_close = safe_float(recent.iloc[-2].get("close"))
             if prev_close is None or not (
                     prev_close <= threshold if side == Side.LONG else prev_close >= threshold):
                 return score
         score += 2.0
 
-        upper_wick, lower_wick, _body, bar_range = _bar_wick_fractions(recent)
+        upper_wick, lower_wick, _body, bar_range = bar_wick_fractions(recent)
         if bar_range > 0:
             wick = lower_wick if side == Side.LONG else upper_wick
             if wick >= 0.30:
@@ -1188,7 +1163,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         for now that clearing the gate is table stakes.
         """
         last = session_frame.iloc[-1]
-        last_close = _safe_float(last.get("close"), close)
+        last_close = safe_float(last.get("close"), close)
         buffer_pct = self._pct_param("vol_squeeze_breakout_buffer_pct", 0.0008, vol_scale)
         if side == Side.LONG:
             required = box_high * (1.0 + buffer_pct)
@@ -1202,10 +1177,10 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             vol_baseline = max(1.0, float(box["volume"].median()))
         except Exception:
             vol_baseline = 1.0
-        cur_vol = _safe_float(last.get("volume"), 0.0)
+        cur_vol = safe_float(last.get("volume"), 0.0)
         vol_ratio = (cur_vol / vol_baseline) if vol_baseline > 0.0 else 0.0
         min_vol_ratio = float(self.params.get("vol_squeeze_min_breakout_volume_ratio", 1.12))
-        close_pos = _bar_close_position(session_frame)
+        close_pos = bar_close_position(session_frame)
         min_close_pos = float(self.params.get("vol_squeeze_min_bar_close_position", 0.63))
         return {
             "close": last_close,
@@ -1258,7 +1233,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         scoring-only on those three, so this reverts with it -- the two must
         agree under either setting, which is the whole point."""
         lookback = max(6, int(self.params.get("vol_squeeze_lookback_bars", 12)))
-        session_frame = frame[_same_day_mask(frame, sessions.now_et().date())]
+        session_frame = frame[same_day_mask(frame, sessions.now_et().date())]
         if len(session_frame) < lookback + 2:
             return 0.0
         # Look at the box (last lookback bars BEFORE the current one). The
@@ -1267,8 +1242,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         box = prior.tail(lookback)
         if len(box) < lookback:
             return 0.0
-        box_high = _safe_float(box["high"].max(), close)
-        box_low = _safe_float(box["low"].min(), close)
+        box_high = safe_float(box["high"].max(), close)
+        box_low = safe_float(box["low"].min(), close)
         box_range = max(0.0, box_high - box_low)
         box_range_pct = (box_range / close) if close > 0 else 0.0
         box_range_atr = (box_range / atr) if atr > 0 else float("inf")
@@ -1276,7 +1251,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         max_range_atr = float(self.params.get("vol_squeeze_max_range_atr", 1.8))
         compression_box_ok = box_range_pct <= max_range_pct and box_range_atr <= max_range_atr
         bb_squeeze_flag = bool(getattr(tech_ctx, "bollinger_squeeze", False))
-        bb_width_pct = _safe_float(getattr(tech_ctx, "bollinger_width_pct", None), 0.0)
+        bb_width_pct = safe_float(getattr(tech_ctx, "bollinger_width_pct", None), 0.0)
         max_width_pct = float(self.params.get("vol_squeeze_max_width_pct", 0.05))
         compression_bb_ok = bb_squeeze_flag or (0.0 < bb_width_pct <= max_width_pct)
 
@@ -1348,7 +1323,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
 
         # N-bar breakout (use today's bars only)
         lookback = max(3, int(self.params.get("momentum_breakout_lookback_bars", 6)))
-        session_frame = frame[_same_day_mask(frame, sessions.now_et().date())]
+        session_frame = frame[same_day_mask(frame, sessions.now_et().date())]
         if len(session_frame) < lookback + 1:
             return 0.0
         recent = session_frame.tail(lookback + 1).iloc[:-1]
@@ -1367,7 +1342,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
 
         # Breakout above N-bar high (LONG) / below low (SHORT)
         if side == Side.LONG:
-            breakout_level = _safe_float(recent["high"].max(), close)
+            breakout_level = safe_float(recent["high"].max(), close)
             if close > breakout_level:
                 score += 1.5
             if close > vwap:
@@ -1377,7 +1352,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             if ret15 > 0:
                 score += 0.5
         else:
-            breakout_level = _safe_float(recent["low"].min(), close)
+            breakout_level = safe_float(recent["low"].min(), close)
             if close < breakout_level:
                 score += 1.5
             if close < vwap:
@@ -1412,7 +1387,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         """
         if vwap <= 0 or close <= 0 or atr <= 0 or frame is None or frame.empty:
             return 0.0
-        session_frame = frame[_same_day_mask(frame, sessions.now_et().date())]
+        session_frame = frame[same_day_mask(frame, sessions.now_et().date())]
         lookback = max(2, int(self.params.get("vwap_reclaim_lookback_bars", 6)))
         if len(session_frame) < lookback + 1 or "vwap" not in session_frame.columns:
             return 0.0
@@ -1431,8 +1406,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         if not (dipped and reclaimed):
             return 0.0
         score = 0.5 + 2.0
-        cur_vol = _safe_float(session_frame.iloc[-1].get("volume"), 0.0)
-        vol_mean = _safe_float(recent["volume"].mean(), 1.0)
+        cur_vol = safe_float(session_frame.iloc[-1].get("volume"), 0.0)
+        vol_mean = safe_float(recent["volume"].mean(), 1.0)
         if vol_mean > 0 and cur_vol / vol_mean >= float(self.params.get("vwap_reclaim_min_volume_ratio", 1.2)):
             score += 1.0
         if side == Side.LONG:
@@ -1445,7 +1420,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 score += 0.7
             if ema9 <= ema20:
                 score += 0.3
-        upper_wick, lower_wick, _body, bar_range = _bar_wick_fractions(session_frame)
+        upper_wick, lower_wick, _body, bar_range = bar_wick_fractions(session_frame)
         if bar_range > 0:
             wick = lower_wick if side == Side.LONG else upper_wick
             if wick >= 0.25:
@@ -1539,7 +1514,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         if flip_hit and not proximity_hit:
             score += 0.5
 
-        upper_wick, lower_wick, _body, bar_range = _bar_wick_fractions(frame)
+        upper_wick, lower_wick, _body, bar_range = bar_wick_fractions(frame)
         if bar_range > 0:
             wick = lower_wick if side == Side.LONG else upper_wick
             if wick >= 0.30:
@@ -1573,7 +1548,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         ``+directional_bias_min_day_strength`` (default 0.20%), ``Side.SHORT``
         below the negative threshold, ``None`` within the neutral band.
 
-        Both values share one ``_session_open_price`` call so the soft-bias
+        Both values share one ``session_open_price`` call so the soft-bias
         penalty path doesn't repeat the session-open lookup. Used by
         ``entry_signals`` (needs both bias for side selection AND magnitude
         for penalty scaling) and by ``_compute_live_directional_bias`` (the
@@ -1702,14 +1677,9 @@ class TopTierAdaptiveStrategy(BaseStrategy):
     # ------------------------------------------------------------------
     # Time-of-day gating
     # ------------------------------------------------------------------
-    @staticmethod
-    def _time_in_range(now_t, start: str, end: str) -> bool:
-        return parse_hhmm(start) <= now_t <= parse_hhmm(end)
-
     def _orb_range_end(self) -> str:
         """HH:MM at which today's opening range finishes forming."""
-        total = 9 * 60 + 30 + max(1, int(self.params.get("orb_range_minutes", 15)))
-        return f"{total // 60:02d}:{total % 60:02d}"
+        return rth_open_plus(max(1, int(self.params.get("orb_range_minutes", 15)))).strftime("%H:%M")
 
     def _in_orb_window(self, now_t) -> bool:
         """Is *now_t* inside the ORB window — the span where the ORB regime
@@ -1733,7 +1703,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         """
         if bool(self.params.get("disable_orb_regime", False)):
             return False
-        return self._time_in_range(now_t, self._orb_range_end(), str(self.params.get("orb_end_time", "10:05")))
+        return is_time_in_window(now_t, self._orb_range_end(), str(self.params.get("orb_end_time", "10:05")))
 
     def _allowed_regimes(self, now_t) -> set[str]:
         """Return which regimes are allowed at the current time.
@@ -1842,14 +1812,14 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # directly. Distinct from ``disable_orb_window`` (which keeps the
         # carve-out but skips entries until orb_end_time).
         orb_disabled = bool(self.params.get("disable_orb_regime", False))
-        orb_range_end = self._orb_range_end()
         if not orb_disabled:
+            orb_range_end = self._orb_range_end()
             # Opening range forms over the first ``orb_range_minutes`` of RTH
             # (09:30 →). NO entries while it forms — the true-ORB thesis waits
             # for the range, it does not trade the opening chaos. (In extended
             # mode pre-market 07:00-09:30 still trades via the fallthrough
             # below; 09:30→range-end is reserved for range formation.)
-            # HALF-OPEN at the end. `_time_in_range` is inclusive on both
+            # HALF-OPEN at the end. `is_time_in_window` is inclusive on both
             # sides, so a closed check here overlapped the ORB window by one
             # minute at `orb_range_end` -- and since this branch returns
             # first, that minute was silently unreachable: with the default
@@ -1857,9 +1827,9 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # while `entry_windows` opened at 09:45. The range is built from
             # bars in [09:30, range_end), so at range_end it is complete and
             # the window should already be open.
-            if parse_hhmm("09:30") <= now_t < parse_hhmm(orb_range_end):
+            if EQUITY_RTH_OPEN <= now_t < parse_hhmm(orb_range_end):
                 return set()
-            if self._time_in_range(now_t, orb_range_end, orb_end):
+            if is_time_in_window(now_t, orb_range_end, orb_end):
                 # ORB window: opening-range breakout only. Whole-window opt-out
                 # via disable_orb_window (skip the open, start at orb_end_time).
                 if not orb_window_enabled:
@@ -1867,8 +1837,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 return _filter({"orb"})
         # Primary window. With ORB enabled it starts at orb_end; with the ORB
         # regime disabled it starts at 09:30 so the open trades the normal mix.
-        primary_start = "09:30" if orb_disabled else orb_end
-        if self._time_in_range(now_t, primary_start, midday_start):
+        primary_start = EQUITY_RTH_OPEN if orb_disabled else orb_end
+        if is_time_in_window(now_t, primary_start, midday_start):
             # Full regime mix including momentum + sr_scalp. The day_strength
             # gate filters momentum; the distance gate filters sr_scalp. Neither
             # blocks the trend / pullback / range / vol_squeeze regimes.
@@ -1883,7 +1853,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 # branch's inclusive end, so the two modes agree to the second.
                 regimes.discard("sr_scalp")
             return _filter(regimes)
-        if self._time_in_range(now_t, midday_start, midday_end):
+        if is_time_in_window(now_t, midday_start, midday_end):
             # Midday: pullbacks remain the default fit for top-tier chop,
             # but momentum is allowed because day_strength >= threshold
             # implies a stock is genuinely trending despite the lunchtime
@@ -1902,7 +1872,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # 3.00 against 3.5, momentum at 3.00 against 4.0, vwap_reclaim
             # at 0.00. Ninety minutes a day in which nothing could fire.
             return _filter({"pullback", "momentum", "sr_scalp", "vwap_reclaim", "vol_squeeze"})
-        if self._time_in_range(now_t, afternoon_start, no_new):
+        if is_time_in_window(now_t, afternoon_start, no_new):
             # Range regime is included in afternoon by default because
             # afternoon tapes are often range-bound and forcing trend/pullback
             # entries there produces late-in-move longs. Range regime handles
@@ -1927,13 +1897,11 @@ class TopTierAdaptiveStrategy(BaseStrategy):
 
     @staticmethod
     def _day_strength_session_open(frame: pd.DataFrame) -> float | None:
-        """Session-open anchor for the live ``day_strength`` bias. In
-        extended-hours indicator mode the VWAP/EMA session reset and this
-        anchor both key off the 07:00 equity-stream open; otherwise the RTH
-        09:30 open (original behavior)."""
-        if get_session_indicator_window() == "extended":
-            return _session_open_price(frame, session_start=EQUITY_STREAM_START)
-        return _session_open_price(frame)
+        """Session-open anchor for the live ``day_strength`` bias: today's
+        first open from where the VWAP/EMA session reset starts
+        (``indicator_session_start``) -- the 07:00 equity-stream open in
+        extended-hours indicator mode, otherwise the RTH 09:30 open."""
+        return session_open_price(frame, sessions.now_et().date(), session_start=indicator_session_start())
 
     def _extended_hours_tradable_set(self) -> set[str]:
         """Symbols eligible for pre/post-market entries (extended-indicator
@@ -2180,7 +2148,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         reclaimed = close > level if side == Side.LONG else close < level
         min_close_pos = min(0.95, max(0.05, float(
             self.params.get("armed_retest_min_close_position", 0.60))))
-        close_pos = _bar_close_position(frame)
+        close_pos = bar_close_position(frame)
         bar_ok = (close_pos >= min_close_pos if side == Side.LONG
                   else close_pos <= (1.0 - min_close_pos))
 
@@ -2234,14 +2202,14 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             return None, None
         if source is None or source.empty:
             return None, None
-        session = source[_same_day_mask(source, sessions.now_et().date())]
+        session = source[same_day_mask(source, sessions.now_et().date())]
         recent = session.tail(lookback + 1).iloc[:-1] if len(session) > lookback else session.iloc[:-1]
         if recent.empty:
             return None, None
         if side == Side.LONG:
-            level = _safe_float(recent["high"].max(), float("nan"))
+            level = safe_float(recent["high"].max(), float("nan"))
         else:
-            level = _safe_float(recent["low"].min(), float("nan"))
+            level = safe_float(recent["low"].min(), float("nan"))
         if level is None or not math.isfinite(float(level)):
             return recent, None
         return recent, float(level)
@@ -2281,19 +2249,19 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     f"no_fresh_breakout(close={close:.4f}<=recent_high={trigger_high:.4f})",
                 )
                 return None
-            stop = _safe_float(recent["low"].min(), close) - buffer
+            stop = safe_float(recent["low"].min(), close) - buffer
             stop = min(stop, close * (1.0 - effective_default_stop_pct))
             risk = max(0.01, close - stop)
             target = close + risk * target_rr
         else:
-            trigger_low = _safe_float(recent["low"].min(), close)
+            trigger_low = safe_float(recent["low"].min(), close)
             if not breakout_confirmed and close >= trigger_low:
                 self._set_build_failure(
                     c.symbol, "trend",
                     f"no_fresh_breakdown(close={close:.4f}>=recent_low={trigger_low:.4f})",
                 )
                 return None
-            stop = _safe_float(recent["high"].max(), close) + buffer
+            stop = safe_float(recent["high"].max(), close) + buffer
             stop = max(stop, close * (1.0 + effective_default_stop_pct))
             risk = max(0.01, stop - close)
             target = max(0.01, close - risk * target_rr)
@@ -2432,7 +2400,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # ltf is resampled from the full multi-day history frame, so tail(N)
         # crosses session boundary during early RTH. Scope swing/stop lookups
         # to today's session bars only.
-        session_ltf = ltf[_same_day_mask(ltf, sessions.now_et().date())]
+        session_ltf = ltf[same_day_mask(ltf, sessions.now_et().date())]
         recent = session_ltf.tail(lookback + 1).iloc[:-1] if len(session_ltf) > lookback else session_ltf.iloc[:-1]
         if recent.empty:
             self._set_build_failure(c.symbol, "pullback", "insufficient_ltf_history")
@@ -2517,16 +2485,16 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         swing_bars = max(8, round(100 / ltf_min))
 
         if side == Side.LONG:
-            stop = _safe_float(recent["low"].min(), close) - buffer
+            stop = safe_float(recent["low"].min(), close) - buffer
             stop = min(stop, close * (1.0 - effective_default_stop_pct))
             risk = max(0.01, close - stop)
-            swing_high = _safe_float(session_ltf.tail(swing_bars)["high"].max(), close + risk * target_rr)
+            swing_high = safe_float(session_ltf.tail(swing_bars)["high"].max(), close + risk * target_rr)
             target = max(close + risk * target_rr, swing_high)
         else:
-            stop = _safe_float(recent["high"].max(), close) + buffer
+            stop = safe_float(recent["high"].max(), close) + buffer
             stop = max(stop, close * (1.0 + effective_default_stop_pct))
             risk = max(0.01, stop - close)
-            swing_low = _safe_float(session_ltf.tail(swing_bars)["low"].min(), close - risk * target_rr)
+            swing_low = safe_float(session_ltf.tail(swing_bars)["low"].min(), close - risk * target_rr)
             target = max(0.01, min(close - risk * target_rr, swing_low))
 
         return self._finalize_signal(c, side, close, stop, target, "pullback", regime_score, frame, data, vol_scale=vol_scale)
@@ -2537,7 +2505,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         lookback = max(8, int(self.params.get("range_lookback_bars", 20)))
         # Scope to today's session so range_high/range_low are not polluted
         # by prior-session bars during early RTH.
-        session_frame = frame[_same_day_mask(frame, sessions.now_et().date())]
+        session_frame = frame[same_day_mask(frame, sessions.now_et().date())]
         recent = session_frame.tail(lookback)
         if len(recent) < 8:
             self._set_build_failure(c.symbol, "range", f"insufficient_range_bars({len(recent)}<8)")
@@ -2574,7 +2542,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         require_prev_bar = bool(self.params.get("range_require_prev_bar_confirmation", True))
         prev_close = None
         if require_prev_bar and len(recent) >= 2:
-            prev_close = _optional_float(recent.iloc[-2].get("close"), None)
+            prev_close = safe_float(recent.iloc[-2].get("close"))
 
         if side == Side.LONG:
             # Enter near range low
@@ -2622,7 +2590,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         is the standard RR multiple. Shared filters (HTF bias, stretched-entry,
         SR/structure, FVG retest, etc.) run inside ``_finalize_signal``."""
         lookback = max(6, int(self.params.get("vol_squeeze_lookback_bars", 12)))
-        session_frame = frame[_same_day_mask(frame, sessions.now_et().date())]
+        session_frame = frame[same_day_mask(frame, sessions.now_et().date())]
         if len(session_frame) < lookback + 2:
             self._set_build_failure(c.symbol, "vol_squeeze", "insufficient_session_bars")
             return None
@@ -2631,8 +2599,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         if len(box) < lookback:
             self._set_build_failure(c.symbol, "vol_squeeze", "insufficient_box_bars")
             return None
-        box_high = _safe_float(box["high"].max(), close)
-        box_low = _safe_float(box["low"].min(), close)
+        box_high = safe_float(box["high"].max(), close)
+        box_low = safe_float(box["low"].min(), close)
         box_range = max(0.0, box_high - box_low)
 
         # Hard breakout-quality gates (2026-05-14): weak breakout volume, a
@@ -2699,7 +2667,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         sr_alignment_threshold = float(self.params.get("vol_squeeze_min_sr_bias_alignment", 0.20))
         if sr_alignment_threshold > 0.0:
             sr_ctx = self._sr_context(c.symbol, frame, data)
-            sr_bias_score = _safe_float(getattr(sr_ctx, "bias_score", None), 0.0)
+            sr_bias_score = safe_float(getattr(sr_ctx, "bias_score", None), 0.0)
             if side == Side.LONG and sr_bias_score < -sr_alignment_threshold:
                 self._set_build_failure(
                     c.symbol, "vol_squeeze",
@@ -2715,7 +2683,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         pct_b_threshold = float(self.params.get("vol_squeeze_min_pct_b_directional", 0.50))
         if pct_b_threshold > 0.0:
             tech_ctx = self._technical_context(frame)
-            pct_b = _safe_float(getattr(tech_ctx, "bollinger_percent_b", None), 0.5)
+            pct_b = safe_float(getattr(tech_ctx, "bollinger_percent_b", None), 0.5)
             if side == Side.LONG and pct_b < pct_b_threshold:
                 self._set_build_failure(
                     c.symbol, "vol_squeeze",
@@ -2802,12 +2770,12 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # get knocked out by expanded per-bar noise.
         effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening * vol_scale
         if side == Side.LONG:
-            swing = _safe_float(recent["low"].min(), close) - (atr * 0.08 * vol_widening * self._side_stop_buffer_mult(side))
+            swing = safe_float(recent["low"].min(), close) - (atr * 0.08 * vol_widening * self._side_stop_buffer_mult(side))
             stop = max(close * (1.0 - effective_default_stop_pct), swing)
             risk = max(0.01, close - stop)
             target = close + risk * target_rr
         else:
-            swing = _safe_float(recent["high"].max(), close) + (atr * 0.08 * vol_widening * self._side_stop_buffer_mult(side))
+            swing = safe_float(recent["high"].max(), close) + (atr * 0.08 * vol_widening * self._side_stop_buffer_mult(side))
             stop = min(close * (1.0 + effective_default_stop_pct), swing)
             risk = max(0.01, stop - close)
             target = max(0.01, close - risk * target_rr)
@@ -2822,30 +2790,30 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         because losing VWAP again is the invalidation. Target rides toward the
         session high/low (HOD/LOD) so a re-igniting squeeze gets room, floored to
         the regime R:R (the runner/ladder management extends past it)."""
-        session_frame = frame[_same_day_mask(frame, sessions.now_et().date())]
+        session_frame = frame[same_day_mask(frame, sessions.now_et().date())]
         lookback = max(2, int(self.params.get("vwap_reclaim_lookback_bars", 6)))
         recent = session_frame.tail(lookback + 1).iloc[:-1] if len(session_frame) > lookback else session_frame.iloc[:-1]
         if recent.empty:
             self._set_build_failure(c.symbol, "vwap_reclaim", "insufficient_session_history")
             return None
-        vwap = _safe_float(session_frame.iloc[-1].get("vwap"), close)
+        vwap = safe_float(session_frame.iloc[-1].get("vwap"), close)
         buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening * self._side_stop_buffer_mult(side)
         effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening * vol_scale
         target_rr = float(self.params.get("vwap_reclaim_target_rr", 2.0)) * self._side_target_rr_mult(side)
 
         if side == Side.LONG:
-            dip_low = _safe_float(recent["low"].min(), close)
+            dip_low = safe_float(recent["low"].min(), close)
             stop = min(dip_low, vwap) - buffer
             stop = min(stop, close * (1.0 - effective_default_stop_pct))
             risk = max(0.01, close - stop)
-            session_high = _safe_float(session_frame["high"].max(), close + risk * target_rr)
+            session_high = safe_float(session_frame["high"].max(), close + risk * target_rr)
             target = max(close + risk * target_rr, session_high)
         else:
-            dip_high = _safe_float(recent["high"].max(), close)
+            dip_high = safe_float(recent["high"].max(), close)
             stop = max(dip_high, vwap) + buffer
             stop = max(stop, close * (1.0 + effective_default_stop_pct))
             risk = max(0.01, stop - close)
-            session_low = _safe_float(session_frame["low"].min(), close - risk * target_rr)
+            session_low = safe_float(session_frame["low"].min(), close - risk * target_rr)
             target = max(0.01, min(close - risk * target_rr, session_low))
 
         return self._finalize_signal(c, side, close, stop, target, "vwap_reclaim", regime_score, frame, data, vol_scale=vol_scale)
@@ -2887,8 +2855,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         if active.empty:
             return 0.0
         if side == Side.LONG:
-            return max(0.0, level - _safe_float(active["low"].min(), level))
-        return max(0.0, _safe_float(active["high"].max(), level) - level)
+            return max(0.0, level - safe_float(active["low"].min(), level))
+        return max(0.0, safe_float(active["high"].max(), level) - level)
 
     def _build_sr_scalp_signal(self, c: Candidate, side: Side, close: float, atr: float,
                                frame: pd.DataFrame, regime_score: float,
@@ -3078,7 +3046,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # really there. ``sr_scalp_min_stop_atr_mult`` stays as a small
         # absolute backstop for a degenerate, never-touched level.
         noise_lookback = max(2, int(self.params.get("sr_scalp_noise_lookback_bars", 20)))
-        noise_frame = frame[_same_day_mask(frame, sessions.now_et().date())].tail(noise_lookback)
+        noise_frame = frame[same_day_mask(frame, sessions.now_et().date())].tail(noise_lookback)
         pierce = self._level_pierce(side, noise_frame, entry_level)
         min_stop_atr = float(self.params.get("sr_scalp_min_stop_atr_mult", 0.5))
         atr_floor = min_stop_atr * atr if (min_stop_atr > 0 and atr > 0) else 0.0
@@ -3159,13 +3127,13 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # window.
         if regime in {"trend", "pullback", "sr_scalp"}:
             if bool(self.params.get("reject_oversized_entry_bar", True)):
-                atr14 = _optional_float(getattr(tech_ctx, "atr14", None))
+                atr14 = safe_float(getattr(tech_ctx, "atr14", None))
                 if frame is not None and not frame.empty and atr14 is not None and atr14 > 0.0:
                     last_bar = frame.iloc[-1]
-                    bar_high = _optional_float(last_bar.get("high"))
-                    bar_low = _optional_float(last_bar.get("low"))
-                    bar_open = _optional_float(last_bar.get("open"))
-                    bar_close = _optional_float(last_bar.get("close"))
+                    bar_high = safe_float(last_bar.get("high"))
+                    bar_low = safe_float(last_bar.get("low"))
+                    bar_open = safe_float(last_bar.get("open"))
+                    bar_close = safe_float(last_bar.get("close"))
                     range_atr = (
                         (bar_high - bar_low) / atr14
                         if (bar_high is not None and bar_low is not None)
@@ -3225,8 +3193,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                                 f"elapsed={elapsed_min:.1f}m<{cooldown_min:.1f}m)",
                             )
                             return None
-                pct_b = _optional_float(getattr(tech_ctx, "bollinger_percent_b", None))
-                atr_stretch = _optional_float(getattr(tech_ctx, "atr_stretch_ema20_mult", None))
+                pct_b = safe_float(getattr(tech_ctx, "bollinger_percent_b", None))
+                atr_stretch = safe_float(getattr(tech_ctx, "atr_stretch_ema20_mult", None))
                 pct_b_max = float(self.params.get("stretched_percent_b_max", 0.80))
                 stretch_max = float(self.params.get("stretched_atr_mult_max", 1.1))
                 if (
@@ -3315,14 +3283,14 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 frame_5m = None
             if frame_5m is not None and not frame_5m.empty:
                 now_dt = sessions.now_et()
-                session_start = now_dt.replace(hour=9, minute=30, second=0, microsecond=0)
+                session_start = now_dt.replace(hour=EQUITY_RTH_OPEN.hour, minute=EQUITY_RTH_OPEN.minute, second=0, microsecond=0)
                 today_bars = frame_5m[frame_5m.index >= session_start] if hasattr(frame_5m, "index") else frame_5m
                 # Use iloc[-2] (previous completed bar) when ≥2 exist.
                 # iloc[-1] is the currently-forming bar.
                 if hasattr(today_bars, "iloc") and len(today_bars) >= 2:
                     last_closed = today_bars.iloc[-2]
-                    bar_open = _optional_float(last_closed.get("open"), None)
-                    bar_close = _optional_float(last_closed.get("close"), None)
+                    bar_open = safe_float(last_closed.get("open"))
+                    bar_close = safe_float(last_closed.get("close"))
                     if bar_open is not None and bar_close is not None:
                         if side == Side.LONG and bar_close <= bar_open:
                             self._set_build_failure(c.symbol, regime, f"long_orb_5m_not_bullish(open={bar_open:.4f},close={bar_close:.4f})")
@@ -3423,10 +3391,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # now always blocks. Keyed on the regime since 2026-09-24 (it rode
         # the in-window S/R bypass): the orb regime exists only inside the
         # ORB window, and the exemption this block backstops keys on it too.
-        frame_atr = _safe_float(
-            frame.iloc[-1].get("atr14") if (frame is not None and not frame.empty and "atr14" in frame.columns) else None,
-            max(close * 0.0015, 0.01),
-        )
+        frame_atr = last_bar_atr(frame, close)
         orb_opposing_atr_mult = float(self.params.get("orb_opposing_sr_atr_mult", 0.5) or 0.0)
         if regime == "orb" and orb_opposing_atr_mult > 0 and frame_atr > 0:
             threshold = orb_opposing_atr_mult * frame_atr
@@ -3486,8 +3451,8 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # filter becomes meaningful.
         orb_exhaustion_bypass = bool(self.params.get("orb_bypass_exhaustion", True)) and in_orb_window
         if not orb_exhaustion_bypass:
-            vwap = _safe_float(frame.iloc[-1].get("vwap"), close)
-            ema9 = _safe_float(frame.iloc[-1].get("ema9"), close)
+            vwap = safe_float(frame.iloc[-1].get("vwap"), close)
+            ema9 = safe_float(frame.iloc[-1].get("ema9"), close)
             exhaustion = self._entry_exhaustion_reasons(side, frame, close=close, vwap=vwap, ema9=ema9)
             if exhaustion:
                 self._set_build_failure(c.symbol, regime, exhaustion[0])
@@ -3771,20 +3736,20 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             # The HTF EMA trend, read once per candidate for the score term
             # below (the gate reads the same context in _finalize_signal).
             htf_ema_read = (
-                self._htf_bias(self._default_htf_context_for_score(c.symbol, data), _safe_float(ltf.iloc[-1]["close"]))
+                self._htf_bias(self._default_htf_context_for_score(c.symbol, data), safe_float(ltf.iloc[-1]["close"], 0.0))
                 if float(self.params.get("htf_ema_alignment_score", 0.0)) else ("neutral", 0, 0)
             )
             idx_neutral = self._index_neutral(c.symbol, bars)
 
             last = ltf.iloc[-1]
-            close = _safe_float(last["close"])
-            vwap = _safe_float(last.get("vwap"), close)
-            ema9 = _safe_float(last.get("ema9"), close)
-            ema20 = _safe_float(last.get("ema20"), close)
-            adx = _safe_float(last.get("adx14"), 0.0)
-            ret5 = _safe_float(last.get("ret5"), 0.0)
-            ret15 = _safe_float(last.get("ret15"), 0.0)
-            atr = max(_safe_float(last.get("atr14"), close * 0.0015), close * 0.0005, 0.01)
+            close = safe_float(last["close"], 0.0)
+            vwap = safe_float(last.get("vwap"), close)
+            ema9 = safe_float(last.get("ema9"), close)
+            ema20 = safe_float(last.get("ema20"), close)
+            adx = safe_float(last.get("adx14"), 0.0)
+            ret5 = safe_float(last.get("ret5"), 0.0)
+            ret15 = safe_float(last.get("ret15"), 0.0)
+            atr = last_bar_atr(ltf, close, floor_pct=0.0005)
 
             # Per-symbol volatility scale: this symbol's 20-day ADR relative
             # to ``reference_adr_pct``, the ADR the percent-of-price params
@@ -3830,7 +3795,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             respect_bias = bool(self.params.get("respect_screener_bias", True)) and not orb_screener_bypass
 
             # Single computation — bias for side selection + day_strength
-            # magnitude for penalty scaling, sharing one _session_open_price
+            # magnitude for penalty scaling, sharing one session_open_price
             # lookup (instead of the two separate calls the prior code did).
             live_bias, day_strength = self._compute_live_bias_and_day_strength(frame, close)
 

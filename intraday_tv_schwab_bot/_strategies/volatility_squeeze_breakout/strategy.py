@@ -1,18 +1,15 @@
 # SPDX-License-Identifier: MIT
-from ..shared import (
-    Candidate,
-    Position,
-    Side,
-    Signal,
-    _bar_close_position,
-    insufficient_bars_reason,
-    _reason_with_values,
-    _safe_float,
-    math,
-    pd,
-)
+import math
+
+import pandas as pd
+
+from ...models import Candidate, Position, Side, Signal
+from ...numeric import safe_float
+from ...reasons import insufficient_bars_reason, reason_with_values
+from ...bars import bar_close_position
 from ..shared_entry import EntryContexts, EntryProposal, RetestTrigger
 from ..strategy_base import BaseStrategy
+from ...indicators import last_bar_atr
 
 # The pending reasons an FVG retest of the squeeze box edge may clear, per
 # side: no break of the box yet, a weak trigger bar, or the anti-chase
@@ -149,25 +146,25 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_squeeze_history", len(prior), squeeze_lookback + baseline_bars)])
                 continue
 
-            last_close = _safe_float(last["close"])
-            day_strength = _safe_float(c.metadata.get("change_from_open"), 0.0)
-            last_vwap = _safe_float(last.get("vwap"), last_close)
-            last_ema9 = _safe_float(last.get("ema9"), last_close)
-            last_ema20 = _safe_float(last.get("ema20"), last_close)
-            atr = max(_safe_float(last.get("atr14"), last_close * 0.0015), max(last_close * 0.0015, 0.01))
-            close_pos = _bar_close_position(frame)
-            breakout_high = _safe_float(box_slice["high"].max(), last_close)
-            breakout_low = _safe_float(box_slice["low"].min(), last_close)
+            last_close = safe_float(last["close"], 0.0)
+            day_strength = safe_float(c.metadata.get("change_from_open"), 0.0)
+            last_vwap = safe_float(last.get("vwap"), last_close)
+            last_ema9 = safe_float(last.get("ema9"), last_close)
+            last_ema20 = safe_float(last.get("ema20"), last_close)
+            atr = last_bar_atr(frame, last_close, floor_pct=0.0015)
+            close_pos = bar_close_position(frame)
+            breakout_high = safe_float(box_slice["high"].max(), last_close)
+            breakout_low = safe_float(box_slice["low"].min(), last_close)
             box_range = max(0.0, breakout_high - breakout_low)
             box_range_pct = (box_range / last_close) if last_close > 0 else 0.0
             box_range_atr = (box_range / atr) if atr > 0 else math.inf
             volume_baseline = max(1.0, self._safe_series_median(box_slice["volume"], fallback=1.0))
-            breakout_volume_ratio = _safe_float(last.get("volume"), 0.0) / volume_baseline
+            breakout_volume_ratio = safe_float(last.get("volume"), 0.0) / volume_baseline
             pressure_split = max(2, squeeze_lookback // 2)
             first_half = box_slice.iloc[:pressure_split]
             second_half = box_slice.iloc[-pressure_split:]
-            rising_lows_ok = _safe_float(second_half["low"].min(), breakout_low) >= _safe_float(first_half["low"].min(), breakout_low) * (1.0 + min_pressure_drift_pct)
-            falling_highs_ok = _safe_float(second_half["high"].max(), breakout_high) <= _safe_float(first_half["high"].max(), breakout_high) * (1.0 - min_pressure_drift_pct)
+            rising_lows_ok = safe_float(second_half["low"].min(), breakout_low) >= safe_float(first_half["low"].min(), breakout_low) * (1.0 + min_pressure_drift_pct)
+            falling_highs_ok = safe_float(second_half["high"].max(), breakout_high) <= safe_float(first_half["high"].max(), breakout_high) * (1.0 - min_pressure_drift_pct)
 
             bb_len = int(self._technical_level_setting("bollinger_length", 20) or 20)
             bb_mult = float(self._technical_level_setting("bollinger_std_mult", 2.0) or 2.0)
@@ -206,7 +203,7 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 "compression_rising_lows": bool(rising_lows_ok),
                 "compression_falling_highs": bool(falling_highs_ok),
             }
-            atr_expansion_mult_val = _safe_float(getattr(tech_ctx, "atr_expansion_mult", None), 0.0)
+            atr_expansion_mult_val = safe_float(getattr(tech_ctx, "atr_expansion_mult", None), 0.0)
             bollinger_squeeze_flag = bool(getattr(tech_ctx, "bollinger_squeeze", False))
 
             compression_ok = bool(
@@ -220,11 +217,11 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 )
             )
             if not compression_ok:
-                reasons.append(_reason_with_values("no_valid_squeeze", current=box_range_pct, required=max_range_pct, op="<=", digits=4, extras={"range_atr": (box_range_atr, "<=", max_range_atr), "width_pct": (box_width_pct, "<=", max_width_pct), "width_ratio": (width_ratio, "<=", max_width_ratio)}))
+                reasons.append(reason_with_values("no_valid_squeeze", current=box_range_pct, required=max_range_pct, op="<=", digits=4, extras={"range_atr": (box_range_atr, "<=", max_range_atr), "width_pct": (box_width_pct, "<=", max_width_pct), "width_ratio": (width_ratio, "<=", max_width_ratio)}))
             if breakout_volume_ratio < min_breakout_volume_ratio:
-                reasons.append(_reason_with_values("breakout_volume_too_light", current=breakout_volume_ratio, required=min_breakout_volume_ratio, op=">=", digits=4))
+                reasons.append(reason_with_values("breakout_volume_too_light", current=breakout_volume_ratio, required=min_breakout_volume_ratio, op=">=", digits=4))
             if atr_expansion_mult_val < min_atr_expansion_mult:
-                reasons.append(_reason_with_values("no_atr_expansion", current=atr_expansion_mult_val, required=min_atr_expansion_mult, op=">=", digits=4))
+                reasons.append(reason_with_values("no_atr_expansion", current=atr_expansion_mult_val, required=min_atr_expansion_mult, op=">=", digits=4))
             if prefer_bollinger_flag and not bollinger_squeeze_flag and box_width_pct > max_width_pct * 0.90:
                 reasons.append("bollinger_squeeze_not_confirmed")
             # Compression-aware stop buffer: for TIGHT squeezes (narrow
@@ -242,21 +239,21 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 if long:
                     trigger_level = breakout_high
                     breakout_fired = last_close >= breakout_high * (1.0 + breakout_buffer_pct)
-                    bullish_avwap = max(_safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0), _safe_float(getattr(tech_ctx, "anchored_vwap_bullish_impulse", None), 0.0))
+                    bullish_avwap = max(safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0), safe_float(getattr(tech_ctx, "anchored_vwap_bullish_impulse", None), 0.0))
                     if day_strength < min_change:
-                        side_blockers.append(_reason_with_values("weak_day_strength", current=day_strength, required=min_change, op=">=", digits=4))
+                        side_blockers.append(reason_with_values("weak_day_strength", current=day_strength, required=min_change, op=">=", digits=4))
                     if require_vwap_alignment and last_close <= last_vwap:
-                        side_blockers.append(_reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
+                        side_blockers.append(reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
                     if last_ema9 < last_ema20:
-                        side_blockers.append(_reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
+                        side_blockers.append(reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
                     if require_avwap_alignment and bullish_avwap > 0 and last_close <= bullish_avwap:
-                        side_blockers.append(_reason_with_values("below_bullish_avwap", current=last_close, required=bullish_avwap, op=">", digits=4))
+                        side_blockers.append(reason_with_values("below_bullish_avwap", current=last_close, required=bullish_avwap, op=">", digits=4))
                     if not rising_lows_ok:
                         side_blockers.append("pressure_not_building_up")
                     if not breakout_fired:
-                        side_blockers.append(_reason_with_values("no_squeeze_breakout", current=last_close, required=breakout_high * (1.0 + breakout_buffer_pct), op=">=", digits=4))
+                        side_blockers.append(reason_with_values("no_squeeze_breakout", current=last_close, required=breakout_high * (1.0 + breakout_buffer_pct), op=">=", digits=4))
                     if close_pos < min_close_pos:
-                        side_blockers.append(_reason_with_values("weak_bar_close", current=close_pos, required=min_close_pos, op=">=", digits=4))
+                        side_blockers.append(reason_with_values("weak_bar_close", current=close_pos, required=min_close_pos, op=">=", digits=4))
                     stop = min(breakout_low - stop_buffer, last_close * (1.0 - self.config.risk.default_stop_pct))
                     bos_active = bool(getattr(ms_ctx, "bos_up", False))
                     # Strong quality needs the bar to close in its top
@@ -265,22 +262,22 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 else:
                     trigger_level = breakout_low
                     breakout_fired = last_close <= breakout_low * (1.0 - breakout_buffer_pct)
-                    bearish_avwap_vals = [v for v in [_safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0), _safe_float(getattr(tech_ctx, "anchored_vwap_bearish_impulse", None), 0.0)] if v > 0]
+                    bearish_avwap_vals = [v for v in [safe_float(getattr(tech_ctx, "anchored_vwap_open", None), 0.0), safe_float(getattr(tech_ctx, "anchored_vwap_bearish_impulse", None), 0.0)] if v > 0]
                     bearish_avwap = min(bearish_avwap_vals) if bearish_avwap_vals else 0.0
                     if day_strength > -min_change:
-                        side_blockers.append(_reason_with_values("weak_day_weakness", current=day_strength, required=-min_change, op="<=", digits=4))
+                        side_blockers.append(reason_with_values("weak_day_weakness", current=day_strength, required=-min_change, op="<=", digits=4))
                     if require_vwap_alignment and last_close >= last_vwap:
-                        side_blockers.append(_reason_with_values("above_vwap", current=last_close, required=last_vwap, op="<", digits=4))
+                        side_blockers.append(reason_with_values("above_vwap", current=last_close, required=last_vwap, op="<", digits=4))
                     if last_ema9 > last_ema20:
-                        side_blockers.append(_reason_with_values("ema9_above_ema20", current=last_ema9, required=last_ema20, op="<=", digits=4))
+                        side_blockers.append(reason_with_values("ema9_above_ema20", current=last_ema9, required=last_ema20, op="<=", digits=4))
                     if require_avwap_alignment and 0 < bearish_avwap <= last_close:
-                        side_blockers.append(_reason_with_values("above_bearish_avwap", current=last_close, required=bearish_avwap, op="<", digits=4))
+                        side_blockers.append(reason_with_values("above_bearish_avwap", current=last_close, required=bearish_avwap, op="<", digits=4))
                     if not falling_highs_ok:
                         side_blockers.append("pressure_not_building_down")
                     if not breakout_fired:
-                        side_blockers.append(_reason_with_values("no_squeeze_breakdown", current=last_close, required=breakout_low * (1.0 - breakout_buffer_pct), op="<=", digits=4))
+                        side_blockers.append(reason_with_values("no_squeeze_breakdown", current=last_close, required=breakout_low * (1.0 - breakout_buffer_pct), op="<=", digits=4))
                     if close_pos > (1.0 - min_close_pos):
-                        side_blockers.append(_reason_with_values("weak_bar_close", current=1.0 - close_pos, required=min_close_pos, op=">=", digits=4))
+                        side_blockers.append(reason_with_values("weak_bar_close", current=1.0 - close_pos, required=min_close_pos, op=">=", digits=4))
                     stop = max(breakout_high + stop_buffer, last_close * (1.0 + self.config.risk.default_stop_pct))
                     bos_active = bool(getattr(ms_ctx, "bos_down", False))
                     # ... and in its bottom (1 - tier_close_floor) for a SHORT.

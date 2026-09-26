@@ -227,8 +227,11 @@ def _coerce_session_datetime(ts: datetime | pd.Timestamp | None = None) -> datet
     return current
 
 
-def is_time_in_window(current: time, start: time, end: time) -> bool:
-    return start <= current <= end
+def is_time_in_window(current: time, start: time | str | int, end: time | str | int) -> bool:
+    """``start <= current <= end``, inclusive at both ends. Each end is
+    anything ``parse_hhmm`` reads: a ``time``, "HH:MM", or YAML's
+    sexagesimal minutes."""
+    return parse_hhmm(start) <= current <= parse_hhmm(end)
 
 
 def equity_session_state(

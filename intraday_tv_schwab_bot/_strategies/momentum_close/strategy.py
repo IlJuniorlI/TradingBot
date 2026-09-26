@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: MIT
-from ..shared import (
-    Candidate,
-    Position,
-    Side,
-    Signal,
-    insufficient_bars_reason,
-    _reason_with_values,
-    _safe_float,
-    pd,
-)
+import pandas as pd
+
+from ...models import Candidate, Position, Side, Signal
+from ...numeric import safe_float
+from ...reasons import insufficient_bars_reason, reason_with_values
 from ..shared_entry import EntryContexts, EntryProposal, RetestTrigger
 from ..strategy_base import BaseStrategy
 
@@ -57,25 +52,25 @@ class MomentumIntoCloseStrategy(BaseStrategy):
             last = frame.iloc[-1]
             recent = frame.tail(lookback + 1).iloc[:-1]
             breakout_level = float(recent["high"].max())
-            last_close = _safe_float(last["close"])
+            last_close = safe_float(last["close"], 0.0)
             breakout = last_close > breakout_level
-            day_strength = _safe_float(c.metadata.get("change_from_open"), 0.0)
+            day_strength = safe_float(c.metadata.get("change_from_open"), 0.0)
             ctx = self._chart_context(frame)
             pattern_ok = bool(ctx.matched_bullish_continuation or ctx.matched_bullish_reversal) or ctx.bias_score >= 0.0
-            last_vwap = _safe_float(last["vwap"], last_close)
-            last_ret15 = _safe_float(last["ret15"], 0.0)
-            last_ema9 = _safe_float(last["ema9"], last_close)
-            last_ema20 = _safe_float(last["ema20"], last_close)
+            last_vwap = safe_float(last["vwap"], last_close)
+            last_ret15 = safe_float(last["ret15"], 0.0)
+            last_ema9 = safe_float(last["ema9"], last_close)
+            last_ema20 = safe_float(last["ema20"], last_close)
             if not breakout:
-                reasons.append(_reason_with_values("no_breakout", current=last_close, required=breakout_level, op=">", digits=4))
+                reasons.append(reason_with_values("no_breakout", current=last_close, required=breakout_level, op=">", digits=4))
             if day_strength < min_day_strength:
-                reasons.append(_reason_with_values("weak_day_strength", current=day_strength, required=min_day_strength, op=">=", digits=4))
+                reasons.append(reason_with_values("weak_day_strength", current=day_strength, required=min_day_strength, op=">=", digits=4))
             if last_close <= last_vwap:
-                reasons.append(_reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
+                reasons.append(reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
             if last_ret15 <= 0:
-                reasons.append(_reason_with_values("weak_ret15", current=last_ret15, required=0.0, op=">", digits=4))
+                reasons.append(reason_with_values("weak_ret15", current=last_ret15, required=0.0, op=">", digits=4))
             if last_ema9 < last_ema20:
-                reasons.append(_reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
+                reasons.append(reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
             if not pattern_ok:
                 reasons.append("chart_pattern_not_supportive")
             reasons.extend(self._entry_exhaustion_reasons(Side.LONG, frame, close=last_close, vwap=last_vwap, ema9=last_ema9))
@@ -85,7 +80,7 @@ class MomentumIntoCloseStrategy(BaseStrategy):
             # floor so we never risk more than the configured percentage.
             # Non-restrictive — only LOOSENS the stop slightly on
             # high-conviction momentum setups.
-            last_atr = _safe_float(last.get("atr14"), 0.0)
+            last_atr = safe_float(last.get("atr14"), 0.0)
             swing_low = float(recent["low"].min())
             if last_atr > 0:
                 swing_low = swing_low - (last_atr * 0.08)

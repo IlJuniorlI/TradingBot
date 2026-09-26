@@ -28,7 +28,7 @@ from .levels_shared import (
 )
 from .sessions import datetime_index, latest_session_date, session_segment_ids
 from .numeric import safe_float
-from .bars import ensure_ohlcv_frame, session_bucket_ends, resolve_current_price
+from .bars import completed_bucket_mask, ensure_ohlcv_frame, resolve_current_price
 from .indicators import (
     atr_with_floor,
     ensure_standard_indicator_frame,
@@ -334,25 +334,18 @@ def _completed_htf_frame(frame: pd.DataFrame, timeframe_minutes: int) -> pd.Data
         return pd.DataFrame(columns=getattr(frame, "columns", []))
     try:
         base = frame.copy()
-        idx = datetime_index(base.index)
-        base.index = idx
-        # Anchor "now" in the ET trading timezone so the cutoff matches the
-        # frame's ET-localized bar labels, even when the bot runs on a
-        # non-ET server. Previously this used `pd.Timestamp.now()` as the
-        # tz-naive fallback, which returns the SERVER's wall clock — off by
-        # hours if the process isn't running on US Eastern.
-        et_now = pd.Timestamp(sessions.now_et())
-        if idx.tz is not None:
-            now_ts = et_now.tz_convert(idx.tz)
-        else:
-            now_ts = et_now.tz_localize(None)
+        base.index = datetime_index(base.index)
+        # "now" is the ET clock, read on a tz-naive index's ET wall clock
+        # (completed_bucket_mask). Until 2026-04 the tz-naive fallback used
+        # `pd.Timestamp.now()`, the SERVER's wall clock -- off by hours if the
+        # process isn't running on US Eastern.
         # Every frame is labelled at bar START -- the broker's and
         # `resample_bars`' alike -- so bar T is complete once its bucket has
         # ended: T + tf, or the session boundary that cuts a 60m bar short
         # (15:30 ends at 16:00). Not `T < now.floor(tf)`: that holds only for
         # clock-aligned bars, and regular-session 60m bars start at XX:30.
         tf = max(1, int(timeframe_minutes))
-        completed = base[session_bucket_ends(base.index, tf) <= now_ts]
+        completed = base[completed_bucket_mask(base.index, tf, sessions.now_et())]
         return completed if isinstance(completed, pd.DataFrame) else pd.DataFrame(columns=base.columns)
     except Exception:
         return frame.iloc[:-1].copy() if len(frame) > 1 else pd.DataFrame(columns=frame.columns)

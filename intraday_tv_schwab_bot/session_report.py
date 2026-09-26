@@ -44,6 +44,7 @@ except ImportError:  # pragma: no cover — yaml is a hard dep elsewhere
 from .paper_account import PaperAccount, TradeRecord, closed_trade_lifecycles
 from .models import Position
 from . import sessions
+from .reasons import exit_reason_code, reason_head
 from .serialization import atomic_write_text
 
 LOG = logging.getLogger(__name__)
@@ -170,17 +171,9 @@ def _per_symbol(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
     return {symbol: _summarize_group(group) for symbol, group in _group_by(trades, lambda t: t.symbol).items()}
 
 
-def _exit_reason_bucket(reason: str) -> str:
-    # Strip any parameterization off the reason string so
-    # "resistance_break_exit:311.5900" and "resistance_break_exit:313.00"
-    # roll up into "resistance_break_exit".
-    base = str(reason or "unknown").split(":", 1)[0].strip()
-    return base or "unknown"
-
-
 def _per_exit_reason(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
     """Closed trades by the reason of their FINAL exit."""
-    return {reason: _summarize_group(group) for reason, group in _group_by(trades, lambda t: _exit_reason_bucket(t.reason)).items()}
+    return {reason: _summarize_group(group) for reason, group in _group_by(trades, lambda t: exit_reason_code(t.reason) or "unknown").items()}
 
 
 def _per_partial_exit_reason(slices: list[TradeRecord]) -> dict[str, dict[str, Any]]:
@@ -189,7 +182,7 @@ def _per_partial_exit_reason(slices: list[TradeRecord]) -> dict[str, dict[str, A
     reason, so without this a divergence scale-out never appeared in the
     exit tables at all (2026-09-24)."""
     partials = [t for t in slices if bool(t.partial_exit)]
-    return {reason: _summarize_group(group) for reason, group in _group_by(partials, lambda t: _exit_reason_bucket(t.reason)).items()}
+    return {reason: _summarize_group(group) for reason, group in _group_by(partials, lambda t: exit_reason_code(t.reason) or "unknown").items()}
 
 
 def _per_hour(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
@@ -283,7 +276,7 @@ def _post_stop_continuation(
     """
     stop_exits = [
         t for t in trades
-        if str(t.reason or "").split(":", 1)[0].strip().lower() == "stop"
+        if (exit_reason_code(t.reason) or "").lower() == "stop"
     ]
     summary: dict[str, Any] = {
         "window_minutes": int(window_minutes),
@@ -586,23 +579,6 @@ def _entry_timing(
     return summary
 
 
-def _normalize_skip_reason(reason: str) -> str:
-    """Collapse parameterized skip reasons into a stable bucket name.
-
-    Many skip reasons carry numeric context in parentheses — e.g.
-    ``long_no_fresh_breakout(close=248.7250<=recent_high=248.8099)`` or
-    ``short_no_qualifying_regime(trend=1.0,pb=0.0,range=1.0)``. Every
-    unique price/score combination would otherwise bloat the filter-
-    rejection counter into hundreds of near-duplicate buckets. Strip the
-    parenthetical suffix so counts roll up cleanly. The detailed
-    variants are still preserved in ``all_reasons`` under a separate
-    ``variants`` bucket so they can be inspected when tuning."""
-    idx = reason.find("(")
-    if idx <= 0:
-        return reason
-    return reason[:idx].rstrip()
-
-
 def _filter_rejection_summary(skip_counts: dict[str, int] | None) -> dict[str, Any]:
     """Shape the engine's raw skip-count dict into a stable, sorted payload.
 
@@ -620,7 +596,7 @@ def _filter_rejection_summary(skip_counts: dict[str, int] | None) -> dict[str, A
     normalized: dict[str, int] = {}
     variants: dict[str, dict[str, int]] = {}
     for reason, count in skip_counts.items():
-        bucket = _normalize_skip_reason(str(reason))
+        bucket = reason_head(str(reason))
         normalized[bucket] = normalized.get(bucket, 0) + int(count)
         if bucket != reason:
             # Preserve the raw variant so tuning can see distributions.
@@ -1360,7 +1336,7 @@ def _gate_attribution(
     a row led by a built signal (``top_tier_range_long,max_positions``) is
     scored under the engine gate that blocked it, on the signal's side.
 
-    Reasons are normalised through ``_normalize_skip_reason``, so the numeric
+    Reasons are normalised through ``reasons.reason_head``, so the numeric
     detail that fragments `session_skip_counts` into hundreds of near-
     duplicates rolls up. Decisions are deduped by (symbol, minute, reason)
     because one decision is logged repeatedly across a cycle.
@@ -1433,7 +1409,7 @@ def _gate_attribution(
                 excursion: tuple[float, float, float] | None = None
                 excursion_read = False
                 for token, token_side in gates:
-                    reason = _normalize_skip_reason(token)
+                    reason = reason_head(token)
                     key = (symbol, ts.replace(second=0), reason)
                     if key in seen:
                         continue

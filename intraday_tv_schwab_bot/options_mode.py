@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .models import OrderIntent, Side
-from .numeric import safe_float, safe_int
+from .numeric import first_float, safe_float, safe_int
 
 
 @dataclass(slots=True)
@@ -238,6 +238,34 @@ def net_credit_dollars(short_leg: OptionContract, long_leg: OptionContract) -> t
     return conservative, mid, max_loss
 
 
+def clamp_long_premium_levels(
+    entry_value: float, stop_value: float, target_value: float | None,
+) -> tuple[float, float | None]:
+    """Ensure stop < entry and (if set) target > entry on a LONG. Floors
+    everything at 0.01 (penny) and enforces a 0.01 minimum gap between
+    stop/target and entry."""
+    entry = max(0.01, float(entry_value))
+    stop = max(0.01, min(float(stop_value), entry - 0.01))
+    if target_value is None:
+        return stop, None
+    target = max(entry + 0.01, float(target_value))
+    return stop, target
+
+
+def clamp_short_premium_levels(
+    entry_value: float, stop_value: float, target_value: float | None,
+) -> tuple[float, float | None]:
+    """Ensure stop > entry and (if set) target < entry on a SHORT. Floors
+    everything at 0.01 and enforces 0.01 minimum gap between
+    stop/target and entry."""
+    entry = max(0.01, float(entry_value))
+    stop = max(entry + 0.01, float(stop_value))
+    if target_value is None:
+        return stop, None
+    target = max(0.01, min(float(target_value), entry - 0.01))
+    return stop, target
+
+
 def realized_max_loss_per_contract(metadata: dict[str, Any], fill_price_dollars: float) -> float | None:
     """Max loss per contract implied by the price the order ACTUALLY filled at.
 
@@ -346,40 +374,30 @@ def contract_from_quote(symbol: str, quote: dict[str, Any] | None, fallback: dic
     quote = quote or {}
     fallback = fallback or {}
 
-    def pick(key: str, default: Any = 0.0) -> Any:
-        val = quote.get(key)
-        if val in (None, ""):
-            val = fallback.get(key, default)
-        return val
-
-    def pick_greek(key: str, alt_key: str | None = None) -> float | None:
-        # Fresh quote first, then fallback metadata. Treat NaN/None/"" as missing.
-        for source in (quote, fallback):
-            val = source.get(key) if source else None
-            if val in (None, "", "NaN"):
-                if alt_key:
-                    val = source.get(alt_key) if source else None
-            if val not in (None, "", "NaN"):
-                try:
-                    return safe_float(val)
-                except Exception:
-                    continue
-        return None
+    def pick(*keys: str, default: float | None = None) -> float | None:
+        # Key by key, the fresh quote first and then the fallback metadata; a
+        # missing, blank, NaN or unparseable value falls through to the next.
+        for key in keys:
+            for source in (quote, fallback):
+                number = first_float(source, key)
+                if number is not None:
+                    return number
+        return default
 
     return OptionContract(
         symbol=symbol,
         expiration=str(fallback.get("expiration") or ""),
         put_call=str(fallback.get("put_call") or fallback.get("putCall") or "CALL"),
         strike=safe_float(fallback.get("strike") or fallback.get("strikePrice"), 0.0),
-        bid=safe_float(pick("bid"), 0.0),
-        ask=safe_float(pick("ask"), 0.0),
-        mark=safe_float(pick("mark", pick("last")), 0.0),
-        delta=pick_greek("delta"),
-        gamma=pick_greek("gamma"),
-        theta=pick_greek("theta"),
-        open_interest=safe_int(pick("open_interest", pick("openInterest", 0)), 0),
-        total_volume=safe_int(pick("total_volume", pick("totalVolume", pick("volume", 0))), 0),
-        days_to_expiration=safe_int(pick("days_to_expiration", pick("daysToExpiration", 0)), 0),
+        bid=pick("bid", default=0.0),
+        ask=pick("ask", default=0.0),
+        mark=pick("mark", "last", default=0.0),
+        delta=pick("delta"),
+        gamma=pick("gamma"),
+        theta=pick("theta"),
+        open_interest=safe_int(pick("open_interest", "openInterest"), 0),
+        total_volume=safe_int(pick("total_volume", "totalVolume", "volume"), 0),
+        days_to_expiration=safe_int(pick("days_to_expiration", "daysToExpiration"), 0),
         in_the_money=bool(quote.get("in_the_money") if "in_the_money" in quote else (quote.get("inTheMoney") if "inTheMoney" in quote else fallback.get("in_the_money") or fallback.get("inTheMoney", False))),
     )
 

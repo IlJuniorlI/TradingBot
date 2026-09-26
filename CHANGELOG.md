@@ -219,6 +219,221 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **One posture test; the peer family reads one session open (refactor cut
+  B20).** *2026-09-26* — `indicators.bar_posture(last, reference=None)`
+  replaces top_tier `_frame_agrees`' and the peer vote's copies; a bar with
+  no close has no posture (top_tier read a NaN close as 0.0, a SHORT lean;
+  the peer vote used the 1m close; the data feed drops NaN-close bars, so
+  live runs are unaffected). **Behaviour change:** the macro vote's no-VWAP
+  fallback (index symbols without volume: NYICDX and VIX in every peer
+  preset) reads today's RTH open, the one the peer vote uses
+  (`_session_open`), instead of the first bar of the frame's last date:
+  after 09:30 on a frame with premarket bars it measures from 09:30, and
+  with no bar today the term cannot vote.
+
+- **The peer family runs one side template (refactor cut B12).** *2026-09-26* —
+  htf_pivots and trend_continuation evaluate their sides through the family
+  base: `_preferred_sides`, `_evaluate_sides`, `_pick_side_signal`
+  (`rank_key`, then the screener's side). One `_macro_allows` (from the
+  params; trend_continuation read the context's `enabled` stamp, set from the
+  same param) and one failure key, `_failure_style_name`. key_levels' macro
+  gate calls `_macro_allows` then its net-bias check; its level-first loop,
+  side pick and disregard of `directional_bias` are unchanged. **Behaviour
+  change:** trend_continuation skips a candidate outside a non-empty
+  `params.tradable` as `symbol_not_tradable`, before the position check, as
+  the other two do. Its screener emits only `params.tradable` symbols, so
+  live runs are unaffected; such a candidate can no longer take a
+  divergence-only entry.
+
+- **One last-bar ATR read for the strategy layer (refactor cut B7).**
+  *2026-09-26* — `indicators.last_bar_atr(frame, close, *, fallback_pct=0.0015,
+  floor_pct=None, floor_abs=0.01, fallback_atr=None)` replaces
+  `BaseStrategy._frame_atr14`, `SharedEntryPolicy._last_atr` and the
+  hand-rolled copies in top_tier_adaptive, the peer strategies,
+  volatility_squeeze_breakout, `_entry_exhaustion_reasons` and the divergence
+  entry. A last bar with no ATR (fewer than 15 bars of warm-up, a NaN) now
+  reads like a missing column: max(0.15% of the close, $0.01). `_frame_atr14`
+  (the refinement clamp, the retest stop anchor, the technical-exit buffer,
+  the divergence ladder) read it as 0.15% of the close alone, under a cent
+  below $6.67, so on small_cap_squeeze and microcap names without an ATR yet
+  the `min_stop_atr_mult` floor and those buffers now use $0.01. Every other
+  site passes the floor it had and reads the same. An infinite ATR reads as
+  missing too (the same NaN-trap rule as the numeric fixes).
+
+- **`_strategies/helpers.py` is gone; symbols have their own module,
+  `symbols.py` (refactor cut C24).** *2026-09-26* — `symbols.py` holds the
+  feed's symbol tables (`STREAMABLE_EQUITY_RE`, `NON_STREAMABLE`,
+  `SR_SYMBOL_ALIASES`, `MARKET_INTERNAL_SYMBOLS`, `QUOTE_SYMBOL_ALIASES`),
+  the four classifiers that were `MarketDataStore` static methods
+  (`is_streamable_equity`, `normalize_context_symbol`,
+  `is_market_internal_symbol`, `is_support_resistance_symbol`) and
+  `normalize_symbol_list` / `normalize_symbol_list_details`, which replace
+  the helpers pair and three private copies: config's
+  `_normalize_symbol_tokens`, `DashboardCache._normalize_symbol_list` and
+  the peer family's `_dedupe_symbols`. Every list reads as before; the
+  dashboard's lists now also accept a frozenset or a generator (none is
+  passed today). The option premium clamps are
+  `options_mode.clamp_long_premium_levels` / `clamp_short_premium_levels`;
+  the positive-quote read is `numeric.first_float(..., positive=True)`; the
+  zone-width policy and the position/strategy-name match are `BaseStrategy`
+  static methods; `_long_option_style_gate` moved from the 0DTE base to
+  `zero_dte_etf_long_options`, its only user, and its
+  `_long_option_style_enabled` twin of the inherited `_style_enabled` is
+  gone. There is no alias: `data_feed.NON_STREAMABLE` and
+  `MarketDataStore.is_streamable_equity` & co. are gone, import from
+  `intraday_tv_schwab_bot.symbols`. No behaviour changes beyond the Fixed
+  entry for `options.underlyings`.
+
+- **The strategy layer reads numbers through `numeric` too (refactor cut
+  C23).** *2026-09-26* — `_strategies/helpers.py`'s `_safe_float`,
+  `_optional_float` and `_optional_int` are gone. Every strategy module,
+  `shared_entry`, `shared_exit` and `strategy_base` call
+  `numeric.safe_float(value, 0.0)` where `_safe_float` defaulted to 0.0, and
+  `numeric.safe_float(value, default)` / `numeric.safe_int(value, default)`
+  elsewhere. `_is_scalar_missing` is private to `reasons.py`, and the 0DTE
+  `ambiguous_regime` / `no_style_trigger` reasons compute their score gap and
+  ORB triggers with `safe_float`. The scaffold templates and the plugin
+  README example import `safe_float` from `numeric`. The readings are
+  unchanged except for inputs no shipped preset or feed produces:
+  - a string spelling NaN (`'nan'`; PyYAML reads a bare `nan` as one) is now
+    the default instead of NaN;
+  - `_safe_float` passed its default through `float()`, and every call
+    passes a float default anyway;
+  - a `float()` that raises something other than TypeError / ValueError /
+    OverflowError now propagates.
+
+- **Bar geometry, session slices and bucket completion live in `bars.py`
+  (refactor cut C22).** *2026-09-26* — `bar_close_position`,
+  `bar_wick_fractions`, `bars_have_range`, `CANDLE_PATTERN_WINDOW_BARS`,
+  `same_day_mask`, `time_gte_mask` and `session_open_price` moved out of
+  `_strategies/helpers.py` under public names, and `chart_patterns`' own
+  `_bar_close_position` copy is gone. `session_open_price` takes the `day`
+  (it no longer reads the clock), and the 0DTE strategy's RTH-then-premarket
+  retry is `fallback_to_premarket_on_nan=True`. `bar_closed_after` moved out
+  of `shared_exit`. `last_bucket_forming` / `completed_bucket_mask` are the
+  one "is this bucket still trading" test (strategy_base, the dashboard,
+  data_feed, htf_levels). `rth_open_plus` and
+  `indicators.indicator_session_start` replace the 09:30 literals and the
+  extended-vs-RTH start rule. `sessions.is_time_in_window` reads its ends
+  like `parse_hhmm` and replaces the two `_time_in_range` copies and the
+  macro blackout's inline check. There is no alias. No behaviour changes on
+  any input the bot produces (the string `'nan'` now reads as missing; a
+  naive frame compared with the clock is read on the ET wall clock).
+
+- **trend_continuation's extension hard cap refuses under its own tokens
+  (refactor cut B19).** *2026-09-26* — past `max_extension_from_vwap_atr` /
+  `max_extension_from_ema9_atr` x `extension_hard_cap_mult` the side is now
+  refused as `too_extended_hard_cap_vwap_atr` / `too_extended_hard_cap_ema9_atr`.
+  It used the base exhaustion filter's `too_extended_from_vwap_atr` /
+  `too_extended_from_ema9_atr` (`max_entry_*_extension_atr`), a separate check
+  with its own thresholds, so a refusal could list one token twice with two
+  thresholds, and the session report's filter rejections and gate
+  attribution counted both checks as one gate. The thresholds and what is
+  refused are unchanged; only the reason strings (and so those report
+  buckets) change, and a comparison across this date has to add the two
+  hard-cap buckets back to the base filter's. With the shipped preset the
+  base filter's lower thresholds (0.95 / 0.75 ATR against the caps' 1.52 /
+  1.28) always fire with it on the trend side, so a hard-cap token appears
+  without the base filter's only when the close is that far past VWAP /
+  EMA9 against the side (the cap measures the absolute distance) or the base
+  filter is off.
+
+- **Reason strings have one home, `reasons.py` (refactor cut C21).**
+  *2026-09-26* — `reason_with_values`, `insufficient_bars_reason`,
+  `detail_fields`, `fmt_metric`, `bool_token` and `side_prefixed_reason(s)`
+  moved out of `_strategies/helpers.py` under public names (the leading
+  underscore is gone). Two readers replace five copies. `reason_head` (the
+  text before the first `(`, stripped, or the whole reason when nothing
+  precedes the `(`) replaces the entry stage's `_reason_prefix` and the
+  session report's `_normalize_skip_reason`. `exit_reason_code` (the text
+  before the first `:`, stripped, or None) replaces the report's
+  `_exit_reason_bucket`, its inline stop-exit test and the code half of
+  `position_metrics.exit_reason_details`. Every reason the bot builds reads as
+  before; only a malformed exit reason (an empty code, or a blank before the
+  colon) now gets a stripped code or None in the exit payload. The peer
+  family's `_gate_snapshot`, `_score_threshold` and `_discrete_score_threshold`
+  moved to `peer_confirmed_key_levels/strategy.py`, and the 0DTE formatters
+  `_style_unavailable_reason`, `_ambiguous_regime_reason` and
+  `_no_style_trigger_reason` to `zero_dte_etf_options/strategy.py`.
+  `_strategies/__init__.py` is now only a docstring and re-exports nothing,
+  which reverses the "`_strategies.insufficient_bars_reason` promoted to
+  public API" note under Added: the warm-up tracker imports it from
+  `reasons`. There is no alias or stub. `tests/test_reasons.py` keeps the old
+  parsers as oracles.
+
+- **`_strategies/shared.py` is gone: every module imports a name from the
+  module that defines it (refactor cut C20).** *2026-09-26* — the hub
+  re-exported 95 names (18 of them imported by nobody) and gave the strategy
+  layer a second import route beside the origin modules that `shared_entry`,
+  `shared_exit` and half of `strategy_base` already used. The strategies,
+  screeners and `strategy_base` now import the domain types from `models`,
+  the session names from `sessions`, the analysis contexts from `candles`,
+  `chart_patterns`, `support_resistance`, `htf_levels` and
+  `technical_levels`, `resample_bars` from `bars`, the indicator helpers from
+  `indicators`, the option builders from `options_mode`, the pure strategy
+  helpers from `_strategies/helpers.py`, and the standard library and pandas
+  directly. There is no alias or stub. `strategy_base`, the 0DTE ETF options
+  strategy and five screeners (opening_range_breakout, microcap_gap_orb and
+  the three peer_confirmed ones) logged through the hub's logger; each now
+  logs under its own module name (for example
+  `intraday_tv_schwab_bot._strategies.strategy_base` instead of
+  `intraday_tv_schwab_bot._strategies.shared`), so a log filter on the old
+  name must change. The plugin scaffold and the `_strategies/README.md`
+  examples import the same way, and `tests/test_shared_knob_contract.py`
+  now imports every name they use (its AST scans never did, so a template
+  importing a deleted module passed). `tests/test_module_layering.py`
+  rejects a module that imports another module's `LOG`. No behaviour changes.
+
+- **The plugin registry is two modules, `catalogue.py` and `factory.py`
+  (refactor cut C19).** *2026-09-26* — `_strategies/catalogue.py` reads and
+  validates the manifests and looks plugins up (`get_plugins`, `get_plugin`,
+  `plugin_names`, `normalize_strategy_name`, `default_strategy_name`,
+  `option_strategy_names`, `is_option_strategy`, and `plugin_key`, the
+  lower-cased name key, which was the private `_normalize_name`); it imports
+  no plugin module. `_strategies/factory.py` imports a plugin's classes and
+  builds them (`build_strategy`, `build_screener`,
+  `normalize_strategy_params`), importing `BaseStrategy` and
+  `BaseStrategyScreener` at the top instead of inside the loaders.
+  `registry.py` is gone and there is no alias: import from the two new
+  modules. The `_strategies` package no longer re-exports the registry
+  functions, `StrategyManifest`, `BaseStrategy` or `BaseStrategyScreener`
+  (nothing used them); `insufficient_bars_reason` stays for now.
+  `BaseStrategy.__init__` looks its manifest up with no fallback, so a
+  hand-built config naming an unknown strategy now raises `ValueError`
+  instead of building a strategy with no manifest capabilities (`load_config`
+  and `build_strategy` already rejected such a name). The engine, entry
+  gatekeeper, startup reconciler, warmup tracker and position manager import
+  `BaseStrategy` for type annotations only. Importing `config` now loads the
+  strategy base (and with it `shared_entry`), which the first `load_config`
+  used to do. The runtime import graph has no cycles. No other behaviour
+  changes.
+
+- **The two support/resistance config helpers are `SupportResistanceConfig`
+  methods (refactor cut C18).** *2026-09-26* — `config.flip_confirmation_bars(sr)`
+  and `config.htf_structure_event_lookback(sr)` are now
+  `SupportResistanceConfig.flip_confirmation_bars()` and
+  `.htf_structure_event_lookback()`; callers read
+  `config.support_resistance.flip_confirmation_bars()`. They were the only
+  reason a strategy module imported `config` at runtime (both peer plugins,
+  and a function-local import in `BaseStrategy._structure_event_recent`), so
+  the strategy layers now import `config` for types only and `config` is out
+  of the runtime import cycle; `tests/test_module_layering.py` drops the three
+  allowlisted imports and the cycle shrinks to registry <-> strategy_base.
+  `dashboard_cache` imports `BotConfig` with its other config names instead of
+  under `TYPE_CHECKING`. `_structure_event_recent` reads
+  `self.config.support_resistance` directly (a config without that section
+  used to fall back to a 6-bar HTF window; every `BotConfig` has one). No
+  behaviour change.
+
+- **`VETO_GATES` lives in `_strategies/plugin_api.py` (refactor cut C17).**
+  *2026-09-26* — the closed set of vetoes a manifest's
+  `capabilities.shared_entry.exemptions` may name is manifest vocabulary, so
+  it moved out of `shared_entry.py` next to `StrategyManifest`. The registry
+  imported the whole entry stage only to validate those lists. Import it from
+  `intraday_tv_schwab_bot._strategies.plugin_api`: `shared_entry` does not
+  re-export it, and the knob-contract test no longer lets a strategy import
+  it from there. No behavior change.
+
 - **Every level builder floors its ATR the same way (refactor cut B6).**
   *2026-09-26* — `indicators.atr_with_floor(frame, price, *, floor_pct=0.0015,
   abs_floor=0.0)` = max(the frame's current ATR, `price` x 0.15%,
@@ -777,6 +992,43 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `levels_shared.find_divergence` a required `bar_clock`.
 
 ### Fixed
+
+- **`options.underlyings` must be a list (refactor cut C24).** *2026-09-26* —
+  a YAML scalar (`underlyings: SPY`) used to load as `['S', 'P', 'Y']`: the
+  config normalizer iterated the string, so the 0DTE screeners built three
+  one-letter candidates and the options position cap became 3. A scalar,
+  mapping or number now fails at load, naming the key. A list reads as
+  before. Tests: `tests/test_config_validation.py`.
+
+- **An infinite or NaN value no longer switches off a runner, a quote or an
+  option leg.** *2026-09-26*
+  - A runner target R of `.inf` / `-.inf` put the target at ±inf. A runner
+    then never took profit, or took it on the same check when the target
+    landed behind the price (a -inf LONG, a +inf SHORT). The runner
+    extension (target, extension R and runner trail) now applies only when
+    its candidate target is finite, as the stop tiers already do.
+  - A NaN or infinite `initial_stop_price` made the initial risk 0 (NaN) or
+    inf, which silently turned off adaptive management, peak giveback and
+    the trail's +0.5R activation. It now reads as missing, so the live stop
+    anchors the risk. The same holds wherever it is read: the R multiple the
+    discretionary exits use, the exit context, and the dashboard position
+    risk fall back to the live stop, and the trade record carries no initial
+    risk. Tests: `TestInitialStopReadersIgnoreNonFinite`.
+  - A quote field of ±inf (Python's JSON parser accepts a bare `Infinity`)
+    now falls through to the next key. Before, an infinite mark became the
+    management price and exited every equity position on the next check.
+  - An option leg rebuilt from a quote read a NaN bid, ask, mark, greek or
+    count as 0 / None instead of falling back to the leg's stored value or
+    the next key (`mark` then `last`); a NaN greek skipped the stored one.
+    The same fall-through now covers inputs no shipped feed produces (quotes
+    come from the normalized quote cache and stored legs from
+    `OptionContract`): an unparseable string in the quote (it read 0.0, or
+    None for a greek), a `pd.NA` (it raised `TypeError`), and a stored value
+    that is None, blank or unparseable where the field has another key to
+    try (`mark` then `last`, and the `open_interest` / `total_volume` /
+    `days_to_expiration` spellings), which read 0.
+  - Tests: `tests/test_properties.py` (n8, n11, n12) and
+    `tests/test_bug_regressions.py` (`TestPartialBreakevenTier2026_04_23`).
 
 - **Four numeric reads no longer mis-read NaN or float strings (refactor cut C16).**
   *2026-09-26*

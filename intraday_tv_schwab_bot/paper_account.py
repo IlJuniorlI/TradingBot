@@ -11,7 +11,7 @@ from threading import RLock
 from typing import Any, Iterable
 
 from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side
-from .numeric import first_float
+from .numeric import first_float, safe_float
 from .log_setup import TRADEFLOW_LEVEL
 from . import sessions
 
@@ -237,7 +237,7 @@ class PaperAccount:
             # trades from strategies that don't populate them stay valid.
             # MAE/MFE prefer the clean key and fall back to the engine's
             # diag_ copy written during management.
-            initial_stop = first_float(metadata, "initial_stop_price")
+            initial_stop = first_float(metadata, "initial_stop_price", finite=True)
             initial_risk = (
                 abs(float(position.entry_price) - initial_stop)
                 if initial_stop is not None and initial_stop > 0
@@ -357,10 +357,8 @@ class PaperAccount:
             # which is the most common state for winning trades. The
             # ``initial_*`` fields are stamped at entry by entry_gatekeeper
             # (lines 677-678 / 1215-1216) and never mutate after.
-            initial_stop_raw = metadata.get("initial_stop_price")
-            try:
-                initial_stop = float(initial_stop_raw) if initial_stop_raw is not None else float(position.stop_price or position.entry_price)
-            except (TypeError, ValueError):
+            initial_stop = safe_float(metadata.get("initial_stop_price"), finite=True)
+            if initial_stop is None:
                 initial_stop = float(position.stop_price or position.entry_price)
             if position.side == Side.LONG:
                 risk_per_share = max(0.0, float(position.entry_price) - initial_stop)

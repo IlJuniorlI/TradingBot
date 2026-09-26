@@ -1,28 +1,108 @@
 # SPDX-License-Identifier: MIT
-from ..shared import (
-    Any,
-    Candidate,
-    HTFContext,
-    Position,
-    Side,
-    Signal,
-    _bar_close_position,
-    _bar_wick_fractions,
-    _discrete_score_threshold,
-    insufficient_bars_reason,
-    _optional_float,
-    _safe_float,
-    _session_open_price,
-    _side_prefixed_reasons,
-    htf_ema_spans,
-    pd,
-)
+import math
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+import pandas as pd
+
+from ...htf_levels import HTFContext
+from ...indicators import bar_posture, htf_ema_spans, last_bar_atr
+from ...numeric import safe_float
+from ...reasons import insufficient_bars_reason, side_prefixed_reasons
 from ..shared_entry import EntryProposal
-from ..shared_exit import ExitTape, bar_closed_after
+from ..shared_exit import ExitTape
 from ..strategy_base import BaseStrategy
-from ...config import flip_confirmation_bars
-from ...models import ExitDecision
+from ... import sessions
+from ...bars import bar_close_position, bar_closed_after, bar_wick_fractions, session_open_price
+from ...models import Candidate, ExitDecision, Position, Side, Signal
 from ...support_resistance import zone_flip_confirmed
+from ...symbols import normalize_symbol_list
+
+
+def _score_threshold(value: Any, default: float, *, minimum: float = 0.0) -> float:
+    """Threshold for a CONTINUOUS score, kept as configured.
+
+    The LTF trigger score moves in 0.5 / 0.75 steps plus candle bonuses and
+    the total score is continuous, so ``_discrete_score_threshold``'s ceil
+    turned ``min_ltf_score: 2.5`` into 3 and ``min_total_score: 5.5`` into 6:
+    setups the configured threshold passes were rejected. Falls back to
+    ``default`` on parse failure; floors at ``minimum``.
+    """
+    try:
+        raw = float(value)
+    except Exception:
+        raw = float(default)
+    if math.isnan(raw):
+        raw = float(default)
+    return max(float(minimum), raw)
+
+
+def _discrete_score_threshold(
+    value: Any,
+    default: int,
+    *,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> int:
+    """Coerce ``value`` to an integer threshold, falling back to
+    ``default`` on parse failure and clamping to ``[minimum, maximum]``
+    (maximum optional).
+
+    For INTEGER-valued counts only (peer agreement). A fractional setting is
+    rounded UP, which is right for a count -- "at least 2.5 peers" means 3 --
+    and wrong for a continuous score; use ``_score_threshold`` for those.
+    """
+    try:
+        raw = float(value)
+    except Exception:
+        raw = float(default)
+    if math.isnan(raw):
+        raw = float(default)
+    threshold = int(math.ceil(raw))
+    threshold = max(int(minimum), threshold)
+    if maximum is not None:
+        threshold = min(int(maximum), threshold)
+    return threshold
+
+
+def _gate_snapshot(
+    name: str,
+    *,
+    passed: bool,
+    current: Any = None,
+    required: Any = None,
+    op: str = ">=",
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Build a gate-decision record for structured logging."""
+    payload: dict[str, Any] = {
+        "name": str(name),
+        "pass": bool(passed),
+        "op": str(op),
+    }
+    if current is not None:
+        payload["current"] = current
+    if required is not None:
+        payload["required"] = required
+    if note:
+        payload["note"] = str(note)
+    return payload
+
+
+
+@dataclass
+class SideEvaluation:
+    """What ``_evaluate_sides`` found for one candidate: the signals the sides
+    built, every refused side's blockers (side-prefixed, in evaluation
+    order), each side's ``side_eval`` and ``extra`` payloads keyed by side,
+    and the near-miss blockers keyed ``<side>.<gate>``."""
+    signals: list[Signal] = field(default_factory=list)
+    fail_reasons: list[str] = field(default_factory=list)
+    side_eval: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, dict[str, Any]] = field(default_factory=dict)
+    near_miss_blockers: dict[str, Any] = field(default_factory=dict)
+
 
 class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
     strategy_name = 'peer_confirmed_key_levels'
@@ -46,8 +126,8 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
     @classmethod
     def normalize_params(cls, params: dict[str, Any]) -> dict[str, Any]:
         out = super().normalize_params(params)
-        tradable = cls._dedupe_symbols([str(sym) for sym in out.get("tradable", []) if str(sym).strip()])
-        peers = cls._dedupe_symbols([str(sym) for sym in out.get("peers", []) if str(sym).strip()])
+        tradable = normalize_symbol_list([str(sym) for sym in out.get("tradable", []) if str(sym).strip()])
+        peers = normalize_symbol_list([str(sym) for sym in out.get("peers", []) if str(sym).strip()])
         if tradable:
             tradable_set = set(tradable)
             peers = [symbol for symbol in peers if symbol not in tradable_set]
@@ -55,31 +135,16 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         out["peers"] = peers
         return out
 
-    @staticmethod
-    def _dedupe_symbols(values: list[str]) -> list[str]:
-        out: list[str] = []
-        seen: set[str] = set()
-        invalid_tokens = {"NONE", "NULL", "NAN"}
-        for raw in values:
-            if raw is None:
-                continue
-            token = str(raw).upper().strip()
-            if not token or token in invalid_tokens or token in seen:
-                continue
-            seen.add(token)
-            out.append(token)
-        return out
-
     def _tradable_symbols(self) -> list[str]:
-        return self._dedupe_symbols([str(sym) for sym in self.params.get("tradable", []) if str(sym).strip()])
+        return normalize_symbol_list([str(sym) for sym in self.params.get("tradable", []) if str(sym).strip()])
 
     def _peer_symbols(self) -> list[str]:
         tradable = set(self._tradable_symbols())
-        peers = self._dedupe_symbols([str(sym) for sym in self.params.get("peers", []) if str(sym).strip()])
+        peers = normalize_symbol_list([str(sym) for sym in self.params.get("peers", []) if str(sym).strip()])
         return [symbol for symbol in peers if symbol not in tradable]
 
     def _confirmation_universe(self) -> list[str]:
-        return self._dedupe_symbols(self._tradable_symbols() + self._peer_symbols())
+        return normalize_symbol_list(self._tradable_symbols() + self._peer_symbols())
 
     def should_force_flatten(self, position: Position) -> bool:
         return self._configurable_stock_force_flatten(position)
@@ -118,12 +183,12 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         metadata = position.metadata if isinstance(position.metadata, dict) else {}
         if not bool(metadata.get("ladder_management_enabled")):
             return None
-        defense_price = _optional_float(metadata.get("ladder_defense_price"))
+        defense_price = safe_float(metadata.get("ladder_defense_price"))
         if defense_price is None or defense_price <= 0:
             return None
         close = tape.close
         refs = tape.refs()
-        defense_zone_width = max(0.0, _optional_float(metadata.get("ladder_defense_zone_width"), 0.0) or 0.0)
+        defense_zone_width = max(0.0, safe_float(metadata.get("ladder_defense_zone_width"), 0.0) or 0.0)
         symbol = str(metadata.get("underlying") or position.symbol)
         htf_minutes = int(self.params.get("htf_minutes", 60))
         sr_ctx = None
@@ -150,7 +215,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         eps = max(float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0) * 0.15, close * 0.0001, 1e-6)
         # Through the shared reader: `int(value or 2)` turned a configured 0
         # (that frame's gate off) back into the default (2026-09-23).
-        confirm_1m, confirm_5m = flip_confirmation_bars(self.config.support_resistance)
+        confirm_1m, confirm_5m = self.config.support_resistance.flip_confirmation_bars()
         lower, upper = self._ladder_bounds(defense_price, defense_zone_width)
         ms = getattr(sr_ctx, "market_structure", None)
 
@@ -232,6 +297,13 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                                 **self._symbol_htf_request())
         return self._htf_trend_row(*self._htf_bias(htf, float(price)))
 
+    @staticmethod
+    def _session_open(frame: pd.DataFrame) -> float | None:
+        """Today's session open for the peer and macro votes: the first bar
+        at or after 09:30, or today's first bar before then; None with no
+        bar today."""
+        return session_open_price(frame, sessions.now_et().date())
+
     def _peer_signal(self, symbol: str, bars: dict[str, pd.DataFrame], data) -> dict[str, Any]:
         universe = self._confirmation_universe()
         htf_request = self._symbol_htf_request()
@@ -246,28 +318,24 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             if frame is None or frame.empty:
                 details[peer] = "missing"
                 continue
-            close = _safe_float(frame.iloc[-1]["close"])
+            close = safe_float(frame.iloc[-1]["close"], 0.0)
             ltf = self._resampled_frame(frame, int(self.params.get("ltf_minutes", 5)), symbol=peer, data=data)
             htf = self._htf_context(peer, data, current_price=close, **htf_request)
             bull_votes = 0
             bear_votes = 0
-            ema_fast = _optional_float(getattr(htf, "ema_fast", None))
+            ema_fast = safe_float(getattr(htf, "ema_fast", None))
             if ema_fast is not None:
                 if close > ema_fast:
                     bull_votes += 1
                 elif close < ema_fast:
                     bear_votes += 1
             if ltf is not None and not ltf.empty:
-                last = ltf.iloc[-1]
-                ltf_close = _safe_float(last["close"], close)
-                ltf_vwap = _safe_float(last.get("vwap"), ltf_close)
-                ema9 = _safe_float(last.get("ema9"), ltf_close)
-                ema20 = _safe_float(last.get("ema20"), ltf_close)
-                if ltf_close > ltf_vwap and ema9 >= ema20:
+                posture = bar_posture(ltf.iloc[-1])
+                if posture == Side.LONG:
                     bull_votes += 1
-                elif ltf_close < ltf_vwap and ema9 <= ema20:
+                elif posture == Side.SHORT:
                     bear_votes += 1
-            session_open = _session_open_price(frame)
+            session_open = self._session_open(frame)
             if session_open is not None:
                 if close > session_open:
                     bull_votes += 1
@@ -305,32 +373,26 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 details[key] = "missing"
                 continue
             last = macro.iloc[-1]
-            close = _safe_float(last["close"])
-            vwap = _optional_float(last.get("vwap"))
-            volume = _optional_float(last.get("volume"))
-            ema9 = _safe_float(last.get("ema9"), close)
-            ema20 = _safe_float(last.get("ema20"), close)
-            ret5 = _safe_float(last.get("ret5"), 0.0)
+            close = safe_float(last["close"], 0.0)
+            vwap = safe_float(last.get("vwap"))
+            volume = safe_float(last.get("volume"))
+            ema9 = safe_float(last.get("ema9"), close)
+            ema20 = safe_float(last.get("ema20"), close)
+            ret5 = safe_float(last.get("ret5"), 0.0)
             use_vwap = vwap is not None and volume is not None and volume > 0.0
             if use_vwap:
                 up = close > float(vwap) and ema9 >= ema20 and ret5 >= 0.0
                 down = close < float(vwap) and ema9 <= ema20 and ret5 <= 0.0
             else:
-                session_slice = macro
-                try:
-                    normalized_index = pd.to_datetime(macro.index, errors="coerce")
-                    valid_index = normalized_index[normalized_index.notna()]
-                    if len(valid_index) > 0:
-                        session_mask = normalized_index.normalize() == valid_index[-1].normalize()
-                        if bool(session_mask.any()):
-                            session_slice = macro.loc[session_mask]
-                except Exception:
-                    session_slice = macro
-                session_open = _safe_float(session_slice.iloc[0].get("open"), close) if session_slice is not None and not session_slice.empty else close
+                # The RTH open _peer_signal votes on; with no bar today the
+                # close stands in, so the term cannot vote.
+                session_open = self._session_open(frame)
+                if session_open is None:
+                    session_open = close
                 recent_window = macro.tail(6)
                 prior_bars = recent_window.iloc[:-1] if len(recent_window) > 1 else recent_window.iloc[0:0]
-                recent_5bar_high = _safe_float(prior_bars["high"].max(), close) if not prior_bars.empty and "high" in prior_bars.columns else close
-                recent_5bar_low = _safe_float(prior_bars["low"].min(), close) if not prior_bars.empty and "low" in prior_bars.columns else close
+                recent_5bar_high = safe_float(prior_bars["high"].max(), close) if not prior_bars.empty and "high" in prior_bars.columns else close
+                recent_5bar_low = safe_float(prior_bars["low"].min(), close) if not prior_bars.empty and "low" in prior_bars.columns else close
                 bull_votes = 0
                 bear_votes = 0
                 if ema9 > ema20:
@@ -369,6 +431,17 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                     details[key] = "neutral"
         return {"long_agree": long_agree, "short_agree": short_agree, "details": details, "enabled": True}
 
+    def _macro_allows(self, side: Side, macro_ctx: dict[str, Any]) -> bool:
+        """The family's macro gate: at least ``require_macro_agreement_count``
+        macro symbols agree with ``side``, or macro confirmation is off
+        (``enable_macro_confirmation``). key_levels refuses on it (and adds
+        its net-bias check); htf_pivots and trend_continuation score it."""
+        if not bool(self.params.get("enable_macro_confirmation", True)):
+            return True
+        required = max(0, int(self.params.get("require_macro_agreement_count", 1)))
+        agree = macro_ctx.get("long_agree" if side == Side.LONG else "short_agree", 0)
+        return int(agree or 0) >= required
+
     @staticmethod
     def _peer_level_source_priority(kind: str) -> float:
         name = str(kind or "").strip().lower()
@@ -383,7 +456,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
     def _collapse_peer_levels(self, candidates: list[dict[str, Any]], close: float, htf: HTFContext) -> list[dict[str, Any]]:
         if not candidates:
             return []
-        atr = _optional_float(getattr(htf, "atr14", None)) or max(float(close) * 0.0015, 0.01)
+        atr = last_bar_atr(None, float(close), fallback_atr=getattr(htf, "atr14", None))
         tolerance = max(
             float(atr) * float(self.params.get("htf_atr_tolerance_mult", 0.35)),
             float(close) * float(self.params.get("htf_pct_tolerance", 0.0030)),
@@ -455,8 +528,8 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 local_confluence_score += 1.0
             if self._round_number_hit(float(price), tolerance_pct):
                 local_confluence_score += 1.0
-            ema_fast = _optional_float(getattr(htf, "ema_fast", None))
-            ema_slow = _optional_float(getattr(htf, "ema_slow", None))
+            ema_fast = safe_float(getattr(htf, "ema_fast", None))
+            ema_slow = safe_float(getattr(htf, "ema_slow", None))
             if ema_fast is not None and abs(float(price) - ema_fast) <= max(float(close) * tolerance_pct, float(getattr(htf, "atr14", 0.0) or 0.0) * 0.25):
                 local_confluence_score += 1.0
             if ema_slow is not None and abs(float(price) - ema_slow) <= max(float(close) * tolerance_pct, float(getattr(htf, "atr14", 0.0) or 0.0) * 0.25):
@@ -489,10 +562,10 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             source_priority = float(getattr(level_obj, "source_priority", self._peer_level_source_priority(kind)) or self._peer_level_source_priority(kind))
             _append(
                 kind,
-                _optional_float(getattr(level_obj, "price", None)),
+                safe_float(getattr(level_obj, "price", None)),
                 touches=int(getattr(level_obj, "touches", 1) or 1),
                 base_score=max(1.5, source_priority),
-                raw_htf_score=_optional_float(getattr(level_obj, "score", None)),
+                raw_htf_score=safe_float(getattr(level_obj, "score", None)),
                 source_priority=source_priority,
             )
 
@@ -501,9 +574,9 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 _append_level_obj(level_obj, "nearest_htf_support")
             _append_level_obj(getattr(htf, "broken_resistance", None), "broken_htf_resistance")
             for gap in (getattr(htf, "bullish_fvgs", []) or []):
-                lower = _optional_float(getattr(gap, "lower", None))
-                upper = _optional_float(getattr(gap, "upper", None))
-                midpoint = _optional_float(getattr(gap, "midpoint", None))
+                lower = safe_float(getattr(gap, "lower", None))
+                upper = safe_float(getattr(gap, "upper", None))
+                midpoint = safe_float(getattr(gap, "midpoint", None))
                 if lower is None or upper is None or midpoint is None:
                     continue
                 if lower > close and upper > close:
@@ -514,9 +587,9 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 _append_level_obj(level_obj, "nearest_htf_resistance")
             _append_level_obj(getattr(htf, "broken_support", None), "broken_htf_support")
             for gap in (getattr(htf, "bearish_fvgs", []) or []):
-                lower = _optional_float(getattr(gap, "lower", None))
-                upper = _optional_float(getattr(gap, "upper", None))
-                midpoint = _optional_float(getattr(gap, "midpoint", None))
+                lower = safe_float(getattr(gap, "lower", None))
+                upper = safe_float(getattr(gap, "upper", None))
+                midpoint = safe_float(getattr(gap, "midpoint", None))
                 if lower is None or upper is None or midpoint is None:
                     continue
                 if lower < close and upper < close:
@@ -529,8 +602,8 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         zone_floor = float(min_zone)
         zone_width = max(float(self.params.get("zone_atr_mult", 0.21)) * atr, min_zone)
         if isinstance(candidate, dict):
-            zone_lower = _optional_float(candidate.get("zone_lower"))
-            zone_upper = _optional_float(candidate.get("zone_upper"))
+            zone_lower = safe_float(candidate.get("zone_lower"))
+            zone_upper = safe_float(candidate.get("zone_upper"))
             if zone_lower is not None and zone_upper is not None and zone_upper >= zone_lower:
                 # Use the FVG span to raise the zone FLOOR (so very small FVGs
                 # don't shrink below min_zone), but do NOT let a tall FVG blow
@@ -595,7 +668,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
     def _select_level(self, side: Side, close: float, ltf: pd.DataFrame, htf: HTFContext) -> dict[str, Any] | None:
         if ltf is None or ltf.empty:
             return None
-        atr = _safe_float(ltf.iloc[-1].get("atr14"), _optional_float(getattr(htf, "atr14", None)) or max(close * 0.0015, 0.01))
+        atr = last_bar_atr(ltf, close, fallback_atr=getattr(htf, "atr14", None))
         recent = ltf.tail(4)
         best: dict[str, Any] | None = None
         for candidate in self._candidate_levels(close, htf, side):
@@ -668,13 +741,13 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         if prior.empty:
             return {"quality_bonus": 0.0, "quality_reasons": [], "quality_breakdown": {}}
 
-        close = _safe_float(last.get("close"), level_price)
-        open_ = _safe_float(last.get("open"), close)
-        atr = max(_safe_float(last.get("atr14"), max(abs(float(close)) * 0.0015, 0.01)), max(abs(float(close)) * 0.0005, 0.01))
-        upper_wick_frac, lower_wick_frac, body_frac, bar_range = _bar_wick_fractions(ltf)
-        close_pos = _bar_close_position(ltf)
+        close = safe_float(last.get("close"), level_price)
+        open_ = safe_float(last.get("open"), close)
+        atr = last_bar_atr(ltf, close, floor_pct=0.0005)
+        upper_wick_frac, lower_wick_frac, body_frac, bar_range = bar_wick_fractions(ltf)
+        close_pos = bar_close_position(ltf)
         recent_ranges = (prior["high"] - prior["low"]).tail(10) if {"high", "low"}.issubset(prior.columns) else pd.Series(dtype=float)
-        avg_range = _safe_float(recent_ranges.mean(), bar_range if bar_range > 0 else atr)
+        avg_range = safe_float(recent_ranges.mean(), bar_range if bar_range > 0 else atr)
         avg_range = max(avg_range, atr * 0.35, 1e-9)
         range_ratio = float(bar_range) / avg_range if avg_range > 0 else 0.0
         zone_scale = max(float(zone_width), atr * 0.15, abs(float(level_price)) * 0.0005, 1e-6)
@@ -710,11 +783,11 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 components["range_expansion_bonus"] = range_bonus
 
         if side == Side.LONG:
-            sweep_extreme = _safe_float(sweep_window["low"].min(), close) if "low" in sweep_window.columns else close
+            sweep_extreme = safe_float(sweep_window["low"].min(), close) if "low" in sweep_window.columns else close
             recovery_distance = max(0.0, close - float(level_price))
             penetration_ratio = max(0.0, float(level_price) - float(sweep_extreme)) / zone_scale
         else:
-            sweep_extreme = _safe_float(sweep_window["high"].max(), close) if "high" in sweep_window.columns else close
+            sweep_extreme = safe_float(sweep_window["high"].max(), close) if "high" in sweep_window.columns else close
             recovery_distance = max(0.0, float(level_price) - close)
             penetration_ratio = max(0.0, float(sweep_extreme) - float(level_price)) / zone_scale
 
@@ -947,7 +1020,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         }
 
     def _build_equity_signal(self, c: Candidate, frame: pd.DataFrame, ltf: pd.DataFrame, htf: HTFContext, side: Side, level: dict[str, Any], peer_ctx: dict[str, Any], macro_ctx: dict[str, Any], data=None) -> Signal | None:
-        close = _safe_float(frame.iloc[-1]["close"])
+        close = safe_float(frame.iloc[-1]["close"], 0.0)
         failure_style = self._failure_style_name(side)
         # Cheap directional gates run BEFORE expensive trigger scoring so that
         # symbols mis-sided against the hourly/peer/macro tape short-circuit out
@@ -981,17 +1054,13 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 self._set_build_failure(c.symbol, failure_style, "peer_confirmation_insufficient_short")
                 return None
         macro_confirmation_enabled = bool(self.params.get("enable_macro_confirmation", True))
-        required_macro = int(self.params.get("require_macro_agreement_count", 1))
         require_macro_net_bias = bool(self.params.get("require_macro_net_bias", True))
         long_agree = int(macro_ctx.get("long_agree", 0))
         short_agree = int(macro_ctx.get("short_agree", 0))
+        if not self._macro_allows(side, macro_ctx):
+            self._set_build_failure(c.symbol, failure_style, "macro_confirmation_insufficient_long" if side == Side.LONG else "macro_confirmation_insufficient_short")
+            return None
         if macro_confirmation_enabled:
-            if side == Side.LONG and long_agree < required_macro:
-                self._set_build_failure(c.symbol, failure_style, "macro_confirmation_insufficient_long")
-                return None
-            if side == Side.SHORT and short_agree < required_macro:
-                self._set_build_failure(c.symbol, failure_style, "macro_confirmation_insufficient_short")
-                return None
             if require_macro_net_bias:
                 if side == Side.LONG and long_agree <= short_agree:
                     self._set_build_failure(c.symbol, failure_style, f"macro_net_bias_insufficient_long:long={long_agree}<=short={short_agree}")
@@ -1007,8 +1076,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         if ltf_score < ltf_min_score:
             self._set_build_failure(c.symbol, failure_style, f"ltf_score_below_min:{ltf_score:.4f}<{ltf_min_score:.4f}")
             return None
-        last5 = ltf.iloc[-1]
-        atr = _safe_float(last5.get("atr14"), _optional_float(getattr(htf, "atr14", None)) or max(close * 0.0015, 0.01))
+        atr = last_bar_atr(ltf, close, fallback_atr=getattr(htf, "atr14", None))
         target_clearance = self._peer_target_clearance(side, close, htf, atr)
         # key_levels' own clearance check: the NEAREST HTF key level in the
         # trade's direction must clear BOTH support_resistance.entry_min_
@@ -1213,6 +1281,72 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         frame = bars[str(position.metadata.get("underlying") or position.symbol)]
         return self._ladder_exit_signal(position, frame, tape, data=data)
 
+    # -- The side template htf_pivots and trend_continuation run -----------
+    # key_levels keeps its own level-first loop: it gates each side on its
+    # selected level, ignores the screener's directional bias and picks the
+    # side on (final_priority_score, selection_quality_score).
+
+    def _skip_untradable(self, symbol: str, tradable: set[str]) -> bool:
+        """Record ``symbol_not_tradable`` for a candidate outside a non-empty
+        ``tradable`` list; True when it was skipped."""
+        if tradable and symbol not in tradable:
+            self._record_entry_decision(symbol, "skipped", ["symbol_not_tradable"])
+            return True
+        return False
+
+    def _preferred_sides(self, c: Candidate) -> list[Side] | None:
+        """The sides to evaluate, the screener's bias first. None when the
+        bias is SHORT and shorts are off: the candidate is skipped
+        (``shorts_disabled``) rather than read LONG against its bias."""
+        allow_short = bool(self.config.risk.allow_short)
+        if c.directional_bias == Side.SHORT:
+            return [Side.SHORT, Side.LONG] if allow_short else None
+        return [Side.LONG, Side.SHORT] if allow_short else [Side.LONG]
+
+    def _evaluate_sides(self, c: Candidate, side_order: list[Side], build: Callable[[Side], Signal | None],
+                        *, extra: tuple[str, ...] = ()) -> SideEvaluation:
+        """Build each side in ``side_order`` and collect what the decision
+        log needs: each built signal's (or refusal's) ``side_eval`` and
+        ``extra`` fields, the near-miss blockers, and every blocker of a
+        refused side -- this side's own, then the shared vetoes. A refusal's
+        details were written before the shared entry stage ran, so its
+        reasons, not its details, are the full list."""
+        out = SideEvaluation(extra={key: {} for key in extra})
+        for side in side_order:
+            side_key = str(side.value).lower()
+            signal = build(side)
+            if signal is not None:
+                out.signals.append(signal)
+                meta = signal.metadata if isinstance(signal.metadata, dict) else {}
+                out.side_eval[side_key] = meta.get("side_eval")
+                for key in extra:
+                    out.extra[key][side_key] = meta.get(key)
+                continue
+            failure = self._consume_build_failure_payload(c.symbol, self._failure_style_name(side))
+            if failure is None:
+                reasons = [f"{side_key}_setup_not_ready"]
+            else:
+                details = failure.get("details") if isinstance(failure.get("details"), dict) else {}
+                out.side_eval[side_key] = details.get("side_eval")
+                for key in extra:
+                    out.extra[key][side_key] = details.get(key)
+                for gate, value in details.get("near_miss_blockers", {}).items():
+                    out.near_miss_blockers[f"{side_key}.{gate}"] = value
+                reasons = failure.get("reasons") or [failure.get("primary_reason") or f"{side_key}_setup_not_ready"]
+            for token in side_prefixed_reasons(side, reasons):
+                if token not in out.fail_reasons:
+                    out.fail_reasons.append(token)
+        return out
+
+    def _pick_side_signal(self, signals: list[Signal], c: Candidate) -> Signal:
+        """The side entered when both sides built: the gatekeeper's rank key
+        (the manifest's signal_priority), then the screener's preferred
+        side."""
+        def _key(signal: Signal) -> tuple[float, ...]:
+            preferred = 1.0 if c.directional_bias is not None and signal.side == c.directional_bias else 0.0
+            return self.entry_policy.rank_key(signal, c) + (preferred,)
+        return max(signals, key=_key)
+
     def entry_signals(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], client=None, data=None) -> list[Signal]:
         self._reset_entry_decisions()
         out: list[Signal] = []
@@ -1225,8 +1359,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         macro_ctx = self._macro_signal(bars, data=data)
         tradable_symbols = set(self._tradable_symbols())
         for c in candidates:
-            if tradable_symbols and c.symbol not in tradable_symbols:
-                self._record_entry_decision(c.symbol, "skipped", ["symbol_not_tradable"])
+            if self._skip_untradable(c.symbol, tradable_symbols):
                 continue
             reasons: list[str] = []
             frame = bars.get(c.symbol)
@@ -1240,7 +1373,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             if ltf is None or len(ltf) < min_ltf_bars:
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_ltf_bars", 0 if ltf is None else len(ltf), min_ltf_bars)])
                 continue
-            close = _safe_float(frame.iloc[-1]["close"])
+            close = safe_float(frame.iloc[-1]["close"], 0.0)
             htf = self._htf_context(c.symbol, data, current_price=close, **htf_request)
             symbol_peer_ctx = self._peer_signal(c.symbol, bars, data)
             short_side_enabled = bool(allow_short)
@@ -1272,7 +1405,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                     # lists all of them (2026-09-24), its own gates one.
                     for side in (Side.LONG, Side.SHORT):
                         failure = self._consume_build_failure_payload(c.symbol, self._failure_style_name(side))
-                        for token in _side_prefixed_reasons(side, failure["reasons"] if failure else []):
+                        for token in side_prefixed_reasons(side, failure["reasons"] if failure else []):
                             if token and token not in reasons:
                                 reasons.append(token)
                     if not reasons:

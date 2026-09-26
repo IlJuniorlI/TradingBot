@@ -1,17 +1,11 @@
 # SPDX-License-Identifier: MIT
-from ..shared import (
-    Candidate,
-    Position,
-    Side,
-    Signal,
-    _bar_close_position,
-    insufficient_bars_reason,
-    _reason_with_values,
-    _safe_float,
-    _same_day_mask,
-    pd,
-)
+import pandas as pd
+
+from ...models import Candidate, Position, Side, Signal
+from ...numeric import safe_float
+from ...reasons import insufficient_bars_reason, reason_with_values
 from ... import sessions
+from ...bars import bar_close_position, same_day_mask
 from ..shared_entry import EntryContexts, EntryProposal
 from ..strategy_base import BaseStrategy
 
@@ -44,17 +38,17 @@ class ClosingReversalStrategy(BaseStrategy):
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), 20)])
                 continue
             last = frame.iloc[-1]
-            last_close = _safe_float(last["close"])
-            day_strength = _safe_float(c.metadata.get("change_from_open"), 0.0)
+            last_close = safe_float(last["close"], 0.0)
+            day_strength = safe_float(c.metadata.get("change_from_open"), 0.0)
             if day_strength < min_day_strength:
-                reasons.append(_reason_with_values("weak_day_strength", current=day_strength, required=min_day_strength, op=">=", digits=4))
-            session_frame = frame[_same_day_mask(frame, sessions.now_et().date())]
+                reasons.append(reason_with_values("weak_day_strength", current=day_strength, required=min_day_strength, op=">=", digits=4))
+            session_frame = frame[same_day_mask(frame, sessions.now_et().date())]
             session_high = float(session_frame["high"].max()) if not session_frame.empty else 0.0
             if session_high <= 0:
                 reasons.append("invalid_session_high")
             pullback_pct = (session_high - last_close) / session_high if session_high > 0 else 0.0
             if session_high > 0 and pullback_pct > max_pullback_from_high:
-                reasons.append(_reason_with_values("pullback_too_deep", current=pullback_pct, required=max_pullback_from_high, op="<=", digits=4))
+                reasons.append(reason_with_values("pullback_too_deep", current=pullback_pct, required=max_pullback_from_high, op="<=", digits=4))
             last3 = frame.tail(3)
             momentum_up = bool(last3["close"].iloc[-1] > last3["close"].iloc[0])
             candle_signal = self._directional_candle_signal(frame, Side.LONG)
@@ -67,22 +61,22 @@ class ClosingReversalStrategy(BaseStrategy):
             ctx = self._chart_context(frame)
             chart_ok = bool(ctx.matched_bullish_reversal or ctx.matched_bullish_continuation) or (candle_confirmed and ctx.bias_score >= 0.0)
             if not momentum_up:
-                reasons.append(_reason_with_values("no_short_term_bounce", current=_safe_float(last3["close"].iloc[-1]), required=_safe_float(last3["close"].iloc[0]), op=">", digits=4))
+                reasons.append(reason_with_values("no_short_term_bounce", current=safe_float(last3["close"].iloc[-1], 0.0), required=safe_float(last3["close"].iloc[0], 0.0), op=">", digits=4))
             if not (candle_confirmed or ctx.matched_bullish_reversal):
                 reasons.append("no_reversal_pattern")
             if not chart_ok:
                 reasons.append("chart_pattern_not_supportive")
-            ema9 = _safe_float(last["ema9"], last_close)
-            last_ret5 = _safe_float(last.get("ret5"), 0.0)
-            close_pos = _bar_close_position(frame)
+            ema9 = safe_float(last["ema9"], last_close)
+            last_ret5 = safe_float(last.get("ret5"), 0.0)
+            close_pos = bar_close_position(frame)
             min_reversal_close_position = float(self.params.get("min_reversal_close_position", 0.61))
             require_positive_ret5 = bool(self.params.get("require_positive_reversal_ret5", True))
             if last_close <= ema9:
-                reasons.append(_reason_with_values("below_ema9", current=last_close, required=ema9, op=">", digits=4))
+                reasons.append(reason_with_values("below_ema9", current=last_close, required=ema9, op=">", digits=4))
             if close_pos < min_reversal_close_position:
-                reasons.append(_reason_with_values("weak_reversal_close", current=close_pos, required=min_reversal_close_position, op=">=", digits=4))
+                reasons.append(reason_with_values("weak_reversal_close", current=close_pos, required=min_reversal_close_position, op=">=", digits=4))
             if require_positive_ret5 and last_ret5 <= 0.0:
-                reasons.append(_reason_with_values("reversal_momentum_not_positive", current=last_ret5, required=0.0, op=">", digits=4))
+                reasons.append(reason_with_values("reversal_momentum_not_positive", current=last_ret5, required=0.0, op=">", digits=4))
             default_target = last_close * (1 + min(0.02, self.config.risk.default_target_pct))
             proposal = EntryProposal(
                 candidate=c,

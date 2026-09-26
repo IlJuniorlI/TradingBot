@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: MIT
-from ..shared import (
-    Candidate,
-)
+from ...models import Candidate
 from ..screener_base import BaseStrategyScreener
 
 class ZeroDteEtfOptionsScreener(BaseStrategyScreener):
@@ -19,7 +17,7 @@ class ZeroDteEtfOptionsScreener(BaseStrategyScreener):
         Downstream decisioning (``_regime_confirm`` in strategy.py) uses
         ``bars[underlying]`` (Schwab data feed) for ALL metrics:
           * close / volume / change_from_open computed from the frame
-            (change_from_open = u_day_ret from _session_open_price)
+            (change_from_open = u_day_ret from bars.session_open_price)
           * relative_volume_10d_calc replaced by ``live_activity_score``
           * confirm_index / volatility_symbol read from config
         So the candidate object only needs to be PRESENT for the engine

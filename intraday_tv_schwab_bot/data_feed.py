@@ -4,7 +4,6 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import re
 import math
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,13 +15,14 @@ from typing import Any, Iterable, Mapping, NamedTuple
 import pandas as pd
 from schwabdev import Client, Stream
 
-from .config import BotConfig, flip_confirmation_bars, htf_structure_event_lookback
+from .config import BotConfig
 from .support_resistance import SupportResistanceContext, build_support_resistance_context
 from .htf_levels import HTFContext, FairValueGapContext, build_fair_value_gap_context, build_htf_context, empty_fvg_context
 from .order_blocks import OrderBlockContext, build_order_block_context, empty_order_block_context
 from .numeric import first_float, safe_float
+from .symbols import QUOTE_SYMBOL_ALIASES, STREAMABLE_EQUITY_RE, is_streamable_equity, is_support_resistance_symbol
 from .schwab_api import call_schwab_client, call_schwab_json, response_ok
-from .bars import ensure_ohlcv_frame, equity_stream_window_bars, floor_minute, resample_bars, session_bucket_ends, session_bucket_floor
+from .bars import completed_bucket_mask, ensure_ohlcv_frame, equity_stream_window_bars, floor_minute, resample_bars, session_bucket_floor
 from .indicators import ensure_standard_indicator_frame, indicator_session_open, resolve_ema_spans
 from . import sessions
 from .sessions import (
@@ -35,36 +35,6 @@ from .sessions import (
 )
 
 LOG = logging.getLogger(__name__)
-STREAMABLE_EQUITY_RE = re.compile(r"^[A-Z]{1,6}$")
-NON_STREAMABLE = {"VIX", "$VIX", "$VIX.X", "DXY", "$DXY", "$DXY.X", "NYICDX", "$NYICDX", "$NYICDX.X", "SPX", "$SPX", "$SPX.X", "$COMPX", "COMPX", "NDX", "$NDX", "RUT", "$RUT", "$DJI", "DJI"}
-SR_SYMBOL_ALIASES = {
-    "VIX": "VIX",
-    "$VIX": "VIX",
-    "$VIX.X": "VIX",
-    "DXY": "NYICDX",
-    "$DXY": "NYICDX",
-    "$DXY.X": "NYICDX",
-    "NYICDX": "NYICDX",
-    "$NYICDX": "NYICDX",
-    "$NYICDX.X": "NYICDX",
-}
-MARKET_INTERNAL_SYMBOLS = {
-    "TICK", "$TICK", "$TICK.X", "TICKQ", "$TICKQ", "$TICKQ.X",
-    "ADD", "$ADD", "$ADD.X", "ADDQ", "$ADDQ", "$ADDQ.X",
-    "VOLD", "$VOLD", "$VOLD.X", "VOLDQ", "$VOLDQ", "$VOLDQ.X",
-    "TRIN", "$TRIN", "$TRIN.X", "TRINQ", "$TRINQ", "$TRINQ.X",
-}
-QUOTE_SYMBOL_ALIASES = {
-    "VIX": ["$VIX", "$VIX.X", "VIX"],
-    "$VIX": ["$VIX", "$VIX.X", "VIX"],
-    "$VIX.X": ["$VIX.X", "$VIX", "VIX"],
-    "DXY": ["$NYICDX", "NYICDX", "$DXY", "$DXY.X", "DXY"],
-    "$DXY": ["$NYICDX", "NYICDX", "$DXY", "$DXY.X", "DXY"],
-    "$DXY.X": ["$NYICDX", "NYICDX", "$DXY.X", "$DXY", "DXY"],
-    "NYICDX": ["$NYICDX", "NYICDX", "$DXY", "$DXY.X", "DXY"],
-    "$NYICDX": ["$NYICDX", "NYICDX", "$DXY", "$DXY.X", "DXY"],
-    "$NYICDX.X": ["$NYICDX.X", "$NYICDX", "NYICDX", "$DXY", "$DXY.X", "DXY"],
-}
 
 
 @dataclass(slots=True)
@@ -172,15 +142,6 @@ class MarketDataStore:
         self._resolved_quote_alias: dict[str, str] = {}
 
     @staticmethod
-    def is_streamable_equity(symbol: str) -> bool:
-        sym = str(symbol).upper().strip()
-        if sym in NON_STREAMABLE:
-            return False
-        if sym.startswith("$") or " " in sym or "/" in sym:
-            return False
-        return bool(STREAMABLE_EQUITY_RE.match(sym))
-
-    @staticmethod
     def is_regular_session(now: datetime | None = None) -> bool:
         return is_regular_equity_session(now)
 
@@ -234,39 +195,12 @@ class MarketDataStore:
         return (sessions.now_et() - last).total_seconds() >= ttl
 
     @staticmethod
-    def normalize_context_symbol(symbol: str) -> str:
-        sym = str(symbol).upper().strip()
-        if not sym:
-            return ""
-        return SR_SYMBOL_ALIASES.get(sym, sym)
-
-    @classmethod
-    def is_market_internal_symbol(cls, symbol: str) -> bool:
-        sym = cls.normalize_context_symbol(symbol)
-        raw = str(symbol).upper().strip()
-        return sym in MARKET_INTERNAL_SYMBOLS or raw in MARKET_INTERNAL_SYMBOLS
-
-    @classmethod
-    def is_support_resistance_symbol(cls, symbol: str) -> bool:
-        raw = str(symbol).upper().strip()
-        if not raw:
-            return False
-        if " " in raw or "/" in raw:
-            return False
-        if cls.is_market_internal_symbol(raw):
-            return False
-        normalized = cls.normalize_context_symbol(raw)
-        if raw.startswith("$") and normalized == raw:
-            return False
-        return True
-
-    @staticmethod
     def _symbol_key(symbol: str) -> str:
         return str(symbol).upper().strip()
 
     def should_refresh_support_resistance(self, symbol: str, *, timeframe_minutes: int | None = None) -> bool:
         cfg = getattr(self.config, "support_resistance", None)
-        if cfg is None or not bool(cfg.enabled) or not self.is_support_resistance_symbol(symbol):
+        if cfg is None or not bool(cfg.enabled) or not is_support_resistance_symbol(symbol):
             return False
         tf = int(timeframe_minutes or getattr(cfg, "timeframe_minutes", 15) or 15)
         return self.should_refresh_htf_context(symbol, tf)
@@ -509,7 +443,7 @@ class MarketDataStore:
         """
         if frame.empty:
             return frame
-        return frame[session_bucket_ends(frame.index, int(bar_minutes)) <= pd.Timestamp(requested_at)]
+        return frame[completed_bucket_mask(frame.index, int(bar_minutes), requested_at)]
 
     @staticmethod
     def _htf_incremental_start(
@@ -791,7 +725,7 @@ class MarketDataStore:
         with self._lock:
             if self._cycle_active and cache_key in self._cycle_htf_context_cache:
                 return self._cycle_htf_context_cache[cache_key]
-        if allow_refresh and self.is_support_resistance_symbol(symbol) and self.should_refresh_htf_context(symbol, tf):
+        if allow_refresh and is_support_resistance_symbol(symbol) and self.should_refresh_htf_context(symbol, tf):
             try:
                 self._refresh_htf_frame(symbol, tf, int(lookback_days))
             except Exception as exc:
@@ -1044,7 +978,7 @@ class MarketDataStore:
         """Return whether a symbol has a fresh live 1m stream bar suitable for entries."""
         key = self._symbol_key(symbol)
         reference = now if now is not None else sessions.now_et()
-        requires_live_entry_bar = self.is_streamable_equity(key) and self.is_equity_stream_session(reference)
+        requires_live_entry_bar = is_streamable_equity(key) and self.is_equity_stream_session(reference)
         stale_after = float(self._stream_stale_after_seconds())
         with self._lock:
             stream_subscribed = key in self.stream_symbols
@@ -1090,7 +1024,7 @@ class MarketDataStore:
 
     def should_backfill_stream_symbol(self, symbol: str) -> bool:
         """Return True when a streamable symbol needs a history repair/backfill."""
-        if not self.is_streamable_equity(symbol):
+        if not is_streamable_equity(symbol):
             return self.should_refresh_history(symbol)
         cache_key = self._symbol_key(symbol)
         if cache_key not in self.stream_symbols:
@@ -1273,7 +1207,7 @@ class MarketDataStore:
         allow_refresh: bool = True,
     ) -> SupportResistanceContext | None:
         cfg = getattr(self.config, "support_resistance", None)
-        if cfg is None or not bool(cfg.enabled) or not self.is_support_resistance_symbol(symbol):
+        if cfg is None or not bool(cfg.enabled) or not is_support_resistance_symbol(symbol):
             return None
         tf = int(timeframe_minutes or getattr(cfg, "timeframe_minutes", 15) or 15)
         frame = self.get_htf_frame(
@@ -1324,7 +1258,7 @@ class MarketDataStore:
             breakout_buffer_pct=float(cfg.breakout_buffer_pct),
             stop_buffer_atr_mult=float(cfg.stop_buffer_atr_mult),
             structure_eq_atr_mult=float(getattr(cfg, "structure_eq_atr_mult", 0.25)),
-            structure_event_max_age_bars=htf_structure_event_lookback(cfg),
+            structure_event_max_age_bars=cfg.htf_structure_event_lookback(),
             structure_min_range_atr_mult=float(getattr(cfg, "structure_min_range_atr_mult", 1.5) or 0.0),
             use_prior_day_high_low=resolved_use_prior_day_high_low,
             use_prior_week_high_low=resolved_use_prior_week_high_low,
@@ -1393,7 +1327,7 @@ class MarketDataStore:
                 if self._cycle_active:
                     self._cycle_sr_cache[cycle_key] = cached
             return cached
-        flip_1m, flip_5m = flip_confirmation_bars(cfg) if normalized_mode == "trading" else (0, 0)
+        flip_1m, flip_5m = cfg.flip_confirmation_bars() if normalized_mode == "trading" else (0, 0)
         ctx = build_support_resistance_context(
             frame,
             current_price=current_price,
@@ -1410,7 +1344,7 @@ class MarketDataStore:
             breakout_buffer_pct=float(cfg.breakout_buffer_pct),
             stop_buffer_atr_mult=float(cfg.stop_buffer_atr_mult),
             structure_eq_atr_mult=float(getattr(cfg, "structure_eq_atr_mult", 0.25)),
-            structure_event_max_age_bars=htf_structure_event_lookback(cfg),
+            structure_event_max_age_bars=cfg.htf_structure_event_lookback(),
             structure_min_range_atr_mult=float(getattr(cfg, "structure_min_range_atr_mult", 1.5) or 0.0),
             use_prior_day_high_low=resolved_use_prior_day_high_low,
             use_prior_week_high_low=resolved_use_prior_week_high_low,
@@ -1894,10 +1828,10 @@ class MarketDataStore:
         payload = payload or {}
         quote = payload.get("quote") if isinstance(payload.get("quote"), dict) else payload
         reference = payload.get("reference") if isinstance(payload.get("reference"), dict) else {}
-        bid = first_float(quote, "bidPrice", "bid", "bidPriceInDouble", default=0.0)
-        ask = first_float(quote, "askPrice", "ask", "askPriceInDouble", default=0.0)
-        mark = first_float(quote, "mark", "markPrice", "lastPrice", "closePrice", default=0.0)
-        last = first_float(quote, "lastPrice", "last", default=mark)
+        bid = first_float(quote, "bidPrice", "bid", "bidPriceInDouble", default=0.0, finite=True)
+        ask = first_float(quote, "askPrice", "ask", "askPriceInDouble", default=0.0, finite=True)
+        mark = first_float(quote, "mark", "markPrice", "lastPrice", "closePrice", default=0.0, finite=True)
+        last = first_float(quote, "lastPrice", "last", default=mark, finite=True)
         mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else (mark or last)
         total_volume = first_float(
             quote,
@@ -1909,6 +1843,7 @@ class MarketDataStore:
             "totalVolumeTraded",
             "accumulatedVolume",
             default=0.0,
+            finite=True,
         )
         return {
             "symbol": symbol,
@@ -1917,10 +1852,10 @@ class MarketDataStore:
             "mid": mid,
             "mark": mark,
             "last": last,
-            "close": first_float(quote, "closePrice"),
-            "open": first_float(quote, "openPrice"),
-            "net_change": first_float(quote, "netChange"),
-            "percent_change": first_float(quote, "netPercentChangeInDouble", "percentChange"),
+            "close": first_float(quote, "closePrice", finite=True),
+            "open": first_float(quote, "openPrice", finite=True),
+            "net_change": first_float(quote, "netChange", finite=True),
+            "percent_change": first_float(quote, "netPercentChangeInDouble", "percentChange", finite=True),
             "total_volume": total_volume,
             "description": payload.get("description") or reference.get("description"),
             "raw": payload,
@@ -1941,7 +1876,7 @@ class MarketDataStore:
         # Lock only wraps state mutations — network I/O (stream.start/send)
         # is kept outside so the schwabdev callback thread (which reads this
         # same state inside self._lock) isn't blocked waiting for Schwab.
-        symbols = sorted({self._symbol_key(s) for s in set(symbols) if self.is_streamable_equity(s)})
+        symbols = sorted({self._symbol_key(s) for s in set(symbols) if is_streamable_equity(s)})
         if not symbols:
             return
         if not self.stream.active:

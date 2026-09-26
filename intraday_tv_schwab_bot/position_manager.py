@@ -32,12 +32,12 @@ import copy
 import logging
 import time
 from datetime import datetime
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import pandas as pd
 
 from .audit_logger import AuditLogger
-from .config import BotConfig, flip_confirmation_bars
+from .config import BotConfig
 from .dashboard_cache import DashboardCache
 from .data_feed import MarketDataStore
 from .execution import BracketCancel, SchwabExecutor
@@ -60,13 +60,15 @@ from .position_metrics import (
 )
 from .risk import RiskManager
 from ._sr_ladder import _select_next_distinct_level, _sr_effective_side_tolerance
-from ._strategies.registry import is_option_strategy
+from ._strategies.catalogue import is_option_strategy
 from ._strategies.shared_exit import SharedExitPolicy, partial_exit_qty
-from ._strategies.strategy_base import BaseStrategy
 from .broker_positions import active_broker_bracket, order_result_needs_broker_recheck, working_exit_outstanding_qty
 from .support_resistance import zone_flip_confirmed
 from .log_setup import TRADEFLOW_LEVEL
 from . import sessions
+
+if TYPE_CHECKING:
+    from ._strategies.strategy_base import BaseStrategy
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -449,7 +451,7 @@ class PositionManager:
         entry_price = safe_float(position.entry_price, None)
         stop_price = safe_float(position.stop_price, None)
         target_price = safe_float(position.target_price, None)
-        initial_stop_price = safe_float(meta.get('initial_stop_price'), stop_price)
+        initial_stop_price = safe_float(meta.get('initial_stop_price'), stop_price, finite=True)
         initial_target_price = safe_float(meta.get('initial_target_price'), target_price)
         current_price = safe_float(mark_price, None)
         current_unrealized = position_unrealized_at_price(position, current_price)
@@ -798,7 +800,7 @@ class PositionManager:
         level_buffer = float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0)
         stop_buffer = max(level_buffer, zone_width * 0.25, close * 0.0005)
         eps = max(level_buffer * 0.15, close * 0.0001, 1e-6)
-        confirm_1m, confirm_5m = flip_confirmation_bars(self.config.support_resistance)
+        confirm_1m, confirm_5m = self.config.support_resistance.flip_confirmation_bars()
         current_target = safe_float(position.target_price, None)
         if position.side == Side.LONG:
             rung_confirmed = zone_flip_confirmed("resistance", lower, upper, flip_frame=frame, confirm_1m_bars=confirm_1m, confirm_5m_bars=confirm_5m, fallback_bar=None, eps=eps)

@@ -23,7 +23,7 @@ squeezer is always extended), hybrid scalp+runner management — lives in
 ``configs/config.small_cap_squeeze.yaml``. No engine logic is overridden here;
 this subclass exists only to bind a distinct ``strategy_name`` (and therefore
 its own manifest + params block) to the shared top_tier engine. The plugin
-registry requires the class to be defined in this module, so it cannot simply
+factory requires the class to be defined in this module, so it cannot simply
 point at ``TopTierAdaptiveStrategy`` directly.
 """
 from __future__ import annotations

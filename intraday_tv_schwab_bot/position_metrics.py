@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from .models import Position, Side
+from .reasons import exit_reason_code
 
 
 def position_unrealized_at_price(position: Position, price: float | None) -> float | None:
@@ -50,8 +51,8 @@ def exit_reason_details(reason: str) -> dict[str, Any]:
     ``exit_reason_family`` (one of: risk, schedule, technical, strategy),
     and ``exit_trigger_level`` (float or None)."""
     raw = str(reason or "").strip()
-    code, _, level_text = raw.partition(":")
-    code = code or raw or None
+    code = exit_reason_code(raw)
+    level_text = raw.partition(":")[2]
     family = "strategy"
     if code in {"stop", "target"}:
         family = "risk"

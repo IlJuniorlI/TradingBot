@@ -11,7 +11,7 @@ from .broker_positions import active_broker_bracket
 from .config import BotConfig
 from .models import ASSET_TYPE_EQUITY, OPTION_ASSET_TYPES, Position, Side, Signal
 from .numeric import first_float, safe_float
-from ._strategies.registry import is_option_strategy
+from ._strategies.catalogue import is_option_strategy
 from .position_metrics import append_management_adjustment
 from . import sessions
 
@@ -896,10 +896,8 @@ class RiskManager:
             meta.setdefault("management_adjustments", [])
         position.update_extremes(last_price)
 
-        initial_stop = meta.get("initial_stop_price", position.stop_price)
-        try:
-            initial_stop = float(initial_stop)
-        except Exception:
+        initial_stop = safe_float(meta.get("initial_stop_price"), finite=True)
+        if initial_stop is None:
             initial_stop = float(position.stop_price)
         initial_risk = max(0.0, abs(float(position.entry_price) - initial_stop))
         trail_activation_mult = 0.5
@@ -1071,23 +1069,24 @@ class RiskManager:
                 runner_target_rr = _meta_float("adaptive_runner_target_rr", None)
                 if runner_enabled and runner_trigger_rr is not None and runner_target_rr is not None and max_favorable_r >= runner_trigger_rr and not bool(meta.get("adaptive_target_extended", False)):
                     candidate_target = float(position.entry_price) + (float(runner_target_rr) * initial_risk)
-                    current_target = _meta_float("initial_target_price", None)
-                    existing_target = float(position.target_price) if position.target_price is not None else None
-                    if existing_target is None or candidate_target > float(existing_target) + 1e-6:
-                        prior_target = float(existing_target) if existing_target is not None else None
-                        position.target_price = float(candidate_target)
-                        meta["adaptive_target_extended"] = True
-                        meta["adaptive_target_price"] = float(candidate_target)
-                        if isinstance(meta, dict):
-                            append_management_adjustment(meta,{"manager": "adaptive", "kind": "target", "reason": "runner_extension", "from": prior_target, "to": float(candidate_target)})
-                    if current_target is not None:
-                        meta["adaptive_target_extension_rr"] = float((candidate_target - current_target) / initial_risk)
-                    runner_trail_pct = _meta_float("adaptive_runner_trail_pct", None)
-                    if runner_trail_pct is not None and runner_trail_pct > 0:
-                        prior_trail = float(position.trail_pct) if position.trail_pct else None
-                        position.trail_pct = float(runner_trail_pct)
-                        if isinstance(meta, dict) and prior_trail != float(runner_trail_pct):
-                            append_management_adjustment(meta,{"manager": "adaptive", "kind": "trail_pct", "reason": "runner_extension", "from": prior_trail, "to": float(runner_trail_pct)})
+                    if math.isfinite(candidate_target):
+                        current_target = _meta_float("initial_target_price", None)
+                        existing_target = float(position.target_price) if position.target_price is not None else None
+                        if existing_target is None or candidate_target > float(existing_target) + 1e-6:
+                            prior_target = float(existing_target) if existing_target is not None else None
+                            position.target_price = float(candidate_target)
+                            meta["adaptive_target_extended"] = True
+                            meta["adaptive_target_price"] = float(candidate_target)
+                            if isinstance(meta, dict):
+                                append_management_adjustment(meta,{"manager": "adaptive", "kind": "target", "reason": "runner_extension", "from": prior_target, "to": float(candidate_target)})
+                        if current_target is not None:
+                            meta["adaptive_target_extension_rr"] = float((candidate_target - current_target) / initial_risk)
+                        runner_trail_pct = _meta_float("adaptive_runner_trail_pct", None)
+                        if runner_trail_pct is not None and runner_trail_pct > 0:
+                            prior_trail = float(position.trail_pct) if position.trail_pct else None
+                            position.trail_pct = float(runner_trail_pct)
+                            if isinstance(meta, dict) and prior_trail != float(runner_trail_pct):
+                                append_management_adjustment(meta,{"manager": "adaptive", "kind": "trail_pct", "reason": "runner_extension", "from": prior_trail, "to": float(runner_trail_pct)})
             if trailing_enabled and position.trail_pct and position.highest_price:
                 activation_price = float(position.entry_price)
                 if initial_risk > 0:
@@ -1148,23 +1147,24 @@ class RiskManager:
                 runner_target_rr = _meta_float("adaptive_runner_target_rr", None)
                 if runner_enabled and runner_trigger_rr is not None and runner_target_rr is not None and max_favorable_r >= runner_trigger_rr and not bool(meta.get("adaptive_target_extended", False)):
                     candidate_target = float(position.entry_price) - (float(runner_target_rr) * initial_risk)
-                    current_target = _meta_float("initial_target_price", None)
-                    existing_target = float(position.target_price) if position.target_price is not None else None
-                    if existing_target is None or candidate_target < float(existing_target) - 1e-6:
-                        prior_target = float(existing_target) if existing_target is not None else None
-                        position.target_price = float(candidate_target)
-                        meta["adaptive_target_extended"] = True
-                        meta["adaptive_target_price"] = float(candidate_target)
-                        if isinstance(meta, dict):
-                            append_management_adjustment(meta,{"manager": "adaptive", "kind": "target", "reason": "runner_extension", "from": prior_target, "to": float(candidate_target)})
-                    if current_target is not None:
-                        meta["adaptive_target_extension_rr"] = float((current_target - candidate_target) / initial_risk)
-                    runner_trail_pct = _meta_float("adaptive_runner_trail_pct", None)
-                    if runner_trail_pct is not None and runner_trail_pct > 0:
-                        prior_trail = float(position.trail_pct) if position.trail_pct else None
-                        position.trail_pct = float(runner_trail_pct)
-                        if isinstance(meta, dict) and prior_trail != float(runner_trail_pct):
-                            append_management_adjustment(meta,{"manager": "adaptive", "kind": "trail_pct", "reason": "runner_extension", "from": prior_trail, "to": float(runner_trail_pct)})
+                    if math.isfinite(candidate_target):
+                        current_target = _meta_float("initial_target_price", None)
+                        existing_target = float(position.target_price) if position.target_price is not None else None
+                        if existing_target is None or candidate_target < float(existing_target) - 1e-6:
+                            prior_target = float(existing_target) if existing_target is not None else None
+                            position.target_price = float(candidate_target)
+                            meta["adaptive_target_extended"] = True
+                            meta["adaptive_target_price"] = float(candidate_target)
+                            if isinstance(meta, dict):
+                                append_management_adjustment(meta,{"manager": "adaptive", "kind": "target", "reason": "runner_extension", "from": prior_target, "to": float(candidate_target)})
+                        if current_target is not None:
+                            meta["adaptive_target_extension_rr"] = float((current_target - candidate_target) / initial_risk)
+                        runner_trail_pct = _meta_float("adaptive_runner_trail_pct", None)
+                        if runner_trail_pct is not None and runner_trail_pct > 0:
+                            prior_trail = float(position.trail_pct) if position.trail_pct else None
+                            position.trail_pct = float(runner_trail_pct)
+                            if isinstance(meta, dict) and prior_trail != float(runner_trail_pct):
+                                append_management_adjustment(meta,{"manager": "adaptive", "kind": "trail_pct", "reason": "runner_extension", "from": prior_trail, "to": float(runner_trail_pct)})
             if trailing_enabled and position.trail_pct and position.lowest_price:
                 activation_price = float(position.entry_price)
                 if initial_risk > 0:

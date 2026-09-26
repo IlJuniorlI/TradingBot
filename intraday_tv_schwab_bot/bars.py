@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: MIT
 """Bar frames: OHLCV normalization, the session bucket grid and resampling,
-the equity stream-window slice, and the live-price read."""
+bucket completion, the equity stream-window slice, bar geometry, the
+same-day and session-open slices, and the live-price read."""
 import logging
 import math
-from datetime import datetime
+from datetime import date, datetime, time
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 
+from .numeric import safe_float
 from .sessions import (
     EQUITY_PREMARKET_START,
     EQUITY_RTH_OPEN,
@@ -212,6 +216,47 @@ def session_bucket_ends(index: pd.DatetimeIndex | pd.Index, minutes: int) -> pd.
     return idx + pd.to_timedelta(np.minimum(seg_end - wall, length * _MINUTE_NS), unit="ns")
 
 
+def completed_bucket_mask(index: pd.DatetimeIndex | pd.Index, minutes: int, now: datetime | pd.Timestamp) -> npt.NDArray[np.bool_]:
+    """Per label of a ``minutes`` frame: has its bucket ended by ``now``
+    (``session_bucket_ends(index, minutes) <= now``)? A tz-naive index is ET
+    wall time (``session_bucket_bounds``), so an aware ``now`` is read on the
+    ET wall clock; an aware index compares instants."""
+    ends = session_bucket_ends(index, minutes)
+    moment = pd.Timestamp(now)
+    if ends.tz is None and moment.tzinfo is not None:
+        moment = moment.tz_convert(EXCHANGE_TZ).tz_localize(None)
+    return np.asarray(ends <= moment)
+
+
+def last_bucket_forming(index: pd.DatetimeIndex | pd.Index, minutes: int, now: datetime | pd.Timestamp) -> bool:
+    """Is the last bar of a ``minutes`` frame labelled at ``index`` a bucket
+    still trading at ``now``? A resample keeps the partial last bucket, and
+    so does a native frame fetched mid-bucket; a frame of completed bars
+    never reads as forming. False on an empty index."""
+    return len(index) > 0 and not bool(completed_bucket_mask(index[-1:], minutes, now)[0])
+
+
+def bar_closed_after(label: Any, moment: Any, bar_minutes: int) -> bool:
+    """Did the ``bar_minutes`` bar labelled ``label`` CLOSE after ``moment``?
+
+    Bars are labelled at their START (``resample_bars``) and the
+    frames hold completed bars, so the entry never saw a bar that closed
+    after its fill, even though that bar's label is earlier than the fill.
+    Structure events, pivots and divergence pivots are judged against the
+    entry this way (2026-09-24): compared by label, a CHoCH that crossed on
+    the bar the entry filled in read as pre-entry for as long as price
+    stayed through the level -- blind to the first post-entry breakdown, the
+    most common reversal. A resampled frame's last bucket can be partial, so
+    an event on the bucket the entry filled in counts as post-entry even if
+    part of that bucket traded before the fill: the entry never saw its
+    close. None (no event) is never after anything.
+    """
+    if label is None:
+        return False
+    end = session_bucket_ends(pd.DatetimeIndex([pd.Timestamp(label)]), max(1, int(bar_minutes)))[0]
+    return end > pd.Timestamp(moment)
+
+
 def frame_bar_minutes(index: pd.DatetimeIndex | pd.Index) -> int:
     """Bar length, in whole minutes, of a frame labelled at ``index``: its
     smallest positive label step. The smallest, not the typical one: a thin
@@ -271,6 +316,138 @@ def equity_stream_window_bars(frame: pd.DataFrame) -> pd.DataFrame:
     window_open = EQUITY_STREAM_START.hour * 60 + EQUITY_STREAM_START.minute
     window_close = EQUITY_STREAM_END.hour * 60 + EQUITY_STREAM_END.minute
     return frame[(minute_of_day >= window_open) & (minute_of_day < window_close)]
+
+
+# ---------------------------------------------------------------------------
+# Bar geometry: the last bar's shape
+# ---------------------------------------------------------------------------
+
+def bar_close_position(frame: pd.DataFrame | None) -> float:
+    """Close position within the last bar's range, in [0, 1].
+
+    1.0 = close at high, 0.0 = close at low. Returns 0.5 on degenerate
+    or empty frames so caller logic doesn't have to special-case; a
+    missing high / low / close reads 0.0."""
+    if frame is None or frame.empty:
+        return 0.5
+    last = frame.iloc[-1]
+    low = safe_float(last["low"], 0.0)
+    high = safe_float(last["high"], 0.0)
+    if high <= low:
+        return 0.5
+    return (safe_float(last["close"], 0.0) - low) / (high - low)
+
+
+# The window a candle read is judged on for single prints: the span of the
+# patterns single prints build on their own (TRISTAR and GAPSIDESIDEWHITE are
+# three bars, HARAMI / HARAMICROSS two). The entry candle veto abstains and the
+# exit candle_pattern family holds unless every bar in it traded a range.
+CANDLE_PATTERN_WINDOW_BARS = 3
+
+
+def bars_have_range(frame: pd.DataFrame | None, n: int) -> bool:
+    """Did every one of the last ``n`` bars trade a range (high > low)?
+
+    False on an empty frame and on an unreadable high / low. A single print
+    (high == low) is not a candle, whatever TA-Lib names it: thin tape
+    builds doji / white-candle patterns (TRISTAR, GAPSIDESIDEWHITE,
+    HARAMICROSS) out of single prints alone. Both candle readers -- the entry
+    veto and the exit candle_pattern family -- check the last
+    ``CANDLE_PATTERN_WINDOW_BARS`` bars with this."""
+    if frame is None or frame.empty or "high" not in frame.columns or "low" not in frame.columns:
+        return False
+    tail = frame.iloc[-max(1, int(n)):]
+    high = pd.to_numeric(tail["high"], errors="coerce")
+    low = pd.to_numeric(tail["low"], errors="coerce")
+    return bool((high > low).all())
+
+
+def bar_wick_fractions(frame: pd.DataFrame | None) -> tuple[float, float, float, float]:
+    """Decompose the latest bar into (upper_wick_frac, lower_wick_frac,
+    body_frac, bar_range). The first three are fractions of bar range
+    in [0, 1]; the fourth is the absolute bar range (high-low)."""
+    if frame is None or frame.empty:
+        return 0.0, 0.0, 0.0, 0.0
+    last = frame.iloc[-1]
+    high = safe_float(last.get("high"), 0.0)
+    low = safe_float(last.get("low"), 0.0)
+    open_ = safe_float(last.get("open"), low)
+    close = safe_float(last.get("close"), open_)
+    bar_range = max(0.0, high - low)
+    if bar_range <= 0.0:
+        return 0.0, 0.0, 0.0, 0.0
+    upper_wick = max(0.0, high - max(open_, close))
+    lower_wick = max(0.0, min(open_, close) - low)
+    body = abs(close - open_)
+    return upper_wick / bar_range, lower_wick / bar_range, body / bar_range, bar_range
+
+
+# ---------------------------------------------------------------------------
+# Session slices
+# ---------------------------------------------------------------------------
+
+def same_day_mask(frame: pd.DataFrame, day: date) -> pd.Series:
+    """Boolean mask selecting bars whose timestamp falls on ``day``, read on
+    the index's own wall clock (ET for the feed's frames)."""
+    return frame.index.to_series().map(lambda ts: ts.date() == day)
+
+
+def time_gte_mask(frame: pd.DataFrame, t: time) -> pd.Series:
+    """Boolean mask selecting bars at or after time-of-day ``t``."""
+    return frame.index.to_series().map(lambda ts: ts.time() >= t)
+
+
+def rth_open_plus(minutes: int) -> time:
+    """The wall time ``minutes`` after the 09:30 open. Each caller clamps
+    ``minutes`` itself (top_tier's range is at least 1 minute, the ORB
+    strategy's at least 0); a time past midnight raises ValueError."""
+    total = EQUITY_RTH_OPEN.hour * 60 + EQUITY_RTH_OPEN.minute + int(minutes)
+    return time(total // 60, total % 60)
+
+
+def _first_open(rows: pd.DataFrame) -> float | None:
+    if "open" not in rows.columns:
+        return None
+    return safe_float(rows.iloc[0]["open"])
+
+
+def session_open_price(
+    frame: pd.DataFrame | None,
+    day: date,
+    *,
+    regular_session_only: bool = True,
+    session_start: time | None = None,
+    fallback_to_premarket_on_nan: bool = False,
+) -> float | None:
+    """First open price of trading day ``day``. None when the frame has no
+    bar on ``day`` or that open is missing.
+
+    The session-start cutoff is chosen in priority order: ``session_start``
+    when given (``indicators.indicator_session_start()`` anchors it to the
+    07:00 extended-hours open under the extended window, matching the
+    session VWAP reset), else the RTH 09:30 open when
+    ``regular_session_only`` (default), else the first bar of the day. In
+    every case it falls back to the first available same-day bar when no bar
+    sits at/after the cutoff (e.g. the regular session hasn't started).
+
+    ``fallback_to_premarket_on_nan``: when the cutoff bar's open is missing
+    (NaN, None, unparseable), read the day's first bar instead, premarket
+    included."""
+    if frame is None or frame.empty:
+        return None
+    same_day = frame[same_day_mask(frame, day)]
+    if same_day.empty:
+        return None
+    cutoff = session_start if session_start is not None else (EQUITY_RTH_OPEN if regular_session_only else None)
+    rows = same_day
+    if cutoff is not None:
+        windowed = same_day[time_gte_mask(same_day, cutoff)]
+        if not windowed.empty:
+            rows = windowed
+    value = _first_open(rows)
+    if value is None and fallback_to_premarket_on_nan:
+        value = _first_open(same_day)
+    return value
 
 
 def resolve_current_price(

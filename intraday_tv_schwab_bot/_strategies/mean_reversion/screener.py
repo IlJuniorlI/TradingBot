@@ -1,8 +1,5 @@
 # SPDX-License-Identifier: MIT
-from ..shared import (
-    Candidate,
-    Side,
-)
+from ...models import Candidate, Side
 from ..screener_base import BaseStrategyScreener
 
 class MeanReversionScreener(BaseStrategyScreener):

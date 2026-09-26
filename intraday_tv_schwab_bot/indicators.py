@@ -4,6 +4,7 @@ the TA-Lib wrappers, the session stitch and masks, ATR reads, and
 ``add_indicators``."""
 import math
 from collections.abc import Mapping
+from datetime import time
 from typing import Any
 
 import numpy as np
@@ -17,7 +18,9 @@ except Exception:  # pragma: no cover - optional until indicators are computed
 
 from . import sessions
 from .bars import ensure_ohlcv_frame
-from .sessions import session_mask
+from .models import Side
+from .numeric import safe_float
+from .sessions import EQUITY_RTH_OPEN, EQUITY_STREAM_START, session_mask
 
 _USE_RTH_SESSION_INDICATORS = True
 # Which session window the per-session indicator reset (VWAP/EMA/TA-Lib
@@ -45,6 +48,14 @@ def set_session_indicator_window(window: str) -> None:
 
 def get_session_indicator_window() -> str:
     return _SESSION_INDICATOR_WINDOW
+
+
+def indicator_session_start() -> time:
+    """The time of day the indicator session starts: the 09:30 open, or the
+    07:00 equity-stream open under the "extended" window. The session
+    VWAP / EMA reset keys off it, so a reader anchoring "the session" to
+    that reset (the session open, the leg-anchor scan) starts here too."""
+    return EQUITY_STREAM_START if get_session_indicator_window() == "extended" else EQUITY_RTH_OPEN
 
 
 STANDARD_INDICATOR_COLUMNS: tuple[str, ...] = (
@@ -368,6 +379,61 @@ def atr_with_floor(
     HTF atr14 and the order-block thrust ran below the S/R floor.
     """
     return max(latest_atr14(frame) or 0.0, price * floor_pct if price > 0 else 0.0, abs_floor)
+
+
+def last_bar_atr(
+    frame: pd.DataFrame | None,
+    close: float,
+    *,
+    fallback_pct: float = 0.0015,
+    floor_pct: float | None = None,
+    floor_abs: float = 0.01,
+    fallback_atr: float | None = None,
+) -> float:
+    """The ``atr14`` on ``frame``'s last bar: the ATR a strategy sizes its
+    stop clamps, buffers and extension gates with (ST-5, 2026-09-26).
+
+    No reading -- no frame, an empty one, no ``atr14`` column, or a NaN or
+    infinite last value (fewer than 15 bars of warm-up) -- falls back to
+    ``fallback_atr`` when that is a finite positive number (a context's
+    ATR), else to ``max(close * fallback_pct, floor_abs)``. With
+    ``floor_pct``, the result is floored at ``max(close * floor_pct,
+    floor_abs)``; without it a reading is used as read.
+
+    Not ``latest_atr14``: that one is session-aware and skips back past NaN
+    to an older bar; a strategy reads the bar it decides on. Until
+    2026-09-26 ``BaseStrategy._frame_atr14`` (the refinement clamp, the
+    retest anchor, the technical exit buffer, the divergence ladder) read a
+    NaN as ``close * 0.0015`` with no $0.01 floor: under a cent below $6.67,
+    while a missing column there already read as $0.01.
+    """
+    atr = None
+    if frame is not None and not frame.empty and "atr14" in frame.columns:
+        atr = safe_float(frame["atr14"].iloc[-1], finite=True)
+    if atr is None:
+        context_atr = safe_float(fallback_atr, finite=True)
+        atr = context_atr if context_atr is not None and context_atr > 0 else max(close * fallback_pct, floor_abs)
+    if floor_pct is not None:
+        atr = max(atr, max(close * floor_pct, floor_abs))
+    return atr
+
+
+def bar_posture(last: Mapping[str, Any] | pd.Series, reference: float | None = None) -> Side | None:
+    """Which way ``last`` leans: LONG when its close is above ``reference``
+    and EMA9 >= EMA20, SHORT when the close is below it and EMA9 <= EMA20,
+    else None. ``reference`` defaults to the bar's VWAP. A missing VWAP or
+    EMA stands in as the close; a bar with no close has no posture."""
+    close = safe_float(last.get("close"))
+    if close is None:
+        return None
+    level = safe_float(last.get("vwap"), close) if reference is None else float(reference)
+    ema9 = safe_float(last.get("ema9"), close)
+    ema20 = safe_float(last.get("ema20"), close)
+    if close > level and ema9 >= ema20:
+        return Side.LONG
+    if close < level and ema9 <= ema20:
+        return Side.SHORT
+    return None
 
 
 def htf_ema_spans(params: Any) -> tuple[int, int]:

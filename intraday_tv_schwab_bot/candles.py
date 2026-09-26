@@ -739,8 +739,9 @@ def detect_bullish_patterns(frame: pd.DataFrame, allowed_patterns: Iterable[str]
     build average-body and trend state from preceding bars and return 0 for
     anything inside their warmup, so a 3-bar input starves nearly all of
     them: over 600 random tapes the 3-bar slice fired on 88 where the
-    30-bar slice fired on 441. Re-exported from ``_strategies.shared`` for
-    plugin authors, who would otherwise inherit that silent shortfall.
+    30-bar slice fired on 441. Public here for plugin authors (an opt-in
+    extension point with no in-package caller), who would otherwise
+    inherit that silent shortfall.
     """
     allowed = _normalize_allowed_patterns(allowed_patterns, bullish=True)
     if not allowed:

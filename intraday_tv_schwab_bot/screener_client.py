@@ -8,7 +8,8 @@ from typing import Any
 
 import pandas as pd
 
-from ._strategies.registry import build_screener, normalize_strategy_name
+from ._strategies.catalogue import normalize_strategy_name
+from ._strategies.factory import build_screener
 from .config import BotConfig
 from .log_setup import warn_once
 from .models import Candidate

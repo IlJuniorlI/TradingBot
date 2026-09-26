@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from datetime import datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
@@ -37,10 +37,13 @@ from .audit_logger import AuditLogger
 from .config import BotConfig
 from .data_feed import MarketDataStore
 from .models import Position
-from ._strategies import insufficient_bars_reason
-from ._strategies.strategy_base import BaseStrategy
+from .reasons import insufficient_bars_reason
 from .sessions import equity_rth_open_at, is_regular_equity_session, is_weekday_session_day, previous_regular_close
+from .symbols import is_streamable_equity
 from . import sessions
+
+if TYPE_CHECKING:
+    from ._strategies.strategy_base import BaseStrategy
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -138,7 +141,7 @@ class WarmupTracker:
                 should_fetch = age >= 10.0
         if context_refresh_active and not should_fetch:
             if streaming_active:
-                if self.data.is_streamable_equity(symbol) and history_has_rows:
+                if is_streamable_equity(symbol) and history_has_rows:
                     should_fetch = self.data.should_backfill_stream_symbol(symbol)
                 else:
                     should_fetch = self.data.should_refresh_history(symbol)

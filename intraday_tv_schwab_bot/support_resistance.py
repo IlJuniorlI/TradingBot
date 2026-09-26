@@ -86,7 +86,7 @@ class MarketStructureContext:
     # back), None when there is no such cross. They are bar LABELS -- the
     # bar's start, like the frame -- so a consumer comparing one with a
     # wall-clock moment must use the bar's close
-    # (shared_exit.bar_closed_after). The exit side counts pivots and
+    # (bars.bar_closed_after). The exit side counts pivots and
     # judges events against the position's entry time with these. Before, it
     # compared ``pivot_count`` -- a count over a ROLLING window, so it could
     # fall as old pivots scrolled off -- against a count stamped at entry that

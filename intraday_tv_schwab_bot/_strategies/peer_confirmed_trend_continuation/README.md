@@ -18,7 +18,7 @@ That makes it more fluid than the key-level strategy. It is willing to trade con
 
 ### 2. It still uses the same confirmation universe
 
-The configured `tradable` and `peers` lists are used the same way as in the key-level family. The strategy still wants:
+The configured `tradable` and `peers` lists are used the same way as in the key-level family. A candidate outside `tradable` is skipped as `symbol_not_tradable`, as in key_levels and htf_pivots (2026-09-26). The strategy still wants:
 
 - peer agreement
 - directional peer score
@@ -102,7 +102,8 @@ Strategy-specific knobs:
 - Re-expansion trigger detail:
   - `breakout_buffer_pct`, `min_ltf_close_position`, `min_ltf_volume_ratio`
 - Anti-chase / extension controls:
-  - `max_extension_from_vwap_atr`, `max_extension_from_ema9_atr`
+  - `max_extension_from_vwap_atr`, `max_extension_from_ema9_atr`, `extension_penalty_per_atr`, `extension_hard_cap_mult`
+  - past `max_extension_from_*_atr` the score pays `extension_penalty_per_atr` per ATR; past that times `extension_hard_cap_mult` the side is refused as `too_extended_hard_cap_vwap_atr` / `too_extended_hard_cap_ema9_atr` (before 2026-09-26 it reused the base exhaustion filter's `too_extended_from_*_atr`, which `max_entry_*_extension_atr` still drives)
 - Peer and macro confirmation:
   - `min_peer_agreement`, `min_peer_score`
   - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`

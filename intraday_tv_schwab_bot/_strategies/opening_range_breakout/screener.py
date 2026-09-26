@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
-from ..shared import (
-    Candidate,
-    LOG,
-    Side,
-)
+import logging
+
+from ...models import Candidate, Side
 from ..screener_base import BaseStrategyScreener
+from ...sessions import EQUITY_RTH_OPEN
+
+LOG = logging.getLogger(__name__)
+
 
 class ORBScreener(BaseStrategyScreener):
     strategy_name = 'opening_range_breakout'
@@ -15,7 +17,7 @@ class ORBScreener(BaseStrategyScreener):
 
     def cached_candidates(self, now, cached: list[Candidate] | None, last_refresh) -> list[Candidate] | None:
         mode = self.watchlist_mode()
-        if mode != "premarket" or now.time().hour < 9 or (now.time().hour == 9 and now.time().minute < 30):
+        if mode != "premarket" or now.time() < EQUITY_RTH_OPEN:
             return None
         if cached is not None and last_refresh is not None and last_refresh.date() == now.date():
             return cached

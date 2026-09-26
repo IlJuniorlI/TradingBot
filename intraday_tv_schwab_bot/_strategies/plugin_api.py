@@ -1,8 +1,16 @@
 # SPDX-License-Identifier: MIT
+"""The plugin API's vocabulary: the manifest a plugin ships and the closed
+sets its declarations name."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+
+# The shared entry stage's P3 vetoes (shared_entry.SharedEntryPolicy), in
+# evaluation (and reporting) order. A manifest exempts a style from any of
+# them: capabilities.shared_entry.exemptions {style: [gate]}, which the
+# catalogue validates against this closed set.
+VETO_GATES: tuple[str, ...] = ("structure", "sr", "broken_level", "chart", "dual_divergence", "candle")
 
 
 @dataclass(frozen=True, slots=True)

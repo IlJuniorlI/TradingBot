@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .bars import bar_close_position
 from .sessions import session_segment_ids
 
 
@@ -341,17 +342,6 @@ def _line_fit(values: pd.Series) -> tuple[float, float]:
     return float(slope), float(intercept)
 
 
-def _bar_close_position(frame: pd.DataFrame, idx: int = -1) -> float:
-    if frame is None or frame.empty:
-        return 0.5
-    row = frame.iloc[idx]
-    low = float(row.low)
-    high = float(row.high)
-    if high <= low:
-        return 0.5
-    return (float(row.close) - low) / (high - low)
-
-
 def _signed_body_fraction(frame: pd.DataFrame, idx: int = -1) -> float:
     """(close - open) / range: positive for a green bar, negative for red."""
     if frame is None or frame.empty:
@@ -502,7 +492,7 @@ def _bullish_breakout_ready(frame: pd.DataFrame, level: float, tol: float) -> bo
     if frame is None or frame.empty:
         return False
     close = _close(frame)
-    near_high = _bar_close_position(frame) >= 0.58
+    near_high = bar_close_position(frame) >= 0.58
     directional = _recent_move(frame, 3) >= -_pct(frame, 0.002)
     trend_ok = close >= _ema(frame, "ema9") * (1.0 - _pct(frame, 0.003))
     return bool(close >= level - tol * 0.20 and near_high and directional and trend_ok and _has_volume_expansion(frame, ratio=1.08))
@@ -512,7 +502,7 @@ def _bearish_breakdown_ready(frame: pd.DataFrame, level: float, tol: float) -> b
     if frame is None or frame.empty:
         return False
     close = _close(frame)
-    near_low = _bar_close_position(frame) <= 0.42
+    near_low = bar_close_position(frame) <= 0.42
     directional = _recent_move(frame, 3) <= _pct(frame, 0.002)
     trend_ok = close <= _ema(frame, "ema9") * (1.0 + _pct(frame, 0.003))
     return bool(close <= level + tol * 0.20 and near_low and directional and trend_ok and _has_volume_expansion(frame, ratio=1.08))
@@ -522,7 +512,7 @@ def _bullish_reversal_breakout_ready(frame: pd.DataFrame, level: float, tol: flo
     if frame is None or frame.empty:
         return False
     close = _close(frame)
-    close_pos = _bar_close_position(frame)
+    close_pos = bar_close_position(frame)
     directional = _recent_move(frame, 3) >= -_pct(frame, 0.004)
     trend_ok = (close >= _ema(frame, "ema9") * (1.0 - _pct(frame, 0.006))
                 or close >= _ema(frame, "vwap") * (1.0 - _pct(frame, 0.002)))
@@ -540,7 +530,7 @@ def _bearish_reversal_breakdown_ready(frame: pd.DataFrame, level: float, tol: fl
     if frame is None or frame.empty:
         return False
     close = _close(frame)
-    close_pos = _bar_close_position(frame)
+    close_pos = bar_close_position(frame)
     directional = _recent_move(frame, 3) <= _pct(frame, 0.004)
     trend_ok = (close <= _ema(frame, "ema9") * (1.0 + _pct(frame, 0.006))
                 or close <= _ema(frame, "vwap") * (1.0 + _pct(frame, 0.002)))
@@ -633,7 +623,7 @@ def bearish_rising_wedge(frame: pd.DataFrame) -> bool:
     stats = _trend_stats(f)
     if stats is None or len(f) < 12:
         return False
-    weak_close = _close(f) < _ema(f, "ema9") and _bar_close_position(f) <= 0.48
+    weak_close = _close(f) < _ema(f, "ema9") and bar_close_position(f) <= 0.48
     return bool(
         _prior_impulse(_head(f, max(8, len(f) // 2)), "up")
         and stats.slope_high > 0
@@ -649,7 +639,7 @@ def bullish_falling_wedge(frame: pd.DataFrame) -> bool:
     stats = _trend_stats(f)
     if stats is None or len(f) < 12:
         return False
-    strong_close = _close(f) > _ema(f, "ema9") and _bar_close_position(f) >= 0.52
+    strong_close = _close(f) > _ema(f, "ema9") and bar_close_position(f) >= 0.52
     return bool(
         _prior_impulse(_head(f, max(8, len(f) // 2)), "down")
         and stats.slope_high < stats.slope_low < 0 < stats.range_end < stats.range_start * 0.78
@@ -670,7 +660,7 @@ def bearish_broadening_top(frame: pd.DataFrame) -> bool:
         and stats.slope_high > 0 > stats.slope_low
         and stats.range_end > stats.range_start * 1.18
         and _close(f) <= midrange
-        and _bar_close_position(f) <= 0.45
+        and bar_close_position(f) <= 0.45
     )
 
 
@@ -687,7 +677,7 @@ def bullish_broadening_bottom(frame: pd.DataFrame) -> bool:
         and stats.slope_high > 0 > stats.slope_low
         and stats.range_end > stats.range_start * 1.18
         and _close(f) >= midrange
-        and _bar_close_position(f) >= 0.55
+        and bar_close_position(f) >= 0.55
     )
 
 

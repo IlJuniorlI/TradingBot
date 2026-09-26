@@ -25,16 +25,17 @@ from .chart_patterns import (
     invalid_allowed_chart_patterns,
 )
 from .models import PairDefinition, StrategySchedule, Window
-from ._strategies.registry import (
+from ._strategies.catalogue import (
     default_strategy_name,
     get_plugins,
     is_option_strategy,
     normalize_strategy_name,
-    normalize_strategy_params as apply_strategy_param_normalizer,
     plugin_names,
 )
+from ._strategies.factory import normalize_strategy_params
 from .indicators import set_runtime_indicator_mode, set_session_indicator_window
 from .sessions import parse_hhmm
+from .symbols import normalize_symbol_list
 
 LOG = logging.getLogger(__name__)
 
@@ -698,16 +699,6 @@ class ChartPatternsConfig:
     bearish_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_BEARISH_CHART_PATTERNS))
 
 
-def htf_structure_event_lookback(sr_cfg: Any) -> int:
-    """HTF BOS/CHoCH freshness window in HTF bars: the explicit
-    ``htf_structure_event_lookback_bars`` when set, else the shared
-    ``structure_event_lookback_bars``. The one place that fallback lives."""
-    explicit = getattr(sr_cfg, "htf_structure_event_lookback_bars", None)
-    if explicit is not None:
-        return max(1, int(explicit))
-    return max(1, int(getattr(sr_cfg, "structure_event_lookback_bars", 6) or 6))
-
-
 @dataclass(slots=True)
 class SupportResistanceConfig:
     enabled: bool = True
@@ -887,18 +878,25 @@ class SupportResistanceConfig:
     # structure_exit_grace_minutes). Set 0 to disable.
     orb_entry_exit_grace_minutes: int = 20
 
+    def flip_confirmation_bars(self) -> tuple[int, int]:
+        """``(bars_1m, bars_5m)`` for the dual-frame level-flip confirmation.
 
-def flip_confirmation_bars(sr_cfg: SupportResistanceConfig) -> tuple[int, int]:
-    """``(bars_1m, bars_5m)`` for the dual-frame level-flip confirmation.
+        Either frame confirming a flip is enough; 0 switches that frame's gate
+        off, so ``(0, 1)`` confirms on 5m bars only and ``(2, 0)`` on 1m only.
+        Until 2026-09-23 every reader spelled this ``int(value or 2)`` /
+        ``int(value or 1)``, which turned a configured 0 back into the default
+        and made the single-frame modes impossible to configure. The one place
+        these two knobs are read; ``load_config`` rejects negatives.
+        """
+        return int(self.trading_flip_confirmation_1m_bars), int(self.trading_flip_confirmation_5m_bars)
 
-    Either frame confirming a flip is enough; 0 switches that frame's gate
-    off, so ``(0, 1)`` confirms on 5m bars only and ``(2, 0)`` on 1m only.
-    Until 2026-09-23 every reader spelled this ``int(value or 2)`` /
-    ``int(value or 1)``, which turned a configured 0 back into the default
-    and made the single-frame modes impossible to configure. The one place
-    these two knobs are read; ``load_config`` rejects negatives.
-    """
-    return int(sr_cfg.trading_flip_confirmation_1m_bars), int(sr_cfg.trading_flip_confirmation_5m_bars)
+    def htf_structure_event_lookback(self) -> int:
+        """HTF BOS/CHoCH freshness window in HTF bars: the explicit
+        ``htf_structure_event_lookback_bars`` when set, else the shared
+        ``structure_event_lookback_bars``. The one place that fallback lives."""
+        if self.htf_structure_event_lookback_bars is not None:
+            return max(1, int(self.htf_structure_event_lookback_bars))
+        return max(1, int(self.structure_event_lookback_bars or 6))
 
 
 @dataclass(slots=True)
@@ -1506,21 +1504,6 @@ def _normalize_tv_percent_param(value: Any) -> float:
     return float(value)
 
 
-def _normalize_symbol_tokens(values: Any) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    invalid_tokens = {"NONE", "NULL", "NAN"}
-    for raw in values or []:
-        if raw is None:
-            continue
-        token = str(raw).upper().strip()
-        if not token or token in invalid_tokens or token in seen:
-            continue
-        seen.add(token)
-        out.append(token)
-    return out
-
-
 def _normalize_pairs_config(values: Any) -> list[PairDefinition]:
     out: list[PairDefinition] = []
     seen: set[tuple[str, str]] = set()
@@ -1557,7 +1540,7 @@ def _normalize_force_flatten_time(value: Any) -> str:
 
 def _normalize_options_config(raw: dict[str, Any]) -> dict[str, Any]:
     out = dict(raw or {})
-    underlyings = _normalize_symbol_tokens(out.get("underlyings"))
+    underlyings = normalize_symbol_list(out.get("underlyings"))
     if underlyings:
         out["underlyings"] = underlyings
     confirmation_symbols = out.get("confirmation_symbols") or {}
@@ -1582,7 +1565,7 @@ def _normalize_strategy_params(
 ) -> dict[str, Any]:
     out = dict(params or {})
     if apply_plugin_normalizer and strategy_name is not None:
-        out = apply_strategy_param_normalizer(strategy_name, out)
+        out = normalize_strategy_params(strategy_name, out)
     for key in _PERCENT_PARAM_NAMES:
         if key in out and out[key] is not None:
             out[key] = _normalize_tv_percent_param(out[key])
@@ -1645,7 +1628,7 @@ def _validate_runtime_config(runtime: RuntimeConfig, config_path: Path) -> None:
 
 def _validate_support_resistance_config(sr: SupportResistanceConfig, config_path: Path) -> None:
     """Reject flip-confirmation bar counts below 0, and both at 0. 0 is valid
-    for one frame (that frame's gate is off, see ``flip_confirmation_bars``);
+    for one frame (that frame's gate is off, see ``SupportResistanceConfig.flip_confirmation_bars``);
     a negative count has no meaning and would read as "never confirms" deep
     inside confirm_by_bars. With both off the readers disagreed: the S/R
     builders fell back to the last HTF bar, while the adaptive ladder's rung
@@ -1739,6 +1722,8 @@ def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path)
         errors.append(f"options.max_loss_per_trade must be > 0, got {options.max_loss_per_trade}")
     if options.max_contracts_per_trade < 1:
         errors.append(f"options.max_contracts_per_trade must be >= 1, got {options.max_contracts_per_trade}")
+    if options.underlyings is not None and not isinstance(options.underlyings, list):
+        errors.append(f"options.underlyings must be a list of symbols, got {options.underlyings!r}")
     if errors:
         raise ValueError(f"{config_path}: invalid options configuration:\n  " + "\n  ".join(errors))
 

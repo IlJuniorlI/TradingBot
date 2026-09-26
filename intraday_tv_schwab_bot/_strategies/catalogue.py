@@ -1,23 +1,21 @@
 # SPDX-License-Identifier: MIT
+"""The strategy plugins' manifests: discovery, validation and lookup by name.
+
+Reading a manifest imports no plugin module; ``factory`` imports and builds
+the classes a manifest names.
+"""
 from __future__ import annotations
 
 from collections.abc import Iterable
 from copy import deepcopy
 from functools import lru_cache
-from importlib import import_module
 import json
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 from ..sessions import parse_hhmm
-from .plugin_api import StrategyManifest
-from .shared_entry import VETO_GATES
-
-if TYPE_CHECKING:
-    from ..config import BotConfig
-    from .strategy_base import BaseStrategy
-    from .screener_base import BaseStrategyScreener
+from .plugin_api import VETO_GATES, StrategyManifest
 
 _MANIFEST_FILENAME = "manifest.json"
 _STRATEGY_MODULE_NAME = "strategy"
@@ -344,7 +342,7 @@ def _coerce_schema_version(raw: object, *, manifest_path: Path) -> int:
         )
     return int(cast(int, raw))
 
-def _normalize_name(value: str) -> str:
+def plugin_key(value: str) -> str:
     return str(value or "").strip().lower()
 
 
@@ -422,7 +420,7 @@ def _load_manifest(manifest_path: Path) -> StrategyManifest:
 
     schema_version = _coerce_schema_version(raw.get("schema_version"), manifest_path=manifest_path)
 
-    name = _normalize_name(raw.get("name", ""))
+    name = plugin_key(raw.get("name", ""))
     if not name:
         raise ValueError(f"{manifest_path}: 'name' must be non-empty")
     if plugin_dir.name != name:
@@ -433,7 +431,7 @@ def _load_manifest(manifest_path: Path) -> StrategyManifest:
     screener_module = _required_manifest_string(raw, "screener_module", manifest_path=manifest_path)
     screener_class = _required_manifest_string(raw, "screener_class", manifest_path=manifest_path)
 
-    plugin_type = _normalize_name(_required_manifest_string(raw, "type", manifest_path=manifest_path))
+    plugin_type = plugin_key(_required_manifest_string(raw, "type", manifest_path=manifest_path))
     if plugin_type not in _VALID_PLUGIN_TYPES:
         raise ValueError(f"{manifest_path}: 'type' must be one of {sorted(_VALID_PLUGIN_TYPES)}")
 
@@ -477,7 +475,7 @@ def plugin_names() -> tuple[str, ...]:
 
 
 def get_plugin(name: str) -> StrategyManifest:
-    normalized = _normalize_name(name)
+    normalized = plugin_key(name)
     plugins = get_plugins()
     if normalized not in plugins:
         available = ", ".join(sorted(plugins))
@@ -503,75 +501,4 @@ def option_strategy_names() -> frozenset[str]:
 def is_option_strategy(name: str | None) -> bool:
     if name is None:
         return False
-    return _normalize_name(name) in option_strategy_names()
-
-
-@lru_cache(maxsize=None)
-def _load_strategy_class(name: str) -> type[BaseStrategy]:
-    from .strategy_base import BaseStrategy
-
-    manifest = get_plugin(name)
-    try:
-        module = import_module(manifest.strategy_module)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to import strategy module '{manifest.strategy_module}': {exc}") from exc
-    strategy_cls = getattr(module, manifest.strategy_class, None)
-    if not isinstance(strategy_cls, type) or not issubclass(strategy_cls, BaseStrategy):
-        raise TypeError(f"{manifest.strategy_module}.{manifest.strategy_class} must inherit BaseStrategy")
-    if getattr(strategy_cls, "__module__", None) != manifest.strategy_module:
-        raise TypeError(
-            f"{manifest.strategy_module}.{manifest.strategy_class} must be defined in {manifest.strategy_module}, not re-exported from {getattr(strategy_cls, '__module__', None)!r}"
-        )
-    declared_name = _normalize_name(getattr(strategy_cls, "strategy_name", ""))
-    if declared_name != manifest.name:
-        raise TypeError(
-            f"{manifest.strategy_module}.{manifest.strategy_class}.strategy_name must be {manifest.name!r}, got {declared_name!r}"
-        )
-    return strategy_cls
-
-
-@lru_cache(maxsize=None)
-def _load_screener_class(name: str) -> type[BaseStrategyScreener]:
-    from .screener_base import BaseStrategyScreener
-
-    manifest = get_plugin(name)
-    try:
-        module = import_module(manifest.screener_module)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to import screener module '{manifest.screener_module}': {exc}") from exc
-    screener_cls = getattr(module, manifest.screener_class, None)
-    if not isinstance(screener_cls, type) or not issubclass(screener_cls, BaseStrategyScreener):
-        raise TypeError(f"{manifest.screener_module}.{manifest.screener_class} must inherit BaseStrategyScreener")
-    if getattr(screener_cls, "__module__", None) != manifest.screener_module:
-        raise TypeError(
-            f"{manifest.screener_module}.{manifest.screener_class} must be defined in {manifest.screener_module}, not re-exported from {getattr(screener_cls, '__module__', None)!r}"
-        )
-    declared_name = _normalize_name(getattr(screener_cls, "strategy_name", ""))
-    if declared_name != manifest.name:
-        raise TypeError(
-            f"{manifest.screener_module}.{manifest.screener_class}.strategy_name must be {manifest.name!r}, got {declared_name!r}"
-        )
-    return screener_cls
-
-
-def normalize_strategy_params(name: str | None, params: dict[str, object] | None) -> dict[str, object]:
-    if name is None or str(name).strip() == "":
-        return dict(params or {})
-    strategy_cls = _load_strategy_class(name)
-    normalizer = getattr(strategy_cls, "normalize_params", None)
-    if normalizer is None:
-        return dict(params or {})
-    normalized = normalizer(dict(params or {}))
-    if not isinstance(normalized, dict):
-        raise TypeError(f"{strategy_cls.__module__}.{strategy_cls.__name__}.normalize_params() must return a dict")
-    return normalized
-
-
-def build_strategy(config: BotConfig) -> BaseStrategy:
-    strategy_cls = _load_strategy_class(config.strategy)
-    return strategy_cls(config)
-
-
-def build_screener(client, strategy: str) -> BaseStrategyScreener:
-    screener_cls = _load_screener_class(strategy)
-    return screener_cls(client)
+    return plugin_key(name) in option_strategy_names()

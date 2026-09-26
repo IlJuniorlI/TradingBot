@@ -39,11 +39,14 @@ Shipped runtime presets live under `configs/config.<strategy>.yaml`.
 - `_strategies/<name>/manifest.json` — lightweight manifest used for discovery and explicit plugin metadata
 - `_strategies/strategy_base.py` — shared base class for strategy logic
 - `_strategies/screener_base.py` — shared base class for screener logic
-- `_strategies/plugin_api.py` — `StrategyManifest` dataclass
-- `_strategies/registry.py` — manifest discovery and on-demand loading
+- `_strategies/plugin_api.py` — `StrategyManifest` dataclass and `VETO_GATES`, the gates a manifest may exempt
+- `_strategies/catalogue.py` — manifest discovery and validation, plugin lookup (`get_plugin(s)`, `plugin_names`, `normalize_strategy_name`, `is_option_strategy`)
+- `_strategies/factory.py` — imports a plugin's strategy / screener class on demand and builds it (`build_strategy`, `build_screener`, `normalize_strategy_params`)
 - `_strategies/shared_entry.py` — the shared entry stage (`SharedEntryPolicy`: `admit` / `emit` / `rank_key`, `EntryProposal`, divergence entries)
-- `_strategies/shared_exit.py` — the shared exit policy (`SharedExitPolicy`, `ExitTape`, `EXIT_FAMILY_GATES`, `bar_closed_after`)
-- `_strategies/shared.py` — curated shared helpers/reexports for plugin files (import explicitly; do not use wildcard imports)
+- `_strategies/shared_exit.py` — the shared exit policy (`SharedExitPolicy`, `ExitTape`, `EXIT_FAMILY_GATES`)
+- `reasons.py` (package root) — skip / exit reason strings: `reason_with_values`, `insufficient_bars_reason`, `detail_fields`, `fmt_metric`, `bool_token`, `side_prefixed_reason(s)`, and the readers `reason_head` / `exit_reason_code`
+
+There is no re-export hub: a plugin imports each name from the module that defines it, explicitly (no wildcard imports). The domain types come from `intraday_tv_schwab_bot.models` (`Candidate`, `Position`, `Side`, `Signal`, `ExitDecision`, the `ASSET_TYPE_*` constants); the clock and session calendar from `sessions` (`sessions.now_et()`, `parse_hhmm`, `equity_session_state`, `EQUITY_*`); bar frames, bar geometry (`bar_close_position`, `bar_wick_fractions`, `bars_have_range`), session slices (`same_day_mask`, `session_open_price`, `rth_open_plus`) and bucket completion (`bar_closed_after`, `last_bucket_forming`) from `bars`; indicators (and `indicator_session_start`, and `last_bar_atr` for a bar's ATR with its fallback) from `indicators`; option chains, contract selection, order builders and the premium clamps (`clamp_long_premium_levels` / `clamp_short_premium_levels`) from `options_mode`; numeric reads from `numeric` (`safe_float`, `safe_int`, `first_float`); symbol lists and classification from `symbols` (`normalize_symbol_list`, `is_streamable_equity`); skip-reason strings from `reasons` (`reason_with_values`, `insufficient_bars_reason`, `detail_fields`, `side_prefixed_reasons`); and the analysis contexts from `candles` (including the opt-in `detect_bullish_patterns` / `detect_bearish_patterns`), `chart_patterns`, `support_resistance`, `htf_levels` and `technical_levels`. Standard-library and pandas names are imported directly (`import pandas as pd`).
 
 ## Minimum requirements
 
@@ -75,7 +78,7 @@ Optional manifest capabilities and strategy hooks
 - `manifest.json -> capabilities.watchlist.quote_sources` can declaratively build the quote watchlist from standard symbol sources such as `active_watchlist`, `options.volatility_symbol`, `options.confirmation_symbols`, or filtered position metadata descriptors like `positions.metadata_list` for option valuation legs.
 - `@classmethod normalize_params(cls, params)` lets a plugin normalize its own manifest/config params without adding strategy-name branches to the generic config loader.
 - **Reserved names.** `BaseStrategy.__init_subclass__` raises `TypeError` when a strategy class defines `position_exit_signal`, `shared_exit_signal`, `strategy_logic_default` or `signal_priority_key` (2026-09-24). A knob is set in the preset YAML, not rewritten by the strategy. A style is exempted from a veto in the manifest, a strategy's own exits go in `strategy_exit_signal`, and ranking is declared in `capabilities.signal_priority`. An out-of-tree plugin therefore cannot quietly opt out of the global knobs.
-- **Exits.** The shared exit families (time stop, chart / candle pattern, CHoCH and bias structure, technical, S/R loss, divergence scale-out) are decided for every strategy by `shared_exit.SharedExitPolicy`, which the position manager owns. A strategy's OWN exits go in `strategy_exit_signal(self, position, bars, tape, data=None) -> ExitDecision | None`, which runs after every shared family held and holds by default. `tape` is the `ExitTape` the shared families read (close, EMA9 / EMA20 / VWAP, close position; None where a value is missing), so a hook judges the same references. Return `ExitDecision(reason, "strategy")` for a full exit. `peer_confirmed_key_levels` (and its subclasses) implements its adaptive-ladder defence there, and `microcap_pm_breakout` its blowoff guard. The exit graces key on `metadata['entry_style_family']` (`orb`, `pullback`), which `emit` stamps from the proposal's style family. A hook that judges a structure event or pivot against the entry must compare the bar's CLOSE, not its label: use `shared_exit.bar_closed_after(label, position.entry_time, bar_minutes)`. Bars are labelled at their start, so an event on the bar the entry filled in is post-entry. The peer ladder does this for its HTF CHoCH / BoS.
+- **Exits.** The shared exit families (time stop, chart / candle pattern, CHoCH and bias structure, technical, S/R loss, divergence scale-out) are decided for every strategy by `shared_exit.SharedExitPolicy`, which the position manager owns. A strategy's OWN exits go in `strategy_exit_signal(self, position, bars, tape, data=None) -> ExitDecision | None`, which runs after every shared family held and holds by default. `tape` is the `ExitTape` the shared families read (close, EMA9 / EMA20 / VWAP, close position; None where a value is missing), so a hook judges the same references. Return `ExitDecision(reason, "strategy")` for a full exit. `peer_confirmed_key_levels` (and its subclasses) implements its adaptive-ladder defence there, and `microcap_pm_breakout` its blowoff guard. The exit graces key on `metadata['entry_style_family']` (`orb`, `pullback`), which `emit` stamps from the proposal's style family. A hook that judges a structure event or pivot against the entry must compare the bar's CLOSE, not its label: use `bars.bar_closed_after(label, position.entry_time, bar_minutes)`. Bars are labelled at their start, so an event on the bar the entry filled in is post-entry. The peer ladder does this for its HTF CHoCH / BoS.
 - `manifest.json -> capabilities.history.required_bars` can set a fixed startup warmup bar requirement for simple strategies that do not need a custom formula.
 - `required_history_bars(self, symbol=None, positions=None)` still exists for strategies that need a formula based on params or position state.
 - The other runtime hooks still exist as the escape hatch for behavior that is too custom to express cleanly in the manifest.
@@ -217,9 +220,9 @@ Worked examples, simplest first:
 
 - (a) Only `shared_entry.py` and `shared_exit.py` reference `config.shared_entry` / `config.shared_exit`, including through `getattr` / `hasattr` / `setattr`.
 - (b) Only `shared_entry.py` constructs `Signal(...)` or `AdmittedEntry(...)`, also under an import alias.
-- (c) A `strategy.py` may not define, call or import a helper that moved into the policy (the knob accessors, the veto predicates, the refinement passes, the retest plans, the score terms, the divergence candidate, `_build_signal_metadata`; the full list is `MOVED_HELPERS` in the test). From `shared_entry` it may import only `EntryProposal`, `EntryContexts`, `RetestTrigger`, `AdmittedEntry`, `STYLE_FAMILIES`, `VETO_GATES` and `DIVERGENCE_ENTRY_SOURCE`.
+- (c) A `strategy.py` may not define, call or import a helper that moved into the policy (the knob accessors, the veto predicates, the refinement passes, the retest plans, the score terms, the divergence candidate, `_build_signal_metadata`; the full list is `MOVED_HELPERS` in the test). From `shared_entry` it may import only `EntryProposal`, `EntryContexts`, `RetestTrigger`, `AdmittedEntry`, `STYLE_FAMILIES` and `DIVERGENCE_ENTRY_SOURCE` (`VETO_GATES` is in `plugin_api`).
 - (d) `BaseStrategy.__init_subclass__` refuses `position_exit_signal`, `shared_exit_signal`, `strategy_logic_default` and `signal_priority_key`, at import.
-- (e) A `strategy.py` may not rewrite what `emit` built: no `dataclasses.replace` under any alias (including the `replace` re-exported by `_strategies/shared.py`), and no assignment or `setattr` of `.stop_price` / `.target_price`. It may not reach into the policy's privates (`self.entry_policy._x`, directly, through an alias or through `getattr`). Pass the stop / target through the proposal and the ladder, and metadata through `emit(metadata=...)`.
+- (e) A `strategy.py` may not rewrite what `emit` built: no `dataclasses.replace` under any alias (`import dataclasses as dc`, `from dataclasses import replace as swap`), and no assignment or `setattr` of `.stop_price` / `.target_price`. It may not reach into the policy's privates (`self.entry_policy._x`, directly, through an alias or through `getattr`). Pass the stop / target through the proposal and the ladder, and metadata through `emit(metadata=...)`.
 
 ### Manifest capabilities
 
@@ -240,7 +243,7 @@ Worked examples, simplest first:
 
 The `signal_priority` block is top_tier's declaration plus a metadata tail. Every field it names should be metadata the strategy stamps: a missing one ranks as 0, and a missing unit field zeroes the shared term. `rank_unit_field` is only valid with a positive `shared_score_weight`. A strategy whose primary is `final_priority_score` (which already contains the shared terms) keeps the default weight 0 and declares no unit field.
 
-- `shared_entry.exemptions` maps a proposal `style` to the vetoes it skips. The gates come from `VETO_GATES` (`structure`, `sr`, `broken_level`, `chart`, `dual_divergence`, `candle`); a list needs at least one gate and no repeats. `divergence_entry` defaults to true. Unknown keys fail at load, and a knob cannot be set here.
+- `shared_entry.exemptions` maps a proposal `style` to the vetoes it skips. The gates come from `plugin_api.VETO_GATES` (`structure`, `sr`, `broken_level`, `chart`, `dual_divergence`, `candle`); a list needs at least one gate and no repeats. `divergence_entry` defaults to true. Unknown keys fail at load, and a knob cannot be set here.
 - `signal_priority` is read by `SharedEntryPolicy.rank_key`, the gatekeeper's sort key (and htf_pivots' / trend_continuation's side pick): `(tier, primary + w x shared_context_score x unit, *metadata_fields, final_priority_score, activity, -rank)`.
   - `primary_field` defaults to `final_priority_score`, which already contains the shared terms.
   - `shared_score_weight` (w) defaults to 0.
@@ -306,21 +309,19 @@ intraday_tv_schwab_bot/_strategies/my_new_strategy/
 
 ### Example `strategy.py`
 
-Avoid `from ..shared import *`. Import only the names your plugin uses. Entries go through the shared entry stage (see the contract above); the strategy never constructs a `Signal` itself.
+Import only the names your plugin uses, each from the module that defines it (see [What lives where](#what-lives-where)); no wildcard imports. Entries go through the shared entry stage (see the contract above); the strategy never constructs a `Signal` itself.
 
-Read the clock through its module: `from ... import sessions`, then `sessions.now_et()`. `_strategies/shared.py` does not re-export `now_et`, and a name bound with `from ... import now_et` would escape the tests' clock pin (`tests/support/clock.freeze_et`); `tests/test_module_layering.py` rejects it.
+Read the clock through its module: `from ... import sessions`, then `sessions.now_et()`. A name bound with `from ... import now_et` would escape the tests' clock pin (`tests/support/clock.freeze_et`); `tests/test_module_layering.py` rejects it.
+
+Import `config` only under `TYPE_CHECKING`: read settings through `self.config`, and the derived S/R values through `SupportResistanceConfig`'s methods (`self.config.support_resistance.flip_confirmation_bars()`, `.htf_structure_event_lookback()`). `tests/test_module_layering.py` rejects a runtime import.
 
 
 ```python
-from ..shared import (
-    Candidate,
-    Position,
-    Side,
-    Signal,
-    _safe_float,
-    insufficient_bars_reason,
-    pd,
-)
+import pandas as pd
+
+from ...models import Candidate, Position, Side, Signal
+from ...numeric import safe_float
+from ...reasons import insufficient_bars_reason
 from ..shared_entry import EntryProposal
 from ..strategy_base import BaseStrategy
 
@@ -360,10 +361,10 @@ class MyNewStrategy(BaseStrategy):
                 continue
 
             last = frame.iloc[-1]
-            close = _safe_float(last.get("close"), 0.0)
-            vwap = _safe_float(last.get("vwap"), close)
-            day_strength = _safe_float(c.metadata.get("change_from_open"), 0.0)
-            rvol = _safe_float(c.metadata.get("relative_volume_10d_calc"), 0.0)
+            close = safe_float(last.get("close"), 0.0)
+            vwap = safe_float(last.get("vwap"), close)
+            day_strength = safe_float(c.metadata.get("change_from_open"), 0.0)
+            rvol = safe_float(c.metadata.get("relative_volume_10d_calc"), 0.0)
 
             side = Side.SHORT if (allow_short and close < vwap and day_strength < 0) else Side.LONG
             # The setup's own blockers become the proposal's pending reasons,
@@ -428,7 +429,7 @@ class MyNewStrategy(BaseStrategy):
 ### Example `screener.py`
 
 ```python
-from ..shared import Candidate, Side
+from ...models import Candidate, Side
 from ..screener_base import BaseStrategyScreener
 
 

@@ -31,7 +31,7 @@ from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime
 from threading import RLock
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pandas as pd
 
@@ -39,19 +39,17 @@ import copy
 
 from .candles import detect_candle_context, detect_per_bar_candle_patterns
 from .chart_patterns import analyze_chart_pattern_context
-from .config import DashboardChartConfig, DashboardChartingConfig, flip_confirmation_bars, htf_structure_event_lookback
+from .config import BotConfig, DashboardChartConfig, DashboardChartingConfig
 from .htf_levels import summarize_htf_trend
 from .models import Side
 from .numeric import safe_float
 from .support_resistance import analyze_market_structure, zone_flip_confirmed
+from .symbols import normalize_symbol_list
 from .technical_levels import build_technical_levels_context
-from .bars import equity_stream_window_bars, resample_bars, session_bucket_ends
+from .bars import equity_stream_window_bars, last_bucket_forming, resample_bars, session_bucket_ends
 from .indicators import ensure_standard_indicator_frame, htf_ema_spans, ltf_ema_spans
 from . import sessions
 from ._sr_ladder import _collapse_price_ladder, _sr_effective_side_tolerance
-
-if TYPE_CHECKING:
-    from .config import BotConfig
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -489,9 +487,7 @@ def dashboard_htf_chart_frame(
     if buckets.empty:
         return completed, None
     frame = ensure_standard_indicator_frame(pd.concat([completed[ohlcv], buckets[ohlcv]]))
-    last_start = pd.Timestamp(buckets.index[-1])
-    last_end = session_bucket_ends(buckets.index[-1:], int(timeframe_minutes))[0]
-    forming = last_start if last_end > pd.Timestamp(now) else None
+    forming = pd.Timestamp(buckets.index[-1]) if last_bucket_forming(buckets.index, int(timeframe_minutes), now) else None
     return frame, forming
 
 
@@ -782,21 +778,6 @@ class DashboardCache:
                 except Exception:
                     return None
         return None
-
-    @staticmethod
-    def _normalize_symbol_list(values: object) -> list[str]:
-        out: list[str] = []
-        seen: set[str] = set()
-        invalid_tokens = {"NONE", "NULL", "NAN"}
-        for raw in values if isinstance(values, list | tuple | set) else []:
-            if raw is None:
-                continue
-            token = str(raw).upper().strip()
-            if not token or token in invalid_tokens or token in seen:
-                continue
-            seen.add(token)
-            out.append(token)
-        return out
 
     def symbol_snapshot(
         self,
@@ -1678,7 +1659,7 @@ class DashboardCache:
         # as flipped — confusing when the dashboard sidebar (which already
         # uses trading mode via `sr_row()`) and the chart disagreed about
         # the same level.
-        zone_flip_1m, zone_flip_5m = flip_confirmation_bars(self.config.support_resistance)
+        zone_flip_1m, zone_flip_5m = self.config.support_resistance.flip_confirmation_bars()
         fallback_bar = None
         if frame is not None and not frame.empty:
             try:
@@ -1922,7 +1903,7 @@ class DashboardCache:
             return None
         current_price = price if price is not None else self.symbol_price(symbol)
         # mode="trading" gives the sidebar the same flip-confirmation
-        # strictness (config.flip_confirmation_bars) that position management,
+        # strictness (support_resistance.flip_confirmation_bars()) that position management,
         # the chart's zone-flip detection, and the entry gatekeeper all
         # use. A single "trading" mode means the sidebar / chart /
         # gatekeeper / strategy agree on which side of a level price is
@@ -2293,7 +2274,7 @@ class DashboardCache:
                 # the same split the pivot gap above already makes.
                 structure_event_max_age_bars=(
                     int(getattr(sr_cfg, "structure_event_lookback_bars", 6) or 6)
-                    if is_ltf_chart else htf_structure_event_lookback(sr_cfg)
+                    if is_ltf_chart else sr_cfg.htf_structure_event_lookback()
                 ),
                 min_range_atr_mult=float(getattr(sr_cfg, "structure_min_range_atr_mult", 1.5) or 0.0),
                 min_pivot_gap_bars=overlay_gap_bars,
@@ -2416,7 +2397,7 @@ class DashboardCache:
                 # 2026-09-23 it was drawn as complete and candle-tagged off
                 # its first minutes (AAPL 09-22 10:03: a 3-minute 10:00 5m bar
                 # tagged CDLHAMMER; complete, it tags as a bearish marubozu).
-                if frame is not None and not frame.empty and session_bucket_ends(frame.index[-1:], ltf_min)[0] > pd.Timestamp(sessions.now_et()):
+                if frame is not None and not frame.empty and last_bucket_forming(frame.index, ltf_min, sessions.now_et()):
                     forming_start = pd.Timestamp(frame.index[-1])
             else:
                 frame = self.data.get_merged(symbol_key, with_indicators=True)
@@ -2575,7 +2556,7 @@ class DashboardCache:
         strategy_obj = self.strategy
         if strategy_obj is not None:
             try:
-                return self._normalize_symbol_list(strategy_obj.dashboard_tradable_symbols())
+                return normalize_symbol_list(strategy_obj.dashboard_tradable_symbols())
             except Exception:
                 pass
         params = getattr(strategy_obj, "params", {}) or {}
@@ -2584,7 +2565,7 @@ class DashboardCache:
             raw_symbols = params.get("tradable")
             if raw_symbols is None:
                 raw_symbols = params.get("symbols")
-        return self._normalize_symbol_list(raw_symbols)
+        return normalize_symbol_list(raw_symbols)
 
     def index_symbols(self) -> list[str]:
         """Index ETFs used for directional confirmation (top_tier_adaptive's
@@ -2595,7 +2576,7 @@ class DashboardCache:
         strategy_obj = self.strategy
         if strategy_obj is not None:
             try:
-                return self._normalize_symbol_list(strategy_obj.dashboard_index_symbols())
+                return normalize_symbol_list(strategy_obj.dashboard_index_symbols())
             except Exception:
                 pass
         params = getattr(strategy_obj, "params", {}) or {}
@@ -2604,9 +2585,9 @@ class DashboardCache:
         merged: set[str] = set()
         raw_index = params.get("index_symbols")
         if raw_index:
-            merged.update(self._normalize_symbol_list(raw_index))
+            merged.update(normalize_symbol_list(raw_index))
         sector_map = params.get("sector_index_map")
         if isinstance(sector_map, dict):
             for tickers in sector_map.values():
-                merged.update(self._normalize_symbol_list(tickers))
+                merged.update(normalize_symbol_list(tickers))
         return sorted(merged)

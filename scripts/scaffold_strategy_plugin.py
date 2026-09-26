@@ -192,15 +192,11 @@ def _stock_strategy_py(name: str, class_stem: str) -> str:
     return dedent(
         f'''
         # SPDX-License-Identifier: MIT
-        from ..shared import (
-            Candidate,
-            Position,
-            Side,
-            Signal,
-            _safe_float,
-            insufficient_bars_reason,
-            pd,
-        )
+        import pandas as pd
+
+        from ...models import Candidate, Position, Side, Signal
+        from ...numeric import safe_float
+        from ...reasons import insufficient_bars_reason
         from ..shared_entry import EntryProposal
         from ..strategy_base import BaseStrategy
 
@@ -250,10 +246,10 @@ def _stock_strategy_py(name: str, class_stem: str) -> str:
                         continue
 
                     last = frame.iloc[-1]
-                    close = _safe_float(last.get("close"), 0.0)
-                    vwap = _safe_float(last.get("vwap"), close)
-                    rvol = _safe_float(candidate.metadata.get("relative_volume_10d_calc"), 0.0)
-                    day_strength = _safe_float(candidate.metadata.get("change_from_open"), 0.0)
+                    close = safe_float(last.get("close"), 0.0)
+                    vwap = safe_float(last.get("vwap"), close)
+                    rvol = safe_float(candidate.metadata.get("relative_volume_10d_calc"), 0.0)
+                    day_strength = safe_float(candidate.metadata.get("change_from_open"), 0.0)
 
                     side = Side.SHORT if (allow_short and close < vwap and day_strength < 0) else Side.LONG
                     # The setup's own blockers. They are the proposal's
@@ -325,18 +321,12 @@ def _option_strategy_py(name: str, class_stem: str) -> str:
     return dedent(
         f'''
         # SPDX-License-Identifier: MIT
-        from typing import Any
+        import pandas as pd
 
-        from ..shared import (
-            Candidate,
-            Position,
-            Side,
-            Signal,
-            _safe_float,
-            _session_open_price,
-            insufficient_bars_reason,
-            pd,
-        )
+        from ...models import Candidate, Position, Side, Signal
+        from ...bars import session_open_price
+        from ...numeric import safe_float
+        from ...reasons import insufficient_bars_reason
         from ..strategy_base import BaseStrategy
         from ... import sessions
 
@@ -388,21 +378,19 @@ def _option_strategy_py(name: str, class_stem: str) -> str:
                     return None
                 try:
                     last = frame.iloc[-1]
-                    close = _safe_float(last.get("close"), 0.0)
+                    close = safe_float(last.get("close"), 0.0)
                     if close <= 0:
                         return None
-                    vwap = _safe_float(last.get("vwap"), close)
-                    ema9 = _safe_float(last.get("ema9"), close)
-                    ema20 = _safe_float(last.get("ema20"), close)
+                    vwap = safe_float(last.get("vwap"), close)
+                    ema9 = safe_float(last.get("ema9"), close)
+                    ema20 = safe_float(last.get("ema20"), close)
                     vwap_dist = (close - vwap) / close
                     ema_gap = (ema9 - ema20) / close
                     p = self.params
                     vwap_thresh = float(p.get("trend_vwap_distance_pct", 0.0016))
                     ema_thresh = float(p.get("trend_ema_gap_pct", 0.00075))
                     session_day = sessions.now_et().date()
-                    u_open = _session_open_price(frame, session_day, regular_session_only=True)
-                    if u_open is None:
-                        u_open = _session_open_price(frame, session_day, regular_session_only=False)
+                    u_open = session_open_price(frame, session_day, fallback_to_premarket_on_nan=True)
                     day_ret = ((close / u_open) - 1.0) if u_open and u_open > 0 else 0.0
                     if vwap_dist >= vwap_thresh and ema_gap >= ema_thresh and day_ret > 0:
                         return Side.LONG
@@ -486,7 +474,7 @@ def _stock_screener_py(name: str, class_stem: str) -> str:
     return dedent(
         f'''
         # SPDX-License-Identifier: MIT
-        from ..shared import Candidate, Side
+        from ...models import Candidate, Side
         from ..screener_base import BaseStrategyScreener
 
 
@@ -531,7 +519,7 @@ def _option_screener_py(name: str, class_stem: str) -> str:
     return dedent(
         f'''
         # SPDX-License-Identifier: MIT
-        from ..shared import Candidate
+        from ...models import Candidate
         from ..screener_base import BaseStrategyScreener
 
 

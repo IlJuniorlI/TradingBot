@@ -30,7 +30,7 @@ from typing import Any
 import numpy as np
 import yaml
 
-from .sessions import parse_hhmm
+from .sessions import is_time_in_window
 from . import sessions
 
 LOG = logging.getLogger(__name__)
@@ -219,7 +219,7 @@ class EventBlackoutCalendar:
             end = event.get("end")
             if not start or not end:
                 continue
-            if parse_hhmm(str(start)) <= now_t <= parse_hhmm(str(end)):
+            if is_time_in_window(now_t, str(start), str(end)):
                 return event
         return None
 

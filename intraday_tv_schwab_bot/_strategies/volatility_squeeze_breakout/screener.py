@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: MIT
-from ..shared import (
-    Candidate,
-    Side,
-    pd,
-)
+import pandas as pd
+
+from ...models import Candidate, Side
 from ..screener_base import BaseStrategyScreener
 from ..rvol import rvol_profile_for_symbol
 

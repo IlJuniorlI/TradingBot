@@ -34,10 +34,10 @@ from typing import TYPE_CHECKING, Any, Mapping
 import pandas as pd
 
 from ..models import ExitDecision, Position
-from ..bars import session_bucket_ends
-from ..indicators import get_runtime_indicator_mode
+from ..bars import CANDLE_PATTERN_WINDOW_BARS, bar_closed_after, bars_have_range
+from ..indicators import get_runtime_indicator_mode, last_bar_atr
 from .. import sessions
-from .helpers import CANDLE_PATTERN_WINDOW_BARS, _bars_have_range, _optional_float, _safe_float
+from ..numeric import safe_float
 
 if TYPE_CHECKING:
     from ..config import BotConfig
@@ -63,13 +63,13 @@ class FamilyGates:
     - ``post_entry_event``: the structure event the exit reads must have
       happened after entry.
     - ``bar_range``: every bar of the candle pattern window
-      (``helpers.CANDLE_PATTERN_WINDOW_BARS``) must have traded a range
+      (``bars.CANDLE_PATTERN_WINDOW_BARS``) must have traded a range
       (high > low) -- the window the entry candle veto checks too.
     - ``tape``: ``none``, ``strict`` (``ExitTape.weak``) or ``strict_or_loose``
       (``weak`` or ``weak_loose``).
 
     "Since entry" / "after entry" is judged by when a bar CLOSED
-    (``bar_closed_after``), not by its label.
+    (``bars.bar_closed_after``), not by its label.
     """
 
     r_gate: bool
@@ -152,12 +152,12 @@ def _first_session_bar(frame: pd.DataFrame) -> bool:
     """
     if "ema9_rth" not in frame.columns:
         return False
-    last = _optional_float(frame["ema9_rth"].iloc[-1])
+    last = safe_float(frame["ema9_rth"].iloc[-1])
     if last is None:
         return False
     if len(frame) < 2:
         return True
-    if _optional_float(frame["ema9_rth"].iloc[-2]) is None:
+    if safe_float(frame["ema9_rth"].iloc[-2]) is None:
         return True
     return pd.Timestamp(frame.index[-2]).date() != pd.Timestamp(frame.index[-1]).date()
 
@@ -185,7 +185,7 @@ class ExitTape:
     def read(cls, frame: pd.DataFrame, rules: TapeRules) -> ExitTape | None:
         """None when the last close is unreadable: nothing can be judged."""
         last = frame.iloc[-1]
-        close = _optional_float(last.get("close"))
+        close = safe_float(last.get("close"))
         if close is None:
             return None
         # The session-reset references restart on the first session bar (see
@@ -193,15 +193,15 @@ class ExitTape:
         # the VWAP, which that bar alone defines, abstains.
         first_bar = get_runtime_indicator_mode() and _first_session_bar(frame)
         ema9_col, ema20_col = ("ema9_all", "ema20_all") if first_bar else ("ema9", "ema20")
-        high, low = _optional_float(last.get("high")), _optional_float(last.get("low"))
+        high, low = safe_float(last.get("high")), safe_float(last.get("low"))
         close_pos = None
         if high is not None and low is not None and high > low:
             close_pos = (close - low) / (high - low)
         return cls(
             close=close,
-            ema9=_optional_float(last.get(ema9_col)),
-            ema20=_optional_float(last.get(ema20_col)),
-            vwap=None if first_bar else _optional_float(last.get("vwap")),
+            ema9=safe_float(last.get(ema9_col)),
+            ema20=safe_float(last.get(ema20_col)),
+            vwap=None if first_bar else safe_float(last.get("vwap")),
             close_pos=close_pos,
             rules=rules,
         )
@@ -260,27 +260,6 @@ class ExitTape:
         return True
 
 
-def bar_closed_after(label: Any, moment: Any, bar_minutes: int) -> bool:
-    """Did the ``bar_minutes`` bar labelled ``label`` CLOSE after ``moment``?
-
-    Bars are labelled at their START (``bars.resample_bars``) and the
-    frames hold completed bars, so the entry never saw a bar that closed
-    after its fill, even though that bar's label is earlier than the fill.
-    Structure events, pivots and divergence pivots are judged against the
-    entry this way (2026-09-24): compared by label, a CHoCH that crossed on
-    the bar the entry filled in read as pre-entry for as long as price
-    stayed through the level -- blind to the first post-entry breakdown, the
-    most common reversal. A resampled frame's last bucket can be partial, so
-    an event on the bucket the entry filled in counts as post-entry even if
-    part of that bucket traded before the fill: the entry never saw its
-    close. None (no event) is never after anything.
-    """
-    if label is None:
-        return False
-    end = session_bucket_ends(pd.DatetimeIndex([pd.Timestamp(label)]), max(1, int(bar_minutes)))[0]
-    return end > pd.Timestamp(moment)
-
-
 # ---------------------------------------------------------------------------
 # The policy
 # ---------------------------------------------------------------------------
@@ -300,7 +279,7 @@ class SharedExitPolicy:
         return bool(getattr(self.config.shared_exit, key))
 
     def _number(self, key: str) -> float | None:
-        return _optional_float(getattr(self.config.shared_exit, key))
+        return safe_float(getattr(self.config.shared_exit, key))
 
     def tape_rules(self) -> TapeRules:
         cfg = self.config.shared_exit
@@ -410,7 +389,7 @@ class SharedExitPolicy:
     def _gates_open(self, family: str, position: Position, tape: ExitTape, ms_ctx: Any = None,
                     frame: pd.DataFrame | None = None) -> bool:
         gates = EXIT_FAMILY_GATES[family]
-        if gates.bar_range and not _bars_have_range(frame, CANDLE_PATTERN_WINDOW_BARS):
+        if gates.bar_range and not bars_have_range(frame, CANDLE_PATTERN_WINDOW_BARS):
             return False
         if gates.orb_grace and self._orb_grace_active(position):
             return False
@@ -462,7 +441,7 @@ class SharedExitPolicy:
         entry = self.strategy._underlying_entry_price(position) or 0.0
         if entry <= 0 or frame is None or frame.empty or "close" not in frame.columns:
             return None
-        last_close = _optional_float(frame["close"].iloc[-1])
+        last_close = safe_float(frame["close"].iloc[-1])
         if last_close is None:
             return None
         min_return_pct = float(self.config.risk.time_stop_min_return_pct or 0.0)
@@ -570,7 +549,7 @@ class SharedExitPolicy:
             return None
         close = tape.close
         tech_ctx = self.strategy._technical_context(frame)
-        atr = self.strategy._frame_atr14(frame, close)
+        atr = last_bar_atr(frame, close)
         buffer = max(atr * float(self.strategy._technical_level_setting("trendline_breakout_buffer_atr_mult", 0.65)), close * 0.0010)
         weak_tape = self._tape_ok("technical", tape, direction)
         channel_ctx = tech_ctx.channel
@@ -579,20 +558,20 @@ class SharedExitPolicy:
         # exited at 439.50 on one dip and closed the day at 446.67. With the
         # two-bar confirm the PRIOR bar must have closed through it too.
         two_bar = self._on("anchored_vwap_exit_require_two_bar_confirm")
-        prior_close = _safe_float(frame["close"].iloc[-2], close) if len(frame) >= 2 else None
+        prior_close = safe_float(frame["close"].iloc[-2], close) if len(frame) >= 2 else None
         if direction == "bullish":
             if bool(tech_ctx.trendline_break_down) and self._on("use_trendline_break") and weak_tape:
-                support_value = _safe_float(getattr(tech_ctx.support_trendline, "current_value", None), close)
+                support_value = safe_float(getattr(tech_ctx.support_trendline, "current_value", None), close)
                 return ExitDecision(f"trendline_break_exit:{support_value:.4f}", "technical")
             if bool(getattr(channel_ctx, "valid", False)) and getattr(channel_ctx, "lower", None) is not None and self._on("use_channel_break"):
                 lower = float(channel_ctx.lower)
                 if close <= lower - buffer and weak_tape:
                     return ExitDecision(f"channel_breakdown_exit:{lower:.4f}", "technical")
             if bool(tech_ctx.bollinger_upper_reject) and self._on("use_bollinger_reject") and weak_tape:
-                upper = _safe_float(tech_ctx.bollinger_upper, close)
+                upper = safe_float(tech_ctx.bollinger_upper, close)
                 return ExitDecision(f"bollinger_upper_reject_exit:{upper:.4f}", "technical")
             if self._on("use_anchored_vwap_loss"):
-                avwap_floor = max(_safe_float(tech_ctx.anchored_vwap_open, 0.0), _safe_float(tech_ctx.anchored_vwap_bullish_impulse, 0.0))
+                avwap_floor = max(safe_float(tech_ctx.anchored_vwap_open, 0.0), safe_float(tech_ctx.anchored_vwap_bullish_impulse, 0.0))
                 # Armed only once the underlying has traded at or above
                 # floor + buffer since entry: a LONG filled below the floor
                 # otherwise "lost" it on the next tick (AMZN 2026-04-24 10:59,
@@ -604,17 +583,17 @@ class SharedExitPolicy:
                     return ExitDecision(f"anchored_vwap_loss_exit:{avwap_floor:.4f}", "technical")
             return None
         if bool(tech_ctx.trendline_break_up) and self._on("use_trendline_break") and weak_tape:
-            resistance_value = _safe_float(getattr(tech_ctx.resistance_trendline, "current_value", None), close)
+            resistance_value = safe_float(getattr(tech_ctx.resistance_trendline, "current_value", None), close)
             return ExitDecision(f"trendline_break_exit:{resistance_value:.4f}", "technical")
         if bool(getattr(channel_ctx, "valid", False)) and getattr(channel_ctx, "upper", None) is not None and self._on("use_channel_break"):
             upper = float(channel_ctx.upper)
             if close >= upper + buffer and weak_tape:
                 return ExitDecision(f"channel_breakout_exit:{upper:.4f}", "technical")
         if bool(tech_ctx.bollinger_lower_reject) and self._on("use_bollinger_reject") and weak_tape:
-            lower = _safe_float(tech_ctx.bollinger_lower, close)
+            lower = safe_float(tech_ctx.bollinger_lower, close)
             return ExitDecision(f"bollinger_lower_reject_exit:{lower:.4f}", "technical")
         if self._on("use_anchored_vwap_loss"):
-            ceilings = [px for px in (_safe_float(tech_ctx.anchored_vwap_open, 0.0), _safe_float(tech_ctx.anchored_vwap_bearish_impulse, 0.0)) if px > 0]
+            ceilings = [px for px in (safe_float(tech_ctx.anchored_vwap_open, 0.0), safe_float(tech_ctx.anchored_vwap_bearish_impulse, 0.0)) if px > 0]
             avwap_ceiling = min(ceilings) if ceilings else 0.0
             # Mirror of the LONG armed guard: META 2026-04-24 09:35 SHORT was
             # filled under the ceiling and out in 55 s for -$68.86.
@@ -698,7 +677,7 @@ class SharedExitPolicy:
             if current_r is None or current_r <= 0:
                 return None
         min_age = int(self._number("divergence_exit_min_age_bars") or 0)
-        max_age = _optional_float(self.strategy._technical_level_setting("divergence_max_age_bars", None))
+        max_age = safe_float(self.strategy._technical_level_setting("divergence_max_age_bars", None))
         counter = "bearish" if direction == "bullish" else "bullish"
         consumed = {
             str(marker.get("pivot_b_ts"))

@@ -2,22 +2,14 @@
 import logging
 import math
 
-from ..shared import (
-    Candidate,
-    Position,
-    Side,
-    Signal,
-    insufficient_bars_reason,
-    _reason_with_values,
-    _safe_float,
-    _same_day_mask,
-    _time_gte_mask,
-    datetime,
-    pd,
-    time,
-    timedelta,
-)
+import pandas as pd
+
+from ...models import Candidate, Position, Side, Signal
+from ...numeric import safe_float
+from ...reasons import insufficient_bars_reason, reason_with_values
 from ... import sessions
+from ...bars import rth_open_plus, same_day_mask, time_gte_mask
+from ...sessions import EQUITY_RTH_OPEN
 from ..shared_entry import EntryContexts, EntryProposal, RetestTrigger
 from ..strategy_base import BaseStrategy
 
@@ -81,22 +73,22 @@ class ORBStrategy(BaseStrategy):
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)])
                 continue
             day = sessions.now_et().date()
-            session = frame[_same_day_mask(frame, day)]
+            session = frame[same_day_mask(frame, day)]
             if len(session) < opening_range_minutes + 2:
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("opening_range_incomplete", len(session), opening_range_minutes + 2)])
                 continue
-            opening_start_time = time(9, 30)
-            after_start_time = (datetime.combine(day, opening_start_time) + timedelta(minutes=max(0, opening_range_minutes))).time()
+            opening_start_time = EQUITY_RTH_OPEN
+            after_start_time = rth_open_plus(max(0, opening_range_minutes))
             times_series = session.index.to_series().map(lambda ts: ts.time())
             opening_mask = (times_series >= opening_start_time) & (times_series < after_start_time)
             opening = session[opening_mask.to_numpy()]
-            after = session[_time_gte_mask(session, after_start_time)]
+            after = session[time_gte_mask(session, after_start_time)]
             if opening.empty or after.empty:
                 self._record_entry_decision(
                     c.symbol,
                     "skipped",
                     [
-                        _reason_with_values(
+                        reason_with_values(
                             "opening_range_incomplete",
                             current=len(opening),
                             required=1,
@@ -116,17 +108,17 @@ class ORBStrategy(BaseStrategy):
             trigger = or_high * (1.0 + buffer_pct)
             ctx = self._chart_context(frame)
             ms_ctx = self._structure_context(frame, "ltf")
-            last_close = _safe_float(last["close"])
+            last_close = safe_float(last["close"], 0.0)
             pattern_ok = bool(ctx.matched_bullish_continuation or ctx.matched_bullish_reversal) or ctx.bias_score >= 0.0
-            last_vwap = _safe_float(last["vwap"], last_close)
-            last_ema9 = _safe_float(last["ema9"], last_close)
-            last_ema20 = _safe_float(last["ema20"], last_close)
+            last_vwap = safe_float(last["vwap"], last_close)
+            last_ema9 = safe_float(last["ema9"], last_close)
+            last_ema20 = safe_float(last["ema20"], last_close)
             if last_close <= trigger:
-                reasons.append(_reason_with_values("no_orb_breakout", current=last_close, required=trigger, op=">", digits=4))
+                reasons.append(reason_with_values("no_orb_breakout", current=last_close, required=trigger, op=">", digits=4))
             if last_close <= last_vwap:
-                reasons.append(_reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
+                reasons.append(reason_with_values("below_vwap", current=last_close, required=last_vwap, op=">", digits=4))
             if last_ema9 < last_ema20:
-                reasons.append(_reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
+                reasons.append(reason_with_values("ema9_below_ema20", current=last_ema9, required=last_ema20, op=">=", digits=4))
             if not pattern_ok:
                 reasons.append("chart_pattern_not_supportive")
             reasons.extend(self._entry_exhaustion_reasons(Side.LONG, frame, close=last_close, vwap=last_vwap, ema9=last_ema9))

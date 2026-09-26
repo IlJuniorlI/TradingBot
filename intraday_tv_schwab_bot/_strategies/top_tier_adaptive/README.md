@@ -669,7 +669,7 @@ the moment the cap was corrected.
    buffered break and the +1.0 marks a *decisive* one at 2× the buffer; the
    ceiling stays 5.0. `vol_squeeze` had the same shape and was fixed the same
    way on 2026-05-14.
-2. **The window lost a minute.** `_time_in_range` is inclusive at both ends, so
+2. **The window lost a minute.** `_time_in_range` (now `sessions.is_time_in_window`) is inclusive at both ends, so
    the range-formation check overlapped the ORB window at `orb_range_end` — and
    since formation returns first, that minute was unreachable. With the default
    15-minute range the window ran 09:46–10:05 while `entry_windows` opened at

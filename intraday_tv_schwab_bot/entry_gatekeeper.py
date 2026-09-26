@@ -36,7 +36,7 @@ import logging
 import time
 from collections.abc import Mapping
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from schwabdev import Client
 
@@ -58,9 +58,11 @@ from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .numeric import safe_float
 from .risk import RiskManager
-from ._strategies.strategy_base import BaseStrategy
 from .log_setup import TRADEFLOW_LEVEL
 from . import sessions
+
+if TYPE_CHECKING:
+    from ._strategies.strategy_base import BaseStrategy
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 

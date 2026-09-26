@@ -1,22 +1,16 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
+from datetime import time
 from threading import RLock
-from typing import TYPE_CHECKING, ClassVar, Iterable
+from typing import TYPE_CHECKING, Any, ClassVar, Iterable
 
-from .helpers import (
-    _bar_close_position,
-    _bar_wick_fractions,
-    _dashboard_zone_width_from_policy,
-    _normalize_symbol_list,
-    _normalize_symbol_list_details,
-    _optional_float,
-    _optional_int,
-    _position_strategy_matches,
-    _reason_with_values,
-    _safe_float,
-)
+import pandas as pd
+
+from ..numeric import safe_float, safe_int
+from ..reasons import reason_with_values
 from ..event_blackouts import EventBlackoutCalendar
 from ..order_blocks import (
     OrderBlockContext,
@@ -24,41 +18,38 @@ from ..order_blocks import (
     empty_order_block_context,
 )
 from .shared_entry import SharedEntryPolicy
-from ..models import OPTION_ASSET_TYPES, ExitDecision
-from ..bars import frame_bar_minutes, session_bucket_ends
-from .shared import (
-    Any,
-    Candidate,
+from .catalogue import get_plugin
+from ..models import OPTION_ASSET_TYPES, Candidate, ExitDecision, Position, Side, Signal
+from ..bars import bar_close_position, bar_wick_fractions, frame_bar_minutes, last_bucket_forming, resample_bars
+from ..symbols import normalize_symbol_list, normalize_symbol_list_details
+from ..candles import detect_candle_context, directional_candle_signal
+from ..chart_patterns import analyze_chart_pattern_context
+from ..htf_levels import (
     FairValueGapContext,
     HTFContext,
-    LOG,
-    Position,
-    Side,
-    Signal,
-    TechnicalLevelsContext,
-    analyze_chart_pattern_context,
-    analyze_market_structure,
     build_fair_value_gap_context,
-    build_technical_levels_context,
-    equity_session_state,
-    detect_candle_context,
-    directional_candle_signal,
-    ensure_standard_indicator_frame,
     empty_fvg_context,
     empty_htf_context,
-    htf_ema_spans,
+)
+from ..indicators import ensure_standard_indicator_frame, htf_ema_spans, last_bar_atr
+from ..sessions import equity_session_state
+from ..support_resistance import (
+    analyze_market_structure,
     empty_market_structure_context,
     empty_support_resistance_context,
+)
+from ..technical_levels import (
+    TechnicalLevelsContext,
+    build_technical_levels_context,
     empty_technical_levels_context,
-    pd,
-    resample_bars,
-    time,
 )
 from .. import sessions
 
 if TYPE_CHECKING:
     from ..config import BotConfig
     from .shared_exit import ExitTape
+
+LOG = logging.getLogger(__name__)
 
 
 class BaseStrategy:
@@ -125,8 +116,7 @@ class BaseStrategy:
         return dict(params or {})
 
     def _manifest_capabilities(self) -> dict[str, Any]:
-        raw = getattr(self._manifest, "capabilities", None)
-        return raw if isinstance(raw, dict) else {}
+        return self._manifest.capabilities
 
     def _capability(self, path: str, default: Any = None) -> Any:
         node: Any = self._manifest_capabilities()
@@ -156,26 +146,26 @@ class BaseStrategy:
         if token.startswith("params."):
             key = token.split(".", 1)[1]
             if isinstance(self.params, dict):
-                return _normalize_symbol_list(self.params.get(key))
+                return normalize_symbol_list(self.params.get(key))
             return []
         if token.startswith("options."):
             if not self._options_capability_enabled():
                 return []
             optcfg = getattr(self.config, "options", None)
             if token == "options.underlyings":
-                return _normalize_symbol_list(getattr(optcfg, "underlyings", []))
+                return normalize_symbol_list(getattr(optcfg, "underlyings", []))
             if token == "options.confirmation_symbols":
                 values = getattr(optcfg, "confirmation_symbols", {})
                 if isinstance(values, dict):
                     values = values.values()
-                return _normalize_symbol_list(values)
+                return normalize_symbol_list(values)
             if token == "options.volatility_symbol":
-                return _normalize_symbol_list([getattr(optcfg, "volatility_symbol", "")])
+                return normalize_symbol_list([getattr(optcfg, "volatility_symbol", "")])
             return []
         if token == "pairs.symbols":
-            return _normalize_symbol_list(getattr(pair, "symbol", "") for pair in (getattr(self, "pairs", None) or []))
+            return normalize_symbol_list(getattr(pair, "symbol", "") for pair in (getattr(self, "pairs", None) or []))
         if token == "pairs.references":
-            return _normalize_symbol_list(getattr(pair, "reference", "") for pair in (getattr(self, "pairs", None) or []))
+            return normalize_symbol_list(getattr(pair, "reference", "") for pair in (getattr(self, "pairs", None) or []))
         return []
 
     def __init__(self, config: BotConfig):
@@ -190,12 +180,7 @@ class BaseStrategy:
         # the HTF context builders swallow errors (a bad pair used to turn
         # into "no HTF context" -- no EMA gate, no HTF divergence -- silently).
         htf_ema_spans(self.params)
-        self._manifest = None
-        try:
-            from .registry import get_plugin
-            self._manifest = get_plugin(config.strategy)
-        except Exception:
-            self._manifest = None
+        self._manifest = get_plugin(config.strategy)
         # Scheduled-event calendar (macro windows + per-symbol earnings),
         # shared by every strategy. Lazily re-reads its YAML sources when
         # their mtime changes, so it is safe to build once here.
@@ -265,12 +250,21 @@ class BaseStrategy:
         for source in sources:
             label = self._watchlist_source_label(source)
             raw_values = self._watchlist_source_values(source, candidates, positions, bars=bars, active_symbols=active_symbols)
-            normalized, skipped = _normalize_symbol_list_details(raw_values)
+            normalized, skipped = normalize_symbol_list_details(raw_values)
             trace[label] = {
                 "symbols": normalized,
                 "skipped": skipped,
             }
         return trace
+
+    @staticmethod
+    def _position_strategy_matches(position: Position, strategy_names: list[str] | None) -> bool:
+        """True if ``position.strategy`` matches any of the configured
+        strategy names. None or empty strategy_names means 'match anything'."""
+        if not strategy_names:
+            return True
+        current = str(getattr(position, "strategy", "") or "").strip().lower()
+        return current in {str(name).strip().lower() for name in strategy_names if str(name).strip()}
 
     def _watchlist_source_values(
         self,
@@ -337,7 +331,7 @@ class BaseStrategy:
             strategy_names = [str(item).strip().lower() for item in source.get("strategy_names", []) if str(item).strip()]
             values: list[object] = []
             for position in positions.values():
-                if not _position_strategy_matches(position, strategy_names):
+                if not self._position_strategy_matches(position, strategy_names):
                     continue
                 metadata = getattr(position, "metadata", {}) if isinstance(getattr(position, "metadata", {}), dict) else {}
                 raw_value = metadata.get(key)
@@ -361,7 +355,7 @@ class BaseStrategy:
         active_symbols: set[str] | None = None,
     ) -> list[str]:
         raw_values = self._watchlist_source_values(source, candidates, positions, bars=bars, active_symbols=active_symbols)
-        return _normalize_symbol_list(raw_values)
+        return normalize_symbol_list(raw_values)
 
     def _watchlist_symbols_from_capabilities(
         self,
@@ -378,7 +372,7 @@ class BaseStrategy:
         symbols: set[str] = set()
         for source in sources:
             symbols.update(self._watchlist_symbols_from_source(source, candidates, positions, bars=bars, active_symbols=active_symbols))
-        return {token for token in _normalize_symbol_list(symbols)}
+        return {token for token in normalize_symbol_list(symbols)}
 
     def dashboard_tradable_symbols(self) -> list[str]:
         source = self._capability("dashboard.tradable_symbols_source", None)
@@ -389,7 +383,7 @@ class BaseStrategy:
         raw_symbols = self.params.get("tradable")
         if raw_symbols is None:
             raw_symbols = self.params.get("symbols")
-        return _normalize_symbol_list(raw_symbols)
+        return normalize_symbol_list(raw_symbols)
 
     def dashboard_index_symbols(self) -> list[str]:
         """Return the union of ETFs used for directional confirmation:
@@ -405,11 +399,11 @@ class BaseStrategy:
         symbols: set[str] = set()
         raw_index = self.params.get("index_symbols")
         if raw_index:
-            symbols.update(_normalize_symbol_list(raw_index))
+            symbols.update(normalize_symbol_list(raw_index))
         sector_map = self.params.get("sector_index_map")
         if isinstance(sector_map, dict):
             for tickers in sector_map.values():
-                symbols.update(_normalize_symbol_list(tickers))
+                symbols.update(normalize_symbol_list(tickers))
         return sorted(symbols)
 
     def restore_eligible_symbols(self) -> list[str] | None:
@@ -537,6 +531,52 @@ class BaseStrategy:
                 policy = override
         return policy if isinstance(policy, dict) else None
 
+    @staticmethod
+    def _dashboard_zone_width_from_policy(policy: dict[str, Any], close: float, atr: float) -> float | None:
+        """Resolve a numeric zone-width given a dashboard zone-width policy
+        dict and the current price + ATR. Supports four ``mode`` values:
+        ``fixed`` (use ``value``/``fixed_width`` directly), ``atr_mult``
+        (multiply ATR by ``value``/``atr_mult``), ``pct_of_price`` /
+        ``price_pct`` (multiply close by the configured percentage), and
+        ``max_of`` (take max of any of the above components present).
+        Returns None for unrecognized modes or invalid values; otherwise
+        floors at ``min_width`` (default 0.01)."""
+        mode = str(policy.get("mode") or "").strip().lower()
+        min_width = float(policy.get("min_width", 0.01) or 0.01)
+        computed_width: float | None
+        if mode == "fixed":
+            value = policy.get("value", policy.get("fixed_width"))
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            computed_width = float(value)
+        elif mode == "atr_mult":
+            value = policy.get("value", policy.get("atr_mult"))
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            computed_width = float(atr) * float(value)
+        elif mode in {"pct_of_price", "price_pct"}:
+            value = policy.get("value", policy.get("pct_of_price", policy.get("price_pct")))
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            computed_width = float(close) * float(value)
+        elif mode == "max_of":
+            parts: list[float] = []
+            fixed_width = policy.get("fixed_width")
+            atr_mult = policy.get("atr_mult")
+            pct_of_price = policy.get("pct_of_price", policy.get("price_pct"))
+            if isinstance(fixed_width, (int, float)) and not isinstance(fixed_width, bool):
+                parts.append(float(fixed_width))
+            if isinstance(atr_mult, (int, float)) and not isinstance(atr_mult, bool):
+                parts.append(float(atr) * float(atr_mult))
+            if isinstance(pct_of_price, (int, float)) and not isinstance(pct_of_price, bool):
+                parts.append(float(close) * float(pct_of_price))
+            if not parts:
+                return None
+            computed_width = max(parts)
+        else:
+            return None
+        return max(float(computed_width), float(min_width), 0.01)
+
     def dashboard_zone_width_for_level(
         self,
         side: Side,
@@ -548,7 +588,7 @@ class BaseStrategy:
     ) -> float | None:
         policy = self._resolve_dashboard_zone_width_policy(candidate)
         if isinstance(policy, dict):
-            return _dashboard_zone_width_from_policy(policy, close=float(close), atr=float(atr))
+            return self._dashboard_zone_width_from_policy(policy, close=float(close), atr=float(atr))
         return None
 
     def dashboard_overlay_candidates(self, side: Side, close: float, ltf: pd.DataFrame, htf: HTFContext) -> list[dict[str, Any]] | None:
@@ -571,13 +611,6 @@ class BaseStrategy:
             return max(0, int(self.params.get("min_bars", 0) or 0))
         except Exception:
             return 0
-
-    @staticmethod
-    def _frame_atr14(frame: pd.DataFrame | None, close: float) -> float:
-        """ATR14 from the last bar of ``frame``, with a price-scaled fallback."""
-        if frame is not None and not frame.empty and "atr14" in frame.columns:
-            return _safe_float(frame.iloc[-1]["atr14"], close * 0.0015)
-        return max(close * 0.0015, 0.01)
 
     def _technical_level_setting(self, key: str, default: Any) -> Any:
         cfg = getattr(self.config, "technical_levels", None)
@@ -922,39 +955,38 @@ class BaseStrategy:
             return []
         if not bool(self.params.get("entry_exhaustion_filter_enabled", True)):
             return []
-        atr = _safe_float(frame.iloc[-1].get("atr14"), max(abs(float(close)) * 0.0015, 0.01))
-        atr = max(atr, max(abs(float(close)) * 0.0005, 0.01))
+        atr = last_bar_atr(frame, float(close), floor_pct=0.0005)
         max_vwap_ext_atr = max(0.1, float(self.params.get("max_entry_vwap_extension_atr", 0.95)))
         max_ema9_ext_atr = max(0.1, float(self.params.get("max_entry_ema9_extension_atr", 0.75)))
         max_bar_range_atr = max(0.25, float(self.params.get("max_entry_bar_range_atr", 1.7)))
         max_upper_wick_frac = min(0.95, max(0.05, float(self.params.get("max_entry_upper_wick_frac", 0.30))))
         max_lower_wick_frac = min(0.95, max(0.05, float(self.params.get("max_entry_lower_wick_frac", 0.30))))
         wick_close_pos_guard = min(0.95, max(0.05, float(self.params.get("entry_wick_close_position_guard", 0.62))))
-        upper_wick_frac, lower_wick_frac, _, bar_range = _bar_wick_fractions(frame)
-        close_pos = _bar_close_position(frame)
+        upper_wick_frac, lower_wick_frac, _, bar_range = bar_wick_fractions(frame)
+        close_pos = bar_close_position(frame)
         reasons: list[str] = []
         if side == Side.LONG:
             vwap_ext_atr = max(0.0, float(close) - float(vwap)) / atr if float(vwap) > 0 else 0.0
             ema9_ext_atr = max(0.0, float(close) - float(ema9)) / atr if float(ema9) > 0 else 0.0
             if vwap_ext_atr > max_vwap_ext_atr:
-                reasons.append(_reason_with_values("too_extended_from_vwap_atr", current=vwap_ext_atr, required=max_vwap_ext_atr, op="<=", digits=4))
+                reasons.append(reason_with_values("too_extended_from_vwap_atr", current=vwap_ext_atr, required=max_vwap_ext_atr, op="<=", digits=4))
             if ema9_ext_atr > max_ema9_ext_atr:
-                reasons.append(_reason_with_values("too_extended_from_ema9_atr", current=ema9_ext_atr, required=max_ema9_ext_atr, op="<=", digits=4))
+                reasons.append(reason_with_values("too_extended_from_ema9_atr", current=ema9_ext_atr, required=max_ema9_ext_atr, op="<=", digits=4))
             if upper_wick_frac > max_upper_wick_frac and close_pos < wick_close_pos_guard:
-                reasons.append(_reason_with_values("upper_wick_rejection", current=upper_wick_frac, required=max_upper_wick_frac, op="<=", digits=4, extras={"close_position": (close_pos, ">=", wick_close_pos_guard)}))
+                reasons.append(reason_with_values("upper_wick_rejection", current=upper_wick_frac, required=max_upper_wick_frac, op="<=", digits=4, extras={"close_position": (close_pos, ">=", wick_close_pos_guard)}))
             if (bar_range / atr) > max_bar_range_atr and (vwap_ext_atr > max_vwap_ext_atr * 0.75 or ema9_ext_atr > max_ema9_ext_atr * 0.75):
-                reasons.append(_reason_with_values("expansion_bar_too_large", current=(bar_range / atr), required=max_bar_range_atr, op="<=", digits=4))
+                reasons.append(reason_with_values("expansion_bar_too_large", current=(bar_range / atr), required=max_bar_range_atr, op="<=", digits=4))
         else:
             vwap_ext_atr = max(0.0, float(vwap) - float(close)) / atr if float(vwap) > 0 else 0.0
             ema9_ext_atr = max(0.0, float(ema9) - float(close)) / atr if float(ema9) > 0 else 0.0
             if vwap_ext_atr > max_vwap_ext_atr:
-                reasons.append(_reason_with_values("too_extended_from_vwap_atr", current=vwap_ext_atr, required=max_vwap_ext_atr, op="<=", digits=4))
+                reasons.append(reason_with_values("too_extended_from_vwap_atr", current=vwap_ext_atr, required=max_vwap_ext_atr, op="<=", digits=4))
             if ema9_ext_atr > max_ema9_ext_atr:
-                reasons.append(_reason_with_values("too_extended_from_ema9_atr", current=ema9_ext_atr, required=max_ema9_ext_atr, op="<=", digits=4))
+                reasons.append(reason_with_values("too_extended_from_ema9_atr", current=ema9_ext_atr, required=max_ema9_ext_atr, op="<=", digits=4))
             if lower_wick_frac > max_lower_wick_frac and close_pos > (1.0 - wick_close_pos_guard):
-                reasons.append(_reason_with_values("lower_wick_rejection", current=lower_wick_frac, required=max_lower_wick_frac, op="<=", digits=4, extras={"close_position": (close_pos, "<=", 1.0 - wick_close_pos_guard)}))
+                reasons.append(reason_with_values("lower_wick_rejection", current=lower_wick_frac, required=max_lower_wick_frac, op="<=", digits=4, extras={"close_position": (close_pos, "<=", 1.0 - wick_close_pos_guard)}))
             if (bar_range / atr) > max_bar_range_atr and (vwap_ext_atr > max_vwap_ext_atr * 0.75 or ema9_ext_atr > max_ema9_ext_atr * 0.75):
-                reasons.append(_reason_with_values("expansion_bar_too_large", current=(bar_range / atr), required=max_bar_range_atr, op="<=", digits=4))
+                reasons.append(reason_with_values("expansion_bar_too_large", current=(bar_range / atr), required=max_bar_range_atr, op="<=", digits=4))
         return reasons
 
     def _htf_minutes(self) -> int:
@@ -1143,8 +1175,8 @@ class BaseStrategy:
         ``(bias, bull_votes, bear_votes)``."""
         bull = 0
         bear = 0
-        ema_fast = _optional_float(getattr(htf, "ema_fast", None))
-        ema_slow = _optional_float(getattr(htf, "ema_slow", None))
+        ema_fast = safe_float(getattr(htf, "ema_fast", None))
+        ema_slow = safe_float(getattr(htf, "ema_slow", None))
         if ema_fast is not None:
             if close > ema_fast:
                 bull += 1
@@ -1234,42 +1266,42 @@ class BaseStrategy:
             "broken_htf_resistance": float(ctx.broken_resistance.price) if getattr(ctx, "broken_resistance", None) else None,
             "nearest_htf_resistance": float(ctx.nearest_resistance.price) if getattr(ctx, "nearest_resistance", None) else None,
             "broken_htf_support": float(ctx.broken_support.price) if getattr(ctx, "broken_support", None) else None,
-            "prior_day_high": _optional_float(getattr(ctx, "prior_day_high", None)) if "prior_day_high" in active_sources else None,
-            "prior_day_low": _optional_float(getattr(ctx, "prior_day_low", None)) if "prior_day_low" in active_sources else None,
-            "prior_week_high": _optional_float(getattr(ctx, "prior_week_high", None)) if "prior_week_high" in active_sources else None,
-            "prior_week_low": _optional_float(getattr(ctx, "prior_week_low", None)) if "prior_week_low" in active_sources else None,
-            "htf_ema_fast": _optional_float(getattr(ctx, "ema_fast", None)),
-            "htf_ema_slow": _optional_float(getattr(ctx, "ema_slow", None)),
-            "htf_atr14": _optional_float(getattr(ctx, "atr14", None)),
+            "prior_day_high": safe_float(getattr(ctx, "prior_day_high", None)) if "prior_day_high" in active_sources else None,
+            "prior_day_low": safe_float(getattr(ctx, "prior_day_low", None)) if "prior_day_low" in active_sources else None,
+            "prior_week_high": safe_float(getattr(ctx, "prior_week_high", None)) if "prior_week_high" in active_sources else None,
+            "prior_week_low": safe_float(getattr(ctx, "prior_week_low", None)) if "prior_week_low" in active_sources else None,
+            "htf_ema_fast": safe_float(getattr(ctx, "ema_fast", None)),
+            "htf_ema_slow": safe_float(getattr(ctx, "ema_slow", None)),
+            "htf_atr14": safe_float(getattr(ctx, "atr14", None)),
             "htf_trend_bias": str(getattr(ctx, "trend_bias", "neutral")),
             "htf_level_buffer": float(getattr(ctx, "level_buffer", 0.0) or 0.0),
             "htf_bullish_fvgs": [
                 {
-                    "lower": _optional_float(getattr(gap, "lower", None)),
-                    "upper": _optional_float(getattr(gap, "upper", None)),
-                    "midpoint": _optional_float(getattr(gap, "midpoint", None)),
-                    "size": _optional_float(getattr(gap, "size", None)),
-                    "filled_pct": _optional_float(getattr(gap, "filled_pct", None)),
+                    "lower": safe_float(getattr(gap, "lower", None)),
+                    "upper": safe_float(getattr(gap, "upper", None)),
+                    "midpoint": safe_float(getattr(gap, "midpoint", None)),
+                    "size": safe_float(getattr(gap, "size", None)),
+                    "filled_pct": safe_float(getattr(gap, "filled_pct", None)),
                 }
                 for gap in (getattr(ctx, "bullish_fvgs", []) or [])
             ],
             "htf_bearish_fvgs": [
                 {
-                    "lower": _optional_float(getattr(gap, "lower", None)),
-                    "upper": _optional_float(getattr(gap, "upper", None)),
-                    "midpoint": _optional_float(getattr(gap, "midpoint", None)),
-                    "size": _optional_float(getattr(gap, "size", None)),
-                    "filled_pct": _optional_float(getattr(gap, "filled_pct", None)),
+                    "lower": safe_float(getattr(gap, "lower", None)),
+                    "upper": safe_float(getattr(gap, "upper", None)),
+                    "midpoint": safe_float(getattr(gap, "midpoint", None)),
+                    "size": safe_float(getattr(gap, "size", None)),
+                    "filled_pct": safe_float(getattr(gap, "filled_pct", None)),
                 }
                 for gap in (getattr(ctx, "bearish_fvgs", []) or [])
             ],
-            "nearest_htf_bullish_fvg": _optional_float(getattr(getattr(ctx, "nearest_bullish_fvg", None), "midpoint", None)),
-            "nearest_htf_bearish_fvg": _optional_float(getattr(getattr(ctx, "nearest_bearish_fvg", None), "midpoint", None)),
+            "nearest_htf_bullish_fvg": safe_float(getattr(getattr(ctx, "nearest_bullish_fvg", None), "midpoint", None)),
+            "nearest_htf_bearish_fvg": safe_float(getattr(getattr(ctx, "nearest_bearish_fvg", None), "midpoint", None)),
         }
 
     def _ltf_fvg_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> FairValueGapContext:
         ltf_min = self._ltf_minutes()
-        current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
+        current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         if not bool(self._support_resistance_setting("ltf_fair_value_gaps_enabled", False)):
             return empty_fvg_context(current_price, timeframe_minutes=ltf_min)
         max_per_side = int(self._support_resistance_setting("fair_value_gap_max_per_side", 4) or 4)
@@ -1328,7 +1360,7 @@ class BaseStrategy:
         candidates per cycle and the dashboard). Falls back to inline
         `build_order_block_context` when there's no data store available."""
         ltf_min = self._ltf_minutes()
-        current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
+        current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         knobs = self._order_block_tuning_knobs()
         mode = knobs["mode"]
         if not bool(self._support_resistance_setting("ltf_order_blocks_enabled", False)):
@@ -1374,7 +1406,7 @@ class BaseStrategy:
         Routes through `data.get_order_block_context` when available so the
         HTF resample + OB detection is shared with the dashboard via the
         cycle-scoped cache."""
-        current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
+        current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         knobs = self._order_block_tuning_knobs()
         mode = knobs["mode"]
         htf_minutes = self._htf_minutes()
@@ -1463,7 +1495,7 @@ class BaseStrategy:
             cached = self._structure_context_cache.get(cache_key)
             if cached is not None:
                 return cached[1]
-        current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
+        current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         if frame is None or frame.empty or not bool(self._support_resistance_setting("structure_enabled", True)):
             empty_ctx = empty_market_structure_context(current_price)
             with self._structure_context_lock:
@@ -1485,20 +1517,17 @@ class BaseStrategy:
                 if resampled is not None and not resampled.empty:
                     analysis_frame = resampled
                     bar_minutes = ltf_tf_min
-                    current_price = _safe_float(analysis_frame.iloc[-1]["close"], current_price)
+                    current_price = safe_float(analysis_frame.iloc[-1]["close"], current_price)
         if bar_minutes is None:
             bar_minutes = frame_bar_minutes(analysis_frame.index)
         # The resample keeps the still-forming last bucket, and so does a
         # peer's native 5m LTF frame (get_merged resamples the live 1m
         # stream). Its first minutes must not confirm a pivot (2026-09-25,
         # see analyze_market_structure). The same clock test as the
-        # dashboard's forming bucket and data_feed._completed_bars; a frame of
-        # completed 1m bars never reads as forming. A tz-naive index is ET
-        # wall time (session_bucket_bounds).
-        last_end = session_bucket_ends(analysis_frame.index[-1:], bar_minutes)[0]
-        now = pd.Timestamp(sessions.now_et())
-        if last_end.tzinfo is None:
-            now = now.tz_localize(None)
+        # dashboard's forming bucket and data_feed._completed_bars
+        # (bars.last_bucket_forming / completed_bucket_mask); a frame of
+        # completed 1m bars never reads as forming.
+        last_bar_forming = last_bucket_forming(analysis_frame.index, bar_minutes, sessions.now_et())
         pct_tolerance = float(self._support_resistance_setting("pct_tolerance", 0.0030) or 0.0030)
         if is_ltf_analysis:
             pct_tolerance *= 0.60
@@ -1514,7 +1543,7 @@ class BaseStrategy:
             structure_event_max_age_bars=structure_event_max_age_bars,
             min_range_atr_mult=float(self._support_resistance_setting("structure_min_range_atr_mult", 1.5) or 0.0),
             min_pivot_gap_bars=int(self._support_resistance_setting("structure_min_pivot_gap_bars", 0) or 0),
-            last_bar_forming=bool(last_end > now),
+            last_bar_forming=last_bar_forming,
         )
         with self._structure_context_lock:
             self._structure_context_cache[cache_key] = (frame, ctx)
@@ -1587,7 +1616,7 @@ class BaseStrategy:
             cached = self._technical_context_cache.get(cache_key)
             if cached is not None:
                 return cached[1]
-        current_price = _safe_float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
+        current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         cfg = getattr(self.config, "technical_levels", None)
         sr_cfg = getattr(self.config, "support_resistance", None)
         if frame is None or frame.empty or not bool(self._technical_level_setting("enabled", True)):
@@ -1602,9 +1631,9 @@ class BaseStrategy:
             pivot_span=max(1, pivot_span),
             fib_lookback_bars=int(self._technical_level_setting("fib_lookback_bars", 120) or 120),
             fib_min_impulse_atr=float(self._technical_level_setting("fib_min_impulse_atr", 1.25) or 1.25),
-            anchored_vwap_impulse_lookback_bars=_optional_int(self._technical_level_setting("anchored_vwap_impulse_lookback_bars", None), None),
-            anchored_vwap_min_impulse_atr=_optional_float(self._technical_level_setting("anchored_vwap_min_impulse_atr", None), None),
-            anchored_vwap_pivot_span=_optional_int(self._technical_level_setting("anchored_vwap_pivot_span", None), None),
+            anchored_vwap_impulse_lookback_bars=safe_int(self._technical_level_setting("anchored_vwap_impulse_lookback_bars", None)),
+            anchored_vwap_min_impulse_atr=safe_float(self._technical_level_setting("anchored_vwap_min_impulse_atr", None)),
+            anchored_vwap_pivot_span=safe_int(self._technical_level_setting("anchored_vwap_pivot_span", None)),
             trendline_lookback_bars=int(self._technical_level_setting("trendline_lookback_bars", 120) or 120),
             trendline_min_touches=int(self._technical_level_setting("trendline_min_touches", 3) or 3),
             trendline_atr_tolerance_mult=float(self._technical_level_setting("trendline_atr_tolerance_mult", 0.35) or 0.35),
@@ -1758,8 +1787,8 @@ class BaseStrategy:
         always armed) and a credit spread as ~-5R (never armed).
         """
         meta = position.metadata if isinstance(position.metadata, dict) else {}
-        entry = _optional_float(position.entry_price)
-        initial_stop = _optional_float(meta.get("initial_stop_price"), position.stop_price)
+        entry = safe_float(position.entry_price)
+        initial_stop = safe_float(meta.get("initial_stop_price"), safe_float(position.stop_price, finite=True), finite=True)
         if entry is None or initial_stop is None:
             return None
         risk = abs(entry - initial_stop)
@@ -1767,7 +1796,7 @@ class BaseStrategy:
             return None
         price: float | None = close
         if BaseStrategy._is_option_position(position):
-            price = _optional_float(meta.get("last_mark_price"))
+            price = safe_float(meta.get("last_mark_price"))
             if price is None:
                 return None
         move = (price - entry) if position.side == Side.LONG else (entry - price)
@@ -1788,9 +1817,9 @@ class BaseStrategy:
         callers treat as "no opinion".
         """
         if not BaseStrategy._is_option_position(position):
-            return _optional_float(position.entry_price)
+            return safe_float(position.entry_price)
         meta = position.metadata if isinstance(position.metadata, dict) else {}
-        return _optional_float(meta.get("underlying_entry"))
+        return safe_float(meta.get("underlying_entry"))
 
     @staticmethod
     def _underlying_extremes(position: Position) -> tuple[float | None, float | None]:
@@ -1802,11 +1831,11 @@ class BaseStrategy:
         """
         entry = BaseStrategy._underlying_entry_price(position)
         if not BaseStrategy._is_option_position(position):
-            return (_optional_float(position.highest_price, entry), _optional_float(position.lowest_price, entry))
+            return (safe_float(position.highest_price, entry), safe_float(position.lowest_price, entry))
         meta = position.metadata if isinstance(position.metadata, dict) else {}
         return (
-            _optional_float(meta.get("underlying_high_since_entry"), entry),
-            _optional_float(meta.get("underlying_low_since_entry"), entry),
+            safe_float(meta.get("underlying_high_since_entry"), entry),
+            safe_float(meta.get("underlying_low_since_entry"), entry),
         )
 
     def _structure_event_recent(self, age_bars: int | None, *, htf: bool = False) -> bool:
@@ -1814,11 +1843,8 @@ class BaseStrategy:
         bars of the structure it came from, so pass ``htf=True`` for the S/R
         context's ``market_structure`` -- its ages are HTF bars and must be
         judged by the HTF window, not the LTF one."""
-        # Local import: this module keeps `..config` behind TYPE_CHECKING.
-        from ..config import htf_structure_event_lookback
-        cfg = getattr(self.config, "support_resistance", None)
         lookback = (
-            htf_structure_event_lookback(cfg) if htf
+            self.config.support_resistance.htf_structure_event_lookback() if htf
             else int(self._support_resistance_setting("structure_event_lookback_bars", 6) or 6)
         )
         return age_bars is not None and age_bars <= lookback
@@ -1897,8 +1923,8 @@ class BaseStrategy:
             )
             or max(runner_target_rr_default, current_target_rr + runner_bonus_rr + (continuation_scale * 0.18) + strong_setup_bonus)
         )
-        base_trail_pct = _optional_float(getattr(self.config.risk, "trailing_stop_pct", None))
-        runner_trail_pct = _optional_float(self.params.get("adaptive_runner_trail_pct"))
+        base_trail_pct = safe_float(getattr(self.config.risk, "trailing_stop_pct", None))
+        runner_trail_pct = safe_float(self.params.get("adaptive_runner_trail_pct"))
         if runner_trail_pct is None and base_trail_pct is not None and base_trail_pct > 0:
             runner_trail_pct = max(0.0005, float(base_trail_pct) * (0.85 if trend_like else 0.90))
         return {
