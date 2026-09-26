@@ -43,13 +43,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from typing import Any, Callable
 
-from schwabdev import Client
-
 from .broker_positions import (
     active_broker_bracket,
     broker_position_side_qty,
-    extract_broker_positions,
-    extract_working_orders,
     working_exit_outstanding_qty,
 )
 from .config import BotConfig
@@ -60,7 +56,7 @@ from .position_metrics import safe_float
 from .position_store import ReconcileMetadataStore
 from ._strategies.registry import is_option_strategy
 from ._strategies.strategy_base import BaseStrategy
-from .utils import UTC, call_schwab_client, now_et
+from .utils import UTC, now_et
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -70,7 +66,6 @@ class StartupReconciler:
         self,
         config: BotConfig,
         *,
-        client: Client,
         executor,
         data: MarketDataStore,
         account: PaperAccount,
@@ -81,7 +76,6 @@ class StartupReconciler:
         stock_position_trail_pct: Callable[..., float | None],
     ) -> None:
         self.config = config
-        self.client = client
         self.executor = executor
         self.data = data
         self.account = account
@@ -113,9 +107,11 @@ class StartupReconciler:
             symbol = str(row.get("symbol") or "").upper().strip()
             if not symbol or symbol not in ignored:
                 continue
-            long_qty = int(float(row.get("longQuantity") or 0) or 0)
-            short_qty = int(float(row.get("shortQuantity") or 0) or 0)
-            if long_qty > 0 or short_qty > 0:
+            # A held broker row reads the way the settle reads it: a
+            # malformed quantity is not held, and neither is a row that is
+            # both long and short.
+            _side, qty, _avg = broker_position_side_qty(row)
+            if qty > 0:
                 blocked.add(symbol)
         return blocked
 
@@ -170,14 +166,11 @@ class StartupReconciler:
         symbol_upper = str(symbol).upper().strip()
         if not symbol_upper or symbol_upper not in self._entry_block_symbols:
             return False
-        try:
-            account = call_schwab_client(self.client, "account_details", self.executor.account_hash, fields="positions").json()
-            raw_positions = extract_broker_positions(account)
-            still_blocked = symbol_upper in self._ignored_open_position_symbols(raw_positions)
-        except Exception as exc:
-            LOG.warning("Could not refresh startup-reconcile entry block for %s: %s", symbol_upper, exc)
+        raw_positions = self.executor.fetch_account_positions()
+        if raw_positions is None:
+            LOG.warning("Could not refresh startup-reconcile entry block for %s: the broker account read failed", symbol_upper)
             return True
-        if still_blocked:
+        if symbol_upper in self._ignored_open_position_symbols(raw_positions):
             return True
         self._entry_block_symbols.discard(symbol_upper)
         if isinstance(self.result, dict):
@@ -238,9 +231,19 @@ class StartupReconciler:
                 # They are this position's, booked from the order's own fill
                 # record by the first cycle; strict equality lost the metadata
                 # (levels, marker, the order) to a restore_basic (2026-09-25).
-                # A gap the order does not explain, or an order whose state
-                # cannot be read, still does not match.
-                held_when_saved += self._unbooked_working_exit_fills(position) or 0
+                # A gap the order does not explain still does not match. An
+                # order whose state cannot be read fails the attempt: read as
+                # no fills, it restored the position basic at the broker
+                # quantity with its stop resized to all of it beside the exit
+                # order's outstanding shares, and lost the order for good. A
+                # dry run reads no order state, by design: there it does not
+                # match.
+                unbooked = self._unbooked_working_exit_fills(position)
+                if unbooked is None:
+                    if self.config.schwab.dry_run:
+                        continue
+                    raise RuntimeError(f"the working exit order state of {symbol_upper} could not be read")
+                held_when_saved += unbooked
             if int(position.qty) != held_when_saved:
                 continue
             return str(key), position
@@ -371,7 +374,7 @@ class StartupReconciler:
             return outstanding
         return max(0, int(state.get("filled_qty") or 0) - int(record.get("booked_qty") or 0))
 
-    def _settle_positions_closed_at_broker(self, raw_positions: list[dict[str, Any]]) -> None:
+    def _settle_positions_closed_at_broker(self, raw_positions: list[dict[str, Any]]) -> bool:
         """Stop managing what the broker no longer holds.
 
         The session-boundary re-run of ``reconcile`` exists for positions
@@ -396,11 +399,16 @@ class StartupReconciler:
         Skipped in dry-run: those positions are simulated and never reach the
         broker, so the account holding none of them says nothing -- reading
         it as a close wiped every paper position held into a new session.
+
+        Returns False when a working exit order's state could not be read: that
+        position is left tracked, and the reconcile reports failure so the
+        engine retries rather than tracking it at the wrong size all day.
         """
         if not self.positions or self.config.schwab.dry_run:
-            return
+            return True
         held = {str(row.get("symbol") or "").upper().strip(): row for row in raw_positions}
         changed = False
+        exit_states_read = True
         for key, position in list(self.positions.items()):
             remaining = self._broker_held_qty(position, held)
             if remaining is None:
@@ -409,6 +417,7 @@ class StartupReconciler:
             unbooked = self._unbooked_working_exit_fills(position)
             if unbooked is None:
                 LOG.warning("%s: its working exit order's fills cannot be read; leaving it tracked", key)
+                exit_states_read = False
                 continue
             # What the broker holds once the manager books the position's own
             # working exit fills (next cycle, from the order's fill record).
@@ -454,6 +463,7 @@ class StartupReconciler:
             changed = True
         if changed:
             self._save_reconcile_metadata()
+        return exit_states_read
 
     @staticmethod
     def _resting_stop_for(position: Position, working_orders: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -501,7 +511,7 @@ class StartupReconciler:
             owned.update(str(oid) for oid in (bracket.get("child_order_ids") or []) if oid)
         return [order for order in working_orders if str(order.get("orderId")) not in owned]
 
-    def _drop_retired_orders(self, orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _drop_retired_orders(self, orders: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
         """The startup-snapshot orders still live now. A restore that resizes
         an adopted child replaces it, and the session-boundary settle cancels
         the bracket of a position closed outside the bot: the old ids read
@@ -514,19 +524,24 @@ class StartupReconciler:
         (a stop entered before an overnight hold, or hours before the
         restart) is read on its own with ``order_details``. Reading the
         missing id as live kept it foreign. Unreadable state keeps an order
-        (fail closed)."""
+        (fail closed) and returns False with the list, so the reconcile is
+        retried rather than blocking entries for the day on one bad read."""
         states = self.executor.fetch_order_states()
         if states is None:
-            return orders
+            return orders, False
         live: list[dict[str, Any]] = []
+        all_read = True
         for order in orders:
             order_id = str(order.get("orderId"))
             state = states.get(order_id)
             if state is None:
                 state = self.executor.order_state(order_id)
-            if state is None or not (state.get("is_terminal_failure") or state.get("is_filled")):
+            if state is None:
+                all_read = False
                 live.append(order)
-        return live
+            elif not (state.get("is_terminal_failure") or state.get("is_filled")):
+                live.append(order)
+        return live, all_read
 
     def _restore_broker_positions(self, positions: list[dict[str, Any]], *, use_metadata: bool,
                                   working_orders: list[dict[str, Any]]) -> tuple[int, int]:
@@ -657,7 +672,12 @@ class StartupReconciler:
             restored += 1
         if use_metadata:
             try:
-                removed = self.reconcile_metadata_store.delete_unmatched_positions(matched_metadata_keys)
+                # A position already tracked keeps its row. The loop skips it,
+                # so it never matches, and the engine's save skips an unchanged
+                # position set: pruning its row lost its levels, bracket and
+                # working-exit ids to the next restart (the session-boundary
+                # re-run and every reconcile retry reach this).
+                removed = self.reconcile_metadata_store.delete_unmatched_positions(matched_metadata_keys | set(self.positions))
                 if removed:
                     LOG.info("Pruned %s stale startup reconcile metadata row(s) after hybrid restore", removed)
             except Exception as exc:
@@ -670,68 +690,72 @@ class StartupReconciler:
     # Main entry point — called once from engine.run() before step loop.
     # ------------------------------------------------------------------
 
-    def reconcile(self) -> None:
+    def reconcile(self) -> bool:
+        """Read the broker and apply ``startup_reconcile_mode``.
+
+        Returns False when the attempt could not read the broker: the
+        account, the working orders, a tracked or saved position's working
+        exit order, or a working order it would otherwise count as foreign. A
+        failed read is recorded in ``result`` and, in the blocking modes,
+        blocks entries (``startup_reconcile_failed``, or
+        ``working_orders_present`` for an unread foreign order); the engine
+        retries until an attempt succeeds, which clears the block.
+        """
         mode = str(self.config.runtime.startup_reconcile_mode or "ignore").lower()
-        self._entry_block_symbols = set()
         if not self.config.runtime.reconcile_on_startup or mode == "ignore":
-            return
+            self._entry_block_symbols = set()
+            return True
+        account_read = False
         try:
             # account_details and account_orders are independent reads; fire
             # both in parallel to halve the boot-time stall that blocks the
-            # engine from entering its first scan cycle. Result objects are
-            # processed sequentially below — same behaviour as before for
-            # 4xx/5xx (status_code branch) and network errors (re-raised by
-            # future.result(), caught by the outer try/except).
+            # engine from entering its first scan cycle. Each returns None
+            # when the broker could not be read.
             now = now_et()
             from_ts = (now - timedelta(days=self.config.runtime.startup_order_lookback_days)).astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             to_ts = now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="bot-startup-reconcile") as executor:
-                # Wrap each call in a lambda so executor.submit sees a
-                # zero-arg callable. Passing positional/keyword args directly
-                # to submit() trips PyCharm's ParamSpec inference against
-                # schwabdev.Client method overloads (e.g. place_order's
-                # dict-typed second arg), producing false positives. The
-                # lambda also keeps from_ts / to_ts bound at definition time
-                # — they're set once above and never mutated, so no late-
-                # binding issue.
-                account_future = executor.submit(
-                    lambda: call_schwab_client(
-                        self.client, "account_details", self.executor.account_hash, fields="positions"
-                    )
-                )
-                orders_future = executor.submit(
-                    lambda: call_schwab_client(
-                        self.client,
-                        "account_orders",
-                        self.executor.account_hash,
-                        fromEnteredTime=from_ts,
-                        toEnteredTime=to_ts,
-                    )
-                )
-                account = account_future.result().json()
-                orders_resp = orders_future.result()
-            raw_positions = extract_broker_positions(account)
-            self._settle_positions_closed_at_broker(raw_positions)
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="bot-startup-reconcile") as pool:
+                positions_future = pool.submit(self.executor.fetch_account_positions)
+                orders_future = pool.submit(self.executor.fetch_working_orders, from_ts, to_ts)
+                raw_positions = positions_future.result()
+                raw_orders = orders_future.result()
+            # An unread account is not an empty one: settling against it
+            # books every tracked position closed_outside_bot and cancels its
+            # broker stop, and the empty hybrid branch below prunes the
+            # metadata the next restart restores from. Nothing is done.
+            if raw_positions is None:
+                raise RuntimeError("the broker account read failed")
+            account_read = True
+            # The settle reads the account, not the order list.
+            exit_states_read = self._settle_positions_closed_at_broker(raw_positions)
             ignored_open_position_symbols = sorted(self._ignored_open_position_symbols(raw_positions))
-            if ignored_open_position_symbols:
-                self._entry_block_symbols = set(ignored_open_position_symbols)
+            self._entry_block_symbols = set(ignored_open_position_symbols)
             positions = self._filter_reconcile_positions(raw_positions)
-            orders_lookup_failed = False
-            if getattr(orders_resp, "status_code", 200) >= 400:
-                orders_lookup_failed = True
-                LOG.warning("Startup order lookup failed status=%s body=%s", getattr(orders_resp, "status_code", None), getattr(orders_resp, "text", ""))
-                working_orders = []
-            else:
-                working_orders = self._filter_reconcile_orders(extract_working_orders(orders_resp.json()))
+            if raw_orders is None:
+                # An unread order list is not an empty one either. A
+                # bracket-mode restore against it cannot see the stop still
+                # resting from before the restart and submits fresh protection
+                # beside it, and a restored symbol is never revisited, so both
+                # stops stay (together they sell the position net short).
+                # Without bracket mode the list protects nothing: restore what
+                # the broker holds so the engine manages it, and fail the
+                # attempt so the retry reads the list (it skips what is
+                # already tracked).
+                if mode in {"restore_basic", "restore_hybrid"} and not self.executor.bracket_orders_enabled():
+                    self._restore_broker_positions(positions, use_metadata=(mode == "restore_hybrid"), working_orders=[])
+                raise RuntimeError("the broker working-order read failed")
+            working_orders = self._filter_reconcile_orders(raw_orders)
+            # False when a working order's state could not be read (below);
+            # the order still counts, and the attempt is retried.
+            order_states_read = True
             ignored = sorted(self._ignore_symbols())
             self.result = {
                 "positions": positions,
                 "working_orders": working_orders,
                 "ignored_symbols": ignored,
                 "ignored_open_position_symbols": ignored_open_position_symbols,
-                "orders_lookup_failed": bool(orders_lookup_failed),
             }
-            if positions or working_orders or orders_lookup_failed:
+            if positions or working_orders:
                 msg = f"Startup reconciliation found {len(positions)} broker positions and {len(working_orders)} working orders"
                 if ignored:
                     msg += f" after ignoring {','.join(ignored)}"
@@ -744,10 +768,8 @@ class StartupReconciler:
                         reasons.append("broker_positions_present")
                     if working_orders:
                         reasons.append("working_orders_present")
-                    if orders_lookup_failed:
-                        reasons.append("orders_lookup_failed")
                     self.trading_blocked_reason = ",".join(reasons) if reasons else "startup_reconcile_blocked"
-                    self.trading_blocked_message = msg if not orders_lookup_failed else (msg + "; working-order lookup failed")
+                    self.trading_blocked_message = msg
                 elif mode == "log_only":
                     self.trading_blocked_reason = None
                     self.trading_blocked_message = None
@@ -763,19 +785,16 @@ class StartupReconciler:
                     # resized, or the bracket the settle cancelled. The settle
                     # runs with nothing restored (a tracked symbol is
                     # skipped), so the filter no longer waits on a restore
-                    # (2026-09-25).
+                    # (2026-09-25). A dry run retires nothing at the broker.
                     foreign_orders = self._foreign_working_orders(working_orders)
-                    if foreign_orders:
-                        foreign_orders = self._drop_retired_orders(foreign_orders)
+                    if foreign_orders and not self.config.schwab.dry_run:
+                        foreign_orders, order_states_read = self._drop_retired_orders(foreign_orders)
                     self.result["foreign_working_orders"] = foreign_orders
                     self.result["restored_positions"] = restored
                     self.result["skipped_restore_positions"] = skipped
                     if restored:
                         LOG.warning("Restored %s broker position(s) using startup_reconcile_mode=%s", restored, mode)
-                    if orders_lookup_failed:
-                        self.trading_blocked_reason = "startup_reconcile_orders_lookup_failed"
-                        self.trading_blocked_message = "Startup reconciliation could not verify working orders; clear the issue before new entries"
-                    elif is_option_strategy(self.config.strategy) and positions:
+                    if is_option_strategy(self.config.strategy) and positions:
                         self.trading_blocked_reason = "startup_reconcile_option_restore_unsupported"
                         self.trading_blocked_message = (
                             f"Startup reconciliation found {len(positions)} broker position(s) for an option strategy, "
@@ -784,6 +803,8 @@ class StartupReconciler:
                     elif foreign_orders:
                         self.trading_blocked_reason = "working_orders_present"
                         self.trading_blocked_message = f"Startup reconciliation restored positions but found {len(foreign_orders)} working orders they do not own; clear them before new entries"
+                        if not order_states_read:
+                            self.trading_blocked_message += " (some order states could not be read; retrying)"
                     else:
                         self.trading_blocked_reason = None
                         self.trading_blocked_message = None
@@ -796,7 +817,8 @@ class StartupReconciler:
                 self.trading_blocked_message = None
                 if mode == "restore_hybrid":
                     try:
-                        removed = self.reconcile_metadata_store.delete_unmatched_positions(set())
+                        # A position the settle left tracked keeps its row.
+                        removed = self.reconcile_metadata_store.delete_unmatched_positions(set(self.positions))
                         if removed:
                             LOG.info("Pruned %s stale startup reconcile metadata row(s); no live broker positions were found", removed)
                     except Exception as exc:
@@ -811,7 +833,20 @@ class StartupReconciler:
                     LOG.info("Startup reconciliation found no broker positions or working orders")
         except Exception as exc:
             LOG.exception("Startup reconciliation failed: %s", exc)
+            if not account_read:
+                # Holdings unknown: every ignore-list symbol may be held, so
+                # each stays blocked until its own recheck reads the account.
+                self._entry_block_symbols |= self._ignore_symbols()
             self.result = {"error": str(exc), "positions": [], "working_orders": [], "ignored_symbols": sorted(self._ignore_symbols()), "ignored_open_position_symbols": sorted(self._entry_block_symbols)}
             if mode in {"block", "restore_basic", "restore_hybrid"}:
                 self.trading_blocked_reason = "startup_reconcile_failed"
                 self.trading_blocked_message = f"Startup reconciliation failed: {exc}"
+            return False
+        if not exit_states_read and mode in {"block", "restore_basic", "restore_hybrid"} and not self.trading_blocked_reason:
+            # Blocks like any other failed read, so a retry never restores
+            # beside an entry the cycle left unsettled, and a failed attempt
+            # never clears an earlier attempt's block.
+            self.trading_blocked_reason = "startup_reconcile_failed"
+            self.trading_blocked_message = "Startup reconciliation could not read a tracked position's working exit order; retrying"
+        self.result["order_states_read"] = order_states_read and exit_states_read
+        return order_states_read and exit_states_read

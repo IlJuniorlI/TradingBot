@@ -103,15 +103,24 @@ class ReconcileMetadataStore:
         )
 
     def save_positions(self, positions: dict[str, Position]) -> None:
+        """Replace every stored row with *positions*."""
+        self._write(positions, replace_all=True)
+
+    def upsert_positions(self, positions: dict[str, Position]) -> None:
+        """Write *positions* over their stored rows and delete no other row."""
+        self._write(positions, replace_all=False)
+
+    def _write(self, positions: dict[str, Position], *, replace_all: bool) -> None:
         self._ensure_ready()
         rows = [self._serialize(key, pos) for key, pos in positions.items()]
         conn = sqlite3.connect(self.path)
         try:
-            conn.execute("DELETE FROM open_position_metadata")
+            if replace_all:
+                conn.execute("DELETE FROM open_position_metadata")
             if rows:
                 conn.executemany(
                     """
-                    INSERT INTO open_position_metadata (
+                    INSERT OR REPLACE INTO open_position_metadata (
                         position_key, symbol, strategy, side, qty, entry_price, entry_time,
                         stop_price, target_price, trail_pct, highest_price, lowest_price,
                         pair_id, reference_symbol, metadata_json, updated_at

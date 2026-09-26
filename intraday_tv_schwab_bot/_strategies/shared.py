@@ -52,7 +52,6 @@ from ..htf_levels import (
 )
 from ..technical_levels import TechnicalLevelsContext, build_technical_levels_context, empty_technical_levels_context
 from ..utils import (
-    call_schwab_client,
     ensure_standard_indicator_frame,
     equity_session_state,
     EQUITY_RTH_OPEN,
@@ -161,7 +160,6 @@ __all__ = [
     'build_single_option_position_label',
     'build_technical_levels_context',
     'build_vertical_order',
-    'call_schwab_client',
     'ensure_standard_indicator_frame',
     'equity_session_state',
     'EQUITY_RTH_OPEN',

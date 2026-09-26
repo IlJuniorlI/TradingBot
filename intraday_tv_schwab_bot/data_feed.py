@@ -21,7 +21,8 @@ from .support_resistance import SupportResistanceContext, build_support_resistan
 from .htf_levels import HTFContext, FairValueGapContext, build_fair_value_gap_context, build_htf_context, empty_fvg_context
 from .levels_shared import latest_session_date
 from .order_blocks import OrderBlockContext, build_order_block_context, empty_order_block_context
-from .utils import EQUITY_STREAM_HISTORY_REFRESH_READY, call_schwab_client, ensure_ohlcv_frame, ensure_standard_indicator_frame, equity_stream_window_bars, floor_minute, get_runtime_timezone_name, indicator_session_open, is_equity_stream_session, is_regular_equity_session, is_weekday_session_day, now_et, resample_bars, resolve_ema_spans, session_bucket_ends, session_bucket_floor
+from .schwab_api import call_schwab_client, call_schwab_json, response_ok
+from .utils import EQUITY_STREAM_HISTORY_REFRESH_READY, ensure_ohlcv_frame, ensure_standard_indicator_frame, equity_stream_window_bars, floor_minute, get_runtime_timezone_name, indicator_session_open, is_equity_stream_session, is_regular_equity_session, is_weekday_session_day, now_et, resample_bars, resolve_ema_spans, session_bucket_ends, session_bucket_floor
 
 LOG = logging.getLogger(__name__)
 STREAMABLE_EQUITY_RE = re.compile(r"^[A-Z]{1,6}$")
@@ -1532,12 +1533,7 @@ class MarketDataStore:
             LOG.debug("price_history alias attempts for %s: %s", symbol, aliases)
         for request_symbol in aliases:
             try:
-                response = call_schwab_client(self.client, "price_history", symbol=request_symbol, **kwargs)
-                status = getattr(response, "status_code", 200)
-                if status >= 400:
-                    body = getattr(response, "text", "")
-                    raise RuntimeError(f"status={status} body={body}")
-                payload = response.json()
+                payload = call_schwab_json(self.client, "price_history", symbol=request_symbol, **kwargs)
                 if not isinstance(payload, dict):
                     payload = {}
                 candles = payload.get("candles", [])
@@ -1570,12 +1566,7 @@ class MarketDataStore:
             LOG.debug("Quote alias attempts for %s: %s", symbol, aliases)
         for request_symbol in aliases:
             try:
-                response = call_schwab_client(self.client, "quote", request_symbol)
-                status = getattr(response, "status_code", 200)
-                if status >= 400:
-                    body = getattr(response, "text", "")
-                    raise RuntimeError(f"status={status} body={body}")
-                payload = response.json()
+                payload = call_schwab_json(self.client, "quote", request_symbol)
                 extracted = self._extract_quote_payloads(payload, [request_symbol, symbol])
                 quote_payload = extracted.get(symbol) or extracted.get(request_symbol)
                 if quote_payload is None and isinstance(payload, dict):
@@ -1654,13 +1645,14 @@ class MarketDataStore:
             for arg in attempts:
                 try:
                     response = call_schwab_client(self.client, method_name, arg)
-                    status_code = int(getattr(response, "status_code", 200) or 200)
-                    if not 200 <= status_code < 300:
+                    if not response_ok(response):
+                        status_code = getattr(response, "status_code", None)
                         try:
                             body_preview = str(getattr(response, "text", "") or "")[:240]
                         except Exception:
                             body_preview = ""
-                        log_fn = LOG.warning if status_code in {401, 403, 404, 429} or status_code >= 500 else LOG.debug
+                        loud = not isinstance(status_code, int) or status_code in {401, 403, 404, 429} or status_code >= 500
+                        log_fn = LOG.warning if loud else LOG.debug
                         log_fn(
                             "Batch quote request via %s returned status=%s for %s%s",
                             method_name,

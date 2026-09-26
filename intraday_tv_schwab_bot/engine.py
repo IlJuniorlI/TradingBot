@@ -38,9 +38,19 @@ from .warmup_tracker import WarmupTracker
 from ._strategies.registry import build_strategy
 from ._strategies.strategy_base import BaseStrategy
 from .session_report import export_session_archive, write_session_report
-from .utils import EQUITY_STREAM_END, TRADEFLOW_LEVEL, SchwabdevApiUsageTracker, equity_session_state, now_et, register_schwab_api_tracker, setup_logging
+from .schwab_api import SchwabdevApiUsageTracker, register_schwab_api_tracker
+from .utils import EQUITY_STREAM_END, TRADEFLOW_LEVEL, equity_session_state, now_et, setup_logging
 
 LOG = logging.getLogger(__name__)
+
+# How long the engine waits after a failed broker reconcile before the next
+# attempt, measured from the end of the failed one. It doubles with each
+# failure in a row, up to RECONCILE_RETRY_MAX_SECONDS. An attempt is at least
+# two Schwab reads (account_details and account_orders), plus order-state
+# reads for working exit orders and foreign orders; a read that hangs takes
+# ~30s (schwabdev retries a timed-out read), all of it on the engine thread.
+RECONCILE_RETRY_SECONDS = 60.0
+RECONCILE_RETRY_MAX_SECONDS = 300.0
 
 
 class IntradayBot:
@@ -106,14 +116,18 @@ class IntradayBot:
         # for symbols no longer in the active set (streaming + watchlist
         # + held positions). Default: every 30 minutes.
         self._last_symbol_prune_monotonic: float = 0.0
-        # ET session date of the most recent broker reconcile. The
-        # startup reconcile sets this on first successful run; the
+        # ET session date of the most recent SUCCESSFUL broker reconcile.
+        # The startup reconcile sets it when it succeeds; the
         # session-boundary reconcile in `_maybe_session_reconcile`
         # re-runs at the start of each new ET trading day so an
         # always-on bot catches broker-side state changes that
         # happened during the 8pm-7am gap (manual position closes
         # via the Schwab app, server-side stop fills, etc.).
         self._last_reconcile_session_date: date | None = None
+        # Failed reconcile attempts in a row; while it is non-zero,
+        # `_maybe_session_reconcile` retries on `_reconcile_retry_delay()`.
+        self._reconcile_failures = 0
+        self._last_reconcile_attempt_monotonic: float = 0.0
         self._last_reconcile_metadata_signature: str | None = None
         # ET session date of the most recent daily session-archive
         # export. `_maybe_export_session_archive` fires once per ET
@@ -147,7 +161,6 @@ class IntradayBot:
         )
         self.startup_reconciler = StartupReconciler(
             config,
-            client=self.client,
             executor=self.executor,
             data=self.data,
             account=self.account,
@@ -230,7 +243,16 @@ class IntradayBot:
         if signature == self._last_reconcile_metadata_signature:
             return
         try:
-            self.reconcile_metadata_store.save_positions(self.positions)
+            if self._last_reconcile_session_date is None:
+                # No reconcile has succeeded yet, so self.positions may be
+                # only part of what the broker holds: a failed startup attempt
+                # restores some positions, or none. Replacing every row with it
+                # wiped the rows the retry restores from (the first management
+                # cycle did it); write what is tracked over them instead and
+                # delete none. `_reconcile_broker` replaces them all on success.
+                self.reconcile_metadata_store.upsert_positions(self.positions)
+            else:
+                self.reconcile_metadata_store.save_positions(self.positions)
             self._last_reconcile_metadata_signature = signature
         except Exception as exc:
             LOG.warning("Could not save startup reconcile metadata: %s", exc)
@@ -259,11 +281,10 @@ class IntradayBot:
                 # bot running headlessly rather than refuse to start.
                 LOG.exception("Could not start dashboard on %s:%s: %s", self.config.dashboard.host, self.config.dashboard.port, exc)
                 self.dashboard = None
-        self.startup_reconciler.reconcile()
-        # Initial reconcile counts as today's reconcile. The session-
-        # boundary reconcile in `_maybe_session_reconcile` won't fire
-        # again until the ET date rolls over.
-        self._last_reconcile_session_date = now_et().date()
+        # A successful startup reconcile counts as today's reconcile: the
+        # session-boundary reconcile in `_maybe_session_reconcile` won't fire
+        # again until the ET date rolls over. A failed one is retried there.
+        self._reconcile_broker(now_et().date())
         LOG.info("Starting bot with strategy=%s dry_run=%s", self.config.strategy, self.config.schwab.dry_run)
         risk_budget_dollars = float(
             self.config.risk.max_notional_per_trade * self.config.risk.risk_per_trade_frac_of_notional
@@ -423,18 +444,28 @@ class IntradayBot:
         - Stream session is open (i.e., we've actually crossed 7am ET)
         - Today's date != date of last successful reconcile
 
-        First run is satisfied by the startup `reconcile()` call which
-        sets `_last_reconcile_session_date` immediately. So a fresh
-        bot start at 9am Tuesday won't double-reconcile.
+        First run is satisfied by a successful startup reconcile, which
+        sets `_last_reconcile_session_date`. So a fresh bot start at 9am
+        Tuesday won't double-reconcile.
 
-        Disable via `runtime.session_reconcile_on_resume: false`.
+        A failed reconcile (startup or session-boundary) is retried, first
+        RECONCILE_RETRY_SECONDS after the failed attempt ends and then at a
+        doubling interval capped at RECONCILE_RETRY_MAX_SECONDS, until one
+        succeeds. The failure blocks entries (`startup_reconcile_failed` in
+        the blocking modes) and the success clears the block, so one blip no
+        longer blocks the day. The retry runs even with
+        `session_reconcile_on_resume: false`, which disables only the new-day
+        reconcile.
+
+        Disable the new-day reconcile via `runtime.session_reconcile_on_resume: false`.
         """
-        if not bool(getattr(self.config.runtime, "session_reconcile_on_resume", True)):
-            return
         # Honor the same gate the startup reconcile honors.
         if not self.config.runtime.reconcile_on_startup:
             return
         if str(self.config.runtime.startup_reconcile_mode or "ignore").lower() == "ignore":
+            return
+        retrying = self._reconcile_failures > 0
+        if not retrying and not bool(getattr(self.config.runtime, "session_reconcile_on_resume", True)):
             return
         now = now_et()
         state = equity_session_state(
@@ -446,21 +477,42 @@ class IntradayBot:
         if not state.stream_available:
             return
         today = now.date()
-        if self._last_reconcile_session_date == today:
+        if retrying:
+            if time.monotonic() - self._last_reconcile_attempt_monotonic < self._reconcile_retry_delay():
+                return
+            LOG.info("Retrying the failed broker reconcile")
+        elif self._last_reconcile_session_date == today:
             return
-        LOG.info(
-            "Session-boundary reconcile: new ET trading day %s (last=%s) — syncing broker positions/orders",
-            today, self._last_reconcile_session_date,
-        )
-        try:
-            self.startup_reconciler.reconcile()
-            self._last_reconcile_session_date = today
-        except Exception:
-            # If reconcile fails (network blip, Schwab API hiccup), don't
-            # update the date — try again on the next loop iteration via
-            # the same gate. Log full exc only on first failure each
-            # session to avoid spam during a sustained outage.
-            LOG.exception("Session-boundary reconcile failed (will retry next cycle)")
+        else:
+            LOG.info(
+                "Session-boundary reconcile: new ET trading day %s (last=%s) — syncing broker positions/orders",
+                today, self._last_reconcile_session_date,
+            )
+        self._reconcile_broker(today)
+
+    def _reconcile_broker(self, session_date: date) -> None:
+        """Run the broker reconcile once. Success stamps ``session_date`` as
+        reconciled and saves the reconcile metadata; failure leaves both and
+        schedules a retry."""
+        ok = self.startup_reconciler.reconcile()
+        # The retry delay runs from the END of the attempt, so an attempt that
+        # hangs for longer than the delay is not re-fired at once.
+        self._last_reconcile_attempt_monotonic = time.monotonic()
+        if ok:
+            self._last_reconcile_session_date = session_date
+            self._reconcile_failures = 0
+            # A full replace, even when the positions are unchanged: saves
+            # before the first success only upserted, so stale rows remain.
+            self._last_reconcile_metadata_signature = None
+            self._save_reconcile_metadata()
+            return
+        self._reconcile_failures += 1
+        LOG.warning("Broker reconcile failed (%d in a row); retrying in %.0fs",
+                    self._reconcile_failures, self._reconcile_retry_delay())
+
+    def _reconcile_retry_delay(self) -> float:
+        doublings = max(0, self._reconcile_failures - 1)
+        return min(RECONCILE_RETRY_MAX_SECONDS, RECONCILE_RETRY_SECONDS * 2.0 ** min(doublings, 16))
 
     def _maybe_session_rollover_reset(self) -> None:
         """Clear per-session counters when the ET trading date rolls.

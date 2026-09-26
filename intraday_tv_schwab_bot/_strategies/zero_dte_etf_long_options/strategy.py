@@ -55,6 +55,9 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             return None
         put_call = "CALL" if bullish else "PUT"
         contracts = self._fetch_filtered_contracts(client, underlying, put_call)
+        if contracts is None:
+            self._set_build_failure(underlying, style, "option_chain_unavailable")
+            return None
         if not contracts:
             self._set_build_failure(underlying, style, "option_chain_empty")
             return None

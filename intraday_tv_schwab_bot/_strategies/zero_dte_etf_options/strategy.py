@@ -27,7 +27,6 @@ from ..shared import (
     asdict,
     build_position_label,
     build_vertical_order,
-    call_schwab_client,
     choose_by_delta,
     choose_nearest_strike,
     contract_from_quote,
@@ -51,6 +50,7 @@ from ..shared import (
     vertical_price_bounds,
 )
 from ..shared_entry import AdmittedEntry, EntryContexts, EntryProposal
+from ...schwab_api import SchwabHTTPError, call_schwab_json
 from ..strategy_base import BaseStrategy
 
 class ZeroDteEtfOptionsStrategy(BaseStrategy):
@@ -81,6 +81,10 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         self.optcfg = config.options
         self.force_flat_time = parse_hhmm(self.optcfg.force_flatten_time)
         self._option_chain_cache: dict[tuple[str, str], tuple[datetime, list[OptionContract]]] = {}
+        # Symbol -> when its last option_chains read failed. The read is not
+        # retried until option_chain_cache_seconds has passed, the same pace
+        # as a successful one, so a failing chain costs no extra Schwab calls.
+        self._option_chain_read_failed_at: dict[str, datetime] = {}
         self._underlying_atr_cache: dict[str, float] = {}
         self._underlying_ref_atr_cache: dict[str, float] = {}
 
@@ -119,6 +123,13 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             self._option_chain_cache.pop(key, None)
             return None
         return list(contracts)
+
+    def _option_chain_read_failed_recently(self, symbol: str) -> bool:
+        ttl = max(0, int(self.optcfg.option_chain_cache_seconds))
+        failed_at = self._option_chain_read_failed_at.get(str(symbol).upper().strip())
+        if ttl <= 0 or failed_at is None:
+            return False
+        return (now_et() - failed_at).total_seconds() <= ttl
 
     def _set_cached_option_chain(self, symbol: str, contracts: list[OptionContract]) -> None:
         ttl = max(0, int(self.optcfg.option_chain_cache_seconds))
@@ -956,17 +967,21 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             },
         }
 
-    def _fetch_raw_option_chain(self, client, symbol: str) -> list[OptionContract]:
-        # Return the full unfiltered 0DTE option chain for `symbol`.
+    def _fetch_raw_option_chain(self, client, symbol: str) -> list[OptionContract] | None:
+        # Return the full unfiltered 0DTE option chain for `symbol`, or None
+        # when Schwab did not return one (see _option_chain_read_failed_at).
         # Reads from the per-symbol cache when warm; on miss, issues one
         # Schwab option_chains call, parses, caches, and returns the
         # result. Pure I/O + cache plumbing — no put/call or
         # liquidity filter applied. Use _fetch_filtered_contracts when
         # you need a filtered list; use this when you only want to warm
-        # the cache.
+        # the cache. An error response is not an empty chain: it is not
+        # cached, and the build path reports option_chain_unavailable.
         cached = self._get_cached_option_chain(symbol)
         if cached is not None:
             return cached
+        if self._option_chain_read_failed_recently(symbol):
+            return None
         today = now_et().date()
         # strikeCount=24 (was 12) — for 0DTE credit spreads the short leg
         # sits at ~0.20-0.30 delta (3-5 strikes OTM) and the hedge then
@@ -977,15 +992,21 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         # from spot. 24 strikes (±12) gives the hedge plenty of headroom
         # without meaningfully changing the API cost or liquidity-filter
         # processing time.
-        response = call_schwab_client(client, "option_chains",
-            symbol=symbol,
-            contractType="ALL",
-            strikeCount=24,
-            includeUnderlyingQuote=True,
-            fromDate=today,
-            toDate=today,
-        )
-        contracts = parse_option_chain(response.json(), only_dte=0)
+        try:
+            payload = call_schwab_json(client, "option_chains",
+                symbol=symbol,
+                contractType="ALL",
+                strikeCount=24,
+                includeUnderlyingQuote=True,
+                fromDate=today,
+                toDate=today,
+            )
+        except SchwabHTTPError as exc:
+            LOG.warning("Option chain read failed for %s: %s", symbol, exc)
+            self._option_chain_read_failed_at[str(symbol).upper().strip()] = now_et()
+            return None
+        self._option_chain_read_failed_at.pop(str(symbol).upper().strip(), None)
+        contracts = parse_option_chain(payload, only_dte=0)
         self._set_cached_option_chain(symbol, contracts)
         return contracts
 
@@ -1002,8 +1023,12 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         )
         return True
 
-    def _fetch_filtered_contracts(self, client, symbol: str, put_call: str) -> list[OptionContract]:
+    def _fetch_filtered_contracts(self, client, symbol: str, put_call: str) -> list[OptionContract] | None:
+        """The chain's liquid ``put_call`` contracts; None when the chain
+        could not be read."""
         contracts = self._fetch_raw_option_chain(client, symbol)
+        if contracts is None:
+            return None
         filtered = filter_contracts(
             contracts,
             put_call=put_call,
@@ -1020,9 +1045,10 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         # for N>1 cache-miss candidates that's N * ~150ms of stacked I/O on
         # the engine thread per cycle. The chain cache is symbol+date keyed
         # (no put_call), so one fetch per symbol covers both CALL and PUT
-        # build paths. Failures are logged and swallowed — the build path
-        # will retry on its own and emit its own option_chain_empty
-        # decision if the retry also fails.
+        # build paths. A Schwab error response is remembered by
+        # _fetch_raw_option_chain, so the build path does not re-read it and
+        # emits option_chain_unavailable; any other failure is logged and
+        # swallowed here, and the build path retries on its own.
         misses = [
             sym for sym in {str(s or "").upper().strip() for s in symbols}
             if sym and self._get_cached_option_chain(sym) is None
@@ -1292,6 +1318,9 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return None
         put_call = "CALL" if bullish else "PUT"
         contracts = self._fetch_filtered_contracts(client, underlying, put_call)
+        if contracts is None:
+            self._set_build_failure(underlying, style, "option_chain_unavailable")
+            return None
         if not contracts:
             self._set_build_failure(underlying, style, "option_chain_empty")
             return None
@@ -1401,6 +1430,12 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return None
         put_call = "PUT" if bullish else "CALL"
         contracts = self._fetch_filtered_contracts(client, underlying, put_call)
+        if contracts is None:
+            self._set_build_failure(
+                underlying, style,
+                _style_unavailable_reason(style, "reason=option_chain_unavailable", put_call=put_call),
+            )
+            return None
         all_contracts = self._get_cached_option_chain(underlying) or []
         if not contracts:
             self._set_build_failure(

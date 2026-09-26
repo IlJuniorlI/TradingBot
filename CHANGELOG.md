@@ -219,6 +219,18 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The Schwab client wrapper has its own module, `schwab_api.py`.**
+  *2026-09-25* — `call_schwab_client`, `SchwabdevApiUsageTracker`,
+  `register_schwab_api_tracker` / `get_schwab_api_tracker` and the
+  token-refresh lock moved out of `utils.py`, which no longer imports
+  `schwabdev`. There is no alias: import them from
+  `intraday_tv_schwab_bot.schwab_api`. `_strategies.shared` no longer
+  re-exports `call_schwab_client`. The module also holds the one reading of a
+  response, `response_ok`, and `call_schwab_json` (see Fixed).
+  - `StartupReconciler` no longer takes `client`; it reads the broker through
+    `SchwabExecutor.fetch_account_positions()` and
+    `fetch_working_orders(from_ts, to_ts)`.
+
 - **What the shared stage changed, per strategy family.** *2026-09-24*
 
   **top_tier_adaptive / small_cap_squeeze** (small_cap subclasses top_tier)
@@ -616,6 +628,135 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `levels_shared.find_divergence` a required `bar_clock`.
 
 ### Fixed
+
+- **A dry run no longer replaces a live broker order.** *2026-09-25* —
+  `SchwabExecutor.replace_bracket_child` had no dry-run guard, unlike
+  `submit_protective_oco` and `cancel_bracket`. In bracket mode a dry-run
+  restore adopts the REAL stop resting at the broker, and resizing it went
+  through that path, as did every trail sync after it. So a paper bot
+  replaced the user's stop at the broker, at the bot's own size and price.
+  The old id then read as a foreign order and blocked entries for the day.
+  A dry run now logs the replace and sends nothing. Bracket mode is off in
+  every preset.
+  - Tests: `tests/test_sweep_fixes.py` (`TestDryRunNeverReplacesALiveOrder`).
+
+- **A broker read that fails no longer reads as an empty account.**
+  *2026-09-25* — the startup and session-boundary reconcile read
+  `account_details` without checking the status, and the entry-block recheck
+  did the same. A JSON error body (the 401 a lapsed token returns) parsed
+  fine and held no positions, so:
+  - at the session boundary every tracked position was booked
+    `closed_outside_bot`, its broker bracket was cancelled while the broker
+    still held the shares, and it was dropped from tracking;
+  - at startup, `restore_hybrid` took the empty branch and pruned every
+    reconcile metadata row, which the next restart needs;
+  - the entry-block recheck cleared the block for an ignored open symbol.
+
+  The reads now go through `SchwabExecutor.fetch_account_positions()` and
+  `fetch_working_orders()`, which return None on any failure. Every read the
+  reconcile makes now fails the attempt when it cannot be read, and the
+  engine retries it (next entry):
+  - An unread account: nothing is settled, cancelled, restored or pruned,
+    and the blocking modes block entries (`startup_reconcile_failed`). Every
+    ignore-list symbol is blocked, in every mode, until its own recheck
+    reads the account: the holdings are unknown. The recheck keeps its
+    block on a failed read.
+  - An unread working-order list: the settle still runs (it reads only the
+    account), then the attempt fails with `startup_reconcile_failed`. In
+    bracket mode the restore waits for the list. Without it, the restore
+    could not see the stop still resting from before the restart and placed
+    a second one beside it; a restored symbol is never revisited, so both
+    stayed, and the pair sells the position net short when both trigger.
+    This was already so for an HTTP error, and a dropped connection or an
+    undecodable body used to fail the whole reconcile. Without bracket mode
+    the list protects nothing, so the restore runs and the engine manages
+    what the broker holds while the retry waits for the list. The
+    `orders_lookup_failed` result key and the `orders_lookup_failed` /
+    `startup_reconcile_orders_lookup_failed` block reasons are gone.
+  - A tracked position's working exit order whose state cannot be read:
+    the settle leaves the position tracked, and the attempt fails and blocks
+    entries in the blocking modes. The position used to stay at the wrong
+    size all day, its exits selling shares that were not held.
+  - A saved position's working exit order whose state cannot be read during
+    a hybrid match: the attempt fails before that position is restored. It
+    was read as "no fills", so the position was restored basic at the broker
+    quantity with its stop resized to all of it, beside the shares the
+    order still sells, and the order was lost for good. A dry run reads no
+    order state by design, so there the row still just does not match.
+  - A foreign working order whose state cannot be read still counts
+    (`working_orders_present`), but the attempt fails. It used to succeed,
+    and the block held for the day against an order the settle had already
+    cancelled. A dry run skips this check, since it retires nothing at the
+    broker.
+
+  The ignore-list check reads a broker row with `broker_position_side_qty`,
+  as the settle does: a malformed quantity no longer fails the whole
+  reconcile, and a row both long and short is not held.
+  - Tests: `tests/test_startup_reconciler.py` (`TestAccountReadFailsClosed`,
+    `TestExecutorAccountReads`, `TestIgnoredOpenPositionParsing`) and
+    `tests/test_sweep_fixes.py` (`TestReconcileOnAnUnreadOrderList`,
+    `TestReconcileOnAnUnreadOrderState`, `TestSessionReconcileBesideAWorkingExit`,
+    `TestHybridMatchAcrossAWorkingExitsFills`).
+
+- **A failed reconcile is retried instead of blocking the whole day.**
+  *2026-09-25* — `reconcile()` swallowed every exception, and the engine
+  then marked the day as reconciled, so its "will retry" branch never ran.
+  One network blip or 5xx during the 07:00 session-boundary reconcile, or at
+  startup, blocked entries (`startup_reconcile_failed`) until the next ET day
+  or a restart. `reconcile()` now returns whether it read the broker, and
+  the engine stamps the day only on success.
+  - The retry fires on trading days inside the stream window. The first
+    retry comes 60 seconds after the failed attempt ENDS
+    (`RECONCILE_RETRY_SECONDS`). The interval doubles with each failure in a
+    row, up to 5 minutes (`RECONCILE_RETRY_MAX_SECONDS`). An attempt is at
+    least two Schwab reads, plus order-state reads, and a read that hangs
+    takes about 30 seconds on the engine thread. The first success clears
+    the block.
+  - The retry runs in every mode, `log_only` included, since an unread
+    account there still leaves positions closed overnight unsettled. It also
+    runs with `session_reconcile_on_resume: false`, which now turns off only
+    the new-day re-run.
+  - Until a reconcile has succeeded, a metadata save writes the tracked
+    positions over their stored rows and deletes none
+    (`ReconcileMetadataStore.upsert_positions`). A failed startup attempt
+    restores some positions, or none, and the first management cycle's save
+    then replaced every stored row with that set, so the retry restored the
+    rest basic, or skipped the positions that need metadata. The first
+    successful reconcile replaces all the rows.
+  - Tests: `tests/test_startup_reconciler.py` (`TestEngineReconcileRetry`).
+
+- **A hybrid reconcile no longer prunes the metadata of a position it still
+  tracks.** *2026-09-25* — a `restore_hybrid` reconcile deleted every
+  metadata row it did not match, and it never matches a tracked symbol (the
+  restore skips it). The session-boundary re-run therefore deleted the rows
+  of positions held overnight, and the engine's save, which skips an
+  unchanged position set, did not rewrite them. A crash before the position
+  next changed restored it with `restore_basic` defaults: its levels,
+  bracket ids and working-exit order were lost, or it was skipped outright
+  when the strategy requires hybrid metadata. The empty-broker branch did
+  the same to positions the settle leaves tracked. Both prunes now keep the
+  rows of tracked positions. The Phase A retry would otherwise have repeated
+  the prune.
+  - Tests: `tests/test_startup_reconciler.py` (`TestAccountReadFailsClosed`).
+
+- **One reading of a Schwab response.** *2026-09-25* — status checks used
+  four conventions: `status >= 400` (a 3xx, or a response with no status,
+  passed), `200 <= status < 300` with a missing status read as 0 or as 200,
+  and a bare `response.status_code` that raised. Three reads checked nothing.
+  Now `schwab_api.response_ok` (2xx only; a missing status is a failure) is
+  the only status reading, and `call_schwab_json` also requires a body that
+  decodes, raising `SchwabHTTPError` otherwise. The data-feed price-history,
+  quote and batch-quote reads, the account-hash lookup, every order status
+  check in `execution.py` and the bracket reconcile's `account_orders` read
+  use them.
+  - 0DTE option chains: an error body parsed to an empty chain, which was
+    cached for `option_chain_cache_seconds`, so the build skipped entries as
+    `option_chain_empty`. Now an error is not cached as a chain. The build
+    reports `option_chain_unavailable`, and the symbol is re-read after
+    `option_chain_cache_seconds`, the same pace as a good chain, so a
+    failing chain costs no extra Schwab calls. An HTML error body no longer
+    fails the whole engine cycle.
+  - Tests: `tests/test_schwab_api.py`.
 
 - **top_tier's Fix G lets a first ladder rung sit on the nearest level.**
   *2026-09-25* — both top_tier_adaptive and small_cap_squeeze ship

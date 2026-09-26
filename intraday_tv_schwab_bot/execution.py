@@ -11,6 +11,7 @@ from typing import Any
 
 from schwabdev import Client
 
+from .broker_positions import extract_broker_positions, extract_working_orders
 from .config import BotConfig
 from .models import (
     ASSET_TYPE_EQUITY,
@@ -23,7 +24,8 @@ from .models import (
     Side,
 )
 from .options_mode import build_single_option_close_order, build_vertical_close_order, close_limit_price_from_metadata, close_single_option_limit_from_metadata, contract_from_quote, single_option_price_bounds, vertical_price_bounds
-from .utils import call_schwab_client, classify_equity_session, equity_session_state, is_regular_equity_session
+from .schwab_api import call_schwab_client, call_schwab_json, response_ok
+from .utils import classify_equity_session, equity_session_state, is_regular_equity_session
 
 LOG = logging.getLogger(__name__)
 
@@ -87,8 +89,7 @@ class SchwabExecutor:
         self.account_hash = config.schwab.account_hash or self._resolve_account_hash()
 
     def _resolve_account_hash(self) -> str:
-        response = call_schwab_client(self.client, "linked_accounts")
-        payload = response.json()
+        payload = call_schwab_json(self.client, "linked_accounts")
         if isinstance(payload, list) and payload:
             for row in payload:
                 for key in ("hashValue", "accountHash", "encryptedAccountNumber"):
@@ -105,11 +106,12 @@ class SchwabExecutor:
             LOG.info("DRY RUN order: %s", spec)
             return OrderResult(ok=True, order_id=None, raw=spec, message="dry_run", simulated=True)
         response = call_schwab_client(self.client, "place_order", self.account_hash, spec)
-        ok = 200 <= response.status_code < 300
+        ok = response_ok(response)
+        status_code = getattr(response, "status_code", None)
         order_id = self._response_order_id(response)
         if not ok:
-            LOG.warning("Order submission failed status=%s spec=%s", response.status_code, spec)
-        return OrderResult(ok=ok, order_id=order_id, raw=response.text, message=f"status={response.status_code}")
+            LOG.warning("Order submission failed status=%s spec=%s", status_code, spec)
+        return OrderResult(ok=ok, order_id=order_id, raw=response.text, message=f"status={status_code}")
 
     @staticmethod
     def order_intent_for_entry(side: Side) -> OrderIntent:
@@ -431,7 +433,7 @@ class SchwabExecutor:
             response = call_schwab_client(self.client, "order_details", self.account_hash, order_id)
         except Exception as exc:
             return None, f"order_details_error:{exc}"
-        if not (200 <= getattr(response, 'status_code', 0) < 300):
+        if not response_ok(response):
             return None, f"order_details_status={getattr(response, 'status_code', None)}"
         try:
             payload = response.json()
@@ -480,8 +482,8 @@ class SchwabExecutor:
             if ok:
                 return ok, msg, payload
             return False, f"cancel_error:{exc}", payload
-        status_code = getattr(response, 'status_code', 0)
-        if 200 <= status_code < 300:
+        status_code = getattr(response, 'status_code', None)
+        if response_ok(response):
             return _post_cancel_check(f"cancel_status={status_code}")
         ok, msg, payload = _post_cancel_check("cancel_postcheck")
         if ok:
@@ -560,9 +562,8 @@ class SchwabExecutor:
         timeout_seconds = max(0.5, float(self.config.execution.entry_live_fill_timeout_seconds))
         poll_seconds = max(0.1, float(self.config.execution.entry_live_poll_seconds))
         response = self._submit_live_order_spec(spec)
-        status_code = getattr(response, 'status_code', 0)
-        if not (200 <= status_code < 300):
-            return OrderResult(ok=False, order_id=None, raw=getattr(response, 'text', spec), message=f"status={status_code}", simulated=False)
+        if not response_ok(response):
+            return OrderResult(ok=False, order_id=None, raw=getattr(response, 'text', spec), message=f"status={getattr(response, 'status_code', None)}", simulated=False)
         order_id = self._response_order_id(response)
         if not order_id:
             return OrderResult(ok=False, order_id=None, raw=getattr(response, 'text', spec), message="live_missing_order_id", simulated=False)
@@ -605,9 +606,8 @@ class SchwabExecutor:
         current_spec = self._build_order(current_request)
         for attempt in range(reprice_attempts + 1):
             response = self._submit_live_order_spec(current_spec)
-            status_code = getattr(response, 'status_code', 0)
-            if not (200 <= status_code < 300):
-                return OrderResult(ok=False, order_id=None, raw=getattr(response, 'text', current_spec), message=f"status={status_code}", simulated=False)
+            if not response_ok(response):
+                return OrderResult(ok=False, order_id=None, raw=getattr(response, 'text', current_spec), message=f"status={getattr(response, 'status_code', None)}", simulated=False)
             order_id = self._response_order_id(response)
             if not order_id:
                 return OrderResult(ok=False, order_id=None, raw=getattr(response, 'text', current_spec), message="live_missing_order_id", simulated=False)
@@ -1007,24 +1007,45 @@ class SchwabExecutor:
             return {}
         now = datetime.datetime.now(datetime.timezone.utc)
         try:
-            response = call_schwab_client(
+            payload = call_schwab_json(
                 self.client, "account_orders", self.account_hash,
                 now - datetime.timedelta(minutes=max(1, int(lookback_minutes))), now,
             )
         except Exception as exc:
             LOG.warning("account_orders failed during bracket reconcile: %s", exc)
             return None
-        if not (200 <= getattr(response, "status_code", 0) < 300):
-            LOG.warning("account_orders status=%s during bracket reconcile", getattr(response, "status_code", None))
-            return None
-        try:
-            payload = response.json()
-        except Exception as exc:
-            LOG.warning("account_orders json decode failed during bracket reconcile: %s", exc)
-            return None
         out: dict[str, dict[str, Any]] = {}
         self._flatten_order_tree(payload, out)
         return out
+
+    def fetch_account_positions(self) -> list[dict[str, Any]] | None:
+        """The account's position rows (``extract_broker_positions``), or None
+        when the account could not be read.
+
+        Never an empty list for a failed read: the startup reconciler settles
+        and prunes on this list, and an error body read as "no positions"
+        booked every live position ``closed_outside_bot`` and cancelled its
+        broker stop. Read in dry-run too, like every reconcile read.
+        """
+        try:
+            payload = call_schwab_json(self.client, "account_details", self.account_hash, fields="positions")
+            return extract_broker_positions(payload)
+        except Exception as exc:
+            LOG.warning("account_details read failed: %s", exc)
+            return None
+
+    def fetch_working_orders(self, from_ts: str, to_ts: str) -> list[dict[str, Any]] | None:
+        """The account's working orders entered between the two ISO
+        timestamps (``extract_working_orders``), or None when they could not
+        be read."""
+        try:
+            payload = call_schwab_json(
+                self.client, "account_orders", self.account_hash, fromEnteredTime=from_ts, toEnteredTime=to_ts,
+            )
+            return extract_working_orders(payload)
+        except Exception as exc:
+            LOG.warning("account_orders read failed: %s", exc)
+            return None
 
     def order_state(self, order_id: str) -> dict[str, Any] | None:
         """One order's state row (the ``fetch_order_states`` shape) via
@@ -1072,8 +1093,8 @@ class SchwabExecutor:
             LOG.info("DRY RUN protective OCO: %s", spec)
             return OrderResult(ok=True, order_id=None, raw=spec, message="dry_run_protective_oco", simulated=True)
         response = self._submit_live_order_spec(spec)
-        status_code = getattr(response, "status_code", 0)
-        if not (200 <= status_code < 300):
+        status_code = getattr(response, "status_code", None)
+        if not response_ok(response):
             LOG.error("Protective OCO submission failed symbol=%s qty=%s status=%s", symbol, qty, status_code)
             return OrderResult(ok=False, order_id=None, raw=getattr(response, "text", spec),
                                message=f"protective_oco_status={status_code}", simulated=False)
@@ -1223,14 +1244,22 @@ class SchwabExecutor:
         its first moved level while the engine kept deferring its stop to it --
         and the fill reconcile watched the dead id, so the replacement's fill
         was never booked.
+
+        A dry run sends nothing, like ``submit_protective_oco`` and
+        ``cancel_bracket``: a dry-run restore that adopts a REAL resting stop
+        resizes it through here, and so does every trail sync after it, so the
+        paper bot replaced the user's stop at the broker.
         """
         child_order_id = str(bracket.get(child_key) or "")
+        if self.config.schwab.dry_run:
+            LOG.info("DRY RUN bracket replace %s %s: %s", child_key, child_order_id, spec)
+            return True, "dry_run_replace"
         try:
             response = call_schwab_client(self.client, "replace_order", self.account_hash, child_order_id, spec)
         except Exception as exc:
             return False, f"replace_error:{exc}"
-        status_code = getattr(response, "status_code", 0)
-        if not 200 <= status_code < 300:
+        status_code = getattr(response, "status_code", None)
+        if not response_ok(response):
             return False, f"replace_status={status_code}"
         new_order_id = self._response_order_id(response)
         if not new_order_id:
@@ -1480,8 +1509,8 @@ class SchwabExecutor:
         poll_seconds = max(0.1, float(self.config.execution.entry_live_poll_seconds))
         spec = self.build_bracket_order(request, side=side, stop_price=stop_price, target_price=target_price)
         response = self._submit_live_order_spec(spec)
-        status_code = getattr(response, "status_code", 0)
-        if not (200 <= status_code < 300):
+        status_code = getattr(response, "status_code", None)
+        if not response_ok(response):
             return OrderResult(ok=False, order_id=None, raw=getattr(response, "text", spec),
                                message=f"bracket_status={status_code}", simulated=False)
         order_id = self._response_order_id(response)
