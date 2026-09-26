@@ -22,7 +22,7 @@ try:
 except Exception:  # pragma: no cover - optional until indicators are computed
     talib = None
 
-from .models import DEFAULT_RUNTIME_TZ, Side, StrategySchedule, Window
+from .models import DEFAULT_RUNTIME_TZ, StrategySchedule, Window
 
 
 LOG = logging.getLogger(__name__)
@@ -970,36 +970,6 @@ def talib_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
     )
 
 
-def talib_bbands(
-    close: pd.Series,
-    *,
-    length: int,
-    mult: float,
-) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Bollinger Bands via TA-Lib.
-
-    Returns ``(upper, middle, lower)`` matching TA-Lib's own return order.
-    Uses an SMA basis (``matype=ta.MA_Type.SMA``) so the math matches the
-    bot's manual ``rolling(N).mean() + rolling(N).std(ddof=0)`` fallbacks.
-    Emits NaN until the full ``length`` window is available — same warmup
-    semantics as the strategy-side fallbacks that already use
-    ``min_periods=length``.
-    """
-    ta = _require_talib()
-    upper, middle, lower = ta.BBANDS(
-        _to_float64_array(close),
-        timeperiod=int(length),
-        nbdevup=float(mult),
-        nbdevdn=float(mult),
-        matype=ta.MA_Type.SMA,
-    )
-    return (
-        _series_from_talib(close.index, upper),
-        _series_from_talib(close.index, middle),
-        _series_from_talib(close.index, lower),
-    )
-
-
 def _session_stitch_factor(
     open_: FloatArray,
     close: FloatArray,
@@ -1524,6 +1494,3 @@ def setup_logging(log_dir: Union[str, Path]) -> None:
 
     LOG.info("Logging to %s (daily rotation at ET midnight)", file_handler.baseFilename)
 
-
-def opposite_side(side: Side) -> Side:
-    return Side.SHORT if side == Side.LONG else Side.LONG

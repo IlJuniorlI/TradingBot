@@ -459,11 +459,6 @@ def session_datetime_index(index: pd.Index) -> pd.DatetimeIndex:
     return dt_index.tz_convert(_SESSION_TZ).tz_localize(None)
 
 
-def session_dates(index: pd.Index) -> pd.Index:
-    """Return ET session dates for each timestamp in ``index``."""
-    return pd.Index(session_datetime_index(index).date)
-
-
 def session_segment_ids(index: pd.Index) -> np.ndarray:
     """Run id per bar that advances at every change of ET session date.
 

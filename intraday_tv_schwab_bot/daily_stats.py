@@ -63,9 +63,6 @@ class SymbolDailyStats:
         return self.beta is not None
 
 
-EMPTY_STATS = SymbolDailyStats(symbol="")
-
-
 def _clean_daily(frame: pd.DataFrame | None) -> pd.DataFrame | None:
     """Return *frame* with the OHLC columns coerced to float and any row
     carrying a non-positive or missing price dropped. ``None`` when nothing

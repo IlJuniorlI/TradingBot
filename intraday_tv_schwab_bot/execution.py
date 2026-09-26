@@ -55,21 +55,6 @@ class BracketCancel:
 
 
 class SchwabExecutor:
-    _EQUITY_WORKING_STATUSES = {
-        "AWAITING_PARENT_ORDER",
-        "AWAITING_CONDITION",
-        "AWAITING_MANUAL_REVIEW",
-        "ACCEPTED",
-        "AWAITING_UR_OUT",
-        "PENDING_ACTIVATION",
-        "PENDING_ACKNOWLEDGEMENT",
-        "PENDING_RECALL",
-        "QUEUED",
-        "WORKING",
-        "OPEN",
-        "LIVE",
-        "PARTIALLY_FILLED",
-    }
     _EQUITY_TERMINAL_FAILURE_STATUSES = {
         "CANCELED",
         "CANCELLED",
@@ -96,22 +81,6 @@ class SchwabExecutor:
                     if row.get(key):
                         return str(row[key])
         raise RuntimeError("Could not resolve account hash from linked_accounts()")
-
-    def submit(self, request: OrderRequest) -> OrderResult:
-        spec = self._build_order(request)
-        return self.submit_raw(spec)
-
-    def submit_raw(self, spec: dict[str, Any]) -> OrderResult:
-        if self.config.schwab.dry_run:
-            LOG.info("DRY RUN order: %s", spec)
-            return OrderResult(ok=True, order_id=None, raw=spec, message="dry_run", simulated=True)
-        response = call_schwab_client(self.client, "place_order", self.account_hash, spec)
-        ok = response_ok(response)
-        status_code = getattr(response, "status_code", None)
-        order_id = self._response_order_id(response)
-        if not ok:
-            LOG.warning("Order submission failed status=%s spec=%s", status_code, spec)
-        return OrderResult(ok=ok, order_id=order_id, raw=response.text, message=f"status={status_code}")
 
     @staticmethod
     def order_intent_for_entry(side: Side) -> OrderIntent:

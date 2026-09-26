@@ -178,7 +178,7 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
                 # Manual rolling Bollinger fallback when bb_len != 20 or
                 # bb_mult != 2.0 (shipped configs always use 20/2.0 so this
                 # branch is dead code in production). Kept on pandas instead
-                # of talib_bbands because TA-Lib's BBANDS poisons the entire
+                # of TA-Lib's BBANDS because BBANDS poisons the entire
                 # output once it sees a NaN in close, while pandas rolling
                 # recovers as soon as the window moves past the NaN — same
                 # NaN-tolerance the rest of this strategy assumes.

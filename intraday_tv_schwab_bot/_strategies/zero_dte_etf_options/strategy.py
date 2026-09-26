@@ -159,10 +159,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
     def _time_in_range(now_t: time, start: str, end: str) -> bool:
         return parse_hhmm(start) <= now_t <= parse_hhmm(end)
 
-    @staticmethod
-    def _option_quote_force_cooldown_seconds() -> float:
-        return 1.0
-
     def _compute_time_decay_scale(self) -> float:
         """Returns 1.0 at/before decay_start, min_scale at/after decay_end,
         linear interpolation between. Used to scale debit/single target and
@@ -252,10 +248,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
     def _safe_pct(value: Any) -> float:
         pct = _safe_float(value, 0.0)
         return pct / 100.0 if abs(pct) > 1.0 else pct
-
-    @classmethod
-    def insufficient_bars_reason(cls, name: str, current: Any, required: Any) -> str:
-        return _reason_with_values(name, current=current, required=required, op='>=', digits=0)
 
     @staticmethod
     def _fraction_relative(frame: pd.DataFrame, column: str, lookback: int, direction: str) -> float:

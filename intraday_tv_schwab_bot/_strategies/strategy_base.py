@@ -23,7 +23,6 @@ from ..order_blocks import (
     build_order_block_context,
     empty_order_block_context,
 )
-from .rvol import effective_relative_volume, relative_volume_gate_threshold
 from .shared_entry import SharedEntryPolicy
 from ..models import OPTION_ASSET_TYPES, ExitDecision
 from ..utils import frame_bar_minutes, session_bucket_ends
@@ -224,14 +223,6 @@ class BaseStrategy:
         # The shared entry stage: the only reader of config.shared_entry
         # (see shared_entry.py). Built last -- it reads the manifest.
         self.entry_policy = SharedEntryPolicy(self)
-
-    @staticmethod
-    def _effective_relative_volume(symbol: str, raw_relative_volume: object, params: dict[str, Any] | None = None, *, cap_default: float = 2.5, standard_floor: float = 0.5, dollar_volume: object = None) -> float:
-        return effective_relative_volume(symbol, raw_relative_volume, params or {}, cap_default=cap_default, standard_floor=standard_floor, dollar_volume=dollar_volume)
-
-    @staticmethod
-    def _relative_volume_gate_threshold(symbol: str, base_threshold: object, params: dict[str, Any] | None = None, *, dollar_volume: object = None) -> float:
-        return relative_volume_gate_threshold(symbol, base_threshold, params or {}, dollar_volume=dollar_volume)
 
     def _watchlist_capability_sources(self, kind: str) -> list[object] | None:
         raw = self._capability(f"watchlist.{kind}_sources", None)

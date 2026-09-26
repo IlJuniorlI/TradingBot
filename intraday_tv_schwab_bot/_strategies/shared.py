@@ -62,7 +62,6 @@ from ..utils import (
     now_et,
     parse_hhmm,
     resample_bars,
-    talib_bbands,
     talib_obv,
 )
 
@@ -196,7 +195,6 @@ __all__ = [
     'single_option_limit_price',
     'single_option_price_bounds',
     'summarize_htf_trend',
-    'talib_bbands',
     'talib_obv',
     'time',
     'time_mod',

@@ -585,6 +585,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Removed
 
+- **Dead code (refactor cut C08).** *2026-09-25* — none of these had a caller, or each
+  duplicated what it inherits:
+  - `utils.opposite_side` and `utils.talib_bbands` (and its `_strategies.shared` re-export);
+  - `candles.CUSTOM_2C_PATTERNS` and `daily_stats.EMPTY_STATS`;
+  - `levels_shared.session_dates` (only a test called it);
+  - `BaseStrategy._effective_relative_volume` / `_relative_volume_gate_threshold` (the screeners resolve to `screener_base`'s);
+  - the 0DTE strategy's `_option_quote_force_cooldown_seconds` and its `insufficient_bars_reason` classmethod (the module-level function is the one called);
+  - `microcap_pm_breakout`'s screener `watchlist_mode`, a byte-identical copy of the one it inherits from `microcap_gap_orb` (which now answers the same calls);
+  - `SchwabExecutor._EQUITY_WORKING_STATUSES`, `submit` and `submit_raw`.
+
 - **Breaking: renamed and retired config keys fail at load.** *2026-09-24* —
   a stale YAML fails at load with the replacement named, rather than
   silently doing nothing.
@@ -1339,7 +1349,6 @@ and were deliberately left unchanged. Each one needs a decision.
     left `unprotected`, and the engine owns the stop.
   - A dry run restores a real position again at the next reconcile after
     the paper engine exits it.
-  - `SchwabExecutor.submit` / `submit_raw` have no callers.
 
 - **A dry run and the live bot share one reconcile-metadata file.** Every
   preset points `startup_reconcile_metadata_db_path` at
