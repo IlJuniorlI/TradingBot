@@ -584,6 +584,18 @@ class EntryGatekeeper:
             result.order_id, position_key, result.message,
         )
 
+    def unsettled_entry_order_ids(self) -> dict[str, str]:
+        """Position key -> order id of every entry order still settling.
+
+        The broker account holds an order's fills before
+        settle_unsettled_entry_orders books them, so the startup reconciler
+        leaves these positions to it: its restore adopted the same fill a
+        second time, and its settle read an outside close short by the late
+        fills (2026-09-25). Keyed by position key, not the record's symbol,
+        which is the underlying of an option entry."""
+        return {str(key).upper().strip(): str(record.get("order_id") or "")
+                for key, record in self.unsettled_entry_orders.items()}
+
     def has_unsettled_entry(self, symbol: str) -> bool:
         wanted = str(symbol or "").upper().strip()
         return any(str(record.get("symbol") or "").upper().strip() == wanted

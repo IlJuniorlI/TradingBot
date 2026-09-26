@@ -51,6 +51,11 @@ LOG = logging.getLogger(__name__)
 # ~30s (schwabdev retries a timed-out read), all of it on the engine thread.
 RECONCILE_RETRY_SECONDS = 60.0
 RECONCILE_RETRY_MAX_SECONDS = 300.0
+# The retry delay while the settle holds a position it could not settle (its
+# bracket not confirmed down): the manager sends nothing for it until then, so
+# the first retry after a hold comes sooner, whatever failed before it, and
+# doubles only over the attempts that keep holding it.
+RECONCILE_SETTLE_RETRY_SECONDS = 10.0
 
 
 class IntradayBot:
@@ -127,6 +132,9 @@ class IntradayBot:
         # Failed reconcile attempts in a row; while it is non-zero,
         # `_maybe_session_reconcile` retries on `_reconcile_retry_delay()`.
         self._reconcile_failures = 0
+        # Failed attempts in a row that left a position held
+        # (``settle_pending``); see _reconcile_retry_delay.
+        self._settle_hold_failures = 0
         self._last_reconcile_attempt_monotonic: float = 0.0
         self._last_reconcile_metadata_signature: str | None = None
         # ET session date of the most recent daily session-archive
@@ -159,17 +167,6 @@ class IntradayBot:
             save_reconcile_metadata=self._save_reconcile_metadata,
             is_startup_reconcile_entry_blocked=lambda symbol: self.startup_reconciler.is_entry_blocked(symbol),
         )
-        self.startup_reconciler = StartupReconciler(
-            config,
-            executor=self.executor,
-            data=self.data,
-            account=self.account,
-            strategy=self.strategy,
-            positions=self.positions,
-            reconcile_metadata_store=self.reconcile_metadata_store,
-            save_reconcile_metadata=self._save_reconcile_metadata,
-            stock_position_trail_pct=self.entry_gatekeeper.stock_position_trail_pct,
-        )
         self.position_manager = PositionManager(
             config,
             data=self.data,
@@ -182,6 +179,21 @@ class IntradayBot:
             positions=self.positions,
             save_reconcile_metadata=self._save_reconcile_metadata,
             structured_metadata_snapshot=self.entry_gatekeeper.structured_metadata_snapshot,
+        )
+        self.startup_reconciler = StartupReconciler(
+            config,
+            executor=self.executor,
+            data=self.data,
+            account=self.account,
+            risk=self.risk,
+            strategy=self.strategy,
+            positions=self.positions,
+            reconcile_metadata_store=self.reconcile_metadata_store,
+            save_reconcile_metadata=self._save_reconcile_metadata,
+            stock_position_trail_pct=self.entry_gatekeeper.stock_position_trail_pct,
+            book_bracket_cancel_fills=self.position_manager.book_bracket_cancel_fills,
+            settle_unsettled_entry_orders=self.entry_gatekeeper.settle_unsettled_entry_orders,
+            unsettled_entry_order_ids=self.entry_gatekeeper.unsettled_entry_order_ids,
         )
         # Close the cycle: EntryGatekeeper also needs a PositionManager ref
         # (for initialize_position_diagnostics + underlying_price_for_position
@@ -331,6 +343,11 @@ class IntradayBot:
         consecutive_errors = 0
         while True:
             try:
+                # Ahead of the cycle: at 07:00 the first premarket cycle
+                # otherwise managed, and sent exits for, positions closed in
+                # the app overnight before the session-boundary reconcile
+                # dropped them (2026-09-25).
+                self._maybe_session_reconcile()
                 self.step()
                 self.last_error = None
                 consecutive_errors = 0
@@ -391,7 +408,6 @@ class IntradayBot:
                     LOG.info("Auto-exit: all windows closed at %s, no open positions — shutting down", exit_after.strftime("%H:%M"))
                     self._shutdown_cleanup()
                     break
-            self._maybe_session_reconcile()
             self._maybe_export_session_archive()
             self._maybe_session_rollover_reset()
             self._maybe_prune_inactive_symbols()
@@ -478,7 +494,14 @@ class IntradayBot:
             return
         today = now.date()
         if retrying:
-            if time.monotonic() - self._last_reconcile_attempt_monotonic < self._reconcile_retry_delay():
+            # An attempt that failed only because entry orders were still
+            # settling retries as soon as the gatekeeper has booked them: until
+            # then the engine manages the grown or adopted quantity against an
+            # account it has not reconciled, and entries stay blocked.
+            deferred = bool(self.startup_reconciler.result.get("unsettled_entry_orders"))
+            entries_settled = not self.entry_gatekeeper.unsettled_entry_orders
+            if not (deferred and entries_settled) and \
+                    time.monotonic() - self._last_reconcile_attempt_monotonic < self._reconcile_retry_delay():
                 return
             LOG.info("Retrying the failed broker reconcile")
         elif self._last_reconcile_session_date == today:
@@ -501,18 +524,27 @@ class IntradayBot:
         if ok:
             self._last_reconcile_session_date = session_date
             self._reconcile_failures = 0
+            self._settle_hold_failures = 0
             # A full replace, even when the positions are unchanged: saves
             # before the first success only upserted, so stale rows remain.
             self._last_reconcile_metadata_signature = None
             self._save_reconcile_metadata()
             return
         self._reconcile_failures += 1
+        held = any(isinstance(position.metadata, dict) and position.metadata.get("settle_pending")
+                   for position in self.positions.values())
+        self._settle_hold_failures = self._settle_hold_failures + 1 if held else 0
         LOG.warning("Broker reconcile failed (%d in a row); retrying in %.0fs",
                     self._reconcile_failures, self._reconcile_retry_delay())
 
     def _reconcile_retry_delay(self) -> float:
-        doublings = max(0, self._reconcile_failures - 1)
-        return min(RECONCILE_RETRY_MAX_SECONDS, RECONCILE_RETRY_SECONDS * 2.0 ** min(doublings, 16))
+        if self._settle_hold_failures:
+            doublings = self._settle_hold_failures - 1
+            base = RECONCILE_SETTLE_RETRY_SECONDS
+        else:
+            doublings = max(0, self._reconcile_failures - 1)
+            base = RECONCILE_RETRY_SECONDS
+        return min(RECONCILE_RETRY_MAX_SECONDS, base * 2.0 ** min(doublings, 16))
 
     def _maybe_session_rollover_reset(self) -> None:
         """Clear per-session counters when the ET trading date rolls.

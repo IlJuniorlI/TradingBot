@@ -229,7 +229,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   response, `response_ok`, and `call_schwab_json` (see Fixed).
   - `StartupReconciler` no longer takes `client`; it reads the broker through
     `SchwabExecutor.fetch_account_positions()` and
-    `fetch_working_orders(from_ts, to_ts)`.
+    `fetch_working_orders(from_ts, to_ts)`. It takes `risk`,
+    `book_bracket_cancel_fills` (the manager's, now public),
+    `settle_unsettled_entry_orders` and `unsettled_entry_order_ids` (the
+    entry gatekeeper's). The engine builds `PositionManager` first.
 
 - **What the shared stage changed, per strategy family.** *2026-09-24*
 
@@ -739,6 +742,124 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the prune.
   - Tests: `tests/test_startup_reconciler.py` (`TestAccountReadFailsClosed`).
 
+- **The settle books a bracket's own fills, and never stacks protection
+  beside a cancel it cannot confirm.** *2026-09-25* — the settle booked the
+  whole gap between the tracked and the held quantity as
+  `closed_outside_bot` at the last mark. A bracket stop that filled after
+  the last management cycle therefore read as an outside close (a stop
+  filled at 3.94 against a 4.20 mark was booked as a gain), and the risk
+  manager never saw the exit. It then cancelled the bracket and, even when
+  the cancel was not confirmed, placed fresh protection beside it; both
+  stops sold the position net short.
+  - The bracket is cancelled first. What its children filled is booked
+    through `PositionManager.book_bracket_cancel_fills`, at the broker's
+    price with the risk manager's registration, and only the rest of the
+    gap is booked outside.
+  - A cancel that cannot be confirmed leaves the position as it was:
+    nothing booked, nothing placed. The attempt fails, and the retry sends
+    the cancel again, as the manager's cancel-before-exit does. Until then
+    the position is held (`settle_pending`): the manager sends it no exit and
+    no re-protect sized to shares the broker no longer holds. The first
+    retry after a hold comes after 10 seconds
+    (`RECONCILE_SETTLE_RETRY_SECONDS`), whatever failed before it, and the
+    delay doubles only while the hold lasts. Only an attempt that can read
+    the position again lifts the hold.
+  - When the cancel reports fills, the account and then the working exit
+    order are read again once the bracket is down. A child, or the working
+    exit, can fill between the first reads and the cancel. Sizing from the
+    first reads kept, and re-protected, shares the stop had already sold,
+    and booked a slice's fill twice.
+  - The re-protect adopts a stop still resting for the position (one moved
+    in the app) instead of placing fresh protection beside it. It uses the
+    saved stop while the order list still shows it. Otherwise it uses the
+    stop resting for the position, or, when none rests, the saved one, which
+    is adopted only if its own state read shows it live or cannot be read.
+    The children the settle just cancelled are left out of the list. A
+    bracketed position that keeps shares therefore waits for the order
+    list; one the broker no longer holds does not.
+  - The estimated loss of a close outside the bot now counts toward
+    `max_daily_loss`; an estimated gain does not, since the mark can be
+    stale. It had been left out because "the close happened outside this
+    session", but the reconcile now also runs mid-session on a retry.
+  - Tests: `tests/test_sweep_fixes.py` (`TestSettleBooksTheBracketsOwnFills`,
+    `TestSettleAdoptsAStopMovedInTheApp`, `TestDryRunProtectionIsSimulated`).
+
+- **A dry run's broker protection is simulated.** *2026-09-25* — a
+  dry-run restore adopted the REAL resting stop as the paper position's
+  active bracket. RiskManager left the stop to the broker, but a dry run
+  reads no order state and never saw that stop fill, so the paper position
+  never exited on its stop.
+  - `ensure_position_protected` now returns a simulated bracket in a dry
+    run, adopting, resizing and submitting nothing, so the engine owns the
+    exits. It keeps the ids of the real protection, which the reconcile
+    counts as the position's own instead of as a foreign order that blocks
+    every entry.
+  - A saved row that tracks a working exit order no longer matches in a
+    dry run, which can never settle that order. Restored with it, the paper
+    position was never managed again, and every cycle tried to cancel the
+    user's real order; only `cancel_working_order`'s dry-run guard stopped
+    it.
+
+- **An entry order still settling is left to the entry gatekeeper at the
+  reconcile.** *2026-09-25* — the account holds an unsettled entry order's
+  fills before the gatekeeper books them.
+  - The restore adopted the same fill a second time. The gatekeeper then
+    grew the restored position by the same shares, recording the entry
+    twice, and in bracket mode resized its stop to twice what was held.
+  - The settle read an outside close short by the late fills. A position
+    closed entirely in the app was dropped, and the gatekeeper then adopted
+    its late fills as a new position the broker no longer held.
+
+  The fix:
+  - The reconcile now books unsettled entry orders from their own fill
+    records before it reads the broker.
+  - Anything still unsettled is left alone: the restore skips it, the settle
+    skips it, and no working order is judged.
+  - The attempt fails (`startup_reconcile_failed`, naming the orders) and is
+    retried as soon as the gatekeeper has booked them.
+  - A restart clears an order that never settles, and the restore then
+    adopts its fills.
+  - The session-boundary reconcile also runs before the cycle now. The first
+    premarket cycle used to manage, and send exits for, positions closed
+    overnight before the reconcile dropped them.
+  - Tests: `tests/test_startup_reconciler.py`
+    (`TestUnsettledEntriesAtTheReconcile`, `TestEngineReconcileRetry`).
+
+- **A bracket whose stop died at the broker is retired.** *2026-09-25* — a
+  DAY child expires at its session's end (09:25 for AM, 16:00 for NORMAL),
+  and a stop can be cancelled in the app. The bracket still read active,
+  so RiskManager deferred the stop to an order that no longer rested. The
+  position had no broker stop and no engine stop.
+  - The fill reconcile now retires a bracket whose stop reads EXPIRED,
+    CANCELED or REJECTED. What else of it rests is cancelled, what that
+    cancel reports filled is booked, and the position is re-protected, or
+    the engine owns the stop.
+  - A REJECTED stop is never placed again. The broker rejects the same
+    order again, and each rejected replacement read as protection that
+    suppressed the engine stop, every cycle. A stop is also re-placed at
+    most once per bracket.
+  - When that cancel cannot be confirmed, the rest of the bracket (a target
+    the OCO no longer links) stays tracked, so its fill is still booked and
+    the cancel-before-exit still sends its cancel. Only the dead stop is
+    dropped, so the engine owns the stop at once. Only the dead stop's own
+    fills are booked then, recorded on the bracket
+    (`booked_child_fills`) so that a later cancel of the wrapper, which
+    still lists the dead stop, does not report them again. The rest's are
+    booked once, when their cancel confirms or they fill. Once the rest is confirmed down (or dies itself),
+    the dead stop gets its one fresh placement, unless it was REJECTED.
+  - A REPLACED stop is not dead: its replacement may rest under an id the
+    bracket could not be re-pointed to.
+  - The fill reconcile also reads a child the 8-hour listing no longer
+    returns on its own. A stop placed before 07:00 lives until 16:00, and
+    its fill after 15:00 was never booked. A live child is read at most
+    once a minute (`UNLISTED_BRACKET_CHILD_READ_SECONDS`).
+  - A working exit order that closes the position now takes its leftover
+    bracket down. A remainder stop left resting beside it opened a new
+    position on trigger.
+  - Bracket mode is off in every preset.
+  - Tests: `tests/test_bracket_orders.py`
+    (`TestBracketChildrenTheListingMisses`, `TestAStopThatDiedAtTheBroker`).
+
 - **One reading of a Schwab response.** *2026-09-25* — status checks used
   four conventions: `status >= 400` (a 3xx, or a response with no status,
   passed), `200 <= status < 300` with a missing status read as 0 or as 200,
@@ -1199,6 +1320,42 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 These were found during the 2026-09-24 change and its 2026-09-25 follow-up
 and were deliberately left unchanged. Each one needs a decision.
+
+- **Bracket-mode adoption, found with the 2026-09-25 reconcile follow-up.**
+  These were left out of that cut because the fix changes the adoption
+  contract that the manager, the gatekeeper and the restore share. Bracket
+  mode is off in every preset.
+  - `ensure_position_protected` places fresh protection when a tracked
+    bracket's stop is dead, but it does not cancel that bracket's live
+    target first. A target moved by replace may not be OCO-linked, and it
+    then rests beside the fresh one.
+  - A partly filled STOP_LIMIT stop is adopted as it rests. Its fills are
+    already outside the account quantity, and the manager's later cancel
+    books them again.
+  - A resize that the broker refuses leaves an oversized stop adopted
+    (`qty_mismatch`).
+  - At 07:00 with extended hours on, fresh protection is an AM-session
+    order, and Schwab rejects STOP orders outside NORMAL. The position is
+    left `unprotected`, and the engine owns the stop.
+  - A dry run restores a real position again at the next reconcile after
+    the paper engine exits it.
+  - `SchwabExecutor.submit` / `submit_raw` have no callers.
+
+- **A dry run and the live bot share one reconcile-metadata file.** Every
+  preset points `startup_reconcile_metadata_db_path` at
+  `.logs/startup_reconcile_metadata.sqlite`, and `SessionRiskStateStore`
+  opens the same file. So switching a live bot to a dry run and back can
+  lose the live bot's restore state.
+  - A dry run's first successful reconcile replaces every row with its own
+    positions.
+  - A paper exit deletes a real position's row.
+  - A row that tracks a working exit order no longer matches in a dry run.
+  - The next live restart then restores basic, or skips a position that
+    requires hybrid metadata. In bracket mode it adopts and resizes the
+    resting stop to the full position beside a still-working exit order.
+  - The fix is a per-mode path (for example a `.dry_run` suffix for both
+    stores). It changes where a dry run keeps its session risk tallies, so
+    it needs a decision.
 
 - **What the S/R veto read is not logged.** `_sr_lists` records neither
   the pending level nor the S/R ATR in ENTRY_CONTEXT. That is part of why

@@ -30,6 +30,15 @@ Design notes:
 - ``stock_position_trail_pct`` injected as callable (lives on
   EntryGatekeeper). Restore uses it to compute trail_pct consistent with
   normal entry path.
+- ``settle_unsettled_entry_orders`` / ``unsettled_entry_order_ids`` injected
+  as callables (live on EntryGatekeeper). The account holds an unsettled
+  entry order's fills before the gatekeeper books them, so the reconcile
+  settles those orders first and leaves the positions of any still unsettled
+  to the gatekeeper (2026-09-25). Empty at startup.
+- ``book_bracket_cancel_fills`` injected as callable (lives on
+  PositionManager): what a cancelled bracket's children filled is booked at
+  the broker's price with the risk manager's registration, as the manager
+  books it. ``risk`` receives the estimated loss of a close outside the bot.
 - Trading-blocked state (``trading_blocked_reason`` / ``trading_blocked_message``)
   moved off ``IntradayBot`` onto this class. Engine reads via
   ``self.startup_reconciler.trading_blocked_reason`` at step() + publish
@@ -38,6 +47,7 @@ Design notes:
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -54,6 +64,7 @@ from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTI
 from .paper_account import PaperAccount
 from .position_metrics import safe_float
 from .position_store import ReconcileMetadataStore
+from .risk import RiskManager
 from ._strategies.registry import is_option_strategy
 from ._strategies.strategy_base import BaseStrategy
 from .utils import UTC, now_et
@@ -69,21 +80,29 @@ class StartupReconciler:
         executor,
         data: MarketDataStore,
         account: PaperAccount,
+        risk: RiskManager,
         strategy: BaseStrategy,
         positions: dict[str, Position],
         reconcile_metadata_store: ReconcileMetadataStore,
         save_reconcile_metadata: Callable[[], None],
         stock_position_trail_pct: Callable[..., float | None],
+        book_bracket_cancel_fills: Callable[..., None],
+        settle_unsettled_entry_orders: Callable[[], None],
+        unsettled_entry_order_ids: Callable[[], dict[str, str]],
     ) -> None:
         self.config = config
         self.executor = executor
         self.data = data
         self.account = account
+        self.risk = risk
         self.strategy = strategy
         self.positions = positions
         self.reconcile_metadata_store = reconcile_metadata_store
         self._save_reconcile_metadata = save_reconcile_metadata
         self._stock_position_trail_pct = stock_position_trail_pct
+        self._book_bracket_cancel_fills = book_bracket_cancel_fills
+        self._settle_unsettled_entry_orders = settle_unsettled_entry_orders
+        self._unsettled_entry_order_ids = unsettled_entry_order_ids
         # State set by reconcile() and read by engine + entry gate.
         self.trading_blocked_reason: str | None = None
         self.trading_blocked_message: str | None = None
@@ -225,6 +244,13 @@ class StartupReconciler:
                 continue
             if abs(float(position.entry_price) - float(entry_price)) > tolerance:
                 continue
+            if self.config.schwab.dry_run and working_exit_outstanding_qty(position):
+                # A dry run reads no order state, so it can never settle the
+                # row's working exit order: restored with it, the paper
+                # position was never managed again, and every cycle tried to
+                # cancel the user's real order (2026-09-25). It restores
+                # basic, and the engine owns the exits.
+                continue
             held_when_saved = int(qty)
             if int(position.qty) != held_when_saved and working_exit_outstanding_qty(position):
                 # Its working exit order sold shares while the bot was down.
@@ -235,13 +261,9 @@ class StartupReconciler:
                 # order whose state cannot be read fails the attempt: read as
                 # no fills, it restored the position basic at the broker
                 # quantity with its stop resized to all of it beside the exit
-                # order's outstanding shares, and lost the order for good. A
-                # dry run reads no order state, by design: there it does not
-                # match.
+                # order's outstanding shares, and lost the order for good.
                 unbooked = self._unbooked_working_exit_fills(position)
                 if unbooked is None:
-                    if self.config.schwab.dry_run:
-                        continue
                     raise RuntimeError(f"the working exit order state of {symbol_upper} could not be read")
                 held_when_saved += unbooked
             if int(position.qty) != held_when_saved:
@@ -286,7 +308,17 @@ class StartupReconciler:
             return
         stale = metadata.get("bracket") if isinstance(metadata.get("bracket"), dict) else None
         parent_order_id = stale.get("parent_order_id") if stale else None
-        known = stale if stale and stale.get("stop_order_id") else self._resting_stop_for(position, working_orders)
+        # The saved stop while the working-order snapshot still lists it,
+        # otherwise the stop resting for the position now. A stop moved in the
+        # app (REPLACED under a new id), or by a trail sync whose save was lost
+        # in a crash, left the saved id dead: fresh protection went in beside
+        # the live one, and both sold the position net short (2026-09-25).
+        saved = stale if stale and stale.get("stop_order_id") else None
+        listed = {str(order.get("orderId")) for order in working_orders}
+        known = (
+            saved if saved is not None and str(saved["stop_order_id"]) in listed
+            else self._resting_stop_for(position, working_orders) or saved
+        )
         try:
             refreshed = self.executor.ensure_position_protected(
                 str(metadata.get("underlying") or position.symbol),
@@ -374,7 +406,9 @@ class StartupReconciler:
             return outstanding
         return max(0, int(state.get("filled_qty") or 0) - int(record.get("booked_qty") or 0))
 
-    def _settle_positions_closed_at_broker(self, raw_positions: list[dict[str, Any]]) -> bool:
+    def _settle_positions_closed_at_broker(self, raw_positions: list[dict[str, Any]],
+                                           working_orders: list[dict[str, Any]] | None,
+                                           unsettled: set[str]) -> bool:
         """Stop managing what the broker no longer holds.
 
         The session-boundary re-run of ``reconcile`` exists for positions
@@ -386,30 +420,57 @@ class StartupReconciler:
 
         Each is booked as an exit (``closed_outside_bot``) at the last mark,
         flagged estimated and broker-recovered so reports can tell it apart,
-        and dropped; one only partly closed is cut to what remains. Anything
-        of its bracket still resting is cancelled -- a stop left against a
-        closed position opens a new one when it triggers. Not registered with
-        the risk manager: the close happened outside this session.
+        and dropped; one only partly closed is cut to what remains. Its loss
+        goes to the risk manager, an estimated gain does not (2026-09-25): the
+        reconcile also runs mid-session on a retry, and dropping the position
+        took its open risk out of the daily-loss projection, while a stale
+        mark's gain must not loosen ``max_daily_loss``.
+
+        A position with a resting broker bracket has it cancelled first, and
+        what its children filled -- a stop that triggered after the last
+        management cycle -- is the bracket's exit, not an outside close:
+        ``book_bracket_cancel_fills`` books it at the broker's price with the
+        risk manager's registration, and only the rest of the gap is booked
+        outside. Booked at the mark, a stop filled at 3.91 against a 4.20 mark
+        read as a gain, and the risk manager never saw the exit (2026-09-25).
+        A cancel that cannot be confirmed leaves the position as it was:
+        nothing is booked, nothing is placed beside a bracket that may still
+        rest (fresh protection beside it sold the position net short when
+        both stops triggered), and the retry sends the cancel again, as the
+        manager's cancel-before-exit does. Until then the position is held
+        (``settle_pending``): the manager neither exits nor re-protects it at
+        a size the broker no longer holds. When the cancel reports fills, the
+        account is read again once the bracket is down, since a child can fill
+        between the first read and the cancel. What is left is re-protected,
+        adopting a stop still resting for it (moved in the app) rather than
+        stacking on it, so a bracketed position that keeps shares waits for
+        the working-order list.
 
         Fills of the position's own working exit order are not an outside
         close: the manager books them from the order's record next cycle, so
         they are netted out here, and a position whose order cannot be read
-        is left tracked (2026-09-25).
+        is left tracked (2026-09-25). So is one an entry order is still
+        settling (``unsettled``): the account holds that order's late fills
+        before the gatekeeper grows the position by them.
 
         Skipped in dry-run: those positions are simulated and never reach the
         broker, so the account holding none of them says nothing -- reading
         it as a close wiped every paper position held into a new session.
 
-        Returns False when a working exit order's state could not be read: that
-        position is left tracked, and the reconcile reports failure so the
-        engine retries rather than tracking it at the wrong size all day.
+        Returns False when a position was left tracked because something
+        could not be read or confirmed -- its working exit order's state, the
+        order list its re-protect needs, or its bracket's cancel -- so the
+        reconcile reports failure and the engine retries.
         """
         if not self.positions or self.config.schwab.dry_run:
             return True
         held = {str(row.get("symbol") or "").upper().strip(): row for row in raw_positions}
         changed = False
-        exit_states_read = True
+        settled = True
         for key, position in list(self.positions.items()):
+            if str(key).upper().strip() in unsettled:
+                LOG.warning("%s: its entry order is still settling; leaving it to the entry gatekeeper", key)
+                continue
             remaining = self._broker_held_qty(position, held)
             if remaining is None:
                 LOG.warning("Broker rows for %s do not read as its position; leaving it tracked", key)
@@ -417,8 +478,13 @@ class StartupReconciler:
             unbooked = self._unbooked_working_exit_fills(position)
             if unbooked is None:
                 LOG.warning("%s: its working exit order's fills cannot be read; leaving it tracked", key)
-                exit_states_read = False
+                settled = False
                 continue
+            # A hold is lifted only here, once the position is decided again:
+            # one whose reads failed above keeps it, and the manager still
+            # sends nothing for it.
+            if isinstance(position.metadata, dict):
+                position.metadata.pop("settle_pending", None)
             # What the broker holds once the manager books the position's own
             # working exit fills (next cycle, from the order's fill record).
             # Those are not closed outside the bot: booking them here too
@@ -427,43 +493,91 @@ class StartupReconciler:
             expected = int(position.qty) - unbooked
             if remaining >= expected:
                 continue
-            closed_qty = expected - int(remaining)
-            kept = int(remaining) + unbooked
-            mark = self.account.last_prices.get(position.symbol)
-            exit_price = float(mark) if mark is not None and float(mark) > 0 else float(position.entry_price)
-            exited = copy.copy(position)
-            exited.qty = closed_qty
-            self.account.record_exit(
-                exited, exit_price, "closed_outside_bot",
-                final_exit=kept <= 0,
-                remaining_qty_after_exit=kept,
-                fill_price_estimated=True,
-                broker_recovered=True,
-            )
+            gap = expected - int(remaining)
             bracket = active_broker_bracket(position)
+            bracket_filled = 0
             if bracket is not None:
-                leftover = self.executor.cancel_bracket(bracket)
-                if not leftover.ok:
-                    LOG.error("Could not confirm %s's resting bracket is down (%s) -- check the broker",
-                              key, leftover.message)
+                if working_orders is None and int(remaining) + unbooked > 0:
+                    LOG.warning("%s: the broker holds %s of %s, but the working-order list its re-protect needs "
+                                "could not be read; holding it for the retry", key, remaining, expected)
+                    position.metadata["settle_pending"] = True
+                    settled = False
+                    continue
+                cancel = self.executor.cancel_bracket(bracket)
+                if not cancel.ok:
+                    LOG.error("%s: the broker holds %s of %s, but its resting bracket cannot be confirmed down (%s); "
+                              "holding it until the retry cancels it", key, remaining, expected, cancel.message)
+                    position.metadata["settle_pending"] = True
+                    settled = False
+                    continue
+                changed = True
+                position.metadata.pop("bracket", None)
+                if cancel.filled_qty > 0:
+                    # A child can fill between the account read and the cancel;
+                    # once the bracket is down nothing of it can, so a second
+                    # read sizes what is held. Without it the settle kept, and
+                    # re-protected, shares the stop had sold after the read.
+                    # The working exit's state is read again after it, in the
+                    # reconcile's order (account first): a slice fill landing
+                    # in between was otherwise booked here and again by the
+                    # manager from the order's record.
+                    fresh = self.executor.fetch_account_positions()
+                    fresh_remaining = None if fresh is None else self._broker_held_qty(
+                        position, {str(row.get("symbol") or "").upper().strip(): row for row in fresh})
+                    fresh_unbooked = None if fresh_remaining is None else self._unbooked_working_exit_fills(position)
+                    if fresh_remaining is None or fresh_unbooked is None:
+                        LOG.warning("%s: the broker could not be read again after its bracket's fills; sizing from "
+                                    "the first read, and the retry sizes it again", key)
+                        settled = False
+                        bracket_filled = min(int(position.qty), int(cancel.filled_qty))
+                    else:
+                        remaining, unbooked = fresh_remaining, fresh_unbooked
+                        expected = int(position.qty) - unbooked
+                        gap = max(0, expected - int(remaining))
+                        bracket_filled = min(int(position.qty), int(cancel.filled_qty), gap)
+                    if bracket_filled > 0:
+                        self._book_bracket_cancel_fills(key, position, bracket,
+                                                        replace(cancel, filled_qty=bracket_filled),
+                                                        self.account.last_prices.get(position.symbol), {})
+                        if key not in self.positions:
+                            continue
+            closed_qty = max(0, gap - bracket_filled)
+            kept = int(position.qty) - closed_qty
+            if closed_qty > 0:
+                mark = self.account.last_prices.get(position.symbol)
+                exit_price = float(mark) if mark is not None and float(mark) > 0 else float(position.entry_price)
+                exited = copy.copy(position)
+                exited.qty = closed_qty
+                realized = self.account.record_exit(
+                    exited, exit_price, "closed_outside_bot",
+                    final_exit=kept <= 0,
+                    remaining_qty_after_exit=kept,
+                    fill_price_estimated=True,
+                    broker_recovered=True,
+                )
+                if float(realized) < 0:
+                    self.risk.register_realized_pnl(float(realized))
+                changed = True
+                LOG.warning("%s: broker holds %s of %s; %s closed outside the bot, booked at the last mark %.4f "
+                            "(estimated)", key, remaining, expected, closed_qty, exit_price)
             if kept <= 0:
                 self.positions.pop(key, None)
-                LOG.warning("%s qty=%s is no longer held at the broker; closed outside the bot, "
-                            "booked at the last mark %.4f (estimated)", key, closed_qty, exit_price)
-            else:
-                position.qty = kept
-                if isinstance(position.metadata, dict):
-                    position.metadata["qty"] = kept
-                    if bracket is not None:
-                        position.metadata.pop("bracket", None)
-                        self._reprotect_restored_position(position, [])
-                LOG.warning("%s: broker holds %s of %s; %s closed outside the bot, booked at the last "
-                            "mark %.4f (estimated); %s left to book from its working exit order",
-                            key, remaining, expected, closed_qty, exit_price, unbooked)
-            changed = True
+                continue
+            position.qty = kept
+            if isinstance(position.metadata, dict):
+                position.metadata["qty"] = kept
+            if bracket is not None:
+                # The snapshot predates the cancel: the cancelled children
+                # would read as a stop still resting for the position.
+                cancelled = {str(oid) for oid in (bracket.get("oco_order_id"), bracket.get("protective_order_id"),
+                                                  bracket.get("stop_order_id"), bracket.get("target_order_id"),
+                                                  *(bracket.get("child_order_ids") or [])) if oid}
+                self._reprotect_restored_position(
+                    position, [order for order in working_orders or [] if str(order.get("orderId")) not in cancelled],
+                )
         if changed:
             self._save_reconcile_metadata()
-        return exit_states_read
+        return settled
 
     @staticmethod
     def _resting_stop_for(position: Position, working_orders: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -503,7 +617,11 @@ class StartupReconciler:
             if isinstance(record, dict) and record.get("order_id"):
                 owned.add(str(record["order_id"]))
             bracket = position.metadata.get("bracket") if isinstance(position.metadata, dict) else None
-            if not isinstance(bracket, dict) or not bracket.get("active"):
+            # A dry run's bracket is simulated (the engine owns the exits) but
+            # keeps the ids of the real protection it stands for: that order
+            # is the position's own in a dry run too, and read as foreign it
+            # blocked every entry of the dry run (2026-09-25).
+            if not isinstance(bracket, dict) or not (bracket.get("active") or bracket.get("simulated")):
                 continue
             for key in ("oco_order_id", "protective_order_id", "stop_order_id", "target_order_id"):
                 if bracket.get(key):
@@ -544,7 +662,7 @@ class StartupReconciler:
         return live, all_read
 
     def _restore_broker_positions(self, positions: list[dict[str, Any]], *, use_metadata: bool,
-                                  working_orders: list[dict[str, Any]]) -> tuple[int, int]:
+                                  working_orders: list[dict[str, Any]], unsettled: set[str]) -> tuple[int, int]:
         if is_option_strategy(self.config.strategy):
             LOG.warning("startup_reconcile_mode=%s does not restore option strategies; leaving options handling unchanged", self.config.runtime.startup_reconcile_mode)
             return 0, len(positions)
@@ -570,6 +688,17 @@ class StartupReconciler:
                 skipped += 1
                 continue
             if symbol in self.positions:
+                continue
+            if symbol in unsettled:
+                # An entry order still settling bought these shares, and the
+                # gatekeeper adopts them from the order's own fill record.
+                # Restoring them as well tracked the fill twice: the
+                # gatekeeper then grew the restored position by the same
+                # shares and, in bracket mode, resized its stop to twice what
+                # was held, net short on trigger (2026-09-25).
+                LOG.warning("Skipping startup restore for %s: its entry order is still settling, and the entry "
+                            "gatekeeper adopts its fills", symbol)
+                skipped += 1
                 continue
             side = Side.LONG if long_qty > 0 else Side.SHORT
             entry_price = max(0.01, float(row.get("averagePrice") or 0.0))
@@ -602,6 +731,9 @@ class StartupReconciler:
                     LOG.debug("Could not fetch current price for restored position %s; using entry_price.", symbol, exc_info=True)
             if matched is not None:
                 metadata = dict(matched.metadata or {})
+                # A hold from the process that saved the row: this reconcile
+                # settles the position afresh.
+                metadata.pop("settle_pending", None)
                 metadata.update({
                     "restored_on_startup": True,
                     "restored_mode": "restore_hybrid",
@@ -693,11 +825,14 @@ class StartupReconciler:
     def reconcile(self) -> bool:
         """Read the broker and apply ``startup_reconcile_mode``.
 
-        Returns False when the attempt could not read the broker: the
-        account, the working orders, a tracked or saved position's working
-        exit order, or a working order it would otherwise count as foreign. A
-        failed read is recorded in ``result`` and, in the blocking modes,
-        blocks entries (``startup_reconcile_failed``, or
+        Returns False when the attempt could not read or settle the broker:
+        the account, the working orders, a tracked or saved position's
+        working exit order, a tracked position's bracket that cannot be
+        confirmed down, or a working order it would otherwise count as
+        foreign. It also returns False while an entry order is still settling:
+        its position is left to the gatekeeper, and every order is judged by
+        the retry. A failure is recorded in ``result`` and, in the blocking
+        modes, blocks entries (``startup_reconcile_failed``, or
         ``working_orders_present`` for an unread foreign order); the engine
         retries until an attempt succeeds, which clears the block.
         """
@@ -706,7 +841,16 @@ class StartupReconciler:
             self._entry_block_symbols = set()
             return True
         account_read = False
+        unsettled: dict[str, str] = {}
         try:
+            # Entry orders an earlier cycle left unsettled are booked first,
+            # from their own fill records: the account read below already
+            # holds their fills, and a position the gatekeeper had yet to
+            # adopt was restored a second time, or read as closed short by its
+            # late fills (2026-09-25). Before the reads, so a fill that lands
+            # between them is in both or in neither.
+            self._settle_unsettled_entry_orders()
+            unsettled = self._unsettled_entry_order_ids()
             # account_details and account_orders are independent reads; fire
             # both in parallel to halve the boot-time stall that blocks the
             # engine from entering its first scan cycle. Each returns None
@@ -726,8 +870,10 @@ class StartupReconciler:
             if raw_positions is None:
                 raise RuntimeError("the broker account read failed")
             account_read = True
-            # The settle reads the account, not the order list.
-            exit_states_read = self._settle_positions_closed_at_broker(raw_positions)
+            working_orders = None if raw_orders is None else self._filter_reconcile_orders(raw_orders)
+            # The settle needs the order list only to re-protect a bracketed
+            # position, and waits for it there.
+            exit_states_read = self._settle_positions_closed_at_broker(raw_positions, working_orders, set(unsettled))
             ignored_open_position_symbols = sorted(self._ignored_open_position_symbols(raw_positions))
             self._entry_block_symbols = set(ignored_open_position_symbols)
             positions = self._filter_reconcile_positions(raw_positions)
@@ -742,9 +888,9 @@ class StartupReconciler:
                 # attempt so the retry reads the list (it skips what is
                 # already tracked).
                 if mode in {"restore_basic", "restore_hybrid"} and not self.executor.bracket_orders_enabled():
-                    self._restore_broker_positions(positions, use_metadata=(mode == "restore_hybrid"), working_orders=[])
+                    self._restore_broker_positions(positions, use_metadata=(mode == "restore_hybrid"),
+                                                   working_orders=[], unsettled=set(unsettled))
                 raise RuntimeError("the broker working-order read failed")
-            working_orders = self._filter_reconcile_orders(raw_orders)
             # False when a working order's state could not be read (below);
             # the order still counts, and the attempt is retried.
             order_states_read = True
@@ -754,6 +900,7 @@ class StartupReconciler:
                 "working_orders": working_orders,
                 "ignored_symbols": ignored,
                 "ignored_open_position_symbols": ignored_open_position_symbols,
+                "unsettled_entry_orders": dict(unsettled),
             }
             if positions or working_orders:
                 msg = f"Startup reconciliation found {len(positions)} broker positions and {len(working_orders)} working orders"
@@ -776,6 +923,7 @@ class StartupReconciler:
                 elif mode in {"restore_basic", "restore_hybrid"}:
                     restored, skipped = self._restore_broker_positions(
                         positions, use_metadata=(mode == "restore_hybrid"), working_orders=working_orders,
+                        unsettled=set(unsettled),
                     )
                     # A restored position's own resting protection is not a
                     # foreign order. Counting it blocked every entry for the
@@ -787,7 +935,7 @@ class StartupReconciler:
                     # skipped), so the filter no longer waits on a restore
                     # (2026-09-25). A dry run retires nothing at the broker.
                     foreign_orders = self._foreign_working_orders(working_orders)
-                    if foreign_orders and not self.config.schwab.dry_run:
+                    if foreign_orders and not unsettled and not self.config.schwab.dry_run:
                         foreign_orders, order_states_read = self._drop_retired_orders(foreign_orders)
                     self.result["foreign_working_orders"] = foreign_orders
                     self.result["restored_positions"] = restored
@@ -800,7 +948,13 @@ class StartupReconciler:
                             f"Startup reconciliation found {len(positions)} broker position(s) for an option strategy, "
                             "but restore is unsupported; reconcile or close them before new entries"
                         )
-                    elif foreign_orders:
+                    elif foreign_orders and not unsettled:
+                        # While an entry order is still settling no order is
+                        # judged: that entry's own (the order, its bracket's
+                        # children) belong to no tracked position yet, and
+                        # "clear them" meant cancelling the stop of the
+                        # position it opened. The attempt fails and blocks
+                        # below; the retry judges every order.
                         self.trading_blocked_reason = "working_orders_present"
                         self.trading_blocked_message = f"Startup reconciliation restored positions but found {len(foreign_orders)} working orders they do not own; clear them before new entries"
                         if not order_states_read:
@@ -842,11 +996,21 @@ class StartupReconciler:
                 self.trading_blocked_reason = "startup_reconcile_failed"
                 self.trading_blocked_message = f"Startup reconciliation failed: {exc}"
             return False
-        if not exit_states_read and mode in {"block", "restore_basic", "restore_hybrid"} and not self.trading_blocked_reason:
-            # Blocks like any other failed read, so a retry never restores
-            # beside an entry the cycle left unsettled, and a failed attempt
-            # never clears an earlier attempt's block.
+        if (unsettled or not exit_states_read) and mode in {"block", "restore_basic", "restore_hybrid"} \
+                and not self.trading_blocked_reason:
+            # Blocks like any other failed attempt; a failed attempt never
+            # clears an earlier attempt's block.
             self.trading_blocked_reason = "startup_reconcile_failed"
-            self.trading_blocked_message = "Startup reconciliation could not read a tracked position's working exit order; retrying"
+            if unsettled:
+                waiting = ", ".join(f"{order_id} ({key})" for key, order_id in sorted(unsettled.items()))
+                self.trading_blocked_message = (
+                    f"Startup reconciliation is waiting on entry order(s) {waiting} to settle; retrying "
+                    "(a restart clears an order that never does, and the restore then adopts its fills)"
+                )
+            else:
+                self.trading_blocked_message = (
+                    "Startup reconciliation could not settle a tracked position with the broker "
+                    "(an unread working exit order, or a bracket not confirmed down); retrying"
+                )
         self.result["order_states_read"] = order_states_read and exit_states_read
-        return order_states_read and exit_states_read
+        return order_states_read and exit_states_read and not unsettled

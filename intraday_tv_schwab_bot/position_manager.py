@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import time
 from datetime import datetime
 from typing import Any, Callable, Mapping
 
@@ -66,6 +67,13 @@ from .support_resistance import zone_flip_confirmed
 from .utils import TRADEFLOW_LEVEL, append_management_adjustment as _append_adjustment, now_et
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
+
+# How often a bracket child the account_orders listing does not return is read
+# on its own with order_details. The listing looks back 8 hours, and a child
+# placed outside an order session (a restore before 07:00, a re-protect the
+# evening before) is a NORMAL DAY order that can outlive it. One read a minute
+# per such child keeps a few of them far inside Schwab's ~120 requests/minute.
+UNLISTED_BRACKET_CHILD_READ_SECONDS = 60.0
 
 
 def _next_unpassed_rung(rungs: list, active_index: int, close: float,
@@ -125,6 +133,9 @@ class PositionManager:
         self.positions = positions
         self._save_reconcile_metadata = save_reconcile_metadata
         self._structured_metadata_snapshot = structured_metadata_snapshot
+        # Child id -> (monotonic time read, order state) for bracket children
+        # the listing does not return; see _unlisted_bracket_child_state.
+        self._unlisted_child_states: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
     # ------------------------------------------------------------------
     # SR-config accessors (read config + strategy params).
@@ -1001,13 +1012,32 @@ class PositionManager:
         position no longer exists at the broker, and managing or exiting a
         phantom position sends a duplicate order that opens a NEW position in
         the opposite direction.
+
+        A child the 8-hour listing does not return is read on its own
+        (``_unlisted_bracket_child_state``): a stop placed before 07:00 that
+        filled after 15:00 was never booked. A stop that died at the broker
+        without filling -- a DAY order EXPIRED at its session's end, one
+        CANCELED in the app, a REJECTED one -- retires its bracket
+        (``_retire_dead_bracket``): until then the bracket still read active,
+        so RiskManager deferred the stop to an order that no longer rested
+        and nothing protected the position (2026-09-25).
         """
         bracketed = {
             key: position for key, position in self.positions.items()
-            if active_broker_bracket(position) is not None
+            if active_broker_bracket(position) is not None and not self._settle_pending(position)
         }
         if not bracketed:
+            self._unlisted_child_states.clear()
             return
+        tracked_children: set[str] = set()
+        for position in bracketed.values():
+            bracket = active_broker_bracket(position) or {}
+            tracked_children.update(
+                str(oid) for oid in (bracket.get("stop_order_id"), bracket.get("target_order_id"),
+                                     *(bracket.get("child_order_ids") or [])) if oid
+            )
+        for child_id in [cid for cid in self._unlisted_child_states if cid not in tracked_children]:
+            del self._unlisted_child_states[child_id]
         states = self.executor.fetch_order_states()
         if states is None:
             # Could not read broker state. Do NOT assume "nothing filled" --
@@ -1021,11 +1051,15 @@ class PositionManager:
             bracket = active_broker_bracket(position)
             if bracket is None:
                 continue
+            child_states: dict[str, dict[str, Any] | None] = {}
             for child_key, reason in (("stop_order_id", "broker_stop"), ("target_order_id", "broker_target")):
                 child_id = bracket.get(child_key)
                 if not child_id:
                     continue
                 state = states.get(str(child_id))
+                if state is None:
+                    state = self._unlisted_bracket_child_state(str(child_id))
+                child_states[child_key] = state
                 if not isinstance(state, dict) or not state.get("is_filled"):
                     continue
                 filled_qty = int(state.get("filled_qty") or 0)
@@ -1064,14 +1098,126 @@ class PositionManager:
                             key, reason, leftover.message,
                         )
                 break
+            else:
+                # The child that protects the position: its stop, or once an
+                # unconfirmed retire dropped a dead stop, what is left of it.
+                guard_key = "stop_order_id" if bracket.get("stop_order_id") else "target_order_id"
+                self._retire_dead_bracket(key, position, bracket, guard_key, child_states.get(guard_key), bars)
 
-    def _book_bracket_cancel_fills(self, key: str, position: Position, bracket: dict[str, Any],
+    _DEAD_STOP_STATUSES = frozenset({"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"})
+
+    @staticmethod
+    def _settle_pending(position: Position) -> bool:
+        """The broker reconcile found the broker holding less than this
+        position tracks but could not confirm its bracket down (or read the
+        order list its re-protect needs), so the position is held as it was.
+        Until its retry settles it, nothing is sent for it: an exit or a
+        re-protect would be sized to shares the broker no longer holds
+        (2026-09-25)."""
+        return bool(position.metadata.get("settle_pending")) if isinstance(position.metadata, dict) else False
+
+    def _unlisted_bracket_child_state(self, child_id: str) -> dict[str, Any] | None:
+        """``order_details`` state of a bracket child the account_orders
+        listing does not return, read at most once per
+        UNLISTED_BRACKET_CHILD_READ_SECONDS; a final state (filled, or
+        terminal) is kept for as long as the child is tracked. None when it
+        cannot be read."""
+        now = time.monotonic()
+        cached = self._unlisted_child_states.get(child_id)
+        if cached is not None:
+            read_at, state = cached
+            if state is not None and (state.get("is_filled") or state.get("is_terminal_failure")):
+                return state
+            if now - read_at < UNLISTED_BRACKET_CHILD_READ_SECONDS:
+                return state
+        state = self.executor.order_state(child_id)
+        self._unlisted_child_states[child_id] = (now, state)
+        return state
+
+    def _retire_dead_bracket(self, key: str, position: Position, bracket: dict[str, Any],
+                             child_key: str, child_state: dict[str, Any] | None, bars) -> None:
+        """Take down a bracket whose protecting child (``child_key``: its
+        stop, or its target once an unconfirmed retire dropped the dead stop)
+        died at the broker without filling, and hand the position a fresh
+        stop, or the engine's.
+
+        A REPLACED stop is not dead: its replacement may rest under an id the
+        bracket could not be re-pointed to. What else of the bracket still
+        rests (a target the OCO no longer links) is cancelled first, and the
+        fills its cancel reports are booked, so the fresh protection covers
+        only what is held. A cancel that cannot be confirmed keeps the rest
+        tracked and drops only the dead child; the dead stop's own fills are
+        booked then (and recorded, so a later cancel of the wrapper that still
+        lists it does not report them again), and the rest's once, when their
+        cancel confirms or they fill. A stop is re-placed at most once per bracket, and never after a
+        REJECTED one (2026-09-25)."""
+        status = str((child_state or {}).get("status") or "")
+        if status not in self._DEAD_STOP_STATUSES:
+            return
+        dead_id = str(bracket.get(child_key) or "")
+        child = "stop" if child_key == "stop_order_id" else "target"
+        LOG.warning("Bracket %s %s for %s is %s at the broker", child, dead_id, key, status)
+        leftover = self.executor.cancel_bracket(bracket)
+        if leftover.ok:
+            if leftover.filled_qty > 0:
+                self.book_bracket_cancel_fills(key, position, bracket, leftover, None, bars)
+        else:
+            # The rest of it (a target the OCO no longer links) may still
+            # rest: it stays tracked, so its fill is still booked and the
+            # cancel-before-exit still sends its cancel, and only the dead
+            # child is dropped, so the engine owns the stop at once. Only that
+            # child's fills are booked now: a later cancel or fill of what
+            # stays tracked reports its fills again, cumulatively.
+            dead_filled = int((child_state or {}).get("filled_qty") or 0)
+            if dead_filled > 0:
+                self.book_bracket_cancel_fills(
+                    key, position, bracket,
+                    BracketCancel(False, leftover.message, dead_filled, safe_float(child_state.get("fill_price"), None),
+                                  f"broker_{child}"),
+                    None, bars,
+                )
+                # The wrapper still lists the dead child; a later cancel of it
+                # must not report these again.
+                bracket.setdefault("booked_child_fills", {})[dead_id] = dead_filled
+            bracket[child_key] = None
+            bracket["child_order_ids"] = [oid for oid in bracket.get("child_order_ids") or [] if str(oid) != dead_id]
+            if child == "stop":
+                bracket["dead_stop_status"] = status
+            if bracket.get("stop_order_id") or bracket.get("target_order_id"):
+                bracket["state"] = f"{child}_{status.lower()}_cancel_unconfirmed"
+                LOG.error(
+                    "Could not confirm the rest of %s's bracket is down after its %s was %s (%s) -- "
+                    "the engine owns the stop, and the leftovers stay tracked", key, child, status.lower(), leftover.message,
+                )
+                self._save_reconcile_metadata()
+                return
+        # Nothing of the bracket rests any more.
+        bracket["active"] = False
+        bracket["state"] = f"{child}_{status.lower()}"
+        # A rejected stop is the broker's verdict on the order itself (a STOP
+        # outside the regular session, a stop through the market): placing it
+        # again is rejected again, every cycle, and each rejected replacement
+        # read as protection that suppressed the engine stop. The same goes
+        # for protection this retire already replaced once. The engine owns
+        # the stop instead.
+        dead_stop = status if child == "stop" else bracket.get("dead_stop_status")
+        if (key in self.positions and dead_stop and dead_stop != "REJECTED"
+                and not bracket.get("replaces_dead_stop")):
+            self._reprotect_beside_working_order(position, working_exit_outstanding_qty(position))
+            fresh = active_broker_bracket(position)
+            if fresh is not None and fresh is not bracket:
+                fresh["replaces_dead_stop"] = dead_stop
+        self._save_reconcile_metadata()
+
+    def book_bracket_cancel_fills(self, key: str, position: Position, bracket: dict[str, Any],
                                    cancel: BracketCancel, last_price: float | None, bars) -> None:
         """Book what the resting children filled before a cancel landed.
 
         A stop that triggered after this cycle's fill reconcile has already
         sold those shares; exiting the full local quantity on top of it takes
-        the position net short.
+        the position net short. The startup reconciler's settle books a
+        cancel's fills through here too, at the broker's price and with the
+        risk manager's registration (2026-09-25).
         """
         if cancel.filled_qty <= 0:
             return
@@ -1123,7 +1269,7 @@ class PositionManager:
                     "still protects the position, retrying next cycle", key, cancel.message,
                 )
                 return
-            self._book_bracket_cancel_fills(key, position, bracket, cancel, last_price, bars)
+            self.book_bracket_cancel_fills(key, position, bracket, cancel, last_price, bars)
             if key not in self.positions:
                 return
             replacement = self.executor.ensure_position_protected(
@@ -1291,6 +1437,20 @@ class PositionManager:
                 fill_price_estimated=broker_price is None,
             )
             if key not in self.positions:
+                # A bracket still resting beside the order that closed the
+                # position (a remainder stop beside a slice) opens a new
+                # position in the opposite direction when it triggers; the
+                # fill reconcile's own close takes its leftovers down the same
+                # way (2026-09-25).
+                leftover_bracket = active_broker_bracket(position)
+                if leftover_bracket is not None:
+                    leftover = self.executor.cancel_bracket(leftover_bracket)
+                    if not leftover.ok:
+                        LOG.error(
+                            "Could not confirm %s's bracket is down after its working exit order closed it (%s) -- "
+                            "check the broker for a resting order on a closed position",
+                            key, leftover.message,
+                        )
                 return True
             self._record_exit_marker(position, str(record.get("family") or ""), record.get("marker"), "booked")
         if state.get("is_filled") or state.get("is_terminal_failure"):
@@ -1362,6 +1522,13 @@ class PositionManager:
         order_states: dict[str, Any] = {}  # account_orders, fetched once and only if needed
         for key, position in list(self.positions.items()):
             if key not in self.positions:
+                continue
+            if self._settle_pending(position):
+                self.audit.log_cycle(
+                    f"exit_gate:{key}", "settle_pending",
+                    f"Exit held {key}: the broker reconcile could not confirm its bracket down; retrying",
+                    interval=60.0, level=TRADEFLOW_LEVEL,
+                )
                 continue
             last_price, market_snapshot = self._position_management_snapshot(position, bars)
             if self._exit_order_in_flight(key, position, last_price, bars, order_states):
@@ -1484,7 +1651,7 @@ class PositionManager:
                         "attempt_status": "deferred_bracket_cancel_failed",
                     })
                     continue
-                self._book_bracket_cancel_fills(key, position, open_bracket, cancel, last_price, bars)
+                self.book_bracket_cancel_fills(key, position, open_bracket, cancel, last_price, bars)
                 if key not in self.positions:
                     continue
                 # A child that filled before the cancel shrank the position.

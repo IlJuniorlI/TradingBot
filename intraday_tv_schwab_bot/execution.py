@@ -1126,6 +1126,11 @@ class SchwabExecutor:
         is resized, and the levels recorded are the ones the broker actually
         holds.
 
+        A dry run adopts, resizes and submits nothing: its bracket is
+        simulated, as a dry-run entry's is, so the engine owns every exit. It
+        keeps the ids ``known_bracket`` tracks, which the reconcile reads as
+        the position's own rather than as foreign orders.
+
         Returns the bracket state dict, or None when bracket mode is off.
         """
         if not self.bracket_orders_enabled():
@@ -1146,6 +1151,17 @@ class SchwabExecutor:
             ),
             "qty": int(qty),
         }
+        if self.config.schwab.dry_run:
+            # What rests at the broker in a dry run is the real account's
+            # protection, not the paper position's. A dry-run restore adopted
+            # the real stop as an active bracket, so RiskManager stood the
+            # engine stop down for the broker, while a dry run reads no order
+            # state and never saw that stop fill: the paper position never
+            # exited on its stop (2026-09-25).
+            mirrored = self._tracked_protection_ids(known_bracket) or {
+                **dict.fromkeys(self._PROTECTION_ID_KEYS), "child_order_ids": [],
+            }
+            return {**base, **mirrored, "active": False, "simulated": True, "state": "dry_run"}
         existing = self._adoptable_protection(parent_order_id, known_bracket)
         if existing is not None:
             resting_qty = existing.pop("resting_qty", None)
@@ -1178,6 +1194,18 @@ class SchwabExecutor:
         return {**base, **(replacement.bracket or {}), "protective_order_id": replacement.order_id,
                 "active": True, "state": "standalone_oco"}
 
+    _PROTECTION_ID_KEYS = ("oco_order_id", "protective_order_id", "stop_order_id", "target_order_id")
+
+    @classmethod
+    def _tracked_protection_ids(cls, known_bracket: dict[str, Any] | None) -> dict[str, Any] | None:
+        """The protective order ids *known_bracket* tracks, or None when it
+        tracks no stop."""
+        if not (isinstance(known_bracket, dict) and known_bracket.get("stop_order_id")):
+            return None
+        ids: dict[str, Any] = {key: known_bracket.get(key) for key in cls._PROTECTION_ID_KEYS}
+        ids["child_order_ids"] = [str(oid) for oid in (known_bracket.get("child_order_ids") or []) if oid]
+        return ids
+
     def _adoptable_protection(self, parent_order_id: str | None,
                               known_bracket: dict[str, Any] | None) -> dict[str, Any] | None:
         """Child ids (plus what they rest) of protection still working, or None.
@@ -1193,15 +1221,10 @@ class SchwabExecutor:
         unknown (``resting_qty`` None), which ``ensure_position_protected``
         re-issues at the position's size.
         """
-        if isinstance(known_bracket, dict) and known_bracket.get("stop_order_id"):
-            ids: dict[str, Any] = {
-                key: known_bracket.get(key)
-                for key in ("oco_order_id", "protective_order_id", "stop_order_id", "target_order_id")
-            }
-            ids["child_order_ids"] = [str(oid) for oid in (known_bracket.get("child_order_ids") or []) if oid]
-        elif parent_order_id:
+        ids = self._tracked_protection_ids(known_bracket)
+        if ids is None and parent_order_id:
             ids = self._bracket_state_from_order(str(parent_order_id))
-        else:
+        if ids is None:
             return None
         stop_id = ids.get("stop_order_id")
         if not stop_id:
@@ -1245,10 +1268,12 @@ class SchwabExecutor:
         and the fill reconcile watched the dead id, so the replacement's fill
         was never booked.
 
-        A dry run sends nothing, like ``submit_protective_oco`` and
-        ``cancel_bracket``: a dry-run restore that adopts a REAL resting stop
-        resizes it through here, and so does every trail sync after it, so the
-        paper bot replaced the user's stop at the broker.
+        A dry run sends nothing, as no executor write does in a dry run
+        (``submit_protective_oco``, ``cancel_bracket``,
+        ``cancel_working_order``). This one had no guard, and a dry-run
+        restore that adopted the REAL resting stop resized it through here, so
+        the paper bot replaced the user's stop at the broker (2026-09-25).
+        Since then a dry run adopts nothing (``ensure_position_protected``).
         """
         child_order_id = str(bracket.get(child_key) or "")
         if self.config.schwab.dry_run:
@@ -1399,6 +1424,16 @@ class SchwabExecutor:
             ok = ok and cancel_ok
             messages.append(f"{child_id}:{msg}")
             self._collect_protective_fills(payload, fills)
+        # Fills already booked for a child the bracket no longer tracks (a
+        # dead stop an unconfirmed retire dropped): its wrapper's payload
+        # still carries it and reports them again (2026-09-25).
+        for oid, booked in (bracket.get("booked_child_fills") or {}).items():
+            if str(oid) in fills:
+                qty, px, kind = fills[str(oid)]
+                if qty - int(booked) > 0:
+                    fills[str(oid)] = (qty - int(booked), px, kind)
+                else:
+                    del fills[str(oid)]
         if ok:
             bracket["active"] = False
             bracket["state"] = "canceled"
