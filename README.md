@@ -49,8 +49,10 @@ python main.py --config configs/config.yaml --strategy zero_dte_etf_options
 ```
 
 Alternatively, `pip install -e .` consumes `pyproject.toml` and registers the
-`intraday-tv-schwab-bot` console script. The package version is pulled from
-`version.txt` at the repo root and exposed as `intraday_tv_schwab_bot.__version__`.
+`intraday-tv-schwab-bot` console script, which takes the same arguments as
+`python main.py` (both run `intraday_tv_schwab_bot.cli.main`). The package
+version is pulled from `version.txt` at the repo root and exposed as
+`intraday_tv_schwab_bot.__version__`.
 
 `requirements.txt` pins `TA-Lib==0.8.0`, which backs the standard indicator and candlestick-pattern layer. Its PyPI wheels (cp39–cp314 for Windows, macOS 13+ Intel and 14+ Apple Silicon, and glibc and musl Linux on x86_64 and aarch64) bundle the TA-Lib C library, so `pip install` needs no separate native install. Only a platform with no wheel builds from source, and that build needs TA-Lib C 0.8.1 installed first.
 

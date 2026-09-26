@@ -1007,6 +1007,18 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   2026-09-18, and its wheels bundle the C library on Windows, macOS and
   Linux; only a build from source needs TA-Lib C 0.8.1 installed.
 
+- **The `intraday-tv-schwab-bot` console script starts the bot.** *2026-09-26*
+  — `pyproject.toml` pointed it at `main:main`, the root-level `main.py`,
+  which the wheel does not ship (`packages.find` includes only
+  `intraday_tv_schwab_bot*`). The script failed with `ModuleNotFoundError: No
+  module named 'main'` after `pip install .`, and after the README's
+  `pip install -e .` too, since setuptools 64+ editable installs expose only
+  the declared packages. The command line moved to
+  `intraday_tv_schwab_bot/cli.py` and the script runs
+  `intraday_tv_schwab_bot.cli:main`; `main.py` is now a launcher that calls
+  the same `main`, so `python main.py ...` works as before. Tests:
+  `tests/test_packaging.py`.
+
 - **`options.underlyings` must be a list (refactor cut C24).** *2026-09-26* —
   a YAML scalar (`underlyings: SPY`) used to load as `['S', 'P', 'Y']`: the
   config normalizer iterated the string, so the 0DTE screeners built three
