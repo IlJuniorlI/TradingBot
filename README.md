@@ -1289,7 +1289,7 @@ Behavior and valid values:
 
 - Underlying universe and symbols:
   - `enabled`: master on/off.
-  - `underlyings`: list of ETF underlyings the option engine may trade. It must be a YAML list: a scalar (`underlyings: SPY`), mapping or number fails at load; `null` loads as none, which only a stock strategy accepts.
+  - `underlyings`: list of ETF underlyings the option engine may trade. It must be a YAML list: a scalar (`underlyings: SPY`), mapping or number fails at load; `null` loads as none, which only a stock strategy accepts. Each entry must be one ticker, read upper case, stripped and once: an unquoted `ON` (YAML's `true`; quote it), `~`, `NONE`, `NULL`, `NAN`, a blank, two tickers in one entry or a number fails at load, naming its index.
   - `confirmation_symbols`: mapping from underlying to confirmation index symbol.
   - `volatility_symbol`: symbol used as the volatility regime input.
   - `styles`: valid values are `orb_debit_spread`, `trend_debit_spread`, `midday_credit_spread`, `orb_long_option`, `trend_long_option`. The spread strategy uses the spread styles; the long-option strategy uses only `orb_long_option` and `trend_long_option` for its two directional style gates.

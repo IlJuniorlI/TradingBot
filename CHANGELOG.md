@@ -310,6 +310,40 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Each `options.underlyings` entry is checked at load, and the dashboard
+  publishes the strategy's own tradable and index symbols (refactor cut
+  B16).** *2026-09-27* — the decided half of the cut had landed: a scalar
+  `options.underlyings` fails at load (cut C24), and the dashboard's copies of
+  the strategy's symbol reads went on 2026-09-26. Every entry of the list must
+  now be one ticker the symbol normalizer keeps, as an event row's symbols
+  must: each one that is not fails at load naming it,
+  `options.underlyings[INDEX] must be a ticker, got ...`, with the quote hint
+  the event rows and `runtime.startup_reconcile_ignore_symbols` give for a
+  ticker YAML read as a boolean or null. The list the bot reads is the checked
+  one, upper case, stripped and each ticker once; `_normalize_options_config`
+  no longer touches it, since it kept the raw list whenever nothing of it
+  survived normalizing. `null` still loads as no list, which only a stock
+  strategy accepts. `DashboardCache.tradable_symbols` and `index_symbols` are
+  gone: they normalized the hooks' already normalized lists again, and
+  `DashboardCache.build_payload` publishes `dashboard_tradable_symbols()` /
+  `dashboard_index_symbols()` as the strategy returns them (no plugin
+  overrides either; 24 published engine states read byte for byte as before).
+
+  **Behaviour change:** a config that loaded before may now refuse to start,
+  naming the entry. Until now `[SPY, ON]` loaded as `['SPY', 'TRUE']` (YAML
+  reads an unquoted ON as true), so ON Semiconductor was traded as the ticker
+  TRUE; `[~]`, `[NONE]` and `[' ']` loaded as the raw list, which passed the
+  emptiness check: an options strategy started and its screener offered `NONE`
+  as a ticker, or nothing, while the options position cap counted the raw
+  entries; `[SPY, ~]` loaded as `['SPY']` without a word, and `['QQQ IWM']`
+  and `[5]` as the tickers `QQQ IWM` and `5`. Quote a ticker YAML would read
+  as a boolean (`'ON'`). Every shipped preset loads unchanged (`[SPY, QQQ]`).
+  Tests: `tests/test_config_validation.py` (`TestOptionsValidation`: each bad
+  entry named with the hint, no options strategy loads with no underlyings,
+  the normalized list), `tests/test_index_symbols.py` (`TestTheDashboard`,
+  read from the published state) and `tests/test_silent_excepts.py`
+  (`TestRemovedHandlers`).
+
 - **A symbol's S/R snapshot has its own module, `sr_snapshot.py`, and the
   position manager no longer imports the dashboard (refactor cut C41).**
   *2026-09-27* — `sr_snapshot.sr_snapshot(config, data, symbol, *, price,

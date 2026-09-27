@@ -56,7 +56,7 @@ from .models import Candidate, Position, Side, asset_type_of, is_option_asset
 from .numeric import safe_float
 from .sr_snapshot import sr_snapshot, structure_event_label
 from .support_resistance import analyze_market_structure
-from .symbols import NON_STREAMABLE, normalize_symbol_list
+from .symbols import NON_STREAMABLE
 from .technical_levels import build_technical_levels_context
 from .bars import last_bucket_forming, session_bucket_ends
 from .indicators import htf_ema_spans, last_bar_atr, ltf_ema_spans
@@ -452,8 +452,8 @@ class DashboardCache:
             "data": {
                 **self.data.dashboard_data_snapshot(),
                 "non_streamable_symbols": sorted(NON_STREAMABLE),
-                "tradable_symbols": self.tradable_symbols(),
-                "index_symbols": self.index_symbols(),
+                "tradable_symbols": self.strategy.dashboard_tradable_symbols(),
+                "index_symbols": self.strategy.dashboard_index_symbols(),
             },
             "performance": performance,
             "candidates": candidates,
@@ -1843,21 +1843,3 @@ class DashboardCache:
         with self.lock:
             self.chart_cache[cache_key] = {"signature": chart_signature, "payload": copy.deepcopy(payload)}
         return payload
-
-    def tradable_symbols(self) -> list[str]:
-        """The strategy's ``dashboard_tradable_symbols``. Until 2026-09-26 a
-        copy of that hook's params read sat behind a silent ``except
-        Exception``; the hook cannot raise on any params, so the copy never
-        ran for a real strategy."""
-        return normalize_symbol_list(self.strategy.dashboard_tradable_symbols())
-
-    def index_symbols(self) -> list[str]:
-        """Index ETFs used for directional confirmation, as the strategy's
-        ``dashboard_index_symbols`` reports them (``index_symbols`` +
-        ``sector_index_map`` entries). Surfaced to the dashboard payload so
-        watchlist cards can render an "IX" tag for these symbols (mirrors
-        the "TR"/"NS" tagging for tradable / non-streamable). Until
-        2026-09-26 a copy of that hook's union sat behind a silent
-        ``except Exception``; the hook cannot raise on any params, so the
-        copy never ran for a real strategy."""
-        return normalize_symbol_list(self.strategy.dashboard_index_symbols())

@@ -1538,10 +1538,10 @@ def _normalize_pairs_config(values: Any) -> list[PairDefinition]:
 
 
 def _normalize_options_config(raw: dict[str, Any]) -> dict[str, Any]:
+    """The options section with its confirmation map read as SYMBOL: SYMBOL.
+    ``underlyings`` is checked entry by entry first (``_validate_options_config``)
+    and normalized by ``load_config`` after that check."""
     out = dict(raw or {})
-    underlyings = normalize_symbol_list(out.get("underlyings"))
-    if underlyings:
-        out["underlyings"] = underlyings
     confirmation_symbols = out.get("confirmation_symbols") or {}
     if isinstance(confirmation_symbols, dict):
         normalized_confirmation: dict[str, str] = {}
@@ -2032,8 +2032,21 @@ def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path)
     fallback in the engine before Phase 1 validators landed; validation
     replaces that silent default."""
     errors = _section_errors("options", options)
-    if options.underlyings is not None and not isinstance(options.underlyings, list):
-        errors.append(f"options.underlyings must be a list of symbols, got {options.underlyings!r}")
+    underlyings = options.underlyings
+    if underlyings is not None and not isinstance(underlyings, list):
+        errors.append(f"options.underlyings must be a list of symbols, got {underlyings!r}")
+    elif underlyings is not None:
+        # One message per entry that is not one ticker the symbol normalizer
+        # keeps, as for an event row's symbols. Until 2026-09-27 an unquoted
+        # ON (read as true) was traded as TRUE, and an entry the normalizer
+        # drops (~, NONE, NULL, NAN, a blank) went unseen: a list of nothing
+        # else was kept raw, so it passed the emptiness check and an options
+        # strategy ran with no underlyings.
+        errors += [
+            f"options.underlyings[{index}] must be a ticker, got {symbol!r}{ticker_quote_hint(symbol)}"
+            for index, symbol in enumerate(underlyings)
+            if not isinstance(symbol, str) or len(symbol.split()) != 1 or not normalize_symbol_list([symbol])
+        ]
     # The times fail here, naming the key, instead of where they are read:
     # force_flatten_time when an options strategy is built, the other three
     # at their first read, mid-session. A blank force_flatten_time meant
@@ -2401,6 +2414,9 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
 
     options_cfg = ZeroDteOptionsConfig(**options_raw)
     _validate_options_config(options_cfg, config_path)
+    if options_cfg.underlyings is not None:
+        # Every entry is a ticker (checked above): upper case, stripped, once.
+        options_cfg.underlyings = normalize_symbol_list(options_cfg.underlyings)
     if is_option_strategy(strategy) and not options_cfg.underlyings:
         raise ValueError(
             f"{config_path}: active strategy {strategy!r} is an options strategy "

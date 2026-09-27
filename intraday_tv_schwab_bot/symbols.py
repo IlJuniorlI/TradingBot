@@ -129,8 +129,8 @@ def ticker_quote_hint(value: object) -> str:
     """The hint for a ticker YAML read as a boolean or null (an unquoted
     ``ON``, ON Semiconductor, is ``true``), for the messages that refuse a
     ticker that is not a string: an event row's ``symbols``, an earnings
-    key and ``runtime.startup_reconcile_ignore_symbols``. Empty for any
-    other value."""
+    key, ``runtime.startup_reconcile_ignore_symbols`` and
+    ``options.underlyings``. Empty for any other value."""
     if value is None or isinstance(value, bool):
         return " (YAML reads an unquoted ON, OFF, YES, NO, TRUE, FALSE or ~ as a boolean or null: quote the ticker)"
     return ""
