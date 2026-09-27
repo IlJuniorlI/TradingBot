@@ -26,7 +26,6 @@ from typing import Any
 
 from .config import BotConfig
 from .models import Position
-from ._strategies.catalogue import is_option_strategy
 from .sessions import equity_session_state, is_weekday_session_day
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
@@ -112,7 +111,7 @@ class CycleGate:
     def _entries_actionable(self, session_state: Any) -> bool:
         if not bool(getattr(session_state, "is_trading_day", False)):
             return False
-        if is_option_strategy(self.config.strategy):
+        if self.config.active_is_option:
             return bool(getattr(session_state, "regular_session", False))
         return getattr(session_state, "equity_order_session", None) is not None
 

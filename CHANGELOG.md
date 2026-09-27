@@ -310,6 +310,23 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The active strategy's option-ness is `BotConfig.active_is_option`
+  (refactor cut C37).** *2026-09-27* — the cycle gate (an option strategy
+  enters in the regular session only), the startup reconciler (an option
+  strategy's broker positions are not restored, and block new entries) and
+  the engine's startup log read `config.active_is_option`, the active
+  strategy's manifest `plugin_type`, instead of importing the plugin
+  catalogue's `is_option_strategy` / `option_strategy_names`. It is a
+  property of the strategy name, not a flag set at load, so it cannot go
+  stale when `config.strategy` is reassigned (tests and helpers do). The
+  load-time check that an option strategy names `options.underlyings`
+  keeps `is_option_strategy`: it runs before the `BotConfig` exists. No
+  behaviour changes. Tests: `tests/test_asset_type.py` (every shipped
+  preset against its manifest; a reassigned strategy),
+  `tests/test_cycle_gate.py` (`TestEntriesActionable`),
+  `tests/test_startup_reconciler.py` (an option strategy's broker
+  positions block entries).
+
 - **One asset-type read, and position math in `position_metrics` (refactor
   cut C36).** *2026-09-27* — `models.asset_type_of(metadata)` (upper-cased,
   `EQUITY` when none is named) and `models.is_option_asset(metadata)`

@@ -41,7 +41,8 @@ def asset_type_of(metadata: Mapping[str, Any] | None) -> str:
 
 def is_option_asset(metadata: Mapping[str, Any] | None) -> bool:
     """Whether a signal or a position is an option: ``asset_type_of`` its
-    metadata is one of ``OPTION_ASSET_TYPES``."""
+    metadata is one of ``OPTION_ASSET_TYPES``. The one option check below
+    the strategy, whose own is ``BotConfig.active_is_option``."""
     return asset_type_of(metadata) in OPTION_ASSET_TYPES
 
 

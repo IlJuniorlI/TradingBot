@@ -26,7 +26,6 @@ from .data_feed import MarketDataStore
 from .entry_gatekeeper import EntryGatekeeper
 from .execution import SchwabExecutor
 from .models import Candidate, Position, Side
-from ._strategies.catalogue import option_strategy_names
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .position_store import ReconcileMetadataStore, SessionRiskStateStore
@@ -387,7 +386,7 @@ class IntradayBot:
                     "in your config to silence this warning.",
                     self.config.strategy,
                 )
-        if self.config.strategy in option_strategy_names():
+        if self.config.active_is_option:
             styles = [str(style) for style in (self.config.options.styles or [])]
             underlyings = [str(symbol) for symbol in (self.config.options.underlyings or [])]
             LOG.info(

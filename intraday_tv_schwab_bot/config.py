@@ -1406,6 +1406,14 @@ class BotConfig:
     def active_strategy(self) -> StrategyConfig:
         return self.strategies[self.strategy]
 
+    @property
+    def active_is_option(self) -> bool:
+        """Whether the active strategy trades options (its manifest's
+        ``plugin_type``): the one strategy-level option check. A signal or
+        a position is an option by its own metadata
+        (``models.is_option_asset``)."""
+        return is_option_strategy(self.strategy)
+
 
 def _strategy_defaults() -> dict[str, StrategyConfig]:
     plugins = get_plugins()

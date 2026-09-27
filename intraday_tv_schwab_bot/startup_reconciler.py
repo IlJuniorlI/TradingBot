@@ -70,7 +70,6 @@ from .paper_account import PaperAccount
 from .numeric import first_float, safe_float
 from .position_store import ReconcileMetadataStore
 from .risk import RiskManager, default_levels
-from ._strategies.catalogue import is_option_strategy
 from . import sessions
 from .sessions import UTC
 
@@ -713,7 +712,7 @@ class StartupReconciler:
         hybrid prune waits for an attempt with no unusable row: such a row's
         saved levels are what its retry restores it from.
         """
-        if is_option_strategy(self.config.strategy):
+        if self.config.active_is_option:
             LOG.warning("startup_reconcile_mode=%s does not restore option strategies; leaving options handling unchanged", self.config.runtime.startup_reconcile_mode)
             return 0, len(positions), []
         metadata_positions = self._load_reconcile_metadata() if use_metadata else {}
@@ -1011,7 +1010,7 @@ class StartupReconciler:
                     self.result["foreign_working_orders"] = foreign_orders
                     self.result["restored_positions"] = restored
                     self.result["skipped_restore_positions"] = skipped
-                    if is_option_strategy(self.config.strategy) and positions:
+                    if self.config.active_is_option and positions:
                         self.trading_blocked_reason = "startup_reconcile_option_restore_unsupported"
                         self.trading_blocked_message = (
                             f"Startup reconciliation found {len(positions)} broker position(s) for an option strategy, "
