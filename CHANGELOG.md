@@ -310,6 +310,52 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **In-position stop and target management has one home, `TradeManager` in
+  `trade_management.py` (refactor cut C38).** *2026-09-27* —
+  `RiskManager.update_position` (the stop and target exits with their
+  broker-bracket and touch-hold deferrals, the peak give-back floor, the
+  option premium ratchet and the adaptive breakeven / profit lock / runner
+  extension / trail) and `PositionManager`'s two managers moved there:
+  `_sr_flip_management_confirmed` is `TradeManager.manage_sr_flip` and
+  `_adaptive_ladder_management` is `manage_adaptive_ladder`, with the touch
+  hold's helpers and constants (`_TouchHold`, `_next_unpassed_rung`,
+  `_delivered_touch_bar`, `LADDER_TOUCH_CLOSE_POSITION_MIN` and the rest).
+  `default_levels` and `trail_allowed` (cut C35) moved from `risk.py` with
+  them: the entry gatekeeper and the startup reconciler import
+  `default_levels` from `trade_management`, and
+  `RiskManager.stock_position_trail_pct` reads `trail_allowed` there.
+  `PositionManager.__init__` builds `self.trade_manager` over its own
+  config, feed, strategy and audit (the ladder reads its touch-hold switch
+  from `strategy.exit_policy`, and the S/R reads use the strategy's
+  `htf_minutes()` / `htf_lookback_days()`), and `manage_positions` runs the
+  two managers and then `trade_manager.update_position` where it ran them
+  before, with the same per-position isolation: a manager that raises is
+  skipped, a touch hold a failed ladder pass left is dropped, and the risk
+  check still runs. The working-slice check runs the same
+  `update_position`. `RiskManager` keeps the entry side (the gates, sizing,
+  the daily loss, the cooldowns and the same-level block) and no longer
+  imports `broker_payloads`. There is no alias: `RiskManager.update_position`,
+  the two `PositionManager` managers, `risk.default_levels` /
+  `risk.trail_allowed` and `position_manager._next_unpassed_rung` & co. are
+  gone. One log line changes logger: a malformed
+  `peak_giveback_min_r_override` warning now logs under
+  `intraday_tv_schwab_bot.engine` with the ladder's lines (was
+  `intraday_tv_schwab_bot.risk`). No behaviour changes: on 1,200 seeded
+  position walks (30,476 management passes over four presets and every
+  trade management mode) the moved code returns the same decisions and
+  leaves the same levels, metadata, audit records and log messages as
+  before. Tests: `tests/test_trade_management.py` (new: the level-check
+  tests from `tests/test_risk_manager.py`, C35's `TestDefaultLevels` and
+  `TestTrailAllowed`, a 3R+ give-back tier case they did not pin, and the
+  first cover of the sr_flip manager and of the per-position call order),
+  `tests/support/brokers.py` (`_trade_manager`, `_holding_trade_manager`),
+  `tests/test_module_layering.py` (the runtime layer gains
+  `trade_management`) and the call sites in test_ladder_touch_hold,
+  test_bug_regressions, test_properties, test_bracket_orders,
+  test_position_isolation, test_partial_exit, test_sweep_fixes,
+  test_startup_reconciler, test_exit_levels_logging, test_quote_price_reads,
+  test_side_tolerance and test_strategy_requests.
+
 - **An option signal is known by its asset type, and the entry stage
   requires one (refactor cut B18).** *2026-09-27* —
   `SharedEntryPolicy.emit` raises `ValueError` for an option strategy's

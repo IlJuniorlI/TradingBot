@@ -373,7 +373,7 @@ class IntradayBot:
         # Fix C — silent-fallback warning. When config requests
         # adaptive_ladder but the active strategy class explicitly opts out
         # via supports_adaptive_ladder=False, the engine silently falls back
-        # to trailing-stop behavior (see RiskManager.position_management /
+        # to trailing-stop behavior (see TradeManager.update_position's
         # ladder_management_enabled gate). Surface that at startup so the
         # operator knows ladder mechanics aren't actually running.
         if self._trade_management_mode() == "adaptive_ladder":

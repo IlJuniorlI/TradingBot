@@ -509,7 +509,7 @@ class SchwabExecutor:
         if self.config.schwab.dry_run:
             result = self._simulate_equity_fill(request, data, refresh_quotes=False, market_snapshot=market)
             if bracketed and result.ok:
-                # Dry-run keeps exits ENGINE-side (risk.update_position already
+                # Dry-run keeps exits ENGINE-side (TradeManager.update_position already
                 # decides stop/target identically), so the bracket is recorded
                 # for parity/inspection but nothing rests at a broker. Live
                 # fills at the resting limit will beat these poll-priced exits.

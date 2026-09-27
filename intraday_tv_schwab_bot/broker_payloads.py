@@ -6,7 +6,7 @@ Parsing only -- no Schwab client or executor state -- which is why these are
 free functions rather than methods on a broker client wrapper:
 ``SchwabExecutor`` keeps the I/O and reads what comes back through them, and
 the startup reconciler, ``PositionManager``, ``EntryGatekeeper`` and
-``RiskManager`` share the position and bracket readers. The order readers
+``TradeManager`` share the position and bracket readers. The order readers
 were ``SchwabExecutor`` classmethods until 2026-09-27, and the module was
 ``broker_positions``.
 """
@@ -342,7 +342,7 @@ def active_broker_bracket(position: Any) -> dict[str, Any] | None:
     Returns None for dry-run (``simulated``) brackets and for any bracket whose
     protection could not be established (``active`` false). In both cases
     nothing rests at a broker, so the engine must keep owning the stop/target
-    exits. Shared by ``RiskManager`` (which suppresses the exits the broker
+    exits. Shared by ``TradeManager`` (which suppresses the exits the broker
     owns) and ``PositionManager`` (reconcile / sync / cancel-before-exit) so
     the two can never disagree about who owns an exit.
     """

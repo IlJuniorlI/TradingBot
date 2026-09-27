@@ -57,7 +57,8 @@ from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .numeric import safe_float
 from .reasons import reason_gate
-from .risk import RiskManager, default_levels
+from .risk import RiskManager
+from .trade_management import default_levels
 from .log_setup import TRADEFLOW_LEVEL
 from . import sessions
 

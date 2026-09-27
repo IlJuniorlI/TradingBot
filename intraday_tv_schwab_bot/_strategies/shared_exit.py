@@ -283,8 +283,8 @@ class SharedExitPolicy:
         return safe_float(getattr(self.config.shared_exit, key))
 
     def ladder_touch_hold_timeout_seconds(self) -> float | None:
-        """The adaptive ladder's touch hold, which the position manager runs
-        (``PositionManager._adaptive_ladder_management``): None while
+        """The adaptive ladder's touch hold, which the trade manager runs
+        (``TradeManager.manage_adaptive_ladder``): None while
         ``shared_exit.adaptive_ladder_touch_hold`` is off, else
         ``adaptive_ladder_touch_hold_timeout_seconds``, how long after the
         touch bar's close the hold waits for that bar to be delivered."""

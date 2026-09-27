@@ -38,9 +38,9 @@ Design notes:
   PositionManager): what a cancelled bracket's children filled is booked at
   the broker's price with the risk manager's registration, as the manager
   books it. ``risk`` receives the estimated loss of a close outside the bot,
-  and gives a restored position its default-distance levels
-  (``risk.default_levels``) and its trail (``stock_position_trail_pct``) as
-  the entry path gives a filled one.
+  and gives a restored position its trail (``stock_position_trail_pct``) as
+  the entry path gives a filled one; its default-distance levels are the
+  entry path's too (``trade_management.default_levels``).
 - Trading-blocked state (``trading_blocked_reason`` / ``trading_blocked_message``)
   moved off ``IntradayBot`` onto this class. Engine reads via
   ``self.startup_reconciler.trading_blocked_reason`` at step() + publish
@@ -69,7 +69,8 @@ from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTI
 from .paper_account import PaperAccount
 from .numeric import first_float, safe_float
 from .position_store import ReconcileMetadataStore
-from .risk import RiskManager, default_levels
+from .risk import RiskManager
+from .trade_management import default_levels
 from . import sessions
 from .sessions import UTC
 
@@ -245,9 +246,9 @@ class StartupReconciler:
 
     def _restore_levels_for_stock_position(self, side: Side, entry_price: float, current_price: float | None = None, metadata: dict[str, Any] | None = None) -> tuple[float, float | None, float | None, float | None, float | None]:
         """A restored stock position's levels without saved ones: the
-        default-distance stop and target (``risk.default_levels``, as a fill
-        the signal's levels no longer fit gets), the watermarks from the
-        entry and the current price, and the trail a new entry gets."""
+        default-distance stop and target (``trade_management.default_levels``,
+        as a fill the signal's levels no longer fit gets), the watermarks from
+        the entry and the current price, and the trail a new entry gets."""
         entry = max(0.01, float(entry_price))
         current = max(0.01, float(current_price if current_price is not None else entry))
         stop, target = default_levels(side, entry, self.config.risk)
@@ -299,7 +300,7 @@ class StartupReconciler:
         The hybrid path rehydrates metadata written before the restart, so a
         restored position can carry a ``bracket`` dict whose child order ids
         were cancelled or filled while the bot was down. Left alone, that stale
-        dict makes RiskManager suppress the engine's stop exit for a position
+        dict makes TradeManager suppress the engine's stop exit for a position
         that has nothing resting at the broker -- unprotected AND unmanaged.
 
         ``ensure_position_protected`` adopts the children when they are still

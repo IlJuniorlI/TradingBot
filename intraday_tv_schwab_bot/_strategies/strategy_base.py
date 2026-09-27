@@ -1872,7 +1872,7 @@ class BaseStrategy:
 
         Each rung dict carries price, kind, zone_width, lower, upper (the
         zone around the price) and rr. The first rung is the signal's target.
-        The adaptive ladder's touch hold (PositionManager._adaptive_ladder_management,
+        The adaptive ladder's touch hold (TradeManager.manage_adaptive_ladder,
         ``shared_exit.adaptive_ladder_touch_hold``) reads the price, zone
         width and kind to promote past a rung; with the hold off the first
         rung is a plain take-profit. An empty list disables laddering — the
@@ -1958,7 +1958,7 @@ class BaseStrategy:
     ) -> dict[str, Any]:
         """Produce the ladder metadata a laddered position carries.
 
-        RiskManager and PositionManager._adaptive_ladder_management read
+        TradeManager.update_position and manage_adaptive_ladder read
         ladder_management_enabled, ladder_rungs and ladder_active_index; a
         touch-hold promotion rewrites ladder_active_index, the
         ladder_defense_* keys and ladder_final_rung_cleared. The key-levels

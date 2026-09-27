@@ -114,8 +114,8 @@ def underlying_extremes(position: Position) -> tuple[float | None, float | None]
 
 # The adaptive ladder's touch hold (shared_exit.adaptive_ladder_touch_hold):
 # the position metadata key of a hold in progress, which keeps
-# RiskManager.update_position off the target, and the codes of the exits
-# the hold takes instead (see PositionManager._adaptive_ladder_management).
+# TradeManager.update_position off the target, and the codes of the exits
+# the hold takes instead (see TradeManager.manage_adaptive_ladder).
 LADDER_TOUCH_HOLD_KEY = "ladder_touch_hold"
 TARGET_WEAK_CLOSE = "target_weak_close"
 TARGET_HOLD_GUARD = "target_hold_guard"
