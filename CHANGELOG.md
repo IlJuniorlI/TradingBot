@@ -310,6 +310,29 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **One default-level rule and one trail rule, with the trail pct on
+  `RiskManager` (refactor cut C35).** *2026-09-27* —
+  `risk.default_levels(side, entry_price, risk_cfg)` replaces
+  `EntryGatekeeper._fallback_equity_levels`, the gatekeeper's inline
+  post-fill copy and the startup reconciler's restore copy;
+  `risk.trail_allowed(mode, metadata, *, options)` replaces the
+  gatekeeper's and `RiskManager.update_position`'s copies of the "does this
+  position trail" rule. `stock_position_trail_pct` moved from
+  `EntryGatekeeper` to `RiskManager`, so `StartupReconciler` no longer takes
+  it as an injected callable (the `stock_position_trail_pct=` constructor
+  argument is gone; it asks its `risk`). Both functions sit in `risk.py`
+  until `trade_management.py` exists (cut C38). There is no alias. The
+  entry path, `update_position` and the trail pct read as before. One
+  reading changed, on inputs no shipped preset produces: a position
+  restored without saved levels gets the entry path's floors, a LONG stop
+  and a SHORT target of at least $0.01; they could be $0.00 at
+  `default_stop_pct` / `default_target_pct` 1.0, or under a cent on a
+  broker average price under about 1.04 cents. Tests:
+  `tests/test_risk_manager.py` (`TestDefaultLevels`, `TestTrailAllowed`),
+  `tests/test_startup_reconciler.py` (`TestLevelRestore`: the floors, and
+  the trail of a basic and of a saved-row restore through the real risk
+  manager).
+
 - **One JSON normalizer, `audit_logger.json_safe` (refactor cut B17).**
   *2026-09-27* — `json_safe(value, *, non_finite)` replaces
   `audit_logger._json_ready` (the TRADEFLOW records, and the stored

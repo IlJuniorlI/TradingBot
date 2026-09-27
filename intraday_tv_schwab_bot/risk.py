@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
 
 from .broker_payloads import active_broker_bracket
-from .config import BotConfig
+from .config import BotConfig, RiskConfig
 from .models import ASSET_TYPE_EQUITY, OPTION_ASSET_TYPES, Position, Side, Signal
 from .numeric import first_float, safe_float
 from ._strategies.catalogue import is_option_strategy
@@ -16,6 +17,30 @@ from .position_metrics import LADDER_TOUCH_HOLD_KEY, append_management_adjustmen
 from . import sessions
 
 LOG = logging.getLogger(__name__)
+
+
+def default_levels(side: Side, entry_price: float, risk_cfg: RiskConfig) -> tuple[float, float]:
+    """The default-distance stop and target of a stock position:
+    ``risk.default_stop_pct`` / ``default_target_pct`` from ``entry_price``,
+    a LONG's stop and a SHORT's target floored at $0.01. What a fill the
+    signal's levels no longer fit is booked with (``EntryGatekeeper``), and a
+    broker position restored without its saved levels (``StartupReconciler``).
+    """
+    stop_pct = float(risk_cfg.default_stop_pct)
+    target_pct = float(risk_cfg.default_target_pct)
+    if side == Side.LONG:
+        return max(0.01, entry_price * (1.0 - stop_pct)), entry_price * (1.0 + target_pct)
+    return entry_price * (1.0 + stop_pct), max(0.01, entry_price * (1.0 - target_pct))
+
+
+def trail_allowed(mode: str, meta: Mapping[str, Any], *, options: bool) -> bool:
+    """Whether a position's stop trails by its ``trail_pct``: never an
+    option's (its premium ratchet stands in), always under the ``adaptive``
+    trade management mode, and under ``adaptive_ladder`` unless the ladder
+    manages the position (``metadata['ladder_management_enabled']``)."""
+    if options:
+        return False
+    return mode == "adaptive" or (mode == "adaptive_ladder" and not bool(meta.get("ladder_management_enabled")))
 
 
 @dataclass(slots=True)
@@ -770,6 +795,27 @@ class RiskManager:
         qty = self.floor_discrete_units(self.config.options.max_loss_per_trade, max_loss_per_contract)
         return max(0, min(qty, self.config.options.max_contracts_per_trade))
 
+    def stock_position_trail_pct(self, metadata: Mapping[str, Any] | None = None,
+                                 existing_trail_pct: float | None = None) -> float | None:
+        """The ``trail_pct`` a stock position opens with (``EntryGatekeeper``)
+        or is restored with (``StartupReconciler``): a restored position's
+        own (``existing_trail_pct``), else ``risk.trailing_stop_pct``; None
+        when the position does not trail (``trail_allowed``) or the pct is
+        null or 0."""
+        meta = metadata if isinstance(metadata, dict) else {}
+        if not trail_allowed(self.config.risk.trade_management_mode, meta, options=False):
+            return None
+        candidate = existing_trail_pct
+        if candidate is None:
+            candidate = self.config.risk.trailing_stop_pct
+        if candidate is None:
+            return None
+        # A finite number: a restored position's trail_pct is read with
+        # safe_float, and load_config refuses any risk.trailing_stop_pct but
+        # a finite number >= 0 or null (config._NUMBER_CHECKS); 0 is off.
+        candidate = float(candidate)
+        return candidate if candidate > 0 else None
+
     @staticmethod
     def _peak_and_current_r(position: Position, last_price: float, initial_risk: float) -> tuple[float, float]:
         """Return (peak_r, current_r) where R = initial_risk per unit.
@@ -1009,7 +1055,7 @@ class RiskManager:
         ladder_management_enabled = (not options_position) and trade_management_mode == "adaptive_ladder" and bool(meta.get("ladder_management_enabled", False))
         adaptive_enabled = (not options_position) and trade_management_mode in {"adaptive", "adaptive_ladder"} and bool(meta.get("adaptive_management_enabled", False)) and initial_risk > 0
         adaptive_runner_extension_enabled = adaptive_enabled and not ladder_management_enabled
-        trailing_enabled = (not options_position) and (trade_management_mode == "adaptive" or (trade_management_mode == "adaptive_ladder" and not ladder_management_enabled))
+        trailing_enabled = trail_allowed(trade_management_mode, meta, options=options_position)
         # The adaptive ladder's touch hold (shared_exit.adaptive_ladder_touch_hold,
         # off by default): while PositionManager holds a touched rung, the
         # target is not taken here. It only ever sets the key when on.

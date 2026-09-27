@@ -1685,7 +1685,7 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         # while the filled position was being booked.
         "risk_overage_warn_frac": _Number(note=" (below 0 turns the warning off)"),
         "entry_slippage_warn_pct": _Number(note=" (0 or below turns the warning off)"),
-        # Read at every entry and restore (EntryGatekeeper.stock_position_trail_pct),
+        # Read at every entry and restore (RiskManager.stock_position_trail_pct),
         # where an unreadable value switched the trail off without a word
         # until 2026-09-26, and so did a negative one.
         "trailing_stop_pct": _Number(low=0, nullable=True, note=" (0 or null turns the trail off)"),

@@ -25,9 +25,6 @@ Design notes:
   ``unsettled_entry_orders`` and settled from the order's own fill record
   (``settle_unsettled_entry_orders``, run by the engine every management
   cycle), never from a positions snapshot.
-- Config accessor ``stock_position_trail_pct`` moved here even though
-  ``_restore_levels_for_stock_position`` on engine still needs it —
-  engine dispatches through ``self.entry_gatekeeper.stock_position_trail_pct``.
 """
 from __future__ import annotations
 
@@ -58,7 +55,7 @@ from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .numeric import safe_float
 from .reasons import reason_gate
-from .risk import RiskManager
+from .risk import RiskManager, default_levels
 from .log_setup import TRADEFLOW_LEVEL
 from . import sessions
 
@@ -250,24 +247,6 @@ class EntryGatekeeper:
             if target is not None and target >= entry:
                 return False, "target_not_below_entry"
         return True, None
-
-    def stock_position_trail_pct(self, metadata: dict[str, Any] | None = None, existing_trail_pct: float | None = None) -> float | None:
-        mode = self.config.risk.trade_management_mode
-        meta = metadata if isinstance(metadata, dict) else {}
-        ladder_enabled = mode == "adaptive_ladder" and bool(meta.get("ladder_management_enabled"))
-        trail_allowed = mode == "adaptive" or (mode == "adaptive_ladder" and not ladder_enabled)
-        if not trail_allowed:
-            return None
-        candidate = existing_trail_pct
-        if candidate is None:
-            candidate = self.config.risk.trailing_stop_pct
-        if candidate is None:
-            return None
-        # A finite number: a restored position's trail_pct is read with
-        # safe_float, and load_config refuses any risk.trailing_stop_pct but
-        # a finite number >= 0 or null (config._NUMBER_CHECKS); 0 is off.
-        candidate = float(candidate)
-        return candidate if candidate > 0 else None
 
     @staticmethod
     def _scaled_order_spec(spec: dict[str, Any], qty: int) -> dict[str, Any]:
@@ -655,7 +634,7 @@ class EntryGatekeeper:
             levels_ok, levels_reason = self._entry_levels_valid(signal.side, entry_price, stop_price, target_price)
             position_metadata = dict(signal.metadata or {})
             if not levels_ok:
-                stop_price, target_price = self._fallback_equity_levels(signal.side, entry_price)
+                stop_price, target_price = default_levels(signal.side, entry_price, self.config.risk)
                 position_metadata["emergency_fallback_levels"] = True
                 position_metadata["original_levels_reason"] = levels_reason
             position_metadata.setdefault("initial_stop_price", float(stop_price))
@@ -669,7 +648,7 @@ class EntryGatekeeper:
             )
             if bracket is not None:
                 position_metadata["bracket"] = bracket
-            trail_pct = self.stock_position_trail_pct(position_metadata)
+            trail_pct = self.risk.stock_position_trail_pct(position_metadata)
             reference_symbol = signal.reference_symbol
         position_metadata["broker_reconciled_after_order_uncertainty"] = True
         position_metadata["broker_recovery_order_id"] = str(record["order_id"])
@@ -697,14 +676,6 @@ class EntryGatekeeper:
         self._save_reconcile_metadata()
         LOG.warning("Adopted entry %s qty=%s @ %.4f from unsettled order %s (%s)",
                     position_key, qty, entry_price, record["order_id"], record["message"])
-
-    def _fallback_equity_levels(self, side: Side, entry_price: float) -> tuple[float, float]:
-        """Default-distance stop/target for a fill the signal's levels no longer fit."""
-        stop_pct = float(self.config.risk.default_stop_pct)
-        target_pct = float(self.config.risk.default_target_pct)
-        if side == Side.LONG:
-            return max(0.01, entry_price * (1.0 - stop_pct)), entry_price * (1.0 + target_pct)
-        return entry_price * (1.0 + stop_pct), max(0.01, entry_price * (1.0 - target_pct))
 
     # ------------------------------------------------------------------
     # Entry-decision logging + per-cycle summary.
@@ -1197,20 +1168,13 @@ class EntryGatekeeper:
                 # Already filled at the broker — we MUST track the position, so
                 # fall back to the configured default distances rather than
                 # orphaning it or keeping levels the fill has invalidated.
-                fallback_stop_pct = float(self.config.risk.default_stop_pct)
-                fallback_target_pct = float(self.config.risk.default_target_pct)
                 LOG.error(
                     "Post-fill level validation FAILED for %s (reason=%s side=%s fill=%.4f "
                     "signal_entry=%.4f stop=%.4f target=%s); applying default-distance fallback levels.",
                     signal.symbol, levels_reason, signal.side.value, entry_price,
                     signal_entry_price, stop_price, target_price,
                 )
-                if signal.side == Side.LONG:
-                    stop_price = max(0.01, entry_price * (1.0 - fallback_stop_pct))
-                    target_price = entry_price * (1.0 + fallback_target_pct)
-                else:
-                    stop_price = entry_price * (1.0 + fallback_stop_pct)
-                    target_price = max(0.01, entry_price * (1.0 - fallback_target_pct))
+                stop_price, target_price = default_levels(signal.side, entry_price, self.config.risk)
 
             position_metadata = dict(signal.metadata or {})
             position_metadata.setdefault("initial_stop_price", stop_price)
@@ -1274,7 +1238,7 @@ class EntryGatekeeper:
                 entry_time=sessions.now_et(),
                 stop_price=stop_price,
                 target_price=target_price,
-                trail_pct=self.stock_position_trail_pct(position_metadata),
+                trail_pct=self.risk.stock_position_trail_pct(position_metadata),
                 highest_price=entry_price,
                 lowest_price=entry_price,
                 pair_id=signal.pair_id,

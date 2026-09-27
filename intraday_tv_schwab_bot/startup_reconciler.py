@@ -29,9 +29,6 @@ Design notes:
   ``ReconcileMetadataStore.save_if_changed`` skips a save that would write
   what it last wrote. StartupReconciler just triggers a save after
   mutations.
-- ``stock_position_trail_pct`` injected as callable (lives on
-  EntryGatekeeper). Restore uses it to compute trail_pct consistent with
-  normal entry path.
 - ``settle_unsettled_entry_orders`` / ``unsettled_entry_order_ids`` injected
   as callables (live on EntryGatekeeper). The account holds an unsettled
   entry order's fills before the gatekeeper books them, so the reconcile
@@ -40,7 +37,10 @@ Design notes:
 - ``book_bracket_cancel_fills`` injected as callable (lives on
   PositionManager): what a cancelled bracket's children filled is booked at
   the broker's price with the risk manager's registration, as the manager
-  books it. ``risk`` receives the estimated loss of a close outside the bot.
+  books it. ``risk`` receives the estimated loss of a close outside the bot,
+  and gives a restored position its default-distance levels
+  (``risk.default_levels``) and its trail (``stock_position_trail_pct``) as
+  the entry path gives a filled one.
 - Trading-blocked state (``trading_blocked_reason`` / ``trading_blocked_message``)
   moved off ``IntradayBot`` onto this class. Engine reads via
   ``self.startup_reconciler.trading_blocked_reason`` at step() + publish
@@ -69,7 +69,7 @@ from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTI
 from .paper_account import PaperAccount
 from .numeric import first_float, safe_float
 from .position_store import ReconcileMetadataStore
-from .risk import RiskManager
+from .risk import RiskManager, default_levels
 from ._strategies.catalogue import is_option_strategy
 from . import sessions
 from .sessions import UTC
@@ -113,7 +113,6 @@ class StartupReconciler:
         positions: dict[str, Position],
         reconcile_metadata_store: ReconcileMetadataStore,
         save_reconcile_metadata: Callable[[], None],
-        stock_position_trail_pct: Callable[..., float | None],
         book_bracket_cancel_fills: Callable[..., None],
         settle_unsettled_entry_orders: Callable[[], None],
         unsettled_entry_order_ids: Callable[[], dict[str, str]],
@@ -127,7 +126,6 @@ class StartupReconciler:
         self.positions = positions
         self.reconcile_metadata_store = reconcile_metadata_store
         self._save_reconcile_metadata = save_reconcile_metadata
-        self._stock_position_trail_pct = stock_position_trail_pct
         self._book_bracket_cancel_fills = book_bracket_cancel_fills
         self._settle_unsettled_entry_orders = settle_unsettled_entry_orders
         self._unsettled_entry_order_ids = unsettled_entry_order_ids
@@ -247,20 +245,15 @@ class StartupReconciler:
             return {}
 
     def _restore_levels_for_stock_position(self, side: Side, entry_price: float, current_price: float | None = None, metadata: dict[str, Any] | None = None) -> tuple[float, float | None, float | None, float | None, float | None]:
+        """A restored stock position's levels without saved ones: the
+        default-distance stop and target (``risk.default_levels``, as a fill
+        the signal's levels no longer fit gets), the watermarks from the
+        entry and the current price, and the trail a new entry gets."""
         entry = max(0.01, float(entry_price))
         current = max(0.01, float(current_price if current_price is not None else entry))
-        if side == Side.LONG:
-            stop = entry * (1.0 - float(self.config.risk.default_stop_pct))
-            target = entry * (1.0 + float(self.config.risk.default_target_pct))
-            highest = max(entry, current)
-            lowest = min(entry, current)
-        else:
-            stop = entry * (1.0 + float(self.config.risk.default_stop_pct))
-            target = entry * (1.0 - float(self.config.risk.default_target_pct))
-            highest = max(entry, current)
-            lowest = min(entry, current)
-        trail_pct = self._stock_position_trail_pct(metadata)
-        return float(stop), float(target), float(highest), float(lowest), trail_pct
+        stop, target = default_levels(side, entry, self.config.risk)
+        trail_pct = self.risk.stock_position_trail_pct(metadata)
+        return float(stop), float(target), float(max(entry, current)), float(min(entry, current)), trail_pct
 
     def _find_reconcile_metadata_match_with_key(self, metadata_positions: dict[str, Position], symbol: str, side: Side, qty: int, entry_price: float) -> tuple[str, Position] | None:
         symbol_upper = str(symbol).upper().strip()
@@ -816,7 +809,7 @@ class StartupReconciler:
                     highest_price = highest_price if highest_price is not None else fallback_high
                     lowest_price = lowest_price if lowest_price is not None else fallback_low
                     trail_pct = trail_pct if trail_pct is not None else fallback_trail
-                trail_pct = self._stock_position_trail_pct(metadata, trail_pct)
+                trail_pct = self.risk.stock_position_trail_pct(metadata, trail_pct)
                 position = Position(
                     symbol=symbol,
                     strategy=self.config.strategy,

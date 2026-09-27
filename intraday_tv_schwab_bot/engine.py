@@ -262,7 +262,6 @@ class IntradayBot:
             positions=self.positions,
             reconcile_metadata_store=self.reconcile_metadata_store,
             save_reconcile_metadata=self._save_reconcile_metadata,
-            stock_position_trail_pct=self.entry_gatekeeper.stock_position_trail_pct,
             book_bracket_cancel_fills=self.position_manager.book_bracket_cancel_fills,
             settle_unsettled_entry_orders=self.entry_gatekeeper.settle_unsettled_entry_orders,
             unsettled_entry_order_ids=self.entry_gatekeeper.unsettled_entry_order_ids,
