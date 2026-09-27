@@ -930,7 +930,7 @@ class EntryGatekeeper:
         finalized: set[str] = set()
         for signal in signals:
             finalized.add(signal.symbol)
-            signal_market_side = RiskManager.market_side(signal.strategy, signal.side, signal.metadata)
+            signal_market_side = RiskManager.market_side(signal.side, signal.metadata)
             if self._is_startup_reconcile_entry_blocked(signal.symbol):
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "startup_reconcile_ignored_open_position"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
                 continue

@@ -35,7 +35,8 @@ OPTION_ASSET_TYPES: frozenset[str] = frozenset({ASSET_TYPE_OPTION_VERTICAL, ASSE
 def asset_type_of(metadata: Mapping[str, Any] | None) -> str:
     """The ``asset_type`` a signal's or a position's metadata names,
     upper-cased; ``EQUITY`` when it names none. Every option signal builder
-    stamps one, and the position carries it on."""
+    stamps one (the shared entry stage refuses an option strategy's signal
+    without it), and the position carries it on."""
     return str((metadata or {}).get("asset_type") or ASSET_TYPE_EQUITY).upper()
 
 

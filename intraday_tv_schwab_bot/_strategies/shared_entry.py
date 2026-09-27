@@ -55,7 +55,7 @@ from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
-from ..models import Candidate, Position, Side, Signal
+from ..models import OPTION_ASSET_TYPES, Candidate, Position, Side, Signal, is_option_asset
 from ..bars import CANDLE_PATTERN_WINDOW_BARS, bar_close_position, bars_have_range
 from ..indicators import last_bar_atr
 from .. import sessions
@@ -734,7 +734,12 @@ class SharedEntryPolicy:
         must agree with the proposal's direction: every veto and score term
         was judged on the latter, so a conversion that proposed the ORDER
         side (a bull put credit spread as SHORT) raises here instead of
-        trading on vetoes read the wrong way round.
+        trading on vetoes read the wrong way round. An option strategy's
+        signal must name its ``metadata['asset_type']`` (one of
+        ``OPTION_ASSET_TYPES``), or it raises: the gatekeeper's order path
+        and the risk checks know an option by it (``is_option_asset``), and
+        one without it would be sized, gated and sent as an equity order for
+        the underlying.
 
         Stamps ``entry_style_family`` (the exit graces key on it: 'orb',
         'pullback'), ``orb_window_entry``, ``strategy_priority_score``,
@@ -772,6 +777,11 @@ class SharedEntryPolicy:
             retest_plans=admitted.retest_plans, ladder_meta=ladder_meta,
             final_priority_score=final_priority_score, leading=metadata,
         )
+        if self.config.active_is_option and not is_option_asset(meta):
+            raise ValueError(
+                f"{p.style}: an option strategy's signal needs metadata['asset_type'] in "
+                f"{sorted(OPTION_ASSET_TYPES)}, got {meta.get('asset_type')!r}"
+            )
         meta.setdefault("regime", p.style)
         meta.update({
             "entry_style_family": p.style_family,

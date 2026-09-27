@@ -1409,9 +1409,9 @@ class BotConfig:
     @property
     def active_is_option(self) -> bool:
         """Whether the active strategy trades options (its manifest's
-        ``plugin_type``): the one strategy-level option check. A signal or
-        a position is an option by its own metadata
-        (``models.is_option_asset``)."""
+        ``plugin_type``): the one strategy-level option check, so the
+        runtime reads no plugin catalogue. A signal or a position is an
+        option by its own metadata (``models.is_option_asset``)."""
         return is_option_strategy(self.strategy)
 
 

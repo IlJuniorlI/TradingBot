@@ -310,6 +310,34 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **An option signal is known by its asset type, and the entry stage
+  requires one (refactor cut B18).** *2026-09-27* —
+  `SharedEntryPolicy.emit` raises `ValueError` for an option strategy's
+  signal whose `metadata['asset_type']` is not `OPTION_VERTICAL` or
+  `OPTION_SINGLE`, like its other contract checks (a present `EQUITY` or
+  blank stamp is refused too). The risk manager's option checks on a
+  signal (the one-slot-per-underlying position cap, the `allow_short`
+  exemption, the same-level block's market direction and level, the
+  fib-pullback override) read that asset type (`models.is_option_asset`)
+  instead of the strategy name, so no runtime module but the screener
+  client imports the plugin catalogue, and `tests/test_module_layering.py`
+  holds it there. `RiskManager.market_side` and `same_level_anchor` lose
+  their `strategy` argument: `market_side(side, metadata)`,
+  `same_level_anchor(side, metadata, price)`. The ENTRY_CONTEXT,
+  TRADE_SUMMARY and EXIT_CONTEXT `asset_type` fields still log the stored
+  value, null for an equity.
+
+  **Behaviour change:** none for the shipped strategies (both 0DTE
+  strategies stamp every signal, and neither builds divergence-only
+  entries). An option signal without the stamp now fails the strategy's
+  entry cycle; before, risk treated it as an option by name while the
+  gatekeeper's order path, which reads the asset type, took it for an
+  equity entry on the underlying (checked against the ETF's price, and,
+  for a LONG with no target, sent as an equity order). Tests:
+  `tests/test_shared_entry_policy.py`, `tests/test_risk_manager.py`,
+  `tests/test_option_same_level_block.py`,
+  `tests/test_report_skip_buckets.py`, `tests/test_module_layering.py`.
+
 - **The active strategy's option-ness is `BotConfig.active_is_option`
   (refactor cut C37).** *2026-09-27* — the cycle gate (an option strategy
   enters in the regular session only), the startup reconciler (an option

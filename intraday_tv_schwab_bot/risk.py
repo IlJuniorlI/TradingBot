@@ -12,7 +12,6 @@ from .broker_payloads import active_broker_bracket
 from .config import BotConfig, RiskConfig
 from .models import Position, Side, Signal, is_option_asset
 from .numeric import first_float, safe_float
-from ._strategies.catalogue import is_option_strategy
 from .position_metrics import LADDER_TOUCH_HOLD_KEY, append_management_adjustment, favorable_move
 from . import sessions
 
@@ -425,7 +424,7 @@ class RiskManager:
             )
             return False, "daily_loss_limit"
         max_positions = self.config.risk.max_positions
-        if is_option_strategy(signal.strategy):
+        if is_option_asset(signal.metadata):
             max_positions = min(max_positions, len(self.config.options.underlyings))
         active_slots: set[str] = set()
         for pos in positions.values():
@@ -502,7 +501,7 @@ class RiskManager:
         blocked, block_reason = self._same_level_block_check(signal)
         if blocked:
             return False, block_reason
-        if signal.side == Side.SHORT and not self.config.risk.allow_short and not is_option_strategy(signal.strategy):
+        if signal.side == Side.SHORT and not self.config.risk.allow_short and not is_option_asset(signal.metadata):
             return False, "shorts_disabled"
         return True, "ok"
 
@@ -532,8 +531,7 @@ class RiskManager:
         meta = signal.metadata if isinstance(signal.metadata, dict) else {}
         raw_key = meta.get("position_key") if isinstance(meta, dict) else None
         raw_key_norm = self._symbol_key(raw_key) if raw_key else None
-        anchor = self.same_level_anchor(signal.strategy, signal.side, signal.metadata,
-                                        self._signal_entry_price(signal))
+        anchor = self.same_level_anchor(signal.side, signal.metadata, self._signal_entry_price(signal))
         if anchor is None:
             return False, "ok"
         signal_side, signal_entry = anchor
@@ -568,18 +566,18 @@ class RiskManager:
         return False, "ok"
 
     @staticmethod
-    def market_side(strategy: str, side: Side, metadata: Any) -> Side | None:
+    def market_side(side: Side, metadata: Mapping[str, Any]) -> Side | None:
         """The way a signal, or the position it became, bets on its symbol's
-        price. An equity: its side. An option: the UNDERLYING's market
-        direction (``metadata['direction']``, bullish* / bearish*, stamped
-        by every option signal builder and carried onto the position), since
-        its side is the ORDER side: a bear put debit is bought and a bull put
-        credit sold. None when an option's direction cannot be read.
+        price. An equity: its side. An option (``is_option_asset``): the
+        UNDERLYING's market direction (``metadata['direction']``, bullish* /
+        bearish*, stamped by every option signal builder and carried onto the
+        position), since its side is the ORDER side: a bear put debit is
+        bought and a bull put credit sold. None when an option's direction
+        cannot be read.
         """
-        if not is_option_strategy(strategy):
+        if not is_option_asset(metadata):
             return side
-        meta = metadata if isinstance(metadata, dict) else {}
-        market = str(meta.get("direction") or "").strip().lower()
+        market = str(metadata.get("direction") or "").strip().lower()
         if market.startswith("bullish"):
             return Side.LONG
         if market.startswith("bearish"):
@@ -587,7 +585,7 @@ class RiskManager:
         return None
 
     @staticmethod
-    def same_level_anchor(strategy: str, side: Side, metadata: Any, price: Any) -> tuple[Side, float] | None:
+    def same_level_anchor(side: Side, metadata: Mapping[str, Any], price: Any) -> tuple[Side, float] | None:
         """The (direction, price level) the same-level retry block keys on,
         read the same way from a signal and from the position it became.
 
@@ -601,11 +599,11 @@ class RiskManager:
         (fixed 2026-09-25). None when either cannot be read; the block then
         skips.
         """
-        side = RiskManager.market_side(strategy, side, metadata)
+        side = RiskManager.market_side(side, metadata)
         if side is None:
             return None
-        if is_option_strategy(strategy):
-            price = (metadata if isinstance(metadata, dict) else {}).get("underlying_entry")
+        if is_option_asset(metadata):
+            price = metadata.get("underlying_entry")
         try:
             value = float(price)
         except (TypeError, ValueError):
@@ -636,7 +634,7 @@ class RiskManager:
         same price space as the anchors. Option signals started carrying the
         anchors when their entries moved onto the shared stage (2026-09-24).
         """
-        if is_option_strategy(signal.strategy):
+        if is_option_asset(signal.metadata):
             return False
         meta = signal.metadata if isinstance(signal.metadata, dict) else {}
         try:

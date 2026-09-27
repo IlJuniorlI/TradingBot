@@ -1122,8 +1122,7 @@ class PositionManager:
         )
         self.risk.register_exit(
             management_symbol, realized, additional_symbol=key, side=position.side,
-            level=RiskManager.same_level_anchor(position.strategy, position.side, position.metadata,
-                                                position.entry_price),
+            level=RiskManager.same_level_anchor(position.side, position.metadata, position.entry_price),
             exit_price=level_exit, atr=exit_atr,
         )
 
