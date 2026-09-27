@@ -1100,8 +1100,9 @@ class DashboardCache:
         htf_ctx = None
         chart_wants_rsi_div = bool(compact_chart_profile.show_rsi_divergence) or bool(expanded_chart_profile.show_rsi_divergence)
         try:
-            sr_cfg = getattr(self.config, "support_resistance", None)
-            include_fair_value_gaps = bool(getattr(sr_cfg, "htf_fair_value_gaps_enabled", True)) if sr_cfg is not None else True
+            # The strategy's HTF FVG arguments, part of the context's cache key.
+            htf_fvg_request = self.strategy.htf_fvg_request()
+            include_fair_value_gaps = bool(htf_fvg_request["include_fair_value_gaps"])
             chart_wants_htf_fvgs = bool(compact_chart_profile.show_htf_fair_value_gaps) or bool(expanded_chart_profile.show_htf_fair_value_gaps)
             need_htf_ctx = (include_fair_value_gaps and chart_wants_htf_fvgs) or chart_wants_rsi_div
             if need_htf_ctx and self.data is not None:
@@ -1113,10 +1114,7 @@ class DashboardCache:
                     allow_refresh=allow_refresh,
                     use_prior_day_high_low=bool(getattr(self.config.support_resistance, "use_prior_day_high_low", True)),
                     use_prior_week_high_low=bool(getattr(self.config.support_resistance, "use_prior_week_high_low", True)),
-                    include_fair_value_gaps=include_fair_value_gaps,
-                    fair_value_gap_max_per_side=int(getattr(self.config.support_resistance, "fair_value_gap_max_per_side", 4) or 4),
-                    fair_value_gap_min_atr_mult=float(getattr(self.config.support_resistance, "fair_value_gap_min_atr_mult", 0.05) or 0.05),
-                    fair_value_gap_min_pct=float(getattr(self.config.support_resistance, "fair_value_gap_min_pct", 0.0005) or 0.0005),
+                    **htf_fvg_request,
                 )
                 if include_fair_value_gaps and chart_wants_htf_fvgs and htf_ctx is not None:
                     htf_min = self.strategy.htf_minutes()
@@ -1135,6 +1133,13 @@ class DashboardCache:
             htf_fair_value_gaps = []
             htf_ctx = None
 
+        # The LTF FVG and order block overlays are the contexts the strategy
+        # reads: its request, at its price, the close of the frame's last
+        # bar (the data feed's cycle cache holds them under that price). Until
+        # 2026-09-27 the dashboard asked at the quote's last, so it drew
+        # blocks and gaps sized, ranked and cut at a price the strategy never
+        # judged, and built them a second time.
+        frame_close = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         ltf_fair_value_gaps: list[dict[str, Any]] = []
         try:
             sr_cfg = getattr(self.config, "support_resistance", None)
@@ -1145,10 +1150,8 @@ class DashboardCache:
                 fvg_ctx = self.data.get_fair_value_gap_context(
                     symbol,
                     timeframe_minutes=ltf_min_for_fvg,
-                    current_price=current_price,
-                    max_per_side=int(getattr(self.config.support_resistance, "fair_value_gap_max_per_side", 4) or 4),
-                    min_gap_atr_mult=float(getattr(self.config.support_resistance, "fair_value_gap_min_atr_mult", 0.05) or 0.05),
-                    min_gap_pct=float(getattr(self.config.support_resistance, "fair_value_gap_min_pct", 0.0005) or 0.0005),
+                    current_price=frame_close,
+                    **self.strategy.ltf_fvg_request(),
                 )
                 if fvg_ctx is not None:
                     if ltf_min_for_fvg == 1:
@@ -1174,31 +1177,23 @@ class DashboardCache:
         # is reused since it's shape-driven, not type-driven. Frontend reads
         # `htf_order_blocks` and `ltf_order_blocks` separately and renders
         # them with dashed-stroke styling vs FVGs' solid-fill styling.
-        # Pull tuning knobs once for both blocks below.
+        # One request (the strategy's tuning knobs) for both blocks below.
         sr_cfg = getattr(self.config, "support_resistance", None)
-        ob_kwargs = dict(
-            mode=sr_cfg.order_block_mode,  # loose / strict, checked at load (config._CHOICES)
-            max_per_side=int(getattr(sr_cfg, "order_block_max_per_side", 4) or 4),
-            min_block_atr_mult=float(getattr(sr_cfg, "order_block_min_atr_mult", 0.05) or 0.05),
-            min_block_pct=float(getattr(sr_cfg, "order_block_min_pct", 0.0005) or 0.0005),
-            min_thrust_atr_mult=float(getattr(sr_cfg, "order_block_min_thrust_atr_mult", 0.75) or 0.75),
-            pivot_span=int(getattr(sr_cfg, "order_block_pivot_span", 2) or 2),
-            new_high_lookback=int(getattr(sr_cfg, "order_block_new_high_lookback", 8) or 8),
-        ) if sr_cfg is not None else None
+        ob_request = self.strategy.order_block_request()
 
         htf_order_blocks: list[dict[str, Any]] = []
         try:
             include_htf_obs = bool(getattr(sr_cfg, "htf_order_blocks_enabled", False)) if sr_cfg is not None else False
             chart_wants_htf_obs = bool(compact_chart_profile.show_htf_order_blocks) or bool(expanded_chart_profile.show_htf_order_blocks)
-            if include_htf_obs and chart_wants_htf_obs and self.data is not None and ob_kwargs is not None:
+            if include_htf_obs and chart_wants_htf_obs and self.data is not None:
                 htf_minutes = self.strategy.htf_minutes()
                 # Cycle-cached: hits get_order_block_context's cache when the
                 # strategy already computed it earlier in the same cycle.
                 ob_ctx_htf = self.data.get_order_block_context(
                     symbol,
                     timeframe_minutes=htf_minutes,
-                    current_price=current_price,
-                    **ob_kwargs,
+                    current_price=frame_close,
+                    **ob_request,
                 )
                 for ob in list(getattr(ob_ctx_htf, "bullish_obs", []) or []) + list(getattr(ob_ctx_htf, "bearish_obs", []) or []):
                     payload_ob = dashboard_fvg_payload(ob)
@@ -1219,15 +1214,15 @@ class DashboardCache:
         try:
             include_ltf_obs = bool(getattr(sr_cfg, "ltf_order_blocks_enabled", False)) if sr_cfg is not None else False
             chart_wants_ltf_obs = bool(compact_chart_profile.show_ltf_order_blocks) or bool(expanded_chart_profile.show_ltf_order_blocks)
-            if include_ltf_obs and chart_wants_ltf_obs and self.data is not None and ob_kwargs is not None:
+            if include_ltf_obs and chart_wants_ltf_obs and self.data is not None:
                 # Cycle-cached: same cache as the strategy uses when it calls
                 # `_ltf_order_block_context` during entry evaluation.
                 ltf_min_for_ob = self.strategy.ltf_minutes()
                 ob_ctx_ltf = self.data.get_order_block_context(
                     symbol,
                     timeframe_minutes=ltf_min_for_ob,
-                    current_price=current_price,
-                    **ob_kwargs,
+                    current_price=frame_close,
+                    **ob_request,
                 )
                 # We still need an in-scope LTF frame for the anchor_abs_index
                 # lookup that drives chart placement; the OB context alone
@@ -1454,10 +1449,6 @@ class DashboardCache:
         sr_cfg = getattr(self.config, "support_resistance", None)
         use_prior_day_high_low = bool(getattr(sr_cfg, "use_prior_day_high_low", True)) if sr_cfg is not None else True
         use_prior_week_high_low = bool(getattr(sr_cfg, "use_prior_week_high_low", True)) if sr_cfg is not None else True
-        include_fair_value_gaps = bool(getattr(sr_cfg, "htf_fair_value_gaps_enabled", True)) if sr_cfg is not None else True
-        fair_value_gap_max_per_side = int(getattr(sr_cfg, "fair_value_gap_max_per_side", 4) or 4) if sr_cfg is not None else 4
-        fair_value_gap_min_atr_mult = float(getattr(sr_cfg, "fair_value_gap_min_atr_mult", 0.05) or 0.05) if sr_cfg is not None else 0.05
-        fair_value_gap_min_pct = float(getattr(sr_cfg, "fair_value_gap_min_pct", 0.0005) or 0.0005) if sr_cfg is not None else 0.0005
 
         htf = self.data.get_htf_context(
             symbol,
@@ -1473,10 +1464,7 @@ class DashboardCache:
             allow_refresh=allow_htf_refresh,
             use_prior_day_high_low=use_prior_day_high_low,
             use_prior_week_high_low=use_prior_week_high_low,
-            include_fair_value_gaps=include_fair_value_gaps,
-            fair_value_gap_max_per_side=fair_value_gap_max_per_side,
-            fair_value_gap_min_atr_mult=fair_value_gap_min_atr_mult,
-            fair_value_gap_min_pct=fair_value_gap_min_pct,
+            **strategy_obj.htf_fvg_request(),
         )
         if htf is None:
             return []
@@ -1895,10 +1883,7 @@ class DashboardCache:
                         allow_refresh=allow_refresh,
                         use_prior_day_high_low=bool(getattr(sr_cfg, "use_prior_day_high_low", True)),
                         use_prior_week_high_low=bool(getattr(sr_cfg, "use_prior_week_high_low", True)),
-                        include_fair_value_gaps=bool(getattr(sr_cfg, "htf_fair_value_gaps_enabled", True)),
-                        fair_value_gap_max_per_side=int(getattr(sr_cfg, "fair_value_gap_max_per_side", 4) or 4),
-                        fair_value_gap_min_atr_mult=float(getattr(sr_cfg, "fair_value_gap_min_atr_mult", 0.05) or 0.05),
-                        fair_value_gap_min_pct=float(getattr(sr_cfg, "fair_value_gap_min_pct", 0.0005) or 0.0005),
+                        **self.strategy.htf_fvg_request(),
                     )
                     htf_trend_bias = str(getattr(htf_ctx, "trend_bias", "neutral") or "neutral").strip().lower()
         except Exception:

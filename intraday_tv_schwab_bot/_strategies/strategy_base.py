@@ -1165,7 +1165,9 @@ class BaseStrategy:
     def htf_fvg_request(self) -> dict[str, Any]:
         """The FVG arguments ``_htf_context`` builds every context with. They
         are part of the data feed's context cache key, so a prefetch meant to
-        warm a context the strategy reads has to pass them too."""
+        warm a context the strategy reads has to pass them too, and so does
+        the dashboard's HTF context read (until 2026-09-27 it resolved them
+        from the config itself)."""
         return {
             "include_fair_value_gaps": bool(self._support_resistance_setting("htf_fair_value_gaps_enabled", True)),
             "fair_value_gap_max_per_side": int(self._support_resistance_setting("fair_value_gap_max_per_side", 4) or 4),
@@ -1304,41 +1306,44 @@ class BaseStrategy:
             "nearest_htf_bearish_fvg": safe_float(getattr(getattr(ctx, "nearest_bearish_fvg", None), "midpoint", None)),
         }
 
+    def ltf_fvg_request(self) -> dict[str, Any]:
+        """The detection arguments of the LTF FVG context
+        (``get_fair_value_gap_context`` / ``build_fair_value_gap_context``,
+        both take these names); the caller adds the timeframe and the
+        price. The dashboard's LTF FVG overlay asks for it with the frame's
+        close, as ``_ltf_fvg_context`` does, so the overlay is the context
+        the strategy read (until 2026-09-27 it resolved the arguments from
+        the config itself and built at the quote's last)."""
+        return {
+            "max_per_side": int(self._support_resistance_setting("fair_value_gap_max_per_side", 4) or 4),
+            "min_gap_atr_mult": float(self._support_resistance_setting("fair_value_gap_min_atr_mult", 0.05) or 0.05),
+            "min_gap_pct": float(self._support_resistance_setting("fair_value_gap_min_pct", 0.0005) or 0.0005),
+        }
+
     def _ltf_fvg_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> FairValueGapContext:
         ltf_min = self.ltf_minutes()
         current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         if not bool(self._support_resistance_setting("ltf_fair_value_gaps_enabled", False)):
             return empty_fvg_context(current_price, timeframe_minutes=ltf_min)
-        max_per_side = int(self._support_resistance_setting("fair_value_gap_max_per_side", 4) or 4)
-        min_gap_atr_mult = float(self._support_resistance_setting("fair_value_gap_min_atr_mult", 0.05) or 0.05)
-        min_gap_pct = float(self._support_resistance_setting("fair_value_gap_min_pct", 0.0005) or 0.0005)
+        request = self.ltf_fvg_request()
         if data is not None and hasattr(data, "get_fair_value_gap_context") and symbol:
             try:
-                return data.get_fair_value_gap_context(
-                    symbol,
-                    timeframe_minutes=ltf_min,
-                    current_price=current_price,
-                    max_per_side=max_per_side,
-                    min_gap_atr_mult=min_gap_atr_mult,
-                    min_gap_pct=min_gap_pct,
-                )
+                return data.get_fair_value_gap_context(symbol, timeframe_minutes=ltf_min, current_price=current_price, **request)
             except Exception:
                 LOG.debug("Failed to load cached fair value gap context for %s; recomputing from frame.", symbol, exc_info=True)
         if frame is None or frame.empty:
             return empty_fvg_context(current_price, timeframe_minutes=ltf_min)
-        return build_fair_value_gap_context(
-            frame,
-            timeframe_minutes=ltf_min,
-            current_price=current_price,
-            max_per_side=max_per_side,
-            min_gap_atr_mult=min_gap_atr_mult,
-            min_gap_pct=min_gap_pct,
-        )
+        return build_fair_value_gap_context(frame, timeframe_minutes=ltf_min, current_price=current_price, **request)
 
-    def _order_block_tuning_knobs(self) -> dict[str, Any]:
-        """Resolve the SHARED OB tuning knobs from support_resistance config.
-        Both 1m and HTF OB contexts read the same settings — only the enable
-        flag and the input frame's timeframe differ between them.
+    def order_block_request(self) -> dict[str, Any]:
+        """The SHARED OB tuning knobs from support_resistance config, under
+        the names ``get_order_block_context`` / ``build_order_block_context``
+        take; the caller adds the timeframe and the price. Both 1m and HTF
+        OB contexts read the same settings — only the enable flag and the
+        input frame's timeframe differ between them. The dashboard's OB
+        overlays ask for it with the frame's close, as the strategy does
+        (until 2026-09-27 they resolved the knobs from the config
+        themselves and built at the quote's last).
 
         The ``min_thrust_atr_mult`` knob (added 2026-05) gates BoS
         displacement to filter micro-breakouts; combined with the
@@ -1351,8 +1356,8 @@ class BaseStrategy:
         return {
             "mode": self.config.support_resistance.order_block_mode,
             "max_per_side": int(self._support_resistance_setting("order_block_max_per_side", 4) or 4),
-            "min_atr_mult": float(self._support_resistance_setting("order_block_min_atr_mult", 0.05) or 0.05),
-            "min_pct": float(self._support_resistance_setting("order_block_min_pct", 0.0005) or 0.0005),
+            "min_block_atr_mult": float(self._support_resistance_setting("order_block_min_atr_mult", 0.05) or 0.05),
+            "min_block_pct": float(self._support_resistance_setting("order_block_min_pct", 0.0005) or 0.0005),
             "min_thrust_atr_mult": float(
                 self._support_resistance_setting("order_block_min_thrust_atr_mult", 0.75) or 0.75
             ),
@@ -1369,40 +1374,18 @@ class BaseStrategy:
         `build_order_block_context` when there's no data store available."""
         ltf_min = self.ltf_minutes()
         current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
-        knobs = self._order_block_tuning_knobs()
-        mode = knobs["mode"]
+        request = self.order_block_request()
+        mode = request["mode"]
         if not bool(self._support_resistance_setting("ltf_order_blocks_enabled", False)):
             return empty_order_block_context(current_price, timeframe_minutes=ltf_min, mode=mode)
         if data is not None and hasattr(data, "get_order_block_context") and symbol:
             try:
-                return data.get_order_block_context(
-                    symbol,
-                    timeframe_minutes=ltf_min,
-                    current_price=current_price,
-                    mode=mode,
-                    max_per_side=knobs["max_per_side"],
-                    min_block_atr_mult=knobs["min_atr_mult"],
-                    min_block_pct=knobs["min_pct"],
-                    min_thrust_atr_mult=knobs["min_thrust_atr_mult"],
-                    pivot_span=knobs["pivot_span"],
-                    new_high_lookback=knobs["new_high_lookback"],
-                )
+                return data.get_order_block_context(symbol, timeframe_minutes=ltf_min, current_price=current_price, **request)
             except Exception:
                 LOG.debug("Failed to load cached order block context for %s; recomputing from frame.", symbol, exc_info=True)
         if frame is None or frame.empty:
             return empty_order_block_context(current_price, timeframe_minutes=ltf_min, mode=mode)
-        return build_order_block_context(
-            frame,
-            timeframe_minutes=ltf_min,
-            current_price=current_price,
-            mode=mode,
-            max_per_side=knobs["max_per_side"],
-            min_block_atr_mult=knobs["min_atr_mult"],
-            min_block_pct=knobs["min_pct"],
-            min_thrust_atr_mult=knobs["min_thrust_atr_mult"],
-            pivot_span=knobs["pivot_span"],
-            new_high_lookback=knobs["new_high_lookback"],
-        )
+        return build_order_block_context(frame, timeframe_minutes=ltf_min, current_price=current_price, **request)
 
     def _htf_order_block_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> OrderBlockContext:
         """HTF order block context. Disabled by default — opt in via
@@ -1415,25 +1398,14 @@ class BaseStrategy:
         HTF resample + OB detection is shared with the dashboard via the
         cycle-scoped cache."""
         current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
-        knobs = self._order_block_tuning_knobs()
-        mode = knobs["mode"]
+        request = self.order_block_request()
+        mode = request["mode"]
         htf_minutes = self.htf_minutes()
         if not bool(self._support_resistance_setting("htf_order_blocks_enabled", False)):
             return empty_order_block_context(current_price, timeframe_minutes=htf_minutes, mode=mode)
         if data is not None and hasattr(data, "get_order_block_context") and symbol:
             try:
-                return data.get_order_block_context(
-                    symbol,
-                    timeframe_minutes=htf_minutes,
-                    current_price=current_price,
-                    mode=mode,
-                    max_per_side=knobs["max_per_side"],
-                    min_block_atr_mult=knobs["min_atr_mult"],
-                    min_block_pct=knobs["min_pct"],
-                    min_thrust_atr_mult=knobs["min_thrust_atr_mult"],
-                    pivot_span=knobs["pivot_span"],
-                    new_high_lookback=knobs["new_high_lookback"],
-                )
+                return data.get_order_block_context(symbol, timeframe_minutes=htf_minutes, current_price=current_price, **request)
             except Exception:
                 LOG.debug("Failed to load cached HTF order block context for %s; recomputing from frame.", symbol, exc_info=True)
         if frame is None or frame.empty:
@@ -1441,18 +1413,7 @@ class BaseStrategy:
         htf_frame = self._resampled_frame(frame, htf_minutes, symbol=symbol, data=data)
         if htf_frame is None or htf_frame.empty:
             return empty_order_block_context(current_price, timeframe_minutes=htf_minutes, mode=mode)
-        return build_order_block_context(
-            htf_frame,
-            timeframe_minutes=htf_minutes,
-            current_price=current_price,
-            mode=mode,
-            max_per_side=knobs["max_per_side"],
-            min_block_atr_mult=knobs["min_atr_mult"],
-            min_block_pct=knobs["min_pct"],
-            min_thrust_atr_mult=knobs["min_thrust_atr_mult"],
-            pivot_span=knobs["pivot_span"],
-            new_high_lookback=knobs["new_high_lookback"],
-        )
+        return build_order_block_context(htf_frame, timeframe_minutes=htf_minutes, current_price=current_price, **request)
 
     @staticmethod
     def _resampled_frame(

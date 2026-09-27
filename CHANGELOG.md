@@ -310,6 +310,29 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The dashboard draws the order blocks and fair value gaps the strategy
+  read (refactor cut B14).** *2026-09-27* — the LTF FVG and the HTF / LTF
+  order-block overlays ask for the strategy's `ltf_fvg_request()` /
+  `order_block_request()` (public; `_order_block_tuning_knobs` is gone, and
+  the request's keys are now the feed's parameter names, `min_block_atr_mult`
+  / `min_block_pct`) at the strategy's price, the close of the 1m frame's
+  last bar, and the HTF context, the level zones and the sidebar's trend
+  read take `htf_fvg_request()`; the dashboard resolved every knob from the
+  config itself (the same values). The strategy's own LTF FVG and order
+  block reads pass the requests through as they are.
+
+  **Behaviour change:** the overlays were built at the quote's last
+  whenever the quote was fresh, a price the strategy never judged, and
+  missed the data feed's cycle cache; they now hit it. On the 11 presets
+  that draw LTF gaps, over 27,349 archived top_tier checkpoints (8 days),
+  the drawn set differs at 0.02% (a quote just after the bar) to 0.17% (a
+  minute later) of them: a gap entering or leaving the top 3 by distance,
+  or one at the size floor. No preset draws order blocks. The `or default`
+  reads (a configured 0 read as the default) are unchanged on both sides.
+  Tests: `tests/test_strategy_requests.py`
+  (`TestTheDashboardDrawsTheStrategysContexts`, and the request keys),
+  `tests/test_config_validation.py`.
+
 - **The score context is the FVG term's context (refactor cut B13).**
   *2026-09-27* — `BaseStrategy._default_htf_request()` is the HTF request
   the score context (`_default_htf_context_for_score`), the shared FVG score
