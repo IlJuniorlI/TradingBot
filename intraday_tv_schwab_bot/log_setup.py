@@ -119,7 +119,7 @@ class ColorConsoleFormatter(logging.Formatter):
 
 class _ETDailyFileHandler(logging.FileHandler):
     """FileHandler that rotates to ``bot_{YYYY-MM-DD}.log`` on ET-date change,
-    regardless of host timezone. `session_report.export_session_archive`
+    regardless of host timezone. `session_archive.export_session_archive`
     expects a filename matching the current session date. Date-check is
     throttled via a monotonic timer so the hot log path doesn't pay for a
     tz conversion on every record."""

@@ -310,6 +310,37 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The session archive has its own module, `session_archive.py` (refactor
+  cut C39).** *2026-09-27* — `export_session_archive` moved out of
+  `session_report.py` with everything only it uses: the config snapshot and
+  its secret redaction, the events and decisions read from the day's log, the
+  archive bar loader and forward-move helpers, the gate attribution and the
+  regime-call outcomes. `session_report.py` keeps the end-of-session report
+  and the persistent trades.csv; the archive writes its own trades.csv with
+  the report's `TRADE_CSV_COLUMNS` and `trade_csv_row` (the leading
+  underscore is gone), an import in one direction only. The exporter is a
+  sequence of stage functions (symbols, bars folders, log copy, trades,
+  config and account snapshots, events, decisions, manifest), each writing
+  one part and reporting its own failure as before; a symbol whose frame
+  cannot be read is still skipped per folder, and the stored HTF frame is
+  still read at the strategy's `htf_minutes()`, after the resampled
+  folders. The `yaml` import guard is gone: the package cannot import
+  without PyYAML. There is no alias: import `export_session_archive` from
+  `intraday_tv_schwab_bot.session_archive`. The archive's log lines now log
+  under `intraday_tv_schwab_bot.session_archive`, so a log filter on the old
+  name must change. No behaviour changes: on seven archive scenarios (a
+  failing and an empty symbol, a failing HTF read, partial exits, a
+  prior-day trade, an option position, a real config and strategy, a log
+  with events and decisions; no account, no log, no feed, an unreadable
+  trade, a config YAML cannot represent, a strategy without params) the two
+  modules write the same 95 files byte for byte and the same log messages.
+  Tests: `tests/test_session_archive.py` (new) pins the stages no test
+  reached: the archived symbols, the redacted config snapshot, the account
+  snapshot, the events and decisions read from the log copy, a failed
+  trades export and a failed stage. The archive tests import from
+  `session_archive`, and `tests/test_module_layering.py`'s runtime layer
+  gains it.
+
 - **In-position stop and target management has one home, `TradeManager` in
   `trade_management.py` (refactor cut C38).** *2026-09-27* —
   `RiskManager.update_position` (the stop and target exits with their

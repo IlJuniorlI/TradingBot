@@ -35,7 +35,8 @@ from .startup_reconciler import StartupReconciler
 from .symbols import NON_STREAMABLE
 from .warmup_tracker import WarmupTracker
 from ._strategies.factory import build_strategy
-from .session_report import export_session_archive, write_session_report
+from .session_archive import export_session_archive
+from .session_report import write_session_report
 from .schwab_api import SchwabdevApiUsageTracker, register_schwab_api_tracker
 from .log_setup import TRADEFLOW_LEVEL, setup_logging
 from .sessions import EQUITY_STREAM_END, equity_session_state
@@ -850,11 +851,11 @@ class IntradayBot:
                 LOG.warning("Session archive export failed: %s", exc, exc_info=True)
 
     def _export_session_archive(self) -> None:
-        """Thin wrapper that delegates to ``session_report.export_session_archive``.
+        """Thin wrapper that delegates to ``session_archive.export_session_archive``.
 
         Kept on the engine so the call site in ``_write_session_report``
         can stay symmetric with ``write_session_report``. All the actual
-        I/O lives in ``session_report.py``.
+        I/O lives in ``session_archive.py``.
         """
         export_session_archive(
             log_dir=self.config.runtime.log_dir,

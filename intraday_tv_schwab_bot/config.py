@@ -522,7 +522,7 @@ class RuntimeConfig:
     # bars/{N}m/ resamples for ltf/htf minutes above 1, bars/htf_{N}m/ (the
     # stored HTF frame levels are built from), trades.csv filtered to the
     # day, decisions.csv and manifest.json with strategy + summary stats; see
-    # session_report.export_session_archive for the full list. Disable to
+    # session_archive.export_session_archive for the full list. Disable to
     # save disk space if running without dashboard/analysis needs.
     export_session_archive: bool = True
 

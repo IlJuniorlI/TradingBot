@@ -7,7 +7,7 @@ Owns:
   - Fingerprinted watchlist traces (``log_watchlist_trace``): only emit when
     the per-kind fingerprint changes.
   - Structured JSON event logs (``log_structured``): TRADEFLOW-level events
-    that downstream tools (session_report) parse out of the log file.
+    that downstream tools (session_archive) parse out of the log file.
   - The position metadata those records carry
     (``structured_metadata_snapshot``): the entry gatekeeper's ENTRY_CONTEXT
     and the position manager's EXIT_CONTEXT both filter it through here.
@@ -250,7 +250,7 @@ class AuditLogger:
         *,
         level: int = TRADEFLOW_LEVEL,
     ) -> None:
-        """Emit ``{prefix} <compact-json>`` at TRADEFLOW_LEVEL. session_report
+        """Emit ``{prefix} <compact-json>`` at TRADEFLOW_LEVEL. session_archive
         parses these lines back into events.jsonl at EOD."""
         try:
             text = json.dumps(json_safe(payload, non_finite="keep"), sort_keys=True, separators=(",", ":"))
