@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .models import Position, Side
+from .models import ExitDecision, Position, Side
 from .numeric import safe_float
 from .reasons import exit_reason_code
 
@@ -51,33 +51,27 @@ LADDER_TOUCH_HOLD_KEY = "ladder_touch_hold"
 TARGET_WEAK_CLOSE = "target_weak_close"
 TARGET_HOLD_GUARD = "target_hold_guard"
 TARGET_HOLD_TIMEOUT = "target_hold_timeout"
-# The exit codes of the "risk" family: the stop and the target, and the touch
-# hold's three exits at the target.
-RISK_EXIT_CODES = frozenset({"stop", "target", TARGET_WEAK_CLOSE, TARGET_HOLD_GUARD, TARGET_HOLD_TIMEOUT})
 
 
-def exit_reason_details(reason: str) -> dict[str, Any]:
-    """Classify an exit reason string into family + code + optional trigger
-    level. Used for structured event logging at exit time.
+def exit_reason_details(decision: ExitDecision) -> dict[str, Any]:
+    """The exit fields of the structured exit record (EXIT_CONTEXT) for
+    ``decision``: ``exit_reason`` (the reason, stripped, or None),
+    ``exit_reason_code`` (:func:`~intraday_tv_schwab_bot.reasons.exit_reason_code`),
+    ``exit_reason_family`` (the decision's ``family``: who decided it, see
+    :class:`~intraday_tv_schwab_bot.models.ExitDecision`) and
+    ``exit_trigger_level``.
 
-    Input format: ``"<code>"`` or ``"<code>:<level>"`` (e.g. ``"stop:99.5"``).
-    Output dict includes ``exit_reason`` (raw), ``exit_reason_code``,
-    ``exit_reason_family`` (one of: risk, schedule, technical, strategy),
-    and ``exit_trigger_level`` (float or None)."""
-    raw = str(reason or "").strip()
+    Until 2026-09-27 the family was guessed from the reason string (risk,
+    schedule, technical or strategy), so a peak-giveback exit read
+    ``strategy`` and force flatten ``schedule`` while the decision said
+    ``risk`` and ``force_flatten``."""
+    raw = decision.reason.strip()
     code = exit_reason_code(raw)
     level_text = raw.partition(":")[2]
-    family = "strategy"
-    if code in RISK_EXIT_CODES:
-        family = "risk"
-    elif code in {"time_exit", "force_flatten", "session_exit"}:
-        family = "schedule"
-    elif isinstance(code, str) and any(token in code for token in ("trendline", "channel_", "bollinger_", "anchored_vwap")):
-        family = "technical"
     return {
         "exit_reason": raw or None,
         "exit_reason_code": code,
-        "exit_reason_family": family,
+        "exit_reason_family": decision.family,
         # The level after the colon when it is a number; a word there
         # (``candle_pattern_exit:CDLENGULFING``) or a NaN is no level.
         "exit_trigger_level": safe_float(level_text),

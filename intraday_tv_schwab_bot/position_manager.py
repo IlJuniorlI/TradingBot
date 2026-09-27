@@ -599,7 +599,7 @@ class PositionManager:
             'close_position_pct': close_position_pct,
         }
 
-    def _position_exit_context(self, position: Position, reason: str, mark_price: float | None, underlying_price: float | None, market_snapshot: dict[str, Any] | None, bars) -> dict[str, Any]:
+    def _position_exit_context(self, position: Position, decision: ExitDecision, mark_price: float | None, underlying_price: float | None, market_snapshot: dict[str, Any] | None, bars) -> dict[str, Any]:
         meta = position.metadata if isinstance(position.metadata, dict) else {}
         entry_price = safe_float(position.entry_price, None)
         stop_price = safe_float(position.stop_price, None)
@@ -720,7 +720,7 @@ class PositionManager:
             'decision_ask': safe_float((market_snapshot or {}).get('ask'), None) if isinstance(market_snapshot, dict) else None,
             'decision_last': safe_float((market_snapshot or {}).get('last'), None) if isinstance(market_snapshot, dict) else None,
             'decision_price': safe_float((market_snapshot or {}).get('decision_price'), None) if isinstance(market_snapshot, dict) else None,
-            **exit_reason_details(reason),
+            **exit_reason_details(decision),
             **self._exit_bar_snapshot(management_frame),
         }
         if isinstance(sr_row, dict):
@@ -1134,13 +1134,15 @@ class PositionManager:
         )
 
     def _book_broker_exit(self, key: str, position: Position, exit_qty: int, exit_price: float,
-                          reason: str, bars, *, result_message: str, attempt_status: str,
+                          decision: ExitDecision, bars, *, result_message: str, attempt_status: str,
                           fill_price_estimated: bool) -> float:
         """Record an exit the engine learned of from the BROKER -- a resting
-        bracket child that filled, or an exit order that filled after its
-        submit call returned -- mirroring the manage_positions tail. Returns
-        the realized P&L of the slice."""
-        exit_context = self._position_exit_context(position, reason, exit_price, exit_price, None, bars)
+        bracket child that filled (a ``risk`` exit), or an exit order that
+        filled after its submit call returned (the decision it was sent for)
+        -- mirroring the manage_positions tail. Returns the realized P&L of
+        the slice."""
+        reason = decision.reason
+        exit_context = self._position_exit_context(position, decision, exit_price, exit_price, None, bars)
         exited_position = copy.copy(position)
         exited_position.qty = int(exit_qty)
         remaining_qty_after_exit = max(0, int(position.qty) - int(exit_qty))
@@ -1266,7 +1268,7 @@ class PositionManager:
             bracket["active"] = False
             bracket["state"] = f"filled:{reason}"
             self._book_broker_exit(
-                key, position, exit_qty, float(fill_price), reason, bars,
+                key, position, exit_qty, float(fill_price), ExitDecision(reason, "risk"), bars,
                 result_message="bracket_child_filled", attempt_status="broker_bracket",
                 fill_price_estimated=state.get("fill_price") is None,
             )
@@ -1419,7 +1421,8 @@ class PositionManager:
             fill_price = float(position.entry_price)
         LOG.log(TRADEFLOW_LEVEL, "Bracket %s filled for %s qty=%s before its cancel landed", reason, key, cancel.filled_qty)
         self._book_broker_exit(
-            key, position, max(1, min(int(position.qty), int(cancel.filled_qty))), float(fill_price), reason, bars,
+            key, position, max(1, min(int(position.qty), int(cancel.filled_qty))), float(fill_price),
+            ExitDecision(reason, "risk"), bars,
             result_message="bracket_child_filled_before_cancel", attempt_status="broker_bracket",
             fill_price_estimated=cancel.fill_price is None,
         )
@@ -1616,8 +1619,10 @@ class PositionManager:
                 )
                 return True
             record["booked_qty"] = booked + slice_qty
+            # _track_working_exit, the record's only writer, stores the
+            # reason and family the order was sent for.
             self._book_broker_exit(
-                key, position, slice_qty, float(exit_price), str(record.get("reason") or "exit"), bars,
+                key, position, slice_qty, float(exit_price), ExitDecision(record["reason"], record["family"]), bars,
                 result_message=f"working_exit_filled:{state.get('status')}", attempt_status="broker_working_exit",
                 fill_price_estimated=broker_price is None,
             )
@@ -1637,7 +1642,7 @@ class PositionManager:
                             key, leftover.message,
                         )
                 return True
-            self._record_exit_marker(position, str(record.get("family") or ""), record.get("marker"), "booked")
+            self._record_exit_marker(position, record["family"], record.get("marker"), "booked")
         if state.get("is_filled") or state.get("is_terminal_failure"):
             position.metadata.pop("working_exit_order", None)
             if record.get("reprotect"):
@@ -1896,8 +1901,7 @@ class PositionManager:
                 interval=60.0, level=TRADEFLOW_LEVEL,
             )
             return
-        exit_context = self._position_exit_context(position, reason, last_price, underlying_price, market_snapshot, bars)
-        exit_context["exit_family"] = decision.family
+        exit_context = self._position_exit_context(position, decision, last_price, underlying_price, market_snapshot, bars)
         if not self.executor.can_close_position_now(position, now):
             self.audit.log_cycle(
                 f"exit_gate:{key}",

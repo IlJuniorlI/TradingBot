@@ -33,8 +33,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     once (`target_hold_guard:<guard>`), and a touch bar still undelivered
     the timeout after it closed exits at market
     (`target_hold_timeout:<rung>`). A bar delivered late is still judged.
-  - The three are `risk` exits (EXIT_CONTEXT `exit_family` and
-    `exit_reason_family`), each its own `per_exit_reason` bucket; a stop or
+  - The three are `risk` exits (EXIT_CONTEXT `exit_reason_family`), each
+    its own `per_exit_reason` bucket; a stop or
     peak-giveback exit on the same cycle wins. A decided exit stays on the
     hold, so an order that fails or is deferred is sent again with the same
     reason, whatever the price does next, and the target is never taken
@@ -309,6 +309,40 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gates ran, which were exempt and what the shared score was.
 
 ### Changed
+
+- **EXIT_CONTEXT names the family that decided the exit (refactor cut
+  B15).** *2026-09-27* — `exit_reason_family` is the `family` of the
+  `ExitDecision` the exit was taken for, and
+  `position_metrics.exit_reason_details` takes the decision. The family was
+  guessed from the reason string (`risk` / `schedule` / `technical` /
+  `strategy`) and logged beside the decision's own `exit_family`, which is
+  gone: EXIT_CONTEXT carries one family key. A bracket child the broker
+  filled (`broker_stop` / `broker_target`, found by the fill reconcile,
+  before a cancel landed, or at the startup settle) is a `risk` exit. A
+  working exit order's fill keeps the family it was sent for, read from the
+  order's record (its only writer stores the reason and the family, so the
+  fill reads them without a fallback). `exit_reason_code` was already
+  `reasons.exit_reason_code` (cut C21). `RISK_EXIT_CODES` is gone; the
+  guess was its only reader. The touch-hold entry under Added now names
+  `exit_reason_family` alone.
+
+  **Behaviour change (logs only; no decision, order, report bucket or
+  dashboard reads the family):**
+  - peak-giveback exits read `risk` (was `strategy`);
+  - force flatten reads `force_flatten` (was `schedule`);
+  - these read their own family (all were `strategy`): the time stop
+    (`time_stop`), the chart, candle and structure exits (`chart_pattern`,
+    `candle_pattern`, `structure_choch`, `structure_bias`), the S/R-loss
+    exit (`sr_loss`) and the divergence scale-out (`divergence_partial`);
+  - filled bracket children read `risk` (were `strategy`).
+
+  The stop, the target, the touch hold's three exits, the technical exits
+  and a strategy's own exits read as before. Comparing archived
+  EXIT_CONTEXT rows across this date means mapping the old values, or
+  reading the old rows' `exit_family` where the manager wrote one. Tests:
+  `tests/test_reasons.py` (keeps the old guess as an oracle),
+  `tests/test_partial_exit.py` (`TestTheExitFamily`, every exit path),
+  `tests/test_ladder_touch_hold.py`.
 
 - **The strategy owns its exit policy, and an exit decision sizes itself
   (refactor cut C33).** *2026-09-27* — `BaseStrategy.__init__` builds
