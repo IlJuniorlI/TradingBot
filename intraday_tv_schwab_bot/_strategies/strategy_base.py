@@ -20,7 +20,7 @@ from ..order_blocks import (
 from .shared_entry import SharedEntryPolicy
 from .shared_exit import ExitTape, SharedExitPolicy
 from .catalogue import get_plugin
-from ..models import OPTION_ASSET_TYPES, Candidate, ExitDecision, Position, Side, Signal
+from ..models import Candidate, ExitDecision, Position, Side, Signal
 from ..bars import bar_close_position, bar_wick_fractions, frame_bar_minutes, last_bucket_forming, resample_bars
 from ..symbols import normalize_symbol_list, normalize_symbol_list_details
 from ..candles import CANDLE_CONTEXT_BARS, detect_candle_context, directional_candle_signal
@@ -1743,74 +1743,6 @@ class BaseStrategy:
             f"{prefix}_reason": str(getattr(ctx, "reason", "unknown") or "unknown"),
         }
         return out
-
-    @staticmethod
-    def _position_r_multiple(position: Position, close: float) -> float | None:
-        """Open profit at ``close`` in initial-risk (R) units.
-
-        Anchors to ``metadata['initial_stop_price']`` — stamped once at entry
-        by the gatekeeper — rather than ``position.stop_price``, which moves
-        with breakeven/trailing management and would make R drift over the
-        life of the trade. Returns None when the initial risk is unknown or
-        degenerate, which callers treat as "no opinion".
-
-        An option position's entry and stop are PREMIUM while ``close`` is the
-        underlying's, so its R is measured on the option's own mark (stamped
-        each cycle by the position manager) -- dividing an underlying move by
-        a premium risk read a debit position as ~+7R (discretionary exits
-        always armed) and a credit spread as ~-5R (never armed).
-        """
-        meta = position.metadata if isinstance(position.metadata, dict) else {}
-        entry = safe_float(position.entry_price)
-        initial_stop = safe_float(meta.get("initial_stop_price"), safe_float(position.stop_price, finite=True), finite=True)
-        if entry is None or initial_stop is None:
-            return None
-        risk = abs(entry - initial_stop)
-        if risk <= 0:
-            return None
-        price: float | None = close
-        if BaseStrategy._is_option_position(position):
-            price = safe_float(meta.get("last_mark_price"))
-            if price is None:
-                return None
-        move = (price - entry) if position.side == Side.LONG else (entry - price)
-        return move / risk
-
-    @staticmethod
-    def _is_option_position(position: Position) -> bool:
-        meta = position.metadata if isinstance(position.metadata, dict) else {}
-        return str(meta.get("asset_type") or "").upper() in OPTION_ASSET_TYPES
-
-    @staticmethod
-    def _underlying_entry_price(position: Position) -> float | None:
-        """Entry in the price space of the frame the exit logic reads.
-
-        An equity's own entry. An option's ``entry_price`` is premium, so its
-        underlying's price at entry (``underlying_entry``, stamped by every
-        option signal builder) -- None when that was never recorded, which
-        callers treat as "no opinion".
-        """
-        if not BaseStrategy._is_option_position(position):
-            return safe_float(position.entry_price)
-        meta = position.metadata if isinstance(position.metadata, dict) else {}
-        return safe_float(meta.get("underlying_entry"))
-
-    @staticmethod
-    def _underlying_extremes(position: Position) -> tuple[float | None, float | None]:
-        """(high, low) since entry in the underlying's price space.
-
-        An option position's ``highest_price`` / ``lowest_price`` track its
-        PREMIUM; the underlying's own range is tracked separately by the
-        position manager. Falls back to the entry when nothing has been seen.
-        """
-        entry = BaseStrategy._underlying_entry_price(position)
-        if not BaseStrategy._is_option_position(position):
-            return (safe_float(position.highest_price, entry), safe_float(position.lowest_price, entry))
-        meta = position.metadata if isinstance(position.metadata, dict) else {}
-        return (
-            safe_float(meta.get("underlying_high_since_entry"), entry),
-            safe_float(meta.get("underlying_low_since_entry"), entry),
-        )
 
     def _structure_event_recent(self, age_bars: int | None, *, htf: bool = False) -> bool:
         """Is a BOS/CHoCH ``age_bars`` old still fresh? ``age_bars`` is in the

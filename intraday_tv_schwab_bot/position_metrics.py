@@ -1,19 +1,37 @@
 # SPDX-License-Identifier: MIT
-"""Pure position-metric helpers extracted from ``IntradayBot``, and the
-capped management-adjustment log a position's metadata carries.
+"""Pure position math, and the capped management-adjustment log a
+position's metadata carries.
 
-These are ``@staticmethod`` helpers with no engine-side dependencies — just
-:class:`~intraday_tv_schwab_bot.models.Position` inputs and scalar math. Moved
-into their own module so future callers (PositionManager, reports, tests)
-can import them without dragging the whole engine surface along.
+Plain functions of a :class:`~intraday_tv_schwab_bot.models.Position` (or a
+side, an entry and a price) with no engine-side dependencies: the paper
+account, the position manager, the risk manager and the exit side read a
+position's move, return, R and underlying price space here. Each caller
+keeps its own answer for degenerate input (a zero entry, no price).
 """
 from __future__ import annotations
 
 from typing import Any
 
-from .models import ExitDecision, Position, Side
+from .models import ExitDecision, Position, Side, is_option_asset
 from .numeric import safe_float
 from .reasons import exit_reason_code
+
+
+def favorable_move(side: Side, entry: float, price: float) -> float:
+    """The per-unit move from ``entry`` to ``price``, positive the trade's
+    way: ``price - entry`` for a LONG, ``entry - price`` for a SHORT."""
+    return (price - entry) if side == Side.LONG else (entry - price)
+
+
+def return_pct(side: Side, entry: float, price: float) -> float:
+    """The % return from ``entry`` to ``price``, on the entry basis for
+    both sides: a SHORT from 100 covered at 90 is +10.0%, not the +11.1% of
+    ``entry / price - 1``. ``entry`` must not be 0; each caller answers for a
+    zero one (the paper account 0.0, ``position_return_pct_at_price`` None)."""
+    ratio = price / entry
+    if side == Side.LONG:
+        return (ratio - 1.0) * 100.0
+    return (1.0 - ratio) * 100.0
 
 
 def position_unrealized_at_price(position: Position, price: float | None) -> float | None:
@@ -21,26 +39,77 @@ def position_unrealized_at_price(position: Position, price: float | None) -> flo
     were marked at ``price``. None if ``price`` is None."""
     if price is None:
         return None
-    entry = float(position.entry_price)
-    qty = int(position.qty)
-    if position.side == Side.LONG:
-        return (float(price) - entry) * qty
-    return (entry - float(price)) * qty
+    return favorable_move(position.side, float(position.entry_price), float(price)) * int(position.qty)
 
 
 def position_return_pct_at_price(position: Position, price: float | None) -> float | None:
-    """Return % P&L relative to entry price.
-
-    SHORT convention: a short from 100 → 90 is +10.0% (measured against
-    entry basis), NOT +11.1% as the naive (entry / current - 1) formula
-    would report. Mirrors paper_account._return_pct."""
+    """``return_pct`` of ``position`` marked at ``price``; None without a
+    price, at a price of 0 or with a zero entry."""
     if price in (None, 0.0) or not float(position.entry_price):
         return None
-    entry = float(position.entry_price)
-    current = float(price)
-    if position.side == Side.LONG:
-        return ((current / entry) - 1.0) * 100.0
-    return (1.0 - (current / entry)) * 100.0
+    return return_pct(position.side, float(position.entry_price), float(price))
+
+
+def position_r_multiple(position: Position, close: float) -> float | None:
+    """Open profit at ``close`` in initial-risk (R) units.
+
+    Anchors to ``metadata['initial_stop_price']`` — stamped once at entry
+    by the gatekeeper — rather than ``position.stop_price``, which moves
+    with breakeven/trailing management and would make R drift over the
+    life of the trade. Returns None when the initial risk is unknown or
+    degenerate, which callers treat as "no opinion".
+
+    An option position's entry and stop are PREMIUM while ``close`` is the
+    underlying's, so its R is measured on the option's own mark (stamped
+    each cycle by the position manager) -- dividing an underlying move by
+    a premium risk read a debit position as ~+7R (discretionary exits
+    always armed) and a credit spread as ~-5R (never armed).
+    """
+    meta = position.metadata if isinstance(position.metadata, dict) else {}
+    entry = safe_float(position.entry_price)
+    initial_stop = safe_float(meta.get("initial_stop_price"), safe_float(position.stop_price, finite=True), finite=True)
+    if entry is None or initial_stop is None:
+        return None
+    risk = abs(entry - initial_stop)
+    if risk <= 0:
+        return None
+    price: float | None = close
+    if is_option_asset(meta):
+        price = safe_float(meta.get("last_mark_price"))
+        if price is None:
+            return None
+    return favorable_move(position.side, entry, price) / risk
+
+
+def underlying_entry_price(position: Position) -> float | None:
+    """Entry in the price space of the frame the exit logic reads.
+
+    An equity's own entry. An option's ``entry_price`` is premium, so its
+    underlying's price at entry (``underlying_entry``, stamped by every
+    option signal builder) -- None when that was never recorded, which
+    callers treat as "no opinion".
+    """
+    meta = position.metadata if isinstance(position.metadata, dict) else {}
+    if not is_option_asset(meta):
+        return safe_float(position.entry_price)
+    return safe_float(meta.get("underlying_entry"))
+
+
+def underlying_extremes(position: Position) -> tuple[float | None, float | None]:
+    """(high, low) since entry in the underlying's price space.
+
+    An option position's ``highest_price`` / ``lowest_price`` track its
+    PREMIUM; the underlying's own range is tracked separately by the
+    position manager. Falls back to the entry when nothing has been seen.
+    """
+    entry = underlying_entry_price(position)
+    meta = position.metadata if isinstance(position.metadata, dict) else {}
+    if not is_option_asset(meta):
+        return (safe_float(position.highest_price, entry), safe_float(position.lowest_price, entry))
+    return (
+        safe_float(meta.get("underlying_high_since_entry"), entry),
+        safe_float(meta.get("underlying_low_since_entry"), entry),
+    )
 
 
 # The adaptive ladder's touch hold (shared_exit.adaptive_ladder_touch_hold):

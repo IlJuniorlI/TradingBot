@@ -10,7 +10,7 @@ from typing import Any
 import pandas as pd
 
 from ...htf_levels import summarize_htf_trend
-from ...models import ASSET_TYPE_OPTION_VERTICAL, Candidate, Position, Side, Signal
+from ...models import ASSET_TYPE_OPTION_VERTICAL, Candidate, Position, Side, Signal, asset_type_of
 from ...options_mode import (
     OptionContract,
     build_position_label,
@@ -1822,8 +1822,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
     def position_mark_price(self, position: Position, data) -> float | None:
         if position.strategy not in {self.strategy_name, 'zero_dte_etf_long_options'}:
             return None
-        asset_type = position.metadata.get("asset_type")
-        if asset_type != ASSET_TYPE_OPTION_VERTICAL:
+        if asset_type_of(position.metadata) != ASSET_TYPE_OPTION_VERTICAL:
             return None
         spread_side = Side(position.metadata.get("spread_side", Side.LONG.value))
         long_symbol = str(position.metadata.get("long_leg_symbol") or "")

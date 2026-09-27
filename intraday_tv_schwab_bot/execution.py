@@ -32,11 +32,12 @@ from .models import (
     ASSET_TYPE_EQUITY,
     ASSET_TYPE_OPTION_SINGLE,
     ASSET_TYPE_OPTION_VERTICAL,
-    OPTION_ASSET_TYPES,
     OrderIntent,
     OrderResult,
     Position,
     Side,
+    asset_type_of,
+    is_option_asset,
 )
 from .numeric import first_float, safe_float, safe_int
 from .options_mode import build_single_option_close_order, build_vertical_close_order, close_limit_price_from_metadata, close_single_option_limit_from_metadata, contract_from_quote, single_option_price_bounds, vertical_price_bounds
@@ -1466,8 +1467,7 @@ class SchwabExecutor:
         return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0)
 
     def can_close_position_now(self, position: Position, ts=None) -> bool:
-        asset_type = str((position.metadata or {}).get("asset_type") or ASSET_TYPE_EQUITY).upper()
-        if asset_type in OPTION_ASSET_TYPES:
+        if is_option_asset(position.metadata):
             return self._is_regular_options_session(ts)
         return self._equity_session(ts) is not None
 
@@ -1480,7 +1480,7 @@ class SchwabExecutor:
         """
         if not 1 <= int(qty) <= int(position.qty):
             raise ValueError(f"close_position qty {qty!r} outside 1..{position.qty} for {position.symbol}")
-        asset_type = position.metadata.get("asset_type")
+        asset_type = asset_type_of(position.metadata)
         if asset_type == ASSET_TYPE_OPTION_VERTICAL:
             first_symbol = str(position.metadata.get("long_leg_symbol") or "")
             second_symbol = str(position.metadata.get("short_leg_symbol") or "")

@@ -43,12 +43,14 @@ from .config import BotConfig
 from .data_feed import MarketDataStore
 from .execution import SchwabExecutor
 from .models import (
+    ASSET_TYPE_EQUITY,
     ASSET_TYPE_OPTION_SINGLE,
     ASSET_TYPE_OPTION_VERTICAL,
-    OPTION_ASSET_TYPES,
     Candidate,
     Position,
     Side,
+    asset_type_of,
+    is_option_asset,
 )
 from .options_mode import realized_max_loss_per_contract
 from .paper_account import PaperAccount
@@ -172,7 +174,7 @@ class EntryGatekeeper:
 
     def _option_position_levels(self, signal, entry_price: float) -> tuple[float, float | None, dict[str, Any]]:
         metadata = dict(signal.metadata or {})
-        asset_type = str(metadata.get("asset_type") or "")
+        asset_type = asset_type_of(metadata)
         entry_value = max(0.01, float(entry_price))
         if asset_type == ASSET_TYPE_OPTION_VERTICAL and signal.side.value == "LONG":
             debit_stop_frac = float(self.config.options.debit_stop_frac)
@@ -406,7 +408,7 @@ class EntryGatekeeper:
         stop = safe_float(signal.stop_price, None)
         qty_i = int(qty) if qty is not None else None
         out: dict[str, Any] = {}
-        if signal.metadata.get('asset_type') in {'OPTION_VERTICAL', 'OPTION_SINGLE'}:
+        if is_option_asset(signal.metadata):
             per_contract = safe_float(signal.metadata.get('max_loss_per_contract'), None)
             out.update({
                 'risk_option_budget': float(self.config.options.max_loss_per_trade),
@@ -559,7 +561,7 @@ class EntryGatekeeper:
             filled = int(state.get("filled_qty") or 0)
             booked = int(record["booked_qty"])
             if filled > booked:
-                scale = 100.0 if record["asset_type"] in OPTION_ASSET_TYPES else 1.0
+                scale = 100.0 if is_option_asset(record) else 1.0
                 average = safe_float(state.get("fill_price"), None)
                 average = average * scale if average is not None else None
                 extra = filled - booked
@@ -620,9 +622,8 @@ class EntryGatekeeper:
         levels, as a normal filled entry would, never an untracked position.
         """
         signal = record["signal"]
-        asset_type = str(record["asset_type"])
         entry_price = float(fill_price) if fill_price is not None and fill_price > 0 else float(record["preview_entry_price"])
-        if asset_type in OPTION_ASSET_TYPES:
+        if is_option_asset(record):
             stop_price, target_price, position_metadata = self._materialize_option_position_levels(signal, entry_price)
             position_metadata["qty"] = int(qty)
             position_metadata["entry_price"] = float(entry_price)
@@ -943,8 +944,7 @@ class EntryGatekeeper:
                 LOG.log(TRADEFLOW_LEVEL, "Skipping %s %s: %s", signal.symbol, signal.reason, reason)
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, reason], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
                 continue
-            asset_type = signal.metadata.get("asset_type")
-            if asset_type in OPTION_ASSET_TYPES and self._is_option_entry_retry_blocked(signal.symbol, signal.metadata):
+            if is_option_asset(signal.metadata) and self._is_option_entry_retry_blocked(signal.symbol, signal.metadata):
                 self._log_entry_decision(
                     signal.strategy,
                     signal.symbol,
@@ -954,7 +954,8 @@ class EntryGatekeeper:
                     market_side=signal_market_side,
                 )
                 continue
-            if asset_type in OPTION_ASSET_TYPES:
+            if is_option_asset(signal.metadata):
+                asset_type = asset_type_of(signal.metadata)
                 preview_entry_price = safe_float(signal.metadata.get("entry_price"), 0.0, finite=True)
                 levels_ok, levels_reason = self._entry_levels_valid(signal.side, preview_entry_price, signal.stop_price, signal.target_price)
                 if not levels_ok:
@@ -989,7 +990,7 @@ class EntryGatekeeper:
                         self._track_unsettled_entry(
                             signal, result,
                             position_key=str(signal.metadata.get("position_key") or signal.symbol),
-                            asset_type=str(asset_type), preview_entry_price=preview_entry_price, booked_qty=0,
+                            asset_type=asset_type, preview_entry_price=preview_entry_price, booked_qty=0,
                         )
                         self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_unsettled:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, preview_entry_price, result.message)}, market_side=signal_market_side)
                         continue
@@ -1069,7 +1070,7 @@ class EntryGatekeeper:
                     # Partial fill whose cancel never confirmed: the rest of
                     # the order may still fill and must grow this position.
                     self._track_unsettled_entry(
-                        signal, result, position_key=position_key, asset_type=str(asset_type),
+                        signal, result, position_key=position_key, asset_type=asset_type,
                         preview_entry_price=preview_entry_price, booked_qty=qty_for_position,
                     )
                 self._save_reconcile_metadata()
@@ -1139,7 +1140,7 @@ class EntryGatekeeper:
             if not result.ok:
                 if result.order_id and (result.may_still_be_working or order_result_needs_broker_recheck(result.message)):
                     self._track_unsettled_entry(
-                        signal, result, position_key=signal.symbol, asset_type="EQUITY",
+                        signal, result, position_key=signal.symbol, asset_type=ASSET_TYPE_EQUITY,
                         preview_entry_price=entry_price, booked_qty=0,
                     )
                     self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_unsettled:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, entry_price, result_message=result.message, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)}, market_side=signal_market_side)
@@ -1252,7 +1253,7 @@ class EntryGatekeeper:
                 # Partial fill whose cancel never confirmed: the rest of the
                 # order may still fill and must grow this position.
                 self._track_unsettled_entry(
-                    signal, result, position_key=signal.symbol, asset_type="EQUITY",
+                    signal, result, position_key=signal.symbol, asset_type=ASSET_TYPE_EQUITY,
                     preview_entry_price=signal_entry_price, booked_qty=qty_for_position,
                 )
             self._save_reconcile_metadata()

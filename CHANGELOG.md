@@ -310,6 +310,36 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **One asset-type read, and position math in `position_metrics` (refactor
+  cut C36).** *2026-09-27* — `models.asset_type_of(metadata)` (upper-cased,
+  `EQUITY` when none is named) and `models.is_option_asset(metadata)`
+  replace about twenty hand-rolled reads across the entry gatekeeper,
+  execution, the paper account, the position and risk managers, the
+  startup reconciler, the dashboard and both 0DTE strategies, the
+  gatekeeper's literal `{'OPTION_VERTICAL', 'OPTION_SINGLE'}`, the
+  dashboard's `startswith("OPTION")` and `BaseStrategy._is_option_position`.
+  The risk manager's stock-notional total and the position manager's exit
+  registration read the position's own asset type instead of asking the
+  plugin catalogue by strategy name. The three log passthroughs (the
+  ENTRY_CONTEXT signal snapshot, TRADE_SUMMARY and EXIT_CONTEXT) keep the
+  stored value, null for an equity. `BaseStrategy._position_r_multiple`,
+  `_underlying_entry_price` and `_underlying_extremes` are now
+  `position_metrics.position_r_multiple`, `underlying_entry_price` and
+  `underlying_extremes` (the exit policy and microcap_pm_breakout call
+  them). `position_metrics.favorable_move` and `return_pct` are the one
+  per-unit move and return-% formula, used by the paper account
+  (`PaperAccount._position_unrealized` is gone), the position manager's
+  excursion tracking and exit context, and the risk manager's R math; each
+  caller keeps its own answer for a zero entry (the paper account 0.0,
+  `position_return_pct_at_price` None). There is no alias. No behaviour
+  changes: the numbers are bit for bit the same, and every builder stamps
+  one of the upper-case option types. On inputs nothing produces, an
+  asset type now reads the same in lower case, and the dashboard no longer
+  draws a bare `OPTION` or an unknown `OPTION_*` type as an option. Tests:
+  `tests/test_asset_type.py` (new), `tests/test_properties.py` (a5, a6),
+  `tests/test_dashboard_cache.py` (`TestPositionMarkers`),
+  `tests/test_execution_invariants.py` (`TestTheCloseSessionGate`).
+
 - **One default-level rule and one trail rule, with the trail pct on
   `RiskManager` (refactor cut C35).** *2026-09-27* —
   `risk.default_levels(side, entry_price, risk_cfg)` replaces

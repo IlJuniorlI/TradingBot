@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, time
 from enum import Enum
@@ -29,6 +30,19 @@ ASSET_TYPE_EQUITY = "EQUITY"
 ASSET_TYPE_OPTION_VERTICAL = "OPTION_VERTICAL"
 ASSET_TYPE_OPTION_SINGLE = "OPTION_SINGLE"
 OPTION_ASSET_TYPES: frozenset[str] = frozenset({ASSET_TYPE_OPTION_VERTICAL, ASSET_TYPE_OPTION_SINGLE})
+
+
+def asset_type_of(metadata: Mapping[str, Any] | None) -> str:
+    """The ``asset_type`` a signal's or a position's metadata names,
+    upper-cased; ``EQUITY`` when it names none. Every option signal builder
+    stamps one, and the position carries it on."""
+    return str((metadata or {}).get("asset_type") or ASSET_TYPE_EQUITY).upper()
+
+
+def is_option_asset(metadata: Mapping[str, Any] | None) -> bool:
+    """Whether a signal or a position is an option: ``asset_type_of`` its
+    metadata is one of ``OPTION_ASSET_TYPES``."""
+    return asset_type_of(metadata) in OPTION_ASSET_TYPES
 
 
 class OrderIntent(str, Enum):

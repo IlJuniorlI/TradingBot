@@ -38,6 +38,7 @@ from ..bars import CANDLE_PATTERN_WINDOW_BARS, bar_closed_after, bars_have_range
 from ..indicators import get_runtime_indicator_mode, last_bar_atr
 from .. import sessions
 from ..numeric import safe_float
+from ..position_metrics import position_r_multiple, underlying_entry_price, underlying_extremes
 
 if TYPE_CHECKING:
     from ..config import BotConfig
@@ -390,7 +391,7 @@ class SharedExitPolicy:
         min_r = self._number("discretionary_exit_min_r")
         if min_r is None or min_r <= 0:
             return True
-        current_r = self.strategy._position_r_multiple(position, close)
+        current_r = position_r_multiple(position, close)
         return current_r is None or current_r >= min_r
 
     def _gates_open(self, family: str, position: Position, tape: ExitTape, ms_ctx: Any = None,
@@ -445,7 +446,7 @@ class SharedExitPolicy:
         held_minutes = self._hold_minutes(position)
         if held_minutes < time_stop_minutes:
             return None
-        entry = self.strategy._underlying_entry_price(position) or 0.0
+        entry = underlying_entry_price(position) or 0.0
         if entry <= 0 or frame is None or frame.empty or "close" not in frame.columns:
             return None
         last_close = safe_float(frame["close"].iloc[-1])
@@ -583,7 +584,7 @@ class SharedExitPolicy:
                 # floor + buffer since entry: a LONG filled below the floor
                 # otherwise "lost" it on the next tick (AMZN 2026-04-24 10:59,
                 # out in 13 s for -$3.99).
-                highest_price, _lowest = self.strategy._underlying_extremes(position)
+                highest_price, _lowest = underlying_extremes(position)
                 avwap_armed = avwap_floor > 0 and highest_price is not None and highest_price >= avwap_floor + buffer
                 prior_confirms = not two_bar or prior_close is None or prior_close < avwap_floor - buffer
                 if avwap_armed and close < avwap_floor - buffer and weak_tape and prior_confirms:
@@ -604,7 +605,7 @@ class SharedExitPolicy:
             avwap_ceiling = min(ceilings) if ceilings else 0.0
             # Mirror of the LONG armed guard: META 2026-04-24 09:35 SHORT was
             # filled under the ceiling and out in 55 s for -$68.86.
-            _highest, lowest_price = self.strategy._underlying_extremes(position)
+            _highest, lowest_price = underlying_extremes(position)
             avwap_armed = avwap_ceiling > 0 and lowest_price is not None and lowest_price <= avwap_ceiling - buffer
             prior_confirms = not two_bar or prior_close is None or prior_close > avwap_ceiling + buffer
             if avwap_armed and close > avwap_ceiling + buffer and weak_tape and prior_confirms:
@@ -627,7 +628,7 @@ class SharedExitPolicy:
             return None
         if not self._gates_open("sr_loss", position, tape):
             return None
-        entry_price = self.strategy._underlying_entry_price(position)
+        entry_price = underlying_entry_price(position)
         if entry_price is None:
             return None
         sr_ctx = self.strategy._sr_context(symbol, frame, data)
@@ -680,7 +681,7 @@ class SharedExitPolicy:
         if fraction is None or fraction <= 0:
             return None
         if self._on("divergence_exit_require_in_profit"):
-            current_r = self.strategy._position_r_multiple(position, tape.close)
+            current_r = position_r_multiple(position, tape.close)
             if current_r is None or current_r <= 0:
                 return None
         min_age = int(self._number("divergence_exit_min_age_bars") or 0)

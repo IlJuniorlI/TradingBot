@@ -48,13 +48,13 @@ from .dashboard_cache import DashboardCache
 from .data_feed import EXECUTION_LAST_KEYS, MANAGEMENT_PRICE_KEYS, MarketDataStore
 from .execution import BracketCancel, SchwabExecutor
 from .models import (
-    ASSET_TYPE_EQUITY,
     ASSET_TYPE_OPTION_SINGLE,
     ASSET_TYPE_OPTION_VERTICAL,
-    OPTION_ASSET_TYPES,
     ExitDecision,
     Position,
     Side,
+    asset_type_of,
+    is_option_asset,
 )
 from .numeric import first_float, safe_float
 from .paper_account import PaperAccount
@@ -67,12 +67,12 @@ from .position_metrics import (
     TARGET_WEAK_CLOSE,
     append_management_adjustment,
     exit_reason_details,
+    favorable_move,
     position_return_pct_at_price,
     position_unrealized_at_price,
 )
 from .risk import RiskManager
 from .levels_shared import effective_side_tolerance, select_next_distinct_level
-from ._strategies.catalogue import is_option_strategy
 from .broker_payloads import (
     active_broker_bracket,
     bracket_order_ids,
@@ -334,8 +334,7 @@ class PositionManager:
         if mark is not None:
             price = float(mark)
             return price, None
-        asset_type = str(position.metadata.get("asset_type") or ASSET_TYPE_EQUITY)
-        if asset_type in OPTION_ASSET_TYPES:
+        if is_option_asset(position.metadata):
             return self._option_position_management_snapshot(position)
         if self.data is not None:
             max_age = max(1.0, float(self.config.runtime.quote_cache_seconds))
@@ -385,7 +384,7 @@ class PositionManager:
         if self.data is None:
             return None, None
         meta = position.metadata if isinstance(position.metadata, dict) else {}
-        asset_type = str(meta.get("asset_type") or "")
+        asset_type = asset_type_of(meta)
         max_age = float(self.config.options.max_quote_age_seconds)
         if asset_type == ASSET_TYPE_OPTION_VERTICAL:
             long_symbol = str(meta.get("long_leg_symbol") or "")
@@ -482,10 +481,7 @@ class PositionManager:
         risk times the lifecycle's full quantity.
         """
         meta = position.metadata if isinstance(position.metadata, dict) else {}
-        if position.side.value == 'LONG':
-            unrealized = float(mark_price) - float(position.entry_price)
-        else:
-            unrealized = float(position.entry_price) - float(mark_price)
+        unrealized = favorable_move(position.side, float(position.entry_price), float(mark_price))
         initial_qty = max(int(meta.get('initial_qty') or 0), int(position.qty))
         meta['initial_qty'] = initial_qty
         best = float(meta.get('diag_best_unrealized_pnl_per_unit', 0.0))
@@ -637,12 +633,11 @@ class PositionManager:
         # how far the trade had run.
         stop_r = peak_r = None
         if entry_price is not None and initial_risk_per_unit is not None and initial_risk_per_unit > 0:
-            direction = 1.0 if position.side == Side.LONG else -1.0
             peak_price = safe_float(position.highest_price if position.side == Side.LONG else position.lowest_price, None)
             if stop_price is not None:
-                stop_r = direction * (stop_price - entry_price) / initial_risk_per_unit
+                stop_r = favorable_move(position.side, entry_price, stop_price) / initial_risk_per_unit
             if peak_price is not None:
-                peak_r = direction * (peak_price - entry_price) / initial_risk_per_unit
+                peak_r = favorable_move(position.side, entry_price, peak_price) / initial_risk_per_unit
         management_symbol = str(meta.get('underlying') or position.symbol)
         management_frame = bars.get(management_symbol) if bars else None
         sr_row = None
@@ -753,8 +748,7 @@ class PositionManager:
         cfg = getattr(self.config, "support_resistance", None)
         if cfg is None or not bool(cfg.enabled):
             return
-        asset_type = str(position.metadata.get("asset_type") or ASSET_TYPE_EQUITY)
-        if asset_type in OPTION_ASSET_TYPES:
+        if is_option_asset(position.metadata):
             return
         if frame is None or frame.empty or last_price <= 0:
             return
@@ -912,7 +906,7 @@ class PositionManager:
         meta = position.metadata if isinstance(position.metadata, dict) else None
         if meta is None or not bool(meta.get("ladder_management_enabled")):
             return None
-        if str(meta.get("asset_type") or ASSET_TYPE_EQUITY) in OPTION_ASSET_TYPES:
+        if is_option_asset(meta):
             return None
         timeout = self.strategy.exit_policy.ladder_touch_hold_timeout_seconds()
         if timeout is None:
@@ -1123,7 +1117,7 @@ class PositionManager:
             else None
         )
         level_exit = (
-            self.underlying_price_for_position(position, bars) if is_option_strategy(position.strategy)
+            self.underlying_price_for_position(position, bars) if is_option_asset(position.metadata)
             else float(exit_price)
         )
         self.risk.register_exit(
@@ -1606,9 +1600,8 @@ class PositionManager:
         booked = int(record.get("booked_qty") or 0)
         if filled > booked:
             slice_qty = max(1, min(int(position.qty), filled - booked))
-            asset_type = str(position.metadata.get("asset_type") or ASSET_TYPE_EQUITY)
             broker_price = safe_float(state.get("fill_price"), None)
-            if broker_price is not None and asset_type in OPTION_ASSET_TYPES:
+            if broker_price is not None and is_option_asset(position.metadata):
                 broker_price *= 100.0
             exit_price = broker_price if broker_price is not None else safe_float(last_price, None)
             if exit_price is None:
@@ -1802,10 +1795,9 @@ class PositionManager:
         last_price, market_snapshot = self._position_management_snapshot(position, bars)
         if self._exit_order_in_flight(key, position, last_price, bars, order_states):
             return
-        asset_type = str(position.metadata.get("asset_type") or ASSET_TYPE_EQUITY)
         management_symbol = str(position.metadata.get("underlying") or position.symbol)
         management_frame = bars.get(management_symbol)
-        if asset_type not in OPTION_ASSET_TYPES:
+        if not is_option_asset(position.metadata):
             underlying_price = last_price
         else:
             underlying_price = self.underlying_price_for_position(position, bars, None)
@@ -1857,7 +1849,7 @@ class PositionManager:
                     self.audit.log_structured("POSITION_ADJUSTMENT", {
                         "symbol": key,
                         "underlying": str(position.metadata.get("underlying") or position.symbol),
-                        "asset_type": str(position.metadata.get("asset_type") or ASSET_TYPE_EQUITY),
+                        "asset_type": asset_type_of(position.metadata),
                         "manager": str(adj.get("manager") or "unknown"),
                         "kind": str(adj.get("kind") or "unknown"),
                         "reason": str(adj.get("reason") or "unknown"),

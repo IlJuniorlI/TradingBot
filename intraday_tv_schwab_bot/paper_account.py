@@ -10,8 +10,16 @@ from datetime import datetime
 from threading import RLock
 from typing import Any, Iterable
 
-from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side
+from .models import (
+    ASSET_TYPE_EQUITY,
+    ASSET_TYPE_OPTION_SINGLE,
+    ASSET_TYPE_OPTION_VERTICAL,
+    Position,
+    Side,
+    asset_type_of,
+)
 from .numeric import first_float, safe_float
+from .position_metrics import favorable_move, return_pct
 from .log_setup import TRADEFLOW_LEVEL
 from . import sessions
 
@@ -19,14 +27,11 @@ LOG = logging.getLogger(__name__)
 
 
 def _return_pct(side: Side, entry_price: float, last_or_exit_price: float) -> float:
+    """``position_metrics.return_pct``, 0.0 for a zero entry: the paper
+    account's rows and trades always carry a number."""
     if not entry_price:
         return 0.0
-    if side == Side.LONG:
-        return ((last_or_exit_price / entry_price) - 1.0) * 100.0
-    # Short: profit % is measured relative to the entry (= margin committed),
-    # not the exit. A short from 100 → cover at 90 is a 10% gain on entry,
-    # NOT 11.1% (which is what (entry/exit - 1) reports).
-    return (1.0 - (last_or_exit_price / entry_price)) * 100.0
+    return return_pct(side, entry_price, last_or_exit_price)
 
 
 @dataclass(slots=True)
@@ -216,10 +221,9 @@ class PaperAccount:
         with self._lock:
             if position.side == Side.LONG:
                 self.cash += position.qty * fill_price
-                realized = (fill_price - position.entry_price) * position.qty
             else:
                 self.cash -= position.qty * fill_price
-                realized = (position.entry_price - fill_price) * position.qty
+            realized = favorable_move(position.side, position.entry_price, fill_price) * position.qty
             self.realized_pnl += realized
             self.realized_pnl_by_symbol[position.symbol] = self.realized_pnl_by_symbol.get(position.symbol, 0.0) + realized
             self.last_prices[position.symbol] = fill_price
@@ -249,7 +253,7 @@ class PaperAccount:
                 return_pct=_return_pct(position.side, float(position.entry_price), fill_price),
                 hold_minutes=hold_minutes,
                 reason=reason,
-                asset_type=str(metadata.get("asset_type") or ASSET_TYPE_EQUITY),
+                asset_type=asset_type_of(metadata),
                 underlying=str(metadata.get("underlying") or "").upper().strip() or None,
                 exchange=str(metadata.get("exchange") or "").upper().strip() or None,
                 option_type=(str(metadata.get("option_type") or "").upper().strip() or None),
@@ -293,18 +297,12 @@ class PaperAccount:
             return position.qty * last_price
         return -position.qty * last_price
 
-    @staticmethod
-    def _position_unrealized(position: Position, last_price: float) -> float:
-        if position.side == Side.LONG:
-            return (last_price - position.entry_price) * position.qty
-        return (position.entry_price - last_price) * position.qty
-
     def _position_summary(self, position: Position) -> dict[str, Any]:
         last_price = float(self.last_prices.get(position.symbol, position.entry_price))
-        unrealized = self._position_unrealized(position, last_price)
+        unrealized = favorable_move(position.side, position.entry_price, last_price) * position.qty
         market_value = self._position_market_value(position, last_price)
         metadata = position.metadata or {}
-        asset_type = str(metadata.get("asset_type") or ASSET_TYPE_EQUITY)
+        asset_type = asset_type_of(metadata)
         breakeven = None
         _max_risk = None
         max_reward = None

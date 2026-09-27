@@ -4,7 +4,7 @@ from typing import Any
 
 import pandas as pd
 
-from ...models import ASSET_TYPE_OPTION_SINGLE, Candidate, Position, Side, Signal
+from ...models import ASSET_TYPE_OPTION_SINGLE, Candidate, Position, Side, Signal, asset_type_of
 from ...options_mode import (
     build_single_option_order,
     build_single_option_position_label,
@@ -361,7 +361,7 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
     def position_mark_price(self, position: Position, data) -> float | None:
         if position.strategy != self.strategy_name:
             return super().position_mark_price(position, data)
-        if position.metadata.get("asset_type") != ASSET_TYPE_OPTION_SINGLE:
+        if asset_type_of(position.metadata) != ASSET_TYPE_OPTION_SINGLE:
             return None
         symbol = str(position.metadata.get("option_symbol") or "")
         q = data.get_quote(symbol) if data and symbol else None

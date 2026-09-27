@@ -42,7 +42,7 @@ from .chart_patterns import analyze_chart_pattern_context
 from .config import BotConfig, DashboardChartConfig
 from .data_feed import DISPLAY_PRICE_KEYS
 from .htf_levels import summarize_htf_trend
-from .models import Side
+from .models import Side, asset_type_of, is_option_asset
 from .numeric import first_float, safe_float
 from .support_resistance import analyze_market_structure, zone_flip_confirmed
 from .symbols import normalize_symbol_list
@@ -1052,11 +1052,10 @@ class DashboardCache:
                     "resistance_respected": bool(getattr(tech_ctx, "resistance_respected", False)),
                 }
 
-        asset_type = str((position_row or {}).get("asset_type") or "").upper().strip()
-        is_option = asset_type.startswith("OPTION")
+        is_option = is_option_asset(position_row)
         allows_underlying_markers = bool(position_row) and not is_option
         position_markers = {
-            "asset_type": asset_type or None,
+            "asset_type": asset_type_of(position_row) if position_row else None,
             "show_underlying_lines": allows_underlying_markers,
             "side": (position_row or {}).get("side"),
             "entry": safe_float((position_row or {}).get("entry_price")) if allows_underlying_markers else None,
@@ -1068,7 +1067,7 @@ class DashboardCache:
             "breakeven": safe_float((position_row or {}).get("breakeven")),
             "entry_time": (position_row or {}).get("entry_time"),
             # Option-specific: strikes in underlying-price units. Drawn on the
-            # underlying chart when asset_type starts with OPTION_ because the
+            # underlying chart for an option position (is_option_asset) because the
             # bot's stop_price/target_price are in OPTION-price units and can't
             # be plotted on the underlying's axis.
             "option_type": (position_row or {}).get("option_type") if is_option else None,

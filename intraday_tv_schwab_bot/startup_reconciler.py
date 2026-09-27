@@ -65,7 +65,7 @@ from .broker_payloads import (
 )
 from .config import BotConfig
 from .data_feed import MANAGEMENT_PRICE_KEYS, MarketDataStore
-from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side
+from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side, asset_type_of
 from .paper_account import PaperAccount
 from .numeric import first_float, safe_float
 from .position_store import ReconcileMetadataStore
@@ -372,7 +372,7 @@ class StartupReconciler:
         its vertical legs are out of step. A row whose quantity is not a
         finite number raises ``ValueError`` naming it (``_held_side_qty``)."""
         meta = position.metadata if isinstance(position.metadata, dict) else {}
-        asset_type = str(meta.get("asset_type") or ASSET_TYPE_EQUITY).upper()
+        asset_type = asset_type_of(meta)
         if asset_type == ASSET_TYPE_OPTION_VERTICAL:
             long_side, long_qty = _held_side_qty(held, meta.get("long_leg_symbol"))
             short_side, short_qty = _held_side_qty(held, meta.get("short_leg_symbol"))

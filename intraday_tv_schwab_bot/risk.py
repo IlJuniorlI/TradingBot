@@ -10,10 +10,10 @@ from typing import Any
 
 from .broker_payloads import active_broker_bracket
 from .config import BotConfig, RiskConfig
-from .models import ASSET_TYPE_EQUITY, OPTION_ASSET_TYPES, Position, Side, Signal
+from .models import Position, Side, Signal, is_option_asset
 from .numeric import first_float, safe_float
 from ._strategies.catalogue import is_option_strategy
-from .position_metrics import LADDER_TOUCH_HOLD_KEY, append_management_adjustment
+from .position_metrics import LADDER_TOUCH_HOLD_KEY, append_management_adjustment, favorable_move
 from . import sessions
 
 LOG = logging.getLogger(__name__)
@@ -679,8 +679,7 @@ class RiskManager:
     def current_stock_notional(self, positions: dict[str, Position]) -> float:
         total = 0.0
         for position in positions.values():
-            asset_type = str(position.metadata.get("asset_type") or "")
-            if is_option_strategy(position.strategy) or asset_type.startswith("OPTION"):
+            if is_option_asset(position.metadata):
                 continue
             total += self.position_notional(position)
         return total
@@ -827,14 +826,11 @@ class RiskManager:
         if initial_risk <= 0:
             return 0.0, 0.0
         entry = float(position.entry_price)
-        if position.side == Side.LONG:
-            peak = float(position.highest_price) if position.highest_price is not None else float(last_price)
-            peak_r = (peak - entry) / initial_risk
-            current_r = (float(last_price) - entry) / initial_risk
-        else:
-            trough = float(position.lowest_price) if position.lowest_price is not None else float(last_price)
-            peak_r = (entry - trough) / initial_risk  # favorable for SHORT
-            current_r = (entry - float(last_price)) / initial_risk
+        # The peak is the highest price for a LONG, the lowest for a SHORT.
+        extreme = position.highest_price if position.side == Side.LONG else position.lowest_price
+        peak = float(extreme) if extreme is not None else float(last_price)
+        peak_r = favorable_move(position.side, entry, peak) / initial_risk
+        current_r = favorable_move(position.side, entry, float(last_price)) / initial_risk
         return round(peak_r, 9), round(current_r, 9)
 
     def _peak_giveback_floor_r(self, peak_r: float) -> float | None:
@@ -943,8 +939,7 @@ class RiskManager:
             initial_stop = float(position.stop_price)
         initial_risk = max(0.0, abs(float(position.entry_price) - initial_stop))
         trail_activation_mult = 0.5
-        asset_type = str(meta.get("asset_type") or ASSET_TYPE_EQUITY).upper()
-        options_position = asset_type in OPTION_ASSET_TYPES
+        options_position = is_option_asset(meta)
 
         # Peak-giveback floor — fires *before* normal stop/target/trail logic
         # so a winner that reaches +NR and retraces past the tiered floor
@@ -1077,9 +1072,10 @@ class RiskManager:
 
         if position.side == Side.LONG:
             if adaptive_enabled:
-                # Round to 9dp to absorb IEEE 754 rounding errors that cause
-                # exact-threshold hits (e.g. 0.9R, 1.15R) to fail >= checks.
-                max_favorable_r = round(((float(position.highest_price) if position.highest_price is not None else float(last_price)) - float(position.entry_price)) / initial_risk, 9)
+                # The peak R, rounded to 9dp (_peak_and_current_r) to absorb
+                # IEEE 754 rounding errors that cause exact-threshold hits
+                # (e.g. 0.9R, 1.15R) to fail >= checks.
+                max_favorable_r = self._peak_and_current_r(position, last_price, initial_risk)[0]
                 # Partial-breakeven tier (fires first, at lowest RR). 2026-04-23
                 # trades that peaked 0.5–0.8R (AVGO, RBLX 10:00, COST 09:51) had
                 # nothing between the trail and the 1.0R breakeven — COST 09:51
@@ -1160,7 +1156,7 @@ class RiskManager:
                 return True, "target"
         else:
             if adaptive_enabled:
-                max_favorable_r = round((float(position.entry_price) - (float(position.lowest_price) if position.lowest_price is not None else float(last_price))) / initial_risk, 9)
+                max_favorable_r = self._peak_and_current_r(position, last_price, initial_risk)[0]
                 # Mirror of the LONG partial_breakeven tier above — see comment
                 # at LONG branch for motivation.
                 partial_breakeven_rr = _meta_float("adaptive_partial_breakeven_rr", None)
