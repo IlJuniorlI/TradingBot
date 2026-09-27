@@ -43,6 +43,19 @@ def position_return_pct_at_price(position: Position, price: float | None) -> flo
     return (1.0 - (current / entry)) * 100.0
 
 
+# The adaptive ladder's touch hold (shared_exit.adaptive_ladder_touch_hold):
+# the position metadata key of a hold in progress, which keeps
+# RiskManager.update_position off the target, and the codes of the exits
+# the hold takes instead (see PositionManager._adaptive_ladder_management).
+LADDER_TOUCH_HOLD_KEY = "ladder_touch_hold"
+TARGET_WEAK_CLOSE = "target_weak_close"
+TARGET_HOLD_GUARD = "target_hold_guard"
+TARGET_HOLD_TIMEOUT = "target_hold_timeout"
+# The exit codes of the "risk" family: the stop and the target, and the touch
+# hold's three exits at the target.
+RISK_EXIT_CODES = frozenset({"stop", "target", TARGET_WEAK_CLOSE, TARGET_HOLD_GUARD, TARGET_HOLD_TIMEOUT})
+
+
 def exit_reason_details(reason: str) -> dict[str, Any]:
     """Classify an exit reason string into family + code + optional trigger
     level. Used for structured event logging at exit time.
@@ -55,7 +68,7 @@ def exit_reason_details(reason: str) -> dict[str, Any]:
     code = exit_reason_code(raw)
     level_text = raw.partition(":")[2]
     family = "strategy"
-    if code in {"stop", "target"}:
+    if code in RISK_EXIT_CODES:
         family = "risk"
     elif code in {"time_exit", "force_flatten", "session_exit"}:
         family = "schedule"
@@ -74,12 +87,24 @@ def exit_reason_details(reason: str) -> dict[str, Any]:
 _MAX_MANAGEMENT_ADJUSTMENTS = 200
 
 
+# The position metadata key naming the management step that last moved the
+# stop, ``<manager>:<reason>`` (``adaptive:profit_lock``, ``adaptive:trail``,
+# ``adaptive_ladder:touch_promoted``, ...), set by every stop move through
+# append_management_adjustment. Absent while the stop is the one the position
+# opened (or was restored) with; EXIT_CONTEXT reads that as ``initial``, so a
+# stop exit says which ratchet's level it hit.
+STOP_SOURCE_KEY = "stop_source"
+
+
 def append_management_adjustment(meta: dict, entry: dict) -> None:
-    """Append a management adjustment to position metadata with a size cap.
+    """Append a management adjustment to position metadata with a size cap,
+    and record a stop move's manager and reason under ``STOP_SOURCE_KEY``.
 
     Keeps the most recent ``_MAX_MANAGEMENT_ADJUSTMENTS`` entries so the list
     doesn't grow without bound on very active trades.
     """
+    if entry.get("kind") == "stop":
+        meta[STOP_SOURCE_KEY] = f"{entry.get('manager')}:{entry.get('reason')}"
     adjustments = meta.setdefault("management_adjustments", [])
     adjustments.append(entry)
     if len(adjustments) > _MAX_MANAGEMENT_ADJUSTMENTS:

@@ -382,16 +382,20 @@ class RiskConfig:
     time_stop_min_return_pct: float = 0.003
     # Peak-giveback floor: once the trade's max_favorable_r (peak R since
     # entry) crosses peak_giveback_min_r, force an exit when current_r
-    # retraces past a tiered fraction of the peak. The fraction widens as
-    # the peak grows so larger runs get more room: at 1R peak, retrace
-    # below 50% of peak fires; at 2R peak, below 60%; at 3R+ peak, below 70%.
-    # Complements Fix 4 (protective BE at +0.5R): BE catches 0.5-1R winners,
-    # this catches 1R+ runners that give back too much. 2026-04-17 this
-    # would have locked INTC +$95 → +$47 instead of -$3, AMZN +$62 → +$31
-    # instead of -$13, AMD +$31 → +$15 instead of -$30. Net modeled
-    # improvement ~+$135 on the session (alongside BE fix). Set
-    # peak_giveback_enabled=False to disable entirely; peak_giveback_min_r
-    # must be above 0 (a 0 read as 1.0 until 2026-09-26).
+    # retraces to the floor, a tiered fraction of the peak it keeps: the
+    # peak_giveback_retain_* fractions below (0.65 of a 1R-2R peak, 0.72 of
+    # 2R-3R, 0.78 of 3R+ by default; 0.50 / 0.60 / 0.70 until 2026-05-27).
+    # The tiers start at a 1R peak whatever min_r is: below 1R only the low
+    # tier (below) has a floor. A position whose entry stamped
+    # peak_giveback_min_r_override (the high-conviction day override) arms
+    # at that override instead, with no low tier. Complements Fix 4
+    # (protective BE at +0.5R): BE catches 0.5-1R winners, this catches 1R+
+    # runners that give back too much. 2026-04-17 this would have locked
+    # INTC +$95 → +$47 instead of -$3, AMZN +$62 → +$31 instead of -$13, AMD
+    # +$31 → +$15 instead of -$30. Net modeled improvement ~+$135 on the
+    # session (alongside BE fix). peak_giveback_enabled: false turns the
+    # giveback off (the low tier with it); peak_giveback_min_r must be above
+    # 0 (a 0 read as 1.0 until 2026-09-26, and is refused at load now).
     peak_giveback_enabled: bool = True
     peak_giveback_min_r: float = 1.0
     # Low-tier peak-giveback (2026-05-26). The main peak-giveback gate only
@@ -635,11 +639,13 @@ class EquityExecutionConfig:
     bracket_sync_mode: str = "static"
     # stop_and_target = both OCO children rest at the broker.
     # stop_only       = only the protective stop rests; the target stays
-    #   engine-side. REQUIRED for `trade_management_mode: adaptive_ladder`:
-    #   the ladder deliberately declines a target-tag exit
-    #   (`adaptive_ladder_suppress_target_exit`) so it can roll to the next
-    #   rung, and it clears target_price entirely on the final rung to run a
-    #   runner. A resting target limit fills through both behaviours.
+    #   engine-side. REQUIRED for `trade_management_mode: adaptive_ladder`
+    #   with `shared_exit.adaptive_ladder_touch_hold` on: the hold declines
+    #   the target exit at a touched rung until that bar's close decides it,
+    #   then moves the target to the next rung or clears it past the last
+    #   one (a runner). A resting target limit fills through all of that.
+    #   With the hold off the ladder's first rung is a plain take-profit,
+    #   which a resting target serves as well.
     bracket_legs: str = "stop_and_target"
     # STOP fills wherever a flush ends — punishing on thin small caps.
     # STOP_LIMIT bounds the slippage at the cost of a no-fill tail risk.
@@ -1174,6 +1180,33 @@ class SharedExitLogicConfig:
     # shared_exit.EXIT_FAMILY_GATES). Set to 0 to restore the un-gated
     # behaviour.
     discretionary_exit_min_r: float = 0.5
+    # The adaptive ladder's touch hold (risk.trade_management_mode:
+    # adaptive_ladder, 2026-09-27). OFF in every preset and as the code
+    # default: the ladder's first rung is then a plain take-profit, taken on
+    # the first quote at it. (It replaces a target-exit suppression and a
+    # zone-flip rung promotion, removed: after 2026-05-14 the suppression
+    # acted only when the quote sampling missed a strong 1m close through
+    # the target - in the replays only with a quote once a minute, in three
+    # trades, two better and one worse for this default - and such a touch
+    # now takes the target.)
+    # On: the first quote at the target holds the position -- no target exit
+    # -- until the 1m bar the quote was fetched in is delivered, then judges
+    # that bar once. A close at or through the target at least 55% of the
+    # way up its range (down, for a SHORT) promotes the rung: the stop to the
+    # rung less the ladder's stop buffer (the S/R level buffer, a quarter of
+    # the rung's zone width or 0.05% of the price, whichever is widest), the
+    # target to the next rung that close has not passed, or none past the
+    # last rung (a runner). Any other close exits at market
+    # (target_weak_close). While it holds, a quote the stop buffer back
+    # through the rung exits at once (target_hold_guard), and a touch bar
+    # still undelivered this many seconds after it closed exits at market
+    # (target_hold_timeout). There is no index veto. Each touch and verdict
+    # is logged on one INFO line (LADDER_TOUCH / LADDER_VERDICT) for a
+    # dry-run A/B. Needs execution.bracket_legs: stop_only with brackets.
+    # Both are checked at load (_NUMBER_CHECKS["shared_exit"], the switch
+    # check).
+    adaptive_ladder_touch_hold: bool = False
+    adaptive_ladder_touch_hold_timeout_seconds: float = 45.0
     # Divergence exit (counter-direction REGULAR divergence forms while
     # holding). LONG + new bearish RSI/OBV div -> consider partial close.
     # SHORT + new bullish div -> mirror. Hidden divergence is continuation
@@ -1722,6 +1755,15 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         "same_side_min_gap_atr_mult": _ABOVE_ZERO,
         "same_side_min_gap_pct": _ABOVE_ZERO,
     },
+    # The position manager's adaptive ladder touch hold (2026-09-27): a 0
+    # would time every hold out on its first cycle, before any bar could be
+    # delivered. The section's switches are checked with it; its other
+    # numbers are the exit policy's to read, and are not checked here.
+    "shared_exit": {
+        # An hour is far past any bar delivery; a timeout past pandas'
+        # Timedelta range (~9.2e9 s) raised in the ladder pass mid-session.
+        "adaptive_ladder_touch_hold_timeout_seconds": _Number(low=0, low_open=True, high=3600),
+    },
     "execution": {
         "entry_limit_min_buffer": _AT_LEAST_ZERO,
         "entry_limit_max_buffer": _AT_LEAST_ZERO,
@@ -1898,9 +1940,9 @@ def _validate_support_resistance_config(sr: SupportResistanceConfig, config_path
     for one frame (that frame's gate is off, see ``SupportResistanceConfig.flip_confirmation_bars``);
     a negative count has no meaning and would read as "never confirms" deep
     inside confirm_by_bars. With both off the readers disagreed: the S/R
-    builders fell back to the last HTF bar, while the adaptive ladder's rung
-    check has no fallback bar and could never confirm, so its stop was never
-    promoted.
+    builders fell back to the last HTF bar, while the key-levels ladder
+    defence (``_ladder_exit_signal``) has no fallback bar and could never
+    confirm, so it never fired.
 
     The four level-spacing tolerances (``_NUMBER_CHECKS``) must be finite
     YAML numbers above 0, even with ``enabled: false``. The S/R and HTF
@@ -1920,24 +1962,29 @@ def _validate_support_resistance_config(sr: SupportResistanceConfig, config_path
         raise ValueError(f"{config_path}: invalid support_resistance configuration:\n  " + "\n  ".join(errors))
 
 
-def _validate_execution_config(execution: EquityExecutionConfig, risk: RiskConfig, config_path: Path) -> None:
+def _validate_execution_config(execution: EquityExecutionConfig, risk: RiskConfig,
+                               shared_exit: SharedExitLogicConfig, config_path: Path) -> None:
     """Plausibility checks for the equity execution / bracket-order block:
     the numbers, the bracket modes and the switches (``_NUMBER_CHECKS`` /
     ``_CHOICES["execution"]``), and the bracket combinations the risk
-    management mode rules out."""
+    management mode and the adaptive ladder's touch hold rule out
+    (``shared_exit`` is checked before this)."""
     errors = _section_errors("execution", execution)
     if execution.bracket_orders_enabled is True:  # anything but a bool is refused above
-        # A resting target limit defeats the ladder's two defining behaviours:
-        # suppress-target-exit (roll to the next rung) and final-rung runner
-        # (target_price cleared to None). Refuse the combination outright
-        # rather than let it silently degrade every ladder trade to a rung-1
-        # scalp.
-        if risk.trade_management_mode == "adaptive_ladder" and execution.bracket_legs == "stop_and_target":
+        # A resting target limit fills at the touched rung, through the
+        # adaptive ladder's touch hold, so the hold could never promote a
+        # rung or run past the last one. Without the hold the ladder's first
+        # rung is a plain take-profit, which a resting target serves as well
+        # (until 2026-09-27 this refused every adaptive_ladder bracket, for
+        # the target-exit suppression and the final-rung runner, removed).
+        if (risk.trade_management_mode == "adaptive_ladder" and shared_exit.adaptive_ladder_touch_hold is True
+                and execution.bracket_legs == "stop_and_target"):
             errors.append(
                 "execution.bracket_legs must be 'stop_only' when "
-                "risk.trade_management_mode is 'adaptive_ladder': a resting "
-                "target limit fills through adaptive_ladder_suppress_target_exit "
-                "and through the final-rung runner, so the ladder can never extend"
+                "shared_exit.adaptive_ladder_touch_hold is on with "
+                "risk.trade_management_mode 'adaptive_ladder': a resting target "
+                "limit fills at the touched rung through the hold, so the ladder "
+                "could never promote a rung or run past the last one"
             )
         # static sync + an engine that ratchets stops = the broker holds a
         # stale protective level for the life of the trade. Every breakeven /
@@ -1951,6 +1998,21 @@ def _validate_execution_config(execution: EquityExecutionConfig, risk: RiskConfi
                 "bracket_sync_mode: replace, or a non-adaptive management mode"
             )
     _raise_section_errors("execution", errors, config_path)
+
+
+def _validate_shared_exit_config(shared_exit: SharedExitLogicConfig, risk: RiskConfig, config_path: Path) -> None:
+    """The shared exit switches, and the adaptive ladder touch hold's
+    timeout (``_NUMBER_CHECKS["shared_exit"]``). ``SharedExitPolicy`` reads
+    a switch with ``bool()``, so a quoted ``"false"`` turned an exit family
+    (or the touch hold) on and a blank one off. The touch hold acts only on
+    a laddered position, so it is refused unless
+    ``risk.trade_management_mode`` is ``adaptive_ladder``: on under another
+    mode it would do nothing without a word."""
+    errors = _section_errors("shared_exit", shared_exit)
+    if shared_exit.adaptive_ladder_touch_hold is True and risk.trade_management_mode != "adaptive_ladder":
+        errors.append("shared_exit.adaptive_ladder_touch_hold acts only on laddered positions: it needs "
+                      f"risk.trade_management_mode adaptive_ladder, got {risk.trade_management_mode!r}")
+    _raise_section_errors("shared_exit", errors, config_path)
 
 
 def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path) -> None:
@@ -2322,8 +2384,11 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     risk_cfg = RiskConfig(**risk_raw)
     _validate_risk_config(risk_cfg, config_path)
 
+    shared_exit_cfg = SharedExitLogicConfig(**shared_exit_raw)
+    _validate_shared_exit_config(shared_exit_cfg, risk_cfg, config_path)
+
     execution_cfg = EquityExecutionConfig(**execution_raw)
-    _validate_execution_config(execution_cfg, risk_cfg, config_path)
+    _validate_execution_config(execution_cfg, risk_cfg, shared_exit_cfg, config_path)
 
     options_cfg = ZeroDteOptionsConfig(**options_raw)
     _validate_options_config(options_cfg, config_path)
@@ -2365,7 +2430,7 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
         technical_levels=TechnicalLevelsConfig(**technical_levels_raw),
         events=events_cfg,
         shared_entry=SharedEntryLogicConfig(**shared_entry_raw),
-        shared_exit=SharedExitLogicConfig(**shared_exit_raw),
+        shared_exit=shared_exit_cfg,
         options=options_cfg,
         strategies=strategies,
         pairs=pairs,

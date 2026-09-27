@@ -9,6 +9,97 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`shared_exit.adaptive_ladder_touch_hold` (off in every preset and by
+  default) and `adaptive_ladder_touch_hold_timeout_seconds` (45).**
+  *2026-09-27* — the adaptive ladder's option to ride past a rung
+  (`risk.trade_management_mode: adaptive_ladder`, an equity position with
+  ladder rungs). Off, the first rung is a plain take-profit. On:
+  - The first price at or through the target holds the position:
+    `RiskManager` leaves the target while the hold lasts. The touch belongs
+    to the 1m bar the price was observed in, the quote's `fetched_at` (up to
+    `runtime.quote_cache_seconds` before the cycle's clock) or the bar whose
+    close it is; the management snapshot now names that time (`price_at`).
+  - When that bar is delivered it is judged once. A close at or through the
+    target at least 55% of the way up its range (down, for a SHORT)
+    promotes the rung: the stop moves to the rung less the stop buffer
+    (never loosened), the target to the first later rung more than 0.05%
+    past that close, or none past the last rung (a runner). The stop buffer
+    is the widest of the S/R level buffer (a finite number above 0), a
+    quarter of the rung's zone width and 0.05% of the touch price. A price
+    already at the new target starts that rung's hold in the same pass. Any
+    other close, a bar with no range or an unreadable price included, exits
+    at market: `target_weak_close:<rung>`.
+  - While it holds, a price the stop buffer back through the rung exits at
+    once (`target_hold_guard:<guard>`), and a touch bar still undelivered
+    the timeout after it closed exits at market
+    (`target_hold_timeout:<rung>`). A bar delivered late is still judged.
+  - The three are `risk` exits (EXIT_CONTEXT `exit_family` and
+    `exit_reason_family`), each its own `per_exit_reason` bucket; a stop or
+    peak-giveback exit on the same cycle wins. A decided exit stays on the
+    hold, so an order that fails or is deferred is sent again with the same
+    reason, whatever the price does next, and the target is never taken
+    instead.
+  - Ladder metadata read back from the position store that the hold cannot
+    use (the rungs, the active rung index or rung, the price's time) is
+    reported as a WARNING and the position keeps its target exit. A stored
+    hold is read whole (every field it reads, the times with their zone) or
+    dropped with a WARNING, so a restart can never apply half a promotion.
+    A ladder pass that raises drops the hold, so its target still fires
+    (`manage_positions`); with the knob off, a hold left from a run with it
+    on is dropped and logged.
+  - There is no index veto. Each touch logs `LADDER_TOUCH symbol= side=
+    rung= level= touch= guard= bar= price_at= deadline=` and each verdict
+    `LADDER_VERDICT ... verdict= close_pos= guard_hit= outcome= price= stop=
+    target= held_s=`, at INFO, for a dry-run A/B.
+  - Checked at load: the switch must be `true` or `false` and the timeout a
+    finite number in (0, 3600] (`config._NUMBER_CHECKS["shared_exit"]`: past
+    about 9.2e9 s it raised in the ladder pass); on, it needs
+    `risk.trade_management_mode: adaptive_ladder` (under another mode it
+    could never act) and, with brackets on, `execution.bracket_legs:
+    stop_only`.
+  - `config.example.yaml` and the three `adaptive_ladder` presets declare
+    both; `tests/test_preset_parity.py` pins them off in every preset.
+  - Replay against the default (2026-09-26, reproduced 2026-09-27; 1m bars
+    walked open, low, high, close, fills at the levels, no spread): +1.18R
+    over 105 archived laddered trades (9 touched rung 1; per touched trade
+    -0.42R to +2.14R, median -0.15R; one runner, DXST 2026-06-02, carries
+    it), +0.10R at the 8 recorded target exits, +2.46R on the fixture tapes
+    (one touch). Without the in-bar guard: +1.05R and -0.42R. Nine to
+    twelve touches cannot separate this from noise: turning it on is a
+    dry-run decision.
+  - Tests: `tests/test_ladder_touch_hold.py` (new), `tests/test_properties.py`
+    (G), `tests/test_position_isolation.py`, `tests/test_preset_parity.py`,
+    `tests/test_config_validation.py`, `tests/test_bracket_orders.py`,
+    `tests/test_risk_manager.py`.
+
+- **The exit and entry records name the levels an exit turned on.**
+  *2026-09-27* — logging only; no decision changes. The giveback, profit
+  lock and trail exits could not be told apart in the archive (a profit-lock
+  or trail exit is a `stop`), and the ladder's rungs had to be rebuilt from
+  the S/R lists (the S1 exit and S2 rung studies, 2026-09-26).
+  - EXIT_CONTEXT, every exit: `stop_source`, the management step that last
+    moved the stop, `<manager>:<reason>` (`adaptive:profit_lock`,
+    `adaptive:trail`, `adaptive:breakeven`, `adaptive:partial_breakeven`,
+    `adaptive_ladder:touch_promoted`, `options_ratchet:...`, `sr_flip:...`),
+    or `initial`; `stop_r` and `peak_r`, that stop and the trade's best
+    price in R from the entry, positive the trade's way. The stop level
+    itself is `stop_price`, the peak `highest_price` / `lowest_price`.
+    `append_management_adjustment` records `stop_source` in the position
+    metadata on every stop move, so it survives a restart.
+  - A peak-giveback exit stamps its floor and its peak as prices,
+    `peak_giveback_floor_price` and `peak_giveback_peak_price`, beside the
+    `peak_giveback_floor_r` / `_peak_r` it had (EXIT_CONTEXT carries the
+    `peak_giveback_*` stamps). The reason strings are unchanged.
+  - ENTRY_CONTEXT of a laddered entry: `ladder_rungs` (each rung with the
+    R:R the builder measured from the signal close, `entry_price_model`),
+    `ladder_active_index` (the rung the entry targets: rung 1, except on a
+    key_levels strong setup, which targets rung 2) and
+    `ladder_target_rung_rr_from_fill`, that rung's R:R from `fill_price`: its
+    distance past the fill over the fill's distance to the stop, below 0
+    when the fill is already past it, absent without a finite fill short of
+    the stop.
+  - Tests: `tests/test_exit_levels_logging.py` (new).
+
 - **The `shared_entry` and `shared_exit` knobs are global: one entry stage
   and one exit policy for every strategy.** *2026-09-24* — every shared knob
   now acts on every strategy whose preset sets it, and no strategy has to
@@ -218,6 +309,46 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gates ran, which were exempt and what the shared score was.
 
 ### Changed
+
+- **Brackets with a resting target now load with `adaptive_ladder`, unless
+  the touch hold is on.** *2026-09-27* — `execution.bracket_legs:
+  stop_and_target` was refused for every `adaptive_ladder` config, for the
+  target-exit suppression and the final-rung runner (both removed, see
+  Removed). With the hold off the ladder's first rung is a plain
+  take-profit, which a resting target serves as well; with it on,
+  `stop_only` is still required. Brackets are off in every preset. Tests:
+  `tests/test_bracket_orders.py`, `tests/test_ladder_touch_hold.py`.
+
+- **Every `shared_exit` switch must be `true` or `false` at load.**
+  *2026-09-27* — the section is checked like the others
+  (`_validate_shared_exit_config`, with the touch hold's timeout in
+  `config._NUMBER_CHECKS["shared_exit"]`). `SharedExitPolicy` reads a switch
+  with `bool()`, so a quoted `"false"` turned an exit family on and a blank
+  one off (`shared_exit.use_structure_exit must be true or false, got
+  'false'`). The section's other numbers are the exit policy's and are not
+  checked. Every shipped preset loads unchanged. Tests:
+  `tests/test_config_validation.py`, `tests/test_ladder_touch_hold.py`.
+
+- **Docs: the peak-giveback tiers, its off switch and what manages a
+  small_cap runner.** *2026-09-27* — no behaviour change (the S1 exit
+  study).
+  - `RiskConfig`'s comment, fifteen presets' `peak_giveback_*` comments and
+    top_tier's README table described the tiers before 2026-05-27 ("50% at
+    1R-2R, 40% at 2R-3R, 30% at 3R+"). The floor keeps
+    `peak_giveback_retain_*` of the peak: 65% / 72% / 78% by default and in
+    top_tier, 60% / 70% / 78% in small_cap_squeeze. The README table's
+    low-tier fraction (0.45 in top_tier) and override (2.5R at a 2.5% day
+    strength) are corrected too.
+  - The off switch is `peak_giveback_enabled: false` (the low tier with
+    it); `peak_giveback_min_r` must be above 0 and is refused at load
+    otherwise. The docs say so.
+  - `config.small_cap_squeeze.yaml` and the small_cap README no longer say
+    peak giveback owns the runner: the high-conviction override (a 5% day
+    strength) was on 37 of the 43 replayed entries, and on those giveback
+    arms only at a 2.5R peak, with no low tier. Below that, break-even at
+    1.2R, the profit lock at 1.8R (to +1.0R) and, for an entry with no
+    ladder rung, the 5% trail (a median 0.32R wide) manage it.
+  - `configs/README_PRESETS.md` lists both.
 
 - **`--version`, and the version in the start-up log.** *2026-09-26* —
   nothing reported `intraday_tv_schwab_bot.__version__`. `python main.py
@@ -1679,6 +1810,62 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     use a regime the veto still reaches.
 
 ### Removed
+
+- **The adaptive ladder's target-exit suppression and zone-flip rung
+  promotion.** *2026-09-27* — with the touch hold off (every preset), the
+  ladder's first rung is now a plain take-profit on every path.
+  - The suppression declined `RiskManager`'s target exit while a strong push
+    was under way. Until 2026-05-14 one quote at the target was enough, and
+    it did hold targets live: AAPL on 2026-05-13 and TSLA and AVGO on 05-14
+    ran past an unchanged target without a target exit. From 2026-05-14 it
+    also needed the last closed bar in the frame to have closed through the
+    target at least 55% of the way up its range, and a
+    `confirmation_indices` ETF still leaning the trade's way.
+  - The management frame holds only delivered bars, so that bar had closed
+    one to two minutes before the quote being judged, and a quote at the
+    target inside it had already been taken as the target. The suppression
+    could still act when the quote sampling (one quote per management pass,
+    about every 4-25 s) missed a strong 1m close through the target and a
+    later quote reached the target before the next bar was delivered (or the
+    mark lagged the prints that way). Where it happens the default now takes the target instead of
+    holding it for the next bar (the replays below found three, all with a
+    quote sampled only once a minute).
+  - The zone-flip promotion (stop to the rung's zone edge, target to the
+    next rung, a runner past the last) needed two delivered bars wholly past
+    the rung's zone while the target still sat on the rung, which only a
+    restart past the rung, or an exit order failing for two bars, could
+    leave. No ladder adjustment was logged from 2026-05-01 to 2026-09-25.
+    There the default now takes the target.
+  - Gone: `_ladder_target_strength_confirmed`, `_ladder_indices_still_aligned`,
+    the `adaptive_ladder_suppress_target_exit` flag (in
+    `RiskManager.update_position` and both ladder metadata builders; a
+    restored position that carries it has it ignored), the zone-flip
+    promotion, `ladder_last_promoted_price`, and the ladder pass's S/R read
+    every cycle (it reads the S/R context only at a touch, with the hold
+    on). The `confirmation_indices` stamp stays: ENTRY_CONTEXT and
+    EXIT_CONTEXT log it.
+  - Replayed before and after, the touch hold off, on the live frame shape:
+    27 settings (the bar path, the points per leg, bar delivery at 0 / 10 /
+    50 s, with and without the shared exits, quotes sampled every tick or
+    every 6 s (two phases), 15 s, 30 s or 60 s (two phases), and the price's
+    time lagging 6 s), over the 105 archived laddered trades, the 8 recorded
+    target exits and the 23 fixture-tape entries: 1,746 trade-walks per tree
+    with the same exit time, price, reason and R in all but the case above,
+    which appears only with quotes sampled once a minute and depends on the
+    sampling phase: AMD 2026-09-24 (its 12:26 bar closed strongly through
+    the target between two samples; the old code held the target at the
+    next two sampled quotes and took it two minutes later, 0.15R lower) and,
+    in a verifier's wider grid (every tick, 3, 6, 10, 15, 20, 30, 45, 60 at
+    six phases and 90 s), ADBE (the new default 0.56R better) and NVDA
+    (0.28R worse: there the hold paid). None appears with a quote every 30 s
+    or more often. A crafted tape shows the case
+    (`tests/test_ladder_touch_hold.py`).
+  - Tests: the suppress-flag, passed-rung, promotion-price, ladder index
+    re-check and posture tests went with the code (`test_bug_regressions.py`,
+    `test_index_symbols.py`, `test_bar_posture.py`,
+    `test_fix_strategy_consumers.py`, `test_silent_excepts.py`,
+    `test_properties.py` g1-g3); `tests/test_ladder_touch_hold.py` pins the
+    rung-1 take-profit, a crafted missed-sampling case included.
 
 - **Dead code (refactor cut C08).** *2026-09-25* — none of these had a caller, or each
   duplicated what it inherits:

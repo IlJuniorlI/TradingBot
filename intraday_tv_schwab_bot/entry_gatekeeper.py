@@ -355,10 +355,9 @@ class EntryGatekeeper:
             'selection_components', 'candidate_reason', 'decision_summary',
             # Per-sector index confirmation snapshot. Stamped at entry by
             # top_tier_adaptive.strategy.entry_signals via
-            # ``_indices_for_symbol(symbol)``. Position_manager re-reads it
-            # at adaptive-ladder target-hit time (``_ladder_indices_still_aligned``).
-            # Logged here so post-session analysis can verify which sector
-            # ETFs each entry was confirmed against.
+            # ``_indices_for_symbol(symbol)``. Logged here so post-session
+            # analysis can verify which sector ETFs each entry was
+            # confirmed against.
             'confirmation_indices',
             # Volatility widening factor stamped by Tier 2a / early-session
             # widening — useful for slicing trade outcomes by widening tier.
@@ -538,13 +537,46 @@ class EntryGatekeeper:
             **self._signal_snapshot(signal, qty, entry_price, result_message, market_snapshot=market_snapshot, order_intent=order_intent),
             **self._risk_snapshot(signal, entry_price, qty),
         }
+        fill_price = None
         if result is not None:
+            fill_price = safe_float(getattr(result, "fill_price", None), None)
             payload.update({
                 "attempt_status": "filled" if bool(getattr(result, "ok", False)) else "not_filled",
-                "fill_price": safe_float(getattr(result, "fill_price", None), None),
+                "fill_price": fill_price,
                 "filled_qty": int(getattr(result, "filled_qty", 0) or 0) if getattr(result, "filled_qty", None) is not None else None,
             })
+        payload.update(self._ladder_entry_snapshot(signal, fill_price))
         return {k: v for k, v in payload.items() if v is not None}
+
+    @staticmethod
+    def _ladder_entry_snapshot(signal, fill_price: float | None) -> dict[str, Any]:
+        """A laddered entry's rungs as the strategy built them (each with the
+        R:R it measured from the signal close, ``entry_price_model``), the
+        rung the position first targets (``ladder_active_index``: rung 1,
+        except on a key_levels strong setup, which targets rung 2) and that
+        rung's R:R measured from the fill (2026-09-27): the rung's distance
+        past the fill over the fill's distance to the stop, below 0 when the
+        fill is already past it; None without a finite fill or with the fill
+        at or through the stop. The feed's fill can sit well past the signal
+        close, which moves the rung's R:R, and until now the archive kept
+        neither the rungs nor that R:R."""
+        meta = signal.metadata if isinstance(signal.metadata, Mapping) else {}
+        rungs = meta.get("ladder_rungs")
+        if not isinstance(rungs, list) or not rungs:
+            return {}
+        active_index = meta.get("ladder_active_index")
+        out: dict[str, Any] = {"ladder_rungs": rungs, "ladder_active_index": active_index}
+        rung = rungs[active_index] if isinstance(active_index, int) and 0 <= active_index < len(rungs) else None
+        rung_price = safe_float(rung.get("price"), None, finite=True) if isinstance(rung, Mapping) else None
+        fill = safe_float(fill_price, None, finite=True)
+        stop = safe_float(signal.stop_price, None, finite=True)
+        if rung_price is None or fill is None or stop is None:
+            return out
+        direction = 1.0 if signal.side == Side.LONG else -1.0
+        risk = direction * (fill - stop)
+        if risk > 0:
+            out["ladder_target_rung_rr_from_fill"] = round(direction * (rung_price - fill) / risk, 4)
+        return out
 
     # ------------------------------------------------------------------
     # Entry orders whose outcome the submit call could not settle.

@@ -68,8 +68,10 @@ risk:
   time_stop_minutes: 45
   time_stop_min_return_pct: 0.003
   # Peak-giveback floor: once max_favorable_r since entry crosses
-  # peak_giveback_min_r (default 1.0), exit when current_r retraces below
-  # a tiered fraction of the peak — 50% at 1R-2R, 40% at 2R-3R, 30% at 3R+.
+  # peak_giveback_min_r (default 1.0), exit when current_r retraces to a
+  # floor that keeps a tiered fraction of the peak: 65% of a 1R-2R peak, 72%
+  # of 2R-3R, 78% of 3R+ (the peak_giveback_retain_* code defaults; 50/60/70%
+  # until 2026-05-27). peak_giveback_enabled: false turns it off.
   peak_giveback_enabled: true
   peak_giveback_min_r: 1.0
 

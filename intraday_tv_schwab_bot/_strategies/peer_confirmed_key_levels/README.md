@@ -77,8 +77,7 @@ This strategy is especially strong in post-entry management because it knows the
 
 - place the initial stop beyond the defended zone with ATR buffering
 - target the next qualifying level(s)
-- emit rung metadata for `adaptive_ladder` management
-- ratchet stops behind defended levels as the trade progresses
+- emit rung metadata for `adaptive_ladder` management: the targeted rung is a plain take-profit; with `shared_exit.adaptive_ladder_touch_hold` on, the bar that touches it decides whether to promote the rung (stop just under it, which also becomes the defended level, and the next rung as the target) or exit (top_tier README, "Adaptive ladder")
 - exit on the ladder defence (its `strategy_exit_signal` hook, after every shared exit held): the defended zone flipped (`ladder_support_lost` / `ladder_resistance_lost`), or an HTF CHoCH / BoS against the trade with the close through every EMA / VWAP reference that has a value (`ladder_structure_fail_long` / `_short`). The break must have happened after entry — its `htf_minutes` bar closed after the fill. Until 2026-09-24 any break still inside `htf_structure_event_lookback_bars` counted, a whole session of 60m bars, so a trade taken against a morning CHoCH exited on its first cycle with the close under its references.
 
 The strategy proposes its stop and the FARTHEST qualifying rung as the target; the shared refinement may pull the stop in and cap the target. The rungs are then re-qualified from the refined stop at `min_rr` — none past the refined target (`no_qualifying_target_rr_after_refine` when none is left) — so the ladder's R multiples are the traded stop's, and the signal targets the first rung (or the strong-setup offset rung).
@@ -101,7 +100,7 @@ In plain English:
 
 ## Shipped reference
 
-Purpose: trade around hourly key levels/zones only when a tradable symbol, its peer basket, and optional macro symbols agree strongly enough, then ride the cleaned S/R ladder while price action still defends the last reclaimed/broken rung.
+Purpose: trade around hourly key levels/zones only when a tradable symbol, its peer basket, and optional macro symbols agree strongly enough, then take profit at the targeted rung of the cleaned S/R ladder, exiting early if price loses the level the entry defends (with `shared_exit.adaptive_ladder_touch_hold` on, a strong close at a rung moves the target to the next rung and the defended level to that rung).
 
 Default windows:
 
@@ -129,7 +128,7 @@ Strategy-specific knobs:
   - `level_round_number_tolerance_pct`
 - Strong-setup runner / ladder logic:
   - `strong_setup_runner_enabled`, `strong_setup_min_ltf_score`, `strong_setup_min_level_score`, `strong_setup_min_peer_score`, `strong_setup_min_htf_vote_edge`, `strong_setup_target_level_offset`
-  - When `risk.trade_management_mode: adaptive_ladder` is active, this strategy stores rung metadata at entry and promotes targets one rung at a time while ratcheting stops behind defended S/R levels/zones. Non-ladder strategies safely fall back to adaptive management.
+  - When `risk.trade_management_mode: adaptive_ladder` is active, this strategy stores rung metadata at entry and defends the entry level (the ladder defence exit). The targeted rung is a take-profit; with `shared_exit.adaptive_ladder_touch_hold` on, a strong touch bar moves the target to the next rung past its close (or clears it past the last rung) and the stop and the defended level to the touched rung. Non-ladder strategies safely fall back to adaptive management.
 
 Also uses these shared stock groups:
 

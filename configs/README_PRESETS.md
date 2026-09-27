@@ -108,3 +108,15 @@ No other preset value changed. Three fixes and two manifest exemptions change wh
 - `use_structure_filter` (on in `top_tier_adaptive` and `small_cap_squeeze`) no longer reaches their `range`, `pullback` and `sr_scalp` regimes. Both manifests exempt them (`capabilities.shared_entry.exemptions`, a user decision). It is inert in `small_cap_squeeze`, whose preset runs none of the three.
 - `use_sr_filter` (on in both) no longer reaches top_tier's `vwap_reclaim`. top_tier's manifest exempts it (a user decision); `small_cap_squeeze` keeps the veto on vwap_reclaim.
 - Neither exemption switches a gate on or off, and no YAML value moved. The evidence is in the top_tier README, section 6.
+
+## The adaptive ladder's touch hold (2026-09-27)
+
+- `shared_exit.adaptive_ladder_touch_hold` ships `false` in every preset and as the code default. The three presets that run `risk.trade_management_mode: adaptive_ladder` (`top_tier_adaptive`, `small_cap_squeeze`, `peer_confirmed_key_levels`) and `config.example.yaml` declare it, with `adaptive_ladder_touch_hold_timeout_seconds: 45`; the others run `adaptive`, where it is inert, and take the code default. `tests/test_preset_parity.py` pins both.
+- Off, the ladder's first rung is a plain take-profit, taken on the first quote at it. The target-exit suppression and the zone-flip rung promotion removed that day are why this was not always so: until 2026-05-14 one quote at the target held its exit (it did, live, on 2026-05-13 and 05-14); after that the suppression could act only when the quote sampling missed a strong 1m close through the target, which the replays found only with a quote once a minute (three trades: two better for the new default, one worse), and such a touch now takes the target. No zone-flip promotion was logged from 2026-05-01 to 2026-09-25.
+- On, the bar that touches the target decides whether to promote the rung or exit (root README, `shared_exit`). Turning it on is a dry-run decision; with brackets it needs `execution.bracket_legs: stop_only`.
+
+## Peak giveback: what the preset comments now say (2026-09-27)
+
+- Every preset's `peak_giveback_*` comment described the tiers before 2026-05-27 ("50% at 1R-2R, 40% at 2R-3R, 30% at 3R+"). The presets that do not set `peak_giveback_retain_*` run the code defaults, a floor that keeps 65% / 72% / 78% of a 1R-2R / 2R-3R / 3R+ peak; `top_tier_adaptive` sets the same three and `small_cap_squeeze` 60% / 70% / 78%. No value moved.
+- `peak_giveback_enabled: false` is the off switch (the low tier with it); `peak_giveback_min_r` must be above 0 and is refused at load otherwise.
+- `small_cap_squeeze`'s comment no longer says peak giveback owns the runner: with the 5% day-strength override on most entries it applies only above 2.5R, and break-even at 1.2R, the profit lock at 1.8R (to +1.0R) and, without a ladder rung, the 5% trail manage the trade below that.

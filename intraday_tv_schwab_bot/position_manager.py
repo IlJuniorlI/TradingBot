@@ -33,7 +33,9 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import time
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
@@ -44,7 +46,6 @@ from .config import BotConfig
 from .dashboard_cache import DashboardCache
 from .data_feed import MarketDataStore
 from .execution import BracketCancel, SchwabExecutor
-from .indicators import bar_posture
 from .models import (
     ASSET_TYPE_EQUITY,
     ASSET_TYPE_OPTION_SINGLE,
@@ -56,7 +57,13 @@ from .models import (
 )
 from .numeric import first_float, safe_float
 from .paper_account import PaperAccount
+from .reasons import exit_reason_code
 from .position_metrics import (
+    LADDER_TOUCH_HOLD_KEY,
+    STOP_SOURCE_KEY,
+    TARGET_HOLD_GUARD,
+    TARGET_HOLD_TIMEOUT,
+    TARGET_WEAK_CLOSE,
     append_management_adjustment,
     exit_reason_details,
     position_return_pct_at_price,
@@ -67,7 +74,6 @@ from ._sr_ladder import _select_next_distinct_level, _sr_effective_side_toleranc
 from ._strategies.catalogue import is_option_strategy
 from ._strategies.shared_exit import SharedExitPolicy, partial_exit_qty
 from .broker_positions import active_broker_bracket, order_result_needs_broker_recheck, working_exit_outstanding_qty
-from .support_resistance import zone_flip_confirmed
 from .log_setup import TRADEFLOW_LEVEL
 from . import sessions
 
@@ -97,17 +103,15 @@ def _next_unpassed_rung(rungs: list, active_index: int, close: float,
 
     A rung behind price cannot serve as a target — setting one would exit
     immediately — and cannot serve as a defense level either, so the ladder is
-    finished and the caller promotes the position to a runner.
+    finished and the caller promotes the position to a runner. A rung whose
+    price is not a finite number above 0 is no target and is skipped.
     """
     for index in range(int(active_index) + 1, len(rungs)):
         entry = rungs[index]
         if not isinstance(entry, dict):
             continue
-        try:
-            price = float(entry.get("price", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            continue
-        if price <= 0:
+        price = safe_float(entry.get("price"), None, finite=True)
+        if price is None or price <= 0:
             continue
         if side == Side.LONG:
             if price > close + gap:
@@ -115,6 +119,168 @@ def _next_unpassed_rung(rungs: list, active_index: int, close: float,
         elif price < close - gap:
             return index
     return None
+
+
+# The adaptive ladder's touch hold (``shared_exit.adaptive_ladder_touch_hold``).
+# A delivered touch bar that closed through the target at least this far into
+# its range, from the low for a LONG and from the high for a SHORT, promotes
+# the rung; any other close exits.
+LADDER_TOUCH_CLOSE_POSITION_MIN = 0.55
+# The hold's stop buffer, the widest of the S/R context's level buffer, this
+# share of the rung's zone width and this share of the touch price. It sets
+# the in-bar guard and the promoted stop (the zone-flip promotion's formula).
+LADDER_STOP_BUFFER_ZONE_FRAC = 0.25
+LADDER_STOP_BUFFER_PRICE_FRAC = 0.0005
+# A promotion's next target is the first later rung more than this share of
+# the touch bar's close beyond that close; a rung within it counts as passed.
+LADDER_NEXT_RUNG_GAP_FRAC = 0.0005
+_TOUCH_HOLD_EXIT_CODES = frozenset({TARGET_WEAK_CLOSE, TARGET_HOLD_GUARD, TARGET_HOLD_TIMEOUT})
+
+
+def _finite_number(value: Any) -> float | None:
+    """``value`` when it is a finite int or float (not a bool, not text)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _whole_number(value: Any) -> int | None:
+    """``value`` as an int when it is a finite whole number (``2`` or ``2.0``)."""
+    number = _finite_number(value)
+    return int(number) if number is not None and number.is_integer() else None
+
+
+def _aware_time(value: Any) -> pd.Timestamp | None:
+    """``value`` (an ISO string or a datetime) as a tz-aware timestamp in the
+    exchange's time zone; None when it does not parse or names no zone."""
+    if not isinstance(value, str | datetime):
+        return None
+    try:
+        stamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(stamp) or stamp.tzinfo is None:
+        return None
+    return stamp.tz_convert(sessions.EXCHANGE_TZ)
+
+
+def _bar_time(frame: pd.DataFrame) -> pd.Timestamp | None:
+    """The open time of ``frame``'s last bar in the exchange's time zone (a
+    naive index is exchange time, as the feed's frames are), or None when the
+    frame has no time index."""
+    if not isinstance(frame.index, pd.DatetimeIndex) or pd.isna(frame.index[-1]):
+        return None
+    stamp = frame.index[-1]
+    return stamp.tz_localize(sessions.EXCHANGE_TZ) if stamp.tzinfo is None else stamp.tz_convert(sessions.EXCHANGE_TZ)
+
+
+@dataclass(frozen=True, slots=True)
+class _TouchHold:
+    """A touch hold in progress: ``metadata[LADDER_TOUCH_HOLD_KEY]``, written
+    by ``PositionManager._start_touch_hold`` and read back each cycle,
+    possibly from the position store after a restart.
+
+    ``read`` checks every field the hold reads, so a hold is either whole or
+    dropped: one that came back without its ``kind``, with a naive time or a
+    rung index past its count can never apply half a promotion. The times
+    are stored as ISO strings, ``exit_reason`` once the hold has decided to
+    exit (the order is then sent again with it until it books)."""
+
+    rung_index: int
+    rung_count: int
+    level: float
+    zone_width: float
+    kind: str
+    touch_price: float
+    touch_at: pd.Timestamp
+    touch_bar: pd.Timestamp
+    stop_buffer: float
+    guard: float
+    deadline: pd.Timestamp
+    exit_reason: str | None = None
+
+    def to_meta(self) -> dict[str, Any]:
+        return {
+            "rung_index": self.rung_index, "rung_count": self.rung_count, "level": self.level,
+            "zone_width": self.zone_width, "kind": self.kind, "touch_price": self.touch_price,
+            "touch_at": self.touch_at.isoformat(), "touch_bar": self.touch_bar.isoformat(),
+            "stop_buffer": self.stop_buffer, "guard": self.guard, "deadline": self.deadline.isoformat(),
+            "exit_reason": self.exit_reason,
+        }
+
+    @classmethod
+    def read(cls, raw: Any) -> _TouchHold | None:
+        """The hold ``raw`` holds, or None when any field it reads is missing
+        or unreadable: a number that is not finite (or a negative buffer or
+        zone), a rung index that is not a whole number below the rung count,
+        a blank ``kind``, a time that does not parse or names no time zone,
+        or an ``exit_reason`` that is not one of the hold's exits."""
+        if not isinstance(raw, dict):
+            return None
+        numbers = {key: _finite_number(raw.get(key))
+                   for key in ("level", "zone_width", "touch_price", "stop_buffer", "guard")}
+        if any(value is None for value in numbers.values()) or numbers["zone_width"] < 0 or numbers["stop_buffer"] < 0:
+            return None
+        rung_index, rung_count = _whole_number(raw.get("rung_index")), _whole_number(raw.get("rung_count"))
+        if rung_index is None or rung_count is None or not 0 <= rung_index < rung_count:
+            return None
+        kind = raw.get("kind")
+        if not isinstance(kind, str) or not kind.strip():
+            return None
+        times = {key: _aware_time(raw.get(key)) for key in ("touch_at", "touch_bar", "deadline")}
+        if any(value is None for value in times.values()):
+            return None
+        exit_reason = raw.get("exit_reason")
+        if exit_reason is not None and not (isinstance(exit_reason, str)
+                                            and exit_reason_code(exit_reason) in _TOUCH_HOLD_EXIT_CODES):
+            return None
+        return cls(rung_index=rung_index, rung_count=rung_count, kind=kind, exit_reason=exit_reason,
+                   **numbers, **times)
+
+
+def _ladder_rungs(meta: Mapping[str, Any]) -> list | None:
+    """A laddered position's rungs, or None when they are not a non-empty
+    list (every ladder builder emits at least one rung)."""
+    rungs = meta.get("ladder_rungs")
+    return rungs if isinstance(rungs, list) and rungs else None
+
+
+def _delivered_touch_bar(frame: pd.DataFrame | None, touch_bar: pd.Timestamp,
+                         now: pd.Timestamp) -> pd.Series | None:
+    """The touch bar's row once it has closed and is in the frame, else None.
+
+    The management frame holds completed bars, each delivered a few seconds
+    after it closes. The clock check keeps a frame that does carry a forming
+    row from being judged before its minute is over."""
+    if frame is None or frame.empty or now < touch_bar + pd.Timedelta(minutes=1):
+        return None
+    index = pd.DatetimeIndex(frame.index)
+    label = touch_bar if index.tz is not None else touch_bar.tz_convert(sessions.EXCHANGE_TZ).tz_localize(None)
+    hits = (index == label).nonzero()[0]
+    return frame.iloc[int(hits[-1])] if len(hits) else None
+
+
+def _touch_bar_verdict(bar: pd.Series, side: Side, level: float) -> tuple[str, float | None, float | None]:
+    """``strong``, ``weak`` or ``unreadable`` for a delivered touch bar, with
+    its close position (from the low for a LONG, from the high for a SHORT;
+    None on a bar with no range or an unreadable price) and its close.
+
+    Strong: the close is at or through ``level`` and its close position is at
+    least ``LADDER_TOUCH_CLOSE_POSITION_MIN``. A bar with no range has no
+    upper part and is weak."""
+    high = safe_float(bar.get("high"), None, finite=True)
+    low = safe_float(bar.get("low"), None, finite=True)
+    close = safe_float(bar.get("close"), None, finite=True)
+    if high is None or low is None or close is None:
+        return "unreadable", None, None
+    span = high - low
+    if span <= 0:
+        return "weak", None, close
+    long_side = side == Side.LONG
+    close_pos = (close - low) / span if long_side else (high - close) / span
+    through = close >= level if long_side else close <= level
+    return ("strong" if through and close_pos >= LADDER_TOUCH_CLOSE_POSITION_MIN else "weak"), close_pos, close
 
 
 class PositionManager:
@@ -178,6 +344,11 @@ class PositionManager:
     # ------------------------------------------------------------------
 
     def _position_management_snapshot(self, position: Position, bars) -> tuple[float | None, dict[str, Any] | None]:
+        """The price this cycle manages ``position`` at, and where it came
+        from. An equity's snapshot names the price's time as ``price_at``:
+        the quote's ``fetched_at``, or the open time of the bar whose close
+        it is (the adaptive ladder's touch hold attributes a touch to that
+        1m bar); the account's cached price has none."""
         mark = self.strategy.position_mark_price(position, self.data)
         if mark is not None:
             price = float(mark)
@@ -208,18 +379,21 @@ class PositionManager:
                         "last": safe_float(quote.get("last") or quote.get("mark") or quote.get("close"), None),
                         "source": "quote",
                         "decision_price": price,
+                        "price_at": quote.get("fetched_at"),
                     }
                     return price, market_snapshot
         frame = bars.get(position.symbol)
         if frame is not None and not frame.empty:
             price = float(frame.iloc[-1].close)
-            return price, {"bid": price, "ask": price, "last": price, "source": "bar_close", "decision_price": price}
+            return price, {"bid": price, "ask": price, "last": price, "source": "bar_close", "decision_price": price,
+                           "price_at": _bar_time(frame)}
         underlying = position.metadata.get("underlying")
         if underlying:
             frame = bars.get(str(underlying))
             if frame is not None and not frame.empty:
                 price = float(frame.iloc[-1].close)
-                return price, {"bid": price, "ask": price, "last": price, "source": "underlying_bar_close", "decision_price": price}
+                return price, {"bid": price, "ask": price, "last": price, "source": "underlying_bar_close",
+                               "decision_price": price, "price_at": _bar_time(frame)}
         cached = self.account.last_prices.get(position.symbol)
         if cached is not None:
             price = float(cached)
@@ -477,6 +651,18 @@ class PositionManager:
         initial_rr = None
         if initial_risk_per_unit not in (None, 0.0) and initial_reward_per_unit is not None:
             initial_rr = initial_reward_per_unit / initial_risk_per_unit
+        # The stop level and the peak in R from the entry, positive the
+        # trade's way (2026-09-27): with stop_source they say what a stop exit
+        # hit -- the profit lock's level, the trail's, the break-even -- and
+        # how far the trade had run.
+        stop_r = peak_r = None
+        if entry_price is not None and initial_risk_per_unit is not None and initial_risk_per_unit > 0:
+            direction = 1.0 if position.side == Side.LONG else -1.0
+            peak_price = safe_float(position.highest_price if position.side == Side.LONG else position.lowest_price, None)
+            if stop_price is not None:
+                stop_r = direction * (stop_price - entry_price) / initial_risk_per_unit
+            if peak_price is not None:
+                peak_r = direction * (peak_price - entry_price) / initial_risk_per_unit
         management_symbol = str(meta.get('underlying') or position.symbol)
         management_frame = bars.get(management_symbol) if bars else None
         sr_row = None
@@ -533,6 +719,9 @@ class PositionManager:
             'initial_risk_per_unit': initial_risk_per_unit,
             'initial_reward_per_unit': initial_reward_per_unit,
             'initial_rr': initial_rr,
+            'stop_source': meta.get(STOP_SOURCE_KEY) or 'initial',
+            'stop_r': stop_r,
+            'peak_r': peak_r,
             'trail_pct': safe_float(position.trail_pct, None),
             'trail_armed': bool(meta.get('trail_armed')) if meta.get('trail_armed') is not None else None,
             'trail_activation_price': safe_float(meta.get('trail_activation_price'), None),
@@ -659,285 +848,268 @@ class PositionManager:
                         position.metadata["sr_flip_target_source"] = float(target_level.price)
                         append_management_adjustment(position.metadata,{"manager": "sr_flip", "kind": "target", "reason": "next_support", "from": prior_target, "to": float(candidate_target), "source_level": float(target_level.price), "structural_gap": float(structural_gap)})
 
-    def _ladder_indices_still_aligned(
-        self,
-        indices: list[str] | tuple[str, ...] | None,
-        side: Side,
-    ) -> bool:
-        """Re-check at target-hit time whether at least one of the trade's
-        confirmation indices is STILL aligned with the trade direction.
+    # ------------------------------------------------------------------
+    # The adaptive ladder
+    #
+    # The strategy builds the rungs at entry (``_build_ladder_rungs``, or the
+    # key-levels peer rungs) and emits the active rung as the target. With
+    # ``shared_exit.adaptive_ladder_touch_hold`` off -- every preset and the
+    # code default -- that target is a plain take-profit: RiskManager exits
+    # on the first quote at it and nothing here acts.
+    #
+    # Until 2026-09-27 this pass also ran a target-exit suppression and a
+    # two-bar zone-flip rung promotion, both removed. Since 2026-05-14 the
+    # suppression needed the last closed bar in the frame to have closed
+    # strongly through the target (and a confirmation index still leaning
+    # the trade's way); before that one quote at the target was enough, and
+    # it did hold targets live on 2026-05-13 and 05-14. The frame holds only
+    # delivered bars, so that bar closed one to two minutes before the quote
+    # being judged, and a quote at the target during it had already been
+    # taken as the target. The suppression could act only when the quote
+    # sampling (one quote per management pass, about every 4-25 s) missed a
+    # strong 1m close through the target and a later quote reached it again
+    # before the next bar was delivered (or the quote's mark lagged the
+    # prints that way). The 2026-09-26/27 replays found it only with a
+    # quote once a minute, in three trades (AMD 2026-09-24 and ADBE better
+    # for taking the target, NVDA worse); where it happens the target is now
+    # taken. The zone flip
+    # needed two delivered bars wholly past the rung's zone while the target
+    # still sat on the rung, which only a restart past the rung or an exit
+    # order failing for two bars could leave; no ladder adjustment was
+    # logged from 2026-05-01 to 2026-09-25.
+    # ------------------------------------------------------------------
 
-        Each index's latest 1m bar is read with the posture test the
-        entry-side ``_index_confirms`` uses (``indicators.bar_posture``),
-        again at the suppress decision, so a sector reversal can
-        short-circuit the adaptive-ladder wait window. If the broader sector
-        tape has flipped against the trade since entry, the trade's apparent
-        strength is divergent and target-exit should fire instead of waiting
-        for the multi-bar zone flip. The reference is session VWAP, where
-        the entry side reads the leg's anchored VWAP under
-        ``leg_anchored_confirmation``. Until 2026-09-26 it wrote the test
-        out and read a NaN EMA as no posture, where the entry side stands
-        the close in.
+    def _adaptive_ladder_management(self, position: Position, frame: pd.DataFrame | None,
+                                    last_price: float, price_at: datetime | None) -> ExitDecision | None:
+        """The adaptive ladder's touch hold, when it is on; the exit it takes.
 
-        Returns True if no ``indices`` are configured (no extra gate —
-        treats the alignment check as inert for legacy positions /
-        strategies that don't stamp ``confirmation_indices`` at entry, and
-        for a strategy with no index symbols, which stamps an empty list:
-        small_cap_squeeze). This layer only vetoes the suppress when the
-        tape the trade leaned on has turned; with no index there is no tape
-        to turn, and the breakout-strength and rung checks decide alone.
-        A stamped index with no bars is skipped, and when none can be read
-        the answer is False, so the target exit fires. Until 2026-09-26
-        small_cap_squeeze stamped SPY / QQQ, which it never streams, so its
-        target exit was never suppressed.
+        ``price_at`` is when ``last_price`` was observed (a quote's
+        ``fetched_at``, or the open time of the bar whose close it is; see
+        ``_position_management_snapshot``): the touch is attributed to the
+        1m bar that time falls in, not to the cycle's clock, which can run up
+        to the quote cache age later.
+
+        A hold starts on the first price at or through the target, the price
+        RiskManager would take the target on; while it lasts,
+        ``LADDER_TOUCH_HOLD_KEY`` in the metadata keeps RiskManager off the
+        target. It ends:
+
+        - at once, on a price ``stop_buffer`` back through the rung (under
+          it for a LONG, over it for a SHORT): ``target_hold_guard``;
+        - when the bar that touched the target is in the frame, delivered a
+          few seconds after it closes, with one verdict on that bar. A close
+          at or through the target at least ``LADDER_TOUCH_CLOSE_POSITION_MIN``
+          of the way up its range (down, for a SHORT) promotes the rung. Any
+          other close exits at market: ``target_weak_close``. A bar with no
+          range has no upper part and is weak; one with an unreadable price
+          is weak too;
+        - when the touch bar is still missing the configured timeout after
+          it closed: ``target_hold_timeout``, at market.
+
+        A promotion moves the stop to the rung less ``stop_buffer`` (never
+        loosening it) and the target to the first later rung more than
+        ``LADDER_NEXT_RUNG_GAP_FRAC`` of the touch bar's close beyond that
+        close (``_next_unpassed_rung``), or clears it past the last rung,
+        which leaves a runner. A price already at the new target starts that
+        rung's hold in the same pass. ``stop_buffer`` is the widest of the
+        S/R context's level buffer (when it is a finite number),
+        ``LADDER_STOP_BUFFER_ZONE_FRAC`` of the rung's zone width and
+        ``LADDER_STOP_BUFFER_PRICE_FRAC`` of the touch price.
+
+        The exits belong to the ``risk`` family, and the caller lets
+        RiskManager's own exits (stop, peak giveback) win on the same cycle.
+        A decided exit stays on the hold, so a failed order is sent again
+        with the same reason, whatever the price does next, and the target
+        is never taken instead. There is no index veto. Ladder metadata the
+        hold cannot read (the rungs, the active rung, the price's time) is
+        reported and leaves the target exit in place; a hold it cannot read
+        back is dropped whole. Every touch and every verdict is logged on one
+        INFO line (``LADDER_TOUCH`` / ``LADDER_VERDICT``), so a dry-run A/B
+        can be read from the log.
         """
-        if not indices:
-            return True
-        if self.data is None:
-            return True
-        for sym in indices:
-            sym_key = str(sym or "").upper().strip()
-            if not sym_key:
-                continue
-            frame = self.data.get_merged(sym_key)
-            if frame is None or len(frame) == 0:
-                continue
-            if bar_posture(frame.iloc[-1]) == side:
-                return True
-        return False
-
-    @staticmethod
-    def _ladder_target_strength_confirmed(
-        frame: pd.DataFrame | None,
-        side: Side,
-        target_price: float | None,
-        *,
-        close_pos_min: float = 0.55,
-    ) -> bool:
-        """Return True when the last FULLY CLOSED bar shows a strong push
-        through ``target_price``. Used as a pre-suppress gate so single-tick
-        wicks at the target don't lock the position into a multi-bar
-        zone-flip wait window.
-
-        Strong push:
-          LONG:  close >= target  AND  (close - low) / (high - low) >= ``close_pos_min``
-          SHORT: close <= target  AND  (high - close) / (high - low) >= ``close_pos_min``
-
-        ``close_pos_min`` default 0.55 means the close has to land at least
-        55% of the way up the bar's intra-bar range, its upper 45% (for LONG;
-        down, for SHORT). Doji / wick-top prints don't qualify.
-
-        Returns False on insufficient data — caller treats False as "not
-        strong enough to suppress" and lets the normal target-exit fire.
-        """
-        if target_price is None or frame is None or len(frame) < 2:
-            return False
-        # iloc[-1] is the current FORMING bar; iloc[-2] is the last fully
-        # closed bar. Strength must be evaluated on a closed bar so an
-        # intra-bar tick doesn't get treated as a confirmed breakout.
-        try:
-            bar = frame.iloc[-2]
-            bar_high = float(bar.get("high"))
-            bar_low = float(bar.get("low"))
-            bar_close = float(bar.get("close"))
-            target = float(target_price)
-        except (TypeError, ValueError, KeyError):
-            return False
-        bar_range = bar_high - bar_low
-        if bar_range <= 0:
-            return False
-        if side == Side.LONG:
-            if bar_close < target:
-                return False
-            close_pos = (bar_close - bar_low) / bar_range
-        else:
-            if bar_close > target:
-                return False
-            close_pos = (bar_high - bar_close) / bar_range
-        return close_pos >= close_pos_min
-
-    def _adaptive_ladder_management(self, position: Position, frame: pd.DataFrame | None, last_price: float) -> None:
-        if isinstance(position.metadata, dict):
-            position.metadata.setdefault("management_adjustments", [])
-        mode = self.config.risk.trade_management_mode
-        if mode != "adaptive_ladder":
-            return
+        if self.config.risk.trade_management_mode != "adaptive_ladder":
+            return None
         meta = position.metadata if isinstance(position.metadata, dict) else None
-        if not isinstance(meta, dict) or not bool(meta.get("ladder_management_enabled")):
+        if meta is None or not bool(meta.get("ladder_management_enabled")):
+            return None
+        if str(meta.get("asset_type") or ASSET_TYPE_EQUITY) in OPTION_ASSET_TYPES:
+            return None
+        timeout = self.exit_policy.ladder_touch_hold_timeout_seconds()
+        if timeout is None:
+            # The hold is off. One a restart carried over from a run with it
+            # on would keep RiskManager off the target for good.
+            if meta.pop(LADDER_TOUCH_HOLD_KEY, None) is not None:
+                LOG.info("LADDER_VERDICT symbol=%s side=%s outcome=dropped reason=touch_hold_off",
+                         position.symbol, position.side.value)
+            return None
+        if not math.isfinite(last_price) or last_price <= 0:
+            return None
+        now = pd.Timestamp(sessions.now_et())
+        if LADDER_TOUCH_HOLD_KEY in meta:
+            decision = self._resolve_touch_hold(position, meta, frame, float(last_price), now)
+            if decision is not None or LADDER_TOUCH_HOLD_KEY in meta:
+                return decision
+        self._start_touch_hold(position, meta, frame, float(last_price), price_at, now, float(timeout))
+        return None
+
+    def _ladder_unreadable(self, position: Position, what: str, message: str) -> None:
+        self.audit.log_cycle(f"ladder_unreadable:{position.symbol}", what, message, level=logging.WARNING)
+
+    def _start_touch_hold(self, position: Position, meta: dict[str, Any], frame: pd.DataFrame | None,
+                          last_price: float, price_at: datetime | None, now: pd.Timestamp, timeout: float) -> None:
+        """Start a hold when ``last_price`` is at or through the target. The
+        ladder metadata is read back from the position store: a value the
+        hold cannot read is reported, and the position keeps its target
+        exit."""
+        target = safe_float(position.target_price, None, finite=True)
+        if target is None:
             return
-        asset_type = str(meta.get("asset_type") or ASSET_TYPE_EQUITY)
-        if asset_type in OPTION_ASSET_TYPES:
+        long_side = position.side == Side.LONG
+        if (last_price < target) if long_side else (last_price > target):
             return
-        if frame is None or frame.empty or last_price <= 0:
+        rungs = _ladder_rungs(meta)
+        if rungs is None:
+            self._ladder_unreadable(position, "rungs", f"Ladder rungs of {position.symbol} are unreadable "
+                                    f"({meta.get('ladder_rungs')!r}); taking the target without a hold")
             return
-        rungs = meta.get("ladder_rungs")
-        if not isinstance(rungs, list) or not rungs:
+        active_index = _whole_number(meta.get("ladder_active_index"))
+        if active_index is None or not 0 <= active_index < len(rungs):
+            self._ladder_unreadable(position, "active_index",
+                                    f"Ladder active index {meta.get('ladder_active_index')!r} of {position.symbol} "
+                                    f"is unreadable for {len(rungs)} rung(s); taking the target without a hold")
             return
-        # Only clear the suppress flag once we know the ladder manager is
-        # actually going to re-evaluate it. Clearing before the guard clauses
-        # meant a stale-frame tick would reset a previously-computed True flag,
-        # letting update_position fire a target exit on the next cycle.
-        meta["adaptive_ladder_suppress_target_exit"] = False
-        # The ladder metadata is read back from the position store: a value
-        # it cannot read is reported and handled for this position alone,
-        # rather than raise out of every position's management.
-        try:
-            active_index = max(0, min(int(meta.get("ladder_active_index", 0) or 0), len(rungs) - 1))
-        except (TypeError, ValueError, OverflowError):
-            self.audit.log_cycle(
-                f"ladder_unreadable:{position.symbol}", "active_index",
-                f"Ladder active index {meta.get('ladder_active_index')!r} of {position.symbol} is unreadable; "
-                "managing from the first rung",
-                level=logging.WARNING,
-            )
-            active_index = 0
-        current = rungs[active_index] if active_index < len(rungs) else None
-        if not isinstance(current, dict):
+        rung = rungs[active_index]
+        zone_width = _finite_number(rung.get("zone_width")) if isinstance(rung, dict) else None
+        kind = rung.get("kind") if isinstance(rung, dict) else None
+        if zone_width is None or zone_width < 0 or not isinstance(kind, str) or not kind.strip():
+            self._ladder_unreadable(position, "rung", f"Ladder rung {active_index} of {position.symbol} is unreadable "
+                                    f"({rung!r}); taking the target without a hold")
             return
-        try:
-            rung_price = float(current.get("price", 0.0) or 0.0)
-            zone_width = max(0.0, float(current.get("zone_width", 0.0) or 0.0))
-            lower = float(current.get("lower", rung_price - zone_width) or (rung_price - zone_width))
-            upper = float(current.get("upper", rung_price + zone_width) or (rung_price + zone_width))
-        except (TypeError, ValueError, OverflowError):
-            self.audit.log_cycle(
-                f"ladder_unreadable:{position.symbol}", "rung",
-                f"Ladder rung {active_index} of {position.symbol} is unreadable ({current!r}); skipping the ladder pass",
-                level=logging.WARNING,
-            )
-            return
-        if rung_price <= 0:
+        touch_at = _aware_time(price_at)
+        if touch_at is None:
+            self._ladder_unreadable(position, "price_at", f"The time of {position.symbol}'s price {last_price:.4f} is "
+                                    f"unknown ({price_at!r}); taking the target without a hold")
             return
         symbol = str(meta.get("underlying") or position.symbol)
         sr_ctx = self.data.get_support_resistance(symbol, current_price=last_price, flip_frame=frame, mode="trading", timeframe_minutes=self.active_htf_minutes(), lookback_days=self.active_htf_lookback_days(), allow_refresh=True) if self.data is not None else None
-        close = safe_float(frame.iloc[-1].get("close"), last_price)
-        level_buffer = float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0)
-        stop_buffer = max(level_buffer, zone_width * 0.25, close * 0.0005)
-        eps = max(level_buffer * 0.15, close * 0.0001, 1e-6)
-        confirm_1m, confirm_5m = self.config.support_resistance.flip_confirmation_bars()
-        current_target = safe_float(position.target_price, None)
-        if position.side == Side.LONG:
-            rung_confirmed = zone_flip_confirmed("resistance", lower, upper, flip_frame=frame, confirm_1m_bars=confirm_1m, confirm_5m_bars=confirm_5m, fallback_bar=None, eps=eps)
-            target_reached = bool(current_target is not None and last_price >= float(current_target) - max(close * 0.0003, 1e-6))
-            # Confirmation layer #1: require the last CLOSED bar to show
-            # a strong upper-body push through the target before
-            # suppressing. Filters intra-bar wick-throughs that revert.
-            breakout_strength = self._ladder_target_strength_confirmed(frame, Side.LONG, current_target)
-            # Confirmation layer #2: re-check the trade's entry-time
-            # confirmation indices (stamped on metadata as
-            # ``confirmation_indices``). If the sector ETF has flipped
-            # bearish since entry, the stock's target-tag is divergent
-            # from its peer group — exit at target instead of waiting
-            # for a zone flip that's now structurally less likely.
-            indices_aligned = self._ladder_indices_still_aligned(
-                meta.get("confirmation_indices"), Side.LONG,
-            )
-            meta["adaptive_ladder_suppress_target_exit"] = bool(
-                target_reached and breakout_strength and indices_aligned and not rung_confirmed
-            )
-            if not rung_confirmed:
-                return
-            # Validate the promoted stop against BOTH the bar close and the
-            # LIVE price. `close` comes from the management frame, while the
-            # exit check in RiskManager.update_position runs against the quote
-            # snapshot — two different sources that diverge on a fast move.
-            # Promoting on `close` alone could set a stop the quote had already
-            # fallen through, and update_position then stopped the trade out on
-            # the same cycle at a price well past it: rung 1 at 101.00 with the
-            # bar closing 101.50 and a 99.00 quote promoted the stop to 100.69
-            # and exited immediately, where the original 98.00 stop would have
-            # held. Taking the tighter of the two means a rung price has
-            # already fallen back through simply does not promote, and the
-            # position keeps the stop it had.
-            reference_price = min(close, float(last_price))
-            candidate_stop = float(lower) - stop_buffer
-            if reference_price > candidate_stop > float(position.stop_price):
-                prior_stop = float(position.stop_price)
-                position.stop_price = float(candidate_stop)
-                append_management_adjustment(meta,{"manager": "adaptive_ladder", "kind": "stop", "reason": "promoted_support", "from": prior_stop, "to": float(candidate_stop), "source_level": float(rung_price)})
-            meta["ladder_defense_price"] = float(rung_price)
-            meta["ladder_defense_zone_width"] = float(zone_width)
-            meta["ladder_defense_kind"] = str(current.get("kind") or "target")
-            meta["ladder_last_promoted_price"] = float(rung_price)
-            # Advance to the first rung price has NOT already passed.
-            #
-            # Stepping blindly to active_index + 1 left the target frozen on a
-            # rung BEHIND price whenever one cycle cleared several rungs at
-            # once. The guard below correctly refuses to set a target under
-            # price, but the index advanced regardless, so the position kept a
-            # stale target it had already blown through and update_position
-            # fired a target exit on the next tick. Walked a LONG from 100.5 to
-            # 104.9 against rungs at 101/102/103/104: the index stepped 1, 2, 3
-            # while the target stayed 101.00 the whole way, exiting the
-            # remainder at rung 1 on exactly the fast move the ladder exists to
-            # ride. Consistent with the 2026-06-01 dry run, where runners came
-            # in around 1R against 3-4R of MFE.
-            #
-            # When price has outrun EVERY remaining rung the ladder is spent,
-            # so it falls through to the runner branch below instead of
-            # defending a level that is now behind the trade.
-            rung_gap = max(close * 0.0005, 1e-6)
-            next_index = _next_unpassed_rung(rungs, active_index, close, Side.LONG, rung_gap)
-            if next_index is not None:
-                candidate_target = float(rungs[next_index].get("price", 0.0) or 0.0)
-                if current_target is None or candidate_target > float(current_target) + rung_gap:
-                    prior_target = float(current_target) if current_target is not None else None
-                    position.target_price = float(candidate_target)
-                    append_management_adjustment(meta,{"manager": "adaptive_ladder", "kind": "target", "reason": "next_rung", "from": prior_target, "to": float(candidate_target), "source_level": float(candidate_target)})
-                meta["ladder_active_index"] = int(next_index)
-                meta["ladder_final_rung_cleared"] = False
+        # A level buffer that is not a finite number is no buffer, and one at
+        # or below 0 never beats the price term: the zone and price terms set
+        # the stop buffer then.
+        level_buffer = safe_float(getattr(sr_ctx, "level_buffer", None), None, finite=True)
+        stop_buffer = max(0.0 if level_buffer is None else level_buffer,
+                          zone_width * LADDER_STOP_BUFFER_ZONE_FRAC, last_price * LADDER_STOP_BUFFER_PRICE_FRAC)
+        touch_bar = touch_at.floor("1min")
+        hold = _TouchHold(
+            rung_index=active_index, rung_count=len(rungs), level=target, zone_width=zone_width, kind=kind,
+            touch_price=last_price, touch_at=touch_at, touch_bar=touch_bar, stop_buffer=stop_buffer,
+            guard=target - stop_buffer if long_side else target + stop_buffer,
+            deadline=touch_bar + pd.Timedelta(minutes=1) + pd.Timedelta(seconds=timeout),
+        )
+        meta[LADDER_TOUCH_HOLD_KEY] = hold.to_meta()
+        LOG.info(
+            "LADDER_TOUCH symbol=%s side=%s rung=%d/%d level=%.4f touch=%.4f guard=%.4f bar=%s price_at=%s "
+            "deadline=%s",
+            position.symbol, position.side.value, active_index + 1, len(rungs), target, last_price, hold.guard,
+            touch_bar.strftime("%H:%M"), touch_at.strftime("%H:%M:%S"), hold.deadline.strftime("%H:%M:%S"),
+        )
+
+    def _resolve_touch_hold(self, position: Position, meta: dict[str, Any], frame: pd.DataFrame | None,
+                            last_price: float, now: pd.Timestamp) -> ExitDecision | None:
+        """A decided exit again, else the guard, the verdict or the timeout
+        for the hold in progress; None while it still holds (the hold stays
+        in the metadata) or once it promoted the rung (the hold is gone)."""
+        raw = meta.get(LADDER_TOUCH_HOLD_KEY)
+        hold = _TouchHold.read(raw)
+        rungs = _ladder_rungs(meta)
+        if hold is None or rungs is None:
+            # Read back from the position store: a hold it cannot read (or
+            # whose rungs it cannot) is dropped whole, reported, and a price
+            # at the target starts a new one or takes the target.
+            meta.pop(LADDER_TOUCH_HOLD_KEY, None)
+            if hold is None:
+                message = f"Ladder touch hold of {position.symbol} is unreadable ({raw!r}); dropped"
             else:
-                if current_target is not None:
-                    prior_target = float(current_target)
-                    position.target_price = None
-                    append_management_adjustment(meta,{"manager": "adaptive_ladder", "kind": "target", "reason": "final_rung_runner", "from": prior_target, "to": None, "source_level": float(rung_price)})
-                meta["ladder_final_rung_cleared"] = True
-                meta["adaptive_ladder_suppress_target_exit"] = False
-        else:
-            rung_confirmed = zone_flip_confirmed("support", lower, upper, flip_frame=frame, confirm_1m_bars=confirm_1m, confirm_5m_bars=confirm_5m, fallback_bar=None, eps=eps)
-            target_reached = bool(current_target is not None and last_price <= float(current_target) + max(close * 0.0003, 1e-6))
-            # Mirror of the LONG suppress gate: strength check + index
-            # re-alignment check before suppressing the SHORT's target.
-            breakout_strength = self._ladder_target_strength_confirmed(frame, Side.SHORT, current_target)
-            indices_aligned = self._ladder_indices_still_aligned(
-                meta.get("confirmation_indices"), Side.SHORT,
-            )
-            meta["adaptive_ladder_suppress_target_exit"] = bool(
-                target_reached and breakout_strength and indices_aligned and not rung_confirmed
-            )
-            if not rung_confirmed:
-                return
-            # Mirror of the LONG guard above: the tighter of bar close and
-            # live quote, so a promotion is never validated against a price
-            # the quote has already passed.
-            reference_price = max(close, float(last_price))
-            candidate_stop = float(upper) + stop_buffer
-            if reference_price < candidate_stop < float(position.stop_price):
-                prior_stop = float(position.stop_price)
-                position.stop_price = float(candidate_stop)
-                append_management_adjustment(meta,{"manager": "adaptive_ladder", "kind": "stop", "reason": "promoted_resistance", "from": prior_stop, "to": float(candidate_stop), "source_level": float(rung_price)})
-            meta["ladder_defense_price"] = float(rung_price)
-            meta["ladder_defense_zone_width"] = float(zone_width)
-            meta["ladder_defense_kind"] = str(current.get("kind") or "target")
-            meta["ladder_last_promoted_price"] = float(rung_price)
-            # Mirror of the LONG skip-ahead above.
-            rung_gap = max(close * 0.0005, 1e-6)
-            next_index = _next_unpassed_rung(rungs, active_index, close, Side.SHORT, rung_gap)
-            if next_index is not None:
-                candidate_target = float(rungs[next_index].get("price", 0.0) or 0.0)
-                if current_target is None or candidate_target < float(current_target) - rung_gap:
-                    prior_target = float(current_target) if current_target is not None else None
-                    position.target_price = float(candidate_target)
-                    append_management_adjustment(meta,{"manager": "adaptive_ladder", "kind": "target", "reason": "next_rung", "from": prior_target, "to": float(candidate_target), "source_level": float(candidate_target)})
-                meta["ladder_active_index"] = int(next_index)
-                meta["ladder_final_rung_cleared"] = False
-            else:
-                if current_target is not None:
-                    prior_target = float(current_target)
-                    position.target_price = None
-                    append_management_adjustment(meta,{"manager": "adaptive_ladder", "kind": "target", "reason": "final_rung_runner", "from": prior_target, "to": None, "source_level": float(rung_price)})
-                meta["ladder_final_rung_cleared"] = True
-                meta["adaptive_ladder_suppress_target_exit"] = False
+                message = (f"Ladder rungs of {position.symbol} are unreadable ({meta.get('ladder_rungs')!r}); "
+                           "touch hold dropped")
+            self._ladder_unreadable(position, "touch_hold", message)
+            return None
+        if hold.exit_reason:
+            # Decided on an earlier cycle and not booked yet (a failed or
+            # deferred order): the same exit, whatever the price does now.
+            return ExitDecision(hold.exit_reason, "risk")
+        long_side = position.side == Side.LONG
+        if (last_price <= hold.guard) if long_side else (last_price >= hold.guard):
+            return self._touch_hold_exit(position, meta, hold, f"{TARGET_HOLD_GUARD}:{hold.guard:.4f}", "pending",
+                                         None, last_price, now, guard_hit=True)
+        bar = _delivered_touch_bar(frame, hold.touch_bar, now)
+        if bar is not None:
+            verdict, close_pos, close = _touch_bar_verdict(bar, position.side, hold.level)
+            if verdict != "strong" or close is None:
+                return self._touch_hold_exit(position, meta, hold, f"{TARGET_WEAK_CLOSE}:{hold.level:.4f}", verdict,
+                                             close_pos, last_price, now, guard_hit=False)
+            del meta[LADDER_TOUCH_HOLD_KEY]
+            outcome = self._promote_touched_rung(position, meta, hold, rungs, close)
+            self._log_touch_verdict(position, hold, verdict, close_pos, outcome, last_price, now, guard_hit=False)
+            return None
+        if now >= hold.deadline:
+            return self._touch_hold_exit(position, meta, hold, f"{TARGET_HOLD_TIMEOUT}:{hold.level:.4f}", "missing",
+                                         None, last_price, now, guard_hit=False)
+        return None
+
+    def _touch_hold_exit(self, position: Position, meta: dict[str, Any], hold: _TouchHold, reason: str, verdict: str,
+                         close_pos: float | None, last_price: float, now: pd.Timestamp, *,
+                         guard_hit: bool) -> ExitDecision:
+        """Record the hold's exit on the hold itself and log its verdict."""
+        meta[LADDER_TOUCH_HOLD_KEY] = replace(hold, exit_reason=reason).to_meta()
+        self._log_touch_verdict(position, hold, verdict, close_pos, f"exit:{exit_reason_code(reason)}",
+                                last_price, now, guard_hit=guard_hit)
+        return ExitDecision(reason, "risk")
+
+    @staticmethod
+    def _promote_touched_rung(position: Position, meta: dict[str, Any], hold: _TouchHold, rungs: list,
+                              bar_close: float) -> str:
+        """A strong touch bar: the stop to the rung less the stop buffer, the
+        target to the next rung the bar's close has not passed, or none past
+        the last rung. Returns ``promoted`` or ``runner``. Every value is
+        read before the first write, so the promotion applies whole."""
+        long_side = position.side == Side.LONG
+        candidate_stop = hold.level - hold.stop_buffer if long_side else hold.level + hold.stop_buffer
+        prior_stop = float(position.stop_price)
+        tighter = (candidate_stop > prior_stop) if long_side else (candidate_stop < prior_stop)
+        next_index = _next_unpassed_rung(rungs, hold.rung_index, bar_close, position.side,
+                                         max(bar_close * LADDER_NEXT_RUNG_GAP_FRAC, 1e-6))
+        new_target = None if next_index is None else safe_float(rungs[next_index].get("price"), None, finite=True)
+        prior_target = safe_float(position.target_price, None)
+        if tighter:
+            position.stop_price = float(candidate_stop)
+            append_management_adjustment(meta, {"manager": "adaptive_ladder", "kind": "stop", "reason": "touch_promoted", "from": prior_stop, "to": float(candidate_stop), "source_level": hold.level})
+        meta["ladder_defense_price"] = hold.level
+        meta["ladder_defense_zone_width"] = hold.zone_width
+        meta["ladder_defense_kind"] = hold.kind
+        if next_index is not None and new_target is not None:
+            position.target_price = new_target
+            meta["ladder_active_index"] = int(next_index)
+            meta["ladder_final_rung_cleared"] = False
+            append_management_adjustment(meta, {"manager": "adaptive_ladder", "kind": "target", "reason": "next_rung", "from": prior_target, "to": new_target, "source_level": new_target})
+            return "promoted"
+        position.target_price = None
+        meta["ladder_final_rung_cleared"] = True
+        append_management_adjustment(meta, {"manager": "adaptive_ladder", "kind": "target", "reason": "final_rung_runner", "from": prior_target, "to": None, "source_level": hold.level})
+        return "runner"
+
+    @staticmethod
+    def _log_touch_verdict(position: Position, hold: _TouchHold, verdict: str, close_pos: float | None,
+                           outcome: str, last_price: float, now: pd.Timestamp, *, guard_hit: bool) -> None:
+        target = safe_float(position.target_price, None)
+        LOG.info(
+            "LADDER_VERDICT symbol=%s side=%s rung=%d/%d level=%.4f touch=%.4f bar=%s verdict=%s close_pos=%s "
+            "guard_hit=%s outcome=%s price=%.4f stop=%.4f target=%s held_s=%.0f",
+            position.symbol, position.side.value, hold.rung_index + 1, hold.rung_count, hold.level,
+            hold.touch_price, hold.touch_bar.strftime("%H:%M"), verdict,
+            "-" if close_pos is None else f"{close_pos:.2f}", "yes" if guard_hit else "no", outcome,
+            last_price, float(position.stop_price), "none" if target is None else f"{target:.4f}",
+            (now - hold.touch_at).total_seconds(),
+        )
 
     # ------------------------------------------------------------------
     # Broker-side bracket lifecycle
@@ -1565,8 +1737,9 @@ class PositionManager:
           manager, the adaptive ladder, the exit policy with the shared exits
           and the strategy's own) is skipped this cycle, and the rest of its
           management runs: the RiskManager check on the levels as the failed
-          step left them, so its stop and target still fire, then force
-          flatten and the exit order.
+          step left them, so its stop and target still fire (a touch hold
+          left by a failed ladder pass is dropped, since it keeps the
+          target off), then force flatten and the exit order.
         - Anywhere else (its bracket-fill booking, the working-exit
           settlement, the risk check itself, the bracket sync, the exit order
           and its booking) its cycle ends where it failed. Those steps can
@@ -1670,20 +1843,32 @@ class PositionManager:
             position.metadata["management_adjustments"] = []
         decision: ExitDecision | None = None
         if last_price is not None:
-            # The in-trade managers only move this position's levels. One that
-            # raises is skipped, and the risk check below runs on the levels
-            # as it left them, so the failure never costs the position its
-            # stop or target (2026-09-26).
-            for step, manager in (("the sr_flip manager", self._sr_flip_management_confirmed),
-                                  ("the adaptive ladder", self._adaptive_ladder_management)):
-                try:
-                    manager(position, management_frame, float(last_price))
-                except Exception as exc:
-                    self._position_failed(key, step, exc, failures, rest_runs=True)
+            # The in-trade managers only move this position's levels, and the
+            # adaptive ladder's touch hold proposes an exit. One that raises
+            # is skipped, and the risk check below runs on the levels as it
+            # left them, so the failure never costs the position its stop or
+            # target (2026-09-26): a touch hold the failed ladder pass left in
+            # the metadata is dropped, since it keeps RiskManager off the
+            # target.
+            ladder_exit: ExitDecision | None = None
+            try:
+                self._sr_flip_management_confirmed(position, management_frame, float(last_price))
+            except Exception as exc:
+                self._position_failed(key, "the sr_flip manager", exc, failures, rest_runs=True)
+            try:
+                price_at = market_snapshot.get("price_at") if isinstance(market_snapshot, dict) else None
+                ladder_exit = self._adaptive_ladder_management(position, management_frame, float(last_price), price_at)
+            except Exception as exc:
+                if isinstance(position.metadata, dict):
+                    position.metadata.pop(LADDER_TOUCH_HOLD_KEY, None)
+                self._position_failed(key, "the adaptive ladder", exc, failures, rest_runs=True)
             self._update_position_diagnostics(position, last_price, underlying_price)
             risk_exit, risk_reason = self.risk.update_position(position, last_price)
             if risk_exit:
                 decision = ExitDecision(risk_reason, "risk")
+            elif ladder_exit is not None:
+                # The ladder's touch hold exits after the risk exits.
+                decision = ladder_exit
             # Push any level the managers just moved onto the resting
             # broker children, before the exit decision below can cancel
             # them. No-op outside `replace` sync mode.

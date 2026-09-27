@@ -1968,10 +1968,13 @@ class BaseStrategy:
     ) -> list[dict[str, Any]]:
         """Return a list of ladder rungs ordered in the direction of travel.
 
-        Each rung dict matches the shape the adaptive_ladder manager
-        (PositionManager._adaptive_ladder_management) expects: price, kind,
-        zone_width, lower, upper, rr. An empty list disables laddering —
-        the signal keeps its originally-computed target and behaves as a
+        Each rung dict carries price, kind, zone_width, lower, upper (the
+        zone around the price) and rr. The first rung is the signal's target.
+        The adaptive ladder's touch hold (PositionManager._adaptive_ladder_management,
+        ``shared_exit.adaptive_ladder_touch_hold``) reads the price, zone
+        width and kind to promote past a rung; with the hold off the first
+        rung is a plain take-profit. An empty list disables laddering — the
+        signal keeps its originally-computed target and behaves as a
         single-target trade.
         """
         if sr_ctx is None:
@@ -2051,14 +2054,16 @@ class BaseStrategy:
         close: float,
         atr: float,
     ) -> dict[str, Any]:
-        """Produce the metadata dict the ladder manager reads.
+        """Produce the ladder metadata a laddered position carries.
 
-        Keys match PositionManager._adaptive_ladder_management exactly —
-        changing any of these without updating the manager will silently
-        break ladder management. The manager uses ladder_defense_price /
-        zone_width as the initial structural defense (usually the entry
-        level). Subclasses that know a better defense level (e.g. HTF peer
-        level) can add a post-process step after calling this helper.
+        RiskManager and PositionManager._adaptive_ladder_management read
+        ladder_management_enabled, ladder_rungs and ladder_active_index; a
+        touch-hold promotion rewrites ladder_active_index, the
+        ladder_defense_* keys and ladder_final_rung_cleared. The key-levels
+        ladder defence reads ladder_defense_price / _zone_width, the defended
+        level (the entry stop here). Subclasses that know a better defense
+        level (e.g. HTF peer level) can add a post-process step after
+        calling this helper.
         """
         zone_mult = max(0.0, self._ladder_param("ladder_zone_atr_mult", 0.5))
         defense_width = max(float(atr or 0.0) * zone_mult, float(close) * 0.0010, 1e-6)
@@ -2075,7 +2080,6 @@ class BaseStrategy:
             "ladder_entry_level_zone_width": round(defense_width, 6),
             "ladder_entry_level_kind": "entry_level",
             "ladder_final_rung_cleared": False,
-            "adaptive_ladder_suppress_target_exit": False,
         }
 
     def _apply_ladder_if_enabled(

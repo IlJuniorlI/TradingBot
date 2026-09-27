@@ -12,7 +12,7 @@ from .config import BotConfig
 from .models import ASSET_TYPE_EQUITY, OPTION_ASSET_TYPES, Position, Side, Signal
 from .numeric import first_float, safe_float
 from ._strategies.catalogue import is_option_strategy
-from .position_metrics import append_management_adjustment
+from .position_metrics import LADDER_TOUCH_HOLD_KEY, append_management_adjustment
 from . import sessions
 
 LOG = logging.getLogger(__name__)
@@ -926,10 +926,19 @@ class RiskManager:
             else:
                 floor_r = self._peak_giveback_floor_r(peak_r)
             if isinstance(meta, dict):
+                # The floor and the peak as prices too (2026-09-27), beside
+                # their R: what EXIT_CONTEXT records for the exit
+                # (``peak_giveback_*`` is in the structured snapshot).
+                direction = 1.0 if position.side == Side.LONG else -1.0
+                entry = float(position.entry_price)
                 meta["peak_giveback_fired"] = True
                 meta["peak_giveback_peak_r"] = round(float(peak_r), 4)
                 meta["peak_giveback_floor_r"] = None if floor_r is None else round(float(floor_r), 4)
                 meta["peak_giveback_current_r"] = round(float(current_r), 4)
+                peak_price = position.highest_price if position.side == Side.LONG else position.lowest_price
+                meta["peak_giveback_peak_price"] = float(last_price if peak_price is None else peak_price)
+                meta["peak_giveback_floor_price"] = (
+                    None if floor_r is None else round(entry + direction * float(floor_r) * initial_risk, 6))
                 meta["peak_giveback_min_r_used"] = round(min_r_used, 4)
                 meta["peak_giveback_override_active"] = override_active
                 meta["peak_giveback_low_tier_active"] = low_tier_active
@@ -1001,7 +1010,10 @@ class RiskManager:
         adaptive_enabled = (not options_position) and trade_management_mode in {"adaptive", "adaptive_ladder"} and bool(meta.get("adaptive_management_enabled", False)) and initial_risk > 0
         adaptive_runner_extension_enabled = adaptive_enabled and not ladder_management_enabled
         trailing_enabled = (not options_position) and (trade_management_mode == "adaptive" or (trade_management_mode == "adaptive_ladder" and not ladder_management_enabled))
-        suppress_target_exit = (not options_position) and trade_management_mode == "adaptive_ladder" and bool(meta.get("adaptive_ladder_suppress_target_exit", False))
+        # The adaptive ladder's touch hold (shared_exit.adaptive_ladder_touch_hold,
+        # off by default): while PositionManager holds a touched rung, the
+        # target is not taken here. It only ever sets the key when on.
+        touch_hold = ladder_management_enabled and isinstance(meta.get(LADDER_TOUCH_HOLD_KEY), dict)
 
         # Broker-side bracket: whichever legs are actually RESTING at the broker
         # are owned by the broker, and the engine must not also fire them --
@@ -1098,7 +1110,7 @@ class RiskManager:
                         append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "trail", "from": prior_stop, "to": float(candidate_stop)})
             if last_price <= position.stop_price and not broker_owns_stop:
                 return True, "stop"
-            if position.target_price is not None and last_price >= position.target_price and not suppress_target_exit and not broker_owns_target:
+            if position.target_price is not None and last_price >= position.target_price and not touch_hold and not broker_owns_target:
                 return True, "target"
         else:
             if adaptive_enabled:
@@ -1176,6 +1188,6 @@ class RiskManager:
                         append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "trail", "from": prior_stop, "to": float(candidate_stop)})
             if last_price >= position.stop_price and not broker_owns_stop:
                 return True, "stop"
-            if position.target_price is not None and last_price <= position.target_price and not suppress_target_exit and not broker_owns_target:
+            if position.target_price is not None and last_price <= position.target_price and not touch_hold and not broker_owns_target:
                 return True, "target"
         return False, "hold"

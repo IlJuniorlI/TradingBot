@@ -75,8 +75,10 @@ risk:
   time_stop_minutes: 0
   time_stop_min_return_pct: 0.003
   # Peak-giveback floor: once max_favorable_r since entry crosses
-  # peak_giveback_min_r (default 1.0), exit when current_r retraces below
-  # a tiered fraction of the peak — 50% at 1R-2R, 40% at 2R-3R, 30% at 3R+.
+  # peak_giveback_min_r (default 1.0), exit when current_r retraces to a
+  # floor that keeps a tiered fraction of the peak: 65% of a 1R-2R peak, 72%
+  # of 2R-3R, 78% of 3R+ (the peak_giveback_retain_* code defaults; 50/60/70%
+  # until 2026-05-27). peak_giveback_enabled: false turns it off.
   peak_giveback_enabled: true
   peak_giveback_min_r: 1.0
 
@@ -466,6 +468,20 @@ shared_exit:
   bullish_close_position_loose_max: 0.38
   bearish_close_position_loose_min: 0.62
   use_candle_pattern_exit: false
+  # The adaptive ladder's touch hold (2026-09-27). OFF: the first ladder rung
+  # is a plain take-profit, taken on the first quote at it. ON: that quote
+  # holds the position until the 1m bar it was fetched in is delivered; a
+  # close at or through the target at least 55% of the way up the bar (down
+  # for a SHORT) promotes the rung (stop to the rung less the stop buffer,
+  # target to the next rung, or none past the last), any other close exits
+  # (target_weak_close). While it holds, a quote the stop buffer back through
+  # the rung exits at once (target_hold_guard), and a touch bar still missing
+  # this many seconds after it closed exits (target_hold_timeout). A dry-run
+  # A/B reads the LADDER_TOUCH / LADDER_VERDICT log lines. Replay and details:
+  # README, shared_exit. With brackets it needs execution.bracket_legs:
+  # stop_only.
+  adaptive_ladder_touch_hold: false
+  adaptive_ladder_touch_hold_timeout_seconds: 45
 
 # Strategy-specific windows and tuned parameters.
 strategies:

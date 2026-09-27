@@ -201,8 +201,9 @@ execution:
   # static = submit once, never touch; replace = every engine stop/target
   # move replaces the child (required for adaptive / adaptive_ladder).
   bracket_sync_mode: static
-  # stop_and_target | stop_only (stop_only is required for adaptive_ladder,
-  # which rolls past targets and clears the final one for a runner).
+  # stop_and_target | stop_only (stop_only is required for adaptive_ladder
+  # with shared_exit.adaptive_ladder_touch_hold on, which holds the target at
+  # a touched rung, rolls it to the next one and clears it for a runner).
   bracket_legs: stop_and_target
   # STOP_LIMIT bounds slippage at the cost of a no-fill tail; STOP always fills.
   bracket_stop_order_type: STOP_LIMIT
@@ -690,6 +691,20 @@ shared_exit:
   # kept it dead.
   # 0 = un-gated.
   discretionary_exit_min_r: 0.5
+  # The adaptive ladder's touch hold (2026-09-27). OFF: the first ladder rung
+  # is a plain take-profit, taken on the first quote at it. ON: that quote
+  # holds the position until the 1m bar it was fetched in is delivered; a
+  # close at or through the target at least 55% of the way up the bar (down
+  # for a SHORT) promotes the rung (stop to the rung less the stop buffer,
+  # target to the next rung, or none past the last), any other close exits
+  # (target_weak_close). While it holds, a quote the stop buffer back through
+  # the rung exits at once (target_hold_guard), and a touch bar still missing
+  # this many seconds after it closed exits (target_hold_timeout). A dry-run
+  # A/B reads the LADDER_TOUCH / LADDER_VERDICT log lines. Replay and details:
+  # README, shared_exit. With brackets it needs execution.bracket_legs:
+  # stop_only.
+  adaptive_ladder_touch_hold: false
+  adaptive_ladder_touch_hold_timeout_seconds: 45
   # Counter-direction REGULAR divergence forming on a held position (its latest
   # pivot closed after the entry) scales out divergence_exit_partial_frac of
   # the current quantity, once per divergence pivot; the slice is floored, so a

@@ -77,8 +77,10 @@ risk:
   time_stop_minutes: 45
   time_stop_min_return_pct: 0.003
   # Peak-giveback floor: once max_favorable_r since entry crosses
-  # peak_giveback_min_r (default 1.0), exit when current_r retraces below
-  # a tiered fraction of the peak — 50% at 1R-2R, 40% at 2R-3R, 30% at 3R+.
+  # peak_giveback_min_r (default 1.0), exit when current_r retraces to a
+  # floor that keeps a tiered fraction of the peak: the
+  # peak_giveback_retain_* fractions below (65% of a 1R-2R peak, 72% of
+  # 2R-3R, 78% of 3R+). peak_giveback_enabled: false turns it off.
   peak_giveback_enabled: true
   peak_giveback_min_r: 1.0
   # Low-tier peak-giveback (2026-05-26): catches 0.7-1.0R MFE trades
@@ -556,6 +558,20 @@ shared_exit:
   # only on the losing side of entry, so the gate had kept it dead (it ships
   # off anyway, see use_sr_loss_exit).
   discretionary_exit_min_r: 0.5
+  # The adaptive ladder's touch hold (2026-09-27). OFF: the first ladder rung
+  # is a plain take-profit, taken on the first quote at it. ON: that quote
+  # holds the position until the 1m bar it was fetched in is delivered; a
+  # close at or through the target at least 55% of the way up the bar (down
+  # for a SHORT) promotes the rung (stop to the rung less the stop buffer,
+  # target to the next rung, or none past the last), any other close exits
+  # (target_weak_close). While it holds, a quote the stop buffer back through
+  # the rung exits at once (target_hold_guard), and a touch bar still missing
+  # this many seconds after it closed exits (target_hold_timeout). A dry-run
+  # A/B reads the LADDER_TOUCH / LADDER_VERDICT log lines. Replay and details:
+  # README, shared_exit. With brackets it needs execution.bracket_legs:
+  # stop_only.
+  adaptive_ladder_touch_hold: false
+  adaptive_ladder_touch_hold_timeout_seconds: 45
 
 # Per-strategy windows and parameter blocks.
 strategies:
@@ -980,8 +996,9 @@ strategies:
       # Target-inside-SR (CEILING): reject trend entries whose target
       # projects past nearest opposing SR. Complements entry_min_clearance_atr
       # (FLOOR on SR clearance). Ladder mode (2026-09-25): a first rung ON the
-      # nearest level passes (the ladder manages it); the ratio only bites on
-      # a rung past a nearer, unladdered level. Runners (no target) are exempt.
+      # nearest level passes (it is the ladder's own take-profit there); the
+      # ratio only bites on a rung past a nearer, unladdered level. Runners
+      # (no target) are exempt.
       reject_target_beyond_sr: true
       target_max_sr_ratio: 0.7                 # HIGH_VOL: was 0.8 — more conservative target placement (30% head-room); SR targets fail more in high vol
 
@@ -1050,8 +1067,10 @@ strategies:
       # is "adaptive_ladder"). Walks S/R resistances (long) / supports
       # (short) and keeps only rungs that clear ladder_min_target_rr.
       # Range-regime trades skip laddering (single target at range_high).
+      # Rung 1 is the target, a plain take-profit: the rungs past it and the
+      # zone act only with shared_exit.adaptive_ladder_touch_hold on (off).
       ladder_min_target_rr: 1.2     # rejects rungs with R:R below this
-      ladder_zone_atr_mult: 0.5     # rung confirmation zone width = 0.5 * ATR
+      ladder_zone_atr_mult: 0.5     # rung zone width = 0.5 * ATR; the touch hold's stop buffer is at least a quarter of it
       ladder_max_rungs: 4           # cap on number of rungs per signal
 
       # ===== vol_squeeze regime (added 2026-05-12) =====
@@ -1347,7 +1366,7 @@ strategies:
       vwap_reclaim_lookback_bars: 6 # the dip below VWAP must be within the last ~6 min
       vwap_reclaim_min_volume_ratio: 1.5
       vwap_reclaim_buffer_pct: 0.0015
-      vwap_reclaim_target_rr: 2.0   # matches trend/pullback/momentum; the ladder extends past it
+      vwap_reclaim_target_rr: 2.0   # matches trend/pullback/momentum; a ladder rung replaces it when one qualifies
 
       # Live directional bias threshold (added 2026-05-12). Day_strength is
       # computed LIVE from session_open + current close in the strategy

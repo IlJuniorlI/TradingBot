@@ -295,7 +295,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         mapping for the symbol): the ETF path of ``_index_confirms`` then
         has nothing to agree, ``_index_neutral`` reads neutral, the
         relative-strength gate and the sector beta have no benchmark, and
-        the adaptive ladder's index re-check is inert.
+        the signal's ``confirmation_indices`` stamp is empty.
         """
         fallback = self._index_symbols()
         sector_groups = self.params.get("sector_groups") or {}
@@ -3574,9 +3574,9 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                 level_name = "support"
                 reason_prefix = "short_target_beyond_support"
             # A first ladder rung ON the nearest level is the ladder's own
-            # take-profit at that level, and the ladder manages it (zone-flip
-            # stop promotion and the next rung; a strong push suppresses the
-            # target exit). The rung builder draws from the list nearest_*
+            # take-profit at that level (with shared_exit's touch hold on,
+            # the ladder judges the bar that touches it and may promote to
+            # the next rung). The rung builder draws from the list nearest_*
             # heads, so rung 1 sits at or past the nearest level and the
             # ratio is >= 1.00 by construction: at the shipped 0.7 / 0.8
             # ratios this gate refused every laddered trend entry until
@@ -4470,15 +4470,12 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     if bool(self.params.get("atr_aware_stop_enabled", True)) and isinstance(sig.metadata, dict):
                         sig.metadata["vol_widening_factor"] = round(float(vol_widening), 4)
                     # Stamp the per-sector confirmation indices used at
-                    # entry. ``position_manager._adaptive_ladder_management``
-                    # re-checks these at target-hit time so a sector ETF
-                    # that has flipped against the trade can short-circuit
-                    # the multi-bar zone-flip wait (target exits at the
-                    # rung price instead of riding through a sector
-                    # reversal). Read in
-                    # ``_ladder_indices_still_aligned``. With no index
-                    # symbols (small_cap_squeeze) the list is empty and the
-                    # re-check is inert.
+                    # entry, for the entry and exit records (ENTRY_CONTEXT,
+                    # EXIT_CONTEXT): which sector ETFs confirmed the trade.
+                    # Until 2026-09-27 the adaptive ladder also re-read them
+                    # at the target, for its target-exit suppression (removed;
+                    # see PositionManager's adaptive ladder). With no index
+                    # symbols (small_cap_squeeze) the list is empty.
                     if isinstance(sig.metadata, dict):
                         sig.metadata["confirmation_indices"] = list(self._indices_for_symbol(c.symbol))
                         # Cross-regime-comparable score: the manifest's

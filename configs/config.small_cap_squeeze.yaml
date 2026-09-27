@@ -487,6 +487,20 @@ shared_exit:
   # ladder is deliberately LATER than top_tier's (breakeven 1.2 vs 0.6) —
   # this gate sits well below it and does not interact.
   discretionary_exit_min_r: 0.5
+  # The adaptive ladder's touch hold (2026-09-27). OFF: the first ladder rung
+  # is a plain take-profit, taken on the first quote at it. ON: that quote
+  # holds the position until the 1m bar it was fetched in is delivered; a
+  # close at or through the target at least 55% of the way up the bar (down
+  # for a SHORT) promotes the rung (stop to the rung less the stop buffer,
+  # target to the next rung, or none past the last), any other close exits
+  # (target_weak_close). While it holds, a quote the stop buffer back through
+  # the rung exits at once (target_hold_guard), and a touch bar still missing
+  # this many seconds after it closed exits (target_hold_timeout). A dry-run
+  # A/B reads the LADDER_TOUCH / LADDER_VERDICT log lines. Replay and details:
+  # README, shared_exit. With brackets it needs execution.bracket_legs:
+  # stop_only.
+  adaptive_ladder_touch_hold: false
+  adaptive_ladder_touch_hold_timeout_seconds: 45
 
 strategies:
   small_cap_squeeze:
@@ -566,13 +580,13 @@ strategies:
       # decisive clear of VWAP + real volume on the reclaim bar.
       vwap_reclaim_min_volume_ratio: 1.5   # was 1.2 — reclaim bar volume vs recent avg
       vwap_reclaim_buffer_pct: 0.0025      # was 0.0005 — clear VWAP decisively, not a 1-tick poke
-      vwap_reclaim_target_rr: 2.5          # runner-friendly; ladder/peak-giveback extend past it
+      vwap_reclaim_target_rr: 2.5          # runner-friendly; a ladder rung replaces it when one qualifies
 
       # ===================== No confirmations / no sector =====================
       require_index_confirmation: false
-      # No index ETF anywhere: none streamed, no sector beta, and the adaptive
-      # ladder's index re-check is inert (until 2026-09-26 [] was read as
-      # SPY / QQQ, never streamed here, so every rung tag exited at target).
+      # No index ETF anywhere: none streamed, no sector beta, and an empty
+      # confirmation_indices stamp (until 2026-09-26 [] was read as SPY / QQQ,
+      # never streamed here).
       index_symbols: []
       sector_groups: {}
       sector_index_map: {}
@@ -635,18 +649,23 @@ strategies:
       momentum_min_day_strength: 3.0
       directional_bias_min_day_strength: 0.5
 
-      # ===================== Hybrid scalp + runner management =====================
-      # The adaptive ladder steps the stop and target up through the S/R rungs;
-      # it never sells part of the position, so the whole position rides to one
-      # exit (the last rung clears the target, and peak-giveback -- loose on
-      # high-conviction squeeze days so big moves get room to extend -- trails it).
+      # ===================== Scalp + runner management =====================
+      # The adaptive ladder's first S/R rung is the take-profit; it steps the
+      # stop and target up the rungs only with shared_exit.adaptive_ladder_touch_hold
+      # on (off here). It never sells part of the position, so the whole
+      # position rides to one exit: the rung, the stop or peak-giveback.
       # 2026-06-01 dry-run retune: the original 0.6R break-even / 1.1R profit-lock /
       # 0.5R lock moved the stop up so early that routine mid-squeeze pullbacks
       # (these names breathe 15-25% intra-move) stopped runners out at ~1R while
       # they had 3-4R of MFE available (HKIT vwap_reclaim peaked +$94 exited +$29;
-      # momentum peaked +$84 exited +$19). Delayed break-even + profit-lock and a
-      # wider protected stop so peak_giveback (which captured 2.60R of a 3.33R peak
-      # on the one trade it managed) owns the runner instead of being pre-empted.
+      # momentum peaked +$84 exited +$19). So break-even waits for 1.2R and the
+      # profit lock for 1.8R, which moves the stop to +1.0R.
+      # What manages a runner (S1 exit study, 2026-09-26): the high-conviction
+      # override below (a 5% day strength) was on 37 of the 43 replayed entries,
+      # and on those peak-giveback arms only at a 2.5R peak, with no low tier.
+      # Below 2.5R the break-even, the profit lock and, for an entry with no
+      # ladder rung, the 5% trail (risk.trailing_stop_pct, a median 0.32R wide on
+      # those entries) manage it; peak-giveback owns only a run past 2.5R.
       adaptive_breakeven_rr: 1.2          # was 0.6 — don't flatten risk until a real cushion
       adaptive_profit_lock_rr: 1.8         # was 1.1 — lock later so early volatility doesn't trip it
       adaptive_profit_lock_stop_rr: 1.0    # was 0.5 — protect 1R when it locks (captures more of the run)
