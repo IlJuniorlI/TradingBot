@@ -27,6 +27,7 @@ from .broker_payloads import (
     order_status,
 )
 from .config import BotConfig
+from .data_feed import EXECUTION_LAST_KEYS
 from .models import (
     ASSET_TYPE_EQUITY,
     ASSET_TYPE_OPTION_SINGLE,
@@ -132,9 +133,9 @@ class SchwabExecutor:
         max_age = max(1.0, float(self.config.runtime.quote_cache_seconds))
         if not data.quotes_are_fresh([symbol], max_age):
             return None
-        bid = first_float(quote, "bid", "bidPrice", positive=True)
-        ask = first_float(quote, "ask", "askPrice", positive=True)
-        last = first_float(quote, "last", "lastPrice", "mark", "markPrice", "close", "closePrice", positive=True)
+        bid = first_float(quote, "bid", positive=True)
+        ask = first_float(quote, "ask", positive=True)
+        last = first_float(quote, *EXECUTION_LAST_KEYS, positive=True)
         return bid, ask, last
 
     @staticmethod
@@ -153,9 +154,9 @@ class SchwabExecutor:
             last = first_float({"v": market_snapshot[2]}, "v", positive=True)
             return bid, ask, last
         if isinstance(market_snapshot, dict):
-            bid = first_float(market_snapshot, "bid", "bidPrice", positive=True)
-            ask = first_float(market_snapshot, "ask", "askPrice", positive=True)
-            last = first_float(market_snapshot, "last", "lastPrice", "mark", "markPrice", "close", "closePrice", "mid", positive=True)
+            bid = first_float(market_snapshot, "bid", positive=True)
+            ask = first_float(market_snapshot, "ask", positive=True)
+            last = first_float(market_snapshot, *EXECUTION_LAST_KEYS, "mid", positive=True)
             return bid, ask, last
         return None
 

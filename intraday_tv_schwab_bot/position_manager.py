@@ -44,7 +44,7 @@ import pandas as pd
 from .audit_logger import AuditLogger
 from .config import BotConfig
 from .dashboard_cache import DashboardCache
-from .data_feed import MarketDataStore
+from .data_feed import EXECUTION_LAST_KEYS, MANAGEMENT_PRICE_KEYS, MarketDataStore
 from .execution import BracketCancel, SchwabExecutor
 from .models import (
     ASSET_TYPE_EQUITY,
@@ -375,13 +375,12 @@ class PositionManager:
                 # Bid (for LONG) and ask (for SHORT) can cause false stop triggers
                 # during wide spreads — the actual traded price may be far from the
                 # bid/ask extremes.
-                price = first_float(quote, "mark", "markPrice", "last", "lastPrice", "close", "closePrice",
-                                    positive=True)
+                price = first_float(quote, *MANAGEMENT_PRICE_KEYS, positive=True)
                 if price is not None:
                     market_snapshot = {
                         "bid": safe_float(quote.get("bid"), None),
                         "ask": safe_float(quote.get("ask"), None),
-                        "last": safe_float(quote.get("last") or quote.get("mark") or quote.get("close"), None),
+                        "last": first_float(quote, *EXECUTION_LAST_KEYS, positive=True),
                         "source": "quote",
                         "decision_price": price,
                         "price_at": quote.get("fetched_at"),
@@ -1830,14 +1829,7 @@ class PositionManager:
         else:
             underlying_price = self.underlying_price_for_position(position, bars, None)
             if underlying_price is None:
-                quote = self.data.get_quote(management_symbol)
-                if quote is not None:
-                    mark = quote.get("mark")
-                    try:
-                        if mark is not None and float(mark) > 0:
-                            underlying_price = float(mark)
-                    except (TypeError, ValueError):
-                        underlying_price = None
+                underlying_price = first_float(self.data.get_quote(management_symbol), "mark", positive=True)
         # Always reset management_adjustments at the start of each cycle to
         # prevent stale adjustments from persisting when price is unavailable.
         if isinstance(position.metadata, dict):

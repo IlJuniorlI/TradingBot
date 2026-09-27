@@ -40,6 +40,7 @@ import copy
 from .candles import detect_candle_context, detect_per_bar_candle_patterns
 from .chart_patterns import analyze_chart_pattern_context
 from .config import BotConfig, DashboardChartConfig
+from .data_feed import DISPLAY_PRICE_KEYS
 from .htf_levels import summarize_htf_trend
 from .models import Side
 from .numeric import first_float, safe_float
@@ -718,7 +719,7 @@ class DashboardCache:
 
     def symbol_price(self, symbol: str) -> float | None:
         quote = self.data.get_quote(symbol) if self.data is not None else None
-        price = first_float(quote, "last", "mark", "mid", "close", "bid", "ask", positive=True)
+        price = first_float(quote, *DISPLAY_PRICE_KEYS, positive=True)
         if price is not None:
             return price
         if self.data is not None:

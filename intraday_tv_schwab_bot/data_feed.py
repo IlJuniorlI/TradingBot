@@ -37,6 +37,17 @@ from .sessions import (
 
 LOG = logging.getLogger(__name__)
 
+# The price keys a quote-cache entry (``MarketDataStore._normalize_quote``
+# holds bid, ask, mid, mark, last and close) is read by, the first above
+# zero winning (``numeric.first_float(quote, *keys, positive=True)``). Stop
+# and target decisions read the mark first: in a wide spread the bid or ask
+# can trigger a stop the traded price never reached. Pricing an equity limit
+# order reads the last trade first, as does the dashboard, which falls back
+# as far as the bid and ask.
+MANAGEMENT_PRICE_KEYS = ("mark", "last", "close")
+EXECUTION_LAST_KEYS = ("last", "mark", "close")
+DISPLAY_PRICE_KEYS = ("last", "mark", "mid", "close", "bid", "ask")
+
 
 @dataclass(slots=True)
 class MergeStats:

@@ -310,6 +310,26 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The quote-price reads name their key order (refactor cut C31).**
+  *2026-09-27* — `data_feed` holds the three orders beside the quote
+  cache, each read with `numeric.first_float(..., positive=True)`:
+  `MANAGEMENT_PRICE_KEYS` (`mark`, `last`, `close`: the manager's
+  stop/target price and the restore's current price),
+  `EXECUTION_LAST_KEYS` (`last`, `mark`, `close`: the executor's last
+  price, and the last price of the manager's market snapshot) and
+  `DISPLAY_PRICE_KEYS` (`last`, `mark`, `mid`, `close`, `bid`, `ask`: the
+  dashboard). The camelCase keys the manager, the restore and the executor
+  also tried (`markPrice`, `lastPrice`, `closePrice`, `bidPrice`,
+  `askPrice`) are gone: a cached quote holds `_normalize_quote`'s keys
+  only, and a market snapshot bid, ask and last. An option position's
+  underlying price, when no bar has one, is its quote's `mark` read the
+  same way (an int too large for a float no longer raises out of the
+  cycle). One reading changed, for inputs no cached quote holds: the
+  snapshot's last price was `safe_float(last or mark or close)`, so a NaN
+  or unparseable `last` read as None and a negative one as itself; it now
+  falls through to `mark`. On every quote the cache can hold it reads as
+  before. Tests: `tests/test_quote_price_reads.py`, `tests/test_numeric.py`.
+
 - **Broker payload parsing has one home, `broker_payloads.py` (refactor
   cut C30).** *2026-09-27* — `broker_positions.py` is renamed
   `broker_payloads.py` and takes the order readers that were

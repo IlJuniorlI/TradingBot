@@ -62,7 +62,7 @@ from .broker_payloads import (
     working_exit_outstanding_qty,
 )
 from .config import BotConfig
-from .data_feed import MarketDataStore
+from .data_feed import MANAGEMENT_PRICE_KEYS, MarketDataStore
 from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side
 from .paper_account import PaperAccount
 from .numeric import first_float, safe_float
@@ -788,8 +788,8 @@ class StartupReconciler:
             if self.data is not None:
                 try:
                     self.data.fetch_quotes([symbol], force=True, source="engine:restore_broker_position")
-                    current_price = first_float(self.data.get_quote(symbol), "mark", "markPrice", "last", "lastPrice",
-                                                "close", "closePrice", default=entry_price, positive=True)
+                    current_price = first_float(self.data.get_quote(symbol), *MANAGEMENT_PRICE_KEYS,
+                                                default=entry_price, positive=True)
                 except Exception:
                     LOG.debug("Could not fetch current price for restored position %s; using entry_price.", symbol, exc_info=True)
             if matched is not None:
