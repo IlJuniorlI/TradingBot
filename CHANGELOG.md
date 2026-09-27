@@ -310,6 +310,24 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The strategy owns its exit policy, and an exit decision sizes itself
+  (refactor cut C33).** *2026-09-27* — `BaseStrategy.__init__` builds
+  `self.exit_policy = SharedExitPolicy(config, self)` beside
+  `self.entry_policy`, and the position manager decides each open
+  position's exit through `strategy.exit_policy`; the adaptive ladder's
+  touch hold reads its timeout there too. The manager no longer builds its
+  own copy or imports `_strategies.shared_exit`.
+  `shared_exit.partial_exit_qty(qty, fraction)` is now
+  `ExitDecision.close_qty(qty)` in `models.py`: the whole quantity at a
+  fraction of 1.0, otherwise the floor of the product rounded to 9 places.
+  There is no alias: `partial_exit_qty` and `PositionManager.exit_policy`
+  are gone. No behaviour changes: the engine builds the strategy and the
+  position manager from one config, which the policy reads live. Tests:
+  the sizing cases moved from `tests/test_shared_exit_policy.py` to
+  `tests/test_partial_exit.py` (`TestCloseQty`); stubs that set
+  `manager.exit_policy` now set `manager.strategy.exit_policy`;
+  `TestTheStrategyOwnsThePolicy` pins the ownership.
+
 - **The dashboard draws the order blocks and fair value gaps the strategy
   read (refactor cut B14).** *2026-09-27* — the LTF FVG and the HTF / LTF
   order-block overlays ask for the strategy's `ltf_fvg_request()` /

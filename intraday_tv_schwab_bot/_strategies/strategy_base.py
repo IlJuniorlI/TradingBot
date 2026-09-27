@@ -18,6 +18,7 @@ from ..order_blocks import (
     empty_order_block_context,
 )
 from .shared_entry import SharedEntryPolicy
+from .shared_exit import ExitTape, SharedExitPolicy
 from .catalogue import get_plugin
 from ..models import OPTION_ASSET_TYPES, Candidate, ExitDecision, Position, Side, Signal
 from ..bars import bar_close_position, bar_wick_fractions, frame_bar_minutes, last_bucket_forming, resample_bars
@@ -42,7 +43,6 @@ from .. import sessions
 
 if TYPE_CHECKING:
     from ..config import BotConfig
-    from .shared_exit import ExitTape
 
 LOG = logging.getLogger(__name__)
 
@@ -76,17 +76,17 @@ class BaseStrategy:
     # classes don't cross-contaminate.
     _observed_contexts: ClassVar[set[tuple]] = set()
 
-    # The shared exit families belong to shared_exit.SharedExitPolicy, which
-    # the position manager owns; a strategy adds its own exits through
-    # strategy_exit_signal. Until 2026-09-24 the pipeline was a BaseStrategy
-    # method any subclass could override, and the peer family's override
-    # silently dropped the time stop and five exit families (see
-    # shared_exit.py). The entry side is the same: the shared entry stage is
-    # shared_entry.SharedEntryPolicy (self.entry_policy), the gatekeeper
-    # ranks with its rank_key, and the knob-rewriting hook
-    # strategy_logic_default is gone. Defining any of these names now fails
-    # at import, so an out-of-tree plugin cannot quietly opt out of the
-    # global knobs.
+    # The shared exit families belong to shared_exit.SharedExitPolicy
+    # (self.exit_policy, which the position manager calls); a strategy adds
+    # its own exits through strategy_exit_signal. Until 2026-09-24 the
+    # pipeline was a BaseStrategy method any subclass could override, and
+    # the peer family's override silently dropped the time stop and five
+    # exit families (see shared_exit.py). The entry side is the same: the
+    # shared entry stage is shared_entry.SharedEntryPolicy
+    # (self.entry_policy), the gatekeeper ranks with its rank_key, and the
+    # knob-rewriting hook strategy_logic_default is gone. Defining any of
+    # these names now fails at import, so an out-of-tree plugin cannot
+    # quietly opt out of the global knobs.
     _RESERVED_NAMES: ClassVar[dict[str, str]] = {
         "position_exit_signal": (
             "shared exits are decided by shared_exit.SharedExitPolicy for every strategy and cannot be "
@@ -212,6 +212,10 @@ class BaseStrategy:
         # The shared entry stage: the only reader of config.shared_entry
         # (see shared_entry.py). Built last -- it reads the manifest.
         self.entry_policy = SharedEntryPolicy(self)
+        # Every shared_exit knob, for every strategy: the only reader of
+        # config.shared_exit (see shared_exit.py). The position manager
+        # decides each open position's exit through it.
+        self.exit_policy = SharedExitPolicy(config, self)
 
     def _watchlist_capability_sources(self, kind: str) -> list[object] | None:
         raw = self._capability(f"watchlist.{kind}_sources", None)

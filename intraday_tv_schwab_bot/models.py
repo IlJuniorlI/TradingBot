@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, time
 from enum import Enum
@@ -125,8 +126,8 @@ class ExitDecision:
     ``structure_choch``, ...), ``strategy`` (a strategy's own
     ``strategy_exit_signal``), ``divergence_partial`` or ``force_flatten``.
     ``fraction`` is the share of the CURRENT quantity to close; below 1.0 it
-    is a scale-out, which the position manager sizes with a floor and holds
-    when that rounds to zero units. ``marker`` is the one-shot record the
+    is a scale-out, which :meth:`close_qty` sizes with a floor and the
+    position manager holds when that rounds to zero units. ``marker`` is the one-shot record the
     manager appends to ``metadata['<family>_exits']`` once the slice books,
     so the same trigger cannot scale the position out on every cycle.
 
@@ -147,6 +148,18 @@ class ExitDecision:
     @property
     def is_partial(self) -> bool:
         return self.fraction < 1.0
+
+    def close_qty(self, qty: int) -> int:
+        """Units this exit closes out of ``qty``: all of it at a fraction of
+        1.0, otherwise the floor -- a 1-lot option or a 1-share position
+        cannot scale out, and rounding up would turn a half-exit of 3 into a
+        two-thirds exit. The product is rounded to 9 places before the floor:
+        a float product that is an integer in exact arithmetic can land just
+        below it (100 x 0.29 = 28.999999999999996, 90 x 0.7 =
+        62.99999999999999) and floored a unit short."""
+        if self.fraction >= 1.0:
+            return int(qty)
+        return int(math.floor(round(int(qty) * float(self.fraction), 9)))
 
 
 @dataclass(slots=True)

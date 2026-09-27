@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 """The shared exit families -- every ``shared_exit`` knob, for every strategy.
 
-``SharedExitPolicy`` is built and owned by the ``PositionManager``, and it is
-the ONLY reader of ``config.shared_exit``. Each cycle it decides, for one open
-position, in this order:
+``SharedExitPolicy`` is built and owned by the strategy
+(``BaseStrategy.exit_policy``, beside its ``entry_policy``), the position
+manager calls it, and it is the ONLY reader of ``config.shared_exit``. Each
+cycle it decides, for one open position, in this order:
 
 1. the shared families, in the order of ``EXIT_FAMILY_GATES`` and each gated
    by its row there;
@@ -26,7 +27,6 @@ is honoured as written.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Mapping
@@ -711,16 +711,3 @@ class SharedExitPolicy:
                 marker={"pivot_b_ts": pivot_b_ts, "indicator": indicator},
             )
         return None
-
-
-def partial_exit_qty(qty: int, fraction: float) -> int:
-    """Units a ``fraction`` exit closes out of ``qty``: all of it at 1.0,
-    otherwise the floor -- a 1-lot option or a 1-share position cannot scale
-    out, and rounding up would turn a half-exit of 3 into a two-thirds exit.
-    The product is rounded to 9 places before the floor: a float product that
-    is an integer in exact arithmetic can land just below it (100 x 0.29 =
-    28.999999999999996, 90 x 0.7 = 62.99999999999999) and floored a unit
-    short."""
-    if fraction >= 1.0:
-        return int(qty)
-    return int(math.floor(round(int(qty) * float(fraction), 9)))

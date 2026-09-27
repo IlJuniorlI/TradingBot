@@ -1126,7 +1126,7 @@ The ORB and pullback graces are global since 2026-09-24. They follow the style f
 
 **Partial closes.** An exit decision is an `ExitDecision(reason, family, fraction, marker)`; a `fraction` below 1 is a scale-out of the CURRENT quantity. The position manager handles a scale-out as follows:
 
-- It sizes the slice with a floor (`shared_exit.partial_exit_qty`). A 1-lot option or 1-share position cannot scale out, so the trigger is spent without an order.
+- It sizes the slice with a floor (`ExitDecision.close_qty`). A 1-lot option or 1-share position cannot scale out, so the trigger is spent without an order.
 - It cancels any resting broker bracket first, as for every engine-side exit.
 - It sends `execution.close_position(position, qty)`.
 - It books the slice as a partial leg: the session report lists slices under `per_partial_exit_reason`, and `trades.csv` folds them into the trade's row.

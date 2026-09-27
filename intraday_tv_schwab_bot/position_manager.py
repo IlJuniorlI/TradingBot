@@ -71,7 +71,6 @@ from .position_metrics import (
 from .risk import RiskManager
 from .levels_shared import effective_side_tolerance, select_next_distinct_level
 from ._strategies.catalogue import is_option_strategy
-from ._strategies.shared_exit import SharedExitPolicy, partial_exit_qty
 from .broker_payloads import (
     active_broker_bracket,
     bracket_order_ids,
@@ -310,9 +309,6 @@ class PositionManager:
         self.audit = audit
         self.account = account
         self.strategy = strategy
-        # Every shared_exit knob, for every strategy; the strategy only adds
-        # its own exits through strategy_exit_signal (see shared_exit.py).
-        self.exit_policy = SharedExitPolicy(config, strategy)
         self.dashboard_cache = dashboard_cache
         self.positions = positions
         self._save_reconcile_metadata = save_reconcile_metadata
@@ -918,7 +914,7 @@ class PositionManager:
             return None
         if str(meta.get("asset_type") or ASSET_TYPE_EQUITY) in OPTION_ASSET_TYPES:
             return None
-        timeout = self.exit_policy.ladder_touch_hold_timeout_seconds()
+        timeout = self.strategy.exit_policy.ladder_touch_hold_timeout_seconds()
         if timeout is None:
             # The hold is off. One a restart carried over from a run with it
             # on would keep RiskManager off the target for good.
@@ -1869,7 +1865,7 @@ class PositionManager:
             # The shared exits and the strategy's own only propose an exit. One
             # that raises proposes none this cycle; force flatten still applies.
             try:
-                decision = self.exit_policy.decide(position, bars, data=self.data)
+                decision = self.strategy.exit_policy.decide(position, bars, data=self.data)
             except Exception as exc:
                 self._position_failed(key, "the exit policy", exc, failures, rest_runs=True)
         if self.strategy.should_force_flatten(position):
@@ -1888,7 +1884,7 @@ class PositionManager:
         if decision is None:
             return
         reason = decision.reason
-        requested_qty = partial_exit_qty(int(position.qty), decision.fraction)
+        requested_qty = decision.close_qty(int(position.qty))
         if requested_qty < 1:
             # A 1-lot option or a 1-share position cannot scale out. The
             # trigger is spent, so it does not re-fire every cycle.
