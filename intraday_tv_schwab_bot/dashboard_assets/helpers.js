@@ -119,11 +119,13 @@ function pnlClass(value) {
 
 // Class names must stay in sync with dashboard.css — ".mode-chip" and
 // "status-starting" are NOT real classes there, so don't invent them.
+// 'stale': the engine could not build a new state, and the page is its last
+// one (engine._publish_state).
 function statusBadge(status) {
   const value = String(status || '').toLowerCase();
   const tone = value === 'running'
     ? 'status-running'
-    : (value === 'error' || value === 'stopped' || value === 'disconnected'
+    : (value === 'error' || value === 'stale' || value === 'stopped' || value === 'disconnected'
       ? 'status-error'
       : (value === 'starting' ? 'status-warning' : 'status-idle'));
   return `<span class="status-chip ${tone}">${escapeHtml(value || 'idle')}</span>`;

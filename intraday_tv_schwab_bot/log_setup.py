@@ -35,28 +35,29 @@ def warn_once(key: str) -> bool:
 def _enable_windows_ansi() -> None:
     if os.name != "nt":
         return
-    try:
-        import ctypes
+    # Every way this can fail on Windows is a return value (a missing entry
+    # point, no console handle, a console that refuses the mode), and each is
+    # checked: the colours are simply left off. Nothing here raises, so a
+    # broad except around it (until 2026-09-26) guarded nothing.
+    import ctypes
 
-        kernel32 = ctypes.windll.kernel32
-        get_std_handle = getattr(kernel32, "GetStdHandle", None)
-        get_console_mode = getattr(kernel32, "GetConsoleMode", None)
-        set_console_mode = getattr(kernel32, "SetConsoleMode", None)
-        if (
-            not callable(get_std_handle)
-            or not callable(get_console_mode)
-            or not callable(set_console_mode)
-        ):
-            return
-        handle = get_std_handle(-11)
-        if not handle:
-            return
-        mode = ctypes.c_uint32()
-        if get_console_mode(handle, ctypes.byref(mode)) == 0:
-            return
-        set_console_mode(handle, mode.value | 0x0004)
-    except Exception:
+    kernel32 = ctypes.windll.kernel32
+    get_std_handle = getattr(kernel32, "GetStdHandle", None)
+    get_console_mode = getattr(kernel32, "GetConsoleMode", None)
+    set_console_mode = getattr(kernel32, "SetConsoleMode", None)
+    if (
+        not callable(get_std_handle)
+        or not callable(get_console_mode)
+        or not callable(set_console_mode)
+    ):
         return
+    handle = get_std_handle(-11)
+    if not handle:
+        return
+    mode = ctypes.c_uint32()
+    if get_console_mode(handle, ctypes.byref(mode)) == 0:
+        return
+    set_console_mode(handle, mode.value | 0x0004)
 
 
 def _console_supports_color(stream: Any) -> bool:

@@ -26,7 +26,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from .log_setup import TRADEFLOW_LEVEL
+from .log_setup import TRADEFLOW_LEVEL, warn_once
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -53,19 +53,33 @@ def _json_ready(value: Any) -> Any:
             return value.isoformat()
         except Exception:
             LOG.debug("Failed to serialize isoformat-capable value", exc_info=True)
+    # A number type (a numpy or Decimal scalar) reads as a float. float()
+    # refuses anything else with one of these three, and the value is then
+    # written as its string.
     try:
         return float(value)
-    except Exception:
-        pass
+    except (TypeError, ValueError, OverflowError):
+        return _safe_str(value)
+
+
+def _safe_str(value: Any) -> str:
+    """``str(value)``, or ``<unserializable TYPE>`` when the value's own
+    ``__str__`` / ``__repr__`` raises. The last fallback of ``_json_ready``
+    and of ``log_structured``, so it must not be able to throw: they feed
+    audit logging and the sqlite position-metadata write, and neither should
+    ever fail because a value could not describe itself. The first failure
+    per type is logged with its traceback (until 2026-09-26 none was)."""
     try:
         return str(value)
     except Exception:
-        # str() itself can raise when __str__/__repr__ is broken. This is the
-        # LAST fallback in the normalizer, so it must not be able to throw —
-        # _json_ready feeds audit logging and the sqlite position-metadata
-        # write, and neither should ever fail because a value could not
-        # describe itself.
-        return f"<unserializable {type(value).__name__}>"
+        name = type(value).__name__
+        if warn_once(f"audit_safe_str:{name}"):
+            LOG.warning(
+                "A %s value raised in __str__ / __repr__; it is written as <unserializable %s>. "
+                "Further occurrences are not logged.",
+                name, name, exc_info=True,
+            )
+        return f"<unserializable {name}>"
 
 
 class AuditLogger:
@@ -135,18 +149,20 @@ class AuditLogger:
         try:
             text = json.dumps(_json_ready(payload), sort_keys=True, separators=(",", ":"))
         except Exception:
-            try:
-                text = json.dumps({"serialization_error": True, "payload": str(payload)})
-            except Exception:
-                # The fallback must not be able to raise either. It did: a
-                # payload whose __repr__ throws made str(payload) re-raise out
-                # of the except block, so an audit-logging failure propagated
-                # into the caller — and the callers are the entry and exit
-                # flows (ENTRY_CONTEXT / EXIT_CONTEXT). Losing one line's
-                # fidelity is acceptable; taking a trade operation down with
-                # it is not.
-                text = json.dumps({
-                    "serialization_error": True,
-                    "payload": f"<unserializable {type(payload).__name__}>",
-                })
+            # A logging call must not fail its caller, and the callers are the
+            # entry and exit flows (ENTRY_CONTEXT / EXIT_CONTEXT): losing one
+            # line's fidelity is acceptable, taking a trade operation down
+            # with it is not. _json_ready fails only on a payload it cannot
+            # walk (a circular or runaway-deep one raises RecursionError) or a
+            # value whose __float__ raises what no number type does. The line
+            # is written as the payload's string (_safe_str cannot raise, even
+            # on a payload whose __repr__ throws), and the first failure per
+            # prefix is logged with its traceback (until 2026-09-26 none was).
+            if warn_once(f"log_structured:{prefix}"):
+                LOG.warning(
+                    "%s payload could not be serialized; it is logged as serialization_error. "
+                    "Further occurrences are not logged.",
+                    prefix, exc_info=True,
+                )
+            text = json.dumps({"serialization_error": True, "payload": _safe_str(payload)})
         LOG.log(level, "%s %s", prefix, text)

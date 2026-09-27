@@ -580,16 +580,13 @@ def _line_has_material_slope_over_span(
 ) -> bool:
     if line is None:
         return False
-    try:
-        start_pos = int(start_pos)
-        end_pos = int(end_pos)
-        if end_pos <= start_pos:
-            return False
-        start_value = _line_value(float(line.slope), float(line.intercept), start_pos)
-        end_value = _line_value(float(line.slope), float(line.intercept), end_pos)
-        return abs(float(end_value) - float(start_value)) > max(float(tolerance), 1e-9)
-    except Exception:
+    start_pos = int(start_pos)
+    end_pos = int(end_pos)
+    if end_pos <= start_pos:
         return False
+    start_value = _line_value(float(line.slope), float(line.intercept), start_pos)
+    end_value = _line_value(float(line.slope), float(line.intercept), end_pos)
+    return abs(float(end_value) - float(start_value)) > max(float(tolerance), 1e-9)
 
 
 def _trendline_has_material_slope(line: TechnicalLine | None, *, current_pos: int, tolerance: float) -> bool:

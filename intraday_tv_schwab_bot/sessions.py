@@ -37,17 +37,19 @@ def parse_hhmm(value: object) -> time:
     integer values that can appear when YAML parses unquoted ``HH:MM`` as
     sexagesimal minutes (for example ``14:15`` -> ``855``). Anything else
     raises ``ValueError`` naming the value. Until 2026-09-26 a blank or
-    colon-less string failed as "not enough values to unpack", and an
-    infinity or a field past a C int ("2147483648:00") as ``OverflowError``.
+    colon-less string failed as "not enough values to unpack", an infinity
+    or a field past a C int ("2147483648:00") as ``OverflowError``, and a
+    float was truncated to whole minutes.
     """
     if isinstance(value, time):
         return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        # The range check comes first: int() of a NaN or an infinity raises
-        # its own error, and the infinity's is not a ValueError.
+    if isinstance(value, float):
+        # YAML reads a dotted typo as a float, 9.30 as 9.3 and 9.00 as 9.0,
+        # and both read as 00:09. No time form is a float, whole or not.
+        raise ValueError(f"Invalid HH:MM numeric value: {value!r} (a decimal, not a time; write \"HH:MM\")")
+    if isinstance(value, int) and not isinstance(value, bool):
         if 0 <= value < 24 * 60:
-            ivalue = int(value)
-            return time(hour=ivalue // 60, minute=ivalue % 60)
+            return time(hour=value // 60, minute=value % 60)
         raise ValueError(f"Invalid HH:MM numeric value: {value!r}")
     try:
         hh, mm = str(value).strip().split(":", 1)
@@ -204,13 +206,10 @@ def us_equity_market_holidays(year: int) -> frozenset[date]:
 
 def is_weekday_session_day(ts: datetime | date | pd.Timestamp | None = None) -> bool:
     current = now_et() if ts is None else ts
-    try:
-        session_day = current.date() if hasattr(current, "date") else current
-        if not isinstance(session_day, date):
-            return False
-        return int(session_day.weekday()) < 5 and session_day not in us_equity_market_holidays(int(session_day.year))
-    except Exception:
+    session_day = current.date() if hasattr(current, "date") else current
+    if not isinstance(session_day, date):
         return False
+    return int(session_day.weekday()) < 5 and session_day not in us_equity_market_holidays(int(session_day.year))
 
 
 EQUITY_PREMARKET_START = time(4, 0)

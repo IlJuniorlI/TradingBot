@@ -42,7 +42,7 @@ from .session_report import export_session_archive, write_session_report
 from .schwab_api import SchwabdevApiUsageTracker, register_schwab_api_tracker
 from .log_setup import TRADEFLOW_LEVEL, setup_logging
 from .sessions import EQUITY_STREAM_END, equity_session_state
-from . import sessions
+from . import __version__, sessions
 
 if TYPE_CHECKING:
     from ._strategies.strategy_base import BaseStrategy
@@ -62,10 +62,14 @@ RECONCILE_RETRY_MAX_SECONDS = 300.0
 # the first retry after a hold comes sooner, whatever failed before it, and
 # doubles only over the attempts that keep holding it.
 RECONCILE_SETTLE_RETRY_SECONDS = 10.0
+# A dashboard update that fails logs its traceback on the first failure in a
+# row and on every DASHBOARD_TRACEBACK_EVERY-th after it (about once a minute
+# at the 2 s cycle), and a DEBUG line in between; see _publish_state.
+DASHBOARD_TRACEBACK_EVERY = 30
 
 
 class _StopSignals:
-    """SIGINT and SIGTERM for the life of ``IntradayBot.run``.
+    """SIGINT, SIGTERM, SIGHUP and SIGBREAK for the life of ``IntradayBot.run``.
 
     The first one raises KeyboardInterrupt, so `kill <pid>` and `systemctl
     stop` take the same shutdown path as Ctrl+C, and starts the hold: from
@@ -75,6 +79,20 @@ class _StopSignals:
     `TimeoutStopSec` still ends a cleanup that hangs. The handler logs
     nothing, since logging from a handler can re-enter a stream write it
     interrupted, so ``run`` reports what it ignored once the cleanup is done.
+
+    SIGHUP is the terminal hanging up: an SSH disconnect or a killed tmux
+    pane with the bot in the foreground. Until 2026-09-26 it killed the bot
+    without the cleanup. It is taken only when it is not already ignored:
+    `nohup` starts the bot with SIGHUP ignored so that a hangup leaves it
+    running, and it stays ignored. Windows has no SIGHUP.
+
+    SIGBREAK is Windows' Ctrl+Break, which also killed the bot without the
+    cleanup until 2026-09-26. It is taken the same way, where the platform
+    has it and it is not ignored. On Windows only SIGINT wakes
+    ``time.sleep``, so a Ctrl+Break in the sleep between cycles takes effect
+    when that sleep ends. Closing the console window (CTRL_CLOSE_EVENT)
+    arrives as SIGBREAK as well, but Windows ends the process as soon as the
+    C runtime's console handler returns, so the cleanup cannot finish.
     """
 
     def __init__(self) -> None:
@@ -83,7 +101,12 @@ class _StopSignals:
         self._previous: dict[signal.Signals, Any] = {}
 
     def __enter__(self) -> _StopSignals:
-        for signum in (signal.SIGINT, signal.SIGTERM):
+        signums = [signal.SIGINT, signal.SIGTERM]
+        for name in ("SIGHUP", "SIGBREAK"):
+            optional = getattr(signal, name, None)
+            if optional is not None and signal.getsignal(optional) is not signal.SIG_IGN:
+                signums.append(optional)
+        for signum in signums:
             try:
                 self._previous[signum] = signal.signal(signum, self._handle)
             except ValueError:
@@ -109,6 +132,10 @@ class IntradayBot:
     def __init__(self, config: BotConfig):
         self.config = config
         setup_logging(config.runtime.log_dir)
+        # Logged as soon as there is a log, ahead of anything that can fail
+        # (the Schwab client, the strategy build), so the day's log names the
+        # code that wrote it.
+        LOG.info("intraday-tv-schwab-bot %s", __version__)
         self.audit = AuditLogger(config.strategy)
         self.api_usage = SchwabdevApiUsageTracker()
         self.client = Client(
@@ -161,6 +188,8 @@ class IntradayBot:
         self.last_watchlist: list[str] = []
         self.last_quote_watchlist: list[str] = []
         self.last_error: str | None = None
+        # Dashboard updates that failed in a row; see _publish_state.
+        self._dashboard_failures = 0
         # Memory-pressure prune cadence. Symbol-keyed state in
         # MarketDataStore + DashboardCache grows unbounded across cycles
         # as the screener returns new symbols day to day. Every
@@ -263,10 +292,7 @@ class IntradayBot:
     def _tracked_capital_baseline(self) -> float:
         if self.config.schwab.dry_run:
             return float(self.config.paper.starting_equity)
-        try:
-            configured = float(self.config.risk.max_total_notional)
-        except Exception:
-            configured = 0.0
+        configured = float(self.config.risk.max_total_notional)
         if configured > 0:
             return configured
         return float(self.config.paper.starting_equity)
@@ -442,16 +468,16 @@ class IntradayBot:
                 if escalation_message is not None:
                     LOG.critical("%s", escalation_message)
                     status_message = escalation_message
-                now = sessions.now_et()
-                gate_state = self.cycle_gate.evaluate(now, self.config.active_strategy.schedule())
+                # The status publish evaluates the gate itself and logs its
+                # own failure (_publish_state). Until 2026-09-26 one that
+                # failed here escaped run() and stopped the bot on an error it
+                # only meant to report.
                 self._publish_state(
-                    now,
+                    sessions.now_et(),
+                    status_message,
                     screening_active=False,
                     streaming_active=self.data.has_stream_symbols(),
                     management_active=False,
-                    message=status_message,
-                    context_refresh_active=gate_state.context_refresh_active,
-                    gate_state=gate_state,
                 )
             if auto_exit and not self.positions:
                 now = sessions.now_et()
@@ -494,7 +520,7 @@ class IntradayBot:
         Open positions are named explicitly — that is the part that costs
         money while nothing is managing them.
         """
-        threshold = int(getattr(self.config.runtime, "error_escalation_cycles", 0) or 0)
+        threshold = self.config.runtime.error_escalation_cycles
         if threshold <= 0 or consecutive_errors < threshold:
             return None
         if consecutive_errors % threshold != 0:
@@ -542,10 +568,10 @@ class IntradayBot:
         # Honor the same gate the startup reconcile honors.
         if not self.config.runtime.reconcile_on_startup:
             return
-        if str(self.config.runtime.startup_reconcile_mode or "ignore").lower() == "ignore":
+        if self.config.runtime.startup_reconcile_mode == "ignore":
             return
         retrying = self._reconcile_failures > 0
-        if not retrying and not bool(getattr(self.config.runtime, "session_reconcile_on_resume", True)):
+        if not retrying and not self.config.runtime.session_reconcile_on_resume:
             return
         now = sessions.now_et()
         state = equity_session_state(
@@ -715,7 +741,7 @@ class IntradayBot:
         A symbol that drops out of all three has no consumer; safe to evict.
         Re-fetched cleanly on revival via the warmup tracker.
         """
-        ttl = float(getattr(self.config.runtime, "symbol_state_prune_seconds", 1800.0) or 0.0)
+        ttl = self.config.runtime.symbol_state_prune_seconds
         if ttl <= 0:
             return
         now = time.monotonic()
@@ -723,11 +749,7 @@ class IntradayBot:
             return
         self._last_symbol_prune_monotonic = now
         # Symbols we still care about — anything that could need state.
-        active: set[str] = set()
-        try:
-            active.update(self.data.stream_symbols)
-        except Exception:
-            pass
+        active: set[str] = set(self.data.stream_symbols)
         active.update(self.last_watchlist or [])
         active.update(self.last_quote_watchlist or [])
         active.update(self.positions.keys() if self.positions else [])
@@ -776,8 +798,12 @@ class IntradayBot:
         Set `idle_sleep_seconds <= loop_sleep_seconds` to disable the
         optimization entirely.
         """
-        base = float(self.config.runtime.loop_sleep_seconds)
-        idle = float(getattr(self.config.runtime, "idle_sleep_seconds", 60.0) or 60.0)
+        # Both finite, the loop's above 0 and the idle one at least 0, checked
+        # at load: this runs between cycles, outside their error handling, so
+        # an unreadable, NaN or infinite value here ended run() without its
+        # shutdown. A null or 0 idle sleep read as 60 until 2026-09-26.
+        base = self.config.runtime.loop_sleep_seconds
+        idle = self.config.runtime.idle_sleep_seconds
         if idle <= base:
             return base
         state = equity_session_state(
@@ -1073,13 +1099,15 @@ class IntradayBot:
                 idle_closed_market=gate_state.idle_closed_market,
                 position_monitoring_active=gate_state.position_monitoring_active,
             )
+            # Last, and inside the cycle, so it reads the frames the cycle
+            # cached. It cannot fail the cycle: a failure is the dashboard's
+            # (_publish_state).
             self._publish_state(
                 now,
+                message,
                 screening_active=gate_state.screening_active,
                 streaming_active=gate_state.streaming_active,
                 management_active=gate_state.management_active,
-                message=message,
-                context_refresh_active=gate_state.context_refresh_active,
                 gate_state=gate_state,
                 warmup_summary=warmup_summary,
             )
@@ -1104,11 +1132,8 @@ class IntradayBot:
         return prices
 
     def _cycle_precompute_workers(self) -> int:
-        try:
-            configured = int(getattr(getattr(self.config, "runtime", None), "cycle_precompute_workers", 4) or 4)
-        except Exception:
-            configured = 4
-        return max(1, configured)
+        # An integer >= 1 (_validate_runtime_config).
+        return self.config.runtime.cycle_precompute_workers
 
     def _parallel_symbol_map(self, symbols: list[str], func, *, label: str) -> dict[str, Any]:
         ordered: list[str] = []
@@ -1234,7 +1259,61 @@ class IntradayBot:
 
         self._parallel_symbol_map(symbols, _warm, label="Strategy context precompute")
 
-    def _publish_state(self, now: datetime, screening_active: bool, streaming_active: bool, management_active: bool, message: str, context_refresh_active: bool = False, gate_state: CycleGateState | None = None, warmup_summary: dict[str, Any] | None = None) -> None:
+    def _publish_state(self, now: datetime, message: str, *, screening_active: bool, streaming_active: bool, management_active: bool, gate_state: CycleGateState | None = None, warmup_summary: dict[str, Any] | None = None) -> None:
+        """Build the dashboard state and publish it. The gate is evaluated
+        here when the caller has none (the error path).
+
+        The dashboard shows the cycle; it is not part of it. Until 2026-09-26
+        an error building the state (a snapshot or S/R row read that raises)
+        escaped ``step()`` after the cycle's management and entries had run
+        and failed the cycle, and the error path's own publish then failed
+        the same way, which stopped the bot. Now the failure is logged, with
+        the traceback on the first in a row and every
+        ``DASHBOARD_TRACEBACK_EVERY``-th, the loop keeps its cadence, and the
+        dashboard keeps its last state, marked ``stale`` (``error`` while
+        the cycles themselves fail) with a message saying what failed and
+        when; its ``last_update`` stays the time of that state. Broad
+        because the build runs strategy hooks; a stop signal
+        (KeyboardInterrupt) is not an Exception and reaches the shutdown.
+        """
+        try:
+            if gate_state is None:
+                gate_state = self.cycle_gate.evaluate(now, self.config.active_strategy.schedule())
+            payload = self._dashboard_state(
+                now,
+                message,
+                screening_active=screening_active,
+                streaming_active=streaming_active,
+                management_active=management_active,
+                gate_state=gate_state,
+                warmup_summary=warmup_summary,
+            )
+        except Exception as exc:
+            self._dashboard_failures += 1
+            failures = self._dashboard_failures
+            first_line = str(exc).splitlines()[0] if str(exc) else ""
+            error = f"{type(exc).__name__}: {first_line}" if first_line else type(exc).__name__
+            if failures == 1 or failures % DASHBOARD_TRACEBACK_EVERY == 0:
+                LOG.warning("Dashboard update failed (consecutive=%d); it keeps its last state, marked stale: %s",
+                            failures, error, exc_info=True)
+            else:
+                LOG.debug("Dashboard update failed (consecutive=%d): %s", failures, error)
+            if self.dashboard is not None:
+                self.dashboard.publish_stale(
+                    "stale" if self.last_error is None else "error",
+                    f"{message} · dashboard update failed ({failures} in a row, the last at "
+                    f"{now:%H:%M:%S}: {error}); the rest of this page is from its last update",
+                )
+            return
+        if self._dashboard_failures:
+            LOG.info("Dashboard update recovered after %d failed update(s)", self._dashboard_failures)
+            self._dashboard_failures = 0
+        if self.dashboard is not None:
+            self.dashboard.publish(payload)
+
+    def _dashboard_state(self, now: datetime, message: str, *, screening_active: bool, streaming_active: bool, management_active: bool, gate_state: CycleGateState, warmup_summary: dict[str, Any] | None) -> dict[str, Any]:
+        """The dashboard state ``_publish_state`` publishes."""
+        context_refresh_active = gate_state.context_refresh_active
         performance = self.account.snapshot_copy(self.positions)
         candidates = []
         entry_decision_by_symbol = {str(symbol or '').upper().strip(): copy.deepcopy(payload) for symbol, payload in (self.entry_gatekeeper.last_entry_decisions or {}).items() if str(symbol or '').upper().strip()}
@@ -1443,13 +1522,12 @@ class IntradayBot:
                     if key[0] in active_dashboard_symbol_set
                 }
 
-        runtime_gate_state = gate_state or self.cycle_gate.evaluate(now, self.config.active_strategy.schedule())
-        payload = {
+        return {
             "status": "running" if self.last_error is None else "error",
-            "entry_window_active": runtime_gate_state.entry_actionable,
-            "management_window_active": runtime_gate_state.intraday_session_day and runtime_gate_state.management_window_open,
+            "entry_window_active": gate_state.entry_actionable,
+            "management_window_active": gate_state.intraday_session_day and gate_state.management_window_open,
             "management_active": management_active,
-            "position_monitoring_active": runtime_gate_state.position_monitoring_active,
+            "position_monitoring_active": gate_state.position_monitoring_active,
             "message": message,
             "strategy": self.config.strategy,
             "dry_run": self.config.schwab.dry_run,
@@ -1476,5 +1554,3 @@ class IntradayBot:
             "dashboard_charting": self.dashboard_cache.charting_settings(),
             "dashboard_symbols": dashboard_symbols,
         }
-        if self.dashboard is not None:
-            self.dashboard.publish(payload)

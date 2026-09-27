@@ -39,7 +39,7 @@ dashboard:
   theme: dark            # or default, light, example_custom, or your own
 ```
 
-If the name is malformed (not matching `^[a-z0-9_-]{1,40}$`) or the folder is missing, the server logs a warning and falls back to `default`.
+The name must be a folder here, named to `^[a-z0-9_-]{1,40}$` and spelled exactly so; any other value stops the bot at startup, naming `dashboard.theme` and listing the theme folders. Until 2026-09-26 the server lowercased and stripped the name, so `Nebula` or ` dark ` served that theme, and read a malformed one, or one naming no folder, as `default` with a warning.
 
 ---
 

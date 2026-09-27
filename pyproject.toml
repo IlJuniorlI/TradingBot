@@ -25,9 +25,11 @@ dependencies = [
 # declared nowhere, so `pip install -e .` produced a package that could not be
 # tested and nothing recorded which versions the suite had been run against.
 #     pip install -e ".[dev]"
+# pytest-xdist runs the suite in parallel: pytest -n 24 --dist loadfile
 [project.optional-dependencies]
 dev = [
     "pytest==9.0.3",
+    "pytest-xdist==3.8.0",
     "hypothesis==6.151.12",
     "flake8==7.3.0",
     "vermin==1.8.0",
@@ -44,9 +46,20 @@ intraday-tv-schwab-bot = "intraday_tv_schwab_bot.cli:main"
 [tool.setuptools.dynamic]
 version = { file = "intraday_tv_schwab_bot/VERSION" }
 
+# The two microcap strategy plugins live only in the private source tree (git
+# leaves them out), and the bot loads them from that checkout. No build takes
+# them: not their modules (packages.find), not their manifest.json and
+# README.md (exclude-package-data), and not what an earlier build's egg-info
+# SOURCES.txt lists (MANIFEST.in).
 [tool.setuptools.packages.find]
 include = ["intraday_tv_schwab_bot*"]
-exclude = ["tests*", "scripts*", "theme_previews*"]
+exclude = [
+    "tests*",
+    "scripts*",
+    "theme_previews*",
+    "intraday_tv_schwab_bot._strategies.microcap_gap_orb",
+    "intraday_tv_schwab_bot._strategies.microcap_pm_breakout",
+]
 
 [tool.setuptools.package-data]
 intraday_tv_schwab_bot = [
@@ -55,4 +68,10 @@ intraday_tv_schwab_bot = [
     "_strategies/*/README.md",
     "dashboard_assets/*",
     "dashboard_assets/**/*",
+]
+
+[tool.setuptools.exclude-package-data]
+intraday_tv_schwab_bot = [
+    "_strategies/microcap_gap_orb/*",
+    "_strategies/microcap_pm_breakout/*",
 ]

@@ -1570,8 +1570,15 @@ class SchwabExecutor:
         metadata: dict[str, Any],
         data,
         refresh_quotes: bool = True,
-        allow_natural_fill: bool = False,
     ) -> OrderResult:
+        """A dry-run fill: the limit, ``dry_run_replace_attempts`` reprices
+        ``dry_run_step_frac`` of the way to the natural price, then the
+        natural itself. That last step models the chase a live order makes:
+        without it the 2-attempt 0.25 ramp never reached the fill threshold
+        from a limit below mid (the market moved between the signal and the
+        order), so a dry run took no entry (``dry_run_not_filled_debit``).
+        Until 2026-09-26 the step sat behind an ``allow_natural_fill`` flag
+        that every caller set."""
         market = self._vertical_market(metadata, data, refresh_quotes=refresh_quotes)
         if market is None:
             return OrderResult(ok=False, order_id=None, raw=spec, message="dry_run_missing_or_stale_quotes", simulated=True)
@@ -1595,13 +1602,13 @@ class SchwabExecutor:
                 cur = round(min(natural, cur + ((natural - cur) * step_frac)), 2)
                 if cur not in prices:
                     prices.append(cur)
-            if allow_natural_fill and natural not in prices:
+            if natural not in prices:
                 prices.append(round(natural, 2))
             for idx, px in enumerate(prices):
                 if px >= threshold or px >= natural:
                     sim = copy.deepcopy(spec)
                     sim["price"] = f"{px:.2f}"
-                    suffix = "_natural" if allow_natural_fill and abs(px - natural) < 0.005 else ""
+                    suffix = "_natural" if abs(px - natural) < 0.005 else ""
                     return OrderResult(ok=True, order_id=None, raw=sim, message=f"dry_run_fill_attempt_{idx}{suffix}", fill_price=px * 100.0, filled_qty=spec_qty, simulated=True)
             return OrderResult(ok=False, order_id=None, raw=spec, message="dry_run_not_filled_debit", simulated=True)
         if order_type == "NET_CREDIT":
@@ -1611,13 +1618,13 @@ class SchwabExecutor:
                 cur = round(max(natural, cur - ((cur - natural) * step_frac)), 2)
                 if cur not in prices:
                     prices.append(cur)
-            if allow_natural_fill and natural not in prices:
+            if natural not in prices:
                 prices.append(round(natural, 2))
             for idx, px in enumerate(prices):
                 if px <= threshold or px <= natural:
                     sim = copy.deepcopy(spec)
                     sim["price"] = f"{px:.2f}"
-                    suffix = "_natural" if allow_natural_fill and abs(px - natural) < 0.005 else ""
+                    suffix = "_natural" if abs(px - natural) < 0.005 else ""
                     return OrderResult(ok=True, order_id=None, raw=sim, message=f"dry_run_fill_attempt_{idx}{suffix}", fill_price=px * 100.0, filled_qty=spec_qty, simulated=True)
             return OrderResult(ok=False, order_id=None, raw=spec, message="dry_run_not_filled_credit", simulated=True)
         return OrderResult(ok=False, order_id=None, raw=spec, message="dry_run_unsupported_order_type", simulated=True)
@@ -1628,8 +1635,8 @@ class SchwabExecutor:
         metadata: dict[str, Any],
         data,
         refresh_quotes: bool = True,
-        allow_natural_fill: bool = False,
     ) -> OrderResult:
+        """The single-option ladder, as ``_simulate_vertical_fill``'s."""
         market = self._single_option_market(metadata, data, refresh_quotes=refresh_quotes)
         if market is None:
             return OrderResult(ok=False, order_id=None, raw=spec, message="dry_run_missing_or_stale_quotes", simulated=True)
@@ -1654,13 +1661,13 @@ class SchwabExecutor:
                 cur = round(min(natural, cur + ((natural - cur) * step_frac)), 2)
                 if cur not in prices:
                     prices.append(cur)
-            if allow_natural_fill and natural not in prices:
+            if natural not in prices:
                 prices.append(round(natural, 2))
             for idx, px in enumerate(prices):
                 if px >= threshold or px >= natural:
                     sim = copy.deepcopy(spec)
                     sim["price"] = f"{px:.2f}"
-                    suffix = "_natural" if allow_natural_fill and abs(px - natural) < 0.005 else ""
+                    suffix = "_natural" if abs(px - natural) < 0.005 else ""
                     return OrderResult(ok=True, order_id=None, raw=sim, message=f"dry_run_fill_attempt_{idx}{suffix}", fill_price=px * 100.0, filled_qty=spec_qty, simulated=True)
             return OrderResult(ok=False, order_id=None, raw=spec, message="dry_run_not_filled_long_option", simulated=True)
         natural = min(cur, bid if bid > 0 else mid)
@@ -1669,33 +1676,26 @@ class SchwabExecutor:
             cur = round(max(natural, cur - ((cur - natural) * step_frac)), 2)
             if cur not in prices:
                 prices.append(cur)
-        if allow_natural_fill and natural not in prices:
+        if natural not in prices:
             prices.append(round(natural, 2))
         for idx, px in enumerate(prices):
             if px <= threshold or px <= natural:
                 sim = copy.deepcopy(spec)
                 sim["price"] = f"{px:.2f}"
-                suffix = "_natural" if allow_natural_fill and abs(px - natural) < 0.005 else ""
+                suffix = "_natural" if abs(px - natural) < 0.005 else ""
                 return OrderResult(ok=True, order_id=None, raw=sim, message=f"dry_run_fill_attempt_{idx}{suffix}", fill_price=px * 100.0, filled_qty=spec_qty, simulated=True)
         return OrderResult(ok=False, order_id=None, raw=spec, message="dry_run_not_filled_long_option_exit", simulated=True)
 
     def submit_option_vertical(self, spec: dict[str, Any], metadata: dict[str, Any], data=None) -> OrderResult:
         if self.config.schwab.dry_run:
-            # allow_natural_fill=True mirrors the close-position path so the
-            # dry-run reprice loop can fall back to the natural (ask) price on
-            # the final attempt. Without it, the 2-attempt step_frac=0.25 ramp
-            # never reaches threshold when the limit starts below mid (e.g.,
-            # after market movement between signal time and execution time),
-            # causing "dry_run_not_filled_debit" and no entry in dry-run mode.
-            return self._simulate_vertical_fill(spec, metadata, data, allow_natural_fill=True)
+            return self._simulate_vertical_fill(spec, metadata, data)
         if self._vertical_market(metadata, data, refresh_quotes=True) is None:
             return OrderResult(ok=False, order_id=None, raw=spec, message="live_missing_or_stale_quotes", simulated=False)
         return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0)
 
     def submit_option_single(self, spec: dict[str, Any], metadata: dict[str, Any], data=None) -> OrderResult:
         if self.config.schwab.dry_run:
-            # See submit_option_vertical for allow_natural_fill rationale.
-            return self._simulate_single_option_fill(spec, metadata, data, allow_natural_fill=True)
+            return self._simulate_single_option_fill(spec, metadata, data)
         if self._single_option_market(metadata, data, refresh_quotes=True) is None:
             return OrderResult(ok=False, order_id=None, raw=spec, message="live_missing_or_stale_quotes", simulated=False)
         return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0)
@@ -1728,7 +1728,7 @@ class SchwabExecutor:
             limit_price = close_limit_price_from_metadata(position.metadata, q1, q2, mode=self.config.options.vertical_limit_mode)
             spec = build_vertical_close_order(position.metadata, int(qty), limit_price=limit_price)
             if self.config.schwab.dry_run:
-                return self._simulate_vertical_fill(spec, position.metadata, data, refresh_quotes=False, allow_natural_fill=True)
+                return self._simulate_vertical_fill(spec, position.metadata, data, refresh_quotes=False)
             return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0)
         if asset_type == ASSET_TYPE_OPTION_SINGLE:
             symbol = str(position.metadata.get("option_symbol") or "")
@@ -1740,7 +1740,7 @@ class SchwabExecutor:
             limit_price = close_single_option_limit_from_metadata(position.metadata, q, mode=self.config.options.option_limit_mode)
             spec = build_single_option_close_order(position.metadata, int(qty), limit_price=limit_price)
             if self.config.schwab.dry_run:
-                return self._simulate_single_option_fill(spec, position.metadata, data, refresh_quotes=False, allow_natural_fill=True)
+                return self._simulate_single_option_fill(spec, position.metadata, data, refresh_quotes=False)
             return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0)
         intent = self.order_intent_for_exit(position.side)
         return self.submit_equity_exit(position.symbol, int(qty), intent, data=data, market_snapshot=market_snapshot)

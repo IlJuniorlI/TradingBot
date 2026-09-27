@@ -190,10 +190,7 @@ def _per_hour(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
         # Bucket by ENTRY hour (local time). Entry time tells us when the
         # bot decided to trade; exit time is a product of management and
         # can drift long after entry.
-        try:
-            return f"{t.entry_time.hour:02d}:00"
-        except Exception:
-            return "unknown"
+        return f"{t.entry_time.hour:02d}:00"
 
     return {hour: _summarize_group(group) for hour, group in _group_by(trades, _hour_bucket).items()}
 
@@ -429,13 +426,10 @@ def _entry_timing(
 
     def _retrace_r(frame, at, is_long: bool, entry: float, risk: float) -> float | None:
         """Deepest move AGAINST *entry* in the window after *at*, in R."""
-        try:
-            window = frame[(frame.index > at) & (frame.index <= at + timedelta(minutes=int(window_minutes)))]
-            if window.empty:
-                return None
-            worst = float(window["low"].min()) if is_long else float(window["high"].max())
-        except Exception:
+        window = frame[(frame.index > at) & (frame.index <= at + timedelta(minutes=int(window_minutes)))]
+        if window.empty:
             return None
+        worst = float(window["low"].min()) if is_long else float(window["high"].max())
         adverse = (entry - worst) if is_long else (worst - entry)
         if not math.isfinite(adverse):
             return None
@@ -494,13 +488,10 @@ def _entry_timing(
         # edge above it -- while the docstring claimed a same-session
         # comparison. The whole metric is the gap between observed and
         # baseline, so a baseline drawn from a different tape measures nothing.
-        try:
-            session_mask = frame.index.date == trade.entry_time.date()
-            session = frame[session_mask]
-            rows = (session.iloc[::max(1, int(baseline_stride))]
-                    if not session.empty else None)
-        except Exception:
-            rows = None
+        session_mask = frame.index.date == trade.entry_time.date()
+        session = frame[session_mask]
+        rows = (session.iloc[::max(1, int(baseline_stride))]
+                if not session.empty else None)
         if rows is not None:
             for at, row in rows.iterrows():
                 anchor_price = float(row.get("close", float("nan")))
@@ -791,7 +782,8 @@ def write_session_report(
         (e.g., ``engine._log_structured``).
     skip_counts : dict[str, int], optional
         Session-wide tally of per-candidate skip reasons from
-        ``engine.session_skip_counts``. Used to emit the filter-rejection
+        ``engine.session_skip_counts`` (a signal an engine gate refused
+        counts under that gate alone). Used to emit the filter-rejection
         summary.
     """
     # Initialized before the try so the CSV-append path below (outside the
@@ -1282,10 +1274,11 @@ def _forward_baseline(
     }
 
 
-def _reason_tokens(reasons: str) -> list[str]:
+def _reason_tokens(reasons: str, maxsplit: int = -1) -> list[str]:
     """A decision's comma-joined ``reasons`` split into its reasons: at the
     commas outside parentheses, since a reason's detail
-    (``(trend=1.0,pb=0.0)``, ``(group=ai_hardware,n=2)``) holds commas."""
+    (``(trend=1.0,pb=0.0)``, ``(group=ai_hardware,n=2)``) holds commas. At
+    most ``maxsplit`` splits when it is not negative, as ``str.split``."""
     tokens: list[str] = []
     depth = 0
     start = 0
@@ -1294,7 +1287,7 @@ def _reason_tokens(reasons: str) -> list[str]:
             depth += 1
         elif char == ")":
             depth = max(0, depth - 1)
-        elif char == "," and depth == 0:
+        elif char == "," and depth == 0 and (maxsplit < 0 or len(tokens) < maxsplit):
             tokens.append(reasons[start:pos])
             start = pos + 1
     tokens.append(reasons[start:])
@@ -1337,7 +1330,8 @@ def _gate_attribution(
     signal bets on the symbol (``market_side``; an option's underlying
     direction, not its order side), lists the signal's reason first and the
     engine gate that refused it after (``peer_confirmed_key_level_long,
-    max_positions``): the gate is scored, on that side. Until
+    max_positions``): the gate, everything after the signal's reason, is
+    scored, on that side. Until
     2026-09-26 only top_tier's signal names (``top_tier_range_long``) were
     recognised, so every other strategy's refused signal was scored under
     its own name, on the screener's side, and the gate never was.
@@ -1412,11 +1406,17 @@ def _gate_attribution(
                 # only for reasons that name no side. Without a side there is
                 # no "favourable" direction and the row cannot be scored.
                 side_pref = str(row.get("side_pref", "") or "").strip().upper()
-                tokens = _reason_tokens(str(row.get("reasons", "") or "")) or [primary]
+                reasons = str(row.get("reasons", "") or "")
                 market_side = str(row.get("market_side", "") or "").strip().upper()
                 if market_side in {"LONG", "SHORT"}:
-                    gates = [(token, Side(market_side)) for token in tokens[1:]]
+                    # The one gate the gatekeeper wrote is all that follows
+                    # the signal's reason: a broker message in it
+                    # (`order_failed:...cancel_error:{exc}`) can hold a comma
+                    # outside parentheses, which until 2026-09-26 split off
+                    # a second, spurious gate.
+                    gates = [(gate, Side(market_side)) for gate in _reason_tokens(reasons, maxsplit=1)[1:]]
                 else:
+                    tokens = _reason_tokens(reasons) or [primary]
                     gates = [(primary, reason_side(primary))] + [
                         (token, reason_side(token)) for token in tokens[1:]
                         if _BUILD_FAILED_SIDE_RE.match(token.lower()) or split_side_prefix(token.lower())[0] is not None
@@ -1876,14 +1876,11 @@ def export_session_archive(
     # Collect symbols we care about: active watchlist + index symbols
     # + any symbol with a position today (in case it left the watchlist).
     symbols: set[str] = set()
-    try:
-        watch = strategy.active_watchlist(list(last_candidates or []), positions or {})
-        for sym in watch or set():
-            key = str(sym or "").upper().strip()
-            if key:
-                symbols.add(key)
-    except Exception:
-        pass
+    watch = strategy.active_watchlist(list(last_candidates or []), positions or {})
+    for sym in watch or set():
+        key = str(sym or "").upper().strip()
+        if key:
+            symbols.add(key)
     for pos in (positions or {}).values():
         underlying = str((pos.metadata or {}).get("underlying") or pos.symbol or "").upper().strip()
         if underlying:
@@ -1934,10 +1931,17 @@ def export_session_archive(
         written = 0
         skipped = 0
         for symbol in sorted(symbols):
+            # A frame that cannot be built (get_merged resamples it and runs
+            # the indicators) costs that symbol, not the archive, as the HTF
+            # read below does. An error let through here would end the export
+            # before the trades, log and manifest, and the daily export would
+            # retry it every cycle.
             try:
                 frame = data.get_merged(symbol, timeframe=tf_arg, with_indicators=True) if data is not None else None
-            except Exception:
-                frame = None
+            except Exception as exc:
+                LOG.warning("Could not read the merged frame for %s/%s: %s", symbol, tf_label, exc, exc_info=True)
+                skipped += 1
+                continue
             if frame is None or frame.empty:
                 skipped += 1
                 continue
@@ -2008,7 +2012,10 @@ def export_session_archive(
             for handler in logging.getLogger().handlers:
                 try:
                     handler.flush()
-                except Exception:
+                except (OSError, ValueError):
+                    # A handler whose stream failed or was closed (ValueError:
+                    # I/O operation on closed file) has nothing to add to the
+                    # copy.
                     pass
             shutil.copy2(log_src, log_dst)
             log_copied = True

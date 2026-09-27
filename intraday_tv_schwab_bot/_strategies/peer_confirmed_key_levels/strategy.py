@@ -31,7 +31,7 @@ def _score_threshold(value: Any, default: float, *, minimum: float = 0.0) -> flo
     """
     try:
         raw = float(value)
-    except Exception:
+    except (TypeError, ValueError):
         raw = float(default)
     if math.isnan(raw):
         raw = float(default)
@@ -55,7 +55,7 @@ def _discrete_score_threshold(
     """
     try:
         raw = float(value)
-    except Exception:
+    except (TypeError, ValueError):
         raw = float(default)
     if math.isnan(raw):
         raw = float(default)
@@ -193,20 +193,21 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         htf_minutes = int(self.params.get("htf_minutes", 60))
         sr_ctx = None
         if data is not None and hasattr(data, "get_support_resistance"):
-            try:
-                sr_ctx = data.get_support_resistance(
-                    symbol,
-                    current_price=close,
-                    flip_frame=frame,
-                    mode="trading",
-                    timeframe_minutes=htf_minutes,
-                    lookback_days=int(self.params.get("htf_lookback_days", 60)),
-                    use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
-                    use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
-                    allow_refresh=True,
-                )
-            except Exception:
-                sr_ctx = None
+            # A failed HTF fetch is logged and absorbed inside the feed
+            # (get_htf_context). Any other error here reaches the position
+            # manager, which skips this position's exit policy for the cycle
+            # and still checks its stop and target (manage_positions).
+            sr_ctx = data.get_support_resistance(
+                symbol,
+                current_price=close,
+                flip_frame=frame,
+                mode="trading",
+                timeframe_minutes=htf_minutes,
+                lookback_days=int(self.params.get("htf_lookback_days", 60)),
+                use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
+                use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
+                allow_refresh=True,
+            )
         buffer = max(
             defense_zone_width * 0.25,
             float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0),
@@ -261,7 +262,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
     def _clamp_weight(value: float, default: float) -> float:
         try:
             numeric = float(value)
-        except Exception:
+        except (TypeError, ValueError):
             numeric = float(default)
         return max(0.0, min(1.0, numeric))
 
@@ -929,10 +930,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         def _append(kind: str, price: float | None, *, touches: int = 1) -> None:
             if price is None:
                 return
-            try:
-                level_price = float(price)
-            except Exception:
-                return
+            level_price = float(price)
             if level_price <= 0:
                 return
             raw_candidates.append({

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from . import __version__
 from .config import available_strategy_names, load_config
 
 _DEFAULT_CONFIG_CANDIDATES = (
@@ -31,6 +32,11 @@ def _default_config_path() -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="TradingView + Schwabdev intraday bot"
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"intraday-tv-schwab-bot {__version__}",
     )
     parser.add_argument(
         "--config",

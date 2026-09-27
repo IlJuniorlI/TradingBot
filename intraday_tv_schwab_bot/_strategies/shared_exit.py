@@ -329,10 +329,7 @@ class SharedExitPolicy:
 
     @staticmethod
     def _hold_minutes(position: Position) -> float:
-        try:
-            return max(0.0, (sessions.now_et() - position.entry_time).total_seconds() / 60.0)
-        except Exception:
-            return 0.0
+        return max(0.0, (sessions.now_et() - position.entry_time).total_seconds() / 60.0)
 
     @staticmethod
     def _entry_family(position: Position) -> str:
@@ -432,7 +429,7 @@ class SharedExitPolicy:
         option, the underlying since entry -- its premium against the
         underlying's close was never under the threshold.
         """
-        time_stop_minutes = int(self.config.risk.time_stop_minutes or 0)
+        time_stop_minutes = self.config.risk.time_stop_minutes
         if time_stop_minutes <= 0:
             return None
         held_minutes = self._hold_minutes(position)
@@ -444,7 +441,7 @@ class SharedExitPolicy:
         last_close = safe_float(frame["close"].iloc[-1])
         if last_close is None:
             return None
-        min_return_pct = float(self.config.risk.time_stop_min_return_pct or 0.0)
+        min_return_pct = self.config.risk.time_stop_min_return_pct
         if abs((last_close - entry) / entry) < min_return_pct:
             return ExitDecision(f"time_stop:{int(held_minutes)}m", "time_stop")
         return None

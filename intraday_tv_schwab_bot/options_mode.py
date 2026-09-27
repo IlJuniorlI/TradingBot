@@ -49,10 +49,11 @@ def parse_option_chain(payload: dict[str, Any], only_dte: int | None = 0) -> lis
     for root_key in ("callExpDateMap", "putExpDateMap"):
         exp_map = payload.get(root_key) or {}
         for exp_key, strikes in exp_map.items():
-            try:
-                exp_date, dte_txt = str(exp_key).split(":", 1)
-                dte = int(float(dte_txt))
-            except Exception:
+            # Schwab keys an expiration "YYYY-MM-DD:DTE"; a key without a
+            # readable DTE falls back to the chain's daysToExpiration.
+            exp_date, _, dte_txt = str(exp_key).partition(":")
+            dte = safe_int(dte_txt)
+            if dte is None:
                 exp_date = str(exp_key)
                 dte = safe_int(payload.get("daysToExpiration"), -1)
             if only_dte is not None and dte != only_dte:

@@ -1,0 +1,25 @@
+# The sdist is what setuptools puts in by default: the package (its modules
+# and package-data), pyproject.toml, README.md and LICENSE. Nothing here adds
+# to that; every line takes something out. Put any include line above them:
+# MANIFEST.in applies its lines in order, so these must come last to win.
+
+# The default rules also take tests/test*.py, and tests/ is a dev-only tree
+# (.gitignore), missing from a clean clone.
+prune tests
+
+# User settings, credentials (a .env beside the config or at the root), OAuth
+# tokens and runtime logs: never shipped, whatever a line above or a stale
+# egg-info SOURCES.txt brings in. Each line warns at build time while it has
+# nothing to take out.
+exclude configs/config.yaml
+global-exclude .env
+prune .schwabdev
+prune .logs
+
+# The strategy plugins that live only in the private source tree (git leaves
+# them out). pyproject.toml keeps them out of the build's defaults; these take
+# out what an earlier build's SOURCES.txt lists, for the sdist and for a wheel
+# built straight from the tree. They too warn while they have nothing to take
+# out, as they do in a clean clone.
+prune intraday_tv_schwab_bot/_strategies/microcap_gap_orb
+prune intraday_tv_schwab_bot/_strategies/microcap_pm_breakout

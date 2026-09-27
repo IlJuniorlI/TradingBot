@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from .models import Position, Side
+from .numeric import safe_float
 from .reasons import exit_reason_code
 
 
@@ -60,17 +61,13 @@ def exit_reason_details(reason: str) -> dict[str, Any]:
         family = "schedule"
     elif isinstance(code, str) and any(token in code for token in ("trendline", "channel_", "bollinger_", "anchored_vwap")):
         family = "technical"
-    trigger_level = None
-    if level_text:
-        try:
-            trigger_level = float(level_text)
-        except Exception:
-            trigger_level = None
     return {
         "exit_reason": raw or None,
         "exit_reason_code": code,
         "exit_reason_family": family,
-        "exit_trigger_level": trigger_level,
+        # The level after the colon when it is a number; a word there
+        # (``candle_pattern_exit:CDLENGULFING``) or a NaN is no level.
+        "exit_trigger_level": safe_float(level_text),
     }
 
 

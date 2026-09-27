@@ -130,16 +130,13 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             return None
         nat_bid, nat_ask, quoted_mid = market
         entry_limit = single_option_limit_price(contract, mode=self.optcfg.option_limit_mode, opening=True)
-        if entry_limit <= 0:
-            self._set_build_failure(underlying, style, "invalid_limit_price")
-            return None
         entry_value = entry_limit * 100.0
         single_stop_frac = max(0.01, min(0.99, float(self.optcfg.single_stop_frac)))
         single_target_mult = max(1.01, float(self.optcfg.single_target_mult))
         time_decay_scale = self._compute_time_decay_scale()
         if time_decay_scale < 1.0:
             single_target_mult = max(1.01, 1.0 + (single_target_mult - 1.0) * time_decay_scale)
-            widen = float(getattr(self.optcfg, "debit_stop_time_decay_widen_factor", 0.30))
+            widen = self.optcfg.debit_stop_time_decay_widen_factor
             single_stop_frac = max(0.01, min(0.99, single_stop_frac * (1.0 + (1.0 - time_decay_scale) * widen)))
         stop = entry_value * single_stop_frac
         target = entry_value * single_target_mult
@@ -302,7 +299,7 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
 
             if trend_enabled and trend_window and (bullish or bearish):
                 momentum_ok = True
-                if getattr(self.optcfg, "trend_momentum_filter_enabled", False):
+                if self.optcfg.trend_momentum_filter_enabled:
                     atr_current = safe_float(last.get("atr14"), 0.0)
                     atr_tail = frame.tail(20)["atr14"].dropna() if "atr14" in frame.columns else pd.Series(dtype=float)
                     atr_mean = float(atr_tail.mean()) if len(atr_tail) > 0 else 0.0

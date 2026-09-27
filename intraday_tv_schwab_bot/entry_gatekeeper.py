@@ -119,12 +119,9 @@ class EntryGatekeeper:
 
     @staticmethod
     def _safe_series_last(frame, field: str, default: float | None = None) -> float | None:
-        try:
-            if frame is None or frame.empty or field not in frame.columns:
-                return default
-            return safe_float(frame.iloc[-1][field], default)
-        except Exception:
+        if frame is None or frame.empty or field not in frame.columns:
             return default
+        return safe_float(frame.iloc[-1][field], default)
 
     # ------------------------------------------------------------------
     # Retry-backoff for option entries that failed to fill.
@@ -187,7 +184,7 @@ class EntryGatekeeper:
             tds = safe_float(metadata.get("time_decay_scale"), 1.0) or 1.0
             if tds < 1.0:
                 debit_target_mult = max(1.01, 1.0 + (debit_target_mult - 1.0) * tds)
-                widen = float(getattr(self.config.options, "debit_stop_time_decay_widen_factor", 0.30) or 0.30)
+                widen = self.config.options.debit_stop_time_decay_widen_factor
                 debit_stop_frac = max(0.01, min(0.99, debit_stop_frac * (1.0 + (1.0 - tds) * widen)))
             stop = entry_value * debit_stop_frac
             target = entry_value * debit_target_mult
@@ -217,7 +214,7 @@ class EntryGatekeeper:
             tds = safe_float(metadata.get("time_decay_scale"), 1.0) or 1.0
             if tds < 1.0:
                 single_target_mult = max(1.01, 1.0 + (single_target_mult - 1.0) * tds)
-                widen = float(getattr(self.config.options, "debit_stop_time_decay_widen_factor", 0.30) or 0.30)
+                widen = self.config.options.debit_stop_time_decay_widen_factor
                 single_stop_frac = max(0.01, min(0.99, single_stop_frac * (1.0 + (1.0 - tds) * widen)))
             stop = entry_value * single_stop_frac
             target = entry_value * single_target_mult
@@ -263,12 +260,14 @@ class EntryGatekeeper:
             return None
         candidate = existing_trail_pct
         if candidate is None:
-            candidate = getattr(self.config.risk, "trailing_stop_pct", None)
-        try:
-            candidate = float(candidate)
-        except Exception:
+            candidate = self.config.risk.trailing_stop_pct
+        if candidate is None:
             return None
-        return float(candidate) if candidate > 0 else None
+        # A finite number: a restored position's trail_pct is read with
+        # safe_float, and load_config refuses any risk.trailing_stop_pct but
+        # a finite number >= 0 or null (config._NUMBER_CHECKS); 0 is off.
+        candidate = float(candidate)
+        return candidate if candidate > 0 else None
 
     @staticmethod
     def _scaled_order_spec(spec: dict[str, Any], qty: int) -> dict[str, Any]:
@@ -287,15 +286,12 @@ class EntryGatekeeper:
         frame = bars.get(candidate.symbol) if bars else None
         meta = dict(candidate.metadata or {})
         bar_time = None
-        try:
-            if frame is not None and not frame.empty:
-                bar_idx = frame.index[-1]
-                if hasattr(bar_idx, 'isoformat'):
-                    bar_time = bar_idx.isoformat()
-                else:
-                    bar_time = str(bar_idx)
-        except Exception:
-            bar_time = None
+        if frame is not None and not frame.empty:
+            bar_idx = frame.index[-1]
+            if hasattr(bar_idx, 'isoformat'):
+                bar_time = bar_idx.isoformat()
+            else:
+                bar_time = str(bar_idx)
         live_entry_status = self.data.live_entry_bar_status(candidate.symbol)
         out = {
             'symbol': candidate.symbol,
@@ -807,7 +803,9 @@ class EntryGatekeeper:
                 skipped_symbols.append(str(symbol))
                 if isinstance(reasons, (list, tuple)):
                     seen: set[str] = set()
-                    for reason in reasons:
+                    # A refused signal (``market_side``) leads with its own
+                    # reason, which stopped nothing: its gate follows.
+                    for reason in reasons[1:] if payload.get('market_side') else reasons:
                         # The gate, whichever side it stopped and whatever
                         # its detail: `long.market_structure_bearish(matrix)`
                         # and `order_failed:rejected` tally as
@@ -853,7 +851,8 @@ class EntryGatekeeper:
         first of ``reasons``, followed on a skip by the engine gate that
         refused it (``max_positions``, ``order_failed:...``), which the
         session report's gate attribution scores on that side whatever the
-        signal is called."""
+        signal is called. The skip tally and the cycle summary (the
+        payload's ``market_side``) count that gate alone."""
         cleaned: list[str] = []
         for item in reasons or []:
             token = str(item or "").strip()
@@ -861,9 +860,12 @@ class EntryGatekeeper:
                 cleaned.append(token)
         # Tally session-wide skip reasons so session_report can surface a
         # filter-rejection summary at EOD. Each reason gets credit even
-        # when multiple fire on the same decision.
+        # when multiple fire on the same decision. A refused signal's own
+        # reason (on a decision ``market_side`` marks) stopped nothing: only
+        # the gate after it is tallied. Until 2026-09-26 both were, so each
+        # refusal counted twice.
         if str(action).lower() == "skipped":
-            for reason in cleaned:
+            for reason in cleaned[1:] if market_side is not None else cleaned:
                 self.session_skip_counts[reason] = self.session_skip_counts.get(reason, 0) + 1
         dashboard_symbol = str(symbol or '').upper().strip()
         context_payload = copy.deepcopy({str(k): v for k, v in context.items() if v is not None}) if isinstance(context, Mapping) else {}
@@ -876,6 +878,7 @@ class EntryGatekeeper:
                 'reasons': list(cleaned),
                 'primary_reason': cleaned[0] if cleaned else None,
                 'secondary_reason': cleaned[1] if len(cleaned) > 1 else None,
+                'market_side': market_side.value if market_side is not None else None,
                 'updated_at': sessions.now_et().isoformat(),
             }
             if context_payload:

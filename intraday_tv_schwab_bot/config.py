@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, fields
 from copy import deepcopy
 import logging
+import math
 import os
+import re
 from pathlib import Path
 from typing import Any, Mapping
-
-import yaml
 
 from .candles import (
     DEFAULT_BEARISH_PATTERNS,
@@ -24,8 +24,9 @@ from .chart_patterns import (
     chart_pattern_group_tokens,
     invalid_allowed_chart_patterns,
 )
-from .event_blackouts import blackout_time_errors
+from .event_blackouts import blackout_row_errors, earnings_errors
 from .models import PairDefinition, StrategySchedule, Window
+from .serialization import read_yaml
 from ._strategies.catalogue import (
     default_strategy_name,
     get_plugins,
@@ -36,7 +37,7 @@ from ._strategies.catalogue import (
 from ._strategies.factory import normalize_strategy_params
 from .indicators import set_runtime_indicator_mode, set_session_indicator_window
 from .sessions import is_hhmm, parse_hhmm
-from .symbols import normalize_symbol_list
+from .symbols import normalize_symbol_list, ticker_quote_hint
 
 LOG = logging.getLogger(__name__)
 
@@ -389,7 +390,8 @@ class RiskConfig:
     # would have locked INTC +$95 → +$47 instead of -$3, AMZN +$62 → +$31
     # instead of -$13, AMD +$31 → +$15 instead of -$30. Net modeled
     # improvement ~+$135 on the session (alongside BE fix). Set
-    # peak_giveback_min_r=0 to disable entirely.
+    # peak_giveback_enabled=False to disable entirely; peak_giveback_min_r
+    # must be above 0 (a 0 read as 1.0 until 2026-09-26).
     peak_giveback_enabled: bool = True
     peak_giveback_min_r: float = 1.0
     # Low-tier peak-giveback (2026-05-26). The main peak-giveback gate only
@@ -444,8 +446,8 @@ class RuntimeConfig:
     # between cycles instead of `loop_sleep_seconds`. Cuts overnight CPU
     # waste by ~95% — the loop wakes up every minute to recheck whether
     # the stream session has started, instead of every 2s. Set to a
-    # value <= loop_sleep_seconds to disable the optimization entirely
-    # (no idle slowdown).
+    # value <= loop_sleep_seconds (0 included; it read as 60 until
+    # 2026-09-26) to disable the optimization entirely (no idle slowdown).
     idle_sleep_seconds: float = 60.0
     # How often the engine evicts per-symbol state (history frames, HTF
     # caches, dashboard snapshot/chart payloads) for symbols that have
@@ -582,37 +584,13 @@ class DashboardChartingConfig:
         )
     )
 
-    @staticmethod
-    def _normalize_max_bars(value: Any, fallback: int) -> int:
-        try:
-            return max(1, min(int(value or fallback), 480))
-        except Exception:
-            return fallback
-
-    @staticmethod
-    def _normalize_chart_timeframe(value: Any) -> str:
-        return "htf" if str(value or "ltf").strip().lower() == "htf" else "ltf"
-
-    @classmethod
-    def _normalize_profile(cls, cfg: DashboardChartConfig | None, *, fallback_max_bars: int) -> DashboardChartConfig:
-        if cfg is None:
-            cfg = DashboardChartConfig(max_bars=fallback_max_bars)
-        values = asdict(cfg)
-        normalized: dict[str, Any] = {}
-        for key, value in list(values.items()):
-            if key == "max_bars":
-                normalized[key] = cls._normalize_max_bars(value, fallback_max_bars)
-            else:
-                normalized[key] = bool(value)
-        return DashboardChartConfig(**normalized)
-
     def resolved_profile(self, mode: str) -> DashboardChartConfig:
-        profile_name = "expanded" if str(mode or "").lower() == "expanded" else "compact"
-        fallback_max_bars = 360 if profile_name == "expanded" else 90
-        return self._normalize_profile(getattr(self, profile_name, None), fallback_max_bars=fallback_max_bars)
-
-    def normalized_compact_chart_timeframe(self) -> str:
-        return self._normalize_chart_timeframe(self.compact_chart_timeframe)
+        """The ``expanded`` profile for that mode, else ``compact``.
+        ``load_config`` checks each profile's ``max_bars`` (an integer in
+        1-480) and switches; until 2026-09-26 this read an unreadable
+        ``max_bars`` as the profile's default, clamped it to 1-480 and read
+        any string as a switch that is on."""
+        return self.expanded if str(mode or "").lower() == "expanded" else self.compact
 
 
 @dataclass(slots=True)
@@ -1419,9 +1397,6 @@ _PERCENT_PARAM_NAMES = {
 }
 
 
-_TRADE_MANAGEMENT_MODE_VALUES = {"adaptive", "adaptive_ladder", "sr_flip", "none"}
-
-
 # Keys removed from a config section, with what replaced them. A YAML still
 # carrying one fails at load with the replacement named, instead of a bare
 # "unexpected keyword argument" (or, for a key a dataclass would have
@@ -1488,14 +1463,6 @@ def _reject_retired_keys(config_path: Path, section: str, raw: Mapping[str, Any]
         raise ValueError(f"{config_path}: retired config keys -- " + "; ".join(stale))
 
 
-def _normalize_trade_management_mode(value: Any) -> str:
-    mode = str(value or "adaptive_ladder").strip().lower()
-    if mode not in _TRADE_MANAGEMENT_MODE_VALUES:
-        LOG.warning("Unsupported risk.trade_management_mode=%r; using 'adaptive_ladder'. Valid values: %s", mode, sorted(_TRADE_MANAGEMENT_MODE_VALUES))
-        return "adaptive_ladder"
-    return mode
-
-
 def _normalize_tv_percent_param(value: Any) -> float:
     if isinstance(value, str):
         raw = value.strip()
@@ -1509,12 +1476,10 @@ def _normalize_pairs_config(values: Any) -> list[PairDefinition]:
     out: list[PairDefinition] = []
     seen: set[tuple[str, str]] = set()
     for item in values or []:
-        if not isinstance(item, dict):
-            continue
-        symbol = str(item.get("symbol") or "").upper().strip()
-        reference = str(item.get("reference") or "").upper().strip()
-        if not symbol or not reference:
-            continue
+        # _section_shape_errors has refused a row that is not a mapping with
+        # a symbol and a reference.
+        symbol = str(item["symbol"]).upper().strip()
+        reference = str(item["reference"]).upper().strip()
         key = (symbol, reference)
         if key in seen:
             continue
@@ -1564,58 +1529,368 @@ def _normalize_strategy_params(
     return out
 
 
-def _validate_risk_config(risk: RiskConfig, config_path: Path) -> None:
-    """Reject or clamp nonsensical risk parameter values that would cause
-    silent misbehaviour at runtime (e.g. negative max_daily_loss inverting
-    the daily loss check, or zero max_positions blocking all entries)."""
-    errors: list[str] = []
-    if risk.max_positions < 1:
-        errors.append(f"risk.max_positions must be >= 1, got {risk.max_positions}")
-    if risk.risk_per_trade_frac_of_notional <= 0 or risk.risk_per_trade_frac_of_notional > 1.0:
-        errors.append(
-            "risk.risk_per_trade_frac_of_notional must be in (0, 1.0], got "
-            f"{risk.risk_per_trade_frac_of_notional}"
+@dataclass(frozen=True, slots=True)
+class _Number:
+    """The load check for one numeric key: a YAML number (a quoted one is a
+    string), never a bool (``float(True)`` is 1.0), finite, and inside the
+    bounds; ``integer`` asks for an int, and ``nullable`` lets a null
+    through. The readers take the value as it is, through ``float()`` /
+    ``int()`` or none, mid-session: a string raised there (in the sleep
+    between cycles it ended ``run()`` without its shutdown), a NaN or an
+    infinity passed ``max()`` / ``min()`` clamps and comparisons silently,
+    and a float was truncated."""
+
+    integer: bool = False
+    low: float | None = None
+    low_open: bool = False
+    high: float | None = None
+    nullable: bool = False
+    note: str = ""
+
+    def error(self, key: str, value: Any) -> str | None:
+        """The message naming *key* when *value* fails, else ``None``."""
+        if self._accepts(value):
+            return None
+        kind = "an integer" if self.integer else "a finite number"
+        return (f"{key} must be {kind}{self._bounds()}{self.note}, got {value!r}"
+                f"{self._text_hint(value)}{self._decimal_hint(value)}")
+
+    def _accepts(self, value: Any) -> bool:
+        if value is None:
+            return self.nullable
+        return (
+            isinstance(value, int if self.integer else int | float)
+            and not isinstance(value, bool)
+            and (isinstance(value, int) or math.isfinite(value))
+            and (self.low is None or (value > self.low if self.low_open else value >= self.low))
+            and (self.high is None or value <= self.high)
         )
-    if risk.max_notional_per_trade <= 0:
-        errors.append(f"risk.max_notional_per_trade must be > 0, got {risk.max_notional_per_trade}")
-    if risk.max_total_notional <= 0:
-        errors.append(f"risk.max_total_notional must be > 0, got {risk.max_total_notional}")
-    if risk.max_daily_loss <= 0:
-        errors.append(f"risk.max_daily_loss must be > 0, got {risk.max_daily_loss}")
-    if risk.default_stop_pct <= 0 or risk.default_stop_pct > 1.0:
-        errors.append(f"risk.default_stop_pct must be in (0, 1.0], got {risk.default_stop_pct}")
-    if risk.default_target_pct <= 0 or risk.default_target_pct > 1.0:
-        errors.append(f"risk.default_target_pct must be in (0, 1.0], got {risk.default_target_pct}")
-    if risk.cooldown_minutes < 0:
-        errors.append(f"risk.cooldown_minutes must be >= 0, got {risk.cooldown_minutes}")
+
+    def _text_hint(self, value: Any) -> str:
+        """The hint for a number YAML read as text: a quoted one, or an
+        exponent without a dot and a signed power (YAML 1.1 reads ``5e6``
+        and ``1.5e6`` as strings, ``1.5e+6`` as a number). Names the value
+        to write, in a form YAML reads as that number, and only when that
+        number passes the check: an integer key's as an integer (``1e16``:
+        ``10000000000000000``), and no hint for a number out of range
+        (``'-5'`` for a count), whose unquoted form is refused too."""
+        if not isinstance(value, str):
+            return ""
+        try:
+            number = float(value)
+        except ValueError:
+            return ""
+        if not math.isfinite(number) or (self.integer and not number.is_integer()):
+            return ""
+        if self.integer or (number.is_integer() and abs(number) < 1e15):
+            written, parsed = str(int(number)), int(number)
+        else:
+            mantissa, _, power = repr(number).partition("e")
+            written, parsed = f"{mantissa if '.' in mantissa else mantissa + '.0'}{'e' + power if power else ''}", number
+        if not self._accepts(parsed):
+            return ""
+        return f" (YAML read it as text, not a number: write {written})"
+
+    def _decimal_hint(self, value: Any) -> str:
+        """The hint for a whole number written with a decimal point where an
+        integer belongs (``max_positions: 2.0``, a float to YAML): names the
+        integer to write, when the check takes it. Such a value loaded until
+        2026-09-26, when the counts became integers."""
+        if not self.integer or not isinstance(value, float) or not value.is_integer():
+            return ""
+        if not self._accepts(int(value)):
+            return ""
+        return f" (YAML read it as a decimal, not an integer: write {int(value)})"
+
+    def _bounds(self) -> str:
+        if self.low is None:
+            return ""
+        if self.high is None:
+            return f" {'>' if self.low_open else '>='} {self.low:g}"
+        return f" in {'(' if self.low_open else '['}{self.low:g}, {self.high:g}]"
+
+
+_ABOVE_ZERO = _Number(low=0, low_open=True)
+_AT_LEAST_ZERO = _Number(low=0)
+_FRACTION = _Number(low=0, high=1)
+_COUNT = _Number(integer=True, low=1)
+_COUNT_OR_ZERO = _Number(integer=True, low=0)
+
+# The numbers the engine, the data feed, the risk manager, the position
+# manager, the execution layer and the dashboard read at runtime, by config
+# section. load_config refuses a value outside its check, naming the key; the
+# readers take the value as it is. The switches (every field a section's
+# dataclass declares ``bool``) must be true or false; ``_section_errors``
+# reads them off the dataclass.
+_NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
+    "schwab": {
+        "timeout": _COUNT,
+    },
+    "tradingview": {
+        "max_candidates": _COUNT,
+        "screener_refresh_seconds": _AT_LEAST_ZERO,
+        "min_market_cap": _AT_LEAST_ZERO,
+        "max_market_cap": _AT_LEAST_ZERO,
+        "min_volume": _COUNT_OR_ZERO,
+        "min_value_traded_1m": _Number(low=0, note=" (0 turns the filter off)"),
+        "min_volume_1m": _Number(integer=True, low=0, note=" (0 turns the filter off)"),
+    },
+    "risk": {
+        "max_positions": _COUNT,
+        "risk_per_trade_frac_of_notional": _Number(low=0, low_open=True, high=1),
+        "max_notional_per_trade": _ABOVE_ZERO,
+        "max_total_notional": _ABOVE_ZERO,
+        "max_daily_loss": _ABOVE_ZERO,
+        "default_stop_pct": _Number(low=0, low_open=True, high=1),
+        "default_target_pct": _Number(low=0, low_open=True, high=1),
+        "cooldown_minutes": _COUNT_OR_ZERO,
+        "same_level_block_minutes": _Number(integer=True, low=0, note=" (0 turns the block off)"),
+        "same_level_block_atr_mult": _Number(low=0, note=" (0 turns the block off)"),
+        "entry_slippage_allowance_spread_frac": _Number(low=0, note=" (0 sizes on the raw stop distance)"),
+        "entry_slippage_allowance_max_pct": _Number(low=0, note=" (0 leaves the allowance uncapped)"),
+        # Detection thresholds, read after the fill: an unreadable one raised
+        # while the filled position was being booked.
+        "risk_overage_warn_frac": _Number(note=" (below 0 turns the warning off)"),
+        "entry_slippage_warn_pct": _Number(note=" (0 or below turns the warning off)"),
+        # Read at every entry and restore (EntryGatekeeper.stock_position_trail_pct),
+        # where an unreadable value switched the trail off without a word
+        # until 2026-09-26, and so did a negative one.
+        "trailing_stop_pct": _Number(low=0, nullable=True, note=" (0 or null turns the trail off)"),
+        "time_stop_minutes": _Number(integer=True, low=0, note=" (0 turns the time stop off)"),
+        "time_stop_min_return_pct": _AT_LEAST_ZERO,
+        "peak_giveback_min_r": _Number(
+            low=0, low_open=True, note=" (peak_giveback_enabled: false turns the giveback off)",
+        ),
+        "peak_giveback_low_tier_min_r": _Number(low=0, note=" (0 turns the low tier off)"),
+        "peak_giveback_low_tier_giveback_frac": _FRACTION,
+        "peak_giveback_retain_1to2r": _FRACTION,
+        "peak_giveback_retain_2to3r": _FRACTION,
+        "peak_giveback_retain_3r_plus": _FRACTION,
+    },
+    "runtime": {
+        "loop_sleep_seconds": _ABOVE_ZERO,
+        "idle_sleep_seconds": _Number(low=0, note=" (at or below loop_sleep_seconds turns the idle cadence off)"),
+        "symbol_state_prune_seconds": _Number(low=0, note=" (0 turns pruning off)"),
+        # Read with float() in the feed's history refresh check and the
+        # warm-up retry timing, both ahead of the cycle's position management.
+        "history_poll_seconds": _ABOVE_ZERO,
+        "quote_poll_seconds": _ABOVE_ZERO,
+        "quote_cache_seconds": _AT_LEAST_ZERO,
+        "quote_batch_size": _COUNT,
+        "history_lookback_minutes": _COUNT,
+        "warmup_minutes": _COUNT,
+        "prewarm_before_windows_minutes": _COUNT_OR_ZERO,
+        "stream_connect_timeout_seconds": _COUNT,
+        "stream_fallback_poll_seconds": _COUNT,
+        "stream_stale_fallback_seconds": _COUNT,
+        "stream_health_log_seconds": _COUNT,
+        "startup_order_lookback_days": _COUNT,
+        # Read every cycle by the position manager's per-position escalation
+        # and on every failed cycle by the engine's. A null used to turn the
+        # engine's off, and a typo raised out of its error path (2026-09-26).
+        "error_escalation_cycles": _Number(integer=True, low=0, note=" (0 turns the escalation off)"),
+        # The engine read ``int(value or 4)`` behind a silent except until
+        # 2026-09-26.
+        "cycle_precompute_workers": _COUNT,
+        # Read by every quote refresh (MarketDataStore._parallel_quote_fetch),
+        # where a typo used to read as 5 and null or a negative count as 0.
+        "max_consecutive_quote_failures": _Number(integer=True, low=0, note=" (0 turns the gate off)"),
+    },
+    "paper": {
+        "starting_equity": _ABOVE_ZERO,
+        "max_equity_points": _COUNT,
+        "max_trade_history": _COUNT,
+    },
+    "dashboard": {
+        "port": _Number(integer=True, low=1, high=65535),
+        "refresh_ms": _COUNT,
+    },
+    "dashboard.charting.compact": {"max_bars": _Number(integer=True, low=1, high=480)},
+    "dashboard.charting.expanded": {"max_bars": _Number(integer=True, low=1, high=480)},
+    # The level-spacing tolerances, read as they are by the S/R and HTF
+    # builds, the strategies' HTF context and market-structure reads, the
+    # dashboard and the ladder spacing (_sr_ladder), even with
+    # support_resistance.enabled: false. Each is above 0: until 2026-09-26 a
+    # 0 read as 0 in the S/R build's merge tolerance and the chart's HTF
+    # request, and as a reader's own default in the others (0.35 or 0.60 ATR,
+    # 0.003, 0.10 ATR, 0.0015), and a negative one read as it was, but as 0
+    # in the ladder spacing. The section's other numbers are the strategies'
+    # to read, and are not checked here.
+    "support_resistance": {
+        "atr_tolerance_mult": _ABOVE_ZERO,
+        "pct_tolerance": _ABOVE_ZERO,
+        "same_side_min_gap_atr_mult": _ABOVE_ZERO,
+        "same_side_min_gap_pct": _ABOVE_ZERO,
+    },
+    "execution": {
+        "entry_limit_min_buffer": _AT_LEAST_ZERO,
+        "entry_limit_max_buffer": _AT_LEAST_ZERO,
+        "entry_limit_spread_frac": _AT_LEAST_ZERO,
+        # An infinite timeout polled an unfilled order forever.
+        "entry_live_fill_timeout_seconds": _ABOVE_ZERO,
+        "entry_live_poll_seconds": _ABOVE_ZERO,
+        "entry_live_reprice_attempts": _COUNT_OR_ZERO,
+        "entry_live_reprice_step_frac": _AT_LEAST_ZERO,
+        # A NaN offset priced the resting STOP_LIMIT at "nan".
+        "bracket_stop_limit_offset_r": _AT_LEAST_ZERO,
+        "bracket_replace_min_price_delta": _AT_LEAST_ZERO,
+    },
+    "events": {
+        "earnings_block_sessions_before": _COUNT_OR_ZERO,
+        "earnings_block_sessions_after": _COUNT_OR_ZERO,
+    },
+    # The options numbers the risk manager, the position manager, the
+    # execution layer and the entry gatekeeper read (the 0DTE strategies read
+    # the rest). The level fractions are read after the fill.
+    "options": {
+        "max_loss_per_trade": _ABOVE_ZERO,
+        "max_contracts_per_trade": _COUNT,
+        "max_quote_age_seconds": _AT_LEAST_ZERO,
+        "dry_run_replace_attempts": _COUNT_OR_ZERO,
+        "dry_run_step_frac": _AT_LEAST_ZERO,
+        "debit_stop_frac": _ABOVE_ZERO,
+        "debit_target_mult": _ABOVE_ZERO,
+        "credit_stop_mult": _ABOVE_ZERO,
+        "credit_target_frac": _ABOVE_ZERO,
+        "single_stop_frac": _ABOVE_ZERO,
+        "single_target_mult": _ABOVE_ZERO,
+        "debit_stop_time_decay_widen_factor": _AT_LEAST_ZERO,
+        "options_breakeven_mark_mult": _ABOVE_ZERO,
+        "options_breakeven_stop_mult": _ABOVE_ZERO,
+        "options_profit_lock_mark_mult": _ABOVE_ZERO,
+        "options_profit_lock_stop_mult": _ABOVE_ZERO,
+    },
+}
+
+
+# The settings that name one of a fixed set of modes, by config section, with
+# the values each takes, spelled exactly so. load_config refuses any other
+# value, naming the key and the values; the readers compare the value as it
+# is. Until 2026-09-26 all but the bracket modes were read in any case, and
+# all but startup_reconcile_mode and the two option limit modes with
+# surrounding spaces ignored, so "Strict", "NATURAL", "EXTENDED" or " HTF "
+# read as that mode (they are refused now); and they fell back at runtime,
+# with a WARNING or without a word: a typo'd startup_reconcile_mode read as
+# log_only, which turned the entry block off; an unknown
+# trade_management_mode read as adaptive_ladder, and reentry_policy took six
+# undocumented aliases and read an unknown value as cooldown;
+# equity_session_indicator_window and compact_chart_timeframe read anything
+# else as rth / ltf, order_block_mode as loose and the two option limit
+# modes as mid. dashboard.theme, whose values are the theme folders, is
+# checked in _validate_dashboard_config.
+_CHOICES: dict[str, dict[str, tuple[str, ...]]] = {
+    "risk": {
+        "trade_management_mode": ("adaptive", "adaptive_ladder", "none", "sr_flip"),
+        "reentry_policy": ("cooldown", "immediate", "rest_of_day"),
+    },
+    "runtime": {
+        "startup_reconcile_mode": ("block", "ignore", "log_only", "restore_basic", "restore_hybrid"),
+        "equity_session_indicator_window": ("extended", "rth"),
+    },
+    "dashboard.charting": {
+        "compact_chart_timeframe": ("htf", "ltf"),
+    },
+    "support_resistance": {
+        "order_block_mode": ("loose", "strict"),
+    },
+    "options": {
+        "option_limit_mode": ("bid", "mid", "natural"),
+        "vertical_limit_mode": ("bid", "mid", "natural"),
+    },
+    # A misspelling fell through to a "not that mode" branch at order-build
+    # time, with a live order already in flight.
+    "execution": {
+        "bracket_sync_mode": ("replace", "static"),
+        "bracket_legs": ("stop_and_target", "stop_only"),
+        "bracket_stop_order_type": ("STOP", "STOP_LIMIT"),
+    },
+}
+
+# The dashboard themes: the folders under dashboard_assets/themes whose name
+# the dashboard serves (README "Custom themes"), "default" among them.
+DASHBOARD_THEMES_DIR = Path(__file__).with_name("dashboard_assets") / "themes"
+THEME_NAME_PATTERN = re.compile(r"^[a-z0-9_-]{1,40}$")
+
+
+def dashboard_themes() -> list[str]:
+    """The theme names ``dashboard.theme`` takes, sorted: the folders under
+    ``DASHBOARD_THEMES_DIR`` named to ``THEME_NAME_PATTERN``, so a theme a
+    user drops in there is one."""
+    return sorted(path.name for path in DASHBOARD_THEMES_DIR.iterdir()
+                  if path.is_dir() and THEME_NAME_PATTERN.match(path.name))
+
+
+def _choice_errors(section: str, cfg: Any) -> list[str]:
+    """``section``'s modes (``_CHOICES``) that are none of their values."""
+    return [
+        f"{section}.{key} must be one of {sorted(choices)}, got {getattr(cfg, key)!r}"
+        for key, choices in _CHOICES.get(section, {}).items()
+        if getattr(cfg, key) not in choices
+    ]
+
+
+def _number_errors(section: str, cfg: Any) -> list[str]:
+    """``section``'s numbers (``_NUMBER_CHECKS``) that fail their check."""
+    return [
+        error for key, check in _NUMBER_CHECKS.get(section, {}).items()
+        if (error := check.error(f"{section}.{key}", getattr(cfg, key))) is not None
+    ]
+
+
+def _section_errors(section: str, cfg: Any) -> list[str]:
+    """``section``'s numbers (``_NUMBER_CHECKS``), modes (``_CHOICES``) and
+    switches: every field its dataclass declares ``bool`` must be true or
+    false. YAML reads ``yes`` / ``no`` / ``on`` / ``off`` as booleans too;
+    the string ``"false"`` is truthy and a null is falsy, so either flipped
+    the switch without a word (a blank ``schwab.dry_run:`` traded live)."""
+    errors = _number_errors(section, cfg)
+    errors += _choice_errors(section, cfg)
+    for spec in fields(cfg):
+        value = getattr(cfg, spec.name)
+        if spec.type == "bool" and not isinstance(value, bool):
+            errors.append(f"{section}.{spec.name} must be true or false, got {value!r}")
+    return errors
+
+
+def _raise_section_errors(section: str, errors: list[str], config_path: Path) -> None:
     if errors:
-        raise ValueError(f"{config_path}: invalid risk configuration:\n  " + "\n  ".join(errors))
+        raise ValueError(f"{config_path}: invalid {section} configuration:\n  " + "\n  ".join(errors))
+
+
+def _validate_risk_config(risk: RiskConfig, config_path: Path) -> None:
+    """The risk numbers, modes and switches (``_NUMBER_CHECKS["risk"]``,
+    ``_CHOICES["risk"]``): a negative max_daily_loss inverted the daily
+    loss check, zero max_positions blocked every entry, and a typo raised in
+    the entry or management cycle."""
+    _raise_section_errors("risk", _section_errors("risk", risk), config_path)
 
 
 def _validate_runtime_config(runtime: RuntimeConfig, config_path: Path) -> None:
-    """Plausibility checks for runtime cadence and cache settings.
+    """The runtime cadence, cache, stream and reconcile numbers, modes and
+    switches (``_NUMBER_CHECKS["runtime"]``, ``_CHOICES["runtime"]``).
 
     These fields previously had scattered getattr(..., default) fallbacks in
     call sites (engine.py, data_feed.py, execution.py) that silently papered
     over bad or missing values. With those removed, we validate at load time
-    so misconfiguration fails loudly up front."""
-    errors: list[str] = []
-    if runtime.loop_sleep_seconds <= 0:
-        errors.append(f"runtime.loop_sleep_seconds must be > 0, got {runtime.loop_sleep_seconds}")
-    if runtime.quote_poll_seconds <= 0:
-        errors.append(f"runtime.quote_poll_seconds must be > 0, got {runtime.quote_poll_seconds}")
-    if runtime.quote_cache_seconds < 0:
-        errors.append(f"runtime.quote_cache_seconds must be >= 0, got {runtime.quote_cache_seconds}")
-    if runtime.quote_batch_size < 1:
-        errors.append(f"runtime.quote_batch_size must be >= 1, got {runtime.quote_batch_size}")
-    if runtime.history_lookback_minutes < 1:
-        errors.append(f"runtime.history_lookback_minutes must be >= 1, got {runtime.history_lookback_minutes}")
-    if runtime.warmup_minutes < 1:
-        errors.append(f"runtime.warmup_minutes must be >= 1, got {runtime.warmup_minutes}")
-    if runtime.prewarm_before_windows_minutes < 0:
-        errors.append(f"runtime.prewarm_before_windows_minutes must be >= 0, got {runtime.prewarm_before_windows_minutes}")
-    if errors:
-        raise ValueError(f"{config_path}: invalid runtime configuration:\n  " + "\n  ".join(errors))
+    so misconfiguration fails loudly up front. The two sleeps and the prune
+    cadence are read between cycles, outside the cycle's error handling: an
+    unreadable, NaN or infinite value there ended ``run()`` without its
+    shutdown (2026-09-26)."""
+    errors = _section_errors("runtime", runtime)
+    # Iterated as symbols: a string was read letter by letter, so the symbol
+    # it named was never ignored, and an unquoted ON (read as true) as TRUE.
+    # One message per bad entry, as for an event row's symbols.
+    ignore = runtime.startup_reconcile_ignore_symbols
+    if ignore is not None and not isinstance(ignore, list):
+        errors.append(f"runtime.startup_reconcile_ignore_symbols must be a list of tickers, got {ignore!r}")
+    elif ignore is not None:
+        errors += [
+            f"runtime.startup_reconcile_ignore_symbols[{index}] must be a ticker, got {symbol!r}"
+            f"{ticker_quote_hint(symbol)}"
+            for index, symbol in enumerate(ignore)
+            if not isinstance(symbol, str) or not symbol.strip()
+        ]
+    _raise_section_errors("runtime", errors, config_path)
 
 
 def _validate_support_resistance_config(sr: SupportResistanceConfig, config_path: Path) -> None:
@@ -1625,8 +1900,15 @@ def _validate_support_resistance_config(sr: SupportResistanceConfig, config_path
     inside confirm_by_bars. With both off the readers disagreed: the S/R
     builders fell back to the last HTF bar, while the adaptive ladder's rung
     check has no fallback bar and could never confirm, so its stop was never
-    promoted."""
-    errors: list[str] = []
+    promoted.
+
+    The four level-spacing tolerances (``_NUMBER_CHECKS``) must be finite
+    YAML numbers above 0, even with ``enabled: false``. The S/R and HTF
+    builders and the dashboard read them with ``float()``, so a typo raised
+    in every build; the ladder spacing (``_sr_ladder``: sr_flip management
+    and the dashboard ladder) read it as the default. ``order_block_mode`` is
+    ``loose`` or ``strict`` (``_CHOICES``)."""
+    errors = _number_errors("support_resistance", sr) + _choice_errors("support_resistance", sr)
     names = ("trading_flip_confirmation_1m_bars", "trading_flip_confirmation_5m_bars")
     for name in names:
         value = getattr(sr, name)
@@ -1639,41 +1921,12 @@ def _validate_support_resistance_config(sr: SupportResistanceConfig, config_path
 
 
 def _validate_execution_config(execution: EquityExecutionConfig, risk: RiskConfig, config_path: Path) -> None:
-    """Plausibility checks for the equity execution / bracket-order block.
-
-    The bracket knobs are enum-ish strings whose misspelling would otherwise
-    fall through to a silent "not that mode" branch at order-build time — by
-    which point a live order is already in flight. Validate at load."""
-    errors: list[str] = []
-    sync_modes = {"static", "replace"}
-    if execution.bracket_sync_mode not in sync_modes:
-        errors.append(
-            f"execution.bracket_sync_mode must be one of {sorted(sync_modes)}, "
-            f"got {execution.bracket_sync_mode!r}"
-        )
-    leg_modes = {"stop_and_target", "stop_only"}
-    if execution.bracket_legs not in leg_modes:
-        errors.append(
-            f"execution.bracket_legs must be one of {sorted(leg_modes)}, "
-            f"got {execution.bracket_legs!r}"
-        )
-    stop_types = {"STOP", "STOP_LIMIT"}
-    if execution.bracket_stop_order_type not in stop_types:
-        errors.append(
-            f"execution.bracket_stop_order_type must be one of {sorted(stop_types)}, "
-            f"got {execution.bracket_stop_order_type!r}"
-        )
-    if execution.bracket_stop_limit_offset_r < 0:
-        errors.append(
-            "execution.bracket_stop_limit_offset_r must be >= 0, got "
-            f"{execution.bracket_stop_limit_offset_r}"
-        )
-    if execution.bracket_replace_min_price_delta < 0:
-        errors.append(
-            "execution.bracket_replace_min_price_delta must be >= 0, got "
-            f"{execution.bracket_replace_min_price_delta}"
-        )
-    if execution.bracket_orders_enabled:
+    """Plausibility checks for the equity execution / bracket-order block:
+    the numbers, the bracket modes and the switches (``_NUMBER_CHECKS`` /
+    ``_CHOICES["execution"]``), and the bracket combinations the risk
+    management mode rules out."""
+    errors = _section_errors("execution", execution)
+    if execution.bracket_orders_enabled is True:  # anything but a bool is refused above
         # A resting target limit defeats the ladder's two defining behaviours:
         # suppress-target-exit (roll to the next rung) and final-rung runner
         # (target_price cleared to None). Refuse the combination outright
@@ -1697,23 +1950,17 @@ def _validate_execution_config(execution: EquityExecutionConfig, risk: RiskConfi
                 "resting child, leaving the broker on the entry-time stop. Use "
                 "bracket_sync_mode: replace, or a non-adaptive management mode"
             )
-    if errors:
-        raise ValueError(f"{config_path}: invalid execution configuration:\n  " + "\n  ".join(errors))
+    _raise_section_errors("execution", errors, config_path)
 
 
 def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path) -> None:
-    """Plausibility checks for options sizing, quote-freshness and the times.
+    """Plausibility checks for options sizing, quote-freshness, the levels,
+    the switches and the times (``_NUMBER_CHECKS["options"]``).
 
     max_quote_age_seconds was previously read via ``getattr(..., 10)``
     fallback in the engine before Phase 1 validators landed; validation
     replaces that silent default."""
-    errors: list[str] = []
-    if options.max_quote_age_seconds < 0:
-        errors.append(f"options.max_quote_age_seconds must be >= 0, got {options.max_quote_age_seconds}")
-    if options.max_loss_per_trade <= 0:
-        errors.append(f"options.max_loss_per_trade must be > 0, got {options.max_loss_per_trade}")
-    if options.max_contracts_per_trade < 1:
-        errors.append(f"options.max_contracts_per_trade must be >= 1, got {options.max_contracts_per_trade}")
+    errors = _section_errors("options", options)
     if options.underlyings is not None and not isinstance(options.underlyings, list):
         errors.append(f"options.underlyings must be a list of symbols, got {options.underlyings!r}")
     # The times fail here, naming the key, instead of where they are read:
@@ -1725,20 +1972,75 @@ def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path)
         value = getattr(options, name)
         if not is_hhmm(value):
             errors.append(f"options.{name} must be an HH:MM time, got {value!r}")
-    if errors:
-        raise ValueError(f"{config_path}: invalid options configuration:\n  " + "\n  ".join(errors))
+    _raise_section_errors("options", errors, config_path)
 
 
 def _validate_events_config(events: EventsConfig, config_path: Path) -> None:
-    """An inline blackout row's ``start`` / ``end`` must be an HH:MM time.
+    """``events.blackouts`` must be a list of mappings whose ``start`` /
+    ``end`` are HH:MM times (and whose other fields read, see
+    ``blackout_row_errors``), ``events.earnings`` a
+    ``{SYMBOL: [YYYY-MM-DD, ...]}`` map, ``enabled`` a switch and the two
+    earnings session counts integers >= 0.
 
-    The calendar parses them only on the row's date, inside the entry and
-    (for the 0DTE strategies) force-flatten checks, so a typo waited for the
-    event itself. The ``blackout_file`` rows are checked when the strategy
-    builds its calendar (``event_blackouts.EventBlackoutCalendar``)."""
-    errors = blackout_time_errors(events.blackouts, "events.blackouts")
-    if errors:
-        raise ValueError(f"{config_path}: invalid events configuration:\n  " + "\n  ".join(errors))
+    The calendar parses a row's times only on the row's date, inside the
+    entry and (for the 0DTE strategies) force-flatten checks, so a typo
+    waited for the event itself; a scalar where a list belongs raised a bare
+    TypeError, and a bad earnings date was dropped with a warning. The two
+    files are checked when the strategy builds its calendar
+    (``event_blackouts.EventBlackoutCalendar``)."""
+    errors = _section_errors("events", events)
+    errors += blackout_row_errors(events.blackouts, "events.blackouts")
+    errors += earnings_errors(events.earnings, "events.earnings")
+    _raise_section_errors("events", errors, config_path)
+
+
+def _validate_dashboard_config(dashboard: DashboardConfig, config_path: Path) -> None:
+    """The dashboard's port, refresh, theme and switches, the compact
+    chart's timeframe, and each chart profile's ``max_bars`` (1-480) and
+    switches. The server read the port and the refresh with ``int()`` when
+    the bot was built; it lowercased and stripped the theme, so ``Nebula``
+    or `` dark `` served that theme, and read one that was malformed or
+    named no folder there as ``default``, with a WARNING (a null without
+    one); a chart profile read an unreadable ``max_bars`` as its default
+    and any string as a switch that is on."""
+    errors = _section_errors("dashboard", dashboard)
+    themes = dashboard_themes()
+    if dashboard.theme not in themes:
+        errors.append(
+            f"dashboard.theme must be one of the theme folders under {DASHBOARD_THEMES_DIR}, {themes}, "
+            f"got {dashboard.theme!r}"
+        )
+    errors += _section_errors("dashboard.charting", dashboard.charting)
+    for name in ("compact", "expanded"):
+        errors += _section_errors(f"dashboard.charting.{name}", getattr(dashboard.charting, name))
+    _raise_section_errors("dashboard", errors, config_path)
+
+
+def _charting_key_errors(charting: Mapping[str, Any], compact: Mapping[str, Any],
+                         expanded: Mapping[str, Any]) -> list[str]:
+    """The keys under ``dashboard.charting`` and its two chart profiles that
+    none of them takes. ``load_config`` splits the section by hand, so an
+    unknown key (a typo such as ``compact_timeframe:``) was ignored without
+    a word until 2026-09-26, leaving the setting it meant at its default;
+    one in a profile raised the dataclass's bare "unexpected keyword
+    argument". The retired ``shared`` profile and top-level ``*_max_bars``
+    keys, which had messages of their own, are unknown keys like any
+    other."""
+    taken = [spec.name for spec in fields(DashboardChartingConfig)]
+    profile = [spec.name for spec in fields(DashboardChartConfig)]
+    errors = [f"dashboard.charting has an unknown key {key!r}: it takes {', '.join(taken)}"
+              for key in charting if key not in taken]
+    for name, raw in (("compact", compact), ("expanded", expanded)):
+        errors += [f"dashboard.charting.{name} has an unknown key {key!r}: a chart profile takes {', '.join(profile)}"
+                   for key in raw if key not in profile]
+    return errors
+
+
+def _validate_section(section: str, cfg: Any, config_path: Path) -> None:
+    """A section with only numbers and switches to check: ``schwab``
+    (``timeout``, and ``dry_run``, which a blank or ``0`` read as false:
+    live trading), ``tradingview`` and ``paper``."""
+    _raise_section_errors(section, _section_errors(section, cfg), config_path)
 
 
 def _validate_strategy_windows(strategies: dict[str, "StrategyConfig"], config_path: Path) -> None:
@@ -1816,6 +2118,68 @@ def _validate_sector_index_map(strategies: dict[str, "StrategyConfig"], config_p
         )
 
 
+# The top-level sections load_config reads as mappings of settings; ``pairs``
+# is a list of pair rows.
+_MAPPING_SECTIONS = ("schwab", "tradingview", "risk", "runtime", "paper", "dashboard", "execution", "candles",
+                     "chart_patterns", "support_resistance", "technical_levels", "events", "shared_entry",
+                     "shared_exit", "options", "strategies")
+
+
+def _section_shape_errors(raw: Mapping[str, Any]) -> list[str]:
+    """One message per section, ``dashboard.charting`` or chart profile,
+    strategy entry or its ``params`` that is not a mapping (a null one is
+    empty), and for a ``pairs`` that is not a list. Until 2026-09-26 each
+    was read with ``dict(value or {})`` (a strategy entry with ``.get``):
+    ``risk: 5`` raised a bare "'int' object is not iterable" and
+    ``compact: [1]`` a bare "cannot convert dictionary update sequence
+    element", naming neither the section nor the file, ``strategies:
+    {top_tier_adaptive: 5}`` (or ``null``) a bare AttributeError; a section
+    left as ``0``, ``""``, ``[]`` or ``false`` read as an empty one, so every
+    key in it ran on its default, a list of ``[key, value]`` pairs read as a
+    mapping, and ``pairs: {...}`` as no pairs. A pair row that is not a
+    mapping with a symbol and a reference was dropped without a word, and a
+    top-level key that names no section was ignored."""
+    errors: list[str] = []
+
+    def mapping(where: str, value: Any, what: str = "a mapping of settings") -> Mapping[str, Any]:
+        """*value* when it is a mapping; else empty, with a message unless
+        it is null."""
+        if value is not None and not isinstance(value, dict):
+            errors.append(f"{where} must be {what}, got {value!r}")
+        return value if isinstance(value, dict) else {}
+
+    sections = {
+        section: mapping(section, raw.get(section), "a mapping of strategy names to their settings"
+                         if section == "strategies" else "a mapping of settings")
+        for section in _MAPPING_SECTIONS
+    }
+    charting = mapping("dashboard.charting", sections["dashboard"].get("charting"))
+    for name in ("compact", "expanded"):
+        mapping(f"dashboard.charting.{name}", charting.get(name))
+    for name, entry in sections["strategies"].items():
+        mapping(f"strategies.{name}.params", mapping(f"strategies.{name}", entry).get("params"))
+    pairs = raw.get("pairs")
+    if pairs is not None and not isinstance(pairs, list):
+        errors.append(f"pairs must be a list of pair rows, got {pairs!r}")
+    for index, row in enumerate(pairs if isinstance(pairs, list) else []):
+        if not isinstance(row, dict) or not all(str(row.get(key) or "").strip() for key in ("symbol", "reference")):
+            errors.append(f"pairs[{index}] must be a mapping with a symbol and a reference, got {row!r}")
+    # A misspelled section (``risks:``, ``support_resistence:``) used to
+    # load, and every key under it ran on its default.
+    known = set(_MAPPING_SECTIONS) | {"strategy", "pairs"}
+    for key in raw:
+        if key not in known:
+            errors.append(f"unknown section {key!r}: the config takes {', '.join(sorted(known))}")
+    return errors
+
+
+def _settings(raw: Mapping[str, Any], key: str) -> dict[str, Any]:
+    """A copy of the mapping under *key* (``_section_shape_errors`` has
+    refused one that is not); a null or absent one is empty."""
+    value = raw.get(key)
+    return {} if value is None else dict(value)
+
+
 def load_config(path: str | Path, strategy_override: str | None = None, env_path: str | Path | None = None) -> BotConfig:
     config_path = Path(path).expanduser()
     if not config_path.exists():
@@ -1823,9 +2187,20 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
             f"Config file not found: {config_path}. "
             "Copy configs/config.example.yaml to configs/config.yaml or pass --config with a valid YAML path."
         )
-    raw = yaml.safe_load(config_path.read_text()) or {}
-    if raw.get("strategies") is not None and not isinstance(raw.get("strategies"), dict):
-        raise TypeError(f"{config_path}:strategies must be a YAML object when present")
+    # Read as the event calendar reads its files (serialization.read_yaml):
+    # an unquoted date that cannot exist (events.earnings AAPL: [2026-11-31])
+    # raised PyYAML's bare "day is out of range for month", naming neither
+    # the file nor the line, and a YAML syntax error did not name the file
+    # (2026-09-26). An empty file (or one of comments only) is refused: it
+    # ran on the code defaults, a config the operator never wrote.
+    raw = read_yaml(config_path)
+    if raw is None:
+        raise ValueError(f"{config_path}: the config file is empty; it must be a mapping of config sections")
+    if not isinstance(raw, dict):
+        raise ValueError(f"{config_path}: must be a mapping of config sections, got {raw!r}")
+    shape_errors = _section_shape_errors(raw)
+    if shape_errors:
+        raise ValueError(f"{config_path}: invalid config sections:\n  " + "\n  ".join(shape_errors))
 
     # Load .env (if present) before resolving secrets. Process env always
     # wins; .env only fills in keys that aren't already set. If env_path
@@ -1836,8 +2211,8 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
 
     strategy = normalize_strategy_name(strategy_override or raw.get("strategy", default_strategy_name()))
     raw["strategy"] = strategy
-    schwab_raw = dict(raw.get("schwab", {}) or {})
-    tv_raw = dict(raw.get("tradingview", {}) or {})
+    schwab_raw = _settings(raw, "schwab")
+    tv_raw = _settings(raw, "tradingview")
     tv_raw.pop("cookies_from_browser", None)
     tv_raw.pop("browser", None)
 
@@ -1874,46 +2249,42 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     # SCHWAB_ENCRYPTION_KEY so the key isn't committed to yaml.
     schwab_encryption = _resolve_secret(schwab_raw.get("encryption"), "SCHWAB_ENCRYPTION_KEY")
     schwab_raw["encryption"] = schwab_encryption
-    risk_raw = dict(raw.get("risk", {}) or {})
-    risk_raw["trade_management_mode"] = _normalize_trade_management_mode(risk_raw.get("trade_management_mode", "adaptive_ladder"))
-    runtime_raw = dict(raw.get("runtime", {}) or {})
-    paper_raw = dict(raw.get("paper", {}) or {})
-    dashboard_raw = dict(raw.get("dashboard", {}) or {})
-    dashboard_charting_raw = dict(dashboard_raw.pop("charting", {}) or {})
-    if "shared" in dashboard_charting_raw:
-        raise ValueError("dashboard.charting.shared is no longer supported. Use dashboard.charting.compact and dashboard.charting.expanded only.")
-    compact_charting_raw = dict(dashboard_charting_raw.get("compact", {}) or {})
-    expanded_charting_raw = dict(dashboard_charting_raw.get("expanded", {}) or {})
-    unsupported_charting_keys = [key for key in ("one_minute_max_bars", "1m_max_bars", "ltf_max_bars", "htf_max_bars") if key in dashboard_charting_raw]
-    if unsupported_charting_keys:
-        raise ValueError(
-            "dashboard.charting no longer supports top-level timeframe "
-            "max-bars keys. Use dashboard.charting.compact.max_bars and "
-            "dashboard.charting.expanded.max_bars instead."
-        )
-    execution_raw = dict(raw.get("execution", {}) or {})
-    candles_raw = dict(raw.get("candles", {}) or {})
-    chart_patterns_raw = dict(raw.get("chart_patterns", {}) or {})
+    risk_raw = _settings(raw, "risk")
+    runtime_raw = _settings(raw, "runtime")
+    paper_raw = _settings(raw, "paper")
+    dashboard_raw = _settings(raw, "dashboard")
+    dashboard_charting_raw = _settings(dashboard_raw, "charting")
+    dashboard_raw.pop("charting", None)
+    compact_charting_raw = _settings(dashboard_charting_raw, "compact")
+    expanded_charting_raw = _settings(dashboard_charting_raw, "expanded")
+    _raise_section_errors("dashboard", _charting_key_errors(
+        dashboard_charting_raw, compact_charting_raw, expanded_charting_raw), config_path)
+    execution_raw = _settings(raw, "execution")
+    candles_raw = _settings(raw, "candles")
+    chart_patterns_raw = _settings(raw, "chart_patterns")
     _validate_pattern_config(config_path, candles_raw, chart_patterns_raw)
-    support_resistance_raw = dict(raw.get("support_resistance", {}) or {})
-    technical_levels_raw = dict(raw.get("technical_levels", {}) or {})
-    events_raw = dict(raw.get("events", {}) or {})
-    shared_entry_raw = dict(raw.get("shared_entry", {}) or {})
-    shared_exit_raw = dict(raw.get("shared_exit", {}) or {})
+    support_resistance_raw = _settings(raw, "support_resistance")
+    technical_levels_raw = _settings(raw, "technical_levels")
+    events_raw = _settings(raw, "events")
+    shared_entry_raw = _settings(raw, "shared_entry")
+    shared_exit_raw = _settings(raw, "shared_exit")
     for section, section_raw in (("shared_entry", shared_entry_raw), ("technical_levels", technical_levels_raw),
                                  ("runtime", runtime_raw)):
         _reject_retired_keys(config_path, section, section_raw, _RETIRED_SECTION_KEYS[section])
-    options_raw = _normalize_options_config(raw.get("options", {}))
+    options_raw = _normalize_options_config(_settings(raw, "options"))
 
     strategies = _strategy_defaults()
 
-    for key, value in (raw.get("strategies", {}) or {}).items():
+    strategies_raw = _settings(raw, "strategies")
+    for key in strategies_raw:
         name = normalize_strategy_name(key)
-        _reject_retired_keys(config_path, f"strategies.{name}.params", value.get("params", {}) or {},
+        value = _settings(strategies_raw, key)
+        params_raw = _settings(value, "params")
+        _reject_retired_keys(config_path, f"strategies.{name}.params", params_raw,
                              _RETIRED_STRATEGY_PARAMS.get(name, {}))
         base = strategies[name]
         merged_params = deepcopy(base.params)
-        merged_params.update(deepcopy(value.get("params", {}) or {}))
+        merged_params.update(deepcopy(params_raw))
         strategies[name] = StrategyConfig(
             name=name,
             entry_windows=deepcopy(value.get("entry_windows", base.entry_windows)),
@@ -1935,6 +2306,13 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     )
 
     pairs = _normalize_pairs_config(raw.get("pairs", []))
+
+    schwab_cfg = SchwabConfig(**schwab_raw)
+    _validate_section("schwab", schwab_cfg, config_path)
+    tradingview_cfg = TradingViewConfig(**tv_raw)
+    _validate_section("tradingview", tradingview_cfg, config_path)
+    paper_cfg = PaperConfig(**paper_raw)
+    _validate_section("paper", paper_cfg, config_path)
 
     runtime_cfg = RuntimeConfig(**runtime_raw)
     _validate_runtime_config(runtime_cfg, config_path)
@@ -1962,21 +2340,24 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     events_cfg = EventsConfig(**events_raw)
     _validate_events_config(events_cfg, config_path)
 
+    dashboard_cfg = DashboardConfig(
+        **dashboard_raw,
+        charting=DashboardChartingConfig(
+            compact_chart_timeframe=dashboard_charting_raw.get("compact_chart_timeframe", "ltf"),
+            compact=DashboardChartConfig(**compact_charting_raw),
+            expanded=DashboardChartConfig(**expanded_charting_raw),
+        ),
+    )
+    _validate_dashboard_config(dashboard_cfg, config_path)
+
     return BotConfig(
         strategy=strategy,
-        schwab=SchwabConfig(**schwab_raw),
-        tradingview=TradingViewConfig(**tv_raw),
+        schwab=schwab_cfg,
+        tradingview=tradingview_cfg,
         risk=risk_cfg,
         runtime=runtime_cfg,
-        paper=PaperConfig(**paper_raw),
-        dashboard=DashboardConfig(
-            **dashboard_raw,
-            charting=DashboardChartingConfig(
-                compact_chart_timeframe=dashboard_charting_raw.get("compact_chart_timeframe", "ltf"),
-                compact=DashboardChartConfig(**compact_charting_raw),
-                expanded=DashboardChartConfig(**expanded_charting_raw),
-            ),
-        ),
+        paper=paper_cfg,
+        dashboard=dashboard_cfg,
         execution=execution_cfg,
         candles=CandlesConfig(**candles_raw),
         chart_patterns=ChartPatternsConfig(**chart_patterns_raw),

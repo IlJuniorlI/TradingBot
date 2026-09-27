@@ -183,10 +183,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         allowed = {str(s).strip() for s in (self.optcfg.styles or []) if str(s).strip()}
         return style in allowed
 
-    def _matching_event_blackout(self, now_dt=None) -> dict[str, Any] | None:
-        """Macro window covering *now_dt*, via the shared event calendar."""
-        return self._event_calendar.matching_macro_event(now_dt=now_dt)
-
     def _option_entry_block_reason(self, now_dt=None) -> str | None:
         return self._event_calendar.entry_block_reason(now_dt=now_dt)
 
@@ -243,11 +239,11 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         """Returns 1.0 at/before decay_start, min_scale at/after decay_end,
         linear interpolation between. Used to scale debit/single target and
         stop multipliers as theta decay accelerates through the 0DTE session."""
-        if not getattr(self.optcfg, "debit_target_time_decay_enabled", False):
+        if not self.optcfg.debit_target_time_decay_enabled:
             return 1.0
         now_t = sessions.now_et().time()
-        start = parse_hhmm(getattr(self.optcfg, "debit_target_time_decay_start", "10:30"))
-        end = parse_hhmm(getattr(self.optcfg, "debit_target_time_decay_end", "14:00"))
+        start = parse_hhmm(self.optcfg.debit_target_time_decay_start)
+        end = parse_hhmm(self.optcfg.debit_target_time_decay_end)
         min_scale = max(0.10, float(getattr(self.optcfg, "debit_target_time_decay_min_scale", 0.70)))
         if now_t <= start:
             return 1.0
@@ -262,10 +258,10 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
     def _time_adjusted_delta(self, base_delta: float) -> float:
         """Shift delta higher (more ITM) as session progresses to reduce theta
         exposure on 0DTE contracts. NOT applied to credit short deltas."""
-        if not getattr(self.optcfg, "delta_time_shift_enabled", False):
+        if not self.optcfg.delta_time_shift_enabled:
             return base_delta
         now_t = sessions.now_et().time()
-        shift_start = parse_hhmm(getattr(self.optcfg, "delta_time_shift_start", "10:00"))
+        shift_start = parse_hhmm(self.optcfg.delta_time_shift_start)
         if now_t <= shift_start:
             return base_delta
         shift_per_hour = float(getattr(self.optcfg, "delta_time_shift_per_hour", 0.025))
@@ -287,7 +283,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         exist on the chain. Rounding to whole dollars matches the
         ``strike_width_by_symbol`` defaults (all integer) and the actual
         Schwab chain grid for these ETFs."""
-        if not getattr(self.optcfg, "adaptive_width_enabled", False):
+        if not self.optcfg.adaptive_width_enabled:
             return base_width
         current_atr = getattr(self, "_underlying_atr_cache", {}).get(underlying)
         ref_atr = getattr(self, "_underlying_ref_atr_cache", {}).get(underlying)
@@ -381,8 +377,10 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             "lookback_days": self._htf_lookback_days(),
             "pivot_span": int(self._support_resistance_setting("pivot_span", 2) or 2),
             "max_levels_per_side": int(self._support_resistance_setting("max_levels_per_side", 6) or 6),
-            "atr_tolerance_mult": float(self._support_resistance_setting("atr_tolerance_mult", 0.35) or 0.35),
-            "pct_tolerance": float(self._support_resistance_setting("pct_tolerance", 0.0030) or 0.0030),
+            # Checked at load (above 0); a 0 read as 0.35 / 0.003 until
+            # 2026-09-26.
+            "atr_tolerance_mult": float(self.config.support_resistance.atr_tolerance_mult),
+            "pct_tolerance": float(self.config.support_resistance.pct_tolerance),
             "stop_buffer_atr_mult": float(self._support_resistance_setting("stop_buffer_atr_mult", 0.25) or 0.25),
             "ema_fast_span": ema_fast_span,
             "ema_slow_span": ema_slow_span,
@@ -453,25 +451,24 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             lie (illiquid spikes, etc).
 
         Returns 1.0 (neutral) when the frame is None/empty/insufficient
-        or when columns are missing — fails open, doesn't crash entry."""
+        or when columns are missing — fails open, doesn't crash entry. A
+        frame whose columns do not read raises: until 2026-09-26 that read
+        as the neutral 1.0 too, which ``min_activity_for_entry`` passes."""
         if frame is None or frame.empty or len(frame) < 20:
             return 1.0
-        try:
-            if "volume" in frame.columns:
-                recent_vol = float(frame.tail(5)["volume"].sum())
-                prior_vol = float(frame.iloc[-20:-5]["volume"].sum())
-                vol_momentum = recent_vol / max(prior_vol / 3.0, 1.0)
-            else:
-                vol_momentum = 1.0
-            if "atr14" in frame.columns:
-                atr_tail = frame["atr14"].dropna().tail(20)
-                atr_current = float(atr_tail.iloc[-1]) if len(atr_tail) > 0 else 0.0
-                atr_baseline = float(atr_tail.median()) if len(atr_tail) >= 5 else 0.0
-                atr_expansion = atr_current / max(atr_baseline, 0.01) if atr_baseline > 0 else 1.0
-            else:
-                atr_expansion = 1.0
-        except Exception:
-            return 1.0
+        if "volume" in frame.columns:
+            recent_vol = float(frame.tail(5)["volume"].sum())
+            prior_vol = float(frame.iloc[-20:-5]["volume"].sum())
+            vol_momentum = recent_vol / max(prior_vol / 3.0, 1.0)
+        else:
+            vol_momentum = 1.0
+        if "atr14" in frame.columns:
+            atr_tail = frame["atr14"].dropna().tail(20)
+            atr_current = float(atr_tail.iloc[-1]) if len(atr_tail) > 0 else 0.0
+            atr_baseline = float(atr_tail.median()) if len(atr_tail) >= 5 else 0.0
+            atr_expansion = atr_current / max(atr_baseline, 0.01) if atr_baseline > 0 else 1.0
+        else:
+            atr_expansion = 1.0
         return 0.6 * vol_momentum + 0.4 * atr_expansion
 
     def dashboard_directional_bias(self, frame: pd.DataFrame | None) -> Side | None:
@@ -499,28 +496,25 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         """
         if frame is None or frame.empty or len(frame) < 5:
             return None
-        try:
-            last = frame.iloc[-1]
-            close = safe_float(last.get("close"), 0.0)
-            if close <= 0:
-                return None
-            vwap = safe_float(last.get("vwap"), close)
-            ema9 = safe_float(last.get("ema9"), close)
-            ema20 = safe_float(last.get("ema20"), close)
-            vwap_dist = (close - vwap) / close
-            ema_gap = (ema9 - ema20) / close
-            p = self.params
-            vwap_thresh = float(p.get("trend_vwap_distance_pct", 0.0016))
-            ema_thresh = float(p.get("trend_ema_gap_pct", 0.00075))
-            session_day = sessions.now_et().date()
-            u_open = session_open_price(frame, session_day, fallback_to_premarket_on_nan=True)
-            day_ret = ((close / u_open) - 1.0) if u_open and u_open > 0 else 0.0
-            if vwap_dist >= vwap_thresh and ema_gap >= ema_thresh and day_ret > 0:
-                return Side.LONG
-            if vwap_dist <= -vwap_thresh and ema_gap <= -ema_thresh and day_ret < 0:
-                return Side.SHORT
-        except Exception:
+        last = frame.iloc[-1]
+        close = safe_float(last.get("close"), 0.0)
+        if close <= 0:
             return None
+        vwap = safe_float(last.get("vwap"), close)
+        ema9 = safe_float(last.get("ema9"), close)
+        ema20 = safe_float(last.get("ema20"), close)
+        vwap_dist = (close - vwap) / close
+        ema_gap = (ema9 - ema20) / close
+        p = self.params
+        vwap_thresh = float(p.get("trend_vwap_distance_pct", 0.0016))
+        ema_thresh = float(p.get("trend_ema_gap_pct", 0.00075))
+        session_day = sessions.now_et().date()
+        u_open = session_open_price(frame, session_day, fallback_to_premarket_on_nan=True)
+        day_ret = ((close / u_open) - 1.0) if u_open and u_open > 0 else 0.0
+        if vwap_dist >= vwap_thresh and ema_gap >= ema_thresh and day_ret > 0:
+            return Side.LONG
+        if vwap_dist <= -vwap_thresh and ema_gap <= -ema_thresh and day_ret < 0:
+            return Side.SHORT
         return None
 
     @staticmethod
@@ -554,17 +548,14 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         """
         if frame is None or frame.empty:
             return None
-        try:
-            session_day = sessions.now_et().date()
-            u_open = session_open_price(frame, session_day, fallback_to_premarket_on_nan=True)
-            if not u_open or u_open <= 0:
-                return None
-            close = safe_float(frame.iloc[-1].get("close"), 0.0)
-            if close <= 0:
-                return None
-            return ((close / u_open) - 1.0) * 100.0
-        except Exception:
+        session_day = sessions.now_et().date()
+        u_open = session_open_price(frame, session_day, fallback_to_premarket_on_nan=True)
+        if not u_open or u_open <= 0:
             return None
+        close = safe_float(frame.iloc[-1].get("close"), 0.0)
+        if close <= 0:
+            return None
+        return ((close / u_open) - 1.0) * 100.0
 
     def _regime_confirm(self, candidate: Candidate, bars: dict[str, pd.DataFrame], data) -> dict[str, Any]:
         p = self.params
@@ -621,13 +612,12 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             idx_range = abs(idx_vwap_dist) <= float(p.get("range_vwap_distance_pct", 0.0019)) and abs(idx_ema_gap) <= float(p.get("range_ema_gap_pct", 0.00075))
 
         q = data.get_quote(vol_symbol) if data else None
+        # No guard: until 2026-09-26 a freshness check that raised kept the
+        # quote it could not vouch for, and the VIX gates read it.
         if data is not None and vol_symbol:
-            try:
-                max_age = max(1.0, float(self.config.runtime.quote_cache_seconds))
-                if not data.quotes_are_fresh([vol_symbol], max_age):
-                    q = None
-            except Exception:
-                LOG.debug("Failed to validate freshness of volatility quote for %s; using current quote snapshot as-is.", vol_symbol, exc_info=True)
+            max_age = max(1.0, float(self.config.runtime.quote_cache_seconds))
+            if not data.quotes_are_fresh([vol_symbol], max_age):
+                q = None
         vix_last = first_float(q, "last", "mid", "mark", positive=True)
         vix_pct = self._safe_pct(q.get("percent_change")) if q is not None and q.get("percent_change") is not None else 0.0
         # change_from_open is computed live from Schwab session bars
@@ -1376,7 +1366,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         time_decay_scale = self._compute_time_decay_scale()
         if time_decay_scale < 1.0:
             debit_target_mult = max(1.01, 1.0 + (debit_target_mult - 1.0) * time_decay_scale)
-            widen = float(getattr(self.optcfg, "debit_stop_time_decay_widen_factor", 0.30))
+            widen = self.optcfg.debit_stop_time_decay_widen_factor
             debit_stop_frac = max(0.01, min(0.99, debit_stop_frac * (1.0 + (1.0 - time_decay_scale) * widen)))
         stop = entry_value * debit_stop_frac
         target = entry_value * debit_target_mult
@@ -1486,7 +1476,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return None
         # Credit strike distance gate — reject if short strike is too close
         # to the underlying price in ATR terms (risk of breach on vol days).
-        if getattr(self.optcfg, "credit_distance_gate_enabled", False):
+        if self.optcfg.credit_distance_gate_enabled:
             underlying_atr = getattr(self, "_underlying_atr_cache", {}).get(underlying)
             if underlying_atr is not None and underlying_atr > 0:
                 distance_atr = abs(float(short_leg.strike) - last_underlying) / underlying_atr
@@ -1516,7 +1506,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         # unavailable (early session, no pivots) — never blocks the
         # build for missing data. Until 2026-09-25 it read the references
         # from the regime's top level, found none and never fired.
-        if getattr(self.optcfg, "credit_pivot_buffer_gate_enabled", False):
+        if self.optcfg.credit_pivot_buffer_gate_enabled:
             underlying_atr = getattr(self, "_underlying_atr_cache", {}).get(underlying)
             if underlying_atr is not None and underlying_atr > 0 and math.isfinite(underlying_atr):
                 buffer_mult = float(getattr(self.optcfg, "min_short_strike_pivot_buffer_atr", 1.0))
@@ -1778,7 +1768,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 # Trend momentum quality filter — reject if ATR isn't expanding
                 # or volume isn't confirming the move.
                 momentum_ok = True
-                if getattr(self.optcfg, "trend_momentum_filter_enabled", False):
+                if self.optcfg.trend_momentum_filter_enabled:
                     atr_current = safe_float(last.get("atr14"), 0.0)
                     atr_tail = frame.tail(20)["atr14"].dropna() if "atr14" in frame.columns else pd.Series(dtype=float)
                     atr_mean = float(atr_tail.mean()) if len(atr_tail) > 0 else 0.0

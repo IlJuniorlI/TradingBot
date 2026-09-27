@@ -33,24 +33,23 @@ def _is_scalar_missing(value: Any) -> bool:
         return True
     if isinstance(value, (pd.DataFrame, pd.Series, pd.Index)):
         return False
-    try:
-        missing = pd.isna(value)
-    except Exception:
-        return False
+    missing = pd.isna(value)
     return type(missing).__name__ in {"bool", "bool_"} and bool(missing)
 
 
 def fmt_metric(value: Any, digits: int = 4) -> str:
     """Render ``value`` for embedding in a skip-reason string. NaN/None
-    becomes ``'na'``; ints stay ints; floats get fixed-precision."""
-    try:
-        if _is_scalar_missing(value):
-            return "na"
-        if isinstance(value, int) and not isinstance(value, bool):
-            return str(value)
-        return f"{float(value):.{digits}f}"
-    except Exception:
+    becomes ``'na'``, and so does a value ``float`` cannot read; ints stay
+    ints; floats get fixed-precision."""
+    if _is_scalar_missing(value):
         return "na"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "na"
+    return f"{number:.{digits}f}"
 
 
 def bool_token(value: Any) -> str:

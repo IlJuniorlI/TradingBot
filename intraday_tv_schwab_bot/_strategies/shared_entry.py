@@ -1199,15 +1199,18 @@ class SharedEntryPolicy:
         A positive risk and reward are always required. ``min_target_rr`` 0
         or null switches only the ratio floor off; until 2026-09-24 it was
         read as ``float(x or 1.0)``, so a configured 0 meant 1.0.
+
+        A level that does not read as a finite number fails. Until
+        2026-09-26 a non-numeric one passed, and so did a NaN with the ratio
+        floor off (a NaN risk and reward are not <= 0).
         """
         if target is None:
             return True
-        try:
-            close_v = float(close)
-            stop_v = float(stop)
-            target_v = float(target)
-        except (TypeError, ValueError):
-            return True
+        close_v = safe_float(close, finite=True)
+        stop_v = safe_float(stop, finite=True)
+        target_v = safe_float(target, finite=True)
+        if close_v is None or stop_v is None or target_v is None:
+            return False
         if side == Side.LONG:
             risk = close_v - stop_v
             reward = target_v - close_v
@@ -2066,55 +2069,52 @@ class SharedEntryPolicy:
             return out
         if sr_ctx is None:
             return out
-        try:
-            raw_bias = safe_float(getattr(sr_ctx, "bias_score", 0.0), 0.0)
-            directional_bias = raw_bias if side == Side.LONG else -raw_bias
-            bias_weight = max(0.0, self._sr_weight("entry_bias_score_weight", 0.60))
-            favorable_bonus = max(0.0, self._sr_weight("entry_favorable_proximity_bonus", 0.35))
-            opposing_penalty = max(0.0, self._sr_weight("entry_opposing_proximity_penalty", 0.35))
-            proximity_window_atr = max(0.05, self._sr_weight("proximity_atr_mult", 0.75))
-            bias_component = directional_bias * bias_weight
+        raw_bias = safe_float(getattr(sr_ctx, "bias_score", 0.0), 0.0)
+        directional_bias = raw_bias if side == Side.LONG else -raw_bias
+        bias_weight = max(0.0, self._sr_weight("entry_bias_score_weight", 0.60))
+        favorable_bonus = max(0.0, self._sr_weight("entry_favorable_proximity_bonus", 0.35))
+        opposing_penalty = max(0.0, self._sr_weight("entry_opposing_proximity_penalty", 0.35))
+        proximity_window_atr = max(0.05, self._sr_weight("proximity_atr_mult", 0.75))
+        bias_component = directional_bias * bias_weight
 
-            # A pending level (crossed, flip unconfirmed) is the level price
-            # is at, so it counts as near at the clearance the gates read
-            # (``_htf_clearance``: negative, a full proximity score). Reading
-            # nearest_* alone, a bounce testing a just-pierced support got no
-            # favorable bonus (2026-09-23). The breakdown / breakout flags do
-            # not switch these off: they describe a broken level on the far
-            # side of price, never the near one, and they are set on about
-            # half of all checkpoints (2026-09-23).
-            support_near = (
-                bool(getattr(sr_ctx, "near_support", False)) or getattr(sr_ctx, "pending_support", None) is not None
-            )
-            resistance_near = (
-                bool(getattr(sr_ctx, "near_resistance", False)) or getattr(sr_ctx, "pending_resistance", None) is not None
-            )
-            support_dist = safe_float(_htf_clearance(sr_ctx, "support")[1])
-            resistance_dist = safe_float(_htf_clearance(sr_ctx, "resistance")[1])
-            if side == Side.LONG:
-                favorable_near, favorable_dist = support_near, support_dist
-                opposing_near, opposing_dist = resistance_near, resistance_dist
-            else:
-                favorable_near, favorable_dist = resistance_near, resistance_dist
-                opposing_near, opposing_dist = support_near, support_dist
+        # A pending level (crossed, flip unconfirmed) is the level price
+        # is at, so it counts as near at the clearance the gates read
+        # (``_htf_clearance``: negative, a full proximity score). Reading
+        # nearest_* alone, a bounce testing a just-pierced support got no
+        # favorable bonus (2026-09-23). The breakdown / breakout flags do
+        # not switch these off: they describe a broken level on the far
+        # side of price, never the near one, and they are set on about
+        # half of all checkpoints (2026-09-23).
+        support_near = (
+            bool(getattr(sr_ctx, "near_support", False)) or getattr(sr_ctx, "pending_support", None) is not None
+        )
+        resistance_near = (
+            bool(getattr(sr_ctx, "near_resistance", False)) or getattr(sr_ctx, "pending_resistance", None) is not None
+        )
+        support_dist = safe_float(_htf_clearance(sr_ctx, "support")[1])
+        resistance_dist = safe_float(_htf_clearance(sr_ctx, "resistance")[1])
+        if side == Side.LONG:
+            favorable_near, favorable_dist = support_near, support_dist
+            opposing_near, opposing_dist = resistance_near, resistance_dist
+        else:
+            favorable_near, favorable_dist = resistance_near, resistance_dist
+            opposing_near, opposing_dist = support_near, support_dist
 
-            def _proximity_score(dist_atr: float | None) -> float:
-                if dist_atr is None:
-                    return 0.0
-                return max(0.0, min(1.0, 1.0 - (float(dist_atr) / proximity_window_atr)))
+        def _proximity_score(dist_atr: float | None) -> float:
+            if dist_atr is None:
+                return 0.0
+            return max(0.0, min(1.0, 1.0 - (float(dist_atr) / proximity_window_atr)))
 
-            favorable_score = favorable_bonus * _proximity_score(favorable_dist) if favorable_near else 0.0
-            opposing_score = opposing_penalty * _proximity_score(opposing_dist) if opposing_near else 0.0
-            total = bias_component + favorable_score - opposing_score
-            out.update({
-                "sr_directional_bias": round(directional_bias, 4),
-                "sr_bias_component": round(bias_component, 4),
-                "sr_favorable_proximity_score": round(favorable_score, 4),
-                "sr_opposing_proximity_score": round(opposing_score, 4),
-                "sr_entry_adjustment": round(total, 4),
-            })
-        except Exception:
-            return out
+        favorable_score = favorable_bonus * _proximity_score(favorable_dist) if favorable_near else 0.0
+        opposing_score = opposing_penalty * _proximity_score(opposing_dist) if opposing_near else 0.0
+        total = bias_component + favorable_score - opposing_score
+        out.update({
+            "sr_directional_bias": round(directional_bias, 4),
+            "sr_bias_component": round(bias_component, 4),
+            "sr_favorable_proximity_score": round(favorable_score, 4),
+            "sr_opposing_proximity_score": round(opposing_score, 4),
+            "sr_entry_adjustment": round(total, 4),
+        })
         return out
 
     def _entry_adjustment_components(self, side: Side, sr_ctx=None, tech_ctx=None, htf_ctx=None) -> dict[str, float]:
@@ -2214,16 +2214,18 @@ class SharedEntryPolicy:
             stamp = getattr(gap, "last_seen", None) or getattr(gap, "first_seen", None)
             if not stamp:
                 return 1.0
+            # The builders stamp a gap with its bar's isoformat, or str() of
+            # an index label that is not a timestamp: that one has no age.
             try:
                 seen = pd.Timestamp(stamp)
-                if seen.tzinfo is not None:
-                    seen = seen.tz_convert(None)
-                current = pd.Timestamp(sessions.now_et())
-                if current.tzinfo is not None:
-                    current = current.tz_convert(None)
-                age_seconds = max(0.0, float((current - seen).total_seconds()))
-            except Exception:
+            except ValueError:
                 return 1.0
+            if seen.tzinfo is not None:
+                seen = seen.tz_convert(None)
+            current = pd.Timestamp(sessions.now_et())
+            if current.tzinfo is not None:
+                current = current.tz_convert(None)
+            age_seconds = max(0.0, float((current - seen).total_seconds()))
             age_bars = age_seconds / max(float(tf) * 60.0, 60.0)
             factor = 0.5 ** (age_bars / max(half_life_bars, 1.0))
             return float(max(min_recency_factor, min(1.0, factor)))
@@ -2321,8 +2323,10 @@ class SharedEntryPolicy:
             lookback_days=self.strategy._htf_lookback_days(),
             pivot_span=int(self._support_resistance_setting("pivot_span", 2) or 2),
             max_levels_per_side=int(self._support_resistance_setting("max_levels_per_side", 6) or 6),
-            atr_tolerance_mult=float(self._support_resistance_setting("atr_tolerance_mult", 0.35) or 0.35),
-            pct_tolerance=float(self._support_resistance_setting("pct_tolerance", 0.0030) or 0.0030),
+            # Checked at load (above 0); a 0 read as 0.35 / 0.003 until
+            # 2026-09-26.
+            atr_tolerance_mult=float(self.config.support_resistance.atr_tolerance_mult),
+            pct_tolerance=float(self.config.support_resistance.pct_tolerance),
             stop_buffer_atr_mult=float(self._support_resistance_setting("stop_buffer_atr_mult", 0.25) or 0.25),
             ema_fast_span=ema_fast_span,
             ema_slow_span=ema_slow_span,

@@ -10,10 +10,23 @@ import pandas as pd
 
 from .numeric import safe_float
 
+# TA-Lib is a pinned dependency. A missing one (or its C library) fails
+# pattern detection where it is used, with the import error as the cause
+# (_require_talib); any other import failure (a broken build) raises here.
+_TALIB_IMPORT_ERROR: ImportError | None = None
 try:
     import talib  # type: ignore
-except Exception:  # pragma: no cover - optional until pattern detection is used
+except ImportError as exc:  # pragma: no cover - TA-Lib is installed wherever the suite runs
     talib = None
+    _TALIB_IMPORT_ERROR = exc
+
+
+def _require_talib() -> Any:
+    if talib is None:
+        raise RuntimeError(
+            f"TA-Lib is required for candlestick pattern detection but could not be imported: {_TALIB_IMPORT_ERROR}"
+        ) from _TALIB_IMPORT_ERROR
+    return talib
 
 
 # Minimum bars to feed TA-Lib for candle pattern detection. TA-Lib
@@ -269,9 +282,7 @@ def _talib_pattern_value_from_key(
 ) -> int:
     if not frame_key:
         return 0
-    if talib is None:
-        raise RuntimeError("TA-Lib is required for candlestick pattern detection but is not installed")
-    func = getattr(talib, func_name)
+    func = getattr(_require_talib(), func_name)
     opens, highs, lows, closes = _ohlc_arrays_from_key(frame_key)
     values = func(opens, highs, lows, closes)
     if len(values) == 0:
@@ -288,10 +299,7 @@ def _talib_pattern_value_from_key(
     for idx in range(-1, -CANDLE_PERSISTENCE_BARS - 1, -1):
         if len(values) + idx < 0:
             break
-        try:
-            signal = int(values[idx])
-        except Exception:
-            continue
+        signal = int(values[idx])
         if signal != 0:
             return signal
     return 0
@@ -561,9 +569,7 @@ def _talib_pattern_array_from_key(
     ``_talib_pattern_value_from_key`` is unchanged."""
     if not frame_key:
         return tuple()
-    if talib is None:
-        raise RuntimeError("TA-Lib is required for candlestick pattern detection but is not installed")
-    func = getattr(talib, func_name)
+    func = getattr(_require_talib(), func_name)
     opens, highs, lows, closes = _ohlc_arrays_from_key(frame_key)
     values = func(opens, highs, lows, closes)
     return tuple(int(v) for v in values)

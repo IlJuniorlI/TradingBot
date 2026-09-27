@@ -219,14 +219,28 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **A blank or malformed time stops the bot at startup, naming the key.**
-  *2026-09-26* — configured times were parsed where they were read, and a
-  bad one raised parse_hhmm's bare error there ("not enough values to
-  unpack" for a value with no colon): a bad `afternoon_start_time` at 13:00,
-  a bad `credit_start_time` in the first 0DTE entry cycle, a bad blackout
-  time on the event's own date (in the 0DTE force-flatten check, the exit
-  path, too), and a malformed `options.force_flatten_time` when the options
-  strategy was built. Now:
+- **`--version`, and the version in the start-up log.** *2026-09-26* —
+  nothing reported `intraday_tv_schwab_bot.__version__`. `python main.py
+  --version` and `intraday-tv-schwab-bot --version` print
+  `intraday-tv-schwab-bot <version>` and exit, and the bot logs the same
+  line at start-up, right after `Logging to ...` and before the Schwab
+  client is built, so the day's log names the code that wrote it even when
+  start-up fails. Tests: `tests/test_packaging.py`, `tests/test_smoke_bot.py`.
+
+- **`pytest-xdist` is declared in the `dev` extra.** *2026-09-26* — the
+  suite's parallel run (`pytest -n 24 --dist loadfile`) needs it, and it was
+  installed in the working venv but declared nowhere. It is pinned at 3.8.0
+  like the rest of the extra; `constraints.txt` still leaves dev-only
+  tooling out.
+
+- **A blank or malformed time, number, switch or mode stops the bot at
+  startup, naming the key.** *2026-09-26* — configured times were parsed where
+  they were read, and a bad one raised parse_hhmm's bare error there ("not
+  enough values to unpack" for a value with no colon): a bad
+  `afternoon_start_time` at 13:00, a bad `credit_start_time` in the first 0DTE
+  entry cycle, a bad blackout time on the event's own date (in the 0DTE
+  force-flatten check, the exit path, too), and a malformed
+  `options.force_flatten_time` when the options strategy was built. Now:
   - at load: the four `options` times (`force_flatten_time`,
     `debit_target_time_decay_start` / `_end`, `delta_time_shift_start`,
     whatever the strategy), every `strategies.<name>.entry_windows` /
@@ -258,9 +272,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   inactive strategy's section is checked, and so is the `blackout_file` of a
   strategy that never consults the calendar or of a disabled `events`
   section, whose "Event calendar file not found" warning now also comes at
-  startup. Not changed: a `blackout_file` edited while the bot runs is read
-  as before (a row missing a time is skipped, a malformed one raises on its
-  date). No shipped preset or feed is affected. Tests:
+  startup. A `blackout_file` edited while the bot runs is checked when it is
+  re-read (see the next entry). No shipped preset or feed is affected. Tests:
   `tests/test_sessions.py`, `tests/test_config_validation.py`
   (`TestOptionsValidation`, `TestStrategyWindowValidation`,
   `TestEventsValidation`), `tests/test_strategy_time_params.py` (with a drift
@@ -268,6 +281,371 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `tests/test_top_tier_megacap.py` (`TestEventBlackouts`) and
   `tests/test_orb_regime.py`.
 
+  The numbers and switches the engine, the data feed, the risk and position
+  managers, the execution layer and the dashboard read are checked at load
+  too (`config._NUMBER_CHECKS`, and every field a section's dataclass
+  declares `bool`). Most were read where they were used, with `float()`,
+  `int()`, `bool()` or as they stood. A typo raised mid-session: in the
+  entry or management cycle, after a fill while the filled position was
+  being booked (`risk.risk_overage_warn_frac`, `entry_slippage_warn_pct`,
+  the `options` premium levels), or between cycles, outside their error
+  handling, where it ended `run()` without its shutdown
+  (`runtime.loop_sleep_seconds`, `idle_sleep_seconds`,
+  `symbol_state_prune_seconds`). A NaN or an infinity passed the clamps and
+  comparisons: an infinite `execution.entry_live_fill_timeout_seconds`
+  polled an unfilled order forever, an infinite `runtime.quote_cache_seconds`
+  left cached quotes unrefreshed, and a NaN `bracket_stop_limit_offset_r`
+  priced the resting stop-limit at `nan`. A quoted `"false"` read as on and
+  a blank as off, so a blank `schwab.dry_run:` traded live. Now a number
+  must be a YAML number (not quoted, not a boolean), finite and inside its
+  range, a count an integer, and a switch `true` or `false`
+  (`runtime.loop_sleep_seconds must be a finite number > 0, got '2s'`):
+  - `schwab`: `timeout` (an integer >= 1), `dry_run`,
+    `open_browser_for_auth`;
+  - `tradingview`: `max_candidates` (an integer >= 1),
+    `screener_refresh_seconds`, `min_market_cap`, `max_market_cap` and
+    `min_value_traded_1m` (>= 0), `min_volume` and `min_volume_1m`
+    (integers >= 0); 0 turns a 1m filter off;
+  - `risk`: `max_positions` (an integer >= 1),
+    `risk_per_trade_frac_of_notional`, `default_stop_pct` and
+    `default_target_pct` (in (0, 1]), `max_notional_per_trade`,
+    `max_total_notional` and `max_daily_loss` (> 0), `cooldown_minutes`,
+    `same_level_block_minutes` and `time_stop_minutes` (integers >= 0),
+    `same_level_block_atr_mult`, `entry_slippage_allowance_spread_frac`,
+    `entry_slippage_allowance_max_pct`, `time_stop_min_return_pct` and
+    `peak_giveback_low_tier_min_r` (>= 0), `peak_giveback_min_r` (> 0),
+    `peak_giveback_low_tier_giveback_frac` and the three
+    `peak_giveback_retain_*` (in [0, 1]), `risk_overage_warn_frac` and
+    `entry_slippage_warn_pct` (finite; below 0, or 0 for the slippage,
+    turns the warning off), `trailing_stop_pct` (>= 0, or null; 0 or null
+    turns the trail off), and its five switches;
+  - `runtime`: `loop_sleep_seconds`, `quote_poll_seconds` and
+    `history_poll_seconds` (> 0), `idle_sleep_seconds`,
+    `symbol_state_prune_seconds` and `quote_cache_seconds` (>= 0),
+    `quote_batch_size`,
+    `history_lookback_minutes`, `warmup_minutes`, the four `stream_*`
+    seconds and `startup_order_lookback_days` (integers >= 1),
+    `prewarm_before_windows_minutes` (an integer >= 0),
+    `startup_reconcile_ignore_symbols` (a list of tickers: a string was
+    read letter by letter, so the symbol it named was not ignored, and a
+    blank entry or one that is not a string is refused, each named with
+    its index, a boolean or null one with the hint to quote the ticker (an
+    unquoted `ON` was read as `TRUE`, so ON was never ignored), as for an
+    event row's symbols (`symbols.ticker_quote_hint`); a null list is
+    none) and its six switches, beside the three the entries below check
+    (`error_escalation_cycles`, `cycle_precompute_workers`,
+    `max_consecutive_quote_failures`), which move into the table unchanged;
+  - `paper`: `starting_equity` (> 0), `max_equity_points` and
+    `max_trade_history` (integers >= 1);
+  - `dashboard`: `port` (1-65535), `refresh_ms` (an integer >= 1), each
+    chart profile's `max_bars` (1-480) and every switch, the profiles'
+    included;
+  - `execution`: `entry_limit_min_buffer`, `entry_limit_max_buffer`,
+    `entry_limit_spread_frac`, `entry_live_reprice_step_frac`,
+    `bracket_stop_limit_offset_r` and `bracket_replace_min_price_delta`
+    (>= 0), `entry_live_fill_timeout_seconds` and `entry_live_poll_seconds`
+    (> 0), `entry_live_reprice_attempts` (an integer >= 0) and its four
+    switches;
+  - `events`: `enabled`, and `earnings_block_sessions_before` / `_after`
+    (integers >= 0; a typo raised in the entry cycle of a symbol with an
+    earnings date);
+  - `options`, what the engine itself reads: `max_loss_per_trade`, the
+    premium level knobs (`debit_stop_frac`, `debit_target_mult`,
+    `credit_stop_mult`, `credit_target_frac`, `single_stop_frac`,
+    `single_target_mult`) and the four `options_breakeven_*` /
+    `options_profit_lock_*` multipliers (> 0), `max_quote_age_seconds`,
+    `dry_run_step_frac` and `debit_stop_time_decay_widen_factor` (>= 0),
+    `max_contracts_per_trade` (an integer >= 1), `dry_run_replace_attempts`
+    (an integer >= 0), and every `options` switch;
+  - `support_resistance`: the four level-spacing tolerances
+    (`atr_tolerance_mult`, `pct_tolerance`, `same_side_min_gap_atr_mult`,
+    `same_side_min_gap_pct`; above 0), which the S/R and HTF builds, the
+    feed's HTF-frame reads, the strategies' HTF context and market-structure
+    reads (the strategy base, the shared entry stage, zero_dte), the
+    dashboard and the ladder spacing read (see "The data feed, the S/R
+    ladder spacing and the level and analysis modules lose their silent
+    broad excepts"). A 0 read as 0 in the S/R build's merge tolerance and
+    the chart's HTF request, and as a reader's own default in the others
+    (0.35 or 0.60 ATR, 0.003, 0.10 ATR, 0.0015), so one value meant 0, 0.35
+    or 0.60 depending on the reader; a negative one read as it was, but as
+    0 in the ladder spacing.
+
+  `runtime.history_poll_seconds`, `risk.trailing_stop_pct` and the four
+  `support_resistance` tolerances had checks of their own (the entries
+  below), under which a quoted number read, and a negative trail read as
+  off; in the table, a quoted one is refused like every other (`"300"`),
+  and so is `true` / `false` (`true` read as 1), and the trail must be
+  >= 0. A number YAML read as text, quoted or an exponent without a dot
+  and a signed power (YAML 1.1 reads `5e6` as a string, `5.0e+6` as a
+  number), is named with the number to write
+  (`tradingview.min_volume must be an integer >= 0, got '5e6' (YAML read
+  it as text, not a number: write 5000000)`); it was refused as
+  `got '5e6'` with no hint why. The hint names only a number the check
+  takes: an integer key's is written as an integer at any size (`1e16`:
+  `10000000000000000`), and a number out of range (`'-5'` for a count)
+  gets none, since unquoted it is refused too. A whole decimal where an
+  integer belongs (`risk.max_positions: 2.0`), which loaded, is named with
+  the integer to write (`risk.max_positions must be an integer >= 1, got
+  2.0 (YAML read it as a decimal, not an integer: write 2)`), when the
+  check takes it.
+
+  The settings that name a mode are checked at load too
+  (`config._CHOICES`): each takes only its documented values, spelled
+  exactly so (`runtime.startup_reconcile_mode must be one of ['block',
+  'ignore', 'log_only', 'restore_basic', 'restore_hybrid'], got 'blok'`).
+  Until now each but the bracket modes read its values in any case, most
+  with the spaces around them trimmed, so a spelling such as `Strict`,
+  `NATURAL`, `EXTENDED`, `HTF` or the theme ` dark ` read as that mode or
+  theme; and each fell back at runtime:
+  - `runtime.startup_reconcile_mode`: lowercased, so any case read; a
+    typo read as `log_only`, with a WARNING whenever the reconcile found
+    broker positions or working orders (none when it found nothing or
+    failed), which turned the blocking modes' entry block off, and a null
+    as `ignore`;
+  - `risk.trade_management_mode`: lowercased and stripped at load
+    (`Adaptive` read as `adaptive`); a null read as `adaptive_ladder`
+    without a word, and an unknown mode with a WARNING;
+  - `risk.reentry_policy`: lowercased and stripped, with six undocumented
+    aliases (`same_day`, `same-day`, `rest-of-day`, `session` and `day` for
+    `rest_of_day`, `none` for `immediate`); a null read as `immediate`
+    (through the `none` alias), and an unknown value as `cooldown` with a
+    WARNING;
+  - without a word: `runtime.equity_session_indicator_window`,
+    `dashboard.charting.compact_chart_timeframe` and
+    `support_resistance.order_block_mode` were lowercased and stripped
+    (`EXTENDED`, ` htf ` and `Strict` read as those modes), and any other
+    value read as `rth` / `ltf` / `loose`; `options.option_limit_mode` /
+    `vertical_limit_mode` were lowercased (`NATURAL` priced at the
+    natural side), and any other value priced at `mid`;
+  - `dashboard.theme` must name a folder under `dashboard_assets/themes`
+    named to `^[a-z0-9_-]{1,40}$`, a user's own included
+    (`config.dashboard_themes()`); the dashboard server lowercased and
+    stripped the name (`Nebula` or ` dark ` served that theme), and read a
+    malformed one, or one naming no folder, as `default` with a WARNING (a
+    null without one).
+
+  The three `execution.bracket_*` modes, checked since the bracket orders
+  landed, move into the same table with the same messages. The readers
+  compare the value as it is: the reconcile's and the engine's
+  `str(mode or "ignore").lower()` and the reconcile's unknown-mode branch,
+  `RiskManager._normalized_reentry_policy`, the load's
+  `_normalize_trade_management_mode`, `set_session_indicator_window`'s
+  fallback, `DashboardChartingConfig.normalized_compact_chart_timeframe`
+  and `dashboard._resolve_theme_name` are gone (the dashboard takes the
+  theme-name pattern from `config`). The order-block mode is passed on as
+  it is by the strategy base, the dashboard (its request to the feed and
+  each block's label) and the feed (its cycle-cache key included), where
+  each lowercased and stripped it or fell back to `loose`; the builder
+  (`order_blocks.build_order_block_context`) and the empty context
+  (`empty_order_block_context`, which the feed and the strategy base
+  return with no bars) raise on any mode but `loose` / `strict`: the
+  builder built loose blocks for one, and the empty context took it,
+  lowercased and stripped, as its label. The option pricing helpers keep
+  their `mode="mid"` default and lowercasing for direct callers.
+
+  The config file itself is read as the event files are
+  (`serialization.read_yaml`, where the calendar's line-naming loader
+  moved): a file that is not YAML names itself, an unquoted date that
+  cannot exist anywhere in it (an `events.earnings` date such as
+  `AAPL: [2026-11-31]`) names its line and column instead of PyYAML's
+  bare "day is out of range for month", and so does a value behind an
+  explicit YAML tag that does not read as it (`!!bool maybe`, `!!int x`,
+  `!!float y`, `!!timestamp 2026-9-30x`, `!!null 2026-09-16`, which
+  PyYAML read as no value at all, and an unquoted `0x_`), which
+  PyYAML failed with a bare KeyError, ValueError, IndexError or
+  AttributeError naming neither the file nor the line (`<path>: not a
+  readable YAML file: line 40, column 16: maybe is not true or false (a
+  !!bool is true, false, yes, no, on or off)`). A file whose top level is
+  not a mapping is refused (a list raised a bare AttributeError). So is an
+  empty file, or one of comments only, naming the file (`<path>: the
+  config file is empty; it must be a mapping of config sections`): it ran
+  on the code defaults, a config the operator never wrote. And each
+  section, `dashboard.charting` and its two profiles, and each
+  `strategies` entry and its `params` must be a mapping, and `pairs` a
+  list; a null one is empty (`config._section_shape_errors`). Each was
+  read with `dict(value or {})`: `risk: 5` raised a bare "'int' object is
+  not iterable" and `compact: [1]` a bare "cannot convert dictionary update
+  sequence element", naming neither the section nor the file, and
+  `strategies: {top_tier_adaptive: 5}` (or `null`) a bare AttributeError;
+  a section left as `0`, `""`, `[]` or `false` read as an empty one, so
+  every key in it ran on its default, a list of `[key, value]` pairs read
+  as a mapping, and `pairs: {...}` as no pairs. A pair row must be a
+  mapping with a `symbol` and a `reference` (`pairs[0] must be a mapping
+  with a symbol and a reference, got 5`): one that was not was dropped
+  without a word. A top-level key that names no section (`risks:`,
+  `support_resistence:`) is refused, listing the sections: it was ignored,
+  and every key under it ran on its default. Every one is named, with the
+  file (`<path>: invalid config sections:` then `risk must be a mapping of
+  settings, got 5`); the `strategies` check that raised a TypeError of its
+  own is one of them.
+
+  A key under `dashboard.charting` or its `compact` / `expanded` profile
+  that none of them takes is refused, naming the key and listing the keys
+  it takes (`dashboard.charting has an unknown key 'compact_timeframe': it
+  takes compact_chart_timeframe, compact, expanded`). The load splits that
+  section by hand, so a typo at its top level was ignored without a word,
+  leaving the setting it meant at its default, and one in a profile raised
+  the dataclass's bare "unexpected keyword argument". The retired `shared`
+  profile and top-level `*_max_bars` keys, which had messages of their own
+  that did not name the file, are unknown keys like any other.
+
+  **Behaviour change:** each value above that is not a YAML number, not
+  finite, out of its range, not `true` / `false` or not one of its mode's
+  values refuses startup, naming the key; the checks run whether or not the
+  feature reading the value is on. A mode or theme spelled in another case or
+  with spaces around it (`Strict`, `NATURAL`, `EXTENDED`, `HTF`, `Nebula`, `
+  dark `), which read as that one, is one of these, and so are a negative
+  `risk.trailing_stop_pct` (it read as off), a 0 or negative
+  `support_resistance` tolerance (above), a whole decimal where an integer
+  belongs (`max_positions: 2.0`), an empty config file, an unknown
+  `dashboard.charting` key, a value behind a YAML tag that does not read as it
+  and a section that is not a mapping (above; one left as `0`, `""`, `[]` or
+  `false` read as empty, a null one still does). The readers take the checked
+  value as it is, so five readings change. `runtime.idle_sleep_seconds: 0`
+  turns the idle cadence off, as documented (it read as 60, like a null).
+  `options.debit_stop_time_decay_widen_factor: 0` is no widening in the
+  post-fill levels too, of a single option and a debit spread alike (the entry
+  gatekeeper read 0 as 0.30, the strategies as 0). `risk.peak_giveback_min_r`
+  must be above 0 (a 0 read as 1.0; `peak_giveback_enabled: false` is the off
+  switch, which the README now says instead of "set it to 0"). A chart
+  profile's `max_bars` is drawn as configured: the clamp to 1-480, the default
+  for an unreadable value and the switches read with `bool()` are gone with
+  the check (`DashboardChartingConfig.resolved_profile` returns the profile).
+  The dashboard's key-level zones read the strategy's level spec's tolerances
+  as it gives them, as the chart's HTF request does, and
+  `support_resistance`'s for a spec without them: a spec without them, or with
+  an `htf_atr_tolerance_mult` / `htf_pct_tolerance` param of 0, which the
+  strategy trades on as 0, read as 0.35 / 0.003. The readers lose their
+  `getattr` defaults and `or` fallbacks for these keys (the 0DTE strategies'
+  six option switches and three option times, microcap_pm_breakout's
+  `risk.default_stop_pct`, the strategy base's `risk.trailing_stop_pct` and
+  every reader of the four `support_resistance` tolerances included; the
+  ladder spacing loses its clamp of a negative one to 0). All 19 presets load
+  and build unchanged (tolerances 0.6, 0.003, 0.1, 0.0015). The README
+  documents the checks (under "How the YAML is organized") and the changed
+  readings; its `dashboard.charting` option reference gains the three profile
+  options it left out (`show_fib_retracements`, `show_rsi_divergence`,
+  `show_obv_divergence`) and no longer offers a `shared` profile.
+  `dashboard_assets/README.md` documents the theme check, and
+  `macro_events.example.yaml` lists `symbols` among a row's keys. Tests:
+  `tests/test_config_validation.py` (`TestNumberAndSwitchChecks`, with a drift
+  check that every number of these sections is listed and a load of every
+  shipped preset, `TestTheReadersTakeTheCheckedValue`, `TestEnumChecks`, with
+  a drift check that every string setting of these sections is a mode or free
+  text, `TestDashboardTheme`, `TestChartingKeys`, with a drift check that the
+  README's option reference lists every profile option, `TestNumberTextHint`,
+  `TestConfigFileRead` and `TestSectionShapes`);
+  `tests/test_sr_tolerance_reads.py` (new: every reader of the four tolerances
+  on values that are none of the defaults, and a scan of the package for a
+  fallback on them) and `tests/test_sr_ladder.py`; `tests/test_dashboard.py`
+  (`TestThemes`, with the theme page read and the `/themes/` route's name
+  check); `tests/test_order_blocks.py` (`TestTheModeIsTakenAsItIs`) and
+  `tests/test_fix_dashboard_charting.py` (`TestOrderBlockMode`);
+  `tests/test_risk_manager.py` loses the reentry alias tests;
+  `tests/test_module_layering.py` lets `serialization` import `yaml`;
+  `tests/test_warmup_tracker.py` and `tests/test_silent_excepts.py` lose the
+  tests of the chart `max_bars` fallback.
+
+
+- **A broken blackout or earnings file stops the bot at startup; edited
+  while it runs, it keeps the rows last read.** *2026-09-26* — the
+  calendar read `events.blackout_file` and `events.earnings_file` behind a
+  broad `except`: a file that was not YAML, or could not be read, was a
+  warning and no rows, so the bot ran with no blackouts. A scalar where a
+  list or a mapping belongs (`events.blackouts: true`, a file whose top
+  level or `events:` is a scalar) raised a bare TypeError or was ignored,
+  and `symbols: NVDA` was read as the letters N, V, D, A, so the window
+  blocked nothing. An earnings date not in a list (`AAPL: 2026-10-29`)
+  raised a TypeError in every top_tier / small_cap_squeeze entry cycle,
+  and an unparseable earnings date was dropped with a warning, so the
+  symbol traded through its print. A `blackout_file` edited while the bot
+  ran was not checked at all: a row missing a time was skipped, and a
+  malformed one raised on the event's date, in the entry cycle and in the
+  0DTE force-flatten check (the exit pass). Now:
+  - at load, `events.blackouts` must be a list of mappings, and in each row
+    `symbols` a list of tickers, `date` a `YYYY-MM-DD` date, `weekday` a
+    weekday (`MON`-`SUN`, `MONDAY`-`SUNDAY` or `0`-`6`, in any case; its
+    date's, when the row has both), `enabled`, `block_new_entries` and
+    `force_flatten` `true` or `false`, and no key but those, `label`, `start`
+    and `end` (`events.blackouts[0].date must be a YYYY-MM-DD date, got
+    '2026-9-30'`, `events.blackouts[0] has an unknown key 'force_flaten': a
+    row takes label, date, weekday, start, end, enabled, block_new_entries,
+    force_flatten, symbols`); `events.earnings` must be a `{SYMBOL:
+    [YYYY-MM-DD, ...]}` map whose symbols are non-blank strings and whose
+    dates are `YYYY-MM-DD` dates (`events.earnings.AAPL[1] must be a
+    YYYY-MM-DD date, got '2026-10-3O'`). A row's date is compared as a date:
+    compared as text with today's ISO string, `2026-9-30`, `09/30/2026` or a
+    YAML datetime never matched, and neither did a weekday that is not one
+    (`FUNDAY`, `7`) or one its date does not fall on, so the window blocked
+    nothing and its force flatten never came; `force_flatten: "false"` read as
+    on; a typo'd key (`force_flaten: true`) was ignored, so the window never
+    flattened; a `symbols` list holding only blank or null entries left a
+    window that blocked nothing; an unquoted ticker YAML reads as a boolean
+    (`ON`) never matched, and as an earnings key filed its dates under `TRUE`;
+    and a blank earnings symbol was skipped. A date written as text must be
+    `YYYY-MM-DD` itself, spaces around it aside: `date.fromisoformat` also
+    read `20260930` (an integer to YAML, unquoted) and the week date
+    `2026-W40-3`, and a weekday any word whose first three letters are one
+    (`Monkey` as `MON`, `SATURN` as `SAT`, `Thurs` as `THU`), all refused now;
+  - when the strategy is built, both files are read and checked the same
+    way, and one that cannot be read or is not YAML is refused too
+    (`invalid events.earnings_file:` then
+    `earnings.yaml: not a readable YAML file: ...`, the path as it
+    resolved). An unquoted date that cannot exist (`2026-11-31`), which
+    PyYAML fails with a bare "day is out of range for month", is refused
+    the same way, naming its line (`...: not a readable YAML file: line 3,
+    column 10: 2026-11-31 is not a date (day is out of range for month)`),
+    and so is a value behind an explicit tag that does not read as it
+    (`!!timestamp 2026-9-30x`, `!!bool maybe`, `!!int x`, `!!float y`,
+    `!!null 2026-09-16`),
+    which PyYAML fails with a bare AttributeError, KeyError, ValueError or
+    IndexError naming neither the file nor the line (the calendar read it,
+    like a file that is not YAML, as a warning and no rows); the loader that
+    names them (`serialization.LineNamingSafeLoader`) reads the config file
+    too, so the same value inline is named the same way (see the entry
+    above).
+    The earnings file was first read in the first entry cycle; like the
+    blackout file, it is now read at construction for every strategy;
+  - a file edited while the bot runs is re-read on its mtime and checked
+    the same way. A broken edit is logged once as an ERROR naming the file
+    (`invalid events.blackout_file, keeping the rows last read from it:`),
+    and the rows last read stay in force until the file is fixed; neither
+    the entry cycle nor the force-flatten check raises on it.
+
+  `sessions.parse_hhmm` refuses a float. YAML reads a dotted typo as one
+  (`9.30` is 9.3, `9.00` is 9.0), and parse_hhmm truncated both to 00:09;
+  every time check at load and construction now refuses it, naming the
+  key. A window row whose `start` is `0` (00:00, which the load check
+  passes) was skipped as falsy; it now applies.
+  `scripts/sync_macro_events.py` wrote `events:` over `[]` when it found
+  no events (every source down, or none inside the horizon), which is not
+  YAML; it now writes `events: []`. `blackout_time_errors` is renamed
+  `blackout_row_errors`, beside the new `earnings_errors`.
+  **Behaviour change:** each fault above now refuses startup, even with
+  `events.enabled: false` or a strategy that never consults the calendar,
+  and a runtime edit carrying one is refused whole: the valid rows or
+  dates in the same edit wait until it is fixed. A row dated with a YAML
+  datetime (`2026-10-28 13:55:00`) now applies on that date, and so does a
+  row whose quoted date has spaces around it (`" 2026-10-28 "`): both were
+  compared as text with today's ISO string and never matched, so the
+  window blocked nothing and its force flatten never came (an earnings
+  date was read with its spaces trimmed already). An empty
+  file, an `events:` / `earnings:` left empty, and a missing file (a
+  warning) still hold no rows, at startup or later. A
+  `macro_events.auto.yaml` that the sync script wrote with no events before
+  this change refuses startup: re-run the script. No shipped preset or feed
+  is affected: all 19 presets build, and the example files, `earnings.yaml`
+  and the script's output read. Tests: `tests/test_sessions.py`,
+  `tests/test_config_validation.py` (`TestOptionsValidation`,
+  `TestEventsValidation`), `tests/test_top_tier_megacap.py`
+  (`TestEventBlackouts`, with the 0DTE force-flatten end to end, and the
+  row fields, the unknown keys, the symbols (lowercase ones scope too),
+  the impossible dates and the values behind a tag that do not read at
+  startup and on a runtime edit, a null weekday in a file row, a row dated
+  ahead that neither blocks nor flattens before its date, a padded quoted
+  date, each earnings session count on its own side of the date, and a
+  lowercase earnings symbol filed in capitals) and the new
+  `tests/test_sync_macro_events.py`.
 
 - **The adaptive ladder's index re-check and the macro vote read the one
   posture test.** *2026-09-26* — the re-check
@@ -326,6 +704,207 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every order of the four inputs, ties and infinities included, against the
   old copy).
 
+
+- **Unreachable branches, a flag that was never False and private copies of
+  a `numeric` read removed.** *2026-09-26* —
+  - Unreachable branches: `DashboardCache.strategy_level_zones` tested
+    `strategy_obj is not None` twice (keeping an `else` for it) after
+    returning at its top when there is no strategy, and read
+    `dashboard_allow_generic_level_fallback` through `getattr` with a
+    default though `BaseStrategy` defines it; top_tier's ORB 5m
+    follow-through asked a DataFrame whether it has an `index` and `iloc`;
+    the long-options builder refused an entry limit not above zero
+    (`invalid_limit_price`), which `single_option_limit_price` cannot
+    return (it prices at least a cent, a NaN quote included).
+  - `SchwabExecutor._simulate_vertical_fill` /
+    `_simulate_single_option_fill` lose `allow_natural_fill`: every caller
+    passed True, so the dry-run reprice ladder always ends on the natural
+    price, as it did. The 0DTE options README no longer names the flag.
+  - The position manager's mark, the startup restore's current price and
+    `DashboardCache.symbol_price` each looped over the quote's price fields
+    with `float()` inside `except Exception`; each is now
+    `numeric.first_float(..., positive=True)`, which reads every value the
+    loop did the same way (+inf included). `PaperAccount.mark_prices` stores
+    `safe_float(price)`: it stored `float(price)` unless that raised, a NaN
+    included. The account-price fallback in `symbol_price` and the max-reward
+    sum in the paper account's position rows lose a `try` that could not
+    fail.
+  - `DashboardCache.index_symbols` is the strategy's
+    `dashboard_index_symbols`; it swallowed any error from it and re-read the
+    params with a copy of the hook's union, which cannot raise.
+  - `ZeroDteEtfOptionsStrategy._matching_event_blackout` had no caller.
+
+  No shipped preset or feed input behaves differently. On inputs the bot
+  cannot produce: a NaN handed to `mark_prices` keeps the last mark (it
+  stored NaN), and an error from `dashboard_index_symbols` reaches the
+  dashboard build. Tests: `tests/test_quote_price_reads.py` (each read
+  against its old loop, on quotes of any shape), `tests/test_index_symbols.py`
+  (`TestTheDashboard`), `tests/test_zero_dte_risk.py`
+  (`TestALimitPriceIsAtLeastACent`) and `tests/test_runtime_nan_reads.py`
+  (a SHORT row's max reward, untested until now).
+
+- **67 silent broad excepts in the engine, dashboard, report, reconcile,
+  position and strategy-base code are gone, narrowed or logged.**
+  *2026-09-26* — each passed, continued or returned a default without
+  logging anything.
+  - 42 are removed: nothing in them could raise on the bot's own frames,
+    quotes, records or validated config, so an error there now raises
+    instead of reading as a default.
+  - 12 are narrowed to the errors their code raises and keep their
+    fallback: the TLS close and the `bars` query parameter, the FVG anchor
+    stamp, the snapshot JSON signature, `fmt_metric`, the key-levels
+    thresholds and weight, the context cache keys, and the archive's log
+    flush. The option chain's `date:dte` key now reads through `partition`
+    and `safe_int`, with the same results as before.
+  - 6 wrap strategy hooks or analysis builders and now log a rate-limited
+    WARNING with the traceback: the dashboard's HTF and LTF fair value
+    gaps, the level-zone candidates and width, the candle context, and the
+    exit record's S/R row. The S/R row is built before the exit order is
+    sent, so it stays guarded.
+  - 1 is the session archive's read of each symbol's merged frame at each
+    timeframe. It now logs a WARNING with the traceback (`Could not read
+    the merged frame for MSFT/15m: ...`) and leaves that symbol out of that
+    timeframe's bars, counted in the manifest's `bars_skipped_by_timeframe`;
+    the rest of the archive is written. Like the HTF-frame read beside it,
+    it runs once per export and is not rate-limited.
+  - 2 are the adaptive ladder's persisted active-index and rung reads. They
+    are narrowed and report an unreadable value once a minute; removing
+    them would have stopped the ladder managing that position.
+  - 3 moved to load time: the two below, and the chart profiles'
+    `max_bars` (see "A blank or malformed time, number, switch or mode stops
+    the bot at startup"); 1 is the restore universe (see Fixed), which now
+    fails closed.
+
+  The 41 in the other 18 modules are covered by the two entries that follow.
+
+  **Behaviour change (config): two values that were accepted silently now
+  refuse to start.**
+  - `runtime.cycle_precompute_workers` must be an integer of at least 1.
+    Before, 0, null or a typo ran 4 workers and a negative count ran 1.
+  - `risk.trailing_stop_pct` must be a finite number >= 0 (a YAML number,
+    not quoted) or null; 0 or null turns the trail off. Before, a typo
+    turned the trail off at every entry and restore, and so did a negative
+    value, and an infinite value kept an infinitely wide trail.
+
+  Every shipped preset loads unchanged: 4 workers, trail 0.012-0.12. A
+  non-numeric `min_bars` or `ladder_*` param now raises like every other
+  strategy param read, instead of reading as 0 or the default. The README
+  documents both checks and the archive's skipped symbol
+  (`export_session_archive`), and `_strategies/README.md` documents the
+  restore universe. Tests: `tests/test_silent_excepts.py` (the archive's
+  frame read in `TestReportedArchiveFrameRead`),
+  `tests/test_config_validation.py`.
+
+- **The data feed, the S/R ladder spacing and the level and analysis
+  modules lose their silent broad excepts.** *2026-09-26* — 24 more
+  `except Exception:` handlers that passed, continued or returned a
+  default without logging anything:
+  - 17 are removed: nothing in them can raise on the bot's own frames,
+    quotes, stamps or validated config. Among them are the quote age and
+    freshness reads (`fetch_quotes` stamps every quote with the ET clock),
+    the completed-bar cut of the HTF and fair-value-gap builds (on an error
+    it returned the frame without its last bar, a completed one), the gap
+    anchor parse, the reference price and the order blocks' last close, the
+    chart patterns' close / open reads and indicator-frame check, a TA-Lib
+    candle signal, the channel slope check, the ladder's level price, the
+    HTF refresh's incremental start (with its tz-naive branch, which no
+    stored frame reaches) and the feed's own `cycle_precompute_workers`
+    read, validated at load since the entry above.
+  - 5 moved to load time (below): the quote blacklist's count and the four
+    tolerances the ladder spacing reads.
+  - The two TA-Lib import guards (`indicators`, `candles`) catch only
+    ImportError. A missing TA-Lib, or a missing C library, still fails
+    where TA-Lib is first used, and the error now says why (`TA-Lib is
+    required for indicator calculation but could not be imported:
+    libta_lib.so.0: ...`, with the ImportError as its cause); it said "is
+    not installed" and dropped the import error. Any other import failure,
+    such as a build against another numpy, now fails at startup instead of
+    reading as "not installed".
+  - Not changed: the quote fetch's two per-symbol handlers, which log a
+    WARNING per failure through `_record_failure`.
+
+  **Behaviour change (config): five values that were read silently now
+  refuse to start.**
+  - `runtime.max_consecutive_quote_failures` must be an integer of at
+    least 0 (0 turns the blacklist off). Before, null or a negative count
+    turned it off, a float was truncated, `"5"` read as 5, `true` as 1 and
+    a typo as 5.
+  - `support_resistance.atr_tolerance_mult`, `pct_tolerance`,
+    `same_side_min_gap_atr_mult` and `same_side_min_gap_pct` must be
+    finite YAML numbers above 0 (not quoted, not `true` / `false`: they are
+    in the load check's number table, see "A blank or malformed time,
+    number, switch or mode stops the bot at startup", where the readings
+    of a 0 or a negative one are listed), even with `enabled: false`.
+    The S/R and HTF builds and the dashboard read them with `float()`, so
+    a typo already failed every build; the ladder spacing (sr_flip
+    management and the dashboard's ladder) read it, or a null, as the
+    default. An infinite or NaN value reached the builds.
+
+  Every shipped preset loads unchanged (blacklist 5; tolerances 0.6,
+  0.003, 0.1, 0.0015). On inputs the bot does not produce, an error in a
+  removed handler now raises instead of reading as a default: a quote
+  stamp that is not a time (it read as no age, and as stale), an index
+  that is not times (the completed-bar cut dropped the last bar), a last
+  close or a ladder level price that is not a number (a 0 reference price;
+  the level skipped), a gap anchor that does not parse (the gaps kept
+  apart). The README documents both load checks. Tests:
+  `tests/test_silent_excepts_data_levels.py` (new),
+  `tests/test_config_validation.py` (`TestRuntimeValidation`,
+  `TestSupportResistanceValidation`) and `tests/test_sr_ladder.py`.
+
+- **15 silent broad excepts in the logging, persistence, symbol, warm-up
+  and shared entry / exit code are gone, narrowed or logged.**
+  *2026-09-26* — each passed or returned a default without logging
+  anything.
+  - 7 are removed, because nothing in them raises on the bot's own inputs:
+    the shared entry stage's S/R proximity term (the entry gates read the
+    same clearance with no guard), the shared exit policy's hold time (the
+    exit record measures the same hold with no guard; its fallback of 0
+    kept the ORB and structure graces open and the time stop off),
+    volatility_squeeze's volume / width median, the Windows console
+    colour setup (every failure there is a checked return value), the
+    warm-up snapshot's history retry timing (its one input is checked at
+    load, below), `log_structured`'s second fallback, and the stored
+    position metadata read (see Fixed). An error in the hold time now
+    skips that position's shared and strategy exits for the cycle, and
+    its stop, target and force flatten still fire (see "One position's
+    management error no longer skips the positions after it" under
+    Fixed).
+  - 4 are narrowed and keep their fallback. `_json_ready` writes a value as
+    its string only on the three errors a number type raises from
+    `float()` (`TypeError`, `ValueError`, `OverflowError`). The FVG recency
+    decay reads a stamp `pd.Timestamp` cannot parse as having no age, and
+    only that. With no `try` at all: an exit reason's trigger level reads
+    through `safe_float`, so `stop:nan` is no level (it was a NaN, written as
+    a bare `NaN` in the exit line). `normalize_symbol_list` still reads a
+    non-iterable (a YAML `5`) as no input, but an iterable that raises
+    while it is read now raises.
+  - 1 moved to load time: the warm-up tracker's chart requirement is now
+    the expanded chart's `max_bars`, which the config load checks (an
+    integer from 1 to 480; see "A blank or malformed time, number, switch
+    or mode stops the bot at startup"). It read the raw value: above 480 it
+    requested bars no chart draws, and a typo requested none. Every shipped
+    preset (360) requests the same bars as before.
+  - 3 stay broad, each at a boundary that must not fail its caller, and now
+    log the first failure with its traceback: `_json_ready`'s last fallback
+    (`<unserializable TYPE>`, once per type), `log_structured`'s
+    `serialization_error` line (once per prefix; the callers are the entry
+    and exit flows), and the warm-up tracker's `required_history_bars` hook,
+    which runs before the cycle's position management (once per strategy;
+    the symbol still reads as needing no warm-up bars).
+
+  **Behaviour change (config): `runtime.history_poll_seconds` must be a
+  finite number above 0.** The feed's history refresh check and the warm-up
+  retry timing read it with `float()` ahead of position management. Before,
+  an unreadable value raised there every cycle, an infinite one never
+  refreshed history, and 0 or less refetched every cycle. It now refuses to
+  start, naming the key, and so does a quoted number, like every number
+  the config load checks. Every shipped preset has 300. The README documents
+  the check and the chart requirement. Tests: `tests/test_audit_logger.py`,
+  `tests/test_log_setup.py`, `tests/test_reasons.py`,
+  `tests/test_position_store.py`, `tests/test_symbols.py`,
+  `tests/test_warmup_tracker.py`, `tests/test_config_validation.py`,
+  `tests/test_shared_entry_policy.py`, `tests/test_shared_exit_policy.py`.
 
 - **The dashboard's key-level zones use the strategy's ATR read.**
   *2026-09-26* — `DashboardCache.strategy_level_zones` sized its zones with
@@ -1192,7 +1771,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the process exits 0. An exception that escapes `run()` is still a crash:
     it propagates without the cleanup, as before, so `Restart=on-failure`
     restarts the bot.
-  - While `run()` runs, SIGINT and SIGTERM share one handler, and the
+  - While `run()` runs, SIGINT and SIGTERM (and SIGHUP and Windows'
+    SIGBREAK, see the next two entries) share one handler, and the
     previous handlers are restored when it returns or raises. The first
     signal raises. Any later one is only recorded, and logged once the
     cleanup is done. A second Ctrl+C or SIGTERM used to raise inside the
@@ -1209,6 +1789,38 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     child process in its sleep) and `tests/test_dashboard.py`
     (`TestStopAfterAnInterruptedStart`).
 
+- **A terminal hangup shuts the bot down cleanly.** *2026-09-26* — SIGHUP
+  was not among the stop signals `run()` takes, so an SSH disconnect or a
+  killed tmux pane with the bot in the foreground ended it on the spot: no
+  dashboard or stream stop, no session report, archive or `trades.csv`
+  append. SIGHUP now shares the SIGINT / SIGTERM handler while `run()` runs
+  (one during the cleanup is ignored and logged, like theirs), and its
+  previous handler is restored afterwards. A bot started with SIGHUP ignored
+  keeps it ignored: under `nohup` a hangup still leaves the bot running, and
+  `kill <pid>` stops it cleanly. Windows has no SIGHUP. After a real hangup
+  the process exits 120 rather than 0 (Python cannot flush stdout to the
+  terminal that is gone); the report, archive and log file are written as on
+  any stop. `README_LINUX_DEPLOY.md`'s tmux and `nohup` notes say so. Tests:
+  `tests/test_engine_shutdown.py` (in-process hangup and `nohup` cases, a
+  real SIGHUP sent to a child process, a real `nohup`, and a child whose
+  pseudo-terminal is closed under it).
+
+- **Ctrl+Break shuts the bot down cleanly on Windows.** *2026-09-26* —
+  SIGBREAK was not among the stop signals `run()` takes, so Ctrl+Break in
+  the bot's console window ended it on the spot, without the cleanup.
+  SIGBREAK now shares the SIGINT / SIGTERM / SIGHUP handler while `run()`
+  runs, taken like SIGHUP: where the platform has it (Windows) and it is not
+  ignored. One during the cleanup is ignored and logged, and its previous
+  handler is restored afterwards. On Windows only Ctrl+C wakes Python's
+  `time.sleep`, so a Ctrl+Break in the sleep between cycles acts when that
+  sleep ends (`runtime.loop_sleep_seconds`, 2 s by default, while the stream
+  runs; `idle_sleep_seconds`, 60 s, outside it). Closing the console window
+  is not covered: it arrives as SIGBREAK too, but Windows ends the process
+  as soon as the C runtime's handler returns, before the cleanup can finish.
+  `start_trading_bot.bat`'s header says both. Not run on Windows: the tests
+  in `tests/test_engine_shutdown.py` stand SIGUSR1 in for SIGBREAK where the
+  signal module has none.
+
 - **The start scripts pass their arguments on to `main.py`.** *2026-09-26* —
   `start_trading_bot.sh` and `start_trading_bot.bat` ran
   `python main.py --config configs/config.yaml` and dropped whatever they
@@ -1224,6 +1836,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a plain `python3` can be older (3.9 on Debian 11). Tests:
   `tests/test_start_scripts.py`.
 
+- **`kill <pid>` of `start_trading_bot.sh` stops the bot cleanly.**
+  *2026-09-26* — the script ran `python` as a child of bash, so a SIGTERM
+  sent to the script's PID killed bash and left the bot running, orphaned
+  and without its shutdown. The launch line is now
+  `exec python main.py ...`: the bot takes over the script's PID (its
+  command line is then `python main.py ...`). `start_trading_bot.bat`
+  cannot do the same, since cmd.exe has no `exec`; its header now says to
+  stop the bot with Ctrl+C in its window, and that ending the `cmd.exe`
+  alone leaves the bot running. Tests: `tests/test_start_scripts.py`.
+
 - **A regular `pip install .` reports the right version.** *2026-09-26* —
   `intraday_tv_schwab_bot.__version__` read `version.txt` from the package's
   parent directory: the repo root in a checkout, but `site-packages/` in an
@@ -1237,6 +1859,60 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same version, and a missing or unreadable file fails the import instead of
   reading `0.0.0`. Releases bump `intraday_tv_schwab_bot/VERSION`, in
   normalized PEP 440 form. Tests: `tests/test_packaging.py`.
+
+- **An sdist built in a working checkout no longer ships the tests.**
+  *2026-09-26* — setuptools' default sdist rules take `tests/test*.py`, so
+  an sdist built in the dev tree carried the untracked test modules (96 of
+  them, without the conftest and helpers they need). A new `MANIFEST.in`
+  prunes `tests/`, and keeps `configs/config.yaml`, any `.env` (at the root
+  or beside the config), `.schwabdev/` and `.logs/` out whatever else
+  brings them in, an earlier build's egg-info `SOURCES.txt` (which
+  setuptools reads back) included. Its lines only take out and must stay
+  last; each warns at build time while it has nothing to take out. The
+  wheel is unchanged by it: the package and its metadata (the next entry
+  keeps the dev-tree plugins out of both). Tests:
+  `tests/test_packaging.py` (offline sdist and wheel builds of a copy of the
+  package among seeded dev-only and private files).
+
+- **No build carries the two microcap plugins that live only in the dev
+  tree.** *2026-09-26* — `microcap_gap_orb` and `microcap_pm_breakout` are
+  kept out of git, but a build run in the dev tree took them: the sdist and
+  the wheel (`python -m build`, and `pip install .`, which builds the wheel
+  straight from the tree) carried their modules (`packages.find` includes
+  `intraday_tv_schwab_bot*`), their `manifest.json` and `README.md` (the
+  `package-data` globs), and whatever an earlier build's egg-info
+  `SOURCES.txt` listed, which setuptools reads back. `pyproject.toml` now
+  excludes both packages from `packages.find` and their files from the
+  package data (`exclude-package-data`), and `MANIFEST.in` prunes both
+  directories, which also keeps a stale `SOURCES.txt` from bringing them
+  back. Each piece is needed: without the exclude, a wheel built in the tree
+  still ships their modules; without `exclude-package-data`, their manifests,
+  which an installed bot would list as plugins whose modules are missing;
+  and without the prune lines, everything a stale `SOURCES.txt` lists. Built
+  from a copy of the dev tree, the wheel and the sdist each lose those 10
+  files and nothing else. The checkout still loads them: `python main.py`
+  imports the package from the tree, and so does an editable install
+  (setuptools' default mode maps the whole package directory). Like the
+  other `MANIFEST.in` lines, the prune lines print a notice at build time
+  while they have nothing to take out, in a clean clone for one. Tests:
+  `tests/test_packaging.py`.
+
+- **The deploy guide's recovery command finds the bot.** *2026-09-26* —
+  for a terminal wedged by the first OAuth, `README_LINUX_DEPLOY.md` gave
+  `kill -9 $(pgrep -f intraday_tv_schwab_bot)`. The bot's command line is
+  `python main.py --config ...` (or the venv's `python` by path), and the
+  package name is not on it, so the command matched nothing and killed
+  nothing. The guide now lists the bots with
+  `pgrep -af '^[^ ]*python[^ ]* main\.py --config'` and kills the wedged one
+  by PID. The pattern finds the bot however the guide starts it (by hand,
+  the systemd unit, `start_trading_bot.sh`, the tmux one-liner). Anchored at
+  the interpreter, it leaves out the tmux server, which keeps the one-liner
+  on its own command line, and an `sh -c` wrapper. A
+  `kill -9 $(pgrep ...)` one-liner would also have killed those, and a bot
+  the systemd unit runs. That was the guide's only `pgrep`, `pkill` or `ps`
+  line. Tests: the new `tests/test_deploy_guide.py` (each way of starting
+  the bot, run for real with a stand-in `main.py`, against the real
+  `pgrep`).
 
 - **An unquoted YAML time is read everywhere.** *2026-09-26* — YAML reads an
   unquoted `10:05` as the sexagesimal integer 605 (and `9:30` as 570; a
@@ -1371,7 +2047,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   any strategy but top_tier / small_cap_squeeze now scores its engine gate
   instead of its own name; top_tier's are scored on the same side as
   before. `regime_call_outcomes` loses rth_trend_pullback's calls, and
-  `ENTRY_CYCLE_SUMMARY` is unchanged. A log written before the change (an
+  `ENTRY_CYCLE_SUMMARY` is unchanged (until the entry below that drops a
+  refused signal's own reason from it). A log written before the change (an
   upgrade mid-session) carries no `market_side`, so in that day's archive
   its refused signals, top_tier's included, read as skip reasons. Tests:
   `tests/test_report_skip_buckets.py` (a refused signal through the entry
@@ -1470,12 +2147,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     booked a tracked position `closed_outside_bot` at the last mark, dropped
     it and cancelled its broker stop. `broker_position_side_qty` now reports
     such a row as unread, and its unused average-price element is gone. The
-    settle leaves the position tracked, as for vertical legs out of step. An
+    settle leaves the position tracked and fails the attempt, so it is
+    retried (see the next entry). An
     ignore-list symbol with such a row is now blocked, as when the account
     read fails; it read as not held. A restore fails the attempt, naming the
     row, on such a quantity (it raised a bare `ValueError` /
     `OverflowError`) or on an `averagePrice` that is not a finite number (a
-    NaN one restored the position at an entry of 0.01).
+    NaN one restored the position at an entry of 0.01), once it has
+    restored every other row (see below).
   - Paper account rows: a NaN or infinite `initial_stop_price` /
     `initial_target_price` went into the dashboard row as it was. It now
     reads as missing, and the max reward falls back to the live target.
@@ -1492,6 +2171,263 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `tests/test_runtime_nan_reads.py` (129, including properties that finite
     levels, sizing and broker rows read as before) and
     `tests/test_startup_reconciler.py` (`TestIgnoredOpenPositionParsing`).
+
+- **The reconcile fails an attempt on a broker row it cannot use, and the
+  session report counts a refused signal under its gate alone.**
+  *2026-09-26* — four gaps the 2026-09-26 NaN-read and skip-bucket fixes
+  left:
+  - A restore read a broker row with no `averagePrice`, or one of 0 or
+    below, as an entry of 0.01, as it did a NaN one. `restore_basic`'s
+    levels around 0.01 are ones the live price is already past, so the
+    first management cycle exited the restored position: a LONG at its
+    target, a SHORT at its stop. Such a row now fails the attempt, naming
+    it (`the broker position row for AAPL holds no usable averagePrice
+    (None)`), as a NaN or infinite one does, once every other row is
+    restored (see the next entry); the restore modes block entries
+    (`startup_reconcile_failed`) until a retry reads a usable one.
+  - The settle left a tracked position whose broker row's quantity cannot
+    be read (NaN, ±inf, `"n/a"`) tracked, but still reported the attempt
+    settled, so in `block` and `log_only` nothing read the row again until
+    the next day. The attempt now fails, and the engine retries it on the
+    usual backoff (60 seconds, doubling to 5 minutes); the position is not
+    held, so it is still managed meanwhile. Which entries are blocked is
+    unchanged in practice: in `block` the held row already blocks them
+    (`broker_positions_present`), `log_only` never does, and a restore mode
+    already failed on the same row. A vertical whose legs are out of step
+    still leaves the attempt settled: its rows were read, and a retry would
+    read them the same.
+  - A signal the strategy built and an engine gate then refused was counted
+    as a skip twice, under the gate and under its own reason. The entry
+    stage now counts only the gate after a decision `market_side` marks: in
+    `session_skip_counts` (the EOD filter rejections and the manifest's raw
+    counts) and in `ENTRY_CYCLE_SUMMARY`, whose entry-decision payload
+    carries `market_side` for it. On a synthetic 40-minute rth_trend_pullback
+    session `rth_trend_pullback_long` (51 in the filter rejections) is gone,
+    and the total drops from 212 to 161.
+  - Gate attribution split a refused signal's row at every comma outside
+    parentheses, so a broker message holding one
+    (`order_failed:live_unfilled_cancel_failed:cancel_error:{'error': ...,
+    'error_description': ...}`) scored a second, spurious gate
+    (`'error_description'`). Everything after the signal's reason is now the
+    one gate the entry stage wrote.
+
+  **Behaviour change:** the restore modes fail the attempt, and block
+  entries, on a row with an absent, zero or negative `averagePrice` they
+  used to restore (and exit at once); a tracked position's unread row fails
+  the attempt in every mode, which adds retries (and, for a tracked
+  ignore-list symbol with nothing else held, blocks every entry in the
+  blocking modes until the row reads). No preset changes, and no feed input
+  is known to send either row. Reporting: `session_skip_counts`, the filter
+  rejections and `ENTRY_CYCLE_SUMMARY`'s `top_skip_reasons` lose each
+  refused signal's own reason, of every strategy (`top_tier_*`,
+  `peer_confirmed_*`, `rth_trend_pullback_*`, the 0DTE `{style}_bull` /
+  `_bear`, pairs' `relative_*_z=...`); gate attribution loses the spurious
+  gates. The dashboard's entry-decision payload gains `market_side`.
+  README: the reconcile section's unread-row bullet and the filter
+  rejection and gate attribution bullets. Tests:
+  `tests/test_startup_reconciler.py` (`TestAnUnreadBrokerRow`, and the
+  engine's retry cadence in `TestEngineReconcileRetry`),
+  `tests/test_report_skip_buckets.py`, `tests/test_entry_cycle_summary.py`,
+  `tests/test_gate_attribution.py`, `tests/test_runtime_nan_reads.py` and
+  `tests/test_sweep_fixes.py`.
+
+- **A restore restores every broker row it can use before it fails the
+  attempt on one it cannot.** *2026-09-26* — a restore failed the attempt
+  at the first broker row whose quantity or `averagePrice` it could not
+  use (see the entries above), so every row after it in the account's
+  order was left unrestored, its position unmanaged by the bot, until a
+  retry could read that row: for a row the broker kept sending that way,
+  all session. The restore now leaves each such row, restores every other
+  one, and then fails the attempt naming each row it left (`the broker
+  position row for AAPL holds no usable averagePrice (None); the broker
+  position row for NVDA holds an unreadable quantity (...)`, after `the
+  broker working-order read failed` when an unread order list lets the
+  restore run without bracket mode). As for any failed attempt, entries
+  are blocked (`startup_reconcile_failed`) and the engine retries on the
+  usual backoff (60 seconds, doubling to 5 minutes). The restored
+  positions are managed meanwhile, stops included, and the retry restores
+  a left row once it reads and nothing twice (a tracked symbol is skipped,
+  so no second stop is placed for it). `restore_hybrid` prunes no saved
+  metadata while a row is left, so the row still restores from its saved
+  levels; the first attempt that reads every row prunes as before.
+
+  **Behaviour change:** only in `restore_basic` / `restore_hybrid`, and
+  only beside a broker row the restore cannot use, which no feed is known
+  to send: the rows after it are restored and managed at once instead of
+  after the retry that reads it, and the error names every such row, not
+  the first. The attempt still fails, and blocks entries, until that row
+  restores. No preset changes. README: the reconcile section's unread-row
+  bullet. Tests: `tests/test_startup_reconciler.py`
+  (`TestARestoreBesideAnUnusableRow`, and `TestEngineReconcileRetry`) and
+  `tests/test_runtime_nan_reads.py`.
+
+- **An unreadable restore universe no longer restores every broker
+  position.** *2026-09-26* — `StartupReconciler._is_restore_eligible_symbol`
+  read the strategy's `restore_eligible_symbols()` inside a silent
+  `except Exception`. An error there read as "no universe", so every broker
+  equity position was restored and managed, including its stop and exits,
+  whatever the strategy's universe. The error now fails the restore
+  attempt: nothing is restored, entries are blocked
+  (`startup_reconcile_failed`, with the error in the message) and the
+  attempt is retried. The hook cannot fail on any shipped
+  manifest or params. Tests: `tests/test_startup_reconciler.py`.
+
+- **A stored position whose metadata does not parse is no longer restored
+  as if from its metadata.** *2026-09-26* —
+  `ReconcileMetadataStore._deserialize` read an unparseable
+  `metadata_json` as `{}` inside a silent `except Exception`, and the row
+  still matched its broker position. It was restored as `restore_hybrid`
+  (`restored_from_metadata: true`) with none of its metadata (initial stop,
+  ladder state, bracket and working-exit order ids), even under a strategy
+  that refuses a restore without it. The row now fails, and
+  `load_positions` logs it (`Skipping startup reconcile metadata row due to
+  parse error`) and skips it. The position is then restored like one with
+  no stored row: `restore_basic`, or skipped with a WARNING where the
+  strategy requires the metadata. The bot writes the column with
+  `json.dumps`, so only a damaged or hand-edited database reaches this.
+  Tests: `tests/test_position_store.py`.
+
+- **A failed read no longer lets an entry through, and a failed error report
+  no longer stops the bot.** *2026-09-26* — several entry gates read their
+  input inside a `try` whose `except` produced the value the gate passes on,
+  so an error let the entry through; and the engine's error path could
+  itself raise out of `run()`.
+  - After a failed cycle the engine re-evaluates the gate and republishes the
+    dashboard state. That can fail the way the cycle did (a dashboard
+    snapshot read that raises every cycle), and the exception escaped
+    `run()` and stopped the bot on an error the path only meant to report.
+    It is now the dashboard's failure, logged and shown as in `step()` (see
+    "A failed dashboard update no longer fails the cycle" below), and the
+    loop and its backoff go on. A stop signal still reaches the shutdown.
+  - top_tier's ORB 5m follow-through gate (`orb_require_5m_followthrough`):
+    an error building the 5m frame set it to None, which skipped the gate.
+    The entry is now refused as `<side>_orb_5m_unavailable(error=...)` and
+    the error logged. (The shipped presets run `disable_orb_regime: true`,
+    so the gate does not run there.)
+  - top_tier's confirmation bar (`require_entry_confirmation_bar`) took a bar
+    whose read raised as a confirmation, and a missing open as 0. An
+    unreadable bar now confirms nothing.
+  - top_tier's vol_squeeze volume gate: a box volume median that raised or
+    was NaN made the baseline 1 share, which any bar cleared. It now fails
+    the gate.
+  - top_tier's pullback maturity checks, relative-strength gate and
+    `require_htf_ema_alignment` skip when their input is missing, and an
+    error reading it was taken for "missing". Those reads now raise out of
+    the cycle, which the engine logs: `_default_htf_context_for_score`, like
+    `_htf_context` and the other context builds, no longer turns a build
+    error into None.
+  - `get_daily_history` treats a payload whose candles do not read as a
+    failed fetch (logged, cached for the day). Its error used to escape
+    uncached, so top_tier refetched it every cycle and read it as "no
+    stats".
+  - The shared stage's `_target_meets_min_rr` (the raw R:R gate, the target
+    caps, the divergence target) passed a non-numeric level, and a NaN one
+    with `min_target_rr` off. A level that does not read as a finite number
+    now fails.
+  - The correlation concentration guard logged an unreadable strategy config
+    and let the signal through without the guard. It now refuses it as
+    `correlation_guard_unavailable`.
+  - 0DTE: `live_activity_score` returned the neutral 1.0, which
+    `min_activity_for_entry` passes, for a frame whose read raised, and the
+    VIX gates read a volatility quote whose freshness check had raised. Both
+    errors now propagate.
+  - No shipped preset or data-feed input changes: on data that reads, every
+    gate decides as before. `_strategies/README.md` (HTF context for the
+    score terms) says that a build that raises propagates.
+  - Tests: `tests/test_fail_closed_gates.py` (new),
+    `tests/test_engine_shutdown.py` (`TestTheErrorPathKeepsTheLoop`),
+    `tests/test_orb_regime.py` (`TestTheFollowThroughGateFailsClosed`),
+    `tests/test_shared_entry_policy.py` and
+    `tests/test_risk_state_persistence.py`.
+
+- **A failed dashboard update no longer fails the cycle.** *2026-09-26* —
+  the engine builds the dashboard state at the end of every cycle, after
+  the cycle's management, exits and entries. An error building it (a symbol
+  snapshot or S/R row read that raises; several such reads no longer pass
+  silently, see "67 silent broad excepts" under Changed) escaped `step()`
+  and failed the cycle, and the error path's own update then failed the
+  same way and stopped the bot (see the entry above).
+  - The update is now the dashboard's alone. `IntradayBot._publish_state`
+    catches a failure of the build, in `step()` and on the error path
+    alike; the cycle counts as done and the loop keeps its normal cadence.
+    The backoff and ENGINE DEGRADED stay for the cycle's own errors.
+  - It is logged as `Dashboard update failed (consecutive=N)`: a WARNING
+    with the traceback on the first failure in a row and every 30th (about
+    once a minute at the 2 s cycle), a DEBUG line in between, and
+    `Dashboard update recovered after N failed update(s)` once one succeeds.
+  - The dashboard (the page and `state_path`) keeps its last state, with
+    the status `stale` (`error` while the cycles themselves fail) and a
+    message that adds the error and the time of the last failure to the
+    cycle's own; `Updated` stays the time of that state. The status chip
+    shows `stale` in the error colour (`DashboardServer.publish_stale`).
+  - A stop signal during the update still reaches the shutdown.
+  - `_publish_state` evaluates the gate itself when the caller has none (the
+    error path) and loses its `context_refresh_active` argument, which both
+    callers took from the gate. The state it builds is unchanged: every
+    shipped preset publishes a running state on a stubbed cycle.
+
+  **Behaviour change:** a dashboard fault no longer slows management or
+  raises ENGINE DEGRADED, and the page says it is stale instead of showing
+  its last good state as live. README: `runtime.error_escalation_cycles`
+  and the `dashboard` section. Tests: `tests/test_dashboard_update_failure.py`
+  (new: a real bot's cycle with a broken snapshot or S/R row read, the
+  loop's cadence and escalation, recovery, the error path, the log
+  throttle, the gate's refresh flag and stop signals),
+  `tests/test_engine_shutdown.py` (`TestTheErrorPathKeepsTheLoop`, the stop
+  points) and `tests/test_dashboard.py` (`TestPublishStale`,
+  `TestTheStatusBadge`).
+
+- **One position's management error no longer skips the positions after
+  it.** *2026-09-26* — `PositionManager.manage_positions` managed the open
+  positions in one loop, and an exception while managing any of them raised
+  out of it. Every position after it went unmanaged that cycle, its stop
+  and target included. The engine then logged an engine error, backed off
+  (2 s, doubling to 60 s) for every position and ran no entries that cycle.
+  The broker-fill booking that runs first did the same for every position.
+  The silent-except cut (under Changed) made this reachable from an exit:
+  key_levels' ladder-defence S/R read now raises instead of dropping its S/R
+  context. Each position is now managed on its own:
+  - The error is logged against the position as
+    `Managing AAPL failed (consecutive=N): <step> raised <error>; ...`,
+    with its traceback on the first failed cycle of a run and every tenth
+    after, and a one-line WARNING in between. The other positions are
+    managed as usual.
+  - A failed sr_flip manager, adaptive ladder or exit policy (the shared
+    exits and the strategy's own) is skipped for that position that cycle,
+    and the rest of its management runs. The RiskManager check runs on the
+    levels as the failed step left them, so its stop and target still
+    fire, and force flatten and the exit order follow.
+  - A failure anywhere else ends that position's cycle where it happened:
+    the working-exit settlement, the risk check, the bracket sync, or the
+    exit order and its booking. A second attempt could double an exit, so
+    it is retried next cycle, and a resting broker stop still protects the
+    position. One that comes before the risk check (the mark read, the
+    working-exit settlement, the risk check itself) costs the position
+    that cycle's stop and target check. A position whose bracket fill
+    could not be booked is not managed that cycle: its bracket may
+    already read down, and the engine would sell again what the broker's
+    stop sold.
+  - A position whose management fails `runtime.error_escalation_cycles`
+    cycles in a row (default 10; 0 turns it off) logs a CRITICAL naming
+    it, `POSITION DEGRADED — AAPL: its management failed 10 consecutive
+    cycles. Last: ...`, on that cycle and every multiple after. A clean
+    cycle, or the position closing, starts the count over.
+
+  A stop signal (KeyboardInterrupt) still ends the cycle. **Behaviour
+  change:** such an error no longer fails the engine cycle. It no longer
+  counts toward ENGINE DEGRADED, slows the loop or skips that cycle's
+  entries, and the dashboard status does not show it.
+
+  **Behaviour change (config): `runtime.error_escalation_cycles` must be
+  an integer of at least 0** (0 turns both escalations off); anything
+  else refuses to start. The per-position escalation reads it every
+  cycle. Before, only the engine read it, after a failed cycle: a null or
+  a negative count as 0 (off), `true` as 1, a float as its whole part and
+  `"10"` as 10, and a typo raised out of the error path, which stopped
+  the bot. Every shipped preset has 10. The README
+  (`error_escalation_cycles`) and `_strategies/README.md` (Exits) say so.
+  Tests: `tests/test_position_isolation.py` (new) and
+  `tests/test_config_validation.py` (`TestRuntimeValidation`).
 
 - **Tests that could not fail now can.** *2026-09-26* — tests only; no
   behaviour changes.
@@ -1529,10 +2465,27 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     options, and Bug 5 pins the attempt each case fills on
     (`dry_run_fill_attempt_3_natural` below mid, `dry_run_fill_attempt_2` at
     mid) on both submit paths. Breaking any ladder's natural step, either
-    submit method's flag or the debit threshold fails them; the old
+    submit method's flag (since removed: every dry-run ladder ends on the
+    natural, see Changed) or the debit threshold fails them; the old
     versions caught one of those seven.
   - Each of the first three was checked by breaking the code under test:
     the old version passed (or skipped) and the new one fails.
+
+- **Five regression tests that read source now run the code.**
+  *2026-09-26* — tests only; no behaviour changes. `test_bug_regressions.py`
+  grepped `inspect.getsource` text: the top_tier screen's `.select(...)`
+  for `"exchange"`, sr_scalp's stop floor and raw R:R gate lines, the
+  partial-breakeven None stamp, risk.py's `is not None` guard (LONG only:
+  the SHORT copy of the line kept it passing with either guard removed) and
+  the force-flatten branch. They now run the screen through the real
+  client against a scan that returns only the selected columns,
+  `_build_sr_scalp_signal` (the stop handed on, its gate, and the real
+  finalize's refusal), `_adaptive_management_components` on the shipped
+  preset, `RiskManager.update_position` on both sides, and
+  `PositionManager.manage_positions` (a stop or target keeps its reason in
+  the force-flatten window, a scale-out is upgraded). Against fourteen
+  mutants of that code the old tests caught eight, the new ones all
+  fourteen.
 
 - **The Linux deploy guide's systemd unit now starts the bot.** *2026-09-26*
   — `README_LINUX_DEPLOY.md` ran `python -m intraday_tv_schwab_bot.main`,

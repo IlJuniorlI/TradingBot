@@ -316,8 +316,8 @@ class TradingViewScreenerClient:
 
     def _liquid_equity_conditions(self, min_price: float = 5.0, max_price: float | None = None):
         min_volume = int(self.config.tradingview.min_volume)
-        min_value_traded_1m = float(getattr(self.config.tradingview, "min_value_traded_1m", 0.0) or 0.0)
-        min_volume_1m = int(getattr(self.config.tradingview, "min_volume_1m", 0) or 0)
+        min_value_traded_1m = self.config.tradingview.min_value_traded_1m
+        min_volume_1m = self.config.tradingview.min_volume_1m
         c = self._column
         conditions = [
             *self._common_equity_conditions(),

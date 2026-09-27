@@ -36,6 +36,7 @@ import pandas as pd
 from .audit_logger import AuditLogger
 from .config import BotConfig
 from .data_feed import MarketDataStore
+from .log_setup import warn_once
 from .models import Position
 from .reasons import insufficient_bars_reason
 from .sessions import equity_rth_open_at, is_regular_equity_session, is_weekday_session_day, previous_regular_close
@@ -81,9 +82,22 @@ class WarmupTracker:
         return max(base_lookback, session_minutes)
 
     def _required_history_bars(self, symbol: str) -> int:
+        # The strategy's hook (a param read, a manifest value, or a plugin's
+        # own formula) runs before the cycle's position management, so an
+        # error in it must not end the cycle there: the symbol is read as
+        # needing no warm-up bars. The strategy's entry_signals reads the
+        # same params after management. Until 2026-09-26 this fallback was
+        # silent; the first failure per strategy is now logged with its
+        # traceback.
         try:
             return max(0, int(self.strategy.required_history_bars(symbol=symbol, positions=self.positions) or 0))
         except Exception:
+            if warn_once(f"required_history_bars:{self.config.strategy}"):
+                LOG.warning(
+                    "required_history_bars raised for strategy %s (symbol %s); treating the symbol as needing "
+                    "no warm-up bars. Further occurrences are not logged.",
+                    self.config.strategy, symbol, exc_info=True,
+                )
             return 0
 
     def desired_history_bars(self, symbol: str) -> int:
@@ -92,10 +106,10 @@ class WarmupTracker:
         readiness (that uses ``_required_history_bars`` which only needs
         the strategy's min_bars)."""
         required = self._required_history_bars(symbol)
-        try:
-            chart_bars = int(getattr(self.config.dashboard.charting.expanded, "max_bars", 0) or 0)
-        except Exception:
-            chart_bars = 0
+        # The bars the expanded chart draws: its max_bars, an integer in
+        # 1-480 (load_config refuses anything else). Until 2026-09-26 an
+        # unreadable one requested none, silently.
+        chart_bars = self.config.dashboard.charting.expanded.max_bars
         return max(required, chart_bars)
 
     def history_fetch_lookback_minutes(self, now: datetime, *, streaming_active: bool, required_bars: int = 0) -> int | None:
@@ -178,16 +192,12 @@ class WarmupTracker:
         stream_last = state.get("last_stream_update")
         next_retry_due = None
         retry_delay_seconds = None
-        try:
-            if not ready and history_last is not None:
-                interval = float(self.config.runtime.history_poll_seconds)
-                if empty_last is not None and empty_last == history_last and not self.data.is_regular_session(sessions.now_et()):
-                    interval = max(interval, 900.0)
-                retry_delay_seconds = max(0.0, interval - max(0.0, (sessions.now_et() - history_last).total_seconds()))
-                next_retry_due = history_last + timedelta(seconds=max(interval, 0.0))
-        except Exception:
-            next_retry_due = None
-            retry_delay_seconds = None
+        if not ready and history_last is not None:
+            interval = float(self.config.runtime.history_poll_seconds)
+            if empty_last is not None and empty_last == history_last and not self.data.is_regular_session(sessions.now_et()):
+                interval = max(interval, 900.0)
+            retry_delay_seconds = max(0.0, interval - max(0.0, (sessions.now_et() - history_last).total_seconds()))
+            next_retry_due = history_last + timedelta(seconds=max(interval, 0.0))
         blocking_reason = None if ready else insufficient_bars_reason("insufficient_bars", merged_rows, required_bars)
         live_entry_state = dict(state.get("live_entry_bar_status") or {})
         return {

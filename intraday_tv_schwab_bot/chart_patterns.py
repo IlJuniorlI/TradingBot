@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .bars import bar_close_position
+from .indicators import has_standard_indicator_columns
 from .sessions import session_segment_ids
 
 
@@ -118,14 +119,10 @@ def _clean_price_frame(frame: pd.DataFrame | None) -> pd.DataFrame:
     # standard indicator column set and skip the slow clean work entirely.
     # This was the dominant cost at the top of every analyze_chart_pattern_context
     # call because strategies pass frames built by add_indicators().
-    try:
-        from .indicators import has_standard_indicator_columns
-        if has_standard_indicator_columns(frame):
-            if frame_attrs is not None:
-                frame_attrs[_CHART_CLEAN_SENTINEL] = True
-            return frame
-    except Exception:
-        pass
+    if has_standard_indicator_columns(frame):
+        if frame_attrs is not None:
+            frame_attrs[_CHART_CLEAN_SENTINEL] = True
+        return frame
     out = frame.copy()
     if "datetime" in out.columns:
         try:
@@ -194,10 +191,7 @@ def _close(frame: pd.DataFrame, idx: int = -1) -> float:
         cached = _CHART_HELPER_CACHE.get(key)
         if cached is not None:
             return cached
-        try:
-            val = float(frame["close"].to_numpy(dtype=np.float64, copy=False)[-1])
-        except Exception:
-            val = float(frame.iloc[idx].close)
+        val = float(frame["close"].to_numpy(dtype=np.float64, copy=False)[-1])
         return _cache_put(frame, key, val)
     return float(frame.iloc[idx].close)
 
@@ -208,10 +202,7 @@ def _open(frame: pd.DataFrame, idx: int = 0) -> float:
         cached = _CHART_HELPER_CACHE.get(key)
         if cached is not None:
             return cached
-        try:
-            val = float(frame["open"].to_numpy(dtype=np.float64, copy=False)[0])
-        except Exception:
-            val = float(frame.iloc[idx].open)
+        val = float(frame["open"].to_numpy(dtype=np.float64, copy=False)[0])
         return _cache_put(frame, key, val)
     return float(frame.iloc[idx].open)
 

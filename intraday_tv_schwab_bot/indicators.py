@@ -11,10 +11,15 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 
+# TA-Lib is a pinned dependency. A missing one (or its C library) fails the
+# first indicator build, with the import error as the cause (_require_talib);
+# any other import failure (a broken build) raises here.
+_TALIB_IMPORT_ERROR: ImportError | None = None
 try:
     import talib  # type: ignore
-except Exception:  # pragma: no cover - optional until indicators are computed
+except ImportError as exc:  # pragma: no cover - TA-Lib is installed wherever the suite runs
     talib = None
+    _TALIB_IMPORT_ERROR = exc
 
 from . import sessions
 from .bars import ensure_ohlcv_frame
@@ -41,9 +46,11 @@ def get_runtime_indicator_mode() -> bool:
 
 
 def set_session_indicator_window(window: str) -> None:
+    """``"rth"`` or ``"extended"``: load_config checks
+    ``runtime.equity_session_indicator_window`` (until 2026-09-26 any other
+    value read as ``"rth"`` without a word)."""
     global _SESSION_INDICATOR_WINDOW
-    w = str(window or "rth").strip().lower()
-    _SESSION_INDICATOR_WINDOW = "extended" if w == "extended" else "rth"
+    _SESSION_INDICATOR_WINDOW = window
 
 
 def get_session_indicator_window() -> str:
@@ -213,7 +220,9 @@ def _series_from_talib(index: pd.Index, values: Any) -> pd.Series:
 
 def _require_talib() -> Any:
     if talib is None:
-        raise RuntimeError("TA-Lib is required for indicator calculation but is not installed")
+        raise RuntimeError(
+            f"TA-Lib is required for indicator calculation but could not be imported: {_TALIB_IMPORT_ERROR}"
+        ) from _TALIB_IMPORT_ERROR
     return talib
 
 

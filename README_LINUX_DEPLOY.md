@@ -522,13 +522,18 @@ reconcile metadata SQLite store.
 | Approach | Use case | Why not for production |
 |---|---|---|
 | `tmux new -d -s bot 'cd ~/TradingBot && .venv/bin/python main.py --config configs/config.yaml'` | Quick one-off testing | No auto-restart on crash; doesn't survive reboot |
-| `nohup ... &` + `disown` | Throwaway run | Loses stderr, no clean shutdown signal |
+| `nohup ... &` + `disown` | Throwaway run | Loses stderr, no auto-restart; `nohup` keeps the logout's hangup (SIGHUP) ignored, so stop it with `kill <pid>` |
 | Docker / Podman | Already a container shop | Extra layer; bot already isolated via venv |
 | `supervisord` | Older systems without systemd | systemd is everywhere on modern Linux |
 
-For dev and one-off testing, `tmux` is fine — `Ctrl+B` then `&` kills the
-pane immediately. For anything you want to leave running across days,
-use the systemd unit above.
+For dev and one-off testing, `tmux` is fine. `Ctrl+B` then `x` (kill-pane)
+or `Ctrl+B` then `&` (kill-window, which closes every pane in the window)
+asks `y/n` first; on `y` the bot gets the hangup (SIGHUP) and still runs its
+clean shutdown (session report, archive) behind it, as it does when an SSH
+session running it in the foreground drops. The one-liner above makes a
+session with one window and one pane, so either key closes just the bot.
+For anything you want to leave running across days, use the systemd unit
+above.
 
 ---
 
@@ -542,10 +547,20 @@ parent is sitting at `input()` waiting for a paste — but Ctrl+C goes to
 the subprocess, not Python. Symptom: terminal wedged, Ctrl+C does
 nothing.
 
-**Recovery:** kill from another shell:
+**Recovery:** kill it from another shell. However this guide starts the
+bot (by hand, the systemd unit, `start_trading_bot.sh`, which `exec`s it,
+or the tmux one-liner), its command line is `<python> main.py --config
+...`, where `<python>` is `python` or a path to the venv's; the package
+name is not on it. List the bots, then kill the wedged one:
 ```bash
-kill -9 $(pgrep -f intraday_tv_schwab_bot)
+pgrep -af '^[^ ]*python[^ ]* main\.py --config'
+kill -9 <pid>
 ```
+The pattern starts at the interpreter, so it leaves out processes that only
+carry the command as text: the tmux server the one-liner started, and a
+shell that wraps it (`sh -c '... main.py --config ...'`). A bot the systemd
+unit runs is listed too; `ps -o pid,tty,args -p <pid>` tells them apart
+(the unit's has no terminal: `?`).
 
 **Don't fight this — sidestep it.** Auth on a machine that has a
 browser, SCP the `tokens.db` over (see "First-time Schwab OAuth"

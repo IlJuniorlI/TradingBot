@@ -14,6 +14,13 @@
 @REM   --strategy <name>            override the strategy the config selects
 @REM   --config <path>              run another config (the last --config wins)
 @REM e.g. start_trading_bot.bat --config configs\config.small_cap_squeeze.yaml
+@REM
+@REM Stop the bot with Ctrl+C in its window: that is its clean shutdown.
+@REM Ctrl+Break stops it cleanly too (in the pause between cycles, once the
+@REM pause ends). Closing the window does not: Windows ends the bot before
+@REM its cleanup can finish.
+@REM cmd.exe has no exec, so python runs as a child of the cmd.exe running
+@REM this file, and ending that cmd.exe alone leaves the bot running.
 @REM ======================================================================
 cd /D "%~dp0"
 call .venv\Scripts\activate

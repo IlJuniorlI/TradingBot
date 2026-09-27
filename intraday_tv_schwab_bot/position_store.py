@@ -79,10 +79,12 @@ class ReconcileMetadataStore:
     @staticmethod
     def _deserialize(row: dict[str, Any]) -> Position:
         metadata_raw = row.get("metadata_json") or "{}"
-        try:
-            metadata = json.loads(metadata_raw) if isinstance(metadata_raw, str) else dict(metadata_raw or {})
-        except Exception:
-            metadata = {}
+        # Metadata that does not parse fails the row, which load_positions
+        # logs and skips: the broker position is then restored as one with no
+        # stored row. Until 2026-09-26 it read as {} without a word, and the
+        # row restored as restore_hybrid ("restored_from_metadata") with none
+        # of its metadata, even for a strategy that refuses a restore without.
+        metadata = json.loads(metadata_raw) if isinstance(metadata_raw, str) else dict(metadata_raw or {})
         entry_time = row.get("entry_time")
         parsed_entry_time = entry_time if isinstance(entry_time, datetime) else datetime.fromisoformat(str(entry_time))
         return Position(

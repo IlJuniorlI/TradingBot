@@ -39,10 +39,10 @@ import copy
 
 from .candles import detect_candle_context, detect_per_bar_candle_patterns
 from .chart_patterns import analyze_chart_pattern_context
-from .config import BotConfig, DashboardChartConfig, DashboardChartingConfig
+from .config import BotConfig, DashboardChartConfig
 from .htf_levels import summarize_htf_trend
 from .models import Side
-from .numeric import safe_float
+from .numeric import first_float, safe_float
 from .support_resistance import analyze_market_structure, zone_flip_confirmed
 from .symbols import normalize_symbol_list
 from .technical_levels import build_technical_levels_context
@@ -136,19 +136,16 @@ def dashboard_technical_line_payload(line: Any) -> dict[str, Any] | None:
     the chart's left edge."""
     if line is None:
         return None
-    try:
-        return {
-            "kind": str(getattr(line, "kind", "line") or "line"),
-            "slope": float(getattr(line, "slope", 0.0) or 0.0),
-            "intercept": float(getattr(line, "intercept", 0.0) or 0.0),
-            "touches": int(getattr(line, "touches", 0) or 0),
-            "start_pos": int(getattr(line, "start_pos", 0) or 0),
-            "end_pos": int(getattr(line, "end_pos", 0) or 0),
-            "current_value": float(getattr(line, "current_value", 0.0) or 0.0),
-            "direction": str(getattr(line, "direction", "neutral") or "neutral"),
-        }
-    except Exception:
-        return None
+    return {
+        "kind": str(getattr(line, "kind", "line") or "line"),
+        "slope": float(getattr(line, "slope", 0.0) or 0.0),
+        "intercept": float(getattr(line, "intercept", 0.0) or 0.0),
+        "touches": int(getattr(line, "touches", 0) or 0),
+        "start_pos": int(getattr(line, "start_pos", 0) or 0),
+        "end_pos": int(getattr(line, "end_pos", 0) or 0),
+        "current_value": float(getattr(line, "current_value", 0.0) or 0.0),
+        "direction": str(getattr(line, "direction", "neutral") or "neutral"),
+    }
 
 
 def dashboard_fvg_payload(gap: Any) -> dict[str, Any] | None:
@@ -164,85 +161,77 @@ def dashboard_fvg_payload(gap: Any) -> dict[str, Any] | None:
                 return str(iso())
         except Exception:
             LOG.debug("Failed to serialize value via isoformat in dashboard payload; falling back to string.", exc_info=True)
-        try:
-            return str(value)
-        except Exception:
-            return None
+        return str(value)
 
-    try:
-        lower = float(getattr(gap, "lower", 0.0) or 0.0)
-        upper = float(getattr(gap, "upper", 0.0) or 0.0)
-        midpoint = float(getattr(gap, "midpoint", (lower + upper) / 2.0) or ((lower + upper) / 2.0))
-        if upper <= lower or lower <= 0:
-            return None
-        return {
-            "direction": str(getattr(gap, "direction", "neutral") or "neutral"),
-            "lower": lower,
-            "upper": upper,
-            "midpoint": midpoint,
-            "size": float(getattr(gap, "size", upper - lower) or (upper - lower)),
-            "filled_pct": float(getattr(gap, "filled_pct", 0.0) or 0.0),
-            "first_seen": _ts(getattr(gap, "first_seen", None)),
-            "last_seen": _ts(getattr(gap, "last_seen", None)),
-        }
-    except Exception:
+    lower = float(getattr(gap, "lower", 0.0) or 0.0)
+    upper = float(getattr(gap, "upper", 0.0) or 0.0)
+    midpoint = float(getattr(gap, "midpoint", (lower + upper) / 2.0) or ((lower + upper) / 2.0))
+    if upper <= lower or lower <= 0:
         return None
+    return {
+        "direction": str(getattr(gap, "direction", "neutral") or "neutral"),
+        "lower": lower,
+        "upper": upper,
+        "midpoint": midpoint,
+        "size": float(getattr(gap, "size", upper - lower) or (upper - lower)),
+        "filled_pct": float(getattr(gap, "filled_pct", 0.0) or 0.0),
+        "first_seen": _ts(getattr(gap, "first_seen", None)),
+        "last_seen": _ts(getattr(gap, "last_seen", None)),
+    }
 
 
 def dashboard_fvg_anchor_abs_index(frame: pd.DataFrame | None, first_seen: Any) -> int | None:
     if frame is None or getattr(frame, "empty", True) or first_seen in (None, ""):
         return None
-    try:
-        index = getattr(frame, "index", None)
-        if not isinstance(index, pd.DatetimeIndex) or index.empty:
-            return None
-        anchor_ts = pd.Timestamp(first_seen)
-        if getattr(anchor_ts, "tzinfo", None) is not None:
-            anchor_ts = anchor_ts.tz_convert(None)
-        index_for_search = index.tz_convert(None) if getattr(index, "tz", None) is not None else index
-        pos = int(index_for_search.searchsorted(anchor_ts, side="left"))
-        if pos < 0 or pos >= len(index_for_search):
-            return None
-        return pos
-    except Exception:
+    index = getattr(frame, "index", None)
+    if not isinstance(index, pd.DatetimeIndex) or index.empty:
         return None
+    # The builders stamp first_seen with the bar's isoformat, or str() of an
+    # index label that is not a timestamp: that one has no chart anchor.
+    try:
+        anchor_ts = pd.Timestamp(first_seen)
+    except ValueError:
+        return None
+    if getattr(anchor_ts, "tzinfo", None) is not None:
+        anchor_ts = anchor_ts.tz_convert(None)
+    index_for_search = index.tz_convert(None) if getattr(index, "tz", None) is not None else index
+    pos = int(index_for_search.searchsorted(anchor_ts, side="left"))
+    if pos < 0 or pos >= len(index_for_search):
+        return None
+    return pos
 
 
 def dashboard_cache_json_signature(value: Any) -> str:
     try:
         return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"), ensure_ascii=False)
-    except Exception:
+    except (TypeError, ValueError):
+        # sort_keys cannot order a dict mixing key types (TypeError), and
+        # json refuses a circular container (ValueError).
         return repr(value)
 
 
 def dashboard_frame_signature(frame: pd.DataFrame | None) -> tuple[Any, ...]:
     if frame is None or getattr(frame, "empty", True):
         return 0, None, None, None, None, None, None
-    try:
-        index = getattr(frame, "index", None)
-        first_idx = index[0] if index is not None and len(index) else None
-        last_idx = index[-1] if index is not None and len(index) else None
-        last_row = frame.iloc[-1]
+    index = getattr(frame, "index", None)
+    first_idx = index[0] if index is not None and len(index) else None
+    last_idx = index[-1] if index is not None and len(index) else None
+    last_row = frame.iloc[-1]
 
-        def _ts(value: Any) -> str | None:
-            if value is None:
-                return None
-            try:
-                return pd.Timestamp(value).isoformat()
-            except Exception:
-                return str(value)
+    def _ts(value: Any) -> str | None:
+        if value is None:
+            return None
+        return pd.Timestamp(value).isoformat()
 
-        return (
-            int(len(frame)),
-            _ts(first_idx),
-            _ts(last_idx),
-            safe_float(last_row.get("close")) if hasattr(last_row, "get") else None,
-            safe_float(last_row.get("high")) if hasattr(last_row, "get") else None,
-            safe_float(last_row.get("low")) if hasattr(last_row, "get") else None,
-            safe_float(last_row.get("volume")) if hasattr(last_row, "get") else None,
-        )
-    except Exception:
-        return int(len(frame)), None, None, None, None, None, None
+    return (
+        int(len(frame)),
+        _ts(first_idx),
+        _ts(last_idx),
+        safe_float(last_row.get("close")) if hasattr(last_row, "get") else None,
+        safe_float(last_row.get("high")) if hasattr(last_row, "get") else None,
+        safe_float(last_row.get("low")) if hasattr(last_row, "get") else None,
+        safe_float(last_row.get("volume")) if hasattr(last_row, "get") else None,
+    )
 
 
 def dashboard_recent_trade_markers(account: Any, symbol: str) -> list[dict[str, Any]]:
@@ -275,26 +264,20 @@ def dashboard_recent_trade_markers(account: Any, symbol: str) -> list[dict[str, 
         exit_time = getattr(trade, "exit_time", None)
         entry_time = getattr(trade, "entry_time", None)
         ref_time = exit_time if exit_time is not None else entry_time
-        try:
-            if ref_time is None or ref_time.date() != today:
-                continue
-        except Exception:
+        if ref_time is None or ref_time.date() != today:
             continue
-        try:
-            out.append({
-                "symbol": key,
-                "side": str(getattr(trade, "side", "") or ""),
-                "qty": int(getattr(trade, "qty", 0) or 0),
-                "entry_price": safe_float(getattr(trade, "entry_price", None)),
-                "exit_price": safe_float(getattr(trade, "exit_price", None)),
-                "entry_time": entry_time.isoformat() if entry_time is not None else None,
-                "exit_time": exit_time.isoformat() if exit_time is not None else None,
-                "realized_pnl": safe_float(getattr(trade, "realized_pnl", None)),
-                "return_pct": safe_float(getattr(trade, "return_pct", None)),
-                "reason": str(getattr(trade, "reason", "") or ""),
-            })
-        except Exception:
-            continue
+        out.append({
+            "symbol": key,
+            "side": str(getattr(trade, "side", "") or ""),
+            "qty": int(getattr(trade, "qty", 0) or 0),
+            "entry_price": safe_float(getattr(trade, "entry_price", None)),
+            "exit_price": safe_float(getattr(trade, "exit_price", None)),
+            "entry_time": entry_time.isoformat() if entry_time is not None else None,
+            "exit_time": exit_time.isoformat() if exit_time is not None else None,
+            "realized_pnl": safe_float(getattr(trade, "realized_pnl", None)),
+            "return_pct": safe_float(getattr(trade, "return_pct", None)),
+            "reason": str(getattr(trade, "reason", "") or ""),
+        })
         if len(out) >= 12:
             break
     return out
@@ -577,33 +560,18 @@ class DashboardCache:
     # ---------------------------------------------------------------------
 
     def chart_profile(self, mode: str = "compact") -> DashboardChartConfig:
-        cfg = getattr(self.config.dashboard, "charting", None)
-        if isinstance(cfg, DashboardChartingConfig):
-            return cfg.resolved_profile(mode)
-        return DashboardChartConfig()
+        return self.config.dashboard.charting.resolved_profile(mode)
 
     def chart_max_bars(self, mode: str = "compact") -> int:
-        profile = self.chart_profile(mode)
-        fallback_profile = DashboardChartingConfig().resolved_profile(mode)
-        fallback_max_bars = int(getattr(fallback_profile, "max_bars", 90) or 90)
-        try:
-            return max(1, min(int(getattr(profile, "max_bars", fallback_max_bars) or fallback_max_bars), 480))
-        except Exception:
-            return fallback_max_bars
+        # An int in [1, 480], checked at load.
+        return self.chart_profile(mode).max_bars
 
     def snapshot_max_bars(self) -> int:
-        try:
-            return max(12, min(self.chart_max_bars("compact"), 48))
-        except Exception:
-            return 48
+        return max(12, min(self.chart_max_bars("compact"), 48))
 
     def charting_settings(self) -> dict[str, Any]:
-        charting_cfg = getattr(self.config.dashboard, "charting", None)
-        compact_timeframe = "ltf"
-        if isinstance(charting_cfg, DashboardChartingConfig):
-            compact_timeframe = charting_cfg.normalized_compact_chart_timeframe()
         return {
-            "compact_chart_timeframe": compact_timeframe,
+            "compact_chart_timeframe": self.config.dashboard.charting.compact_chart_timeframe,
             "compact": asdict(self.chart_profile("compact")),
             "expanded": asdict(self.chart_profile("expanded")),
         }
@@ -617,10 +585,7 @@ class DashboardCache:
         limit = max(1, int(self.config.tradingview.max_candidates))
         if strategy is None:
             return limit
-        try:
-            return max(1, int(strategy.dashboard_candidate_limit(limit)))
-        except Exception:
-            return limit
+        return max(1, int(strategy.dashboard_candidate_limit(limit)))
 
     # ---------------------------------------------------------------------
     # Payload builders that need data/strategy/account (Phase 5 Step 5).
@@ -752,14 +717,10 @@ class DashboardCache:
         }
 
     def symbol_price(self, symbol: str) -> float | None:
-        quote = self.data.get_quote(symbol) or {} if self.data is not None else {}
-        for key in ("last", "mark", "mid", "close", "bid", "ask"):
-            value = quote.get(key)
-            try:
-                if value is not None and float(value) > 0:
-                    return float(value)
-            except Exception:
-                continue
+        quote = self.data.get_quote(symbol) if self.data is not None else None
+        price = first_float(quote, "last", "mark", "mid", "close", "bid", "ask", positive=True)
+        if price is not None:
+            return price
         if self.data is not None:
             try:
                 frame = self.data.get_merged(symbol, with_indicators=False)
@@ -773,10 +734,7 @@ class DashboardCache:
         if self.account is not None:
             cached = getattr(self.account, "last_prices", {}).get(symbol)
             if cached is not None:
-                try:
-                    return float(cached)
-                except Exception:
-                    return None
+                return float(cached)
         return None
 
     def symbol_snapshot(
@@ -854,20 +812,17 @@ class DashboardCache:
         latest_bar: dict[str, Any] = bars[-1] if bars else {}
         session_total_volume: float | None = None
         if frame is not None and not frame.empty:
-            try:
-                if isinstance(frame.index, pd.DatetimeIndex) and "volume" in frame.columns:
-                    session_index = pd.DatetimeIndex(frame.index)
-                    session_anchor = pd.Timestamp(session_index[-1]).normalize()
-                    same_session_mask = session_index.normalize() == session_anchor
-                    if bool(getattr(same_session_mask, "any", lambda: False)()):
-                        session_volume_values = frame.loc[same_session_mask, "volume"]
-                        session_volume_series = pd.Series(session_volume_values, copy=False)
-                        session_volume_numeric_values = pd.to_numeric(session_volume_series, errors="coerce")
-                        session_volume_numeric = pd.Series(session_volume_numeric_values, copy=False)
-                        session_volume = session_volume_numeric.fillna(0.0).sum()
-                        session_total_volume = safe_float(session_volume)
-            except Exception:
-                session_total_volume = None
+            if isinstance(frame.index, pd.DatetimeIndex) and "volume" in frame.columns:
+                session_index = pd.DatetimeIndex(frame.index)
+                session_anchor = pd.Timestamp(session_index[-1]).normalize()
+                same_session_mask = session_index.normalize() == session_anchor
+                if bool(getattr(same_session_mask, "any", lambda: False)()):
+                    session_volume_values = frame.loc[same_session_mask, "volume"]
+                    session_volume_series = pd.Series(session_volume_values, copy=False)
+                    session_volume_numeric_values = pd.to_numeric(session_volume_series, errors="coerce")
+                    session_volume_numeric = pd.Series(session_volume_numeric_values, copy=False)
+                    session_volume = session_volume_numeric.fillna(0.0).sum()
+                    session_total_volume = safe_float(session_volume)
 
         quote_last = safe_float(quote.get("last")) if quote_is_fresh else None
         quote_bid = safe_float(quote.get("bid")) if quote_is_fresh else None
@@ -1185,6 +1140,11 @@ class DashboardCache:
                             payload_fvg["timeframe"] = f"{htf_tf_minutes}m"
                             htf_fair_value_gaps.append(payload_fvg)
         except Exception:
+            self.log_component_failure(
+                "htf_fair_value_gaps_collect",
+                "Dashboard HTF context / fair value gaps collect failed for %s",
+                symbol,
+            )
             htf_fair_value_gaps = []
             htf_ctx = None
 
@@ -1215,6 +1175,11 @@ class DashboardCache:
                             payload_fvg["anchor_abs_index"] = dashboard_fvg_anchor_abs_index(anchor_frame, payload_fvg.get("first_seen"))
                             ltf_fair_value_gaps.append(payload_fvg)
         except Exception:
+            self.log_component_failure(
+                "ltf_fair_value_gaps_collect",
+                "Dashboard LTF fair value gaps collect failed for %s",
+                symbol,
+            )
             ltf_fair_value_gaps = []
 
         # Order blocks. Same payload shape as FVGs (lower/upper/midpoint/size/
@@ -1225,7 +1190,7 @@ class DashboardCache:
         # Pull tuning knobs once for both blocks below.
         sr_cfg = getattr(self.config, "support_resistance", None)
         ob_kwargs = dict(
-            mode=str(getattr(sr_cfg, "order_block_mode", "loose") or "loose"),
+            mode=sr_cfg.order_block_mode,  # loose / strict, checked at load (config._CHOICES)
             max_per_side=int(getattr(sr_cfg, "order_block_max_per_side", 4) or 4),
             min_block_atr_mult=float(getattr(sr_cfg, "order_block_min_atr_mult", 0.05) or 0.05),
             min_block_pct=float(getattr(sr_cfg, "order_block_min_pct", 0.0005) or 0.0005),
@@ -1253,7 +1218,7 @@ class DashboardCache:
                     if payload_ob is not None:
                         payload_ob["timeframe"] = f"{int(htf_minutes)}m"
                         payload_ob["kind"] = "ob"
-                        payload_ob["mode"] = str(getattr(ob_ctx_htf, "mode", "loose") or "loose")
+                        payload_ob["mode"] = ob_ctx_htf.mode
                         htf_order_blocks.append(payload_ob)
         except Exception:
             self.log_component_failure(
@@ -1289,7 +1254,7 @@ class DashboardCache:
                     if payload_ob is not None:
                         payload_ob["timeframe"] = f"{ltf_min_for_ob}m"
                         payload_ob["kind"] = "ob"
-                        payload_ob["mode"] = str(getattr(ob_ctx_ltf, "mode", "loose") or "loose")
+                        payload_ob["mode"] = ob_ctx_ltf.mode
                         payload_ob["anchor_abs_index"] = dashboard_fvg_anchor_abs_index(ltf_frame, payload_ob.get("first_seen"))
                         ltf_order_blocks.append(payload_ob)
         except Exception:
@@ -1490,8 +1455,12 @@ class DashboardCache:
         lookback_days = max(1, int(level_ctx.get("lookback_days", 60) or 60))
         pivot_span = max(1, int(level_ctx.get("pivot_span", 2) or 2))
         max_lvls = max(1, int(level_ctx.get("max_levels_per_side", 6) or 6))
-        atr_tol = float(level_ctx.get("atr_tolerance_mult", 0.35) or 0.35)
-        pct_tol = float(level_ctx.get("pct_tolerance", 0.0030) or 0.0030)
+        # The spec's tolerances as it gives them (support_resistance's, checked
+        # at load, unless the strategy declares htf_* ones), as
+        # _chart_htf_level_request reads them; support_resistance's for a
+        # spec without them. A 0 read as 0.35 / 0.003 until 2026-09-26.
+        atr_tol = float(level_ctx.get("atr_tolerance_mult", self.config.support_resistance.atr_tolerance_mult))
+        pct_tol = float(level_ctx.get("pct_tolerance", self.config.support_resistance.pct_tolerance))
         stop_atr = float(level_ctx.get("stop_buffer_atr_mult", 0.25) or 0.25)
         ema_fast_span = max(1, int(level_ctx.get("ema_fast_span", 50) or 50))
         ema_slow_span = max(1, int(level_ctx.get("ema_slow_span", 200) or 200))
@@ -1550,32 +1519,34 @@ class DashboardCache:
         selected_zone_match_tolerance = max(float(base_zone_half_width) * 0.75, float(close) * float(tolerance_pct) * 0.5, 0.01)
 
         try:
-            if strategy_obj is not None:
-                if not ltf.empty:
-                    overlay_long = strategy_obj.dashboard_overlay_candidates(Side.LONG, float(close), ltf, htf)
-                    overlay_short = strategy_obj.dashboard_overlay_candidates(Side.SHORT, float(close), ltf, htf)
-                    if overlay_long is not None:
-                        long_candidates = list(overlay_long or [])
-                    else:
-                        long_candidates = list(strategy_obj.dashboard_candidate_levels(float(close), htf, Side.LONG) or [])
-                    if overlay_short is not None:
-                        short_candidates = list(overlay_short or [])
-                    else:
-                        short_candidates = list(strategy_obj.dashboard_candidate_levels(float(close), htf, Side.SHORT) or [])
-                    selected_long = strategy_obj.dashboard_select_level(Side.LONG, float(close), ltf, htf)
-                    selected_short = strategy_obj.dashboard_select_level(Side.SHORT, float(close), ltf, htf)
-                    selected_long_price = safe_float((selected_long or {}).get("price")) if isinstance(selected_long, dict) else None
-                    selected_short_price = safe_float((selected_short or {}).get("price")) if isinstance(selected_short, dict) else None
+            if not ltf.empty:
+                overlay_long = strategy_obj.dashboard_overlay_candidates(Side.LONG, float(close), ltf, htf)
+                overlay_short = strategy_obj.dashboard_overlay_candidates(Side.SHORT, float(close), ltf, htf)
+                if overlay_long is not None:
+                    long_candidates = list(overlay_long or [])
                 else:
                     long_candidates = list(strategy_obj.dashboard_candidate_levels(float(close), htf, Side.LONG) or [])
+                if overlay_short is not None:
+                    short_candidates = list(overlay_short or [])
+                else:
                     short_candidates = list(strategy_obj.dashboard_candidate_levels(float(close), htf, Side.SHORT) or [])
+                selected_long = strategy_obj.dashboard_select_level(Side.LONG, float(close), ltf, htf)
+                selected_short = strategy_obj.dashboard_select_level(Side.SHORT, float(close), ltf, htf)
+                selected_long_price = safe_float((selected_long or {}).get("price")) if isinstance(selected_long, dict) else None
+                selected_short_price = safe_float((selected_short or {}).get("price")) if isinstance(selected_short, dict) else None
+            else:
+                long_candidates = list(strategy_obj.dashboard_candidate_levels(float(close), htf, Side.LONG) or [])
+                short_candidates = list(strategy_obj.dashboard_candidate_levels(float(close), htf, Side.SHORT) or [])
         except Exception:
+            # The strategy's own level hooks: a failure draws no zones and
+            # marks no level for entry, so it must show in the log.
+            self.log_component_failure("level_zone_candidates", "Level-zone candidate hooks failed for %s", symbol)
             long_candidates = []
             short_candidates = []
             selected_long_price = None
             selected_short_price = None
 
-        allow_level_fallback = bool(getattr(strategy_obj, "dashboard_allow_generic_level_fallback", lambda: False)())
+        allow_level_fallback = bool(strategy_obj.dashboard_allow_generic_level_fallback())
         if allow_level_fallback and not long_candidates and support_anchors:
             long_candidates = [
                 {"kind": kind_name, "price": price, "touches": 1, "level_score": 0.0, "source_priority": 0.0, "builder_flip_confirmed": flip_confirmed}
@@ -1593,12 +1564,10 @@ class DashboardCache:
                 return None
             zone_kind = "support" if side == Side.LONG else "resistance"
             try:
-                if strategy_obj is not None:
-                    zone_width_override = strategy_obj.dashboard_zone_width_for_level(side, float(close), float(atr), float(price), htf, candidate)
-                    zone_half_width = float(zone_width_override) if zone_width_override is not None else float(base_zone_half_width)
-                else:
-                    zone_half_width = float(base_zone_half_width)
+                zone_width_override = strategy_obj.dashboard_zone_width_for_level(side, float(close), float(atr), float(price), htf, candidate)
+                zone_half_width = float(zone_width_override) if zone_width_override is not None else float(base_zone_half_width)
             except Exception:
+                self.log_component_failure("level_zone_width", "Level-zone width hook failed for %s", symbol)
                 zone_half_width = float(base_zone_half_width)
             zone_half_width = max(float(zone_half_width), 0.01)
             raw_lower = safe_float(candidate.get("zone_lower"))
@@ -1648,11 +1617,8 @@ class DashboardCache:
         zone_flip_1m, zone_flip_5m = self.config.support_resistance.flip_confirmation_bars()
         fallback_bar = None
         if frame is not None and not frame.empty:
-            try:
-                last_bar = frame.iloc[-1]
-                fallback_bar = (float(last_bar.get("high")), float(last_bar.get("low")))
-            except Exception:
-                fallback_bar = None
+            last_bar = frame.iloc[-1]
+            fallback_bar = (float(last_bar.get("high")), float(last_bar.get("low")))
         zone_eps = max(abs(float(close)) * 1e-6, 1e-8)
 
         def _zone_level_kind(zone: dict[str, Any]) -> str:
@@ -1760,10 +1726,7 @@ class DashboardCache:
         def _collapse_duplicate_zones(zones: list[dict[str, Any]]) -> list[dict[str, Any]]:
             collapsed: dict[tuple[str, float], dict[str, Any]] = {}
             for zone in zones:
-                try:
-                    key = (str(zone.get("kind", "") or ""), round(float(zone.get("price", 0.0) or 0.0), 6))
-                except Exception:
-                    continue
+                key = (str(zone.get("kind", "") or ""), round(float(zone.get("price", 0.0) or 0.0), 6))
                 existing = collapsed.get(key)
                 if existing is None:
                     collapsed[key] = zone
@@ -1907,12 +1870,9 @@ class DashboardCache:
         if ctx is None:
             return None
         display_price: float | None = None
-        try:
-            candidate_price = current_price if current_price is not None else getattr(ctx, "current_price", None)
-            if candidate_price is not None and float(candidate_price) > 0:
-                display_price = float(candidate_price)
-        except Exception:
-            display_price = None
+        candidate_price = current_price if current_price is not None else getattr(ctx, "current_price", None)
+        if candidate_price is not None and float(candidate_price) > 0:
+            display_price = float(candidate_price)
         state = "neutral"
 
         def _level_price(level: Any) -> float | None:
@@ -1940,8 +1900,8 @@ class DashboardCache:
                         lookback_days=self._active_htf_lookback_days(),
                         pivot_span=int(getattr(sr_cfg, "pivot_span", 2) or 2),
                         max_levels_per_side=int(getattr(sr_cfg, "max_levels_per_side", 3) or 3),
-                        atr_tolerance_mult=float(getattr(sr_cfg, "atr_tolerance_mult", 0.60) or 0.60),
-                        pct_tolerance=float(getattr(sr_cfg, "pct_tolerance", 0.0030) or 0.0030),
+                        atr_tolerance_mult=float(sr_cfg.atr_tolerance_mult),  # checked at load (above 0)
+                        pct_tolerance=float(sr_cfg.pct_tolerance),
                         stop_buffer_atr_mult=float(getattr(sr_cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
                         ema_fast_span=50,
                         ema_slow_span=200,
@@ -2050,13 +2010,10 @@ class DashboardCache:
         cached snapshot can be returned or must be recomputed."""
         if not allow_refresh:
             return False
-        try:
-            sr_tf = self._active_htf_minutes()
-            if self.data.should_refresh_support_resistance(symbol, timeframe_minutes=sr_tf):
-                return True
-            if self.data.should_refresh_htf_context(symbol, sr_tf):
-                return True
-        except Exception:
+        sr_tf = self._active_htf_minutes()
+        if self.data.should_refresh_support_resistance(symbol, timeframe_minutes=sr_tf):
+            return True
+        if self.data.should_refresh_htf_context(symbol, sr_tf):
             return True
         return False
 
@@ -2151,6 +2108,7 @@ class DashboardCache:
                     bearish_allowed=self.config.candles.bearish_patterns,
                 )
         except Exception:
+            self.log_component_failure("candle_context", "Dashboard candle context failed")
             candle_ctx = detect_candle_context(pd.DataFrame())
         payload["candles_bullish"] = list(candle_ctx.get("matched_bullish_candles", []))
         payload["candles_bearish"] = list(candle_ctx.get("matched_bearish_candles", []))
@@ -2242,7 +2200,7 @@ class DashboardCache:
                 if is_ltf_chart
                 else int(getattr(sr_cfg, "pivot_span", 2) or 2)
             )
-            overlay_pct_tolerance = float(getattr(sr_cfg, "pct_tolerance", 0.0030) or 0.0030)
+            overlay_pct_tolerance = float(sr_cfg.pct_tolerance)  # checked at load (above 0)
             if is_ltf_chart:
                 overlay_pct_tolerance *= 0.60
             overlay_gap_bars = (
@@ -2539,41 +2497,23 @@ class DashboardCache:
         return payload
 
     def tradable_symbols(self) -> list[str]:
-        strategy_obj = self.strategy
-        if strategy_obj is not None:
-            try:
-                return normalize_symbol_list(strategy_obj.dashboard_tradable_symbols())
-            except Exception:
-                pass
-        params = getattr(strategy_obj, "params", {}) or {}
-        raw_symbols = None
-        if isinstance(params, dict):
-            raw_symbols = params.get("tradable")
-            if raw_symbols is None:
-                raw_symbols = params.get("symbols")
-        return normalize_symbol_list(raw_symbols)
+        """The strategy's ``dashboard_tradable_symbols``. Until 2026-09-26 a
+        copy of that hook's params read sat behind a silent ``except
+        Exception``; the hook cannot raise on any params, so the copy never
+        ran for a real strategy."""
+        if self.strategy is None:
+            return []
+        return normalize_symbol_list(self.strategy.dashboard_tradable_symbols())
 
     def index_symbols(self) -> list[str]:
-        """Index ETFs used for directional confirmation (top_tier_adaptive's
-        ``index_symbols`` + sector_index_map entries). Surfaced to the
-        dashboard payload so watchlist cards can render an "IX" tag for
-        these symbols (mirrors the "TR"/"NS" tagging for tradable /
-        non-streamable)."""
-        strategy_obj = self.strategy
-        if strategy_obj is not None:
-            try:
-                return normalize_symbol_list(strategy_obj.dashboard_index_symbols())
-            except Exception:
-                pass
-        params = getattr(strategy_obj, "params", {}) or {}
-        if not isinstance(params, dict):
+        """Index ETFs used for directional confirmation, as the strategy's
+        ``dashboard_index_symbols`` reports them (``index_symbols`` +
+        ``sector_index_map`` entries). Surfaced to the dashboard payload so
+        watchlist cards can render an "IX" tag for these symbols (mirrors
+        the "TR"/"NS" tagging for tradable / non-streamable). Until
+        2026-09-26 a copy of that hook's union sat behind a silent
+        ``except Exception``; the hook cannot raise on any params, so the
+        copy never ran for a real strategy."""
+        if self.strategy is None:
             return []
-        merged: set[str] = set()
-        raw_index = params.get("index_symbols")
-        if raw_index:
-            merged.update(normalize_symbol_list(raw_index))
-        sector_map = params.get("sector_index_map")
-        if isinstance(sector_map, dict):
-            for tickers in sector_map.values():
-                merged.update(normalize_symbol_list(tickers))
-        return sorted(merged)
+        return normalize_symbol_list(self.strategy.dashboard_index_symbols())

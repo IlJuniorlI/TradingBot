@@ -253,11 +253,11 @@ a fill worse than the limit risks more than the sizing assumed — and nothing
 recomputed it. The equity path has reconciled this since 2026-09-18 via
 `realized_entry_risk`; options had no counterpart.
 
-It matters most in **dry runs**, the mode the strategy is tuned from:
-`submit_option_vertical` passes `allow_natural_fill=True` so the reprice loop can
-reach the natural price, deliberately modelling a chase. Sweeping the shipped
-gates over 60,000 quote pairs found a worst case of 20 contracts booked at $25 of
-max loss each that actually risked $38.79 each — **$776 against a $500 budget**.
+It matters most in **dry runs**, the mode the strategy is tuned from: the dry-run
+reprice loop behind `submit_option_vertical` always ends on the natural price,
+deliberately modelling a chase. Sweeping the shipped gates over 60,000 quote
+pairs found a worst case of 20 contracts booked at $25 of max loss each that
+actually risked $38.79 each — **$776 against a $500 budget**.
 
 In live trading a limit order cannot fill worse than its limit, so this is
 primarily a measurement problem rather than a capital one. That is exactly why it

@@ -455,17 +455,11 @@ class MarketDataStore:
     ) -> datetime | None:
         if cached_frame is None or cached_frame.empty:
             return None
-        try:
-            last_idx = pd.Timestamp(cached_frame.index.max())
-        except Exception:
-            return None
+        # The stored frame's index is ET-aware: _history_candles_to_frame
+        # converts every stamp.
+        last_idx = pd.Timestamp(cached_frame.index.max())
         if pd.isna(last_idx):
             return None
-        if last_idx.tzinfo is None:
-            try:
-                last_idx = last_idx.tz_localize(end.tzinfo)
-            except Exception:
-                return None
         overlap_minutes = max(base_frequency_minutes * 4, 240)
         overlap_days = max(2, int(math.ceil(overlap_minutes / 1440.0)))
         recent_window_days = min(max(lookback_days, 5), max(7, overlap_days))
@@ -568,13 +562,15 @@ class MarketDataStore:
         merged = self.get_merged(symbol, with_indicators=False)
         if merged is not None and not merged.empty:
             current = float(merged.iloc[-1].close)
-        sr_cfg = getattr(self.config, "support_resistance", None)
+        sr_cfg = self.config.support_resistance
         ctx = build_htf_context(
             frame,
             current_price=current,
             timeframe_minutes=int(timeframe_minutes),
-            same_side_min_gap_atr_mult=float(getattr(sr_cfg, "same_side_min_gap_atr_mult", 0.10) or 0.10),
-            same_side_min_gap_pct=float(getattr(sr_cfg, "same_side_min_gap_pct", 0.0015) or 0.0015),
+            # Checked at load (above 0); a 0 read as 0.10 / 0.0015 until
+            # 2026-09-26.
+            same_side_min_gap_atr_mult=float(sr_cfg.same_side_min_gap_atr_mult),
+            same_side_min_gap_pct=float(sr_cfg.same_side_min_gap_pct),
             fallback_reference_max_drift_atr_mult=float(getattr(sr_cfg, "fallback_reference_max_drift_atr_mult", 1.0) or 1.0),
             fallback_reference_max_drift_pct=float(getattr(sr_cfg, "fallback_reference_max_drift_pct", 0.01) or 0.01),
             as_of=as_of,
@@ -817,7 +813,7 @@ class MarketDataStore:
             self._symbol_key(symbol),
             int(timeframe_minutes),
             None if current_price is None else round(float(current_price), 8),
-            str(mode or "loose").strip().lower() or "loose",
+            mode,
             int(max_per_side),
             round(float(min_block_atr_mult), 6),
             round(float(min_block_pct), 6),
@@ -839,7 +835,7 @@ class MarketDataStore:
             ctx = empty_order_block_context(
                 float(current_price or 0.0),
                 timeframe_minutes=tf,
-                mode=str(mode or "loose"),
+                mode=mode,
             )
         else:
             close = float(current_price if current_price is not None else merged.iloc[-1].get("close", 0.0) or 0.0)
@@ -847,7 +843,7 @@ class MarketDataStore:
                 merged,
                 timeframe_minutes=tf,
                 current_price=close,
-                mode=str(mode or "loose"),
+                mode=mode,
                 max_per_side=max(0, int(max_per_side or 0)),
                 min_block_atr_mult=float(min_block_atr_mult),
                 min_block_pct=float(min_block_pct),
@@ -948,11 +944,7 @@ class MarketDataStore:
         for frame in (history_frame, live_frame):
             if frame is None or getattr(frame, "empty", True):
                 continue
-            try:
-                last_idx = frame.index[-1]
-            except Exception:
-                continue
-            candidates.append(pd.Timestamp(last_idx))
+            candidates.append(pd.Timestamp(frame.index[-1]))
         if not candidates:
             return None
         latest = max(candidates)
@@ -1157,7 +1149,9 @@ class MarketDataStore:
         rolls. Returns ``None`` on a failed or empty fetch; the caller must
         treat that as "no stats available" rather than substituting a
         default. A failure is cached for the day too, so a delisted or
-        mis-typed symbol does not retry on every cycle.
+        mis-typed symbol does not retry on every cycle. A payload whose
+        candles do not read is a failed fetch; until 2026-09-26 its error
+        escaped uncached, so the fetch was retried every cycle.
         """
         key = self._symbol_key(symbol)
         today = sessions.now_et().date()
@@ -1178,13 +1172,13 @@ class MarketDataStore:
                 needExtendedHoursData=False,
                 needPreviousClose=False,
             )
+            frame = self._history_candles_to_frame(payload.get("candles", []))
         except Exception:
             LOG.warning("Daily price_history fetch failed for %s; daily stats unavailable today.", symbol, exc_info=True)
             with self._lock:
                 self.daily_history[key] = None
                 self.last_daily_refresh[key] = today
             return None
-        frame = self._history_candles_to_frame(payload.get("candles", []))
         if frame.empty:
             LOG.warning("Daily price_history returned no candles for %s (via %s).", symbol, source_symbol)
             frame_or_none = None
@@ -1216,8 +1210,8 @@ class MarketDataStore:
             lookback_days=int(lookback_days or getattr(cfg, "lookback_days", 10) or 10),
             pivot_span=int(getattr(cfg, "pivot_span", 2) or 2),
             max_levels_per_side=int(getattr(cfg, "max_levels_per_side", 3) or 3),
-            atr_tolerance_mult=float(getattr(cfg, "atr_tolerance_mult", 0.60) or 0.60),
-            pct_tolerance=float(getattr(cfg, "pct_tolerance", 0.0030) or 0.0030),
+            atr_tolerance_mult=float(cfg.atr_tolerance_mult),
+            pct_tolerance=float(cfg.pct_tolerance),
             stop_buffer_atr_mult=float(getattr(cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
             allow_refresh=allow_refresh,
         )
@@ -1249,8 +1243,8 @@ class MarketDataStore:
             max_levels_per_side=int(cfg.max_levels_per_side),
             atr_tolerance_mult=float(cfg.atr_tolerance_mult),
             pct_tolerance=float(cfg.pct_tolerance),
-            same_side_min_gap_atr_mult=float(getattr(cfg, "same_side_min_gap_atr_mult", 0.10) or 0.10),
-            same_side_min_gap_pct=float(getattr(cfg, "same_side_min_gap_pct", 0.0015) or 0.0015),
+            same_side_min_gap_atr_mult=float(cfg.same_side_min_gap_atr_mult),
+            same_side_min_gap_pct=float(cfg.same_side_min_gap_pct),
             fallback_reference_max_drift_atr_mult=float(getattr(cfg, "fallback_reference_max_drift_atr_mult", 1.0) or 1.0),
             fallback_reference_max_drift_pct=float(getattr(cfg, "fallback_reference_max_drift_pct", 0.01) or 0.01),
             proximity_atr_mult=float(cfg.proximity_atr_mult),
@@ -1308,8 +1302,8 @@ class MarketDataStore:
             lookback_days=int(lookback_days or getattr(cfg, "lookback_days", 10) or 10),
             pivot_span=int(getattr(cfg, "pivot_span", 2) or 2),
             max_levels_per_side=int(getattr(cfg, "max_levels_per_side", 3) or 3),
-            atr_tolerance_mult=float(getattr(cfg, "atr_tolerance_mult", 0.60) or 0.60),
-            pct_tolerance=float(getattr(cfg, "pct_tolerance", 0.0030) or 0.0030),
+            atr_tolerance_mult=float(cfg.atr_tolerance_mult),
+            pct_tolerance=float(cfg.pct_tolerance),
             stop_buffer_atr_mult=float(getattr(cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
             allow_refresh=allow_refresh,
         )
@@ -1335,8 +1329,8 @@ class MarketDataStore:
             max_levels_per_side=int(cfg.max_levels_per_side),
             atr_tolerance_mult=float(cfg.atr_tolerance_mult),
             pct_tolerance=float(cfg.pct_tolerance),
-            same_side_min_gap_atr_mult=float(getattr(cfg, "same_side_min_gap_atr_mult", 0.10) or 0.10),
-            same_side_min_gap_pct=float(getattr(cfg, "same_side_min_gap_pct", 0.0015) or 0.0015),
+            same_side_min_gap_atr_mult=float(cfg.same_side_min_gap_atr_mult),
+            same_side_min_gap_pct=float(cfg.same_side_min_gap_pct),
             fallback_reference_max_drift_atr_mult=float(getattr(cfg, "fallback_reference_max_drift_atr_mult", 1.0) or 1.0),
             fallback_reference_max_drift_pct=float(getattr(cfg, "fallback_reference_max_drift_pct", 0.01) or 0.01),
             proximity_atr_mult=float(cfg.proximity_atr_mult),
@@ -1382,11 +1376,9 @@ class MarketDataStore:
         # `runtime.max_consecutive_quote_failures` consecutive quote-fetch
         # failures (typically symbol-specific Schwab 401/403/404 such as
         # restricted-security responses), skip it silently for the rest
-        # of the session. Recovers on bot restart.
-        try:
-            failure_threshold = max(0, int(getattr(self.config.runtime, "max_consecutive_quote_failures", 5) or 0))
-        except Exception:
-            failure_threshold = 5
+        # of the session. Recovers on bot restart. The count is validated
+        # at load (an integer >= 0; 0 turns the gate off).
+        failure_threshold = self.config.runtime.max_consecutive_quote_failures
         if failure_threshold > 0 and self._quote_blacklist:
             symbols = [s for s in symbols if s not in self._quote_blacklist]
             if not symbols:
@@ -1410,11 +1402,8 @@ class MarketDataStore:
                     sym, failure_threshold, exc,
                 )
 
-        try:
-            configured = int(getattr(self.config.runtime, "cycle_precompute_workers", 4) or 4)
-        except Exception:
-            configured = 4
-        workers = min(max(1, configured), len(symbols))
+        # Validated at load: an integer >= 1.
+        workers = min(self.config.runtime.cycle_precompute_workers, len(symbols))
         if workers < 2:
             for sym in symbols:
                 try:
@@ -1590,10 +1579,7 @@ class MarketDataStore:
                     response = call_schwab_client(self.client, method_name, arg)
                     if not response_ok(response):
                         status_code = getattr(response, "status_code", None)
-                        try:
-                            body_preview = str(getattr(response, "text", "") or "")[:240]
-                        except Exception:
-                            body_preview = ""
+                        body_preview = str(getattr(response, "text", "") or "")[:240]
                         loud = not isinstance(status_code, int) or status_code in {401, 403, 404, 429} or status_code >= 500
                         log_fn = LOG.warning if loud else LOG.debug
                         log_fn(
@@ -1796,10 +1782,8 @@ class MarketDataStore:
             fetched_at = quote.get("fetched_at")
         if fetched_at is None:
             return None
-        try:
-            return max(0.0, (sessions.now_et() - fetched_at).total_seconds())
-        except Exception:
-            return None
+        # fetch_quotes stamps every cached quote with sessions.now_et().
+        return max(0.0, (sessions.now_et() - fetched_at).total_seconds())
 
     def quotes_are_fresh(self, symbols: Iterable[str], max_age_seconds: float) -> bool:
         # Single lock acquire + single sessions.now_et() call, plus early exit on first
@@ -1815,10 +1799,7 @@ class MarketDataStore:
                 fetched_at = quote.get("fetched_at")
                 if fetched_at is None:
                     return False
-                try:
-                    age = max(0.0, (current - fetched_at).total_seconds())
-                except Exception:
-                    return False
+                age = max(0.0, (current - fetched_at).total_seconds())
                 if age > limit:
                     return False
         return True

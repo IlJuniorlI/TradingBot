@@ -332,23 +332,19 @@ def _pending_level(
 def _completed_htf_frame(frame: pd.DataFrame, timeframe_minutes: int) -> pd.DataFrame:
     if frame is None or frame.empty:
         return pd.DataFrame(columns=getattr(frame, "columns", []))
-    try:
-        base = frame.copy()
-        base.index = datetime_index(base.index)
-        # "now" is the ET clock, read on a tz-naive index's ET wall clock
-        # (completed_bucket_mask). Until 2026-04 the tz-naive fallback used
-        # `pd.Timestamp.now()`, the SERVER's wall clock -- off by hours if the
-        # process isn't running on US Eastern.
-        # Every frame is labelled at bar START -- the broker's and
-        # `resample_bars`' alike -- so bar T is complete once its bucket has
-        # ended: T + tf, or the session boundary that cuts a 60m bar short
-        # (15:30 ends at 16:00). Not `T < now.floor(tf)`: that holds only for
-        # clock-aligned bars, and regular-session 60m bars start at XX:30.
-        tf = max(1, int(timeframe_minutes))
-        completed = base[completed_bucket_mask(base.index, tf, sessions.now_et())]
-        return completed if isinstance(completed, pd.DataFrame) else pd.DataFrame(columns=base.columns)
-    except Exception:
-        return frame.iloc[:-1].copy() if len(frame) > 1 else pd.DataFrame(columns=frame.columns)
+    base = frame.copy()
+    base.index = datetime_index(base.index)
+    # "now" is the ET clock, read on a tz-naive index's ET wall clock
+    # (completed_bucket_mask). Until 2026-04 the tz-naive fallback used
+    # `pd.Timestamp.now()`, the SERVER's wall clock -- off by hours if the
+    # process isn't running on US Eastern.
+    # Every frame is labelled at bar START -- the broker's and
+    # `resample_bars`' alike -- so bar T is complete once its bucket has
+    # ended: T + tf, or the session boundary that cuts a 60m bar short
+    # (15:30 ends at 16:00). Not `T < now.floor(tf)`: that holds only for
+    # clock-aligned bars, and regular-session 60m bars start at XX:30.
+    tf = max(1, int(timeframe_minutes))
+    return base[completed_bucket_mask(base.index, tf, sessions.now_et())]
 
 
 def _htf_flip_checker(
@@ -412,11 +408,10 @@ def _merge_fair_value_gaps(
     def _parsed_ts(value: str | None) -> pd.Timestamp | None:
         if not value:
             return None
-        try:
-            parsed = pd.Timestamp(value)
-            return parsed.tz_convert(None) if parsed.tzinfo is not None else parsed
-        except Exception:
-            return None
+        # The stamps are isoformat labels of _completed_htf_frame's
+        # DatetimeIndex (_detect_fair_value_gaps' _stamp).
+        parsed = pd.Timestamp(value)
+        return parsed.tz_convert(None) if parsed.tzinfo is not None else parsed
 
     ordered = sorted(gaps, key=lambda gap: (float(gap.lower), float(gap.upper)))
     merged: list[HTFFairValueGap] = []

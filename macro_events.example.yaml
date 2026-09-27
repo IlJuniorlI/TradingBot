@@ -9,6 +9,10 @@
 #   end: "HH:MM"
 #   block_new_entries: true|false
 #   force_flatten: true|false
+#   symbols: [TICKER, ...]      # only these tickers; every symbol without it
+#
+# Any other key stops the bot at startup (edited while it runs, the file's
+# rows last read are kept, with an ERROR).
 #
 # Keep this file updated from official calendars if you want hard macro blackouts.
 events:

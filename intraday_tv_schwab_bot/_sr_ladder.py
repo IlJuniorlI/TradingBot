@@ -34,12 +34,11 @@ LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
 
 def _same_side_ladder_min_gap_pct(config: BotConfig, reference_price: float | None) -> float:
-    try:
-        pct = float(getattr(getattr(config, 'support_resistance', None), 'same_side_min_gap_pct', 0.0015) or 0.0015)
-    except Exception:
-        pct = 0.0015
+    # support_resistance's tolerances are checked at load (finite numbers
+    # above 0, config._NUMBER_CHECKS) and read as they are.
+    pct = float(config.support_resistance.same_side_min_gap_pct)
     price = abs(float(reference_price or 0.0))
-    return max(price * max(pct, 0.0), 1e-4)
+    return max(price * pct, 1e-4)
 
 
 def _sr_effective_side_tolerance(config: BotConfig, reference_price: float | None, *, atr: float | None = None, sr_ctx: Any | None = None) -> float:
@@ -50,23 +49,14 @@ def _sr_effective_side_tolerance(config: BotConfig, reference_price: float | Non
                 return ctx_tol
     except Exception:
         LOG.debug("Failed to read side_tolerance from support/resistance context; using config fallback.", exc_info=True)
-    cfg = getattr(config, 'support_resistance', None)
-    try:
-        atr_tolerance_mult = float(getattr(cfg, 'atr_tolerance_mult', 0.60) or 0.60)
-    except Exception:
-        atr_tolerance_mult = 0.60
-    try:
-        pct_tolerance = float(getattr(cfg, 'pct_tolerance', 0.0030) or 0.0030)
-    except Exception:
-        pct_tolerance = 0.0030
-    try:
-        min_gap_atr_mult = float(getattr(cfg, 'same_side_min_gap_atr_mult', 0.10) or 0.10)
-    except Exception:
-        min_gap_atr_mult = 0.10
+    cfg = config.support_resistance
+    atr_tolerance_mult = float(cfg.atr_tolerance_mult)
+    pct_tolerance = float(cfg.pct_tolerance)
+    min_gap_atr_mult = float(cfg.same_side_min_gap_atr_mult)
     price = abs(float(reference_price or 0.0))
     atr_value = abs(float(atr or 0.0))
-    merge_tol = max(atr_value * max(atr_tolerance_mult, 0.0), price * max(pct_tolerance, 0.0))
-    same_side_gap = max(atr_value * max(min_gap_atr_mult, 0.0), _same_side_ladder_min_gap_pct(config, price))
+    merge_tol = max(atr_value * atr_tolerance_mult, price * pct_tolerance)
+    same_side_gap = max(atr_value * min_gap_atr_mult, _same_side_ladder_min_gap_pct(config, price))
     return max(merge_tol, same_side_gap, 1e-4)
 
 
@@ -78,10 +68,7 @@ def _select_next_distinct_level(levels: list[Any] | None, anchor_price: float | 
     tol = max(float(minimum_gap or 0.0), 1e-6)
     anchor = float(anchor_price)
     for level in levels:
-        try:
-            price = float(getattr(level, 'price', 0.0) or 0.0)
-        except Exception:
-            continue
+        price = float(level.price)
         if price <= 0:
             continue
         if above:

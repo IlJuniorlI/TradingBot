@@ -18,8 +18,11 @@
 #   --strategy <name>           override the strategy the config selects
 #   --config <path>             run another config (the last --config wins)
 # e.g. ./start_trading_bot.sh --config configs/config.small_cap_squeeze.yaml
+#
+# The bot takes over this script's process (exec), so `kill <pid>` of the
+# script is a stop signal to the bot, like Ctrl+C: it shuts down cleanly.
 # ======================================================================
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source .venv/bin/activate
-python main.py --config configs/config.yaml "$@"
+exec python main.py --config configs/config.yaml "$@"

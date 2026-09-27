@@ -5,7 +5,9 @@ with a symbol (stream it, quote it under an alias, build S/R on it).
 ``normalize_symbol_list`` is the one reading of a configured or collected
 symbol list: config's ``options.underlyings``, the strategies' watchlist and
 dashboard sources, the dashboard's tradable / index lists and the peer
-family's tradable / peer params all go through it."""
+family's tradable / peer params all go through it. ``ticker_quote_hint`` is
+the hint of every load check that refuses a ticker YAML read as a boolean or
+null."""
 from __future__ import annotations
 
 import re
@@ -82,20 +84,18 @@ def is_support_resistance_symbol(symbol: str) -> bool:
 def normalize_symbol_list_details(values: object) -> tuple[list[str], list[str]]:
     """Normalize an iterable-of-symbols input into (kept, skipped).
 
-    Accepts list/tuple/set or any iterable. Strings/bytes/dict/None are
-    treated as 'no input'. Tokens are uppercased + stripped + dedup'd.
+    Accepts list/tuple/set or any iterable. Strings/bytes/dict/None, and a
+    value that is not iterable (a YAML scalar such as ``5``), are treated as
+    'no input'. Tokens are uppercased + stripped + dedup'd.
     Empty/None/NULL/NAN tokens are routed to the skipped list with
-    placeholder labels (``<NONE>``, ``<EMPTY>``, etc.) for log clarity."""
-    if isinstance(values, (str, bytes, dict)) or values is None:
+    placeholder labels (``<NONE>``, ``<EMPTY>``, etc.) for log clarity.
+
+    An iterable that raises while it is read raises here. Until 2026-09-26
+    a broad except read any error from ``list(values)`` as no input."""
+    if isinstance(values, (str, bytes, dict)) or not isinstance(values, Iterable):
         raw_values: list[object] = []
-    elif isinstance(values, (list, tuple, set, frozenset)):
-        raw_values = list(values)
     else:
-        try:
-            iterable_values: Iterable[object] = values  # type: ignore[assignment]
-            raw_values = list(iterable_values)
-        except Exception:
-            raw_values = []
+        raw_values = list(values)
     out: list[str] = []
     skipped: list[str] = []
     seen: set[str] = set()
@@ -123,3 +123,14 @@ def normalize_symbol_list(values: object) -> list[str]:
     tokens are dropped silently)."""
     kept, _ = normalize_symbol_list_details(values)
     return kept
+
+
+def ticker_quote_hint(value: object) -> str:
+    """The hint for a ticker YAML read as a boolean or null (an unquoted
+    ``ON``, ON Semiconductor, is ``true``), for the messages that refuse a
+    ticker that is not a string: an event row's ``symbols``, an earnings
+    key and ``runtime.startup_reconcile_ignore_symbols``. Empty for any
+    other value."""
+    if value is None or isinstance(value, bool):
+        return " (YAML reads an unquoted ON, OFF, YES, NO, TRUE, FALSE or ~ as a boolean or null: quote the ticker)"
+    return ""

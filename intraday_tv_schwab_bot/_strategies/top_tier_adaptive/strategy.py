@@ -12,6 +12,7 @@ gating.
 """
 from __future__ import annotations
 
+import logging
 import math
 from collections import deque
 from datetime import datetime
@@ -29,6 +30,8 @@ from ... import sessions
 from ..shared_entry import EntryContexts, EntryProposal
 from ..strategy_base import BaseStrategy
 from ...daily_stats import SymbolDailyStats, build_symbol_stats, volatility_scale
+
+LOG = logging.getLogger(__name__)
 
 # Regime families. Several gates apply to one family and deliberately exempt
 # another, so the membership lives here once instead of being re-spelled at
@@ -467,15 +470,15 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         session_open, in percent) for *symbol*. Used by the relative-strength
         gate in entry_signals to compute how much the candidate is
         leading/lagging its sector. Returns ``None`` when no sector ETF
-        bars are loaded or all session-open lookups fail."""
+        bars are loaded or all session-open lookups fail. A frame that does
+        not read raises: the gate skips on ``None``, so until 2026-09-26,
+        when an error here was skipped as a missing frame, it let the entry
+        through."""
         for sym in self._indices_for_symbol(symbol):
             frame = bars.get(sym)
             if frame is None or frame.empty:
                 continue
-            try:
-                close = safe_float(frame.iloc[-1]["close"], 0.0)
-            except Exception:
-                continue
+            close = safe_float(frame.iloc[-1]["close"], 0.0)
             _, ds = self._compute_live_bias_and_day_strength(frame, close)
             if ds is not None:
                 return ds
@@ -498,7 +501,10 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         via ``MarketDataStore.get_daily_history``; everything after that is a
         dict lookup. Returns ``None`` when the feed is unavailable or the
         fetch failed — callers must gate on that explicitly instead of
-        assuming a default ADR or a beta of 1.0.
+        assuming a default ADR or a beta of 1.0. The feed reports a failed
+        fetch as ``None`` (logged, and cached for the day); anything it
+        raises is not a failed fetch and propagates. Until 2026-09-26 it was
+        read as one, which skipped the relative-strength gate in silence.
         """
         if data is None or not hasattr(data, "get_daily_history"):
             return None
@@ -510,10 +516,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         cached = self._daily_stats.get(key)
         if cached is not None:
             return cached
-        try:
-            symbol_daily = data.get_daily_history(key)
-        except Exception:
-            return None
+        symbol_daily = data.get_daily_history(key)
         if symbol_daily is None or symbol_daily.empty:
             return None
         benchmark = None
@@ -521,10 +524,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         indices = self._indices_for_symbol(key)
         if indices:
             benchmark = indices[0]
-            try:
-                benchmark_daily = data.get_daily_history(benchmark)
-            except Exception:
-                benchmark_daily = None
+            benchmark_daily = data.get_daily_history(benchmark)
             if benchmark_daily is None or benchmark_daily.empty:
                 benchmark_daily = None
         stats = build_symbol_stats(
@@ -847,17 +847,19 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         Mirror for SHORT. Uses ``iloc[-2]`` for the last closed bar (since
         ``iloc[-1]`` is the in-progress bar) and ``iloc[-3]`` for the prior
         closed bar. Returns ``True`` when not enough bars (don't block on
-        thin early-session data — other gates handle that case)."""
+        thin early-session data — other gates handle that case), and
+        ``False`` when a bar does not read: it confirms nothing. Until
+        2026-09-26 a read that raised returned ``True`` and a missing column
+        read as 0, which a LONG's close always beat."""
         if ltf is None or len(ltf) < 3:
             return True
-        try:
-            last_closed = ltf.iloc[-2]
-            prev_closed = ltf.iloc[-3]
-            last_open = float(last_closed.get("open", 0))
-            last_close = float(last_closed.get("close", 0))
-            prev_close = float(prev_closed.get("close", 0))
-        except (KeyError, ValueError, TypeError, IndexError):
-            return True
+        last_closed = ltf.iloc[-2]
+        prev_closed = ltf.iloc[-3]
+        last_open = safe_float(last_closed.get("open"))
+        last_close = safe_float(last_closed.get("close"))
+        prev_close = safe_float(prev_closed.get("close"))
+        if last_open is None or last_close is None or prev_close is None:
+            return False
         if side == Side.LONG:
             return last_close > last_open and last_close > prev_close
         return last_close < last_open and last_close < prev_close
@@ -1191,12 +1193,12 @@ class TopTierAdaptiveStrategy(BaseStrategy):
             required = box_low * (1.0 - buffer_pct)
             broke_out = last_close <= required
             decisive_break = last_close <= box_low * (1.0 - 2.0 * buffer_pct)
-        try:
-            vol_baseline = max(1.0, float(box["volume"].median()))
-        except Exception:
-            vol_baseline = 1.0
+        # A box volume that does not read fails the volume gate. Until
+        # 2026-09-26 an error here, and a NaN median (max(1.0, nan) is 1.0),
+        # made the baseline 1 share, which any bar's volume cleared.
+        vol_median = safe_float(box["volume"].median())
         cur_vol = safe_float(last.get("volume"), 0.0)
-        vol_ratio = (cur_vol / vol_baseline) if vol_baseline > 0.0 else 0.0
+        vol_ratio = cur_vol / max(1.0, vol_median) if vol_median is not None else 0.0
         min_vol_ratio = float(self.params.get("vol_squeeze_min_breakout_volume_ratio", 1.12))
         close_pos = bar_close_position(session_frame)
         min_close_pos = float(self.params.get("vol_squeeze_min_bar_close_position", 0.63))
@@ -2383,29 +2385,30 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         ``minutes_since_extreme`` is estimated as ``bars_since_extreme *
         ltf_minutes`` (the LTF bar grid is uniform within the session)
         which avoids per-bar timestamp arithmetic.
+
+        A session whose highs / lows do not read raises: both maturity
+        checks skip on ``(None, None)``, so until 2026-09-26, when a read
+        error returned it, the error let the pullback through.
         """
         if session_ltf is None or session_ltf.empty:
             return None, None
         n = len(session_ltf)
         if n < 2:
             return None, None
-        try:
-            if side == Side.LONG:
-                high_values = session_ltf["high"].values
-                extreme_pos = int(high_values.argmax())
-                extreme_value = float(high_values[extreme_pos])
-                anchor = float(session_ltf["low"].iloc[: extreme_pos + 1].min())
-                leg_size = extreme_value - anchor
-                retrace = extreme_value - current_close
-            else:
-                low_values = session_ltf["low"].values
-                extreme_pos = int(low_values.argmin())
-                extreme_value = float(low_values[extreme_pos])
-                anchor = float(session_ltf["high"].iloc[: extreme_pos + 1].max())
-                leg_size = anchor - extreme_value
-                retrace = current_close - extreme_value
-        except (KeyError, ValueError, TypeError):
-            return None, None
+        if side == Side.LONG:
+            high_values = session_ltf["high"].values
+            extreme_pos = int(high_values.argmax())
+            extreme_value = float(high_values[extreme_pos])
+            anchor = float(session_ltf["low"].iloc[: extreme_pos + 1].min())
+            leg_size = extreme_value - anchor
+            retrace = extreme_value - current_close
+        else:
+            low_values = session_ltf["low"].values
+            extreme_pos = int(low_values.argmin())
+            extreme_value = float(low_values[extreme_pos])
+            anchor = float(session_ltf["high"].iloc[: extreme_pos + 1].max())
+            leg_size = anchor - extreme_value
+            retrace = current_close - extreme_value
         if leg_size <= 0.0:
             return None, None
         bars_since_extreme = max(0, n - 1 - extreme_pos)
@@ -3297,17 +3300,25 @@ class TopTierAdaptiveStrategy(BaseStrategy):
         # has closed) remain unconstrained — ORB is allowed to fire at 09:36
         # if momentum is obvious, but must survive the 09:40 5m close.
         if in_orb_window and bool(self.params.get("orb_require_5m_followthrough", True)):
+            # A 5m frame that cannot be built is a gate that cannot pass.
+            # Until 2026-09-26 an error here set the frame to None, which
+            # skipped the gate and let the entry through. Broad because the
+            # resample runs TA-Lib, which raises a bare Exception.
             try:
                 frame_5m = self._resampled_frame(frame, 5, symbol=c.symbol, data=data)
-            except Exception:
-                frame_5m = None
+            except Exception as exc:
+                LOG.warning("ORB 5m follow-through: could not build %s's 5m frame; refusing the %s %s entry",
+                            c.symbol, side.value, regime, exc_info=True)
+                self._set_build_failure(c.symbol, regime,
+                                        f"{side.value.lower()}_orb_5m_unavailable(error={type(exc).__name__})")
+                return None
             if frame_5m is not None and not frame_5m.empty:
                 now_dt = sessions.now_et()
                 session_start = now_dt.replace(hour=EQUITY_RTH_OPEN.hour, minute=EQUITY_RTH_OPEN.minute, second=0, microsecond=0)
-                today_bars = frame_5m[frame_5m.index >= session_start] if hasattr(frame_5m, "index") else frame_5m
+                today_bars = frame_5m[frame_5m.index >= session_start]
                 # Use iloc[-2] (previous completed bar) when ≥2 exist.
                 # iloc[-1] is the currently-forming bar.
-                if hasattr(today_bars, "iloc") and len(today_bars) >= 2:
+                if len(today_bars) >= 2:
                     last_closed = today_bars.iloc[-2]
                     bar_open = safe_float(last_closed.get("open"))
                     bar_close = safe_float(last_closed.get("close"))

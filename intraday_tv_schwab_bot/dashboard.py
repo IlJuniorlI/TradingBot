@@ -18,6 +18,7 @@ from threading import RLock, Thread
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from .config import THEME_NAME_PATTERN
 from .serialization import atomic_write_text
 
 LOG = logging.getLogger(__name__)
@@ -105,7 +106,6 @@ def _brand_badge_data_uri() -> str:
 
 
 _DASHBOARD_ASSETS_DIR = Path(__file__).with_name("dashboard_assets")
-_THEME_NAME_PATTERN = re.compile(r"^[a-z0-9_-]{1,40}$")
 # Whitelist of extensions a theme may ship under its assets/ folder. Anything
 # outside this set is rejected at the route layer — keeps .py / .html / random
 # binaries from being served under a theme asset URL.
@@ -197,31 +197,12 @@ def _dashboard_asset_binary_bytes(name: str) -> bytes:
 
 def _theme_asset_text_if_present(theme: str, name: str) -> str | None:
     """Return the text of dashboard_assets/themes/<theme>/<name> or None if missing."""
-    if not _THEME_NAME_PATTERN.match(theme):
+    if not THEME_NAME_PATTERN.match(theme):
         return None
     try:
         return _dashboard_asset_text(f"themes/{theme}/{name}")
     except (OSError, ValueError):
         return None
-
-
-def _resolve_theme_name(theme: str | None) -> str:
-    """Normalize the requested theme name and fall back to 'default' if unusable.
-
-    Falls back (with a warning) when the name is malformed or its folder does
-    not exist under dashboard_assets/themes/. The result is always a name we
-    know we can serve cleanly; the rest of the render pipeline can trust it.
-    """
-    requested = str(theme or "default").strip().lower()
-    if requested == "default":
-        return "default"
-    if not _THEME_NAME_PATTERN.match(requested):
-        LOG.warning("Dashboard theme %r has an invalid name — falling back to 'default'.", requested)
-        return "default"
-    if not (_DASHBOARD_ASSETS_DIR / "themes" / requested).is_dir():
-        LOG.warning("Dashboard theme %r not found under %s — falling back to 'default'.", requested, _DASHBOARD_ASSETS_DIR / "themes")
-        return "default"
-    return requested
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -280,7 +261,10 @@ class DashboardServer:
         self.port = int(port)
         self.refresh_ms = int(refresh_ms)
         self.state_path = Path(state_path).expanduser() if state_path else None
-        self.theme = _resolve_theme_name(theme)
+        # A theme folder's name: load_config checks dashboard.theme against
+        # config.dashboard_themes() (until 2026-09-26 an unknown or malformed
+        # name fell back to "default" here, with a WARNING).
+        self.theme = theme
         self.https = bool(https)
         self.ssl_certfile = str(ssl_certfile or "").strip()
         self.ssl_keyfile = str(ssl_keyfile or "").strip()
@@ -387,6 +371,16 @@ class DashboardServer:
         except Exception as exc:
             LOG.warning("Dashboard publish failed: %s", exc, exc_info=True)
 
+    def publish_stale(self, status: str, message: str) -> None:
+        """Republish the last state with ``status`` and ``message`` in place
+        of its own, for when the engine could not build a new one. The rest of
+        it, ``last_update`` included, stays as it was, so the page shows how
+        old it is."""
+        state = self.state.get()
+        state["status"] = status
+        state["message"] = message
+        self.publish(state)
+
     def _make_handler(self) -> type[BaseHTTPRequestHandler]:
         state = self.state
         refresh_ms = self.refresh_ms
@@ -422,7 +416,9 @@ class DashboardServer:
                         LOG.debug("TLS handshake failed for %s: %s", client, exc)
                         try:
                             connection.close()
-                        except Exception:
+                        except OSError:
+                            # The socket is being dropped either way; the
+                            # handshake failure above is what is logged.
                             pass
                         # Re-raise so BaseRequestHandler skips handle()/finish()
                         # on a dead socket; ReusableThreadingHTTPServer.handle_error
@@ -545,7 +541,7 @@ class DashboardServer:
                         return
                     theme_name = rest[:slash]
                     sub_path = rest[slash + 1:]
-                    if not _THEME_NAME_PATTERN.match(theme_name):
+                    if not THEME_NAME_PATTERN.match(theme_name):
                         self.send_error(HTTPStatus.BAD_REQUEST)
                         return
                     if sub_path == "theme.css":
@@ -590,7 +586,7 @@ class DashboardServer:
                         return
                     try:
                         requested_bars = int((params.get("bars") or [90])[0])
-                    except Exception:
+                    except ValueError:
                         requested_bars = 90
                     requested_timeframe_mode = str((params.get("timeframe") or ['ltf'])[0] or 'ltf').strip().lower()
                     if requested_timeframe_mode != 'htf':
@@ -647,7 +643,7 @@ def _apply_template_substitutions(template: str, refresh_ms: int, theme: str) ->
         .replace("__REFRESH_MS__", str(int(refresh_ms)))
         .replace("__IMAGES__", image_assets_json)
         .replace("__BRAND_BADGE__", brand_badge_data_uri)
-        .replace("__THEME__", str(theme or "default").strip().lower())
+        .replace("__THEME__", theme)
     )
 
 

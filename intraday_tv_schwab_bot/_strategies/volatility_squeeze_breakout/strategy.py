@@ -63,10 +63,7 @@ class VolatilitySqueezeBreakoutStrategy(BaseStrategy):
         clean = pd.Series(pd.to_numeric(series, errors="coerce"), index=series.index, copy=False).dropna()
         if clean.empty:
             return float(fallback)
-        try:
-            return float(clean.median())
-        except Exception:
-            return float(fallback)
+        return float(clean.median())
 
     @staticmethod
     def _refined_tier(close: float, risk: float, target: float, tier_rrs: tuple[float, float, float], requested: int) -> tuple[str, float]:

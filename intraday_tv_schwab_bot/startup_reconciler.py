@@ -63,7 +63,7 @@ from .config import BotConfig
 from .data_feed import MarketDataStore
 from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side
 from .paper_account import PaperAccount
-from .numeric import safe_float
+from .numeric import first_float, safe_float
 from .position_store import ReconcileMetadataStore
 from .risk import RiskManager
 from ._strategies.catalogue import is_option_strategy
@@ -74,6 +74,26 @@ if TYPE_CHECKING:
     from ._strategies.strategy_base import BaseStrategy
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
+
+
+def _unreadable_quantity(symbol: str, row: dict[str, Any]) -> str:
+    """The message naming a broker position row whose ``longQuantity`` or
+    ``shortQuantity`` is not a finite number, which fails a reconcile
+    attempt."""
+    return (f"the broker position row for {symbol} holds an unreadable quantity "
+            f"(longQuantity={row.get('longQuantity')!r}, shortQuantity={row.get('shortQuantity')!r})")
+
+
+def _held_side_qty(held: dict[str, dict[str, Any]], symbol: Any) -> tuple[Side | None, int]:
+    """The side and whole-unit quantity of the broker's row for *symbol*
+    (``broker_position_side_qty``; ``(None, 0)`` when it holds none). Raises
+    ``ValueError`` (``_unreadable_quantity``) when the row's quantity cannot
+    be read, which says nothing about what is held."""
+    key = str(symbol or "").upper().strip()
+    side, qty = broker_position_side_qty(held.get(key))
+    if qty is None:
+        raise ValueError(_unreadable_quantity(key, held[key]))
+    return side, qty
 
 
 class StartupReconciler:
@@ -118,8 +138,9 @@ class StartupReconciler:
     # ------------------------------------------------------------------
 
     def _ignore_symbols(self) -> set[str]:
+        # A list of non-blank strings, or null for none (checked at load).
         raw = self.config.runtime.startup_reconcile_ignore_symbols or []
-        return {str(symbol).upper().strip() for symbol in raw if str(symbol).strip()}
+        return {symbol.upper().strip() for symbol in raw}
 
     def _ignored_open_position_symbols(self, positions: list[dict[str, Any]]) -> set[str]:
         ignored = self._ignore_symbols()
@@ -173,10 +194,10 @@ class StartupReconciler:
         strategy_obj = self.strategy
         allowed_symbols = None
         if strategy_obj is not None:
-            try:
-                allowed_symbols = strategy_obj.restore_eligible_symbols()
-            except Exception:
-                allowed_symbols = None
+            # An error raises and fails the restore attempt, which blocks
+            # entries and is retried. Until 2026-09-26 it read as "no
+            # universe" and made every broker position eligible.
+            allowed_symbols = strategy_obj.restore_eligible_symbols()
         if allowed_symbols is not None:
             allowed = {str(sym).upper().strip() for sym in allowed_symbols if str(sym).strip()}
             return symbol_upper in allowed if allowed else False
@@ -351,27 +372,23 @@ class StartupReconciler:
     @staticmethod
     def _broker_held_qty(position: Position, held: dict[str, dict[str, Any]]) -> int | None:
         """Units the broker holds of *position* (0 when none), or None when
-        its rows cannot be read as this position (a quantity that is not a
-        finite number, or vertical legs out of step)."""
+        its vertical legs are out of step. A row whose quantity is not a
+        finite number raises ``ValueError`` naming it (``_held_side_qty``)."""
         meta = position.metadata if isinstance(position.metadata, dict) else {}
         asset_type = str(meta.get("asset_type") or ASSET_TYPE_EQUITY).upper()
         if asset_type == ASSET_TYPE_OPTION_VERTICAL:
-            long_side, long_qty = broker_position_side_qty(held.get(str(meta.get("long_leg_symbol") or "").upper().strip()))
-            short_side, short_qty = broker_position_side_qty(held.get(str(meta.get("short_leg_symbol") or "").upper().strip()))
-            if long_qty is None or short_qty is None:
-                return None
+            long_side, long_qty = _held_side_qty(held, meta.get("long_leg_symbol"))
+            short_side, short_qty = _held_side_qty(held, meta.get("short_leg_symbol"))
             if long_qty <= 0 and short_qty <= 0:
                 return 0
             if long_side != Side.LONG or short_side != Side.SHORT or long_qty != short_qty:
                 return None
             return int(long_qty)
         if asset_type == ASSET_TYPE_OPTION_SINGLE:
-            symbol = str(meta.get("option_symbol") or "")
+            symbol = meta.get("option_symbol")
         else:
-            symbol = str(meta.get("underlying") or position.symbol)
-        side, qty = broker_position_side_qty(held.get(symbol.upper().strip()))
-        if qty is None:
-            return None
+            symbol = meta.get("underlying") or position.symbol
+        side, qty = _held_side_qty(held, symbol)
         return int(qty) if side == position.side else 0
 
     def _working_exit_order_state(self, position: Position) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
@@ -468,9 +485,12 @@ class StartupReconciler:
         it as a close wiped every paper position held into a new session.
 
         Returns False when a position was left tracked because something
-        could not be read or confirmed -- its working exit order's state, the
-        order list its re-protect needs, or its bracket's cancel -- so the
-        reconcile reports failure and the engine retries.
+        could not be read or confirmed -- its broker row's quantity, its
+        working exit order's state, the order list its re-protect needs, or
+        its bracket's cancel -- so the reconcile reports failure and the
+        engine retries. A vertical whose legs are out of step is left tracked
+        without failing the attempt: its rows were read, and a retry would
+        read them the same.
         """
         if not self.positions or self.config.schwab.dry_run:
             return True
@@ -481,9 +501,19 @@ class StartupReconciler:
             if str(key).upper().strip() in unsettled:
                 LOG.warning("%s: its entry order is still settling; leaving it to the entry gatekeeper", key)
                 continue
-            remaining = self._broker_held_qty(position, held)
+            try:
+                remaining = self._broker_held_qty(position, held)
+            except ValueError as exc:
+                # An unread row is neither held nor closed: the position is
+                # left as it is and the attempt fails, so a retry reads the
+                # row again. Until 2026-09-26 the attempt still succeeded, and
+                # block and log_only read it again only the next day.
+                LOG.warning("%s: %s; leaving it tracked, and the retry reads it again", key, exc)
+                settled = False
+                continue
             if remaining is None:
-                LOG.warning("Broker rows for %s do not read as its position; leaving it tracked", key)
+                LOG.warning("Broker rows for %s do not read as its position (vertical legs out of step); "
+                            "leaving it tracked", key)
                 continue
             unbooked = self._unbooked_working_exit_fills(position)
             if unbooked is None:
@@ -532,8 +562,11 @@ class StartupReconciler:
                     # in between was otherwise booked here and again by the
                     # manager from the order's record.
                     fresh = self.executor.fetch_account_positions()
-                    fresh_remaining = None if fresh is None else self._broker_held_qty(
-                        position, {str(row.get("symbol") or "").upper().strip(): row for row in fresh})
+                    try:
+                        fresh_remaining = None if fresh is None else self._broker_held_qty(
+                            position, {str(row.get("symbol") or "").upper().strip(): row for row in fresh})
+                    except ValueError:
+                        fresh_remaining = None      # an unread row, as an unread account
                     fresh_unbooked = None if fresh_remaining is None else self._unbooked_working_exit_fills(position)
                     if fresh_remaining is None or fresh_unbooked is None:
                         LOG.warning("%s: the broker could not be read again after its bracket's fills; sizing from "
@@ -672,26 +705,40 @@ class StartupReconciler:
         return live, all_read
 
     def _restore_broker_positions(self, positions: list[dict[str, Any]], *, use_metadata: bool,
-                                  working_orders: list[dict[str, Any]], unsettled: set[str]) -> tuple[int, int]:
+                                  working_orders: list[dict[str, Any]],
+                                  unsettled: set[str]) -> tuple[int, int, list[str]]:
+        """Restore the broker's rows into ``self.positions``. Returns how many
+        were restored and how many skipped, and a message naming each row
+        that cannot be used (a quantity or an ``averagePrice`` that does not
+        read).
+
+        The caller fails the attempt on those messages, once every other row
+        is restored: those positions are tracked and managed, stops included,
+        and the retry restores an unusable row once it reads (a tracked
+        symbol is skipped, so nothing is restored twice). Until 2026-09-26
+        the first unusable row failed the attempt on the spot, and every row
+        after it waited, unmanaged, for a retry that could read it. The
+        hybrid prune waits for an attempt with no unusable row: such a row's
+        saved levels are what its retry restores it from.
+        """
         if is_option_strategy(self.config.strategy):
             LOG.warning("startup_reconcile_mode=%s does not restore option strategies; leaving options handling unchanged", self.config.runtime.startup_reconcile_mode)
-            return 0, len(positions)
+            return 0, len(positions), []
         metadata_positions = self._load_reconcile_metadata() if use_metadata else {}
         matched_metadata_keys: set[str] = set()
         restored = 0
         skipped = 0
+        unusable: list[str] = []
         for row in positions:
             symbol = str(row.get("symbol") or "").upper().strip()
             asset_type = str(row.get("assetType") or "").upper().strip()
             long_qty = broker_quantity(row.get("longQuantity"))
             short_qty = broker_quantity(row.get("shortQuantity"))
             if long_qty is None or short_qty is None:
-                # Fails the attempt, which is retried: skipping the row left
-                # what the broker holds unmanaged (2026-09-26).
-                raise ValueError(
-                    f"the broker position row for {symbol or '?'} holds an unreadable quantity "
-                    f"(longQuantity={row.get('longQuantity')!r}, shortQuantity={row.get('shortQuantity')!r})"
-                )
+                # Skipping the row left what the broker holds unmanaged
+                # (2026-09-26).
+                unusable.append(_unreadable_quantity(symbol or "?", row))
+                continue
             qty = long_qty if long_qty > 0 else short_qty
             if not symbol or qty <= 0:
                 skipped += 1
@@ -718,12 +765,16 @@ class StartupReconciler:
                 skipped += 1
                 continue
             side = Side.LONG if long_qty > 0 else Side.SHORT
-            average_price = safe_float(row.get("averagePrice") or 0.0, finite=True)
-            if average_price is None:
-                # Fails the attempt too: a NaN one read as an entry of 0.01
-                # and an infinite one as an infinite entry (2026-09-26).
-                raise ValueError(f"the broker position row for {symbol} holds an unreadable averagePrice "
-                                 f"{row.get('averagePrice')!r}")
+            average_price = safe_float(row.get("averagePrice"), finite=True)
+            if average_price is None or average_price <= 0:
+                # An absent, zero, negative or NaN one read as an entry of
+                # 0.01, whose restore_basic levels the live price is already
+                # past: the first management cycle exited a LONG at its
+                # target and a SHORT at its stop. An infinite one read as an
+                # infinite entry (2026-09-26).
+                unusable.append(f"the broker position row for {symbol} holds no usable averagePrice "
+                                f"({row.get('averagePrice')!r})")
+                continue
             entry_price = max(0.01, average_price)
             matched_info = self._find_reconcile_metadata_match_with_key(metadata_positions, symbol, side, qty, entry_price) if use_metadata else None
             matched = matched_info[1] if matched_info is not None else None
@@ -740,16 +791,8 @@ class StartupReconciler:
             if self.data is not None:
                 try:
                     self.data.fetch_quotes([symbol], force=True, source="engine:restore_broker_position")
-                    quote = self.data.get_quote(symbol)
-                    if quote:
-                        for _qk in ("mark", "markPrice", "last", "lastPrice", "close", "closePrice"):
-                            _qv = quote.get(_qk)
-                            try:
-                                if _qv is not None and float(_qv) > 0:
-                                    current_price = float(_qv)
-                                    break
-                            except Exception:
-                                continue
+                    current_price = first_float(self.data.get_quote(symbol), "mark", "markPrice", "last", "lastPrice",
+                                                "close", "closePrice", default=entry_price, positive=True)
                 except Exception:
                     LOG.debug("Could not fetch current price for restored position %s; using entry_price.", symbol, exc_info=True)
             if matched is not None:
@@ -825,13 +868,14 @@ class StartupReconciler:
             except Exception as exc:
                 LOG.warning("Could not materialize restored paper entry for %s: %s", symbol, exc)
             restored += 1
-        if use_metadata:
+        if use_metadata and not unusable:
             try:
                 # A position already tracked keeps its row. The loop skips it,
                 # so it never matches, and the engine's save skips an unchanged
                 # position set: pruning its row lost its levels, bracket and
                 # working-exit ids to the next restart (the session-boundary
-                # re-run and every reconcile retry reach this).
+                # re-run and every reconcile retry reach this). An unusable
+                # row matches nothing either, so no prune runs beside one.
                 removed = self.reconcile_metadata_store.delete_unmatched_positions(matched_metadata_keys | set(self.positions))
                 if removed:
                     LOG.info("Pruned %s stale startup reconcile metadata row(s) after hybrid restore", removed)
@@ -839,7 +883,7 @@ class StartupReconciler:
                 LOG.warning("Could not prune stale startup reconcile metadata after hybrid restore: %s", exc)
         if restored or use_metadata:
             self._save_reconcile_metadata()
-        return restored, skipped
+        return restored, skipped, unusable
 
     # ------------------------------------------------------------------
     # Main entry point — called once from engine.run() before step loop.
@@ -849,17 +893,21 @@ class StartupReconciler:
         """Read the broker and apply ``startup_reconcile_mode``.
 
         Returns False when the attempt could not read or settle the broker:
-        the account, the working orders, a tracked or saved position's
-        working exit order, a tracked position's bracket that cannot be
-        confirmed down, or a working order it would otherwise count as
-        foreign. It also returns False while an entry order is still settling:
-        its position is left to the gatekeeper, and every order is judged by
-        the retry. A failure is recorded in ``result`` and, in the blocking
-        modes, blocks entries (``startup_reconcile_failed``, or
-        ``working_orders_present`` for an unread foreign order); the engine
-        retries until an attempt succeeds, which clears the block.
+        the account, the working orders, a broker position row's quantity
+        (or, in a restore, its average price: the restore still restores
+        every other row first), a tracked or saved position's working exit
+        order, a tracked position's bracket that cannot be confirmed down, or
+        a working order it would otherwise count as foreign. It also returns
+        False while an entry order is still settling: its position is left
+        to the gatekeeper, and every order is judged by the retry. A failure
+        is recorded in ``result`` and, in the blocking modes, blocks entries
+        (``startup_reconcile_failed``, or ``working_orders_present`` for an
+        unread foreign order); the engine retries until an attempt succeeds,
+        which clears the block.
         """
-        mode = str(self.config.runtime.startup_reconcile_mode or "ignore").lower()
+        # One of the five modes, checked at load (_CHOICES): a typo read as
+        # log_only, with a WARNING, until 2026-09-26.
+        mode = self.config.runtime.startup_reconcile_mode
         if not self.config.runtime.reconcile_on_startup or mode == "ignore":
             self._entry_block_symbols = set()
             return True
@@ -909,11 +957,12 @@ class StartupReconciler:
                 # Without bracket mode the list protects nothing: restore what
                 # the broker holds so the engine manages it, and fail the
                 # attempt so the retry reads the list (it skips what is
-                # already tracked).
+                # already tracked), naming each row it could not use too.
+                failures = ["the broker working-order read failed"]
                 if mode in {"restore_basic", "restore_hybrid"} and not self.executor.bracket_orders_enabled():
-                    self._restore_broker_positions(positions, use_metadata=(mode == "restore_hybrid"),
-                                                   working_orders=[], unsettled=set(unsettled))
-                raise RuntimeError("the broker working-order read failed")
+                    failures += self._restore_broker_positions(positions, use_metadata=(mode == "restore_hybrid"),
+                                                               working_orders=[], unsettled=set(unsettled))[2]
+                raise RuntimeError("; ".join(failures))
             # False when a working order's state could not be read (below);
             # the order still counts, and the attempt is retried.
             order_states_read = True
@@ -943,11 +992,18 @@ class StartupReconciler:
                 elif mode == "log_only":
                     self.trading_blocked_reason = None
                     self.trading_blocked_message = None
-                elif mode in {"restore_basic", "restore_hybrid"}:
-                    restored, skipped = self._restore_broker_positions(
+                else:  # restore_basic / restore_hybrid ("ignore" returned above)
+                    restored, skipped, unusable = self._restore_broker_positions(
                         positions, use_metadata=(mode == "restore_hybrid"), working_orders=working_orders,
                         unsettled=set(unsettled),
                     )
+                    if restored:
+                        LOG.warning("Restored %s broker position(s) using startup_reconcile_mode=%s", restored, mode)
+                    if unusable:
+                        # Every other row is restored and managed. The working
+                        # orders are judged by the retry that restores these: a
+                        # stop resting for one of them is its own, not foreign.
+                        raise ValueError("; ".join(unusable))
                     # A restored position's own resting protection is not a
                     # foreign order. Counting it blocked every entry for the
                     # rest of the session in bracket mode -- and "clear them"
@@ -963,8 +1019,6 @@ class StartupReconciler:
                     self.result["foreign_working_orders"] = foreign_orders
                     self.result["restored_positions"] = restored
                     self.result["skipped_restore_positions"] = skipped
-                    if restored:
-                        LOG.warning("Restored %s broker position(s) using startup_reconcile_mode=%s", restored, mode)
                     if is_option_strategy(self.config.strategy) and positions:
                         self.trading_blocked_reason = "startup_reconcile_option_restore_unsupported"
                         self.trading_blocked_message = (
@@ -985,10 +1039,6 @@ class StartupReconciler:
                     else:
                         self.trading_blocked_reason = None
                         self.trading_blocked_message = None
-                else:
-                    LOG.warning("Unknown startup_reconcile_mode=%s; treating as log_only", mode)
-                    self.trading_blocked_reason = None
-                    self.trading_blocked_message = None
             else:
                 self.trading_blocked_reason = None
                 self.trading_blocked_message = None
@@ -1033,7 +1083,7 @@ class StartupReconciler:
             else:
                 self.trading_blocked_message = (
                     "Startup reconciliation could not settle a tracked position with the broker "
-                    "(an unread working exit order, or a bracket not confirmed down); retrying"
+                    "(an unread broker row or working exit order, or a bracket not confirmed down); retrying"
                 )
         self.result["order_states_read"] = order_states_read and exit_states_read
         return order_states_read and exit_states_read and not unsettled

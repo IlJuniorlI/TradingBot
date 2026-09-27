@@ -470,9 +470,5 @@ def resolve_current_price(
             )
     if frame is None or frame.empty:
         return 0.0
-    try:
-        last = frame.iloc[-1]
-        last_close = float(last.get("close", 0.0) if hasattr(last, "get") else last.close)
-    except Exception:
-        last_close = 0.0
+    last_close = float(frame.iloc[-1].get("close", 0.0))
     return last_close if pd.notna(last_close) and last_close > 0.0 else 0.0

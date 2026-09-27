@@ -89,7 +89,6 @@ class RiskManager:
     def __init__(self, config: BotConfig, state_store: Any = None):
         self.config = config
         self.state = RiskState()
-        self._reentry_policy = self._normalized_reentry_policy()
         # Optional SessionRiskStateStore. When attached, the per-day tallies
         # survive a restart (see attach_state_store).
         self._state_store = None
@@ -190,22 +189,6 @@ class RiskManager:
     def _symbol_key(symbol: str | None) -> str:
         return str(symbol or "").upper().strip()
 
-    def _normalized_reentry_policy(self) -> str:
-        policy = str(self.config.risk.reentry_policy).strip().lower()
-        aliases = {
-            "same_day": "rest_of_day",
-            "same-day": "rest_of_day",
-            "rest-of-day": "rest_of_day",
-            "session": "rest_of_day",
-            "day": "rest_of_day",
-            "none": "immediate",
-        }
-        policy = aliases.get(policy, policy)
-        if policy not in {"cooldown", "immediate", "rest_of_day"}:
-            LOG.warning("Unknown risk.reentry_policy=%r; defaulting to 'cooldown'", policy)
-            return "cooldown"
-        return policy
-
     def is_symbol_on_cooldown(self, symbol: str, side: "Side | None" = None) -> bool:
         """Check whether ``symbol`` is on cooldown for ``side``.
 
@@ -295,8 +278,9 @@ class RiskManager:
         self.register_realized_pnl(pnl)
         key = self._symbol_key(symbol)
         extra_key = self._symbol_key(additional_symbol) if additional_symbol else None
-        policy = self._reentry_policy
-        direction_aware = bool(getattr(self.config.risk, "cooldown_direction_aware", True))
+        # cooldown, immediate or rest_of_day (checked at load, _CHOICES).
+        policy = self.config.risk.reentry_policy
+        direction_aware = self.config.risk.cooldown_direction_aware
         sides_to_write: list[Side]
         if side is None or not direction_aware:
             sides_to_write = [Side.LONG, Side.SHORT]
@@ -339,7 +323,7 @@ class RiskManager:
                 self.state.recent_exits.append(record)
                 # Trim: keep only records within the block window (plus a small
                 # margin) to cap memory in pathological sessions.
-                window_minutes = max(1, int(getattr(self.config.risk, "same_level_block_minutes", 30)))
+                window_minutes = max(1, self.config.risk.same_level_block_minutes)
                 cutoff = sessions.now_et() - timedelta(minutes=window_minutes * 2)
                 self.state.recent_exits = [r for r in self.state.recent_exits if r.timestamp >= cutoff]
             except Exception:
@@ -403,7 +387,7 @@ class RiskManager:
         limit = abs(self.config.risk.max_daily_loss)
         open_risk = (
             self.open_risk_to_stops(positions)
-            if bool(getattr(self.config.risk, "daily_loss_includes_open_risk", True))
+            if self.config.risk.daily_loss_includes_open_risk
             else 0.0
         )
         projected_pnl = self.state.realized_pnl - open_risk
@@ -443,18 +427,17 @@ class RiskManager:
         # trade as one book (roughly 0.85 correlated on any macro day), so
         # treating them as three independent sectors let one directional bet
         # fill every position slot while appearing diversified.
-        strategy_params = {}
         try:
             strategy_params = self.config.strategies.get(signal.strategy, self.config.active_strategy).params or {}
         except Exception:
-            # Swallowing this silently disables the concentration guard
-            # entirely (max_group falls to 0), so the bot would happily stack
-            # correlated positions with nothing to show for it. Log loudly —
-            # a risk control must not fail open in silence.
+            # A guard that cannot read its settings refuses. Until 2026-09-26
+            # this logged and switched the guard off for the signal
+            # (max_group fell to 0): loud, but a risk control failing open.
             LOG.warning(
-                "Could not read strategy params for %s; the correlation concentration "
-                "guard is INACTIVE for this signal.", signal.strategy, exc_info=True,
+                "Could not read strategy params for %s; refusing the signal rather than "
+                "open it without the correlation concentration guard.", signal.strategy, exc_info=True,
             )
+            return False, "correlation_guard_unavailable"
         max_group = int(strategy_params.get("max_same_correlation_group_same_direction", 0) or 0)
         if max_group > 0:
             correlation_groups = strategy_params.get("correlation_groups") or {}
@@ -516,8 +499,8 @@ class RiskManager:
         is overridden — the entry is a proper pullback, not a breakout
         chase.
         """
-        window_minutes = max(0, int(getattr(self.config.risk, "same_level_block_minutes", 30)))
-        atr_mult = max(0.0, float(getattr(self.config.risk, "same_level_block_atr_mult", 0.3)))
+        window_minutes = self.config.risk.same_level_block_minutes
+        atr_mult = self.config.risk.same_level_block_atr_mult
         if window_minutes <= 0 or atr_mult <= 0 or not self.state.recent_exits:
             return False, "ok"
         key = self._symbol_key(signal.symbol)
@@ -829,10 +812,10 @@ class RiskManager:
             return None
         risk_cfg = self.config.risk
         if peak_r < 2.0:
-            return peak_r * float(getattr(risk_cfg, "peak_giveback_retain_1to2r", 0.65))
+            return peak_r * risk_cfg.peak_giveback_retain_1to2r
         if peak_r < 3.0:
-            return peak_r * float(getattr(risk_cfg, "peak_giveback_retain_2to3r", 0.72))
-        return peak_r * float(getattr(risk_cfg, "peak_giveback_retain_3r_plus", 0.78))
+            return peak_r * risk_cfg.peak_giveback_retain_2to3r
+        return peak_r * risk_cfg.peak_giveback_retain_3r_plus
 
     def _peak_giveback_triggered(self, position: Position, last_price: float, initial_risk: float) -> bool:
         # Per-position override (Tier 3b — high-conviction-day loosening).
@@ -844,7 +827,8 @@ class RiskManager:
         # winners on trend days aren't cut by normal 50% retracements.
         # Falls back to ``config.risk.peak_giveback_min_r`` when not set.
         meta = position.metadata if isinstance(position.metadata, dict) else {}
-        default_min_r = float(getattr(self.config.risk, "peak_giveback_min_r", 1.0) or 1.0)
+        # Above 0, checked at load (a 0 read as 1.0 until 2026-09-26).
+        default_min_r = self.config.risk.peak_giveback_min_r
         override = meta.get("peak_giveback_min_r_override")
         override_active = False
         if override is not None:
@@ -871,9 +855,9 @@ class RiskManager:
         # because at sub-1R peaks the run-vs-noise signal is weaker and
         # a constant pct is simpler to reason about than tiers within
         # tiers.
-        low_tier_enabled = bool(getattr(self.config.risk, "peak_giveback_low_tier_enabled", True))
-        low_tier_min_r = float(getattr(self.config.risk, "peak_giveback_low_tier_min_r", 0.7) or 0.0)
-        low_tier_frac = float(getattr(self.config.risk, "peak_giveback_low_tier_giveback_frac", 0.7))
+        low_tier_enabled = self.config.risk.peak_giveback_low_tier_enabled
+        low_tier_min_r = self.config.risk.peak_giveback_low_tier_min_r
+        low_tier_frac = self.config.risk.peak_giveback_low_tier_giveback_frac
         if (
             low_tier_enabled
             and not override_active
@@ -922,7 +906,7 @@ class RiskManager:
         # (options have their own ratchet via options_breakeven + profit_lock).
         peak_giveback_exit = (
             (not options_position)
-            and bool(getattr(self.config.risk, "peak_giveback_enabled", True))
+            and self.config.risk.peak_giveback_enabled
             and initial_risk > 0
             and self._peak_giveback_triggered(position, last_price, initial_risk)
         )
@@ -937,7 +921,7 @@ class RiskManager:
             # Floor for the exit reason string: low-tier uses fixed
             # giveback_frac × peak; main tier uses the peak-size ladder.
             if low_tier_active:
-                low_tier_frac = float(getattr(self.config.risk, "peak_giveback_low_tier_giveback_frac", 0.7))
+                low_tier_frac = self.config.risk.peak_giveback_low_tier_giveback_frac
                 floor_r = peak_r * (1.0 - low_tier_frac)
             else:
                 floor_r = self._peak_giveback_floor_r(peak_r)
@@ -968,22 +952,22 @@ class RiskManager:
         # Options bypass equity adaptive management, but this simpler premium-
         # based ratchet prevents giving back all gains on a winning trade.
         if options_position:
-            opt_cfg = getattr(self.config, "options", None)
+            opt_cfg = self.config.options
             opt_entry = max(0.01, float(position.entry_price))
             if position.side == Side.LONG:
                 opt_peak = float(position.highest_price) if position.highest_price is not None else float(last_price)
-                if opt_cfg is not None and getattr(opt_cfg, "options_breakeven_enabled", False):
-                    be_thresh = opt_entry * float(getattr(opt_cfg, "options_breakeven_mark_mult", 1.25))
-                    be_stop = opt_entry * float(getattr(opt_cfg, "options_breakeven_stop_mult", 1.05))
+                if opt_cfg.options_breakeven_enabled:
+                    be_thresh = opt_entry * opt_cfg.options_breakeven_mark_mult
+                    be_stop = opt_entry * opt_cfg.options_breakeven_stop_mult
                     if opt_peak >= be_thresh and be_stop > float(position.stop_price):
                         prior = float(position.stop_price)
                         position.stop_price = float(be_stop)
                         if isinstance(meta, dict):
                             append_management_adjustment(meta,{"manager": "options_ratchet", "kind": "stop", "reason": "breakeven", "from": prior, "to": float(be_stop)})
                             meta["options_breakeven_armed"] = True
-                if opt_cfg is not None and getattr(opt_cfg, "options_profit_lock_enabled", False):
-                    pl_thresh = opt_entry * float(getattr(opt_cfg, "options_profit_lock_mark_mult", 1.40))
-                    pl_stop = opt_entry * float(getattr(opt_cfg, "options_profit_lock_stop_mult", 1.15))
+                if opt_cfg.options_profit_lock_enabled:
+                    pl_thresh = opt_entry * opt_cfg.options_profit_lock_mark_mult
+                    pl_stop = opt_entry * opt_cfg.options_profit_lock_stop_mult
                     if opt_peak >= pl_thresh and pl_stop > float(position.stop_price):
                         prior = float(position.stop_price)
                         position.stop_price = float(pl_stop)
@@ -993,18 +977,18 @@ class RiskManager:
             else:
                 # SHORT (credit spreads): mark goes DOWN for profit.
                 opt_trough = float(position.lowest_price) if position.lowest_price is not None else float(last_price)
-                if opt_cfg is not None and getattr(opt_cfg, "options_breakeven_enabled", False):
-                    be_thresh = opt_entry * (2.0 - float(getattr(opt_cfg, "options_breakeven_mark_mult", 1.25)))
-                    be_stop = opt_entry * (2.0 - float(getattr(opt_cfg, "options_breakeven_stop_mult", 1.05)))
+                if opt_cfg.options_breakeven_enabled:
+                    be_thresh = opt_entry * (2.0 - opt_cfg.options_breakeven_mark_mult)
+                    be_stop = opt_entry * (2.0 - opt_cfg.options_breakeven_stop_mult)
                     if opt_trough <= be_thresh and be_stop < float(position.stop_price):
                         prior = float(position.stop_price)
                         position.stop_price = float(be_stop)
                         if isinstance(meta, dict):
                             append_management_adjustment(meta,{"manager": "options_ratchet", "kind": "stop", "reason": "breakeven", "from": prior, "to": float(be_stop)})
                             meta["options_breakeven_armed"] = True
-                if opt_cfg is not None and getattr(opt_cfg, "options_profit_lock_enabled", False):
-                    pl_thresh = opt_entry * (2.0 - float(getattr(opt_cfg, "options_profit_lock_mark_mult", 1.40)))
-                    pl_stop = opt_entry * (2.0 - float(getattr(opt_cfg, "options_profit_lock_stop_mult", 1.15)))
+                if opt_cfg.options_profit_lock_enabled:
+                    pl_thresh = opt_entry * (2.0 - opt_cfg.options_profit_lock_mark_mult)
+                    pl_stop = opt_entry * (2.0 - opt_cfg.options_profit_lock_stop_mult)
                     if opt_trough <= pl_thresh and pl_stop < float(position.stop_price):
                         prior = float(position.stop_price)
                         position.stop_price = float(pl_stop)

@@ -67,6 +67,17 @@ class OrderBlockContext:
     mode: str = "loose"
 
 
+def _require_mode(mode: str) -> str:
+    """``mode`` when it is ``loose`` or ``strict``, spelled so (load_config
+    checks ``support_resistance.order_block_mode``); any other value raises,
+    with or without bars to build from. Until 2026-09-26 the builder
+    lowercased and stripped it, and read an unknown one as loose without a
+    word."""
+    if mode not in ("loose", "strict"):
+        raise ValueError(f"order block mode must be 'loose' or 'strict', got {mode!r}")
+    return mode
+
+
 def empty_order_block_context(
     current_price: float = 0.0,
     *,
@@ -76,7 +87,7 @@ def empty_order_block_context(
     return OrderBlockContext(
         timeframe_minutes=int(timeframe_minutes),
         current_price=float(current_price or 0.0),
-        mode=str(mode or "loose").strip().lower() or "loose",
+        mode=_require_mode(mode),
     )
 
 
@@ -556,34 +567,32 @@ def build_order_block_context(
        survivor by raw price distance, so consumers wanting "what's
        the immediate level" still get the right answer rather than
        "what's the strongest level (which might be far away)".
+
+    ``mode`` is ``loose`` or ``strict``, spelled so; any other value raises
+    (``_require_mode``), before the frame is looked at.
     """
-    mode_norm = (str(mode or "loose").strip().lower() or "loose")
-    if mode_norm not in {"loose", "strict"}:
-        mode_norm = "loose"
+    _require_mode(mode)
     if frame is None or frame.empty:
         return empty_order_block_context(
             float(current_price or 0.0),
             timeframe_minutes=timeframe_minutes,
-            mode=mode_norm,
+            mode=mode,
         )
     base = ensure_standard_indicator_frame(ensure_ohlcv_frame(frame.copy()))
     if base.empty or len(base) < 5:
         return empty_order_block_context(
             float(current_price or 0.0),
             timeframe_minutes=timeframe_minutes,
-            mode=mode_norm,
+            mode=mode,
         )
     if current_price is None or current_price <= 0:
-        try:
-            current_price = float(base.iloc[-1]["close"])
-        except Exception:
-            current_price = 0.0
+        current_price = float(base.iloc[-1]["close"])
     ref_close = float(current_price or 0.0)
     atr = atr_with_floor(base, ref_close, abs_floor=0.01)
     min_size = max(float(atr) * float(min_block_atr_mult), float(ref_close) * float(min_block_pct), 1e-8)
     min_thrust = max(float(atr) * float(min_thrust_atr_mult), 1e-8)
     eps = max(min_size * 0.05, ref_close * 1e-6, 1e-8)
-    if mode_norm == "strict":
+    if mode == "strict":
         bullish_raw, bearish_raw = _detect_order_blocks_strict(
             base,
             pivot_span=max(1, int(pivot_span)),
@@ -651,5 +660,5 @@ def build_order_block_context(
         bearish_obs=bearish,
         nearest_bullish_ob=nearest_bullish,
         nearest_bearish_ob=nearest_bearish,
-        mode=mode_norm,
+        mode=mode,
     )

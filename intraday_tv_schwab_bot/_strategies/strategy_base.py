@@ -136,10 +136,7 @@ class BaseStrategy:
     def _options_capability_enabled(self) -> bool:
         checker = getattr(self, "_options_enabled", None)
         if callable(checker):
-            try:
-                return bool(checker())
-            except Exception:
-                return False
+            return bool(checker())
         return True
 
     def _symbols_from_capability_source(self, source: object) -> list[str] | None:
@@ -438,10 +435,7 @@ class BaseStrategy:
             symbols = self.dashboard_tradable_symbols()
             return len(symbols) if symbols else max(1, int(default_limit))
         if mode == "fixed":
-            try:
-                return max(1, int(self._capability("dashboard.candidate_limit", default_limit)))
-            except Exception:
-                return max(1, int(default_limit))
+            return max(1, int(self._capability("dashboard.candidate_limit", default_limit)))
         return max(1, int(default_limit))
 
     def dashboard_allow_generic_level_fallback(self) -> bool:
@@ -610,19 +604,13 @@ class BaseStrategy:
         raw = self._capability("history.required_bars", None)
         if raw is None:
             return None
-        try:
-            return max(0, int(raw))
-        except Exception:
-            return None
+        return max(0, int(raw))
 
     def required_history_bars(self, symbol: str | None = None, positions: dict[str, Position] | None = None) -> int:
         capability_bars = self._manifest_required_history_bars()
         if capability_bars is not None:
             return capability_bars
-        try:
-            return max(0, int(self.params.get("min_bars", 0) or 0))
-        except Exception:
-            return 0
+        return max(0, int(self.params.get("min_bars", 0) or 0))
 
     def _technical_level_setting(self, key: str, default: Any) -> Any:
         cfg = getattr(self.config, "technical_levels", None)
@@ -655,10 +643,7 @@ class BaseStrategy:
         windows = getattr(self.config.active_strategy.schedule(), "management_windows", [])
         if not windows:
             return None
-        try:
-            return max((window.end for window in windows), default=None)
-        except Exception:
-            return None
+        return max(window.end for window in windows)
 
     def _configurable_stock_force_flatten(self, position: Position, default_enabled: bool = True) -> bool:
         settings = self._force_flatten_settings()
@@ -921,7 +906,8 @@ class BaseStrategy:
             for idx, row in tail.iterrows():
                 try:
                     idx_marker = idx.isoformat()  # type: ignore[attr-defined]
-                except Exception:
+                except AttributeError:
+                    # An index label that is not a timestamp.
                     idx_marker = repr(idx)
                 rows.append((idx_marker, float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])))
             frame_marker = tuple(rows) if rows else (("empty",),)
@@ -1097,7 +1083,10 @@ class BaseStrategy:
         always 0 that way).
 
         Returns ``None`` if HTF data isn't available — the score path is
-        defensive (None ctx -> zero adjustment).
+        defensive (None ctx -> zero adjustment). A build that raises is not
+        "no data" and propagates, as it does from ``_htf_context``: until
+        2026-09-26 it returned None, which ``require_htf_ema_alignment``
+        reads as a neutral trend, so the error let the entry through.
         """
         if data is None or not hasattr(data, "get_htf_context"):
             return None
@@ -1105,28 +1094,27 @@ class BaseStrategy:
         if sr_cfg is None:
             return None
         ema_fast_span, ema_slow_span = htf_ema_spans(self.params)
-        try:
-            return data.get_htf_context(
-                symbol,
-                timeframe_minutes=int(self._htf_minutes()),
-                lookback_days=int(self._htf_lookback_days()),
-                pivot_span=int(getattr(sr_cfg, "pivot_span", 2) or 2),
-                max_levels_per_side=int(getattr(sr_cfg, "max_levels_per_side", 6) or 6),
-                atr_tolerance_mult=float(getattr(sr_cfg, "atr_tolerance_mult", 0.35) or 0.35),
-                pct_tolerance=float(getattr(sr_cfg, "pct_tolerance", 0.0030) or 0.0030),
-                stop_buffer_atr_mult=float(getattr(sr_cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
-                # The strategy's own HTF EMA spans: top_tier trades on this
-                # context's EMA trend (require_htf_ema_alignment /
-                # htf_ema_alignment_score). Until 2026-09-24 50/200 was
-                # hard-coded here whatever htf_ema_*_span said.
-                ema_fast_span=ema_fast_span,
-                ema_slow_span=ema_slow_span,
-                use_prior_day_high_low=bool(getattr(sr_cfg, "use_prior_day_high_low", True)),
-                use_prior_week_high_low=bool(getattr(sr_cfg, "use_prior_week_high_low", True)),
-                allow_refresh=False,
-            )
-        except Exception:
-            return None
+        return data.get_htf_context(
+            symbol,
+            timeframe_minutes=int(self._htf_minutes()),
+            lookback_days=int(self._htf_lookback_days()),
+            pivot_span=int(getattr(sr_cfg, "pivot_span", 2) or 2),
+            max_levels_per_side=int(getattr(sr_cfg, "max_levels_per_side", 6) or 6),
+            # Checked at load (above 0); a 0 read as 0.35 / 0.003 here until
+            # 2026-09-26.
+            atr_tolerance_mult=float(sr_cfg.atr_tolerance_mult),
+            pct_tolerance=float(sr_cfg.pct_tolerance),
+            stop_buffer_atr_mult=float(getattr(sr_cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
+            # The strategy's own HTF EMA spans: top_tier trades on this
+            # context's EMA trend (require_htf_ema_alignment /
+            # htf_ema_alignment_score). Until 2026-09-24 50/200 was
+            # hard-coded here whatever htf_ema_*_span said.
+            ema_fast_span=ema_fast_span,
+            ema_slow_span=ema_slow_span,
+            use_prior_day_high_low=bool(getattr(sr_cfg, "use_prior_day_high_low", True)),
+            use_prior_week_high_low=bool(getattr(sr_cfg, "use_prior_week_high_low", True)),
+            allow_refresh=False,
+        )
 
     def _htf_context(
             self,
@@ -1351,9 +1339,12 @@ class BaseStrategy:
         displacement to filter micro-breakouts; combined with the
         strength-based sort in build_order_block_context, this stops
         weak close-to-price OBs from displacing strong distant ones.
+
+        ``mode`` is the checked ``order_block_mode`` (``loose`` / ``strict``,
+        config._CHOICES), read as it is.
         """
         return {
-            "mode": str(self._support_resistance_setting("order_block_mode", "loose") or "loose").strip().lower() or "loose",
+            "mode": self.config.support_resistance.order_block_mode,
             "max_per_side": int(self._support_resistance_setting("order_block_max_per_side", 4) or 4),
             "min_atr_mult": float(self._support_resistance_setting("order_block_min_atr_mult", 0.05) or 0.05),
             "min_pct": float(self._support_resistance_setting("order_block_min_pct", 0.0005) or 0.0005),
@@ -1540,7 +1531,7 @@ class BaseStrategy:
         # (bars.last_bucket_forming / completed_bucket_mask); a frame of
         # completed 1m bars never reads as forming.
         last_bar_forming = last_bucket_forming(analysis_frame.index, bar_minutes, sessions.now_et())
-        pct_tolerance = float(self._support_resistance_setting("pct_tolerance", 0.0030) or 0.0030)
+        pct_tolerance = float(self.config.support_resistance.pct_tolerance)  # checked at load (above 0)
         if is_ltf_analysis:
             pct_tolerance *= 0.60
         structure_event_max_age_bars = int(self._support_resistance_setting("structure_event_lookback_bars", 6) or 6)
@@ -1617,7 +1608,8 @@ class BaseStrategy:
         last_idx = frame.index[-1]
         try:
             last_marker = last_idx.isoformat()  # type: ignore[attr-defined]
-        except Exception:
+        except AttributeError:
+            # An index label that is not a timestamp.
             last_marker = repr(last_idx)
         return id(frame), len(frame), last_marker
 
@@ -1884,10 +1876,7 @@ class BaseStrategy:
         risk_per_unit = max(0.01, abs(float(close) - float(stop)))
         target_rr = None
         if target is not None:
-            try:
-                reward = abs(float(target) - float(close))
-            except Exception:
-                reward = 0.0
+            reward = abs(float(target) - float(close))
             if reward > 0:
                 target_rr = reward / risk_per_unit
         # Runner mode (target=None): the trade has no fixed take-profit and
@@ -1935,7 +1924,7 @@ class BaseStrategy:
             )
             or max(runner_target_rr_default, current_target_rr + runner_bonus_rr + (continuation_scale * 0.18) + strong_setup_bonus)
         )
-        base_trail_pct = safe_float(getattr(self.config.risk, "trailing_stop_pct", None))
+        base_trail_pct = self.config.risk.trailing_stop_pct  # a finite number >= 0 or null, checked at load
         runner_trail_pct = safe_float(self.params.get("adaptive_runner_trail_pct"))
         if runner_trail_pct is None and base_trail_pct is not None and base_trail_pct > 0:
             runner_trail_pct = max(0.0005, float(base_trail_pct) * (0.85 if trend_like else 0.90))
@@ -1965,10 +1954,7 @@ class BaseStrategy:
     # regimes where the thesis is mean-reversion inside a bounded zone).
     # ------------------------------------------------------------------
     def _ladder_param(self, name: str, default: float) -> float:
-        try:
-            return float(self.params.get(name, default) or default)
-        except Exception:
-            return float(default)
+        return float(self.params.get(name, default) or default)
 
     def _build_ladder_rungs(
         self,

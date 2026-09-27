@@ -169,11 +169,7 @@ class PaperAccount:
     def _trade_lifecycle_id(position: Position) -> str:
         meta = position.metadata if isinstance(position.metadata, dict) else {}
         base = str(meta.get("position_key") or position.symbol)
-        try:
-            entry_ts = position.entry_time.isoformat()
-        except Exception:
-            entry_ts = str(position.entry_time)
-        return f"{base}|{entry_ts}"
+        return f"{base}|{position.entry_time.isoformat()}"
 
     def __init__(self, starting_equity: float, max_equity_points: int = 2000, max_trade_history: int = 200):
         self.starting_equity = float(starting_equity)
@@ -191,12 +187,9 @@ class PaperAccount:
     def mark_prices(self, prices: dict[str, float]) -> None:
         with self._lock:
             for symbol, price in prices.items():
-                if price is None:
-                    continue
-                try:
-                    self.last_prices[str(symbol)] = float(price)
-                except Exception:
-                    continue
+                number = safe_float(price)
+                if number is not None:
+                    self.last_prices[str(symbol)] = number
 
     def record_entry(self, position: Position, fill_price: float) -> None:
         fill_price = float(fill_price)
@@ -368,17 +361,12 @@ class PaperAccount:
             if target_for_reward is None:
                 target_for_reward = safe_float(position.target_price, finite=True)
             if target_for_reward is not None:
-                try:
-                    entry_price = float(position.entry_price)
-                    qty = int(position.qty)
-                    if position.side == Side.LONG:
-                        reward_per_unit = max(0.0, target_for_reward - entry_price)
-                    else:
-                        reward_per_unit = max(0.0, entry_price - target_for_reward)
-                    if reward_per_unit > 0:
-                        max_reward = reward_per_unit * qty
-                except Exception:
-                    max_reward = None
+                if position.side == Side.LONG:
+                    reward_per_unit = max(0.0, target_for_reward - float(position.entry_price))
+                else:
+                    reward_per_unit = max(0.0, float(position.entry_price) - target_for_reward)
+                if reward_per_unit > 0:
+                    max_reward = reward_per_unit * int(position.qty)
 
         # Surface the trade's INITIAL stop/target alongside the live ones
         # so the dashboard's progress bar can use a stable trade range
