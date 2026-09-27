@@ -241,7 +241,6 @@ class IntradayBot:
             audit=self.audit,
             account=self.account,
             strategy=self.strategy,
-            dashboard_cache=self.dashboard_cache,
             positions=self.positions,
             save_reconcile_metadata=self._save_reconcile_metadata,
         )

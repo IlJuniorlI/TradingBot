@@ -36,9 +36,9 @@ def warn_once(key: str) -> bool:
 class ComponentFailureLog:
     """Logs a failing component's error with its traceback, for a failure
     that can repeat every cycle: at WARNING at most once a minute per
-    component, at DEBUG in between. Its owner (``DashboardCache``) calls it
-    from inside the ``except``; each owner keeps its own minute per
-    component."""
+    component, at DEBUG in between. Its owner (``DashboardCache``, the
+    position manager's exit record) calls it from inside the ``except``;
+    each owner keeps its own minute per component."""
 
     def __init__(self, logger: logging.Logger) -> None:
         self._logger = logger

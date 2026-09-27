@@ -44,7 +44,6 @@ import pandas as pd
 
 from .audit_logger import AuditLogger, structured_metadata_snapshot
 from .config import BotConfig
-from .dashboard_cache import DashboardCache
 from .data_feed import EXECUTION_LAST_KEYS, MANAGEMENT_PRICE_KEYS, MarketDataStore
 from .execution import BracketCancel, SchwabExecutor
 from .models import (
@@ -68,6 +67,7 @@ from .position_metrics import (
     position_unrealized_at_price,
 )
 from .risk import RiskManager
+from .sr_snapshot import sr_snapshot
 from .trade_management import TradeManager
 from .broker_payloads import (
     active_broker_bracket,
@@ -75,7 +75,7 @@ from .broker_payloads import (
     order_result_needs_broker_recheck,
     working_exit_outstanding_qty,
 )
-from .log_setup import TRADEFLOW_LEVEL
+from .log_setup import TRADEFLOW_LEVEL, ComponentFailureLog
 from . import sessions
 
 if TYPE_CHECKING:
@@ -118,7 +118,6 @@ class PositionManager:
         audit: AuditLogger,
         account: PaperAccount,
         strategy: BaseStrategy,
-        dashboard_cache: DashboardCache,
         positions: dict[str, Position],
         save_reconcile_metadata: Callable[[], None],
     ) -> None:
@@ -131,7 +130,8 @@ class PositionManager:
         self.strategy = strategy
         # The in-trade managers and the level check, run for each position.
         self.trade_manager = TradeManager(config, data=data, strategy=strategy, audit=audit)
-        self.dashboard_cache = dashboard_cache
+        # The exit record's S/R snapshot failures (_position_exit_context).
+        self._log_component_failure = ComponentFailureLog(LOG)
         self.positions = positions
         self._save_reconcile_metadata = save_reconcile_metadata
         # Child id -> (monotonic time read, order state) for bracket children
@@ -461,17 +461,25 @@ class PositionManager:
                 peak_r = favorable_move(position.side, entry_price, peak_price) / initial_risk_per_unit
         management_symbol = str(meta.get('underlying') or position.symbol)
         management_frame = bars.get(management_symbol) if bars else None
-        sr_row = None
+        sr_fields = None
         if self.data is not None and management_symbol:
             try:
-                sr_row = self.dashboard_cache.sr_row(management_symbol, price=underlying_price or current_price, allow_refresh=False)
+                sr_fields = sr_snapshot(
+                    self.config,
+                    self.data,
+                    management_symbol,
+                    price=underlying_price or current_price,
+                    strategy=self.strategy,
+                    account=self.account,
+                    allow_refresh=False,
+                )
             except Exception:
                 # A diagnostic read for the exit record: it runs the S/R
                 # build, and an exit is never held up by it.
-                self.dashboard_cache.log_component_failure(
+                self._log_component_failure(
                     "exit_context_sr_row", "Exit-context S/R row failed for %s", management_symbol,
                 )
-                sr_row = None
+                sr_fields = None
         payload = {
             'position_symbol': position.symbol,
             'management_symbol': management_symbol,
@@ -539,19 +547,19 @@ class PositionManager:
             **exit_reason_details(decision),
             **self._exit_bar_snapshot(management_frame),
         }
-        if isinstance(sr_row, dict):
+        if sr_fields is not None:
             payload.update({
-                'sr_timeframe': sr_row.get('timeframe'),
-                'sr_state': sr_row.get('state'),
-                'sr_trend_state': sr_row.get('trend_state'),
-                'sr_structure_bias': sr_row.get('structure_bias'),
-                'sr_structure_event': sr_row.get('structure_event'),
-                'sr_nearest_support': safe_float(sr_row.get('nearest_support'), None),
-                'sr_nearest_resistance': safe_float(sr_row.get('nearest_resistance'), None),
-                'sr_support_distance_pct': safe_float(sr_row.get('support_distance_pct'), None),
-                'sr_resistance_distance_pct': safe_float(sr_row.get('resistance_distance_pct'), None),
-                'sr_broken_support': safe_float(sr_row.get('broken_support'), None),
-                'sr_broken_resistance': safe_float(sr_row.get('broken_resistance'), None),
+                'sr_timeframe': sr_fields.get('timeframe'),
+                'sr_state': sr_fields.get('state'),
+                'sr_trend_state': sr_fields.get('trend_state'),
+                'sr_structure_bias': sr_fields.get('structure_bias'),
+                'sr_structure_event': sr_fields.get('structure_event'),
+                'sr_nearest_support': safe_float(sr_fields.get('nearest_support'), None),
+                'sr_nearest_resistance': safe_float(sr_fields.get('nearest_resistance'), None),
+                'sr_support_distance_pct': safe_float(sr_fields.get('support_distance_pct'), None),
+                'sr_resistance_distance_pct': safe_float(sr_fields.get('resistance_distance_pct'), None),
+                'sr_broken_support': safe_float(sr_fields.get('broken_support'), None),
+                'sr_broken_resistance': safe_float(sr_fields.get('broken_resistance'), None),
             })
         extra = structured_metadata_snapshot(meta)
         payload.update({k: v for k, v in extra.items() if k not in payload and v is not None})

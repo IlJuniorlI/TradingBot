@@ -18,8 +18,9 @@
 and builds the payloads: the dashboard state's symbol part
 (``build_payload``, which the engine publishes each cycle), each symbol's
 snapshot, S/R row and key-level zones, and the chart the HTTP handler
-serves. The stateless helpers are in ``dashboard_payloads`` and the zone
-classification in ``dashboard_zones``.
+serves. The stateless helpers are in ``dashboard_payloads``, the zone
+classification in ``dashboard_zones`` and the S/R snapshot in
+``sr_snapshot``.
 """
 from __future__ import annotations
 
@@ -50,11 +51,10 @@ from .dashboard_payloads import (
     technical_line_payload,
 )
 from .dashboard_zones import build_level_zones, level_anchors
-from .data_feed import DISPLAY_PRICE_KEYS
-from .htf_levels import summarize_htf_trend
 from .log_setup import ComponentFailureLog
 from .models import Candidate, Position, Side, asset_type_of, is_option_asset
-from .numeric import first_float, safe_float
+from .numeric import safe_float
+from .sr_snapshot import sr_snapshot, structure_event_label
 from .support_resistance import analyze_market_structure
 from .symbols import NON_STREAMABLE, normalize_symbol_list
 from .technical_levels import build_technical_levels_context
@@ -79,28 +79,6 @@ LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 # oldest bars of the window, and the snapshot's starved tags overwrote the
 # chart's on the newest 48 bars. 12 extra bars already matched on every bar.
 _CANDLE_PATTERN_WARMUP_BARS = 14
-
-
-def dashboard_structure_event_label(ms_ctx: Any) -> str:
-    if ms_ctx is None:
-        return "—"
-    candidates: list[tuple[int, int, str]] = []
-    choch_up_age = getattr(ms_ctx, "choch_up_age_bars", None)
-    choch_down_age = getattr(ms_ctx, "choch_down_age_bars", None)
-    bos_up_age = getattr(ms_ctx, "bos_up_age_bars", None)
-    bos_down_age = getattr(ms_ctx, "bos_down_age_bars", None)
-    if bool(getattr(ms_ctx, "choch_up", False)) and choch_up_age is not None:
-        candidates.append((int(choch_up_age), 0, "CHOCH↑"))
-    if bool(getattr(ms_ctx, "choch_down", False)) and choch_down_age is not None:
-        candidates.append((int(choch_down_age), 0, "CHOCH↓"))
-    if bool(getattr(ms_ctx, "bos_up", False)) and bos_up_age is not None:
-        candidates.append((int(bos_up_age), 1, "BOS↑"))
-    if bool(getattr(ms_ctx, "bos_down", False)) and bos_down_age is not None:
-        candidates.append((int(bos_down_age), 1, "BOS↓"))
-    if candidates:
-        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-        return candidates[0][2]
-    return "—"
 
 
 class DashboardCache:
@@ -254,56 +232,6 @@ class DashboardCache:
                 bar["ema9"] = safe_float(fast)
                 bar["ema20"] = safe_float(slow)
         return spans
-
-    def htf_trend(self, symbol: str, *, allow_refresh: bool = True) -> dict[str, Any]:
-        tf = self.strategy.htf_minutes()
-        lookback_days = self.strategy.htf_lookback_days()
-        frame = None
-        if self.data is not None and hasattr(self.data, "get_htf_frame"):
-            frame = self.data.get_htf_frame(
-                symbol,
-                timeframe_minutes=tf,
-                lookback_days=lookback_days,
-                allow_refresh=allow_refresh,
-            )
-        summary = summarize_htf_trend(
-            frame,
-            min_bars=20,
-            vwap_distance_pct=0.0010,
-            ema_gap_pct=0.0008,
-            min_ret3=0.0010,
-            range_vwap_distance_pct=0.0020,
-            range_ema_gap_pct=0.0010,
-        )
-        return {
-            "label": str(summary.get("label", "—")),
-            "state": str(summary.get("state", "neutral")),
-            "vwap_dist": float(summary.get("vwap_dist", 0.0) or 0.0),
-            "ema_gap": float(summary.get("ema_gap", 0.0) or 0.0),
-            "ret3": float(summary.get("ret3", 0.0) or 0.0),
-            "timeframe": f"{tf}m",
-        }
-
-    def symbol_price(self, symbol: str) -> float | None:
-        quote = self.data.get_quote(symbol) if self.data is not None else None
-        price = first_float(quote, *DISPLAY_PRICE_KEYS, positive=True)
-        if price is not None:
-            return price
-        if self.data is not None:
-            try:
-                frame = self.data.get_merged(symbol, with_indicators=False)
-                if frame is not None and not frame.empty:
-                    return float(frame.iloc[-1].close)
-            except Exception:
-                LOG.debug(
-                    "Failed to read merged frame last price for %s; falling back to cached/account.",
-                    symbol, exc_info=True,
-                )
-        if self.account is not None:
-            cached = getattr(self.account, "last_prices", {}).get(symbol)
-            if cached is not None:
-                return float(cached)
-        return None
 
     def build_payload(
         self,
@@ -1409,159 +1337,19 @@ class DashboardCache:
         )
 
     def sr_row(self, symbol: str, price: float | None = None, *, allow_refresh: bool = True) -> dict[str, Any] | None:
-        """Build the support/resistance row payload for the dashboard ladder.
-        Extracted from IntradayBot as part of Phase 5 Step 6."""
-        cfg = getattr(self.config, "support_resistance", None)
-        if cfg is None or not bool(cfg.enabled):
+        """The dashboard's support/resistance row: ``symbol``'s S/R snapshot
+        (``sr_snapshot.sr_snapshot``, which the exit record reads too) and the
+        strategy's LTF label, which the expanded chart's LTF toggle shows
+        ("5m LTF" rather than a hardcoded "1M LTF"), third in the row."""
+        snapshot = sr_snapshot(self.config, self.data, symbol, price=price, strategy=self.strategy,
+                               account=self.account, allow_refresh=allow_refresh)
+        if snapshot is None:
             return None
-        current_price = price if price is not None else self.symbol_price(symbol)
-        # mode="trading" gives the sidebar the same flip-confirmation
-        # strictness (support_resistance.flip_confirmation_bars()) that position management,
-        # the chart's zone-flip detection, and the entry gatekeeper all
-        # use. A single "trading" mode means the sidebar / chart /
-        # gatekeeper / strategy agree on which side of a level price is
-        # currently sitting on — no path where one consumer sees a level
-        # as broken before another does.
-        ctx = self.data.get_support_resistance(
-            symbol,
-            current_price=current_price,
-            flip_frame=self.data.get_merged(symbol, with_indicators=False),
-            mode="trading",
-            timeframe_minutes=self.strategy.htf_minutes(),
-            lookback_days=self.strategy.htf_lookback_days(),
-            allow_refresh=allow_refresh,
-        )
-        if ctx is None:
-            return None
-        display_price: float | None = None
-        candidate_price = current_price if current_price is not None else getattr(ctx, "current_price", None)
-        if candidate_price is not None and float(candidate_price) > 0:
-            display_price = float(candidate_price)
-        state = "neutral"
-
-        def _level_price(level: Any) -> float | None:
-            return None if level is None else float(level.price)
-
-        trend_row = self.htf_trend(symbol, allow_refresh=allow_refresh)
-        htf_trend_bias = "neutral"
-        # The strategy's own HTF trend -- the read its gates and scores use --
-        # when it has one; the generic 50/200 read below only for the rest.
-        own_trend = None
-        own_trend_hook = getattr(self.strategy, "dashboard_htf_trend", None)
-        trend_price = display_price if display_price is not None else float(getattr(ctx, "current_price", 0.0) or 0.0)
-        if callable(own_trend_hook) and self.data is not None and trend_price:
-            try:
-                own_trend = own_trend_hook(symbol, self.data, trend_price, allow_refresh=allow_refresh)
-            except Exception:
-                LOG.debug("Failed to read the strategy's HTF trend for %s; using the generic read.", symbol, exc_info=True)
-        try:
-            if self.data is not None and own_trend is None:
-                sr_cfg = getattr(self.config, "support_resistance", None)
-                if sr_cfg is not None:
-                    htf_ctx = self.data.get_htf_context(
-                        symbol,
-                        timeframe_minutes=self.strategy.htf_minutes(),
-                        lookback_days=self.strategy.htf_lookback_days(),
-                        pivot_span=int(getattr(sr_cfg, "pivot_span", 2) or 2),
-                        max_levels_per_side=int(getattr(sr_cfg, "max_levels_per_side", 3) or 3),
-                        atr_tolerance_mult=float(sr_cfg.atr_tolerance_mult),  # checked at load (above 0)
-                        pct_tolerance=float(sr_cfg.pct_tolerance),
-                        stop_buffer_atr_mult=float(getattr(sr_cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
-                        ema_fast_span=50,
-                        ema_slow_span=200,
-                        allow_refresh=allow_refresh,
-                        use_prior_day_high_low=bool(getattr(sr_cfg, "use_prior_day_high_low", True)),
-                        use_prior_week_high_low=bool(getattr(sr_cfg, "use_prior_week_high_low", True)),
-                        **self.strategy.htf_fvg_request(),
-                    )
-                    htf_trend_bias = str(getattr(htf_ctx, "trend_bias", "neutral") or "neutral").strip().lower()
-        except Exception:
-            LOG.debug("Failed to read HTF trend bias context for %s; falling back to summarize_htf_trend().", symbol, exc_info=True)
-        trend_state = str(trend_row.get("state", "neutral") or "neutral").strip().lower()
-        trend_label = str(trend_row.get("label", "—") or "—")
-        if own_trend is not None:
-            trend_state = str(own_trend.get("state", "neutral") or "neutral").strip().lower()
-            trend_label = str(own_trend.get("label", "—") or "—")
-        elif htf_trend_bias in {"bullish", "bearish"}:
-            trend_state = htf_trend_bias
-            trend_label = "Bullish" if htf_trend_bias == "bullish" else "Bearish"
-        ms_ctx = getattr(ctx, "market_structure", None)
-        structure_bias = str(getattr(ms_ctx, "bias", "neutral") or "neutral") if ms_ctx is not None else "neutral"
-        structure_event = dashboard_structure_event_label(ms_ctx)
-
-        bullish_structure = structure_bias == "bullish" or structure_event in {"BOS↑", "CHOCH↑"}
-        bearish_structure = structure_bias == "bearish" or structure_event in {"BOS↓", "CHOCH↓"}
-        bullish_conflict = bearish_structure or trend_state == "bearish"
-        bearish_conflict = bullish_structure or trend_state == "bullish"
-
-        if ctx.breakout_above_resistance and not bullish_conflict and (bullish_structure or trend_state == "bullish"):
-            state = "breakout"
-        elif ctx.breakdown_below_support and not bearish_conflict and (bearish_structure or trend_state == "bearish"):
-            state = "breakdown"
-        elif ctx.near_support and not ctx.near_resistance:
-            state = "near_support"
-        elif ctx.near_resistance and not ctx.near_support:
-            state = "near_resistance"
-        elif ctx.near_support and ctx.near_resistance:
-            state = "compressed"
-        elif ctx.breakout_above_resistance and not bullish_conflict:
-            state = "breakout_watch"
-        elif ctx.breakdown_below_support and not bearish_conflict:
-            state = "breakdown_watch"
-
-        htf_min_active = self.strategy.htf_minutes()
-        timeframe_minutes = int(getattr(ctx, "timeframe_minutes", htf_min_active) or htf_min_active)
-        symbol_key = str(symbol or "").upper().strip()
-        htf_refresh = self.data.last_htf_refresh.get((symbol_key, timeframe_minutes)) if symbol_key else None
-        ltf_min = max(1, self.strategy.ltf_minutes())
-
         return {
-            "symbol": symbol,
-            "timeframe": f"{timeframe_minutes}m",
-            # LTF label exposed alongside HTF so the dashboard's expanded-chart
-            # LTF toggle button can render "5m LTF" (or whatever ltf_minutes
-            # resolves to) instead of the hardcoded "1M LTF" fallback.
-            "ltf_timeframe": f"{ltf_min}m",
-            "price": display_price,
-            "htf_refresh_token": htf_refresh.isoformat() if htf_refresh is not None else None,
-            "side_tolerance": safe_float(getattr(ctx, "side_tolerance", None)),
-            # The strategy's own levels, as it reads them (2026-09-23): the
-            # nearest support / resistance and their distances are ctx's, the
-            # ladders are ctx's (nearest first), and broken / pending levels
-            # travel in their own fields for the chart to draw as their own
-            # zones. Until then the row folded broken_resistance into the
-            # support ladder (broken_support into the resistance one) and
-            # published the NEAREST price of the result, while ctx keeps the
-            # STRONGEST member of each side_tolerance group: in 11% of
-            # archived samples the sidebar and top_tier's support zone showed
-            # another level than sr_ctx.nearest_support (AAPL 2026-09-22 10:05:
-            # 338.58 drawn, 338.42 used by the strategy), next to a distance
-            # measured to the strategy's level.
-            "nearest_support": _level_price(ctx.nearest_support),
-            "nearest_resistance": _level_price(ctx.nearest_resistance),
-            "support_distance_pct": ctx.support_distance_pct,
-            "resistance_distance_pct": ctx.resistance_distance_pct,
-            "support_distance_atr": ctx.support_distance_atr,
-            "resistance_distance_atr": ctx.resistance_distance_atr,
-            "breakout_above_resistance": bool(ctx.breakout_above_resistance),
-            "breakdown_below_support": bool(ctx.breakdown_below_support),
-            "near_support": bool(ctx.near_support),
-            "near_resistance": bool(ctx.near_resistance),
-            "regime_hint": str(ctx.regime_hint),
-            "trend": trend_label,
-            "trend_state": trend_state,
-            "structure_bias": structure_bias,
-            "structure_event": structure_event,
-            "structure_last_high_label": getattr(ms_ctx, "last_high_label", None) if ms_ctx is not None else None,
-            "structure_last_low_label": getattr(ms_ctx, "last_low_label", None) if ms_ctx is not None else None,
-            "bias_score": float(ctx.bias_score),
-            "state": state,
-            "supports": [float(level.price) for level in ctx.supports],
-            "resistances": [float(level.price) for level in ctx.resistances],
-            "broken_support": _level_price(ctx.broken_support),
-            "broken_resistance": _level_price(ctx.broken_resistance),
-            "pending_support": _level_price(ctx.pending_support),
-            "pending_resistance": _level_price(ctx.pending_resistance),
+            "symbol": snapshot["symbol"],
+            "timeframe": snapshot["timeframe"],
+            "ltf_timeframe": f"{max(1, self.strategy.ltf_minutes())}m",
+            **snapshot,
         }
 
     def snapshot_should_bypass_cache(self, symbol: str, *, allow_refresh: bool) -> bool:
@@ -1791,7 +1579,7 @@ class DashboardCache:
                 int(timeframe_minutes or 1),
             )
             return payload
-        event = dashboard_structure_event_label(ms_ctx)
+        event = structure_event_label(ms_ctx)
         age = None
         level = None
         if event == "CHOCH↑":

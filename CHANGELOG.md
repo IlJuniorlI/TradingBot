@@ -310,6 +310,43 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A symbol's S/R snapshot has its own module, `sr_snapshot.py`, and the
+  position manager no longer imports the dashboard (refactor cut C41).**
+  *2026-09-27* — `sr_snapshot.sr_snapshot(config, data, symbol, *, price,
+  strategy, account, allow_refresh)` is what `DashboardCache.sr_row` built:
+  the trading-mode S/R context, its state (breakout, near_support, ...), the
+  HTF trend (the strategy's own read, else the generic 50/200 one, with the
+  strategy's HTF FVG request), the market-structure bias and last event, and
+  the level prices. It reads the strategy's timeframes itself
+  (`strategy.htf_minutes()` / `htf_lookback_days()`, cut C32), so there is
+  one resolution and no timeframe arguments. `DashboardCache.sr_row` is the
+  snapshot plus the strategy's LTF label (`ltf_timeframe`), third in the row
+  as before. The exit record (`PositionManager._position_exit_context`)
+  reads the snapshot itself, so `PositionManager` loses its
+  `dashboard_cache` argument and the runtime layer's one import of the
+  presentation layer is gone. `DashboardCache`'s `symbol_price` (the price
+  when none is given, over `DISPLAY_PRICE_KEYS`) and `htf_trend` moved with
+  it (`sr_snapshot.symbol_price`, and the private `_htf_trend`), and
+  `dashboard_structure_event_label` is `sr_snapshot.structure_event_label`;
+  the moved code's guards against a missing data store or config section
+  are gone, since both are required arguments. The exit record still reads
+  the snapshot inside its own exception boundary, since the record is built
+  before the exit order goes out; a failure is logged by the position
+  manager's own `ComponentFailureLog`, at WARNING at most once a minute and
+  DEBUG in between, as it was through the dashboard's (the plan's DEBUG-only
+  line would have lowered it). There is no alias. No behaviour changes:
+  2,000 fuzzed S/R rows, 1,000 exit records, 200 snapshots and charts and 24
+  published engine states read byte for byte as before. Tests:
+  `tests/test_sr_snapshot.py` (new: the classification, the strategy's
+  timeframes, the price fallback, the strategy's trend, the row's key order,
+  an option's exit record read on its underlying, the structure-event
+  label, and that neither reader imports a dashboard module),
+  `tests/test_silent_excepts.py` (`TestReportedExitContextSrRow`, now also
+  the DEBUG line within the minute), `tests/test_quote_price_reads.py`,
+  `tests/test_strategy_requests.py`, and the manager stubs in
+  `tests/support/brokers.py` and test_option_same_level_block;
+  `tests/test_module_layering.py`'s runtime layer gains `sr_snapshot`.
+
 - **The dashboard's payload helpers, level zones and state build have homes
   of their own (refactor cut C40).** *2026-09-27* — `dashboard_payloads.py`
   holds the stateless helpers that were `dashboard_cache` module functions,
