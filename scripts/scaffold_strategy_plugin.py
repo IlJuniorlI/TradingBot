@@ -529,7 +529,7 @@ def _option_screener_py(name: str, class_stem: str) -> str:
             full rationale. Synthesizes candidates from
             ``config.options.underlyings`` without calling TradingView.
             Live activity_score + directional_bias are resolved at publish
-            time by engine._publish_state via the strategy's
+            time by DashboardCache.build_payload via the strategy's
             ``live_activity_score`` and ``dashboard_directional_bias``
             public hooks (see _strategies/README.md "Extension hooks").
             """

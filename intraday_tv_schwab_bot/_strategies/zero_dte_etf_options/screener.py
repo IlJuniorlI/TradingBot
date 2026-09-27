@@ -23,7 +23,7 @@ class ZeroDteEtfOptionsScreener(BaseStrategyScreener):
         So the candidate object only needs to be PRESENT for the engine
         to dispatch ``entry_signals`` per underlying. The dashboard
         candidate tile reads its activity_score + directional_bias from
-        ``engine._publish_state``'s live resolver (which calls back into
+        ``DashboardCache.build_payload``'s live resolver (which calls back into
         the strategy's public ``live_activity_score`` and
         ``dashboard_directional_bias`` hooks against the streamed
         frame — see _strategies/README.md "Extension hooks"), so

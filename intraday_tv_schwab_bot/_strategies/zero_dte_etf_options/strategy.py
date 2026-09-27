@@ -501,7 +501,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         0..1 ratio) lets the dashboard concatenate ``%`` without unit
         translation.
 
-        Engine ``_publish_state`` reads this via the same duck-typed
+        ``DashboardCache.build_payload`` reads this via the same duck-typed
         ``getattr`` dispatch used for ``live_activity_score`` and
         ``dashboard_directional_bias``; strategies that don't define
         the hook fall through to the candidate's existing

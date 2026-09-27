@@ -20,7 +20,8 @@ Design notes:
 - ``self.positions`` is a shared-reference dict; the tracker never mutates
   it — only passes to ``strategy.required_history_bars`` which reads the
   current position count for per-symbol requirement calculation.
-- ``_symbol_warmup_snapshot`` output is consumed by ``_publish_state`` +
+- ``_symbol_warmup_snapshot`` output is consumed by the dashboard state
+  (the engine's ``_dashboard_state`` and ``DashboardCache.build_payload``) +
   EntryGatekeeper's candidate-level entry gate (via live_entry_bar_status
   on MarketDataStore, not directly from the tracker).
 """

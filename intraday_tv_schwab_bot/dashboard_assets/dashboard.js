@@ -2244,7 +2244,7 @@ function drawSelectedChart(snapshot) {
     }
 
     // Per-bar bias reads. Only ``dmi_bias`` and ``obv_bias`` are emitted by
-    // ``dashboard_bars_from_frame`` per-bar; the other reads (trend_state /
+    // ``dashboard_payloads.bars_from_frame`` per-bar; the other reads (trend_state /
     // structure_bias / anchored_vwap_bias / breakout_above_resistance /
     // breakdown_below_support / near_support / near_resistance) were dead
     // code — those fields live on the snapshot's structure / SR sections,
@@ -3856,7 +3856,7 @@ function drawSelectedChart(snapshot) {
       // column, or a stale frame), the tooltip shows ``—`` instead of
       // misleadingly reporting the current state as the hovered bar's
       // state. Bars payload now carries adx/plus_di/minus_di/dmi_bias
-      // per-bar (see dashboard_bars_from_frame), so honest values
+      // per-bar (see dashboard_payloads.bars_from_frame), so honest values
       // appear whenever the data exists.
       sections.push(`
         <div class="tt-section">

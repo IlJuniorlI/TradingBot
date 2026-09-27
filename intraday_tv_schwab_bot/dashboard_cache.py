@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""Dashboard cache state container.
+"""The dashboard's state and payload builders.
 
-Extracted from ``IntradayBot`` as the first step of the Phase 5 engine split.
-Owns the four pieces of dashboard-related state that used to live as
-``self._dashboard_snapshot_cache`` / ``_dashboard_chart_cache`` /
-``_dashboard_cache_lock`` / ``_dashboard_error_log_times`` on the bot:
+``DashboardCache`` holds:
 
   - ``snapshot_cache``: per-symbol dashboard snapshot payloads, keyed by
     upper-cased symbol. Values are ``{"signature": tuple, "payload": dict}``
@@ -14,405 +11,62 @@ Owns the four pieces of dashboard-related state that used to live as
     same signature-keyed shape.
   - ``lock``: single ``RLock`` guarding both caches. Held briefly around
     get/set operations so concurrent dashboard polls don't corrupt state.
-  - ``log_component_failure``: rate-limited (60s) component-error logger
-    used across dashboard payload builders. Emits WARNING once per minute
-    per component; DEBUG otherwise.
+  - ``log_component_failure``: the payload builders' failure log
+    (``log_setup.ComponentFailureLog``: WARNING at most once a minute per
+    component, DEBUG otherwise).
 
-Future Phase 5 steps will grow this into a full ``DashboardPublisher`` that
-absorbs the payload-building methods too. This first step just relocates
-the state so subsequent extractions have a settled home.
+and builds the payloads: the dashboard state's symbol part
+(``build_payload``, which the engine publishes each cycle), each symbol's
+snapshot, S/R row and key-level zones, and the chart the HTTP handler
+serves. The stateless helpers are in ``dashboard_payloads`` and the zone
+classification in ``dashboard_zones``.
 """
 from __future__ import annotations
 
-import json
+import copy
 import logging
-import time
+import math
 from collections.abc import Mapping
 from dataclasses import asdict
-from datetime import datetime
 from threading import RLock
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
-
-import copy
 
 from .candles import detect_candle_context, detect_per_bar_candle_patterns
 from .chart_patterns import analyze_chart_pattern_context
 from .config import BotConfig, DashboardChartConfig
+from .dashboard_payloads import (
+    bars_from_frame,
+    cache_json_signature,
+    frame_signature,
+    fvg_anchor_abs_index,
+    fvg_payload,
+    htf_chart_frame,
+    normalize_exchange,
+    quote_exchange,
+    recent_trade_markers,
+    symbol_trade_signature,
+    technical_line_payload,
+)
+from .dashboard_zones import build_level_zones, level_anchors
 from .data_feed import DISPLAY_PRICE_KEYS
 from .htf_levels import summarize_htf_trend
-from .models import Side, asset_type_of, is_option_asset
+from .log_setup import ComponentFailureLog
+from .models import Candidate, Position, Side, asset_type_of, is_option_asset
 from .numeric import first_float, safe_float
-from .support_resistance import analyze_market_structure, zone_flip_confirmed
-from .symbols import normalize_symbol_list
+from .support_resistance import analyze_market_structure
+from .symbols import NON_STREAMABLE, normalize_symbol_list
 from .technical_levels import build_technical_levels_context
-from .bars import equity_stream_window_bars, last_bucket_forming, resample_bars, session_bucket_ends
-from .indicators import ensure_standard_indicator_frame, htf_ema_spans, last_bar_atr, ltf_ema_spans
+from .bars import last_bucket_forming, session_bucket_ends
+from .indicators import htf_ema_spans, last_bar_atr, ltf_ema_spans
 from . import sessions
 from .levels_shared import collapse_price_ladder, effective_side_tolerance
 
+if TYPE_CHECKING:
+    from ._strategies.strategy_base import BaseStrategy
+
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
-
-
-# ---------------------------------------------------------------------------
-# Pure static dashboard helpers (Phase 5 Step 2 extraction).
-# Previously @staticmethod on IntradayBot; moved here as module-level
-# functions so payload-builder code can be relocated without dragging the
-# full engine surface along.
-# ---------------------------------------------------------------------------
-
-_EXCHANGE_ALIASES = {
-    "NASDAQ": "NASDAQ",
-    "NSDQ": "NASDAQ",
-    "NASD": "NASDAQ",
-    "NASDAQ GLOBAL MARKET": "NASDAQ",
-    "NASDAQ GLOBAL SELECT": "NASDAQ",
-    "NASDAQ CAPITAL MARKET": "NASDAQ",
-    "NMS": "NASDAQ",
-    "NGM": "NASDAQ",
-    "NCM": "NASDAQ",
-    "NGS": "NASDAQ",
-    "NYSE": "NYSE",
-    "NEW YORK STOCK EXCHANGE": "NYSE",
-    "NYSE AMERICAN": "AMEX",
-    "NYSE MKT": "AMEX",
-    "AMEX": "AMEX",
-    "NYSE ARCA": "AMEX",
-    "ARCA": "AMEX",
-    "BATS": "BATS",
-    "CBOE BZX": "BATS",
-    "BZX": "BATS",
-    "IEX": "IEX",
-}
-
-
-def dashboard_normalize_exchange(value: Any) -> str | None:
-    token = str(value or "").upper().strip()
-    if not token:
-        return None
-    normalized = " ".join(token.replace("-", " ").replace("/", " ").split())
-    return _EXCHANGE_ALIASES.get(normalized, _EXCHANGE_ALIASES.get(token, token or None))
-
-
-def dashboard_quote_exchange(quote: Mapping[str, Any] | None) -> str | None:
-    if not isinstance(quote, Mapping):
-        return None
-    raw_payload = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
-    raw_quote = raw_payload.get("quote") if isinstance(raw_payload.get("quote"), dict) else raw_payload
-    raw_reference = raw_payload.get("reference") if isinstance(raw_payload.get("reference"), dict) else {}
-    # Prefer the full exchange NAME fields ("NASDAQ" / "NYSE" / "NYSE Arca")
-    # over Schwab's single-letter ``exchange`` code ("q" / "n" / "a" / "p").
-    # The single letters aren't valid TradingView exchanges and aren't in
-    # _EXCHANGE_ALIASES, so they pass through raw and build broken deep-links
-    # (symbols/N-XOM/ -> 404). The full names map cleanly via _EXCHANGE_ALIASES,
-    # so they must win when present; the short codes stay only as a last resort.
-    candidates = [
-        raw_quote.get("exchangeName"),
-        raw_quote.get("primaryExchangeName"),
-        raw_reference.get("exchangeName"),
-        raw_reference.get("primaryExchangeName"),
-        raw_reference.get("listingExchange"),
-        quote.get("exchange"),
-        raw_quote.get("exchange"),
-        raw_quote.get("primaryExchange"),
-        raw_reference.get("exchange"),
-        raw_reference.get("primaryExchange"),
-    ]
-    for value in candidates:
-        normalized = dashboard_normalize_exchange(value)
-        if normalized:
-            return normalized
-    return None
-
-
-def dashboard_technical_line_payload(line: Any) -> dict[str, Any] | None:
-    """A trendline / channel edge for the chart. Its positions (start_pos,
-    end_pos, and the intercept at position 0) are in the coordinate space of
-    the frame handed to ``build_technical_levels_context`` -- the dashboard
-    hands it the chart's own frame, so they are the chart bars' abs_index
-    and ``slope * abs_index + intercept`` at the newest bar is
-    ``current_value``. Until 2026-09-23 they were positions in the builder's
-    internal 120-280 bar tail, and every line drew as a zero-length stub at
-    the chart's left edge."""
-    if line is None:
-        return None
-    return {
-        "kind": str(getattr(line, "kind", "line") or "line"),
-        "slope": float(getattr(line, "slope", 0.0) or 0.0),
-        "intercept": float(getattr(line, "intercept", 0.0) or 0.0),
-        "touches": int(getattr(line, "touches", 0) or 0),
-        "start_pos": int(getattr(line, "start_pos", 0) or 0),
-        "end_pos": int(getattr(line, "end_pos", 0) or 0),
-        "current_value": float(getattr(line, "current_value", 0.0) or 0.0),
-        "direction": str(getattr(line, "direction", "neutral") or "neutral"),
-    }
-
-
-def dashboard_fvg_payload(gap: Any) -> dict[str, Any] | None:
-    if gap is None:
-        return None
-
-    def _ts(value: Any) -> str | None:
-        if value is None:
-            return None
-        try:
-            iso = getattr(value, "isoformat", None)
-            if callable(iso):
-                return str(iso())
-        except Exception:
-            LOG.debug("Failed to serialize value via isoformat in dashboard payload; falling back to string.", exc_info=True)
-        return str(value)
-
-    lower = float(getattr(gap, "lower", 0.0) or 0.0)
-    upper = float(getattr(gap, "upper", 0.0) or 0.0)
-    midpoint = float(getattr(gap, "midpoint", (lower + upper) / 2.0) or ((lower + upper) / 2.0))
-    if upper <= lower or lower <= 0:
-        return None
-    return {
-        "direction": str(getattr(gap, "direction", "neutral") or "neutral"),
-        "lower": lower,
-        "upper": upper,
-        "midpoint": midpoint,
-        "size": float(getattr(gap, "size", upper - lower) or (upper - lower)),
-        "filled_pct": float(getattr(gap, "filled_pct", 0.0) or 0.0),
-        "first_seen": _ts(getattr(gap, "first_seen", None)),
-        "last_seen": _ts(getattr(gap, "last_seen", None)),
-    }
-
-
-def dashboard_fvg_anchor_abs_index(frame: pd.DataFrame | None, first_seen: Any) -> int | None:
-    if frame is None or getattr(frame, "empty", True) or first_seen in (None, ""):
-        return None
-    index = getattr(frame, "index", None)
-    if not isinstance(index, pd.DatetimeIndex) or index.empty:
-        return None
-    # The builders stamp first_seen with the bar's isoformat, or str() of an
-    # index label that is not a timestamp: that one has no chart anchor.
-    try:
-        anchor_ts = pd.Timestamp(first_seen)
-    except ValueError:
-        return None
-    if getattr(anchor_ts, "tzinfo", None) is not None:
-        anchor_ts = anchor_ts.tz_convert(None)
-    index_for_search = index.tz_convert(None) if getattr(index, "tz", None) is not None else index
-    pos = int(index_for_search.searchsorted(anchor_ts, side="left"))
-    if pos < 0 or pos >= len(index_for_search):
-        return None
-    return pos
-
-
-def dashboard_cache_json_signature(value: Any) -> str:
-    try:
-        return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"), ensure_ascii=False)
-    except (TypeError, ValueError):
-        # sort_keys cannot order a dict mixing key types (TypeError), and
-        # json refuses a circular container (ValueError).
-        return repr(value)
-
-
-def dashboard_frame_signature(frame: pd.DataFrame | None) -> tuple[Any, ...]:
-    if frame is None or getattr(frame, "empty", True):
-        return 0, None, None, None, None, None, None
-    index = getattr(frame, "index", None)
-    first_idx = index[0] if index is not None and len(index) else None
-    last_idx = index[-1] if index is not None and len(index) else None
-    last_row = frame.iloc[-1]
-
-    def _ts(value: Any) -> str | None:
-        if value is None:
-            return None
-        return pd.Timestamp(value).isoformat()
-
-    return (
-        int(len(frame)),
-        _ts(first_idx),
-        _ts(last_idx),
-        safe_float(last_row.get("close")) if hasattr(last_row, "get") else None,
-        safe_float(last_row.get("high")) if hasattr(last_row, "get") else None,
-        safe_float(last_row.get("low")) if hasattr(last_row, "get") else None,
-        safe_float(last_row.get("volume")) if hasattr(last_row, "get") else None,
-    )
-
-
-def dashboard_recent_trade_markers(account: Any, symbol: str) -> list[dict[str, Any]]:
-    """Return up to 12 dashboard-shaped trade rows for ``symbol`` from
-    today's ``account.trades`` (filtered by current ET session date).
-
-    Two correctness fixes vs. the original Phase-5 extraction:
-    1. The symbol filter runs BEFORE the slice. The trades deque is
-       LIFO-ordered (newest at index 0); pre-slicing to [:12] would make
-       a fresh fill on a long-quiet symbol invisible if 12 other tickers
-       traded after it.
-    2. Multi-day filter: ``account.trades`` is a multi-day deque
-       (maxlen=200). A naked iteration leaks yesterday's exits onto
-       today's chart. We restrict to trades whose ``exit_time`` falls
-       on the current ET trading date (or, for still-open positions
-       that emit a marker, ``entry_time``).
-    """
-    out: list[dict[str, Any]] = []
-    key = str(symbol or "").upper().strip()
-    if not key:
-        return out
-    today = sessions.now_et().date()
-    for trade in list(getattr(account, "trades", [])):
-        if str(getattr(trade, "symbol", "") or "").upper().strip() != key:
-            continue
-        # Today-filter: a trade belongs to today's chart if either side
-        # of the round-trip happened today. Exit-time wins when present;
-        # fall back to entry_time so paper-account entries that haven't
-        # exited yet still surface.
-        exit_time = getattr(trade, "exit_time", None)
-        entry_time = getattr(trade, "entry_time", None)
-        ref_time = exit_time if exit_time is not None else entry_time
-        if ref_time is None or ref_time.date() != today:
-            continue
-        out.append({
-            "symbol": key,
-            "side": str(getattr(trade, "side", "") or ""),
-            "qty": int(getattr(trade, "qty", 0) or 0),
-            "entry_price": safe_float(getattr(trade, "entry_price", None)),
-            "exit_price": safe_float(getattr(trade, "exit_price", None)),
-            "entry_time": entry_time.isoformat() if entry_time is not None else None,
-            "exit_time": exit_time.isoformat() if exit_time is not None else None,
-            "realized_pnl": safe_float(getattr(trade, "realized_pnl", None)),
-            "return_pct": safe_float(getattr(trade, "return_pct", None)),
-            "reason": str(getattr(trade, "reason", "") or ""),
-        })
-        if len(out) >= 12:
-            break
-    return out
-
-
-def dashboard_symbol_trade_signature(account: Any, symbol: str) -> tuple[Any, ...]:
-    """Build a cache-key signature capturing the last trade state for
-    ``symbol`` on ``account``.
-
-    Same correctness fix as ``dashboard_recent_trade_markers``: filter
-    by symbol BEFORE slicing. Without this, a fresh fill on a
-    long-quiet symbol won't change the signature when 24 other tickers
-    have traded after it, so the cached snapshot stays stale.
-
-    The signature is intentionally NOT date-filtered — cache invalidation
-    must catch any newly-recorded trade for the symbol regardless of
-    session date, even if the chart payload itself filters to today.
-    """
-    key = str(symbol or "").upper().strip()
-    if not key:
-        return 0, None, None, None
-    count = 0
-    latest_exit: str | None = None
-    latest_entry: str | None = None
-    latest_reason: str | None = None
-    matched = 0
-    for trade in list(getattr(account, "trades", [])):
-        if str(getattr(trade, "symbol", "") or "").upper().strip() != key:
-            continue
-        count += 1
-        if latest_exit is None:
-            exit_time = getattr(trade, "exit_time", None)
-            entry_time = getattr(trade, "entry_time", None)
-            latest_exit = exit_time.isoformat() if exit_time is not None else None
-            latest_entry = entry_time.isoformat() if entry_time is not None else None
-            latest_reason = str(getattr(trade, "reason", "") or "")
-        matched += 1
-        if matched >= 24:
-            break
-    return count, latest_exit, latest_entry, latest_reason
-
-
-def dashboard_bars_from_frame(
-    frame: pd.DataFrame | None,
-    *,
-    max_bars: int = 90,
-    per_bar_candles: dict[Any, dict[str, list[str]]] | None = None,
-) -> list[dict[str, Any]]:
-    """Convert the last ``max_bars`` OHLCV rows of ``frame`` into a list of
-    JSON-serializable dicts for the dashboard chart payload. Returns [] for
-    None / empty frames.
-
-    Carries per-bar indicator values so the dashboard tooltip can honestly
-    display the hovered bar's state (instead of silently falling back to a
-    global latest-snapshot value). Per-bar fields:
-      * adx / plus_di / minus_di / dmi_bias (derived from DI lines)
-      * obv / obv_ema / obv_bias (derived from OBV vs OBV-EMA)
-      * candles_bullish / candles_bearish (from ``per_bar_candles`` map,
-        completion-bar only, with tier cascade applied)
-    """
-    capped_bars = max(1, min(int(max_bars or 90), 480))
-    bars: list[dict[str, Any]] = []
-    if frame is None or frame.empty:
-        return bars
-    tail = frame.tail(capped_bars).copy()
-    tail_offset = max(0, len(frame) - len(tail))
-    per_bar_candles = per_bar_candles or {}
-    for rel_idx, (idx, row) in enumerate(tail.iterrows()):
-        close_val = safe_float(row.get("close"))
-        atr14 = safe_float(row.get("atr14"))
-        plus_di = safe_float(row.get("plus_di14"))
-        minus_di = safe_float(row.get("minus_di14"))
-        obv = safe_float(row.get("obv"))
-        obv_ema = safe_float(row.get("obv_ema20"))
-        # DMI bias: bullish if +DI > -DI, bearish if -DI > +DI, else neutral.
-        # None when either reading is unavailable (warmup bars).
-        if plus_di is not None and minus_di is not None:
-            if plus_di > minus_di:
-                dmi_bias = "bullish"
-            elif minus_di > plus_di:
-                dmi_bias = "bearish"
-            else:
-                dmi_bias = "neutral"
-        else:
-            dmi_bias = None
-        # OBV bias: bullish if OBV > OBV-EMA, bearish if below, else neutral.
-        if obv is not None and obv_ema is not None:
-            if obv > obv_ema:
-                obv_bias = "bullish"
-            elif obv < obv_ema:
-                obv_bias = "bearish"
-            else:
-                obv_bias = "neutral"
-        else:
-            obv_bias = None
-        bar_candle_match = per_bar_candles.get(idx, {})
-        candles_bullish = list(bar_candle_match.get("bullish", []))
-        candles_bearish = list(bar_candle_match.get("bearish", []))
-        bars.append({
-            "ts": idx.isoformat() if hasattr(idx, "isoformat") else str(idx),
-            "abs_index": tail_offset + rel_idx,
-            # True only on a chart's still-forming last bucket, which
-            # chart_payload marks; every bar built here is complete.
-            "in_progress": False,
-            "open": safe_float(row.get("open")),
-            "high": safe_float(row.get("high")),
-            "low": safe_float(row.get("low")),
-            "close": close_val,
-            "volume": safe_float(row.get("volume")),
-            "ema9": safe_float(row.get("ema9")),
-            "ema20": safe_float(row.get("ema20")),
-            "vwap": safe_float(row.get("vwap")),
-            "atr14": atr14,
-            "atr_pct": (atr14 / close_val) if atr14 is not None and close_val not in (None, 0.0) else None,
-            "ret1": safe_float(row.get("ret1")),
-            "ret5": safe_float(row.get("ret5")),
-            "ret15": safe_float(row.get("ret15")),
-            "bb_mid": safe_float(row.get("bb_mid")),
-            "bb_upper": safe_float(row.get("bb_upper")),
-            "bb_lower": safe_float(row.get("bb_lower")),
-            "bb_width_pct": safe_float(row.get("bb_width_pct")),
-            "bb_percent_b": safe_float(row.get("bb_percent_b")),
-            "bb_zscore": safe_float(row.get("bb_zscore")),
-            "adx": safe_float(row.get("adx14")),
-            "plus_di": plus_di,
-            "minus_di": minus_di,
-            "dmi_bias": dmi_bias,
-            "obv": obv,
-            "obv_ema": obv_ema,
-            "obv_bias": obv_bias,
-            "candles_bullish": candles_bullish,
-            "candles_bearish": candles_bearish,
-        })
-    return bars
 
 
 # TA-Lib's candle functions read at most 14 bars before the bar they score
@@ -425,54 +79,6 @@ def dashboard_bars_from_frame(
 # oldest bars of the window, and the snapshot's starved tags overwrote the
 # chart's on the newest 48 bars. 12 extra bars already matched on every bar.
 _CANDLE_PATTERN_WARMUP_BARS = 14
-
-# Key-level zone kinds for a level price has crossed: broken_* once the flip
-# is confirmed, pending_* while it is not. Each is drawn as its own zone, in
-# its flipped role once confirmed and marked pending until then.
-_FLIP_CANDIDATE_LEVEL_KINDS = frozenset({
-    "broken_htf_support",
-    "broken_htf_resistance",
-    "pending_htf_support",
-    "pending_htf_resistance",
-})
-
-
-def dashboard_htf_chart_frame(
-    completed: pd.DataFrame | None,
-    minute_frame: pd.DataFrame | None,
-    *,
-    timeframe_minutes: int,
-    now: datetime,
-) -> tuple[pd.DataFrame | None, pd.Timestamp | None]:
-    """The HTF chart's frame, and the start of its still-forming bucket (None
-    when every bucket in it is complete).
-
-    ``completed`` is the stored HTF frame: completed bars only, refreshed once
-    per bucket, so on its own the chart ends at the last bucket completed
-    before that refresh. The buckets after it are built here from the live 1m
-    frame -- cut to the 07:00-20:00 window like the stored bars, then
-    resampled on the same session grid -- and the one holding ``now`` is
-    the forming bucket. Until 2026-09-23 the chart plotted the stored frame
-    as-is, whose last row was the bucket Schwab returned seconds after it
-    opened, drawn as if complete and frozen at that stub for the whole
-    bucket.
-    """
-    if completed is None or completed.empty or minute_frame is None or minute_frame.empty:
-        return completed, None
-    ohlcv = ["open", "high", "low", "close", "volume"]
-    completed_end = session_bucket_ends(completed.index[-1:], int(timeframe_minutes))[0]
-    after = minute_frame.loc[minute_frame.index >= completed_end, ohlcv]
-    if after.empty:
-        return completed, None
-    after = equity_stream_window_bars(after)
-    if after.empty:
-        return completed, None
-    buckets = resample_bars(after, f"{int(timeframe_minutes)}min")
-    if buckets.empty:
-        return completed, None
-    frame = ensure_standard_indicator_frame(pd.concat([completed[ohlcv], buckets[ohlcv]]))
-    forming = pd.Timestamp(buckets.index[-1]) if last_bucket_forming(buckets.index, int(timeframe_minutes), now) else None
-    return frame, forming
 
 
 def dashboard_structure_event_label(ms_ctx: Any) -> str:
@@ -498,10 +104,13 @@ def dashboard_structure_event_label(ms_ctx: Any) -> str:
 
 
 class DashboardCache:
-    """Dashboard-side state container + config-bound helpers.
+    """Dashboard-side state container, payload builders and config-bound
+    helpers.
 
-    Owns snapshot/chart caches, the rate-limited error logger, and the
-    small config-reading helpers that resolve chart profile / max-bars /
+    Owns snapshot/chart caches, the rate-limited error logger, the builders
+    (``build_payload``, ``symbol_snapshot``, ``sr_row``,
+    ``strategy_level_zones``, ``chart_payload``), and the small
+    config-reading helpers that resolve chart profile / max-bars /
     candidate-limit from ``config.dashboard`` and ``config.tradingview``.
     """
 
@@ -510,7 +119,7 @@ class DashboardCache:
         config: BotConfig,
         *,
         data: Any = None,
-        strategy: Any = None,
+        strategy: BaseStrategy,
         account: Any = None,
     ) -> None:
         self.config = config
@@ -520,7 +129,7 @@ class DashboardCache:
         self.snapshot_cache: dict[str, dict[str, Any]] = {}
         self.chart_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
         self.lock = RLock()
-        self._error_log_times: dict[str, float] = {}
+        self.log_component_failure = ComponentFailureLog(LOG)
 
     def prune_inactive_symbols(self, active_symbols: set[str]) -> int:
         """Drop cached snapshot + chart payloads for symbols no longer in the
@@ -539,21 +148,6 @@ class DashboardCache:
         # Distinct symbol count, not entry count, so the engine has a
         # consistent figure to log alongside the data_feed prune count.
         return len({str(sym).upper().strip() for sym in (snap_stale | {k[0] for k in chart_stale})})
-
-    def log_component_failure(self, component: str, message: str, *message_args: Any) -> None:
-        """Rate-limited component error logger.
-
-        Emits ``LOG.warning(message, ..., exc_info=True)`` at most once per
-        60 seconds per ``component``; intermediate failures go to DEBUG so
-        they're still captured but don't spam the WARNING stream."""
-        key = str(component or "dashboard")
-        now_ts = time.monotonic()
-        last_ts = float(self._error_log_times.get(key, 0.0) or 0.0)
-        if now_ts - last_ts >= 60.0:
-            self._error_log_times[key] = now_ts
-            LOG.warning(message, *message_args, exc_info=True)
-        else:
-            LOG.debug(message, *message_args, exc_info=True)
 
     # ---------------------------------------------------------------------
     # Chart-profile helpers (Phase 5 Step 3 extraction).
@@ -577,16 +171,13 @@ class DashboardCache:
             "expanded": asdict(self.chart_profile("expanded")),
         }
 
-    def candidate_limit(self, strategy: Any = None) -> int:
+    def candidate_limit(self) -> int:
         """Resolve the max candidate rows to emit on the dashboard.
 
         Base limit is ``config.tradingview.max_candidates``; a strategy may
         override via ``dashboard_candidate_limit(base)``."""
-        strategy = strategy if strategy is not None else self.strategy
         limit = max(1, int(self.config.tradingview.max_candidates))
-        if strategy is None:
-            return limit
-        return max(1, int(strategy.dashboard_candidate_limit(limit)))
+        return max(1, int(self.strategy.dashboard_candidate_limit(limit)))
 
     # ---------------------------------------------------------------------
     # Payload builders that need data/strategy/account (Phase 5 Step 5).
@@ -714,6 +305,235 @@ class DashboardCache:
                 return float(cached)
         return None
 
+    def build_payload(
+        self,
+        *,
+        positions: Mapping[str, Position],
+        last_candidates: list[Candidate],
+        watchlist: list[str],
+        quote_watchlist: list[str],
+        entry_decisions: Mapping[str, Any],
+        warmup_summary: Mapping[str, Any],
+        allow_refresh: bool,
+    ) -> dict[str, Any]:
+        """The symbol part of the dashboard state the engine publishes each
+        cycle, which adds its own status fields: the account's performance
+        (its positions carrying their S/R row's fields), the candidates card,
+        each shown symbol's snapshot and exchange, the feed's and the
+        strategy's symbol lists, and the chart settings. The symbols shown are
+        the positions', the watchlist, the quote watchlist, the candidates and
+        the S/R rows', in that order; the caches drop every other symbol.
+        ``allow_refresh`` is the gate's context refresh: the S/R rows and
+        snapshots refresh their HTF reads only while it is on. Until
+        2026-09-27 this was the engine's ``_dashboard_state`` (refactor cut
+        C40)."""
+        performance = self.account.snapshot_copy(positions)
+        candidates = []
+        entry_decision_by_symbol = {str(symbol or '').upper().strip(): copy.deepcopy(payload) for symbol, payload in entry_decisions.items() if str(symbol or '').upper().strip()}
+        candidate_limit = self.candidate_limit()
+        symbol_exchanges: dict[str, str] = {}
+
+        def remember_exchange(symbol_value: Any, exchange_value: Any = None) -> None:
+            symbol_key = str(symbol_value or '').upper().strip()
+            if not symbol_key:
+                return
+            normalized_exchange = normalize_exchange(exchange_value)
+            if normalized_exchange is None:
+                normalized_exchange = quote_exchange(self.data.get_quote(symbol_key) or {})
+            if normalized_exchange:
+                symbol_exchanges[symbol_key] = normalized_exchange
+
+        # Live activity-score + directional-bias resolvers for the
+        # dashboard candidates card. Strategies whose screeners can't
+        # populate real values at screen time (e.g. 0DTE option
+        # strategies that synthesize candidates locally without TV)
+        # opt into resolution here by defining the public
+        # methods ``live_activity_score(frame)``,
+        # ``dashboard_directional_bias(frame)``, and/or
+        # ``dashboard_change_from_open(frame)`` on the strategy class.
+        # Strategies whose screeners DO populate real values (e.g.
+        # equity strategies pulling rvol + change_from_open from TV)
+        # just don't define them — the candidate's existing
+        # activity_score / directional_bias / change_from_open values
+        # flow through unchanged. Pure duck-typing — no plugin-type
+        # dispatch needed. All compute paths share a single frame
+        # fetch per candidate.
+        live_score_fn = getattr(self.strategy, 'live_activity_score', None)
+        live_bias_fn = getattr(self.strategy, 'dashboard_directional_bias', None)
+        live_change_fn = getattr(self.strategy, 'dashboard_change_from_open', None)
+        all_candidate_rows: list[dict[str, Any]] = []
+        for c in last_candidates:
+            remember_exchange(c.symbol, c.metadata.get("exchange"))
+            exchange = normalize_exchange(c.metadata.get("exchange"))
+            activity_score_for_row = c.activity_score
+            directional_bias_for_row = c.directional_bias
+            change_from_open_for_row = c.metadata.get("change_from_open")
+            if live_score_fn is not None or live_bias_fn is not None or live_change_fn is not None:
+                try:
+                    frame = self.data.get_merged(c.symbol, with_indicators=True)
+                    if live_score_fn is not None:
+                        live_score = float(live_score_fn(frame))
+                        # Reject NaN / +/-Inf — live_activity_score is
+                        # designed to fail-open at 1.0 (neutral) but a
+                        # subclass override could regress, and downstream
+                        # json_safe would silently coerce to null and
+                        # break the score ring rather than the candidate
+                        # stub of 1.0 the rest of the system expects.
+                        if math.isfinite(live_score):
+                            activity_score_for_row = live_score
+                    if live_bias_fn is not None:
+                        live_bias = live_bias_fn(frame)
+                        # Type guard — only accept Side enum members.
+                        # Defends against a subclass returning a string
+                        # ("LONG") or other shape that would crash the
+                        # ``.value`` deref below and kill the entire
+                        # publish loop.
+                        if isinstance(live_bias, Side):
+                            directional_bias_for_row = live_bias
+                    if live_change_fn is not None:
+                        live_change = live_change_fn(frame)
+                        # Same finite guard as activity_score — a None
+                        # return means "frame insufficient to compute,
+                        # fall back to candidate metadata" (which for
+                        # 0DTE is also None after the 2026-05-19
+                        # stub-removal, so the dashboard renders "—"
+                        # until session bars are sufficient).
+                        if live_change is not None:
+                            live_change_f = float(live_change)
+                            if math.isfinite(live_change_f):
+                                change_from_open_for_row = live_change_f
+                except Exception:
+                    LOG.debug("Dashboard live-publish compute failed for %s; using candidate stubs.", c.symbol, exc_info=True)
+            row = {
+                "symbol": c.symbol,
+                "rank": c.rank,
+                "activity_score": activity_score_for_row,
+                "exchange": exchange or None,
+                "change_from_open": change_from_open_for_row,
+                # ``change`` (prior-close-relative) is shipped alongside
+                # ``change_from_open`` (session-open-relative) for strategies
+                # that emit both (currently: top_tier_adaptive). Dashboard
+                # uses ``change`` for the "Day %" display fallback so the
+                # screener-fallback value matches the prior-close semantic
+                # of the live Schwab ``quote.percent_change`` primary.
+                # Strategies that don't emit ``change`` get None here.
+                "change": c.metadata.get("change"),
+                "close": c.metadata.get("close"),
+                "volume": c.metadata.get("volume"),
+                "directional_bias": directional_bias_for_row.value if directional_bias_for_row else None,
+            }
+            all_candidate_rows.append(row)
+            if len(candidates) < candidate_limit:
+                candidates.append(copy.deepcopy(row))
+
+        sr_symbols: list[str] = []
+        seen: set[str] = set()
+        for row in performance.get("positions", []):
+            sym = str(row.get("underlying") or row.get("symbol") or "").upper().strip()
+            if sym and sym not in seen:
+                seen.add(sym)
+                sr_symbols.append(sym)
+        for sym in list(quote_watchlist) + list(watchlist) + [c.get("symbol") for c in candidates]:
+            symbol = str(sym or "").upper().strip()
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                sr_symbols.append(symbol)
+        sr_symbols = sr_symbols[:12]
+
+        sr_levels = []
+        sr_by_symbol: dict[str, dict[str, Any]] = {}
+        for symbol in sr_symbols:
+            row = self.sr_row(symbol, allow_refresh=allow_refresh)
+            if row is None:
+                continue
+            sr_levels.append(row)
+            sr_by_symbol[symbol] = row
+
+        if performance.get("positions"):
+            enriched_positions = []
+            for row in performance["positions"]:
+                symbol = str(row.get("underlying") or row.get("symbol") or "").upper().strip()
+                sr_row = sr_by_symbol.get(symbol) or self.sr_row(symbol, allow_refresh=allow_refresh)
+                new_row = copy.deepcopy(row)
+                if sr_row is not None:
+                    new_row.update({
+                        "sr_symbol": symbol,
+                        "sr_timeframe": sr_row.get("timeframe"),
+                        "sr_nearest_support": sr_row.get("nearest_support"),
+                        "sr_nearest_resistance": sr_row.get("nearest_resistance"),
+                        "sr_support_distance_pct": sr_row.get("support_distance_pct"),
+                        "sr_resistance_distance_pct": sr_row.get("resistance_distance_pct"),
+                        "sr_regime_hint": sr_row.get("regime_hint"),
+                        "sr_state": sr_row.get("state"),
+                    })
+                enriched_positions.append(new_row)
+            performance["positions"] = enriched_positions
+
+        candidate_by_symbol = {str(row.get("symbol") or "").upper().strip(): row for row in all_candidate_rows}
+        position_by_symbol: dict[str, dict[str, Any]] = {}
+        for row in performance.get("positions", []):
+            base_symbol = str(row.get("underlying") or row.get("symbol") or "").upper().strip()
+            if base_symbol and base_symbol not in position_by_symbol:
+                position_by_symbol[base_symbol] = row
+
+        warmup_by_symbol = {
+            str(item.get('symbol') or '').upper().strip(): item
+            for item in (warmup_summary.get('symbols') or [])
+            if str(item.get('symbol') or '').upper().strip()
+        }
+
+        dashboard_symbol_order: list[str] = []
+        seen_dashboard_symbols: set[str] = set()
+        for bucket in (
+            [str(row.get("underlying") or row.get("symbol") or "").upper().strip() for row in performance.get("positions", [])],
+            [str(sym or "").upper().strip() for sym in watchlist],
+            [str(sym or "").upper().strip() for sym in quote_watchlist],
+            [str(row.get("symbol") or "").upper().strip() for row in candidates],
+            [str(row.get("symbol") or "").upper().strip() for row in sr_levels],
+        ):
+            for symbol in bucket:
+                if symbol and symbol not in seen_dashboard_symbols:
+                    seen_dashboard_symbols.add(symbol)
+                    dashboard_symbol_order.append(symbol)
+
+        for row in performance.get("positions", []):
+            remember_exchange(row.get("underlying") or row.get("symbol"))
+        for trade in performance.get("recent_trades", []):
+            remember_exchange(trade.get("underlying") or trade.get("symbol"))
+        for symbol in dashboard_symbol_order:
+            remember_exchange(symbol)
+
+        dashboard_symbols = [
+            self.symbol_snapshot(
+                symbol,
+                exchange=symbol_exchanges.get(symbol),
+                sr_row=sr_by_symbol.get(symbol),
+                candidate_row=candidate_by_symbol.get(symbol),
+                position_row=position_by_symbol.get(symbol),
+                entry_decision=entry_decision_by_symbol.get(symbol),
+                warmup=warmup_by_symbol.get(symbol),
+                allow_refresh=allow_refresh,
+            )
+            for symbol in dashboard_symbol_order
+        ]
+        for snapshot in dashboard_symbols:
+            remember_exchange(snapshot.get('symbol'), snapshot.get('exchange'))
+        self.prune_inactive_symbols(set(dashboard_symbol_order))
+
+        return {
+            "data": {
+                **self.data.dashboard_data_snapshot(),
+                "non_streamable_symbols": sorted(NON_STREAMABLE),
+                "tradable_symbols": self.tradable_symbols(),
+                "index_symbols": self.index_symbols(),
+            },
+            "performance": performance,
+            "candidates": candidates,
+            "symbol_exchanges": symbol_exchanges,
+            "dashboard_charting": self.charting_settings(),
+            "dashboard_symbols": dashboard_symbols,
+        }
+
     def symbol_snapshot(
         self,
         symbol: str,
@@ -776,7 +596,7 @@ class DashboardCache:
                     symbol,
                 )
                 snapshot_per_bar_candles = {}
-        bars = dashboard_bars_from_frame(
+        bars = bars_from_frame(
             frame,
             max_bars=snapshot_bars_count,
             per_bar_candles=snapshot_per_bar_candles,
@@ -1040,12 +860,12 @@ class DashboardCache:
                         "upper": safe_float(getattr(getattr(tech_ctx, "channel", None), "upper", None)),
                         "mid": safe_float(getattr(getattr(tech_ctx, "channel", None), "mid", None)),
                         "position_pct": safe_float(getattr(getattr(tech_ctx, "channel", None), "position_pct", None)),
-                        "lower_line": dashboard_technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "lower_line", None)),
-                        "upper_line": dashboard_technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "upper_line", None)),
-                        "mid_line": dashboard_technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "mid_line", None)),
+                        "lower_line": technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "lower_line", None)),
+                        "upper_line": technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "upper_line", None)),
+                        "mid_line": technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "mid_line", None)),
                     },
-                    "support_trendline": dashboard_technical_line_payload(getattr(tech_ctx, "support_trendline", None)),
-                    "resistance_trendline": dashboard_technical_line_payload(getattr(tech_ctx, "resistance_trendline", None)),
+                    "support_trendline": technical_line_payload(getattr(tech_ctx, "support_trendline", None)),
+                    "resistance_trendline": technical_line_payload(getattr(tech_ctx, "resistance_trendline", None)),
                     "trendline_break_up": bool(getattr(tech_ctx, "trendline_break_up", False)),
                     "trendline_break_down": bool(getattr(tech_ctx, "trendline_break_down", False)),
                     "support_respected": bool(getattr(tech_ctx, "support_respected", False)),
@@ -1119,7 +939,7 @@ class DashboardCache:
                     htf_min = self.strategy.htf_minutes()
                     htf_tf_minutes = int(getattr(htf_ctx, "timeframe_minutes", htf_min) or htf_min)
                     for gap in list(getattr(htf_ctx, "bullish_fvgs", []) or []) + list(getattr(htf_ctx, "bearish_fvgs", []) or []):
-                        payload_fvg = dashboard_fvg_payload(gap)
+                        payload_fvg = fvg_payload(gap)
                         if payload_fvg is not None:
                             payload_fvg["timeframe"] = f"{htf_tf_minutes}m"
                             htf_fair_value_gaps.append(payload_fvg)
@@ -1158,10 +978,10 @@ class DashboardCache:
                     else:
                         anchor_frame = self.data.get_merged(symbol, timeframe=f"{ltf_min_for_fvg}min", with_indicators=True)
                     for gap in list(getattr(fvg_ctx, "bullish_fvgs", []) or []) + list(getattr(fvg_ctx, "bearish_fvgs", []) or []):
-                        payload_fvg = dashboard_fvg_payload(gap)
+                        payload_fvg = fvg_payload(gap)
                         if payload_fvg is not None:
                             payload_fvg["timeframe"] = f"{ltf_min_for_fvg}m"
-                            payload_fvg["anchor_abs_index"] = dashboard_fvg_anchor_abs_index(anchor_frame, payload_fvg.get("first_seen"))
+                            payload_fvg["anchor_abs_index"] = fvg_anchor_abs_index(anchor_frame, payload_fvg.get("first_seen"))
                             ltf_fair_value_gaps.append(payload_fvg)
         except Exception:
             self.log_component_failure(
@@ -1172,7 +992,7 @@ class DashboardCache:
             ltf_fair_value_gaps = []
 
         # Order blocks. Same payload shape as FVGs (lower/upper/midpoint/size/
-        # direction/filled_pct/first_seen/last_seen) — `dashboard_fvg_payload`
+        # direction/filled_pct/first_seen/last_seen) — `fvg_payload`
         # is reused since it's shape-driven, not type-driven. Frontend reads
         # `htf_order_blocks` and `ltf_order_blocks` separately and renders
         # them with dashed-stroke styling vs FVGs' solid-fill styling.
@@ -1195,7 +1015,7 @@ class DashboardCache:
                     **ob_request,
                 )
                 for ob in list(getattr(ob_ctx_htf, "bullish_obs", []) or []) + list(getattr(ob_ctx_htf, "bearish_obs", []) or []):
-                    payload_ob = dashboard_fvg_payload(ob)
+                    payload_ob = fvg_payload(ob)
                     if payload_ob is not None:
                         payload_ob["timeframe"] = f"{int(htf_minutes)}m"
                         payload_ob["kind"] = "ob"
@@ -1231,12 +1051,12 @@ class DashboardCache:
                 else:
                     ltf_frame = self.data.get_merged(symbol, timeframe=f"{ltf_min_for_ob}min", with_indicators=True)
                 for ob in list(getattr(ob_ctx_ltf, "bullish_obs", []) or []) + list(getattr(ob_ctx_ltf, "bearish_obs", []) or []):
-                    payload_ob = dashboard_fvg_payload(ob)
+                    payload_ob = fvg_payload(ob)
                     if payload_ob is not None:
                         payload_ob["timeframe"] = f"{ltf_min_for_ob}m"
                         payload_ob["kind"] = "ob"
                         payload_ob["mode"] = ob_ctx_ltf.mode
-                        payload_ob["anchor_abs_index"] = dashboard_fvg_anchor_abs_index(ltf_frame, payload_ob.get("first_seen"))
+                        payload_ob["anchor_abs_index"] = fvg_anchor_abs_index(ltf_frame, payload_ob.get("first_seen"))
                         ltf_order_blocks.append(payload_ob)
         except Exception:
             self.log_component_failure(
@@ -1324,7 +1144,7 @@ class DashboardCache:
             },
             "technicals": technical_payload,
             "position_markers": position_markers,
-            "recent_trades": dashboard_recent_trade_markers(self.account, symbol),
+            "recent_trades": recent_trade_markers(self.account, symbol),
             # Spans of the snapshot bars' ema9 / ema20, for labelling them
             # before (or without) a chart payload.
             "ema_fast_span": snapshot_ema_spans[0],
@@ -1334,9 +1154,9 @@ class DashboardCache:
         payload = {
             "symbol": symbol,
             "exchange": (
-                dashboard_normalize_exchange(exchange)
-                or dashboard_normalize_exchange((candidate_row or {}).get("exchange"))
-                or dashboard_quote_exchange(quote)
+                normalize_exchange(exchange)
+                or normalize_exchange((candidate_row or {}).get("exchange"))
+                or quote_exchange(quote)
             ),
             "description": quote.get("description"),
             "quote": {
@@ -1378,10 +1198,13 @@ class DashboardCache:
         pending_resistance_price: float | None = None,
         allow_htf_refresh: bool = True,
     ) -> list[dict[str, Any]]:
-        """Build strategy-specific dashboard level zones (support + resistance
-        with flip confirmation, score, selection). Extracted from IntradayBot."""
+        """The chart's key-level zones: the strategy's level candidates (the S/R
+        row's levels for a strategy that allows the generic fallback) as zones
+        sized by its hooks, read here with the HTF context and the LTF frame
+        its spec names, then classified and picked by
+        ``dashboard_zones.build_level_zones``."""
         strategy_obj = self.strategy
-        if strategy_obj is None or self.data is None:
+        if self.data is None:
             return []
         try:
             level_ctx = strategy_obj.dashboard_level_context_spec() or {}
@@ -1404,23 +1227,12 @@ class DashboardCache:
         # and pending levels were not drawn at all. A flipped or pending level
         # is listed ahead of a plain one at the same price, which it labels
         # more precisely.
-        def _anchors(entries: list[tuple[float | None, str, bool]]) -> list[tuple[float, str, bool]]:
-            deduped: list[tuple[float, str, bool]] = []
-            seen: set[float] = set()
-            for price, kind_name, flip_confirmed in entries:
-                value = safe_float(price)
-                if value is None or round(value, 4) <= 0 or round(value, 4) in seen:
-                    continue
-                seen.add(round(value, 4))
-                deduped.append((value, kind_name, flip_confirmed))
-            return deduped
-
-        support_anchors = _anchors([
+        support_anchors = level_anchors([
             (broken_resistance_price, "broken_htf_resistance", True),
             (pending_support_price, "pending_htf_support", False),
             *((price, "nearest_htf_support", False) for price in (support_prices or [])),
         ])
-        resistance_anchors = _anchors([
+        resistance_anchors = level_anchors([
             (broken_support_price, "broken_htf_support", True),
             (pending_resistance_price, "pending_htf_resistance", False),
             *((price, "nearest_htf_resistance", False) for price in (resistance_prices or [])),
@@ -1572,8 +1384,8 @@ class DashboardCache:
                 "passes_min_level_score": bool(float(candidate.get("level_score", 0.0) or 0.0) >= float(min_level_score)),
                 "selected_for_entry": bool(selected_anchor_price is not None and abs(float(price) - float(selected_anchor_price)) <= float(selected_zone_match_tolerance)),
                 # The S/R builder's verdict on a generic-fallback level's flip;
-                # absent on a strategy's own candidates, whose flips the zone
-                # check below decides.
+                # absent on a strategy's own candidates, whose flips
+                # dashboard_zones checks on the zone's edges.
                 "builder_flip_confirmed": candidate.get("builder_flip_confirmed"),
             }
 
@@ -1588,235 +1400,13 @@ class DashboardCache:
         # as flipped — confusing when the dashboard sidebar (which already
         # uses trading mode via `sr_row()`) and the chart disagreed about
         # the same level.
-        zone_flip_1m, zone_flip_5m = self.config.support_resistance.flip_confirmation_bars()
-        fallback_bar = None
-        if frame is not None and not frame.empty:
-            last_bar = frame.iloc[-1]
-            fallback_bar = (float(last_bar.get("high")), float(last_bar.get("low")))
-        zone_eps = max(abs(float(close)) * 1e-6, 1e-8)
-
-        def _zone_level_kind(zone: dict[str, Any]) -> str:
-            return str(zone.get("engine_level_kind", "") or "").strip().lower()
-
-        def _is_fvg_zone(zone: dict[str, Any]) -> bool:
-            kind_name = _zone_level_kind(zone)
-            return kind_name in {"bullish_htf_fvg", "bearish_htf_fvg"} or "fvg" in kind_name
-
-        def _zone_original_kind(zone: dict[str, Any]) -> str | None:
-            kind_name = _zone_level_kind(zone)
-            if not kind_name or _is_fvg_zone(zone):
-                return None
-            if kind_name in {"broken_htf_support", "pending_htf_support"}:
-                return "support"
-            if kind_name in {"broken_htf_resistance", "pending_htf_resistance"}:
-                return "resistance"
-            if kind_name in {"prior_day_low", "prior_week_low"} or kind_name.endswith("_low"):
-                return "support"
-            if kind_name in {"prior_day_high", "prior_week_high"} or kind_name.endswith("_high"):
-                return "resistance"
-            if "support" in kind_name and "resistance" not in kind_name:
-                return "support"
-            if "resistance" in kind_name and "support" not in kind_name:
-                return "resistance"
-            return None
-
-        def _zone_flipped_kind(kind_name: str | None) -> str | None:
-            if kind_name == "support":
-                return "resistance"
-            if kind_name == "resistance":
-                return "support"
-            return None
-
-        def _apply_zone_confirmation_state(zone: dict[str, Any]) -> dict[str, Any]:
-            original_kind = _zone_original_kind(zone)
-            if original_kind is None:
-                return zone
-            flipped_kind = _zone_flipped_kind(original_kind)
-            if flipped_kind is None:
-                return zone
-            level_kind = _zone_level_kind(zone)
-            builder_verdict = zone.get("builder_flip_confirmed")
-            if builder_verdict is None:
-                confirmed = zone_flip_confirmed(
-                    original_kind,
-                    float(zone.get("lower", 0.0) or 0.0),
-                    float(zone.get("upper", 0.0) or 0.0),
-                    flip_frame=frame,
-                    confirm_1m_bars=zone_flip_1m,
-                    confirm_5m_bars=zone_flip_5m,
-                    fallback_bar=fallback_bar,
-                    eps=zone_eps,
-                )
-            else:
-                # The builder confirmed (broken_*) or has yet to confirm
-                # (pending_*, nearest) this flip on the level price; the
-                # zone-edge check above answers a different question and
-                # could relabel a confirmed breakout-retest level as pending.
-                confirmed = bool(builder_verdict)
-            sources = list(zone.get("sources", []) or [])
-            zone["original_kind"] = str(original_kind)
-            zone["confirmed_flip"] = False
-            zone["flip_state"] = "original"
-            zone["pending_flip"] = False
-            zone["pending_state"] = ""
-            zone["flip_target_kind"] = ""
-            if level_kind in _FLIP_CANDIDATE_LEVEL_KINDS:
-                if confirmed:
-                    zone["kind"] = flipped_kind
-                    zone["confirmed_flip"] = True
-                    zone["flip_state"] = "confirmed_flip"
-                    zone["sources"] = list(dict.fromkeys([*sources, f"confirmed_broken_{original_kind}_zone"]))
-                else:
-                    zone["kind"] = original_kind
-                    zone["flip_state"] = "pending_flip"
-                    zone["pending_flip"] = True
-                    zone["pending_state"] = "pending_break" if original_kind == "support" else "pending_reclaim"
-                    zone["flip_target_kind"] = flipped_kind
-                    zone["sources"] = list(dict.fromkeys([*sources, f"pending_broken_{original_kind}"]))
-                return zone
-            if confirmed:
-                zone["kind"] = flipped_kind
-                zone["confirmed_flip"] = True
-                zone["flip_state"] = "confirmed_flip"
-                zone["sources"] = list(dict.fromkeys([*sources, f"confirmed_flipped_{original_kind}_zone"]))
-            else:
-                zone["kind"] = original_kind
-                zone["sources"] = list(dict.fromkeys(sources))
-            return zone
-
-        all_zones = [_apply_zone_confirmation_state(zone) for zone in (support_zones + resistance_zones)]
-
-        def _zone_rank_key(zone: dict[str, Any]) -> tuple[float, ...]:
-            level_kind = _zone_level_kind(zone)
-            return (
-                1.0 if bool(zone.get("selected_for_entry", False)) else 0.0,
-                1.0 if not bool(zone.get("pending_flip", False)) else 0.0,
-                1.0 if level_kind in _FLIP_CANDIDATE_LEVEL_KINDS else 0.0,
-                float(zone.get("engine_level_score", 0.0) or 0.0),
-                float(zone.get("score", 0.0) or 0.0),
-                float(int(zone.get("touches", 0) or 0)),
-            )
-
-        def _collapse_duplicate_zones(zones: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            collapsed: dict[tuple[str, float], dict[str, Any]] = {}
-            for zone in zones:
-                key = (str(zone.get("kind", "") or ""), round(float(zone.get("price", 0.0) or 0.0), 6))
-                existing = collapsed.get(key)
-                if existing is None:
-                    collapsed[key] = zone
-                    continue
-                existing_key = _zone_rank_key(existing)
-                zone_key = _zone_rank_key(zone)
-                if zone_key > existing_key:
-                    best, other = zone, existing
-                else:
-                    best, other = existing, zone
-                best["labels"] = list(dict.fromkeys([*list(best.get("labels", []) or []), *list(other.get("labels", []) or [])]))
-                best["sources"] = list(dict.fromkeys([*list(best.get("sources", []) or []), *list(other.get("sources", []) or [])]))
-                best["selected_for_entry"] = bool(best.get("selected_for_entry", False) or other.get("selected_for_entry", False))
-                collapsed[key] = best
-            return list(collapsed.values())
-
-        all_zones = _collapse_duplicate_zones(all_zones)
-        support_zones = [item for item in all_zones if str(item.get("kind")) == "support"]
-        resistance_zones = [item for item in all_zones if str(item.get("kind")) == "resistance"]
-
-        # Overlapping support / resistance zones split the gap at its
-        # midpoint. Only a support BELOW a resistance is such a pair: a
-        # pending level is drawn in its original role on the far side of
-        # price (a pending support above a nearer resistance), and trimming
-        # that crossed pair collapsed both zones, the strategy's own nearest
-        # level included, to zero width (2026-09-23).
-        for support in support_zones:
-            support_price = float(support.get("price", 0.0) or 0.0)
-            for resistance in resistance_zones:
-                resistance_price = float(resistance.get("price", 0.0) or 0.0)
-                if support_price >= resistance_price:
-                    continue
-                support_upper = float(support.get("upper", 0.0) or 0.0)
-                resistance_lower = float(resistance.get("lower", 0.0) or 0.0)
-                if support_upper < resistance_lower:
-                    continue
-                midpoint = (support_price + resistance_price) / 2.0
-                support_half_width = max(0.0, min(float(support.get("zone_half_width", 0.0) or 0.0), midpoint - support_price))
-                resistance_half_width = max(0.0, min(float(resistance.get("zone_half_width", 0.0) or 0.0), resistance_price - midpoint))
-                support["lower"] = max(0.0, support_price - support_half_width)
-                support["upper"] = support_price + support_half_width
-                resistance["lower"] = max(0.0, resistance_price - resistance_half_width)
-                resistance["upper"] = resistance_price + resistance_half_width
-
-        support_zones = [item for item in support_zones if float(item.get("upper", 0.0) or 0.0) >= float(item.get("price", 0.0) or 0.0)]
-        resistance_zones = [item for item in resistance_zones if float(item.get("lower", 0.0) or 0.0) <= float(item.get("price", 0.0) or 0.0)]
-        ordered = sorted((support_zones + resistance_zones), key=lambda item: (float(item["price"]), item["kind"]))
-
-        def _zone_sort_key(zone: dict[str, Any]) -> tuple[float, float, float]:
-            price = float(zone.get("price", 0.0) or 0.0)
-            selected_delta = 0.0 if bool(zone.get("selected_for_entry", False)) else 1.0
-            distance = abs(price - float(close))
-            return selected_delta, distance, -float(zone.get("engine_level_score", 0.0) or 0.0)
-
-        selected_zones = sorted([item for item in ordered if bool(item.get("selected_for_entry", False))], key=_zone_sort_key)
-        display_zones: list[dict[str, Any]]
-        if selected_zones:
-            primary_selected = selected_zones[0]
-            primary_kind = str(primary_selected.get("kind", "") or "")
-            opposite_kind = "resistance" if primary_kind == "support" else "support"
-            opposite_candidates = [item for item in ordered if str(item.get("kind", "") or "") == opposite_kind and not bool(item.get("selected_for_entry", False))]
-            if opposite_kind == "resistance":
-                above = [item for item in opposite_candidates if float(item.get("price", 0.0) or 0.0) >= float(close)]
-                preferred_pool = above if above else opposite_candidates
-                opposite_candidates = sorted(preferred_pool, key=lambda item: (float(item.get("price", 0.0) or 0.0), -float(item.get("engine_level_score", 0.0) or 0.0)))
-            else:
-                below = [item for item in opposite_candidates if float(item.get("price", 0.0) or 0.0) <= float(close)]
-                preferred_pool = below if below else opposite_candidates
-                opposite_candidates = sorted(preferred_pool, key=lambda item: (-float(item.get("price", 0.0) or 0.0), -float(item.get("engine_level_score", 0.0) or 0.0)))
-            display_zones = [primary_selected]
-            if opposite_candidates:
-                display_zones.append(opposite_candidates[0])
-            display_zones = sorted(display_zones, key=lambda item: (float(item["price"]), item["kind"]))
-        else:
-            # The nearest plain zone of each kind, plus every broken / pending
-            # level as its own zone. A flipped level no longer competes with
-            # the nearest one for the single support / resistance slot (until
-            # 2026-09-23 the S/R row folded a broken resistance into the
-            # support ladder, so the zone drawn was whichever of the two was
-            # nearer, not the level the strategy reads).
-            plain_zones = [item for item in ordered if _zone_level_kind(item) not in _FLIP_CANDIDATE_LEVEL_KINDS]
-            nearest_support = sorted([item for item in plain_zones if str(item.get("kind", "") or "") == "support"], key=lambda item: abs(float(item.get("price", 0.0) or 0.0) - float(close)))
-            nearest_resistance = sorted([item for item in plain_zones if str(item.get("kind", "") or "") == "resistance"], key=lambda item: abs(float(item.get("price", 0.0) or 0.0) - float(close)))
-            display_zones = [item for item in ordered if _zone_level_kind(item) in _FLIP_CANDIDATE_LEVEL_KINDS]
-            if nearest_support:
-                display_zones.append(nearest_support[0])
-            if nearest_resistance:
-                display_zones.append(nearest_resistance[0])
-            display_zones = sorted(display_zones, key=lambda item: (float(item["price"]), item["kind"]))
-
-        return [
-            {
-                "kind": str(item["kind"]),
-                "price": float(item["price"]),
-                "lower": float(item["lower"]),
-                "upper": float(item["upper"]),
-                "score": float(item["score"]),
-                "touches": int(item["touches"]),
-                "labels": list(item["labels"]),
-                "sources": list(item["sources"]),
-                "timeframe": f"{tf}m",
-                "zone_half_width": float(item.get("zone_half_width", 0.0) or 0.0),
-                "pending_flip": bool(item.get("pending_flip", False)),
-                "pending_state": str(item.get("pending_state", "") or ""),
-                "flip_target_kind": str(item.get("flip_target_kind", "") or ""),
-                "confirmed_flip": bool(item.get("confirmed_flip", False)),
-                "flip_state": str(item.get("flip_state", "original") or "original"),
-                "original_kind": str(item.get("original_kind", "") or ""),
-                "engine_level_kind": item.get("engine_level_kind"),
-                "engine_source_priority": float(item.get("engine_source_priority", 0.0) or 0.0),
-                "engine_level_score": float(item.get("engine_level_score", 0.0) or 0.0),
-                "passes_min_level_score": bool(item.get("passes_min_level_score", False)),
-                "selected_for_entry": bool(item.get("selected_for_entry", False)),
-            }
-            for item in display_zones
-        ]
+        return build_level_zones(
+            support_zones + resistance_zones,
+            close=close,
+            flip_frame=frame,
+            flip_confirmation_bars=self.config.support_resistance.flip_confirmation_bars(),
+            timeframe_minutes=tf,
+        )
 
     def sr_row(self, symbol: str, price: float | None = None, *, allow_refresh: bool = True) -> dict[str, Any] | None:
         """Build the support/resistance row payload for the dashboard ladder.
@@ -2012,7 +1602,7 @@ class DashboardCache:
         htf_refresh = self.data.last_htf_refresh.get((symbol_key, self.strategy.htf_minutes())) if symbol_key else None
         quote_body = quote or {}
         return (
-            dashboard_frame_signature(frame),
+            frame_signature(frame),
             bool(quote_is_fresh),
             quote_refresh.isoformat() if quote_refresh is not None else None,
             history_refresh.isoformat() if history_refresh is not None else None,
@@ -2023,12 +1613,12 @@ class DashboardCache:
             safe_float(quote_body.get("ask")) if isinstance(quote_body, Mapping) else None,
             safe_float(quote_body.get("mark")) if isinstance(quote_body, Mapping) else None,
             safe_float(quote_body.get("total_volume")) if isinstance(quote_body, Mapping) else None,
-            dashboard_cache_json_signature(sr_row or {}),
-            dashboard_cache_json_signature(candidate_row or {}),
-            dashboard_cache_json_signature(position_row or {}),
-            dashboard_cache_json_signature(entry_decision or {}),
-            dashboard_cache_json_signature(warmup or {}),
-            dashboard_symbol_trade_signature(self.account, symbol_key),
+            cache_json_signature(sr_row or {}),
+            cache_json_signature(candidate_row or {}),
+            cache_json_signature(position_row or {}),
+            cache_json_signature(entry_decision or {}),
+            cache_json_signature(warmup or {}),
+            symbol_trade_signature(self.account, symbol_key),
             bool(allow_refresh),
         )
 
@@ -2289,7 +1879,7 @@ class DashboardCache:
                 allow_refresh=False,
             )
             minute_frame = self.data.get_merged(symbol_key, with_indicators=False)
-            frame, forming_start = dashboard_htf_chart_frame(
+            frame, forming_start = htf_chart_frame(
                 stored_frame,
                 minute_frame,
                 timeframe_minutes=htf_min,
@@ -2320,8 +1910,8 @@ class DashboardCache:
         context_frame = frame if resolved_mode == "ltf" else completed_frame
         source_bar_ts = minute_frame.index[-1].isoformat() if minute_frame is not None and not minute_frame.empty else None
         htf_refresh = self.data.last_htf_refresh.get((symbol_key, timeframe_minutes)) if resolved_mode == "htf" and symbol_key else None
-        frame_signature = (
-            dashboard_frame_signature(frame),
+        chart_signature = (
+            frame_signature(frame),
             htf_refresh.isoformat() if htf_refresh is not None else None,
             source_bar_ts,
             forming_start.isoformat() if forming_start is not None else None,
@@ -2329,7 +1919,7 @@ class DashboardCache:
         cache_key = (symbol_key, resolved_mode, capped_bars)
         with self.lock:
             cache_entry = self.chart_cache.get(cache_key)
-            if cache_entry is not None and cache_entry.get("signature") == frame_signature:
+            if cache_entry is not None and cache_entry.get("signature") == chart_signature:
                 # Shallow copy of the top-level dict — we only mutate
                 # `last_update` on the returned object. A `copy.deepcopy`
                 # here costs ~4ms per call on a 360-bar payload (measured)
@@ -2342,13 +1932,13 @@ class DashboardCache:
                 #      dict, so the cached entry's bars/levels/structure
                 #      payloads stay isolated from the caller.
                 # Re-stamping `last_update` keeps the frontend timestamp
-                # advancing while the underlying frame_signature is
+                # advancing while the underlying chart_signature is
                 # unchanged.
                 cached_payload = dict(cache_entry["payload"])
                 cached_payload["last_update"] = sessions.now_et().isoformat()
                 return cached_payload
         # Per-bar candle pattern map for the tooltip's per-bar candle section,
-        # for every chart bar (see dashboard_bars_from_frame docstring +
+        # for every chart bar (see the dashboard_payloads.bars_from_frame docstring +
         # detect_per_bar_candle_patterns). Read from completed_frame, so the
         # forming bucket gets none and every other bar is scored -- on the
         # HTF chart that includes the buckets completed since the stored
@@ -2365,7 +1955,7 @@ class DashboardCache:
                     symbol_key,
                 )
                 chart_per_bar_candles = {}
-        bars = dashboard_bars_from_frame(
+        bars = bars_from_frame(
             frame,
             max_bars=capped_bars,
             per_bar_candles=chart_per_bar_candles,
@@ -2463,7 +2053,7 @@ class DashboardCache:
         # pollers that hit this cache_key can't observe/mutate each other.
         # Matches the ordering in symbol_snapshot at line 964.
         with self.lock:
-            self.chart_cache[cache_key] = {"signature": frame_signature, "payload": copy.deepcopy(payload)}
+            self.chart_cache[cache_key] = {"signature": chart_signature, "payload": copy.deepcopy(payload)}
         return payload
 
     def tradable_symbols(self) -> list[str]:
@@ -2471,8 +2061,6 @@ class DashboardCache:
         copy of that hook's params read sat behind a silent ``except
         Exception``; the hook cannot raise on any params, so the copy never
         ran for a real strategy."""
-        if self.strategy is None:
-            return []
         return normalize_symbol_list(self.strategy.dashboard_tradable_symbols())
 
     def index_symbols(self) -> list[str]:
@@ -2484,6 +2072,4 @@ class DashboardCache:
         2026-09-26 a copy of that hook's union sat behind a silent
         ``except Exception``; the hook cannot raise on any params, so the
         copy never ran for a real strategy."""
-        if self.strategy is None:
-            return []
         return normalize_symbol_list(self.strategy.dashboard_index_symbols())

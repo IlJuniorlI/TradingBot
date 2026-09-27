@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Process logging: the TRADEFLOW level, the handlers ``setup_logging``
-installs (an ET-dated daily file and a colour console), and ``warn_once``
-for warnings raised from a hot path."""
+installs (an ET-dated daily file and a colour console), ``warn_once`` for
+warnings raised from a hot path, and ``ComponentFailureLog`` for a failure
+that can repeat every cycle."""
 from __future__ import annotations
 
 import logging
@@ -30,6 +31,26 @@ def warn_once(key: str) -> bool:
         return False
     _WARNED.add(key)
     return True
+
+
+class ComponentFailureLog:
+    """Logs a failing component's error with its traceback, for a failure
+    that can repeat every cycle: at WARNING at most once a minute per
+    component, at DEBUG in between. Its owner (``DashboardCache``) calls it
+    from inside the ``except``; each owner keeps its own minute per
+    component."""
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self._logger = logger
+        self._warned_at: dict[str, float] = {}
+
+    def __call__(self, component: str, message: str, *message_args: Any) -> None:
+        now_ts = time.monotonic()
+        if now_ts - self._warned_at.get(component, 0.0) >= 60.0:
+            self._warned_at[component] = now_ts
+            self._logger.warning(message, *message_args, exc_info=True)
+        else:
+            self._logger.debug(message, *message_args, exc_info=True)
 
 
 def _enable_windows_ansi() -> None:

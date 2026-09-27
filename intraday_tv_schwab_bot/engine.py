@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
-import copy
 import logging
-import math
 import signal
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,25 +12,20 @@ from schwabdev import Client
 import pandas as pd
 
 from .audit_logger import AuditLogger
-from .dashboard_cache import (
-    DashboardCache,
-    dashboard_normalize_exchange,
-    dashboard_quote_exchange,
-)
+from .dashboard_cache import DashboardCache
 from .config import BotConfig
 from .cycle_gate import CycleGate, CycleGateState
 from .dashboard import DashboardServer
 from .data_feed import MarketDataStore
 from .entry_gatekeeper import EntryGatekeeper
 from .execution import SchwabExecutor
-from .models import Candidate, Position, Side
+from .models import Candidate, Position
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .position_store import ReconcileMetadataStore, SessionRiskStateStore
 from .risk import RiskManager
 from .screener_client import TradingViewScreenerClient
 from .startup_reconciler import StartupReconciler
-from .symbols import NON_STREAMABLE
 from .warmup_tracker import WarmupTracker
 from ._strategies.factory import build_strategy
 from .session_archive import export_session_archive
@@ -1277,203 +1270,20 @@ class IntradayBot:
             self.dashboard.publish(payload)
 
     def _dashboard_state(self, now: datetime, message: str, *, screening_active: bool, streaming_active: bool, management_active: bool, gate_state: CycleGateState, warmup_summary: dict[str, Any] | None) -> dict[str, Any]:
-        """The dashboard state ``_publish_state`` publishes."""
-        context_refresh_active = gate_state.context_refresh_active
-        performance = self.account.snapshot_copy(self.positions)
-        candidates = []
-        entry_decision_by_symbol = {str(symbol or '').upper().strip(): copy.deepcopy(payload) for symbol, payload in (self.entry_gatekeeper.last_entry_decisions or {}).items() if str(symbol or '').upper().strip()}
-        candidate_limit = self.dashboard_cache.candidate_limit()
-        symbol_exchanges: dict[str, str] = {}
-
-        def remember_exchange(symbol_value: Any, exchange_value: Any = None) -> None:
-            symbol_key = str(symbol_value or '').upper().strip()
-            if not symbol_key:
-                return
-            normalized_exchange = dashboard_normalize_exchange(exchange_value)
-            if normalized_exchange is None:
-                normalized_exchange = dashboard_quote_exchange(self.data.get_quote(symbol_key) or {})
-            if normalized_exchange:
-                symbol_exchanges[symbol_key] = normalized_exchange
-
-        # Live activity-score + directional-bias resolvers for the
-        # dashboard candidates card. Strategies whose screeners can't
-        # populate real values at screen time (e.g. 0DTE option
-        # strategies that synthesize candidates locally without TV)
-        # opt into engine-side resolution by defining the public
-        # methods ``live_activity_score(frame)``,
-        # ``dashboard_directional_bias(frame)``, and/or
-        # ``dashboard_change_from_open(frame)`` on the strategy class.
-        # Strategies whose screeners DO populate real values (e.g.
-        # equity strategies pulling rvol + change_from_open from TV)
-        # just don't define them — the candidate's existing
-        # activity_score / directional_bias / change_from_open values
-        # flow through unchanged. Pure duck-typing — no plugin-type
-        # dispatch needed. All compute paths share a single frame
-        # fetch per candidate.
-        live_score_fn = getattr(self.strategy, 'live_activity_score', None)
-        live_bias_fn = getattr(self.strategy, 'dashboard_directional_bias', None)
-        live_change_fn = getattr(self.strategy, 'dashboard_change_from_open', None)
-        all_candidate_rows: list[dict[str, Any]] = []
-        for c in self.last_candidates:
-            remember_exchange(c.symbol, c.metadata.get("exchange"))
-            exchange = dashboard_normalize_exchange(c.metadata.get("exchange"))
-            activity_score_for_row = c.activity_score
-            directional_bias_for_row = c.directional_bias
-            change_from_open_for_row = c.metadata.get("change_from_open")
-            if live_score_fn is not None or live_bias_fn is not None or live_change_fn is not None:
-                try:
-                    frame = self.data.get_merged(c.symbol, with_indicators=True)
-                    if live_score_fn is not None:
-                        live_score = float(live_score_fn(frame))
-                        # Reject NaN / +/-Inf — live_activity_score is
-                        # designed to fail-open at 1.0 (neutral) but a
-                        # subclass override could regress, and downstream
-                        # json_safe would silently coerce to null and
-                        # break the score ring rather than the candidate
-                        # stub of 1.0 the rest of the system expects.
-                        if math.isfinite(live_score):
-                            activity_score_for_row = live_score
-                    if live_bias_fn is not None:
-                        live_bias = live_bias_fn(frame)
-                        # Type guard — only accept Side enum members.
-                        # Defends against a subclass returning a string
-                        # ("LONG") or other shape that would crash the
-                        # ``.value`` deref below and kill the entire
-                        # publish loop.
-                        if isinstance(live_bias, Side):
-                            directional_bias_for_row = live_bias
-                    if live_change_fn is not None:
-                        live_change = live_change_fn(frame)
-                        # Same finite guard as activity_score — a None
-                        # return means "frame insufficient to compute,
-                        # fall back to candidate metadata" (which for
-                        # 0DTE is also None after the 2026-05-19
-                        # stub-removal, so the dashboard renders "—"
-                        # until session bars are sufficient).
-                        if live_change is not None:
-                            live_change_f = float(live_change)
-                            if math.isfinite(live_change_f):
-                                change_from_open_for_row = live_change_f
-                except Exception:
-                    LOG.debug("Dashboard live-publish compute failed for %s; using candidate stubs.", c.symbol, exc_info=True)
-            row = {
-                "symbol": c.symbol,
-                "rank": c.rank,
-                "activity_score": activity_score_for_row,
-                "exchange": exchange or None,
-                "change_from_open": change_from_open_for_row,
-                # ``change`` (prior-close-relative) is shipped alongside
-                # ``change_from_open`` (session-open-relative) for strategies
-                # that emit both (currently: top_tier_adaptive). Dashboard
-                # uses ``change`` for the "Day %" display fallback so the
-                # screener-fallback value matches the prior-close semantic
-                # of the live Schwab ``quote.percent_change`` primary.
-                # Strategies that don't emit ``change`` get None here.
-                "change": c.metadata.get("change"),
-                "close": c.metadata.get("close"),
-                "volume": c.metadata.get("volume"),
-                "directional_bias": directional_bias_for_row.value if directional_bias_for_row else None,
-            }
-            all_candidate_rows.append(row)
-            if len(candidates) < candidate_limit:
-                candidates.append(copy.deepcopy(row))
-
-        sr_symbols: list[str] = []
-        seen: set[str] = set()
-        for row in performance.get("positions", []):
-            sym = str(row.get("underlying") or row.get("symbol") or "").upper().strip()
-            if sym and sym not in seen:
-                seen.add(sym)
-                sr_symbols.append(sym)
-        for sym in list(self.last_quote_watchlist) + list(self.last_watchlist) + [c.get("symbol") for c in candidates]:
-            symbol = str(sym or "").upper().strip()
-            if symbol and symbol not in seen:
-                seen.add(symbol)
-                sr_symbols.append(symbol)
-        sr_symbols = sr_symbols[:12]
-
-        sr_levels = []
-        sr_by_symbol: dict[str, dict[str, Any]] = {}
-        for symbol in sr_symbols:
-            row = self.dashboard_cache.sr_row(symbol, allow_refresh=context_refresh_active)
-            if row is None:
-                continue
-            sr_levels.append(row)
-            sr_by_symbol[symbol] = row
-
-        if performance.get("positions"):
-            enriched_positions = []
-            for row in performance["positions"]:
-                symbol = str(row.get("underlying") or row.get("symbol") or "").upper().strip()
-                sr_row = sr_by_symbol.get(symbol) or self.dashboard_cache.sr_row(symbol, allow_refresh=context_refresh_active)
-                new_row = copy.deepcopy(row)
-                if sr_row is not None:
-                    new_row.update({
-                        "sr_symbol": symbol,
-                        "sr_timeframe": sr_row.get("timeframe"),
-                        "sr_nearest_support": sr_row.get("nearest_support"),
-                        "sr_nearest_resistance": sr_row.get("nearest_resistance"),
-                        "sr_support_distance_pct": sr_row.get("support_distance_pct"),
-                        "sr_resistance_distance_pct": sr_row.get("resistance_distance_pct"),
-                        "sr_regime_hint": sr_row.get("regime_hint"),
-                        "sr_state": sr_row.get("state"),
-                    })
-                enriched_positions.append(new_row)
-            performance["positions"] = enriched_positions
-
-        candidate_by_symbol = {str(row.get("symbol") or "").upper().strip(): row for row in all_candidate_rows}
-        position_by_symbol: dict[str, dict[str, Any]] = {}
-        for row in performance.get("positions", []):
-            base_symbol = str(row.get("underlying") or row.get("symbol") or "").upper().strip()
-            if base_symbol and base_symbol not in position_by_symbol:
-                position_by_symbol[base_symbol] = row
-
+        """The dashboard state ``_publish_state`` publishes: the engine's
+        status fields, and the symbol part ``DashboardCache.build_payload``
+        builds from the state the engine hands it."""
         if warmup_summary is None:
             warmup_summary = self.warmup_tracker.warmup_summary(self.last_watchlist)
-        warmup_by_symbol = {
-            str(item.get('symbol') or '').upper().strip(): item
-            for item in (warmup_summary.get('symbols') or [])
-            if str(item.get('symbol') or '').upper().strip()
-        }
-
-        dashboard_symbol_order: list[str] = []
-        seen_dashboard_symbols: set[str] = set()
-        for bucket in (
-            [str(row.get("underlying") or row.get("symbol") or "").upper().strip() for row in performance.get("positions", [])],
-            [str(sym or "").upper().strip() for sym in self.last_watchlist],
-            [str(sym or "").upper().strip() for sym in self.last_quote_watchlist],
-            [str(row.get("symbol") or "").upper().strip() for row in candidates],
-            [str(row.get("symbol") or "").upper().strip() for row in sr_levels],
-        ):
-            for symbol in bucket:
-                if symbol and symbol not in seen_dashboard_symbols:
-                    seen_dashboard_symbols.add(symbol)
-                    dashboard_symbol_order.append(symbol)
-
-        for row in performance.get("positions", []):
-            remember_exchange(row.get("underlying") or row.get("symbol"))
-        for trade in performance.get("recent_trades", []):
-            remember_exchange(trade.get("underlying") or trade.get("symbol"))
-        for symbol in dashboard_symbol_order:
-            remember_exchange(symbol)
-
-        dashboard_symbols = [
-            self.dashboard_cache.symbol_snapshot(
-                symbol,
-                exchange=symbol_exchanges.get(symbol),
-                sr_row=sr_by_symbol.get(symbol),
-                candidate_row=candidate_by_symbol.get(symbol),
-                position_row=position_by_symbol.get(symbol),
-                entry_decision=entry_decision_by_symbol.get(symbol),
-                warmup=warmup_by_symbol.get(symbol),
-                allow_refresh=context_refresh_active,
-            )
-            for symbol in dashboard_symbol_order
-        ]
-        for snapshot in dashboard_symbols:
-            remember_exchange(snapshot.get('symbol'), snapshot.get('exchange'))
-        self.dashboard_cache.prune_inactive_symbols(set(dashboard_symbol_order))
-
+        symbol_state = self.dashboard_cache.build_payload(
+            positions=self.positions,
+            last_candidates=self.last_candidates,
+            watchlist=self.last_watchlist,
+            quote_watchlist=self.last_quote_watchlist,
+            entry_decisions=self.entry_gatekeeper.last_entry_decisions,
+            warmup_summary=warmup_summary,
+            allow_refresh=gate_state.context_refresh_active,
+        )
         return {
             "status": "running" if self.last_error is None else "error",
             "entry_window_active": gate_state.entry_actionable,
@@ -1491,18 +1301,15 @@ class IntradayBot:
             "startup_reconcile": self.startup_reconciler.result,
             "active_watchlist": self.last_watchlist,
             "quote_watchlist": self.last_quote_watchlist,
-            "data": {
-                **self.data.dashboard_data_snapshot(),
-                "non_streamable_symbols": sorted(NON_STREAMABLE),
-                "tradable_symbols": self.dashboard_cache.tradable_symbols(),
-                "index_symbols": self.dashboard_cache.index_symbols(),
-            },
+            "data": symbol_state["data"],
             "warmup": warmup_summary,
+            # Read after the build, so it counts the Schwab calls the build's
+            # HTF refreshes made.
             "api_usage": self.api_usage.snapshot(now),
-            "performance": performance,
+            "performance": symbol_state["performance"],
             "tracked_capital_label": self._tracked_capital_label(),
-            "candidates": candidates,
-            "symbol_exchanges": symbol_exchanges,
-            "dashboard_charting": self.dashboard_cache.charting_settings(),
-            "dashboard_symbols": dashboard_symbols,
+            "candidates": symbol_state["candidates"],
+            "symbol_exchanges": symbol_state["symbol_exchanges"],
+            "dashboard_charting": symbol_state["dashboard_charting"],
+            "dashboard_symbols": symbol_state["dashboard_symbols"],
         }

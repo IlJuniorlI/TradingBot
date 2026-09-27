@@ -310,6 +310,49 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The dashboard's payload helpers, level zones and state build have homes
+  of their own (refactor cut C40).** *2026-09-27* — `dashboard_payloads.py`
+  holds the stateless helpers that were `dashboard_cache` module functions,
+  without their `dashboard_` prefix: `normalize_exchange`, `quote_exchange`,
+  `technical_line_payload`, `fvg_payload`, `fvg_anchor_abs_index`,
+  `cache_json_signature`, `frame_signature`, `recent_trade_markers`,
+  `symbol_trade_signature`, `bars_from_frame` and `htf_chart_frame`.
+  `dashboard_zones.py` holds the second half of
+  `DashboardCache.strategy_level_zones`, which was nested closures:
+  `level_anchors`, and `build_level_zones(candidate_zones, *, close,
+  flip_frame, flip_confirmation_bars, timeframe_minutes)`, which gives each
+  zone its flip state, merges a kind's zones at one price, trims an
+  overlapping support and resistance and picks the zones drawn. The method
+  keeps the reads (the spec, the HTF context, the LTF frame and its ATR, the
+  strategy's hooks and the zone each candidate makes) and hands its zones
+  over. The symbol part of the dashboard state is
+  `DashboardCache.build_payload(positions=, last_candidates=, watchlist=,
+  quote_watchlist=, entry_decisions=, warmup_summary=, allow_refresh=)`: the
+  performance with its positions' S/R fields, the candidates card, the
+  snapshots and exchanges, the symbol lists, the chart settings and the
+  cache prune (cut C34's `prune_inactive_symbols` call). The engine's
+  `_dashboard_state` reads the warmup summary on the error path, hands the
+  build the engine's state, adds its own status fields and publishes them
+  in the order they had; `_publish_state` still isolates a failed build and
+  marks the page stale. The engine imports only `DashboardCache` from the
+  dashboard. The rate-limited failure log is `log_setup.ComponentFailureLog`
+  (WARNING with the traceback at most once a minute per component, DEBUG in
+  between), which `DashboardCache` keeps as `log_component_failure`, so its
+  call sites are unchanged. `DashboardCache` requires its strategy (critic
+  G5): every builder reads it, and the `strategy is None` answers of
+  `candidate_limit` (and its unused `strategy` argument), `tradable_symbols`,
+  `index_symbols` and `strategy_level_zones` could not run. There is no
+  alias: import the helpers from `dashboard_payloads` and the zone builder
+  from `dashboard_zones`. No behaviour changes: 2,000 fuzzed level-zone
+  builds, 2,000 S/R rows, 1,000 exit records, 200 snapshots and charts on
+  the recorded tapes and 24 published engine states (12 real bots, two
+  cycles each) read byte for byte as before. Tests:
+  `tests/test_dashboard_zones.py`, `tests/test_dashboard_state.py` and
+  `tests/test_log_setup.py` (`TestComponentFailureLog`) are new; the helper
+  tests in test_silent_excepts, test_fix_dashboard_charting and
+  test_bug_regressions import from `dashboard_payloads`, and
+  `tests/test_module_layering.py`'s runtime layer gains the two modules.
+
 - **The session archive has its own module, `session_archive.py` (refactor
   cut C39).** *2026-09-27* — `export_session_archive` moved out of
   `session_report.py` with everything only it uses: the config snapshot and

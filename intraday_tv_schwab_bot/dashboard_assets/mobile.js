@@ -294,7 +294,7 @@
       const bias = String(row.directional_bias || '').toUpperCase();
       const tone = bias === 'SHORT' ? 'tone-short' : (bias === 'LONG' ? 'tone-long' : 'tone-neutral');
       // Activity score is an unbounded multiplier (live tape can push it
-      // well above 1.0 for option strategies — see engine._publish_state
+      // well above 1.0 for option strategies — see DashboardCache.build_payload
       // and ZeroDteEtfOptionsStrategy.live_activity_score). Use the
       // shared log-scaled scorePct() so the mobile readout matches the
       // desktop candidate ring and stays legible across the full range.
