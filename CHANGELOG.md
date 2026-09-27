@@ -310,6 +310,32 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The score context is the FVG term's context (refactor cut B13).**
+  *2026-09-27* — `BaseStrategy._default_htf_request()` is the HTF request
+  the score context (`_default_htf_context_for_score`), the shared FVG score
+  term and zero_dte's entry read and prefetch share; the score context goes
+  through `_htf_context`, so it carries the strategy's FVG arguments
+  (`htf_fvg_request()`, public now; was `_htf_fvg_request`). zero_dte's
+  `_htf_fvg_context_request` and the FVG term's copy of the request are
+  gone. The peer family's ladder exit and HTF request read
+  `htf_minutes()` / `htf_lookback_days()` instead of the params with a
+  literal 60 (every peer manifest declares 60/60, so they read the same).
+
+  **Behaviour change:** none in any score, and one HTF build fewer per
+  symbol per stored-frame change. The FVG arguments are part of the data
+  feed's cache key and every preset sets them off the feed's defaults
+  (3 / 0.06 / 0.0006), so the score context was a second build of the same
+  frame on every preset. FVG detection reads nothing else, and no score
+  reads the score context's FVGs: on 463 checkpoints x 2 presets
+  (top_tier_adaptive, peer_confirmed_key_levels) on the fixture and archive
+  15m frames, every other field is identical. With no feed or no stored
+  HTF frame the score context is the empty context instead of `None`,
+  which every reader takes the same way (no EMAs, a neutral trend, no
+  divergence). Tests: `tests/test_strategy_requests.py`
+  (`TestTheRequestsNameTheFeedsArguments`,
+  `TestTheScoreContextIsTheFvgTermsContext`), `tests/test_htf_ema_knobs.py`,
+  `tests/test_fail_closed_gates.py`, `tests/test_sr_tolerance_reads.py`.
+
 - **The strategy's timeframes have one home (refactor cut C32).**
   *2026-09-27* — `BaseStrategy.htf_minutes()`, `htf_lookback_days()` and
   `ltf_minutes()` are public, and the engine (the context refresh and the

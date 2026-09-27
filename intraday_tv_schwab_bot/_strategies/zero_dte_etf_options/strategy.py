@@ -10,7 +10,6 @@ from typing import Any
 import pandas as pd
 
 from ...htf_levels import summarize_htf_trend
-from ...indicators import htf_ema_spans
 from ...models import ASSET_TYPE_OPTION_VERTICAL, Candidate, Position, Side, Signal
 from ...options_mode import (
     OptionContract,
@@ -315,10 +314,11 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         ]
         if not symbols:
             return
-        # The context the entry path reads (_htf_fvg_request below), so the
-        # prefetch warms it; with only the timeframe it built a default-level
-        # context no decision read (until 2026-09-24).
-        data.prefetch_htf_contexts(symbols, **self._htf_fvg_context_request(), **self._htf_fvg_request())
+        # The context the entry path reads (_default_htf_request, the
+        # strategy's score context), so the prefetch warms it; with only the
+        # timeframe it built a default-level context no decision read (until
+        # 2026-09-24).
+        data.prefetch_htf_contexts(symbols, **self._default_htf_request(), **self.htf_fvg_request())
 
     @staticmethod
     def _safe_pct(value: Any) -> float:
@@ -360,33 +360,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         if ref <= 0:
             return 0.0
         return max(0.0, float(recent["high"].max()) - float(recent["low"].min())) / ref
-
-    def _htf_fvg_context_request(self) -> dict[str, Any]:
-        """The level arguments of the HTF context the entry path reads for
-        its FVGs (shared with the prefetch, which has to warm this one).
-
-        The EMA spans are the strategy's own, resolved by ``htf_ema_spans``
-        as every other HTF-EMA consumer does. Until 2026-09-25 they were
-        read from ``support_resistance.ema_fast_span`` / ``ema_slow_span``,
-        fields that do not exist, so the request was always 50/200 whatever
-        ``htf_ema_*_span`` said (zero_dte declares neither, so 50/200 is
-        what it asks for either way)."""
-        ema_fast_span, ema_slow_span = htf_ema_spans(self.params)
-        return {
-            "timeframe_minutes": self.htf_minutes(),
-            "lookback_days": self.htf_lookback_days(),
-            "pivot_span": int(self._support_resistance_setting("pivot_span", 2) or 2),
-            "max_levels_per_side": int(self._support_resistance_setting("max_levels_per_side", 6) or 6),
-            # Checked at load (above 0); a 0 read as 0.35 / 0.003 until
-            # 2026-09-26.
-            "atr_tolerance_mult": float(self.config.support_resistance.atr_tolerance_mult),
-            "pct_tolerance": float(self.config.support_resistance.pct_tolerance),
-            "stop_buffer_atr_mult": float(self._support_resistance_setting("stop_buffer_atr_mult", 0.25) or 0.25),
-            "ema_fast_span": ema_fast_span,
-            "ema_slow_span": ema_slow_span,
-            "use_prior_day_high_low": bool(self._support_resistance_setting("use_prior_day_high_low", True)),
-            "use_prior_week_high_low": bool(self._support_resistance_setting("use_prior_week_high_low", True)),
-        }
 
     def dashboard_htf_trend(self, symbol: str, data, price: float, *, allow_refresh: bool = True) -> dict[str, str] | None:
         """The HTF trend the entry gate reads: ``_htf_trend_context``
@@ -752,7 +725,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         if use_htf_confirmation and require_htf_alignment and not htf_available:
             reasons.append(str(htf_ctx.get("reason") or "insufficient_htf_bars"))
 
-        htf_fvg_ctx = self._htf_context(underlying, data, current_price=u_close, **self._htf_fvg_context_request())
+        htf_fvg_ctx = self._htf_context(underlying, data, current_price=u_close, **self._default_htf_request())
         fvg_ltf_ctx = self._ltf_fvg_context(underlying, u, data)
         fvg_context_weight_scale = max(0.0, float(p.get("fvg_context_weight_scale", 0.9) or 0.0))
         # shared_entry.use_fvg_context is the entry policy's to read

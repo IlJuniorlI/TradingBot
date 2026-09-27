@@ -1066,11 +1066,42 @@ class BaseStrategy:
             **BaseStrategy._structure_lists(ms_ctx, prefix="mshtf"),
         }
 
-    def _default_htf_context_for_score(self, symbol: str, data):
-        """The HTF context a strategy scores on: its own HTF frame
-        (``_htf_minutes`` / ``_htf_lookback_days``, the frame the engine
-        refreshes), the support_resistance level settings, and its HTF EMA
-        spans. It never refreshes.
+    def _default_htf_request(self) -> dict[str, Any]:
+        """The level arguments of the HTF context a strategy scores on: its
+        own HTF frame (``htf_minutes()`` / ``htf_lookback_days()``, the frame
+        the engine refreshes), the support_resistance level settings and its
+        HTF EMA spans. ``_htf_context`` adds the FVG arguments.
+
+        The score context (``_default_htf_context_for_score``), the shared
+        FVG score term and zero_dte's entry read and prefetch all ask for it,
+        so they share one data-feed cache entry. Until 2026-09-27 each built
+        its own copy, and the score context left out the FVG arguments (part
+        of the cache key): with any FVG setting off its default, every
+        preset's, it was a second build of the same frame."""
+        ema_fast_span, ema_slow_span = htf_ema_spans(self.params)
+        return {
+            "timeframe_minutes": self.htf_minutes(),
+            "lookback_days": self.htf_lookback_days(),
+            "pivot_span": int(self._support_resistance_setting("pivot_span", 2) or 2),
+            "max_levels_per_side": int(self._support_resistance_setting("max_levels_per_side", 6) or 6),
+            # Checked at load (above 0); a 0 read as 0.35 / 0.003 until
+            # 2026-09-26.
+            "atr_tolerance_mult": float(self.config.support_resistance.atr_tolerance_mult),
+            "pct_tolerance": float(self.config.support_resistance.pct_tolerance),
+            "stop_buffer_atr_mult": float(self._support_resistance_setting("stop_buffer_atr_mult", 0.25) or 0.25),
+            # The strategy's own HTF EMA spans: top_tier trades on this
+            # context's EMA trend (require_htf_ema_alignment /
+            # htf_ema_alignment_score). Until 2026-09-24 50/200 was
+            # hard-coded here whatever htf_ema_*_span said.
+            "ema_fast_span": ema_fast_span,
+            "ema_slow_span": ema_slow_span,
+            "use_prior_day_high_low": bool(self._support_resistance_setting("use_prior_day_high_low", True)),
+            "use_prior_week_high_low": bool(self._support_resistance_setting("use_prior_week_high_low", True)),
+        }
+
+    def _default_htf_context_for_score(self, symbol: str, data) -> HTFContext:
+        """The HTF context a strategy scores on (``_default_htf_request``,
+        through ``_htf_context``). It never refreshes.
 
         The shared entry policy scores a proposal's HTF RSI divergence on it
         when the proposal brings no HTF context of its own
@@ -1081,39 +1112,14 @@ class BaseStrategy:
         on every cycle (peer_confirmed_htf_pivots' HTF divergence score was
         always 0 that way).
 
-        Returns ``None`` if HTF data isn't available — the score path is
-        defensive (None ctx -> zero adjustment). A build that raises is not
-        "no data" and propagates, as it does from ``_htf_context``: until
-        2026-09-26 it returned None, which ``require_htf_ema_alignment``
-        reads as a neutral trend, so the error let the entry through.
+        No HTF data (no feed, no stored frame yet) is the empty context,
+        which every reader takes as None was taken until 2026-09-27: no EMAs,
+        a neutral trend, no divergence, so a zero adjustment. A build that
+        raises is not "no data" and propagates: until 2026-09-26 it returned
+        None, which ``require_htf_ema_alignment`` reads as a neutral trend,
+        so the error let the entry through.
         """
-        if data is None or not hasattr(data, "get_htf_context"):
-            return None
-        sr_cfg = getattr(self.config, "support_resistance", None)
-        if sr_cfg is None:
-            return None
-        ema_fast_span, ema_slow_span = htf_ema_spans(self.params)
-        return data.get_htf_context(
-            symbol,
-            timeframe_minutes=int(self.htf_minutes()),
-            lookback_days=int(self.htf_lookback_days()),
-            pivot_span=int(getattr(sr_cfg, "pivot_span", 2) or 2),
-            max_levels_per_side=int(getattr(sr_cfg, "max_levels_per_side", 6) or 6),
-            # Checked at load (above 0); a 0 read as 0.35 / 0.003 here until
-            # 2026-09-26.
-            atr_tolerance_mult=float(sr_cfg.atr_tolerance_mult),
-            pct_tolerance=float(sr_cfg.pct_tolerance),
-            stop_buffer_atr_mult=float(getattr(sr_cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
-            # The strategy's own HTF EMA spans: top_tier trades on this
-            # context's EMA trend (require_htf_ema_alignment /
-            # htf_ema_alignment_score). Until 2026-09-24 50/200 was
-            # hard-coded here whatever htf_ema_*_span said.
-            ema_fast_span=ema_fast_span,
-            ema_slow_span=ema_slow_span,
-            use_prior_day_high_low=bool(getattr(sr_cfg, "use_prior_day_high_low", True)),
-            use_prior_week_high_low=bool(getattr(sr_cfg, "use_prior_week_high_low", True)),
-            allow_refresh=False,
-        )
+        return self._htf_context(symbol, data, allow_refresh=False, **self._default_htf_request())
 
     def _htf_context(
             self,
@@ -1150,13 +1156,13 @@ class BaseStrategy:
             use_prior_day_high_low=bool(use_prior_day_high_low),
             use_prior_week_high_low=bool(use_prior_week_high_low),
             allow_refresh=bool(allow_refresh),
-            **self._htf_fvg_request(),
+            **self.htf_fvg_request(),
         )
         if ctx is None:
             return empty_htf_context(current_price or 0.0, timeframe_minutes=timeframe_minutes)
         return ctx
 
-    def _htf_fvg_request(self) -> dict[str, Any]:
+    def htf_fvg_request(self) -> dict[str, Any]:
         """The FVG arguments ``_htf_context`` builds every context with. They
         are part of the data feed's context cache key, so a prefetch meant to
         warm a context the strategy reads has to pass them too."""

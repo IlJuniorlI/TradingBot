@@ -190,7 +190,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         refs = tape.refs()
         defense_zone_width = max(0.0, safe_float(metadata.get("ladder_defense_zone_width"), 0.0) or 0.0)
         symbol = str(metadata.get("underlying") or position.symbol)
-        htf_minutes = int(self.params.get("htf_minutes", 60))
+        htf_minutes = self.htf_minutes()
         sr_ctx = None
         if data is not None and hasattr(data, "get_support_resistance"):
             # A failed HTF fetch is logged and absorbed inside the feed
@@ -203,7 +203,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 flip_frame=frame,
                 mode="trading",
                 timeframe_minutes=htf_minutes,
-                lookback_days=int(self.params.get("htf_lookback_days", 60)),
+                lookback_days=self.htf_lookback_days(),
                 use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
                 use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
                 allow_refresh=True,
@@ -276,8 +276,8 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         the FVG arguments and warmed a context no decision read."""
         fast, slow = htf_ema_spans(self.params)
         return {
-            "timeframe_minutes": int(self.params.get("htf_minutes", 60)),
-            "lookback_days": int(self.params.get("htf_lookback_days", 60)),
+            "timeframe_minutes": self.htf_minutes(),
+            "lookback_days": self.htf_lookback_days(),
             "pivot_span": int(self.params.get("htf_pivot_span", 2)),
             "max_levels_per_side": int(self.params.get("htf_max_levels_per_side", 6)),
             "atr_tolerance_mult": float(self.params.get("htf_atr_tolerance_mult", 0.35)),
@@ -1268,7 +1268,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         ]
         if not universe:
             return
-        data.prefetch_htf_contexts(universe, **self._symbol_htf_request(), **self._htf_fvg_request())
+        data.prefetch_htf_contexts(universe, **self._symbol_htf_request(), **self.htf_fvg_request())
 
     def strategy_exit_signal(self, position: Position, bars: dict[str, pd.DataFrame], tape: ExitTape, data=None) -> ExitDecision | None:
         # Only the ladder defence is peer-specific. The technical exits this

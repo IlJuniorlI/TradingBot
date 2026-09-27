@@ -57,7 +57,7 @@ import pandas as pd
 
 from ..models import Candidate, Position, Side, Signal
 from ..bars import CANDLE_PATTERN_WINDOW_BARS, bar_close_position, bars_have_range
-from ..indicators import htf_ema_spans, last_bar_atr
+from ..indicators import last_bar_atr
 from .. import sessions
 from ..numeric import safe_float
 from ..reasons import detail_fields, reason_head, reason_with_values
@@ -2306,34 +2306,14 @@ class SharedEntryPolicy:
         close = safe_float(frame.iloc[-1].get("close"), 0.0)
         if close <= 0:
             return out
-        # Build parameters, not weights: a 0 there is no switch, so they keep
-        # the same fallback as every other builder of this HTF context.
-        # The EMA spans are the strategy's HTF spans, as in
-        # _default_htf_context_for_score (2026-09-25): support_resistance has
-        # no ema_*_span field, so the read here was always 50/200 whatever
-        # htf_ema_*_span said (the peers declare 34/200). The request now
-        # differs from _default_htf_context_for_score's only by the FVG
-        # arguments _htf_context adds. FVG detection never reads the EMAs,
-        # so no FVG or FVG score changes.
-        ema_fast_span, ema_slow_span = htf_ema_spans(self.params)
-        htf_ctx = self.strategy._htf_context(
-            symbol,
-            data,
-            timeframe_minutes=self.strategy.htf_minutes(),
-            lookback_days=self.strategy.htf_lookback_days(),
-            pivot_span=int(self._support_resistance_setting("pivot_span", 2) or 2),
-            max_levels_per_side=int(self._support_resistance_setting("max_levels_per_side", 6) or 6),
-            # Checked at load (above 0); a 0 read as 0.35 / 0.003 until
-            # 2026-09-26.
-            atr_tolerance_mult=float(self.config.support_resistance.atr_tolerance_mult),
-            pct_tolerance=float(self.config.support_resistance.pct_tolerance),
-            stop_buffer_atr_mult=float(self._support_resistance_setting("stop_buffer_atr_mult", 0.25) or 0.25),
-            ema_fast_span=ema_fast_span,
-            ema_slow_span=ema_slow_span,
-            current_price=close,
-            use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
-            use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
-        )
+        # The strategy's score context (_default_htf_request), read with the
+        # FVG arguments _htf_context adds: the same data-feed cache entry as
+        # _default_htf_context_for_score since 2026-09-27. The EMA spans are
+        # the strategy's HTF spans (2026-09-25: support_resistance has no
+        # ema_*_span field, so the read here was always 50/200 whatever
+        # htf_ema_*_span said; the peers declare 34/200). FVG detection
+        # never reads the EMAs, so no FVG or FVG score changed with them.
+        htf_ctx = self.strategy._htf_context(symbol, data, current_price=close, **self.strategy._default_htf_request())
         fvg_ltf_ctx = self.strategy._ltf_fvg_context(symbol, frame, data)
         htf_score = self._score_fvg_context(close, htf_ctx, timeframe_minutes=getattr(htf_ctx, "timeframe_minutes", self.strategy.htf_minutes()))
         fvg_ltf_score = self._score_fvg_context(close, fvg_ltf_ctx, timeframe_minutes=self.strategy.ltf_minutes())
