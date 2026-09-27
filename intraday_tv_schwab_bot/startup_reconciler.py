@@ -53,8 +53,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable
 
-from .broker_positions import (
+from .broker_payloads import (
+    STOP_ORDER_TYPES,
     active_broker_bracket,
+    bracket_order_ids,
     broker_position_side_qty,
     broker_quantity,
     working_exit_outstanding_qty,
@@ -612,9 +614,7 @@ class StartupReconciler:
             if bracket is not None:
                 # The snapshot predates the cancel: the cancelled children
                 # would read as a stop still resting for the position.
-                cancelled = {str(oid) for oid in (bracket.get("oco_order_id"), bracket.get("protective_order_id"),
-                                                  bracket.get("stop_order_id"), bracket.get("target_order_id"),
-                                                  *(bracket.get("child_order_ids") or [])) if oid}
+                cancelled = bracket_order_ids(bracket)
                 self._reprotect_restored_position(
                     position, [order for order in working_orders or [] if str(order.get("orderId")) not in cancelled],
                 )
@@ -640,7 +640,7 @@ class StartupReconciler:
                 continue
             if [str(s).upper().strip() for s in order.get("symbols") or []] != [symbol]:
                 continue
-            if order.get("orderType") not in {"STOP", "STOP_LIMIT"}:
+            if order.get("orderType") not in STOP_ORDER_TYPES:
                 continue
             if list(order.get("instructions") or []) != [exit_instruction]:
                 continue
@@ -666,10 +666,7 @@ class StartupReconciler:
             # blocked every entry of the dry run (2026-09-25).
             if not isinstance(bracket, dict) or not (bracket.get("active") or bracket.get("simulated")):
                 continue
-            for key in ("oco_order_id", "protective_order_id", "stop_order_id", "target_order_id"):
-                if bracket.get(key):
-                    owned.add(str(bracket[key]))
-            owned.update(str(oid) for oid in (bracket.get("child_order_ids") or []) if oid)
+            owned |= bracket_order_ids(bracket)
         return [order for order in working_orders if str(order.get("orderId")) not in owned]
 
     def _drop_retired_orders(self, orders: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:

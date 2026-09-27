@@ -11,7 +11,21 @@ from typing import Any
 
 from schwabdev import Client
 
-from .broker_positions import extract_broker_positions, extract_working_orders
+from .broker_payloads import (
+    BRACKET_ID_KEYS,
+    STOP_ORDER_TYPES,
+    bracket_wrapper_and_children,
+    collect_protective_fills,
+    extract_bracket_children,
+    extract_broker_positions,
+    extract_working_orders,
+    flatten_order_tree,
+    order_fill_price,
+    order_filled_qty,
+    order_is_filled,
+    order_is_terminal_failure,
+    order_status,
+)
 from .config import BotConfig
 from .models import (
     ASSET_TYPE_EQUITY,
@@ -57,14 +71,6 @@ class BracketCancel:
 
 
 class SchwabExecutor:
-    _EQUITY_TERMINAL_FAILURE_STATUSES = {
-        "CANCELED",
-        "CANCELLED",
-        "EXPIRED",
-        "REJECTED",
-        "REPLACED",
-    }
-
     @staticmethod
     def _is_regular_options_session(ts=None) -> bool:
         return is_regular_equity_session(ts)
@@ -101,151 +107,6 @@ class SchwabExecutor:
         location = getattr(response, "headers", {}).get("Location", "") or ""
         order_id = str(location).split("/")[-1].strip()
         return order_id or None
-
-    @classmethod
-    def _equity_order_status(cls, payload: dict[str, Any] | None) -> str:
-        if not isinstance(payload, dict):
-            return "UNKNOWN"
-        status = str(payload.get("status") or "").upper().strip()
-        return status or "UNKNOWN"
-
-    @classmethod
-    def _equity_order_remaining_qty(cls, payload: dict[str, Any] | None) -> int | None:
-        if not isinstance(payload, dict):
-            return None
-        for key in ("remainingQuantity", "remainingQty", "leavesQuantity"):
-            value = safe_int(payload.get(key))
-            if value is not None:
-                return max(0, value)
-        return None
-
-    @classmethod
-    def _equity_order_filled_qty(cls, payload: dict[str, Any] | None) -> int | None:
-        if not isinstance(payload, dict):
-            return None
-        for key in ("filledQuantity", "filledQty", "cumulativeQuantity", "executedQuantity"):
-            value = safe_int(payload.get(key))
-            if value is not None:
-                return max(0, value)
-        per_leg: dict[Any, int] = {}
-        for activity in payload.get("orderActivityCollection") or []:
-            if not isinstance(activity, dict):
-                continue
-            for leg in activity.get("executionLegs") or []:
-                if not isinstance(leg, dict):
-                    continue
-                qty = safe_int(leg.get("quantity"))
-                if qty is None:
-                    continue
-                per_leg[leg.get("legId")] = per_leg.get(leg.get("legId"), 0) + max(0, qty)
-        if not per_leg:
-            return None
-        legs = [leg for leg in (payload.get("orderLegCollection") or []) if isinstance(leg, dict)]
-        if len(legs) <= 1:
-            return sum(per_leg.values())
-        # A vertical's executions arrive once per LEG: summing them counted
-        # every spread twice. A spread unit is filled once every leg is, so
-        # the order's fill is its least-filled leg, per unit of order quantity.
-        # A quantity that is not a finite number reads as missing: an
-        # infinite order quantity made every ratio 0 and raised
-        # ZeroDivisionError (2026-09-26).
-        order_qty = safe_float(payload.get("quantity"), finite=True)
-        ratios: list[float] = []
-        for leg in legs:
-            leg_qty = safe_float(leg.get("quantity"), finite=True)
-            ratios.append(leg_qty / order_qty if leg_qty and order_qty and order_qty > 0 else 1.0)
-        if set(per_leg) == {None}:
-            # No legId on any execution: the pool holds every leg's shares.
-            return int(sum(per_leg.values()) / sum(ratios))
-        return min(int(per_leg.get(leg.get("legId"), 0) / ratio) for leg, ratio in zip(legs, ratios))
-
-    @classmethod
-    def _order_executions(cls, payload: dict[str, Any]) -> dict[Any, tuple[float, float]]:
-        """``(notional, quantity)`` of an order's executions, per ``legId``.
-
-        Executions carrying no ``legId`` pool under ``None``; a single-leg
-        order's executions need no attribution. One whose price or quantity
-        is not a finite number is skipped, as a missing one is: an infinite
-        quantity read the fill price as NaN (2026-09-26).
-        """
-        out: dict[Any, tuple[float, float]] = {}
-        for activity in payload.get("orderActivityCollection") or []:
-            if not isinstance(activity, dict):
-                continue
-            for leg in activity.get("executionLegs") or []:
-                if not isinstance(leg, dict):
-                    continue
-                px = safe_float(leg.get("price"), finite=True)
-                qty = safe_float(leg.get("quantity"), finite=True)
-                if px is None or qty is None or px <= 0 or qty <= 0:
-                    continue
-                notional, filled = out.get(leg.get("legId"), (0.0, 0.0))
-                out[leg.get("legId")] = (notional + px * qty, filled + qty)
-        return out
-
-    @classmethod
-    def _multi_leg_net_fill_price(cls, payload: dict[str, Any], legs: list[dict[str, Any]],
-                                  executions: dict[Any, tuple[float, float]]) -> float | None:
-        """Net price per spread unit of a multi-leg order (a vertical).
-
-        Each leg executes at its OWN price, so pooling the executions averaged
-        the long and short strikes: a 2.00/1.00 vertical read back as 1.50
-        instead of its 1.00 net, and the stop, target and P&L built on that
-        entry price inherited the error. The net is the signed sum of the leg
-        prices (buys add, sells subtract) scaled by each leg's ratio to the
-        order quantity; its magnitude is the debit paid or credit received.
-        None when any leg has no attributable execution. A quantity that is
-        not a finite number reads as missing (2026-09-26).
-        """
-        order_qty = safe_float(payload.get("quantity"), finite=True)
-        net = 0.0
-        for leg in legs:
-            notional, filled = executions.get(leg.get("legId"), (0.0, 0.0))
-            leg_qty = safe_float(leg.get("quantity"), finite=True)
-            if filled <= 0 or leg_qty is None or leg_qty <= 0:
-                return None
-            ratio = leg_qty / order_qty if order_qty and order_qty > 0 else 1.0
-            sign = 1.0 if str(leg.get("instruction") or "").upper().startswith("BUY") else -1.0
-            net += sign * (notional / filled) * ratio
-        net = abs(net)
-        return net if net > 0 else None
-
-    @classmethod
-    def _equity_order_fill_price(cls, payload: dict[str, Any] | None) -> float | None:
-        """Average fill price per unit: per share, or per spread for a vertical."""
-        if not isinstance(payload, dict):
-            return None
-        executions = cls._order_executions(payload)
-        legs = [leg for leg in (payload.get("orderLegCollection") or []) if isinstance(leg, dict)]
-        if len(legs) > 1:
-            net = cls._multi_leg_net_fill_price(payload, legs, executions)
-            if net is not None:
-                return net
-        elif executions:
-            notional = sum(value[0] for value in executions.values())
-            filled = sum(value[1] for value in executions.values())
-            return notional / filled
-        for key in ("price", "filledPrice", "averagePrice"):
-            px = safe_float(payload.get(key), finite=True)
-            if px is not None and px > 0:
-                return px
-        return None
-
-    @classmethod
-    def _equity_order_is_filled(cls, payload: dict[str, Any] | None) -> bool:
-        status = cls._equity_order_status(payload)
-        if status == "FILLED":
-            return True
-        remaining = cls._equity_order_remaining_qty(payload)
-        filled_qty = cls._equity_order_filled_qty(payload)
-        return remaining == 0 and (filled_qty or 0) > 0
-
-
-    @classmethod
-    def _equity_order_is_terminal_failure(cls, payload: dict[str, Any] | None) -> bool:
-        status = cls._equity_order_status(payload)
-        return status in cls._EQUITY_TERMINAL_FAILURE_STATUSES
-
 
     def _equity_session(self, ts=None) -> str | None:
         return classify_equity_session(
@@ -379,7 +240,7 @@ class SchwabExecutor:
             payload = response.json()
         except Exception as exc:
             return None, f"order_details_json_error:{exc}"
-        return payload, self._equity_order_status(payload)
+        return payload, order_status(payload)
 
     def _poll_equity_order(self, order_id: str, timeout_seconds: float, poll_seconds: float) -> tuple[dict[str, Any] | None, str]:
         deadline = time_module.monotonic() + max(0.0, timeout_seconds)
@@ -387,7 +248,7 @@ class SchwabExecutor:
             payload, status = self._equity_order_details(order_id)
             if payload is None:
                 return payload, status
-            if self._equity_order_is_filled(payload) or self._equity_order_is_terminal_failure(payload):
+            if order_is_filled(payload) or order_is_terminal_failure(payload):
                 return payload, status
             if time_module.monotonic() >= deadline:
                 return payload, status
@@ -409,9 +270,9 @@ class SchwabExecutor:
             payload, status = self._poll_equity_order(order_id, timeout_seconds, poll_seconds)
             if payload is None:
                 return False, f"{prefix}:{status}", payload
-            if self._equity_order_is_terminal_failure(payload):
+            if order_is_terminal_failure(payload):
                 return True, f"{prefix}:{status}", payload
-            if self._equity_order_is_filled(payload):
+            if order_is_filled(payload):
                 return True, f"{prefix}:{status}", payload
             return False, f"{prefix}_unconfirmed:{status}", payload
 
@@ -458,8 +319,8 @@ class SchwabExecutor:
         )
 
     def _finalize_live_equity_entry_result(self, request: OrderRequest, spec: dict[str, Any], payload: dict[str, Any] | None, order_id: str | None, message: str, data=None) -> OrderResult:
-        filled_qty = self._equity_order_filled_qty(payload)
-        broker_fill_price = self._equity_order_fill_price(payload)
+        filled_qty = order_filled_qty(payload)
+        broker_fill_price = order_fill_price(payload)
         fill_price = broker_fill_price
         if fill_price is None and data is not None:
             # Use live quotes as estimated fill price for metadata/logging.
@@ -486,8 +347,8 @@ class SchwabExecutor:
         *,
         price_scale: float = 1.0,
     ) -> OrderResult:
-        filled_qty = self._equity_order_filled_qty(payload)
-        fill_price = self._equity_order_fill_price(payload)
+        filled_qty = order_filled_qty(payload)
+        fill_price = order_fill_price(payload)
         if fill_price is not None and price_scale != 1.0:
             fill_price *= float(price_scale)
         return OrderResult(ok=(filled_qty or 0) > 0, order_id=order_id, raw=payload or spec, message=message, fill_price=fill_price, filled_qty=filled_qty, simulated=False)
@@ -508,9 +369,9 @@ class SchwabExecutor:
         if not order_id:
             return OrderResult(ok=False, order_id=None, raw=getattr(response, 'text', spec), message="live_missing_order_id", simulated=False)
         payload, status = self._poll_equity_order(order_id, timeout_seconds, poll_seconds)
-        if payload is not None and self._equity_order_is_filled(payload):
+        if payload is not None and order_is_filled(payload):
             return self._finalize_live_polled_order_result(spec, payload, order_id, f"live_fill:{status}", price_scale=price_scale)
-        filled_qty = self._equity_order_filled_qty(payload) or 0
+        filled_qty = order_filled_qty(payload) or 0
         if filled_qty > 0:
             cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
             latest_payload = cancel_payload or payload
@@ -524,9 +385,9 @@ class SchwabExecutor:
                                may_still_be_working=True)
         cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
         latest_payload = cancel_payload or payload
-        if latest_payload is not None and self._equity_order_is_filled(latest_payload):
+        if latest_payload is not None and order_is_filled(latest_payload):
             return self._finalize_live_polled_order_result(spec, latest_payload, order_id, f"live_fill_after_cancel:{cancel_msg}", price_scale=price_scale)
-        latest_filled_qty = self._equity_order_filled_qty(latest_payload) or 0
+        latest_filled_qty = order_filled_qty(latest_payload) or 0
         if latest_filled_qty > 0:
             result = self._finalize_live_polled_order_result(spec, latest_payload, order_id, f"live_partial_fill_after_cancel:{cancel_msg}", price_scale=price_scale)
             if not result.ok:
@@ -552,9 +413,9 @@ class SchwabExecutor:
             if not order_id:
                 return OrderResult(ok=False, order_id=None, raw=getattr(response, 'text', current_spec), message="live_missing_order_id", simulated=False)
             payload, _ = self._poll_equity_order(order_id, timeout_seconds, poll_seconds)
-            if self._equity_order_is_filled(payload):
+            if order_is_filled(payload):
                 return self._finalize_live_equity_entry_result(current_request, current_spec, payload, order_id, f"live_fill_attempt_{attempt}", data=data)
-            filled_qty = self._equity_order_filled_qty(payload) or 0
+            filled_qty = order_filled_qty(payload) or 0
             if filled_qty > 0:
                 cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
                 latest_payload = cancel_payload or payload
@@ -566,9 +427,9 @@ class SchwabExecutor:
             if attempt >= reprice_attempts:
                 cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
                 latest_payload = cancel_payload or payload
-                if latest_payload is not None and self._equity_order_is_filled(latest_payload):
+                if latest_payload is not None and order_is_filled(latest_payload):
                     return self._finalize_live_equity_entry_result(current_request, current_spec, latest_payload, order_id, f"live_fill_after_cancel_attempt_{attempt}:{cancel_msg}", data=data)
-                latest_filled_qty = self._equity_order_filled_qty(latest_payload) or 0
+                latest_filled_qty = order_filled_qty(latest_payload) or 0
                 if latest_filled_qty > 0:
                     result = self._finalize_live_equity_entry_result(current_request, current_spec, latest_payload, order_id, f"live_partial_fill_after_cancel_attempt_{attempt}:{cancel_msg}", data=data)
                     if result.ok:
@@ -580,9 +441,9 @@ class SchwabExecutor:
                 return OrderResult(ok=False, order_id=order_id, raw=latest_payload or current_spec, message="live_unfilled_canceled", simulated=False)
             cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
             latest_payload = cancel_payload or payload
-            if latest_payload is not None and self._equity_order_is_filled(latest_payload):
+            if latest_payload is not None and order_is_filled(latest_payload):
                 return self._finalize_live_equity_entry_result(current_request, current_spec, latest_payload, order_id, f"live_fill_after_reprice_cancel_attempt_{attempt}:{cancel_msg}", data=data)
-            latest_filled_qty = self._equity_order_filled_qty(latest_payload) or 0
+            latest_filled_qty = order_filled_qty(latest_payload) or 0
             if latest_filled_qty > 0:
                 result = self._finalize_live_equity_entry_result(current_request, current_spec, latest_payload, order_id, f"live_partial_fill_after_reprice_cancel_attempt_{attempt}:{cancel_msg}", data=data)
                 if result.ok:
@@ -704,7 +565,6 @@ class SchwabExecutor:
             return self._simulate_equity_fill(request, data, refresh_quotes=False, market_snapshot=market)
         return self._submit_live_single_order_with_poll(self._build_order(request), cancel_on_timeout=True, price_scale=1.0)
 
-
     # ------------------------------------------------------------------
     # Broker-side bracket (first-triggers-OCO) orders
     #
@@ -713,8 +573,6 @@ class SchwabExecutor:
     # The exit then rests AT THE BROKER instead of waiting for the engine's
     # management poll to observe the level and fire a marketable limit.
     # ------------------------------------------------------------------
-
-    _BRACKET_STOP_ORDER_TYPES = {"STOP", "STOP_LIMIT"}
 
     def bracket_orders_enabled(self) -> bool:
         return bool(self.config.execution.bracket_orders_enabled)
@@ -869,74 +727,6 @@ class SchwabExecutor:
         wrapped = self._wrap_oco(children)
         return wrapped[0] if len(wrapped) == 1 else {"orderStrategyType": "OCO", "childOrderStrategies": children}
 
-    @classmethod
-    def extract_bracket_children(cls, payload: dict[str, Any] | None) -> dict[str, Any]:
-        """Pull child order ids out of an ``order_details`` payload.
-
-        Walks nested ``childOrderStrategies`` (TRIGGER -> OCO -> SINGLE) and
-        classifies each leaf by ``orderType``. Returns empty ids when the
-        broker has not yet materialised the children.
-        """
-        found: dict[str, Any] = {
-            "oco_order_id": None,
-            "stop_order_id": None,
-            "target_order_id": None,
-            "child_order_ids": [],
-        }
-
-        def _walk(nodes: Any) -> None:
-            if not isinstance(nodes, list):
-                return
-            for node in nodes:
-                if not isinstance(node, dict):
-                    continue
-                order_id = node.get("orderId")
-                strategy_type = str(node.get("orderStrategyType") or "").upper()
-                order_type = str(node.get("orderType") or "").upper()
-                if order_id is not None:
-                    if strategy_type == "OCO":
-                        found["oco_order_id"] = str(order_id)
-                    else:
-                        found["child_order_ids"].append(str(order_id))
-                        if order_type in cls._BRACKET_STOP_ORDER_TYPES and found["stop_order_id"] is None:
-                            found["stop_order_id"] = str(order_id)
-                        elif order_type == "LIMIT" and found["target_order_id"] is None:
-                            found["target_order_id"] = str(order_id)
-                _walk(node.get("childOrderStrategies"))
-
-        if isinstance(payload, dict):
-            _walk(payload.get("childOrderStrategies"))
-        return found
-
-    @classmethod
-    def _flatten_order_tree(cls, node: Any, out: dict[str, dict[str, Any]]) -> None:
-        if isinstance(node, list):
-            for item in node:
-                cls._flatten_order_tree(item, out)
-            return
-        if not isinstance(node, dict):
-            return
-        order_id = node.get("orderId")
-        if order_id is not None:
-            legs = [leg for leg in (node.get("orderLegCollection") or []) if isinstance(leg, dict)]
-            out[str(order_id)] = {
-                "status": cls._equity_order_status(node),
-                "order_type": str(node.get("orderType") or "").upper(),
-                "filled_qty": cls._equity_order_filled_qty(node),
-                "fill_price": cls._equity_order_fill_price(node),
-                "is_filled": cls._equity_order_is_filled(node),
-                "is_terminal_failure": cls._equity_order_is_terminal_failure(node),
-                # Shares still resting: what adoption compares against the
-                # position before it trusts a working child.
-                "remaining_qty": cls._equity_order_remaining_qty(node),
-                "leg_qty": safe_int(legs[0].get("quantity")) if len(legs) == 1 else None,
-                # Adopted over the bracket's own levels, so an infinite one
-                # reads as missing and the bracket keeps its own (2026-09-26).
-                "stop_price": safe_float(node.get("stopPrice"), finite=True),
-                "price": safe_float(node.get("price"), finite=True),
-            }
-        cls._flatten_order_tree(node.get("childOrderStrategies"), out)
-
     def fetch_order_states(self, lookback_minutes: int = 480) -> dict[str, dict[str, Any]] | None:
         """Snapshot every recent order (and child) in ONE ``account_orders`` call.
 
@@ -957,7 +747,7 @@ class SchwabExecutor:
             LOG.warning("account_orders failed during bracket reconcile: %s", exc)
             return None
         out: dict[str, dict[str, Any]] = {}
-        self._flatten_order_tree(payload, out)
+        flatten_order_tree(payload, out)
         return out
 
     def fetch_account_positions(self) -> list[dict[str, Any]] | None:
@@ -1000,7 +790,7 @@ class SchwabExecutor:
         if not isinstance(payload, dict):
             return None
         out: dict[str, dict[str, Any]] = {}
-        self._flatten_order_tree(payload, out)
+        flatten_order_tree(payload, out)
         return out.get(str(order_id))
 
     def _bracket_state_from_order(self, order_id: str) -> dict[str, Any]:
@@ -1010,10 +800,10 @@ class SchwabExecutor:
         the order itself IS the stop, so its own id is reported as the stop id.
         """
         payload, _status = self._equity_order_details(order_id)
-        children = self.extract_bracket_children(payload)
+        children = extract_bracket_children(payload)
         if not children["child_order_ids"] and isinstance(payload, dict):
             order_type = str(payload.get("orderType") or "").upper()
-            if order_type in self._BRACKET_STOP_ORDER_TYPES:
+            if order_type in STOP_ORDER_TYPES:
                 children["stop_order_id"] = str(order_id)
                 children["child_order_ids"] = [str(order_id)]
             elif order_type == "LIMIT":
@@ -1101,7 +891,7 @@ class SchwabExecutor:
             # state and never saw that stop fill: the paper position never
             # exited on its stop (2026-09-25).
             mirrored = self._tracked_protection_ids(known_bracket) or {
-                **dict.fromkeys(self._PROTECTION_ID_KEYS), "child_order_ids": [],
+                **dict.fromkeys(BRACKET_ID_KEYS), "child_order_ids": [],
             }
             return {**base, **mirrored, "active": False, "simulated": True, "state": "dry_run"}
         existing = self._adoptable_protection(parent_order_id, known_bracket)
@@ -1136,15 +926,13 @@ class SchwabExecutor:
         return {**base, **(replacement.bracket or {}), "protective_order_id": replacement.order_id,
                 "active": True, "state": "standalone_oco"}
 
-    _PROTECTION_ID_KEYS = ("oco_order_id", "protective_order_id", "stop_order_id", "target_order_id")
-
-    @classmethod
-    def _tracked_protection_ids(cls, known_bracket: dict[str, Any] | None) -> dict[str, Any] | None:
+    @staticmethod
+    def _tracked_protection_ids(known_bracket: dict[str, Any] | None) -> dict[str, Any] | None:
         """The protective order ids *known_bracket* tracks, or None when it
         tracks no stop."""
         if not (isinstance(known_bracket, dict) and known_bracket.get("stop_order_id")):
             return None
-        ids: dict[str, Any] = {key: known_bracket.get(key) for key in cls._PROTECTION_ID_KEYS}
+        ids: dict[str, Any] = {key: known_bracket.get(key) for key in BRACKET_ID_KEYS}
         ids["child_order_ids"] = [str(oid) for oid in (known_bracket.get("child_order_ids") or []) if oid]
         return ids
 
@@ -1339,33 +1127,29 @@ class SchwabExecutor:
             return BracketCancel(True, "no_bracket")
         if self.config.schwab.dry_run:
             return BracketCancel(True, "dry_run_cancel")
-        wrapper_id = bracket.get("oco_order_id") or bracket.get("protective_order_id")
-        child_ids: list[str] = []
-        for oid in (bracket.get("stop_order_id"), bracket.get("target_order_id"), *(bracket.get("child_order_ids") or [])):
-            if oid and str(oid) != str(wrapper_id or "") and str(oid) not in child_ids:
-                child_ids.append(str(oid))
+        wrapper_id, child_ids = bracket_wrapper_and_children(bracket)
         if not wrapper_id and not child_ids:
             return BracketCancel(True, "no_resting_orders")
         ok = True
         messages: list[str] = []
         fills: dict[str, tuple[int, float | None, str]] = {}
         if wrapper_id:
-            cancel_ok, msg, payload = self._cancel_live_equity_order(str(wrapper_id))
+            cancel_ok, msg, payload = self._cancel_live_equity_order(wrapper_id)
             ok = cancel_ok
             messages.append(f"{wrapper_id}:{msg}")
-            self._collect_protective_fills(payload, fills)
+            collect_protective_fills(payload, fills)
         for child_id in child_ids:
             if wrapper_id:
                 # Usually already down with the wrapper: confirm before
                 # spending a cancel call on it.
                 payload, _status = self._equity_order_details(child_id)
-                if payload is not None and (self._equity_order_is_terminal_failure(payload) or self._equity_order_is_filled(payload)):
-                    self._collect_protective_fills(payload, fills)
+                if payload is not None and (order_is_terminal_failure(payload) or order_is_filled(payload)):
+                    collect_protective_fills(payload, fills)
                     continue
             cancel_ok, msg, payload = self._cancel_live_equity_order(child_id)
             ok = ok and cancel_ok
             messages.append(f"{child_id}:{msg}")
-            self._collect_protective_fills(payload, fills)
+            collect_protective_fills(payload, fills)
         # Fills already booked for a child the bracket no longer tracks (a
         # dead stop an unconfirmed retire dropped): its wrapper's payload
         # still carries it and reports them again (2026-09-25).
@@ -1386,31 +1170,11 @@ class SchwabExecutor:
         fill_reason = max(fills.values(), key=lambda fill: fill[0])[2] if fills else None
         return BracketCancel(ok, ",".join(messages), int(filled_qty), fill_price, fill_reason)
 
-    @classmethod
-    def _collect_protective_fills(cls, payload: Any, into: dict[str, tuple[int, float | None, str]]) -> None:
-        """Record ``order_id -> (filled_qty, fill_price, exit reason)`` for every
-        protective leg in *payload* that has fills. Keyed by order id so a leg
-        seen both under its wrapper and on its own is counted once."""
-        if isinstance(payload, list):
-            for node in payload:
-                cls._collect_protective_fills(node, into)
-            return
-        if not isinstance(payload, dict):
-            return
-        order_id = payload.get("orderId")
-        if order_id is not None and str(payload.get("orderStrategyType") or "").upper() != "OCO":
-            filled_qty = cls._equity_order_filled_qty(payload) or 0
-            if filled_qty > 0:
-                order_type = str(payload.get("orderType") or "").upper()
-                reason = "broker_stop" if order_type in cls._BRACKET_STOP_ORDER_TYPES else "broker_target"
-                into[str(order_id)] = (int(filled_qty), cls._equity_order_fill_price(payload), reason)
-        cls._collect_protective_fills(payload.get("childOrderStrategies"), into)
-
     def _finalize_bracket_protection(self, result: OrderResult, request: OrderRequest, side: Side,
                                      stop_price: float, target_price: float | None,
                                      parent_order_id: str, payload: dict[str, Any] | None) -> OrderResult:
         """Attach bracket state to an entry result and make the sizing correct."""
-        children = self.extract_bracket_children(payload)
+        children = extract_bracket_children(payload)
         direction = self._bracket_round_direction(side)
         bracket: dict[str, Any] = {
             "parent_order_id": str(parent_order_id),
@@ -1495,10 +1259,10 @@ class SchwabExecutor:
             return OrderResult(ok=False, order_id=None, raw=getattr(response, "text", spec),
                                message="bracket_missing_order_id", simulated=False)
         payload, status = self._poll_equity_order(order_id, timeout_seconds, poll_seconds)
-        if payload is not None and self._equity_order_is_filled(payload):
+        if payload is not None and order_is_filled(payload):
             result = self._finalize_live_equity_entry_result(request, spec, payload, order_id, f"live_bracket_fill:{status}", data=data)
             return self._finalize_bracket_protection(result, request, side, stop_price, target_price, order_id, payload)
-        if (self._equity_order_filled_qty(payload) or 0) > 0:
+        if (order_filled_qty(payload) or 0) > 0:
             # Partial fill: stop further shares arriving BEFORE sizing the
             # protection, so the resize target quantity cannot move underneath.
             cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
@@ -1512,10 +1276,10 @@ class SchwabExecutor:
             return self._finalize_bracket_protection(result, request, side, stop_price, target_price, order_id, latest)
         cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
         latest = cancel_payload or payload
-        if latest is not None and self._equity_order_is_filled(latest):
+        if latest is not None and order_is_filled(latest):
             result = self._finalize_live_equity_entry_result(request, spec, latest, order_id, f"live_bracket_fill_after_cancel:{cancel_msg}", data=data)
             return self._finalize_bracket_protection(result, request, side, stop_price, target_price, order_id, latest)
-        if (self._equity_order_filled_qty(latest) or 0) > 0:
+        if (order_filled_qty(latest) or 0) > 0:
             result = self._finalize_live_equity_entry_result(request, spec, latest, order_id, f"live_bracket_partial_fill_after_cancel:{cancel_msg}", data=data)
             if result.ok:
                 result.may_still_be_working = not cancel_ok

@@ -310,6 +310,44 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Broker payload parsing has one home, `broker_payloads.py` (refactor
+  cut C30).** *2026-09-27* — `broker_positions.py` is renamed
+  `broker_payloads.py` and takes the order readers that were
+  `SchwabExecutor` classmethods, as free functions: `order_status`,
+  `order_remaining_qty`, `order_filled_qty`, `order_fill_price`,
+  `order_is_filled`, `order_is_terminal_failure`,
+  `extract_bracket_children`, `flatten_order_tree` and
+  `collect_protective_fills` (with the private `_order_executions` and
+  `_multi_leg_net_fill_price`). The executor keeps the I/O. The broker's
+  vocabulary is named once: `WORKING_STATUSES` (the working-order
+  listing's inline set), `TERMINAL_FAILURE_STATUSES` (was
+  `SchwabExecutor._EQUITY_TERMINAL_FAILURE_STATUSES`) and
+  `STOP_ORDER_TYPES` (was `_BRACKET_STOP_ORDER_TYPES`, and a literal in the
+  restore's resting-stop match). A bracket record's order-id keys are
+  `BRACKET_ID_KEYS` (`BRACKET_WRAPPER_KEYS` + `BRACKET_CHILD_KEYS`):
+  - `bracket_order_ids(bracket)` reads them for the reconcile's
+    foreign-order check, the settle's cancelled set and the manager's
+    unlisted-child cache;
+  - `bracket_wrapper_and_children(bracket)` reads them for
+    `cancel_bracket`, where the OCO still wins over a protective order
+    beside it;
+  - adoption and the dry-run mirror iterate `BRACKET_ID_KEYS` (was
+    `SchwabExecutor._PROTECTION_ID_KEYS`).
+
+  Five enumerations of the keys (two in the reconciler, two in the
+  executor, one in the manager) had to agree; a key one of them missed
+  read an owned order as foreign, which blocks every entry. There is no
+  alias: import from `intraday_tv_schwab_bot.broker_payloads`. With
+  `_sr_ladder` (cut B9) and `broker_positions` gone, no module imports a
+  retired module, and the layering guard's allowlist for those imports is
+  empty. No behaviour changes (the unlisted-child cache now also keeps a
+  bracket's wrapper ids, which are never cached). Tests:
+  `tests/test_broker_payloads.py` (new; the order readers'
+  `TestBrokerPayloadParsing` moved there from
+  `tests/test_execution_invariants.py`), `tests/test_bracket_orders.py`,
+  and the former classmethod calls in `tests/test_sweep_fixes.py`,
+  `tests/test_runtime_nan_reads.py` and `tests/test_properties.py`.
+
 - **The support/resistance ladder is collapsed once, and cut after the
   broken-level drop (refactor cut B8).** *2026-09-27* —
   `build_support_resistance_context` collapsed each side's candidates into

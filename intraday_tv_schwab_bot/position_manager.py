@@ -73,7 +73,12 @@ from .risk import RiskManager
 from .levels_shared import effective_side_tolerance, select_next_distinct_level
 from ._strategies.catalogue import is_option_strategy
 from ._strategies.shared_exit import SharedExitPolicy, partial_exit_qty
-from .broker_positions import active_broker_bracket, order_result_needs_broker_recheck, working_exit_outstanding_qty
+from .broker_payloads import (
+    active_broker_bracket,
+    bracket_order_ids,
+    order_result_needs_broker_recheck,
+    working_exit_outstanding_qty,
+)
 from .log_setup import TRADEFLOW_LEVEL
 from . import sessions
 
@@ -1224,14 +1229,10 @@ class PositionManager:
         if not bracketed:
             self._unlisted_child_states.clear()
             return {}
-        tracked_children: set[str] = set()
+        tracked_ids: set[str] = set()
         for position in bracketed.values():
-            bracket = active_broker_bracket(position) or {}
-            tracked_children.update(
-                str(oid) for oid in (bracket.get("stop_order_id"), bracket.get("target_order_id"),
-                                     *(bracket.get("child_order_ids") or [])) if oid
-            )
-        for child_id in [cid for cid in self._unlisted_child_states if cid not in tracked_children]:
+            tracked_ids |= bracket_order_ids(active_broker_bracket(position) or {})
+        for child_id in [cid for cid in self._unlisted_child_states if cid not in tracked_ids]:
             del self._unlisted_child_states[child_id]
         states = self.executor.fetch_order_states()
         if states is None:
