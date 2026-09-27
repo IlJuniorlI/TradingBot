@@ -13,8 +13,10 @@ Design notes:
   partial) are immediately visible to the engine's other methods.
 - ``save_reconcile_metadata`` is injected as a callable because the engine
   also needs to call it from entry paths (``_open_positions``, broker
-  entry recovery). Keeping a single source of truth on the engine avoids
-  diverging metadata-signature caches between the two owners.
+  entry recovery). Keeping a single save on the engine keeps one rule for
+  how it writes (an upsert until a broker reconcile has succeeded, then a
+  full replace); ``ReconcileMetadataStore.save_if_changed`` skips a save
+  that would write what it last wrote.
 - An exit order whose submit call could not settle it (left working through
   a halt, a cancel the broker never confirmed) is tracked on the position
   and settled from the order's own fill record (``_exit_order_in_flight``),
@@ -40,7 +42,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import pandas as pd
 
-from .audit_logger import AuditLogger
+from .audit_logger import AuditLogger, structured_metadata_snapshot
 from .config import BotConfig
 from .dashboard_cache import DashboardCache
 from .data_feed import EXECUTION_LAST_KEYS, MANAGEMENT_PRICE_KEYS, MarketDataStore
@@ -300,7 +302,6 @@ class PositionManager:
         dashboard_cache: DashboardCache,
         positions: dict[str, Position],
         save_reconcile_metadata: Callable[[], None],
-        structured_metadata_snapshot: Callable[[Mapping[str, Any] | None], dict[str, Any]],
     ) -> None:
         self.config = config
         self.data = data
@@ -312,7 +313,6 @@ class PositionManager:
         self.dashboard_cache = dashboard_cache
         self.positions = positions
         self._save_reconcile_metadata = save_reconcile_metadata
-        self._structured_metadata_snapshot = structured_metadata_snapshot
         # Child id -> (monotonic time read, order state) for bracket children
         # the listing does not return; see _unlisted_bracket_child_state.
         self._unlisted_child_states: dict[str, tuple[float, dict[str, Any] | None]] = {}
@@ -737,7 +737,7 @@ class PositionManager:
                 'sr_broken_support': safe_float(sr_row.get('broken_support'), None),
                 'sr_broken_resistance': safe_float(sr_row.get('broken_resistance'), None),
             })
-        extra = self._structured_metadata_snapshot(meta)
+        extra = structured_metadata_snapshot(meta)
         payload.update({k: v for k, v in extra.items() if k not in payload and v is not None})
         return {k: v for k, v in payload.items() if v is not None}
 

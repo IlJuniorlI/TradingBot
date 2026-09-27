@@ -18,6 +18,9 @@ class ReconcileMetadataStore:
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser()
         self._initialized = False
+        # The last write through save_if_changed: its rows' signature and
+        # whether it replaced every row.
+        self._last_saved: tuple[str, bool] | None = None
 
     def _ensure_schema(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -103,6 +106,39 @@ class ReconcileMetadataStore:
             reference_symbol=str(row.get("reference_symbol") or "") or None,
             metadata=metadata if isinstance(metadata, dict) else {},
         )
+
+    @classmethod
+    def _signature(cls, positions: dict[str, Position]) -> str:
+        """The rows *positions* write, ``updated_at`` aside, as one string."""
+        rows = []
+        for key, position in sorted(positions.items(), key=lambda item: str(item[0])):
+            row = cls._serialize(key, position)
+            del row["updated_at"]
+            rows.append(row)
+        return json.dumps(rows, sort_keys=True, separators=(",", ":"))
+
+    def save_if_changed(self, positions: dict[str, Position], *, replace_all: bool) -> bool:
+        """Write *positions* (``save_positions`` when ``replace_all``, else
+        ``upsert_positions``) unless the last write here stored the same rows.
+        A replace is skipped only after a replace: after an upsert, rows it
+        did not cover may remain. True when it wrote.
+
+        A failed write is logged and the next call tries again: its callers
+        are the entry, exit and reconcile flows, which a metadata save must
+        not fail."""
+        signature = self._signature(positions)
+        if self._last_saved is not None and self._last_saved[0] == signature and (self._last_saved[1] or not replace_all):
+            return False
+        try:
+            if replace_all:
+                self.save_positions(positions)
+            else:
+                self.upsert_positions(positions)
+        except Exception as exc:
+            LOG.warning("Could not save startup reconcile metadata: %s", exc)
+            return False
+        self._last_saved = (signature, replace_all)
+        return True
 
     def save_positions(self, positions: dict[str, Position]) -> None:
         """Replace every stored row with *positions*."""

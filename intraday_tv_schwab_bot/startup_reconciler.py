@@ -23,10 +23,12 @@ Design notes:
 
 - ``self.positions`` is a shared-reference dict with ``IntradayBot``.
   Restored positions land here directly.
-- ``save_reconcile_metadata`` injected as callable because the metadata
-  persistence cache (`_last_reconcile_metadata_signature`) lives on engine
-  to share with entry/exit paths. StartupReconciler just triggers a save
-  after mutations.
+- ``save_reconcile_metadata`` injected as callable because the engine
+  decides how a save writes (an upsert until a broker reconcile has
+  succeeded, then a full replace) for the entry and exit paths too, and
+  ``ReconcileMetadataStore.save_if_changed`` skips a save that would write
+  what it last wrote. StartupReconciler just triggers a save after
+  mutations.
 - ``stock_position_trail_pct`` injected as callable (lives on
   EntryGatekeeper). Restore uses it to compute trail_pct consistent with
   normal entry path.

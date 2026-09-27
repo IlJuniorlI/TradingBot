@@ -8,6 +8,9 @@ Owns:
     the per-kind fingerprint changes.
   - Structured JSON event logs (``log_structured``): TRADEFLOW-level events
     that downstream tools (session_report) parse out of the log file.
+  - The position metadata those records carry
+    (``structured_metadata_snapshot``): the entry gatekeeper's ENTRY_CONTEXT
+    and the position manager's EXIT_CONTEXT both filter it through here.
 
 Historically these were ``IntradayBot`` methods before Phase 2 of the
 engine refactor. Extracting to a dedicated class decouples logging state
@@ -23,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
@@ -34,11 +38,9 @@ LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 def _json_ready(value: Any) -> Any:
     """JSON-safe value normalization. Canonical implementation.
 
-    Also imported by ``engine._reconcile_metadata_signature`` (to build the
-    signature payload for reconcile-metadata dedup) and
-    ``position_store.ReconcileMetadataStore.save_positions`` (to serialize
-    position.metadata before sqlite insert). Previously triplicated across
-    those three call sites; consolidated here after Phase 5.
+    Also imported by ``position_store`` (to serialize position.metadata
+    before the sqlite insert, which ``ReconcileMetadataStore.save_if_changed``
+    also compares to skip a save that changes nothing).
     """
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
@@ -80,6 +82,83 @@ def _safe_str(value: Any) -> str:
                 name, name, exc_info=True,
             )
         return f"<unserializable {name}>"
+
+
+def structured_metadata_snapshot(meta: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The position metadata an ENTRY_CONTEXT / EXIT_CONTEXT record carries:
+    the keys named below and those starting with a prefix below, minus the
+    excluded ones and None values (the gatekeeper's entry snapshot and the
+    position manager's exit snapshot both add it)."""
+    if not isinstance(meta, Mapping):
+        return {}
+    include_keys = {
+        'benchmark', 'zscore', 'side_preference', 'runner_target_applied', 'qualifying_target_count',
+        'ltf_score_required', 'min_peer_score_required', 'strong_setup_ltf_score_required', 'strong_setup_peer_score_required',
+        'or_high', 'or_low', 'pullback_high', 'pullback_low', 'trigger_high', 'trigger_low',
+        'support_low', 'resistance_high', 'extension_from_vwap_pct', 'peer_details', 'macro_details',
+        'spread_side', 'spread_style', 'spread_type', 'entry_price_points', 'entry_credit',
+        'bought_leg_symbol', 'sold_leg_symbol', 'bought_strike', 'sold_strike',
+        'htf_minutes', 'nearest_htf_support', 'nearest_htf_resistance',
+        'broken_htf_support', 'broken_htf_resistance', 'prior_day_high', 'prior_day_low',
+        'prior_week_high', 'prior_week_low', 'htf_ema_fast', 'htf_ema_slow', 'htf_atr14',
+        'htf_trend_bias', 'htf_level_buffer', 'nearest_htf_bullish_fvg', 'nearest_htf_bearish_fvg',
+        'source_priority', 'selection_score', 'selection_ltf_score', 'htf_vote_edge',
+        'macro_agreement_count', 'selection_quality_score', 'activity_score', 'setup_quality_score',
+        'execution_quality_score', 'macro_score', 'entry_family', 'peer_universe', 'side_eval',
+        'family_eval', 'evaluated_sides', 'primary_blocker', 'all_blockers', 'near_miss_blockers',
+        'selection_components', 'candidate_reason', 'decision_summary',
+        # Per-sector index confirmation snapshot. Stamped at entry by
+        # top_tier_adaptive.strategy.entry_signals via
+        # ``_indices_for_symbol(symbol)``. Logged here so post-session
+        # analysis can verify which sector ETFs each entry was
+        # confirmed against.
+        'confirmation_indices',
+        # Volatility widening factor stamped by Tier 2a / early-session
+        # widening — useful for slicing trade outcomes by widening tier.
+        'vol_widening_factor',
+        # The shared entry stage's stamps (2026-09-24): the style family
+        # the exit graces key on, the strategy's own priority vs the
+        # shared score terms added to it, and where the entry came from
+        # (a divergence-only entry) -- what a knob A/B needs afterwards.
+        'entry_style_family', 'strategy_priority_score', 'shared_context_score',
+        'entry_context_adjustment', 'technical_entry_adjustment', 'entry_source',
+    }
+    include_prefixes = (
+        'fvg_', 'htf_fvg_', 'adaptive_', 'anti_chase_fvg_retest_',
+        # Armed-retest provenance (2026-09-20): whether this entry came
+        # from the retest the regime waited for or from the market
+        # fallback after the wait expired, the level it armed on, and how
+        # long it waited. Without this prefix the keys are stamped on the
+        # Signal and then dropped here, and the A/B the feature exists to
+        # settle cannot be measured after the fact.
+        'armed_retest_',
+        # HTF EMA trend at entry (htf_ema_trend / _votes / _bonus,
+        # 2026-09-24) -- what a dry-run A/B of require_htf_ema_alignment
+        # and htf_ema_alignment_score needs after the fact.
+        'htf_ema_',
+        # HTF RSI divergence score term where a strategy records it
+        # (peer_confirmed_htf_pivots' htf_divergence_adjustment, live
+        # since 2026-09-24): ranking-only, so it is invisible in the logs
+        # without this.
+        'htf_divergence_',
+        # The gates the shared entry stage applied / exempted, whether a
+        # retest admitted the entry, and the divergence confirmation or
+        # conflict (2026-09-24).
+        'shared_entry_', 'divergence_entry_', 'anti_chase_ob_retest_',
+        'msltf_', 'mshtf_', 'sr_', 'tech_', 'matched_', 'chart_pattern_',
+        'decision_', 'gate_', 'peak_giveback_', 'orb_',
+    )
+    exclude_keys = {
+        'order_spec', 'long_leg', 'short_leg', 'option_leg', 'valuation_legs',
+        'htf_bullish_fvgs', 'htf_bearish_fvgs',
+    }
+    out: dict[str, Any] = {}
+    for key, value in meta.items():
+        if value is None or key in exclude_keys:
+            continue
+        if key in include_keys or any(str(key).startswith(prefix) for prefix in include_prefixes):
+            out[str(key)] = value
+    return out
 
 
 class AuditLogger:

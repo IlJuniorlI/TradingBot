@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import logging
 import math
 import signal
@@ -14,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 from schwabdev import Client
 import pandas as pd
 
-from .audit_logger import AuditLogger, _json_ready
+from .audit_logger import AuditLogger
 from .dashboard_cache import (
     DashboardCache,
     dashboard_normalize_exchange,
@@ -30,7 +29,6 @@ from .models import Candidate, Position, Side
 from ._strategies.catalogue import option_strategy_names
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
-from .numeric import safe_float
 from .position_store import ReconcileMetadataStore, SessionRiskStateStore
 from .risk import RiskManager
 from .screener_client import TradingViewScreenerClient
@@ -212,7 +210,6 @@ class IntradayBot:
         # (``settle_pending``); see _reconcile_retry_delay.
         self._settle_hold_failures = 0
         self._last_reconcile_attempt_monotonic: float = 0.0
-        self._last_reconcile_metadata_signature: str | None = None
         # ET session date of the most recent daily session-archive
         # export. `_maybe_export_session_archive` fires once per ET
         # trading day after the stream window closes (8pm ET) so an
@@ -254,7 +251,6 @@ class IntradayBot:
             dashboard_cache=self.dashboard_cache,
             positions=self.positions,
             save_reconcile_metadata=self._save_reconcile_metadata,
-            structured_metadata_snapshot=self.entry_gatekeeper.structured_metadata_snapshot,
         )
         self.startup_reconciler = StartupReconciler(
             config,
@@ -301,46 +297,16 @@ class IntradayBot:
         return "Net Liq" if self.config.schwab.dry_run else "Allocated Capital"
 
 
-    def _reconcile_metadata_signature(self) -> str:
-        payload = []
-        for key, position in sorted(self.positions.items(), key=lambda item: str(item[0])):
-            payload.append({
-                "key": str(key),
-                "symbol": str(position.symbol),
-                "strategy": str(position.strategy),
-                "side": str(position.side.value),
-                "qty": int(position.qty),
-                "entry_price": float(position.entry_price),
-                "entry_time": position.entry_time.isoformat(),
-                "stop_price": float(position.stop_price),
-                "target_price": safe_float(position.target_price, None),
-                "trail_pct": safe_float(position.trail_pct, None),
-                "highest_price": safe_float(position.highest_price, None),
-                "lowest_price": safe_float(position.lowest_price, None),
-                "pair_id": position.pair_id,
-                "reference_symbol": position.reference_symbol,
-                "metadata": _json_ready(position.metadata or {}),
-            })
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
-
     def _save_reconcile_metadata(self) -> None:
-        signature = self._reconcile_metadata_signature()
-        if signature == self._last_reconcile_metadata_signature:
-            return
-        try:
-            if self._last_reconcile_session_date is None:
-                # No reconcile has succeeded yet, so self.positions may be
-                # only part of what the broker holds: a failed startup attempt
-                # restores some positions, or none. Replacing every row with it
-                # wiped the rows the retry restores from (the first management
-                # cycle did it); write what is tracked over them instead and
-                # delete none. `_reconcile_broker` replaces them all on success.
-                self.reconcile_metadata_store.upsert_positions(self.positions)
-            else:
-                self.reconcile_metadata_store.save_positions(self.positions)
-            self._last_reconcile_metadata_signature = signature
-        except Exception as exc:
-            LOG.warning("Could not save startup reconcile metadata: %s", exc)
+        # Until a reconcile has succeeded, self.positions may be only part of
+        # what the broker holds: a failed startup attempt restores some
+        # positions, or none. Replacing every row with it wiped the rows the
+        # retry restores from (the first management cycle did it); write what
+        # is tracked over them instead and delete none. `_reconcile_broker`
+        # replaces them all on success.
+        self.reconcile_metadata_store.save_if_changed(
+            self.positions, replace_all=self._last_reconcile_session_date is not None,
+        )
 
     def _trade_management_mode(self) -> str:
         return self.config.risk.trade_management_mode
@@ -616,8 +582,8 @@ class IntradayBot:
             self._reconcile_failures = 0
             self._settle_hold_failures = 0
             # A full replace, even when the positions are unchanged: saves
-            # before the first success only upserted, so stale rows remain.
-            self._last_reconcile_metadata_signature = None
+            # before the first success only upserted, so stale rows remain
+            # (the store never skips a replace that follows an upsert).
             self._save_reconcile_metadata()
             return
         self._reconcile_failures += 1
@@ -1507,20 +1473,7 @@ class IntradayBot:
         ]
         for snapshot in dashboard_symbols:
             remember_exchange(snapshot.get('symbol'), snapshot.get('exchange'))
-        active_dashboard_symbol_set = {str(symbol or '').upper().strip() for symbol in dashboard_symbol_order if str(symbol or '').upper().strip()}
-        with self.dashboard_cache.lock:
-            if self.dashboard_cache.snapshot_cache:
-                self.dashboard_cache.snapshot_cache = {
-                    key: value
-                    for key, value in self.dashboard_cache.snapshot_cache.items()
-                    if key in active_dashboard_symbol_set
-                }
-            if self.dashboard_cache.chart_cache:
-                self.dashboard_cache.chart_cache = {
-                    key: value
-                    for key, value in self.dashboard_cache.chart_cache.items()
-                    if key[0] in active_dashboard_symbol_set
-                }
+        self.dashboard_cache.prune_inactive_symbols(set(dashboard_symbol_order))
 
         return {
             "status": "running" if self.last_error is None else "error",

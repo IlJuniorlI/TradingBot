@@ -310,6 +310,34 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The reconcile metadata store skips its own unchanged saves; the entry
+  and exit metadata filter and the dashboard cache prune have one home each
+  (refactor cut C34).** *2026-09-27* —
+  - `ReconcileMetadataStore.save_if_changed(positions, *, replace_all)`
+    replaces the engine's `_reconcile_metadata_signature`, a hand-kept copy
+    of the store's row serialization. The store compares the rows it would
+    write, `updated_at` aside, with its last write and skips a save that
+    changes nothing. It never skips a replace that follows an upsert, which
+    the engine's signature reset after the first successful reconcile was
+    for. `IntradayBot._save_reconcile_metadata` is one call: an upsert until
+    a broker reconcile has succeeded, then a replace, as before. A failed
+    save still logs `Could not save startup reconcile metadata`, now under
+    `intraday_tv_schwab_bot.position_store`. A successful reconcile after
+    the first in a process no longer rewrites unchanged rows, so their
+    `updated_at`, which nothing reads, keeps its time.
+  - `structured_metadata_snapshot`, the filter of the position metadata
+    ENTRY_CONTEXT and EXIT_CONTEXT carry, is a function in
+    `audit_logger.py`. `EntryGatekeeper.structured_metadata_snapshot` and
+    `PositionManager`'s `structured_metadata_snapshot` argument are gone.
+  - The dashboard update drops the cached snapshots and charts of symbols
+    it no longer shows through `DashboardCache.prune_inactive_symbols`
+    instead of an inline copy of it.
+  - No behaviour changes. There is no alias: import
+    `structured_metadata_snapshot` from `intraday_tv_schwab_bot.audit_logger`.
+    Tests: `tests/test_position_store.py` (`TestSaveIfChanged`),
+    `tests/test_dashboard_cache.py` (new),
+    `tests/test_dashboard_update_failure.py`.
+
 - **EXIT_CONTEXT names the family that decided the exit (refactor cut
   B15).** *2026-09-27* — `exit_reason_family` is the `family` of the
   `ExitDecision` the exit was taken for, and
