@@ -11,6 +11,8 @@ Owns:
   - The position metadata those records carry
     (``structured_metadata_snapshot``): the entry gatekeeper's ENTRY_CONTEXT
     and the position manager's EXIT_CONTEXT both filter it through here.
+  - The one JSON normalizer (``json_safe``): these records, the sqlite
+    position store and the dashboard all write through it.
 
 Historically these were ``IntradayBot`` methods before Phase 2 of the
 engine refactor. Extracting to a dedicated class decouples logging state
@@ -25,52 +27,77 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import Mapping
-from datetime import datetime
-from typing import Any
+from datetime import date
+from typing import Any, Literal
+
+import numpy as np
 
 from .log_setup import TRADEFLOW_LEVEL, warn_once
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
 
-def _json_ready(value: Any) -> Any:
-    """JSON-safe value normalization. Canonical implementation.
+def json_safe(value: Any, *, non_finite: Literal["keep", "null"]) -> Any:
+    """*value* in JSON's own types: a dict with str keys, a list, a str, an
+    int, a float, a bool or None. The one normalizer of what the bot writes
+    as JSON: the TRADEFLOW records (``log_structured``), the sqlite position
+    metadata and risk state (``position_store``), and the dashboard's state
+    and chart payloads (``dashboard``).
 
-    Also imported by ``position_store`` (to serialize position.metadata
-    before the sqlite insert, which ``ReconcileMetadataStore.save_if_changed``
-    also compares to skip a save that changes nothing).
+    - A numpy scalar is unwrapped with ``.item()``: an int64 stays an int
+      and a bool_ a bool.
+    - A date or datetime (a pandas Timestamp too) becomes its
+      ``isoformat()``, a ``T`` between the date and the time.
+    - A tuple or set becomes a list, and a dict key its string.
+    - Another number type (a Decimal, a Fraction) becomes a float. A value
+      ``float()`` refuses with one of the three errors a number type raises
+      is written as its string; any other error from ``float()`` raises.
+
+    ``non_finite`` is what NaN and +/-inf become: ``"keep"`` leaves them for
+    ``json.dumps`` to write as ``NaN`` / ``Infinity``, which Python's reader
+    takes back (the audit records and the sqlite rows); ``"null"`` makes
+    them None, for the dashboard, which serializes with ``allow_nan=False``
+    because the browser's ``JSON.parse`` refuses them.
     """
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if non_finite not in ("keep", "null"):
+        raise ValueError(f"non_finite must be 'keep' or 'null', got {non_finite!r}")
+    return _json_safe_walk(value, non_finite == "keep")
+
+
+def _json_safe_walk(value: Any, keep_non_finite: bool) -> Any:
+    """``json_safe``'s walk; the checks run in the order of how common each
+    type is in a dashboard payload."""
+    if value is None or isinstance(value, (str, bool, int)):
         return value
+    if isinstance(value, float):
+        # float() also unwraps a numpy float64, a float subclass.
+        return float(value) if keep_non_finite or math.isfinite(value) else None
     if isinstance(value, dict):
-        return {str(k): _json_ready(v) for k, v in value.items()}
+        return {str(k): _json_safe_walk(v, keep_non_finite) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
-        return [_json_ready(v) for v in value]
-    if isinstance(value, datetime):
+        return [_json_safe_walk(v, keep_non_finite) for v in value]
+    if isinstance(value, np.generic):
+        return _json_safe_walk(value.item(), keep_non_finite)
+    if isinstance(value, date):
         return value.isoformat()
-    if hasattr(value, "isoformat"):
-        try:
-            return value.isoformat()
-        except Exception:
-            LOG.debug("Failed to serialize isoformat-capable value", exc_info=True)
-    # A number type (a numpy or Decimal scalar) reads as a float. float()
-    # refuses anything else with one of these three, and the value is then
-    # written as its string.
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError, OverflowError):
         return _safe_str(value)
+    return number if keep_non_finite or math.isfinite(number) else None
 
 
 def _safe_str(value: Any) -> str:
     """``str(value)``, or ``<unserializable TYPE>`` when the value's own
-    ``__str__`` / ``__repr__`` raises. The last fallback of ``_json_ready``
+    ``__str__`` / ``__repr__`` raises. The last fallback of ``json_safe``
     and of ``log_structured``, so it must not be able to throw: they feed
-    audit logging and the sqlite position-metadata write, and neither should
-    ever fail because a value could not describe itself. The first failure
-    per type is logged with its traceback (until 2026-09-26 none was)."""
+    audit logging, the sqlite position-metadata write and the dashboard, and
+    none should ever fail because a value could not describe itself. The
+    first failure per type is logged with its traceback (until 2026-09-26
+    none was)."""
     try:
         return str(value)
     except Exception:
@@ -226,12 +253,12 @@ class AuditLogger:
         """Emit ``{prefix} <compact-json>`` at TRADEFLOW_LEVEL. session_report
         parses these lines back into events.jsonl at EOD."""
         try:
-            text = json.dumps(_json_ready(payload), sort_keys=True, separators=(",", ":"))
+            text = json.dumps(json_safe(payload, non_finite="keep"), sort_keys=True, separators=(",", ":"))
         except Exception:
             # A logging call must not fail its caller, and the callers are the
             # entry and exit flows (ENTRY_CONTEXT / EXIT_CONTEXT): losing one
             # line's fidelity is acceptable, taking a trade operation down
-            # with it is not. _json_ready fails only on a payload it cannot
+            # with it is not. json_safe fails only on a payload it cannot
             # walk (a circular or runaway-deep one raises RecursionError) or a
             # value whose __float__ raises what no number type does. The line
             # is written as the payload's string (_safe_str cannot raise, even

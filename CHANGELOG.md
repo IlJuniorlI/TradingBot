@@ -310,6 +310,40 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **One JSON normalizer, `audit_logger.json_safe` (refactor cut B17).**
+  *2026-09-27* — `json_safe(value, *, non_finite)` replaces
+  `audit_logger._json_ready` (the TRADEFLOW records, and the stored
+  position metadata and risk state: `non_finite="keep"`, NaN written as
+  `NaN`) and `dashboard._json_safe` (the dashboard state and chart
+  payloads: `non_finite="null"`). It lives in `audit_logger`, not the
+  foundation's `serialization`: its last fallback reports through
+  `log_setup.warn_once`, an edge the foundation layer does not have.
+
+  **Behaviour change (the written form only):**
+  - A numpy integer is written as an int and a numpy bool as a bool
+    everywhere: ENTRY_CONTEXT, EXIT_CONTEXT and the stored metadata read
+    `3` and `true` where they read `3.0` and `1.0`.
+  - A date or datetime (a pandas Timestamp, a numpy datetime64) is written
+    with `isoformat()` everywhere: the dashboard's has a `T` between the
+    date and the time where it had a space. The page's `Date.parse` and
+    `replace('T', ' ')` displays read both forms.
+  - On the dashboard a Decimal or Fraction is written as a number, not its
+    string (a NaN one as null), and a one-element array or Series as its
+    string, not its element. A value whose `__str__` raises is written as
+    `<unserializable TYPE>` there too, where it failed that update.
+  - None of these reach either writer today. Over the whole test suite no
+    signal, record or stored metadata carried a numpy int or bool, and
+    every time the dashboard shows is written with `isoformat()` where it
+    is built.
+
+  The dashboard's `.item()` guess and the audit side's `isoformat()` guess,
+  each behind a broad `except` logged at DEBUG, are gone: numpy scalars are
+  recognized by type, and only dates and times are asked for
+  `isoformat()`. An unknown `non_finite` raises `ValueError`. There is no
+  alias. Tests: `tests/test_audit_logger.py` (`TestJsonSafe`, both modes,
+  with the dashboard's tests moved in), `tests/test_dashboard.py`,
+  `tests/test_position_store.py`.
+
 - **The reconcile metadata store skips its own unchanged saves; the entry
   and exit metadata filter and the dashboard cache prune have one home each
   (refactor cut C34).** *2026-09-27* —

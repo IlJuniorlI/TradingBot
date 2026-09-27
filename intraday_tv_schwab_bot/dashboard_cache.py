@@ -754,7 +754,7 @@ class DashboardCache:
             if cached_snapshot is not None and cached_snapshot.get("signature") == snapshot_signature and not self.snapshot_should_bypass_cache(symbol, allow_refresh=allow_refresh):
                 # Shallow copy on cache hit instead of deepcopy. The
                 # snapshot is a flat-ish dict of pre-computed values;
-                # downstream serialization (`_json_safe`) creates new
+                # downstream serialization (`json_safe`) creates new
                 # containers rather than mutating, so sharing inner
                 # references is safe. Saves ~5ms per cache hit on
                 # busy multi-symbol watchlists where dashboard polls
@@ -2336,7 +2336,7 @@ class DashboardCache:
                 # here costs ~4ms per call on a 360-bar payload (measured)
                 # and was the dominant cost of every chart refresh.
                 # Safe because:
-                #   1. dashboard.py's `_json_safe` recursively builds new
+                #   1. `audit_logger.json_safe` recursively builds new
                 #      dicts/lists for serialization rather than mutating
                 #      the input — inner references can be shared.
                 #   2. We only assign to a top-level key on the new shallow

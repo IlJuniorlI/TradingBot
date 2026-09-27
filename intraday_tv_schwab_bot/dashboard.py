@@ -5,7 +5,6 @@ import copy
 import inspect
 import json
 import logging
-import math
 import re
 import socket
 import ssl
@@ -18,32 +17,11 @@ from threading import RLock, Thread
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from .audit_logger import json_safe
 from .config import THEME_NAME_PATTERN
 from .serialization import atomic_write_text
 
 LOG = logging.getLogger(__name__)
-
-
-def _json_safe(value: Any) -> Any:
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    # Numpy scalars and pandas Timestamps expose .item(); recurse through
-    # _json_safe so the float/NaN guard catches NaN-valued numpy scalars that
-    # would otherwise slip into json.dumps(..., allow_nan=False) and raise
-    # ValueError on the serving thread.
-    try:
-        item = getattr(value, "item", None)
-        if callable(item):
-            return _json_safe(item())
-    except Exception:
-        LOG.debug("Failed to coerce dashboard JSON value via item(); falling back to recursive serialization.", exc_info=True)
-    if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(v) for v in value]
-    return str(value)
 
 
 def _json_dumps_compact(value: Any) -> str:
@@ -357,7 +335,7 @@ class DashboardServer:
         # Guard the whole body: an exception here (exotic payload, disk write
         # failure) would propagate into the engine thread and kill the cycle.
         try:
-            safe_payload = _json_safe(payload)
+            safe_payload = json_safe(payload, non_finite="null")
             serialized = _json_dumps_compact(safe_payload)
             self.state.update(safe_payload, serialized)
             if not self.state_path:
@@ -432,7 +410,7 @@ class DashboardServer:
                 self.send_header("Referrer-Policy", "no-referrer")
 
             def _write_json(self, payload_obj: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
-                payload = _json_dumps_compact(_json_safe(payload_obj)).encode("utf-8")
+                payload = _json_dumps_compact(json_safe(payload_obj, non_finite="null")).encode("utf-8")
                 self._write_json_bytes(payload, status)
 
             def _write_json_bytes(self, payload: bytes, status: HTTPStatus = HTTPStatus.OK) -> None:

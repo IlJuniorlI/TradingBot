@@ -1329,7 +1329,7 @@ class IntradayBot:
                         # Reject NaN / +/-Inf — live_activity_score is
                         # designed to fail-open at 1.0 (neutral) but a
                         # subclass override could regress, and downstream
-                        # _json_safe would silently coerce to null and
+                        # json_safe would silently coerce to null and
                         # break the score ring rather than the candidate
                         # stub of 1.0 the rest of the system expects.
                         if math.isfinite(live_score):

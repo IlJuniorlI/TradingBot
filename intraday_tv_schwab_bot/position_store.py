@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .audit_logger import _json_ready
+from .audit_logger import json_safe
 from .models import Position, Side
 
 LOG = logging.getLogger(__name__)
@@ -75,7 +75,7 @@ class ReconcileMetadataStore:
             "lowest_price": float(position.lowest_price) if position.lowest_price is not None else None,
             "pair_id": position.pair_id,
             "reference_symbol": position.reference_symbol,
-            "metadata_json": json.dumps(_json_ready(position.metadata or {}), sort_keys=True, separators=(",", ":")),
+            "metadata_json": json.dumps(json_safe(position.metadata or {}, non_finite="keep"), sort_keys=True, separators=(",", ":")),
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         }
 
@@ -290,8 +290,8 @@ class SessionRiskStateStore:
                     (
                         str(session_date),
                         float(realized_pnl),
-                        json.dumps(_json_ready(cooldowns), separators=(",", ":")),
-                        json.dumps(_json_ready(recent_exits), separators=(",", ":")),
+                        json.dumps(json_safe(cooldowns, non_finite="keep"), separators=(",", ":")),
+                        json.dumps(json_safe(recent_exits, non_finite="keep"), separators=(",", ":")),
                         datetime.now(timezone.utc).isoformat(),
                     ),
                 )
