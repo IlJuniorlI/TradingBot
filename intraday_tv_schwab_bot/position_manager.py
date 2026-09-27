@@ -70,7 +70,7 @@ from .position_metrics import (
     position_unrealized_at_price,
 )
 from .risk import RiskManager
-from ._sr_ladder import _select_next_distinct_level, _sr_effective_side_tolerance
+from .levels_shared import effective_side_tolerance, select_next_distinct_level
 from ._strategies.catalogue import is_option_strategy
 from ._strategies.shared_exit import SharedExitPolicy, partial_exit_qty
 from .broker_positions import active_broker_bracket, order_result_needs_broker_recheck, working_exit_outstanding_qty
@@ -794,7 +794,7 @@ class PositionManager:
             max(atr * float(getattr(cfg, "flip_stop_buffer_atr_mult", 0.25) or 0.25), close * 0.0005),
         )
         require_momentum = bool(getattr(cfg, "flip_target_requires_momentum_confirm", True))
-        structural_gap = _sr_effective_side_tolerance(self.config, close, atr=atr, sr_ctx=sr_ctx)
+        structural_gap = effective_side_tolerance(cfg, close, atr=atr, sr_ctx=sr_ctx)
 
         def _momentum_ok(long_side: bool) -> bool:
             if not require_momentum:
@@ -813,7 +813,7 @@ class PositionManager:
                     if isinstance(position.metadata, dict):
                         position.metadata["sr_flip_stop_source"] = float(flipped_support.price)
                         append_management_adjustment(position.metadata,{"manager": "sr_flip", "kind": "stop", "reason": "flipped_support", "from": prior_stop, "to": float(candidate_stop), "source_level": float(flipped_support.price)})
-            target_level = _select_next_distinct_level(getattr(sr_ctx, 'resistances', None), float(flipped_support.price) if flipped_support is not None else None, above=True, minimum_gap=structural_gap) if flipped_support is not None else None
+            target_level = select_next_distinct_level(getattr(sr_ctx, 'resistances', None), float(flipped_support.price) if flipped_support is not None else None, above=True, minimum_gap=structural_gap) if flipped_support is not None else None
             if target_level is None and flipped_support is None:
                 target_level = sr_ctx.nearest_resistance
             if target_level is not None and _momentum_ok(True):
@@ -835,7 +835,7 @@ class PositionManager:
                     if isinstance(position.metadata, dict):
                         position.metadata["sr_flip_stop_source"] = float(flipped_resistance.price)
                         append_management_adjustment(position.metadata,{"manager": "sr_flip", "kind": "stop", "reason": "flipped_resistance", "from": prior_stop, "to": float(candidate_stop), "source_level": float(flipped_resistance.price)})
-            target_level = _select_next_distinct_level(getattr(sr_ctx, 'supports', None), float(flipped_resistance.price) if flipped_resistance is not None else None, above=False, minimum_gap=structural_gap) if flipped_resistance is not None else None
+            target_level = select_next_distinct_level(getattr(sr_ctx, 'supports', None), float(flipped_resistance.price) if flipped_resistance is not None else None, above=False, minimum_gap=structural_gap) if flipped_resistance is not None else None
             if target_level is None and flipped_resistance is None:
                 target_level = sr_ctx.nearest_support
             if target_level is not None and _momentum_ok(False):

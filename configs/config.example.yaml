@@ -515,9 +515,9 @@ technical_levels:
   # shared_entry.use_dual_divergence_veto.
   divergence_counter_rsi_penalty: 0.12
   divergence_counter_obv_penalty: 0.1
-  # Multi-pivot divergence detection (added with the levels_shared.find_divergence
-  # refactor): walk the last N pivots and return the most recent qualifying
-  # pair, gated by max-age in bars so stale divergences don't dominate.
+  # Multi-pivot divergence detection (divergence.find_divergence): walk the
+  # last N pivots and return the most recent qualifying pair, gated by
+  # max-age in bars so stale divergences don't dominate.
   # Since 2026-09-24 the age counts session bars only while session
   # indicators are on and the clock is inside the session, so yesterday's
   # closing pivots stay live across the overnight; a premarket reader counts

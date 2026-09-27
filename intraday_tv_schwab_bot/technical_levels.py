@@ -9,7 +9,8 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-from .levels_shared import DivergenceMatch, find_divergence, pivot_points
+from .divergence import DivergenceMatch, divergence_inputs, find_divergence
+from .levels_shared import pivot_points, reduce_pivots
 from .sessions import EQUITY_RTH_OPEN
 from .bars import ensure_ohlcv_frame, resolve_current_price
 from .indicators import (
@@ -17,8 +18,8 @@ from .indicators import (
     ensure_standard_indicator_frame,
     get_runtime_indicator_mode,
     get_session_indicator_window,
+    has_standard_indicator_columns,
     indicator_session_mask,
-    indicator_session_open,
     indicator_span_scale,
     scaled_span,
     session_price_scale,
@@ -354,46 +355,6 @@ class TechnicalLevelsContext:
 
 def empty_technical_levels_context(current_price: float = 0.0) -> TechnicalLevelsContext:
     return TechnicalLevelsContext(current_price=float(current_price or 0.0), reason="disabled")
-
-def _pivot_points(frame: pd.DataFrame, span: int) -> tuple[list[tuple[int, pd.Timestamp, float]], list[tuple[int, pd.Timestamp, float]]]:
-    # Thin wrapper around the shared detector, as support_resistance and
-    # htf_levels already are. This module carried its own copy of the loop;
-    # identical today, but `levels_shared.pivot_points` exists precisely so
-    # pivot semantics cannot drift between builders, and a third copy is how
-    # they would.
-    return pivot_points(frame, span, include_idx=True)
-
-
-def _reduced_pivots(
-    frame: pd.DataFrame,
-    span: int,
-    *,
-    highs: list[tuple[int, pd.Timestamp, float]] | None = None,
-    lows: list[tuple[int, pd.Timestamp, float]] | None = None,
-) -> list[tuple[str, int, pd.Timestamp, float]]:
-    # Accept pre-computed pivots from the caller so we don't recompute them
-    # when the caller already has (highs, lows) from _pivot_points.
-    if highs is None or lows is None:
-        highs, lows = _pivot_points(frame, span)
-    raw: list[tuple[str, int, pd.Timestamp, float]] = []
-    for pos, ts, price in highs:
-        raw.append(("H", int(pos), ts, float(price)))
-    for pos, ts, price in lows:
-        raw.append(("L", int(pos), ts, float(price)))
-    raw.sort(key=lambda item: item[1])
-    reduced: list[tuple[str, int, pd.Timestamp, float]] = []
-    for kind, pos, ts, price in raw:
-        if not reduced:
-            reduced.append((kind, pos, ts, price))
-            continue
-        prev_kind, _prev_pos, _prev_ts, prev_price = reduced[-1]
-        if kind != prev_kind:
-            reduced.append((kind, pos, ts, price))
-            continue
-        keep_current = price >= prev_price if kind == "H" else price <= prev_price
-        if keep_current:
-            reduced[-1] = (kind, pos, ts, price)
-    return reduced
 
 
 def _line_value(slope: float, intercept: float, pos: int) -> float:
@@ -836,7 +797,7 @@ def _session_open_anchored_vwap(frame: pd.DataFrame) -> float | None:
     return _anchored_vwap(frame, _latest_session_start_pos(frame, from_rth_open=True))
 
 
-# NOTE: divergence detection moved to ``levels_shared.find_divergence``
+# NOTE: divergence detection moved to ``divergence.find_divergence``
 # (DivergenceMatch + multi-pivot + age-cutoff). The old _last_two_pivots /
 # _pivot_series_value / _bullish_divergence / _bearish_divergence helpers
 # only walked the last two pivots and returned booleans; they're superseded
@@ -1115,7 +1076,6 @@ def build_technical_levels_context(
     # frame already has the standard indicator columns — which implies it was
     # already normalized upstream by add_indicators. This was the single hottest
     # line in the profile.
-    from .indicators import has_standard_indicator_columns
     if frame is not None and not frame.empty and has_standard_indicator_columns(frame):
         raw_frame = frame
     else:
@@ -1210,7 +1170,7 @@ def build_technical_levels_context(
     # (peer_confirmed_*) of every fib cap and AVWAP anchor until mid-morning.
     # What they must not do is anchor on a thin pre/post-market print, so with
     # session indicators on only session-bar pivots can end an impulse. The
-    # filter runs on the raw pivots, BEFORE _reduced_pivots merges each run of
+    # filter runs on the raw pivots, BEFORE reduce_pivots merges each run of
     # same-kind pivots into its extreme: filtered after, a premarket extreme
     # took the session pivot it had absorbed down with it, and a genuine
     # session impulse (an open double-bottom's RTH higher low) was lost.
@@ -1219,8 +1179,11 @@ def build_technical_levels_context(
         _latest_session_start_pos(session_frame, from_rth_open=get_session_indicator_window() == "rth") - frame_offset,
     )
     close = resolve_current_price(frame, current_price)
+    # The session mask of the trimmed frame, computed once: the ATR, the
+    # impulse pivots, the divergence RSI and the divergence inputs read it.
+    in_session = indicator_session_mask(frame.index) if get_runtime_indicator_mode() else None
     needs_atr = bool(impulse_context_enabled or trendline_enabled or channel_enabled or atr_context_enabled)
-    atr = atr_with_floor(frame, float(frame["close"].iloc[-1])) if needs_atr else 0.0
+    atr = atr_with_floor(frame, float(frame["close"].iloc[-1]), in_session=in_session) if needs_atr else 0.0
 
     # AVWAP at the base span shares the base pivots; it used to be left out
     # of this test, so AVWAP on its own never got an impulse anchor.
@@ -1229,34 +1192,28 @@ def build_technical_levels_context(
         or (anchored_vwap_enabled and avwap_pivot_span == base_pivot_span)
     )
     if base_pivots_needed:
-        # Compute pivots ONCE and share between _reduced_pivots and the downstream
-        # code that also needs raw (highs, lows). Previously _reduced_pivots
-        # internally called _pivot_points and then this function called it again
-        # on the next line, doubling pivot-detection work per call.
-        highs, lows = _pivot_points(frame, base_pivot_span)
-        pivots = _reduced_pivots(frame, base_pivot_span, highs=highs, lows=lows)
+        # Pivots are detected ONCE: the swing sequence and the downstream code
+        # that needs the raw (highs, lows) share them.
+        highs, lows = pivot_points(frame, base_pivot_span, include_idx=True)
+        pivots = reduce_pivots(highs, lows)
     else:
         pivots = []
         highs = []
         lows = []
 
-    in_session = indicator_session_mask(frame.index) if get_runtime_indicator_mode() else None
-
-    def _impulse_pivots(span_highs, span_lows, span):
+    def _impulse_pivots(span_highs, span_lows):
         if in_session is None:
-            return _reduced_pivots(frame, span, highs=span_highs, lows=span_lows)
-        return _reduced_pivots(
-            frame,
-            span,
-            highs=[p for p in span_highs if in_session[int(p[0])]],
-            lows=[p for p in span_lows if in_session[int(p[0])]],
+            return reduce_pivots(span_highs, span_lows)
+        return reduce_pivots(
+            [p for p in span_highs if in_session[int(p[0])]],
+            [p for p in span_lows if in_session[int(p[0])]],
         )
 
-    fib_impulse_pivots = _impulse_pivots(highs, lows, base_pivot_span) if in_session is not None else pivots
+    fib_impulse_pivots = _impulse_pivots(highs, lows) if in_session is not None else pivots
     avwap_impulse_pivots = fib_impulse_pivots
     if anchored_vwap_enabled and avwap_pivot_span != base_pivot_span:
-        avwap_highs, avwap_lows = _pivot_points(frame, avwap_pivot_span)
-        avwap_impulse_pivots = _impulse_pivots(avwap_highs, avwap_lows, avwap_pivot_span)
+        avwap_highs, avwap_lows = pivot_points(frame, avwap_pivot_span, include_idx=True)
+        avwap_impulse_pivots = _impulse_pivots(avwap_highs, avwap_lows)
 
     ctx = TechnicalLevelsContext(current_price=close)
 
@@ -1326,16 +1283,17 @@ def build_technical_levels_context(
             rsi_series = display_rsi_series
         else:
             # Divergence compares pivot prices on the gap-free session scale
-            # (session_price_scale, below), so its RSI has to be computed on
+            # (divergence_inputs, below), so its RSI has to be computed on
             # that scale too -- the stitched session closes the rsi14 column
             # is built from. On raw all-hours closes the overnight gap sat
             # inside the RSI but not in the prices: at length 21, ADBE
             # 2026-09-23 09:35 read a raw higher low as a bullish divergence.
             closes = frame["close"].astype(float)
             rsi_len = scaled_span(rsi_nominal, span_scale)
-            if get_runtime_indicator_mode():
-                in_session = indicator_session_mask(frame.index)
-                stitched = pd.Series(closes.to_numpy() * session_price_scale(frame), index=frame.index)[in_session]
+            if in_session is not None:
+                stitched = pd.Series(
+                    closes.to_numpy() * session_price_scale(frame, in_session=in_session), index=frame.index,
+                )[in_session]
                 rsi_series = _build_rsi(stitched, rsi_len).reindex(frame.index)
             else:
                 rsi_series = _build_rsi(closes, rsi_len)
@@ -1359,72 +1317,44 @@ def build_technical_levels_context(
         obv_delta = max(1.0, avg_volume * max(0.0, float(divergence_obv_min_volume_frac)))
         rsi_delta = max(0.0, float(divergence_rsi_min_delta))
         last_bar_pos = max(0, len(frame) - 1)
-        lookback = max(2, int(divergence_pivot_lookback))
-        max_age = max(0, int(divergence_max_age_bars))
-        # With session indicators on, the rsi14 / obv columns hold the
-        # session-only series on session bars and the all-hours series on the
-        # others (indicators.add_indicators). A pivot pair straddling the two would
-        # compare different indicators, so only session-bar pivots are paired
-        # (2026-09-23).
-        #
-        # Their age is counted in session bars too, while the clock is inside
-        # the session (indicators.indicator_session_open, 2026-09-24). Counted in
-        # every bar, the pre/post-market bars between yesterday's last session
-        # pivot and today's open aged it out before the open: at 09:33 a 1m
-        # pivot at 15:57 is 5 session bars old, but 83 bars old on a name
-        # printing a 1m bar every 5 minutes outside RTH. The gate is the
-        # clock, not the frame's last bar, as for indicators.latest_atr14: at
-        # 09:30 the last completed bar is still a premarket one. A reader
-        # outside the session (premarket) keeps the all-bar age its own bars
-        # run on.
-        #
-        # On 1m frames this only reaches yesterday's pivots while they are
+        # Session-bar pivots, aged on the session clock and compared on the
+        # gap-free price scale (divergence.divergence_inputs). On 1m frames
+        # the session clock only reaches yesterday's pivots while they are
         # still inside the trimmed tail (``tail_requirements``): with the
         # default lookbacks (120 bars) a name printing a bar every 2 minutes
         # or less outside RTH has trimmed them away by the open. A 5m frame
         # (at most 78 extended-hours bars overnight) and the untrimmed HTF
         # frames keep them.
-        bar_clock: np.ndarray | None = None
-        if get_runtime_indicator_mode():
-            in_session = indicator_session_mask(frame.index)
-            div_highs = [p for p in highs if in_session[int(p[0])]]
-            div_lows = [p for p in lows if in_session[int(p[0])]]
-            if indicator_session_open():
-                bar_clock = np.cumsum(in_session)
-        else:
-            div_highs, div_lows = highs, lows
-        # ...and their prices are compared on the gap-free scale those
-        # series were computed on (find_divergence's price_scale).
-        price_scale = session_price_scale(frame)
+        div_highs, div_lows, bar_clock, price_scale = divergence_inputs(frame, highs, lows, in_session=in_session)
 
         # Regular divergence: pivot pair where price extends but indicator
         # weakens. Reversal-likely setup. Lows for bullish, highs for bearish.
         ctx.bullish_rsi_divergence = find_divergence(
             div_lows, rsi_series, kind="regular", direction="bullish",
             indicator_name="rsi", price_move_frac=price_move_frac,
-            indicator_delta=rsi_delta, pivot_lookback=lookback,
-            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            indicator_delta=rsi_delta, pivot_lookback=divergence_pivot_lookback,
+            max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
             price_scale=price_scale, bar_clock=bar_clock,
         )
         ctx.bearish_rsi_divergence = find_divergence(
             div_highs, rsi_series, kind="regular", direction="bearish",
             indicator_name="rsi", price_move_frac=price_move_frac,
-            indicator_delta=rsi_delta, pivot_lookback=lookback,
-            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            indicator_delta=rsi_delta, pivot_lookback=divergence_pivot_lookback,
+            max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
             price_scale=price_scale, bar_clock=bar_clock,
         )
         ctx.bullish_obv_divergence = find_divergence(
             div_lows, obv_series, kind="regular", direction="bullish",
             indicator_name="obv", price_move_frac=price_move_frac,
-            indicator_delta=obv_delta, pivot_lookback=lookback,
-            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            indicator_delta=obv_delta, pivot_lookback=divergence_pivot_lookback,
+            max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
             price_scale=price_scale, bar_clock=bar_clock,
         )
         ctx.bearish_obv_divergence = find_divergence(
             div_highs, obv_series, kind="regular", direction="bearish",
             indicator_name="obv", price_move_frac=price_move_frac,
-            indicator_delta=obv_delta, pivot_lookback=lookback,
-            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            indicator_delta=obv_delta, pivot_lookback=divergence_pivot_lookback,
+            max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
             price_scale=price_scale, bar_clock=bar_clock,
         )
 
@@ -1434,29 +1364,29 @@ def build_technical_levels_context(
         ctx.bullish_hidden_rsi_divergence = find_divergence(
             div_lows, rsi_series, kind="hidden", direction="bullish",
             indicator_name="rsi", price_move_frac=price_move_frac,
-            indicator_delta=rsi_delta, pivot_lookback=lookback,
-            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            indicator_delta=rsi_delta, pivot_lookback=divergence_pivot_lookback,
+            max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
             price_scale=price_scale, bar_clock=bar_clock,
         )
         ctx.bearish_hidden_rsi_divergence = find_divergence(
             div_highs, rsi_series, kind="hidden", direction="bearish",
             indicator_name="rsi", price_move_frac=price_move_frac,
-            indicator_delta=rsi_delta, pivot_lookback=lookback,
-            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            indicator_delta=rsi_delta, pivot_lookback=divergence_pivot_lookback,
+            max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
             price_scale=price_scale, bar_clock=bar_clock,
         )
         ctx.bullish_hidden_obv_divergence = find_divergence(
             div_lows, obv_series, kind="hidden", direction="bullish",
             indicator_name="obv", price_move_frac=price_move_frac,
-            indicator_delta=obv_delta, pivot_lookback=lookback,
-            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            indicator_delta=obv_delta, pivot_lookback=divergence_pivot_lookback,
+            max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
             price_scale=price_scale, bar_clock=bar_clock,
         )
         ctx.bearish_hidden_obv_divergence = find_divergence(
             div_highs, obv_series, kind="hidden", direction="bearish",
             indicator_name="obv", price_move_frac=price_move_frac,
-            indicator_delta=obv_delta, pivot_lookback=lookback,
-            max_age_bars=max_age, last_bar_pos=last_bar_pos,
+            indicator_delta=obv_delta, pivot_lookback=divergence_pivot_lookback,
+            max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
             price_scale=price_scale, bar_clock=bar_clock,
         )
         for field_name in _DIVERGENCE_FIELDS:

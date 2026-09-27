@@ -17,7 +17,8 @@ from schwabdev import Client, Stream
 
 from .config import BotConfig
 from .support_resistance import SupportResistanceContext, build_support_resistance_context
-from .htf_levels import HTFContext, FairValueGapContext, build_fair_value_gap_context, build_htf_context, empty_fvg_context
+from .htf_levels import HTFContext, build_htf_context
+from .fair_value_gaps import FairValueGapContext, build_fair_value_gap_context, empty_fvg_context
 from .order_blocks import OrderBlockContext, build_order_block_context, empty_order_block_context
 from .numeric import first_float, safe_float
 from .symbols import QUOTE_SYMBOL_ALIASES, STREAMABLE_EQUITY_RE, is_streamable_equity, is_support_resistance_symbol

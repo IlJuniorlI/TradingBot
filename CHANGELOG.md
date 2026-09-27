@@ -310,6 +310,220 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The support/resistance ladder is collapsed once, and cut after the
+  broken-level drop (refactor cut B8).** *2026-09-27* —
+  `build_support_resistance_context` collapsed each side's candidates into
+  rungs and cut the side to `max_levels_per_side`; then
+  `_reconcile_flipped_levels` dropped the rungs near the broken levels and
+  collapsed what was left a second time, even when there was no broken
+  level. A rung keeps its strongest member's price, not the cluster's mean,
+  so two rungs could sit within `side_tolerance` of each other, and the
+  second pass merged them and summed their touches and score again: with a
+  $1 tolerance, candidates at 99.1, 100.0 (three touches) and 100.9 collapse
+  to 100.9 (1 touch) and 100.0 (4), and the second pass made them one
+  support at 100.0 with 5. And because the cut came first, a rung dropped
+  next to a broken level left the side one rung short while deeper
+  candidates existed. Now each side is collapsed once, on its whole
+  candidate pool (`levels_shared.collapse_same_side_levels(...,
+  max_levels=None)` keeps every rung); `_reconcile_flipped_levels` only
+  drops the supports within `side_tolerance` of the lost support and the
+  resistances within it of the reclaimed resistance, reading each rung's
+  price as before; and the side is cut to `max_levels_per_side` after that.
+  The HTF level map already collapsed once and is untouched.
+
+  **Behaviour change:** a side's ladder only gains rungs: a rung the second
+  pass had merged comes back on its own (the rung that absorbed it drops
+  back to its one-pass touches and score), and a side a drop had left short
+  refills from the deeper candidates. Every rung the old ladder held is
+  still there, at the same price, so `nearest_support` /
+  `nearest_resistance` can only move nearer to price. On the 25 archived
+  sessions with 15m bars (519 symbol-days, one build every 15 minutes from
+  09:45 to 16:00, preset settings), with the 1m/5m flip confirmation the
+  entries read, the ladder changes in 11% of builds at 4 levels a side
+  (top_tier_adaptive, small_cap_squeeze, the peer and microcap presets) and
+  9% at 3 (the others, both 0DTE presets among them); without it (the
+  cached and dashboard context) 9% and 7%. The nearest support moves in
+  2.0% of builds and the nearest resistance in 0.5%, always nearer, from a
+  median 1.5 ATR to 0.9 ATR; `near_support` changes in 0.8%, `bias_score`
+  in 1.5% and `regime_hint` in 0.1%. Those feed the S/R veto where
+  `use_sr_filter` is on (in 1.2% of builds the nearest level newly sits
+  inside `entry_min_clearance_*`: 136 supports, under a SHORT, and 21
+  resistances, over a LONG, of 13,467), the S/R stop and target refinement,
+  the proximity scoring, the adaptive ladder's rungs (top_tier_adaptive,
+  small_cap_squeeze), htf_pivots' level candidates and the dashboard's S/R
+  ladder. The broken and pending levels and the market structure do not
+  change.
+
+  The three support/resistance snapshots regenerate byte-identical: on those
+  builds no two rungs sat within tolerance and no rung sat near a broken
+  level. Tests: `tests/test_sr_collapse_once.py` (new). Two tests fail on
+  the old code (the 99.1 / 100.0 / 100.9 example; a drop that left the
+  ladder short); the third pins that the drop reads the rung's price, not
+  its members'. `tests/test_levels_shared_steps.py` pins
+  `max_levels=None`.
+
+- **One side-tolerance formula; `_sr_ladder.py` is gone (refactor cut B9).**
+  *2026-09-27* — `levels_shared.side_tolerance(atr, price, *,
+  atr_tolerance_mult, pct_tolerance, min_gap_atr_mult, min_gap_pct)`, the
+  larger of the merge tolerance (the ATR or the price arm) and the same-side
+  minimum gap (`same_side_min_gap_threshold`), is the one spacing formula:
+  the S/R build collapses its ladders at it and publishes it as
+  `side_tolerance`, and the HTF build collapses at it too.
+  `levels_shared.effective_side_tolerance(sr_cfg, price, *, atr=0.0,
+  sr_ctx=None)` returns the S/R context's tolerance when it is above 0, else
+  the formula from `config.support_resistance`; sr_flip management spaces
+  its next target with it, the dashboard its S/R ladder.
+  `select_next_distinct_level` and `collapse_price_ladder` moved into
+  `levels_shared` under public names; the first no longer reads a missing
+  gap as 0 (its one caller always passes the spacing). `_sr_ladder.py`, its
+  `_same_side_ladder_min_gap_pct` and its engine-named logger are gone, and
+  there is no alias: import from `intraday_tv_schwab_bot.levels_shared`.
+  **Behaviour change:** the fallback wrote the formula out again with 1e-4
+  floors the builders never had (they bound only below $0.0333 at every
+  shipped preset's tolerances), read a None price or ATR as 0, and fell back
+  to the config behind a broad except when the context's tolerance did not
+  read; now there is no floor, the price is required, and such a context
+  raises. The dashboard computes its ladder spacing only for a symbol with an
+  S/R row, so a symbol without one (S/R off) and without a price yet no
+  longer reads the tolerances. The fallback runs only on an empty S/R context,
+  which has no levels to space: on the fixture tapes (AAPL / SPY / TSLA,
+  1,314 checkpoints every 5 minutes over two sessions) every context carried
+  a positive tolerance, and the old and new spacing agreed at every
+  checkpoint with and without the ATR. The S/R and HTF snapshots are
+  byte-identical. Tests: `tests/test_side_tolerance.py` (was
+  `tests/test_sr_ladder.py`, rewritten: the formula, the fallback, that the
+  fallback lands on the build's own tolerance, and the two readers: the
+  sr_flip target, which no test ran before, and the dashboard's rungs),
+  `tests/test_config_validation.py`, `tests/test_module_layering.py` (two
+  allowlisted imports gone).
+
+- **Divergence has its own module, `divergence.py` (refactor cut C25).**
+  *2026-09-27* — `DivergenceMatch` and `find_divergence` moved out of
+  `levels_shared.py`, which keeps the level primitives, the ladder steps
+  and the prior day/week levels. The new `divergence_inputs(frame, highs,
+  lows, *, in_session=None)` returns `(highs, lows, bar_clock,
+  price_scale)`: the session-bar pivots, the session clock and the gap-free
+  price scale that `technical_levels` and `htf_levels` each prepared with a
+  copy of their own. Each builder now computes its frame's session mask
+  once and hands it to every session-aware read as `in_session`:
+  `divergence_inputs`, `indicators.session_price_scale`,
+  `indicators.latest_atr14` (through `atr_with_floor`), and in the technical
+  build the impulse pivots and a non-default divergence RSI. The technical
+  build computed the mask up to six times and the HTF build three. The
+  builders' own lookback and age clamps are gone; `find_divergence` applies
+  the same two (`max(2, ...)`, `max(0, ...)`). The presets' and
+  `config.py`'s comment on the divergence knobs names
+  `divergence.find_divergence`. There is no alias: import from
+  `intraday_tv_schwab_bot.divergence`. `tests/test_levels_shared_divergence.py`
+  is now `tests/test_divergence.py`. No behaviour changes: the level
+  snapshots are byte-identical.
+
+- **The S/R ladder steps and the swing reduction live in `levels_shared`
+  (refactor cut C28).** *2026-09-27* — `collapse_same_side_levels`,
+  `drop_levels_near_price`, `partition_levels_by_side`, `pending_level`,
+  `split_references_by_flip`, `detect_broken_levels` and the `FlipCheck`
+  type replace the private copies in `htf_levels` and `support_resistance`.
+  `build_htf_context` no longer inlines its side split, its partition closure
+  and its broken-level loops, and both builders' second-chance fallback loop
+  side-assigns what it adds through `split_references_by_flip`. The builders'
+  deliberate differences are arguments at their call sites:
+  - `reduce=`, the cluster reducer: HTF keeps one representative
+    (`_representative_level`), SR merges the cluster (`_merge_level_group`);
+  - `relabel=`, the flipped levels' source: HTF names them
+    `broken_htf_support` / `broken_htf_resistance`, which the peer strategies
+    read; SR keeps the source;
+  - `gate_tol=`, how far short of the close a confirmed flip still counts as
+    broken: float noise (1e-6 of the close) for HTF, the merge tolerance for
+    SR.
+
+  Only SR re-drops its ladder near the confirmed flips
+  (`_reconcile_flipped_levels`). `reduce_pivots(highs, lows, *,
+  min_gap_bars=0)` replaces the alternating-swing loop that market structure
+  (with its minimum gap) and the technical levels (without one) each carried
+  as `_reduced_pivots`; technical's never-taken pivot recompute and SR's
+  redundant empty-frame check go with them. There is no alias; the private
+  names are gone. No behaviour changes: the 10 snapshot JSONs are
+  byte-identical, and the four builders return identical contexts before and
+  after on 12,000 randomized builds, half of them with random flip patterns.
+  SR now tests the broken-level price gate before the flip check, as HTF
+  did, which saves flip checks and changes no result.
+  `tests/test_levels_shared_steps.py` pins each step and the three builder
+  choices.
+
+- **One level class, `levels_shared.Level` (refactor cut C27).**
+  *2026-09-27* — `htf_levels.HTFLevel` and
+  `support_resistance.SupportResistanceLevel` had the same eight fields
+  (`kind`, `price`, `touches`, `score`, `first_seen`, `last_seen`, `source`,
+  `source_priority`); only the HTF class defaulted `touches` (1) and `score`
+  (1.0). `levels_shared.Level`, with those defaults, replaces both, in
+  `HTFContext`, `SupportResistanceContext` and every builder step.
+  `cluster_levels`, `clone_level`, `frame_extreme_side_levels` and
+  `fallback_prior_side_levels` build a `Level` and lose their
+  `level_factory` argument. `build_special_level`, whose one caller is
+  `fallback_prior_side_levels`, is private now (`_build_special_level`).
+  The private wrappers that only bound that argument or `include_idx` are
+  gone: `_pivot_points`, `_cluster_levels`, `_clone_level`,
+  `_frame_extreme_side_levels` and `_fallback_prior_side_levels` in
+  `htf_levels` and `support_resistance`, and `_pivot_points` in
+  `technical_levels`; the builders call `levels_shared` directly. In both
+  builders a side with no pivots and no prior-day/week level takes the frame
+  extreme through `frame_extreme_side_levels` instead of an inline copy of
+  it. `build_htf_context` detects pivots once per build, with their bar
+  positions, and its RSI divergence reuses them; it ran the detector a
+  second time over the same frame and span. There is no alias: import
+  `Level` from `intraday_tv_schwab_bot.levels_shared`. The level snapshots
+  are byte-identical. No behaviour changes. Tests:
+  `tests/test_fix_key_levels.py`
+  (`TestASideWithNoPivotsOrPriorLevelsIsTheFrameExtreme`,
+  `TestHTFDetectsPivotsOnce`).
+
+- **Fair value gaps have their own module, and the zone arithmetic one home
+  (refactor cut C26).** *2026-09-27* — `fair_value_gaps.py` holds
+  `HTFFairValueGap`, `FairValueGapContext`, `empty_fvg_context`,
+  `build_fair_value_gap_context` and the detector, public now as
+  `detect_fair_value_gaps` because the HTF context calls it; they moved out
+  of `htf_levels.py`, which keeps the HTF levels, trend and divergence.
+  `zones.py` holds the arithmetic the gaps share with order blocks:
+  `zone_distance` (the distance to a zone, which never depended on its
+  direction) replaces `_fvg_distance` and `_ob_distance`;
+  `zone_filled_pct(..., bullish=)` replaces the gap detector's two inline
+  fill formulas and `order_blocks._filled_pct_for_bullish` / `_bearish`; and
+  `zone_sizing` returns the minimum size, comparison margin and merge
+  tolerance both builders computed with the same constants. The two merges
+  stay separate on purpose: a merged gap keeps the smaller `filled_pct` of
+  its parts and a merged order block the larger (`tests/test_zones.py` pins
+  both). The completed-bar cut that the HTF flip confirmation and the gap
+  detector read is `bars.completed_bars` (was
+  `htf_levels._completed_htf_frame`). Strict-mode order blocks take their
+  swings from `levels_shared.pivot_points(..., include_idx=True)` instead of
+  support_resistance's private wrapper, the gap and order-block builders no
+  longer copy the frame before `ensure_ohlcv_frame` (which copies), and
+  `technical_levels` and `strategy_base` import at module top what they
+  imported inside a function. There is no alias: import from
+  `intraday_tv_schwab_bot.fair_value_gaps`, `zones` and `bars`. No
+  behaviour changes; the level snapshots are byte-identical.
+
+- **Candle detection reads its bars once and keeps the longest tier once
+  (refactor cut C29).** *2026-09-27* — `candles._ohlc_subset(frame,
+  lookback, *, min_bars)` is the one "last N bars of open/high/low/close,
+  read as numbers, less every bar that does not read" step. The
+  latest-snapshot key (`_ohlc_frame_key`, at least 1 bar) and
+  `detect_per_bar_candle_patterns` (at least `CANDLE_CONTEXT_BARS`) both call
+  it and keep their own floor. `_tier_cascade` is the one longest-tier-wins
+  rule; the per-bar map's nested `_apply_tier_cascade` copy is gone. The
+  frame key holds plain floats. C15's `numeric.safe_float` there only ever
+  saw numbers that `pd.to_numeric` + `dropna` had already cleaned, so the
+  key's `float | None` type, the tweezer helpers' None guards and the per-bar
+  map's unreachable empty-key and length checks go, and candles no longer
+  imports `numeric`. No output changes: the candle context, the opt-in
+  `detect_bullish_patterns` / `detect_bearish_patterns` and the per-bar map
+  read the same on every input tried (NaN and unparseable cells, infinities,
+  Int64 / Float64 columns, naive and non-timestamp indexes, lookbacks from -3
+  to 500). The one input that reads differently is an OHLC column of complex
+  numbers, which used to read as "no pattern" and now raises TypeError; no
+  feed produces one. `tests/test_pattern_indicator_regressions.py` pins both
+  floors, the dropped-bar alignment and the cascade.
+
 - **Brackets with a resting target now load with `adaptive_ladder`, unless
   the touch hold is on.** *2026-09-27* — `execution.bracket_legs:
   stop_and_target` was refused for every `adaptive_ladder` config, for the

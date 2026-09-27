@@ -18,8 +18,10 @@ from .sessions import (
     EQUITY_STREAM_END,
     EQUITY_STREAM_START,
     EXCHANGE_TZ,
+    datetime_index,
     rth_close_minute,
 )
+from . import sessions
 
 
 LOG = logging.getLogger(__name__)
@@ -234,6 +236,28 @@ def last_bucket_forming(index: pd.DatetimeIndex | pd.Index, minutes: int, now: d
     so does a native frame fetched mid-bucket; a frame of completed bars
     never reads as forming. False on an empty index."""
     return len(index) > 0 and not bool(completed_bucket_mask(index[-1:], minutes, now)[0])
+
+
+def completed_bars(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """The bars of a ``minutes`` frame whose bucket has ended by the ET clock
+    (``sessions.now_et()``); an empty frame keeps its columns.
+
+    "Now" is read on a tz-naive index's ET wall clock
+    (``completed_bucket_mask``). Until 2026-04 the tz-naive fallback used
+    ``pd.Timestamp.now()``, the SERVER's wall clock -- off by hours if the
+    process isn't running on US Eastern. Every frame is labelled at bar
+    START -- the broker's and ``resample_bars``' alike -- so bar T is
+    complete once its bucket has ended: T + minutes, or the session boundary
+    that cuts a 60m bar short (15:30 ends at 16:00). Not
+    ``T < now.floor(tf)``: that holds only for clock-aligned bars, and
+    regular-session 60m bars start at XX:30.
+    """
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=getattr(frame, "columns", []))
+    base = frame.copy()
+    base.index = datetime_index(base.index)
+    tf = max(1, int(minutes))
+    return base[completed_bucket_mask(base.index, tf, sessions.now_et())]
 
 
 def bar_closed_after(label: Any, moment: Any, bar_minutes: int) -> bool:

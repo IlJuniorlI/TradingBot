@@ -11,16 +11,17 @@ Two detection modes:
 - **loose**: last bearish bar before any 1m close that exceeds the
   prior N-bar high (and mirror for bearish). Cheap, noisy on
   choppy tape but catches every "down-bar then up-thrust" pattern.
-- **strict**: classic ICT/SMC. Find swing highs (using the same
-  pivot detector as `support_resistance`); for each swing-high
-  break-of-structure (BoS = a later bar's close exceeds the swing
-  high), walk back to find the last bearish candle before the BoS.
-  Mirror for bearish swings.
+- **strict**: classic ICT/SMC. Find swing highs (with
+  `levels_shared.pivot_points`, the pivot detector every level builder
+  uses); for each swing-high break-of-structure (BoS = a later bar's
+  close exceeds the swing high), walk back to find the last bearish
+  candle before the BoS. Mirror for bearish swings.
 
 Both modes emit `OrderBlock` records that are state-comparable to
-`HTFFairValueGap` (same lower/upper/midpoint/size/direction/
-filled_pct fields), so the existing `_fvg_gap_state` lifecycle
-machinery in `BaseStrategy` works on order blocks unchanged.
+`fair_value_gaps.HTFFairValueGap` (same lower/upper/midpoint/size/
+direction/filled_pct fields, and the same zone arithmetic in `zones`),
+so the `_fvg_gap_state` lifecycle machinery in `SharedEntryPolicy`
+works on order blocks unchanged.
 """
 from __future__ import annotations
 
@@ -30,10 +31,11 @@ import logging
 import numpy as np
 import pandas as pd
 
+from .levels_shared import pivot_points
 from .sessions import session_segment_ids
-from .support_resistance import _pivot_points
 from .bars import ensure_ohlcv_frame
 from .indicators import atr_with_floor, ensure_standard_indicator_frame
+from .zones import zone_distance, zone_filled_pct, zone_sizing
 
 LOG = logging.getLogger(__name__)
 
@@ -126,39 +128,6 @@ def _ob_strength_score(ob: OrderBlock, atr: float, *, age_bars: int | None = Non
     age_score = min(1.5, max(0.5, effective_age / 20.0))
     validity = max(0.1, 1.0 - ob.filled_pct)
     return float(size_score * thrust_score * age_score * validity)
-
-
-def _ob_distance(direction: str, ob: OrderBlock, ref_close: float) -> float:
-    """Closest edge of the OB zone to current price. Used for sort+dedup."""
-    if direction == "bullish":
-        if ref_close < ob.lower:
-            return float(ob.lower - ref_close)
-        if ref_close > ob.upper:
-            return float(ref_close - ob.upper)
-        return 0.0
-    # bearish — mirror
-    if ref_close > ob.upper:
-        return float(ref_close - ob.upper)
-    if ref_close < ob.lower:
-        return float(ob.lower - ref_close)
-    return 0.0
-
-
-def _filled_pct_for_bullish(ob_lower: float, ob_upper: float, min_close_after: float) -> float:
-    """Fraction of bullish OB zone that has been retraced by *closes* — wicks
-    that pierce below ``ob_lower`` but close back inside are tolerated. Once
-    a bar closes below ``ob_lower``, the OB is invalidated (filled_pct=1.0)."""
-    size = max(ob_upper - ob_lower, 1e-9)
-    fill_top = min(ob_upper, max(ob_lower, min_close_after))
-    return max(0.0, min(1.0, (ob_upper - fill_top) / size))
-
-
-def _filled_pct_for_bearish(ob_lower: float, ob_upper: float, max_close_after: float) -> float:
-    """Mirror of bullish version — invalidation requires a close above the
-    OB upper, not just a wick."""
-    size = max(ob_upper - ob_lower, 1e-9)
-    fill_top = min(ob_upper, max(ob_lower, max_close_after))
-    return max(0.0, min(1.0, (fill_top - ob_lower) / size))
 
 
 def _fill_window_start(close_arr: np.ndarray, k: int, breakout_idx: int, edge: float,
@@ -279,7 +248,7 @@ def _detect_order_blocks_loose(
     bars, so until 2026-09-23 a morning gap printed a "new high" against the
     prior evening's closes and the evening's last bearish candle became the
     block, its thrust measured across the unobserved night -- the same seam
-    that minted fair-value gaps (htf_levels._detect_fair_value_gaps).
+    that minted fair-value gaps (fair_value_gaps.detect_fair_value_gaps).
     """
     bullish_raw: list[OrderBlock] = []
     bearish_raw: list[OrderBlock] = []
@@ -333,7 +302,7 @@ def _detect_order_blocks_loose(
                     # closed inside it before price ever departed.
                     after = close_arr[_fill_window_start(close_arr, k, idx, upper, bullish=True) + 1:]
                     min_close_after = float(after.min()) if after.size else upper
-                    filled_pct = _filled_pct_for_bullish(lower, upper, min_close_after)
+                    filled_pct = zone_filled_pct(lower, upper, min_close_after, bullish=True)
                     if filled_pct >= 1.0 - 1e-9:
                         # This candidate is invalidated. Keep walking for an
                         # older still-valid OB.
@@ -375,7 +344,7 @@ def _detect_order_blocks_loose(
                         continue
                     after = close_arr[_fill_window_start(close_arr, k, idx, lower, bullish=False) + 1:]
                     max_close_after = float(after.max()) if after.size else lower
-                    filled_pct = _filled_pct_for_bearish(lower, upper, max_close_after)
+                    filled_pct = zone_filled_pct(lower, upper, max_close_after, bullish=False)
                     if filled_pct >= 1.0 - 1e-9:
                         continue
                     anchor_ts = index_values[k]
@@ -415,7 +384,7 @@ def _detect_order_blocks_strict(
     meaningful distance from the OB candle's close — typically
     0.75 × ATR.
 
-    The swings come from ``_pivot_points``, whose windows stay inside one ET
+    The swings come from ``pivot_points``, whose windows stay inside one ET
     session. The break may come in a later session -- yesterday's swing high
     taken out today is a real break -- but the OB candle must share the
     breakout bar's session: walking back across the unobserved night would
@@ -428,7 +397,7 @@ def _detect_order_blocks_strict(
     if n < (pivot_span * 2 + 4):
         return bullish_raw, bearish_raw
     segments = session_segment_ids(frame.index)
-    swing_highs, swing_lows = _pivot_points(frame, pivot_span)
+    swing_highs, swing_lows = pivot_points(frame, pivot_span, include_idx=True)
     high_arr = frame["high"].to_numpy(dtype=float, copy=False)
     low_arr = frame["low"].to_numpy(dtype=float, copy=False)
     open_arr = frame["open"].to_numpy(dtype=float, copy=False)
@@ -467,7 +436,7 @@ def _detect_order_blocks_strict(
                     continue
                 after = close_arr[_fill_window_start(close_arr, k, bos_idx, upper, bullish=True) + 1:]
                 min_close_after = float(after.min()) if after.size else upper
-                filled_pct = _filled_pct_for_bullish(lower, upper, min_close_after)
+                filled_pct = zone_filled_pct(lower, upper, min_close_after, bullish=True)
                 if filled_pct >= 1.0 - 1e-9:
                     continue
                 anchor_ts = index_values[k]
@@ -512,7 +481,7 @@ def _detect_order_blocks_strict(
                     continue
                 after = close_arr[_fill_window_start(close_arr, k, bos_idx, lower, bullish=False) + 1:]
                 max_close_after = float(after.max()) if after.size else lower
-                filled_pct = _filled_pct_for_bearish(lower, upper, max_close_after)
+                filled_pct = zone_filled_pct(lower, upper, max_close_after, bullish=False)
                 if filled_pct >= 1.0 - 1e-9:
                     continue
                 anchor_ts = index_values[k]
@@ -578,7 +547,7 @@ def build_order_block_context(
             timeframe_minutes=timeframe_minutes,
             mode=mode,
         )
-    base = ensure_standard_indicator_frame(ensure_ohlcv_frame(frame.copy()))
+    base = ensure_standard_indicator_frame(ensure_ohlcv_frame(frame))
     if base.empty or len(base) < 5:
         return empty_order_block_context(
             float(current_price or 0.0),
@@ -589,9 +558,8 @@ def build_order_block_context(
         current_price = float(base.iloc[-1]["close"])
     ref_close = float(current_price or 0.0)
     atr = atr_with_floor(base, ref_close, abs_floor=0.01)
-    min_size = max(float(atr) * float(min_block_atr_mult), float(ref_close) * float(min_block_pct), 1e-8)
+    min_size, eps, merge_tol = zone_sizing(atr, ref_close, min_atr_mult=min_block_atr_mult, min_pct=min_block_pct)
     min_thrust = max(float(atr) * float(min_thrust_atr_mult), 1e-8)
-    eps = max(min_size * 0.05, ref_close * 1e-6, 1e-8)
     if mode == "strict":
         bullish_raw, bearish_raw = _detect_order_blocks_strict(
             base,
@@ -609,7 +577,6 @@ def build_order_block_context(
             atr=atr,
             eps=eps,
         )
-    merge_tol = max(min_size * 0.25, ref_close * 0.00025, 1e-8)
     bullish = _merge_order_blocks(bullish_raw, tolerance=merge_tol)
     bearish = _merge_order_blocks(bearish_raw, tolerance=merge_tol)
     # Enrich every merged OB with computed age_bars + strength_score
@@ -640,8 +607,8 @@ def build_order_block_context(
     bearish = [_enriched(ob) for ob in bearish]
     # Strength-first sort. Closer-to-price as deterministic tiebreaker
     # so two equally-strong OBs render in distance order.
-    bullish.sort(key=lambda ob: (-ob.strength_score, _ob_distance("bullish", ob, ref_close)))
-    bearish.sort(key=lambda ob: (-ob.strength_score, _ob_distance("bearish", ob, ref_close)))
+    bullish.sort(key=lambda ob: (-ob.strength_score, zone_distance(ob.lower, ob.upper, ref_close)))
+    bearish.sort(key=lambda ob: (-ob.strength_score, zone_distance(ob.lower, ob.upper, ref_close)))
     cap = max(0, int(max_per_side or 0))
     bullish = bullish[:cap] if cap > 0 else []
     bearish = bearish[:cap] if cap > 0 else []
@@ -651,8 +618,8 @@ def build_order_block_context(
     # `BaseStrategy._continuation_ob_retest_plan` that want the next
     # OB the price would interact with — even if a stronger OB sits
     # further away in the list. Independent of the strength sort.
-    nearest_bullish = min(bullish, key=lambda ob: _ob_distance("bullish", ob, ref_close)) if bullish else None
-    nearest_bearish = min(bearish, key=lambda ob: _ob_distance("bearish", ob, ref_close)) if bearish else None
+    nearest_bullish = min(bullish, key=lambda ob: zone_distance(ob.lower, ob.upper, ref_close)) if bullish else None
+    nearest_bearish = min(bearish, key=lambda ob: zone_distance(ob.lower, ob.upper, ref_close)) if bearish else None
     return OrderBlockContext(
         timeframe_minutes=max(1, int(timeframe_minutes)),
         current_price=ref_close,

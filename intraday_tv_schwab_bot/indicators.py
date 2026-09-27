@@ -282,7 +282,11 @@ def _session_stitch_factor(
     return np.repeat(later, np.diff(np.r_[starts, n]))
 
 
-def session_price_scale(frame: pd.DataFrame) -> npt.NDArray[np.float64]:
+def session_price_scale(
+    frame: pd.DataFrame,
+    *,
+    in_session: npt.NDArray[np.bool_] | None = None,
+) -> npt.NDArray[np.float64]:
     """Per-bar multiplier that puts each bar's prices on the scale the
     session TA-Lib columns were computed on: the gap-free stitch
     (``_session_stitch_factor``) on session bars, 1.0 on the others (which
@@ -295,12 +299,17 @@ def session_price_scale(frame: pd.DataFrame) -> npt.NDArray[np.float64]:
     alone reads as a higher high or lower low that the gap-free RSI never
     saw. Only ratios between bars matter, and a ratio depends only on the
     gaps between them, so any frame holding both bars gives the same one.
+
+    ``in_session`` is ``indicator_session_mask(frame.index)`` when the caller
+    already holds it; None computes it.
     """
     scale = np.ones(len(frame), dtype=np.float64)
     if frame.empty or not get_runtime_indicator_mode():
         return scale
     index_dt = pd.DatetimeIndex(frame.index)
-    pos = np.flatnonzero(indicator_session_mask(index_dt))
+    if in_session is None:
+        in_session = indicator_session_mask(index_dt)
+    pos = np.flatnonzero(in_session)
     if len(pos):
         scale[pos] = _session_stitch_factor(
             _to_float64_array(frame["open"])[pos],
@@ -331,8 +340,8 @@ def indicator_session_open() -> bool:
     07:00-20:00 under "extended").
 
     Readers that switch to the session-only series in the session and keep
-    the all-hours one outside it (``latest_atr14``, the divergence age in
-    the technical and HTF builders) gate on this, not on their frame's last
+    the all-hours one outside it (``latest_atr14``, the divergence age
+    ``divergence.divergence_inputs`` clocks) gate on this, not on their frame's last
     bar: an HTF frame's last completed bucket is still a premarket one until
     09:45 (15m) or 10:30 (60m), and a reader already in the session must
     not read it as a premarket reader would (2026-09-24).
@@ -341,7 +350,7 @@ def indicator_session_open() -> bool:
         session_mask(pd.DatetimeIndex([sessions.now_et()]), get_session_indicator_window())[0])
 
 
-def latest_atr14(frame: pd.DataFrame) -> float | None:
+def latest_atr14(frame: pd.DataFrame, *, in_session: npt.NDArray[np.bool_] | None = None) -> float | None:
     """The frame's current ``atr14``: at its latest bar, or at its latest
     SESSION bar while session indicators are on and the clock is inside the
     session. None when the frame has no ``atr14`` value.
@@ -354,12 +363,16 @@ def latest_atr14(frame: pd.DataFrame) -> float | None:
     0.57x) of the session ATR it switches to at 09:45 (2026-09-23). A
     premarket reader keeps the all-hours value its own bars carry, not
     yesterday's close.
+
+    ``in_session`` is ``indicator_session_mask(frame.index)`` when the caller
+    already holds it; None computes it.
     """
     if frame is None or frame.empty or "atr14" not in frame.columns:
         return None
     series = frame["atr14"]
     if indicator_session_open():
-        in_session = indicator_session_mask(frame.index)
+        if in_session is None:
+            in_session = indicator_session_mask(frame.index)
         if in_session.any():
             series = series[in_session]
     clean = series.dropna()
@@ -372,6 +385,7 @@ def atr_with_floor(
     *,
     floor_pct: float = 0.0015,
     abs_floor: float = 0.0,
+    in_session: npt.NDArray[np.bool_] | None = None,
 ) -> float:
     """The frame's current ATR (``latest_atr14``: session-aware, last non-NaN),
     floored at ``price * floor_pct`` and ``abs_floor``. A missing, all-NaN or
@@ -381,13 +395,15 @@ def atr_with_floor(
 
     Every level builder sizes its ATR multiples through this helper with its
     own floor base (LV-6, 2026-09-26): support_resistance and technical_levels
-    pass the frame's last close with no absolute floor; htf_levels (context
-    and fair-value gaps) and order_blocks pass the live price with
-    ``abs_floor=0.01``. Until then those three used the raw ATR and floored
-    only a missing one, so on a quiet name (ATR under 0.15% of price) the
-    HTF atr14 and the order-block thrust ran below the S/R floor.
+    pass the frame's last close with no absolute floor; fair_value_gaps (every
+    gap, HTF and LTF), htf_levels (the context) and order_blocks pass the live
+    price with ``abs_floor=0.01``. Until then those builders used the raw ATR
+    and floored only a missing one, so on a quiet name (ATR under 0.15% of
+    price) the HTF atr14 and the order-block thrust ran below the S/R floor.
+
+    ``in_session`` goes to ``latest_atr14``.
     """
-    return max(latest_atr14(frame) or 0.0, price * floor_pct if price > 0 else 0.0, abs_floor)
+    return max(latest_atr14(frame, in_session=in_session) or 0.0, price * floor_pct if price > 0 else 0.0, abs_floor)
 
 
 def last_bar_atr(

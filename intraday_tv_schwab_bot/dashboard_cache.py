@@ -49,7 +49,7 @@ from .technical_levels import build_technical_levels_context
 from .bars import equity_stream_window_bars, last_bucket_forming, resample_bars, session_bucket_ends
 from .indicators import ensure_standard_indicator_frame, htf_ema_spans, last_bar_atr, ltf_ema_spans
 from . import sessions
-from ._sr_ladder import _collapse_price_ladder, _sr_effective_side_tolerance
+from .levels_shared import collapse_price_ladder, effective_side_tolerance
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -879,11 +879,21 @@ class DashboardCache:
         resistance_prices: list[float] = []
         next_support = None
         next_resistance = None
-        ladder_min_gap = safe_float((sr_row or {}).get("side_tolerance")) or _sr_effective_side_tolerance(self.config, current_price)
         technical_payload: dict[str, Any] = {}
         nearest_support = None
         nearest_resistance = None
         if sr_row:
+            # The S/R build's spacing. A row without one (an empty context
+            # carries 0) spaces its rungs at the config's price arms (no ATR
+            # here), and without a price, which the arms scale by, only drops
+            # repeated prices (collapse_price_ladder's floor).
+            row_gap = safe_float(sr_row.get("side_tolerance"))
+            if row_gap:
+                ladder_min_gap = row_gap
+            elif current_price is not None:
+                ladder_min_gap = effective_side_tolerance(self.config.support_resistance, current_price)
+            else:
+                ladder_min_gap = 0.0
             nearest_support = safe_float(sr_row.get("nearest_support"))
             nearest_resistance = safe_float(sr_row.get("nearest_resistance"))
 
@@ -900,8 +910,8 @@ class DashboardCache:
             if nearest_resistance is not None:
                 resistance_prices.append(float(nearest_resistance))
 
-            support_prices = _collapse_price_ladder(support_prices, reverse=True, min_gap=ladder_min_gap)
-            resistance_prices = _collapse_price_ladder(resistance_prices, reverse=False, min_gap=ladder_min_gap)
+            support_prices = collapse_price_ladder(support_prices, reverse=True, min_gap=ladder_min_gap)
+            resistance_prices = collapse_price_ladder(resistance_prices, reverse=False, min_gap=ladder_min_gap)
             support_anchor_prices = list(support_prices)
             resistance_anchor_prices = list(resistance_prices)
 

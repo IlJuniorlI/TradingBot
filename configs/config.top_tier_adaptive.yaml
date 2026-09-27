@@ -431,9 +431,9 @@ technical_levels:
   # mass on counter-trade entries roughly where it was before the upgrade.
   divergence_counter_rsi_penalty: 0.10
   divergence_counter_obv_penalty: 0.08
-  # Multi-pivot divergence detection (added with the levels_shared.find_divergence
-  # refactor): walk the last N pivots and return the most recent qualifying
-  # pair, gated by max-age in bars so stale divergences don'''t dominate.
+  # Multi-pivot divergence detection (divergence.find_divergence): walk the
+  # last N pivots and return the most recent qualifying pair, gated by
+  # max-age in bars so stale divergences don't dominate.
   divergence_pivot_lookback: 4
   divergence_max_age_bars: 8
   divergence_min_price_move_pct: 0.0015

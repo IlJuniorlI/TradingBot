@@ -947,9 +947,9 @@ class TechnicalLevelsConfig:
     # switch here, divergence_block_dual_counter, was removed 2026-09-24.
     divergence_counter_rsi_penalty: float = 0.12
     divergence_counter_obv_penalty: float = 0.10
-    # Multi-pivot detection (added with the levels_shared.find_divergence
-    # refactor): walk the last N pivots and return the most recent qualifying
-    # pair, gated by max-age in bars so stale divergences don't dominate.
+    # Multi-pivot detection (divergence.find_divergence): walk the last N
+    # pivots and return the most recent qualifying pair, gated by max-age in
+    # bars so stale divergences don't dominate.
     # divergence_pivot_lookback, divergence_min_price_move_pct and
     # divergence_rsi_min_delta are shared by the LTF and the HTF divergence:
     # the data feed passes them to every HTF build, in its cache key, since
@@ -1742,7 +1742,7 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
     "dashboard.charting.expanded": {"max_bars": _Number(integer=True, low=1, high=480)},
     # The level-spacing tolerances, read as they are by the S/R and HTF
     # builds, the strategies' HTF context and market-structure reads, the
-    # dashboard and the ladder spacing (_sr_ladder), even with
+    # dashboard and the ladder spacing (effective_side_tolerance), even with
     # support_resistance.enabled: false. Each is above 0: until 2026-09-26 a
     # 0 read as 0 in the S/R build's merge tolerance and the chart's HTF
     # request, and as a reader's own default in the others (0.35 or 0.60 ATR,
@@ -1947,8 +1947,9 @@ def _validate_support_resistance_config(sr: SupportResistanceConfig, config_path
     The four level-spacing tolerances (``_NUMBER_CHECKS``) must be finite
     YAML numbers above 0, even with ``enabled: false``. The S/R and HTF
     builders and the dashboard read them with ``float()``, so a typo raised
-    in every build; the ladder spacing (``_sr_ladder``: sr_flip management
-    and the dashboard ladder) read it as the default. ``order_block_mode`` is
+    in every build; the ladder spacing (sr_flip management and the dashboard
+    ladder, until 2026-09-27 ``_sr_ladder``, now
+    ``levels_shared.effective_side_tolerance``) read it as the default. ``order_block_mode`` is
     ``loose`` or ``strict`` (``_CHOICES``)."""
     errors = _number_errors("support_resistance", sr) + _choice_errors("support_resistance", sr)
     names = ("trading_flip_confirmation_1m_bars", "trading_flip_confirmation_5m_bars")

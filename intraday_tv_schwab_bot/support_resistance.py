@@ -1,27 +1,33 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
 import logging
-from typing import Iterable
 
 import pandas as pd
 
 from .levels_shared import (
-    clone_level,
+    FlipCheck,
+    Level,
     cluster_levels,
-    cluster_levels_by_tolerance,
+    collapse_same_side_levels,
     confirm_by_bars,
+    detect_broken_levels,
+    drop_levels_near_price,
     extend_unique_levels,
     fallback_prior_side_levels,
-    frame_extreme_side_levels as _frame_extreme_side_levels_shared,
+    frame_extreme_side_levels,
+    partition_levels_by_side,
+    pending_level,
     pivot_points,
     prior_day_levels as _prior_day_levels,
     prior_week_levels as _prior_week_levels,
+    reduce_pivots,
     safe_reference_price_for_fallback as _safe_reference_price_for_fallback,
     same_side_min_gap_threshold as _same_side_min_gap_threshold,
+    side_tolerance as _side_tolerance,
+    split_references_by_flip,
 )
 from .sessions import latest_session_date
 from .bars import ensure_ohlcv_frame, resample_bars, resolve_current_price
@@ -30,18 +36,6 @@ from . import sessions
 
 
 LOG = logging.getLogger(__name__)
-
-
-@dataclass(slots=True)
-class SupportResistanceLevel:
-    kind: str
-    price: float
-    touches: int
-    score: float
-    first_seen: str | None = None
-    last_seen: str | None = None
-    source: str = "pivot"
-    source_priority: float = 1.0
 
 
 @dataclass(slots=True)
@@ -103,12 +97,12 @@ class MarketStructureContext:
 class SupportResistanceContext:
     current_price: float
     timeframe_minutes: int = 15
-    supports: list[SupportResistanceLevel] = field(default_factory=list)
-    resistances: list[SupportResistanceLevel] = field(default_factory=list)
-    nearest_support: SupportResistanceLevel | None = None
-    nearest_resistance: SupportResistanceLevel | None = None
-    broken_resistance: SupportResistanceLevel | None = None
-    broken_support: SupportResistanceLevel | None = None
+    supports: list[Level] = field(default_factory=list)
+    resistances: list[Level] = field(default_factory=list)
+    nearest_support: Level | None = None
+    nearest_resistance: Level | None = None
+    broken_resistance: Level | None = None
+    broken_support: Level | None = None
     # A support price has crossed BELOW whose loss is not yet confirmed
     # (pending_resistance: a resistance crossed ABOVE, reclaim unconfirmed) --
     # the nearest one, still in its original role. ``supports`` /
@@ -119,8 +113,8 @@ class SupportResistanceContext:
     # zone test read the next level instead, i.e. treated an unconfirmed break
     # as a confirmed one. Price sat on the wrong side of an unconfirmed pivot
     # level in 12.8% of archived RTH samples.
-    pending_support: SupportResistanceLevel | None = None
-    pending_resistance: SupportResistanceLevel | None = None
+    pending_support: Level | None = None
+    pending_resistance: Level | None = None
     prior_day_high: float | None = None
     prior_day_low: float | None = None
     prior_week_high: float | None = None
@@ -162,61 +156,6 @@ def empty_support_resistance_context(current_price: float = 0.0, *, timeframe_mi
         timeframe_minutes=int(timeframe_minutes or 15),
         market_structure=empty_market_structure_context(current_price),
     )
-
-def _pivot_points(frame: pd.DataFrame, span: int) -> tuple[list[tuple[int, pd.Timestamp, float]], list[tuple[int, pd.Timestamp, float]]]:
-    # Thin wrapper around the shared `pivot_points` helper. Uses
-    # include_idx=True so structure_event detection downstream can
-    # anchor a pivot to its bar position. htf_levels uses include_idx=False.
-    return pivot_points(frame, span, include_idx=True)
-
-
-def _cluster_levels(points: Iterable[tuple[pd.Timestamp, float]], kind: str, tolerance: float) -> list[SupportResistanceLevel]:
-    # Thin wrapper around the shared `cluster_levels` helper — same
-    # multiplicative-recency formula as htf_levels so the two builders
-    # can't drift in their scoring. The previous module-local version
-    # used an additive recency bonus (touches * 1.15 + 0.60 *
-    # recency_factor) which let ancient high-touch bases dominate
-    # close-to-price recent swings — the bug we found in the AMD/INTC
-    # debug. Effective touches via multiplication keeps the rank
-    # ordering stable while letting recency genuinely weight selection.
-    return cluster_levels(points, kind, tolerance, level_factory=SupportResistanceLevel)
-
-
-def _reduced_pivots(
-    frame: pd.DataFrame, span: int, min_gap_bars: int = 0,
-) -> list[tuple[str, int, pd.Timestamp, float]]:
-    highs, lows = _pivot_points(frame, span)
-    if frame is None or frame.empty:
-        return []
-    # _pivot_points now returns (pos, ts, price) tuples so we no longer need
-    # to rebuild a pos_by_ts dict via iterating frame.index (which is very
-    # slow for DatetimeIndex — 36ms/100 calls in the profile).
-    raw: list[tuple[str, int, pd.Timestamp, float]] = []
-    for pos, ts, price in highs:
-        raw.append(("H", int(pos), ts, float(price)))
-    for pos, ts, price in lows:
-        raw.append(("L", int(pos), ts, float(price)))
-    raw.sort(key=lambda item: item[1])
-    reduced: list[tuple[str, int, pd.Timestamp, float]] = []
-    for kind, pos, ts, price in raw:
-        if not reduced:
-            reduced.append((kind, pos, ts, price))
-            continue
-        prev_kind, prev_pos, _prev_ts, prev_price = reduced[-1]
-        if kind != prev_kind:
-            # Minimum-gap filter (2026-05-27, Fix B): an alternating pivot
-            # closer than ``min_gap_bars`` to the prior kept pivot is noise
-            # within the current leg — skip it so the leg continues instead
-            # of registering a 1-2-bar swing that churns the structure
-            # labels. Disabled when min_gap_bars <= 0.
-            if min_gap_bars > 0 and (pos - prev_pos) < min_gap_bars:
-                continue
-            reduced.append((kind, pos, ts, price))
-            continue
-        keep_current = price >= prev_price if kind == "H" else price <= prev_price
-        if keep_current:
-            reduced[-1] = (kind, pos, ts, price)
-    return reduced
 
 
 def _classify_high(current_price: float, prior_price: float | None, tolerance: float) -> str | None:
@@ -378,7 +317,8 @@ def analyze_market_structure(
     # the BoS / CHoCH crosses still read the whole frame, so a break on the
     # forming bucket counts at once. Positions stay valid: only the tail is
     # cut.
-    pivots = _reduced_pivots(frame.iloc[:-1] if last_bar_forming else frame, int(pivot_span), int(min_pivot_gap_bars))
+    highs, lows = pivot_points(frame.iloc[:-1] if last_bar_forming else frame, int(pivot_span), include_idx=True)
+    pivots = reduce_pivots(highs, lows, min_gap_bars=int(min_pivot_gap_bars))
     if not pivots:
         return MarketStructureContext(current_price=close, reason="no_confirmed_pivots")
 
@@ -511,106 +451,7 @@ def analyze_market_structure(
     )
 
 
-def _clone_level(level: SupportResistanceLevel, kind: str) -> SupportResistanceLevel:
-    # Thin factory-binding wrapper around the shared `clone_level` helper.
-    # SR always preserves the original `source` field (HTF allows override
-    # via a `source=` kwarg, but SR's flip semantics never relabel).
-    return clone_level(level, kind, level_factory=SupportResistanceLevel)
-
-
-def _frame_extreme_side_levels(
-    frame: pd.DataFrame,
-    *,
-    side: str,
-    tolerance: float,
-) -> list[SupportResistanceLevel]:
-    # Thin factory-binding wrapper around `frame_extreme_side_levels`.
-    return _frame_extreme_side_levels_shared(
-        frame,
-        side=side,
-        tolerance=tolerance,
-        level_factory=SupportResistanceLevel,
-    )
-
-
-def _partition_levels_by_side(
-    levels: list[SupportResistanceLevel],
-    current_price: float,
-    *,
-    side: str,
-) -> tuple[list[SupportResistanceLevel], list[SupportResistanceLevel]]:
-    """Split ``levels`` into those on their side of ``current_price`` --
-    supports at or below it (nearest first), resistances at or above it --
-    and those beyond it. The builder reports the nearest of the latter whose
-    flip is unconfirmed as ``pending_support`` / ``pending_resistance``."""
-    eps = max(abs(float(current_price)) * 1e-6, 1e-8)
-    if side == "support":
-        on_side = [lv for lv in levels if float(lv.price) <= float(current_price) + eps]
-        on_side.sort(key=lambda lv: lv.price, reverse=True)
-        beyond = [lv for lv in levels if float(lv.price) > float(current_price) + eps]
-        return on_side, beyond
-    on_side = [lv for lv in levels if float(lv.price) >= float(current_price) - eps]
-    on_side.sort(key=lambda lv: lv.price)
-    beyond = [lv for lv in levels if float(lv.price) < float(current_price) - eps]
-    return on_side, beyond
-
-
-def _pending_level(
-    beyond: list[SupportResistanceLevel],
-    *,
-    side: str,
-    close: float,
-    broken: SupportResistanceLevel | None,
-    tolerance: float,
-) -> SupportResistanceLevel | None:
-    """The nearest level of ``side`` that price has crossed while its flip is
-    unconfirmed -- a support now above ``close`` or a resistance now below it.
-
-    ``beyond`` holds the candidates the partition against ``close`` dropped.
-    A level within ``tolerance`` of the confirmed flip on that side
-    (``broken``) is the same zone, already flipped, so it is not pending."""
-    crossed = list(beyond)
-    if broken is not None:
-        crossed = _drop_levels_near_price(crossed, float(broken.price), tolerance=tolerance)
-    if not crossed:
-        return None
-    # Nearest to price first: crossed supports ascend from just above price,
-    # crossed resistances descend from just below it.
-    return _collapse_same_side_levels(
-        crossed,
-        tolerance,
-        close,
-        reverse=(side != "support"),
-        max_levels=1,
-    )[0]
-
-
-
-def _fallback_prior_side_levels(
-    *,
-    side: str,
-    current_price: float,
-    include_prior_day: bool,
-    include_prior_week: bool,
-    prior_day_high: float | None,
-    prior_day_low: float | None,
-    prior_week_high: float | None,
-    prior_week_low: float | None,
-) -> list[SupportResistanceLevel]:
-    return fallback_prior_side_levels(
-        side=side,
-        current_price=current_price,
-        include_prior_day=include_prior_day,
-        include_prior_week=include_prior_week,
-        prior_day_high=prior_day_high,
-        prior_day_low=prior_day_low,
-        prior_week_high=prior_week_high,
-        prior_week_low=prior_week_low,
-        level_factory=SupportResistanceLevel,
-    )
-
-
-def _level_preference(level: SupportResistanceLevel, current_price: float) -> tuple[float, int, float, float]:
+def _level_preference(level: Level, current_price: float) -> tuple[float, int, float, float]:
     blended_strength = float(level.score) + (0.20 * max(0.0, float(getattr(level, "source_priority", 1.0) or 1.0) - 1.0))
     return (
         blended_strength,
@@ -620,7 +461,12 @@ def _level_preference(level: SupportResistanceLevel, current_price: float) -> tu
     )
 
 
-def _merge_level_group(group: list[SupportResistanceLevel], current_price: float) -> SupportResistanceLevel:
+def _merge_level_group(group: list[Level], current_price: float) -> Level:
+    # The SR cluster reducer (levels_shared.collapse_same_side_levels): SR
+    # merges every level in a cluster (sums touches, sums score, adds a
+    # cross-source bonus). htf_levels uses the same tolerance grouping but
+    # picks a single representative; the split is deliberate, so each
+    # builder keeps its own reducer.
     if not group:
         raise ValueError("group must not be empty")
     representative = max(group, key=lambda lv: _level_preference(lv, current_price))
@@ -633,7 +479,7 @@ def _merge_level_group(group: list[SupportResistanceLevel], current_price: float
     merged_score += 0.30 * max(0, len(distinct_sources) - 1)
     first_seen_candidates = [str(level.first_seen) for level in group if getattr(level, "first_seen", None)]
     last_seen_candidates = [str(level.last_seen) for level in group if getattr(level, "last_seen", None)]
-    return SupportResistanceLevel(
+    return Level(
         kind=str(getattr(representative, "kind", "support") or "support"),
         price=float(representative.price),
         touches=int(merged_touches),
@@ -646,78 +492,40 @@ def _merge_level_group(group: list[SupportResistanceLevel], current_price: float
 
 
 
-def _collapse_same_side_levels(
-    levels: list[SupportResistanceLevel],
-    tolerance: float,
-    current_price: float,
-    *,
-    reverse: bool,
-    max_levels: int,
-) -> list[SupportResistanceLevel]:
-    # SR merges every level in a cluster (sums touches, sums score, adds
-    # cross-source bonus). htf_levels uses the same tolerance grouping
-    # but picks a single representative — that's why the grouping lives
-    # in levels_shared and the per-cluster reducer stays local.
-    groups = cluster_levels_by_tolerance(levels, tolerance)
-    if not groups:
-        return []
-    selected = [_merge_level_group(group, current_price) for group in groups]
-    selected.sort(key=lambda lv: float(lv.price), reverse=bool(reverse))
-    return selected[: max(1, int(max_levels))]
-
-
-def _drop_levels_near_price(
-    levels: list[SupportResistanceLevel],
-    target_price: float | None,
-    *,
-    tolerance: float,
-) -> list[SupportResistanceLevel]:
-    if not levels or target_price is None:
-        return list(levels)
-    tol = max(float(tolerance), 1e-9)
-    target = float(target_price)
-    return [level for level in levels if abs(float(level.price) - target) > tol]
-
-
 def _reconcile_flipped_levels(
-    supports: list[SupportResistanceLevel],
-    resistances: list[SupportResistanceLevel],
+    supports: list[Level],
+    resistances: list[Level],
     *,
-    broken_support: SupportResistanceLevel | None,
-    broken_resistance: SupportResistanceLevel | None,
+    broken_support: Level | None,
+    broken_resistance: Level | None,
     tolerance: float,
-    current_price: float,
-    max_levels: int,
-) -> tuple[list[SupportResistanceLevel], list[SupportResistanceLevel]]:
+) -> tuple[list[Level], list[Level]]:
+    """Drop the support rungs within ``tolerance`` of the lost support
+    (``broken_support``) and the resistance rungs within it of the reclaimed
+    resistance (``broken_resistance``): the same zone, already flipped. A
+    drop only. The builder collapses each side once, on its whole candidate
+    pool, before this step and cuts it to ``max_levels_per_side`` after it.
+
+    Until 2026-09-27 the builder cut each side before this step, and this
+    step collapsed the survivors a second time, even with no broken level. A
+    rung keeps its strongest member's price, not the cluster's mean, so two
+    rungs could sit within ``tolerance``; the second pass merged them and
+    summed their touches and score again. And a rung dropped here left the
+    side one short while deeper candidates existed."""
     reconciled_supports = list(supports)
     reconciled_resistances = list(resistances)
     if broken_support is not None:
-        reconciled_supports = _drop_levels_near_price(
+        reconciled_supports = drop_levels_near_price(
             reconciled_supports,
             float(broken_support.price),
             tolerance=tolerance,
         )
     if broken_resistance is not None:
-        reconciled_resistances = _drop_levels_near_price(
+        reconciled_resistances = drop_levels_near_price(
             reconciled_resistances,
             float(broken_resistance.price),
             tolerance=tolerance,
         )
-    tol = max(float(tolerance), 1e-9)
-    reconciled_supports = _collapse_same_side_levels(
-        reconciled_supports,
-        tol,
-        current_price,
-        reverse=True,
-        max_levels=max_levels,
-    ) if reconciled_supports else []
-    reconciled_resistances = _collapse_same_side_levels(
-        reconciled_resistances,
-        tol,
-        current_price,
-        reverse=False,
-        max_levels=max_levels,
-    ) if reconciled_resistances else []
     return reconciled_supports, reconciled_resistances
 
 
@@ -758,9 +566,6 @@ def _completed_flip_frames(flip_frame: pd.DataFrame | None) -> tuple[pd.DataFram
         # confirmation never reads a partial 5m bar.
         completed_5m = completed_5m[completed_5m.index + pd.Timedelta(minutes=5) <= one_min_cutoff]
     return completed_1m, completed_5m
-
-
-FlipCheck = Callable[[float, str], bool]
 
 
 def _flip_checker(
@@ -831,85 +636,6 @@ def zone_flip_confirmed(
     if zone_kind == 'support':
         return check(float(lower), 'loss')
     return check(float(upper), 'reclaim')
-
-
-def _split_references_by_flip(
-    *,
-    support_references: list,
-    resistance_references: list,
-    flip_check: FlipCheck,
-) -> tuple[list, list]:
-    """Initial side-assignment for every reference level. Support refs that
-    have been decisively lost move to the resistance side; resistance refs
-    that have been reclaimed move to the support side. Everything else
-    retains its original side. Extracted from
-    build_support_resistance_context for Phase 3b decomposition."""
-    support_candidates: list = []
-    resistance_candidates: list = []
-    for level in support_references:
-        if flip_check(float(level.price), "loss"):
-            resistance_candidates.append(_clone_level(level, "resistance"))
-        else:
-            support_candidates.append(_clone_level(level, "support"))
-    for level in resistance_references:
-        if flip_check(float(level.price), "reclaim"):
-            support_candidates.append(_clone_level(level, "support"))
-        else:
-            resistance_candidates.append(_clone_level(level, "resistance"))
-    return support_candidates, resistance_candidates
-
-
-def _detect_broken_levels(
-    *,
-    support_references: list,
-    resistance_references: list,
-    flip_check: FlipCheck,
-    merge_tol: float,
-    side_tolerance: float,
-    close: float,
-    max_levels_per_side: int,
-):
-    """Detect levels that have flipped direction: former resistance now acting
-    as support (reclaim) and former support now acting as resistance (loss).
-
-    Returns (broken_support, broken_resistance) — each the top collapsed level
-    on that side, or None. A reclaimed resistance must sit at or below
-    ``close`` (a lost support at or above it), within ``merge_tol``: the same
-    price the ladders are partitioned against. Until 2026-09-23 it was the
-    fallback reference price whenever a side had fallen back to prior levels,
-    so a confirmed-lost pivot support between ``close`` and that reference
-    showed as a flipped resistance in the ladder with broken_support None.
-    Extracted from build_support_resistance_context for Phase 3b
-    decomposition."""
-    broken_resistance_candidates = [
-        _clone_level(level, "support")
-        for level in resistance_references
-        if flip_check(float(level.price), "reclaim")
-        and float(level.price) <= close + merge_tol
-    ]
-    broken_resistance_levels = _collapse_same_side_levels(
-        broken_resistance_candidates,
-        side_tolerance,
-        close,
-        reverse=True,
-        max_levels=max_levels_per_side,
-    )
-    broken_resistance = broken_resistance_levels[0] if broken_resistance_levels else None
-    broken_support_candidates = [
-        _clone_level(level, "resistance")
-        for level in support_references
-        if flip_check(float(level.price), "loss")
-        and float(level.price) >= close - merge_tol
-    ]
-    broken_support_levels = _collapse_same_side_levels(
-        broken_support_candidates,
-        side_tolerance,
-        close,
-        reverse=False,
-        max_levels=max_levels_per_side,
-    )
-    broken_support = broken_support_levels[0] if broken_support_levels else None
-    return broken_support, broken_resistance
 
 
 def _compute_level_proximity_metrics(
@@ -1081,12 +807,12 @@ def build_support_resistance_context(
         max_drift_atr_mult=float(fallback_reference_max_drift_atr_mult),
         max_drift_pct=float(fallback_reference_max_drift_pct),
     )
-    highs, lows = _pivot_points(frame, int(pivot_span))
-    # _cluster_levels expects (ts, price) tuples; strip the leading pos.
+    highs, lows = pivot_points(frame, int(pivot_span), include_idx=True)
+    # cluster_levels expects (ts, price) tuples; strip the leading pos.
     highs_for_cluster = [(ts, price) for _, ts, price in highs]
     lows_for_cluster = [(ts, price) for _, ts, price in lows]
-    raw_pivot_resistances = _cluster_levels(highs_for_cluster, "resistance", merge_tol) if highs_for_cluster else []
-    raw_pivot_supports = _cluster_levels(lows_for_cluster, "support", merge_tol) if lows_for_cluster else []
+    raw_pivot_resistances = cluster_levels(highs_for_cluster, "resistance", merge_tol) if highs_for_cluster else []
+    raw_pivot_supports = cluster_levels(lows_for_cluster, "support", merge_tol) if lows_for_cluster else []
 
     include_prior_day = bool(use_prior_day_high_low)
     include_prior_week = bool(use_prior_week_high_low)
@@ -1103,10 +829,10 @@ def build_support_resistance_context(
     # has crossed joins the pending pool like any other. Partitioned against
     # the reference instead, a gap morning's PDH came out as a resistance
     # below price, at a negative distance.
-    support_references: list[SupportResistanceLevel] = list(raw_pivot_supports)
-    resistance_references: list[SupportResistanceLevel] = list(raw_pivot_resistances)
+    support_references: list[Level] = list(raw_pivot_supports)
+    resistance_references: list[Level] = list(raw_pivot_resistances)
     if not support_references:
-        support_references = _fallback_prior_side_levels(
+        support_references = fallback_prior_side_levels(
             side="support",
             current_price=fallback_reference_price,
             include_prior_day=include_prior_day,
@@ -1117,14 +843,9 @@ def build_support_resistance_context(
             prior_week_low=prior_week_low,
         )
         if not support_references:
-            min_low_pos = int(frame["low"].astype(float).values.argmin())
-            support_references = _cluster_levels(
-                [(pd.Timestamp(frame.index[min_low_pos]), float(frame["low"].iloc[min_low_pos]))],
-                "support",
-                merge_tol,
-            )
+            support_references = frame_extreme_side_levels(frame, side="support", tolerance=merge_tol)
     if not resistance_references:
-        resistance_references = _fallback_prior_side_levels(
+        resistance_references = fallback_prior_side_levels(
             side="resistance",
             current_price=fallback_reference_price,
             include_prior_day=include_prior_day,
@@ -1135,12 +856,7 @@ def build_support_resistance_context(
             prior_week_low=prior_week_low,
         )
         if not resistance_references:
-            max_high_pos = int(frame["high"].astype(float).values.argmax())
-            resistance_references = _cluster_levels(
-                [(pd.Timestamp(frame.index[max_high_pos]), float(frame["high"].iloc[max_high_pos]))],
-                "resistance",
-                merge_tol,
-            )
+            resistance_references = frame_extreme_side_levels(frame, side="resistance", tolerance=merge_tol)
 
     last_bar = frame.iloc[-1]
     last_low = float(last_bar.low)
@@ -1155,16 +871,17 @@ def build_support_resistance_context(
         eps=flip_eps,
     )
 
-    support_candidates, resistance_candidates = _split_references_by_flip(
+    support_candidates, resistance_candidates = split_references_by_flip(
         support_references=support_references,
         resistance_references=resistance_references,
         flip_check=flip_check,
+        relabel=None,
     )
 
     # Candidates beyond their side of price keep their role while the flip is
     # unconfirmed -- they are the pending_support / pending_resistance pool.
-    support_candidates, supports_beyond = _partition_levels_by_side(support_candidates, close, side="support")
-    resistance_candidates, resistances_beyond = _partition_levels_by_side(resistance_candidates, close, side="resistance")
+    support_candidates, supports_beyond = partition_levels_by_side(support_candidates, close, side="support")
+    resistance_candidates, resistances_beyond = partition_levels_by_side(resistance_candidates, close, side="resistance")
 
     # A side left empty takes the prior-day/week levels, then, if those are
     # all across price too, the frame extreme. Until 2026-09-23 the extreme
@@ -1176,7 +893,7 @@ def build_support_resistance_context(
             if support_candidates if side == "support" else resistance_candidates:
                 break
             if source == "prior":
-                refs = _fallback_prior_side_levels(
+                refs = fallback_prior_side_levels(
                     side=side,
                     current_price=fallback_reference_price,
                     include_prior_day=include_prior_day,
@@ -1187,7 +904,7 @@ def build_support_resistance_context(
                     prior_week_low=prior_week_low,
                 )
             else:
-                refs = _frame_extreme_side_levels(frame, side=side, tolerance=merge_tol)
+                refs = frame_extreme_side_levels(frame, side=side, tolerance=merge_tol)
             if not refs:
                 continue
             # A ref already among the side's references (the frame extreme
@@ -1195,44 +912,53 @@ def build_support_resistance_context(
             # fallback) is already a candidate: adding it again doubled its
             # touches and score when the copies merged.
             added = extend_unique_levels(support_references if side == "support" else resistance_references, refs)
-            for level in added:
-                if side == "support" and flip_check(float(level.price), "loss"):
-                    resistance_candidates.append(_clone_level(level, "resistance"))
-                elif side == "resistance" and flip_check(float(level.price), "reclaim"):
-                    support_candidates.append(_clone_level(level, "support"))
-                elif side == "support":
-                    support_candidates.append(_clone_level(level, "support"))
-                else:
-                    resistance_candidates.append(_clone_level(level, "resistance"))
-            support_candidates, more_supports_beyond = _partition_levels_by_side(support_candidates, close, side="support")
-            resistance_candidates, more_resistances_beyond = _partition_levels_by_side(resistance_candidates, close, side="resistance")
+            more_supports, more_resistances = split_references_by_flip(
+                support_references=added if side == "support" else [],
+                resistance_references=added if side == "resistance" else [],
+                flip_check=flip_check,
+                relabel=None,
+            )
+            support_candidates, more_supports_beyond = partition_levels_by_side(support_candidates + more_supports, close, side="support")
+            resistance_candidates, more_resistances_beyond = partition_levels_by_side(resistance_candidates + more_resistances, close, side="resistance")
             supports_beyond += more_supports_beyond
             resistances_beyond += more_resistances_beyond
 
-    side_tolerance = max(merge_tol, same_side_min_gap)
-    supports = _collapse_same_side_levels(
+    side_tolerance = _side_tolerance(
+        atr,
+        close,
+        atr_tolerance_mult=float(atr_tolerance_mult),
+        pct_tolerance=float(pct_tolerance),
+        min_gap_atr_mult=float(same_side_min_gap_atr_mult),
+        min_gap_pct=float(same_side_min_gap_pct),
+    )
+    supports = collapse_same_side_levels(
         support_candidates,
         side_tolerance,
         close,
         reverse=True,
-        max_levels=max_levels_per_side,
+        max_levels=None,
+        reduce=_merge_level_group,
     )
-    resistances = _collapse_same_side_levels(
+    resistances = collapse_same_side_levels(
         resistance_candidates,
         side_tolerance,
         close,
         reverse=False,
-        max_levels=max_levels_per_side,
+        max_levels=None,
+        reduce=_merge_level_group,
     )
 
-    broken_support, broken_resistance = _detect_broken_levels(
+    # A confirmed flip is broken while price is within ``merge_tol`` of the
+    # level or through it (htf_levels allows float noise only).
+    broken_support, broken_resistance = detect_broken_levels(
         support_references=support_references,
         resistance_references=resistance_references,
         flip_check=flip_check,
-        merge_tol=merge_tol,
-        side_tolerance=side_tolerance,
         close=close,
-        max_levels_per_side=max_levels_per_side,
+        gate_tol=merge_tol,
+        tolerance=side_tolerance,
+        relabel=None,
+        reduce=_merge_level_group,
     )
     supports, resistances = _reconcile_flipped_levels(
         supports,
@@ -1240,22 +966,25 @@ def build_support_resistance_context(
         broken_support=broken_support,
         broken_resistance=broken_resistance,
         tolerance=side_tolerance,
-        current_price=close,
-        max_levels=max_levels_per_side,
     )
-    pending_support = _pending_level(
+    ladder_size = max(1, int(max_levels_per_side))
+    supports = supports[:ladder_size]
+    resistances = resistances[:ladder_size]
+    pending_support = pending_level(
         supports_beyond,
         side="support",
         close=close,
         broken=broken_support,
         tolerance=side_tolerance,
+        reduce=_merge_level_group,
     )
-    pending_resistance = _pending_level(
+    pending_resistance = pending_level(
         resistances_beyond,
         side="resistance",
         close=close,
         broken=broken_resistance,
         tolerance=side_tolerance,
+        reduce=_merge_level_group,
     )
     proximity = _compute_level_proximity_metrics(
         supports=supports,

@@ -22,15 +22,10 @@ from .catalogue import get_plugin
 from ..models import OPTION_ASSET_TYPES, Candidate, ExitDecision, Position, Side, Signal
 from ..bars import bar_close_position, bar_wick_fractions, frame_bar_minutes, last_bucket_forming, resample_bars
 from ..symbols import normalize_symbol_list, normalize_symbol_list_details
-from ..candles import detect_candle_context, directional_candle_signal
+from ..candles import CANDLE_CONTEXT_BARS, detect_candle_context, directional_candle_signal
 from ..chart_patterns import analyze_chart_pattern_context
-from ..htf_levels import (
-    FairValueGapContext,
-    HTFContext,
-    build_fair_value_gap_context,
-    empty_fvg_context,
-    empty_htf_context,
-)
+from ..fair_value_gaps import FairValueGapContext, build_fair_value_gap_context, empty_fvg_context
+from ..htf_levels import HTFContext, empty_htf_context
 from ..indicators import ensure_standard_indicator_frame, htf_ema_spans, last_bar_atr
 from ..sessions import equity_session_state, is_hhmm
 from ..support_resistance import (
@@ -897,7 +892,6 @@ class BaseStrategy:
         else:
             # Slice size MUST match what detect_candle_context uses so this
             # cache doesn't collide across different inputs.
-            from ..candles import CANDLE_CONTEXT_BARS
             tail = frame[["open", "high", "low", "close"]].tail(CANDLE_CONTEXT_BARS).copy()
             for col in ("open", "high", "low", "close"):
                 tail[col] = pd.to_numeric(tail[col], errors="coerce")

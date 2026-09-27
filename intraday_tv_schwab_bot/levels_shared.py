@@ -2,16 +2,39 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import date
-from typing import Literal, TypeVar, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 import numpy as np
 import pandas as pd
 
 from .sessions import session_datetime_index, session_mask, session_segment_ids
 
+if TYPE_CHECKING:
+    from .config import SupportResistanceConfig
+    from .support_resistance import SupportResistanceContext
 
-TLevel = TypeVar("TLevel")
+
+@dataclass(slots=True)
+class Level:
+    """A support or resistance level from either level builder
+    (``htf_levels.build_htf_context``,
+    ``support_resistance.build_support_resistance_context``): a cluster of
+    pivots (``cluster_levels``), a prior-day/week high or low
+    (``fallback_prior_side_levels``), or one of those re-emitted as the other
+    kind (``clone_level``). Until 2026-09-27 each builder had its own class
+    with these eight fields, HTFLevel and SupportResistanceLevel, and every
+    helper here took the one to build as a ``level_factory`` argument."""
+
+    kind: str
+    price: float
+    touches: int = 1
+    score: float = 1.0
+    first_seen: str | None = None
+    last_seen: str | None = None
+    source: str = "pivot"
+    source_priority: float = 1.0
 
 
 @overload
@@ -53,11 +76,10 @@ def pivot_points(
     4.4% of swing highs/lows on archived 5m RTH bars (180 of ~4,130 over
     138 symbol-days), exact penny ties that are routine at a round number.
     A V-bottom that tied lost its low entirely and market structure fell
-    back to an older pivot as the reference low. Shared by
-    ``htf_levels._pivot_points`` and ``support_resistance._pivot_points``
-    so the pivot-detection semantics can't drift between the two builders
-    (the kind of bug we debugged through the AMD/INTC support-list
-    mismatch).
+    back to an older pivot as the reference low. Shared by every level
+    builder (htf_levels, support_resistance, technical_levels, order_blocks)
+    so the pivot-detection semantics can't drift between them (the kind of
+    bug we debugged through the AMD/INTC support-list mismatch).
 
     The whole window must lie in ONE ET session (``session_segment_ids``).
     The frames hold no 20:00-07:00 bars, so until 2026-09-23 a 19:45 bar was
@@ -100,13 +122,54 @@ def pivot_points(
     return highs, lows
 
 
+def reduce_pivots(
+    highs: Iterable[tuple[int, pd.Timestamp, float]],
+    lows: Iterable[tuple[int, pd.Timestamp, float]],
+    *,
+    min_gap_bars: int = 0,
+) -> list[tuple[str, int, pd.Timestamp, float]]:
+    """Merge ``pivot_points(..., include_idx=True)`` highs and lows into one
+    alternating swing sequence of ``(kind, pos, ts, price)``, ``kind`` "H" or
+    "L", in bar order.
+
+    A run of same-kind pivots keeps its extreme (the later one on a tie). An
+    alternating pivot closer than ``min_gap_bars`` to the prior kept pivot is
+    noise within the current leg (2026-05-27, Fix B): it is skipped so the leg
+    continues instead of registering a 1-2-bar swing that churns the
+    structure labels. ``min_gap_bars <= 0`` keeps every alternation.
+
+    Market structure (``support_resistance.analyze_market_structure``) passes
+    the gap; the technical levels' swings (``technical_levels``) keep every
+    alternation. Each module carried its own copy of this loop.
+    """
+    raw: list[tuple[str, int, pd.Timestamp, float]] = []
+    for pos, ts, price in highs:
+        raw.append(("H", int(pos), ts, float(price)))
+    for pos, ts, price in lows:
+        raw.append(("L", int(pos), ts, float(price)))
+    raw.sort(key=lambda item: item[1])
+    reduced: list[tuple[str, int, pd.Timestamp, float]] = []
+    for kind, pos, ts, price in raw:
+        if not reduced:
+            reduced.append((kind, pos, ts, price))
+            continue
+        prev_kind, prev_pos, _prev_ts, prev_price = reduced[-1]
+        if kind != prev_kind:
+            if min_gap_bars > 0 and (pos - prev_pos) < min_gap_bars:
+                continue
+            reduced.append((kind, pos, ts, price))
+            continue
+        keep_current = price >= prev_price if kind == "H" else price <= prev_price
+        if keep_current:
+            reduced[-1] = (kind, pos, ts, price)
+    return reduced
+
+
 def cluster_levels(
     points: Iterable[tuple[pd.Timestamp, float]],
     kind: str,
     tolerance: float,
-    *,
-    level_factory: Callable[..., TLevel],
-) -> list[TLevel]:
+) -> list[Level]:
     """Cluster pivot points by price proximity and return EVERY cluster,
     ranked by score.
 
@@ -120,10 +183,12 @@ def cluster_levels(
     keep recent close-to-price levels visible alongside long-standing
     historical bases.
 
-    ``level_factory`` is the dataclass to construct (HTFLevel /
-    SupportResistanceLevel — both have the same field shape). This is the
-    single source of truth for cluster scoring so a fix landing here
-    propagates to every consumer (HTF and LTF SR contexts).
+    This is the single source of truth for cluster scoring, so a fix
+    landing here reaches both builders (HTF and LTF SR contexts). A copy
+    local to support_resistance once used an additive recency bonus
+    (``touches * 1.15 + 0.60 * recency_factor``), which let ancient
+    high-touch bases outrank close-to-price recent swings (the AMD/INTC
+    debug).
 
     No count cap. Until 2026-09-23 the builders kept the top
     ``2 * max_levels_per_side`` clusters by score here, BEFORE knowing which
@@ -133,7 +198,7 @@ def cluster_levels(
     (AVGO 2026-05-28: nearest resistance 430.40 at 1.1-1.4 ATR instead of
     427.96 at 0.0-0.6 ATR, flipping the long clearance gate). The builders
     now keep the nearest ``max_levels_per_side`` per side after the side
-    split (``_collapse_same_side_levels``).
+    split (``collapse_same_side_levels``).
     """
     ordered = sorted([(ts, float(price)) for ts, price in points], key=lambda x: x[1])
     if not ordered:
@@ -155,7 +220,7 @@ def cluster_levels(
             groups[-1].append(point)
         else:
             groups.append([point])
-    levels: list[TLevel] = []
+    levels: list[Level] = []
     for grp in groups:
         grp_sorted = sorted(grp, key=lambda x: x[0])
         prices = [price for _, price in grp_sorted]
@@ -171,7 +236,7 @@ def cluster_levels(
         effective_touches = float(touches) * recency_factor
         score = effective_touches + 0.50 * persistence_factor
         levels.append(
-            level_factory(
+            Level(
                 kind=kind,
                 price=float(sum(prices) / len(prices)),
                 touches=touches,
@@ -219,13 +284,12 @@ def confirm_by_bars(
 
 
 def clone_level(
-    level: TLevel,
+    level: Level,
     kind: str,
     *,
-    level_factory: Callable[..., TLevel],
     source: str | None = None,
-) -> TLevel:
-    """Re-emit ``level`` as ``kind`` via ``level_factory``.
+) -> Level:
+    """Re-emit ``level`` as ``kind``.
 
     When ``source`` is ``None`` (default) the cloned level inherits the
     original level's ``source``; pass an explicit ``source`` to relabel
@@ -234,7 +298,7 @@ def clone_level(
     across htf_levels and support_resistance.
     """
     inherited_source = str(getattr(level, "source", "pivot") or "pivot")
-    return level_factory(
+    return Level(
         kind=kind,
         price=float(level.price),
         touches=int(level.touches),
@@ -283,8 +347,7 @@ def frame_extreme_side_levels(
     *,
     side: str,
     tolerance: float,
-    level_factory: Callable[..., TLevel],
-) -> list[TLevel]:
+) -> list[Level]:
     """Build a single-cluster fallback level from the frame's extreme bar.
 
     Returns the cluster_levels output from a single ``(timestamp, price)``
@@ -296,27 +359,27 @@ def frame_extreme_side_levels(
     if str(side).strip().lower() == "support":
         pos = int(frame["low"].astype(float).values.argmin())
         point = (pd.Timestamp(frame.index[pos]), float(frame["low"].iloc[pos]))
-        return cluster_levels([point], "support", tolerance, level_factory=level_factory)
+        return cluster_levels([point], "support", tolerance)
     pos = int(frame["high"].astype(float).values.argmax())
     point = (pd.Timestamp(frame.index[pos]), float(frame["high"].iloc[pos]))
-    return cluster_levels([point], "resistance", tolerance, level_factory=level_factory)
+    return cluster_levels([point], "resistance", tolerance)
 
 
-def cluster_levels_by_tolerance(levels: list[TLevel], tolerance: float) -> list[list[TLevel]]:
+def cluster_levels_by_tolerance(levels: list[Level], tolerance: float) -> list[list[Level]]:
     """Group ``levels`` into price-proximity clusters.
 
     Each cluster's anchor is its running mean — a level joins the prior
     cluster when ``abs(level.price - anchor) <= tolerance``, otherwise it
     starts a new one. Pure grouping with no per-cluster reduction; the
     caller chooses whether to pick a representative (htf_levels) or
-    merge attributes (support_resistance). Replaces the duplicated
-    grouping loop in both modules' ``_collapse_same_side_levels``.
+    merge attributes (support_resistance) through
+    ``collapse_same_side_levels``' ``reduce``.
     """
     if not levels:
         return []
     ordered = sorted(levels, key=lambda lv: float(lv.price))
     tol = max(float(tolerance), 1e-9)
-    groups: list[list[TLevel]] = []
+    groups: list[list[Level]] = []
     for level in ordered:
         if not groups:
             groups.append([level])
@@ -330,17 +393,204 @@ def cluster_levels_by_tolerance(levels: list[TLevel], tolerance: float) -> list[
     return groups
 
 
-def build_special_level(
+# The ladder steps both S/R builders run (htf_levels.build_htf_context and
+# support_resistance.build_support_resistance_context): side assignment by
+# flip, the partition against price, the per-side collapse, the confirmed
+# flips and the pending levels. Where the builders differ on purpose, the
+# difference is an argument each passes at its call site: the cluster
+# reducer (``reduce``), the flipped levels' ``source`` (``relabel``) and the
+# broken-level gate (``gate_tol``). Only support_resistance re-drops the
+# ladder near its confirmed flips (``_reconcile_flipped_levels``).
+
+# ``check(level_price, direction)``: is the level's flip confirmed?
+# ``direction`` is "loss" (a support price has broken below) or "reclaim"
+# (a resistance price has been taken back). Each builder makes its own from
+# its confirmation bars.
+FlipCheck = Callable[[float, str], bool]
+
+
+def collapse_same_side_levels(
+    levels: list[Level],
+    tolerance: float,
+    current_price: float,
+    *,
+    reverse: bool,
+    max_levels: int | None,
+    reduce: Callable[[list[Level], float], Level],
+) -> list[Level]:
+    """One level per price cluster (``cluster_levels_by_tolerance``), sorted
+    by price (descending with ``reverse``, so a support ladder reads nearest
+    first) and cut to ``max_levels`` (at least one). ``max_levels=None``
+    keeps every rung: support_resistance cuts its ladder only after it drops
+    the rungs near its confirmed flips (``_reconcile_flipped_levels``).
+
+    ``reduce(group, current_price)`` makes a cluster's level. htf_levels
+    keeps one representative (highest source priority, then score);
+    support_resistance merges the cluster (sums touches and score, adds a
+    cross-source bonus). The split is deliberate, so each builder passes its
+    own and the reducers stay in their modules.
+    """
+    selected = [reduce(group, current_price) for group in cluster_levels_by_tolerance(levels, tolerance)]
+    selected.sort(key=lambda lv: float(lv.price), reverse=bool(reverse))
+    if max_levels is None:
+        return selected
+    return selected[: max(1, int(max_levels))]
+
+
+def drop_levels_near_price(levels: list[Level], price: float, *, tolerance: float) -> list[Level]:
+    """``levels`` without the ones within ``tolerance`` (at least 1e-9) of
+    ``price``."""
+    tol = max(float(tolerance), 1e-9)
+    return [level for level in levels if abs(float(level.price) - float(price)) > tol]
+
+
+def partition_levels_by_side(
+    levels: list[Level],
+    current_price: float,
+    *,
+    side: str,
+) -> tuple[list[Level], list[Level]]:
+    """Split ``levels`` into those on their side of ``current_price`` --
+    supports at or below it (nearest first), resistances at or above it, a
+    level within 1e-6 of the price counting as at it -- and those beyond it.
+    The builders report the nearest of the latter whose flip is unconfirmed
+    as ``pending_support`` / ``pending_resistance`` (``pending_level``)."""
+    eps = max(abs(float(current_price)) * 1e-6, 1e-8)
+    if side == "support":
+        on_side = [lv for lv in levels if float(lv.price) <= float(current_price) + eps]
+        on_side.sort(key=lambda lv: lv.price, reverse=True)
+        beyond = [lv for lv in levels if float(lv.price) > float(current_price) + eps]
+        return on_side, beyond
+    on_side = [lv for lv in levels if float(lv.price) >= float(current_price) - eps]
+    on_side.sort(key=lambda lv: lv.price)
+    beyond = [lv for lv in levels if float(lv.price) < float(current_price) - eps]
+    return on_side, beyond
+
+
+def pending_level(
+    beyond: list[Level],
+    *,
+    side: str,
+    close: float,
+    broken: Level | None,
+    tolerance: float,
+    reduce: Callable[[list[Level], float], Level],
+) -> Level | None:
+    """The nearest level of ``side`` that price has crossed while its flip is
+    unconfirmed -- a support now above ``close`` or a resistance now below it.
+
+    ``beyond`` holds the candidates the partition against ``close`` dropped.
+    A level within ``tolerance`` of the confirmed flip on that side
+    (``broken``) is the same zone, already flipped, so it is not pending.
+    ``reduce`` is the builder's cluster reducer (``collapse_same_side_levels``).
+    """
+    crossed = beyond if broken is None else drop_levels_near_price(beyond, float(broken.price), tolerance=tolerance)
+    if not crossed:
+        return None
+    # Nearest to price first: crossed supports ascend from just above price,
+    # crossed resistances descend from just below it.
+    return collapse_same_side_levels(
+        crossed,
+        tolerance,
+        close,
+        reverse=(side != "support"),
+        max_levels=1,
+        reduce=reduce,
+    )[0]
+
+
+def split_references_by_flip(
+    *,
+    support_references: list[Level],
+    resistance_references: list[Level],
+    flip_check: FlipCheck,
+    relabel: tuple[str, str] | None,
+) -> tuple[list[Level], list[Level]]:
+    """Side-assign reference levels: ``(support_candidates,
+    resistance_candidates)``, each a ``clone_level`` copy. A support reference
+    whose flip is confirmed lost becomes a resistance candidate, a reclaimed
+    resistance reference a support candidate; the rest keep their side.
+
+    ``relabel`` is ``(lost_support_source, reclaimed_resistance_source)`` for
+    the flipped copies, or None to keep each reference's ``source``.
+    htf_levels relabels (``broken_htf_support`` / ``broken_htf_resistance``:
+    the peer strategies read those sources back as the level's role);
+    support_resistance keeps the source.
+    """
+    lost_source, reclaimed_source = relabel if relabel is not None else (None, None)
+    support_candidates: list[Level] = []
+    resistance_candidates: list[Level] = []
+    for level in support_references:
+        if flip_check(float(level.price), "loss"):
+            resistance_candidates.append(clone_level(level, "resistance", source=lost_source))
+        else:
+            support_candidates.append(clone_level(level, "support"))
+    for level in resistance_references:
+        if flip_check(float(level.price), "reclaim"):
+            support_candidates.append(clone_level(level, "support", source=reclaimed_source))
+        else:
+            resistance_candidates.append(clone_level(level, "resistance"))
+    return support_candidates, resistance_candidates
+
+
+def detect_broken_levels(
+    *,
+    support_references: list[Level],
+    resistance_references: list[Level],
+    flip_check: FlipCheck,
+    close: float,
+    gate_tol: float,
+    tolerance: float,
+    relabel: tuple[str, str] | None,
+    reduce: Callable[[list[Level], float], Level],
+) -> tuple[Level | None, Level | None]:
+    """The confirmed flips nearest price: ``(broken_support,
+    broken_resistance)``, each None when there is none.
+
+    ``broken_resistance`` comes from the resistance references whose flip is
+    confirmed reclaimed, at or below ``close + gate_tol``; ``broken_support``
+    from the lost support references at or above ``close - gate_tol``. Each
+    pool collapses like a ladder side (``tolerance``, ``reduce``) and keeps
+    the level nearest price. The flipped copies take ``relabel`` as in
+    ``split_references_by_flip``.
+
+    ``gate_tol`` is the builder's choice: htf_levels allows float noise (1e-6
+    of ``close``), support_resistance its clustering tolerance. Both gate
+    against ``close``, the price the ladders are partitioned against: until
+    2026-09-23 support_resistance used the fallback reference price whenever
+    a side had fallen back to prior levels, so a confirmed-lost pivot support
+    between ``close`` and that reference showed as a flipped resistance in
+    the ladder with broken_support None.
+    """
+    lost_source, reclaimed_source = relabel if relabel is not None else (None, None)
+    reclaimed = [
+        clone_level(level, "support", source=reclaimed_source)
+        for level in resistance_references
+        if float(level.price) <= close + gate_tol and flip_check(float(level.price), "reclaim")
+    ]
+    lost = [
+        clone_level(level, "resistance", source=lost_source)
+        for level in support_references
+        if float(level.price) >= close - gate_tol and flip_check(float(level.price), "loss")
+    ]
+    broken_resistance = collapse_same_side_levels(reclaimed, tolerance, close, reverse=True, max_levels=1, reduce=reduce)
+    broken_support = collapse_same_side_levels(lost, tolerance, close, reverse=False, max_levels=1, reduce=reduce)
+    return (
+        broken_support[0] if broken_support else None,
+        broken_resistance[0] if broken_resistance else None,
+    )
+
+
+def _build_special_level(
     kind: str,
     price: float,
     *,
     source: str,
     source_priority: float,
-    level_factory: Callable[..., TLevel],
     score: float | None = None,
-) -> TLevel:
+) -> Level:
     level_score = float(score if score is not None else source_priority)
-    return level_factory(
+    return Level(
         kind=kind,
         price=float(price),
         touches=1,
@@ -360,8 +610,7 @@ def fallback_prior_side_levels(
     prior_day_low: float | None,
     prior_week_high: float | None,
     prior_week_low: float | None,
-    level_factory: Callable[..., TLevel],
-) -> list[TLevel]:
+) -> list[Level]:
     candidates: list[tuple[str, float, float, float]] = []
     if include_prior_day and prior_day_low is not None:
         candidates.append(("prior_day_low", float(prior_day_low), 2.0, 2.0))
@@ -381,13 +630,12 @@ def fallback_prior_side_levels(
         filtered = [item for item in candidates if float(item[1]) > float(current_price) + eps]
         filtered.sort(key=lambda item: float(item[1]))
     return [
-        build_special_level(
+        _build_special_level(
             side,
             price,
             source=source,
             source_priority=source_priority,
             score=score,
-            level_factory=level_factory,
         )
         for source, price, source_priority, score in filtered
     ]
@@ -403,6 +651,100 @@ def same_side_min_gap_threshold(
     atr_component = max(0.0, float(atr or 0.0)) * max(0.0, float(min_gap_atr_mult or 0.0))
     pct_component = abs(float(current_price or 0.0)) * max(0.0, float(min_gap_pct or 0.0))
     return max(atr_component, pct_component, 0.0)
+
+
+def side_tolerance(
+    atr: float,
+    price: float,
+    *,
+    atr_tolerance_mult: float,
+    pct_tolerance: float,
+    min_gap_atr_mult: float,
+    min_gap_pct: float,
+) -> float:
+    """How far apart two same-side levels must sit to stay two levels: the
+    larger of the merge tolerance (``atr * atr_tolerance_mult``, or ``price *
+    pct_tolerance`` when larger) and the same-side minimum gap
+    (``same_side_min_gap_threshold``). The S/R and HTF builds collapse their
+    ladders at it (the S/R context publishes it as ``side_tolerance``), and
+    ``effective_side_tolerance`` spaces the sr_flip target and the
+    dashboard's S/R ladder with it."""
+    merge_tolerance = max(atr * atr_tolerance_mult, price * pct_tolerance)
+    return max(
+        merge_tolerance,
+        same_side_min_gap_threshold(atr, price, min_gap_atr_mult=min_gap_atr_mult, min_gap_pct=min_gap_pct),
+    )
+
+
+def effective_side_tolerance(
+    sr_cfg: SupportResistanceConfig,
+    price: float,
+    *,
+    atr: float = 0.0,
+    sr_ctx: SupportResistanceContext | None = None,
+) -> float:
+    """The S/R context's ``side_tolerance`` when it has one (above 0; an empty
+    context carries 0), else ``side_tolerance`` at ``price`` and ``atr`` from
+    ``sr_cfg``'s four tolerances (checked at load, above 0). An ``atr`` of 0
+    leaves the ATR arms out: the dashboard's ladder has no ATR to give.
+
+    Until 2026-09-27 this was ``_sr_ladder._sr_effective_side_tolerance``,
+    which wrote the formula out again with 1e-4 floors of its own (they bound
+    only below about $0.03), read a None price or ATR as 0, and fell back to
+    the config behind a broad except when the context's tolerance did not
+    read."""
+    if sr_ctx is not None and sr_ctx.side_tolerance > 0:
+        return sr_ctx.side_tolerance
+    return side_tolerance(
+        atr,
+        price,
+        atr_tolerance_mult=float(sr_cfg.atr_tolerance_mult),
+        pct_tolerance=float(sr_cfg.pct_tolerance),
+        min_gap_atr_mult=float(sr_cfg.same_side_min_gap_atr_mult),
+        min_gap_pct=float(sr_cfg.same_side_min_gap_pct),
+    )
+
+
+def select_next_distinct_level(
+    levels: list[Level] | None,
+    anchor_price: float | None,
+    *,
+    above: bool,
+    minimum_gap: float,
+) -> Level | None:
+    """The first of ``levels`` (nearest first) more than ``minimum_gap``
+    above ``anchor_price`` (below it with ``above=False``), skipping a level
+    whose price is not positive; the first level when there is no anchor.
+    sr_flip management takes the next target past a flipped level with it."""
+    if not levels:
+        return None
+    if anchor_price is None:
+        return levels[0]
+    tol = max(float(minimum_gap), 1e-6)
+    anchor = float(anchor_price)
+    for level in levels:
+        price = float(level.price)
+        if price <= 0:
+            continue
+        if above:
+            if price > anchor + tol:
+                return level
+        else:
+            if price < anchor - tol:
+                return level
+    return None
+
+
+def collapse_price_ladder(values: list[float], *, reverse: bool, min_gap: float) -> list[float]:
+    """The positive ``values`` in order (descending with ``reverse``), each
+    kept only when it sits more than ``min_gap`` from the last one kept: the
+    dashboard's S/R ladder rungs."""
+    ordered = sorted((float(v) for v in values if float(v) > 0), reverse=reverse)
+    collapsed: list[float] = []
+    for value in ordered:
+        if not collapsed or abs(float(value) - float(collapsed[-1])) > max(float(min_gap), 1e-4):
+            collapsed.append(float(value))
+    return collapsed
 
 
 def safe_reference_price_for_fallback(
@@ -475,358 +817,3 @@ def prior_week_levels(frame: pd.DataFrame, as_of: date) -> tuple[float | None, f
     last_week = weeks[eligible].max()
     bars = frame.loc[eligible & np.asarray(weeks == last_week, dtype=bool)]
     return float(bars["high"].max()), float(bars["low"].min())
-
-
-# ---------------------------------------------------------------------------
-# Divergence detection (shared by technical_levels.py + htf_levels.py)
-#
-# A divergence is a misalignment between a price pivot pair and the
-# corresponding indicator (RSI, OBV) pivot values:
-#
-#   regular bullish: at pivot lows, price prints LL (price2 < price1 by
-#       price_move_frac) but indicator prints HL (ind2 > ind1 + delta).
-#       Reversal-likely from a downtrend.
-#
-#   regular bearish: at pivot highs, price prints HH but indicator prints
-#       LH. Reversal-likely from an uptrend.
-#
-#   hidden bullish: at pivot lows, price prints HL but indicator prints
-#       LL. Continuation in an uptrend.
-#
-#   hidden bearish: at pivot highs, price prints LH but indicator prints
-#       HH. Continuation in a downtrend.
-#
-# ``b`` is always the most recent pivot (and must be within
-# ``max_age_bars``, counted on the caller's bar clock -- session bars while
-# session indicators are on and the clock is inside the session); ``a`` is
-# the nearest earlier pivot, within ``pivot_lookback``, that satisfies the
-# price half of the pattern, and a pivot in between that contradicts it
-# means there is no divergence. See
-# ``find_divergence`` for why it is the nearest and not merely any.
-# ---------------------------------------------------------------------------
-
-
-_DivergencePoint = tuple[int, "pd.Timestamp", float]
-
-
-class DivergenceMatch:
-    """A confirmed divergence between two pivot points and a momentum
-    indicator series.
-
-    Stored as a small immutable record so consumers (engine score
-    adjustments, dashboard chart overlay, shared entry candidate builder)
-    can read pivot positions, indicator values, and freshness without
-    re-deriving them. ``__slots__`` keeps memory footprint tight when many
-    contexts hold these — typically 8 fields per TechnicalLevelsContext.
-
-    ``age_bars`` is how many bars have closed since ``b``, counted on the
-    ``bar_clock`` ``find_divergence`` was given. The builders pass the
-    session-bar clock while session indicators are on and the clock is
-    inside the session (``indicators.indicator_session_open``), so it is SESSION
-    bars there: the overnight between yesterday's last pivot and today's
-    open is not part of the age. Without a clock (session indicators off, or
-    a reader outside the session) it is every bar. The pivot positions are
-    frame positions either way.
-    """
-
-    __slots__ = (
-        "kind",
-        "direction",
-        "indicator",
-        "pivot_a_pos",
-        "pivot_a_ts",
-        "pivot_a_price",
-        "pivot_a_indicator",
-        "pivot_b_pos",
-        "pivot_b_ts",
-        "pivot_b_price",
-        "pivot_b_indicator",
-        "indicator_delta",
-        "age_bars",
-    )
-
-    kind: str
-    direction: str
-    indicator: str
-    pivot_a_pos: int
-    pivot_a_ts: pd.Timestamp
-    pivot_a_price: float
-    pivot_a_indicator: float
-    pivot_b_pos: int
-    pivot_b_ts: pd.Timestamp
-    pivot_b_price: float
-    pivot_b_indicator: float
-    indicator_delta: float
-    age_bars: int
-
-    def __init__(
-        self,
-        *,
-        kind: str,
-        direction: str,
-        indicator: str,
-        pivot_a_pos: int,
-        pivot_a_ts: pd.Timestamp,
-        pivot_a_price: float,
-        pivot_a_indicator: float,
-        pivot_b_pos: int,
-        pivot_b_ts: pd.Timestamp,
-        pivot_b_price: float,
-        pivot_b_indicator: float,
-        indicator_delta: float,
-        age_bars: int,
-    ) -> None:
-        self.kind = str(kind)
-        self.direction = str(direction)
-        self.indicator = str(indicator)
-        self.pivot_a_pos = int(pivot_a_pos)
-        self.pivot_a_ts = pivot_a_ts
-        self.pivot_a_price = float(pivot_a_price)
-        self.pivot_a_indicator = float(pivot_a_indicator)
-        self.pivot_b_pos = int(pivot_b_pos)
-        self.pivot_b_ts = pivot_b_ts
-        self.pivot_b_price = float(pivot_b_price)
-        self.pivot_b_indicator = float(pivot_b_indicator)
-        self.indicator_delta = float(indicator_delta)
-        self.age_bars = int(age_bars)
-
-    def __bool__(self) -> bool:
-        # All DivergenceMatch instances are truthy. Lets existing callers
-        # that test ``bool(getattr(ctx, "bullish_rsi_divergence", False))``
-        # keep working — None is falsy, a match is truthy.
-        return True
-
-    def __repr__(self) -> str:
-        return (
-            f"DivergenceMatch({self.kind} {self.direction} {self.indicator} "
-            f"a@{self.pivot_a_ts}={self.pivot_a_price:.4f}/{self.pivot_a_indicator:.4f} "
-            f"b@{self.pivot_b_ts}={self.pivot_b_price:.4f}/{self.pivot_b_indicator:.4f} "
-            f"age={self.age_bars}b delta={self.indicator_delta:.4f})"
-        )
-
-    def to_payload(self) -> dict[str, object]:
-        """Render to a JSON-friendly dict for chart / metadata export."""
-        return {
-            "kind": self.kind,
-            "direction": self.direction,
-            "indicator": self.indicator,
-            "pivot_a": {
-                "pos": int(self.pivot_a_pos),
-                "ts": str(self.pivot_a_ts),
-                "price": float(self.pivot_a_price),
-                "indicator": float(self.pivot_a_indicator),
-            },
-            "pivot_b": {
-                "pos": int(self.pivot_b_pos),
-                "ts": str(self.pivot_b_ts),
-                "price": float(self.pivot_b_price),
-                "indicator": float(self.pivot_b_indicator),
-            },
-            "indicator_delta": float(self.indicator_delta),
-            "age_bars": int(self.age_bars),
-        }
-
-
-def _pivot_indicator_value(indicator: pd.Series, pos: int) -> float | None:
-    if pos < 0 or pos >= len(indicator):
-        return None
-    value = indicator.iloc[pos]
-    if pd.isna(value):
-        return None
-    return float(value)
-
-
-def _b_above_a(kind: str, direction: str) -> bool:
-    """Does the pattern need the latest pivot ``b`` ABOVE the earlier ``a``?
-    Regular bearish (HH) and hidden bullish (HL) do; regular bullish (LL) and
-    hidden bearish (LH) need it below."""
-    return (kind == "regular") == (direction == "bearish")
-
-
-def _price_condition(*, kind: str, direction: str, price_a: float, price_b: float,
-                     price_move_frac: float) -> bool:
-    """The price half of ``_qualifies`` -- does ``b`` make the swing the
-    pattern needs against ``a``, by at least ``price_move_frac``?"""
-    if _b_above_a(kind, direction):
-        return price_b > price_a * (1.0 + price_move_frac)
-    return price_b < price_a * (1.0 - price_move_frac)
-
-
-def _contradicts(*, kind: str, direction: str, price_a: float, price_b: float) -> bool:
-    """Is ``a`` on the wrong side of ``b`` for this pattern -- so that, against
-    the swing ``a`` marks, ``b`` made the OPPOSITE move to the one claimed?
-
-    Regular bullish: a lower low than ``b`` (``b`` is not the extreme).
-    Hidden bullish: a higher low than ``b`` (``b`` broke it -- not a higher
-    low). The bearish two mirror them. A pivot on the right side of ``b`` but
-    inside ``price_move_frac`` is neither: it is noise, and skipped."""
-    if _b_above_a(kind, direction):
-        return price_a > price_b
-    return price_a < price_b
-
-
-def _qualifies(
-    *,
-    kind: str,
-    direction: str,
-    price_a: float,
-    price_b: float,
-    ind_a: float,
-    ind_b: float,
-    price_move_frac: float,
-    indicator_delta: float,
-) -> tuple[bool, float]:
-    """Return ``(matched, |ind_b - ind_a|)`` for the requested pattern.
-
-    Pattern matrix (all four cases reduce to the same shape):
-
-      regular bullish (lows):  price_b < price_a*(1-frac), ind_b > ind_a + delta
-      regular bearish (highs): price_b > price_a*(1+frac), ind_b < ind_a - delta
-      hidden bullish  (lows):  price_b > price_a*(1+frac), ind_b < ind_a - delta
-      hidden bearish  (highs): price_b < price_a*(1-frac), ind_b > ind_a + delta
-    """
-    if kind == "regular" and direction == "bullish":
-        price_ok = price_b < price_a * (1.0 - price_move_frac)
-        ind_ok = ind_b > ind_a + indicator_delta
-    elif kind == "regular" and direction == "bearish":
-        price_ok = price_b > price_a * (1.0 + price_move_frac)
-        ind_ok = ind_b < ind_a - indicator_delta
-    elif kind == "hidden" and direction == "bullish":
-        price_ok = price_b > price_a * (1.0 + price_move_frac)
-        ind_ok = ind_b < ind_a - indicator_delta
-    elif kind == "hidden" and direction == "bearish":
-        price_ok = price_b < price_a * (1.0 - price_move_frac)
-        ind_ok = ind_b > ind_a + indicator_delta
-    else:
-        return False, 0.0
-    return bool(price_ok and ind_ok), abs(ind_b - ind_a)
-
-
-def find_divergence(
-    points: list[_DivergencePoint],
-    indicator: pd.Series,
-    *,
-    kind: str,
-    direction: str,
-    indicator_name: str,
-    price_move_frac: float,
-    indicator_delta: float,
-    pivot_lookback: int,
-    max_age_bars: int,
-    last_bar_pos: int,
-    price_scale: np.ndarray | None = None,
-    bar_clock: np.ndarray | None,
-) -> DivergenceMatch | None:
-    """Divergence between the latest swing and the swing it is measured
-    against, or None.
-
-    ``bar_clock`` (one value per bar of the frame the pivot positions index,
-    non-decreasing) is what ``b``'s age is counted on: ``clock[last_bar_pos]
-    - clock[pos_b]``. None counts every bar (``last_bar_pos - pos_b``). It
-    has no default, so no caller falls back to the all-bar age by leaving it
-    out. The builders pass ``np.cumsum`` of the indicator session mask while
-    session indicators are on and the clock is inside the session
-    (``indicators.indicator_session_open``), so the age is session bars. Until
-    2026-09-24 it was always every bar: with pivots paired only on session
-    bars, the post- and pre-market bars aged yesterday's last session pivot
-    past the limit overnight. On the divergence-age study's symbol-days with
-    a dense overnight tape (447 over 27 sessions on 60m, 554 over 29 on 15m)
-    the 60m HTF divergence read on none of the minutes from 09:30 to 11:00;
-    on session-bar age it reads on 23.6% of RTH minutes instead of 10.4%
-    (15m: 16.4% instead of 14.6%).
-
-    ``price_scale`` (``indicators.session_price_scale`` of the frame the pivot
-    positions index) puts the pivot prices on the scale the indicator was
-    computed on before they are compared; the match still reports the raw
-    prices. The session rsi14 / obv are stitched across the overnight gap,
-    so compared raw a gap alone made a "higher high" the RSI never saw: 371
-    of 571 cross-session HTF RSI divergences over 10 archived sessions were
-    the gap (2026-09-23).
-
-    ``points`` is a list of ``(pos, ts, price)`` tuples -- pivot lows for
-    bullish patterns, pivot highs for bearish ones.
-
-    ``b`` is the MOST RECENT pivot, and it must be within ``max_age_bars``.
-    A newer pivot that does not diverge supersedes an older one that did:
-    reporting the older one would describe a state the tape has moved past.
-
-    ``a`` is the NEAREST earlier pivot (within ``pivot_lookback``) that
-    satisfies the price half of the pattern, and only that pair has its
-    indicator tested. Pivots nearer than it that miss the minimum price move
-    are skipped as noise. A pivot on the WRONG side of ``b`` ends the scan
-    with no divergence (``_contradicts``): for regular divergence ``b`` is then
-    not the extreme of the swing, and for hidden divergence ``b`` broke the
-    swing it would be a higher low (or lower high) against. The regular half
-    of that rule landed first; hidden divergence kept skipping such pivots,
-    so lows 95 -> 103 -> 101 were reported as a hidden bullish divergence
-    95 -> 101 across the 103 swing that 101 broke.
-
-    Until 2026-09-22 this paired ``b`` with the OLDEST qualifying pivot in
-    the window. Lows at 100 (RSI 20), 96 (RSI 35), 95 (RSI 30) were reported
-    as a bullish divergence 100 -> 95, stepping over the 96 swing at which
-    RSI had in fact CONFIRMED the new low (30 < 35). Divergence is a claim
-    about the swing price just made against the one before it; an older
-    pivot is only a valid reference when nothing in between contradicts it.
-
-    Returns None when no pair qualifies or the indicator is missing at
-    either pivot.
-    """
-    if not points or len(points) < 2:
-        return None
-    pivot_lookback = max(2, int(pivot_lookback))
-    max_age_bars = max(0, int(max_age_bars))
-    candidates = points[-pivot_lookback:]
-    if len(candidates) < 2:
-        return None
-    def _on_scale(pos: int, price: float) -> float:
-        return float(price) * (float(price_scale[int(pos)]) if price_scale is not None else 1.0)
-
-    pos_b, ts_b, price_b = candidates[-1]
-    if bar_clock is None:
-        age = max(0, int(last_bar_pos) - int(pos_b))
-    else:
-        age = max(0, int(bar_clock[int(last_bar_pos)]) - int(bar_clock[int(pos_b)]))
-    if age > max_age_bars:
-        return None
-    ind_b = _pivot_indicator_value(indicator, pos_b)
-    if ind_b is None:
-        return None
-    cmp_b = _on_scale(pos_b, price_b)
-    for pos_a, ts_a, price_a in reversed(candidates[:-1]):
-        cmp_a = _on_scale(pos_a, price_a)
-        if _contradicts(kind=kind, direction=direction, price_a=cmp_a, price_b=cmp_b):
-            return None
-        if not _price_condition(kind=kind, direction=direction, price_a=cmp_a,
-                                price_b=cmp_b, price_move_frac=float(price_move_frac)):
-            continue
-        ind_a = _pivot_indicator_value(indicator, pos_a)
-        if ind_a is None:
-            return None
-        matched, delta = _qualifies(
-            kind=kind,
-            direction=direction,
-            price_a=cmp_a,
-            price_b=cmp_b,
-            ind_a=ind_a,
-            ind_b=ind_b,
-            price_move_frac=float(price_move_frac),
-            indicator_delta=float(indicator_delta),
-        )
-        if not matched:
-            return None
-        return DivergenceMatch(
-            kind=kind,
-            direction=direction,
-            indicator=indicator_name,
-            pivot_a_pos=int(pos_a),
-            pivot_a_ts=ts_a,
-            pivot_a_price=float(price_a),
-            pivot_a_indicator=float(ind_a),
-            pivot_b_pos=int(pos_b),
-            pivot_b_ts=ts_b,
-            pivot_b_price=float(price_b),
-            pivot_b_indicator=float(ind_b),
-            indicator_delta=float(delta),
-            age_bars=int(age),
-        )
-    return None

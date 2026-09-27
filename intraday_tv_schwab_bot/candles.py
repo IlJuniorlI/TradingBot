@@ -8,8 +8,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .numeric import safe_float
-
 # TA-Lib is a pinned dependency. A missing one (or its C library) fails
 # pattern detection where it is used, with the import error as the cause
 # (_require_talib); any other import failure (a broken build) raises here.
@@ -236,33 +234,43 @@ def _normalize_allowed_patterns(allowed_patterns: Iterable[str] | None, bullish:
     return tuple(sorted(selected))
 
 
-def _ohlc_frame_key(frame: pd.DataFrame | None, lookback: int = CANDLE_CONTEXT_BARS) -> tuple[tuple[float | None, float | None, float | None, float | None], ...]:
+# One bar of a frame key: (open, high, low, close). The key is the hashable
+# form of an _ohlc_subset, the lru_cache key of every detector below.
+_Bar = tuple[float, float, float, float]
+_FrameKey = tuple[_Bar, ...]
+
+
+def _ohlc_subset(frame: pd.DataFrame | None, lookback: int, *, min_bars: int) -> pd.DataFrame | None:
+    """The last ``max(lookback, min_bars)`` bars of ``frame``'s
+    open/high/low/close, read as numbers, less every bar with a field that
+    is missing or does not read as one; None when no bar is left.
+
+    ``min_bars`` is the caller's floor on ``lookback``: 1 for the
+    latest-snapshot key, ``CANDLE_CONTEXT_BARS`` for the per-bar map.
+    """
     if frame is None or frame.empty:
-        return tuple()
-    subset = frame[["open", "high", "low", "close"]].tail(max(int(lookback), 1)).copy()
-    if subset.empty:
-        return tuple()
+        return None
+    subset = frame[["open", "high", "low", "close"]].tail(max(int(lookback), min_bars)).copy()
     for col in ("open", "high", "low", "close"):
         subset[col] = pd.to_numeric(subset[col], errors="coerce")
     subset = subset.dropna(subset=["open", "high", "low", "close"])
-    if subset.empty:
-        return tuple()
-    out: list[tuple[float | None, float | None, float | None, float | None]] = []
-    for row in subset.itertuples(index=False, name=None):
-        open_, high_, low_, close_ = row
-        out.append(
-            (
-                safe_float(open_),
-                safe_float(high_),
-                safe_float(low_),
-                safe_float(close_),
-            )
-        )
-    return tuple(out)
+    return None if subset.empty else subset
+
+
+def _key_from_subset(subset: pd.DataFrame) -> _FrameKey:
+    return tuple(
+        (float(open_), float(high), float(low), float(close))
+        for open_, high, low, close in subset.itertuples(index=False, name=None)
+    )
+
+
+def _ohlc_frame_key(frame: pd.DataFrame | None, lookback: int = CANDLE_CONTEXT_BARS) -> _FrameKey:
+    subset = _ohlc_subset(frame, lookback, min_bars=1)
+    return tuple() if subset is None else _key_from_subset(subset)
 
 
 @lru_cache(maxsize=4096)
-def _ohlc_arrays_from_key(frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _ohlc_arrays_from_key(frame_key: _FrameKey) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if not frame_key:
         empty = np.asarray([], dtype=float)
         return empty, empty, empty, empty
@@ -277,7 +285,7 @@ def _ohlc_arrays_from_key(frame_key: tuple[tuple[float | None, float | None, flo
 
 @lru_cache(maxsize=1024)
 def _talib_pattern_value_from_key(
-    frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...],
+    frame_key: _FrameKey,
     func_name: str,
 ) -> int:
     if not frame_key:
@@ -305,44 +313,40 @@ def _talib_pattern_value_from_key(
     return 0
 
 
-def _range_from_row(row: tuple[float | None, float | None, float | None, float | None]) -> float:
+def _range_from_row(row: _Bar) -> float:
     _open, high, low, _close = row
-    if high is None or low is None:
-        return 0.0
-    return max(0.0, float(high) - float(low))
+    return max(0.0, high - low)
 
 
-def _bull_from_row(row: tuple[float | None, float | None, float | None, float | None]) -> bool:
+def _bull_from_row(row: _Bar) -> bool:
     open_, _high, _low, close = row
-    return open_ is not None and close is not None and float(close) > float(open_)
+    return close > open_
 
 
-def _bear_from_row(row: tuple[float | None, float | None, float | None, float | None]) -> bool:
+def _bear_from_row(row: _Bar) -> bool:
     open_, _high, _low, close = row
-    return open_ is not None and close is not None and float(close) < float(open_)
+    return close < open_
 
 
-def _near(a: float | None, b: float | None, tolerance: float) -> bool:
-    if a is None or b is None:
-        return False
-    return abs(float(a) - float(b)) <= max(0.0, float(tolerance))
+def _near(a: float, b: float, tolerance: float) -> bool:
+    return abs(a - b) <= max(0.0, tolerance)
 
 
-def _tweezer_bottom_at(pair: tuple[tuple[float | None, ...], tuple[float | None, ...]]) -> bool:
+def _tweezer_bottom_at(pair: tuple[_Bar, _Bar]) -> bool:
     prev, cur = pair
     tolerance = max(_range_from_row(prev), _range_from_row(cur)) * 0.05
     return bool(_bear_from_row(prev) and _bull_from_row(cur) and _near(prev[2], cur[2], tolerance))
 
 
-def _tweezer_top_at(pair: tuple[tuple[float | None, ...], tuple[float | None, ...]]) -> bool:
+def _tweezer_top_at(pair: tuple[_Bar, _Bar]) -> bool:
     prev, cur = pair
     tolerance = max(_range_from_row(prev), _range_from_row(cur)) * 0.05
     return bool(_bull_from_row(prev) and _bear_from_row(cur) and _near(prev[1], cur[1], tolerance))
 
 
 def _tweezer_pairs(
-    frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...],
-) -> list[tuple[tuple[float | None, ...], tuple[float | None, ...]]]:
+    frame_key: _FrameKey,
+) -> list[tuple[_Bar, _Bar]]:
     """The adjacent bar pairs completing within the persistence window."""
     pairs = []
     for offset in range(CANDLE_PERSISTENCE_BARS):
@@ -353,11 +357,11 @@ def _tweezer_pairs(
     return pairs
 
 
-def _tweezer_bottom_from_key(frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...]) -> bool:
+def _tweezer_bottom_from_key(frame_key: _FrameKey) -> bool:
     return any(_tweezer_bottom_at(pair) for pair in _tweezer_pairs(frame_key))
 
 
-def _tweezer_top_from_key(frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...]) -> bool:
+def _tweezer_top_from_key(frame_key: _FrameKey) -> bool:
     return any(_tweezer_top_at(pair) for pair in _tweezer_pairs(frame_key))
 
 
@@ -383,7 +387,7 @@ def _talib_value_matches_side(token: str, value: int, *, bullish: bool) -> bool:
 
 
 def _evaluate_side_pattern(
-    frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...],
+    frame_key: _FrameKey,
     name: str,
     *,
     bullish: bool,
@@ -399,18 +403,9 @@ def _evaluate_side_pattern(
     return _talib_value_matches_side(token, value, bullish=bullish)
 
 
-@lru_cache(maxsize=4096)
-def _detect_side_patterns_cached(
-    frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...],
-    allowed: tuple[str, ...],
-    bullish: bool,
-) -> tuple[str, ...]:
-    """Detect matching candle patterns with longest-tier-wins cascade.
-
-    Each pattern fires via ``_evaluate_side_pattern`` using the existing
-    3-bar persistence window (TA-Lib's completion-bar lookback). After
-    detection, results are grouped by pattern length (1/2/3 bars) and
-    only the longest non-empty tier is returned.
+def _tier_cascade(matches: Iterable[str]) -> tuple[str, ...]:
+    """Longest tier wins: the ``matches`` of the longest pattern length
+    (3, then 2, then 1 bars), sorted; empty when nothing matched.
 
     Rationale: a 3-bar Morning Star describes the same 3 candles that
     also fire 1-bar Marubozu / Belt Hold / Long Line on the 3rd bar. The
@@ -421,18 +416,26 @@ def _detect_side_patterns_cached(
     user-facing "4 bullish + 3 bearish patterns" noise where a single
     strong-bodied bar generates a flood of overlapping 1-bar readings.
     """
+    names = list(matches)
+    if not names:
+        return tuple()
+    longest = max(pattern_length(name) for name in names)
+    return tuple(sorted(name for name in names if pattern_length(name) == longest))
+
+
+@lru_cache(maxsize=4096)
+def _detect_side_patterns_cached(
+    frame_key: _FrameKey,
+    allowed: tuple[str, ...],
+    bullish: bool,
+) -> tuple[str, ...]:
+    """The ``allowed`` patterns that match the latest bars, through
+    ``_tier_cascade``. Each pattern fires via ``_evaluate_side_pattern``
+    using the 3-bar persistence window (TA-Lib's completion-bar lookback).
+    """
     if not frame_key or not allowed:
         return tuple()
-    matches_by_tier: dict[int, list[str]] = {3: [], 2: [], 1: []}
-    for name in allowed:
-        if _evaluate_side_pattern(frame_key, name, bullish=bullish):
-            tier = pattern_length(name)
-            matches_by_tier.setdefault(tier, []).append(name)
-    for tier_length in (3, 2, 1):
-        tier_matches = matches_by_tier.get(tier_length) or []
-        if tier_matches:
-            return tuple(sorted(tier_matches))
-    return tuple()
+    return _tier_cascade(name for name in allowed if _evaluate_side_pattern(frame_key, name, bullish=bullish))
 
 
 def summarize_pattern_matches(matches: Iterable[str] | None) -> dict[str, Any]:
@@ -519,7 +522,7 @@ def summarize_candle_context_from_matches(
 
 @lru_cache(maxsize=2048)
 def _detect_candle_context_cached(
-    frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...],
+    frame_key: _FrameKey,
     bullish_allowed: tuple[str, ...],
     bearish_allowed: tuple[str, ...],
 ) -> dict[str, Any]:
@@ -558,7 +561,7 @@ def detect_candle_context(
 
 @lru_cache(maxsize=1024)
 def _talib_pattern_array_from_key(
-    frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...],
+    frame_key: _FrameKey,
     func_name: str,
 ) -> tuple[int, ...]:
     """Full per-bar TA-Lib output for ``func_name`` against ``frame_key``.
@@ -606,45 +609,19 @@ def detect_per_bar_candle_patterns(
     unchanged and remains the source for the strategy's tech_ctx +
     candle_pattern_exit gates.
     """
-    if frame is None or frame.empty:
+    subset = _ohlc_subset(frame, lookback, min_bars=CANDLE_CONTEXT_BARS)
+    if subset is None:
         return {}
-    effective_lookback = max(int(lookback), CANDLE_CONTEXT_BARS)
-    # Build the dropna'd subset ONCE and derive both frame_key and timestamps
-    # from it — guarantees positional alignment. Previously frame_key came
-    # from _ohlc_frame_key (which dropna's) but timestamps came from a raw
-    # frame.tail(), so any NaN-OHLC bars in the tail would shift the index
-    # away from the TA-Lib output positions.
-    subset = frame[["open", "high", "low", "close"]].tail(effective_lookback).copy()
-    if subset.empty:
-        return {}
-    for col in ("open", "high", "low", "close"):
-        subset[col] = pd.to_numeric(subset[col], errors="coerce")
-    subset = subset.dropna(subset=["open", "high", "low", "close"])
-    if subset.empty:
-        return {}
-    frame_key: tuple[tuple[float | None, float | None, float | None, float | None], ...] = tuple(
-        (
-            safe_float(row[0]),
-            safe_float(row[1]),
-            safe_float(row[2]),
-            safe_float(row[3]),
-        )
-        for row in subset.itertuples(index=False, name=None)
-    )
-    if not frame_key:
-        return {}
+    # The frame_key and the timestamps both come from the one dropna'd
+    # subset, so TA-Lib output position i is the bar at timestamps[i]. Taking
+    # the timestamps from a raw frame.tail() instead would shift every bar
+    # after a NaN-OHLC one.
+    frame_key = _key_from_subset(subset)
+    timestamps = list(subset.index)
     bullish_allowed_tuple = _normalize_allowed_patterns(bullish_allowed, bullish=True)
     bearish_allowed_tuple = _normalize_allowed_patterns(bearish_allowed, bullish=False)
 
     n = len(frame_key)
-    timestamps = list(subset.index)
-    if len(timestamps) != n:
-        # Defensive: the dropna subset and the frame_key derived from it
-        # must always have the same length. If they don't (shouldn't be
-        # possible after the rewrite above), fall back to no per-bar
-        # mapping rather than emitting misaligned data.
-        return {}
-
     bullish_by_pos: dict[int, list[str]] = {i: [] for i in range(n)}
     bearish_by_pos: dict[int, list[str]] = {i: [] for i in range(n)}
 
@@ -678,22 +655,10 @@ def detect_per_bar_candle_patterns(
             if _talib_value_matches_side(token, v, bullish=False):
                 bearish_by_pos[i].append(token)
 
-    def _apply_tier_cascade(matches: list[str]) -> list[str]:
-        if not matches:
-            return []
-        by_tier: dict[int, list[str]] = {3: [], 2: [], 1: []}
-        for name in matches:
-            by_tier.setdefault(pattern_length(name), []).append(name)
-        for tier_length in (3, 2, 1):
-            tier_matches = by_tier.get(tier_length) or []
-            if tier_matches:
-                return sorted(set(tier_matches))
-        return []
-
     out: dict[Any, dict[str, list[str]]] = {}
     for i, ts in enumerate(timestamps):
-        bull = _apply_tier_cascade(bullish_by_pos.get(i, []))
-        bear = _apply_tier_cascade(bearish_by_pos.get(i, []))
+        bull = list(_tier_cascade(bullish_by_pos[i]))
+        bear = list(_tier_cascade(bearish_by_pos[i]))
         if not bull and not bear:
             continue
         out[ts] = {"bullish": bull, "bearish": bear}
