@@ -373,8 +373,8 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         what it asks for either way)."""
         ema_fast_span, ema_slow_span = htf_ema_spans(self.params)
         return {
-            "timeframe_minutes": self._htf_minutes(),
-            "lookback_days": self._htf_lookback_days(),
+            "timeframe_minutes": self.htf_minutes(),
+            "lookback_days": self.htf_lookback_days(),
             "pivot_span": int(self._support_resistance_setting("pivot_span", 2) or 2),
             "max_levels_per_side": int(self._support_resistance_setting("max_levels_per_side", 6) or 6),
             # Checked at load (above 0); a 0 read as 0.35 / 0.003 until
@@ -403,15 +403,13 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
 
     def _htf_trend_context(self, symbol: str, data, *, allow_refresh: bool = True) -> dict[str, Any]:
         p = self.params
-        sr_cfg = getattr(self.config, "support_resistance", None)
         if data is None or not hasattr(data, "get_htf_frame"):
             return {"available": False, "reason": "no_data_feed"}
-        htf_tf = int(p.get("htf_minutes", 15))
-        lookback_days = int(p.get("htf_lookback_days", getattr(sr_cfg, "lookback_days", 10) if sr_cfg is not None else 10))
+        htf_tf = self.htf_minutes()
         frame = data.get_htf_frame(
             symbol,
             timeframe_minutes=htf_tf,
-            lookback_days=lookback_days,
+            lookback_days=self.htf_lookback_days(),
             allow_refresh=allow_refresh,
         )
         min_bars = int(p.get("htf_min_bars", 20))
@@ -940,10 +938,10 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         if not no_trade and sr_cfg is not None and bool(getattr(sr_cfg, "structure_enabled", True)):
             if regime == "bullish_trend" and mshtf_ctx.bias == "bearish":
                 no_trade = True
-                reasons.append(f"htf_structure_bearish(tf={self._htf_minutes()}m,last_high={mshtf_ctx.last_high_label},last_low={mshtf_ctx.last_low_label})")
+                reasons.append(f"htf_structure_bearish(tf={self.htf_minutes()}m,last_high={mshtf_ctx.last_high_label},last_low={mshtf_ctx.last_low_label})")
             elif regime == "bearish_trend" and mshtf_ctx.bias == "bullish":
                 no_trade = True
-                reasons.append(f"htf_structure_bullish(tf={self._htf_minutes()}m,last_high={mshtf_ctx.last_high_label},last_low={mshtf_ctx.last_low_label})")
+                reasons.append(f"htf_structure_bullish(tf={self.htf_minutes()}m,last_high={mshtf_ctx.last_high_label},last_low={mshtf_ctx.last_low_label})")
 
         return {
             "ok": True,

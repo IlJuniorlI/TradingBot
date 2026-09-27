@@ -323,7 +323,7 @@ class EntryGatekeeper:
                 if isinstance(ms_ltf_fields, Mapping):
                     out.update({k: v for k, v in ms_ltf_fields.items() if v is not None})
                 current_price = safe_float(out.get('close'), None)
-                sr_ctx = self.data.get_support_resistance(candidate.symbol, current_price=current_price, flip_frame=frame, mode="trading", timeframe_minutes=self.position_manager.active_htf_minutes(), lookback_days=self.position_manager.active_htf_lookback_days())
+                sr_ctx = self.data.get_support_resistance(candidate.symbol, current_price=current_price, flip_frame=frame, mode="trading", timeframe_minutes=self.strategy.htf_minutes(), lookback_days=self.strategy.htf_lookback_days())
                 mshtf_ctx = getattr(sr_ctx, 'market_structure', None) if sr_ctx is not None else None
                 if mshtf_ctx is not None:
                     mshtf_fields = structure_lists(mshtf_ctx, prefix='mshtf')

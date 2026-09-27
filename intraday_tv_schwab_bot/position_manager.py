@@ -22,10 +22,9 @@ Design notes:
 - Each position is managed on its own: an exception while managing one is
   logged against it, and escalated when it persists, and the others are
   managed as usual (``manage_positions``).
-- Config accessors ``active_htf_*`` (HTF timeframe / lookback) live here
-  so engine call sites in entry / screening paths can dispatch through
-  ``self.position_manager.active_htf_*()`` — the accessors read
-  ``self.config`` and ``self.strategy.params`` and have a single home.
+- The HTF timeframe / lookback are the strategy's
+  (``self.strategy.htf_minutes()`` / ``htf_lookback_days()``), the one
+  resolution the engine, the entry gatekeeper and the dashboard read too.
   HTF refresh cadence is now bar-aligned in ``MarketDataStore.should_refresh_htf_context``
   so there's no longer a refresh-seconds knob on the strategy side.
 """
@@ -324,25 +323,6 @@ class PositionManager:
         # Position key -> consecutive management cycles in which managing
         # that position raised; see _position_failed.
         self._failure_streaks: dict[str, int] = {}
-
-    # ------------------------------------------------------------------
-    # SR-config accessors (read config + strategy params).
-    # ------------------------------------------------------------------
-
-    def active_htf_minutes(self) -> int:
-        """HTF (higher timeframe) for SR detection — strategies declare via
-        `params.htf_minutes`; otherwise inherit
-        `support_resistance.timeframe_minutes`."""
-        cfg = getattr(self.config, "support_resistance", None)
-        fallback = int(getattr(cfg, "timeframe_minutes", 15)) if cfg is not None else 15
-        params = getattr(getattr(self, "strategy", None), "params", {}) or {}
-        return int(params.get("htf_minutes", fallback))
-
-    def active_htf_lookback_days(self) -> int:
-        cfg = getattr(self.config, "support_resistance", None)
-        fallback = int(getattr(cfg, "lookback_days", 10)) if cfg is not None else 10
-        params = getattr(getattr(self, "strategy", None), "params", {}) or {}
-        return int(params.get("htf_lookback_days", fallback))
 
     # ------------------------------------------------------------------
     # Mark-price resolution for open positions.
@@ -783,7 +763,7 @@ class PositionManager:
         if frame is None or frame.empty or last_price <= 0:
             return
         symbol = str(position.metadata.get("underlying") or position.symbol)
-        sr_ctx = self.data.get_support_resistance(symbol, current_price=last_price, flip_frame=frame, mode="trading", timeframe_minutes=self.active_htf_minutes(), lookback_days=self.active_htf_lookback_days()) if self.data is not None else None
+        sr_ctx = self.data.get_support_resistance(symbol, current_price=last_price, flip_frame=frame, mode="trading", timeframe_minutes=self.strategy.htf_minutes(), lookback_days=self.strategy.htf_lookback_days()) if self.data is not None else None
         if sr_ctx is None:
             return
         last = frame.iloc[-1]
@@ -995,7 +975,7 @@ class PositionManager:
                                     f"unknown ({price_at!r}); taking the target without a hold")
             return
         symbol = str(meta.get("underlying") or position.symbol)
-        sr_ctx = self.data.get_support_resistance(symbol, current_price=last_price, flip_frame=frame, mode="trading", timeframe_minutes=self.active_htf_minutes(), lookback_days=self.active_htf_lookback_days(), allow_refresh=True) if self.data is not None else None
+        sr_ctx = self.data.get_support_resistance(symbol, current_price=last_price, flip_frame=frame, mode="trading", timeframe_minutes=self.strategy.htf_minutes(), lookback_days=self.strategy.htf_lookback_days(), allow_refresh=True) if self.data is not None else None
         # A level buffer that is not a finite number is no buffer, and one at
         # or below 0 never beats the price term: the zone and price terms set
         # the stop buffer then.

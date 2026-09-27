@@ -310,6 +310,26 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The strategy's timeframes have one home (refactor cut C32).**
+  *2026-09-27* — `BaseStrategy.htf_minutes()`, `htf_lookback_days()` and
+  `ltf_minutes()` are public, and the engine (the context refresh and the
+  S/R precompute), the position manager (S/R-flip management and the
+  ladder's touch hold), the entry gatekeeper, the dashboard and the session
+  archive ask the strategy for them. `DashboardCache._active_htf_minutes` /
+  `_active_htf_lookback_days` / `_active_ltf_minutes`,
+  `PositionManager.active_htf_minutes` / `active_htf_lookback_days` and the
+  archive's own resolution are gone, and so is the dashboard structure
+  overlay's `params.ltf_minutes` read; 0DTE's HTF trend reads the accessors
+  instead of the params with a literal fallback (its manifests declare the
+  keys). There is no alias. No behaviour changes: every copy was the same
+  read. A strategy handed to the dashboard, the position manager or the
+  archive needs the methods; tests use `tests.support.brokers._StrategyStub`,
+  which borrows BaseStrategy's own. The layering guard
+  (`tests/test_module_layering.py`) fails any runtime or composition module
+  that reads a timeframe from a strategy's params, so a module that joins
+  the runtime layer is covered too. Tests: `tests/test_strategy_requests.py`
+  (new).
+
 - **The quote-price reads name their key order (refactor cut C31).**
   *2026-09-27* — `data_feed` holds the three orders beside the quote
   cache, each read with `numeric.first_float(..., positive=True)`:

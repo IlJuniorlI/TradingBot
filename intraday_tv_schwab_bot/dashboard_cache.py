@@ -592,22 +592,6 @@ class DashboardCache:
     # Payload builders that need data/strategy/account (Phase 5 Step 5).
     # ---------------------------------------------------------------------
 
-    def _active_htf_minutes(self) -> int:
-        """HTF (higher timeframe) for SR detection, key level zones, sidebar
-        ladder, engine SR/stops/exits. Strategies with their own HTF concept
-        declare it via `params.htf_minutes`; otherwise inherits the shared
-        default from `support_resistance.timeframe_minutes`."""
-        cfg = getattr(self.config, "support_resistance", None)
-        fallback = int(getattr(cfg, "timeframe_minutes", 15)) if cfg is not None else 15
-        params = getattr(self.strategy, "params", {}) or {}
-        return int(params.get("htf_minutes", fallback))
-
-    def _active_htf_lookback_days(self) -> int:
-        cfg = getattr(self.config, "support_resistance", None)
-        fallback = int(getattr(cfg, "lookback_days", 10)) if cfg is not None else 10
-        params = getattr(self.strategy, "params", {}) or {}
-        return int(params.get("htf_lookback_days", fallback))
-
     def _chart_htf_level_request(self) -> dict[str, Any]:
         """Level arguments of the HTF context the chart's HTF FVGs and RSI
         divergence lines are drawn from: the strategy's own HTF build
@@ -618,7 +602,7 @@ class DashboardCache:
         on ``htf_pivot_span``, so a preset changing it would chart
         divergences the score did not apply (and miss ones it did)."""
         sr_cfg = self.config.support_resistance
-        spec = self.strategy.dashboard_level_context_spec() if self.strategy is not None else None
+        spec = self.strategy.dashboard_level_context_spec()
         spec = spec if isinstance(spec, dict) else {}
         default_fast, default_slow = htf_ema_spans({})
         return {
@@ -630,14 +614,6 @@ class DashboardCache:
             "ema_fast_span": int(spec.get("ema_fast_span", default_fast)),
             "ema_slow_span": int(spec.get("ema_slow_span", default_slow)),
         }
-
-    def _active_ltf_minutes(self) -> int:
-        """LTF (lower timeframe / trigger frame). Strategies with a distinct
-        intraday trigger candle declare `params.ltf_minutes` (e.g.
-        peer_confirmed_key_levels uses 5-min trigger candles). Otherwise
-        defaults to 1-minute streamed bars."""
-        params = getattr(self.strategy, "params", {}) or {}
-        return int(params.get("ltf_minutes", 1))
 
     def _per_bar_candle_map(self, frame: pd.DataFrame, shown_bars: int) -> dict[Any, dict[str, list[str]]]:
         """Per-bar candle tags for the last ``shown_bars`` bars of ``frame``,
@@ -689,8 +665,8 @@ class DashboardCache:
         return spans
 
     def htf_trend(self, symbol: str, *, allow_refresh: bool = True) -> dict[str, Any]:
-        tf = self._active_htf_minutes()
-        lookback_days = self._active_htf_lookback_days()
+        tf = self.strategy.htf_minutes()
+        lookback_days = self.strategy.htf_lookback_days()
         frame = None
         if self.data is not None and hasattr(self.data, "get_htf_frame"):
             frame = self.data.get_htf_frame(
@@ -808,7 +784,7 @@ class DashboardCache:
         # Snapshot bars are 1m bars; they are the strategy's LTF bars (and are
         # merged into the LTF chart) only when its LTF is 1m.
         snapshot_ema_spans = (9, 20)
-        if bars and self._active_ltf_minutes() == 1:
+        if bars and self.strategy.ltf_minutes() == 1:
             snapshot_ema_spans = self._apply_strategy_ltf_emas(symbol, frame, bars, timeframe="1min")
         latest_bar: dict[str, Any] = bars[-1] if bars else {}
         session_total_volume: float | None = None
@@ -939,7 +915,7 @@ class DashboardCache:
         # with default LTF=1 keep using the 1m streamed frame; strategies
         # with non-1m LTF (e.g. peer_confirmed_key_levels at LTF=5m) get
         # 5m-derived fibs/AVWAP/etc. matching the LTF chart bars.
-        ltf_min_for_tech = self._active_ltf_minutes()
+        ltf_min_for_tech = self.strategy.ltf_minutes()
         if ltf_min_for_tech == 1:
             tech_frame = frame
         elif self.data is not None and symbol:
@@ -1131,8 +1107,8 @@ class DashboardCache:
             if need_htf_ctx and self.data is not None:
                 htf_ctx = self.data.get_htf_context(
                     symbol,
-                    timeframe_minutes=self._active_htf_minutes(),
-                    lookback_days=self._active_htf_lookback_days(),
+                    timeframe_minutes=self.strategy.htf_minutes(),
+                    lookback_days=self.strategy.htf_lookback_days(),
                     **self._chart_htf_level_request(),
                     allow_refresh=allow_refresh,
                     use_prior_day_high_low=bool(getattr(self.config.support_resistance, "use_prior_day_high_low", True)),
@@ -1143,7 +1119,7 @@ class DashboardCache:
                     fair_value_gap_min_pct=float(getattr(self.config.support_resistance, "fair_value_gap_min_pct", 0.0005) or 0.0005),
                 )
                 if include_fair_value_gaps and chart_wants_htf_fvgs and htf_ctx is not None:
-                    htf_min = self._active_htf_minutes()
+                    htf_min = self.strategy.htf_minutes()
                     htf_tf_minutes = int(getattr(htf_ctx, "timeframe_minutes", htf_min) or htf_min)
                     for gap in list(getattr(htf_ctx, "bullish_fvgs", []) or []) + list(getattr(htf_ctx, "bearish_fvgs", []) or []):
                         payload_fvg = dashboard_fvg_payload(gap)
@@ -1165,7 +1141,7 @@ class DashboardCache:
             include_ltf_fvgs = bool(getattr(sr_cfg, "ltf_fair_value_gaps_enabled", False)) if sr_cfg is not None else False
             chart_wants_ltf_fvgs = bool(compact_chart_profile.show_ltf_fair_value_gaps) or bool(expanded_chart_profile.show_ltf_fair_value_gaps)
             if include_ltf_fvgs and chart_wants_ltf_fvgs and self.data is not None:
-                ltf_min_for_fvg = self._active_ltf_minutes()
+                ltf_min_for_fvg = self.strategy.ltf_minutes()
                 fvg_ctx = self.data.get_fair_value_gap_context(
                     symbol,
                     timeframe_minutes=ltf_min_for_fvg,
@@ -1215,7 +1191,7 @@ class DashboardCache:
             include_htf_obs = bool(getattr(sr_cfg, "htf_order_blocks_enabled", False)) if sr_cfg is not None else False
             chart_wants_htf_obs = bool(compact_chart_profile.show_htf_order_blocks) or bool(expanded_chart_profile.show_htf_order_blocks)
             if include_htf_obs and chart_wants_htf_obs and self.data is not None and ob_kwargs is not None:
-                htf_minutes = self._active_htf_minutes()
+                htf_minutes = self.strategy.htf_minutes()
                 # Cycle-cached: hits get_order_block_context's cache when the
                 # strategy already computed it earlier in the same cycle.
                 ob_ctx_htf = self.data.get_order_block_context(
@@ -1246,7 +1222,7 @@ class DashboardCache:
             if include_ltf_obs and chart_wants_ltf_obs and self.data is not None and ob_kwargs is not None:
                 # Cycle-cached: same cache as the strategy uses when it calls
                 # `_ltf_order_block_context` during entry evaluation.
-                ltf_min_for_ob = self._active_ltf_minutes()
+                ltf_min_for_ob = self.strategy.ltf_minutes()
                 ob_ctx_ltf = self.data.get_order_block_context(
                     symbol,
                     timeframe_minutes=ltf_min_for_ob,
@@ -1874,8 +1850,8 @@ class DashboardCache:
             current_price=current_price,
             flip_frame=self.data.get_merged(symbol, with_indicators=False),
             mode="trading",
-            timeframe_minutes=self._active_htf_minutes(),
-            lookback_days=self._active_htf_lookback_days(),
+            timeframe_minutes=self.strategy.htf_minutes(),
+            lookback_days=self.strategy.htf_lookback_days(),
             allow_refresh=allow_refresh,
         )
         if ctx is None:
@@ -1907,8 +1883,8 @@ class DashboardCache:
                 if sr_cfg is not None:
                     htf_ctx = self.data.get_htf_context(
                         symbol,
-                        timeframe_minutes=self._active_htf_minutes(),
-                        lookback_days=self._active_htf_lookback_days(),
+                        timeframe_minutes=self.strategy.htf_minutes(),
+                        lookback_days=self.strategy.htf_lookback_days(),
                         pivot_span=int(getattr(sr_cfg, "pivot_span", 2) or 2),
                         max_levels_per_side=int(getattr(sr_cfg, "max_levels_per_side", 3) or 3),
                         atr_tolerance_mult=float(sr_cfg.atr_tolerance_mult),  # checked at load (above 0)
@@ -1959,11 +1935,11 @@ class DashboardCache:
         elif ctx.breakdown_below_support and not bearish_conflict:
             state = "breakdown_watch"
 
-        htf_min_active = self._active_htf_minutes()
+        htf_min_active = self.strategy.htf_minutes()
         timeframe_minutes = int(getattr(ctx, "timeframe_minutes", htf_min_active) or htf_min_active)
         symbol_key = str(symbol or "").upper().strip()
         htf_refresh = self.data.last_htf_refresh.get((symbol_key, timeframe_minutes)) if symbol_key else None
-        ltf_min = max(1, self._active_ltf_minutes())
+        ltf_min = max(1, self.strategy.ltf_minutes())
 
         return {
             "symbol": symbol,
@@ -2021,7 +1997,7 @@ class DashboardCache:
         cached snapshot can be returned or must be recomputed."""
         if not allow_refresh:
             return False
-        sr_tf = self._active_htf_minutes()
+        sr_tf = self.strategy.htf_minutes()
         if self.data.should_refresh_support_resistance(symbol, timeframe_minutes=sr_tf):
             return True
         if self.data.should_refresh_htf_context(symbol, sr_tf):
@@ -2049,7 +2025,7 @@ class DashboardCache:
         quote_refresh = self.data.last_quote_refresh.get(symbol_key) if symbol_key else None
         history_refresh = self.data.last_history_refresh.get(symbol_key) if symbol_key else None
         stream_refresh = self.data.last_stream_update.get(symbol_key) if symbol_key else None
-        htf_refresh = self.data.last_htf_refresh.get((symbol_key, self._active_htf_minutes())) if symbol_key else None
+        htf_refresh = self.data.last_htf_refresh.get((symbol_key, self.strategy.htf_minutes())) if symbol_key else None
         quote_body = quote or {}
         return (
             dashboard_frame_signature(frame),
@@ -2200,11 +2176,10 @@ class DashboardCache:
             # min-pivot-gap filter (Fix B/D, 2026-05-27); the HTF/base context
             # does not. Detect the LTF chart by matching the display timeframe
             # to the strategy's effective LTF structure timeframe
-            # (structure_ltf_timeframe_minutes, falling back to
-            # params.ltf_minutes). HTF / other timeframes keep the original
-            # base-param behavior unchanged.
-            strat_params = getattr(self.strategy, "params", {}) or {}
-            ltf_struct_tf = int(getattr(sr_cfg, "structure_ltf_timeframe_minutes", 0) or 0) or int(strat_params.get("ltf_minutes", 1) or 1)
+            # (structure_ltf_timeframe_minutes, falling back to the
+            # strategy's ltf_minutes()). HTF / other timeframes keep the
+            # original base-param behavior unchanged.
+            ltf_struct_tf = int(getattr(sr_cfg, "structure_ltf_timeframe_minutes", 0) or 0) or (self.strategy.ltf_minutes() or 1)
             is_ltf_chart = int(timeframe_minutes or 1) == ltf_struct_tf
             overlay_pivot_span = (
                 int(getattr(sr_cfg, "structure_ltf_pivot_span", 2) or 2)
@@ -2286,8 +2261,8 @@ class DashboardCache:
             capped_bars = max(1, min(int(max_bars or 90), 480))
         except (TypeError, ValueError):
             capped_bars = 90
-        ltf_min = max(1, self._active_ltf_minutes())
-        htf_min = self._active_htf_minutes()
+        ltf_min = max(1, self.strategy.ltf_minutes())
+        htf_min = self.strategy.htf_minutes()
         if resolved_mode == "htf":
             timeframe_minutes = htf_min
             timeframe_label = f"{htf_min}m"
@@ -2326,7 +2301,7 @@ class DashboardCache:
             stored_frame = self.data.get_htf_frame(
                 symbol_key,
                 timeframe_minutes=htf_min,
-                lookback_days=self._active_htf_lookback_days(),
+                lookback_days=self.strategy.htf_lookback_days(),
                 allow_refresh=False,
             )
             minute_frame = self.data.get_merged(symbol_key, with_indicators=False)

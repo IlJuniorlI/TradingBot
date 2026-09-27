@@ -989,8 +989,8 @@ class IntradayBot:
                 )
 
             if gate_state.context_refresh_active and getattr(self.config, "support_resistance", None) is not None and bool(self.config.support_resistance.enabled):
-                sr_tf = self.position_manager.active_htf_minutes()
-                sr_lookback = self.position_manager.active_htf_lookback_days()
+                sr_tf = self.strategy.htf_minutes()
+                sr_lookback = self.strategy.htf_lookback_days()
                 # Pre-normalize so the should_refresh check and the threaded
                 # fetch agree on cache keys (data_feed._symbol_key applies the
                 # same upper().strip()).
@@ -1187,8 +1187,8 @@ class IntradayBot:
                 current_price=current_price,
                 flip_frame=frame,
                 mode="trading",
-                timeframe_minutes=self.position_manager.active_htf_minutes(),
-                lookback_days=self.position_manager.active_htf_lookback_days(),
+                timeframe_minutes=self.strategy.htf_minutes(),
+                lookback_days=self.strategy.htf_lookback_days(),
                 allow_refresh=allow_refresh,
                 use_prior_day_high_low=bool(getattr(sr_cfg, "use_prior_day_high_low", True)),
                 use_prior_week_high_low=bool(getattr(sr_cfg, "use_prior_week_high_low", True)),

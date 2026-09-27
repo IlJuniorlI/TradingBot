@@ -871,8 +871,8 @@ class SharedEntryPolicy:
         if not self.config.shared_entry.use_fvg_context:
             return _disabled_fvg_score(), _disabled_fvg_score()
         return (
-            self._score_fvg_context(close, htf_ctx, timeframe_minutes=getattr(htf_ctx, "timeframe_minutes", self.strategy._htf_minutes())),
-            self._score_fvg_context(close, ltf_ctx, timeframe_minutes=self.strategy._ltf_minutes()),
+            self._score_fvg_context(close, htf_ctx, timeframe_minutes=getattr(htf_ctx, "timeframe_minutes", self.strategy.htf_minutes())),
+            self._score_fvg_context(close, ltf_ctx, timeframe_minutes=self.strategy.ltf_minutes()),
         )
 
     # -- divergence ----------------------------------------------------------
@@ -2319,8 +2319,8 @@ class SharedEntryPolicy:
         htf_ctx = self.strategy._htf_context(
             symbol,
             data,
-            timeframe_minutes=self.strategy._htf_minutes(),
-            lookback_days=self.strategy._htf_lookback_days(),
+            timeframe_minutes=self.strategy.htf_minutes(),
+            lookback_days=self.strategy.htf_lookback_days(),
             pivot_span=int(self._support_resistance_setting("pivot_span", 2) or 2),
             max_levels_per_side=int(self._support_resistance_setting("max_levels_per_side", 6) or 6),
             # Checked at load (above 0); a 0 read as 0.35 / 0.003 until
@@ -2335,8 +2335,8 @@ class SharedEntryPolicy:
             use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
         )
         fvg_ltf_ctx = self.strategy._ltf_fvg_context(symbol, frame, data)
-        htf_score = self._score_fvg_context(close, htf_ctx, timeframe_minutes=getattr(htf_ctx, "timeframe_minutes", self.strategy._htf_minutes()))
-        fvg_ltf_score = self._score_fvg_context(close, fvg_ltf_ctx, timeframe_minutes=self.strategy._ltf_minutes())
+        htf_score = self._score_fvg_context(close, htf_ctx, timeframe_minutes=getattr(htf_ctx, "timeframe_minutes", self.strategy.htf_minutes()))
+        fvg_ltf_score = self._score_fvg_context(close, fvg_ltf_ctx, timeframe_minutes=self.strategy.ltf_minutes())
         htf_weight = max(0.0, float(self.params.get("htf_fvg_entry_weight", 0.55)))
         ltf_fvg_weight = max(0.0, float(self.params.get("ltf_fvg_entry_weight", 0.35)))
         opposing_mult = max(0.50, float(self.params.get("opposing_fvg_entry_penalty_mult", 1.00)))

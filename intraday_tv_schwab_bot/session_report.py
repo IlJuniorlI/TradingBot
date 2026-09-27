@@ -1846,8 +1846,9 @@ def export_session_archive(
         holding overnight; on shutdown it's typically empty after
         force-flatten.
     strategy
-        Strategy instance — used for ``strategy.active_watchlist(...)``
-        and ``strategy.params`` (to read trigger/HTF timeframes).
+        Strategy instance — used for ``strategy.active_watchlist(...)``,
+        ``strategy.params`` (to read trigger/HTF timeframes) and
+        ``strategy.htf_minutes()`` (the stored HTF frame's timeframe).
     last_candidates
         The most recent candidate list from the engine; passed to
         ``active_watchlist`` so dynamic-discovery strategies emit the
@@ -1961,10 +1962,8 @@ def export_session_archive(
     # (09-21 07:00 onward in the 09-22 AAPL archive, against a 10-day HTF
     # lookback) -- so without this folder an HTF level could not be traced
     # to the bar that made it (2026-09-23). allow_refresh=False: the
-    # exporter reads what the bot held and never fetches. The HTF minutes
-    # resolve as in BaseStrategy._htf_minutes.
-    htf_default = int(getattr(getattr(config, "support_resistance", None), "timeframe_minutes", 15))
-    htf_minutes = int(strategy_params.get("htf_minutes", htf_default)) if isinstance(strategy_params, dict) else htf_default
+    # exporter reads what the bot held and never fetches.
+    htf_minutes = strategy.htf_minutes()
     htf_label = f"htf_{htf_minutes}m"
     htf_dir = bars_dir / htf_label
     try:

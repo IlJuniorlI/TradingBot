@@ -446,8 +446,8 @@ class BaseStrategy:
         params = self.params if isinstance(self.params, dict) else {}
         sr_cfg = self.config.support_resistance
         spec = {
-            "timeframe_minutes": max(1, self._htf_minutes()),
-            "lookback_days": max(1, self._htf_lookback_days()),
+            "timeframe_minutes": max(1, self.htf_minutes()),
+            "lookback_days": max(1, self.htf_lookback_days()),
             "pivot_span": max(1, int(params.get("htf_pivot_span", sr_cfg.pivot_span))),
             "max_levels_per_side": max(1, int(params.get("htf_max_levels_per_side", sr_cfg.max_levels_per_side))),
             "atr_tolerance_mult": float(params.get("htf_atr_tolerance_mult", sr_cfg.atr_tolerance_mult)),
@@ -981,18 +981,23 @@ class BaseStrategy:
                 reasons.append(reason_with_values("expansion_bar_too_large", current=(bar_range / atr), required=max_bar_range_atr, op="<=", digits=4))
         return reasons
 
-    def _htf_minutes(self) -> int:
+    def htf_minutes(self) -> int:
         """HTF (higher timeframe) for SR detection. Strategies declare via
         `params.htf_minutes`; otherwise inherit
-        `support_resistance.timeframe_minutes`."""
+        `support_resistance.timeframe_minutes`. The one resolution: the
+        engine, the position manager, the entry gatekeeper, the dashboard
+        and the session archive read it here (until 2026-09-27 the
+        dashboard and the position manager each kept a copy)."""
         fallback = int(self._support_resistance_setting("timeframe_minutes", 15))
         return int(self.params.get("htf_minutes", fallback))
 
-    def _htf_lookback_days(self) -> int:
+    def htf_lookback_days(self) -> int:
+        """Days of HTF history a refresh fetches: `params.htf_lookback_days`,
+        else `support_resistance.lookback_days`."""
         fallback = int(self._support_resistance_setting("lookback_days", 10))
         return int(self.params.get("htf_lookback_days", fallback))
 
-    def _ltf_minutes(self) -> int:
+    def ltf_minutes(self) -> int:
         """LTF (lower timeframe / trigger frame). Strategies with a distinct
         intraday trigger candle declare `params.ltf_minutes` (e.g. peer_confirmed
         uses 5-min trigger candles). Otherwise defaults to 1-minute streamed bars."""
@@ -1010,14 +1015,14 @@ class BaseStrategy:
         normalized = str(token or "").strip().lower()
         if normalized == "ltf":
             return True
-        ltf_min = self._ltf_minutes()
+        ltf_min = self.ltf_minutes()
         if ltf_min == 1:
             return normalized in {"1m", "1min", "minute", "execution"}
         return normalized in {f"{ltf_min}m", f"{ltf_min}min"}
 
     def _sr_context(self, symbol: str, frame: pd.DataFrame | None, data):
         current_price = float(frame.iloc[-1]["close"]) if frame is not None and not frame.empty else 0.0
-        timeframe_minutes = self._htf_minutes()
+        timeframe_minutes = self.htf_minutes()
         if not bool(self._support_resistance_setting("enabled", True)) or data is None:
             return empty_support_resistance_context(current_price, timeframe_minutes=timeframe_minutes)
         ctx = data.get_support_resistance(
@@ -1026,7 +1031,7 @@ class BaseStrategy:
             flip_frame=frame,
             mode="trading",
             timeframe_minutes=timeframe_minutes,
-            lookback_days=self._htf_lookback_days(),
+            lookback_days=self.htf_lookback_days(),
             use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
             use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
         )
@@ -1090,8 +1095,8 @@ class BaseStrategy:
         ema_fast_span, ema_slow_span = htf_ema_spans(self.params)
         return data.get_htf_context(
             symbol,
-            timeframe_minutes=int(self._htf_minutes()),
-            lookback_days=int(self._htf_lookback_days()),
+            timeframe_minutes=int(self.htf_minutes()),
+            lookback_days=int(self.htf_lookback_days()),
             pivot_span=int(getattr(sr_cfg, "pivot_span", 2) or 2),
             max_levels_per_side=int(getattr(sr_cfg, "max_levels_per_side", 6) or 6),
             # Checked at load (above 0); a 0 read as 0.35 / 0.003 here until
@@ -1294,7 +1299,7 @@ class BaseStrategy:
         }
 
     def _ltf_fvg_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> FairValueGapContext:
-        ltf_min = self._ltf_minutes()
+        ltf_min = self.ltf_minutes()
         current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         if not bool(self._support_resistance_setting("ltf_fair_value_gaps_enabled", False)):
             return empty_fvg_context(current_price, timeframe_minutes=ltf_min)
@@ -1356,7 +1361,7 @@ class BaseStrategy:
         when available (cycle-cached, avoids redundant builds across multiple
         candidates per cycle and the dashboard). Falls back to inline
         `build_order_block_context` when there's no data store available."""
-        ltf_min = self._ltf_minutes()
+        ltf_min = self.ltf_minutes()
         current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         knobs = self._order_block_tuning_knobs()
         mode = knobs["mode"]
@@ -1406,7 +1411,7 @@ class BaseStrategy:
         current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         knobs = self._order_block_tuning_knobs()
         mode = knobs["mode"]
-        htf_minutes = self._htf_minutes()
+        htf_minutes = self.htf_minutes()
         if not bool(self._support_resistance_setting("htf_order_blocks_enabled", False)):
             return empty_order_block_context(current_price, timeframe_minutes=htf_minutes, mode=mode)
         if data is not None and hasattr(data, "get_order_block_context") and symbol:

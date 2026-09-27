@@ -2516,7 +2516,7 @@ function drawSelectedChart(snapshot) {
   }
   // Channels and trendlines are computed against the LTF frame in
   // dashboard_cache.py (build_technical_levels_context fed by tech_frame
-  // at _active_ltf_minutes), and their start_pos / end_pos / intercept are
+  // at strategy.ltf_minutes()), and their start_pos / end_pos / intercept are
   // positions in that frame: the LTF chart bars' abs_index. On the HTF chart
   // the bars carry HTF abs_index values, so lineValueAt(line, bars[i].abs_index)
   // projects to garbage prices — the line ends up "in empty space" detached
