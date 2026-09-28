@@ -1325,7 +1325,7 @@ Behavior and valid values:
 - Macro-event blackouts are configured in the top-level [`events`](#events) block, which both option strategies read.
 - Chain cache:
   - `option_chain_cache_seconds`, `option_chain_cache_max_entries`
-  - 0DTE strategies (`zero_dte_etf_options`, `zero_dte_etf_long_options`) parallel-prefetch chains for all qualifying candidates at the start of each `entry_signals` pass; the sequential per-candidate build loop then hits the warm cache. Size `option_chain_cache_max_entries` ≥ the number of underlyings you trade so prefetched chains aren't evicted before consumption.
+  - `zero_dte_etf_options` parallel-prefetches chains for all qualifying candidates at the start of each `entry_signals` pass; the sequential per-candidate build loop then hits the warm cache. Size `option_chain_cache_max_entries` ≥ the number of underlyings you trade so prefetched chains aren't evicted before consumption. `zero_dte_etf_long_options` does not prefetch (`_PREFETCH_OPTION_CHAINS`); each build reads its chain through the same cache.
 - Premium ratchet (post-entry stop management). All four premium-ratchet families are off by default; enable the ones you want active.
   - `options_breakeven_enabled` / `options_breakeven_mark_mult` / `options_breakeven_stop_mult`: when the option mark crosses `entry × options_breakeven_mark_mult`, ratchet the stop up to `entry × options_breakeven_stop_mult`. Locks a small protective gain on debit trades that go through their first push.
   - `options_profit_lock_enabled` / `options_profit_lock_mark_mult` / `options_profit_lock_stop_mult`: a second, looser ratchet that activates at a higher mark multiple and locks a larger fraction of the move. Stacks with `options_breakeven_*`.
@@ -2366,13 +2366,18 @@ Special behavior:
   - `trend_debit_spread`
   - `midday_credit_spread`
 - `credit_start_time` / `credit_end_time` are used only by this spread strategy.
+- The ORB style breaks the opening range: the `orb_opening_window_start` - `orb_opening_window_end` bars, once `orb_opening_min_bars` of them are in (since 2026-09-27; before, any bar of a fixed 09:30-09:34 window). Both 0DTE strategies run this strategy's `entry_signals` over their own style table.
 - Every style meets the shared entry stage as a premium proposal on the underlying, in the underlying's market direction (a bull put credit spread is LONG), before the option chain is read. The vetoes are the `shared_entry` knobs (the preset runs the structure veto). `midday_credit_spread` is exempt from the structure veto through the manifest, and ranking is on `strategy_priority_score`. See the strategy README's "Shared entry stage (2026-09-24)" section.
 
 Current package defaults:
 
 | Option                        | Current package default |
 |-------------------------------|-------------------------|
+| `orb_start_time`              | `'09:35'`               |
 | `orb_end_time`                | `'10:05'`               |
+| `orb_opening_window_start`    | `'09:30'`               |
+| `orb_opening_window_end`      | `'09:34'`               |
+| `orb_opening_min_bars`        | `3`                     |
 | `trend_start_time`            | `'10:05'`               |
 | `trend_end_time`              | `'13:40'`               |
 | `credit_start_time`           | `'11:10'`               |
@@ -2444,7 +2449,11 @@ Current package defaults:
 
 | Option                               | Current package default |
 |--------------------------------------|-------------------------|
+| `orb_start_time`                     | `'09:35'`               |
 | `orb_end_time`                       | `'10:05'`               |
+| `orb_opening_window_start`           | `'09:30'`               |
+| `orb_opening_window_end`             | `'09:34'`               |
+| `orb_opening_min_bars`               | `3`                     |
 | `trend_start_time`                   | `'10:05'`               |
 | `trend_end_time`                     | `'13:30'`               |
 | `no_new_entries_after`               | `'13:45'`               |

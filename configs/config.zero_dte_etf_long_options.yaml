@@ -635,8 +635,13 @@ strategies:
       #   * trend_activity_threshold: long premium needs MORE elevation
       #     (1.20) than credit spreads (1.15) — long buyers want
       #     real directional fuel beyond baseline noise.
+      #   * credit_activity_min / max: the range regime's activity band
+      #     (the spreads' values). No credit style trades here, but the
+      #     range score competes with the trend score for the regime.
       min_activity_for_entry: 0.0
       trend_activity_threshold: 1.20
+      credit_activity_min: 0.80
+      credit_activity_max: 1.30
       trend_start_time: "10:05"
       trend_vwap_distance_pct: 0.0014
       trend_vwap_lookback: 10

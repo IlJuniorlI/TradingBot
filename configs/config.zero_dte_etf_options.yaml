@@ -634,6 +634,15 @@ strategies:
       no_new_entries_after: "13:30"
       orb_breakout_buffer_pct: 0.0008
       orb_end_time: "10:05"
+      # The ORB style fires from orb_start_time to orb_end_time on a break
+      # of the opening range: the orb_opening_window_start -
+      # orb_opening_window_end bars, once at least orb_opening_min_bars of
+      # them are in (a lone 09:34 bar is not an opening range; before
+      # 2026-09-27 this strategy took any bar in a fixed 09:30-09:34 window).
+      orb_start_time: "09:35"
+      orb_opening_window_start: "09:30"
+      orb_opening_window_end: "09:34"
+      orb_opening_min_bars: 3
       range_ema_gap_pct: 0.0007
       range_lookback: 25
       range_max_intraday_move_pct: 0.0085

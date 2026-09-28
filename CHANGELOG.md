@@ -310,6 +310,104 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The 0DTE strategies run one entry loop (refactor cut B11).**
+  *2026-09-27* — `ZeroDteEtfOptionsStrategy.entry_signals` runs the
+  strategy's style table, `_entry_styles()`. Each row is an `_EntryStyle`:
+  the `options.styles` token; its kind (`orb`, `trend` or `credit`), which
+  sets its window (`<kind>_start_time` to `<kind>_end_time`), the regime it
+  trades and its trigger; its builder; and its own blockers, which ride on
+  the premium proposal as pending reasons. A kind the loop does not know is
+  refused when the row is built. zero_dte_etf_long_options no longer carries
+  a copy of the loop: it overrides the table (`orb_long_option`, then
+  `trend_long_option` with `_long_option_style_gate`) and sets
+  `_PREFETCH_OPTION_CHAINS = False`, so the parallel chain prefetch stays
+  the spreads' alone, as before. The loop's steps are methods
+  (`_style_window`, `_opening_range`, `_trend_momentum_blocker`), and every
+  builder takes `pending_reasons`. Two dead pieces are gone:
+  `no_contract_selected`, which could not be reached (a style that tried to
+  build always records why it did not), and the long options' `.get` reads
+  of the last close / VWAP / ret5 (the regime reads the same columns with
+  `[]` first). The loop's code defaults are the spreads' (35 bars, 13:30
+  cutoff, `trend_min_ret5` 0.0007, trend window to 13:40), and both
+  manifests declare every param the loop reads, so no code default decides.
+  The long options' 90 / 13:45 / 0.0006 were fallbacks only. Their manifest
+  and preset now also declare `credit_activity_min` / `credit_activity_max`
+  at 0.80 / 1.30, the code defaults their inherited range score read
+  undeclared. The quote-stability checks are one loop,
+  `_stabilize_quotes(data, legs, *, validate, failure_detail, source)`,
+  returning the re-quoted legs and None, or None and why. It replaces
+  `_stabilize_spread_quotes_detailed`, the `_stabilize_spread_quotes`
+  wrapper and `_stabilize_single_option_quote`.
+  `_single_option_market_failure_detail` describes a refused single option
+  as `_spread_market_failure_detail` describes a vertical. The 0DTE family
+  is a class constant, `_OPTION_FAMILY`; until now the base strategy named
+  its subclass in two literals. The constant is deliberately not the
+  catalogue's `is_option_strategy`, which would take in any future option
+  plugin.
+
+  **Behaviour changes:**
+  - The debit ORB (`orb_debit_spread`) takes the long options' opening
+    range. That is the bars from `orb_opening_window_start` to
+    `orb_opening_window_end` (09:30 and 09:34, both inclusive), once at
+    least `orb_opening_min_bars` (3) of them are in. The ORB fires from
+    `orb_start_time` (09:35). zero_dte_etf_options' manifest and preset now
+    declare all four, and `time_params` checks the three times at build.
+    Before, the debit ORB took any bar of a fixed 09:30-09:34 window, so a
+    lone 09:34 bar (a late or gappy feed) was its opening range, the case
+    the long options' own copy had guarded since 2026-05-14. On the real
+    session archive, every SPY / QQQ day (20) had all five opening bars.
+    Across all 730 archived and fixture tapes, only three small-cap days had
+    fewer than three, so the change applies to feed gaps only. The replay
+    below also reran the ORB window with only one or two of the five
+    opening bars in the frame (4,136 debit-spread runs, the regime forced to
+    either trend). The old loop tried the ORB on that range in 992 of them
+    and built a signal in 810; the new one tries it in none. With three or
+    five bars in, only quote details differ.
+  - The debit spreads and the long options record why the quotes did not
+    settle: `quote_not_stable(reason=quote_not_fresh|missing_leg_quotes|
+    mid_drift_too_high|<the validator's refusal>,...)`, where they recorded
+    a bare `quote_not_stable`. The reports bucket skips by the head, which
+    has not changed. The dashboard's compact decision label splits on `:`,
+    so it now shows the detail, as it already did for every parenthesised
+    reason. The credit spread's
+    `midday_credit_spread_unavailable(reason=...)` is unchanged. No
+    decision changes.
+  - zero_dte_etf_long_options now skips an underlying the spreads hold
+    (`underlying_already_open`), as the spreads already skipped one it
+    holds. It also marks a spread's vertical (`position_mark_price`) instead
+    of leaving it to the position manager's quote snapshot. This only
+    matters with both strategies' positions open, for example positions
+    restored after a preset switch; no archived session had both.
+
+  Replay (read-only over the session archive):
+  - Tapes: 34 tape-days, which are the archive's SPY / QQQ days (16 of them
+    with their confirmation index and VIX) and the fixture tapes.
+  - Clocks: 67 a day (every minute 09:30-10:10, every ten minutes to
+    14:30), 2,278 checkpoints per preset.
+  - Runs at each checkpoint: the strategy's own regime; the other strategy
+    holding the underlying; and each regime forced under stable quotes and
+    under one failing kind (stale, a leg missing, or a drifting mid). That
+    makes 53,312 entry runs, with a synthetic chain around the close.
+  - Result: with the strategy's own regime (4,556 runs) there is one
+    difference: a debit spread's `quote_not_stable` now carries its detail
+    (`net_mid_too_low`). No signal changes. Every other difference comes
+    from the three changes above:
+    - 486 quote details;
+    - the long options skipping an underlying the spreads hold, 2,108
+      runs, 9 of which had signalled;
+    - the ORB gap runs;
+    - the `no_style_trigger` reason's `or_high` / `or_low` reading `na`
+      while fewer than three opening bars are in: 3,552 runs, at
+      09:31-09:32 before the ORB window opens, and in gap runs with no
+      breakout.
+
+  Tests: `tests/test_zero_dte_entry_styles.py` and
+  `tests/test_zero_dte_quote_stability.py` (new),
+  `tests/test_strategy_time_params.py`,
+  `tests/test_zero_dte_shared_entry.py` (the `reasons`-list scan reads the
+  one loop) and `tests/support/factories.py` (the wired strategies patch
+  `_stabilize_quotes`).
+
 - **top_tier_adaptive's engine is split across its package (refactor cut
   C43).** *2026-09-27* — `top_tier_adaptive/strategy.py` (4,595 lines down
   to 1,888) keeps the class (`__init__`, the HTF EMA hooks,

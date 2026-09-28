@@ -2,8 +2,9 @@
 import logging
 import math
 import time as time_mod
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, time
 from typing import Any
 
@@ -138,6 +139,32 @@ def _no_style_trigger_reason(
     )
 
 
+_STYLE_KINDS = frozenset({"orb", "trend", "credit"})
+
+
+@dataclass(frozen=True)
+class _EntryStyle:
+    """One row of a 0DTE strategy's style table (``_entry_styles``).
+
+    ``name`` is the ``options.styles`` token and the signal's style.
+    ``kind`` sets the style's window (``<kind>_start_time`` to
+    ``<kind>_end_time``), the regime it trades and its trigger: ``orb`` a
+    trend regime breaking the opening range, ``trend`` a trend regime's
+    5-bar return, ``credit`` the range regime, on the side of VWAP the
+    close is. ``build`` makes the signal; ``pending_reasons``, when set, is
+    the style's own blockers, ``(bullish, frame, regime) -> list``, which
+    ride on its premium proposal."""
+
+    name: str
+    kind: str
+    build: Callable[..., Signal | None]
+    pending_reasons: Callable[[bool, pd.DataFrame, dict[str, Any]], list[str]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in _STYLE_KINDS:
+            raise ValueError(f"0DTE style {self.name!r} has kind {self.kind!r}, not one of {sorted(_STYLE_KINDS)}")
+
+
 class ZeroDteEtfOptionsStrategy(BaseStrategy):
     """0DTE ETF verticals routed by the underlying's regime.
 
@@ -152,11 +179,26 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
     ``midday_credit_spread`` from the structure veto: its range regime was
     never structure-gated); the builder picks the contracts and ``emit``
     builds the signal on the order side with the premium stop / target.
+
+    ``entry_signals`` is the family's one entry loop: the long-options
+    subclass swaps the style table (``_entry_styles``) and its builder, and
+    turns the chain prefetch off. Until 2026-09-27 it carried its own copy
+    of the loop, and fixes reached one copy only.
     """
 
     strategy_name = 'zero_dte_etf_options'
-    time_params = ("no_new_entries_after", "orb_end_time", "trend_start_time", "trend_end_time",
-                   "credit_start_time", "credit_end_time")
+    time_params = ("no_new_entries_after", "orb_start_time", "orb_end_time", "orb_opening_window_start",
+                   "orb_opening_window_end", "trend_start_time", "trend_end_time", "credit_start_time",
+                   "credit_end_time")
+    # The 0DTE family: an underlying either strategy holds is open for both,
+    # and either one marks the other's vertical (a position restored after a
+    # preset switch). Until 2026-09-27 the base named its subclass in two
+    # literals, and a classmethod call on the subclass saw only the
+    # subclass, so the long options ignored the spreads' positions.
+    _OPTION_FAMILY = frozenset({"zero_dte_etf_options", "zero_dte_etf_long_options"})
+    # entry_signals warms every candidate's chain in parallel before the
+    # build loop (_prefetch_option_chains).
+    _PREFETCH_OPTION_CHAINS = True
 
     def required_history_bars(self, symbol: str | None = None, positions: dict[str, Position] | None = None) -> int:
         capability_bars = self._manifest_required_history_bars()
@@ -228,7 +270,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
     @classmethod
     def _underlying_already_open(cls, symbol: str, positions: dict[str, Position]) -> bool:
         for p in positions.values():
-            if p.strategy not in {cls.strategy_name, 'zero_dte_etf_long_options'}:
+            if p.strategy not in cls._OPTION_FAMILY:
                 continue
             if str(p.metadata.get("underlying") or p.symbol) == symbol:
                 return True
@@ -1141,41 +1183,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 return None
         return bid, ask, mid
 
-    def _stabilize_spread_quotes_detailed(self, data, metadata_first: OptionContract, metadata_second: OptionContract) -> tuple[tuple[OptionContract, OptionContract] | None, str | None]:
-        if data is None:
-            return (metadata_first, metadata_second), None
-        symbols = [metadata_first.symbol, metadata_second.symbol]
-        checks = max(1, int(self.optcfg.quote_stability_checks))
-        mids: list[float] = []
-        latest_pair: tuple[OptionContract, OptionContract] | None = None
-        for idx in range(checks):
-            data.fetch_quotes(symbols, force=True, min_force_interval_seconds=self._option_quote_stability_force_cooldown_seconds(), source="strategies:option_quote_stability_spread")
-            if not data.quotes_are_fresh(symbols, self.optcfg.max_quote_age_seconds):
-                return None, detail_fields(reason="quote_not_fresh", required_max_quote_age_seconds=float(self.optcfg.max_quote_age_seconds), completed_checks=idx, symbols="|".join(symbols))
-            q1 = data.get_quote(metadata_first.symbol)
-            q2 = data.get_quote(metadata_second.symbol)
-            if not q1 or not q2:
-                return None, detail_fields(reason="missing_leg_quotes", first_symbol=metadata_first.symbol, second_symbol=metadata_second.symbol, first_quote=bool(q1), second_quote=bool(q2), completed_checks=idx)
-            first = contract_from_quote(metadata_first.symbol, q1, asdict(metadata_first))
-            second = contract_from_quote(metadata_second.symbol, q2, asdict(metadata_second))
-            latest_pair = (first, second)
-            market = self._validate_spread_market(first, second)
-            if market is None:
-                return None, self._spread_market_failure_detail(first, second)
-            _, _, mid = market
-            mids.append(mid)
-            if idx + 1 < checks:
-                time_mod.sleep(max(0.0, float(self.optcfg.quote_stability_pause_ms) / 1000.0))
-        if mids:
-            drift = (max(mids) - min(mids)) / max(mids[-1], 0.01)
-            if drift > float(self.optcfg.max_mid_drift_pct):
-                return None, detail_fields(reason="mid_drift_too_high", required_max_mid_drift_pct=float(self.optcfg.max_mid_drift_pct), current_mid_drift_pct=drift, checks=checks)
-        return latest_pair, None
-
-    def _stabilize_spread_quotes(self, data, metadata_first: OptionContract, metadata_second: OptionContract) -> tuple[OptionContract, OptionContract] | None:
-        pair, _ = self._stabilize_spread_quotes_detailed(data, metadata_first, metadata_second)
-        return pair
-
     def _validate_single_option_market(self, contract: OptionContract) -> tuple[float, float, float] | None:
         """(bid, ask, mid) of a tradable single option, else None; as
         ``_validate_spread_market``, a market it returns has a mid above zero."""
@@ -1188,34 +1195,66 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return None
         return bid, ask, mid
 
-    def _stabilize_single_option_quote(self, data, metadata_contract: OptionContract) -> OptionContract | None:
+    def _single_option_market_failure_detail(self, contract: OptionContract) -> str:
+        """Why ``_validate_single_option_market`` refused ``contract``, as
+        ``_spread_market_failure_detail`` describes a vertical."""
+        bid, ask, mid = single_option_price_bounds(contract)
+        if ask <= 0 or mid <= 0:
+            return detail_fields(reason="invalid_option_market", bid=bid, ask=ask, mid=mid)
+        max_price = float(self.optcfg.max_single_option_price)
+        if ask > max_price:
+            return detail_fields(reason="option_ask_too_high", required_max_ask=max_price, current_ask=ask, bid=bid, mid=mid)
+        return detail_fields(reason="option_spread_pct_too_wide", required_max_spread_pct=float(self.optcfg.max_bid_ask_spread_pct),
+                             current_spread_pct=contract.spread_pct, bid=bid, ask=ask, mid=mid)
+
+    def _stabilize_quotes(
+        self,
+        data,
+        legs: tuple[OptionContract, ...],
+        *,
+        validate: Callable[..., tuple[float, float, float] | None],
+        failure_detail: Callable[..., str],
+        source: str,
+    ) -> tuple[tuple[OptionContract, ...] | None, str | None]:
+        """Re-quote the picked ``legs`` ``options.quote_stability_checks``
+        times, ``quote_stability_pause_ms`` apart: each round forces a quote
+        fetch, needs every leg fresh and quoted, and ``validate`` (called with
+        the re-quoted legs) to pass their market; then the mid may not have
+        drifted more than ``max_mid_drift_pct``. Returns the last re-quoted
+        legs and None, or None and why (``reason=...,k=v``; a refused market
+        described by ``failure_detail``). With no data feed the legs come back
+        as picked. One loop for the verticals and the single options: until
+        2026-09-27 each had a copy, and only the credit spread recorded why."""
         if data is None:
-            return metadata_contract
-        symbol = metadata_contract.symbol
+            return legs, None
+        symbols = [leg.symbol for leg in legs]
         checks = max(1, int(self.optcfg.quote_stability_checks))
         mids: list[float] = []
-        latest_contract: OptionContract | None = None
+        latest = legs
         for idx in range(checks):
-            data.fetch_quotes([symbol], force=True, min_force_interval_seconds=self._option_quote_stability_force_cooldown_seconds(), source="strategies:option_quote_stability_single")
-            if not data.quotes_are_fresh([symbol], self.optcfg.max_quote_age_seconds):
-                return None
-            q = data.get_quote(symbol)
-            if not q:
-                return None
-            contract = contract_from_quote(symbol, q, asdict(metadata_contract))
-            latest_contract = contract
-            market = self._validate_single_option_market(contract)
+            data.fetch_quotes(symbols, force=True, min_force_interval_seconds=self._option_quote_stability_force_cooldown_seconds(), source=source)
+            if not data.quotes_are_fresh(symbols, self.optcfg.max_quote_age_seconds):
+                return None, detail_fields(reason="quote_not_fresh", required_max_quote_age_seconds=float(self.optcfg.max_quote_age_seconds), completed_checks=idx, symbols="|".join(symbols))
+            quotes = [data.get_quote(symbol) for symbol in symbols]
+            if not all(quotes):
+                names = ("first", "second")
+                return None, detail_fields(
+                    reason="missing_leg_quotes",
+                    **{f"{name}_symbol": leg.symbol for name, leg in zip(names, legs)},
+                    **{f"{name}_quote": bool(quote) for name, quote in zip(names, quotes)},
+                    completed_checks=idx,
+                )
+            latest = tuple(contract_from_quote(leg.symbol, quote, asdict(leg)) for leg, quote in zip(legs, quotes))
+            market = validate(*latest)
             if market is None:
-                return None
-            _, _, mid = market
-            mids.append(mid)
+                return None, failure_detail(*latest)
+            mids.append(market[2])
             if idx + 1 < checks:
                 time_mod.sleep(max(0.0, float(self.optcfg.quote_stability_pause_ms) / 1000.0))
-        if mids:
-            drift = (max(mids) - min(mids)) / max(mids[-1], 0.01)
-            if drift > float(self.optcfg.max_mid_drift_pct):
-                return None
-        return latest_contract
+        drift = (max(mids) - min(mids)) / max(mids[-1], 0.01)
+        if drift > float(self.optcfg.max_mid_drift_pct):
+            return None, detail_fields(reason="mid_drift_too_high", required_max_mid_drift_pct=float(self.optcfg.max_mid_drift_pct), current_mid_drift_pct=drift, checks=checks)
+        return latest, None
 
     @staticmethod
     def _option_strategy_score(candidate: Candidate, regime: dict[str, Any], primary_key: str) -> float:
@@ -1286,9 +1325,10 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         payload = self._consume_build_failure_payload(symbol, style)
         return list(payload["reasons"]) if payload and payload.get("reasons") else [f"{style}_unavailable"]
 
-    def _build_debit_spread_signal(self, candidate: Candidate, bullish: bool, client, data, frame: pd.DataFrame, last_underlying: float, style: str, confirm_index: str | None, regime: dict[str, Any]) -> Signal | None:
+    def _build_debit_spread_signal(self, candidate: Candidate, bullish: bool, client, data, frame: pd.DataFrame, last_underlying: float, style: str, confirm_index: str | None, regime: dict[str, Any], *, pending_reasons: tuple[str, ...] | list[str] = ()) -> Signal | None:
         underlying = candidate.symbol
-        admitted = self._admit_premium_entry(candidate, bullish, frame, data, last_underlying, style, "option_debit", regime)
+        admitted = self._admit_premium_entry(candidate, bullish, frame, data, last_underlying, style, "option_debit", regime,
+                                             pending_reasons=pending_reasons)
         if admitted is None:
             return None
         if self._underlying_below_min_price(underlying, style, last_underlying):
@@ -1318,9 +1358,11 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         if entry_debit <= 0:
             self._set_build_failure(underlying, style, "non_positive_entry_debit")
             return None
-        stable = self._stabilize_spread_quotes(data, long_leg, short_leg)
+        stable, instability = self._stabilize_quotes(data, (long_leg, short_leg), validate=self._validate_spread_market,
+                                                     failure_detail=self._spread_market_failure_detail,
+                                                     source="strategies:option_quote_stability_spread")
         if stable is None:
-            self._set_build_failure(underlying, style, "quote_not_stable")
+            self._set_build_failure(underlying, style, f"quote_not_stable({instability})")
             return None
         long_leg, short_leg = stable
         market = self._validate_spread_market(long_leg, short_leg)
@@ -1398,9 +1440,10 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             premium_stop=stop,
         )
 
-    def _build_credit_spread_signal(self, candidate: Candidate, bullish: bool, client, data, frame: pd.DataFrame, last_underlying: float, style: str, confirm_index: str | None, regime: dict[str, Any]) -> Signal | None:
+    def _build_credit_spread_signal(self, candidate: Candidate, bullish: bool, client, data, frame: pd.DataFrame, last_underlying: float, style: str, confirm_index: str | None, regime: dict[str, Any], *, pending_reasons: tuple[str, ...] | list[str] = ()) -> Signal | None:
         underlying = candidate.symbol
-        admitted = self._admit_premium_entry(candidate, bullish, frame, data, last_underlying, style, "option_credit", regime)
+        admitted = self._admit_premium_entry(candidate, bullish, frame, data, last_underlying, style, "option_credit", regime,
+                                             pending_reasons=pending_reasons)
         if admitted is None:
             return None
         if self._underlying_below_min_price(underlying, style, last_underlying):
@@ -1552,13 +1595,11 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 ),
             )
             return None
-        stable, stability_reason = self._stabilize_spread_quotes_detailed(data, short_leg, long_leg)
+        stable, instability = self._stabilize_quotes(data, (short_leg, long_leg), validate=self._validate_spread_market,
+                                                     failure_detail=self._spread_market_failure_detail,
+                                                     source="strategies:option_quote_stability_spread")
         if stable is None:
-            self._set_build_failure(
-                underlying,
-                style,
-                _style_unavailable_reason(style, stability_reason or "reason=quote_not_stable"),
-            )
+            self._set_build_failure(underlying, style, _style_unavailable_reason(style, instability))
             return None
         short_leg, long_leg = stable
         market = self._validate_spread_market(short_leg, long_leg)
@@ -1638,6 +1679,59 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             premium_stop=stop,
         )
 
+    def _entry_styles(self) -> tuple[_EntryStyle, ...]:
+        """The styles ``entry_signals`` tries, in order, one per kind: the
+        ORB and trend debit spreads and the midday credit spread."""
+        return (
+            _EntryStyle("orb_debit_spread", "orb", self._build_debit_spread_signal),
+            _EntryStyle("trend_debit_spread", "trend", self._build_debit_spread_signal),
+            _EntryStyle("midday_credit_spread", "credit", self._build_credit_spread_signal),
+        )
+
+    def _style_window(self, kind: str, now_t: time) -> bool:
+        """Is ``now_t`` inside the ``kind`` style's entry window (both ends
+        inclusive)?"""
+        p = self.params
+        if kind == "orb":
+            return is_time_in_window(now_t, p.get("orb_start_time", rth_open_plus(5)), p.get("orb_end_time", "10:05"))
+        if kind == "trend":
+            return is_time_in_window(now_t, p.get("trend_start_time", "10:05"), p.get("trend_end_time", "13:40"))
+        return is_time_in_window(now_t, p.get("credit_start_time", "11:05"), p.get("credit_end_time", "13:45"))
+
+    def _opening_range(self, frame: pd.DataFrame) -> tuple[float, float] | None:
+        """Today's opening range (high, low) the ORB style breaks: the bars
+        from ``orb_opening_window_start`` to ``orb_opening_window_end``, both
+        inclusive, or None while fewer than ``orb_opening_min_bars`` of them
+        are in. Until 2026-09-27 the debit ORB took a fixed 09:30-09:34
+        window and any bar in it, so a lone 09:34 bar was its opening range
+        (the long options' own copy had required 3 since 2026-05-14)."""
+        start = parse_hhmm(self.params.get("orb_opening_window_start", EQUITY_RTH_OPEN))
+        end = parse_hhmm(self.params.get("orb_opening_window_end", rth_open_plus(4)))
+        opening = frame[same_day_mask(frame, sessions.now_et().date())].between_time(start, end)
+        if opening.empty or len(opening) < int(self.params.get("orb_opening_min_bars", 3)):
+            return None
+        return safe_float(opening["high"].max(), 0.0), safe_float(opening["low"].min(), 0.0)
+
+    def _trend_momentum_blocker(self, frame: pd.DataFrame, last: pd.Series) -> str | None:
+        """``options.trend_momentum_filter_enabled``: the trend style's
+        refusal when ATR is not expanding or volume is not confirming the
+        move, else None."""
+        if not self.optcfg.trend_momentum_filter_enabled:
+            return None
+        atr_current = safe_float(last.get("atr14"), 0.0)
+        atr_tail = frame.tail(20)["atr14"].dropna() if "atr14" in frame.columns else pd.Series(dtype=float)
+        atr_mean = float(atr_tail.mean()) if len(atr_tail) > 0 else 0.0
+        atr_expansion = atr_current / max(atr_mean, 1e-9) if atr_mean > 0 else 0.0
+        vol_current = safe_float(last.get("volume"), 0.0)
+        vol_tail = frame.tail(10)["volume"].dropna() if "volume" in frame.columns else pd.Series(dtype=float)
+        vol_mean = float(vol_tail.mean()) if len(vol_tail) > 0 else 1.0
+        volume_ratio = vol_current / max(vol_mean, 1.0)
+        min_atr_exp = float(getattr(self.optcfg, "trend_min_atr_expansion", 0.85))
+        min_vol_ratio = float(getattr(self.optcfg, "trend_min_volume_ratio", 0.90))
+        if atr_expansion < min_atr_exp or volume_ratio < min_vol_ratio:
+            return f"trend_momentum_filter(atr_exp={atr_expansion:.3f}<{min_atr_exp},vol_ratio={volume_ratio:.3f}<{min_vol_ratio})"
+        return None
+
     def entry_signals(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], client=None, data=None) -> list[Signal]:
         self._reset_entry_decisions()
         if not self._options_enabled() or client is None or data is None:
@@ -1657,37 +1751,40 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             for c in candidates:
                 self._record_entry_decision(c.symbol, "skipped", ["after_entry_cutoff"])
             return out
-        # Pre-warm option-chain cache for candidates that will reach a
-        # spread builder. Cheap pre-filters (already-open, insufficient
-        # bars) match the per-candidate guards below to avoid wasted
-        # Schwab calls on candidates the loop will skip. Regime check is
-        # NOT pre-evaluated here — it's local-only compute, and avoiding
-        # double evaluation matters more than skipping a chain fetch for
-        # a regime-rejected candidate. Worst case: ~1-2 wasted chain
-        # fetches per cycle, well under Schwab's per-minute cap.
-        prefetch_min_bars = int(self.params.get("min_bars", 35))
-        prefetch_symbols = [
-            c.symbol for c in candidates
-            if not self._underlying_already_open(c.symbol, positions)
-            and bars.get(c.symbol) is not None
-            and len(bars.get(c.symbol)) >= prefetch_min_bars
-        ]
-        if prefetch_symbols:
-            self._prefetch_option_chains(prefetch_symbols, client)
+        min_bars = int(self.params.get("min_bars", 35))
+        if self._PREFETCH_OPTION_CHAINS:
+            # Pre-warm option-chain cache for candidates that will reach a
+            # spread builder. Cheap pre-filters (already-open, insufficient
+            # bars) match the per-candidate guards below to avoid wasted
+            # Schwab calls on candidates the loop will skip. Regime check is
+            # NOT pre-evaluated here — it's local-only compute, and avoiding
+            # double evaluation matters more than skipping a chain fetch for
+            # a regime-rejected candidate. Worst case: ~1-2 wasted chain
+            # fetches per cycle, well under Schwab's per-minute cap.
+            prefetch_symbols = [
+                c.symbol for c in candidates
+                if not self._underlying_already_open(c.symbol, positions)
+                and bars.get(c.symbol) is not None
+                and len(bars.get(c.symbol)) >= min_bars
+            ]
+            if prefetch_symbols:
+                self._prefetch_option_chains(prefetch_symbols, client)
+        styles = self._entry_styles()
+        enabled = {style.kind: self._style_enabled(style.name) for style in styles}
+        in_window = {style.kind: self._style_window(style.kind, now_t) for style in styles}
+        buffer_pct = float(self.params.get("orb_breakout_buffer_pct", 0.0008))
+        trend_min_ret5 = float(self.params.get("trend_min_ret5", 0.0007))
         for c in candidates:
-            reasons: list[str] = []
             if self._underlying_already_open(c.symbol, positions):
                 self._record_entry_decision(c.symbol, "skipped", ["underlying_already_open"])
                 continue
             frame = bars.get(c.symbol)
-            min_bars = int(self.params.get("min_bars", 35))
             if frame is None or len(frame) < min_bars:
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_underlying_bars", 0 if frame is None else len(frame), min_bars)])
                 continue
             regime = self._regime_confirm(c, bars, data)
             if not regime.get("ok") or regime.get("no_trade"):
-                reasons.append(str(regime.get("reason") or "regime_blocked"))
-                self._record_entry_decision(c.symbol, "skipped", reasons)
+                self._record_entry_decision(c.symbol, "skipped", [str(regime.get("reason") or "regime_blocked")])
                 continue
             confirm_index = regime.get("confirm_index")
             last = frame.iloc[-1]
@@ -1696,102 +1793,73 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             if "atr14" in frame.columns:
                 atr_series = frame["atr14"].dropna().tail(20)
                 self._underlying_ref_atr_cache[c.symbol] = float(atr_series.median()) if len(atr_series) >= 5 else 0.0
-            opening = frame[same_day_mask(frame, sessions.now_et().date())].between_time(EQUITY_RTH_OPEN, rth_open_plus(4))
+            opening_range = self._opening_range(frame)
+            or_high, or_low = opening_range if opening_range is not None else (None, None)
             regime_name = str(regime.get("regime") or "unknown")
             bullish = regime_name == "bullish_trend"
             bearish = regime_name == "bearish_trend"
             rangeish = regime_name == "range"
-            attempted_style = False
             last_close = safe_float(last["close"], 0.0)
             last_vwap = safe_float(last["vwap"], last_close)
             last_ret5 = safe_float(last["ret5"], 0.0)
-            orb_enabled = self._style_enabled("orb_debit_spread")
-            orb_window = is_time_in_window(now_t, rth_open_plus(5), self.params.get("orb_end_time", "10:05"))
-            trend_enabled = self._style_enabled("trend_debit_spread")
-            trend_window = is_time_in_window(now_t, self.params.get("trend_start_time", "10:05"), self.params.get("trend_end_time", "13:40"))
-            credit_enabled = self._style_enabled("midday_credit_spread")
-            credit_window = is_time_in_window(now_t, self.params.get("credit_start_time", "11:05"), self.params.get("credit_end_time", "13:45"))
-            or_high = safe_float(opening["high"].max(), 0.0) if not opening.empty else None
-            or_low = safe_float(opening["low"].min(), 0.0) if not opening.empty else None
-            buffer_pct = float(self.params.get("orb_breakout_buffer_pct", 0.0008))
-            trend_min_ret5 = float(self.params.get("trend_min_ret5", 0.0007))
-
-            if orb_enabled and orb_window and (bullish or bearish):
-                if not opening.empty:
-                    if bullish and last_close > safe_float(or_high, 0.0) * (1.0 + buffer_pct) and last_close > last_vwap:
-                        attempted_style = True
-                        sig = self._build_debit_spread_signal(c, True, client, data, frame, last_close, "orb_debit_spread", confirm_index, regime)
-                        if sig:
-                            out.append(sig)
-                            self._record_entry_decision(c.symbol, "signal", [sig.reason])
-                            continue
-                        reasons.extend(self._consume_style_failure(c.symbol, "orb_debit_spread"))
-                    if bearish and last_close < safe_float(or_low, 0.0) * (1.0 - buffer_pct) and last_close < last_vwap:
-                        attempted_style = True
-                        sig = self._build_debit_spread_signal(c, False, client, data, frame, last_close, "orb_debit_spread", confirm_index, regime)
-                        if sig:
-                            out.append(sig)
-                            self._record_entry_decision(c.symbol, "signal", [sig.reason])
-                            continue
-                        reasons.extend(self._consume_style_failure(c.symbol, "orb_debit_spread"))
-
-            if trend_enabled and trend_window and (bullish or bearish):
-                # Trend momentum quality filter — reject if ATR isn't expanding
-                # or volume isn't confirming the move.
-                momentum_ok = True
-                if self.optcfg.trend_momentum_filter_enabled:
-                    atr_current = safe_float(last.get("atr14"), 0.0)
-                    atr_tail = frame.tail(20)["atr14"].dropna() if "atr14" in frame.columns else pd.Series(dtype=float)
-                    atr_mean = float(atr_tail.mean()) if len(atr_tail) > 0 else 0.0
-                    atr_expansion = atr_current / max(atr_mean, 1e-9) if atr_mean > 0 else 0.0
-                    vol_current = safe_float(last.get("volume"), 0.0)
-                    vol_tail = frame.tail(10)["volume"].dropna() if "volume" in frame.columns else pd.Series(dtype=float)
-                    vol_mean = float(vol_tail.mean()) if len(vol_tail) > 0 else 1.0
-                    volume_ratio = vol_current / max(vol_mean, 1.0)
-                    min_atr_exp = float(getattr(self.optcfg, "trend_min_atr_expansion", 0.85))
-                    min_vol_ratio = float(getattr(self.optcfg, "trend_min_volume_ratio", 0.90))
-                    if atr_expansion < min_atr_exp or volume_ratio < min_vol_ratio:
-                        momentum_ok = False
-                        reasons.append(f"trend_momentum_filter(atr_exp={atr_expansion:.3f}<{min_atr_exp},vol_ratio={volume_ratio:.3f}<{min_vol_ratio})")
-                if momentum_ok and bullish and last_ret5 >= trend_min_ret5:
-                    attempted_style = True
-                    sig = self._build_debit_spread_signal(c, True, client, data, frame, last_close, "trend_debit_spread", confirm_index, regime)
-                    if sig:
-                        out.append(sig)
-                        self._record_entry_decision(c.symbol, "signal", [sig.reason])
-                        continue
-                    reasons.extend(self._consume_style_failure(c.symbol, "trend_debit_spread"))
-                if momentum_ok and bearish and last_ret5 <= -trend_min_ret5:
-                    attempted_style = True
-                    sig = self._build_debit_spread_signal(c, False, client, data, frame, last_close, "trend_debit_spread", confirm_index, regime)
-                    if sig:
-                        out.append(sig)
-                        self._record_entry_decision(c.symbol, "signal", [sig.reason])
-                        continue
-                    reasons.extend(self._consume_style_failure(c.symbol, "trend_debit_spread"))
-
-            if credit_enabled and credit_window and rangeish:
-                attempted_style = True
-                bullish_credit = last_close >= last_vwap
-                sig = self._build_credit_spread_signal(c, bullish_credit, client, data, frame, last_close, "midday_credit_spread", confirm_index, regime)
-                if sig:
-                    out.append(sig)
-                    self._record_entry_decision(c.symbol, "signal", [sig.reason])
+            reasons: list[str] = []
+            signal: Signal | None = None
+            for style in styles:
+                if not (enabled[style.kind] and in_window[style.kind]):
                     continue
-                reasons.extend(self._consume_style_failure(c.symbol, "midday_credit_spread"))
-
-            final_reasons = reasons or ([
+                if style.kind == "credit":
+                    if not rangeish:
+                        continue
+                    direction = last_close >= last_vwap
+                elif not (bullish or bearish):
+                    continue
+                elif style.kind == "orb":
+                    if opening_range is None:
+                        continue
+                    if bullish and last_close > or_high * (1.0 + buffer_pct) and last_close > last_vwap:
+                        direction = True
+                    elif bearish and last_close < or_low * (1.0 - buffer_pct) and last_close < last_vwap:
+                        direction = False
+                    else:
+                        continue
+                else:
+                    blocker = self._trend_momentum_blocker(frame, last)
+                    if blocker is not None:
+                        reasons.append(blocker)
+                        continue
+                    if bullish and last_ret5 >= trend_min_ret5:
+                        direction = True
+                    elif bearish and last_ret5 <= -trend_min_ret5:
+                        direction = False
+                    else:
+                        continue
+                # The style's own blockers are the proposal's pending
+                # reasons: a refusal lists them first, then every shared veto.
+                pending = style.pending_reasons(direction, frame, regime) if style.pending_reasons is not None else ()
+                signal = style.build(c, direction, client, data, frame, last_close, style.name, confirm_index, regime,
+                                     pending_reasons=pending)
+                if signal is not None:
+                    break
+                reasons.extend(self._consume_style_failure(c.symbol, style.name))
+            if signal is not None:
+                out.append(signal)
+                self._record_entry_decision(c.symbol, "signal", [signal.reason])
+                continue
+            # A style that tried to build recorded why it did not (at least
+            # its ``<style>_unavailable``), so an empty list means no style
+            # triggered.
+            self._record_entry_decision(c.symbol, "skipped", reasons or [
                 _no_style_trigger_reason(
                     regime_name=regime_name,
                     bullish=bullish,
                     bearish=bearish,
                     rangeish=rangeish,
-                    orb_enabled=orb_enabled,
-                    orb_window=orb_window,
-                    trend_enabled=trend_enabled,
-                    trend_window=trend_window,
-                    credit_enabled=credit_enabled,
-                    credit_window=credit_window,
+                    orb_enabled=enabled.get("orb", False),
+                    orb_window=in_window.get("orb", False),
+                    trend_enabled=enabled.get("trend", False),
+                    trend_window=in_window.get("trend", False),
+                    credit_enabled=enabled.get("credit", False),
+                    credit_window=in_window.get("credit", False),
                     last_close=last_close,
                     last_vwap=last_vwap,
                     last_ret5=last_ret5,
@@ -1800,8 +1868,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                     or_low=or_low,
                     orb_buffer_pct=buffer_pct,
                 )
-            ] if not attempted_style else ["no_contract_selected"])
-            self._record_entry_decision(c.symbol, "skipped", final_reasons)
+            ])
         return out
 
     def should_force_flatten(self, position: Position) -> bool:
@@ -1820,7 +1887,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         return now_dt.time() >= flat_time
 
     def position_mark_price(self, position: Position, data) -> float | None:
-        if position.strategy not in {self.strategy_name, 'zero_dte_etf_long_options'}:
+        if position.strategy not in self._OPTION_FAMILY:
             return None
         if asset_type_of(position.metadata) != ASSET_TYPE_OPTION_VERTICAL:
             return None

@@ -98,7 +98,11 @@ Current code defaults:
 
 | Option                        | Current code default |
 |-------------------------------|----------------------|
+| `orb_start_time`              | `09:35`              |
 | `orb_end_time`                | `10:05`              |
+| `orb_opening_window_start`    | `09:30`              |
+| `orb_opening_window_end`      | `09:34`              |
+| `orb_opening_min_bars`        | `3`                  |
 | `trend_start_time`            | `10:05`              |
 | `trend_end_time`              | `13:40`              |
 | `credit_start_time`           | `11:10`              |
@@ -153,7 +157,8 @@ Both option strategies use a regime engine that mixes ORB timing, trend scoring,
 Common parameter families:
 
 - Session clock:
-  - `orb_end_time`, `trend_start_time`, `trend_end_time`, `no_new_entries_after`
+  - `orb_start_time`, `orb_end_time`, `orb_opening_window_start`, `orb_opening_window_end`, `orb_opening_min_bars`, `trend_start_time`, `trend_end_time`, `no_new_entries_after`
+  - The ORB style fires from `orb_start_time` to `orb_end_time` on a break of the opening range: the bars from `orb_opening_window_start` to `orb_opening_window_end` (both inclusive), once at least `orb_opening_min_bars` of them are in. Since 2026-09-27 both strategies run one entry loop (`entry_signals` here, over each strategy's style table), so this strategy's debit ORB takes the long options' configurable window and 3-bar guard; until then it took any bar of a fixed 09:30-09:34 window, so a lone 09:34 bar was its opening range. On the archived tapes (730 symbol-days, all 20 SPY / QQQ days among them) every ETF day had all 5 opening bars; only 3 small-cap days had fewer than 3.
 - Minimum data:
   - `min_bars`, `min_confirm_bars`, `trend_vwap_lookback`, `flip_lookback`, `range_lookback`
 - Live tape filters (replace legacy TV cumulative RVOL — 2026-05-14):

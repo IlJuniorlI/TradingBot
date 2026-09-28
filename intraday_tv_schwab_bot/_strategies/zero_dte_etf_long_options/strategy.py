@@ -12,12 +12,9 @@ from ...options_mode import (
     choose_by_delta,
     single_option_limit_price,
 )
-from ...bars import same_day_mask
-from ...sessions import is_time_in_window, parse_hhmm
 from ...numeric import first_float, safe_float
-from ...reasons import insufficient_bars_reason, reason_with_values
-from ... import sessions
-from ..zero_dte_etf_options.strategy import ZeroDteEtfOptionsStrategy, _no_style_trigger_reason
+from ...reasons import reason_with_values
+from ..zero_dte_etf_options.strategy import ZeroDteEtfOptionsStrategy, _EntryStyle
 
 class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
     """0DTE long calls / puts on the inherited regime engine.
@@ -29,18 +26,29 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
     and conviction blockers (``_long_option_style_gate``) ride along as the
     proposal's pending reasons. The ORB path's own switches
     (``orb_apply_structure_veto`` / ``orb_apply_sr_veto``) were retired on
-    2026-09-24.
+    2026-09-24. The entry loop is the base's (``entry_signals``) on this
+    style table; it reads each chain in the build, with no prefetch.
     """
 
     strategy_name = 'zero_dte_etf_long_options'
     time_params = ("no_new_entries_after", "orb_start_time", "orb_end_time", "orb_opening_window_start",
                    "orb_opening_window_end", "trend_start_time", "trend_end_time")
+    _PREFETCH_OPTION_CHAINS = False
 
     def required_history_bars(self, symbol: str | None = None, positions: dict[str, Position] | None = None) -> int:
         capability_bars = self._manifest_required_history_bars()
         if capability_bars is not None:
             return capability_bars
         return max(0, int(self.params.get("min_bars", 90)))
+
+    def _entry_styles(self) -> tuple[_EntryStyle, ...]:
+        """A long call / put on the ORB, then on the trend, whose own
+        extension and conviction blockers (``_long_option_style_gate``) ride
+        on its premium proposal."""
+        return (
+            _EntryStyle("orb_long_option", "orb", self._build_single_option_signal),
+            _EntryStyle("trend_long_option", "trend", self._build_single_option_signal, self._long_option_style_gate),
+        )
 
     def _long_option_style_gate(self, bullish: bool, frame: pd.DataFrame, regime: dict[str, Any]) -> list[str]:
         """zero_dte_etf_long_options' own trend-entry blockers (conviction,
@@ -119,11 +127,13 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
         if contract is None:
             self._set_build_failure(underlying, style, "no_contract_near_target_delta")
             return None
-        stable = self._stabilize_single_option_quote(data, contract)
+        stable, instability = self._stabilize_quotes(data, (contract,), validate=self._validate_single_option_market,
+                                                     failure_detail=self._single_option_market_failure_detail,
+                                                     source="strategies:option_quote_stability_single")
         if stable is None:
-            self._set_build_failure(underlying, style, "quote_not_stable")
+            self._set_build_failure(underlying, style, f"quote_not_stable({instability})")
             return None
-        contract = stable
+        (contract,) = stable
         market = self._validate_single_option_market(contract)
         if market is None:
             self._set_build_failure(underlying, style, "option_spread_too_wide")
@@ -182,181 +192,6 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             reference_symbol=confirm_index,
             premium_stop=stop,
         )
-
-    def entry_signals(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], client=None, data=None) -> list[Signal]:
-        self._reset_entry_decisions()
-        if not self._options_enabled() or client is None or data is None:
-            return []
-        out: list[Signal] = []
-        self._underlying_atr_cache.clear()
-        self._underlying_ref_atr_cache.clear()
-        now_dt = sessions.now_et()
-        blackout_reason = self._option_entry_block_reason(now_dt)
-        if blackout_reason:
-            for c in candidates:
-                self._record_entry_decision(c.symbol, "skipped", [blackout_reason])
-            return out
-        now_t = now_dt.time()
-        if now_t > parse_hhmm(self.params.get("no_new_entries_after", "13:45")):
-            for c in candidates:
-                self._record_entry_decision(c.symbol, "skipped", ["after_entry_cutoff"])
-            return out
-        for c in candidates:
-            reasons: list[str] = []
-            if self._underlying_already_open(c.symbol, positions):
-                self._record_entry_decision(c.symbol, "skipped", ["underlying_already_open"])
-                continue
-            frame = bars.get(c.symbol)
-            # B2 fix: aligned with required_history_bars() default (90) so the
-            # init-time history fetch and the runtime entry gate use the same
-            # floor. Manifest ships 90; the param.get fallback also lands at
-            # 90 if manifest loading somehow misses (silent-drift guard).
-            min_bars = int(self.params.get("min_bars", 90))
-            if frame is None or len(frame) < min_bars:
-                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_underlying_bars", 0 if frame is None else len(frame), min_bars)])
-                continue
-            regime = self._regime_confirm(c, bars, data)
-            if not regime.get("ok") or regime.get("no_trade"):
-                reasons.append(str(regime.get("reason") or "regime_blocked"))
-                self._record_entry_decision(c.symbol, "skipped", reasons)
-                continue
-            confirm_index = regime.get("confirm_index")
-            last = frame.iloc[-1]
-            self._underlying_atr_cache[c.symbol] = safe_float(last.get("atr14"), 0.0)
-            if "atr14" in frame.columns:
-                atr_series = frame["atr14"].dropna().tail(20)
-                self._underlying_ref_atr_cache[c.symbol] = float(atr_series.median()) if len(atr_series) >= 5 else 0.0
-            # B3 / B4 fix: opening-range bars and ORB-window endpoints are
-            # both configurable. The opening window defines or_high/or_low
-            # (the levels we trade the breakout against); the ORB window
-            # defines WHEN we look for those breakouts. Defaults preserve
-            # legacy behaviour (09:30-09:34 opening, 09:35-10:05 trading).
-            # No str() on these: YAML reads an unquoted 9:30 as the int 570,
-            # and pandas reads between_time("570", "574") as an empty window
-            # without raising, so the opening range never formed.
-            # is_time_in_window parses its own ends; between_time needs times.
-            orb_start_time = self.params.get("orb_start_time", "09:35")
-            orb_end_time = self.params.get("orb_end_time", "10:05")
-            opening_window_start = parse_hhmm(self.params.get("orb_opening_window_start", "09:30"))
-            opening_window_end = parse_hhmm(self.params.get("orb_opening_window_end", "09:34"))
-            opening = frame[same_day_mask(frame, sessions.now_et().date())].between_time(opening_window_start, opening_window_end)
-            regime_name = str(regime.get("regime") or "unknown")
-            bullish = regime_name == "bullish_trend"
-            bearish = regime_name == "bearish_trend"
-            rangeish = regime_name == "range"
-            attempted_style = False
-            # C1 fix: use .get() with safe_float defaults so a frame that
-            # somehow ships without a column (rare edge — partial warmup,
-            # data gap) returns the default instead of KeyError-ing.
-            last_close = safe_float(last.get("close"), 0.0)
-            last_vwap = safe_float(last.get("vwap"), last_close)
-            last_ret5 = safe_float(last.get("ret5"), 0.0)
-            orb_enabled = self._style_enabled("orb_long_option")
-            orb_window = is_time_in_window(now_t, orb_start_time, orb_end_time)
-            trend_enabled = self._style_enabled("trend_long_option")
-            # B2 fix: 13:30 default matches manifest.json (was 13:25 — a
-            # 5-minute silent drift if the manifest ever didn't apply).
-            trend_window = is_time_in_window(now_t, self.params.get("trend_start_time", "10:05"), self.params.get("trend_end_time", "13:30"))
-            # C2 fix: require a minimum number of bars in the opening
-            # window before deriving or_high / or_low. A single 09:34
-            # stream bar would otherwise be treated as the "opening range"
-            # and produce trivially-passable breakout checks. Default 3
-            # bars keeps things flexible for shortened sessions or late-
-            # start data while still requiring real structure.
-            opening_min_bars = int(self.params.get("orb_opening_min_bars", 3))
-            opening_ready = (not opening.empty) and len(opening) >= opening_min_bars
-            or_high = safe_float(opening["high"].max(), 0.0) if opening_ready else None
-            or_low = safe_float(opening["low"].min(), 0.0) if opening_ready else None
-            buffer_pct = float(self.params.get("orb_breakout_buffer_pct", 0.0008))
-            trend_min_ret5 = float(self.params.get("trend_min_ret5", 0.0006))
-
-            if orb_enabled and orb_window and (bullish or bearish):
-                if opening_ready:
-                    # Long premium against the LTF structure, or crowding an
-                    # S/R level, bleeds theta even on a clean breakout. Since
-                    # 2026-09-24 those vetoes are the shared entry stage's
-                    # (shared_entry.use_structure_filter / use_sr_filter on the
-                    # premium proposal the builder admits), recorded under
-                    # their shared tokens; they replace
-                    # params.orb_apply_structure_veto / orb_apply_sr_veto,
-                    # and a veto no longer hides the other one.
-                    if bullish and last_close > safe_float(or_high, 0.0) * (1.0 + buffer_pct) and last_close > last_vwap:
-                        attempted_style = True
-                        sig = self._build_single_option_signal(c, True, client, data, frame, last_close, "orb_long_option", confirm_index, regime)
-                        if sig:
-                            out.append(sig)
-                            self._record_entry_decision(c.symbol, "signal", [sig.reason])
-                            continue
-                        reasons.extend(self._consume_style_failure(c.symbol, "orb_long_option"))
-                    if bearish and last_close < safe_float(or_low, 0.0) * (1.0 - buffer_pct) and last_close < last_vwap:
-                        attempted_style = True
-                        sig = self._build_single_option_signal(c, False, client, data, frame, last_close, "orb_long_option", confirm_index, regime)
-                        if sig:
-                            out.append(sig)
-                            self._record_entry_decision(c.symbol, "signal", [sig.reason])
-                            continue
-                        reasons.extend(self._consume_style_failure(c.symbol, "orb_long_option"))
-
-            if trend_enabled and trend_window and (bullish or bearish):
-                momentum_ok = True
-                if self.optcfg.trend_momentum_filter_enabled:
-                    atr_current = safe_float(last.get("atr14"), 0.0)
-                    atr_tail = frame.tail(20)["atr14"].dropna() if "atr14" in frame.columns else pd.Series(dtype=float)
-                    atr_mean = float(atr_tail.mean()) if len(atr_tail) > 0 else 0.0
-                    atr_expansion = atr_current / max(atr_mean, 1e-9) if atr_mean > 0 else 0.0
-                    vol_current = safe_float(last.get("volume"), 0.0)
-                    vol_tail = frame.tail(10)["volume"].dropna() if "volume" in frame.columns else pd.Series(dtype=float)
-                    vol_mean = float(vol_tail.mean()) if len(vol_tail) > 0 else 1.0
-                    volume_ratio = vol_current / max(vol_mean, 1.0)
-                    min_atr_exp = float(getattr(self.optcfg, "trend_min_atr_expansion", 0.85))
-                    min_vol_ratio = float(getattr(self.optcfg, "trend_min_volume_ratio", 0.90))
-                    if atr_expansion < min_atr_exp or volume_ratio < min_vol_ratio:
-                        momentum_ok = False
-                        reasons.append(f"trend_momentum_filter(atr_exp={atr_expansion:.3f}<{min_atr_exp},vol_ratio={volume_ratio:.3f}<{min_vol_ratio})")
-                # The style gate's own blockers are the proposal's pending
-                # reasons: a refusal lists them first, then every shared veto.
-                if momentum_ok and bullish and last_ret5 >= trend_min_ret5:
-                    attempted_style = True
-                    sig = self._build_single_option_signal(c, True, client, data, frame, last_close, "trend_long_option", confirm_index, regime,
-                                                           pending_reasons=self._long_option_style_gate(True, frame, regime))
-                    if sig:
-                        out.append(sig)
-                        self._record_entry_decision(c.symbol, "signal", [sig.reason])
-                        continue
-                    reasons.extend(self._consume_style_failure(c.symbol, "trend_long_option"))
-                if momentum_ok and bearish and last_ret5 <= -trend_min_ret5:
-                    attempted_style = True
-                    sig = self._build_single_option_signal(c, False, client, data, frame, last_close, "trend_long_option", confirm_index, regime,
-                                                           pending_reasons=self._long_option_style_gate(False, frame, regime))
-                    if sig:
-                        out.append(sig)
-                        self._record_entry_decision(c.symbol, "signal", [sig.reason])
-                        continue
-                    reasons.extend(self._consume_style_failure(c.symbol, "trend_long_option"))
-
-            final_reasons = reasons or ([
-                _no_style_trigger_reason(
-                    regime_name=regime_name,
-                    bullish=bullish,
-                    bearish=bearish,
-                    rangeish=rangeish,
-                    orb_enabled=orb_enabled,
-                    orb_window=orb_window,
-                    trend_enabled=trend_enabled,
-                    trend_window=trend_window,
-                    credit_enabled=False,
-                    credit_window=False,
-                    last_close=last_close,
-                    last_vwap=last_vwap,
-                    last_ret5=last_ret5,
-                    trend_min_ret5=trend_min_ret5,
-                    or_high=or_high,
-                    or_low=or_low,
-                    orb_buffer_pct=buffer_pct,
-                )
-            ] if not attempted_style else ["no_contract_selected"])
-            self._record_entry_decision(c.symbol, "skipped", final_reasons)
-        return out
 
     def position_mark_price(self, position: Position, data) -> float | None:
         if position.strategy != self.strategy_name:
