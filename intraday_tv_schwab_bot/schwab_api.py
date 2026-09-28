@@ -3,6 +3,7 @@
 
 ``call_schwab_client`` counts the call, serializes the token refresh and logs
 a non-2xx response. ``response_ok`` is the one reading of a response status.
+``SCHWAB_TRANSPORT_ERRORS`` are the transport failures the client raises.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from threading import Lock, RLock
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
+import requests
 from schwabdev import Client as SchwabClient
 
 from . import sessions
@@ -207,12 +209,43 @@ class SchwabHTTPError(RuntimeError):
         super().__init__(f"{self.method_name} status={status_code} {detail}")
 
 
+# The transport failures a Schwab read raises (every call_schwab_json call is
+# a GET). schwabdev's Client sends it on a requests Session whose adapter
+# retries a failed connect, a failed read (at most twice) and a 429, 500,
+# 502, 503 or 504 status, within three retries in all, then hands back the
+# last status instead of raising, which call_schwab_json reads as a
+# SchwabHTTPError. A refused, reset or dropped connection, a DNS or TLS
+# failure, a connect timeout and a read timeout raise requests'
+# ConnectionError (ConnectTimeout and SSLError are subclasses): a timed-out
+# read of the headers raises it once its retries are spent, and one of the
+# body at once, never ReadTimeout. A body cut off mid-transfer raises
+# ChunkedEncodingError, a body whose Content-Encoding does not decode
+# ContentDecodingError, and a redirect loop TooManyRedirects (the session
+# follows 30 redirects). The token refresh logs and swallows its own network
+# errors. Anything else is not a transport failure, and propagates:
+# schwabdev's parameter validator raises TypeError or ValueError, and
+# requests raises InvalidURL, MissingSchema and the like for a request it
+# cannot build. So does a redirect to a URL requests cannot use (a malformed
+# Location raises ValueError, a non-http scheme InvalidSchema): the server
+# supplied it, but it propagates like a bug. Checked 2026-09-28 against
+# schwabdev 4.0.0, requests 2.34.2 and urllib3 2.8.0, with loopback servers
+# failing each of those ways.
+SCHWAB_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError,
+    requests.exceptions.TooManyRedirects,
+)
+
+
 def call_schwab_json(client: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
     """Call ``method_name`` and return its decoded JSON body.
 
     The response must be 2xx (``response_ok``) and its body must decode.
     Anything else raises ``SchwabHTTPError``, so an error body is never read
-    as an empty payload. Network errors from the client propagate unchanged.
+    as an empty payload. The decoded body can be any JSON value, not only an
+    object (a list, null, a string). A transport failure propagates
+    unchanged, as one of ``SCHWAB_TRANSPORT_ERRORS``.
     """
     response = call_schwab_client(client, method_name, *args, **kwargs)
     status = getattr(response, "status_code", None)

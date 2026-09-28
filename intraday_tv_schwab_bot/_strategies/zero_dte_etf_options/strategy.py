@@ -185,6 +185,9 @@ class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
         # retried until option_chain_cache_seconds has passed, the same pace
         # as a successful one, so a failing chain costs no extra Schwab calls.
         self._option_chain_read_failed_at: dict[str, datetime] = {}
+        # A prefetch read that raised anything else is logged with its
+        # traceback at WARNING at most once a minute per symbol.
+        self._option_chain_prefetch_failures = self._option_chain_failure_log()
         self._underlying_atr_cache: dict[str, float] = {}
         self._underlying_ref_atr_cache: dict[str, float] = {}
         # pandas' between_time read a reversed opening window as the bars

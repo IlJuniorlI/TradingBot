@@ -3260,6 +3260,84 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A network error or a body that is not a JSON object on a 0DTE
+  option-chain read no longer fails the engine's cycle.** *2026-09-28* —
+  both 0DTE strategies read the chain through `call_schwab_json`, which lets
+  a transport failure through unchanged and returns whatever JSON the body
+  decodes to, and `_fetch_raw_option_chain`
+  (`zero_dte_etf_options/chain.py`) caught only `SchwabHTTPError`. A refused
+  or dropped connection, a timeout, a broken body or a redirect loop raised
+  out of the read, and a 2xx body that was not a JSON object (a list, null)
+  raised out of `parse_option_chain`. Raised by the build path's read,
+  either left `entry_signals` and failed `step()` after position management,
+  on every cycle in which a candidate whose chain read failed reached a
+  build (a style fired on it): the cycle's other candidates got no entry,
+  the end-of-cycle marks were skipped, the dashboard showed the error
+  instead of the cycle, and consecutive failed cycles doubled the loop's
+  sleep, up to 60 s. The spreads' prefetch logged and swallowed the error
+  but recorded no failure, so the build path read the chain again and
+  raised.
+  - `schwab_api.SCHWAB_TRANSPORT_ERRORS` names what the Schwab client raises
+    for a transport failure: requests' `ConnectionError` (with
+    `ConnectTimeout` and `SSLError`), `ChunkedEncodingError`,
+    `ContentDecodingError` and `TooManyRedirects` (a redirect loop: the
+    session follows 30 redirects). It was checked against schwabdev 4.0.0
+    with loopback servers failing each way: a timed-out read ends as a
+    `ConnectionError`, never `ReadTimeout`, and the token refresh swallows
+    its own network errors. The errors requests raises for a request it
+    cannot build (`InvalidURL`, `MissingSchema` and the like) are not in it,
+    nor those of a redirect to a URL it cannot use (`ValueError`,
+    `InvalidSchema`), which propagate like a bug.
+  - The chain read takes a transport failure like an error response: a
+    WARNING under `..._strategies.zero_dte_etf_options.chain`, the failure
+    remembered (`_option_chain_read_failed_at`, so the chain is re-read
+    after `option_chain_cache_seconds`), and the build's
+    `option_chain_unavailable`. The warning names the error's type now:
+    `Option chain read failed for SPY: ConnectionError: ...`, and
+    `SchwabHTTPError: ...` for an error response.
+  - It takes a 2xx body that is not a JSON object the same way, checked
+    before `parse_option_chain` runs: `Option chain read failed for SPY:
+    list body, not a JSON object: []`, the body's repr cut at 120
+    characters.
+  - Anything else the read raises propagates from it, and nothing is
+    remembered: a bug, such as schwabdev's parameter validator's
+    `TypeError`, a request requests cannot build (`InvalidURL`), or a JSON
+    object that `parse_option_chain` cannot read. Raised from the build
+    path's read, it fails the cycle as before, on a cycle in which a style
+    fires on that candidate.
+  - The spreads' prefetch is a warm-up and never fails the cycle. A chain
+    the read found unavailable is remembered, so the build path does not
+    read it again. Anything else a read raises in the prefetch is logged
+    with its type and traceback (`Option chain prefetch failed for SPY:
+    TypeError: ...`), at WARNING at most once a minute per symbol and at
+    DEBUG in between (`log_setup.ComponentFailureLog`: the prefetch runs
+    every entry cycle), and the other symbols still warm; the build path's
+    own read decides for a candidate that needs the chain.
+  - `log_setup.ComponentFailureLog` (the dashboard's, the exit record's and
+    now the prefetch's failure log) read a component that had never warned
+    as warned at 0.0 on the monotonic clock, so a first failure within a
+    minute of the host's boot logged at DEBUG only; it now always warns.
+  - `requests` is a direct dependency (`requirements.txt`, `pyproject.toml`)
+    at 2.34.2, the version `constraints.txt` pinned. The layering guard lets
+    `schwab_api` import it.
+  - Tests: `tests/test_zero_dte_chain.py`. `TestAFailedRead`: each transport
+    error type and a list, null or string body, on the read and on the
+    prefetch; a `TypeError`, an `AttributeError`, requests' `InvalidURL` and
+    a JSON object the parser cannot read, which propagate from the read; a
+    2xx `{}`, an empty chain; one the parser cannot read in the prefetch,
+    logged while the other symbols warm; a bug in the prefetch, logged with
+    its traceback while the other symbols warm, once a minute per symbol,
+    and raised again by the build path's read. `TestTheCycleGoesOn`: an
+    entry cycle of each strategy over SPY and QQQ with SPY's chain failing:
+    QQQ enters when SPY's chain is unavailable, a bug raises when a style
+    fires on SPY, and QQQ enters when none does, a body the parser cannot
+    read included. The C44 warnings test reads both warnings with the
+    error's type. `tests/test_schwab_api.py`: `call_schwab_json` passes each
+    transport error through unchanged, a request requests cannot build is
+    not one, and a 2xx body that is not an object comes back as it is.
+    `tests/test_log_setup.py`: a first failure in the host's first minute
+    warns.
+
 - **A stop signal between cycles shuts the bot down cleanly.** *2026-09-26* —
   the engine routed SIGTERM through KeyboardInterrupt, but only the session
   reconcile and `step()` sat inside the loop's `except KeyboardInterrupt`. A

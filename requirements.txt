@@ -52,7 +52,13 @@
 #     VERIFY THE STREAM ON BETA before promoting.
 #
 # 592 tests pass; `pip check` clean.
+#
+# 2026-09-28: requests is a direct dependency. schwab_api names the
+# transport errors schwabdev's client raises (SCHWAB_TRANSPORT_ERRORS), so
+# the bot imports requests itself. The pin is the one constraints.txt held,
+# the version schwabdev and tradingview-screener already resolved.
 schwabdev==4.0.0
+requests==2.34.2
 tradingview-screener==3.2.2
 pandas==3.0.6
 numpy==2.4.6

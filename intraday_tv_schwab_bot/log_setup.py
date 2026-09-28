@@ -37,8 +37,10 @@ class ComponentFailureLog:
     """Logs a failing component's error with its traceback, for a failure
     that can repeat every cycle: at WARNING at most once a minute per
     component, at DEBUG in between. Its owner (``DashboardCache``, the
-    position manager's exit record) calls it from inside the ``except``;
-    each owner keeps its own minute per component."""
+    position manager's exit record, the 0DTE chain prefetch) calls it from
+    inside the ``except``; each owner keeps its own minute per component.
+    A component's first failure always warns, however soon after the
+    host's boot (the monotonic clock) it comes."""
 
     def __init__(self, logger: logging.Logger) -> None:
         self._logger = logger
@@ -46,7 +48,8 @@ class ComponentFailureLog:
 
     def __call__(self, component: str, message: str, *message_args: Any) -> None:
         now_ts = time.monotonic()
-        if now_ts - self._warned_at.get(component, 0.0) >= 60.0:
+        last = self._warned_at.get(component)
+        if last is None or now_ts - last >= 60.0:
             self._warned_at[component] = now_ts
             self._logger.warning(message, *message_args, exc_info=True)
         else:

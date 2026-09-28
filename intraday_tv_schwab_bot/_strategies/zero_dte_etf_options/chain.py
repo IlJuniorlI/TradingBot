@@ -5,8 +5,9 @@
 the liquidity filter and the parallel prefetch. It also holds the vertical
 and single-option market validators, with the reason each one refused, and
 the quote-stability loop the builders run before they price their legs. The
-strategy's ``__init__`` creates the cache state these methods read
-(``_option_chain_cache``, ``_option_chain_read_failed_at``) and ``optcfg``.
+strategy's ``__init__`` creates the state these methods read
+(``_option_chain_cache``, ``_option_chain_read_failed_at``,
+``_option_chain_prefetch_failures``) and ``optcfg``.
 The mixin moved out of ``strategy.py`` on 2026-09-27; the builders, the
 entry gate ``_underlying_below_min_price`` and the entry loop stay there.
 """
@@ -28,7 +29,8 @@ from ...options_mode import (
 )
 from ...reasons import detail_fields
 from ... import sessions
-from ...schwab_api import SchwabHTTPError, call_schwab_json
+from ...log_setup import ComponentFailureLog
+from ...schwab_api import SCHWAB_TRANSPORT_ERRORS, SchwabHTTPError, call_schwab_json
 
 LOG = logging.getLogger(__name__)
 
@@ -40,6 +42,15 @@ class OptionChainMixin:
     _option_chain_cache: dict[tuple[str, str], tuple[datetime, list[OptionContract]]]
     # Symbol -> when its last option_chains read failed (see __init__).
     _option_chain_read_failed_at: dict[str, datetime]
+    # Logs a prefetch read that raised anything else (see __init__).
+    _option_chain_prefetch_failures: ComponentFailureLog
+
+    @staticmethod
+    def _option_chain_failure_log() -> ComponentFailureLog:
+        """The prefetch's failure log, under this module's logger: a
+        WARNING with the traceback at most once a minute per symbol, DEBUG
+        in between."""
+        return ComponentFailureLog(LOG)
 
     @staticmethod
     def _option_chain_cache_key(symbol: str) -> tuple[str, str]:
@@ -88,7 +99,11 @@ class OptionChainMixin:
         # liquidity filter applied. Use _fetch_filtered_contracts when
         # you need a filtered list; use this when you only want to warm
         # the cache. An error response is not an empty chain: it is not
-        # cached, and the build path reports option_chain_unavailable.
+        # cached, and the build path reports option_chain_unavailable. A
+        # transport failure (SCHWAB_TRANSPORT_ERRORS) and a 2xx body that is
+        # not a JSON object (a list, null, a string) read the same; until
+        # 2026-09-28 they escaped entry_signals and failed the engine cycle.
+        # Anything else the read raises propagates.
         cached = self._get_cached_option_chain(symbol)
         if cached is not None:
             return cached
@@ -113,14 +128,24 @@ class OptionChainMixin:
                 fromDate=today,
                 toDate=today,
             )
-        except SchwabHTTPError as exc:
-            LOG.warning("Option chain read failed for %s: %s", symbol, exc)
-            self._option_chain_read_failed_at[str(symbol).upper().strip()] = sessions.now_et()
+        except (SchwabHTTPError, *SCHWAB_TRANSPORT_ERRORS) as exc:
+            self._record_option_chain_read_failure(symbol, f"{type(exc).__name__}: {exc}")
+            return None
+        if not isinstance(payload, dict):
+            # parse_option_chain reads an object.
+            self._record_option_chain_read_failure(
+                symbol, f"{type(payload).__name__} body, not a JSON object: {payload!r:.120}")
             return None
         self._option_chain_read_failed_at.pop(str(symbol).upper().strip(), None)
         contracts = parse_option_chain(payload, only_dte=0)
         self._set_cached_option_chain(symbol, contracts)
         return contracts
+
+    def _record_option_chain_read_failure(self, symbol: str, detail: str) -> None:
+        """Log a chain read that returned no chain, and remember when, so
+        the chain is not re-read for ``option_chain_cache_seconds``."""
+        LOG.warning("Option chain read failed for %s: %s", symbol, detail)
+        self._option_chain_read_failed_at[str(symbol).upper().strip()] = sessions.now_et()
 
     def _fetch_filtered_contracts(self, client, symbol: str, put_call: str) -> list[OptionContract] | None:
         """The chain's liquid ``put_call`` contracts; None when the chain
@@ -144,10 +169,16 @@ class OptionChainMixin:
         # for N>1 cache-miss candidates that's N * ~150ms of stacked I/O on
         # the engine thread per cycle. The chain cache is symbol+date keyed
         # (no put_call), so one fetch per symbol covers both CALL and PUT
-        # build paths. A Schwab error response is remembered by
-        # _fetch_raw_option_chain, so the build path does not re-read it and
-        # emits option_chain_unavailable; any other failure is logged and
-        # swallowed here, and the build path retries on its own.
+        # build paths. The prefetch is a warm-up and never fails the cycle.
+        # A read that found the chain unavailable (an error response, a
+        # transport failure, a body that is not a JSON object) is remembered
+        # by _fetch_raw_option_chain, so the build path does not re-read it
+        # and emits option_chain_unavailable. Anything else a read raises is
+        # logged here with its traceback (at WARNING at most once a minute
+        # per symbol, at DEBUG in between: the prefetch runs every entry
+        # cycle), and the other symbols still warm. It is not remembered: the
+        # build path reads that chain again, and its read raises for a
+        # candidate a style fires on.
         misses = [
             sym for sym in {str(s or "").upper().strip() for s in symbols}
             if sym and self._get_cached_option_chain(sym) is None
@@ -163,7 +194,9 @@ class OptionChainMixin:
                 # parameterised per build call and don't affect the cache).
                 self._fetch_raw_option_chain(client, sym)
             except Exception as exc:
-                LOG.warning("Option chain prefetch failed for %s: %s", sym, exc)
+                self._option_chain_prefetch_failures(f"option_chain_prefetch:{sym}",
+                                                     "Option chain prefetch failed for %s: %s: %s",
+                                                     sym, type(exc).__name__, exc)
 
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="bot-option-chain-prefetch") as executor:
             futures = [executor.submit(_warm, sym) for sym in misses]
