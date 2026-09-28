@@ -310,6 +310,84 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **One opening-range computation, `bars.opening_range` (refactor cut
+  B10).** *2026-09-27* — `bars.opening_range(frame, day, *, start, minutes,
+  min_bars)` returns `(high, low, bars)` over the bars of `day` labelled in
+  the half-open window `[start, start + minutes)`, or None when the window
+  holds fewer than `min_bars` bars or its high or low is NaN. It replaces
+  three copies, each with its own window convention and bar rule:
+  `opening_range_breakout` (and `microcap_gap_orb`, which inherits it)
+  sliced the day and masked the window by hand; top_tier_adaptive's
+  `_opening_range` mapped a lambda over the day's bars; and the 0DTE
+  strategies' `_opening_range` (one method since cut B11) read their
+  configured window with `between_time`, closed at both ends. Each caller
+  keeps its own start, clamp and bar rule:
+  - the ORB strategy: 09:30, `max(0, opening_range_minutes)`, one bar;
+  - top_tier (`regimes/orb.py`): 09:30, `_orb_range_minutes()`
+    (`max(1, orb_range_minutes)`, in `schedule.py`, the clamp
+    `_orb_range_end` now reads too), one bar. `_opening_range` returns the
+    helper's `(high, low, bars)` or None, not `(None, None)`;
+  - both 0DTE strategies: `_opening_window()`, the start
+    `orb_opening_window_start` and the minutes through
+    `orb_opening_window_end` inclusive (the knobs name the range's first and
+    last 1m bar, as the closed window read them), `orb_opening_min_bars`.
+    `_opening_range` returns the helper's `(high, low, bars)` or None.
+
+  On 1m bars labelled at the minute the closed and the half-open windows
+  select the same bars.
+
+  **Behaviour changes:**
+  - The ORB strategy no longer requires `opening_range_minutes + 2` bars of
+    the day. That count included premarket bars, so it did not measure the
+    opening range; the range needs a bar, and the trade a bar after it, as
+    before. On a tape without premarket bars the 09:35 break of a 5-minute
+    range waited a bar (6 < 7). On the 724 archived symbol-days (33
+    sessions of recorded 1m bars), at the shipped 5 minutes and every minute
+    of the 09:37-10:05 entry window, the decision changes on 7 symbol-days,
+    all thin prints (ABTS, ANY, XOS and ZJYL between 2026-05-29 and
+    2026-06-02, CTVA on 2026-05-28, the VIX index on 2026-04-30 and
+    2026-05-18) with at most 2 premarket bars: on 6 of them the setup is now
+    evaluated where it used to be skipped as `opening_range_incomplete` (35
+    of 20,996 checks, up to 21 minutes earlier on ABTS), and on ZJYL (29
+    checks) and in 10 other checks it is still skipped as incomplete with
+    the window's own counts in the reason. A symbol that is now evaluated
+    and refused records the setup's reasons instead, so a divergence-only
+    entry (`use_divergence_entry_signal`) may consider it. Replayed through
+    both ORB strategies' `entry_signals` on the first six sessions and the
+    small-cap days, with and without their premarket bars, 5 of the new
+    evaluations per strategy build a signal, all on the tapes without
+    premarket bars.
+  - A range with no price (every high or every low in it NaN) is no range.
+    The ORB strategy reported it as `opening_range_values_nan`; it is now
+    `opening_range_incomplete(required>=1,current=0,...)`, and the old token
+    left `shared_entry.DIVERGENCE_INELIGIBLE_REASONS` (the new one is in
+    it). top_tier let a NaN edge through its `or_high <= or_low` check and
+    the ORB builder carried it on to a NaN target or stop; the 0DTE
+    strategies read it as 0.0, which any close breaks bullishly, so either
+    one built a bull ORB entry on it. The feed's frames never hold such a
+    bar (`ensure_ohlcv_frame` drops a bar without a price): top_tier and
+    both 0DTE strategies return the same range on every archived
+    symbol-day, at every clock from 09:25 to 10:35 and at every setting
+    tried (top_tier 0-30 minutes; the 0DTE window 09:30-09:34, 09:30 alone,
+    09:31-09:40 and 09:30-09:59 with 0-5 bars), with and without the
+    premarket bars, and their entry decisions are the same.
+  - Both 0DTE strategies fail at load when `orb_opening_window_end` is
+    before `orb_opening_window_start` (the base's check, since both read
+    the window): pandas' `between_time` read the reversed pair as the bars
+    outside it, a range of premarket and afternoon prints. A one-bar window
+    (the same start and end) builds. No preset is affected.
+
+  Tests: `tests/test_bars.py` (`TestOpeningRange`, new),
+  `tests/test_orb_regime.py` (a range without a price; the one-source test
+  reads the bar count and clamps a 0-minute range),
+  `tests/test_breakout_conversions.py` (the 09:35 break with no premarket
+  bars; the NaN reason), `tests/test_zero_dte_entry_styles.py` (the
+  window's last bar and a range without a price, both presets),
+  `tests/test_strategy_time_params.py` (the reversed window, both
+  presets), `tests/test_top_tier_adaptive_new_regimes.py`. The NaN, the
+  reversed-window and the ORB-break cases fail on the old code; the
+  window's last bar pins what the change must keep.
+
 - **The 0DTE strategies run one entry loop (refactor cut B11).**
   *2026-09-27* — `ZeroDteEtfOptionsStrategy.entry_signals` runs the
   strategy's style table, `_entry_styles()`. Each row is an `_EntryStyle`:

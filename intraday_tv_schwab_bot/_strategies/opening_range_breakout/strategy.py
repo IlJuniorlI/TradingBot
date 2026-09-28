@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 import logging
-import math
 
 import pandas as pd
 
@@ -8,7 +7,7 @@ from ...models import Candidate, Position, Side, Signal
 from ...numeric import safe_float
 from ...reasons import insufficient_bars_reason, reason_with_values
 from ... import sessions
-from ...bars import rth_open_plus, same_day_mask, time_gte_mask
+from ...bars import opening_range, rth_open_plus, same_day_mask, time_gte_mask
 from ...sessions import EQUITY_RTH_OPEN
 from ..shared_entry import EntryContexts, EntryProposal, RetestTrigger
 from ..strategy_base import BaseStrategy
@@ -73,24 +72,21 @@ class ORBStrategy(BaseStrategy):
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)])
                 continue
             day = sessions.now_et().date()
+            range_minutes = max(0, opening_range_minutes)
+            # The opening range, [09:30, 09:30 + N), needs a bar with a price
+            # and the trade a bar after it; premarket bars count toward
+            # neither. A range with no price reads as none (current=0).
+            opening = opening_range(frame, day, start=EQUITY_RTH_OPEN, minutes=range_minutes, min_bars=1)
             session = frame[same_day_mask(frame, day)]
-            if len(session) < opening_range_minutes + 2:
-                self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("opening_range_incomplete", len(session), opening_range_minutes + 2)])
-                continue
-            opening_start_time = EQUITY_RTH_OPEN
-            after_start_time = rth_open_plus(max(0, opening_range_minutes))
-            times_series = session.index.to_series().map(lambda ts: ts.time())
-            opening_mask = (times_series >= opening_start_time) & (times_series < after_start_time)
-            opening = session[opening_mask.to_numpy()]
-            after = session[time_gte_mask(session, after_start_time)]
-            if opening.empty or after.empty:
+            after = session[time_gte_mask(session, rth_open_plus(range_minutes))]
+            if opening is None or after.empty:
                 self._record_entry_decision(
                     c.symbol,
                     "skipped",
                     [
                         reason_with_values(
                             "opening_range_incomplete",
-                            current=len(opening),
+                            current=0 if opening is None else opening[2],
                             required=1,
                             op=">=",
                             digits=0,
@@ -99,11 +95,7 @@ class ORBStrategy(BaseStrategy):
                     ],
                 )
                 continue
-            or_high = float(opening["high"].max())
-            or_low = float(opening["low"].min())
-            if math.isnan(or_high) or math.isnan(or_low):
-                self._record_entry_decision(c.symbol, "skipped", ["opening_range_values_nan"])
-                continue
+            or_high, or_low, _ = opening
             last = after.iloc[-1]
             trigger = or_high * (1.0 + buffer_pct)
             ctx = self._chart_context(frame)

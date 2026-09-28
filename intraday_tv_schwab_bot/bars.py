@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 """Bar frames: OHLCV normalization, the session bucket grid and resampling,
 bucket completion, the equity stream-window slice, bar geometry, the
-same-day and session-open slices, and the live-price read."""
+same-day, opening-range and session-open slices, and the live-price read."""
 import logging
 import math
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 import numpy as np
@@ -427,6 +427,42 @@ def rth_open_plus(minutes: int) -> time:
     strategy's at least 0); a time past midnight raises ValueError."""
     total = EQUITY_RTH_OPEN.hour * 60 + EQUITY_RTH_OPEN.minute + int(minutes)
     return time(total // 60, total % 60)
+
+
+def opening_range(
+    frame: pd.DataFrame,
+    day: date,
+    *,
+    start: time,
+    minutes: int,
+    min_bars: int,
+) -> tuple[float, float, int] | None:
+    """The opening range of trading day ``day``: ``(high, low, bars)`` over
+    the bars labelled inside the half-open window ``[start, start +
+    minutes)``, read on the index's own wall clock (ET for the feed's
+    frames). The high and the low skip a missing value.
+
+    None when the window holds fewer than ``min_bars`` bars or its high or
+    low is NaN, as an empty window's are. Each caller passes its own start,
+    its own clamp on ``minutes`` and its own ``min_bars``; a negative
+    ``minutes`` raises ValueError."""
+    if minutes < 0:
+        raise ValueError(f"opening_range: minutes must be >= 0, got {minutes}")
+    if frame.empty:
+        return None
+    index = frame.index
+    opened_at = datetime.combine(day, start)
+    lo = pd.Timestamp(opened_at, tz=index.tz)
+    hi = pd.Timestamp(opened_at + timedelta(minutes=minutes), tz=index.tz)
+    window = frame[(index >= lo) & (index < hi)]
+    bars = len(window)
+    if bars < min_bars:
+        return None
+    high = float(window["high"].max())
+    low = float(window["low"].min())
+    if math.isnan(high) or math.isnan(low):
+        return None
+    return high, low, bars
 
 
 def _first_open(rows: pd.DataFrame) -> float | None:

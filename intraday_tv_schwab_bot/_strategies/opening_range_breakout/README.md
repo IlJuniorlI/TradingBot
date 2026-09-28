@@ -18,7 +18,7 @@ The point is to start with names that are already active instead of scanning the
 
 ### 2. It waits for the opening range to be fully formed
 
-The strategy will not evaluate a symbol until it has enough same-day bars to define the opening range. It then computes:
+The strategy will not evaluate a symbol until the opening range (the first `opening_range_minutes` of RTH, from 09:30; premarket bars do not count) holds a bar and a bar has printed after it. It then computes:
 
 - opening-range high
 - opening-range low

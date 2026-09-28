@@ -104,7 +104,7 @@ DIVERGENCE_INELIGIBLE_REASONS: frozenset[str] = frozenset({
     "symbol_not_tradable", "already_in_position", "underlying_already_open",
     "outside_entry_window", "after_entry_cutoff", "extended_hours_not_eligible",
     "session_empty", "last_close_invalid", "missing_ltf_context",
-    "opening_range_incomplete", "opening_range_values_nan", "pm_reference_pmh_invalid",
+    "opening_range_incomplete", "pm_reference_pmh_invalid",
     # top_tier's macro-window (CPI, FOMC) and per-symbol earnings blackouts.
     "event_blackout", "earnings_blackout",
     "shorts_disabled",

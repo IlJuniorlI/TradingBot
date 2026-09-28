@@ -30,7 +30,7 @@ from ...options_mode import (
     vertical_limit_price,
     vertical_price_bounds,
 )
-from ...bars import rth_open_plus, same_day_mask, session_open_price
+from ...bars import opening_range, rth_open_plus, session_open_price
 from ...sessions import EQUITY_RTH_OPEN, equity_session_state, is_time_in_window, parse_hhmm
 from ...support_resistance import empty_market_structure_context
 from ...numeric import first_float, safe_float
@@ -216,6 +216,14 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         self._option_chain_read_failed_at: dict[str, datetime] = {}
         self._underlying_atr_cache: dict[str, float] = {}
         self._underlying_ref_atr_cache: dict[str, float] = {}
+        # pandas' between_time read a reversed opening window as the bars
+        # OUTSIDE it, an opening range of premarket and afternoon prints.
+        start, minutes = self._opening_window()
+        if minutes < 1:
+            raise ValueError(
+                f"strategies.{self.strategy_name}.params.orb_opening_window_end must not be before "
+                f"orb_opening_window_start ({start.strftime('%H:%M')}), got {self.params.get('orb_opening_window_end')!r}"
+            )
 
     def _options_enabled(self) -> bool:
         return bool(self.optcfg.enabled)
@@ -1698,19 +1706,26 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return is_time_in_window(now_t, p.get("trend_start_time", "10:05"), p.get("trend_end_time", "13:40"))
         return is_time_in_window(now_t, p.get("credit_start_time", "11:05"), p.get("credit_end_time", "13:45"))
 
-    def _opening_range(self, frame: pd.DataFrame) -> tuple[float, float] | None:
-        """Today's opening range (high, low) the ORB style breaks: the bars
-        from ``orb_opening_window_start`` to ``orb_opening_window_end``, both
-        inclusive, or None while fewer than ``orb_opening_min_bars`` of them
-        are in. Until 2026-09-27 the debit ORB took a fixed 09:30-09:34
-        window and any bar in it, so a lone 09:34 bar was its opening range
-        (the long options' own copy had required 3 since 2026-05-14)."""
+    def _opening_window(self) -> tuple[time, int]:
+        """The opening range's start and its length in minutes.
+        ``orb_opening_window_start`` / ``orb_opening_window_end`` name its
+        first and its last 1m bar, both inclusive, so the half-open window
+        runs one minute past the end."""
         start = parse_hhmm(self.params.get("orb_opening_window_start", EQUITY_RTH_OPEN))
         end = parse_hhmm(self.params.get("orb_opening_window_end", rth_open_plus(4)))
-        opening = frame[same_day_mask(frame, sessions.now_et().date())].between_time(start, end)
-        if opening.empty or len(opening) < int(self.params.get("orb_opening_min_bars", 3)):
-            return None
-        return safe_float(opening["high"].max(), 0.0), safe_float(opening["low"].min(), 0.0)
+        return start, (end.hour * 60 + end.minute) - (start.hour * 60 + start.minute) + 1
+
+    def _opening_range(self, frame: pd.DataFrame) -> tuple[float, float, int] | None:
+        """Today's opening range the ORB style breaks, ``(high, low, bars)``
+        over ``_opening_window()``, or None while fewer than
+        ``orb_opening_min_bars`` of its bars are in or they hold no price.
+        Until 2026-09-27 the debit ORB took a fixed 09:30-09:34 window and
+        any bar in it, so a lone 09:34 bar was its opening range (the long
+        options' own copy had required 3 since 2026-05-14), and both read a
+        window with no price as a range of 0.0."""
+        start, minutes = self._opening_window()
+        return opening_range(frame, sessions.now_et().date(), start=start, minutes=minutes,
+                             min_bars=int(self.params.get("orb_opening_min_bars", 3)))
 
     def _trend_momentum_blocker(self, frame: pd.DataFrame, last: pd.Series) -> str | None:
         """``options.trend_momentum_filter_enabled``: the trend style's
@@ -1793,8 +1808,8 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             if "atr14" in frame.columns:
                 atr_series = frame["atr14"].dropna().tail(20)
                 self._underlying_ref_atr_cache[c.symbol] = float(atr_series.median()) if len(atr_series) >= 5 else 0.0
-            opening_range = self._opening_range(frame)
-            or_high, or_low = opening_range if opening_range is not None else (None, None)
+            opening = self._opening_range(frame)
+            or_high, or_low = (None, None) if opening is None else opening[:2]
             regime_name = str(regime.get("regime") or "unknown")
             bullish = regime_name == "bullish_trend"
             bearish = regime_name == "bearish_trend"
@@ -1814,7 +1829,7 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
                 elif not (bullish or bearish):
                     continue
                 elif style.kind == "orb":
-                    if opening_range is None:
+                    if opening is None:
                         continue
                     if bullish and last_close > or_high * (1.0 + buffer_pct) and last_close > last_vwap:
                         direction = True

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """Time-of-day schedule: which regimes may trade now.
 
-The ORB window (``_orb_range_end``, ``_in_orb_window``, checked once at
-construction by ``_validate_orb_window``), the per-window regime sets of
+The ORB window (``_orb_range_minutes``, ``_orb_range_end``,
+``_in_orb_window``, checked once at construction by
+``_validate_orb_window``), the per-window regime sets of
 ``_allowed_regimes``, and the extended-hours tradable list.
 """
 from __future__ import annotations
@@ -57,9 +58,13 @@ class ScheduleMixin:
                 f"is not wanted."
             )
 
+    def _orb_range_minutes(self) -> int:
+        """The opening range's length: ``orb_range_minutes``, at least 1."""
+        return max(1, int(self.params.get("orb_range_minutes", 15)))
+
     def _orb_range_end(self) -> str:
         """HH:MM at which today's opening range finishes forming."""
-        return rth_open_plus(max(1, int(self.params.get("orb_range_minutes", 15)))).strftime("%H:%M")
+        return rth_open_plus(self._orb_range_minutes()).strftime("%H:%M")
 
     def _in_orb_window(self, now_t) -> bool:
         """Is *now_t* inside the ORB window — the span where the ORB regime

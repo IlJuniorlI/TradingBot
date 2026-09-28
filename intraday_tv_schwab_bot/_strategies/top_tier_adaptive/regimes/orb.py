@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import pandas as pd
 
-from ....bars import same_day_mask
+from ....bars import opening_range
 from ....models import Candidate, Side, Signal
-from ....sessions import EQUITY_RTH_OPEN, parse_hhmm
+from ....sessions import EQUITY_RTH_OPEN
 from .... import sessions
 
 
@@ -16,29 +16,20 @@ class OrbRegimeMixin:
     Mixed into ``TopTierAdaptiveStrategy`` (``strategy.py``), whose
     ``BaseStrategy`` supplies ``params``, ``config`` and the contexts."""
 
-    def _opening_range(self, frame: pd.DataFrame) -> tuple[float | None, float | None]:
-        """Today's opening range — the high/low of the first
-        ``orb_range_minutes`` of RTH (from 09:30). Returns ``(None, None)``
-        when the window has no bars yet (pre-open / range not formed).
-        Computed on the raw (1m) frame for true extremes; pre-market bars are
-        excluded by the 09:30 start so the range is RTH-anchored even in
-        extended-hours mode."""
-        if frame is None or frame.empty:
-            return None, None
-        today = frame[same_day_mask(frame, sessions.now_et().date())]
-        if today.empty:
-            return None, None
-        rth_open = EQUITY_RTH_OPEN
-        # Via `_orb_range_end`, not a local recomputation. The same derivation
-        # used to appear here, in `_orb_range_end` and in `_allowed_regimes`;
-        # three copies of one rule is how the bot ends up forming the range
-        # over one span and opening the window against another.
-        range_end = parse_hhmm(self._orb_range_end())
-        in_window = today.index.to_series().map(lambda ts: rth_open <= ts.time() < range_end)
-        window = today[in_window.values]
-        if window.empty:
-            return None, None
-        return float(window["high"].max()), float(window["low"].min())
+    def _opening_range(self, frame: pd.DataFrame) -> tuple[float, float, int] | None:
+        """Today's opening range, ``(high, low, bars)`` over the first
+        ``orb_range_minutes`` of RTH: [09:30, ``_orb_range_end()``). None
+        when the window has no bars yet (pre-open / range not formed) or no
+        price in them. Computed on the raw (1m) frame for true extremes;
+        pre-market bars are excluded by the 09:30 start so the range is
+        RTH-anchored even in extended-hours mode."""
+        # Via `_orb_range_minutes` (schedule.py), the clamp `_orb_range_end`
+        # reads too. The same derivation used to appear here, in
+        # `_orb_range_end` and in `_allowed_regimes`; three copies of one rule
+        # is how the bot ends up forming the range over one span and opening
+        # the window against another.
+        return opening_range(frame, sessions.now_et().date(), start=EQUITY_RTH_OPEN,
+                             minutes=self._orb_range_minutes(), min_bars=1)
 
     def _score_orb(self, side: Side, close: float, atr: float, frame: pd.DataFrame) -> float:
         """Score the Opening Range Breakout. Fires only on a genuine break of
@@ -68,9 +59,10 @@ class OrbRegimeMixin:
         """
         if atr <= 0 or close <= 0:
             return 0.0
-        or_high, or_low = self._opening_range(frame)
-        if or_high is None or or_low is None or or_high <= or_low:
+        opening = self._opening_range(frame)
+        if opening is None or opening[0] <= opening[1]:
             return 0.5
+        or_high, or_low, _ = opening
         score = 0.5
         buffer = float(self.params.get("orb_breakout_buffer_atr_mult", 0.05)) * atr
         broke = (close > or_high + buffer if side == Side.LONG
@@ -106,10 +98,11 @@ class OrbRegimeMixin:
         caps the target to nearby HTF levels. Range size is sanity-bounded so
         noise ranges (too tight) and untradeable ranges (too wide) are
         skipped."""
-        or_high, or_low = self._opening_range(frame)
-        if or_high is None or or_low is None or or_high <= or_low:
+        opening = self._opening_range(frame)
+        if opening is None or opening[0] <= opening[1]:
             self._set_build_failure(c.symbol, "orb", "orb_no_opening_range")
             return None
+        or_high, or_low, _ = opening
         range_height = or_high - or_low
         min_range = float(self.params.get("orb_min_range_atr_mult", 0.5)) * atr
         max_range_mult = float(self.params.get("orb_max_range_atr_mult", 4.0))
