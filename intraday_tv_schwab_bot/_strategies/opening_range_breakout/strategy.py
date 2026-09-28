@@ -10,7 +10,7 @@ from ... import sessions
 from ...bars import opening_range, rth_open_plus, same_day_mask, time_gte_mask
 from ...sessions import EQUITY_RTH_OPEN
 from ..shared_entry import EntryContexts, EntryProposal, RetestTrigger
-from ..strategy_base import BaseStrategy
+from ..strategy_base import EXHAUSTION_REASONS, BaseStrategy
 
 
 LOG = logging.getLogger(__name__)
@@ -21,13 +21,7 @@ _VALID_ORB_WATCHLIST_MODES = {"none", "premarket", "early_session"}
 # anti-chase exhaustion checks). Until 2026-09-24 two passes cleared them --
 # the own reasons first, the exhaustion ones only once nothing else was
 # pending -- and one pass over the union decides the same.
-_RETEST_DEFERRABLE = frozenset({
-    "no_orb_breakout",
-    "too_extended_from_vwap_atr",
-    "too_extended_from_ema9_atr",
-    "upper_wick_rejection",
-    "expansion_bar_too_large",
-})
+_RETEST_DEFERRABLE = frozenset({"no_orb_breakout"}) | EXHAUSTION_REASONS[Side.LONG]
 
 
 class ORBStrategy(BaseStrategy):

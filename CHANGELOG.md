@@ -310,6 +310,79 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **One screener template per family; the candidate ranking, the gap score
+  and the anti-chase reason names each live once (refactor cut C45).**
+  *2026-09-27* — Screener and plugin code that was written out several times
+  now has one home:
+  - The peer screeners run one algorithm.
+    `PeerConfirmedKeyLevelsScreener.run` is the template: the curated query,
+    the per-symbol metadata, the missing-symbol warning, the effective RVOL
+    and RVOL profile, the sort and the ranks. key_levels_1m still screens
+    under its own name; `_active_strategy_name` loses its `config.strategy`
+    fallback, which was never reached because the base class rejects an
+    empty `strategy_name`. `peer_confirmed_trend_continuation` and
+    `peer_confirmed_htf_pivots` now subclass
+    `PeerConfirmedKeyLevelsScreener`; each had its own copy of `run`. They
+    override only its hooks:
+    - `_relative_volume_cap(params)`: htf_pivots reads its
+      `screener_relative_volume_cap`.
+    - `_score_row(day_change, effective_relative_volume, params)`: the
+      activity score, the directional bias and the metadata that explains
+      them. key_levels scores |move| x RVOL with no bias; trend_continuation
+      scores the same with a +/-0.30% trend bias; htf_pivots scores the move
+      fit x RVOL with a contrarian bias.
+    - `_sort_key`: htf_pivots breaks a score tie on the move fit, the others
+      on the size of the move.
+  - `screener_base.rank_candidates(candidates, limit=None)` puts the highest
+    activity score first, breaks ties by the screener query's own order,
+    cuts to `limit` and renumbers the ranks 1..N.
+    `TradingViewScreenerClient._candidate_rows` and small_cap_squeeze's
+    premarket-lock merge each had a copy. It lives in `screener_base`, not
+    `screener_client`: a plugin may not import the runtime layer.
+  - `screener_base.gap_rvol_activity(row)` is the gap-and-go score (change
+    from open x RVOL clipped to [0.5, 3.0]). It replaces the lambda written
+    out in the opening_range_breakout, microcap_gap_orb,
+    microcap_pm_breakout and small_cap_squeeze screeners.
+  - `BaseStrategyScreener._premarket_locked_candidates(now, cached,
+    last_refresh, label)` is the ORB family's premarket watchlist
+    (`orb_watchlist_mode: premarket`), which opening_range_breakout and
+    microcap_gap_orb each carried. Before 09:30 ET it screens. From the open
+    it returns the same day's list; with none it returns no candidates and a
+    warning.
+  - `MicrocapGapOrbScreener.require_change_filter` (on) gates on `change` as
+    well as `change_from_open`. microcap_pm_breakout turns it off instead of
+    repeating gap_orb's `run`.
+  - `strategy_base.EXHAUSTION_REASONS` names, per side, the reasons
+    `_entry_exhaustion_reasons` (the anti-chase checks) emits; it sits above
+    `BaseStrategy`, beside its emitter. The FVG retest-deferrable sets of
+    opening_range_breakout and momentum_close (the LONG entry),
+    rth_trend_pullback and volatility_squeeze_breakout are now their own
+    reasons plus it. A renamed or added check therefore reaches all four;
+    before, each set listed the four names by hand.
+
+  `_strategies/README.md` names the shared code under "What lives where" and
+  tells a plugin whose retest may clear the anti-chase checks to add
+  `EXHAUSTION_REASONS[side]` to its deferrable set. There is no alias; the
+  private copies are gone. No behaviour changes: the screen queries, the
+  candidates (rank, score, bias, metadata), the warnings' text, the
+  deferrable sets and the entry decisions of the five breakout strategies
+  are identical before and after. This was checked on 3,542 randomized and
+  recorded-tape cases, among them the recorded AAPL / SPY / TSLA sessions
+  every 10 minutes with the exhaustion checks tightened so the retest
+  deferral decides. Two log lines, their text unchanged, now carry the
+  logger of the module that holds their code:
+  - the peer missing-symbol warning, from
+    `peer_confirmed_key_levels.screener` for trend_continuation and
+    htf_pivots too;
+  - the premarket-watchlist warning, from `_strategies.screener_base`.
+
+  htf_pivots' `screener_bias_mode` candidate metadata now sits with its
+  other score keys; nothing reads the metadata's key order. closing_reversal
+  and mean_reversion stay separate plugins. They differ in 14 places across
+  their entry loop (reference high, bounce check, chart predicate, target,
+  reason, score, three defaults), so a shared base would be mostly hooks.
+  Tests: `tests/test_screener_templates.py` (new).
+
 - **The 0DTE regime and option-chain plumbing have their own modules
   (refactor cut C44).** *2026-09-27* — `zero_dte_etf_options/regime.py`
   (`RegimeMixin`) holds `_regime_confirm`, which is no longer one 465-line

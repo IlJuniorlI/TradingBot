@@ -10,6 +10,7 @@ import pandas as pd
 
 from ._strategies.catalogue import normalize_strategy_name
 from ._strategies.factory import build_screener
+from ._strategies.screener_base import rank_candidates
 from .config import BotConfig
 from .log_setup import warn_once
 from .models import Candidate
@@ -386,9 +387,9 @@ class TradingViewScreenerClient:
                         strategy, exc_info=True,
                     )
                 directional_bias = None
-            # Unscored candidates all get 0.0 so the `-candidate_query_order`
-            # tiebreak below restores the order the screener's own `order_by`
-            # asked for. Scoring them by `ordinal` instead REVERSED it: the
+            # Unscored candidates all get 0.0 so the `candidate_query_order`
+            # tiebreak in `rank_candidates` restores the order the screener's
+            # own `order_by` asked for. Scoring them by `ordinal` instead REVERSED it: the
             # sort is descending, so the last row of a "best first" query came
             # out on top. Reachable two ways — a plugin that omits
             # activity_score_fn, and the fallback when one raises.
@@ -412,18 +413,4 @@ class TradingViewScreenerClient:
                 "Dropped %d screener row(s) for strategy %s with no usable ticker "
                 "in the 'name' column.", skipped, strategy,
             )
-        def _tiebreak_key(c: Candidate) -> tuple[float, int]:
-            qo_raw = c.metadata.get("candidate_query_order")
-            if qo_raw is None:
-                query_order = 9_999_999
-            else:
-                try:
-                    query_order = int(qo_raw)
-                except (TypeError, ValueError):
-                    query_order = 9_999_999
-            return float(c.activity_score), -query_order
-
-        out.sort(key=_tiebreak_key, reverse=True)
-        for rank, candidate in enumerate(out, start=1):
-            candidate.rank = rank
-        return out
+        return rank_candidates(out)

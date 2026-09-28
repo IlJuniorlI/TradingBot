@@ -8,7 +8,7 @@ from ...numeric import safe_float
 from ...reasons import insufficient_bars_reason, reason_with_values
 from ...bars import bar_close_position
 from ..shared_entry import EntryContexts, EntryProposal, RetestTrigger
-from ..strategy_base import BaseStrategy
+from ..strategy_base import EXHAUSTION_REASONS, BaseStrategy
 from ...indicators import last_bar_atr
 
 # The pending reasons an FVG retest of the squeeze box edge may clear, per
@@ -18,14 +18,8 @@ from ...indicators import last_bar_atr
 # once nothing else was pending -- and one pass over the union decides the
 # same.
 _RETEST_DEFERRABLE = {
-    Side.LONG: frozenset({
-        "weak_bar_close", "no_squeeze_breakout",
-        "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large",
-    }),
-    Side.SHORT: frozenset({
-        "weak_bar_close", "no_squeeze_breakdown",
-        "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "lower_wick_rejection", "expansion_bar_too_large",
-    }),
+    Side.LONG: frozenset({"weak_bar_close", "no_squeeze_breakout"}) | EXHAUSTION_REASONS[Side.LONG],
+    Side.SHORT: frozenset({"weak_bar_close", "no_squeeze_breakdown"}) | EXHAUSTION_REASONS[Side.SHORT],
 }
 
 # The three target tiers, weakest first (2026-05-14).

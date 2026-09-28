@@ -1,15 +1,60 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterable
 from typing import Any, TYPE_CHECKING, Callable, cast
 
 import pandas as pd
 
 from ..models import Candidate
+from ..sessions import EQUITY_RTH_OPEN
 from .rvol import effective_relative_volume, relative_volume_gate_threshold
 
 if TYPE_CHECKING:
     from ..screener_client import TradingViewScreenerClient
+
+LOG = logging.getLogger(__name__)
+
+
+def rank_candidates(candidates: Iterable[Candidate], limit: int | None = None) -> list[Candidate]:
+    """Candidates best first, cut to ``limit`` (None keeps all), ranked 1..N.
+
+    Best is the higher ``activity_score``, then the earlier
+    ``candidate_query_order`` (the row's place in the screener query's own
+    ``order_by``; a missing or unreadable one comes after every readable
+    one), so ties are broken deterministically rather than by list order;
+    the sort is stable after that. ``rank`` is rewritten
+    because it is the final tiebreak in
+    ``shared_entry.SharedEntryPolicy.rank_key`` and is what the dashboard
+    candidate card and the audit log's ``candidate_rank`` display: a screener
+    that merges two screens (small_cap_squeeze's premarket lock) would
+    otherwise carry each screen's own, duplicated ranks.
+    """
+    def _key(candidate: Candidate) -> tuple[float, int]:
+        raw_order = candidate.metadata.get("candidate_query_order")
+        try:
+            query_order = int(raw_order) if raw_order is not None else 9_999_999
+        except (TypeError, ValueError):
+            query_order = 9_999_999
+        return float(candidate.activity_score), -query_order
+
+    ranked = sorted(candidates, key=_key, reverse=True)[:limit]
+    for rank, candidate in enumerate(ranked, start=1):
+        candidate.rank = rank
+    return ranked
+
+
+def gap_rvol_activity(row: pd.Series) -> float:
+    """The gap-and-go activity score: ``change_from_open`` (percent) times the
+    10-day relative volume clipped to [0.5, 3.0] (a missing or zero RVOL
+    counts as 1.0). A 12% gapper at 2x RVOL ranks above a 20% gapper at
+    0.6x; the clip keeps one fluke print from dominating, so the gap decides
+    otherwise."""
+    return (
+        float(row.get("change_from_open", 0.0) or 0.0)
+        * max(0.5, min(float(row.get("relative_volume_10d_calc", 1.0) or 1.0), 3.0))
+    )
 
 
 class BaseStrategyScreener:
@@ -23,6 +68,27 @@ class BaseStrategyScreener:
 
     def cached_candidates(self, now, cached: list[Candidate] | None, last_refresh) -> list[Candidate] | None:
         return None
+
+    @staticmethod
+    def _premarket_locked_candidates(now, cached: list[Candidate] | None, last_refresh, label: str) -> list[Candidate] | None:
+        """``cached_candidates`` for a watchlist frozen before the open (the
+        ORB family's ``orb_watchlist_mode: premarket``).
+
+        Before 09:30 ET None, so the screen runs. From the open on, the list
+        cached on the same ET day; with none, an empty list and a warning
+        naming ``label``: a bot started after the open has no premarket
+        list to freeze, and a re-screen would not be one.
+        """
+        if now.time() < EQUITY_RTH_OPEN:
+            return None
+        if cached is not None and last_refresh is not None and last_refresh.date() == now.date():
+            return cached
+        LOG.warning(
+            "%s premarket watchlist requested after 09:30 ET without a same-day cached premarket candidate list; returning no candidates. "
+            "Start before the open or use orb_watchlist_mode=early_session/none.",
+            label,
+        )
+        return []
 
     def run(self) -> list[Candidate]:
         raise NotImplementedError

@@ -6,7 +6,7 @@ from ...numeric import safe_float
 from ...reasons import insufficient_bars_reason, reason_with_values
 from ...bars import bar_close_position
 from ..shared_entry import EntryContexts, EntryProposal, RetestTrigger
-from ..strategy_base import BaseStrategy
+from ..strategy_base import EXHAUSTION_REASONS, BaseStrategy
 
 # The pending reasons an FVG retest of the re-expansion trigger may clear,
 # per side: no re-expansion yet, a stretched or weak trigger bar, or the
@@ -15,14 +15,8 @@ from ..strategy_base import BaseStrategy
 # exhaustion ones only once nothing else was pending -- and one pass over
 # the union decides the same.
 _RETEST_DEFERRABLE = {
-    Side.LONG: frozenset({
-        "too_extended_from_vwap", "no_reexpansion_trigger", "weak_bar_close",
-        "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large",
-    }),
-    Side.SHORT: frozenset({
-        "too_extended_from_vwap", "no_reexpansion_trigger", "weak_bar_close",
-        "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "lower_wick_rejection", "expansion_bar_too_large",
-    }),
+    side: frozenset({"too_extended_from_vwap", "no_reexpansion_trigger", "weak_bar_close"}) | EXHAUSTION_REASONS[side]
+    for side in (Side.LONG, Side.SHORT)
 }
 
 

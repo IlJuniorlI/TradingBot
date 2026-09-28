@@ -2,7 +2,7 @@
 import logging
 from typing import Any
 
-from ...models import Candidate
+from ...models import Candidate, Side
 from ..screener_base import BaseStrategyScreener
 from ..rvol import rvol_profile_for_symbol
 
@@ -10,13 +10,47 @@ LOG = logging.getLogger(__name__)
 
 
 class PeerConfirmedKeyLevelsScreener(BaseStrategyScreener):
+    """The peer family's screener, and its template.
+
+    Every configured ``tradable`` symbol is a candidate, from a curated
+    query; one the query did not return is still listed (and warned about).
+    Each is scored from its change from open and its effective relative
+    volume (with its dollar volume and RVOL profile), sorted best first and
+    ranked 1..N. The family's screeners differ only in the hooks:
+    ``_relative_volume_cap``, ``_score_row`` (the activity score, the
+    directional bias and the metadata that explains them) and ``_sort_key``.
+    Here the score is |change from open| x effective RVOL, with no bias.
+    """
+
     strategy_name = 'peer_confirmed_key_levels'
 
     def _active_strategy_name(self) -> str:
-        return str(self.strategy_name or self.config.strategy).strip().lower()
+        return self.strategy_name.strip().lower()
 
     def _universe_label(self) -> str:
         return self._active_strategy_name()
+
+    def _relative_volume_cap(self, params: dict[str, Any]) -> float:
+        """The cap on the effective relative volume."""
+        return 2.5
+
+    def _score_row(self, day_change: float, effective_relative_volume: float, params: dict[str, Any]) -> tuple[float, Side | None, dict[str, Any]]:
+        """``(activity_score, directional_bias, metadata)`` for one symbol,
+        from its change from open (percent) and effective relative volume.
+        The metadata is stamped right after ``configured_order``."""
+        focus_score = abs(day_change) * effective_relative_volume
+        return focus_score, None, {"peer_focus_score": float(focus_score)}
+
+    @staticmethod
+    def _sort_key(candidate: Candidate) -> tuple[float, float, float, int]:
+        """Best first under ``reverse=True``: the score, then the size of the
+        move, the effective RVOL and the configured order."""
+        return (
+            float(candidate.activity_score),
+            abs(float(candidate.metadata.get("change_from_open", 0.0) or 0.0)),
+            float(candidate.metadata.get("activity_relative_volume", 0.0) or 0.0),
+            -int(candidate.metadata.get("configured_order", 9_999) or 9_999),
+        )
 
     def run(self) -> list[Candidate]:
         strategy_name = self._active_strategy_name()
@@ -79,7 +113,7 @@ class PeerConfirmedKeyLevelsScreener(BaseStrategyScreener):
                     "universe": self._universe_label(),
                     "tv_query_ticker": symbol,
                 }
-            day_change = abs(float(metadata.get("change_from_open", 0.0) or 0.0))
+            day_change = float(metadata.get("change_from_open", 0.0) or 0.0)
             raw_relative_volume = float(metadata.get("relative_volume_10d_calc", 1.0) or 1.0)
             # Per-symbol values live in `metadata`; `row` here is a leaked
             # variable from the earlier df.iterrows() loop and would
@@ -87,10 +121,10 @@ class PeerConfirmedKeyLevelsScreener(BaseStrategyScreener):
             # NameError on an empty frame).
             _dollar_volume = (float(metadata.get("close", 0.0) or 0.0)
                               * float(metadata.get("volume", 0.0) or 0.0))
-            effective_relative_volume = self._effective_relative_volume(symbol, raw_relative_volume, params, cap_default=2.5, standard_floor=0.5, dollar_volume=_dollar_volume)
-            focus_score = day_change * effective_relative_volume
+            effective_relative_volume = self._effective_relative_volume(symbol, raw_relative_volume, params, cap_default=self._relative_volume_cap(params), standard_floor=0.5, dollar_volume=_dollar_volume)
+            focus_score, directional_bias, score_metadata = self._score_row(day_change, effective_relative_volume, params)
             metadata["configured_order"] = int(configured_order.get(symbol, 9_999))
-            metadata["peer_focus_score"] = float(focus_score)
+            metadata.update(score_metadata)
             metadata["activity_relative_volume"] = float(effective_relative_volume)
             metadata["raw_relative_volume_10d_calc"] = float(raw_relative_volume)
             metadata["rvol_profile"] = rvol_profile_for_symbol(symbol, params or {}, dollar_volume=_dollar_volume)
@@ -100,19 +134,11 @@ class PeerConfirmedKeyLevelsScreener(BaseStrategyScreener):
                     strategy=strategy_name,
                     rank=0,
                     activity_score=float(focus_score),
-                    directional_bias=None,
+                    directional_bias=directional_bias,
                     metadata=metadata,
                 )
             )
-        rows.sort(
-            key=lambda c: (
-                float(c.activity_score),
-                abs(float(c.metadata.get("change_from_open", 0.0) or 0.0)),
-                float(c.metadata.get("activity_relative_volume", 0.0) or 0.0),
-                -int(c.metadata.get("configured_order", 9_999) or 9_999),
-            ),
-            reverse=True,
-        )
+        rows.sort(key=self._sort_key, reverse=True)
         for idx, candidate in enumerate(rows, start=1):
             candidate.rank = idx
         return rows

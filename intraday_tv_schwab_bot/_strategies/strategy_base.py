@@ -25,6 +25,19 @@ from .. import sessions
 if TYPE_CHECKING:
     from ..config import BotConfig
 
+# The reason heads BaseStrategy._entry_exhaustion_reasons (the anti-chase
+# checks) emits, per side; the wick check is side-specific. A strategy whose
+# retest may clear them builds its deferrable set from this, so a check
+# renamed or added here reaches every such set.
+EXHAUSTION_REASONS: dict[Side, frozenset[str]] = {
+    Side.LONG: frozenset({
+        "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "upper_wick_rejection", "expansion_bar_too_large",
+    }),
+    Side.SHORT: frozenset({
+        "too_extended_from_vwap_atr", "too_extended_from_ema9_atr", "lower_wick_rejection", "expansion_bar_too_large",
+    }),
+}
+
 
 class BaseStrategy(ContextBuildersMixin):
     strategy_name: str | None = None

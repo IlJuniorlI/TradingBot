@@ -5,20 +5,14 @@ from ...models import Candidate, Position, Side, Signal
 from ...numeric import safe_float
 from ...reasons import insufficient_bars_reason, reason_with_values
 from ..shared_entry import EntryContexts, EntryProposal, RetestTrigger
-from ..strategy_base import BaseStrategy
+from ..strategy_base import EXHAUSTION_REASONS, BaseStrategy
 
 # The pending reasons an FVG retest of the breakout level may clear: price
 # not through the level yet, or through it but stretched (the anti-chase
 # exhaustion checks). Until 2026-09-24 two passes cleared them -- the own
 # reasons first, the exhaustion ones only once nothing else was pending --
 # and one pass over the union decides the same.
-_RETEST_DEFERRABLE = frozenset({
-    "no_breakout",
-    "too_extended_from_vwap_atr",
-    "too_extended_from_ema9_atr",
-    "upper_wick_rejection",
-    "expansion_bar_too_large",
-})
+_RETEST_DEFERRABLE = frozenset({"no_breakout"}) | EXHAUSTION_REASONS[Side.LONG]
 
 
 class MomentumIntoCloseStrategy(BaseStrategy):

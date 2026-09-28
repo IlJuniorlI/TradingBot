@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: MIT
-import logging
-
 from ...models import Candidate, Side
-from ..screener_base import BaseStrategyScreener
-from ...sessions import EQUITY_RTH_OPEN
-
-LOG = logging.getLogger(__name__)
+from ..screener_base import BaseStrategyScreener, gap_rvol_activity
 
 
 class ORBScreener(BaseStrategyScreener):
@@ -16,16 +11,9 @@ class ORBScreener(BaseStrategyScreener):
         return str(params.get("orb_watchlist_mode", "premarket") or "premarket").strip().lower() or "premarket"
 
     def cached_candidates(self, now, cached: list[Candidate] | None, last_refresh) -> list[Candidate] | None:
-        mode = self.watchlist_mode()
-        if mode != "premarket" or now.time() < EQUITY_RTH_OPEN:
+        if self.watchlist_mode() != "premarket":
             return None
-        if cached is not None and last_refresh is not None and last_refresh.date() == now.date():
-            return cached
-        LOG.warning(
-            "ORB premarket watchlist requested after 09:30 ET without a same-day cached premarket candidate list; returning no candidates. "
-            "Start before the open or use orb_watchlist_mode=early_session/none."
-        )
-        return []
+        return self._premarket_locked_candidates(now, cached, last_refresh, "ORB")
 
     def run(self) -> list[Candidate]:
         params = self.config.strategies[self.strategy_name].params
@@ -79,8 +67,5 @@ class ORBScreener(BaseStrategyScreener):
             df,
             self.strategy_name,
             directional_bias_fn=lambda row: Side.LONG,
-            activity_score_fn=lambda row: (
-                float(row.get("change_from_open", 0.0) or 0.0)
-                * max(0.5, min(float(row.get("relative_volume_10d_calc", 1.0) or 1.0), 3.0))
-            ),
+            activity_score_fn=gap_rvol_activity,
         )

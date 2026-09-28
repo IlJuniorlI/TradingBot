@@ -36,7 +36,7 @@ re-screen every cycle with no premarket lock. Ranked by gap% x clipped RVOL
 from ...models import Candidate, Side
 from ... import sessions
 from ...sessions import EQUITY_RTH_OPEN
-from ..screener_base import BaseStrategyScreener
+from ..screener_base import BaseStrategyScreener, gap_rvol_activity, rank_candidates
 
 
 class SmallCapSqueezeScreener(BaseStrategyScreener):
@@ -90,17 +90,11 @@ class SmallCapSqueezeScreener(BaseStrategyScreener):
         )
         df = self._execute(q)
 
-        # Score by gap size weighted by RVOL: a 12% gapper with 2x RVOL ranks
-        # above a 20% gapper with 0.6x. RVOL clipped to [0.5, 3.0] so a single
-        # fluke print can't dominate; gap percent dominates otherwise.
         rows = self._candidate_rows(
             df,
             self.strategy_name,
             directional_bias_fn=lambda row: Side.LONG,
-            activity_score_fn=lambda row: (
-                float(row.get("change_from_open", 0.0) or 0.0)
-                * max(0.5, min(float(row.get("relative_volume_10d_calc", 1.0) or 1.0), 3.0))
-            ),
+            activity_score_fn=gap_rvol_activity,
         )
         if self.watchlist_mode() == "premarket_lock_rth_live":
             return self._merge_premarket_lock(rows, sessions.now_et())
@@ -135,28 +129,9 @@ class SmallCapSqueezeScreener(BaseStrategyScreener):
             merged = dict(locked)
             merged.update(fresh)
         self._premarket_locked = locked
-        max_n = int(self.config.tradingview.max_candidates)
-
-        def _rank_key(candidate: Candidate) -> tuple[float, int]:
-            """Same ordering `_candidate_rows` applies: score first, then the
-            screener's own query order, so ties are broken deterministically
-            rather than by dict insertion order (which puts locked-but-faded
-            names ahead of fresh ones)."""
-            score = float(getattr(candidate, "activity_score", 0.0) or 0.0)
-            raw_order = candidate.metadata.get("candidate_query_order")
-            try:
-                query_order = int(raw_order) if raw_order is not None else 9_999_999
-            except (TypeError, ValueError):
-                query_order = 9_999_999
-            return score, -query_order
-
-        ranked = sorted(merged.values(), key=_rank_key, reverse=True)[:max_n]
-        # Re-rank. `_candidate_rows` numbered these 1..N within their own
-        # screen, so after merging two screens and re-sorting, the ranks are
-        # stale AND duplicated — three candidates can all claim rank 2.
-        # `rank` is the final tiebreak in
-        # shared_entry.SharedEntryPolicy.rank_key and is what the dashboard
-        # candidate card and the audit log's `candidate_rank` display.
-        for position, candidate in enumerate(ranked, start=1):
-            candidate.rank = position
-        return ranked
+        # The ordering `_candidate_rows` applies (score, then the screen's own
+        # query order, not dict insertion order, which puts locked-but-faded
+        # names ahead of fresh ones), cut to the cap and re-ranked: each
+        # screen numbered its candidates 1..N, so the merged ranks are stale
+        # AND duplicated.
+        return rank_candidates(merged.values(), limit=int(self.config.tradingview.max_candidates))
