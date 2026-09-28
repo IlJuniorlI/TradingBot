@@ -258,7 +258,7 @@ class ConfirmationMixin:
     def _sector_day_strength(self, symbol: str, bars: dict[str, pd.DataFrame]) -> float | None:
         """Return the first available sector ETF's day_strength (close vs
         session_open, in percent) for *symbol*. Used by the relative-strength
-        gate in entry_signals to compute how much the candidate is
+        gate in ``_read_candidate`` to compute how much the candidate is
         leading/lagging its sector. Returns ``None`` when no sector ETF
         bars are loaded or all session-open lookups fail. A frame that does
         not read raises: the gate skips on ``None``, so until 2026-09-26,
@@ -669,7 +669,7 @@ class ConfirmationMixin:
 
         Both values share one ``session_open_price`` call so the soft-bias
         penalty path doesn't repeat the session-open lookup. Used by
-        ``entry_signals`` (needs both bias for side selection AND magnitude
+        ``_read_candidate`` (needs both bias for side selection AND magnitude
         for penalty scaling) and by ``_compute_live_directional_bias`` (the
         single-return wrapper kept for test compatibility).
 

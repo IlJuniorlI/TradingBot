@@ -145,7 +145,7 @@ def structured_metadata_snapshot(meta: Mapping[str, Any] | None) -> dict[str, An
         'family_eval', 'evaluated_sides', 'primary_blocker', 'all_blockers', 'near_miss_blockers',
         'selection_components', 'candidate_reason', 'decision_summary',
         # Per-sector index confirmation snapshot. Stamped at entry by
-        # top_tier_adaptive.strategy.entry_signals via
+        # top_tier_adaptive.strategy._run_build_queue via
         # ``_indices_for_symbol(symbol)``. Logged here so post-session
         # analysis can verify which sector ETFs each entry was
         # confirmed against.

@@ -19,8 +19,9 @@ Two distinct metrics carried alongside each other:
     Drives ``directional_bias_fn`` + ``activity_score_fn`` here.
 
 The bias from ``change_from_open`` matches the live ``day_strength``
-computation the strategy does itself via ``_compute_live_directional_bias``
-in ``strategy.py`` — that method is the authoritative bias for entry
+computation the strategy does itself via
+``_compute_live_bias_and_day_strength`` in ``confirmation.py``
+(``ConfirmationMixin``) — that method is the authoritative bias for entry
 decisions; the screener-emitted bias is what the gatekeeper consults for
 cooldown lookups before the strategy runs.
 """

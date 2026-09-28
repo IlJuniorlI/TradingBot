@@ -307,8 +307,8 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         target refinement, the shared score terms) -> entry exhaustion ->
         bonuses, ladder, trail runner, Fix G, management -> ``emit``. Every
         refusal lands under ``regime`` (the proposal's style), which the
-        queue loop in ``entry_signals`` consumes before falling through to
-        the next regime. The broken-level guard that sat here until
+        queue loop in ``_run_build_queue`` consumes before falling through
+        to the next regime. The broken-level guard that sat here until
         2026-09-24 (``reject_entry_near_broken_level``) is the shared
         ``shared_entry.use_broken_level_guard`` veto now.
         """
@@ -585,7 +585,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # against it here -- on both sides, long_only / short_only, or
         # neither -- following the ORB-window HTF bypass like the structure
         # gate above; htf_ema_alignment_score acts earlier, on the regime
-        # scores in entry_signals (the bonus recorded below is the one applied
+        # scores in _score_sides (the bonus recorded below is the one applied
         # there).
         htf_ema_bias, htf_ema_bull, htf_ema_bear = self._htf_bias(htf_ctx, close)
         htf_ema_opposed = (

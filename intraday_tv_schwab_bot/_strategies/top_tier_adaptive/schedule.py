@@ -276,7 +276,7 @@ class ScheduleMixin:
             # orb_end above). After-RTH (>16:00) is already covered by the afternoon
             # branch when no_new_entries_after is pushed past the close. The
             # per-regime score gates + the extended-hours universe gate in
-            # entry_signals self-filter; this just opens the time window.
+            # _read_candidate self-filter; this just opens the time window.
             return _filter({"trend", "pullback", "range", "vol_squeeze", "momentum", "sr_scalp", "vwap_reclaim"})
         return set()
 

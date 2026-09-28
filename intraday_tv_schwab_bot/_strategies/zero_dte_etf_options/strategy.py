@@ -156,10 +156,13 @@ class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
                    "orb_opening_window_end", "trend_start_time", "trend_end_time", "credit_start_time",
                    "credit_end_time")
     # The 0DTE family: an underlying either strategy holds is open for both,
-    # and either one marks the other's vertical (a position restored after a
-    # preset switch). Until 2026-09-27 the base named its subclass in two
-    # literals, and a classmethod call on the subclass saw only the
-    # subclass, so the long options ignored the spreads' positions.
+    # and either one marks the other's vertical. No current path puts the
+    # other strategy's position beside this one's: the engine runs one
+    # strategy, option positions are not restored at startup, and a
+    # restored position takes the active strategy's name. Until 2026-09-27
+    # the base named its subclass in two literals, and a classmethod call on
+    # the subclass saw only the subclass, so the long options ignored the
+    # spreads' positions.
     _OPTION_FAMILY = frozenset({"zero_dte_etf_options", "zero_dte_etf_long_options"})
     # entry_signals warms every candidate's chain in parallel before the
     # build loop (_prefetch_option_chains).
