@@ -38,6 +38,7 @@ Shipped runtime presets live under `configs/config.<strategy>.yaml`.
 - `_strategies/<name>/screener.py` — screener implementation
 - `_strategies/<name>/manifest.json` — lightweight manifest used for discovery and explicit plugin metadata
 - `_strategies/strategy_base.py` — shared base class for strategy logic
+- `_strategies/contexts.py` — `ContextBuildersMixin`, which `BaseStrategy` inherits: the analysis-context builders (`_chart_context`, `_candle_context`, `_sr_context`, `_htf_context`, `_ltf_fvg_context`, the order-block and structure contexts, `_technical_context`), the timeframes and build requests they read (`htf_minutes()`, `htf_lookback_days()`, `ltf_minutes()`, `htf_fvg_request()`, `ltf_fvg_request()`, `order_block_request()`), their `*_lists` flatteners, the dashboard's reads of them, and the per-cycle caches the engine pre-warms
 - `_strategies/screener_base.py` — shared base class for screener logic
 - `_strategies/plugin_api.py` — `StrategyManifest` dataclass and `VETO_GATES`, the gates a manifest may exempt
 - `_strategies/catalogue.py` — manifest discovery and validation, plugin lookup (`get_plugin(s)`, `plugin_names`, `normalize_strategy_name`, `is_option_strategy`)

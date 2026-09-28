@@ -310,6 +310,60 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The strategy's context builders have their own module,
+  `_strategies/contexts.py` (refactor cut C42).** *2026-09-27* —
+  `ContextBuildersMixin`, which `BaseStrategy` inherits, holds every
+  analysis context a strategy reads: the chart-pattern and candle contexts;
+  the S/R and HTF contexts, with the HTF EMA trend (`_htf_bias`,
+  `_htf_ema_alignment_sides`, `_side_vote_edge`) and the timeframes they are
+  built on (`htf_minutes()`, `htf_lookback_days()`, `ltf_minutes()`,
+  `_is_ltf_token`); the LTF fair value gaps; the LTF and HTF order blocks;
+  `_resampled_frame`; market structure; the technical levels; the requests
+  the builders pass (`htf_fvg_request()`, `ltf_fvg_request()`,
+  `order_block_request()`, `_default_htf_request()`) and the score context
+  built on the last (`_default_htf_context_for_score`); their `*_lists`
+  flatteners; and the dashboard's reads of them (`dashboard_candle_context`,
+  `dashboard_htf_trend`, `dashboard_htf_ema_columns`). The per-cycle candle,
+  chart, structure and technical caches, their locks and the engine's
+  pre-warm moved with them (`_observed_contexts`, `set_prewarm_frames`,
+  `_observe_context`, `prime_cycle_contexts`, `reset_context_caches`).
+  `BaseStrategy.__init__` builds the caches through `super().__init__()`,
+  where it built them, and the mixin's `__init_subclass__` gives each
+  strategy class its own `_observed_contexts`, as `BaseStrategy`'s did.
+  `strategy_base.py` keeps the plugin contract, the watchlist and dashboard
+  hooks, the settings accessors, force-flatten, decision recording,
+  `_direction_token`, `_entry_exhaustion_reasons`, the structure-event
+  reads, trade management and the hooks (2,072 lines down to 1,113;
+  `contexts.py` is 1,000). The 38 methods moved verbatim under their own
+  names, so no call site changes (`self._structure_context(...)`,
+  `strategy.htf_minutes()` and `BaseStrategy._sr_lists(...)` resolve through
+  inheritance); the one edit inside the moved text is `_sr_lists`' static
+  call, `ContextBuildersMixin._structure_lists(...)` for
+  `BaseStrategy._structure_lists(...)`. There is no alias. A test that
+  patches a builder's collaborator now patches it on `_strategies.contexts`
+  (`analyze_market_structure`, `build_technical_levels_context`, and the
+  `htf_ema_spans` that `_default_htf_request` reads: `strategy_base` still
+  imports it for the watchlist block, so a patch there no longer reaches the
+  builder), and the tests' `_StrategyStub` borrows its six timeframe and
+  request reads from `ContextBuildersMixin`. The builders' four DEBUG lines,
+  for a cached FVG, order-block or merged-frame read that raised and fell
+  back to the frame, now log under
+  `intraday_tv_schwab_bot._strategies.contexts`. No behaviour changes: all
+  17 presets, each as shipped and with every optional context switched on,
+  ran over the fixture tapes before and after the move (each moved builder,
+  flattener, request and hook at 56 clocks on four symbols, with a feed,
+  with no feed and with a feed whose cached reads raise; the pre-warm cycle
+  as the engine drives it; `entry_signals`, the recorded entry decisions and
+  the shared exit decisions at 121 clocks: 4,114 cycles, 22,748 decisions,
+  132 signals and 1,110 exit decisions), and the 68 output files are byte
+  for byte the same. Tests: `tests/test_contexts.py` (new: each strategy
+  class keeps its own pre-warm record, a build records on the strategy's own
+  class, and each instance keeps its own caches and locks); the retargeted
+  patches in test_sr_tolerance_reads, test_shared_entry_policy,
+  test_fix_strategy_consumers and test_htf_ema_knobs;
+  `tests/test_module_layering.py`'s strategy-framework layer gains
+  `_strategies.contexts`.
+
 - **Each `options.underlyings` entry is checked at load, and the dashboard
   publishes the strategy's own tradable and index symbols (refactor cut
   B16).** *2026-09-27* — the decided half of the cut had landed: a scalar

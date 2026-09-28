@@ -1168,8 +1168,9 @@ class IntradayBot:
         workers instead of paying it serially in the entry-window
         critical path.
 
-        Auto-detect: each context builder records its call signature in
-        `BaseStrategy._observed_contexts` (a class-level set of tuples like
+        Auto-detect: each context builder (`_strategies/contexts.py`)
+        records its call signature in its strategy class's
+        `_observed_contexts` (a class-level set of tuples like
         `("structure", "ltf")`) -- but only for a call on one of THIS
         cycle's bars frames, which this method hands the strategy first
         (`set_prewarm_frames`). The caches key on id(frame), so a build on
