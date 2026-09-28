@@ -34,7 +34,7 @@ Shipped runtime presets live under `configs/config.<strategy>.yaml`.
 
 ## What lives where
 
-- `_strategies/<name>/strategy.py` — strategy implementation (the strategy class must be defined here; a large engine may put its parts in modules beside it as mixins of that class, as `top_tier_adaptive/` does with `schedule.py`, `confirmation.py`, `armed_retest.py` and `regimes/`)
+- `_strategies/<name>/strategy.py` — strategy implementation (the strategy class must be defined here; a large engine may put its parts in modules beside it as mixins of that class, as `top_tier_adaptive/` does with `schedule.py`, `confirmation.py`, `armed_retest.py` and `regimes/`, and `zero_dte_etf_options/` with `regime.py` and `chain.py`)
 - `_strategies/<name>/screener.py` — screener implementation
 - `_strategies/<name>/manifest.json` — lightweight manifest used for discovery and explicit plugin metadata
 - `_strategies/strategy_base.py` — shared base class for strategy logic

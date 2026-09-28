@@ -424,9 +424,10 @@ def _option_strategy_py(name: str, class_stem: str) -> str:
                 ``asset_type`` must be ``OPTION_VERTICAL`` or
                 ``OPTION_SINGLE``, or ``emit`` raises.
 
-                See _strategies/zero_dte_etf_options/strategy.py for a
-                fully-fleshed working example with regime confirmation,
-                ORB/trend/credit styles, and option-chain selection.
+                See _strategies/zero_dte_etf_options/ for a fully-fleshed
+                working example: the ORB/trend/credit styles and their
+                builders (strategy.py), the regime confirmation
+                (regime.py) and the option-chain selection (chain.py).
                 """
                 self._reset_entry_decisions()
                 out: list[Signal] = []

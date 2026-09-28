@@ -14,7 +14,7 @@ class ZeroDteEtfOptionsScreener(BaseStrategyScreener):
         SPY / QQQ being present (observed live on 2026-05-19 — 0 trades
         all session because of this).
 
-        Downstream decisioning (``_regime_confirm`` in strategy.py) uses
+        Downstream decisioning (``_regime_confirm`` in regime.py) uses
         ``bars[underlying]`` (Schwab data feed) for ALL metrics:
           * close / volume / change_from_open computed from the frame
             (change_from_open = u_day_ret from bars.session_open_price)

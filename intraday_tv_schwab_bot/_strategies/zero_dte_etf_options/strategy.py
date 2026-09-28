@@ -1,16 +1,12 @@
 # SPDX-License-Identifier: MIT
-import logging
 import math
-import time as time_mod
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, time
 from typing import Any
 
 import pandas as pd
 
-from ...htf_levels import summarize_htf_trend
 from ...models import ASSET_TYPE_OPTION_VERTICAL, Candidate, Position, Side, Signal, asset_type_of
 from ...options_mode import (
     OptionContract,
@@ -20,19 +16,12 @@ from ...options_mode import (
     choose_nearest_strike,
     clamp_long_premium_levels,
     clamp_short_premium_levels,
-    contract_from_quote,
-    filter_contracts,
     net_credit_dollars,
-    net_price_frac_of_width,
     net_debit_dollars,
-    parse_option_chain,
-    single_option_price_bounds,
     vertical_limit_price,
-    vertical_price_bounds,
 )
 from ...bars import opening_range, rth_open_plus, session_open_price
 from ...sessions import EQUITY_RTH_OPEN, equity_session_state, is_time_in_window, parse_hhmm
-from ...support_resistance import empty_market_structure_context
 from ...numeric import first_float, safe_float
 from ...reasons import (
     bool_token,
@@ -42,11 +31,10 @@ from ...reasons import (
     reason_with_values,
 )
 from ... import sessions
-from ..shared_entry import AdmittedEntry, EntryContexts, EntryProposal
-from ...schwab_api import SchwabHTTPError, call_schwab_json
+from ..shared_entry import AdmittedEntry, EntryProposal
 from ..strategy_base import BaseStrategy
-
-LOG = logging.getLogger(__name__)
+from .chain import OptionChainMixin
+from .regime import RegimeMixin
 
 
 def _style_unavailable_reason(style: str, detail: str, **fields: Any) -> str:
@@ -56,31 +44,6 @@ def _style_unavailable_reason(style: str, detail: str, **fields: Any) -> str:
     extra = detail_fields(**fields)
     inner = f"{detail},{extra}" if extra else detail
     return f"{style}_unavailable({inner})"
-
-
-def _ambiguous_regime_reason(
-    *,
-    top_name: str,
-    top_score: Any,
-    second_name: str,
-    second_score: Any,
-    min_top_score: Any,
-    min_score_gap: Any,
-) -> str:
-    """Standard 'top regime score too close to second' skip reason."""
-    top, second = safe_float(top_score), safe_float(second_score)
-    gap = None if top is None or second is None else top - second
-    return (
-        "ambiguous_regime("
-        f"top={top_name},"
-        f"top_score={fmt_metric(top_score, 2)},"
-        f"second={second_name},"
-        f"second_score={fmt_metric(second_score, 2)},"
-        f"required_top_score>={fmt_metric(min_top_score, 2)},"
-        f"required_score_gap>={fmt_metric(min_score_gap, 2)},"
-        f"current_score_gap={fmt_metric(gap, 2)}"
-        ")"
-    )
 
 
 def _no_style_trigger_reason(
@@ -165,7 +128,7 @@ class _EntryStyle:
             raise ValueError(f"0DTE style {self.name!r} has kind {self.kind!r}, not one of {sorted(_STYLE_KINDS)}")
 
 
-class ZeroDteEtfOptionsStrategy(BaseStrategy):
+class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
     """0DTE ETF verticals routed by the underlying's regime.
 
     ``_regime_confirm`` classifies the underlying (bullish / bearish trend,
@@ -183,7 +146,9 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
     ``entry_signals`` is the family's one entry loop: the long-options
     subclass swaps the style table (``_entry_styles``) and its builder, and
     turns the chain prefetch off. Until 2026-09-27 it carried its own copy
-    of the loop, and fixes reached one copy only.
+    of the loop, and fixes reached one copy only. The regime
+    (``regime.RegimeMixin``) and the chain and quote plumbing
+    (``chain.OptionChainMixin``) live beside this module.
     """
 
     strategy_name = 'zero_dte_etf_options'
@@ -205,10 +170,13 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         if capability_bars is not None:
             return capability_bars
         return max(0, int(self.params.get("min_bars", 40) or 40))
+
     def __init__(self, config):
         super().__init__(config)
         self.optcfg = config.options
         self.force_flat_time = parse_hhmm(self.optcfg.force_flatten_time)
+        # The chain cache (chain.OptionChainMixin): (symbol, date) -> when it
+        # was read and the chain.
         self._option_chain_cache: dict[tuple[str, str], tuple[datetime, list[OptionContract]]] = {}
         # Symbol -> when its last option_chains read failed. The read is not
         # retried until option_chain_cache_seconds has passed, the same pace
@@ -234,46 +202,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
 
     def _option_entry_block_reason(self, now_dt=None) -> str | None:
         return self._event_calendar.entry_block_reason(now_dt=now_dt)
-
-    @staticmethod
-    def _option_chain_cache_key(symbol: str) -> tuple[str, str]:
-        return str(symbol).upper().strip(), sessions.now_et().date().isoformat()
-
-    def _get_cached_option_chain(self, symbol: str) -> list[OptionContract] | None:
-        ttl = max(0, int(self.optcfg.option_chain_cache_seconds))
-        if ttl <= 0:
-            return None
-        key = self._option_chain_cache_key(symbol)
-        cached = self._option_chain_cache.get(key)
-        if cached is None:
-            return None
-        fetched_at, contracts = cached
-        if (sessions.now_et() - fetched_at).total_seconds() > ttl:
-            self._option_chain_cache.pop(key, None)
-            return None
-        return list(contracts)
-
-    def _option_chain_read_failed_recently(self, symbol: str) -> bool:
-        ttl = max(0, int(self.optcfg.option_chain_cache_seconds))
-        failed_at = self._option_chain_read_failed_at.get(str(symbol).upper().strip())
-        if ttl <= 0 or failed_at is None:
-            return False
-        return (sessions.now_et() - failed_at).total_seconds() <= ttl
-
-    def _set_cached_option_chain(self, symbol: str, contracts: list[OptionContract]) -> None:
-        ttl = max(0, int(self.optcfg.option_chain_cache_seconds))
-        if ttl <= 0:
-            return
-        key = self._option_chain_cache_key(symbol)
-        if key in self._option_chain_cache:
-            self._option_chain_cache.pop(key, None)
-        self._option_chain_cache[key] = (sessions.now_et(), list(contracts))
-        max_entries = max(1, int(self.optcfg.option_chain_cache_max_entries))
-        while len(self._option_chain_cache) > max_entries:
-            oldest = next(iter(self._option_chain_cache))
-            self._option_chain_cache.pop(oldest, None)
-
-
 
     @classmethod
     def _underlying_already_open(cls, symbol: str, positions: dict[str, Position]) -> bool:
@@ -348,10 +276,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         snapped = float(int(scaled + 0.5))
         return max(snapped, float(base_width))
 
-    @staticmethod
-    def _option_quote_stability_force_cooldown_seconds() -> float:
-        return 0.0
-
     def prefetch_entry_market_data(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], data=None) -> None:
         if data is None or not hasattr(data, "prefetch_htf_contexts"):
             return
@@ -370,47 +294,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         # 2026-09-24).
         data.prefetch_htf_contexts(symbols, **self._default_htf_request(), **self.htf_fvg_request())
 
-    @staticmethod
-    def _safe_pct(value: Any) -> float:
-        pct = safe_float(value, 0.0)
-        return pct / 100.0 if abs(pct) > 1.0 else pct
-
-    @staticmethod
-    def _fraction_relative(frame: pd.DataFrame, column: str, lookback: int, direction: str) -> float:
-        if frame is None or frame.empty:
-            return 0.0
-        recent = frame.tail(max(2, lookback))
-        if recent.empty or column not in recent.columns:
-            return 0.0
-        if direction == "above":
-            return float((recent["close"] > recent[column]).mean())
-        return float((recent["close"] < recent[column]).mean())
-
-    @staticmethod
-    def _flip_count(frame: pd.DataFrame, lookback: int) -> int:
-        if frame is None or frame.empty:
-            return 0
-        recent = frame.tail(max(3, lookback))
-        if recent.empty or "vwap" not in recent.columns:
-            return 0
-        sign = (recent["close"] - recent["vwap"]).apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0)).tolist()
-        sign = [s for s in sign if s != 0]
-        if len(sign) < 2:
-            return 0
-        return sum(1 for a, b in zip(sign, sign[1:]) if a != b)
-
-    @staticmethod
-    def _recent_range_pct(frame: pd.DataFrame, lookback: int) -> float:
-        if frame is None or frame.empty:
-            return 0.0
-        recent = frame.tail(max(2, lookback))
-        if recent.empty:
-            return 0.0
-        ref = safe_float(recent.iloc[-1]["close"], 0.0)
-        if ref <= 0:
-            return 0.0
-        return max(0.0, float(recent["high"].max()) - float(recent["low"].min())) / ref
-
     def dashboard_htf_trend(self, symbol: str, data, price: float, *, allow_refresh: bool = True) -> dict[str, str] | None:
         """The HTF trend the entry gate reads: ``_htf_trend_context``
         (``summarize_htf_trend`` on the continuous ema9_all / ema20_all)."""
@@ -423,33 +306,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
         """``summarize_htf_trend`` reads the continuous (all-hours) EMAs, not
         the session-reset ema9 / ema20 the chart drew until 2026-09-24."""
         return ("ema9_all", "ema20_all")
-
-    def _htf_trend_context(self, symbol: str, data, *, allow_refresh: bool = True) -> dict[str, Any]:
-        p = self.params
-        if data is None or not hasattr(data, "get_htf_frame"):
-            return {"available": False, "reason": "no_data_feed"}
-        htf_tf = self.htf_minutes()
-        frame = data.get_htf_frame(
-            symbol,
-            timeframe_minutes=htf_tf,
-            lookback_days=self.htf_lookback_days(),
-            allow_refresh=allow_refresh,
-        )
-        min_bars = int(p.get("htf_min_bars", 20))
-        summary = summarize_htf_trend(
-            frame,
-            min_bars=min_bars,
-            vwap_distance_pct=float(p.get("htf_vwap_distance_pct", 0.0009)),
-            ema_gap_pct=float(p.get("htf_ema_gap_pct", 0.0007)),
-            min_ret3=float(p.get("htf_min_ret3", 0.0009)),
-            range_vwap_distance_pct=float(p.get("htf_range_vwap_distance_pct", 0.0020)),
-            range_ema_gap_pct=float(p.get("htf_range_ema_gap_pct", 0.0010)),
-        )
-        if not bool(summary.get("available")):
-            bars = 0 if frame is None else len(frame)
-            summary["reason"] = insufficient_bars_reason("insufficient_htf_bars", bars, min_bars)
-        summary["timeframe_minutes"] = htf_tf
-        return summary
 
     @staticmethod
     def live_activity_score(frame: pd.DataFrame | None) -> float:
@@ -578,515 +434,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             return None
         return ((close / u_open) - 1.0) * 100.0
 
-    def _regime_confirm(self, candidate: Candidate, bars: dict[str, pd.DataFrame], data) -> dict[str, Any]:
-        p = self.params
-        sr_cfg = getattr(self.config, "support_resistance", None)
-        underlying = candidate.symbol
-        confirm_symbol = self.optcfg.confirmation_symbols.get(underlying)
-        vol_symbol = self.optcfg.volatility_symbol
-        u = bars.get(underlying)
-        idx = bars.get(confirm_symbol) if confirm_symbol else None
-        min_bars = int(p.get("min_bars", 35))
-        if u is None or len(u) < min_bars:
-            return {
-                "ok": False,
-                "no_trade": True,
-                "reason": insufficient_bars_reason("insufficient_underlying_bars", 0 if u is None else len(u), min_bars),
-                "underlying": underlying,
-                "confirm_index": confirm_symbol,
-            }
-
-        last_u = u.iloc[-1]
-        u_close = safe_float(last_u["close"], 0.0)
-        u_vwap = safe_float(last_u["vwap"], u_close)
-        u_ema9 = safe_float(last_u["ema9"], u_close)
-        u_ema20 = safe_float(last_u["ema20"], u_close)
-        u_vwap_dist = (u_close - u_vwap) / max(u_close, 1.0)
-        u_ema_gap = (u_ema9 - u_ema20) / max(u_close, 1.0)
-        u_ret5 = safe_float(last_u["ret5"], 0.0)
-        u_ret15 = safe_float(last_u["ret15"], 0.0)
-        session_day = sessions.now_et().date()
-        u_open = session_open_price(u, session_day, fallback_to_premarket_on_nan=True)
-        u_day_ret = float((u_close / u_open) - 1.0) if u_open else 0.0
-        u_above_frac = self._fraction_relative(u, "vwap", int(p.get("trend_vwap_lookback", 8)), "above")
-        u_below_frac = self._fraction_relative(u, "vwap", int(p.get("trend_vwap_lookback", 8)), "below")
-        u_flip_count = self._flip_count(u, int(p.get("flip_lookback", 12)))
-        u_range_pct = self._recent_range_pct(u, int(p.get("range_lookback", 20)))
-
-        min_confirm_bars = int(p.get("min_confirm_bars", 20))
-        idx_available = bool(idx is not None and len(idx) >= min_confirm_bars)
-        idx_bullish = idx_bearish = idx_range = False
-        idx_vwap_dist = 0.0
-        idx_ema_gap = 0.0
-        idx_flip_count = 0
-        if idx_available:
-            last_i = idx.iloc[-1]
-            i_close = safe_float(last_i["close"], 0.0)
-            i_vwap = safe_float(last_i["vwap"], i_close)
-            i_ema9 = safe_float(last_i["ema9"], i_close)
-            i_ema20 = safe_float(last_i["ema20"], i_close)
-            idx_vwap_dist = (i_close - i_vwap) / max(i_close, 1.0)
-            idx_ema_gap = (i_ema9 - i_ema20) / max(i_close, 1.0)
-            idx_flip_count = self._flip_count(idx, int(p.get("flip_lookback", 12)))
-            idx_bullish = idx_vwap_dist >= float(p.get("trend_vwap_distance_pct", 0.0016)) and idx_ema_gap >= float(p.get("trend_ema_gap_pct", 0.00075))
-            idx_bearish = idx_vwap_dist <= -float(p.get("trend_vwap_distance_pct", 0.0016)) and idx_ema_gap <= -float(p.get("trend_ema_gap_pct", 0.00075))
-            idx_range = abs(idx_vwap_dist) <= float(p.get("range_vwap_distance_pct", 0.0019)) and abs(idx_ema_gap) <= float(p.get("range_ema_gap_pct", 0.00075))
-
-        q = data.get_quote(vol_symbol) if data else None
-        # No guard: until 2026-09-26 a freshness check that raised kept the
-        # quote it could not vouch for, and the VIX gates read it.
-        if data is not None and vol_symbol:
-            max_age = max(1.0, float(self.config.runtime.quote_cache_seconds))
-            if not data.quotes_are_fresh([vol_symbol], max_age):
-                q = None
-        vix_last = first_float(q, "last", "mid", "mark", positive=True)
-        vix_pct = self._safe_pct(q.get("percent_change")) if q is not None and q.get("percent_change") is not None else 0.0
-        # change_from_open is computed live from Schwab session bars
-        # (u_day_ret above, via session_open_price with RTH-first +
-        # extended-hours fallback). The 2026-05-19 local-synthesis
-        # screener no longer stamps change_from_open on candidate.
-        # metadata at all — bypass was cleaner than carrying a 0.0
-        # stub through downstream consumers.
-        candidate_day_move = u_day_ret
-        # Live activity score (2026-05-14) — replaces TV cumulative RVOL
-        # for 0DTE gating and bonus scoring. Self-normalizing against
-        # the symbol's own last 20 bars, so it works the same morning
-        # vs afternoon and isn't biased low for benchmark ETFs. The TV
-        # candidate_rvol pipeline (raw / effective / profile / required-
-        # threshold) was removed in the same cleanup — those values
-        # were stub-only after the local-synthesis switch and no longer
-        # influenced any gate. Dashboard rings now use this live score.
-        activity_score = self.live_activity_score(u)
-
-        max_vix = float(self.optcfg.max_vix)
-        # Lower-bound VIX floor. 0.0 (default) disables the gate for
-        # backward-compat. Long-premium strategies should set this to
-        # ~12.0 — below that level the typical daily range is too small
-        # to overcome 0DTE theta + commissions even on a correct
-        # directional call. Credit-spread strategies leave it at 0.0
-        # since low-VIX is their target environment.
-        min_vix = float(getattr(self.optcfg, "min_vix", 0.0) or 0.0)
-        vix_spike_pct = float(self.optcfg.vix_spike_pct)
-        chaos_intraday_range_pct = float(p.get("chaos_intraday_range_pct", 0.016))
-        chop_flip_min = int(p.get("chop_flip_min", 4))
-        trend_vwap_distance_pct = float(p.get("trend_vwap_distance_pct", 0.0016))
-
-        reasons: list[str] = []
-        if vix_last is not None and vix_last > max_vix:
-            reasons.append(reason_with_values("vix_above_limit", current=vix_last, required=max_vix, op="<=", digits=2))
-        if vix_last is not None and min_vix > 0.0 and vix_last < min_vix:
-            reasons.append(reason_with_values("vix_below_floor", current=vix_last, required=min_vix, op=">=", digits=2))
-        # IV-rank gate (2026-05-14). Normalize current VIX against the
-        # user-provided 52-week range. Long-premium strategies should
-        # cap max_iv_rank to avoid buying expensive premium; credit-
-        # spread strategies should floor min_iv_rank to ensure juicy
-        # credits. Defaults (min=0.0, max=1.0) disable the gate.
-        if vix_last is not None:
-            vix_52w_low = float(getattr(self.optcfg, "vix_52w_low", 12.0))
-            vix_52w_high = float(getattr(self.optcfg, "vix_52w_high", 30.0))
-            min_iv_rank = float(getattr(self.optcfg, "min_iv_rank", 0.0) or 0.0)
-            max_iv_rank = float(getattr(self.optcfg, "max_iv_rank", 1.0) or 1.0)
-            iv_range = max(0.01, vix_52w_high - vix_52w_low)
-            iv_rank = max(0.0, min(1.0, (vix_last - vix_52w_low) / iv_range))
-            if min_iv_rank > 0.0 and iv_rank < min_iv_rank:
-                reasons.append(reason_with_values("iv_rank_too_low", current=iv_rank, required=min_iv_rank, op=">=", digits=2))
-            if max_iv_rank < 1.0 and iv_rank > max_iv_rank:
-                reasons.append(reason_with_values("iv_rank_too_high", current=iv_rank, required=max_iv_rank, op="<=", digits=2))
-        if abs(vix_pct) >= vix_spike_pct:
-            reasons.append(reason_with_values("vix_spike", current=abs(vix_pct), required=vix_spike_pct, op="<", digits=4))
-        # Live activity gate (replaces legacy weak_relative_volume gate that
-        # used TV cumulative RVOL — see live_activity_score docstring for
-        # why that was unreachable for benchmark ETFs).
-        min_activity = float(p.get("min_activity_for_entry", 0.0))
-        if min_activity > 0.0 and activity_score < min_activity:
-            reasons.append(reason_with_values("dead_tape", current=activity_score, required=min_activity, op=">=", digits=2))
-        if u_range_pct >= chaos_intraday_range_pct and u_flip_count >= chop_flip_min:
-            reasons.append(
-                reason_with_values(
-                    "chaotic_intraday_range",
-                    current=u_range_pct,
-                    required=chaos_intraday_range_pct,
-                    op="<",
-                    digits=4,
-                    extras={"flips": (u_flip_count, "<", chop_flip_min)},
-                )
-            )
-        require_index_confirmation = bool(p.get("require_index_confirmation", True))
-        if require_index_confirmation and confirm_symbol and not idx_available:
-            reasons.append(
-                insufficient_bars_reason(
-                    "insufficient_confirm_bars",
-                    0 if idx is None else len(idx),
-                    min_confirm_bars,
-                )
-            )
-        if require_index_confirmation and idx_available:
-            trend_disagree = (u_vwap_dist > 0 > idx_vwap_dist) or (u_vwap_dist < 0 < idx_vwap_dist)
-            if trend_disagree and abs(u_vwap_dist) >= trend_vwap_distance_pct and abs(idx_vwap_dist) >= trend_vwap_distance_pct:
-                reasons.append(
-                    reason_with_values(
-                        "underlying_index_disagreement",
-                        current=abs(u_vwap_dist),
-                        required=trend_vwap_distance_pct,
-                        op="<",
-                        digits=4,
-                        extras={"index_vwap_dist": (abs(idx_vwap_dist), "<", trend_vwap_distance_pct)},
-                    )
-                )
-
-        pattern_ctx = self._chart_context(u)
-        candle_ctx = self._candle_context(u)
-        bull_candle_signal = self._directional_candle_signal(u, Side.LONG)
-        bear_candle_signal = self._directional_candle_signal(u, Side.SHORT)
-        sr_ctx = self._sr_context(underlying, u, data)
-        mshtf_ctx = getattr(sr_ctx, "market_structure", None) or empty_market_structure_context(u_close)
-        ms_ltf_ctx = self._structure_context(u, "ltf")
-        sr_weight = float(getattr(sr_cfg, "regime_weight", 0.75) or 0.75)
-        mshtf_weight = float(getattr(sr_cfg, "structure_htf_weight", 0.90) or 0.90)
-        ms_ltf_weight = float(getattr(sr_cfg, "structure_ltf_weight", 0.70) or 0.70)
-        bullish_candle_score = float(bull_candle_signal.get("score", 0.0) or 0.0)
-        bearish_candle_score = float(bear_candle_signal.get("score", 0.0) or 0.0)
-        bullish_candle_net_score = float(bull_candle_signal.get("net_score", 0.0) or 0.0)
-        bearish_candle_net_score = float(bear_candle_signal.get("net_score", 0.0) or 0.0)
-        candle_weight = float(p.get("candle_weight", 0.50))
-        candle_sr_weight = float(p.get("candle_sr_weight", 0.35))
-        candle_trend_follow_weight = float(p.get("candle_trend_follow_weight", 0.25))
-        candle_range_penalty = float(p.get("candle_range_penalty", 0.30))
-        candle_mixed_penalty = float(p.get("candle_mixed_penalty", 0.18))
-        candle_anchor = max(
-            float(p.get("range_vwap_distance_pct", 0.0019)),
-            float(p.get("trend_vwap_distance_pct", 0.0016)),
-        )
-        bullish_candle_confirm = bool(bull_candle_signal.get("confirmed") and bullish_candle_net_score > bearish_candle_net_score)
-        bearish_candle_confirm = bool(bear_candle_signal.get("confirmed") and bearish_candle_net_score > bullish_candle_net_score)
-        mixed_candles = bool(bull_candle_signal.get("mixed"))
-        bullish_candle_scale = min(1.0, bullish_candle_net_score / 1.0) if bullish_candle_confirm else 0.0
-        bearish_candle_scale = min(1.0, bearish_candle_net_score / 1.0) if bearish_candle_confirm else 0.0
-
-        use_htf_confirmation = bool(p.get("use_htf_trend_confirmation", False))
-        require_htf_alignment = bool(p.get("require_htf_alignment", use_htf_confirmation))
-        htf_score_bonus = float(p.get("htf_score_bonus", 0.65))
-        htf_score_penalty = float(p.get("htf_score_penalty", 0.65))
-        htf_ctx = self._htf_trend_context(underlying, data) if use_htf_confirmation else {"available": False, "reason": "disabled"}
-        htf_available = bool(htf_ctx.get("available"))
-        htf_bullish = bool(htf_ctx.get("bullish")) if htf_available else False
-        htf_bearish = bool(htf_ctx.get("bearish")) if htf_available else False
-        htf_range = bool(htf_ctx.get("range")) if htf_available else False
-        if use_htf_confirmation and require_htf_alignment and not htf_available:
-            reasons.append(str(htf_ctx.get("reason") or "insufficient_htf_bars"))
-
-        htf_fvg_ctx = self._htf_context(underlying, data, current_price=u_close, **self._default_htf_request())
-        fvg_ltf_ctx = self._ltf_fvg_context(underlying, u, data)
-        fvg_context_weight_scale = max(0.0, float(p.get("fvg_context_weight_scale", 0.9) or 0.0))
-        # shared_entry.use_fvg_context is the entry policy's to read
-        # (2026-09-24): with it off both scores come back as the zero shape,
-        # nearest_bullish / nearest_bearish included, which the metrics
-        # stamping below reads unconditionally.
-        htf_fvg_score, fvg_ltf_score = self.entry_policy.fvg_regime_scores(u_close, htf_fvg_ctx, fvg_ltf_ctx)
-
-        bull_score = 0.0
-        bear_score = 0.0
-        range_score = 0.0
-        bull_score += 1.5 if u_vwap_dist >= float(p.get("trend_vwap_distance_pct", 0.0016)) else 0.0
-        bull_score += 1.0 if u_ema_gap >= float(p.get("trend_ema_gap_pct", 0.00075)) else 0.0
-        bull_score += 1.0 if u_ret5 >= float(p.get("trend_min_ret5", 0.0008)) else 0.0
-        bull_score += 1.0 if u_ret15 >= float(p.get("trend_min_ret15", 0.0014)) else 0.0
-        bull_score += 1.0 if u_above_frac >= float(p.get("trend_above_vwap_frac", 0.75)) else 0.0
-        # Trend activity bonus — replaces legacy trend_rvol check that was
-        # structurally unreachable for SPY/QQQ (cumulative TV-RVOL).
-        bull_score += 0.75 if activity_score >= float(p.get("trend_activity_threshold", 1.15)) else 0.0
-        bull_score += 1.0 if idx_bullish else (-0.5 if require_index_confirmation and idx_available else 0.0)
-        bull_score += 1.25 if pattern_ctx.matched_bullish_continuation else 0.0
-        bull_score += 0.75 if pattern_ctx.matched_bullish_reversal and u_vwap_dist >= 0 else 0.0
-        bull_score -= 0.75 if pattern_ctx.matched_bearish_reversal else 0.0
-        bull_score -= 1.00 if pattern_ctx.matched_bearish_continuation else 0.0
-        bull_score -= 1.0 if u_flip_count > int(p.get("chop_flip_max_for_trend", 3)) else 0.0
-        bull_score -= 1.0 if u_range_pct > float(p.get("chaos_intraday_range_pct", 0.016)) else 0.0
-        bull_score += sr_weight if sr_ctx.breakout_above_resistance else 0.0
-        # near_* is the level on price's own side; the breakdown / breakout
-        # flags are about a broken level on the far side, so they no longer
-        # switch the near terms off (2026-09-23).
-        bull_score += sr_weight * 0.40 if sr_ctx.near_support else 0.0
-        bull_score -= sr_weight * 0.45 if sr_ctx.near_resistance else 0.0
-        bull_score += candle_weight * bullish_candle_scale if bullish_candle_confirm and u_vwap_dist >= -candle_anchor else 0.0
-        bull_score += candle_sr_weight * bullish_candle_scale if bullish_candle_confirm and sr_ctx.near_support else 0.0
-        bull_score += candle_trend_follow_weight * bullish_candle_scale if bullish_candle_confirm and pattern_ctx.matched_bullish_continuation else 0.0
-        bull_score -= candle_weight * bearish_candle_scale if bearish_candle_confirm else 0.0
-        bull_score -= candle_mixed_penalty if mixed_candles else 0.0
-        bull_score += htf_score_bonus if htf_bullish else 0.0
-        bull_score -= htf_score_penalty if htf_bearish else 0.0
-
-        bear_score += 1.5 if u_vwap_dist <= -float(p.get("trend_vwap_distance_pct", 0.0016)) else 0.0
-        bear_score += 1.0 if u_ema_gap <= -float(p.get("trend_ema_gap_pct", 0.00075)) else 0.0
-        bear_score += 1.0 if u_ret5 <= -float(p.get("trend_min_ret5", 0.0008)) else 0.0
-        bear_score += 1.0 if u_ret15 <= -float(p.get("trend_min_ret15", 0.0014)) else 0.0
-        bear_score += 1.0 if u_below_frac >= float(p.get("trend_above_vwap_frac", 0.75)) else 0.0
-        # Trend activity bonus (symmetric with bull side).
-        bear_score += 0.75 if activity_score >= float(p.get("trend_activity_threshold", 1.15)) else 0.0
-        bear_score += 1.0 if idx_bearish else (-0.5 if require_index_confirmation and idx_available else 0.0)
-        bear_score += 1.25 if pattern_ctx.matched_bearish_continuation else 0.0
-        bear_score += 0.75 if pattern_ctx.matched_bearish_reversal and u_vwap_dist <= 0 else 0.0
-        bear_score -= 0.75 if pattern_ctx.matched_bullish_reversal else 0.0
-        bear_score -= 1.00 if pattern_ctx.matched_bullish_continuation else 0.0
-        bear_score -= 1.0 if u_flip_count > int(p.get("chop_flip_max_for_trend", 3)) else 0.0
-        bear_score -= 1.0 if u_range_pct > float(p.get("chaos_intraday_range_pct", 0.016)) else 0.0
-        bear_score += sr_weight if sr_ctx.breakdown_below_support else 0.0
-        bear_score += sr_weight * 0.40 if sr_ctx.near_resistance else 0.0
-        bear_score -= sr_weight * 0.45 if sr_ctx.near_support else 0.0
-        bear_score += candle_weight * bearish_candle_scale if bearish_candle_confirm and u_vwap_dist <= candle_anchor else 0.0
-        bear_score += candle_sr_weight * bearish_candle_scale if bearish_candle_confirm and sr_ctx.near_resistance else 0.0
-        bear_score += candle_trend_follow_weight * bearish_candle_scale if bearish_candle_confirm and pattern_ctx.matched_bearish_continuation else 0.0
-        bear_score -= candle_weight * bullish_candle_scale if bullish_candle_confirm else 0.0
-        bear_score -= candle_mixed_penalty if mixed_candles else 0.0
-        bear_score += htf_score_bonus if htf_bearish else 0.0
-        bear_score -= htf_score_penalty if htf_bullish else 0.0
-
-        range_score += 1.5 if abs(u_vwap_dist) <= float(p.get("range_vwap_distance_pct", 0.0019)) else 0.0
-        range_score += 1.0 if abs(u_ema_gap) <= float(p.get("range_ema_gap_pct", 0.00075)) else 0.0
-        range_score += 1.0 if u_range_pct <= float(p.get("range_max_intraday_move_pct", 0.012)) else 0.0
-        range_score += 1.0 if abs(u_day_ret) <= float(p.get("credit_max_day_move_pct", 0.010)) else 0.0
-        range_score += 1.0 if u_flip_count >= int(p.get("chop_flip_min", 4)) else 0.0
-        range_score += 0.75 if idx_available and idx_range else 0.0
-        # Range/credit activity bonus — moderate activity is the credit
-        # sweet spot (theta-friendly tape). Floor + ceiling replace the
-        # legacy credit_min_rvol / credit_max_rvol thresholds.
-        range_score += 0.5 if activity_score >= float(p.get("credit_activity_min", 0.80)) else 0.0
-        range_score -= 0.50 if pattern_ctx.matched_bullish_continuation or pattern_ctx.matched_bearish_continuation else 0.0
-        range_score -= 0.25 if pattern_ctx.matched_bullish_reversal or pattern_ctx.matched_bearish_reversal else 0.0
-        # Too-active tape kills credit setups (likely directional move
-        # incoming, not range).
-        range_score -= 1.0 if activity_score >= float(p.get("credit_activity_max", 1.30)) else 0.0
-        range_score -= 1.0 if abs(candidate_day_move) >= float(p.get("credit_max_day_move_pct", 0.010)) else 0.0
-        range_score -= 1.0 if abs(vix_pct) >= float(p.get("credit_max_vix_change_pct", 0.015)) else 0.0
-        range_score += sr_weight * 0.30 if sr_ctx.near_support and sr_ctx.near_resistance else 0.0
-        range_score += sr_weight * 0.20 if sr_ctx.regime_hint == "range_between_levels" else 0.0
-        range_score -= sr_weight * 0.35 if sr_ctx.breakout_above_resistance or sr_ctx.breakdown_below_support else 0.0
-        range_score -= candle_range_penalty if bullish_candle_confirm or bearish_candle_confirm else 0.0
-        range_score -= candle_mixed_penalty * 0.5 if mixed_candles else 0.0
-        range_score += htf_score_bonus * 0.35 if htf_range else 0.0
-        range_score -= htf_score_penalty * 0.35 if (htf_bullish or htf_bearish) else 0.0
-
-        bull_score += mshtf_weight * 0.60 if mshtf_ctx.bias == "bullish" else 0.0
-        bull_score -= mshtf_weight * 0.60 if mshtf_ctx.bias == "bearish" else 0.0
-        bull_score += mshtf_weight * 0.95 if self._active_structure_break(mshtf_ctx.bos_up, mshtf_ctx.bos_up_age_bars, htf=True) else 0.0
-        bull_score -= mshtf_weight * 1.05 if self._active_structure_break(mshtf_ctx.choch_down, mshtf_ctx.choch_down_age_bars, htf=True) else 0.0
-        bull_score += ms_ltf_weight * 0.70 if ms_ltf_ctx.bias == "bullish" else 0.0
-        bull_score -= ms_ltf_weight * 0.75 if ms_ltf_ctx.bias == "bearish" else 0.0
-        bull_score += ms_ltf_weight if (ms_ltf_ctx.bos_up and self._structure_event_recent(ms_ltf_ctx.bos_up_age_bars)) else 0.0
-        bull_score -= ms_ltf_weight if (ms_ltf_ctx.choch_down and self._structure_event_recent(ms_ltf_ctx.choch_down_age_bars)) else 0.0
-
-        bear_score += mshtf_weight * 0.60 if mshtf_ctx.bias == "bearish" else 0.0
-        bear_score -= mshtf_weight * 0.60 if mshtf_ctx.bias == "bullish" else 0.0
-        bear_score += mshtf_weight * 0.95 if self._active_structure_break(mshtf_ctx.bos_down, mshtf_ctx.bos_down_age_bars, htf=True) else 0.0
-        bear_score -= mshtf_weight * 1.05 if self._active_structure_break(mshtf_ctx.choch_up, mshtf_ctx.choch_up_age_bars, htf=True) else 0.0
-        bear_score += ms_ltf_weight * 0.70 if ms_ltf_ctx.bias == "bearish" else 0.0
-        bear_score -= ms_ltf_weight * 0.75 if ms_ltf_ctx.bias == "bullish" else 0.0
-        bear_score += ms_ltf_weight if (ms_ltf_ctx.bos_down and self._structure_event_recent(ms_ltf_ctx.bos_down_age_bars)) else 0.0
-        bear_score -= ms_ltf_weight if (ms_ltf_ctx.choch_up and self._structure_event_recent(ms_ltf_ctx.choch_up_age_bars)) else 0.0
-
-        bull_score += (htf_fvg_score["bull_score"] + fvg_ltf_score["bull_score"]) * fvg_context_weight_scale
-        bear_score += (htf_fvg_score["bear_score"] + fvg_ltf_score["bear_score"]) * fvg_context_weight_scale
-
-        range_score += mshtf_weight * 0.35 if mshtf_ctx.bias == "neutral" else 0.0
-        range_score -= mshtf_weight * 0.35 if mshtf_ctx.bias in {"bullish", "bearish"} else 0.0
-        range_score += ms_ltf_weight * 0.20 if ms_ltf_ctx.bias == "neutral" else 0.0
-        range_score -= min(0.45, ((htf_fvg_score["directional_pressure"] * 0.35) + (fvg_ltf_score["directional_pressure"] * 0.25)) * fvg_context_weight_scale)
-
-        scores = {"bullish_trend": bull_score, "bearish_trend": bear_score, "range": range_score}
-        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-        top_name, top_score = ranked[0]
-        second_name, second_score = ranked[1] if len(ranked) > 1 else ("none", 0.0)
-        min_trend_score = float(p.get("min_trend_score", 4.9))
-        min_range_score = float(p.get("min_range_score", 4.6))
-        min_score_gap = float(p.get("min_score_gap", 1.6))
-        regime = "no_trade"
-        no_trade = bool(reasons)
-
-        if not no_trade:
-            if top_name in {"bullish_trend", "bearish_trend"} and top_score >= min_trend_score and (top_score - second_score) >= min_score_gap:
-                regime = top_name
-            elif top_name == "range" and top_score >= min_range_score and (top_score - second_score) >= min_score_gap:
-                regime = "range"
-            else:
-                no_trade = True
-                reasons.append(
-                    _ambiguous_regime_reason(
-                        top_name=top_name,
-                        top_score=top_score,
-                        second_name=second_name,
-                        second_score=second_score,
-                        min_top_score=min_range_score if top_name == "range" else min_trend_score,
-                        min_score_gap=min_score_gap,
-                    )
-                )
-
-        if not no_trade and use_htf_confirmation and require_htf_alignment and htf_available:
-            if regime == "bullish_trend" and not htf_bullish:
-                no_trade = True
-                reasons.append(
-                    reason_with_values(
-                        "htf_trend_misaligned",
-                        current=htf_ctx.get("vwap_dist", 0.0),
-                        required=float(p.get("htf_vwap_distance_pct", 0.0009)),
-                        op=">=",
-                        digits=4,
-                        extras={
-                            "htf_direction": ("bullish" if htf_bullish else ("bearish" if htf_bearish else "range"), "=", "bullish"),
-                            "htf_ret3": (float(htf_ctx.get("ret3", 0.0)), ">=", float(p.get("htf_min_ret3", 0.0009))),
-                        },
-                    )
-                )
-            elif regime == "bearish_trend" and not htf_bearish:
-                no_trade = True
-                reasons.append(
-                    reason_with_values(
-                        "htf_trend_misaligned",
-                        current=abs(float(htf_ctx.get("vwap_dist", 0.0))),
-                        required=float(p.get("htf_vwap_distance_pct", 0.0009)),
-                        op=">=",
-                        digits=4,
-                        extras={
-                            "htf_direction": ("bearish" if htf_bearish else ("bullish" if htf_bullish else "range"), "=", "bearish"),
-                            "htf_ret3": (abs(float(htf_ctx.get("ret3", 0.0))), ">=", float(p.get("htf_min_ret3", 0.0009))),
-                        },
-                    )
-                )
-
-        # The HTF structure bias is the regime's own veto. The LTF structure
-        # veto that followed it here left on 2026-09-24: each style's premium
-        # proposal meets it in the shared entry stage (shared_entry.
-        # use_structure_filter), on this same frame and in the regime's
-        # direction; the manifest exempts midday_credit_spread, as the range
-        # regime was never structure-gated.
-        if not no_trade and sr_cfg is not None and bool(getattr(sr_cfg, "structure_enabled", True)):
-            if regime == "bullish_trend" and mshtf_ctx.bias == "bearish":
-                no_trade = True
-                reasons.append(f"htf_structure_bearish(tf={self.htf_minutes()}m,last_high={mshtf_ctx.last_high_label},last_low={mshtf_ctx.last_low_label})")
-            elif regime == "bearish_trend" and mshtf_ctx.bias == "bullish":
-                no_trade = True
-                reasons.append(f"htf_structure_bullish(tf={self.htf_minutes()}m,last_high={mshtf_ctx.last_high_label},last_low={mshtf_ctx.last_low_label})")
-
-        return {
-            "ok": True,
-            "underlying": underlying,
-            "confirm_index": confirm_symbol,
-            "regime": regime,
-            "no_trade": no_trade or regime == "no_trade",
-            "reason": ",".join(reasons) if reasons else regime,
-            # The contexts the regime was scored on, for the premium
-            # proposals (the S/R context of this frame, its LTF structure and
-            # chart contexts): admit gates on the same reads.
-            "entry_contexts": EntryContexts(sr=sr_ctx, ms=ms_ltf_ctx, chart=pattern_ctx),
-            "scores": scores,
-            "metrics": {
-                "underlying_vwap_dist": u_vwap_dist,
-                "underlying_ema_gap": u_ema_gap,
-                "underlying_ret5": u_ret5,
-                "underlying_ret15": u_ret15,
-                "underlying_day_ret": u_day_ret,
-                "underlying_range_pct": u_range_pct,
-                "underlying_flip_count": u_flip_count,
-                "htf_available": htf_available,
-                "htf_vwap_dist": float(htf_ctx.get("vwap_dist", 0.0)) if htf_available else 0.0,
-                "htf_ema_gap": float(htf_ctx.get("ema_gap", 0.0)) if htf_available else 0.0,
-                "htf_ret3": float(htf_ctx.get("ret3", 0.0)) if htf_available else 0.0,
-                "htf_bullish": htf_bullish,
-                "htf_bearish": htf_bearish,
-                "htf_range": htf_range,
-                "confirm_vwap_dist": idx_vwap_dist,
-                "confirm_ema_gap": idx_ema_gap,
-                "confirm_flip_count": idx_flip_count,
-                "live_activity_score": activity_score,
-                "candidate_change_from_open": candidate_day_move,
-                "vix": vix_last,
-                "vix_pct": vix_pct,
-                "chart_pattern_bias_score": float(pattern_ctx.bias_score),
-                "chart_pattern_regime_hint": str(pattern_ctx.regime_hint),
-                "candle_bias_score": float(candle_ctx["candle_bias_score"]),
-                "candle_net_score": float(candle_ctx.get("candle_net_score", candle_ctx["candle_bias_score"]) or candle_ctx["candle_bias_score"]),
-                "candle_regime_hint": str(candle_ctx["candle_regime_hint"]),
-                "matched_bullish_candles": list(candle_ctx["matched_bullish_candles"]),
-                "matched_bearish_candles": list(candle_ctx["matched_bearish_candles"]),
-                "bullish_candle_score": round(bullish_candle_score, 4),
-                "bearish_candle_score": round(bearish_candle_score, 4),
-                "bullish_candle_net_score": round(bullish_candle_net_score, 4),
-                "bearish_candle_net_score": round(bearish_candle_net_score, 4),
-                **self._structure_lists(ms_ltf_ctx, prefix="msltf"),
-                **self._structure_lists(mshtf_ctx, prefix="mshtf"),
-                "sr_bias_score": float(sr_ctx.bias_score),
-                "sr_regime_hint": str(sr_ctx.regime_hint),
-                "sr_nearest_support": float(sr_ctx.nearest_support.price) if sr_ctx.nearest_support else None,
-                "sr_nearest_resistance": float(sr_ctx.nearest_resistance.price) if sr_ctx.nearest_resistance else None,
-                "sr_support_distance_pct": None if sr_ctx.support_distance_pct is None else float(sr_ctx.support_distance_pct),
-                "sr_resistance_distance_pct": None if sr_ctx.resistance_distance_pct is None else float(sr_ctx.resistance_distance_pct),
-                "sr_breakout_above_resistance": bool(sr_ctx.breakout_above_resistance),
-                "sr_breakdown_below_support": bool(sr_ctx.breakdown_below_support),
-                "sr_supports": [float(round(lv.price, 4)) for lv in sr_ctx.supports],
-                "sr_resistances": [float(round(lv.price, 4)) for lv in sr_ctx.resistances],
-                "matched_bullish_chart_patterns": sorted(pattern_ctx.matched_bullish),
-                "matched_bearish_chart_patterns": sorted(pattern_ctx.matched_bearish),
-                "matched_bullish_chart_reversal_patterns": sorted(pattern_ctx.matched_bullish_reversal),
-                "matched_bullish_chart_continuation_patterns": sorted(pattern_ctx.matched_bullish_continuation),
-                "matched_bearish_chart_reversal_patterns": sorted(pattern_ctx.matched_bearish_reversal),
-                "matched_bearish_chart_continuation_patterns": sorted(pattern_ctx.matched_bearish_continuation),
-                "htf_fvg_bull_score": float(htf_fvg_score["bull_score"]),
-                "htf_fvg_bear_score": float(htf_fvg_score["bear_score"]),
-                "htf_fvg_nearest_bullish_state": str(htf_fvg_score["nearest_bullish"].get("state", "none")),
-                "htf_fvg_nearest_bearish_state": str(htf_fvg_score["nearest_bearish"].get("state", "none")),
-                "htf_fvg_nearest_bullish_midpoint": safe_float(htf_fvg_score["nearest_bullish"].get("midpoint")),
-                "htf_fvg_nearest_bearish_midpoint": safe_float(htf_fvg_score["nearest_bearish"].get("midpoint")),
-                "fvg_ltf_bull_score": float(fvg_ltf_score["bull_score"]),
-                "fvg_ltf_bear_score": float(fvg_ltf_score["bear_score"]),
-                "fvg_ltf_nearest_bullish_state": str(fvg_ltf_score["nearest_bullish"].get("state", "none")),
-                "fvg_ltf_nearest_bearish_state": str(fvg_ltf_score["nearest_bearish"].get("state", "none")),
-                "fvg_ltf_nearest_bullish_midpoint": safe_float(fvg_ltf_score["nearest_bullish"].get("midpoint")),
-                "fvg_ltf_nearest_bearish_midpoint": safe_float(fvg_ltf_score["nearest_bearish"].get("midpoint")),
-            },
-        }
-
-    def _fetch_raw_option_chain(self, client, symbol: str) -> list[OptionContract] | None:
-        # Return the full unfiltered 0DTE option chain for `symbol`, or None
-        # when Schwab did not return one (see _option_chain_read_failed_at).
-        # Reads from the per-symbol cache when warm; on miss, issues one
-        # Schwab option_chains call, parses, caches, and returns the
-        # result. Pure I/O + cache plumbing — no put/call or
-        # liquidity filter applied. Use _fetch_filtered_contracts when
-        # you need a filtered list; use this when you only want to warm
-        # the cache. An error response is not an empty chain: it is not
-        # cached, and the build path reports option_chain_unavailable.
-        cached = self._get_cached_option_chain(symbol)
-        if cached is not None:
-            return cached
-        if self._option_chain_read_failed_recently(symbol):
-            return None
-        today = sessions.now_et().date()
-        # strikeCount=24 (was 12) — for 0DTE credit spreads the short leg
-        # sits at ~0.20-0.30 delta (3-5 strikes OTM) and the hedge then
-        # needs another 2-3 strikes further OTM. The previous 12-strike
-        # window (±6 around ATM) cut off the hedge target on most credit
-        # builds — 2026-05-20 session logged 183 no_hedge_leg skips
-        # because the chain returned didn't include strikes far enough
-        # from spot. 24 strikes (±12) gives the hedge plenty of headroom
-        # without meaningfully changing the API cost or liquidity-filter
-        # processing time.
-        try:
-            payload = call_schwab_json(client, "option_chains",
-                symbol=symbol,
-                contractType="ALL",
-                strikeCount=24,
-                includeUnderlyingQuote=True,
-                fromDate=today,
-                toDate=today,
-            )
-        except SchwabHTTPError as exc:
-            LOG.warning("Option chain read failed for %s: %s", symbol, exc)
-            self._option_chain_read_failed_at[str(symbol).upper().strip()] = sessions.now_et()
-            return None
-        self._option_chain_read_failed_at.pop(str(symbol).upper().strip(), None)
-        contracts = parse_option_chain(payload, only_dte=0)
-        self._set_cached_option_chain(symbol, contracts)
-        return contracts
-
     def _underlying_below_min_price(self, underlying: str, style: str, last_underlying: float) -> bool:
         """``options.min_underlying_price``, which the README documents as an
         option-universe filter and every preset set, was read by nothing
@@ -1099,170 +446,6 @@ class ZeroDteEtfOptionsStrategy(BaseStrategy):
             reason_with_values("underlying_below_min_price", current=last_underlying, required=floor, op=">=", digits=2),
         )
         return True
-
-    def _fetch_filtered_contracts(self, client, symbol: str, put_call: str) -> list[OptionContract] | None:
-        """The chain's liquid ``put_call`` contracts; None when the chain
-        could not be read."""
-        contracts = self._fetch_raw_option_chain(client, symbol)
-        if contracts is None:
-            return None
-        filtered = filter_contracts(
-            contracts,
-            put_call=put_call,
-            min_volume=self.optcfg.min_option_volume,
-            min_open_interest=self.optcfg.min_open_interest,
-            max_bid_ask_spread_pct=self.optcfg.max_bid_ask_spread_pct,
-        )
-        return [c for c in filtered if (c.ask - c.bid) <= float(self.optcfg.max_leg_spread_dollars)]
-
-    def _prefetch_option_chains(self, symbols: list[str], client) -> None:
-        # Warm the per-symbol option-chain cache in parallel before the
-        # sequential candidate-build loop in entry_signals(). Each candidate
-        # would otherwise hit Schwab serially via _fetch_filtered_contracts;
-        # for N>1 cache-miss candidates that's N * ~150ms of stacked I/O on
-        # the engine thread per cycle. The chain cache is symbol+date keyed
-        # (no put_call), so one fetch per symbol covers both CALL and PUT
-        # build paths. A Schwab error response is remembered by
-        # _fetch_raw_option_chain, so the build path does not re-read it and
-        # emits option_chain_unavailable; any other failure is logged and
-        # swallowed here, and the build path retries on its own.
-        misses = [
-            sym for sym in {str(s or "").upper().strip() for s in symbols}
-            if sym and self._get_cached_option_chain(sym) is None
-        ]
-        if not misses:
-            return
-        max_workers = min(len(misses), 4)
-
-        def _warm(sym: str) -> None:
-            try:
-                # I/O-only path: populate the symbol-keyed cache without
-                # running the put/call + liquidity filter (those are
-                # parameterised per build call and don't affect the cache).
-                self._fetch_raw_option_chain(client, sym)
-            except Exception as exc:
-                LOG.warning("Option chain prefetch failed for %s: %s", sym, exc)
-
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="bot-option-chain-prefetch") as executor:
-            futures = [executor.submit(_warm, sym) for sym in misses]
-            for future in as_completed(futures):
-                # _warm swallows its own exceptions; result() here is a
-                # no-op safety check that ensures any unexpected exception
-                # propagates to the caller's outer error handling.
-                future.result()
-
-    def _spread_market_failure_detail(self, first_leg: OptionContract, second_leg: OptionContract) -> str:
-        bid, ask, mid = vertical_price_bounds(first_leg, second_leg)
-        max_net_spread_price = float(self.optcfg.max_net_spread_price)
-        min_net_mid_price = float(self.optcfg.min_net_mid_price)
-        max_net_spread_pct = float(self.optcfg.max_net_spread_pct)
-        if ask <= 0 or mid <= 0:
-            return detail_fields(reason="invalid_spread_market", net_bid=bid, net_ask=ask, net_mid=mid)
-        if ask > max_net_spread_price:
-            return detail_fields(reason="net_ask_too_high", required_max_net_ask=max_net_spread_price, current_net_ask=ask, net_bid=bid, net_mid=mid)
-        if mid < min_net_mid_price:
-            return detail_fields(reason="net_mid_too_low", required_min_net_mid=min_net_mid_price, current_net_mid=mid, net_bid=bid, net_ask=ask)
-        spread_pct = (ask - bid) / max(mid, 0.01)
-        if spread_pct > max_net_spread_pct:
-            return detail_fields(reason="net_spread_pct_too_wide", required_max_net_spread_pct=max_net_spread_pct, current_net_spread_pct=spread_pct, net_bid=bid, net_ask=ask, net_mid=mid)
-        return detail_fields(reason="invalid_spread_market", net_bid=bid, net_ask=ask, net_mid=mid)
-
-    def _validate_spread_market(self, first_leg: OptionContract, second_leg: OptionContract) -> tuple[float, float, float] | None:
-        """(net bid, net ask, net mid) of a tradable vertical, else None.
-        A market it returns has a mid above zero (never NaN), which the
-        builders' ``mark_price_hint`` reads with no fallback."""
-        bid, ask, mid = vertical_price_bounds(first_leg, second_leg)
-        if ask <= 0 or mid <= 0:
-            return None
-        if ask > float(self.optcfg.max_net_spread_price):
-            return None
-        if mid < float(self.optcfg.min_net_mid_price):
-            return None
-        if (ask - bid) / max(mid, 0.01) > float(self.optcfg.max_net_spread_pct):
-            return None
-        # Structural sanity: the net price must be a sane fraction of the
-        # strike width. A quote implying a credit at or above the width is
-        # free money and books a max loss of zero, which then sizes to the
-        # contract cap on a position whose real risk is the full width.
-        width_frac_cap = float(getattr(self.optcfg, "max_net_price_frac_of_width", 0.0) or 0.0)
-        if width_frac_cap > 0:
-            frac = net_price_frac_of_width(first_leg, second_leg, ask)
-            if frac is None or frac > width_frac_cap:
-                return None
-        return bid, ask, mid
-
-    def _validate_single_option_market(self, contract: OptionContract) -> tuple[float, float, float] | None:
-        """(bid, ask, mid) of a tradable single option, else None; as
-        ``_validate_spread_market``, a market it returns has a mid above zero."""
-        bid, ask, mid = single_option_price_bounds(contract)
-        if ask <= 0 or mid <= 0:
-            return None
-        if ask > float(self.optcfg.max_single_option_price):
-            return None
-        if contract.spread_pct > float(self.optcfg.max_bid_ask_spread_pct):
-            return None
-        return bid, ask, mid
-
-    def _single_option_market_failure_detail(self, contract: OptionContract) -> str:
-        """Why ``_validate_single_option_market`` refused ``contract``, as
-        ``_spread_market_failure_detail`` describes a vertical."""
-        bid, ask, mid = single_option_price_bounds(contract)
-        if ask <= 0 or mid <= 0:
-            return detail_fields(reason="invalid_option_market", bid=bid, ask=ask, mid=mid)
-        max_price = float(self.optcfg.max_single_option_price)
-        if ask > max_price:
-            return detail_fields(reason="option_ask_too_high", required_max_ask=max_price, current_ask=ask, bid=bid, mid=mid)
-        return detail_fields(reason="option_spread_pct_too_wide", required_max_spread_pct=float(self.optcfg.max_bid_ask_spread_pct),
-                             current_spread_pct=contract.spread_pct, bid=bid, ask=ask, mid=mid)
-
-    def _stabilize_quotes(
-        self,
-        data,
-        legs: tuple[OptionContract, ...],
-        *,
-        validate: Callable[..., tuple[float, float, float] | None],
-        failure_detail: Callable[..., str],
-        source: str,
-    ) -> tuple[tuple[OptionContract, ...] | None, str | None]:
-        """Re-quote the picked ``legs`` ``options.quote_stability_checks``
-        times, ``quote_stability_pause_ms`` apart: each round forces a quote
-        fetch, needs every leg fresh and quoted, and ``validate`` (called with
-        the re-quoted legs) to pass their market; then the mid may not have
-        drifted more than ``max_mid_drift_pct``. Returns the last re-quoted
-        legs and None, or None and why (``reason=...,k=v``; a refused market
-        described by ``failure_detail``). With no data feed the legs come back
-        as picked. One loop for the verticals and the single options: until
-        2026-09-27 each had a copy, and only the credit spread recorded why."""
-        if data is None:
-            return legs, None
-        symbols = [leg.symbol for leg in legs]
-        checks = max(1, int(self.optcfg.quote_stability_checks))
-        mids: list[float] = []
-        latest = legs
-        for idx in range(checks):
-            data.fetch_quotes(symbols, force=True, min_force_interval_seconds=self._option_quote_stability_force_cooldown_seconds(), source=source)
-            if not data.quotes_are_fresh(symbols, self.optcfg.max_quote_age_seconds):
-                return None, detail_fields(reason="quote_not_fresh", required_max_quote_age_seconds=float(self.optcfg.max_quote_age_seconds), completed_checks=idx, symbols="|".join(symbols))
-            quotes = [data.get_quote(symbol) for symbol in symbols]
-            if not all(quotes):
-                names = ("first", "second")
-                return None, detail_fields(
-                    reason="missing_leg_quotes",
-                    **{f"{name}_symbol": leg.symbol for name, leg in zip(names, legs)},
-                    **{f"{name}_quote": bool(quote) for name, quote in zip(names, quotes)},
-                    completed_checks=idx,
-                )
-            latest = tuple(contract_from_quote(leg.symbol, quote, asdict(leg)) for leg, quote in zip(legs, quotes))
-            market = validate(*latest)
-            if market is None:
-                return None, failure_detail(*latest)
-            mids.append(market[2])
-            if idx + 1 < checks:
-                time_mod.sleep(max(0.0, float(self.optcfg.quote_stability_pause_ms) / 1000.0))
-        drift = (max(mids) - min(mids)) / max(mids[-1], 0.01)
-        if drift > float(self.optcfg.max_mid_drift_pct):
-            return None, detail_fields(reason="mid_drift_too_high", required_max_mid_drift_pct=float(self.optcfg.max_mid_drift_pct), current_mid_drift_pct=drift, checks=checks)
-        return latest, None
 
     @staticmethod
     def _option_strategy_score(candidate: Candidate, regime: dict[str, Any], primary_key: str) -> float:

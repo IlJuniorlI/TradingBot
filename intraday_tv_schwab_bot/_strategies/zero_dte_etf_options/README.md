@@ -245,7 +245,9 @@ strategy uses; the strategy no longer reads any of them itself.
 - `manifest.json` defines the plugin registration metadata.
 - `configs/config.zero_dte_etf_options.yaml` is the matching top-level tuned preset for this strategy.
 - `screener.py` builds the candidate list for this strategy.
-- `strategy.py` contains the actual entry / exit logic.
+- `strategy.py` defines `ZeroDteEtfOptionsStrategy`: the entry loop over the style table (`entry_signals`, `_entry_styles`), the builders, the entry gates and the dashboard hooks. The rest is mixed into that class from the modules beside it:
+  - `regime.py`: the underlying's regime (`_regime_confirm` and its stages), the tape stats and the HTF trend context.
+  - `chain.py`: the option-chain cache, read and prefetch, the vertical and single-option market checks and the quote-stability loop.
 
 ## Risk reconciliation and the width-relative price gate (2026-09-19)
 

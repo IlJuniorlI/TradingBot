@@ -310,6 +310,51 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The 0DTE regime and option-chain plumbing have their own modules
+  (refactor cut C44).** *2026-09-27* — `zero_dte_etf_options/regime.py`
+  (`RegimeMixin`) holds `_regime_confirm`, which is no longer one 465-line
+  method. It runs as stages: `_underlying_tape`, `_confirm_index_tape`,
+  `_vix_read`, `_regime_gate_reasons`, `_regime_contexts`,
+  `_htf_trend_confirmation`, `_fvg_regime_scores`, `_regime_scores`,
+  `_select_regime`, `_regime_vetoes` and `_regime_metrics`. Each stage is
+  the method's own block, unchanged, passing frozen records
+  (`_UnderlyingTape`, `_IndexTape`, `_RegimeContexts`, `_HtfTrend`). The
+  module also holds the static tape stats (`_safe_pct`,
+  `_fraction_relative`, `_flip_count`, `_recent_range_pct`),
+  `_htf_trend_context` and `_ambiguous_regime_reason`, whose only reader is
+  the regime. `zero_dte_etf_options/chain.py` (`OptionChainMixin`) holds the
+  chain cache, `_fetch_raw_option_chain`, `_fetch_filtered_contracts`,
+  `_prefetch_option_chains`, the vertical and single-option validators with
+  their failure details, and the quote-stability loop (`_stabilize_quotes`).
+  `ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy)`
+  keeps the style table and the entry loop, the builders, the entry gates
+  (`_underlying_below_min_price`, `_admit_premium_entry`) and the dashboard
+  hooks (`live_activity_score` and the rest, which the dashboard
+  duck-types). Its `__init__` still creates the chain cache state. There is
+  no alias: `_ambiguous_regime_reason` imports from
+  `zero_dte_etf_options.regime`. The two chain warnings ("Option chain read
+  failed", "Option chain prefetch failed") now log under
+  `..._strategies.zero_dte_etf_options.chain`. The knob-contract scans
+  (`tests/test_shared_knob_contract.py`) read `regime.py` and `chain.py`
+  too, and the HTF EMA-span scan (`tests/test_htf_ema_knobs.py`) reads the
+  whole package. No behaviour changes: on the B11 entry's replay (34
+  tape-days, 4,556 checkpoints), every probe is identical before and after
+  the split, 3,195,450 compared values in all. The probes are the regime
+  (its scores, metrics and contexts field by field), every entry run with
+  its signals, decisions and ordered feed calls, the tape stats, the chain
+  cache against a scripted client and clock, and the validators and the
+  stabiliser on direct inputs. The prefetch's thread order is compared as a
+  set. Tests: `tests/test_zero_dte_chain.py` (new: the chain-read tests,
+  `TestZeroDteChainRead`, moved from `tests/test_schwab_api.py` with the
+  code they test; their scripted client and response are
+  `tests.support.brokers._ScriptedClient` / `_schwab_response`),
+  `tests/test_zero_dte_entry_styles.py` (the declaration guard reads the
+  regime and chain mixins too: both manifests declare every param they
+  read), `tests/test_plugin_contract.py` (the name-disjointness scan knows
+  the two mixins) and `tests/test_numeric.py` (the import). The screener's
+  docstring, the plugin scaffold's template and both READMEs
+  (`_strategies/README.md`, the strategy's own) name the new modules.
+
 - **One opening-range computation, `bars.opening_range` (refactor cut
   B10).** *2026-09-27* — `bars.opening_range(frame, day, *, start, minutes,
   min_bars)` returns `(high, low, bars)` over the bars of `day` labelled in
