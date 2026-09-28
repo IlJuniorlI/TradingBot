@@ -78,7 +78,7 @@ Optional manifest capabilities and strategy hooks
 - `manifest.json -> capabilities.watchlist.active_sources` can declaratively build the streaming/history watchlist from standard symbol sources such as `candidates`, `positions.underlyings_or_symbols`, `positions.reference_symbols`, `dashboard_tradable_symbols`, `params.peers`, `pairs.symbols`, `pairs.references`, `options.underlyings`, and `options.confirmation_symbols`.
 - `manifest.json -> capabilities.watchlist.quote_sources` can declaratively build the quote watchlist from standard symbol sources such as `active_watchlist`, `options.volatility_symbol`, `options.confirmation_symbols`, or filtered position metadata descriptors like `positions.metadata_list` for option valuation legs.
 - `@classmethod normalize_params(cls, params)` lets a plugin normalize its own manifest/config params without adding strategy-name branches to the generic config loader.
-- `time_params` (class attribute, a tuple of param names) lists the params the strategy reads as HH:MM times. `BaseStrategy.__init__` parses each one the params carry and raises naming it (`strategies.<name>.params.<key> must be an HH:MM time, got ''`), so a blank or malformed time fails at startup instead of at its first read, which for a window edge is mid-session (2026-09-26). An absent key is left to its reader's default. `tests/test_strategy_time_params.py` fails when a manifest or shipped preset sets an HH:MM param the class does not list.
+- `time_params` (class attribute, a tuple of param names) lists the params the strategy reads as HH:MM times. `BaseStrategy.__init__` parses each one the params carry and raises naming it (`strategies.<name>.params.<key> must be an HH:MM time, got ''`), so a blank or malformed time fails at startup instead of at its first read, which for a window edge is mid-session (2026-09-26). An absent key is left to its reader's default. `tests/strategies/framework/test_strategy_time_params.py` fails when a manifest or shipped preset sets an HH:MM param the class does not list.
 - **Reserved names.** `BaseStrategy.__init_subclass__` raises `TypeError` when a strategy class defines `position_exit_signal`, `shared_exit_signal`, `strategy_logic_default` or `signal_priority_key` (2026-09-24). A knob is set in the preset YAML, not rewritten by the strategy. A style is exempted from a veto in the manifest, a strategy's own exits go in `strategy_exit_signal`, and ranking is declared in `capabilities.signal_priority`. An out-of-tree plugin therefore cannot quietly opt out of the global knobs.
 - **Exits.** The shared exit families (time stop, chart / candle pattern, CHoCH and bias structure, technical, S/R loss, divergence scale-out) are decided for every strategy by `shared_exit.SharedExitPolicy`, which `BaseStrategy.__init__` builds as `self.exit_policy` (beside `self.entry_policy`) and the position manager calls. A strategy's OWN exits go in `strategy_exit_signal(self, position, bars, tape, data=None) -> ExitDecision | None`, which runs after every shared family held and holds by default. `tape` is the `ExitTape` the shared families read (close, EMA9 / EMA20 / VWAP, close position; None where a value is missing), so a hook judges the same references. Return `ExitDecision(reason, "strategy")` for a full exit. `peer_confirmed_key_levels` (and its subclasses) implements its adaptive-ladder defence there, and `microcap_pm_breakout` its blowoff guard. The exit graces key on `metadata['entry_style_family']` (`orb`, `pullback`), which `emit` stamps from the proposal's style family. A hook that judges a structure event or pivot against the entry must compare the bar's CLOSE, not its label: use `bars.bar_closed_after(label, position.entry_time, bar_minutes)`. Bars are labelled at their start, so an event on the bar the entry filled in is post-entry. The peer ladder does this for its HTF CHoCH / BoS. A hook (or a shared family) that raises is logged against the position, which gets no shared or strategy exit that cycle; its stop, target and force flatten still fire, and the other positions are managed as usual (2026-09-26; see `PositionManager.manage_positions`).
 - `manifest.json -> capabilities.history.required_bars` can set a fixed startup warmup bar requirement for simple strategies that do not need a custom formula.
@@ -219,7 +219,7 @@ Worked examples, simplest first:
 
 ### What a strategy may not do
 
-`tests/test_shared_knob_contract.py` checks every module, and a violation names its file and line:
+`tests/guards/test_shared_knob_contract.py` checks every module, and a violation names its file and line:
 
 - (a) Only `shared_entry.py` and `shared_exit.py` reference `config.shared_entry` / `config.shared_exit`, including through `getattr` / `hasattr` / `setattr`.
 - (b) Only `shared_entry.py` constructs `Signal(...)` or `AdmittedEntry(...)`, also under an import alias.
@@ -270,7 +270,7 @@ While `use_divergence_entry_signal` is on, a symbol the strategy produced no sig
 - The shared metadata stamps and their audit logging.
 - A scaffolded preset that starts from the config dataclass defaults of those sections.
 
-To keep it that way, run `tests/test_shared_knob_contract.py`, and add the strategy's scenario to `_SCENARIOS` in `tests/test_knob_reach_matrix.py`. That matrix switches every veto, the score floor, every score term, both refinements and every exit family on and off for every registered strategy, and fails until the new one has a scenario.
+To keep it that way, run `tests/guards/test_shared_knob_contract.py`, and add the strategy's scenario to `_SCENARIOS` in `tests/guards/test_knob_reach_matrix.py`. That matrix switches every veto, the score floor, every score term, both refinements and every exit family on and off for every registered strategy, and fails until the new one has a scenario.
 
 ## Quick add-a-strategy checklist
 
@@ -288,7 +288,7 @@ To keep it that way, run `tests/test_shared_knob_contract.py`, and add the strat
 12. Add default params and windows to the manifest
 13. Build every entry through `self.entry_policy` (`EntryProposal` -> `admit` -> `emit`) and put strategy-only exits in `strategy_exit_signal`
 14. Set `strategy: <name>` in YAML to use it
-15. Run `tests/test_shared_knob_contract.py`, add the strategy's scenario to `tests/test_knob_reach_matrix.py`, and smoke-test the plugin before production use
+15. Run `tests/guards/test_shared_knob_contract.py`, add the strategy's scenario to `tests/guards/test_knob_reach_matrix.py`, and smoke-test the plugin before production use
 
 A scaffold generator is included now:
 
@@ -314,9 +314,9 @@ intraday_tv_schwab_bot/_strategies/my_new_strategy/
 
 Import only the names your plugin uses, each from the module that defines it (see [What lives where](#what-lives-where)); no wildcard imports. Entries go through the shared entry stage (see the contract above); the strategy never constructs a `Signal` itself.
 
-Read the clock through its module: `from ... import sessions`, then `sessions.now_et()`. A name bound with `from ... import now_et` would escape the tests' clock pin (`tests/support/clock.freeze_et`); `tests/test_module_layering.py` rejects it.
+Read the clock through its module: `from ... import sessions`, then `sessions.now_et()`. A name bound with `from ... import now_et` would escape the tests' clock pin (`tests/support/clock.freeze_et`); `tests/guards/test_module_layering.py` rejects it.
 
-Import `config` only under `TYPE_CHECKING`: read settings through `self.config`, and the derived S/R values through `SupportResistanceConfig`'s methods (`self.config.support_resistance.flip_confirmation_bars()`, `.htf_structure_event_lookback()`). `tests/test_module_layering.py` rejects a runtime import.
+Import `config` only under `TYPE_CHECKING`: read settings through `self.config`, and the derived S/R values through `SupportResistanceConfig`'s methods (`self.config.support_resistance.flip_confirmation_bars()`, `.htf_structure_event_lookback()`). `tests/guards/test_module_layering.py` rejects a runtime import.
 
 
 ```python

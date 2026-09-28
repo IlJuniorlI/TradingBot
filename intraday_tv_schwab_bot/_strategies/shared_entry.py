@@ -40,7 +40,7 @@ strategy called the knob helpers it chose to: most knobs did nothing for most
 strategies (key_levels reached three of them, the reversal strategies never
 met the dual divergence veto, only top_tier met the candle filter), and a
 ``strategy_logic_default`` hook let a strategy rewrite any knob. The rules
-are now enforced by ``tests/test_shared_knob_contract.py``.
+are now enforced by ``tests/guards/test_shared_knob_contract.py``.
 
 The same module ranks the gatekeeper's signals (``rank_key``) and builds the
 opt-in divergence-only entries (``divergence_entries``).

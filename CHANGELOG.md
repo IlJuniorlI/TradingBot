@@ -310,6 +310,39 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The tests are organised by the module under test (refactor cut C48).**
+  *2026-09-28* — `tests/` (source tree only; no build ships it) now has one
+  directory per layer of the plan's import order: `foundation`,
+  `market_data`, `analysis`, `domain`, `strategies/` (`framework`,
+  `top_tier_adaptive`, `zero_dte` and the other plugins), `runtime`,
+  `reporting` and `composition`, plus `guards` (the import layering, the
+  plugin contract, the shared-knob contract and matrix, the preset parity
+  and the S/R tolerance readers), `snapshots` and `properties`. Each file
+  moves whole to the home of the module it mainly tests, under its own
+  name; the names stay unique, so pytest's default import mode still
+  applies. Every test reads the repo's files through
+  `tests/support/paths.REPO_ROOT` instead of the working directory, so the
+  suite runs from any directory (before, run from elsewhere, 2,195 tests
+  failed or errored and eight parametrizations over the presets, modules
+  and screeners collected nothing). The 14 files organised by the review,
+  sweep or bug list that found their defects carry a registered
+  `regression` marker (`-m regression` selects their 887 tests). The docs
+  name the new paths: README.md, `configs/README_PRESETS.md`,
+  `_strategies/README.md`, the `shared_entry` module docstring and the
+  scaffolded strategy's docstring. README.md named a plugin conformance
+  suite that does not exist, `tests/test_strategy_plugin_conformance.py`,
+  and said it ships; it now names `tests/guards/test_plugin_contract.py`, in
+  the source tree only. Two test-only cuts land with it and change no
+  tracked file: C46 gives the duplicated test builders one home
+  (`tests/conftest.py`'s `example_config`, `example_risk`,
+  `top_tier_config` and `top_tier_candidate`; `tests/support`'s
+  `make_position`, `blocking`, `entry_contexts` and `sr_level`), and C47
+  gives the snapshot tests their own folder, `tests/snapshots/`, whose
+  conftest keeps the generic three-way `symbol` fixture to them. The same
+  7,252 tests are collected, the same 7,242 pass (the broad run leaves out
+  the 10 phone-redirect end-to-end tests), from the repo root and from
+  another directory, and the 10 snapshot JSONs are byte-identical.
+
 - **`DashboardCache.symbol_snapshot` is cut into private builders (refactor
   cut C40b).** *2026-09-27* — The 650-line method now assembles the snapshot
   from builders on the same class, called in the order the data feed has

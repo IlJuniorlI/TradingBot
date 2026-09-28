@@ -25,7 +25,7 @@ When in doubt:
 
 Since 2026-09-24 every `shared_entry` and `shared_exit` knob is global: one shared entry stage and one exit policy apply it to every strategy (see the root README's `shared_entry` / `shared_exit` sections). Before, each strategy read only the knobs whose helpers it called, and the peer strategies' exit override ignored most of `shared_exit`. Many presets therefore said `true` for a knob their strategy never read.
 
-**Parity first.** Every preset was rewritten to what its strategy EFFECTIVELY ran before the change. A knob the strategy never read is now `false`, and a value the peer override forced replaces what the YAML said. A preset therefore trades as before, except for the three flips below and the fixes listed in `CHANGELOG.md`. The table is the shipped state. `tests/test_preset_parity.py` pins it, so change a row only together with the preset and a reason.
+**Parity first.** Every preset was rewritten to what its strategy EFFECTIVELY ran before the change. A knob the strategy never read is now `false`, and a value the peer override forced replaces what the YAML said. A preset therefore trades as before, except for the three flips below and the fixes listed in `CHANGELOG.md`. The table is the shipped state. `tests/guards/test_preset_parity.py` pins it, so change a row only together with the preset and a reason.
 
 Legend: 1 = on, 0 = off. `tstop` is `risk.time_stop_minutes`, `prox` is `support_resistance.entry_proximity_scoring_enabled`, and the exit columns are `shared_exit.use_structure_exit` / `use_chart_pattern_exit` / `use_candle_pattern_exit`.
 
@@ -84,7 +84,7 @@ Bold cells are the user-decision flips. Some other cells differ from the old YAM
 
 ## Preset changes from the 2026-09-25 fixes
 
-Two blocks that were on in the 0DTE YAML but had never fired are fixed. Each preset now ships the fixed block off, so it keeps trading as it did. Switching either on is a go-live decision that needs a beta dry-run. `tests/test_preset_parity.py` and `tests/test_zero_dte_shared_entry.py` pin them.
+Two blocks that were on in the 0DTE YAML but had never fired are fixed. Each preset now ships the fixed block off, so it keeps trading as it did. Switching either on is a go-live decision that needs a beta dry-run. `tests/guards/test_preset_parity.py` and `tests/strategies/zero_dte/test_zero_dte_shared_entry.py` pin them.
 
 - `zero_dte_etf_options` and `zero_dte_etf_long_options`: `risk.same_level_block_minutes: 0` (was 30).
   - The old block compared an option's premium with the underlying's ATR, so only an exact premium match could trip it, and it matched on the order side.
@@ -111,7 +111,7 @@ No other preset value changed. Three fixes and two manifest exemptions change wh
 
 ## The adaptive ladder's touch hold (2026-09-27)
 
-- `shared_exit.adaptive_ladder_touch_hold` ships `false` in every preset and as the code default. The three presets that run `risk.trade_management_mode: adaptive_ladder` (`top_tier_adaptive`, `small_cap_squeeze`, `peer_confirmed_key_levels`) and `config.example.yaml` declare it, with `adaptive_ladder_touch_hold_timeout_seconds: 45`; the others run `adaptive`, where it is inert, and take the code default. `tests/test_preset_parity.py` pins both.
+- `shared_exit.adaptive_ladder_touch_hold` ships `false` in every preset and as the code default. The three presets that run `risk.trade_management_mode: adaptive_ladder` (`top_tier_adaptive`, `small_cap_squeeze`, `peer_confirmed_key_levels`) and `config.example.yaml` declare it, with `adaptive_ladder_touch_hold_timeout_seconds: 45`; the others run `adaptive`, where it is inert, and take the code default. `tests/guards/test_preset_parity.py` pins both.
 - Off, the ladder's first rung is a plain take-profit, taken on the first quote at it. The target-exit suppression and the zone-flip rung promotion removed that day are why this was not always so: until 2026-05-14 one quote at the target held its exit (it did, live, on 2026-05-13 and 05-14); after that the suppression could act only when the quote sampling missed a strong 1m close through the target, which the replays found only with a quote once a minute (three trades: two better for the new default, one worse), and such a touch now takes the target. No zone-flip promotion was logged from 2026-05-01 to 2026-09-25.
 - On, the bar that touches the target decides whether to promote the rung or exit (root README, `shared_exit`). Turning it on is a dry-run decision; with brackets it needs `execution.bracket_legs: stop_only`.
 

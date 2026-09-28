@@ -211,7 +211,7 @@ def _stock_strategy_py(name: str, class_stem: str) -> str:
             the score terms -- and records a refusal under the proposal's
             style), then ``self.entry_policy.emit`` the Signal. A strategy
             never builds a Signal itself and never reads config.shared_entry
-            (tests/test_shared_knob_contract.py). See
+            (tests/guards/test_shared_knob_contract.py). See
             _strategies/mean_reversion for a worked example.
             """
 
