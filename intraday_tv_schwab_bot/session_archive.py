@@ -188,7 +188,6 @@ def _extract_decisions(log_path: Path) -> list[dict]:
     return rows
 
 
-
 # ---------------------------------------------------------------------------
 # What price did after each decision: regime-call outcomes, gate attribution
 # ---------------------------------------------------------------------------

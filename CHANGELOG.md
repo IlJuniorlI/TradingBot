@@ -34,11 +34,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the timeout after it closed exits at market
     (`target_hold_timeout:<rung>`). A bar delivered late is still judged.
   - The three are `risk` exits (EXIT_CONTEXT `exit_reason_family`), each
-    its own `per_exit_reason` bucket; a stop or
-    peak-giveback exit on the same cycle wins. A decided exit stays on the
-    hold, so an order that fails or is deferred is sent again with the same
-    reason, whatever the price does next, and the target is never taken
-    instead.
+    its own `per_exit_reason` bucket; a stop or peak-giveback exit on the
+    same cycle wins. A decided exit stays on the hold, so an order that
+    fails or is deferred is sent again with the same reason, whatever the
+    price does next, and the target is never taken instead.
   - Ladder metadata read back from the position store that the hold cannot
     use (the rungs, the active rung index or rung, the price's time) is
     reported as a WARNING and the position keeps its target exit. A stored
@@ -315,19 +314,22 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   B16).** *2026-09-27* — the decided half of the cut had landed: a scalar
   `options.underlyings` fails at load (cut C24), and the dashboard's copies of
   the strategy's symbol reads went on 2026-09-26. Every entry of the list must
-  now be one ticker the symbol normalizer keeps, as an event row's symbols
-  must: each one that is not fails at load naming it,
-  `options.underlyings[INDEX] must be a ticker, got ...`, with the quote hint
-  the event rows and `runtime.startup_reconcile_ignore_symbols` give for a
-  ticker YAML read as a boolean or null. The list the bot reads is the checked
-  one, upper case, stripped and each ticker once; `_normalize_options_config`
-  no longer touches it, since it kept the raw list whenever nothing of it
-  survived normalizing. `null` still loads as no list, which only a stock
-  strategy accepts. `DashboardCache.tradable_symbols` and `index_symbols` are
-  gone: they normalized the hooks' already normalized lists again, and
+  now be one ticker the symbol normalizer keeps: each one that is not fails
+  at load naming it, `options.underlyings[INDEX] must be a ticker, got ...`,
+  in the event rows' message format and with the quote hint they and
+  `runtime.startup_reconcile_ignore_symbols` give for a ticker YAML read as
+  a boolean or null. The rule is stricter than theirs, which asks only for a
+  non-blank string (`NONE` and `QQQ IWM` pass there). The list the bot reads
+  is the checked one, upper case, stripped and each ticker once;
+  `_normalize_options_config` no longer touches it, since it kept the raw
+  list whenever nothing of it survived normalizing. `null` still loads as no
+  list, which only a stock strategy accepts.
+  `DashboardCache.tradable_symbols` and `index_symbols` are gone: they
+  normalized the hooks' already normalized lists again, and
   `DashboardCache.build_payload` publishes `dashboard_tradable_symbols()` /
   `dashboard_index_symbols()` as the strategy returns them (no plugin
-  overrides either; 24 published engine states read byte for byte as before).
+  overrides either; 24 published engine states read byte for byte as
+  before).
 
   **Behaviour change:** a config that loaded before may now refuse to start,
   naming the entry. Until now `[SPY, ON]` loaded as `['SPY', 'TRUE']` (YAML
@@ -357,8 +359,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   snapshot plus the strategy's LTF label (`ltf_timeframe`), third in the row
   as before. The exit record (`PositionManager._position_exit_context`)
   reads the snapshot itself, so `PositionManager` loses its
-  `dashboard_cache` argument and the runtime layer's one import of the
-  presentation layer is gone. `DashboardCache`'s `symbol_price` (the price
+  `dashboard_cache` argument and its one import of a dashboard module is
+  gone (the layering guard puts both in the runtime layer, so no layer rule
+  changes). `DashboardCache`'s `symbol_price` (the price
   when none is given, over `DISPLAY_PRICE_KEYS`) and `htf_trend` moved with
   it (`sr_snapshot.symbol_price`, and the private `_htf_trend`), and
   `dashboard_structure_event_label` is `sr_snapshot.structure_event_label`;
@@ -372,9 +375,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   2,000 fuzzed S/R rows, 1,000 exit records, 200 snapshots and charts and 24
   published engine states read byte for byte as before. Tests:
   `tests/test_sr_snapshot.py` (new: the classification, the strategy's
-  timeframes, the price fallback, the strategy's trend, the row's key order,
-  an option's exit record read on its underlying, the structure-event
-  label, and that neither reader imports a dashboard module),
+  timeframes and HTF FVG request and the caller's `allow_refresh` on every
+  read, the price fallback from the quote to the 1m close to the account,
+  the strategy's trend, the row's key order, an option's exit record read
+  on its underlying without a refresh, the structure-event label, and that
+  neither reader imports a dashboard module),
   `tests/test_silent_excepts.py` (`TestReportedExitContextSrRow`, now also
   the DEBUG line within the minute), `tests/test_quote_price_reads.py`,
   `tests/test_strategy_requests.py`, and the manager stubs in
@@ -402,23 +407,33 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   performance with its positions' S/R fields, the candidates card, the
   snapshots and exchanges, the symbol lists, the chart settings and the
   cache prune (cut C34's `prune_inactive_symbols` call). The engine's
-  `_dashboard_state` reads the warmup summary on the error path, hands the
-  build the engine's state, adds its own status fields and publishes them
-  in the order they had; `_publish_state` still isolates a failed build and
-  marks the page stale. The engine imports only `DashboardCache` from the
-  dashboard. The rate-limited failure log is `log_setup.ComponentFailureLog`
-  (WARNING with the traceback at most once a minute per component, DEBUG in
-  between), which `DashboardCache` keeps as `log_component_failure`, so its
-  call sites are unchanged. `DashboardCache` requires its strategy (critic
-  G5): every builder reads it, and the `strategy is None` answers of
-  `candidate_limit` (and its unused `strategy` argument), `tradable_symbols`,
-  `index_symbols` and `strategy_level_zones` could not run. There is no
-  alias: import the helpers from `dashboard_payloads` and the zone builder
-  from `dashboard_zones`. No behaviour changes: 2,000 fuzzed level-zone
+  `_dashboard_state` reads the warmup summary on the error path (now before
+  the build's S/R rows, where it read it after them; the summary reads no
+  HTF state, so only its clock fields, `retry_delay_seconds` and
+  `last_stream_bar_age_seconds`, can differ, by the time the rows take),
+  hands the build the engine's state, adds its own status fields and
+  publishes them in the order they had; `_publish_state` still isolates a
+  failed build and marks the page stale. The engine imports only
+  `DashboardCache` from the dashboard. The rate-limited failure log is
+  `log_setup.ComponentFailureLog` (WARNING with the traceback at most once a
+  minute per component, DEBUG in between), which `DashboardCache` keeps as
+  `log_component_failure`, so its call sites are unchanged. `DashboardCache`
+  requires its strategy, feed and account (keyword arguments with no
+  default): every builder reads the strategy, and `build_payload` and
+  `symbol_snapshot` read the feed and the account unconditionally, so the
+  `strategy is None` answers of `candidate_limit` (and its unused `strategy`
+  argument), `tradable_symbols`, `index_symbols` and `strategy_level_zones`,
+  and the `data is None` checks of `strategy_level_zones` and of the
+  snapshot's overlay reads, could not run; they are gone. There is no alias:
+  import the helpers from `dashboard_payloads` and the zone builder from
+  `dashboard_zones`. No behaviour changes: 2,000 fuzzed level-zone
   builds, 2,000 S/R rows, 1,000 exit records, 200 snapshots and charts on
   the recorded tapes and 24 published engine states (12 real bots, two
   cycles each) read byte for byte as before. Tests:
-  `tests/test_dashboard_zones.py`, `tests/test_dashboard_state.py` and
+  `tests/test_dashboard_zones.py`, `tests/test_dashboard_state.py` (the
+  engine's hand-over with the cycle's own warmup summary, and the build's
+  S/R rows and shown symbols in order, its 12-row cap, the positions' S/R
+  fields, the candidate limit and the exchanges) and
   `tests/test_log_setup.py` (`TestComponentFailureLog`) are new; the helper
   tests in test_silent_excepts, test_fix_dashboard_charting and
   test_bug_regressions import from `dashboard_payloads`, and
@@ -491,8 +506,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   leaves the same levels, metadata, audit records and log messages as
   before. Tests: `tests/test_trade_management.py` (new: the level-check
   tests from `tests/test_risk_manager.py`, C35's `TestDefaultLevels` and
-  `TestTrailAllowed`, a 3R+ give-back tier case they did not pin, and the
-  first cover of the sr_flip manager and of the per-position call order),
+  `TestTrailAllowed`, a 3R+ give-back tier case they did not pin, new
+  sr_flip tests (the stop flip and next target, the momentum gate, never
+  loosening, and the mode / option / frame / S/R-disabled gates) and the
+  per-position call order),
   `tests/support/brokers.py` (`_trade_manager`, `_holding_trade_manager`),
   `tests/test_module_layering.py` (the runtime layer gains
   `trade_management`) and the call sites in test_ladder_touch_hold,
@@ -563,18 +580,24 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `position_metrics.position_r_multiple`, `underlying_entry_price` and
   `underlying_extremes` (the exit policy and microcap_pm_breakout call
   them). `position_metrics.favorable_move` and `return_pct` are the one
-  per-unit move and return-% formula, used by the paper account
-  (`PaperAccount._position_unrealized` is gone), the position manager's
+  per-unit move and return-% formula, used by the paper account (its
+  unrealized P&L is `position_metrics.position_unrealized_at_price`;
+  `PaperAccount._position_unrealized` is gone), the position manager's
   excursion tracking and exit context, and the risk manager's R math; each
   caller keeps its own answer for a zero entry (the paper account 0.0,
   `position_return_pct_at_price` None). There is no alias. No behaviour
-  changes: the numbers are bit for bit the same, and every builder stamps
-  one of the upper-case option types. On inputs nothing produces, an
+  changes: the numbers are bit for bit the same but for the sign of one
+  zero, and every builder stamps one of the upper-case option types. The
+  zero: EXIT_CONTEXT's `stop_r` / `peak_r` of a SHORT whose stop or peak
+  sits exactly at the entry (a stop moved to breakeven, a trade that never
+  went its way) log `0.0`, where they logged `-0.0`; the numbers are
+  equal, only the log text differs. On inputs nothing produces, an
   asset type now reads the same in lower case, and the dashboard no longer
   draws a bare `OPTION` or an unknown `OPTION_*` type as an option. Tests:
   `tests/test_asset_type.py` (new), `tests/test_properties.py` (a5, a6),
   `tests/test_dashboard_cache.py` (`TestPositionMarkers`),
-  `tests/test_execution_invariants.py` (`TestTheCloseSessionGate`).
+  `tests/test_execution_invariants.py` (`TestTheCloseSessionGate`, and the
+  paper account's unrealized P&L by side).
 
 - **One default-level rule and one trail rule, with the trail pct on
   `RiskManager` (refactor cut C35).** *2026-09-27* —
@@ -615,7 +638,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - A date or datetime (a pandas Timestamp, a numpy datetime64) is written
     with `isoformat()` everywhere: the dashboard's has a `T` between the
     date and the time where it had a space. The page's `Date.parse` and
-    `replace('T', ' ')` displays read both forms.
+    `replace('T', ' ')` displays read both forms. A numpy datetime64 is
+    read as a pandas Timestamp at any unit: at the ns unit pandas uses it
+    was written as its nanoseconds (an int on the dashboard, a float in the
+    audit records), and a day-, month- or year-unit one reads
+    `2026-09-17T00:00:00` where it read `2026-09-17`. Its NaT is null on both sides (the audit side wrote
+    `NaT`); a pandas NaT still reads `NaT`.
+  - A duration is written the same way on both sides now: a pandas
+    Timedelta reads `0 days 00:05:00` (the audit side wrote `P0DT0H5M0S`),
+    and a numpy timedelta64 what `.item()` gives: a timedelta's `0:05:00`
+    (the audit side wrote `5 minutes`), an int count at the ns, month and
+    year units (the audit side a float) and null for its NaT (the audit
+    side `NaT`). A plain timedelta reads `0:05:00` as before. None is
+    written as an ISO 8601 duration: a timedelta has no `isoformat()`, and
+    a timedelta64 in months or years has no pandas Timedelta.
   - On the dashboard a Decimal or Fraction is written as a number, not its
     string (a NaN one as null), and a one-element array or Series as its
     string, not its element. A value whose `__str__` raises is written as
@@ -630,8 +666,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   recognized by type, and only dates and times are asked for
   `isoformat()`. An unknown `non_finite` raises `ValueError`. There is no
   alias. Tests: `tests/test_audit_logger.py` (`TestJsonSafe`, both modes,
-  with the dashboard's tests moved in), `tests/test_dashboard.py`,
-  `tests/test_position_store.py`.
+  with the dashboard's tests moved in; a datetime64 at every unit and the
+  durations), `tests/test_dashboard.py`, `tests/test_position_store.py`,
+  `tests/test_risk_state_persistence.py` (the risk tallies keep NaN).
 
 - **The reconcile metadata store skips its own unchanged saves; the entry
   and exit metadata filter and the dashboard cache prune have one home each
@@ -672,9 +709,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before a cancel landed, or at the startup settle) is a `risk` exit. A
   working exit order's fill keeps the family it was sent for, read from the
   order's record (its only writer stores the reason and the family, so the
-  fill reads them without a fallback). `exit_reason_code` was already
-  `reasons.exit_reason_code` (cut C21). `RISK_EXIT_CODES` is gone; the
-  guess was its only reader. The touch-hold entry under Added now names
+  fill reads them without a fallback, before it marks the fill booked: a
+  record without them raises on every cycle with the fill still unbooked,
+  where marking it first would have lost the fill). `exit_reason_code` was
+  already `reasons.exit_reason_code` (cut C21). `RISK_EXIT_CODES` is gone;
+  the guess was its only reader. The touch-hold entry under Added now names
   `exit_reason_family` alone.
 
   **Behaviour change (logs only; no decision, order, report bucket or
@@ -692,8 +731,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   EXIT_CONTEXT rows across this date means mapping the old values, or
   reading the old rows' `exit_family` where the manager wrote one. Tests:
   `tests/test_reasons.py` (keeps the old guess as an oracle),
-  `tests/test_partial_exit.py` (`TestTheExitFamily`, every exit path),
-  `tests/test_ladder_touch_hold.py`.
+  `tests/test_partial_exit.py` (`TestTheExitFamily`, every exit path and a
+  record without its decision), `tests/test_ladder_touch_hold.py`.
 
 - **The strategy owns its exit policy, and an exit decision sizes itself
   (refactor cut C33).** *2026-09-27* — `BaseStrategy.__init__` builds
@@ -733,8 +772,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   or one at the size floor. No preset draws order blocks. The `or default`
   reads (a configured 0 read as the default) are unchanged on both sides.
   Tests: `tests/test_strategy_requests.py`
-  (`TestTheDashboardDrawsTheStrategysContexts`, and the request keys),
-  `tests/test_config_validation.py`.
+  (`TestTheDashboardDrawsTheStrategysContexts`, the request keys and the
+  knob each key reads), `tests/test_sr_snapshot.py` (the sidebar trend's
+  HTF request, since cut C41), `tests/test_config_validation.py`.
 
 - **The score context is the FVG term's context (refactor cut B13).**
   *2026-09-27* — `BaseStrategy._default_htf_request()` is the HTF request
@@ -767,11 +807,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ltf_minutes()` are public, and the engine (the context refresh and the
   S/R precompute), the position manager (S/R-flip management and the
   ladder's touch hold), the entry gatekeeper, the dashboard and the session
-  archive ask the strategy for them. `DashboardCache._active_htf_minutes` /
-  `_active_htf_lookback_days` / `_active_ltf_minutes`,
-  `PositionManager.active_htf_minutes` / `active_htf_lookback_days` and the
-  archive's own resolution are gone, and so is the dashboard structure
-  overlay's `params.ltf_minutes` read; 0DTE's HTF trend reads the accessors
+  archive's HTF folder ask the strategy for them.
+  `DashboardCache._active_htf_minutes` / `_active_htf_lookback_days` /
+  `_active_ltf_minutes`, `PositionManager.active_htf_minutes` /
+  `active_htf_lookback_days` and the archive's own HTF resolution are gone,
+  and so is the dashboard structure overlay's `params.ltf_minutes` read; 0DTE's HTF trend reads the accessors
   instead of the params with a literal fallback (its manifests declare the
   keys). There is no alias. No behaviour changes: every copy was the same
   read. A strategy handed to the dashboard, the position manager or the
@@ -779,8 +819,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which borrows BaseStrategy's own. The layering guard
   (`tests/test_module_layering.py`) fails any runtime or composition module
   that reads a timeframe from a strategy's params, so a module that joins
-  the runtime layer is covered too. Tests: `tests/test_strategy_requests.py`
-  (new).
+  the runtime layer is covered too. Its one allowlisted read is the session
+  archive's resample list, which still reads `params.ltf_minutes` /
+  `htf_minutes`: a strategy that declares neither gets no resampled folder
+  but `bars/1m`, and asking the strategy would add folders at its defaults,
+  a change not decided yet. Tests: `tests/test_strategy_requests.py` (new: each reader
+  asks a strategy whose own answers differ from its params, from the
+  engine's context refresh and S/R precompute, the trade manager's S/R flip
+  and touch hold, the entry gatekeeper and the dashboard's rows, charts and
+  structure overlay to 0DTE's HTF trend and the archive's HTF folder).
 
 - **The quote-price reads name their key order (refactor cut C31).**
   *2026-09-27* — `data_feed` holds the three orders beside the quote
@@ -793,14 +840,22 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dashboard). The camelCase keys the manager, the restore and the executor
   also tried (`markPrice`, `lastPrice`, `closePrice`, `bidPrice`,
   `askPrice`) are gone: a cached quote holds `_normalize_quote`'s keys
-  only, and a market snapshot bid, ask and last. An option position's
-  underlying price, when no bar has one, is its quote's `mark` read the
-  same way (an int too large for a float no longer raises out of the
-  cycle). One reading changed, for inputs no cached quote holds: the
-  snapshot's last price was `safe_float(last or mark or close)`, so a NaN
-  or unparseable `last` read as None and a negative one as itself; it now
-  falls through to `mark`. On every quote the cache can hold it reads as
-  before. Tests: `tests/test_quote_price_reads.py`, `tests/test_numeric.py`.
+  only, and a market snapshot bid, ask and last. So are the ones
+  `options_mode.contract_from_quote` tried (`putCall`, `strikePrice`,
+  `openInterest`, `totalVolume`, `volume`, `daysToExpiration`,
+  `inTheMoney`): every caller hands it a cached quote and, as its fallback,
+  a stored leg (`asdict(OptionContract)`, since the first commit), so none
+  was in either; a raw chain entry is `parse_option_chain`'s to read. An
+  option position's underlying price, when no bar has one, is its quote's
+  `mark` read the same way (an int too large for a float no longer raises
+  out of the cycle). One reading changed: the snapshot's last price was
+  `safe_float(last or mark or close)`, so a NaN or unparseable `last` read
+  as None and a negative price as itself; it now falls through to the next
+  positive key. The cache never holds a NaN or unparseable price, and holds
+  a negative one only when the broker sends one; every other cached quote
+  reads as before. Tests: `tests/test_quote_price_reads.py`,
+  `tests/test_numeric.py`, `tests/test_options_nan_fallbacks.py`
+  (`TestContractFromQuote`), `tests/test_properties.py` (n12).
 
 - **Broker payload parsing has one home, `broker_payloads.py` (refactor
   cut C30).** *2026-09-27* — `broker_positions.py` is renamed
@@ -832,13 +887,18 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   alias: import from `intraday_tv_schwab_bot.broker_payloads`. With
   `_sr_ladder` (cut B9) and `broker_positions` gone, no module imports a
   retired module, and the layering guard's allowlist for those imports is
-  empty. No behaviour changes (the unlisted-child cache now also keeps a
-  bracket's wrapper ids, which are never cached). Tests:
+  empty. No behaviour changes: the unlisted-child cache's prune now keeps
+  an entry whose id is still one of the bracket's wrapper ids (the old stop
+  of a standalone protective stop after a replace, which moves the stop and
+  child ids to the new order and leaves `protective_order_id` at the old
+  one), and nothing reads that entry again. Tests:
   `tests/test_broker_payloads.py` (new; the order readers'
   `TestBrokerPayloadParsing` moved there from
   `tests/test_execution_invariants.py`), `tests/test_bracket_orders.py`,
-  and the former classmethod calls in `tests/test_sweep_fixes.py`,
-  `tests/test_runtime_nan_reads.py` and `tests/test_properties.py`.
+  the former classmethod calls in `tests/test_sweep_fixes.py`,
+  `tests/test_runtime_nan_reads.py` and `tests/test_properties.py`, and the
+  restore adopting a resting `STOP_LIMIT` as it does a `STOP`
+  (`tests/test_sweep_fixes.py`).
 
 - **The support/resistance ladder is collapsed once, and cut after the
   broken-level drop (refactor cut B8).** *2026-09-27* —

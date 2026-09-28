@@ -1763,7 +1763,7 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         "same_side_min_gap_atr_mult": _ABOVE_ZERO,
         "same_side_min_gap_pct": _ABOVE_ZERO,
     },
-    # The position manager's adaptive ladder touch hold (2026-09-27): a 0
+    # The trade manager's adaptive ladder touch hold (2026-09-27): a 0
     # would time every hold out on its first cycle, before any bar could be
     # delivered. The section's switches are checked with it; its other
     # numbers are the exit policy's to read, and are not checked here.
@@ -2037,11 +2037,12 @@ def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path)
         errors.append(f"options.underlyings must be a list of symbols, got {underlyings!r}")
     elif underlyings is not None:
         # One message per entry that is not one ticker the symbol normalizer
-        # keeps, as for an event row's symbols. Until 2026-09-27 an unquoted
-        # ON (read as true) was traded as TRUE, and an entry the normalizer
-        # drops (~, NONE, NULL, NAN, a blank) went unseen: a list of nothing
-        # else was kept raw, so it passed the emptiness check and an options
-        # strategy ran with no underlyings.
+        # keeps, in the event rows' format; stricter than their rule, which
+        # takes any non-blank string (NONE, 'QQQ IWM'). Until 2026-09-27 an
+        # unquoted ON (read as true) was traded as TRUE, and an entry the
+        # normalizer drops (~, NONE, NULL, NAN, a blank) went unseen: a list
+        # of nothing else was kept raw, so it passed the emptiness check and
+        # an options strategy ran with no underlyings.
         errors += [
             f"options.underlyings[{index}] must be a ticker, got {symbol!r}{ticker_quote_hint(symbol)}"
             for index, symbol in enumerate(underlyings)

@@ -1047,7 +1047,8 @@ strategies:
       adaptive_profit_lock_rr: 0.85            # was 1.20
       adaptive_profit_lock_stop_rr: 0.45       # unchanged — locks +0.45R once the 0.85R trigger arms
       # Partial-breakeven tier DISABLED 2026-07-29 (null = off; see
-      # risk.py, which skips the tier when the value is None).
+      # TradeManager.update_position, which skips the tier when the value
+      # is None).
       # It existed to bridge the gap between the trail and a 1.0R
       # breakeven, moving the stop to entry + adaptive_partial_breakeven_
       # offset_r (0.0 = exactly entry) once max_favorable_r crossed 0.5R.

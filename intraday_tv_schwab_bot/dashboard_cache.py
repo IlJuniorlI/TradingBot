@@ -65,6 +65,8 @@ from .levels_shared import collapse_price_ladder, effective_side_tolerance
 
 if TYPE_CHECKING:
     from ._strategies.strategy_base import BaseStrategy
+    from .data_feed import MarketDataStore
+    from .paper_account import PaperAccount
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -96,9 +98,9 @@ class DashboardCache:
         self,
         config: BotConfig,
         *,
-        data: Any = None,
+        data: MarketDataStore,
         strategy: BaseStrategy,
-        account: Any = None,
+        account: PaperAccount,
     ) -> None:
         self.config = config
         self.data = data
@@ -666,7 +668,7 @@ class DashboardCache:
         ltf_min_for_tech = self.strategy.ltf_minutes()
         if ltf_min_for_tech == 1:
             tech_frame = frame
-        elif self.data is not None and symbol:
+        elif symbol:
             tech_frame = self.data.get_merged(symbol, timeframe=f"{ltf_min_for_tech}min", with_indicators=True)
         else:
             tech_frame = frame
@@ -852,7 +854,7 @@ class DashboardCache:
             include_fair_value_gaps = bool(htf_fvg_request["include_fair_value_gaps"])
             chart_wants_htf_fvgs = bool(compact_chart_profile.show_htf_fair_value_gaps) or bool(expanded_chart_profile.show_htf_fair_value_gaps)
             need_htf_ctx = (include_fair_value_gaps and chart_wants_htf_fvgs) or chart_wants_rsi_div
-            if need_htf_ctx and self.data is not None:
+            if need_htf_ctx:
                 htf_ctx = self.data.get_htf_context(
                     symbol,
                     timeframe_minutes=self.strategy.htf_minutes(),
@@ -892,7 +894,7 @@ class DashboardCache:
             sr_cfg = getattr(self.config, "support_resistance", None)
             include_ltf_fvgs = bool(getattr(sr_cfg, "ltf_fair_value_gaps_enabled", False)) if sr_cfg is not None else False
             chart_wants_ltf_fvgs = bool(compact_chart_profile.show_ltf_fair_value_gaps) or bool(expanded_chart_profile.show_ltf_fair_value_gaps)
-            if include_ltf_fvgs and chart_wants_ltf_fvgs and self.data is not None:
+            if include_ltf_fvgs and chart_wants_ltf_fvgs:
                 ltf_min_for_fvg = self.strategy.ltf_minutes()
                 fvg_ctx = self.data.get_fair_value_gap_context(
                     symbol,
@@ -932,7 +934,7 @@ class DashboardCache:
         try:
             include_htf_obs = bool(getattr(sr_cfg, "htf_order_blocks_enabled", False)) if sr_cfg is not None else False
             chart_wants_htf_obs = bool(compact_chart_profile.show_htf_order_blocks) or bool(expanded_chart_profile.show_htf_order_blocks)
-            if include_htf_obs and chart_wants_htf_obs and self.data is not None:
+            if include_htf_obs and chart_wants_htf_obs:
                 htf_minutes = self.strategy.htf_minutes()
                 # Cycle-cached: hits get_order_block_context's cache when the
                 # strategy already computed it earlier in the same cycle.
@@ -961,7 +963,7 @@ class DashboardCache:
         try:
             include_ltf_obs = bool(getattr(sr_cfg, "ltf_order_blocks_enabled", False)) if sr_cfg is not None else False
             chart_wants_ltf_obs = bool(compact_chart_profile.show_ltf_order_blocks) or bool(expanded_chart_profile.show_ltf_order_blocks)
-            if include_ltf_obs and chart_wants_ltf_obs and self.data is not None:
+            if include_ltf_obs and chart_wants_ltf_obs:
                 # Cycle-cached: same cache as the strategy uses when it calls
                 # `_ltf_order_block_context` during entry evaluation.
                 ltf_min_for_ob = self.strategy.ltf_minutes()
@@ -1131,11 +1133,8 @@ class DashboardCache:
         sized by its hooks, read here with the HTF context and the LTF frame
         its spec names, then classified and picked by
         ``dashboard_zones.build_level_zones``."""
-        strategy_obj = self.strategy
-        if self.data is None:
-            return []
         try:
-            level_ctx = strategy_obj.dashboard_level_context_spec() or {}
+            level_ctx = self.strategy.dashboard_level_context_spec() or {}
         except Exception:
             # Reported, not replaced by the generic 60m / 60-day build below:
             # that build refreshes a key nothing else keeps, so every symbol
@@ -1203,7 +1202,7 @@ class DashboardCache:
             allow_refresh=allow_htf_refresh,
             use_prior_day_high_low=use_prior_day_high_low,
             use_prior_week_high_low=use_prior_week_high_low,
-            **strategy_obj.htf_fvg_request(),
+            **self.strategy.htf_fvg_request(),
         )
         if htf is None:
             return []
@@ -1234,23 +1233,23 @@ class DashboardCache:
 
         try:
             if not ltf.empty:
-                overlay_long = strategy_obj.dashboard_overlay_candidates(Side.LONG, float(close), ltf, htf)
-                overlay_short = strategy_obj.dashboard_overlay_candidates(Side.SHORT, float(close), ltf, htf)
+                overlay_long = self.strategy.dashboard_overlay_candidates(Side.LONG, float(close), ltf, htf)
+                overlay_short = self.strategy.dashboard_overlay_candidates(Side.SHORT, float(close), ltf, htf)
                 if overlay_long is not None:
                     long_candidates = list(overlay_long or [])
                 else:
-                    long_candidates = list(strategy_obj.dashboard_candidate_levels(float(close), htf, Side.LONG) or [])
+                    long_candidates = list(self.strategy.dashboard_candidate_levels(float(close), htf, Side.LONG) or [])
                 if overlay_short is not None:
                     short_candidates = list(overlay_short or [])
                 else:
-                    short_candidates = list(strategy_obj.dashboard_candidate_levels(float(close), htf, Side.SHORT) or [])
-                selected_long = strategy_obj.dashboard_select_level(Side.LONG, float(close), ltf, htf)
-                selected_short = strategy_obj.dashboard_select_level(Side.SHORT, float(close), ltf, htf)
+                    short_candidates = list(self.strategy.dashboard_candidate_levels(float(close), htf, Side.SHORT) or [])
+                selected_long = self.strategy.dashboard_select_level(Side.LONG, float(close), ltf, htf)
+                selected_short = self.strategy.dashboard_select_level(Side.SHORT, float(close), ltf, htf)
                 selected_long_price = safe_float((selected_long or {}).get("price")) if isinstance(selected_long, dict) else None
                 selected_short_price = safe_float((selected_short or {}).get("price")) if isinstance(selected_short, dict) else None
             else:
-                long_candidates = list(strategy_obj.dashboard_candidate_levels(float(close), htf, Side.LONG) or [])
-                short_candidates = list(strategy_obj.dashboard_candidate_levels(float(close), htf, Side.SHORT) or [])
+                long_candidates = list(self.strategy.dashboard_candidate_levels(float(close), htf, Side.LONG) or [])
+                short_candidates = list(self.strategy.dashboard_candidate_levels(float(close), htf, Side.SHORT) or [])
         except Exception:
             # The strategy's own level hooks: a failure draws no zones and
             # marks no level for entry, so it must show in the log.
@@ -1260,7 +1259,7 @@ class DashboardCache:
             selected_long_price = None
             selected_short_price = None
 
-        allow_level_fallback = bool(strategy_obj.dashboard_allow_generic_level_fallback())
+        allow_level_fallback = bool(self.strategy.dashboard_allow_generic_level_fallback())
         if allow_level_fallback and not long_candidates and support_anchors:
             long_candidates = [
                 {"kind": kind_name, "price": price, "touches": 1, "level_score": 0.0, "source_priority": 0.0, "builder_flip_confirmed": flip_confirmed}
@@ -1278,7 +1277,7 @@ class DashboardCache:
                 return None
             zone_kind = "support" if side == Side.LONG else "resistance"
             try:
-                zone_width_override = strategy_obj.dashboard_zone_width_for_level(side, float(close), float(atr), float(price), htf, candidate)
+                zone_width_override = self.strategy.dashboard_zone_width_for_level(side, float(close), float(atr), float(price), htf, candidate)
                 zone_half_width = float(zone_width_override) if zone_width_override is not None else float(base_zone_half_width)
             except Exception:
                 self.log_component_failure("level_zone_width", "Level-zone width hook failed for %s", symbol)
@@ -1302,8 +1301,8 @@ class DashboardCache:
                 "upper": float(zone_upper),
                 "score": float(candidate.get("level_score", 0.0) or 0.0),
                 "touches": int(candidate.get("touches", 1) or 1),
-                "labels": [strategy_obj.dashboard_candidate_label(kind_name, zone_kind)],
-                "sources": strategy_obj.dashboard_candidate_sources(kind_name, zone_kind),
+                "labels": [self.strategy.dashboard_candidate_label(kind_name, zone_kind)],
+                "sources": self.strategy.dashboard_candidate_sources(kind_name, zone_kind),
                 "timeframe": f"{tf}m",
                 "zone_half_width": float(zone_half_width),
                 "engine_level_kind": kind_name or None,

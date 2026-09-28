@@ -143,9 +143,10 @@ class ExitDecision:
     ``strategy_exit_signal``), ``divergence_partial`` or ``force_flatten``.
     ``fraction`` is the share of the CURRENT quantity to close; below 1.0 it
     is a scale-out, which :meth:`close_qty` sizes with a floor and the
-    position manager holds when that rounds to zero units. ``marker`` is the one-shot record the
-    manager appends to ``metadata['<family>_exits']`` once the slice books,
-    so the same trigger cannot scale the position out on every cycle.
+    position manager holds when that rounds to zero units. ``marker`` is
+    the one-shot record the manager appends to
+    ``metadata['<family>_exits']`` once the slice books, so the same
+    trigger cannot scale the position out on every cycle.
 
     Until 2026-09-24 exits were a ``(should_exit, reason)`` tuple and every
     exit closed the whole position, so a partial-close decision had no way

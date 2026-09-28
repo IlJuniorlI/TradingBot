@@ -19,7 +19,7 @@ from .models import (
     asset_type_of,
 )
 from .numeric import first_float, safe_float
-from .position_metrics import favorable_move, return_pct
+from .position_metrics import favorable_move, position_unrealized_at_price, return_pct
 from .log_setup import TRADEFLOW_LEVEL
 from . import sessions
 
@@ -299,7 +299,7 @@ class PaperAccount:
 
     def _position_summary(self, position: Position) -> dict[str, Any]:
         last_price = float(self.last_prices.get(position.symbol, position.entry_price))
-        unrealized = favorable_move(position.side, position.entry_price, last_price) * position.qty
+        unrealized = position_unrealized_at_price(position, last_price)
         market_value = self._position_market_value(position, last_price)
         metadata = position.metadata or {}
         asset_type = asset_type_of(metadata)

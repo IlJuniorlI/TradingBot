@@ -34,6 +34,7 @@ from datetime import date
 from typing import Any, Literal
 
 import numpy as np
+import pandas as pd
 
 from .log_setup import TRADEFLOW_LEVEL, warn_once
 
@@ -49,8 +50,16 @@ def json_safe(value: Any, *, non_finite: Literal["keep", "null"]) -> Any:
 
     - A numpy scalar is unwrapped with ``.item()``: an int64 stays an int
       and a bool_ a bool.
-    - A date or datetime (a pandas Timestamp too) becomes its
-      ``isoformat()``, a ``T`` between the date and the time.
+    - A date or datetime (a pandas Timestamp too, and its NaT, which reads
+      ``NaT``) becomes its ``isoformat()``, a ``T`` between the date and the
+      time. A numpy
+      datetime64 is read as a pandas Timestamp first, whatever its unit
+      (``.item()`` gives an int of nanoseconds at the ns unit pandas uses),
+      and its NaT is None.
+    - A duration is not a date: a timedelta and a pandas Timedelta are
+      written as their string (``0:05:00``, ``0 days 00:05:00``), and a numpy
+      timedelta64 as what ``.item()`` gives (a timedelta, but an int count
+      at the ns, month and year units, and None for its NaT).
     - A tuple or set becomes a list, and a dict key its string.
     - Another number type (a Decimal, a Fraction) becomes a float. A value
       ``float()`` refuses with one of the three errors a number type raises
@@ -79,6 +88,8 @@ def _json_safe_walk(value: Any, keep_non_finite: bool) -> Any:
         return {str(k): _json_safe_walk(v, keep_non_finite) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_json_safe_walk(v, keep_non_finite) for v in value]
+    if isinstance(value, np.datetime64):
+        return None if np.isnat(value) else pd.Timestamp(value).isoformat()
     if isinstance(value, np.generic):
         return _json_safe_walk(value.item(), keep_non_finite)
     if isinstance(value, date):

@@ -1090,11 +1090,15 @@ class PositionManager:
                     interval=60.0, level=TRADEFLOW_LEVEL,
                 )
                 return True
-            record["booked_qty"] = booked + slice_qty
             # _track_working_exit, the record's only writer, stores the
-            # reason and family the order was sent for.
+            # reason and family the order was sent for. Read before the fill
+            # is marked booked: a record without them raises every cycle with
+            # the fill still unbooked, rather than once with it marked booked,
+            # after which no cycle would ever book it.
+            decision = ExitDecision(record["reason"], record["family"])
+            record["booked_qty"] = booked + slice_qty
             self._book_broker_exit(
-                key, position, slice_qty, float(exit_price), ExitDecision(record["reason"], record["family"]), bars,
+                key, position, slice_qty, float(exit_price), decision, bars,
                 result_message=f"working_exit_filled:{state.get('status')}", attempt_status="broker_working_exit",
                 fill_price_estimated=broker_price is None,
             )
@@ -1114,7 +1118,7 @@ class PositionManager:
                             key, leftover.message,
                         )
                 return True
-            self._record_exit_marker(position, record["family"], record.get("marker"), "booked")
+            self._record_exit_marker(position, decision.family, record.get("marker"), "booked")
         if state.get("is_filled") or state.get("is_terminal_failure"):
             position.metadata.pop("working_exit_order", None)
             if record.get("reprotect"):

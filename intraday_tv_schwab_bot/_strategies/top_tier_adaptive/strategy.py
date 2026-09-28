@@ -4453,9 +4453,10 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     # Tier 3b: on high-conviction days, loosen the
                     # peak-giveback threshold so a 2R+ runner doesn't get
                     # cut by a normal 50% retracement. Override is stamped
-                    # per-trade based on day_strength at ENTRY; risk.py
-                    # reads it from position.metadata at management time.
-                    # Falls back to the global config default when not set.
+                    # per-trade based on day_strength at ENTRY; the trade
+                    # manager (TradeManager._peak_giveback_triggered) reads
+                    # it from position.metadata at management time. Falls
+                    # back to the global config default when not set.
                     if day_strength is not None:
                         conv_threshold = float(self.params.get("peak_giveback_high_conviction_day_strength_pct", 2.0))
                         if abs(day_strength) >= conv_threshold:
@@ -4474,7 +4475,7 @@ class TopTierAdaptiveStrategy(BaseStrategy):
                     # EXIT_CONTEXT): which sector ETFs confirmed the trade.
                     # Until 2026-09-27 the adaptive ladder also re-read them
                     # at the target, for its target-exit suppression (removed;
-                    # see PositionManager's adaptive ladder). With no index
+                    # see TradeManager's adaptive ladder). With no index
                     # symbols (small_cap_squeeze) the list is empty.
                     if isinstance(sig.metadata, dict):
                         sig.metadata["confirmation_indices"] = list(self._indices_for_symbol(c.symbol))

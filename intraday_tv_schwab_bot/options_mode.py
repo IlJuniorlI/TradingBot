@@ -371,6 +371,13 @@ def vertical_limit_price(first_leg: OptionContract, second_leg: OptionContract, 
 
 
 def contract_from_quote(symbol: str, quote: dict[str, Any] | None, fallback: dict[str, Any] | None = None) -> OptionContract:
+    """The contract ``symbol`` at its cached ``quote`` (``_normalize_quote``'s
+    keys), each number falling back to the stored leg ``fallback`` (an
+    ``asdict(OptionContract)``). A raw Schwab chain entry, in camelCase, is
+    ``parse_option_chain``'s to read; the camelCase keys this also tried
+    (``putCall``, ``strikePrice``, ``openInterest``, ``totalVolume``,
+    ``volume``, ``daysToExpiration``, ``inTheMoney``) were in neither input
+    and are gone (2026-09-27)."""
     quote = quote or {}
     fallback = fallback or {}
 
@@ -388,19 +395,18 @@ def contract_from_quote(symbol: str, quote: dict[str, Any] | None, fallback: dic
     return OptionContract(
         symbol=symbol,
         expiration=str(fallback.get("expiration") or ""),
-        put_call=str(fallback.get("put_call") or fallback.get("putCall") or "CALL"),
-        strike=(safe_float(fallback.get("strike"), finite=True)
-                or safe_float(fallback.get("strikePrice"), 0.0, finite=True)),
+        put_call=str(fallback.get("put_call") or "CALL"),
+        strike=safe_float(fallback.get("strike"), 0.0, finite=True),
         bid=pick("bid", default=0.0),
         ask=pick("ask", default=0.0),
         mark=pick("mark", "last", default=0.0),
         delta=pick("delta"),
         gamma=pick("gamma"),
         theta=pick("theta"),
-        open_interest=safe_int(pick("open_interest", "openInterest"), 0),
-        total_volume=safe_int(pick("total_volume", "totalVolume", "volume"), 0),
-        days_to_expiration=safe_int(pick("days_to_expiration", "daysToExpiration"), 0),
-        in_the_money=bool(quote.get("in_the_money") if "in_the_money" in quote else (quote.get("inTheMoney") if "inTheMoney" in quote else fallback.get("in_the_money") or fallback.get("inTheMoney", False))),
+        open_interest=safe_int(pick("open_interest"), 0),
+        total_volume=safe_int(pick("total_volume"), 0),
+        days_to_expiration=safe_int(pick("days_to_expiration"), 0),
+        in_the_money=bool(quote.get("in_the_money") if "in_the_money" in quote else fallback.get("in_the_money", False)),
     )
 
 
