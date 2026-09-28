@@ -34,7 +34,7 @@ Shipped runtime presets live under `configs/config.<strategy>.yaml`.
 
 ## What lives where
 
-- `_strategies/<name>/strategy.py` — strategy implementation
+- `_strategies/<name>/strategy.py` — strategy implementation (the strategy class must be defined here; a large engine may put its parts in modules beside it as mixins of that class, as `top_tier_adaptive/` does with `schedule.py`, `confirmation.py`, `armed_retest.py` and `regimes/`)
 - `_strategies/<name>/screener.py` — screener implementation
 - `_strategies/<name>/manifest.json` — lightweight manifest used for discovery and explicit plugin metadata
 - `_strategies/strategy_base.py` — shared base class for strategy logic
@@ -223,9 +223,9 @@ Worked examples, simplest first:
 
 - (a) Only `shared_entry.py` and `shared_exit.py` reference `config.shared_entry` / `config.shared_exit`, including through `getattr` / `hasattr` / `setattr`.
 - (b) Only `shared_entry.py` constructs `Signal(...)` or `AdmittedEntry(...)`, also under an import alias.
-- (c) A `strategy.py` may not define, call or import a helper that moved into the policy (the knob accessors, the veto predicates, the refinement passes, the retest plans, the score terms, the divergence candidate, `_build_signal_metadata`; the full list is `MOVED_HELPERS` in the test). From `shared_entry` it may import only `EntryProposal`, `EntryContexts`, `RetestTrigger`, `AdmittedEntry`, `STYLE_FAMILIES` and `DIVERGENCE_ENTRY_SOURCE` (`VETO_GATES` is in `plugin_api`).
-- (d) `BaseStrategy.__init_subclass__` refuses `position_exit_signal`, `shared_exit_signal`, `strategy_logic_default` and `signal_priority_key`, at import.
-- (e) A `strategy.py` may not rewrite what `emit` built: no `dataclasses.replace` under any alias (`import dataclasses as dc`, `from dataclasses import replace as swap`), and no assignment or `setattr` of `.stop_price` / `.target_price`. It may not reach into the policy's privates (`self.entry_policy._x`, directly, through an alias or through `getattr`). Pass the stop / target through the proposal and the ladder, and metadata through `emit(metadata=...)`.
+- (c) A plugin's `strategy.py`, and any module beside it but the screener, may not define, call or import a helper that moved into the policy (the knob accessors, the veto predicates, the refinement passes, the retest plans, the score terms, the divergence candidate, `_build_signal_metadata`; the full list is `MOVED_HELPERS` in the test). From `shared_entry` it may import only `EntryProposal`, `EntryContexts`, `RetestTrigger`, `AdmittedEntry`, `STYLE_FAMILIES` and `DIVERGENCE_ENTRY_SOURCE` (`VETO_GATES` is in `plugin_api`).
+- (d) `BaseStrategy.__init_subclass__` refuses `position_exit_signal`, `shared_exit_signal`, `strategy_logic_default` and `signal_priority_key`, at import, also from a mixin the class inherits.
+- (e) Those modules may not rewrite what `emit` built: no `dataclasses.replace` under any alias (`import dataclasses as dc`, `from dataclasses import replace as swap`), and no assignment or `setattr` of `.stop_price` / `.target_price`. It may not reach into the policy's privates (`self.entry_policy._x`, directly, through an alias or through `getattr`). Pass the stop / target through the proposal and the ladder, and metadata through `emit(metadata=...)`.
 
 ### Manifest capabilities
 

@@ -473,7 +473,11 @@ Current code defaults:
 - `manifest.json` defines the plugin registration metadata and factory defaults.
 - `configs/config.top_tier_adaptive.yaml` is the matching top-level tuned preset for this strategy.
 - `screener.py` fetches the fixed tradable universe from TradingView and ranks by activity.
-- `strategy.py` contains the regime scoring, signal building, and entry logic.
+- `strategy.py` defines `TopTierAdaptiveStrategy`: the entry loop (`entry_signals` and its stages `_read_candidate`, `_score_sides`, `_queue_builds`, `_run_build_queue`, `_record_candidate`), the gate chain every builder ends in (`_finalize_signal`) and `_breakout_reference`. The rest of the engine is mixed into that class from the modules beside it:
+  - `schedule.py`: the ORB window and the per-window regime sets (`_allowed_regimes`).
+  - `confirmation.py`: sector confirmation (index ETFs, peer breadth, the leg-anchored VWAP), daily statistics and the volatility scale, `REGIME_SCORE_CEILINGS` and the score normalisation, the side asymmetry, the side vote, the confirmation bar, and the live bias, stop widening and soft-bias penalty.
+  - `armed_retest.py`: `ARMED_RETEST_REGIMES` and the armed retest.
+  - `regimes/`: one module per regime (`trend`, `orb`, `pullback`, `range`, `vol_squeeze`, `momentum`, `vwap_reclaim`, `sr_scalp`), each holding its scorer and builder.
 
 ---
 

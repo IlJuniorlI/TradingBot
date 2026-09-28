@@ -75,8 +75,12 @@ class BaseStrategy(ContextBuildersMixin):
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
+        # Looked up on the class, not in its own namespace: a strategy built
+        # from mixins (top_tier_adaptive's engine) must not carry one in a
+        # mixin either. BaseStrategy and ContextBuildersMixin define none of
+        # them.
         for name, why in BaseStrategy._RESERVED_NAMES.items():
-            if name in cls.__dict__:
+            if hasattr(cls, name):
                 raise TypeError(f"{cls.__name__} defines {name}(); {why}")
 
     @classmethod

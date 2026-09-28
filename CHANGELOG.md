@@ -310,6 +310,56 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **top_tier_adaptive's engine is split across its package (refactor cut
+  C43).** *2026-09-27* — `top_tier_adaptive/strategy.py` (4,595 lines down
+  to 1,888) keeps the class (`__init__`, the HTF EMA hooks,
+  `dashboard_htf_trend`, `active_watchlist`, `_build_ladder_rungs`,
+  `required_history_bars`, `should_force_flatten`), `_breakout_reference`,
+  `_finalize_signal`, the entry loop and the regime-family constants only
+  the loop reads. The rest moved, unchanged, into mixins of
+  `TopTierAdaptiveStrategy` beside it: `schedule.py` (`ScheduleMixin`: the
+  ORB window and its load check `_validate_orb_window`, `_allowed_regimes`
+  and the extended-hours set), `confirmation.py` (`ConfirmationMixin`:
+  sector confirmation, daily statistics, the score normalisation with
+  `REGIME_SCORE_CEILINGS`, the side asymmetry, the side vote, the
+  confirmation bar, the live bias and stop widening), `armed_retest.py`
+  (`ArmedRetestMixin`: `ARMED_RETEST_REGIMES` and the armed retest) and
+  `regimes/{trend,orb,pullback,range,vol_squeeze,momentum,vwap_reclaim,sr_scalp}.py`,
+  each regime's scorer and builder with their helpers. The 54 moved methods
+  are byte for byte the same. `entry_signals` is cut along its passes into
+  `_read_candidate`, `_score_sides`, `_queue_builds`, `_run_build_queue` and
+  `_record_candidate`, sharing two private dataclasses (`_EntryCycle`,
+  `_CandidateRead`); each stage is the old text one level less indented, a
+  candidate-level `continue` is a `return None`, and the comments that
+  pointed "above" or "below" across a stage name it. Every `self._x` call,
+  `SmallCapSqueezeStrategy` (unchanged) and every test patch on the class
+  keep working. There is no alias: import `REGIME_SCORE_CEILINGS` from
+  `top_tier_adaptive.confirmation` and `ARMED_RETEST_REGIMES` from
+  `top_tier_adaptive.armed_retest`. `BaseStrategy.__init_subclass__` now
+  looks a reserved name up on the class (`hasattr`), so a strategy cannot
+  carry one in a mixin either; `BaseStrategy` and `ContextBuildersMixin`
+  define none, so every shipped class loads as before. The source scans read
+  the new modules too, not just `strategy.py`: `test_shared_knob_contract`'s
+  rules (c) and (e) every module of a plugin but its screener and
+  `__init__`, the param-declaration check every module of the engine, and
+  the regime-flag and removed-param scans every module of
+  `top_tier_adaptive/`. No behaviour changes: on four archived top_tier
+  sessions, two small-cap sessions and the fixture tapes, under the shipped
+  presets and several wider variants, every signal, entry decision and piece
+  of cross-cycle state, every moved method called directly and the schedule
+  grids are the same before and after the cut (163,236 records, among them
+  465 signals over seven regimes, 86 distinct decision reasons and 580
+  armed-retest `enter` verdicts). Tests: `tests/test_plugin_contract.py`
+  (`TestEachStrategyNameHasOneHome`, new: no two mixins of a strategy, and
+  no mixin and `BaseStrategy`, define the same name, since the MRO would
+  pick one of the two without a word, and the scan sees each strategy's
+  mixins), `tests/test_shared_knob_contract.py` (the scans read the modules
+  beside `strategy.py`; a reserved name in a mixin raises),
+  `tests/test_param_declaration_drift.py` (the scan reads every engine
+  module), `tests/test_skip_decision_regime.py` and
+  `tests/test_last_bar_atr.py` (the stages that now hold the reads), and the
+  constants' imports in the regime tests and `tests/support/factories.py`.
+
 - **The strategy's context builders have their own module,
   `_strategies/contexts.py` (refactor cut C42).** *2026-09-27* —
   `ContextBuildersMixin`, which `BaseStrategy` inherits, holds every
