@@ -230,7 +230,7 @@ reads any of them itself.
 - `manifest.json` defines the plugin registration metadata.
 - `configs/config.zero_dte_etf_long_options.yaml` is the matching top-level tuned preset for this strategy.
 - `screener.py` builds the candidate list for this strategy.
-- `strategy.py` contains the actual entry / exit logic.
+- `strategy.py` defines `ZeroDteEtfLongOptionsStrategy`: its style table (`_entry_styles`), the single-option builder, the style gate (`_long_option_style_gate`) and the option mark (`position_mark_price`). The entry loop, the regime and the chain are `zero_dte_etf_options`' (its `strategy.py`, `regime.py` and `chain.py`).
 
 ## Same-level retry block on an option (2026-09-25)
 

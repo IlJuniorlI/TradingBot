@@ -389,10 +389,10 @@ class TradingViewScreenerClient:
                 directional_bias = None
             # Unscored candidates all get 0.0 so the `candidate_query_order`
             # tiebreak in `rank_candidates` restores the order the screener's
-            # own `order_by` asked for. Scoring them by `ordinal` instead REVERSED it: the
-            # sort is descending, so the last row of a "best first" query came
-            # out on top. Reachable two ways — a plugin that omits
-            # activity_score_fn, and the fallback when one raises.
+            # own `order_by` asked for. Scoring them by `ordinal` instead
+            # REVERSED it: the sort is descending, so the last row of a "best
+            # first" query came out on top. Reachable two ways — a plugin that
+            # omits activity_score_fn, and the fallback when one raises.
             try:
                 activity_score = float(activity_score_fn(row)) if activity_score_fn else 0.0
             except Exception:

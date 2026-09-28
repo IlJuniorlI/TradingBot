@@ -51,13 +51,14 @@ from .dashboard_payloads import (
     technical_line_payload,
 )
 from .dashboard_zones import build_level_zones, level_anchors
+from .htf_levels import HTFContext
 from .log_setup import ComponentFailureLog
 from .models import Candidate, Position, Side, asset_type_of, is_option_asset
 from .numeric import safe_float
 from .sr_snapshot import sr_snapshot, structure_event_label
 from .support_resistance import analyze_market_structure
 from .symbols import NON_STREAMABLE
-from .technical_levels import build_technical_levels_context
+from .technical_levels import TechnicalLevelsContext, build_technical_levels_context
 from .bars import last_bucket_forming, session_bucket_ends
 from .indicators import htf_ema_spans, last_bar_atr, ltf_ema_spans
 from . import sessions
@@ -66,9 +67,7 @@ from .levels_shared import collapse_price_ladder, effective_side_tolerance
 if TYPE_CHECKING:
     from ._strategies.strategy_base import BaseStrategy
     from .data_feed import MarketDataStore
-    from .htf_levels import HTFContext
     from .paper_account import PaperAccount
-    from .technical_levels import TechnicalLevelsContext
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -483,8 +482,10 @@ class DashboardCache:
         one cache-keyed dict. The ``_snapshot_*`` builders below make the
         parts, called in the order the data feed has always been read (its
         cycle caches are order-sensitive); each overlay builder logs its own
-        failure and falls back to no overlay. The HTF context and the frame's
-        close are read once, here, and shared."""
+        failure and falls back to no overlay. The frame's close is read once,
+        here, for the LTF gaps and order blocks; the HTF context is read
+        once, by ``_snapshot_htf_overlays``, and handed on to the divergence
+        lines."""
         symbol = str(symbol or "").upper().strip()
         quote = self.data.get_quote(symbol) or {}
         max_quote_age = max(1.0, float(self.config.runtime.quote_cache_seconds))
@@ -663,11 +664,14 @@ class DashboardCache:
     ) -> tuple[dict[str, Any], float | None]:
         """The snapshot's ``quote`` block and the price its levels are read at.
 
-        A stale quote gives only its open and close; the last price, close,
-        change and volume fall back to the bars and the candidate row. The
-        price is the last price, else the S/R row's, else the newest bar's
-        close. The quote's age is not here: ``symbol_snapshot`` asks the feed
-        for it last, where it always has."""
+        A stale quote gives no last, bid, ask, mark, mid or volume: the last
+        price and the volume come from the bars instead, and the mark and mid
+        from that last price. Its open, close and change fields are read
+        whatever its age; outside the regular session, or when the quote has
+        none, the close and the percent change are the candidate row's. The
+        price is the last price, else the S/R row's,
+        else the newest bar's close. The quote's age is not here:
+        ``symbol_snapshot`` asks the feed for it last, where it always has."""
         latest_bar: dict[str, Any] = bars[-1] if bars else {}
         session_total_volume: float | None = None
         if frame is not None and not frame.empty:

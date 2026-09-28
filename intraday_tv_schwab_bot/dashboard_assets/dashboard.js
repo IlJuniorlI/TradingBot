@@ -288,9 +288,11 @@ const COMPACT_DECISION_REASON_LABELS = {
 };
 
 // Compact form: drops the parameter detail after the first colon and
-// consults COMPACT_DECISION_REASON_LABELS for the most verbose tokens.
-// Used in tight UI spots (e.g. the focus-meta line next to the symbol name)
-// where long ETF-options skip reasons like
+// consults COMPACT_DECISION_REASON_LABELS for the most verbose tokens, a
+// token with a parenthesised detail by its name
+// (`quote_not_stable(reason=mid_drift_too_high,...)` reads "quote
+// unstable"). Used in tight UI spots (e.g. the focus-meta line next to the
+// symbol name) where long ETF-options skip reasons like
 // `option_quote_unstable:bid=1.05 ask=1.20 mid=1.13 stability_pct=14.2`
 // would push the live-price/change/volume chips off the right edge.
 // The full detail still appears in the score-sub line below.
@@ -298,7 +300,7 @@ function humanizeDecisionTokenCompact(value) {
   const raw = String(value || '').trim();
   if (!raw) return '—';
   const head = raw.split(':')[0];
-  const abbrev = COMPACT_DECISION_REASON_LABELS[head];
+  const abbrev = COMPACT_DECISION_REASON_LABELS[head.split('(')[0]];
   if (abbrev) return abbrev;
   return head.replace(/_/g, ' ');
 }
@@ -538,14 +540,14 @@ function expandedChartTimeframeLabel(data = appState.data, mode = expandedChartT
 
 function chartLtfIsOneMinute(data = appState.data, symbol = appState.selectedSymbol) {
   // Single source of truth for "is the LTF chart's bar size literally 1m?".
-  // Snapshot.bars are always 1m streaming bars (dashboard_cache.py:626 reads
-  // get_merged with no timeframe arg). When the active strategy declares
-  // params.ltf_minutes > 1 (e.g. peer_confirmed_key_levels uses 5m), the
-  // /api/chart LTF payload returns 5m bars resampled by data_feed.get_merged.
-  // Merging the 1m snapshot bars into the 5m cache would interleave 1m
-  // candles with the 5m ones (and overwrite each 5m candle with the 1m bar
-  // sharing its start). So this gate must return true ONLY when
-  // ltf_minutes == 1.
+  // Snapshot.bars are always 1m streaming bars
+  // (DashboardCache.symbol_snapshot reads get_merged with no timeframe arg).
+  // When the active strategy declares params.ltf_minutes > 1 (e.g.
+  // peer_confirmed_key_levels uses 5m), the /api/chart LTF payload returns 5m
+  // bars resampled by data_feed.get_merged. Merging the 1m snapshot bars into
+  // the 5m cache would interleave 1m candles with the 5m ones (and overwrite
+  // each 5m candle with the 1m bar sharing its start). So this gate must
+  // return true ONLY when ltf_minutes == 1.
   const label = String(currentLtfTimeframeLabel(data, symbol) || '').trim().toLowerCase();
   return label === '1m';
 }
@@ -2321,9 +2323,10 @@ function drawSelectedChart(snapshot) {
   // Source priority: snapshot.support_resistance.ltf_timeframe is server
   // -emitted truth ("5m" / "1m"). Fall back to the active chart cache's
   // timeframeLabel, then the snapshot.bars-implied 1m default. snapshot.chart
-  // is the levels/technicals meta-payload (dashboard_cache.py:1086) and never
-  // carries timeframe_minutes — reading from it would always resolve to 1
-  // and silently drop LTF FVG/OB overlays for non-1m strategies.
+  // is the levels/technicals meta-payload (the chart dict
+  // DashboardCache.symbol_snapshot assembles) and never carries
+  // timeframe_minutes — reading from it would always resolve to 1 and
+  // silently drop LTF FVG/OB overlays for non-1m strategies.
   const chartTimeframeMinutesRaw = (() => {
     const srLabel = String(snapshot?.support_resistance?.ltf_timeframe || '').trim();
     if (srLabel) {
@@ -2388,11 +2391,11 @@ function drawSelectedChart(snapshot) {
   const htfDivergenceLines = isLtfChart ? [] : (Array.isArray(levels.htf_divergence_lines) ? levels.htf_divergence_lines : []);
   // Patterns + structure overlay only ever come from /api/chart payloads
   // stored on appState.expandedChart / appState.compactChart. snapshot.chart
-  // is the levels/technicals meta-payload built in dashboard_cache.py:1086
-  // and never carries `patterns` or `structure_overlay` — so falling back to
-  // it would always yield {}. Pick the correct cache for the current view
-  // and require a symbol+mode match to avoid showing stale data after a
-  // symbol or mode flip.
+  // is the levels/technicals meta-payload DashboardCache.symbol_snapshot
+  // assembles and never carries `patterns` or `structure_overlay` — so
+  // falling back to it would always yield {}. Pick the correct cache for the
+  // current view and require a symbol+mode match to avoid showing stale data
+  // after a symbol or mode flip.
   const snapshotSymbolUpper = String(snapshot?.symbol || '').toUpperCase();
   const compactCacheMatchesSnapshot = !isExpandedView
     && String(appState.compactChart?.symbol || '').toUpperCase() === snapshotSymbolUpper

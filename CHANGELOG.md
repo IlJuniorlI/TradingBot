@@ -327,31 +327,33 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     and `_snapshot_divergence_lines`.
 
   `symbol_snapshot` keeps the reads before the cache check, the level zones,
-  the chart profiles, the HTF context and the frame's close (each read once
-  and handed to the builders that use it), the payload assembly and the
-  cache store (a shallow copy on a hit, a deep copy on a store). Each
-  builder keeps its try scope, its `log_component_failure` key and message
-  and its fallback. The builders stay in `dashboard_cache.py`, where tests
-  patch the module names they read (`build_technical_levels_context`,
+  the chart profiles, the frame's close (read once, for the LTF gaps and
+  order blocks), the payload assembly and the cache store (a shallow copy on
+  a hit, a deep copy on a store); `_snapshot_htf_overlays` reads the HTF
+  context once, and `symbol_snapshot` hands it on to the divergence lines.
+  Each builder keeps its try scope, its `log_component_failure` key and
+  message and its fallback. The builders stay in `dashboard_cache.py`, where
+  tests patch the module names they read (`build_technical_levels_context`,
   `fvg_payload`, `detect_per_bar_candle_patterns`). This is the split of
-  `symbol_snapshot` the plan's dashboard_cache row asks for (RT-17(3)),
-  which cut C40 left. Its other clause, making the FVG / order-block overlay
+  `symbol_snapshot` the plan's dashboard_cache row asks for (RT-17(3)), which
+  cut C40 left. Its other clause, making the FVG / order-block overlay
   builder reusable by `chart_payload`, is dropped: `chart_payload` builds no
-  FVGs or order blocks (the page draws the snapshot's), so there is no
-  second reader. A comment in `chart_payload` that named a line of the old
-  method now says what it matches. No behaviour changes: 800 fuzzed
-  snapshots, each built and then asked for twice more (from the cache, or
-  rebuilt when a refresh is due), give the same payloads, the same feed and
-  strategy reads in the same order and the same failure logs (key, message
-  and exception), byte for byte. The cases cover every chart-profile overlay
-  toggle, LTF 1m and 5m strategies, missing, stale and fresh quotes,
-  premarket, RTH and after-hours clocks, S/R rows with and without a price
-  or a spacing, equity, option and no positions, and a failure at each of
-  the seven keys. Tests: `tests/test_silent_excepts.py`
-  (`TestReportedSnapshotComponents`) pins the five failure paths no test
-  covered (the candle tags, the technical build, the HTF and LTF order
-  blocks and the divergence lines): each is logged, and its part falls back
-  to empty whatever it held by then.
+  FVGs or order blocks (the page draws the snapshot's), so there is no second
+  reader. A comment in `chart_payload` that named a line of the old method
+  now says what it matches. No behaviour changes: 800 fuzzed snapshots, each
+  built and then asked for twice more (from the cache, or rebuilt when a
+  refresh is due), give the same payloads, the same feed and strategy reads
+  in the same order and the same failure logs (key, message and exception),
+  byte for byte. The cases cover every chart-profile overlay toggle, LTF 1m
+  and 5m strategies, missing, stale and fresh quotes, premarket, RTH and
+  after-hours clocks, S/R rows with and without a price or a spacing, equity,
+  option and no positions, and a failure at each of the seven keys. Tests:
+  `tests/test_silent_excepts.py` (`TestReportedSnapshotComponents`) pins the
+  five failure paths no test covered (the candle tags, the technical build,
+  the HTF and LTF order blocks and the divergence lines): each is logged, and
+  its part falls back to empty whatever it held by then. The class's seven
+  snapshot tests (these five and the two FVG ones) also check each part's
+  `log_component_failure` key, which sets its once-a-minute WARNING.
 
 - **One screener template per family; the candidate ranking, the gap score
   and the anti-chase reason names each live once (refactor cut C45).**
@@ -424,7 +426,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and mean_reversion stay separate plugins. They differ in 14 places across
   their entry loop (reference high, bounce check, chart predicate, target,
   reason, score, three defaults), so a shared base would be mostly hooks.
-  Tests: `tests/test_screener_templates.py` (new).
+  The README's example screener and the plugin scaffold's screener template
+  read the screener's own params (`config.strategies[strategy_name]`), as
+  every shipped screener does, and no longer the running strategy's
+  (`config.active_strategy`). Tests: `tests/test_screener_templates.py`
+  (new), `tests/test_screener_regressions.py` (the example and the template
+  read their own params).
 
 - **The 0DTE regime and option-chain plumbing have their own modules
   (refactor cut C44).** *2026-09-27* — `zero_dte_etf_options/regime.py`
@@ -453,7 +460,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `..._strategies.zero_dte_etf_options.chain`. The knob-contract scans
   (`tests/test_shared_knob_contract.py`) read `regime.py` and `chain.py`
   too, and the HTF EMA-span scan (`tests/test_htf_ema_knobs.py`) reads the
-  whole package. No behaviour changes: on the B11 entry's replay (34
+  whole package, checking that it found `strategy.py`, `regime.py` and
+  `chain.py`. No behaviour changes: on the B11 entry's replay (34
   tape-days, 4,556 checkpoints), every probe is identical before and after
   the split, 3,195,450 compared values in all. The probes are the regime
   (its scores, metrics and contexts field by field), every entry run with
@@ -542,10 +550,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `tests/test_orb_regime.py` (a range without a price; the one-source test
   reads the bar count and clamps a 0-minute range),
   `tests/test_breakout_conversions.py` (the 09:35 break with no premarket
-  bars; the NaN reason), `tests/test_zero_dte_entry_styles.py` (the
+  bars; the NaN reason; a range with no bar after it, whose reason carries
+  the range's own bar count), `tests/test_zero_dte_entry_styles.py` (the
   window's last bar and a range without a price, both presets),
-  `tests/test_strategy_time_params.py` (the reversed window, both
-  presets), `tests/test_top_tier_adaptive_new_regimes.py`. The NaN, the
+  `tests/test_strategy_time_params.py` (the reversed window, ending one
+  minute and four minutes before its start, both presets),
+  `tests/test_top_tier_adaptive_new_regimes.py`. The NaN, the
   reversed-window and the ORB-break cases fail on the old code; the
   window's last bar pins what the change must keep.
 
@@ -606,9 +616,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     settle: `quote_not_stable(reason=quote_not_fresh|missing_leg_quotes|
     mid_drift_too_high|<the validator's refusal>,...)`, where they recorded
     a bare `quote_not_stable`. The reports bucket skips by the head, which
-    has not changed. The dashboard's compact decision label splits on `:`,
-    so it now shows the detail, as it already did for every parenthesised
-    reason. The credit spread's
+    has not changed. The dashboard's compact decision label (the focus
+    line beside the symbol) looks a token's short label up by its name, so
+    it still reads "quote unstable"; a reason with no short label shows as
+    before. Over the decision reasons of the archived sessions, the only
+    other one that reads differently is `iv_rank_too_low(...)`, now "iv
+    low" like the bare token. The credit spread's
     `midday_credit_spread_unavailable(reason=...)` is unchanged. No
     decision changes.
   - zero_dte_etf_long_options now skips an underlying the spreads hold
@@ -694,8 +707,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   beside `strategy.py`; a reserved name in a mixin raises),
   `tests/test_param_declaration_drift.py` (the scan reads every engine
   module), `tests/test_skip_decision_regime.py` and
-  `tests/test_last_bar_atr.py` (the stages that now hold the reads), and the
-  constants' imports in the regime tests and `tests/support/factories.py`.
+  `tests/test_last_bar_atr.py` (the stages that now hold the reads),
+  `tests/test_top_tier_megacap.py` (`TestTheCandidateReadHandOff`, new: the
+  side vote, its breakdown, the widening factor and the index read each
+  reach the stage that reads them, which no other test checked; the vote
+  test gives a LONG trend a qualifying score, so the refusal it checks has
+  to happen), and the constants' imports in the regime tests and
+  `tests/support/factories.py`.
 
 - **The strategy's context builders have their own module,
   `_strategies/contexts.py` (refactor cut C42).** *2026-09-27* —
@@ -713,10 +731,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `dashboard_htf_trend`, `dashboard_htf_ema_columns`). The per-cycle candle,
   chart, structure and technical caches, their locks and the engine's
   pre-warm moved with them (`_observed_contexts`, `set_prewarm_frames`,
-  `_observe_context`, `prime_cycle_contexts`, `reset_context_caches`).
+  `_observe_context`, `prime_cycle_contexts`, `reset_context_caches`), and
+  so did the candle cache's reset: `_reset_entry_decisions` calls the
+  mixin's `_reset_candle_context_cache` where it emptied the cache itself.
   `BaseStrategy.__init__` builds the caches through `super().__init__()`,
   where it built them, and the mixin's `__init_subclass__` gives each
-  strategy class its own `_observed_contexts`, as `BaseStrategy`'s did.
+  strategy class its own `_observed_contexts`, as `BaseStrategy`'s did (the
+  engine's pre-warm reads it with no fallback).
   `strategy_base.py` keeps the plugin contract, the watchlist and dashboard
   hooks, the settings accessors, force-flatten, decision recording,
   `_direction_token`, `_entry_exhaustion_reasons`, the structure-event
@@ -745,11 +766,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   132 signals and 1,110 exit decisions), and the 68 output files are byte
   for byte the same. Tests: `tests/test_contexts.py` (new: each strategy
   class keeps its own pre-warm record, a build records on the strategy's own
-  class, and each instance keeps its own caches and locks); the retargeted
-  patches in test_sr_tolerance_reads, test_shared_entry_policy,
+  class, each instance keeps its own caches and locks, and each entry cycle
+  empties the candle cache and the engine the pre-warmed ones); the
+  retargeted patches in test_sr_tolerance_reads, test_shared_entry_policy,
   test_fix_strategy_consumers and test_htf_ema_knobs;
   `tests/test_module_layering.py`'s strategy-framework layer gains
-  `_strategies.contexts`.
+  `_strategies.contexts`, which the runtime layer, as with `strategy_base`,
+  may import only under `TYPE_CHECKING`.
 
 - **Each `options.underlyings` entry is checked at load, and the dashboard
   publishes the strategy's own tradable and index symbols (refactor cut

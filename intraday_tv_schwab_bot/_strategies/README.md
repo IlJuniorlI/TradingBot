@@ -441,7 +441,7 @@ class MyNewStrategyScreener(BaseStrategyScreener):
 
     def run(self) -> list[Candidate]:
         c = self._column
-        params = self.config.active_strategy.params
+        params = self.config.strategies[self.strategy_name].params
         min_rvol = float(params.get("min_rvol", 1.5))
 
         query = (
@@ -645,7 +645,7 @@ Recommended practices:
 - keep one screener class per `screener.py`
 - keep manifests small, declarative, and explicit
 - prefer additive params with safe defaults
-- use `self.config.active_strategy.params` or `self.params` consistently
+- read a strategy's params as `self.params`, and a screener's as `self.config.strategies[self.strategy_name].params` (`config.active_strategy` is whichever strategy is running)
 - avoid hidden import-time work
 - keep module names stable once released
 

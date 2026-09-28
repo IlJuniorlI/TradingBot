@@ -12,6 +12,9 @@ contexts. The chart, structure and technical contexts are cached per cycle,
 each under its own lock, and the engine pre-warms the ones a strategy asked
 for on this cycle's bars frames (``_observed_contexts``,
 ``set_prewarm_frames``, ``prime_cycle_contexts``, ``reset_context_caches``).
+The candle contexts are cached per entry cycle, and the host empties that
+cache as each ``entry_signals`` starts (``_reset_entry_decisions`` calls
+``_reset_candle_context_cache``).
 
 The host class provides ``config``, ``params`` and the settings accessors
 ``_support_resistance_setting``, ``_technical_level_setting`` and
@@ -105,6 +108,12 @@ class ContextBuildersMixin:
             self._structure_context_cache = {}
         with self._technical_context_lock:
             self._technical_context_cache = {}
+
+    def _reset_candle_context_cache(self) -> None:
+        """Empty the candle-context cache as each ``entry_signals`` starts
+        (the host's ``_reset_entry_decisions`` calls it). The engine does not
+        pre-warm this cache, so ``reset_context_caches`` leaves it."""
+        self._candle_context_cache = {}
 
     def set_prewarm_frames(self, frames: Iterable[pd.DataFrame | None]) -> None:
         """Public API for the engine: this cycle's bars frames, the ones
@@ -244,9 +253,10 @@ class ContextBuildersMixin:
         """HTF (higher timeframe) for SR detection. Strategies declare via
         `params.htf_minutes`; otherwise inherit
         `support_resistance.timeframe_minutes`. The one resolution: the
-        engine, the position manager, the entry gatekeeper, the dashboard
-        and the session archive read it here (until 2026-09-27 the
-        dashboard and the position manager each kept a copy)."""
+        engine, the trade manager, the entry gatekeeper, the dashboard, the
+        S/R snapshot and the session archive's HTF folder read it here
+        (until 2026-09-27 the dashboard and the position manager each kept
+        a copy)."""
         fallback = int(self._support_resistance_setting("timeframe_minutes", 15))
         return int(self.params.get("htf_minutes", fallback))
 

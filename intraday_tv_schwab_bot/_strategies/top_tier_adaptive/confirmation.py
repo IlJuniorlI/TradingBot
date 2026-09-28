@@ -456,12 +456,10 @@ class ConfirmationMixin:
         """Return the percent change over the last ``lookback_bars`` of the
         LTF frame: ``(last_close - close_lookback_bars_ago) / close_ago * 100``.
 
-        Used by the recent-momentum disagreement gate in ``entry_signals``
-        to detect when the LOCAL trend (last N bars) contradicts the
-        session-wide bias signals (which all derive from ``change_from_open``,
-        a backward-looking quantity). On stocks that have reversed intraday,
-        ``day_strength`` still reflects the original direction while recent
-        price action has flipped; the gap is the signal.
+        Its reader is ``_decide_side``: the side vote's first signal, the
+        LOCAL trend (last N bars). On a stock that has reversed intraday,
+        ``day_strength`` (from the session open) still reflects the original
+        direction while recent price action has flipped.
 
         Returns ``None`` when there aren't enough bars or the prior close
         is non-positive (defensive against bad data)."""
@@ -502,7 +500,9 @@ class ConfirmationMixin:
         AND opposing ≤ ``side_decision_max_opposing``. Scaling to the
         participating count matters because two of the four signals abstain
         often — an absolute threshold rejected unanimous 2-0 reads. Mixed
-        reads return ``None`` and the candidate is skipped.
+        reads return ``None``: the direction-following regimes are refused
+        (``<side>_build_failed_<regime>_side_undecided``), while range and
+        sr_scalp still build.
 
         This replaces the previous "evaluate both sides per regime, pick
         highest-scoring" implicit side selection. The old approach could
@@ -773,14 +773,16 @@ class ConfirmationMixin:
 
         Otherwise returns ``bias_penalty_base * magnitude_factor`` where
         ``magnitude_factor = min(1.0, |day_strength| / bias_penalty_saturate_at)``.
-        Default base 1.0, saturate at 2.0% day_strength — so a −0.5% day with
-        SHORT bias applies only a 0.25 penalty to LONG-side regimes (a strong
-        structural LONG setup can still qualify), while a −3% deep-down day
-        applies the full 1.0 penalty (filters most LONG-side setups).
+        The manifest ships base 1.0 and saturates at 0.75% day_strength (the
+        code's fallbacks are 1.0 and 2.0) — so a −0.5% day with SHORT bias
+        applies a 0.67 penalty to LONG-side regimes (a strong structural LONG
+        setup can still qualify), while a −1% day applies the full 1.0
+        penalty (filters most LONG-side setups).
 
         Replaces Fix A's previous HARD lockout (``preferred_sides = [Side]``).
-        Both sides are now always evaluated; the penalty filters weak
-        counter-bias setups while letting strong structural ones through.
+        With no explicit side decision it applies to every regime of the
+        disagreeing side; when the side vote picked a side, only to range and
+        sr_scalp, the regimes that build against it.
         Preserves the 2026-04-20 protection (deep day_strength → full
         penalty) and the trailing-bias memory (inferred bias still
         contributes to the penalty).

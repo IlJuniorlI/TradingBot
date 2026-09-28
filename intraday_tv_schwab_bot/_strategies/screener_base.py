@@ -23,13 +23,12 @@ def rank_candidates(candidates: Iterable[Candidate], limit: int | None = None) -
     Best is the higher ``activity_score``, then the earlier
     ``candidate_query_order`` (the row's place in the screener query's own
     ``order_by``; a missing or unreadable one comes after every readable
-    one), so ties are broken deterministically rather than by list order;
-    the sort is stable after that. ``rank`` is rewritten
-    because it is the final tiebreak in
-    ``shared_entry.SharedEntryPolicy.rank_key`` and is what the dashboard
-    candidate card and the audit log's ``candidate_rank`` display: a screener
-    that merges two screens (small_cap_squeeze's premarket lock) would
-    otherwise carry each screen's own, duplicated ranks.
+    one), so ties are broken deterministically rather than by list order; the
+    sort is stable after that. ``rank`` is rewritten because it is the final
+    tiebreak in ``shared_entry.SharedEntryPolicy.rank_key`` and is what the
+    dashboard candidate card and the audit log's ``candidate_rank`` display:
+    a screener that merges two screens (small_cap_squeeze's premarket lock)
+    would otherwise carry each screen's own, duplicated ranks.
     """
     def _key(candidate: Candidate) -> tuple[float, int]:
         raw_order = candidate.metadata.get("candidate_query_order")

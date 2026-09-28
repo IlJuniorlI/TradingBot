@@ -1201,7 +1201,7 @@ class IntradayBot:
         # unseen tuple mid-cycle. In practice, pre-warm only replays known
         # entries (idempotent set.add → no size change), but a frozenset
         # eliminates any race-window doubt for the cost of one shallow copy.
-        observed = frozenset(getattr(type(self.strategy), "_observed_contexts", ()))
+        observed = frozenset(type(self.strategy)._observed_contexts)
         if not observed:
             return
         symbols = [symbol for symbol, frame in bars.items() if frame is not None and not frame.empty]

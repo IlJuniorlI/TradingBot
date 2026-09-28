@@ -646,7 +646,7 @@ class BaseStrategy(ContextBuildersMixin):
         # the cycle boundary instead of the entry_signals boundary.
         self._entry_decisions = {}
         self._build_failures = {}
-        self._candle_context_cache = {}
+        self._reset_candle_context_cache()
         self.entry_policy.reset_cycle()
 
     def _entry_side_context(self, preferred_sides: list[Side]) -> tuple[list[Side], list[str]]:

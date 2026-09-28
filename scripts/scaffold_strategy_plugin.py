@@ -486,7 +486,8 @@ def _stock_screener_py(name: str, class_stem: str) -> str:
 
             def run(self) -> list[Candidate]:
                 c = self._column
-                min_rvol = float(self.config.active_strategy.params.get("min_rvol", 1.5) or 1.5)
+                params = self.config.strategies[self.strategy_name].params
+                min_rvol = float(params.get("min_rvol", 1.5) or 1.5)
                 query = (
                     self._base_query()
                     .select(

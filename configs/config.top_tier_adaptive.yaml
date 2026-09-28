@@ -737,8 +737,9 @@ strategies:
       # This cuts VOLUME, not per-trade edge — a higher regime score is not
       # yet known to correlate with a better outcome, because regime_score
       # was not stamped into signal metadata during the sessions above. It
-      # is now (strategy.py `leading` dict), so the next dry-run can set
-      # these thresholds from the score/outcome curve instead of by volume.
+      # is now (`regime_score`, which `_finalize_signal` stamps), so the next
+      # dry-run can set these thresholds from the score/outcome curve instead
+      # of by volume.
       min_trend_score: 4.0                # 2026-07-29: 4.5 blocked 384 of 631 qualifying tech SHORTs
       min_pullback_score: 3.5             # 2026-07-29: reverted — 4.0 was UNREACHABLE (observed pullback score maxes at 3.5), which silently killed the regime
       min_pullback_trend_score: 3.0
@@ -838,11 +839,13 @@ strategies:
       # paired gate during the opening window (through orb_end) when early-session
       # indicators (VWAP/EMA/DMI/OBV/pct_b) read extreme due to opening dynamics.
 
-      # Screener bias: honor SHORT/LONG tag instead of falling through to
-      # opposite side on score ties. As of 2026-05-26, this flag also gates
-      # a HARD veto when c.directional_bias lies outside preferred_sides
-      # (e.g., screener=SHORT with allow_short=false) — see strategy.py
-      # `entry_signals` and README section 6f.
+      # Switches the soft-bias penalty. Despite the name it reads no screener
+      # tag: the bias is the live one, the day's move since the open (or,
+      # while that reads neutral, the trailing-bias memory). A side against it
+      # has its regime scores docked by bias_penalty_base x
+      # min(1, |day move| / bias_penalty_saturate_at): every regime's, or only
+      # range / sr_scalp's when the side vote picked a side. See
+      # `_bias_penalty` in top_tier_adaptive/confirmation.py.
       respect_screener_bias: true
       orb_bypass_screener_bias: true           # gap-reversal LONGs need fallthrough during ORB
 
