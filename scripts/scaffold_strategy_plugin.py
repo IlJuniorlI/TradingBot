@@ -421,6 +421,8 @@ def _option_strategy_py(name: str, class_stem: str) -> str:
                 spread's order side>, premium_stop=<premium stop>,
                 target=<premium target>, metadata=<option metadata:
                 asset_type, strike, expiry, contract symbol, etc.>)``.
+                ``asset_type`` must be ``OPTION_VERTICAL`` or
+                ``OPTION_SINGLE``, or ``emit`` raises.
 
                 See _strategies/zero_dte_etf_options/strategy.py for a
                 fully-fleshed working example with regime confirmation,

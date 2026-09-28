@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
 
-def symbol_price(data: MarketDataStore, account: PaperAccount | None, symbol: str) -> float | None:
+def symbol_price(data: MarketDataStore, account: PaperAccount, symbol: str) -> float | None:
     """The symbol's price: the quote's first positive display price
     (``DISPLAY_PRICE_KEYS``), else the 1m frame's last close, else the
     account's last price for it."""
@@ -42,11 +42,8 @@ def symbol_price(data: MarketDataStore, account: PaperAccount | None, symbol: st
             "Failed to read merged frame last price for %s; falling back to cached/account.",
             symbol, exc_info=True,
         )
-    if account is not None:
-        cached = account.last_prices.get(symbol)
-        if cached is not None:
-            return float(cached)
-    return None
+    cached = account.last_prices.get(symbol)
+    return None if cached is None else float(cached)
 
 
 def structure_event_label(ms_ctx: Any) -> str:
@@ -108,7 +105,7 @@ def sr_snapshot(
     *,
     price: float | None,
     strategy: BaseStrategy,
-    account: PaperAccount | None,
+    account: PaperAccount,
     allow_refresh: bool,
 ) -> dict[str, Any] | None:
     """``symbol``'s S/R snapshot at ``price`` (``symbol_price`` when None) on

@@ -372,16 +372,20 @@ def vertical_limit_price(first_leg: OptionContract, second_leg: OptionContract, 
 
 def contract_from_quote(symbol: str, quote: dict[str, Any] | None, fallback: dict[str, Any] | None = None) -> OptionContract:
     """The contract ``symbol`` at its cached ``quote`` (``_normalize_quote``'s
-    keys), each number falling back to the stored leg ``fallback`` (an
-    ``asdict(OptionContract)``). A raw Schwab chain entry, in camelCase, is
-    ``parse_option_chain``'s to read; the camelCase keys this also tried
-    (``putCall``, ``strikePrice``, ``openInterest``, ``totalVolume``,
-    ``volume``, ``daysToExpiration``, ``inTheMoney``) were in neither input
+    keys), over the stored leg ``fallback`` (an ``asdict(OptionContract)``).
+    The prices and the volume, which a cached quote holds, read the quote
+    first and fall back to the stored leg key by key; the expiry, type,
+    strike, greeks, open interest, days to expiration and moneyness, which it
+    does not hold, are the stored leg's. A raw Schwab chain entry, in
+    camelCase, is ``parse_option_chain``'s to read; the camelCase keys this
+    also tried (``putCall``, ``strikePrice``, ``openInterest``,
+    ``totalVolume``, ``volume``, ``daysToExpiration``, ``inTheMoney``) and
+    the quote-first reads of the stored-only fields were in neither input
     and are gone (2026-09-27)."""
     quote = quote or {}
     fallback = fallback or {}
 
-    def pick(*keys: str, default: float | None = None) -> float | None:
+    def pick(*keys: str, default: float) -> float:
         # Key by key, the fresh quote first and then the fallback metadata; a
         # missing, blank, NaN, infinite or unparseable value falls through to
         # the next.
@@ -400,13 +404,13 @@ def contract_from_quote(symbol: str, quote: dict[str, Any] | None, fallback: dic
         bid=pick("bid", default=0.0),
         ask=pick("ask", default=0.0),
         mark=pick("mark", "last", default=0.0),
-        delta=pick("delta"),
-        gamma=pick("gamma"),
-        theta=pick("theta"),
-        open_interest=safe_int(pick("open_interest"), 0),
-        total_volume=safe_int(pick("total_volume"), 0),
-        days_to_expiration=safe_int(pick("days_to_expiration"), 0),
-        in_the_money=bool(quote.get("in_the_money") if "in_the_money" in quote else fallback.get("in_the_money", False)),
+        delta=safe_float(fallback.get("delta"), finite=True),
+        gamma=safe_float(fallback.get("gamma"), finite=True),
+        theta=safe_float(fallback.get("theta"), finite=True),
+        open_interest=safe_int(fallback.get("open_interest"), 0),
+        total_volume=safe_int(pick("total_volume", default=0.0), 0),
+        days_to_expiration=safe_int(fallback.get("days_to_expiration"), 0),
+        in_the_money=bool(fallback.get("in_the_money", False)),
     )
 
 

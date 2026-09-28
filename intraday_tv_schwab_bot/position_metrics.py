@@ -4,7 +4,7 @@ position's metadata carries.
 
 Plain functions of a :class:`~intraday_tv_schwab_bot.models.Position` (or a
 side, an entry and a price) with no engine-side dependencies: the paper
-account, the position manager, the risk manager and the exit side read a
+account, the position manager, the trade manager and the exit side read a
 position's move, return, R and underlying price space here. Each caller
 keeps its own answer for degenerate input (a zero entry, no price).
 """

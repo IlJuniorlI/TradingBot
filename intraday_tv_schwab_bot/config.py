@@ -2038,15 +2038,19 @@ def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path)
     elif underlyings is not None:
         # One message per entry that is not one ticker the symbol normalizer
         # keeps, in the event rows' format; stricter than their rule, which
-        # takes any non-blank string (NONE, 'QQQ IWM'). Until 2026-09-27 an
-        # unquoted ON (read as true) was traded as TRUE, and an entry the
-        # normalizer drops (~, NONE, NULL, NAN, a blank) went unseen: a list
-        # of nothing else was kept raw, so it passed the emptiness check and
-        # an options strategy ran with no underlyings.
+        # takes any non-blank string (NONE, 'QQQ IWM'). Whitespace, a comma
+        # or a semicolon inside an entry reads as two tickers ('SPY QQQ',
+        # 'SPY,QQQ', 'SPY;QQQ'); '$SPX', 'BRK.B' and 'BRK/B' are one each.
+        # Until 2026-09-27 an unquoted ON (read as true) was traded as TRUE,
+        # a joined pair loaded as one ticker, and an entry the normalizer
+        # drops (~, NONE, NULL, NAN, a blank) went unseen: a list of nothing
+        # else was kept raw, so it passed the emptiness check and an options
+        # strategy ran with no underlyings.
         errors += [
             f"options.underlyings[{index}] must be a ticker, got {symbol!r}{ticker_quote_hint(symbol)}"
             for index, symbol in enumerate(underlyings)
-            if not isinstance(symbol, str) or len(symbol.split()) != 1 or not normalize_symbol_list([symbol])
+            if not isinstance(symbol, str) or len(symbol.split()) != 1 or "," in symbol or ";" in symbol
+            or not normalize_symbol_list([symbol])
         ]
     # The times fail here, naming the key, instead of where they are read:
     # force_flatten_time when an options strategy is built, the other three

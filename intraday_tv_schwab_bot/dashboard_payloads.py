@@ -15,7 +15,7 @@ import json
 import logging
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
@@ -23,6 +23,9 @@ from . import sessions
 from .bars import equity_stream_window_bars, last_bucket_forming, resample_bars, session_bucket_ends
 from .indicators import ensure_standard_indicator_frame
 from .numeric import safe_float
+
+if TYPE_CHECKING:
+    from .paper_account import PaperAccount
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -200,7 +203,7 @@ def frame_signature(frame: pd.DataFrame | None) -> tuple[Any, ...]:
     )
 
 
-def recent_trade_markers(account: Any, symbol: str) -> list[dict[str, Any]]:
+def recent_trade_markers(account: PaperAccount, symbol: str) -> list[dict[str, Any]]:
     """Return up to 12 dashboard-shaped trade rows for ``symbol`` from
     today's ``account.trades`` (filtered by current ET session date).
 
@@ -220,7 +223,7 @@ def recent_trade_markers(account: Any, symbol: str) -> list[dict[str, Any]]:
     if not key:
         return out
     today = sessions.now_et().date()
-    for trade in list(getattr(account, "trades", [])):
+    for trade in list(account.trades):
         if str(getattr(trade, "symbol", "") or "").upper().strip() != key:
             continue
         # Today-filter: a trade belongs to today's chart if either side
@@ -249,7 +252,7 @@ def recent_trade_markers(account: Any, symbol: str) -> list[dict[str, Any]]:
     return out
 
 
-def symbol_trade_signature(account: Any, symbol: str) -> tuple[Any, ...]:
+def symbol_trade_signature(account: PaperAccount, symbol: str) -> tuple[Any, ...]:
     """Build a cache-key signature capturing the last trade state for
     ``symbol`` on ``account``.
 
@@ -270,7 +273,7 @@ def symbol_trade_signature(account: Any, symbol: str) -> tuple[Any, ...]:
     latest_entry: str | None = None
     latest_reason: str | None = None
     matched = 0
-    for trade in list(getattr(account, "trades", [])):
+    for trade in list(account.trades):
         if str(getattr(trade, "symbol", "") or "").upper().strip() != key:
             continue
         count += 1

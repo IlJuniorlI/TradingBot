@@ -204,7 +204,7 @@ signal = self.entry_policy.emit(
 
 - `emit` stamps `final_priority_score = strategy_score + shared_context_score`, plus `strategy_priority_score`, `shared_context_score`, `entry_style_family`, `regime` (defaults to the style), `orb_window_entry`, `entry_price` (price-level signals), the `shared_entry_*` stamps and the shared context lists. They are merged over the strategy's own metadata. If a score key of your own should include the shared terms, compute it from `strategy_score + admitted.shared_context_score`.
 - A target other than `admitted.target`, the ladder's active rung or None raises.
-- For an option: pass the order side as `order_side` when it differs from the direction, and the premium stop as `premium_stop` (required for premium proposals, refused otherwise). `metadata['direction']` (`bullish*` / `bearish*`) must agree with the proposal's direction, or `emit` raises.
+- For an option: pass the order side as `order_side` when it differs from the direction, and the premium stop as `premium_stop` (required for premium proposals, refused otherwise). `metadata['direction']` (`bullish*` / `bearish*`) must agree with the proposal's direction, or `emit` raises. `metadata['asset_type']` must be `OPTION_VERTICAL` or `OPTION_SINGLE` (`models.ASSET_TYPE_OPTION_VERTICAL` / `ASSET_TYPE_OPTION_SINGLE`, read upper case), or `emit` raises (2026-09-27): the risk checks and the gatekeeper's order path know an option by it (`models.is_option_asset`), and a signal without it would be sized, gated and sent as an equity order for the underlying.
 
 Worked examples, simplest first:
 

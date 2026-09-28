@@ -52,10 +52,9 @@ def json_safe(value: Any, *, non_finite: Literal["keep", "null"]) -> Any:
       and a bool_ a bool.
     - A date or datetime (a pandas Timestamp too, and its NaT, which reads
       ``NaT``) becomes its ``isoformat()``, a ``T`` between the date and the
-      time. A numpy
-      datetime64 is read as a pandas Timestamp first, whatever its unit
-      (``.item()`` gives an int of nanoseconds at the ns unit pandas uses),
-      and its NaT is None.
+      time. A numpy datetime64 is read as a pandas Timestamp first, whatever
+      its unit (``.item()`` gives an int of nanoseconds at the ns unit pandas
+      uses), and its NaT is None.
     - A duration is not a date: a timedelta and a pandas Timedelta are
       written as their string (``0:05:00``, ``0 days 00:05:00``), and a numpy
       timedelta64 as what ``.item()`` gives (a timedelta, but an int count
