@@ -66,7 +66,9 @@ from .levels_shared import collapse_price_ladder, effective_side_tolerance
 if TYPE_CHECKING:
     from ._strategies.strategy_base import BaseStrategy
     from .data_feed import MarketDataStore
+    from .htf_levels import HTFContext
     from .paper_account import PaperAccount
+    from .technical_levels import TechnicalLevelsContext
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -476,10 +478,13 @@ class DashboardCache:
         *,
         allow_refresh: bool = True,
     ) -> dict[str, Any]:
-        """Assemble the full dashboard snapshot payload for a single symbol.
-        Largest of the dashboard payload builders — combines quote, SR,
-        levels, technicals, bars, patterns, and position markers into one
-        cache-keyed dict. Extracted from IntradayBot."""
+        """Assemble the full dashboard snapshot payload for a single symbol:
+        quote, bars, S/R ladder, technicals, overlays and position markers in
+        one cache-keyed dict. The ``_snapshot_*`` builders below make the
+        parts, called in the order the data feed has always been read (its
+        cycle caches are order-sensitive); each overlay builder logs its own
+        failure and falls back to no overlay. The HTF context and the frame's
+        close are read once, here, and shared."""
         symbol = str(symbol or "").upper().strip()
         quote = self.data.get_quote(symbol) or {}
         max_quote_age = max(1.0, float(self.config.runtime.quote_cache_seconds))
@@ -510,6 +515,115 @@ class DashboardCache:
                 # busy multi-symbol watchlists where dashboard polls
                 # this for every snapshot every refresh cycle.
                 return dict(cached_snapshot["payload"])
+        bars, snapshot_ema_spans = self._snapshot_bars(symbol, frame)
+        quote_payload, current_price = self._snapshot_quote(
+            quote, quote_is_fresh, frame, bars, candidate_row, sr_row,
+        )
+        ladder = self._snapshot_ladder(sr_row, current_price)
+        tech_ctx, technical_payload = self._snapshot_technicals(symbol, frame, current_price)
+        position_markers = self._position_markers(position_row)
+
+        nearest_support = ladder["nearest_support"]
+        nearest_resistance = ladder["nearest_resistance"]
+        zone_support_prices = [nearest_support] if nearest_support not in (None, 0.0) else []
+        zone_resistance_prices = [nearest_resistance] if nearest_resistance not in (None, 0.0) else []
+        key_level_zones = self.strategy_level_zones(
+            symbol,
+            frame,
+            current_price,
+            support_prices=zone_support_prices,
+            resistance_prices=zone_resistance_prices,
+            broken_support_price=safe_float((sr_row or {}).get("broken_support")),
+            broken_resistance_price=safe_float((sr_row or {}).get("broken_resistance")),
+            pending_support_price=safe_float((sr_row or {}).get("pending_support")),
+            pending_resistance_price=safe_float((sr_row or {}).get("pending_resistance")),
+            allow_htf_refresh=allow_refresh,
+        )
+        compact_chart_profile = self.chart_profile("compact")
+        expanded_chart_profile = self.chart_profile("expanded")
+        # The HTF context is read once, if any overlay needs it (the HTF FVGs,
+        # the RSI divergence lines), and the divergence lines reuse it.
+        chart_wants_rsi_div = bool(compact_chart_profile.show_rsi_divergence) or bool(expanded_chart_profile.show_rsi_divergence)
+        htf_ctx, htf_fair_value_gaps = self._snapshot_htf_overlays(
+            symbol, compact_chart_profile, expanded_chart_profile, chart_wants_rsi_div, allow_refresh=allow_refresh,
+        )
+
+        # The LTF FVG and order block overlays are the contexts the strategy
+        # reads: its request, at its price, the close of the frame's last
+        # bar (the data feed's cycle cache holds them under that price). Until
+        # 2026-09-27 the dashboard asked at the quote's last, so it drew
+        # blocks and gaps sized, ranked and cut at a price the strategy never
+        # judged, and built them a second time.
+        frame_close = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
+        ltf_fair_value_gaps = self._snapshot_ltf_fair_value_gaps(
+            symbol, frame, frame_close, compact_chart_profile, expanded_chart_profile,
+        )
+        htf_order_blocks, ltf_order_blocks = self._snapshot_order_blocks(
+            symbol, frame, frame_close, compact_chart_profile, expanded_chart_profile,
+        )
+        ltf_divergence_lines, htf_divergence_lines = self._snapshot_divergence_lines(
+            symbol, tech_ctx, htf_ctx, compact_chart_profile, expanded_chart_profile, chart_wants_rsi_div,
+        )
+
+        chart_payload = {
+            "levels": {
+                "nearest_support": nearest_support,
+                "nearest_resistance": nearest_resistance,
+                "support_distance_pct": safe_float((sr_row or {}).get("support_distance_pct")),
+                "resistance_distance_pct": safe_float((sr_row or {}).get("resistance_distance_pct")),
+                "supports": ladder["supports"],
+                "resistances": ladder["resistances"],
+                "next_support": ladder["next_support"],
+                "next_resistance": ladder["next_resistance"],
+                "broken_support": safe_float((sr_row or {}).get("broken_support")),
+                "broken_resistance": safe_float((sr_row or {}).get("broken_resistance")),
+                "pending_support": safe_float((sr_row or {}).get("pending_support")),
+                "pending_resistance": safe_float((sr_row or {}).get("pending_resistance")),
+                "key_level_zones": key_level_zones,
+                "htf_fair_value_gaps": htf_fair_value_gaps,
+                "ltf_fair_value_gaps": ltf_fair_value_gaps,
+                "htf_order_blocks": htf_order_blocks,
+                "ltf_order_blocks": ltf_order_blocks,
+                "ltf_divergence_lines": ltf_divergence_lines,
+                "htf_divergence_lines": htf_divergence_lines,
+            },
+            "technicals": technical_payload,
+            "position_markers": position_markers,
+            "recent_trades": recent_trade_markers(self.account, symbol),
+            # Spans of the snapshot bars' ema9 / ema20, for labelling them
+            # before (or without) a chart payload.
+            "ema_fast_span": snapshot_ema_spans[0],
+            "ema_slow_span": snapshot_ema_spans[1],
+        }
+
+        payload = {
+            "symbol": symbol,
+            "exchange": (
+                normalize_exchange(exchange)
+                or normalize_exchange((candidate_row or {}).get("exchange"))
+                or quote_exchange(quote)
+            ),
+            "description": quote.get("description"),
+            "quote": {
+                **quote_payload,
+                "age_seconds": self.data.quote_age_seconds(symbol) if quote else None,
+            },
+            "candidate": copy.deepcopy(candidate_row) if candidate_row else None,
+            "entry_decision": copy.deepcopy(entry_decision) if entry_decision else None,
+            "warmup": copy.deepcopy(warmup) if warmup else None,
+            "position": copy.deepcopy(position_row) if position_row else None,
+            "support_resistance": copy.deepcopy(sr_row) if sr_row else None,
+            "bars": bars,
+            "chart": chart_payload,
+        }
+        with self.lock:
+            self.snapshot_cache[symbol] = {"signature": snapshot_signature, "payload": copy.deepcopy(payload)}
+        return payload
+
+    def _snapshot_bars(self, symbol: str, frame: pd.DataFrame | None) -> tuple[list[dict[str, Any]], tuple[int, int]]:
+        """The snapshot's newest bars of ``frame``, each with its candle tags,
+        and the spans of their ema9 / ema20: the strategy's own LTF EMAs when
+        its LTF is 1m, else the frame's 9 / 20."""
         # Per-bar candle pattern map (completion-bar only, tier cascade).
         # Drives the tooltip's "Candle Patterns (this bar)" section. Computed
         # before bars are built so each bar dict can carry its own matched
@@ -536,6 +650,24 @@ class DashboardCache:
         snapshot_ema_spans = (9, 20)
         if bars and self.strategy.ltf_minutes() == 1:
             snapshot_ema_spans = self._apply_strategy_ltf_emas(symbol, frame, bars, timeframe="1min")
+        return bars, snapshot_ema_spans
+
+    def _snapshot_quote(
+        self,
+        quote: dict[str, Any],
+        quote_is_fresh: bool,
+        frame: pd.DataFrame | None,
+        bars: list[dict[str, Any]],
+        candidate_row: dict[str, Any] | None,
+        sr_row: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], float | None]:
+        """The snapshot's ``quote`` block and the price its levels are read at.
+
+        A stale quote gives only its open and close; the last price, close,
+        change and volume fall back to the bars and the candidate row. The
+        price is the last price, else the S/R row's, else the newest bar's
+        close. The quote's age is not here: ``symbol_snapshot`` asks the feed
+        for it last, where it always has."""
         latest_bar: dict[str, Any] = bars[-1] if bars else {}
         session_total_volume: float | None = None
         if frame is not None and not frame.empty:
@@ -601,12 +733,29 @@ class DashboardCache:
             current_price = safe_float((sr_row or {}).get("price"))
         if current_price is None:
             current_price = safe_float(latest_bar.get("close"))
+        return {
+            "last": last_price,
+            "bid": quote_bid,
+            "ask": quote_ask,
+            "mid": display_mid,
+            "mark": display_mark,
+            "open": quote_open,
+            "close": display_close,
+            "net_change": net_change,
+            "percent_change": percent_change,
+            "total_volume": display_total_volume,
+            "is_fresh": quote_is_fresh,
+        }, current_price
 
+    def _snapshot_ladder(self, sr_row: dict[str, Any] | None, current_price: float | None) -> dict[str, Any]:
+        """The chart's S/R ladder from ``sr_row``: the nearest support and
+        resistance, the rungs beyond them, collapsed at the row's spacing, and
+        the next rung on each side. Without a row the prices are None and the
+        rungs empty."""
         support_prices: list[float] = []
         resistance_prices: list[float] = []
         next_support = None
         next_resistance = None
-        technical_payload: dict[str, Any] = {}
         nearest_support = None
         nearest_resistance = None
         if sr_row:
@@ -658,7 +807,22 @@ class DashboardCache:
 
             next_support = support_prices[0] if support_prices else None
             next_resistance = resistance_prices[0] if resistance_prices else None
+        return {
+            "nearest_support": nearest_support,
+            "nearest_resistance": nearest_resistance,
+            "supports": support_prices,
+            "resistances": resistance_prices,
+            "next_support": next_support,
+            "next_resistance": next_resistance,
+        }
 
+    def _snapshot_technicals(
+        self, symbol: str, frame: pd.DataFrame | None, current_price: float | None,
+    ) -> tuple[TechnicalLevelsContext | None, dict[str, Any]]:
+        """The technical levels built on the strategy's LTF frame, and the
+        chart's ``technicals`` payload of them. A failed build is logged
+        (``technical_overlay``) and gives no context and an empty payload."""
+        technical_payload: dict[str, Any] = {}
         # Build technical levels (fib extensions/retracements, AVWAP,
         # Bollinger, ADX, channels, trendlines, etc.) on the strategy's LTF
         # frame so all overlays render at LTF-derived prices. Strategies
@@ -801,10 +965,17 @@ class DashboardCache:
                     "support_respected": bool(getattr(tech_ctx, "support_respected", False)),
                     "resistance_respected": bool(getattr(tech_ctx, "resistance_respected", False)),
                 }
+        return tech_ctx, technical_payload
 
+    @staticmethod
+    def _position_markers(position_row: dict[str, Any] | None) -> dict[str, Any]:
+        """The chart's markers for ``position_row``: an equity position's
+        entry, stop and target, an option position's strikes (its stop and
+        target are option prices, off the underlying's axis), and either
+        one's breakeven."""
         is_option = is_option_asset(position_row)
         allows_underlying_markers = bool(position_row) and not is_option
-        position_markers = {
+        return {
             "asset_type": asset_type_of(position_row) if position_row else None,
             "show_underlying_lines": allows_underlying_markers,
             "side": (position_row or {}).get("side"),
@@ -826,28 +997,21 @@ class DashboardCache:
             "option_strike": safe_float((position_row or {}).get("option_strike")) if is_option else None,
         }
 
-        zone_support_prices = [nearest_support] if nearest_support not in (None, 0.0) else []
-        zone_resistance_prices = [nearest_resistance] if nearest_resistance not in (None, 0.0) else []
-        key_level_zones = self.strategy_level_zones(
-            symbol,
-            frame,
-            current_price,
-            support_prices=zone_support_prices,
-            resistance_prices=zone_resistance_prices,
-            broken_support_price=safe_float((sr_row or {}).get("broken_support")),
-            broken_resistance_price=safe_float((sr_row or {}).get("broken_resistance")),
-            pending_support_price=safe_float((sr_row or {}).get("pending_support")),
-            pending_resistance_price=safe_float((sr_row or {}).get("pending_resistance")),
-            allow_htf_refresh=allow_refresh,
-        )
+    def _snapshot_htf_overlays(
+        self,
+        symbol: str,
+        compact_chart_profile: DashboardChartConfig,
+        expanded_chart_profile: DashboardChartConfig,
+        chart_wants_rsi_div: bool,
+        *,
+        allow_refresh: bool,
+    ) -> tuple[HTFContext | None, list[dict[str, Any]]]:
+        """The HTF context, read if a chart draws its FVGs (and the strategy's
+        request builds them) or its RSI divergence lines, and its FVG overlay.
+        A failure is logged (``htf_fair_value_gaps_collect``) and gives no
+        context and no gaps."""
         htf_fair_value_gaps: list[dict[str, Any]] = []
-        compact_chart_profile = self.chart_profile("compact")
-        expanded_chart_profile = self.chart_profile("expanded")
-        # Hoisted HTF context — built once if any consumer needs it (FVG
-        # rendering, divergence trendlines). Kept outside the FVG try/except
-        # so the divergence block below can read it without re-fetching.
         htf_ctx = None
-        chart_wants_rsi_div = bool(compact_chart_profile.show_rsi_divergence) or bool(expanded_chart_profile.show_rsi_divergence)
         try:
             # The strategy's HTF FVG arguments, part of the context's cache key.
             htf_fvg_request = self.strategy.htf_fvg_request()
@@ -881,14 +1045,20 @@ class DashboardCache:
             )
             htf_fair_value_gaps = []
             htf_ctx = None
+        return htf_ctx, htf_fair_value_gaps
 
-        # The LTF FVG and order block overlays are the contexts the strategy
-        # reads: its request, at its price, the close of the frame's last
-        # bar (the data feed's cycle cache holds them under that price). Until
-        # 2026-09-27 the dashboard asked at the quote's last, so it drew
-        # blocks and gaps sized, ranked and cut at a price the strategy never
-        # judged, and built them a second time.
-        frame_close = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
+    def _snapshot_ltf_fair_value_gaps(
+        self,
+        symbol: str,
+        frame: pd.DataFrame | None,
+        frame_close: float,
+        compact_chart_profile: DashboardChartConfig,
+        expanded_chart_profile: DashboardChartConfig,
+    ) -> list[dict[str, Any]]:
+        """The LTF FVG overlay, when the config builds LTF gaps and a chart
+        draws them: the strategy's context at ``frame_close``, each gap
+        anchored on the LTF frame. A failure is logged
+        (``ltf_fair_value_gaps_collect``) and gives no gaps."""
         ltf_fair_value_gaps: list[dict[str, Any]] = []
         try:
             sr_cfg = getattr(self.config, "support_resistance", None)
@@ -920,7 +1090,20 @@ class DashboardCache:
                 symbol,
             )
             ltf_fair_value_gaps = []
+        return ltf_fair_value_gaps
 
+    def _snapshot_order_blocks(
+        self,
+        symbol: str,
+        frame: pd.DataFrame | None,
+        frame_close: float,
+        compact_chart_profile: DashboardChartConfig,
+        expanded_chart_profile: DashboardChartConfig,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """The HTF and LTF order-block overlays, each when the config builds it
+        and a chart draws it: the strategy's request at ``frame_close``. A
+        failure is logged (``htf_order_blocks_collect`` /
+        ``ltf_order_blocks_collect``) and gives no blocks on that side."""
         # Order blocks. Same payload shape as FVGs (lower/upper/midpoint/size/
         # direction/filled_pct/first_seen/last_seen) — `fvg_payload`
         # is reused since it's shape-driven, not type-driven. Frontend reads
@@ -995,11 +1178,25 @@ class DashboardCache:
                 symbol,
             )
             ltf_order_blocks = []
+        return htf_order_blocks, ltf_order_blocks
 
+    def _snapshot_divergence_lines(
+        self,
+        symbol: str,
+        tech_ctx: TechnicalLevelsContext | None,
+        htf_ctx: HTFContext | None,
+        compact_chart_profile: DashboardChartConfig,
+        expanded_chart_profile: DashboardChartConfig,
+        chart_wants_rsi_div: bool,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """The chart's divergence lines: the LTF ones from ``tech_ctx`` (RSI and
+        OBV, as the profiles draw them) and the HTF RSI ones from ``htf_ctx``.
+        A failure is logged (``divergence_lines_collect``) and gives no lines
+        on either side."""
         # Divergence trendlines (RSI / OBV, regular / hidden, bullish / bearish)
         # for the price chart. LTF divergences come from tech_ctx (built off
         # the strategy's primary frame), HTF divergences come from htf_ctx
-        # (hoisted above; populated when divergence rendering or FVG rendering
+        # (read once by _snapshot_htf_overlays, when divergence or FVG rendering
         # is enabled). Each entry is a DivergenceMatch.to_payload() dict —
         # frontend draws a line connecting the two pivot points and color-
         # codes by direction (green=bullish/red=bearish), kind (solid=regular,
@@ -1049,71 +1246,7 @@ class DashboardCache:
             )
             ltf_divergence_lines = []
             htf_divergence_lines = []
-
-        chart_payload = {
-            "levels": {
-                "nearest_support": nearest_support,
-                "nearest_resistance": nearest_resistance,
-                "support_distance_pct": safe_float((sr_row or {}).get("support_distance_pct")),
-                "resistance_distance_pct": safe_float((sr_row or {}).get("resistance_distance_pct")),
-                "supports": support_prices,
-                "resistances": resistance_prices,
-                "next_support": next_support,
-                "next_resistance": next_resistance,
-                "broken_support": safe_float((sr_row or {}).get("broken_support")),
-                "broken_resistance": safe_float((sr_row or {}).get("broken_resistance")),
-                "pending_support": safe_float((sr_row or {}).get("pending_support")),
-                "pending_resistance": safe_float((sr_row or {}).get("pending_resistance")),
-                "key_level_zones": key_level_zones,
-                "htf_fair_value_gaps": htf_fair_value_gaps,
-                "ltf_fair_value_gaps": ltf_fair_value_gaps,
-                "htf_order_blocks": htf_order_blocks,
-                "ltf_order_blocks": ltf_order_blocks,
-                "ltf_divergence_lines": ltf_divergence_lines,
-                "htf_divergence_lines": htf_divergence_lines,
-            },
-            "technicals": technical_payload,
-            "position_markers": position_markers,
-            "recent_trades": recent_trade_markers(self.account, symbol),
-            # Spans of the snapshot bars' ema9 / ema20, for labelling them
-            # before (or without) a chart payload.
-            "ema_fast_span": snapshot_ema_spans[0],
-            "ema_slow_span": snapshot_ema_spans[1],
-        }
-
-        payload = {
-            "symbol": symbol,
-            "exchange": (
-                normalize_exchange(exchange)
-                or normalize_exchange((candidate_row or {}).get("exchange"))
-                or quote_exchange(quote)
-            ),
-            "description": quote.get("description"),
-            "quote": {
-                "last": last_price,
-                "bid": quote_bid,
-                "ask": quote_ask,
-                "mid": display_mid,
-                "mark": display_mark,
-                "open": quote_open,
-                "close": display_close,
-                "net_change": net_change,
-                "percent_change": percent_change,
-                "total_volume": display_total_volume,
-                "is_fresh": quote_is_fresh,
-                "age_seconds": self.data.quote_age_seconds(symbol) if quote else None,
-            },
-            "candidate": copy.deepcopy(candidate_row) if candidate_row else None,
-            "entry_decision": copy.deepcopy(entry_decision) if entry_decision else None,
-            "warmup": copy.deepcopy(warmup) if warmup else None,
-            "position": copy.deepcopy(position_row) if position_row else None,
-            "support_resistance": copy.deepcopy(sr_row) if sr_row else None,
-            "bars": bars,
-            "chart": chart_payload,
-        }
-        with self.lock:
-            self.snapshot_cache[symbol] = {"signature": snapshot_signature, "payload": copy.deepcopy(payload)}
-        return payload
+        return ltf_divergence_lines, htf_divergence_lines
 
     def strategy_level_zones(
         self,
@@ -1838,7 +1971,7 @@ class DashboardCache:
         }
         # Isolate cache entry from the outgoing payload so concurrent
         # pollers that hit this cache_key can't observe/mutate each other.
-        # Matches the ordering in symbol_snapshot at line 964.
+        # The same deep copy on store as symbol_snapshot's cache.
         with self.lock:
             self.chart_cache[cache_key] = {"signature": chart_signature, "payload": copy.deepcopy(payload)}
         return payload

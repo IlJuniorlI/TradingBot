@@ -310,6 +310,49 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`DashboardCache.symbol_snapshot` is cut into private builders (refactor
+  cut C40b).** *2026-09-27* — The 650-line method now assembles the snapshot
+  from builders on the same class, called in the order the data feed has
+  always been read (its cycle caches are order-sensitive):
+  - `_snapshot_bars`: the newest bars with their candle tags, and the spans
+    of their EMAs;
+  - `_snapshot_quote`: the quote block and the price the levels are read at
+    (the quote's age is still read last, at the assembly);
+  - `_snapshot_ladder`: the S/R ladder, nearest and next rungs each side;
+  - `_snapshot_technicals`: the technical levels on the strategy's LTF
+    frame, and their payload;
+  - `_position_markers` (a static method): the position's chart markers;
+  - `_snapshot_htf_overlays`: the HTF context and its FVGs;
+  - `_snapshot_ltf_fair_value_gaps`, `_snapshot_order_blocks` (HTF and LTF)
+    and `_snapshot_divergence_lines`.
+
+  `symbol_snapshot` keeps the reads before the cache check, the level zones,
+  the chart profiles, the HTF context and the frame's close (each read once
+  and handed to the builders that use it), the payload assembly and the
+  cache store (a shallow copy on a hit, a deep copy on a store). Each
+  builder keeps its try scope, its `log_component_failure` key and message
+  and its fallback. The builders stay in `dashboard_cache.py`, where tests
+  patch the module names they read (`build_technical_levels_context`,
+  `fvg_payload`, `detect_per_bar_candle_patterns`). This is the split of
+  `symbol_snapshot` the plan's dashboard_cache row asks for (RT-17(3)),
+  which cut C40 left. Its other clause, making the FVG / order-block overlay
+  builder reusable by `chart_payload`, is dropped: `chart_payload` builds no
+  FVGs or order blocks (the page draws the snapshot's), so there is no
+  second reader. A comment in `chart_payload` that named a line of the old
+  method now says what it matches. No behaviour changes: 800 fuzzed
+  snapshots, each built and then asked for twice more (from the cache, or
+  rebuilt when a refresh is due), give the same payloads, the same feed and
+  strategy reads in the same order and the same failure logs (key, message
+  and exception), byte for byte. The cases cover every chart-profile overlay
+  toggle, LTF 1m and 5m strategies, missing, stale and fresh quotes,
+  premarket, RTH and after-hours clocks, S/R rows with and without a price
+  or a spacing, equity, option and no positions, and a failure at each of
+  the seven keys. Tests: `tests/test_silent_excepts.py`
+  (`TestReportedSnapshotComponents`) pins the five failure paths no test
+  covered (the candle tags, the technical build, the HTF and LTF order
+  blocks and the divergence lines): each is logged, and its part falls back
+  to empty whatever it held by then.
+
 - **One screener template per family; the candidate ranking, the gap score
   and the anti-chase reason names each live once (refactor cut C45).**
   *2026-09-27* — Screener and plugin code that was written out several times
