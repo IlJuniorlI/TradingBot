@@ -9,6 +9,109 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A static disaster stop rests at the broker for each live equity position
+  (`execution.disaster_stop_enabled`, on by default and in every equity
+  preset, with `disaster_stop_r: 1.0`, `disaster_stop_min_pct: 0.0025` and
+  `disaster_stop_escalation_attempts: 3`).** *2026-09-28* — study B's O5.
+  Brackets are off in every preset, so until now nothing rested at the
+  broker, and a position the bot stopped managing (a crash, a hang, a lost
+  connection) had no stop at all.
+  - One plain `STOP` per position (`DAY`, regular session), resting
+    max(`disaster_stop_r` x initial R, `disaster_stop_min_pct` x entry)
+    beyond the initial stop and rounded a tick away from the market; a LONG's
+    is at least $0.01. It is priced off the fill and the stop the position
+    keeps (the default-distance one after a fill through the signal's),
+    stamped on the position as `disaster_stop_price` (EXIT_CONTEXT carries
+    it), and never moved as the engine's stop ratchets. The floor keeps a
+    trade whose initial risk is inside one minute's noise from resting it
+    there too.
+  - The engine keeps its own stop and every exit: it checks its stop every
+    cycle whatever rests at the broker (see **Fixed**). Every engine exit
+    cancels the disaster stop first (the existing cancel before an exit),
+    and books what it sold before the cancel landed.
+  - It is kept as the position's bracket record with `sync_mode: disaster`, a
+    flavour of its own (`static` is refused with the adaptive modes, whose
+    stop ratchets). So the fill reconcile books a filled one as a
+    `disaster_stop` exit; a scale-out's remainder gets a fresh one at the
+    same price; one that died at the broker is re-placed once, never after
+    `REJECTED`; and the restore adopts one still resting (resized to what is
+    held), places one at the saved price when none rests, and never counts it
+    as a foreign order. With it on, a restore waits for the working-order
+    list, as in bracket mode.
+  - It goes out right after the entry fills and the position is saved.
+    Outside the regular session nothing is sent (Schwab rejects a `STOP`
+    there), and the first cycle after 09:30 places it. A refused submit is
+    tried again a minute later.
+  - A submit whose outcome is unknown is never re-sent blind: a transport
+    failure, a response that timed out (`schwab_api.
+    SCHWAB_WRITE_UNKNOWN_OUTCOME`: schwabdev never retries a POST, so a
+    `place_order` whose response times out raises `requests`' `ReadTimeout`,
+    which the read-side `SCHWAB_TRANSPORT_ERRORS` does not name), or an
+    accepted order without its id. A minute later the day's working orders
+    are read (`broker_payloads.sent_exit_stop`): the exit `STOP` resting at
+    exactly the price and quantity sent is adopted; with no exit stop on the
+    symbol one is placed; beside an exit stop that is not the one sent (one
+    placed by hand in the app) none is adopted and none placed, so a position
+    never rests two stops. `PositionManager.ensure_disaster_stop` saves the
+    record as `unconfirmed`, at the price and quantity about to be sent,
+    before it sends anything, so an error anywhere after that leaves a stop
+    that is looked for before another goes out. A restore whose protection
+    step raises leaves it `unconfirmed` at the saved price for the shares
+    held.
+  - Isolated per position at entry: a placement that raises right after an
+    entry is logged against that position with its type and traceback
+    (`EntryGatekeeper._ensure_disaster_stop_after_entry`), and the entry pass
+    goes on; the next management cycle places the stop still owed.
+  - Escalated: each attempt that leaves a position without its stop logs on
+    its own line (a refused or unknown-outcome submit, an order list that
+    cannot be read or holds a stop it cannot tell for its own, a cancel
+    before an exit that cannot be confirmed, which holds the exit), and every
+    `disaster_stop_escalation_attempts`-th consecutive one logs
+    `DISASTER STOP DEGRADED` at CRITICAL naming the position.
+  - After a full close of a position that had live broker protection, the
+    day's working orders are read once and any exit order still working on
+    the symbol for its side is cancelled (`PositionManager.
+    _sweep_exit_orders`): a stop whose unknown-outcome submit landed after
+    all, a replacement a replace left untracked (`new_id_unknown`), a stop
+    moved in the app. One that cannot be cancelled, or that filled first,
+    logs `EXIT ORDERS LEFT` at CRITICAL. A dry run reads nothing.
+  - Measured on the archive (study B's trade table and the archived 1m tapes:
+    176 trades on 22 equity days): at 1.0R it would have fired on none of
+    them while the engine held the trade (whole 1m bars). Counting every
+    print of the entry and exit minutes, it fires on 4 without the floor and
+    on 1 with it (ADBE 09-24, in the minute the engine stopped out itself).
+    At 0.5R with no floor it fired on AMZN 09-23 (-3.5R), which the floor
+    removes. Held to the close with no exit at all, 22 of the trades went 5R
+    or more against the entry and 8 went 10R or more; the disaster stop caps
+    a trade at about 2R (the median; 9.3R at most, for a trade whose R was
+    0.03% of its price).
+  - A dry run places nothing, and no dry-run result moves.
+  - Checked at load: the switch is `true` or `false`, `disaster_stop_r` a
+    finite number above 0, `disaster_stop_min_pct` a finite number in
+    [0, 1] and `disaster_stop_escalation_attempts` an integer >= 1
+    (`config._NUMBER_CHECKS["execution"]`). It is refused beside
+    `bracket_orders_enabled` (two resting stops on the same shares both sell
+    when a flush takes out both), for an options strategy (equity positions
+    only; the two 0DTE presets say `false`, and so must any options config,
+    since on is the default), and, with `schwab.dry_run: false`, beside
+    `runtime.reconcile_on_startup: false` or `startup_reconcile_mode:
+    ignore` / `log_only`, which would forget the stops a restart finds
+    resting (`config._validate_disaster_stop_restart`; each error names both
+    keys). `tests/guards/test_preset_parity.py` pins the presets and the
+    local `config.yaml` when it exists.
+  - Also: `broker_payloads.collect_protective_fills` takes the stop leg's
+    reason (`stop_reason`); `StartupReconciler._resting_stop_for` is
+    `broker_payloads.resting_exit_stop`, on top of the new
+    `working_exit_orders`; `extract_working_orders` rows carry `stopPrice`,
+    `quantity` and `filledQuantity`; `SchwabExecutor.ensure_position_protected`
+    takes the level the protection rests at (`resting_stop_price`; the
+    engine's stop for a bracket), and `protective_stop_level` rounds a level
+    as a protective order is sent; and the restore's warning when it cannot
+    re-establish protection names the error's type.
+  - Tests: `tests/runtime/test_disaster_stop.py`, the timed-out POST in
+    `tests/foundation/test_schwab_api.py`, and the preset, number and
+    bracket-mode tests that now name the switch.
+
 - **`shared_exit.adaptive_ladder_touch_hold` (off in every preset and by
   default) and `adaptive_ladder_touch_hold_timeout_seconds` (45).**
   *2026-09-27* — the adaptive ladder's option to ride past a rung

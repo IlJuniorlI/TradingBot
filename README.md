@@ -445,6 +445,10 @@ This block controls how equity orders are priced and managed after submission.
 | `bracket_stop_limit_offset_r`     | `0.5`        |
 | `bracket_require_normal_session`  | `true`       |
 | `bracket_replace_min_price_delta` | `0.01`       |
+| `disaster_stop_enabled`           | `true`       |
+| `disaster_stop_r`                 | `1.0`        |
+| `disaster_stop_min_pct`           | `0.0025`     |
+| `disaster_stop_escalation_attempts` | `3`        |
 
 Behavior and valid values:
 
@@ -463,6 +467,10 @@ Behavior and valid values:
 - `bracket_stop_limit_offset_r`: `STOP_LIMIT` only; limit offset beyond the trigger, in units of the position's initial R (entry to initial stop), wherever the stop has moved since.
 - `bracket_require_normal_session`: reject a bracketed entry outside regular hours rather than send it unprotected.
 - `bracket_replace_min_price_delta`: `replace` mode debounce, in dollars.
+- `disaster_stop_enabled`: rest a static disaster stop at the broker for each equity position. See below. On unless a config says `false`: on in every equity preset, off in the two option presets (an options config must say `false`, or it is refused).
+- `disaster_stop_r`: how far beyond the initial stop the disaster stop rests, in units of the trade's initial R. A finite number above 0.
+- `disaster_stop_min_pct`: the least that distance can be, as a fraction of the entry price (0 turns the floor off). A finite number in [0, 1].
+- `disaster_stop_escalation_attempts`: every this-many consecutive attempts that leave a position without its disaster stop log a CRITICAL naming it. An integer >= 1.
 
 #### Broker-side bracket orders
 
@@ -584,6 +592,87 @@ itself.
 Dry runs keep exits engine-side. The bracket is recorded on the `OrderResult`
 for parity and inspection, but nothing rests at a broker and the recorded state
 is marked `simulated`.
+
+#### Static disaster stop
+
+With `disaster_stop_enabled: true` (the default, and every equity preset),
+each live equity position gets one far `STOP` at the broker that is never
+moved. The engine keeps its own stop and every other exit exactly as before;
+the disaster stop is what limits the loss while the bot is down, hung or cut
+off from the broker.
+
+- **Where it rests.** `max(disaster_stop_r x initial R, disaster_stop_min_pct x
+  entry)` beyond the initial stop: below it for a LONG (at least $0.01), above
+  it for a SHORT, rounded a tick away from the market. The price is recorded on
+  the position as `disaster_stop_price` (EXIT_CONTEXT carries it) and computed
+  from the fill and the stop the position keeps. It never follows the engine's
+  break-even, profit lock or trail: a stop resting at the engine's own level
+  fires on prints between two management cycles that the engine never sees,
+  and study B priced that at -4.1R for top_tier on the archived days. The floor
+  keeps a trade whose initial risk sits inside one minute's noise from resting
+  its disaster stop there too.
+- **What it is.** A plain `STOP` (never a `STOP_LIMIT`, which a flush can leave
+  triggered and unfilled), `DAY`, regular session. Schwab rejects a `STOP`
+  outside the regular session, so a premarket entry gets its disaster stop on
+  the first management cycle after 09:30.
+- **When it goes out.** Right after the entry fills and the position is saved,
+  and on any later cycle that decides no exit while the position is still owed
+  one. A submit the broker refuses is tried again a minute later. A submit whose
+  outcome is unknown (a transport failure, a response that timed out, or an
+  accepted order without its id) is never simply re-sent: a minute later the
+  day's working orders are read, and the exit `STOP` resting at exactly the
+  price and quantity sent is adopted; only when no exit stop is listed on the
+  symbol is one placed. Beside an exit stop on the symbol that is not the one
+  sent (one placed by hand in the app, say), none is adopted and none placed,
+  so a position never rests two stops. The record reads `unconfirmed` before
+  anything is sent, so an error anywhere after that leaves a stop that is
+  looked for before another goes out. A placement that raises after an entry
+  is logged against that position, and the entry pass goes on.
+- **Escalation.** Each attempt that leaves a position without its disaster
+  stop logs on its own line: a refused or unknown-outcome submit, an order
+  list that cannot be read or holds a stop it cannot tell for its own, and a
+  cancel before an exit that cannot be confirmed (which holds the exit while
+  the engine's own level may be breached). Every
+  `disaster_stop_escalation_attempts`-th consecutive one for a position logs
+  `DISASTER STOP DEGRADED` at CRITICAL, the line to page on.
+- **What the engine does with it.** It is kept as the position's bracket
+  record, so the machinery above carries it: each cycle's fill reconcile books
+  a filled disaster stop as a `disaster_stop` exit; every engine exit (stop,
+  giveback, time stop, CHoCH, force flatten, a scale-out) cancels it first and
+  books what it sold before the cancel landed (a cancel that cannot be
+  confirmed defers the exit a cycle, as for a bracket); a scale-out's remainder
+  gets a fresh one at the same price, sized to what is held; a stop that died
+  at the broker (a `DAY` order that expired, one cancelled in the app) is
+  re-placed once, never after a `REJECTED` one. Unlike a bracket's stop, it
+  never stands the engine's stop down.
+- **After a full close.** Once a position that had live broker protection
+  is closed in full, the day's working orders are read once, and any exit
+  order still working on the symbol for its side is cancelled: a stop whose
+  unknown-outcome submit landed after all, a replacement a replace left
+  untracked, a stop moved in the app. Filled, it would open a position the bot
+  does not track; one that cannot be cancelled, or filled first, logs
+  `EXIT ORDERS LEFT` at CRITICAL. The bot takes the account's position in a
+  symbol it trades as its own, as the startup reconcile does.
+- **Restarts.** A restore adopts a disaster stop still resting for the
+  position (resized to what is held) rather than placing a second one, and
+  places one at the saved price when none rests; `restore_basic` prices it off
+  its default-distance stop. The position's own disaster stop is never counted
+  as a foreign order. A restore that cannot read the working-order list
+  restores nothing, as in bracket mode. `runtime.reconcile_on_startup: false`,
+  or `startup_reconcile_mode: ignore` or `log_only`, would forget the stops a
+  restart finds resting, so with `schwab.dry_run: false` they are refused at
+  load beside the disaster stop (the error names both keys): use `block`,
+  `restore_basic` or `restore_hybrid`, or turn the disaster stop off.
+- **Costs.** Each engine exit pays a cancel round trip first. While any
+  position holds a live disaster stop, each cycle reads `account_orders` once
+  (the fill reconcile).
+- **Refused at load** beside `bracket_orders_enabled` (the bracket's stop
+  already rests at the engine's own, tighter, level, and two resting stops on
+  the same shares both sell when a flush takes out both), for an options
+  strategy (equity positions only; since the key is on by default, an options
+  config must say `false`), and live with a restart that forgets it (above).
+  Dry runs place nothing: the position carries its `disaster_stop_price` and a
+  `simulated` record.
 
 ### `candles`
 

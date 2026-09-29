@@ -13,6 +13,7 @@ from schwabdev import Client
 
 from .broker_payloads import (
     BRACKET_ID_KEYS,
+    DISASTER_SYNC_MODE,
     STOP_ORDER_TYPES,
     bracket_wrapper_and_children,
     collect_protective_fills,
@@ -20,11 +21,13 @@ from .broker_payloads import (
     extract_broker_positions,
     extract_working_orders,
     flatten_order_tree,
+    is_disaster_stop,
     order_fill_price,
     order_filled_qty,
     order_is_filled,
     order_is_terminal_failure,
     order_status,
+    protective_stop_reason,
 )
 from .config import BotConfig
 from .data_feed import EXECUTION_LAST_KEYS
@@ -40,10 +43,11 @@ from .models import (
     is_option_asset,
 )
 from .numeric import first_float, safe_float, safe_int
+from .position_metrics import DISASTER_STOP_PRICE_KEY
 from .options_mode import build_single_option_close_order, build_vertical_close_order, close_limit_price_from_metadata, close_single_option_limit_from_metadata, contract_from_quote, single_option_price_bounds, vertical_price_bounds
 from . import sessions
 from .sessions import UTC, classify_equity_session, equity_session_state, is_regular_equity_session
-from .schwab_api import call_schwab_client, call_schwab_json, response_ok
+from .schwab_api import SCHWAB_WRITE_UNKNOWN_OUTCOME, call_schwab_client, call_schwab_json, response_ok
 
 LOG = logging.getLogger(__name__)
 
@@ -609,6 +613,58 @@ class SchwabExecutor:
         """
         return self.bracket_orders_enabled() and self.config.execution.bracket_legs == "stop_and_target"
 
+    def disaster_stop_enabled(self) -> bool:
+        """True when each equity position gets a static disaster stop
+        (``execution.disaster_stop_enabled``; refused with brackets and for
+        an option strategy at load)."""
+        return bool(self.config.execution.disaster_stop_enabled)
+
+    def disaster_stop_price(self, side: Side, entry_price: float, initial_stop: float) -> float:
+        """Where a position's disaster stop rests: ``disaster_stop_r`` times
+        its initial R beyond its initial stop, or ``disaster_stop_min_pct``
+        of its entry price when that is further (below the stop for a LONG,
+        floored at $0.01; above it for a SHORT). The floor keeps a trade
+        whose initial risk is inside one minute's noise from resting its
+        disaster stop there too. Unrounded: the order rounds it a tick away
+        from the market (``_round_equity_price``)."""
+        cfg = self.config.execution
+        entry = float(entry_price)
+        stop = float(initial_stop)
+        distance = max(float(cfg.disaster_stop_r) * abs(entry - stop), float(cfg.disaster_stop_min_pct) * entry)
+        if side == Side.LONG:
+            return max(0.01, stop - distance)
+        return stop + distance
+
+    def stamp_disaster_stop_price(self, metadata: dict[str, Any], side: Side, entry_price: float,
+                                  initial_stop: float) -> None:
+        """Record in *metadata* the price the position's disaster stop rests
+        at (``disaster_stop_price``), with the disaster stop on. A price
+        already recorded is kept: a restored position keeps the one it
+        opened with. Stamped in a dry run too, where nothing is placed."""
+        if self.disaster_stop_enabled():
+            metadata.setdefault(DISASTER_STOP_PRICE_KEY, self.disaster_stop_price(side, entry_price, initial_stop))
+
+    def resting_stop_price(self, position: Position) -> float:
+        """The level *position*'s resting broker stop rests at: its disaster
+        price with the disaster stop on (never the engine's moving stop),
+        else the engine's stop, which a bracket's stop follows in
+        ``replace`` sync. Every path that opens or restores a position
+        stamps the disaster price (``stamp_disaster_stop_price``), so one
+        without it raises rather than rest a stop at a level nobody chose."""
+        if not self.disaster_stop_enabled():
+            return float(position.stop_price)
+        meta = position.metadata if isinstance(position.metadata, dict) else {}
+        level = safe_float(meta.get(DISASTER_STOP_PRICE_KEY), None, finite=True)
+        if level is None:
+            raise ValueError(f"{position.symbol} has no {DISASTER_STOP_PRICE_KEY} to rest its disaster stop at")
+        return level
+
+    def protective_stop_level(self, side: Side, price: float) -> float:
+        """The price a protective stop for a *side* position at *price*
+        rests at: rounded to a valid tick, a tick away from the market (down
+        for a LONG, up for a SHORT), as every protective order is sent."""
+        return self._round_equity_price(float(price), self._bracket_round_direction(side))
+
     @staticmethod
     def _round_equity_price(price: float, direction: str = "nearest") -> float:
         """Round to a valid equity tick: a penny at/above $1, else 1/100 penny.
@@ -672,17 +728,18 @@ class SchwabExecutor:
         return self._round_equity_price(float(stop_price) + offset, "up")
 
     def _bracket_stop_child(self, symbol: str, qty: int, exit_intent: OrderIntent, stop_price: float,
-                            stop_limit_price: float | None, session: str) -> dict[str, Any]:
-        cfg = self.config.execution
+                            stop_limit_price: float | None, session: str, *, order_type: str) -> dict[str, Any]:
+        """A protective stop order: ``order_type`` is a bracket's
+        ``bracket_stop_order_type``, or ``STOP`` for a disaster stop."""
         child: dict[str, Any] = {
             "orderStrategyType": "SINGLE",
             "session": session,
             "duration": "DAY",
-            "orderType": cfg.bracket_stop_order_type,
+            "orderType": order_type,
             "stopPrice": f"{stop_price:.4f}",
             "orderLegCollection": [self._equity_order_leg(symbol, qty, exit_intent)],
         }
-        if cfg.bracket_stop_order_type == "STOP_LIMIT":
+        if order_type == "STOP_LIMIT":
             if stop_limit_price is None:
                 raise ValueError("STOP_LIMIT bracket child requires a stop_limit_price")
             child["price"] = f"{stop_limit_price:.4f}"
@@ -713,7 +770,8 @@ class SchwabExecutor:
         direction = self._bracket_round_direction(side)
         rounded_stop = self._round_equity_price(stop_price, direction)
         stop_limit = self.bracket_stop_limit_price(side, rounded_stop, initial_risk=initial_risk)
-        children = [self._bracket_stop_child(symbol, qty, exit_intent, rounded_stop, stop_limit, session)]
+        children = [self._bracket_stop_child(symbol, qty, exit_intent, rounded_stop, stop_limit, session,
+                                             order_type=self.config.execution.bracket_stop_order_type)]
         rounded_target: float | None = None
         if self.bracket_carries_target() and target_price is not None:
             rounded_target = self._round_equity_price(target_price, direction)
@@ -899,30 +957,51 @@ class SchwabExecutor:
         keeps the ids ``known_bracket`` tracks, which the reconcile reads as
         the position's own rather than as foreign orders.
 
-        ``initial_risk`` is the position's initial R per share
-        (``position_metrics.initial_risk_per_unit``), which prices a
-        STOP_LIMIT child's limit (``bracket_stop_limit_price``).
+        ``stop_price`` is the level the protection rests at
+        (``resting_stop_price``). ``initial_risk`` is the position's initial
+        R per share (``position_metrics.initial_risk_per_unit``), which prices
+        a bracket's STOP_LIMIT child (``bracket_stop_limit_price``). With
+        ``execution.disaster_stop_enabled`` the protection is the position's
+        disaster stop (``DISASTER_SYNC_MODE``): one plain STOP for the regular
+        session, never a target, adopted, resized and mirrored in a dry run as
+        a bracket's stop is, and placed by ``_place_disaster_stop``; neither
+        ``initial_risk`` nor ``parent_order_id`` (a bracketed entry's) is read
+        for it.
 
-        Returns the bracket state dict, or None when bracket mode is off.
+        Returns the bracket state dict, or None when neither brackets nor the
+        disaster stop are on.
         """
-        if not self.bracket_orders_enabled():
+        disaster = self.disaster_stop_enabled()
+        if not (disaster or self.bracket_orders_enabled()):
             return None
         if int(qty) <= 0:
             return None
-        session = self._equity_session() or "NORMAL"
         direction = self._bracket_round_direction(side)
-        base: dict[str, Any] = {
-            "parent_order_id": str(parent_order_id) if parent_order_id else None,
-            "sync_mode": str(self.config.execution.bracket_sync_mode),
-            "legs": str(self.config.execution.bracket_legs),
-            "session": session,
-            "stop_price": self._round_equity_price(stop_price, direction),
-            "target_price": (
-                self._round_equity_price(target_price, direction)
-                if (self.bracket_carries_target() and target_price is not None) else None
-            ),
-            "qty": int(qty),
-        }
+        base: dict[str, Any]
+        if disaster:
+            base = {
+                "parent_order_id": None,
+                "sync_mode": DISASTER_SYNC_MODE,
+                "legs": "stop_only",
+                "session": "NORMAL",
+                "stop_price": self._round_equity_price(stop_price, direction),
+                "target_price": None,
+                "qty": int(qty),
+            }
+        else:
+            base = {
+                "parent_order_id": str(parent_order_id) if parent_order_id else None,
+                "sync_mode": str(self.config.execution.bracket_sync_mode),
+                "legs": str(self.config.execution.bracket_legs),
+                "session": self._equity_session() or "NORMAL",
+                "stop_price": self._round_equity_price(stop_price, direction),
+                "target_price": (
+                    self._round_equity_price(target_price, direction)
+                    if (self.bracket_carries_target() and target_price is not None) else None
+                ),
+                "qty": int(qty),
+            }
+        session = str(base["session"])
         if self.config.schwab.dry_run:
             # What rests at the broker in a dry run is the real account's
             # protection, not the paper position's. A dry-run restore adopted
@@ -934,7 +1013,7 @@ class SchwabExecutor:
                 **dict.fromkeys(BRACKET_ID_KEYS), "child_order_ids": [],
             }
             return {**base, **mirrored, "active": False, "simulated": True, "state": "dry_run"}
-        existing = self._adoptable_protection(parent_order_id, known_bracket)
+        existing = self._adoptable_protection(None if disaster else parent_order_id, known_bracket)
         if existing is not None:
             resting_qty = existing.pop("resting_qty", None)
             adopted = {**base, **existing, "active": True, "state": "adopted"}
@@ -954,6 +1033,8 @@ class SchwabExecutor:
                         symbol, "an unknown number of" if resting_qty is None else resting_qty, qty, msg,
                     )
             return adopted
+        if disaster:
+            return self._place_disaster_stop(symbol, int(qty), side, base)
         replacement = self.submit_protective_oco(
             symbol, int(qty), side, float(base["stop_price"]), target_price, session, initial_risk=initial_risk,
         )
@@ -966,6 +1047,63 @@ class SchwabExecutor:
                     "oco_order_id": None, "stop_order_id": None, "target_order_id": None, "child_order_ids": []}
         return {**base, **(replacement.bracket or {}), "protective_order_id": replacement.order_id,
                 "active": True, "state": "standalone_oco"}
+
+    def _place_disaster_stop(self, symbol: str, qty: int, side: Side, base: dict[str, Any]) -> dict[str, Any]:
+        """Submit a position's disaster stop: one plain STOP (never a
+        STOP_LIMIT, which a flush can leave unfilled) for the regular
+        session, DAY, at ``base["stop_price"]``. The record it returns is
+        ``active`` only once the broker returned the new order's id.
+
+        - Outside the regular session nothing is sent (Schwab rejects a STOP
+          there): ``pending_session``, placed by the first regular-session
+          cycle (``PositionManager.ensure_disaster_stop``).
+        - A submit the broker refused (a non-2xx status: nothing was
+          placed): ``unprotected``, which the position manager retries.
+        - A submit whose outcome is unknown -- a transport failure or a
+          timed-out response (``SCHWAB_WRITE_UNKNOWN_OUTCOME``: a POST whose
+          response times out raises ``ReadTimeout``, since the client never
+          retries a POST), or a 2xx without the new order's id -- may have
+          left the stop resting, and a second one beside it sells the shares
+          twice: ``unconfirmed``. The record keeps the price and quantity
+          sent, and the position manager looks for exactly that stop among
+          the working orders before it places another.
+
+        Both carry the attempt's time (``attempted_at``), which the retry
+        waits on.
+        """
+        no_ids = {**dict.fromkeys(BRACKET_ID_KEYS), "child_order_ids": []}
+        if self._equity_session() != "NORMAL":
+            return {**base, **no_ids, "active": False, "state": "pending_session"}
+        attempted_at = sessions.now_et().isoformat()
+        stop_price = float(base["stop_price"])
+        spec = self._bracket_stop_child(symbol, qty, self.order_intent_for_exit(side), stop_price, None, "NORMAL",
+                                        order_type="STOP")
+        try:
+            response = self._submit_live_order_spec(spec)
+        except SCHWAB_WRITE_UNKNOWN_OUTCOME as exc:
+            LOG.error(
+                "Disaster stop for %s qty=%s at %s: the submit's outcome is unknown (%s: %s), so it may rest at "
+                "the broker or not; the working orders are read for it before another is sent",
+                symbol, qty, stop_price, type(exc).__name__, exc,
+            )
+            return {**base, **no_ids, "active": False, "state": "unconfirmed", "attempted_at": attempted_at}
+        status_code = getattr(response, "status_code", None)
+        if not response_ok(response):
+            LOG.error(
+                "Disaster stop for %s qty=%s at %s was refused (status=%s); the position has no broker stop "
+                "until a retry places one", symbol, qty, stop_price, status_code,
+            )
+            return {**base, **no_ids, "active": False, "state": "unprotected", "attempted_at": attempted_at}
+        order_id = self._response_order_id(response)
+        if not order_id:
+            LOG.error(
+                "Disaster stop for %s qty=%s at %s was accepted (status=%s) without its order id; the working "
+                "orders are read for it before another is sent", symbol, qty, stop_price, status_code,
+            )
+            return {**base, **no_ids, "active": False, "state": "unconfirmed", "attempted_at": attempted_at}
+        LOG.info("Disaster stop for %s qty=%s rests at %s (order %s)", symbol, qty, stop_price, order_id)
+        return {**base, **no_ids, "stop_order_id": str(order_id), "child_order_ids": [str(order_id)],
+                "active": True, "state": "disaster_stop"}
 
     @staticmethod
     def _tracked_protection_ids(known_bracket: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1076,12 +1214,14 @@ class SchwabExecutor:
 
     def resize_bracket_children(self, bracket: dict[str, Any], symbol: str, side: Side, qty: int,
                                 session: str, *, initial_risk: float | None) -> tuple[bool, str]:
-        """Re-issue the resting protective children at a new share count.
+        """Re-issue the resting protective children at a new share count, at
+        the levels they rest at (a disaster stop as the plain STOP it is).
 
         The short-flip guard: children are submitted for the REQUESTED entry
         quantity, so a partial entry fill leaves an oversized resting exit that
         would take a long-only strategy net short when it triggers.
-        ``initial_risk`` prices a STOP_LIMIT child (``bracket_stop_limit_price``).
+        ``initial_risk`` prices a bracket's STOP_LIMIT child
+        (``bracket_stop_limit_price``); a disaster stop needs none.
         """
         exit_intent = self.order_intent_for_exit(side)
         stop_price = float(bracket.get("stop_price") or 0.0)
@@ -1089,8 +1229,12 @@ class SchwabExecutor:
         messages: list[str] = []
         ok = True
         if bracket.get("stop_order_id") and stop_price > 0:
-            stop_limit = self.bracket_stop_limit_price(side, stop_price, initial_risk=initial_risk)
-            spec = self._bracket_stop_child(symbol, qty, exit_intent, stop_price, stop_limit, session)
+            if is_disaster_stop(bracket):
+                spec = self._bracket_stop_child(symbol, qty, exit_intent, stop_price, None, session, order_type="STOP")
+            else:
+                stop_limit = self.bracket_stop_limit_price(side, stop_price, initial_risk=initial_risk)
+                spec = self._bracket_stop_child(symbol, qty, exit_intent, stop_price, stop_limit, session,
+                                                order_type=self.config.execution.bracket_stop_order_type)
             child_ok, msg = self.replace_bracket_child(bracket, "stop_order_id", spec)
             ok = ok and child_ok
             messages.append(f"stop:{msg}")
@@ -1130,7 +1274,8 @@ class SchwabExecutor:
             rounded = self._round_equity_price(stop_price, direction)
             if resting_stop is None or abs(rounded - float(resting_stop)) >= min_delta:
                 stop_limit = self.bracket_stop_limit_price(side, rounded, initial_risk=initial_risk)
-                spec = self._bracket_stop_child(symbol, int(qty), exit_intent, rounded, stop_limit, session)
+                spec = self._bracket_stop_child(symbol, int(qty), exit_intent, rounded, stop_limit, session,
+                                                order_type=self.config.execution.bracket_stop_order_type)
                 ok, msg = self.replace_bracket_child(bracket, "stop_order_id", spec)
                 if ok:
                     bracket["stop_price"] = rounded
@@ -1170,6 +1315,8 @@ class SchwabExecutor:
         The result carries what the children FILLED before the cancel landed.
         A stop that triggered after this cycle's fill reconcile has already
         sold those shares; the caller must book them and exit only the rest.
+        A disaster stop's fills carry ``disaster_stop``, a bracket stop's
+        ``broker_stop`` (``protective_stop_reason``).
         """
         if not isinstance(bracket, dict):
             return BracketCancel(True, "no_bracket")
@@ -1181,23 +1328,24 @@ class SchwabExecutor:
         ok = True
         messages: list[str] = []
         fills: dict[str, tuple[int, float | None, str]] = {}
+        stop_reason = protective_stop_reason(bracket)
         if wrapper_id:
             cancel_ok, msg, payload = self._cancel_live_equity_order(wrapper_id)
             ok = cancel_ok
             messages.append(f"{wrapper_id}:{msg}")
-            collect_protective_fills(payload, fills)
+            collect_protective_fills(payload, fills, stop_reason=stop_reason)
         for child_id in child_ids:
             if wrapper_id:
                 # Usually already down with the wrapper: confirm before
                 # spending a cancel call on it.
                 payload, _status = self._equity_order_details(child_id)
                 if payload is not None and (order_is_terminal_failure(payload) or order_is_filled(payload)):
-                    collect_protective_fills(payload, fills)
+                    collect_protective_fills(payload, fills, stop_reason=stop_reason)
                     continue
             cancel_ok, msg, payload = self._cancel_live_equity_order(child_id)
             ok = ok and cancel_ok
             messages.append(f"{child_id}:{msg}")
-            collect_protective_fills(payload, fills)
+            collect_protective_fills(payload, fills, stop_reason=stop_reason)
         # Fills already booked for a child the bracket no longer tracks (a
         # dead stop an unconfirmed retire dropped): its wrapper's payload
         # still carries it and reports them again (2026-09-25).

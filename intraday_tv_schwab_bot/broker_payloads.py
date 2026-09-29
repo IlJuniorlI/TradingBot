@@ -49,6 +49,19 @@ BRACKET_WRAPPER_KEYS = ("oco_order_id", "protective_order_id")
 BRACKET_CHILD_KEYS = ("stop_order_id", "target_order_id")
 BRACKET_ID_KEYS = BRACKET_WRAPPER_KEYS + BRACKET_CHILD_KEYS
 
+# The ``sync_mode`` of a disaster stop's record (``execution.
+# disaster_stop_enabled``, 2026-09-28): a lone STOP beyond the engine's
+# initial stop that is never moved, while the engine keeps its own stop (it
+# checks it every cycle whatever rests at the broker). It is kept as the
+# position's bracket record, so the fill reconcile, the cancel before an
+# engine exit, the re-protect of a remainder, the restore's adoption and the
+# foreign-order check treat it as they treat a bracket's stop.
+DISASTER_SYNC_MODE = "disaster"
+# The exit reason a filled disaster stop is booked with.
+DISASTER_STOP_REASON = "disaster_stop"
+# The exit reason a filled bracket stop is booked with.
+BRACKET_STOP_REASON = "broker_stop"
+
 
 def extract_broker_positions(payload: Any) -> list[dict[str, Any]]:
     acct = payload.get("securitiesAccount") if isinstance(payload, dict) and isinstance(payload.get("securitiesAccount"), dict) else payload
@@ -99,6 +112,10 @@ def extract_working_orders(payload: Any) -> list[dict[str, Any]]:
             "orderType": str(row.get("orderType") or "").upper(),
             "orderStrategyType": str(row.get("orderStrategyType") or "").upper(),
             "instructions": [str(leg.get("instruction") or "").upper() for leg in legs],
+            # None when the row does not carry it as a finite number.
+            "stopPrice": safe_float(row.get("stopPrice"), None, finite=True),
+            "quantity": safe_int(row.get("quantity")),
+            "filledQuantity": order_filled_qty(row),
         })
     return out
 
@@ -316,13 +333,16 @@ def flatten_order_tree(node: Any, out: dict[str, dict[str, Any]]) -> None:
     flatten_order_tree(node.get("childOrderStrategies"), out)
 
 
-def collect_protective_fills(payload: Any, into: dict[str, tuple[int, float | None, str]]) -> None:
+def collect_protective_fills(payload: Any, into: dict[str, tuple[int, float | None, str]], *,
+                             stop_reason: str) -> None:
     """Record ``order_id -> (filled_qty, fill_price, exit reason)`` for every
-    protective leg in *payload* that has fills. Keyed by order id so a leg
-    seen both under its wrapper and on its own is counted once."""
+    protective leg in *payload* that has fills: a stop leg's reason is
+    *stop_reason* (``protective_stop_reason`` of its record), a limit's
+    ``broker_target``. Keyed by order id so a leg seen both under its
+    wrapper and on its own is counted once."""
     if isinstance(payload, list):
         for node in payload:
-            collect_protective_fills(node, into)
+            collect_protective_fills(node, into, stop_reason=stop_reason)
         return
     if not isinstance(payload, dict):
         return
@@ -331,9 +351,20 @@ def collect_protective_fills(payload: Any, into: dict[str, tuple[int, float | No
         filled_qty = order_filled_qty(payload) or 0
         if filled_qty > 0:
             order_type = str(payload.get("orderType") or "").upper()
-            reason = "broker_stop" if order_type in STOP_ORDER_TYPES else "broker_target"
+            reason = stop_reason if order_type in STOP_ORDER_TYPES else "broker_target"
             into[str(order_id)] = (int(filled_qty), order_fill_price(payload), reason)
-    collect_protective_fills(payload.get("childOrderStrategies"), into)
+    collect_protective_fills(payload.get("childOrderStrategies"), into, stop_reason=stop_reason)
+
+
+def is_disaster_stop(bracket: Any) -> bool:
+    """True when *bracket* is a disaster stop's record (``DISASTER_SYNC_MODE``)."""
+    return isinstance(bracket, dict) and bracket.get("sync_mode") == DISASTER_SYNC_MODE
+
+
+def protective_stop_reason(bracket: Any) -> str:
+    """The exit reason a fill of *bracket*'s stop is booked with:
+    ``disaster_stop`` for a disaster stop, ``broker_stop`` for a bracket's."""
+    return DISASTER_STOP_REASON if is_disaster_stop(bracket) else BRACKET_STOP_REASON
 
 
 def active_broker_bracket(position: Any) -> dict[str, Any] | None:
@@ -377,6 +408,67 @@ def bracket_wrapper_and_children(bracket: dict[str, Any]) -> tuple[str | None, l
         if oid and str(oid) != (wrapper_id or "") and str(oid) not in children:
             children.append(str(oid))
     return wrapper_id, children
+
+
+def working_exit_orders(working_orders: list[dict[str, Any]], symbol: Any, side: Side, *,
+                        order_types: frozenset[str] | None = None) -> list[dict[str, Any]]:
+    """The ``extract_working_orders`` rows on *symbol* alone whose one leg
+    exits a *side* position (a SELL for a LONG, a BUY_TO_COVER for a SHORT),
+    of *order_types* when given, in the order listed."""
+    exit_instruction = "SELL" if side == Side.LONG else "BUY_TO_COVER"
+    wanted = str(symbol).upper().strip()
+    return [
+        order for order in working_orders
+        if order.get("orderId") is not None
+        and [str(s).upper().strip() for s in order.get("symbols") or []] == [wanted]
+        and (order_types is None or order.get("orderType") in order_types)
+        and list(order.get("instructions") or []) == [exit_instruction]
+    ]
+
+
+def resting_exit_stop(working_orders: list[dict[str, Any]], symbol: Any, side: Side) -> dict[str, Any] | None:
+    """A working protective stop at the broker for a *side* position in
+    *symbol*, as a bracket stub, from ``extract_working_orders`` rows: a
+    STOP / STOP_LIMIT on that symbol alone whose one leg exits the position.
+
+    The startup reconciler adopts it when the restored metadata carries no
+    child ids (restore_basic, or a position entered before bracket mode was
+    on). Without it fresh protection went in beside the stop still resting;
+    both trigger together and take the position net short. The first match
+    is adopted; any other stop on the symbol stays a foreign order and keeps
+    entries blocked for a human to look at.
+    (``StartupReconciler._resting_stop_for`` until 2026-09-28.)
+    """
+    stops = working_exit_orders(working_orders, symbol, side, order_types=STOP_ORDER_TYPES)
+    if not stops:
+        return None
+    order_id = str(stops[0]["orderId"])
+    return {"stop_order_id": order_id, "child_order_ids": [order_id]}
+
+
+def sent_exit_stop(working_orders: list[dict[str, Any]], symbol: Any, side: Side, *,
+                   stop_price: Any, qty: Any) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Look for the stop an order write with an unknown outcome sent:
+    ``(stub, others)``.
+
+    ``stub`` is the working exit STOP on *symbol* for a *side* position that
+    rests exactly at *stop_price* for exactly *qty* shares, as a bracket stub,
+    or None. ``others`` are the other working exit STOP / STOP_LIMIT orders
+    on the symbol for that side: a stop the bot did not send (one placed by
+    hand in the app) or one it cannot tell for its own. Never adopted, and
+    a second stop is never placed beside one, since both would sell the
+    same shares. A *stop_price* or *qty* that is not known matches nothing."""
+    level = safe_float(stop_price, None, finite=True)
+    shares = safe_int(qty)
+    stops = working_exit_orders(working_orders, symbol, side, order_types=STOP_ORDER_TYPES)
+    for order in stops:
+        if (order.get("orderType") == "STOP" and level is not None and shares is not None
+                and order.get("stopPrice") is not None and abs(float(order["stopPrice"]) - level) < 5e-5
+                and order.get("quantity") == shares):
+            order_id = str(order["orderId"])
+            return ({"stop_order_id": order_id, "child_order_ids": [order_id]},
+                    [other for other in stops if other is not order])
+    return None, stops
 
 
 def working_exit_outstanding_qty(position: Any) -> int:

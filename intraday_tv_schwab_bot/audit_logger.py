@@ -184,6 +184,10 @@ def structured_metadata_snapshot(meta: Mapping[str, Any] | None) -> dict[str, An
         'shared_entry_', 'divergence_entry_', 'anti_chase_ob_retest_',
         'msltf_', 'mshtf_', 'sr_', 'tech_', 'matched_', 'chart_pattern_',
         'decision_', 'gate_', 'peak_giveback_', 'orb_',
+        # The price the position's disaster stop rests at
+        # (execution.disaster_stop_enabled, 2026-09-28): what a
+        # disaster_stop exit, or a dry run's would-be one, is read against.
+        'disaster_stop_',
     )
     exclude_keys = {
         'order_spec', 'long_leg', 'short_leg', 'option_leg', 'valuation_legs',

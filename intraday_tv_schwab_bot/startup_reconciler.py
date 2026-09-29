@@ -56,11 +56,12 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable
 
 from .broker_payloads import (
-    STOP_ORDER_TYPES,
+    DISASTER_SYNC_MODE,
     active_broker_bracket,
     bracket_order_ids,
     broker_position_side_qty,
     broker_quantity,
+    resting_exit_stop,
     working_exit_outstanding_qty,
 )
 from .config import BotConfig
@@ -307,8 +308,16 @@ class StartupReconciler:
 
         ``ensure_position_protected`` adopts the children when they are still
         working and submits fresh protection when they are not; it returns None
-        when bracket mode is off, in which case any stale key is dropped so the
-        engine unambiguously owns the exits. The persisted bracket goes along
+        when neither bracket mode nor the disaster stop is on, in which case
+        any stale key is dropped so the engine unambiguously owns the exits.
+        A disaster stop rests at the price the position opened with, saved in
+        its metadata; a position restored without one (``restore_basic``, a
+        row saved before the disaster stop was on) gets it from its entry
+        and initial stop, as a new entry does (its current stop for a row
+        saved without an initial stop). A restore whose protection step
+        raises leaves the disaster stop ``unconfirmed`` at that price for the
+        shares held, which the first management cycle looks up before it
+        places one. The persisted bracket goes along
         as ``known_bracket``: its child ids are the ones the bot last tracked,
         so a stop replaced before the restart is adopted instead of being read
         as dead (its original, off the parent, is REPLACED) and stacked on.
@@ -342,17 +351,41 @@ class StartupReconciler:
         listed = {str(order.get("orderId")) for order in working_orders}
         known = (
             saved if saved is not None and str(saved["stop_order_id"]) in listed
-            else self._resting_stop_for(position, working_orders) or saved
+            else resting_exit_stop(working_orders, position.symbol, position.side) or saved
         )
+        disaster = self.executor.disaster_stop_enabled()
+        initial_stop = safe_float(metadata.get("initial_stop_price"), None, finite=True)
+        level: float | None = None
         try:
+            self.executor.stamp_disaster_stop_price(
+                metadata, position.side, float(position.entry_price),
+                float(position.stop_price) if initial_stop is None else initial_stop,
+            )
+            if disaster:
+                level = self.executor.protective_stop_level(position.side, self.executor.resting_stop_price(position))
             refreshed = self.executor.ensure_position_protected(
                 str(metadata.get("underlying") or position.symbol),
-                uncovered, position.side, float(position.stop_price), position.target_price,
+                uncovered, position.side, self.executor.resting_stop_price(position), position.target_price,
                 initial_risk=initial_risk_per_unit(position),
                 parent_order_id=str(parent_order_id) if parent_order_id else None,
                 known_bracket=known,
             )
         except Exception as exc:
+            if disaster:
+                # Whether a disaster stop from before the restart still rests
+                # is unknown: none is placed beside it until the manager finds
+                # it or learns there is none (ensure_disaster_stop). The
+                # engine owns its exits either way.
+                LOG.error(
+                    "Could not re-establish the disaster stop of restored position %s (%s: %s); one may still "
+                    "rest from before the restart, so it is looked up before another is placed",
+                    position.symbol, type(exc).__name__, exc,
+                )
+                # The stop a restore rests: the saved price, for the shares
+                # held. The lookup adopts only that one (sent_exit_stop).
+                metadata["bracket"] = {"sync_mode": DISASTER_SYNC_MODE, "legs": "stop_only", "active": False,
+                                       "state": "unconfirmed", "stop_price": level, "qty": uncovered}
+                return
             LOG.warning(
                 "Could not re-establish broker protection for restored position %s: %s: %s; "
                 "dropping stale bracket so the engine owns the exits", position.symbol, type(exc).__name__, exc,
@@ -618,32 +651,6 @@ class StartupReconciler:
         if changed:
             self._save_reconcile_metadata()
         return settled
-
-    @staticmethod
-    def _resting_stop_for(position: Position, working_orders: list[dict[str, Any]]) -> dict[str, Any] | None:
-        """A working protective stop at the broker for *position*, as a bracket stub.
-
-        Used when the restored metadata carries no child ids (restore_basic,
-        or a position entered before bracket mode was on). Without it the
-        restore submitted FRESH protection beside the stop still resting from
-        before the restart; both trigger together and take the position net
-        short. The first match is adopted; any other stop on the symbol stays
-        a foreign order and keeps entries blocked for a human to look at.
-        """
-        exit_instruction = "SELL" if position.side == Side.LONG else "BUY_TO_COVER"
-        symbol = str(position.symbol).upper().strip()
-        for order in working_orders:
-            if order.get("orderId") is None:
-                continue
-            if [str(s).upper().strip() for s in order.get("symbols") or []] != [symbol]:
-                continue
-            if order.get("orderType") not in STOP_ORDER_TYPES:
-                continue
-            if list(order.get("instructions") or []) != [exit_instruction]:
-                continue
-            order_id = str(order["orderId"])
-            return {"stop_order_id": order_id, "child_order_ids": [order_id]}
-        return None
 
     def _foreign_working_orders(self, working_orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Working orders no restored position owns: its resting protection,
@@ -951,13 +958,15 @@ class StartupReconciler:
                 # bracket-mode restore against it cannot see the stop still
                 # resting from before the restart and submits fresh protection
                 # beside it, and a restored symbol is never revisited, so both
-                # stops stay (together they sell the position net short).
-                # Without bracket mode the list protects nothing: restore what
-                # the broker holds so the engine manages it, and fail the
-                # attempt so the retry reads the list (it skips what is
-                # already tracked), naming each row it could not use too.
+                # stops stay (together they sell the position net short); a
+                # disaster stop is placed the same way. Without either, the
+                # list protects nothing: restore what the broker holds so the
+                # engine manages it, and fail the attempt so the retry reads
+                # the list (it skips what is already tracked), naming each
+                # row it could not use too.
                 failures = ["the broker working-order read failed"]
-                if mode in {"restore_basic", "restore_hybrid"} and not self.executor.bracket_orders_enabled():
+                if mode in {"restore_basic", "restore_hybrid"} and not (
+                        self.executor.bracket_orders_enabled() or self.executor.disaster_stop_enabled()):
                     failures += self._restore_broker_positions(positions, use_metadata=(mode == "restore_hybrid"),
                                                                working_orders=[], unsettled=set(unsettled))[2]
                 raise RuntimeError("; ".join(failures))

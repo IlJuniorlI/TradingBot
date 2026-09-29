@@ -631,6 +631,25 @@ class EntryGatekeeper:
         LOG.warning("Entry order %s for %s filled %s more share(s) after its submit returned; position now %s",
                     record["order_id"], position_key, extra_qty, total_qty)
 
+    def _ensure_disaster_stop_after_entry(self, key: str, position: Position) -> None:
+        """Place a position's disaster stop right after its entry is tracked
+        and saved (``PositionManager.ensure_disaster_stop``), isolated to it.
+
+        Whatever that raises is logged against the position with its type and
+        traceback, and the entry pass goes on to its next signal: the
+        position is held either way, and the stop stays owed. The next
+        management cycle that decides no exit for it places it, looking first
+        for one a submit may have left resting (the record reads
+        ``unconfirmed`` before anything is sent). Until 2026-09-28 a raise
+        here ended the entry pass and failed the engine's step."""
+        try:
+            self.position_manager.ensure_disaster_stop(key, position)
+        except Exception as exc:
+            LOG.error(
+                "Disaster stop for %s was not placed after its entry (%s: %s); the position is held and its "
+                "next management cycle places the stop still owed", key, type(exc).__name__, exc, exc_info=exc,
+            )
+
     def _adopt_entry_fill(self, position_key: str, qty: int, fill_price: float | None,
                           record: dict[str, Any]) -> None:
         """Open the position an unsettled entry order turned out to fill.
@@ -658,22 +677,27 @@ class EntryGatekeeper:
             position_metadata.setdefault("initial_stop_price", float(stop_price))
             position_metadata.setdefault("initial_target_price", target_price)
             position_metadata.setdefault("trail_armed", False)
-            # The children of a bracketed entry may or may not have
-            # materialised; adopt them if they are working, protect if not.
-            initial_risk = abs(float(entry_price) - float(stop_price))
-            bracket = self.executor.ensure_position_protected(
-                signal.symbol, int(qty), signal.side, float(stop_price), target_price,
-                initial_risk=initial_risk, parent_order_id=str(record["order_id"]),
-            )
-            if bracket is not None:
-                if levels_reason is not None and bracket.get("active") and not bracket.get("simulated"):
-                    # Children adopted off the order rest at the signal's
-                    # levels, which the fill went through: they move to the
-                    # fallback the position is booked with, as a filled
-                    # entry's do (SchwabExecutor._finalize_bracket_protection).
-                    self.executor.sync_bracket_levels(bracket, signal.symbol, signal.side, int(qty), float(stop_price),
-                                                      target_price, initial_risk=initial_risk)
-                position_metadata["bracket"] = bracket
+            self.executor.stamp_disaster_stop_price(position_metadata, signal.side, float(entry_price), float(stop_price))
+            if not self.executor.disaster_stop_enabled():
+                # The children of a bracketed entry may or may not have
+                # materialised; adopt them if they are working, protect if
+                # not. A disaster stop is placed once the position is
+                # tracked (below).
+                initial_risk = abs(float(entry_price) - float(stop_price))
+                bracket = self.executor.ensure_position_protected(
+                    signal.symbol, int(qty), signal.side, float(stop_price), target_price,
+                    initial_risk=initial_risk, parent_order_id=str(record["order_id"]),
+                )
+                if bracket is not None:
+                    if levels_reason is not None and bracket.get("active") and not bracket.get("simulated"):
+                        # Children adopted off the order rest at the signal's
+                        # levels, which the fill went through: they move to
+                        # the fallback the position is booked with, as a
+                        # filled entry's do
+                        # (SchwabExecutor._finalize_bracket_protection).
+                        self.executor.sync_bracket_levels(bracket, signal.symbol, signal.side, int(qty),
+                                                          float(stop_price), target_price, initial_risk=initial_risk)
+                    position_metadata["bracket"] = bracket
             trail_pct = self.risk.stock_position_trail_pct(position_metadata)
             reference_symbol = signal.reference_symbol
         position_metadata["broker_reconciled_after_order_uncertainty"] = True
@@ -700,6 +724,9 @@ class EntryGatekeeper:
         self.positions[position_key] = position
         self.account.record_entry(position, float(entry_price))
         self._save_reconcile_metadata()
+        # After the position is tracked and saved, so a submit that raises
+        # cannot lose it; the next cycle places a stop still owed.
+        self._ensure_disaster_stop_after_entry(position_key, position)
         LOG.warning("Adopted entry %s qty=%s @ %.4f from unsettled order %s (%s)",
                     position_key, qty, entry_price, record["order_id"], record["message"])
 
@@ -1207,6 +1234,9 @@ class EntryGatekeeper:
             position_metadata.setdefault("initial_stop_price", stop_price)
             position_metadata.setdefault("initial_target_price", target_price)
             position_metadata.setdefault("trail_armed", False)
+            # From the fill and the stop the position keeps (the fallback's
+            # after a fill through the signal's), never the signal's price.
+            self.executor.stamp_disaster_stop_price(position_metadata, signal.side, entry_price, stop_price)
             if not levels_ok:
                 position_metadata["emergency_fallback_levels"] = True
                 position_metadata["original_levels_reason"] = levels_reason
@@ -1283,6 +1313,10 @@ class EntryGatekeeper:
                     preview_entry_price=signal_entry_price, booked_qty=qty_for_position,
                 )
             self._save_reconcile_metadata()
+            # The disaster stop goes out once the position is tracked and
+            # saved, so a submit that raises cannot lose the position; the
+            # management cycle places a stop still owed.
+            self._ensure_disaster_stop_after_entry(signal.symbol, position)
             self._log_entry_decision(signal.strategy, signal.symbol, "entered", [signal.reason], market_side=signal_market_side)
 
         for symbol, payload in decision_map.items():

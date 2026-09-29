@@ -669,6 +669,30 @@ class EquityExecutionConfig:
     # burning the Schwab rate budget on sub-penny adjustments.
     bracket_replace_min_price_delta: float = 0.01
 
+    # --- Static disaster stop (2026-09-28) ---
+    # A far STOP rests at the broker for each live equity position, placed
+    # once the entry fills (at the first regular-session cycle for one opened
+    # before 09:30) and never moved: the engine keeps its own stop and every
+    # other exit, and cancels this one before any exit it sends. It is what
+    # protects the position while the bot is down. It rests
+    # max(disaster_stop_r x initial R, disaster_stop_min_pct x entry price)
+    # beyond the initial stop (below it for a LONG, above for a SHORT). A
+    # dry run places nothing. On unless a config says false: refused with
+    # bracket_orders_enabled (whose stop already rests at the engine's,
+    # tighter, level), with an option strategy (equity positions only, so an
+    # options config must say false), and, when schwab.dry_run is false,
+    # with a startup reconcile that would forget the stops it left resting
+    # (runtime.reconcile_on_startup false, or startup_reconcile_mode ignore
+    # or log_only).
+    disaster_stop_enabled: bool = True
+    disaster_stop_r: float = 1.0
+    disaster_stop_min_pct: float = 0.0025
+    # Every this-many consecutive attempts in which a position is left
+    # without its disaster stop (an owed stop refused, of unknown outcome,
+    # or not looked up; a cancel before an exit not confirmed, which defers
+    # the exit) log a CRITICAL naming it. Each attempt also logs on its own.
+    disaster_stop_escalation_attempts: int = 3
+
 
 @dataclass(slots=True)
 class CandlesConfig:
@@ -1791,6 +1815,13 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         # A NaN offset priced the resting STOP_LIMIT at "nan".
         "bracket_stop_limit_offset_r": _AT_LEAST_ZERO,
         "bracket_replace_min_price_delta": _AT_LEAST_ZERO,
+        # The disaster stop's distance beyond the initial stop. A 0 would
+        # rest it at the engine's own initial stop, where a print between
+        # two management cycles fires it (study B, 2026-09-26: at the
+        # engine's level it cost top_tier -4.1R on the archive).
+        "disaster_stop_r": _ABOVE_ZERO,
+        "disaster_stop_min_pct": _Number(low=0, high=1, note=" (0 turns the floor off)"),
+        "disaster_stop_escalation_attempts": _COUNT,
     },
     "events": {
         "earnings_block_sessions_before": _COUNT_OR_ZERO,
@@ -1979,12 +2010,13 @@ def _validate_support_resistance_config(sr: SupportResistanceConfig, config_path
 
 
 def _validate_execution_config(execution: EquityExecutionConfig, risk: RiskConfig,
-                               shared_exit: SharedExitLogicConfig, config_path: Path) -> None:
+                               shared_exit: SharedExitLogicConfig, strategy: str, config_path: Path) -> None:
     """Plausibility checks for the equity execution / bracket-order block:
     the numbers, the bracket modes and the switches (``_NUMBER_CHECKS`` /
-    ``_CHOICES["execution"]``), and the bracket combinations the risk
+    ``_CHOICES["execution"]``), the bracket combinations the risk
     management mode and the adaptive ladder's touch hold rule out
-    (``shared_exit`` is checked before this)."""
+    (``shared_exit`` is checked before this), and the disaster stop's: not
+    beside brackets, and not for the options ``strategy``."""
     errors = _section_errors("execution", execution)
     if execution.bracket_orders_enabled is True:  # anything but a bool is refused above
         # A resting target limit fills at the touched rung, through the
@@ -2013,6 +2045,55 @@ def _validate_execution_config(execution: EquityExecutionConfig, risk: RiskConfi
                 "resting child, leaving the broker on the entry-time stop. Use "
                 "bracket_sync_mode: replace, or a non-adaptive management mode"
             )
+    if execution.disaster_stop_enabled is True:
+        # Two resting stops on the same shares both sell when a flush takes
+        # out the two levels, the second from a position already closed (net
+        # short). The bracket's stop rests at the engine's own level, which
+        # is always the tighter one, so the disaster stop adds nothing to it.
+        if execution.bracket_orders_enabled is True:
+            errors.append(
+                "execution.disaster_stop_enabled cannot be used with "
+                "execution.bracket_orders_enabled: the bracket's stop already rests at "
+                "the engine's own (tighter) level, and a second resting stop on the "
+                "same shares sells them twice when both trigger"
+            )
+        # Brackets and the disaster stop rest for equity positions only: an
+        # option position would never get one, without a word.
+        if is_option_strategy(strategy):
+            errors.append(
+                f"execution.disaster_stop_enabled rests a stop for equity positions only; "
+                f"the active strategy {strategy!r} trades options"
+            )
+    _raise_section_errors("execution", errors, config_path)
+
+
+def _validate_disaster_stop_restart(execution: EquityExecutionConfig, schwab: SchwabConfig,
+                                    runtime: RuntimeConfig, config_path: Path) -> None:
+    """A live disaster stop needs a restart that sees the stops it left
+    resting. With ``runtime.reconcile_on_startup`` false, or
+    ``startup_reconcile_mode`` ``ignore`` / ``log_only``, a restart forgets
+    them: a re-entry in the symbol places a second stop on the same shares,
+    and a position flattened by hand leaves its stop to open the opposite
+    side. Refused when ``schwab.dry_run`` is false (a dry run places
+    nothing); ``block`` flags them for a human, and the restore modes adopt
+    them."""
+    if execution.disaster_stop_enabled is not True or schwab.dry_run is not False:
+        return
+    errors: list[str] = []
+    if runtime.reconcile_on_startup is False:
+        errors.append(
+            "execution.disaster_stop_enabled: true with runtime.reconcile_on_startup: false is refused when "
+            "schwab.dry_run is false: a restart would forget the disaster stops it left resting. Turn the "
+            "startup reconcile on (startup_reconcile_mode block, restore_basic or restore_hybrid), or set "
+            "execution.disaster_stop_enabled: false"
+        )
+    elif runtime.startup_reconcile_mode in {"ignore", "log_only"}:
+        errors.append(
+            f"execution.disaster_stop_enabled: true with runtime.startup_reconcile_mode: "
+            f"{runtime.startup_reconcile_mode} is refused when schwab.dry_run is false: a restart would "
+            "forget the disaster stops it left resting. Use startup_reconcile_mode block, restore_basic or "
+            "restore_hybrid, or set execution.disaster_stop_enabled: false"
+        )
     _raise_section_errors("execution", errors, config_path)
 
 
@@ -2422,7 +2503,8 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     _validate_shared_exit_config(shared_exit_cfg, risk_cfg, config_path)
 
     execution_cfg = EquityExecutionConfig(**execution_raw)
-    _validate_execution_config(execution_cfg, risk_cfg, shared_exit_cfg, config_path)
+    _validate_execution_config(execution_cfg, risk_cfg, shared_exit_cfg, strategy, config_path)
+    _validate_disaster_stop_restart(execution_cfg, schwab_cfg, runtime_cfg, config_path)
 
     options_cfg = ZeroDteOptionsConfig(**options_raw)
     _validate_options_config(options_cfg, config_path)

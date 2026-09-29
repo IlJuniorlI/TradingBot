@@ -214,6 +214,23 @@ execution:
   bracket_require_normal_session: true
   # replace mode: skip a replace unless a level moved at least this many $.
   bracket_replace_min_price_delta: 0.01
+  # Static disaster stop: a far STOP rests at the broker for each equity
+  # position, placed once the entry fills (at the first regular-session cycle
+  # for a premarket entry) and never moved. The engine keeps its own stop and
+  # every other exit, and cancels this one before any exit it sends; it is
+  # what protects the position while the bot is down. It rests
+  # max(disaster_stop_r x initial R, disaster_stop_min_pct x entry) beyond the
+  # initial stop. A dry run places nothing. On unless a config says false.
+  # Refused with bracket_orders_enabled, for an options strategy, and, with
+  # schwab.dry_run false, with a startup reconcile that forgets the stops it
+  # left resting (reconcile_on_startup false, startup_reconcile_mode ignore or
+  # log_only). Every disaster_stop_escalation_attempts-th consecutive attempt
+  # that leaves a position without its stop (refused, unknown outcome, a
+  # cancel before an exit not confirmed) logs a CRITICAL.
+  disaster_stop_enabled: true
+  disaster_stop_r: 1.0
+  disaster_stop_min_pct: 0.0025
+  disaster_stop_escalation_attempts: 3
 
 # Candle-pattern inputs used by strategies that support them.
 candles:

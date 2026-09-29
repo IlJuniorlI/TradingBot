@@ -175,6 +175,12 @@ _MAX_MANAGEMENT_ADJUSTMENTS = 200
 # stop exit says which ratchet's level it hit.
 STOP_SOURCE_KEY = "stop_source"
 
+# The position metadata key of the price an equity position's disaster stop
+# rests at (execution.disaster_stop_enabled), stamped when the position is
+# opened or restored (``SchwabExecutor.stamp_disaster_stop_price``) and never
+# moved; EXIT_CONTEXT carries it.
+DISASTER_STOP_PRICE_KEY = "disaster_stop_price"
+
 
 def append_management_adjustment(meta: dict, entry: dict) -> None:
     """Append a management adjustment to position metadata with a size cap,

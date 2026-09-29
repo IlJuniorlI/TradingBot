@@ -71,9 +71,15 @@ from .risk import RiskManager
 from .sr_snapshot import sr_snapshot
 from .trade_management import TradeManager
 from .broker_payloads import (
+    BRACKET_ID_KEYS,
+    DISASTER_SYNC_MODE,
     active_broker_bracket,
     bracket_order_ids,
+    is_disaster_stop,
     order_result_needs_broker_recheck,
+    protective_stop_reason,
+    sent_exit_stop,
+    working_exit_orders,
     working_exit_outstanding_qty,
 )
 from .log_setup import TRADEFLOW_LEVEL, ComponentFailureLog
@@ -90,6 +96,16 @@ LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 # evening before) is a NORMAL DAY order that can outlive it. One read a minute
 # per such child keeps a few of them far inside Schwab's ~120 requests/minute.
 UNLISTED_BRACKET_CHILD_READ_SECONDS = 60.0
+
+# How long after an attempt at a position's disaster stop that did not leave
+# it resting the next one waits (ensure_disaster_stop): after the broker
+# refused it (a non-2xx status: nothing placed), one a minute per position
+# keeps a stop the broker keeps refusing (a level the price is already
+# through, a halted symbol) far inside Schwab's ~120 requests/minute, and
+# every attempt logs; after a submit whose outcome is unknown, an order the
+# broker did accept is listed long before the working orders are read to
+# look for it.
+DISASTER_STOP_RETRY_SECONDS = 60.0
 
 # A position whose management raises is logged with its traceback on the first
 # failure of a run of consecutive failed cycles and on every
@@ -642,6 +658,7 @@ class PositionManager:
         if final_exit:
             self._register_closed_position(key, position, realized, float(exit_price), bars)
             self.positions.pop(key, None)
+            self._sweep_exit_orders(key, position)
         else:
             self.risk.register_realized_pnl(realized)
             position.qty -= int(exit_qty)
@@ -713,7 +730,7 @@ class PositionManager:
         if bracket is None:
             return
         child_states: dict[str, dict[str, Any] | None] = {}
-        for child_key, reason in (("stop_order_id", "broker_stop"), ("target_order_id", "broker_target")):
+        for child_key, reason in (("stop_order_id", protective_stop_reason(bracket)), ("target_order_id", "broker_target")):
             child_id = bracket.get(child_key)
             if not child_id:
                 continue
@@ -864,7 +881,7 @@ class PositionManager:
                 self.book_bracket_cancel_fills(
                     key, position, bracket,
                     BracketCancel(False, leftover.message, dead_filled, safe_float(child_state.get("fill_price"), None),
-                                  f"broker_{child}"),
+                                  protective_stop_reason(bracket) if child == "stop" else "broker_target"),
                     None, bars,
                 )
                 # The wrapper still lists the dead child; a later cancel of it
@@ -895,8 +912,12 @@ class PositionManager:
         if (key in self.positions and dead_stop and dead_stop != "REJECTED"
                 and not bracket.get("replaces_dead_stop")):
             self._reprotect_beside_working_order(position, working_exit_outstanding_qty(position))
-            fresh = active_broker_bracket(position)
-            if fresh is not None and fresh is not bracket:
+            # Marked whether the fresh stop rests or is still owed: a
+            # disaster stop owed the regular session, or refused by the
+            # broker, carries it to the stop ensure_disaster_stop places, so
+            # that one is never re-placed after it dies in turn.
+            fresh = position.metadata.get("bracket") if isinstance(position.metadata, dict) else None
+            if isinstance(fresh, dict) and fresh is not bracket:
                 fresh["replaces_dead_stop"] = dead_stop
         self._save_reconcile_metadata()
 
@@ -912,10 +933,10 @@ class PositionManager:
         """
         if cancel.filled_qty <= 0:
             return
-        reason = cancel.fill_reason or "broker_stop"
+        reason = cancel.fill_reason or protective_stop_reason(bracket)
         fill_price = cancel.fill_price
         if fill_price is None:
-            level = bracket.get("stop_price") if reason == "broker_stop" else bracket.get("target_price")
+            level = bracket.get("target_price") if reason == "broker_target" else bracket.get("stop_price")
             fill_price = safe_float(level, None) if level is not None else safe_float(last_price, None)
         if fill_price is None:
             LOG.error(
@@ -1021,12 +1042,18 @@ class PositionManager:
         False for a dry-run (simulated) bracket and for a position that has
         none (bracket mode off, an option)."""
         bracket = position.metadata.get("bracket") if isinstance(position.metadata, dict) else None
-        return isinstance(bracket, dict) and not bracket.get("simulated") and not bracket.get("active")
+        # An unconfirmed disaster stop may rest: one placed beside it would
+        # sell the shares twice, so only ensure_disaster_stop places after
+        # it, once it has looked for it.
+        return (isinstance(bracket, dict) and not bracket.get("simulated") and not bracket.get("active")
+                and bracket.get("state") != "unconfirmed")
 
     def _reprotect_remainder(self, position: Position, qty: int | None = None) -> None:
-        """Resting broker protection, at the current engine levels, for the
-        ``qty`` shares of a position no exit order covers (default: all of
-        it) after its bracket was cancelled to send an exit.
+        """Resting broker protection, at the current engine levels (a
+        disaster stop at the position's disaster price, never the engine's
+        moved stop: ``resting_stop_price``), for the ``qty`` shares of a
+        position no exit order covers (default: all of it) after its bracket
+        was cancelled to send an exit.
 
         The bracket the position still tracks goes along as
         ``known_bracket``: a live one -- the remainder bracket placed beside
@@ -1038,7 +1065,7 @@ class PositionManager:
         reprotected = self.executor.ensure_position_protected(
             str(position.metadata.get("underlying") or position.symbol),
             int(position.qty) if qty is None else int(qty), position.side,
-            float(position.stop_price), position.target_price,
+            self.executor.resting_stop_price(position), position.target_price,
             initial_risk=initial_risk_per_unit(position),
             known_bracket=active_broker_bracket(position),
         )
@@ -1057,6 +1084,179 @@ class PositionManager:
         uncovered = int(position.qty) - int(outstanding_qty)
         if uncovered > 0:
             self._reprotect_remainder(position, uncovered)
+
+    # The states of a disaster stop's record that ensure_disaster_stop places
+    # afresh: owed the regular session (Schwab rejects a STOP outside it),
+    # refused by the broker, and unconfirmed (looked for first); the last two
+    # after DISASTER_STOP_RETRY_SECONDS.
+    _DISASTER_STOP_OWED_STATES = frozenset({"pending_session", "unprotected", "unconfirmed"})
+    _DISASTER_STOP_RETRY_STATES = frozenset({"unprotected", "unconfirmed"})
+
+    def ensure_disaster_stop(self, key: str, position: Position) -> None:
+        """Rest an equity position's disaster stop at the broker when it is
+        owed one (``execution.disaster_stop_enabled``): right after its entry
+        fills (the entry gatekeeper), and on each cycle that decides no exit
+        for it (``_manage_position``).
+
+        Owed: a position with no record yet; one whose stop waits for the
+        regular session (a premarket entry gets it on the first
+        regular-session cycle); one whose stop the broker refused; and one
+        whose submit had an unknown outcome, or whose restore could not read
+        it (``unconfirmed``). The last two wait ``DISASTER_STOP_RETRY_SECONDS``
+        after the attempt (``attempted_at``). An unconfirmed one is looked for
+        first among the day's working orders (``broker_payloads.
+        sent_exit_stop``): the exit STOP resting at exactly the price and
+        quantity sent is adopted; beside any other exit stop on the symbol
+        (one placed by hand, or one it cannot tell for its own) none is
+        adopted and none placed; and nothing is placed until the orders can
+        be read. Not owed: a stop resting, a dry run's (simulated: nothing is
+        placed), one the cancel before an engine exit took down (that exit's
+        own path re-protects what is left), and one that died at the broker
+        (the fill reconcile's retire re-places it once, and never after a
+        REJECTED one; the mark that retire leaves on the stop it owes is
+        carried to the one placed here).
+
+        Before anything is sent the record reads ``unconfirmed`` at the price
+        and quantity about to be sent, and is saved. Whatever raises after
+        that (here, or in the entry pass that called it) leaves a stop the
+        next attempt looks for before it places another: an order write is
+        never assumed not to have landed, and a position never gets two
+        resting stops.
+
+        Each attempt that leaves the position without its stop in the
+        regular session (refused, unknown outcome, the orders unreadable, a
+        stop it cannot tell for its own) counts as a miss
+        (``failed_attempts`` on the record); every
+        ``execution.disaster_stop_escalation_attempts``-th consecutive one
+        is logged at CRITICAL (``_escalate_disaster_stop``)."""
+        if not isinstance(position.metadata, dict) or is_option_asset(position.metadata) \
+                or not self.executor.disaster_stop_enabled():
+            return
+        record = position.metadata.get("bracket")
+        state = record.get("state") if isinstance(record, dict) else None
+        if isinstance(record, dict) and state not in self._DISASTER_STOP_OWED_STATES:
+            return
+        now = sessions.now_et()
+        if state in self._DISASTER_STOP_RETRY_STATES and record.get("attempted_at") is not None \
+                and (now - datetime.fromisoformat(str(record["attempted_at"]))).total_seconds() \
+                < DISASTER_STOP_RETRY_SECONDS:
+            return
+        missed = int(record.get("failed_attempts") or 0) if isinstance(record, dict) else 0
+        known: dict[str, Any] | None = None
+        if state == "unconfirmed":
+            orders = self._todays_working_orders(now)
+            if orders is None:
+                self._disaster_stop_missed(
+                    key, record, missed + 1, now, logging.WARNING,
+                    "the working orders could not be read to look for its unconfirmed stop; none is placed "
+                    "until they are",
+                )
+                return
+            known, others = sent_exit_stop(orders, position.symbol, position.side,
+                                           stop_price=record.get("stop_price"), qty=record.get("qty"))
+            if known is None and others:
+                self._disaster_stop_missed(
+                    key, record, missed + 1, now, logging.ERROR,
+                    f"exit stop(s) {', '.join(str(order['orderId']) for order in others)} rest on "
+                    f"{position.symbol}, none of them the {record.get('qty')} shares at {record.get('stop_price')} "
+                    "its unconfirmed stop sent; none is adopted and none placed beside them",
+                )
+                return
+        level = self.executor.protective_stop_level(position.side, self.executor.resting_stop_price(position))
+        carried = {mark: record[mark] for mark in ("replaces_dead_stop",)
+                   if isinstance(record, dict) and record.get(mark)}
+        position.metadata["bracket"] = {
+            "parent_order_id": None, "sync_mode": DISASTER_SYNC_MODE, "legs": "stop_only", "session": "NORMAL",
+            "stop_price": level, "target_price": None, "qty": int(position.qty),
+            **dict.fromkeys(BRACKET_ID_KEYS), "child_order_ids": [],
+            "active": False, "state": "unconfirmed", "attempted_at": now.isoformat(),
+            "failed_attempts": missed + 1, **carried,
+        }
+        self._save_reconcile_metadata()
+        fresh = self.executor.ensure_position_protected(
+            str(position.metadata.get("underlying") or position.symbol), int(position.qty), position.side,
+            self.executor.resting_stop_price(position), None, initial_risk=None, known_bracket=known,
+        )
+        if isinstance(fresh, dict):
+            fresh.update(carried)
+            if fresh.get("state") in self._DISASTER_STOP_RETRY_STATES:
+                fresh["failed_attempts"] = missed + 1
+                self._escalate_disaster_stop(key, missed + 1, f"its last attempt ended {fresh['state']}")
+            elif fresh.get("state") == "pending_session" and missed:
+                fresh["failed_attempts"] = missed
+        position.metadata["bracket"] = fresh
+        self._save_reconcile_metadata()
+
+    def _todays_working_orders(self, now: datetime) -> list[dict[str, Any]] | None:
+        """The account's working orders entered since midnight ET
+        (``SchwabExecutor.fetch_working_orders``), or None when they could not
+        be read. A DAY order entered before today no longer works."""
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return self.executor.fetch_working_orders(
+            *(stamp.astimezone(sessions.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+              for stamp in (day_start, now)),
+        )
+
+    def _disaster_stop_missed(self, key: str, record: dict[str, Any], missed: int, now: datetime, level: int,
+                              detail: str) -> None:
+        """An unconfirmed disaster stop's lookup that placed nothing: log
+        *detail*, count the miss on *record*, and wait the retry interval."""
+        record["attempted_at"] = now.isoformat()
+        record["failed_attempts"] = missed
+        LOG.log(level, "Disaster stop for %s: %s", key, detail)
+        self._escalate_disaster_stop(key, missed, detail)
+        self._save_reconcile_metadata()
+
+    def _escalate_disaster_stop(self, key: str, count: int, detail: str) -> None:
+        """Log at CRITICAL when *key* has gone *count* consecutive attempts
+        without its disaster stop resting where it should (an owed stop not
+        placed, or a cancel before an exit not confirmed, which defers the
+        exit): on every ``execution.disaster_stop_escalation_attempts``-th.
+        Each miss is logged on its own line too; this is the one to page
+        on."""
+        if count % int(self.config.execution.disaster_stop_escalation_attempts) == 0:
+            LOG.critical("DISASTER STOP DEGRADED — %s: %d consecutive attempts missed. Last: %s", key, count, detail)
+
+    def _sweep_exit_orders(self, key: str, position: Position) -> None:
+        """After a full close of a position that had live broker protection,
+        cancel the exit orders still working on its symbol for its side.
+
+        Once the position is gone, a SELL (for a LONG) or BUY_TO_COVER (for a
+        SHORT) still working at the broker opens a position the bot does not
+        track when it fills. The bot's own records cannot see three: a stop
+        whose submit had an unknown outcome and landed, if the position
+        closed in full before the lookup found it; a replacement a replace
+        left untracked (``new_id_unknown``); and a stop moved in the app.
+        One read of the day's working orders per such close; a dry run and a
+        position that had no broker protection (no record, or a simulated
+        one) read nothing. The account's positions in a symbol the bot
+        trades are taken as the bot's own, as the startup reconcile takes
+        them."""
+        record = position.metadata.get("bracket") if isinstance(position.metadata, dict) else None
+        if (self.config.schwab.dry_run or not isinstance(record, dict) or record.get("simulated")
+                or is_option_asset(position.metadata)):
+            return
+        symbol = str(position.metadata.get("underlying") or position.symbol)
+        orders = self._todays_working_orders(sessions.now_et())
+        if orders is None:
+            LOG.error("The working orders could not be read after %s closed; an exit order still working on %s "
+                      "is not cancelled and would open a position the bot does not track", key, symbol)
+            return
+        left = working_exit_orders(orders, symbol, position.side)
+        if not left:
+            return
+        ids = [str(order["orderId"]) for order in left]
+        LOG.warning("%s closed with exit order(s) %s still working on %s; cancelling them", key, ", ".join(
+            f"{order['orderId']} ({order.get('orderType')} {order.get('quantity')} at "
+            f"{order.get('stopPrice')})" for order in left), symbol)
+        cancel = self.executor.cancel_bracket({"child_order_ids": ids})
+        if not cancel.ok or cancel.filled_qty > 0:
+            LOG.critical(
+                "EXIT ORDERS LEFT — %s closed, and its leftover exit order(s) %s on %s %s: %s. Check the account "
+                "for a position the bot does not track.", key, ", ".join(ids), symbol,
+                f"filled {cancel.filled_qty} share(s) before the cancel" if cancel.filled_qty > 0
+                else "could not be confirmed cancelled", cancel.message,
+            )
 
     @staticmethod
     def _record_exit_marker(position: Position, family: str, marker: dict[str, Any] | None, status: str) -> None:
@@ -1190,10 +1390,11 @@ class PositionManager:
         lookup that keeps failing (2026-09-24). The caller cancels the slice;
         the cycle that settles it sends the full exit. A full exit's order
         covers every share and is not checked. In bracket mode the resting
-        stop placed beside the slice may fill first; the reconcile books it,
-        and the stop exit that follows cancels what still rests (since
-        2026-09-28 the risk check no longer leaves the stop to the broker,
-        see TradeManager.update_position)."""
+        stop placed beside the slice (or a disaster stop, beyond the
+        engine's stop) may fill first; the reconcile books it, and the stop
+        exit that follows cancels what still rests (since 2026-09-28 the risk
+        check no longer leaves the stop to the broker, see
+        TradeManager.update_position)."""
         outstanding = working_exit_outstanding_qty(position)
         if last_price is None or outstanding >= int(position.qty):
             return False
@@ -1399,6 +1600,11 @@ class PositionManager:
             if decision is None or decision.is_partial:
                 decision = ExitDecision("force_flatten", "force_flatten")
         if decision is None:
+            # No exit this cycle: a disaster stop the position is owed is
+            # placed now (one opened before the regular session, or one the
+            # broker refused). A cycle that exits sends none, only to cancel
+            # it again.
+            self.ensure_disaster_stop(key, position)
             return
         reason = decision.reason
         requested_qty = decision.close_qty(int(position.qty))
@@ -1443,6 +1649,17 @@ class PositionManager:
                     "Could not cancel resting bracket for %s before %s exit (%s); "
                     "deferring exit to avoid a double fill", key, reason, cancel.message,
                 )
+                if is_disaster_stop(open_bracket):
+                    # The stop resting is the far disaster stop, not the
+                    # engine's: a DELETE that keeps failing holds the exit
+                    # while the engine's own level is breached. Counted on
+                    # the record, which a confirmed cancel retires.
+                    deferred = int(open_bracket.get("cancel_failures") or 0) + 1
+                    open_bracket["cancel_failures"] = deferred
+                    self._escalate_disaster_stop(
+                        key, deferred, f"its disaster stop's cancel was not confirmed ({cancel.message}), so its "
+                        f"{reason} exit is deferred",
+                    )
                 self.audit.log_structured("EXIT_CONTEXT", {
                     **exit_context, "symbol": key, "qty": int(requested_qty),
                     "result_message": f"bracket_cancel_failed:{cancel.message}",
@@ -1547,6 +1764,7 @@ class PositionManager:
             self._register_closed_position(key, position, realized, exit_price, bars)
             del self.positions[key]
             self._save_reconcile_metadata()
+            self._sweep_exit_orders(key, position)
         else:
             self.risk.register_realized_pnl(realized)
             position.qty -= exit_qty

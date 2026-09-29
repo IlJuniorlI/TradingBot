@@ -127,6 +127,20 @@ execution:
   # Premarket entries require extended-hours orders.
   extended_hours_enabled: true
   market_exit_regular_hours: false
+  # Static disaster stop (a dry run places nothing): a far STOP rests at the
+  # broker for each position, max(disaster_stop_r x initial R,
+  # disaster_stop_min_pct x entry) beyond its initial stop, and is never moved;
+  # the engine keeps its own stop and cancels this one before any exit it
+  # sends. It protects a position while the bot is down. At 1.0R it fired on
+  # none of the 176 archived trades (2026-09-28). With schwab.dry_run false it
+  # needs a startup reconcile that sees the stops it left resting
+  # (startup_reconcile_mode block, restore_basic or restore_hybrid). Every
+  # disaster_stop_escalation_attempts-th consecutive attempt left without it
+  # logs a CRITICAL.
+  disaster_stop_enabled: true
+  disaster_stop_r: 1.0
+  disaster_stop_min_pct: 0.0025
+  disaster_stop_escalation_attempts: 3
 
 # Candle-pattern inputs used by the engine's candle context (single/2/3-bar
 # reversal patterns). Long-only here; the bearish set feeds opposing-pattern

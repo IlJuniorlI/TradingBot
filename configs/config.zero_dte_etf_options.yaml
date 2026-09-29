@@ -130,6 +130,10 @@ execution:
   entry_live_reprice_step_frac: 0.33
   extended_hours_enabled: true
   market_exit_regular_hours: false
+  # Static disaster stop: equity positions only. It is on unless a config says
+  # false, and refused on for an options strategy, so an options config must
+  # say false.
+  disaster_stop_enabled: false
 
 # Candle-pattern inputs used by strategies that support them.
 candles:

@@ -3,7 +3,9 @@
 
 ``call_schwab_client`` counts the call, serializes the token refresh and logs
 a non-2xx response. ``response_ok`` is the one reading of a response status.
-``SCHWAB_TRANSPORT_ERRORS`` are the transport failures the client raises.
+``SCHWAB_TRANSPORT_ERRORS`` are the transport failures the client raises,
+and ``SCHWAB_WRITE_UNKNOWN_OUTCOME`` those an order write raises without
+telling whether the broker acted on it.
 """
 from __future__ import annotations
 
@@ -235,6 +237,22 @@ SCHWAB_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
     requests.exceptions.ChunkedEncodingError,
     requests.exceptions.ContentDecodingError,
     requests.exceptions.TooManyRedirects,
+)
+
+# The failures an order write (place_order, a POST) raises when the request
+# may have reached Schwab: the order may rest at the broker, or not. The
+# adapter above retries GET, PUT and DELETE only (schwabdev's
+# allowed_methods; a POST is not idempotent), so a POST whose response times
+# out raises requests' ReadTimeout at once, which is a Timeout and not a
+# ConnectionError: SCHWAB_TRANSPORT_ERRORS, derived for reads, does not name
+# it. Every transport failure is taken the same way, a refused connection
+# included: an order write never assumes it was not placed. Checked
+# 2026-09-28 against schwabdev 4.0.0, requests 2.34.2 and urllib3 2.8.0 with
+# a loopback server that reads the request and never answers: a POST raised
+# ReadTimeout, a GET ConnectionError.
+SCHWAB_WRITE_UNKNOWN_OUTCOME: tuple[type[Exception], ...] = (
+    requests.exceptions.Timeout,
+    *SCHWAB_TRANSPORT_ERRORS,
 )
 
 
