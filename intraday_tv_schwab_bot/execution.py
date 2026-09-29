@@ -632,14 +632,16 @@ class SchwabExecutor:
         replacement tracked in its place), the last three with
         ``;stopped=status:<STATUS>``. So no second exit order for the same
         shares goes out while one may still fill, except after an order whose
-        submit's outcome is unknown (a POST that times out raises; the shared
-        unknown-outcome path is queued). A re-send is priced off the quote
-        read then, its spread buffer ``1 + n * exit_live_reprice_step_frac``
-        times the first's. There are at most ``exit_live_reprice_attempts``
-        of them, and none once the management pass's ``deadline``
-        (``exit_reprice_deadline``, shared by every exit of the pass) has
-        passed or the session is no longer the one the exit was priced for.
-        The first order always goes out. Then, with
+        submit's outcome is unknown (a POST that times out raises; one
+        answered 5xx ends the call as ``status=5xx``, which
+        ``order_result_needs_broker_recheck`` reads as possibly landed; the
+        shared unknown-outcome path is queued). A re-send is priced off the
+        quote read then, its spread buffer ``1 + n *
+        exit_live_reprice_step_frac`` times the first's. There are at most
+        ``exit_live_reprice_attempts`` of them, and none once the management
+        pass's ``deadline`` (``exit_reprice_deadline``, shared by every exit
+        of the pass) has passed or the session is no longer the one the exit
+        was priced for. The first order always goes out. Then, with
         ``exit_live_market_fallback``, a regular-session exit goes out as a
         MARKET order under the same two limits, left working if it does not
         fill.
@@ -1416,28 +1418,44 @@ class SchwabExecutor:
 
     @staticmethod
     def _tracked_protection_ids(known_bracket: dict[str, Any] | None) -> dict[str, Any] | None:
-        """The protective order ids *known_bracket* tracks, or None when it
-        tracks no stop."""
+        """The protective order ids *known_bracket* tracks, with the fills
+        of them already booked (``booked_child_fills``, when it has any), or
+        None when it tracks no stop. The booked fills go along so the fill
+        reconcile and a later cancel book only what is new (2026-09-29): an
+        adopted stop that had filled in part (while the bot was down, or
+        booked by an unconfirmed stop's lookup) was booked again, in full,
+        when the rest of it filled."""
         if not (isinstance(known_bracket, dict) and known_bracket.get("stop_order_id")):
             return None
         ids: dict[str, Any] = {key: known_bracket.get(key) for key in BRACKET_ID_KEYS}
         ids["child_order_ids"] = [str(oid) for oid in (known_bracket.get("child_order_ids") or []) if oid]
+        if known_bracket.get("booked_child_fills"):
+            ids["booked_child_fills"] = {str(oid): int(qty) for oid, qty in known_bracket["booked_child_fills"].items()}
         return ids
 
     def _adoptable_protection(self, parent_order_id: str | None,
                               known_bracket: dict[str, Any] | None) -> dict[str, Any] | None:
         """Child ids (plus what they rest) of protection still working, or None.
 
-        Each child's state comes from the account_orders listing or, when
-        the listing does not return it (it failed, or the order is older
-        than its 8-hour lookback: a stop entered before an overnight hold),
-        from ``order_state``, as ``startup_reconciler._drop_retired_orders``
-        reads a missing id (2026-09-25). Until then a missing stop was
-        adopted with no size, so ``ensure_position_protected`` never resized
-        it. A stop neither read returns is still adopted, rather than risk
-        stacking a second protective order on a live one, with its size
-        unknown (``resting_qty`` None), which ``ensure_position_protected``
-        re-issues at the position's size.
+        A stub a read of the orders just listed as one that may still work
+        (``broker_payloads.listed_stop``: the unconfirmed stop's lookup, a
+        stop resting on the symbol) is adopted as that read lists it, never
+        read again (2026-09-29): a stop that filled between the two reads
+        read as gone, a new stop was placed beside the fill, and the fill was
+        never booked. Once adopted it is tracked, and the fill reconcile
+        books what it sells.
+
+        Otherwise each child's state comes from the account_orders listing
+        or, when the listing does not return it (it failed, or the order is
+        older than its 8-hour lookback: a stop entered before an overnight
+        hold), from ``order_state``, as
+        ``startup_reconciler._drop_retired_orders`` reads a missing id
+        (2026-09-25). Until then a missing stop was adopted with no size, so
+        ``ensure_position_protected`` never resized it. A stop neither read
+        returns is still adopted, rather than risk stacking a second
+        protective order on a live one, with its size unknown
+        (``resting_qty`` None), which ``ensure_position_protected`` re-issues
+        at the position's size.
         """
         ids = self._tracked_protection_ids(known_bracket)
         if ids is None and parent_order_id:
@@ -1447,6 +1465,12 @@ class SchwabExecutor:
         stop_id = ids.get("stop_order_id")
         if not stop_id:
             return None
+        listed = known_bracket.get("listed") if isinstance(known_bracket, dict) else None
+        if listed is not None:
+            adopted = {**ids, "resting_qty": listed["resting_qty"]}
+            if listed["stop_price"] is not None:
+                adopted["stop_price"] = float(listed["stop_price"])
+            return adopted
         states = self.fetch_order_states() or {}
 
         def _state(order_id: Any) -> dict[str, Any] | None:

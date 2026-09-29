@@ -90,6 +90,7 @@ from .broker_payloads import (
     bracket_order_ids,
     exit_orders,
     is_disaster_stop,
+    listed_stop,
     order_may_be_live,
     order_result_needs_broker_recheck,
     order_row_filled_qty,
@@ -1234,7 +1235,16 @@ class PositionManager:
         # sell the shares twice, so only ensure_disaster_stop places after
         # it, once it has looked for it.
         return (isinstance(bracket, dict) and not bracket.get("simulated") and not bracket.get("active")
-                and bracket.get("state") != "unconfirmed")
+                and not PositionManager._disaster_stop_unconfirmed(position))
+
+    @staticmethod
+    def _disaster_stop_unconfirmed(position: Position) -> bool:
+        """True when the position's record is a disaster stop sent with an
+        unknown outcome (``unconfirmed``): it may rest, or have sold shares,
+        so nothing but ``ensure_disaster_stop`` (or the lookup before an
+        exit) places a stop after it, once it has looked for it."""
+        bracket = position.metadata.get("bracket") if isinstance(position.metadata, dict) else None
+        return is_disaster_stop(bracket) and bracket.get("state") == "unconfirmed"
 
     def _reprotect_remainder(self, position: Position, qty: int | None = None) -> None:
         """Resting broker protection, at the current engine levels (a
@@ -1273,10 +1283,11 @@ class PositionManager:
         if uncovered > 0:
             self._reprotect_remainder(position, uncovered)
 
-    # A disaster stop's record states that rest a stop larger than the
-    # position: an adopted stop whose resize the broker refused
-    # (``qty_mismatch``) or whose size could not be read (``qty_unverified``).
-    _DISASTER_STOP_OVERSIZE_STATES = frozenset({"qty_mismatch", "qty_unverified"})
+    # A disaster stop's record states that rest a stop of another size than
+    # the position: one whose resize the broker refused (``qty_mismatch``: an
+    # adopted stop larger than the position, or one smaller once late entry
+    # fills grew it) or whose size could not be read (``qty_unverified``).
+    _DISASTER_STOP_MISSIZED_STATES = frozenset({"qty_mismatch", "qty_unverified"})
     # The records a dead stop's retire leaves (``stop_<status>``).
     _DISASTER_STOP_DEAD_STATES = frozenset({"stop_rejected", "stop_expired", "stop_canceled", "stop_cancelled"})
 
@@ -1285,13 +1296,13 @@ class PositionManager:
         """True when a live position's disaster stop record rests no stop of
         the position's size: no record yet, one that rests nothing (owed the
         regular session, refused, unconfirmed, cancelled for an exit that did
-        not follow, dead, or filled in part), or an oversized one. A dry
+        not follow, dead, or filled in part), or one of another size. A dry
         run's (simulated) is never owed."""
         if not isinstance(record, dict):
             return True
         if record.get("simulated"):
             return False
-        return not record.get("active") or record.get("state") in cls._DISASTER_STOP_OVERSIZE_STATES
+        return not record.get("active") or record.get("state") in cls._DISASTER_STOP_MISSIZED_STATES
 
     def ensure_disaster_stop(self, key: str, position: Position, bars) -> None:
         """Rest an equity position's disaster stop at the broker when it is
@@ -1306,9 +1317,9 @@ class PositionManager:
           one is still looked up.
         - A record that carries its last attempt's time (``attempted_at``: a
           refused or unconfirmed submit, an order list that could not be
-          read, an oversized stop left as it was, a stop the broker rejected
-          or that died again) waits ``DISASTER_STOP_RETRY_SECONDS`` after
-          it.
+          read, a stop of another size left as it was, a stop the broker
+          rejected or that died again) waits ``DISASTER_STOP_RETRY_SECONDS``
+          after it.
         - Unconfirmed (a submit with an unknown outcome, or a restore that
           could not read its stop): ``_look_up_unconfirmed_stop`` first. A
           stop that filled is booked (the position is closed, or the rest is
@@ -1316,7 +1327,9 @@ class PositionManager:
           (resized to what is held); one REPLACED at the broker is followed
           to its replacement, and none is placed while that cannot be found;
           a dead one, or none after the retry interval, lets one be placed.
-        - Oversized (``qty_mismatch`` / ``qty_unverified``): the resize is
+        - Of another size (``qty_mismatch`` / ``qty_unverified``: an adopted
+          stop larger than the position, or one smaller once late entry
+          fills grew it, ``disaster_stop_resize_refused``): the resize is
           tried again, then the stop is cancelled and one placed at the held
           size; one that neither resizes nor cancels is a miss.
         - Down with no exit working (``canceled`` by the cancel before an
@@ -1390,7 +1403,7 @@ class PositionManager:
                 position.metadata["bracket"] = self._pending_disaster_stop(position, missed=missed, **carried)
                 self._save_reconcile_metadata()
                 return
-        elif state in self._DISASTER_STOP_OVERSIZE_STATES:
+        elif state in self._DISASTER_STOP_MISSIZED_STATES:
             resized, message = self.executor.resize_bracket_children(record, symbol, position.side, int(position.qty),
                                                                       "NORMAL", initial_risk=None)
             if resized:
@@ -1401,19 +1414,24 @@ class PositionManager:
                 self._save_reconcile_metadata()
                 return
             cancel = self.executor.cancel_bracket(record)
+            resting = record.get("qty")
             if not cancel.ok:
                 self._disaster_stop_missed(
                     key, record, missed + 1, now, logging.ERROR,
-                    f"its stop rests {'an unknown number of' if record.get('qty') is None else record.get('qty')} "
-                    f"shares against {position.qty} held, and neither its resize "
-                    f"({message}) nor its cancel ({cancel.message}) was confirmed; it would sell more than is held",
+                    f"its stop rests {'an unknown number of' if resting is None else resting} shares against "
+                    f"{position.qty} held, and neither its resize ({message}) nor its cancel ({cancel.message}) "
+                    "was confirmed; "
+                    + (f"the other {int(position.qty) - int(resting)} have no broker stop"
+                       if resting is not None and int(resting) < int(position.qty)
+                       else "it would sell more than is held"),
                 )
                 return
             self.book_bracket_cancel_fills(key, position, record, cancel, None, bars)
             if key not in self.positions:
                 return
-            LOG.warning("Disaster stop for %s: cancelled the stop resting more shares than the %s held, after its "
-                        "resize was refused again (%s); placing one at the held size", key, position.qty, message)
+            LOG.warning("Disaster stop for %s: cancelled the stop resting %s shares against the %s held, after its "
+                        "resize was refused again (%s); placing one at the held size", key,
+                        "an unknown number of" if resting is None else resting, position.qty, message)
         elif state == "canceled" or (state in self._DISASTER_STOP_DEAD_STATES and state != "stop_rejected"
                                      and not record.get("replaces_dead_stop")):
             # Down, and not counted when it went down: the retire counts the
@@ -1430,14 +1448,13 @@ class PositionManager:
             "failed_attempts": missed + 1, **carried,
         }
         self._save_reconcile_metadata()
+        # The stop the lookup found is adopted as it listed it, with the
+        # fills it booked: a later cancel of it reports them again,
+        # cumulatively (SchwabExecutor._adoptable_protection).
         fresh = self.executor.ensure_position_protected(
             symbol, int(position.qty), position.side, self.executor.resting_stop_price(position), None,
             initial_risk=None, known_bracket=known,
         )
-        if known is not None and known.get("booked_child_fills") and fresh.get("stop_order_id") == known["stop_order_id"]:
-            # The fills the lookup booked; a later cancel of the stop reports
-            # them again, cumulatively.
-            fresh["booked_child_fills"] = dict(known["booked_child_fills"])
         self._record_disaster_stop_attempt(key, position, fresh, missed, carried, now)
 
     def _pending_disaster_stop(self, position: Position, *, missed: int = 0, **carried: Any) -> dict[str, Any]:
@@ -1462,7 +1479,7 @@ class PositionManager:
         broker lists it working."""
         fresh.update(carried)
         state = fresh.get("state")
-        if state in ("unprotected", "unconfirmed") or state in self._DISASTER_STOP_OVERSIZE_STATES:
+        if state in ("unprotected", "unconfirmed") or state in self._DISASTER_STOP_MISSIZED_STATES:
             fresh["failed_attempts"] = missed + 1
             fresh.setdefault("attempted_at", now.isoformat())
             self._escalate_disaster_stop(key, missed + 1, f"its last attempt ended {state}")
@@ -1491,7 +1508,9 @@ class PositionManager:
         - ``closed``: it filled, and booking that closed the position.
         - ``working``: it may still rest (any status but a terminal one:
           PENDING_CANCEL, NEW, AWAITING_RELEASE_TIME and an unknown or
-          missing one included); *stub* (its ids) is for the caller to adopt.
+          missing one included); *stub* is for the caller to adopt as this
+          read lists it (``broker_payloads.listed_stop``, with the fills
+          booked here), never read again.
         - ``absent``: it never landed, or it filled or died: nothing of it
           rests.
 
@@ -1542,8 +1561,7 @@ class PositionManager:
                 if key not in self.positions:
                     return "closed", None
             if status == ORDER_LIVE:
-                return "working", {"stop_order_id": order_id, "child_order_ids": [order_id],
-                                   **({"booked_child_fills": booked} if booked else {})}
+                return "working", {**listed_stop(match), **({"booked_child_fills": booked} if booked else {})}
             if status != ORDER_REPLACED:
                 LOG.warning("Disaster stop %s for %s, sent with an unknown outcome, is %s at the broker", order_id, key,
                             match["status"])
@@ -1560,6 +1578,26 @@ class PositionManager:
             LOG.warning("Disaster stop %s for %s, sent with an unknown outcome, was REPLACED at the broker by order "
                         "%s; that one is taken as the stop sent", order_id, key, replacement["orderId"])
             match = replacement
+
+    def disaster_stop_resize_refused(self, key: str, position: Position, message: str) -> None:
+        """Late entry fills grew *key* past the shares its disaster stop
+        rests, and its resize to what is held was not confirmed (*message*;
+        ``EntryGatekeeper._grow_position``). The record reads
+        ``qty_mismatch`` at the size it rests, so it is owed like any stop
+        of another size (``ensure_disaster_stop`` resizes it again a retry
+        interval later, then cancels it and places one at the held size),
+        and the shares beyond it, which have no broker stop, count as a miss
+        toward ``DISASTER STOP DEGRADED`` (2026-09-29). Until then the record
+        stayed ``disaster_stop``, and the stop rested fewer shares than were
+        held for the rest of the trade, never retried or escalated."""
+        record = position.metadata["bracket"]
+        record["state"] = "qty_mismatch"
+        self._disaster_stop_missed(
+            key, record, int(record.get("failed_attempts") or 0) + 1, sessions.now_et(), logging.ERROR,
+            f"its stop rests {record.get('qty')} shares against the {position.qty} held after late entry fills, "
+            f"and its resize was not confirmed ({message}); the rest have no broker stop until a retry resizes "
+            "it, or cancels it and places one at the held size",
+        )
 
     def _disaster_stop_missed(self, key: str, record: dict[str, Any], missed: int, now: datetime, level: int,
                               detail: str) -> None:
@@ -1601,9 +1639,11 @@ class PositionManager:
     def exit_sweep_owed(self, symbol: str) -> bool:
         """True while a closed position in *symbol* still owes its post-close
         sweep (``_sweep_exit_orders``): the entry gatekeeper opens nothing in
-        it until the sweep has read the orders, so a sweep never cancels a
-        new position's stop, and a stop the closed one left never sells a
-        new one's shares."""
+        it until the sweep has read the orders, so a stop the closed one left
+        never sells a new one's shares. A position that opens in it all the
+        same (an unsettled entry order's late fill, which no signal decides)
+        keeps its orders: the sweep never cancels one an open position
+        tracks (``_run_exit_sweep``)."""
         wanted = str(symbol).upper().strip()
         return any(str(owed["symbol"]).upper().strip() == wanted for owed in self._sweeps_owed.values())
 
@@ -1660,7 +1700,13 @@ class PositionManager:
         is looked for among the orders entered from a minute before its
         submit, as the lookup does, so an earlier stop at the same price and
         size is never taken for it; each order's unbooked fills are reported
-        once."""
+        once.
+
+        An order an open position tracks (its broker protection's ids, its
+        working exit order) is never cancelled: a position opened in the
+        symbol while the sweep was owed (an unsettled entry order's late
+        fill) had its disaster stop cancelled on every pass until the sweep
+        ended, and rested none (2026-09-29)."""
         owed = self._sweeps_owed[key]
         symbol, side, sent = owed["symbol"], owed["side"], owed["sent"]
         orders = self.executor.todays_orders()
@@ -1682,7 +1728,10 @@ class PositionManager:
             del self._sweeps_owed[key]
         if sent is not None:
             self._report_sent_stop_fills(key, owed, sent_orders)
-        left = exit_orders([order for order in orders if order_may_be_live(order["status"])], symbol, side)
+        tracked = self._tracked_order_ids()
+        left = [order for order in exit_orders([order for order in orders if order_may_be_live(order["status"])],
+                                               symbol, side)
+                if str(order["orderId"]) not in tracked]
         if not left:
             return
         ids = [str(order["orderId"]) for order in left]
@@ -1697,6 +1746,19 @@ class PositionManager:
                 f"filled {cancel.filled_qty} share(s) before the cancel" if cancel.filled_qty > 0
                 else "could not be confirmed cancelled", cancel.message,
             )
+
+    def _tracked_order_ids(self) -> set[str]:
+        """Every order id an open position tracks: its broker protection's
+        (``bracket_order_ids``) and its working exit order's."""
+        tracked: set[str] = set()
+        for position in self.positions.values():
+            metadata = position.metadata if isinstance(position.metadata, dict) else {}
+            if isinstance(metadata.get("bracket"), dict):
+                tracked |= bracket_order_ids(metadata["bracket"])
+            working = metadata.get("working_exit_order")
+            if isinstance(working, dict) and working.get("order_id"):
+                tracked.add(str(working["order_id"]))
+        return tracked
 
     @staticmethod
     def _report_sent_stop_fills(key: str, owed: dict[str, Any], orders: list[dict[str, Any]]) -> None:
@@ -1822,13 +1884,18 @@ class PositionManager:
             return self._follow_replaced_exit(key, position, record, state)
         if state.get("is_filled") or state.get("is_terminal_failure"):
             position.metadata.pop("working_exit_order", None)
-            if record.get("reprotect"):
+            if record.get("reprotect") and not self._disaster_stop_unconfirmed(position):
                 # The order is settled and the position is still held. The
                 # submit-time path re-protects a booked exit's remainder;
                 # this is that step for an order that was left working, whose
                 # remainder otherwise kept no broker bracket for the rest of
                 # the trade (2026-09-24). A bracket placed beside a working
-                # slice is adopted and resized to what is held.
+                # slice is adopted and resized to what is held. A disaster
+                # stop placed beside it whose submit had an unknown outcome
+                # is left to ensure_disaster_stop, which looks for it (books
+                # what it sold, adopts it) before it places another: placed
+                # here, a second stop rested beside the one that landed, and
+                # the fills of that one were never booked (2026-09-29).
                 self._reprotect_remainder(position)
             self._save_reconcile_metadata()
             return False
@@ -2214,7 +2281,8 @@ class PositionManager:
                 # Adopted, so the cancel below takes it down first.
                 position.metadata["bracket"] = {**{mark: value for mark, value in record.items()
                                                    if mark not in ("attempted_at", "sent_at")},
-                                                **stub, "active": True, "state": "adopted"}
+                                                **{mark: value for mark, value in stub.items() if mark != "listed"},
+                                                "active": True, "state": "adopted"}
             requested_qty = min(requested_qty, int(position.qty))
         # The engine has decided to exit for a reason the broker cannot see
         # (peak giveback, time stop, CHoCH, force flatten). Tear down the
@@ -2321,12 +2389,14 @@ class PositionManager:
                 # stale quote), or the broker confirmed it dead with
                 # nothing filled, so nothing of it can fill: put back the
                 # protection this cycle tore down. A retry cancels it
-                # again -- churn, never a double fill. One that reached
-                # it with no id to track (live_missing_order_id) may
-                # still fill, so a resting stop beside it could sell the
-                # same shares twice; the engine stop keeps owning it, and
-                # a disaster stop is placed again by the next pass that
-                # decides no exit, as a miss (ensure_disaster_stop).
+                # again -- churn, never a double fill. One that may have
+                # reached it with no id to track (live_missing_order_id,
+                # or a POST answered 5xx: order_result_needs_broker_recheck,
+                # 2026-09-29) may still fill, so a resting stop beside it
+                # could sell the same shares twice; the engine stop keeps
+                # owning it, and a disaster stop is placed again by the
+                # next pass that decides no exit, as a miss
+                # (ensure_disaster_stop).
                 self._reprotect_remainder(position)
                 self._save_reconcile_metadata()
             attempt_status = "not_filled" if not result.ok else "filled_qty_zero"

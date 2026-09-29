@@ -63,6 +63,8 @@ from .broker_payloads import (
     broker_position_side_qty,
     broker_quantity,
     is_disaster_stop,
+    listed_stop,
+    order_row_filled_qty,
     order_status_class,
     resting_exit_stop,
     sent_exit_stop,
@@ -325,6 +327,10 @@ class StartupReconciler:
         as ``known_bracket``: its child ids are the ones the bot last tracked,
         so a stop replaced before the restart is adopted instead of being read
         as dead (its original, off the parent, is REPLACED) and stacked on.
+        What the adopted stop sold before the snapshot is booked on it
+        (``booked_child_fills``): the shares restored are already net of it.
+        A dry run's disaster stop adopts nothing: every stop in the account
+        is the user's (2026-09-29).
 
         A restored working exit order (a slice or a full exit left working
         before the restart) still sells its outstanding shares, so the
@@ -352,7 +358,7 @@ class StartupReconciler:
         # in a crash, left the saved id dead: fresh protection went in beside
         # the live one, and both sold the position net short (2026-09-25).
         saved = stale if stale and stale.get("stop_order_id") else None
-        listed = {str(order.get("orderId")) for order in working_orders}
+        listed = {str(order.get("orderId")): order for order in working_orders}
         # A saved record that carries no id but the price and quantity it
         # sent (an unconfirmed disaster stop: the submit's outcome was
         # unknown, or the process ended before it was looked up) knows its
@@ -363,13 +369,36 @@ class StartupReconciler:
                            qty=stale.get("qty"))
             if stale and is_disaster_stop(stale) and not stale.get("stop_order_id") else None
         )
-        if saved is not None and str(saved["stop_order_id"]) in listed:
+        disaster = self.executor.disaster_stop_enabled()
+        known: dict[str, Any] | None
+        if disaster and self.config.schwab.dry_run:
+            # A dry run rests no stop, so a stop in the real account is the
+            # user's: the paper position's simulated record takes none of
+            # them, and the reconcile still counts it as a foreign order
+            # (2026-09-29). Until then the paper position adopted it as its
+            # own disaster stop, which lifted working_orders_present in the
+            # restore modes.
+            known = None
+        elif saved is not None and str(saved["stop_order_id"]) in listed:
             known = saved
         elif sent is not None:
-            known = {"stop_order_id": str(sent["orderId"]), "child_order_ids": [str(sent["orderId"])]}
+            known = listed_stop(sent)
         else:
             known = resting_exit_stop(working_orders, position.symbol, position.side) or saved
-        disaster = self.executor.disaster_stop_enabled()
+        if known is not None:
+            # The shares restored are the ones the account holds now, net of
+            # what the stops the snapshot lists sold before it: those fills
+            # are booked, so the fill reconcile and a later cancel book only
+            # the ones after it (2026-09-29). Until then a stop that had
+            # filled in part while the bot was down was booked in full when
+            # the rest of it filled, and EXIT OVERFILLED named a short the
+            # account did not hold.
+            booked = {str(oid): int(qty) for oid, qty in (known.get("booked_child_fills") or {}).items()}
+            for order_id in bracket_order_ids(known):
+                if order_id in listed and order_row_filled_qty(listed[order_id]) > 0:
+                    booked[order_id] = order_row_filled_qty(listed[order_id])
+            if booked:
+                known = {**known, "booked_child_fills": booked}
         initial_stop = safe_float(metadata.get("initial_stop_price"), None, finite=True)
         level: float | None = None
         try:
@@ -982,14 +1011,16 @@ class StartupReconciler:
                 # resting from before the restart and submits fresh protection
                 # beside it, and a restored symbol is never revisited, so both
                 # stops stay (together they sell the position net short); a
-                # disaster stop is placed the same way. Without either, the
-                # list protects nothing: restore what the broker holds so the
+                # live disaster stop is placed the same way. Without either
+                # (a dry run places no disaster stop, 2026-09-29), the list
+                # protects nothing: restore what the broker holds so the
                 # engine manages it, and fail the attempt so the retry reads
                 # the list (it skips what is already tracked), naming each
                 # row it could not use too.
                 failures = ["the broker working-order read failed"]
                 if mode in {"restore_basic", "restore_hybrid"} and not (
-                        self.executor.bracket_orders_enabled() or self.executor.disaster_stop_enabled()):
+                        self.executor.bracket_orders_enabled()
+                        or (self.executor.disaster_stop_enabled() and not self.config.schwab.dry_run)):
                     failures += self._restore_broker_positions(positions, use_metadata=(mode == "restore_hybrid"),
                                                                working_orders=[], unsettled=set(unsettled))[2]
                 raise RuntimeError("; ".join(failures))

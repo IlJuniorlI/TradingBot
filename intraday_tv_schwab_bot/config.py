@@ -645,9 +645,10 @@ class EquityExecutionConfig:
     # market_exit_regular_hours, is a marketable LIMIT. One still unfilled
     # after entry_live_fill_timeout_seconds is cancelled, and once the broker
     # confirms it dead with nothing filled it is re-sent at a fresh quote,
-    # in the same management pass, up to this many times (0: the next cycle
-    # sends the next one). A dry run never misses: it fills at the bid (the
-    # ask, for a cover) of the quote the exit read.
+    # in the same management pass, up to this many times (0: no re-send, and
+    # the next cycle sends the next LIMIT; the fallback MARKET order below,
+    # when on, still follows in the same pass). A dry run never misses: it
+    # fills at the bid (the ask, for a cover) of the quote the exit read.
     exit_live_reprice_attempts: int = 2
     # Each re-send's spread buffer is (1 + n * this) times the first's.
     exit_live_reprice_step_frac: float = 0.5

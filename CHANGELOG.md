@@ -133,7 +133,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     after a submit whose outcome is unknown: a re-send's POST that times out
     raises out of the call as the single exit's did, with the order perhaps
     live and untracked, which the queued shared unknown-outcome path is to
-    cover.
+    cover. One answered 5xx (or with a status that is neither 2xx nor 4xx)
+    ends the call as `status=<code>`, and
+    `broker_payloads.order_result_needs_broker_recheck` reads it as one that
+    may have reached the broker, as the disaster stop's own submit does:
+    only a 4xx is a refusal (2026-09-29, the final review's probe). As first
+    cut every `status=` read as never reached, so the disaster stop the exit
+    had cancelled went back in the same pass beside an exit that had
+    landed and filled (stops resting 100 against 0 held); now it goes back
+    on the next pass that decides no exit, as a miss, until the shared
+    lookup covers exits.
   - Only `CANCELED` is followed (2026-09-29, a verifier's finding). The
     single-order submit read every terminal status the cancel's check saw as
     `live_unfilled_canceled`, a 400 on the cancel of an order already dead
@@ -271,7 +280,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - The engine keeps its own stop and every exit: it checks its stop every
     cycle whatever rests at the broker (see **Fixed**). Every engine exit
     cancels the disaster stop first (the existing cancel before an exit),
-    and books what it sold before the cancel landed.
+    and books what it sold before the cancel landed, except a tracked one
+    the user moved in the app: Schwab replaces it under a new id, the cancel
+    reads the REPLACED original as down, and the exit goes out beside the
+    replacement, so a flush can fill both (queued before any live flip, in
+    H_CHECKLIST; after a full close the sweep cancels the replacement).
   - It is kept as the position's bracket record with `sync_mode: disaster`, a
     flavour of its own (`static` is refused with the adaptive modes, whose
     stop ratchets). So the fill reconcile books a filled one as a
@@ -279,9 +292,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     same price; one that died at the broker is re-placed at once, and one
     that dies again, or that the broker `REJECTED`, is owed again a retry
     interval later and counted (below); and the restore adopts one still
-    resting (resized to what is held), places one at the saved price when
-    none rests, and never counts it as a foreign order. With it on, a restore
-    waits for the working-order list, as in bracket mode.
+    resting (resized to what is held, with what it sold before the snapshot
+    booked on it, below), places one at the saved price when none rests, and
+    never counts it as a foreign order. With it on, a live restore waits for
+    the working-order list, as in bracket mode. A dry run's restore adopts
+    no stop of the account, which stays a foreign order (it holds entries
+    in the restore modes), and restores what is held when the list cannot
+    be read, as with the disaster stop off (2026-09-29, the final review's
+    probe: the paper position took the user's stop as its own, lifting
+    `working_orders_present`, and an unread list restored nothing).
   - It goes out right after the entry fills and the position is saved.
     Outside the regular session nothing is sent (Schwab rejects a `STOP`
     there), nor written or saved each cycle (a new position gets a
@@ -333,7 +352,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     filled stop at the same price and size against the position), and a
     restored `unconfirmed` record adopts the stop at exactly the price and
     quantity it sent, in any status but a terminal one, never merely the
-    first exit stop on the symbol (which may be one placed by hand).
+    first exit stop on the symbol (which may be one placed by hand). A
+    restore books on the stop it adopts what that stop sold before the
+    snapshot (`booked_child_fills`, from the working-order rows): the shares
+    it restores are the account's, already net of them; and every adoption
+    keeps what the record it adopts from had booked
+    (`SchwabExecutor._tracked_protection_ids`). Until 2026-09-29 a stop that
+    had filled in part while the bot was down was booked in full when the
+    rest filled, and `EXIT OVERFILLED` named a short the account did not
+    hold (the final review's probe).
   - Before an exit or a slice, an `unconfirmed` record is looked up at once
     (2026-09-29): its fills are booked and the exit sells only the rest, and
     a stop that may still work is adopted (a moved one's replacement too), so
@@ -342,7 +369,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     stop whose replacement is not found, defer the exit a cycle, counted as
     a miss. Until then the exit went out beside it with no cancel, and a
     stop that filled in the same flush sold the shares twice; a slice left
-    the full-size stop resting against what was left.
+    the full-size stop resting against what was left. A slice left working
+    whose re-protect's submit had an unknown outcome leaves that stop to
+    `ensure_disaster_stop`'s lookup when it settles
+    (`PositionManager._disaster_stop_unconfirmed`, 2026-09-29, the final
+    review's probe: the settle placed a second stop at once without looking
+    for the one that landed, whose fills were never booked).
   - Every placement first reads the day's orders
     (`SchwabExecutor.ensure_position_protected`): an exit stop no record
     tracks that may still work on the symbol for the side (in any status but
@@ -353,13 +385,26 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the lookup's rule that neither adopted nor placed beside a stop it could
     not tell for its own. Until 2026-09-29 a scale-out after the user moved
     the stop in the app placed a stop for the rest beside the moved one: 150
-    shares of stops against 50 held.
+    shares of stops against 50 held. A stop the lookup or this read finds is
+    adopted as that read lists it (`broker_payloads.listed_stop`), never
+    read again; tracked from then, what it sells is booked by the fill
+    reconcile (2026-09-29, the final review's probe: the adoption read the
+    orders a second time, a stop that filled in between read as gone, a new
+    one was placed for the shares it had sold, and its fill was never
+    booked).
   - A stop resting more shares than are held (`qty_mismatch`, an adopted one
     the broker would not resize; `qty_unverified`, one whose size could not
     be read) is owed too: the next cycle resizes it again, then cancels it
     and places one at the held size; one that neither resizes nor cancels is
     a miss. Until then it stayed, larger than the position, never retried,
-    cancelled or escalated.
+    cancelled or escalated. So is one left resting fewer shares than are
+    held by late entry fills whose resize was not confirmed
+    (`PositionManager.disaster_stop_resize_refused`, from
+    `EntryGatekeeper._grow_position`): `qty_mismatch` at the size it rests,
+    a miss at once, resized again a retry interval later, then cancelled and
+    placed at the held size (2026-09-29, the final review's probe: it stayed
+    `disaster_stop`, the shares beyond it with no broker stop for the rest
+    of the trade, never retried or escalated).
   - Isolated per position at entry: a placement that raises right after an
     entry is logged against that position with its type and traceback
     (`EntryGatekeeper._ensure_disaster_stop_after_entry`), and the entry pass
@@ -369,7 +414,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     cannot be read, an unconfirmed stop moved in the app whose replacement
     is not found, a stop that went down with the position held and no
     exit working, one resting more than is held that neither resizes nor
-    cancels, a cancel before an exit that cannot be confirmed, which holds
+    cancels, one left resting fewer by late entry fills whose resize is not
+    confirmed, a cancel before an exit that cannot be confirmed, which holds
     the exit), and every `disaster_stop_escalation_attempts`-th consecutive
     one logs `DISASTER STOP DEGRADED` at CRITICAL naming the position. The
     count ends when the broker lists the stop working (the fill reconcile),
@@ -405,8 +451,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     ORDERS LEFT`; while a sweep is owed the symbol takes no entry
     (`exit_sweep_owed`, skip reason `exit_orders_unswept`). Until 2026-09-29
     the sweep read once, cancelled only the working allowlist, and a failed
-    read logged an ERROR once and was dropped. An owed sweep is not saved: a
-    restart forgets it. A dry run reads nothing.
+    read logged an ERROR once and was dropped. The sweep never cancels an
+    order an open position tracks (`PositionManager._tracked_order_ids`,
+    2026-09-29, the final review's probe: a position an unsettled entry
+    order's late fill opened in the symbol while the sweep was owed, which
+    the entry hold does not see, had its disaster stop cancelled on every
+    pass until the sweep ended). An owed sweep is not saved: a restart
+    forgets it. A dry run reads nothing.
   - Measured on the archive (study B's trade table and the archived 1m tapes:
     176 trades on 22 equity days): at 1.0R it would have fired on none of
     them while the engine held the trade (whole 1m bars). Counting every
@@ -417,7 +468,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     or more against the entry and 8 went 10R or more; the disaster stop caps
     a trade at about 2R (the median; 9.3R at most, for a trade whose R was
     0.03% of its price).
-  - A dry run places nothing, and no dry-run result moves.
+  - A dry run places nothing, and no dry-run result moves (its restore
+    adopts no stop of the account, 2026-09-29, above).
   - Checked at load: the switch is `true` or `false`, `disaster_stop_r` a
     finite number above 0, `disaster_stop_min_pct` a finite number in
     [0, 1] and `disaster_stop_escalation_attempts` an integer >= 1
@@ -433,7 +485,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     local `config.yaml` when it exists.
   - Also: `broker_payloads.collect_protective_fills` takes the stop leg's
     reason (`stop_reason`); `StartupReconciler._resting_stop_for` is
-    `broker_payloads.resting_exit_stop`, on top of the new `exit_orders`;
+    `broker_payloads.resting_exit_stop`, on top of the new `exit_orders`,
+    and returns a stub adopted as listed (`listed_stop`);
     `extract_orders` rows (`extract_working_orders` keeps the ones that may
     still work) carry `stopPrice`, `quantity`, `filledQuantity`, `fillPrice`
     and `replacementId`, and `flatten_order_tree`'s states `replaced_by`;
@@ -462,8 +515,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     lookup, an exit, a placement, the restore and the sweep; an unconfirmed
     stop moved in the app, its replacement found or not; a fill beyond the
     holding; the sweep kept owed through the retry interval; the submit time
-    on every unconfirmed record), the timed-out POST and a status that is
-    not a number in `tests/foundation/test_schwab_api.py`,
+    on every unconfirmed record; and from the final review: a stop found
+    working that fills before its adoption, a slice's unconfirmed re-protect
+    left to the lookup, an exit answered 5xx, a stop left smaller by late
+    entry fills, the fills a restore books on the stop it adopts, the sweep
+    beside a position opened since, the dry-run restore, the restore's level
+    off the initial stop, an adopted entry filled through its stop), the
+    timed-out POST and a status that is not a number in
+    `tests/foundation/test_schwab_api.py`,
     `tests/domain/test_broker_payloads.py` (every Schwab status and an
     unknown or missing one, the rows of every status, the exact match's
     order, the replacement), and the preset, number and bracket-mode tests
@@ -789,6 +848,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (the 1m history fetch, the HTF refresh points and the daily-history
     prefetch), whatever the count, and reads the results in the
     watchlist's order. Both isolate a symbol whose call raises (see Fixed).
+    A stop signal (KeyboardInterrupt) while the fetch map waits drops the
+    fetches not started yet, and the pool's shutdown waits only for the
+    ones in flight (2026-09-29, the final review's probe): it waited for
+    every queued fetch, so with 24 HTF refreshes on 4 workers in a
+    price_history brownout (a 10 s timeout, GETs tried three times) the
+    stop took about 180 s, past systemd's 90 s stop timeout, whose SIGKILL
+    skipped the session report; the second Ctrl+C is ignored by design.
     `_parallel_symbol_map` and `_cycle_precompute_workers` are gone, and
     the step's watchlist, the HTF refresh's symbols and both maps key their
     symbols with one helper, `engine._unique_symbol_keys`. The quote
@@ -860,7 +926,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     keep theirs too; whether any thread but the engine's still reaches them
     was not settled here.
   - Tests: `tests/composition/test_cycle_symbol_maps.py` (new; the
-    history-fetch decisions run on the engine thread),
+    history-fetch decisions run on the engine thread, and a stop signal
+    drops the fetches not started),
     `tests/composition/test_htf_refresh_points.py` (the HTF refresh and the
     daily prefetch fetch on the pool),
     `tests/domain/test_config_validation.py`,
@@ -4016,20 +4083,31 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pre-warms too. No archived day logged a PRECOMPUTE_FAILURES event
   (2026-05-01 to 09-25).
   - Now each symbol of the CPU maps is isolated (`_compute_symbol_map`):
-    the error is logged at WARNING with its type and traceback (`Merged
-    frame precompute failed for XYZ: ValueError: ...`, `History fetch
-    decision failed for XYZ: ...`), the symbol is left out of the map's
-    result, one PRECOMPUTE_FAILURES event names the map's failures, and the
-    other symbols run as usual. A symbol without a frame gets no pre-warm,
-    no entry and no frame-based exit that cycle; a position in it is still
-    managed on its quote (stop, target, force flatten). A symbol whose
-    history decision failed is not fetched that cycle. The fetch pool's
-    failures are logged the same way, with the type.
+    the error is logged at WARNING with its type (`Merged frame precompute
+    failed for XYZ (consecutive=1): ValueError: ...`, `History fetch
+    decision failed for XYZ (consecutive=1): ...`), the symbol is left out
+    of the map's result, one PRECOMPUTE_FAILURES event names the map's
+    failures, and the other symbols run as usual. A symbol without a frame
+    gets no pre-warm, no entry and no frame-based exit that cycle; a
+    position in it is still managed on its quote (stop, target, force
+    flatten). A symbol whose history decision failed is not fetched that
+    cycle. The fetch pool's failures are logged the same way, with the type.
+  - The traceback is throttled per map and symbol
+    (`IntradayBot._symbol_map_failed`, 2026-09-29, the final review's
+    probe): on the first failure of a run and every
+    `SYMBOL_MAP_TRACEBACK_EVERY`-th (10th) after, a one-line WARNING in
+    between; the run ends when the symbol builds again in that map.
+    As first cut, a symbol that failed every cycle logged its full
+    traceback every cycle in each map it failed in (44 lines a cycle for
+    one symbol, some 30-50k an hour), where the cycle failure it replaces
+    was throttled so.
   - The second read is gone. It copied every symbol's frame each step and
     threw the copy away, and for a symbol a stream bar reached between the
     map and the read it rebuilt the whole frame with its indicators and
     threw that away.
-  - Tests: `tests/composition/test_cycle_symbol_maps.py`.
+  - Tests: `tests/composition/test_cycle_symbol_maps.py` (with the
+    throttle: tracebacks on the 1st, 10th, 20th and, after a success, the
+    next 1st).
 
 - **The daily history holds completed sessions only.** *2026-09-28* —
   during the session Schwab's daily `price_history` ends with today's
@@ -4119,7 +4197,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     that exits nonzero the window waits for a key, and a clean stop closes it
     as before. `neq 0` also catches a crash's negative NTSTATUS exit, which
     `if errorlevel 1` misses. Its header says so, and that a scheduled start
-    (Task Scheduler) should run `.venv\Scripts\python.exe main.py` itself.
+    (Task Scheduler) should run `.venv\Scripts\python.exe main.py --config
+    configs\config.yaml` itself, with the task's "Start in" set to the
+    checkout: every path in that line, and the `.logs` folder, is relative
+    to it (the `.bat`'s `cd` set it), and an empty "Start in" runs the task
+    in `C:\Windows\System32`, where none is found (2026-09-29).
     `start_trading_bot.sh` is unchanged: it runs in a terminal, which stays
     open.
   - README.md ("Running") and README_LINUX_DEPLOY.md (a failed or

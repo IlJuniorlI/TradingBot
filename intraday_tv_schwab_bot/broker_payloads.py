@@ -503,12 +503,31 @@ def exit_orders(orders: list[dict[str, Any]], symbol: Any, side: Side, *,
     ]
 
 
+def listed_stop(order: dict[str, Any]) -> dict[str, Any]:
+    """A bracket stub of the stop an ``extract_orders`` row lists as one
+    that may still work, adopted as that row lists it
+    (``SchwabExecutor.ensure_position_protected``): its ids, and under
+    ``listed`` the shares it rests (``quantity`` less ``filledQuantity``;
+    None when the row gives no quantity) and its ``stopPrice``.
+
+    The read that listed it is the one the adoption goes by, never a second
+    one: a stop that filled between two reads was taken for one that no
+    longer rests, a new stop was placed beside the fill, and the fill was
+    never booked (2026-09-29). Once adopted the stop is tracked, so the fill
+    reconcile books whatever it sells after that read."""
+    order_id = str(order["orderId"])
+    quantity = order.get("quantity")
+    return {"stop_order_id": order_id, "child_order_ids": [order_id],
+            "listed": {"resting_qty": None if quantity is None else int(quantity) - order_row_filled_qty(order),
+                       "stop_price": order.get("stopPrice")}}
+
+
 def resting_exit_stop(orders: list[dict[str, Any]], symbol: Any, side: Side) -> dict[str, Any] | None:
     """A protective stop that may still work at the broker for a *side*
     position in *symbol* (``order_may_be_live``: any status but a terminal
-    one, since 2026-09-29), as a bracket stub, from ``extract_orders`` rows:
-    a STOP / STOP_LIMIT on that symbol alone whose one leg exits the
-    position.
+    one, since 2026-09-29), as a stub adopted as listed (``listed_stop``),
+    from ``extract_orders`` rows: a STOP / STOP_LIMIT on that symbol alone
+    whose one leg exits the position.
 
     The startup reconciler adopts it when the restored metadata carries no
     child ids (restore_basic, or a position entered before bracket mode was
@@ -524,8 +543,7 @@ def resting_exit_stop(orders: list[dict[str, Any]], symbol: Any, side: Side) -> 
     stops = exit_orders(live, symbol, side, order_types=STOP_ORDER_TYPES)
     if not stops:
         return None
-    order_id = str(stops[0]["orderId"])
-    return {"stop_order_id": order_id, "child_order_ids": [order_id]}
+    return listed_stop(stops[0])
 
 
 def sent_exit_stop(orders: list[dict[str, Any]], symbol: Any, side: Side, *,
@@ -625,18 +643,28 @@ def working_exit_outstanding_qty(position: Any) -> int:
 
 
 def order_result_needs_broker_recheck(message: Any) -> bool:
-    """True when a failed order REACHED the broker, so some of it may have filled.
+    """True when a failed order may have REACHED the broker, so some of it
+    may have filled.
 
-    A rejected submission (``status=`` / ``bracket_status=``) never did. Every
-    other failure from the live submit paths -- an unfilled order, a partial
-    fill whose cancel could not be confirmed, a bracket parent that would not
-    cancel -- may have left shares filled that the result does not report.
+    A submission the broker refused (``status=`` / ``bracket_status=`` with a
+    4xx) never did. Any other answer to the POST (a 5xx, a status that is
+    neither 2xx nor 4xx, one that is not a number or not there) says nothing
+    of whether the order landed: schwabdev retries GET, PUT and DELETE, never
+    a POST, so a gateway error on one may come back for an order that rests
+    or filled (2026-09-29; until then every ``status=`` read as never
+    reached, and the disaster stop an exit had cancelled went back in the
+    same pass beside an exit that had landed). Every other failure from the
+    live submit paths -- an unfilled order, a partial fill whose cancel could
+    not be confirmed, a bracket parent that would not cancel -- may have left
+    shares filled that the result does not report.
     """
     text = str(message or "").strip().lower()
     if not text:
         return False
-    if text.startswith(("status=", "bracket_status=")):
-        return False
+    for prefix in ("status=", "bracket_status="):
+        if text.startswith(prefix):
+            status = safe_int(text[len(prefix):].split(";", 1)[0])
+            return status is None or not 400 <= status < 500
     return (
         text.startswith(("live_", "cancel_", "partial_fill_", "bracket_"))
         or "order_details_" in text

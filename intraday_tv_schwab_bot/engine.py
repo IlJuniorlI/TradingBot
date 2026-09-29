@@ -57,6 +57,11 @@ RECONCILE_SETTLE_RETRY_SECONDS = 10.0
 # row and on every DASHBOARD_TRACEBACK_EVERY-th after it (about once a minute
 # at the 2 s cycle), and a DEBUG line in between; see _publish_state.
 DASHBOARD_TRACEBACK_EVERY = 30
+# A symbol whose call in a per-symbol map fails cycle after cycle logs its
+# traceback on the first failure of the run and on every
+# SYMBOL_MAP_TRACEBACK_EVERY-th after it, and a one-line WARNING in between;
+# see _symbol_map_failed.
+SYMBOL_MAP_TRACEBACK_EVERY = 10
 
 
 def _unique_symbol_keys(symbols: Iterable[str]) -> list[str]:
@@ -246,6 +251,9 @@ class IntradayBot:
         self.last_error: str | None = None
         # Dashboard updates that failed in a row; see _publish_state.
         self._dashboard_failures = 0
+        # Consecutive failed calls per (map label, symbol); see
+        # _symbol_map_failed.
+        self._symbol_map_failures: dict[tuple[str, str], int] = {}
         # The loop pass in progress, whose phases step() times (_run_cycles
         # starts one per pass), and when the last management pass started
         # (time.monotonic), for the gap CYCLE_TIMING reports.
@@ -1214,11 +1222,13 @@ class IntradayBot:
         4 workers and 2.4 s run this way, the means of the four days' medians
         (``CHANGELOG.md``, 2026-09-28).
 
-        A symbol whose call raises is logged with its error's type and
-        traceback and left out of the result, and the cycle's failures are
-        named in one PRECOMPUTE_FAILURES audit event; the other symbols still
-        run. The pool's one-worker branch had no such isolation: one raising
-        symbol failed the cycle.
+        A symbol whose call raises is logged with its error's type
+        (``_symbol_map_failed``: with its traceback on the first failure of a
+        run and every ``SYMBOL_MAP_TRACEBACK_EVERY``-th after) and left out
+        of the result, and the cycle's failures are named in one
+        PRECOMPUTE_FAILURES audit event; the other symbols still run. The
+        pool's one-worker branch had no such isolation: one raising symbol
+        failed the cycle.
         """
         keys = _unique_symbol_keys(symbols)
         results: dict[str, Any] = {}
@@ -1228,7 +1238,9 @@ class IntradayBot:
                 results[symbol] = func(symbol)
             except Exception as exc:
                 failed.append(symbol)
-                LOG.warning("%s failed for %s: %s: %s", label, symbol, type(exc).__name__, exc, exc_info=True)
+                self._symbol_map_failed(label, symbol, exc)
+            else:
+                self._symbol_map_failures.pop((label, symbol), None)
         self._audit_symbol_map_failures(label, len(keys), failed)
         return results
 
@@ -1240,7 +1252,15 @@ class IntradayBot:
         their time waiting on Schwab, so the pool overlaps them. The pool
         runs whatever the count, one worker included. A symbol whose call
         raises is isolated as in ``_compute_symbol_map``. The results are
-        read in the symbols' order."""
+        read in the symbols' order.
+
+        A stop signal (KeyboardInterrupt) while it waits drops the fetches
+        not started yet, and the pool's shutdown waits only for the ones in
+        flight (``cycle_fetch_workers`` at most) before the signal reaches
+        ``run()``'s cleanup (2026-09-29). Until then it waited for every
+        queued fetch: with a price_history brownout, 24 HTF refreshes on 4
+        workers held the stop about 180 s, past systemd's 90 s stop timeout,
+        whose SIGKILL skipped the session report."""
         keys = _unique_symbol_keys(symbols)
         if not keys:
             return {}
@@ -1249,19 +1269,45 @@ class IntradayBot:
         workers = min(self.config.runtime.cycle_fetch_workers, len(keys))
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bot-fetch") as executor:
             futures = {symbol: executor.submit(func, symbol) for symbol in keys}
-            for symbol, future in futures.items():
-                try:
-                    results[symbol] = future.result()
-                except Exception as exc:
-                    failed.append(symbol)
-                    LOG.warning("%s failed for %s: %s: %s", label, symbol, type(exc).__name__, exc, exc_info=True)
+            try:
+                for symbol, future in futures.items():
+                    try:
+                        results[symbol] = future.result()
+                    except Exception as exc:
+                        failed.append(symbol)
+                        self._symbol_map_failed(label, symbol, exc)
+                    else:
+                        self._symbol_map_failures.pop((label, symbol), None)
+            except BaseException as exc:
+                dropped = sum(future.cancel() for future in futures.values())
+                LOG.warning("%s stopped by %s: %d fetch(es) not started are dropped; waiting for the ones in "
+                            "flight", label, type(exc).__name__, dropped)
+                raise
         self._audit_symbol_map_failures(label, len(keys), failed)
         return results
 
+    def _symbol_map_failed(self, label: str, symbol: str, exc: Exception) -> None:
+        """Log that *label*'s call raised for *symbol*, with the error's type:
+        with the traceback on the first failure of a run of consecutive ones
+        and every ``SYMBOL_MAP_TRACEBACK_EVERY``-th after, a one-line WARNING
+        in between (2026-09-29). Until then a symbol that failed every cycle
+        logged its full traceback every cycle, in each map it failed in (44
+        lines a cycle for one symbol, some 30-50k an hour), where the cycle
+        failure it replaces was throttled so. The run ends when the symbol
+        next succeeds in that map."""
+        streak = self._symbol_map_failures.get((label, symbol), 0) + 1
+        self._symbol_map_failures[(label, symbol)] = streak
+        lines = str(exc).splitlines()
+        error = f"{type(exc).__name__}: {lines[0]}" if lines else type(exc).__name__
+        if streak == 1 or streak % SYMBOL_MAP_TRACEBACK_EVERY == 0:
+            LOG.warning("%s failed for %s (consecutive=%d): %s", label, symbol, streak, error, exc_info=exc)
+        else:
+            LOG.warning("%s failed for %s (consecutive=%d): %s", label, symbol, streak, error)
+
     def _audit_symbol_map_failures(self, label: str, total: int, failed: list[str]) -> None:
         """One audit event per map that dropped symbols, so operators can see
-        a cycle skipping them; each failure's own WARNING carries its
-        traceback."""
+        a cycle skipping them; each failure has its own WARNING
+        (``_symbol_map_failed``)."""
         if failed:
             self.audit.log_structured(
                 "PRECOMPUTE_FAILURES",

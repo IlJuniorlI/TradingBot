@@ -27,8 +27,12 @@
 @REM waits for a key, so the reason can be read; it is in the day's log
 @REM too, .logs\bot_<date>.log. A clean stop closes the window as before. A
 @REM scheduled start (Task Scheduler) should run
-@REM .venv\Scripts\python.exe main.py itself: after a failed run this file
-@REM waits for a key that never comes.
+@REM .venv\Scripts\python.exe main.py --config configs\config.yaml itself,
+@REM with the task's "Start in" set to this folder: every path in that
+@REM line, and the .logs folder, is relative to it (the cd below sets it
+@REM here), and an empty "Start in" runs the task in C:\Windows\System32,
+@REM where none is found. After a failed run this file waits for a key that
+@REM never comes.
 @REM ======================================================================
 cd /D "%~dp0"
 call .venv\Scripts\activate

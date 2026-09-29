@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from schwabdev import Client
 
 from .audit_logger import AuditLogger, structured_metadata_snapshot
-from .broker_payloads import active_broker_bracket, order_result_needs_broker_recheck
+from .broker_payloads import active_broker_bracket, is_disaster_stop, order_result_needs_broker_recheck
 from .config import BotConfig
 from .data_feed import MarketDataStore
 from .execution import SchwabExecutor
@@ -624,7 +624,11 @@ class EntryGatekeeper:
                     bracket, str(position.metadata.get("underlying") or position.symbol), position.side,
                     total_qty, str(bracket.get("session") or "NORMAL"), initial_risk=initial_risk_per_unit(position),
                 )
-                if not resized:
+                if not resized and is_disaster_stop(bracket):
+                    # Owed again and counted, as a stop of another size is
+                    # (2026-09-29).
+                    self.position_manager.disaster_stop_resize_refused(position_key, position, msg)
+                elif not resized:
                     LOG.error("Could not resize %s's resting protection to %s after late entry fills (%s)",
                               position_key, total_qty, msg)
         self._save_reconcile_metadata()
