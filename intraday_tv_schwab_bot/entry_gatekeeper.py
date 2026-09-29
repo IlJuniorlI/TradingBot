@@ -631,9 +631,12 @@ class EntryGatekeeper:
         LOG.warning("Entry order %s for %s filled %s more share(s) after its submit returned; position now %s",
                     record["order_id"], position_key, extra_qty, total_qty)
 
-    def _ensure_disaster_stop_after_entry(self, key: str, position: Position) -> None:
+    def _ensure_disaster_stop_after_entry(self, key: str, position: Position, bars) -> None:
         """Place a position's disaster stop right after its entry is tracked
-        and saved (``PositionManager.ensure_disaster_stop``), isolated to it.
+        and saved (``PositionManager.ensure_disaster_stop``, with the pass's
+        *bars*, None where the caller has none: a new position has no record
+        to look up, so nothing is booked that would read them), isolated to
+        it.
 
         Whatever that raises is logged against the position with its type and
         traceback, and the entry pass goes on to its next signal: the
@@ -643,7 +646,7 @@ class EntryGatekeeper:
         ``unconfirmed`` before anything is sent). Until 2026-09-28 a raise
         here ended the entry pass and failed the engine's step."""
         try:
-            self.position_manager.ensure_disaster_stop(key, position)
+            self.position_manager.ensure_disaster_stop(key, position, bars)
         except Exception as exc:
             LOG.error(
                 "Disaster stop for %s was not placed after its entry (%s: %s); the position is held and its "
@@ -726,7 +729,7 @@ class EntryGatekeeper:
         self._save_reconcile_metadata()
         # After the position is tracked and saved, so a submit that raises
         # cannot lose it; the next cycle places a stop still owed.
-        self._ensure_disaster_stop_after_entry(position_key, position)
+        self._ensure_disaster_stop_after_entry(position_key, position, None)
         LOG.warning("Adopted entry %s qty=%s @ %.4f from unsettled order %s (%s)",
                     position_key, qty, entry_price, record["order_id"], record["message"])
 
@@ -984,6 +987,13 @@ class EntryGatekeeper:
             signal_market_side = RiskManager.market_side(signal.side, signal.metadata)
             if self._is_startup_reconcile_entry_blocked(signal.symbol):
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "startup_reconcile_ignored_open_position"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
+                continue
+            if self.position_manager.exit_sweep_owed(signal.symbol):
+                # A position closed in this symbol and the orders it may have
+                # left working could not be read yet: a stop it left would
+                # sell a new position's shares, and the sweep, once it reads
+                # them, would cancel the new position's own stop (2026-09-29).
+                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "exit_orders_unswept"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
                 continue
             if self.has_unsettled_entry(signal.symbol):
                 # An earlier entry order for this symbol may still be live or
@@ -1315,7 +1325,7 @@ class EntryGatekeeper:
             # The disaster stop goes out once the position is tracked and
             # saved, so a submit that raises cannot lose the position; the
             # management cycle places a stop still owed.
-            self._ensure_disaster_stop_after_entry(signal.symbol, position)
+            self._ensure_disaster_stop_after_entry(signal.symbol, position, bars)
             self._log_entry_decision(signal.strategy, signal.symbol, "entered", [signal.reason], market_side=signal_market_side)
 
         for symbol, payload in decision_map.items():

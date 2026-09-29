@@ -357,13 +357,16 @@ class MarketDataStore:
                 return base
         return 1
 
-    def should_refresh_htf_context(self, symbol: str, timeframe_minutes: int) -> bool:
-        """Bar-aligned HTF refresh gate: True once an HTF bar has closed
-        (+10 s) since ``symbol``'s frame was fetched, or when none was; never
-        for a symbol with no S/R (``is_support_resistance_symbol``: a market
-        internal such as $TICK, an option), which keeps no HTF frame. The
-        engine's HTF refresh (``IntradayBot._refresh_htf_frames``) acts on
-        it; no read does (``refresh_htf_frame``).
+    def htf_refresh_due(self, symbols: Iterable[str], timeframe_minutes: int) -> list[str]:
+        """The bar-aligned HTF refresh gate: the ``symbols`` (in their order)
+        whose ``timeframe_minutes`` frame is due, the clock and its bucket
+        read once. A symbol is due once an HTF bar has closed (+10 s) since
+        its frame was fetched, or when none was; never a symbol with no S/R
+        (``is_support_resistance_symbol``: a market internal such as $TICK,
+        an option), which keeps no HTF frame. The engine's HTF refresh
+        (``IntradayBot._refresh_htf_frames``) asks for every symbol a read
+        can ask for at each refresh point, and acts on it; no read does
+        (``refresh_htf_frame``). A bucket floor costs about 0.3 ms.
 
         New HTF data only arrives at HTF bar boundaries — within a single bar
         window the broker has nothing new to give us. This replaces the prior
@@ -381,17 +384,11 @@ class MarketDataStore:
 
         A 10-second settle buffer is applied so we don't fetch at exactly
         ``:30:00`` — gives the broker time to aggregate the just-closed bar.
-        """
-        return bool(self.htf_refresh_due([symbol], timeframe_minutes))
-
-    def htf_refresh_due(self, symbols: Iterable[str], timeframe_minutes: int) -> list[str]:
-        """The ``symbols`` (in their order) whose ``timeframe_minutes`` frame
-        ``should_refresh_htf_context`` says is due, the clock and its bucket
-        read once: the engine asks for every symbol at each refresh point
-        (``IntradayBot._refresh_htf_frames``), and a bucket floor costs about
-        0.3 ms. A frame fetched before the current bucket started is fetched
-        in an earlier bucket: the buckets tile the day, so that is the
-        comparison of the two buckets' starts, with one floor fewer."""
+        A frame fetched before the current bucket started is fetched in an
+        earlier bucket: the buckets tile the day, so that is the comparison
+        of the two buckets' starts, with one floor fewer. (Until 2026-09-29
+        ``should_refresh_htf_context`` asked it for one symbol; after the
+        refresh points no production code did.)"""
         tf_min = max(1, int(timeframe_minutes))
         now = sessions.now_et()
         now_bucket = session_bucket_floor(now, tf_min)
@@ -503,7 +500,7 @@ class MarketDataStore:
 
         The only HTF fetch. The engine runs it on its fetch pool over every
         symbol a read path reads, at each refresh point of its cycle, once
-        the symbol's HTF bar has closed (``should_refresh_htf_context``;
+        the symbol's HTF bar has closed (``htf_refresh_due``;
         ``IntradayBot._refresh_htf_frames``). Every read (``get_htf_frame``,
         ``get_htf_context``, ``get_support_resistance``) returns what is
         stored and never fetches. Until 2026-09-28 a read could fetch: the
@@ -589,8 +586,8 @@ class MarketDataStore:
             # Stamped with ``end``, the time the bars were cut at, not the
             # clock after the response: a refresh requested at 09:59:59 and
             # answered after 10:00 holds nothing past 09:30, and stamped in
-            # the 10:00 bucket it told should_refresh_htf_context the 09:45
-            # bar was in, keeping it out of every context until 10:15.
+            # the 10:00 bucket it told htf_refresh_due the 09:45 bar was
+            # in, keeping it out of every context until 10:15.
             self.last_htf_refresh[key] = end
         self._invalidate_cycle_htf(symbol, tf)
 

@@ -1210,9 +1210,9 @@ class IntradayBot:
         (``runtime.cycle_precompute_workers``, 4 in every preset). It is
         pandas / numpy / TA-Lib on small frames and holds the GIL nearly all
         the time, so the pool never overlapped it and made it slower: replayed
-        on four archived top_tier days, the three maps took a median 5.4 s a
-        step with 4 workers and 2.4 s run this way (``CHANGELOG.md``,
-        2026-09-28).
+        on four archived top_tier days, the three maps took 5.4 s a step with
+        4 workers and 2.4 s run this way, the means of the four days' medians
+        (``CHANGELOG.md``, 2026-09-28).
 
         A symbol whose call raises is logged with its error's type and
         traceback and left out of the result, and the cycle's failures are

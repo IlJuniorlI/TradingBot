@@ -12,12 +12,15 @@ were ``SchwabExecutor`` classmethods until 2026-09-27, and the module was
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from .models import Side
 from .numeric import safe_float, safe_int
 
-# An order ``status`` still working at the broker.
+# An order ``status`` the broker lists as working: what confirms that a
+# disaster stop rests (its miss count ends there). It never decides that an
+# order is dead or no longer rests; ``order_status_class`` does.
 WORKING_STATUSES = frozenset({
     "AWAITING_PARENT_ORDER",
     "AWAITING_STOP_CONDITION",
@@ -34,8 +37,18 @@ WORKING_STATUSES = frozenset({
     "LIVE",
     "PARTIALLY_FILLED",
 })
+# An order ``status`` that ended the order dead: nothing more of it fills.
+DEAD_STATUSES = frozenset({"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"})
+# The ``status`` of an order changed at the broker (in the app): it lives on
+# in its replacement, a new order (``order_replacement_id``).
+REPLACED_STATUS = "REPLACED"
 # An order ``status`` that ended the order without (the rest of) its fill.
-TERMINAL_FAILURE_STATUSES = frozenset({"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "REPLACED"})
+TERMINAL_FAILURE_STATUSES = DEAD_STATUSES | {REPLACED_STATUS}
+# What an order's status says of it (``order_status_class``).
+ORDER_FILLED = "filled"
+ORDER_DEAD = "dead"
+ORDER_REPLACED = "replaced"
+ORDER_LIVE = "live"
 # The ``orderType`` of a protective stop.
 STOP_ORDER_TYPES = frozenset({"STOP", "STOP_LIMIT"})
 
@@ -79,7 +92,51 @@ def extract_broker_positions(payload: Any) -> list[dict[str, Any]]:
     return out
 
 
-def extract_working_orders(payload: Any) -> list[dict[str, Any]]:
+def order_status_class(status: Any) -> str:
+    """What an order ``status`` says of the order, failing closed:
+    ``ORDER_FILLED`` (FILLED), ``ORDER_DEAD`` (``DEAD_STATUSES``: nothing
+    more of it fills), ``ORDER_REPLACED`` (REPLACED: it lives on in its
+    replacement), or ``ORDER_LIVE`` for any other: it may still rest or
+    fill. Live is every working status and every other one too:
+    PENDING_CANCEL and PENDING_REPLACE (a change in the app not done yet),
+    NEW, AWAITING_RELEASE_TIME, UNKNOWN, one the bot has never seen, and none
+    at all. The one reading of a status for whether an order may still rest:
+    the disaster stop's unknown-outcome lookup, the restore's and every
+    placement's adoption of a stop resting on the symbol
+    (``resting_exit_stop``), the post-close sweep and the startup snapshot
+    (``extract_working_orders``). Until 2026-09-29 they kept only
+    ``WORKING_STATUSES``, so a stop in any other status read as dead: a
+    second stop was placed beside it, an exit went out with no cancel, and a
+    post-close sweep left it resting against a flat position."""
+    text = str(status or "").upper().strip()
+    if text == "FILLED":
+        return ORDER_FILLED
+    if text in DEAD_STATUSES:
+        return ORDER_DEAD
+    if text == REPLACED_STATUS:
+        return ORDER_REPLACED
+    return ORDER_LIVE
+
+
+def order_may_be_live(status: Any) -> bool:
+    """True when an order in *status* may still rest or fill
+    (``order_status_class`` reads it ``ORDER_LIVE``)."""
+    return order_status_class(status) == ORDER_LIVE
+
+
+def extract_orders(payload: Any) -> list[dict[str, Any]]:
+    """One row per order in an ``account_orders`` payload, whatever its
+    status, child orders included.
+
+    The rows carry what the readers match on: the symbols and instructions
+    of the legs, the order and strategy types, ``stopPrice``, ``quantity``,
+    ``filledQuantity`` and ``fillPrice`` (None where the order does not
+    carry it as a finite number), and ``replacementId``, the order that
+    REPLACED it (``order_replacement_id``). The disaster stop's
+    unknown-outcome lookup reads every status, since the stop a lost
+    response placed may have filled, died or been replaced since
+    (2026-09-29); ``extract_working_orders`` keeps the ones that may still
+    work."""
     def iter_orders(obj: Any):
         if obj is None:
             return
@@ -99,14 +156,11 @@ def extract_working_orders(payload: Any) -> list[dict[str, Any]]:
     for row in iter_orders(payload):
         if not isinstance(row, dict):
             continue
-        status = str(row.get("status") or "").upper()
-        if status not in WORKING_STATUSES:
-            continue
         legs = [leg for leg in (row.get("orderLegCollection") or []) if isinstance(leg, dict)]
         symbols = [str(((leg.get("instrument") or {}).get("symbol") or "")) for leg in legs]
         out.append({
             "orderId": row.get("orderId"),
-            "status": status,
+            "status": str(row.get("status") or "").upper(),
             "symbols": [s for s in symbols if s],
             "enteredTime": row.get("enteredTime"),
             "orderType": str(row.get("orderType") or "").upper(),
@@ -116,8 +170,28 @@ def extract_working_orders(payload: Any) -> list[dict[str, Any]]:
             "stopPrice": safe_float(row.get("stopPrice"), None, finite=True),
             "quantity": safe_int(row.get("quantity")),
             "filledQuantity": order_filled_qty(row),
+            "fillPrice": order_fill_price(row),
+            "replacementId": order_replacement_id(row),
         })
     return out
+
+
+def extract_working_orders(payload: Any) -> list[dict[str, Any]]:
+    """The ``extract_orders`` rows of the orders that may still work at the
+    broker (``order_may_be_live``: every status but a terminal one, an
+    unknown or missing one included)."""
+    return [row for row in extract_orders(payload) if order_may_be_live(row["status"])]
+
+
+def order_entered_at(order: dict[str, Any]) -> datetime | None:
+    """When the broker entered *order* (an ``extract_orders`` row's
+    ``enteredTime``, as Schwab writes it: ``2026-09-22T14:00:00+0000``), or
+    None when it is missing, unreadable or carries no UTC offset."""
+    try:
+        entered = datetime.fromisoformat(str(order.get("enteredTime") or ""))
+    except ValueError:
+        return None
+    return entered if entered.utcoffset() is not None else None
 
 
 def order_status(payload: dict[str, Any] | None) -> str:
@@ -321,6 +395,8 @@ def flatten_order_tree(node: Any, out: dict[str, dict[str, Any]]) -> None:
             "fill_price": order_fill_price(node),
             "is_filled": order_is_filled(node),
             "is_terminal_failure": order_is_terminal_failure(node),
+            # The order that REPLACED it, when the payload names one.
+            "replaced_by": order_replacement_id(node),
             # Shares still resting: what adoption compares against the
             # position before it trusts a working child.
             "remaining_qty": order_remaining_qty(node),
@@ -410,15 +486,16 @@ def bracket_wrapper_and_children(bracket: dict[str, Any]) -> tuple[str | None, l
     return wrapper_id, children
 
 
-def working_exit_orders(working_orders: list[dict[str, Any]], symbol: Any, side: Side, *,
-                        order_types: frozenset[str] | None = None) -> list[dict[str, Any]]:
-    """The ``extract_working_orders`` rows on *symbol* alone whose one leg
-    exits a *side* position (a SELL for a LONG, a BUY_TO_COVER for a SHORT),
-    of *order_types* when given, in the order listed."""
+def exit_orders(orders: list[dict[str, Any]], symbol: Any, side: Side, *,
+                order_types: frozenset[str] | None = None) -> list[dict[str, Any]]:
+    """The ``extract_orders`` rows among *orders* (whatever their status: the
+    caller picks the rows) on *symbol* alone whose one leg exits a *side*
+    position (a SELL for a LONG, a BUY_TO_COVER for a SHORT), of
+    *order_types* when given, in the order listed."""
     exit_instruction = "SELL" if side == Side.LONG else "BUY_TO_COVER"
     wanted = str(symbol).upper().strip()
     return [
-        order for order in working_orders
+        order for order in orders
         if order.get("orderId") is not None
         and [str(s).upper().strip() for s in order.get("symbols") or []] == [wanted]
         and (order_types is None or order.get("orderType") in order_types)
@@ -426,49 +503,110 @@ def working_exit_orders(working_orders: list[dict[str, Any]], symbol: Any, side:
     ]
 
 
-def resting_exit_stop(working_orders: list[dict[str, Any]], symbol: Any, side: Side) -> dict[str, Any] | None:
-    """A working protective stop at the broker for a *side* position in
-    *symbol*, as a bracket stub, from ``extract_working_orders`` rows: a
-    STOP / STOP_LIMIT on that symbol alone whose one leg exits the position.
+def resting_exit_stop(orders: list[dict[str, Any]], symbol: Any, side: Side) -> dict[str, Any] | None:
+    """A protective stop that may still work at the broker for a *side*
+    position in *symbol* (``order_may_be_live``: any status but a terminal
+    one, since 2026-09-29), as a bracket stub, from ``extract_orders`` rows:
+    a STOP / STOP_LIMIT on that symbol alone whose one leg exits the
+    position.
 
     The startup reconciler adopts it when the restored metadata carries no
     child ids (restore_basic, or a position entered before bracket mode was
-    on). Without it fresh protection went in beside the stop still resting;
-    both trigger together and take the position net short. The first match
-    is adopted; any other stop on the symbol stays a foreign order and keeps
-    entries blocked for a human to look at.
+    on), and ``SchwabExecutor.ensure_position_protected`` before it places a
+    disaster stop (a stop moved in the app is a new order no record tracks,
+    2026-09-29). Without it fresh protection went in beside the stop still
+    resting; both trigger together and take the position net short. The
+    first match is adopted; any other stop on the symbol stays a foreign
+    order and keeps entries blocked for a human to look at.
     (``StartupReconciler._resting_stop_for`` until 2026-09-28.)
     """
-    stops = working_exit_orders(working_orders, symbol, side, order_types=STOP_ORDER_TYPES)
+    live = [order for order in orders if order_may_be_live(order.get("status"))]
+    stops = exit_orders(live, symbol, side, order_types=STOP_ORDER_TYPES)
     if not stops:
         return None
     order_id = str(stops[0]["orderId"])
     return {"stop_order_id": order_id, "child_order_ids": [order_id]}
 
 
-def sent_exit_stop(working_orders: list[dict[str, Any]], symbol: Any, side: Side, *,
-                   stop_price: Any, qty: Any) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    """Look for the stop an order write with an unknown outcome sent:
-    ``(stub, others)``.
+def sent_exit_stop(orders: list[dict[str, Any]], symbol: Any, side: Side, *,
+                   stop_price: Any, qty: Any) -> dict[str, Any] | None:
+    """The ``extract_orders`` row of the stop an order write with an unknown
+    outcome sent, or None: the exit ``STOP`` on *symbol* for a *side*
+    position at exactly *stop_price* for exactly *qty* shares, whatever its
+    status since (working, filled in part or in full, dead, or replaced).
 
-    ``stub`` is the working exit STOP on *symbol* for a *side* position that
-    rests exactly at *stop_price* for exactly *qty* shares, as a bracket stub,
-    or None. ``others`` are the other working exit STOP / STOP_LIMIT orders
-    on the symbol for that side: a stop the bot did not send (one placed by
-    hand in the app) or one it cannot tell for its own. Never adopted, and
-    a second stop is never placed beside one, since both would sell the
-    same shares. A *stop_price* or *qty* that is not known matches nothing."""
+    One that may still work (``order_may_be_live``) comes first, then one
+    that filled shares, then any other: what the caller must act on (adopt
+    it, book its fills) before a dead or replaced one. A *stop_price* or
+    *qty* that is not known matches nothing, and neither does a STOP_LIMIT
+    (the disaster stop is only ever a plain STOP). Until 2026-09-29 only
+    working orders were read, so a stop that landed and filled before the
+    lookup was never booked and another was placed for shares already
+    sold."""
     level = safe_float(stop_price, None, finite=True)
     shares = safe_int(qty)
-    stops = working_exit_orders(working_orders, symbol, side, order_types=STOP_ORDER_TYPES)
-    for order in stops:
-        if (order.get("orderType") == "STOP" and level is not None and shares is not None
-                and order.get("stopPrice") is not None and abs(float(order["stopPrice"]) - level) < 5e-5
-                and order.get("quantity") == shares):
-            order_id = str(order["orderId"])
-            return ({"stop_order_id": order_id, "child_order_ids": [order_id]},
-                    [other for other in stops if other is not order])
-    return None, stops
+    if level is None or shares is None:
+        return None
+    matches = [
+        order for order in exit_orders(orders, symbol, side, order_types=frozenset({"STOP"}))
+        if order.get("stopPrice") is not None and abs(float(order["stopPrice"]) - level) < 5e-5
+        and order.get("quantity") == shares
+    ]
+    live = [order for order in matches if order_may_be_live(order.get("status"))]
+    filled = [order for order in matches if int(order.get("filledQuantity") or 0) > 0]
+    return (live or filled or matches or [None])[0]
+
+
+def order_row_filled_qty(order: dict[str, Any]) -> int:
+    """Shares an ``extract_orders`` row filled: its ``filledQuantity``, or
+    its ``quantity`` when it reads FILLED without one (a FILLED order sold
+    what it asked)."""
+    filled = int(order.get("filledQuantity") or 0)
+    if filled <= 0 and order_status_class(order.get("status")) == ORDER_FILLED:
+        return int(order.get("quantity") or 0)
+    return filled
+
+
+def replacement_order(orders: list[dict[str, Any]], replaced: dict[str, Any], symbol: Any,
+                      side: Side) -> dict[str, Any] | None:
+    """The ``extract_orders`` row among *orders* of the order that REPLACED
+    *replaced* (a row) at the broker, whatever its status since, or None.
+
+    The one *replaced* names (``replacementId``) when it is listed. When it
+    names none: the one exit order on *symbol* for a *side* position
+    (``exit_orders``) of its kind (a stop for a stop, any other type for any
+    other), entered no earlier than it and not dead (``order_status_class``),
+    other than itself. None when that is not exactly one, or when the time
+    *replaced* was entered cannot be read: the caller holds rather than
+    guess (2026-09-29). A candidate whose entry time cannot be read counts,
+    so it makes the match ambiguous rather than being missed."""
+    named = replaced.get("replacementId")
+    if named is not None:
+        return next((order for order in orders if str(order.get("orderId")) == str(named)), None)
+    entered = order_entered_at(replaced)
+    if entered is None:
+        return None
+    is_stop = replaced.get("orderType") in STOP_ORDER_TYPES
+    candidates = [
+        order for order in exit_orders(orders, symbol, side)
+        if str(order["orderId"]) != str(replaced.get("orderId"))
+        and (order.get("orderType") in STOP_ORDER_TYPES) is is_stop
+        and order_status_class(order.get("status")) != ORDER_DEAD
+        and (order_entered_at(order) is None or order_entered_at(order) >= entered)
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def order_replacement_id(payload: dict[str, Any] | None) -> str | None:
+    """The id of the order that REPLACED *payload*'s at the broker (its
+    ``replacingOrderCollection``), or None when the payload does not name
+    one."""
+    if not isinstance(payload, dict):
+        return None
+    for replacing in payload.get("replacingOrderCollection") or []:
+        if isinstance(replacing, dict) and replacing.get("orderId") is not None:
+            return str(replacing["orderId"])
+    return None
 
 
 def working_exit_outstanding_qty(position: Any) -> int:

@@ -21,6 +21,7 @@ import requests
 from schwabdev import Client as SchwabClient
 
 from . import sessions
+from .numeric import safe_int
 
 LOG = logging.getLogger(__name__)
 
@@ -167,6 +168,7 @@ def call_schwab_client(client: Any, method_name: str, *args: Any, **kwargs: Any)
     response = method(*args, **kwargs)
     status = getattr(response, "status_code", None)
     if status is not None and not response_ok(response):
+        code = safe_int(status)
         request = getattr(response, "request", None)
         request_method = str(getattr(request, "method", "") or "")
         request_url = str(getattr(request, "url", "") or "")
@@ -175,7 +177,7 @@ def call_schwab_client(client: Any, method_name: str, *args: Any, **kwargs: Any)
         response_reason = str(getattr(response, "reason", "") or "")
         log_payload = {
             "method_name": str(method_name or "unknown"),
-            "status_code": int(status),
+            "status_code": code if code is not None else str(status),
             "reason": response_reason,
             "request_method": request_method,
             "request_path": request_path,
@@ -183,7 +185,7 @@ def call_schwab_client(client: Any, method_name: str, *args: Any, **kwargs: Any)
             "kwargs": {str(k): _truncate_log_text(v, 120) for k, v in kwargs.items()},
             "response_text": response_body,
         }
-        if int(status) >= 400:
+        if code is None or code >= 400:
             LOG.warning(
                 "Schwab HTTP non-2xx response: %s",
                 json.dumps(log_payload, default=str),
@@ -197,9 +199,11 @@ def call_schwab_client(client: Any, method_name: str, *args: Any, **kwargs: Any)
 
 
 def response_ok(response: Any) -> bool:
-    """True for a 2xx response. A response with no status code is a failure."""
-    status = getattr(response, "status_code", None)
-    return status is not None and 200 <= int(status) < 300
+    """True for a 2xx response. A response with no status code, or one that
+    cannot be read as a number, is a failure (until 2026-09-29 the latter
+    raised ValueError, here and in ``call_schwab_client``'s log of it)."""
+    status = safe_int(getattr(response, "status_code", None))
+    return status is not None and 200 <= status < 300
 
 
 class SchwabHTTPError(RuntimeError):

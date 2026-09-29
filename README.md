@@ -306,7 +306,7 @@ Behavior and valid values:
 - `peak_giveback_retain_1to2r` / `peak_giveback_retain_2to3r` / `peak_giveback_retain_3r_plus`: the fraction of the peak R the main tier keeps before its floor fires, by peak size (1-2R, 2-3R, 3R+). At a 2R peak, `0.65` exits on a retrace to 1.3R. Higher captures more and exits sooner on a retrace; lower leaves more recovery room. Tightened from the original 0.50/0.60/0.70 after the 2026-05-12..27 sample showed winners keeping only 44% of their MFE.
 - `peak_giveback_low_tier_enabled` / `peak_giveback_low_tier_min_r` / `peak_giveback_low_tier_giveback_frac`: a second, lower tier for trades that peak between `peak_giveback_low_tier_min_r` and `peak_giveback_min_r` and would otherwise round-trip to the breakeven stop. It arms at the low-tier peak and exits once `current_r` falls below `peak × (1 − giveback_frac)` — a 0.7R peak with the default `0.7` exits at 0.21R. Skipped while the high-conviction override is active, since those trades want the main tier's wider leash. `peak_giveback_low_tier_min_r: 0` turns the low tier off, like `peak_giveback_low_tier_enabled: false`.
 - What the exit record says about these levels (2026-09-27): every EXIT_CONTEXT carries `stop_source`, the management step that last moved the stop (`<manager>:<reason>`: `adaptive:profit_lock`, `adaptive:trail`, `adaptive:breakeven`, `adaptive:partial_breakeven`, `adaptive_ladder:touch_promoted`, `options_ratchet:...`, `sr_flip:...`, or `initial`), so a `stop` exit says whose level it hit (`stop_price`), and `stop_r` / `peak_r`, that stop and the trade's best price in R from the entry, positive the trade's way. A peak-giveback exit adds its floor and its peak as prices (`peak_giveback_floor_price`, `peak_giveback_peak_price`) beside `peak_giveback_floor_r` / `_peak_r`. The position metadata keeps `stop_source` across a restart.
-- The level and the management passes around it (2026-09-28): every EXIT_CONTEXT names the level the exit is on, `exit_level` and `exit_level_kind` — `stop` (whichever step set it: `stop_source`), `target`, `peak_giveback_floor` (`peak_giveback_floor_price`), `touch_hold_guard` (the adaptive ladder's guard) or `broker_stop` / `broker_target` / `disaster_stop` (the price a resting bracket child, or the static disaster stop, rested at); none for a time stop, a shared or strategy exit, force flatten or the touch hold's close and timeout exits. A filled record adds `exit_slippage`, how far the fill landed past the level per unit, positive when worse for the position (a LONG sold below it, a SHORT covered above it), and `exit_slippage_r`, that in the trade's initial R; not for a fill whose price is estimated. EXIT_CONTEXT and POSITION_ADJUSTMENT also carry `managed_at`, when the management pass that decided them read the price, `prev_managed_at` / `prev_mark_price`, the pass before it and the mark it read, and `managed_gap_s`, the seconds between the two: how long the engine went between two looks at the position. An exit the broker filled carries the last pass before it was booked, and a position's first pass has no pass before it. A stop moved while a scale-out slice works at the broker (the risk check on the shares outside it) is a POSITION_ADJUSTMENT like any other; until 2026-09-28 it reached no record. Each attempt of a live LIMIT exit also carries `exit_limits_missed`, how many of its limits missed in the pass (0 when the first order settled it; see `exit_live_reprice_attempts`); a dry run, a MARKET exit and an option's close carry none. Until 2026-09-28 the slippage was stamped for `stop` and `target` exits only, in the position metadata after the record was built, and reached no record.
+- The level and the management passes around it (2026-09-28): every EXIT_CONTEXT names the level the exit is on, `exit_level` and `exit_level_kind` — `stop` (whichever step set it: `stop_source`), `target`, `peak_giveback_floor` (`peak_giveback_floor_price`), `touch_hold_guard` (the adaptive ladder's guard) or `broker_stop` / `broker_target` / `disaster_stop` (the price a resting bracket child, or the static disaster stop, rested at); none for a time stop, a shared or strategy exit, force flatten or the touch hold's close and timeout exits. A filled record adds `exit_slippage`, how far the fill landed past the level per unit, positive when worse for the position (a LONG sold below it, a SHORT covered above it), and `exit_slippage_r`, that in the trade's initial R; not for a fill whose price is estimated. EXIT_CONTEXT and POSITION_ADJUSTMENT also carry `managed_at`, when the management pass that decided them read the price, `prev_managed_at` / `prev_mark_price`, the pass before it and the mark it read, and `managed_gap_s`, the seconds between the two: how long the engine went between two looks at the position. An exit the broker filled carries the last pass before it was booked, and a position's first pass has no pass before it. A stop moved while a scale-out slice works at the broker (the risk check on the shares outside it) is a POSITION_ADJUSTMENT like any other; until 2026-09-28 it reached no record. Each attempt of a live LIMIT exit also carries `exit_limits_missed`, how many of its limits missed in the pass (0 when the first order settled it; see `exit_live_reprice_attempts`), and so does the record of a fill a later pass books from an order that attempt left working; a dry run, a MARKET exit and an option's close carry none. Until 2026-09-28 the slippage was stamped for `stop` and `target` exits only, in the position metadata after the record was built, and reached no record.
 - `entry_slippage_allowance_spread_frac` / `entry_slippage_allowance_max_pct`: sizing pads the stop distance by an expected-slippage amount — the live spread times `entry_slippage_allowance_spread_frac`, capped at `entry_slippage_allowance_max_pct` of price — so a fill that slips by up to that much still lands inside the risk budget. Without it, realized risk is `qty × |fill − stop|` against a budget sized on the signal price, and the overage scales inversely with stop width (5c of slip is ~2% over on a 1% stop, ~25% over on a stop 10x tighter). Set the spread fraction to `0.0` to size on the raw stop distance.
 - `risk_overage_warn_frac`: after a fill, realized risk more than this fraction over budget is logged and stamped on the position. Detection only — the shares are already bought; the sizing allowance above is the preventive half. A value below `0` turns the warning off.
 - `entry_slippage_warn_pct`: entry slippage beyond this fraction of the signal price is logged and flagged on the position, so a routing or liquidity problem shows up in the log rather than only in an end-of-day report. `0` or below turns the warning off.
@@ -388,7 +388,7 @@ Behavior and valid values:
   - Bracket mode: a stop that died at the broker without filling (a DAY order that EXPIRED at its session's end, one CANCELED in the app, a REJECTED one) retires its bracket: the rest of it is cancelled, what that cancel reports filled is booked, and the position is re-protected once per bracket, or the engine owns the stop. A REJECTED stop is never placed again (the broker would reject it again), and a cancel that cannot be confirmed leaves the rest of the bracket tracked while the engine owns the stop; once the rest is confirmed down, the dead stop gets its one fresh placement. A child the 8-hour order listing no longer returns is read on its own, at most once a minute while it is live, so a stop placed before 07:00 that fills after 15:00 is booked. A working exit order that closes a position takes its leftover bracket down.
 - `startup_reconcile_mode`: valid values are `ignore`, `block`, `log_only`, `restore_basic`, `restore_hybrid`; any other value refuses to start. Until 2026-09-26 it was lowercased, so any case read (`BLOCK` as `block`); a typo read as `log_only` with a warning, which turned the entry block off, and a null as `ignore`.
   - `ignore`: skip startup reconciliation entirely.
-  - `block`: block new entries if broker positions / working orders are found.
+  - `block`: block new entries if broker positions / working orders are found. A working order is one in any status but a terminal one (`FILLED`, `CANCELED`, `REJECTED`, `EXPIRED`, `REPLACED`): since 2026-09-29 a `PENDING_CANCEL`, `NEW`, `UNKNOWN` order, or one with no status, counts too, in every mode's snapshot.
   - `log_only`: log findings but do not block.
   - `restore_basic`: restore broker stock positions into bot memory without metadata help.
   - `restore_hybrid`: restore broker stock positions and also consult the metadata SQLite store for richer restore state.
@@ -400,7 +400,7 @@ Behavior and valid values:
 - `idle_sleep_seconds`: outside the 7am–8pm ET equity stream window (when neither streaming nor order acceptance is available), the loop sleeps this long between iterations instead of `loop_sleep_seconds`. Cuts overnight CPU waste by ~95% on always-on bots — the loop wakes every minute by default to recheck whether streaming has resumed instead of every 2s. Set to a value `<= loop_sleep_seconds`, `0` included, to disable the optimization entirely (until 2026-09-26 a `0` or `null` read as `60`).
 - `symbol_state_prune_seconds`: cadence at which the engine evicts per-symbol state (history frames, HTF/SR caches, dashboard snapshot/chart payloads) for symbols that have dropped out of the active set (streamed symbols + last watchlist + open positions). Long-running multi-day bots otherwise accumulate history dicts (~240KB per 1m frame at default lookback) for every symbol the screener has ever returned. Set to `0` to disable pruning entirely.
 - `session_reconcile_on_resume`: when `true`, the engine re-runs the startup reconcile at the first cycle on each new ET trading day where streaming is back online (i.e., the first cycle past 7am ET). Catches positions that closed overnight via the Schwab app or broker-side stops — without this, an always-on bot would wake at 7am still believing those positions are open and try to manage phantoms. Honors the same `reconcile_on_startup` and `startup_reconcile_mode` knobs as the startup reconcile (no separate mode). Set to `false` to disable if you handle reconciliation externally or only run single-day sessions. A failed reconcile is retried either way; this knob turns off only the new-day re-run.
-- `cycle_fetch_workers`: thread-pool size for each cycle's network fetches: the 1m history per watchlist symbol, the HTF refresh points (every symbol the bot reads) and the daily-history prefetch, and the single-quote fallbacks of a quote refresh. The fetches wait on Schwab, so the pool overlaps them. The cycle's CPU work (the history-fetch decisions, every symbol's step frame with its indicators, the S/R and strategy-context pre-warms) runs serially on the engine thread; a symbol whose build raises is logged with its error's type, left out of the cycle (no pre-warm, entry or frame-based exit; a position in it keeps its stop, target and force flatten on its quote) and named in a `PRECOMPUTE_FAILURES` event, and the other symbols run as usual. An integer of at least 1; anything else refuses to start. It replaced `cycle_precompute_workers` (2026-09-28), which sized one pool for both kinds of work: the CPU work holds the GIL, so the pool never overlapped it and made the cycle slower (replayed on four archived top_tier days, the step frames and the two pre-warms took a median 5.4 s a step with four workers and 2.4 s serially). A config that still sets `cycle_precompute_workers` refuses to start and names the replacement.
+- `cycle_fetch_workers`: thread-pool size for each cycle's network fetches: the 1m history per watchlist symbol, the HTF refresh points (every symbol the bot reads) and the daily-history prefetch, and the single-quote fallbacks of a quote refresh. The fetches wait on Schwab, so the pool overlaps them. The cycle's CPU work (the history-fetch decisions, every symbol's step frame with its indicators, the S/R and strategy-context pre-warms) runs serially on the engine thread; a symbol whose build raises is logged with its error's type, left out of the cycle (no pre-warm, entry or frame-based exit; a position in it keeps its stop, target and force flatten on its quote) and named in a `PRECOMPUTE_FAILURES` event, and the other symbols run as usual. An integer of at least 1; anything else refuses to start. It replaced `cycle_precompute_workers` (2026-09-28), which sized one pool for both kinds of work: the CPU work holds the GIL, so the pool never overlapped it and made the cycle slower (replayed on four archived top_tier days, the step frames and the two pre-warms took 5.4 s a step with four workers and 2.4 s serially, the means of the four days' medians). A config that still sets `cycle_precompute_workers` refuses to start and names the replacement.
 - Orders whose outcome is unsettled: a live order that neither filled nor confirmed its cancel -- a MARKET exit left working through a halt, a cancel Schwab never acknowledged, a partial fill whose remainder may still be live -- is tracked (`working_exit_order` on the position for exits, `EntryGatekeeper.unsettled_entry_orders` for entries) and settled every management cycle from the order's own fills (`account_orders`, falling back to `order_details`). Nothing else is sent for that position or symbol while the order may still be live: fills are booked as they land (exits), adopted as a position or folded into the one a partial already opened (entries), and a live limit is re-cancelled so a fresh one can follow. This replaced a recovery that read broker *positions* through a snapshot cached once per cycle, which after the cycle's first order was already stale.
 - `max_consecutive_quote_failures`: per-symbol quote-fetch failure threshold. After a symbol fails this many consecutive quote refreshes (typically symbol-specific Schwab 401/403/404 such as restricted-security responses), it is silenced from quote refresh for the rest of the session. The counter resets on any successful fetch; the blacklist clears on bot restart. Set to `0` to disable (always retry — pre-2026-04-29 behavior). The default `5` catches symbol-specific permission errors without triggering on transient hiccups. Other endpoints (history, stream) for the same symbol are unaffected. An integer of at least 0; anything else refuses to start.
 - `export_session_archive`: when `true`, the engine writes a per-day archive to `{log_dir}/sessions/{YYYY-MM-DD}/` containing, for every active watchlist symbol (plus any symbol traded or held today), `bars/1m/{SYMBOL}.csv` (the full merged 1m frame with indicators: warmup history, pre-market, RTH and post-market, not filtered to today's RTH), `bars/{N}m/{SYMBOL}.csv` resamples of it for the strategy's `ltf_minutes` / `htf_minutes` when above 1, and `bars/htf_{N}m/{SYMBOL}.csv` (the stored HTF frame that S/R, HTF levels, HTF structure and HTF FVGs are built from), plus `trades.csv` filtered to the day, `decisions.csv`, `events.jsonl`, `config_snapshot.yaml`, `account_snapshot.json`, the day's log and `manifest.json` with strategy + summary stats. A symbol whose frame cannot be read is left out of that folder with a WARNING (and counted in the manifest's `bars_skipped_by_timeframe`); the rest of the archive is written. The archive fires automatically once per ET trading day after the stream window closes (8 PM ET), so an always-on bot produces one archive per session without waiting for shutdown; shutdown still writes its own (potentially overwriting today's bundle with a fresher snapshot). Useful for trade audits and post-session analysis. Disable to save disk space if running without dashboard/analysis needs.
@@ -482,7 +482,7 @@ Behavior and valid values:
 - `entry_live_reprice_step_frac`: size of each reprice step as a fraction of the entry buffer.
 - `extended_hours_enabled`: allow equity orders outside regular hours when the broker permits it.
 - `market_exit_regular_hours`: when `true`, stock exits during regular hours are MARKET orders, left working and tracked if they do not fill in the poll window. When `false`, and outside regular hours always, an exit is a marketable LIMIT at the bid less the entry buffer (the ask plus it, for a cover).
-- `exit_live_reprice_attempts` / `exit_live_reprice_step_frac` / `exit_live_reprice_max_seconds` / `exit_live_market_fallback`: a live LIMIT exit that has not filled after `entry_live_fill_timeout_seconds` is cancelled, and once the broker confirms it dead with nothing filled it is re-sent in the same management pass, priced off a fresh quote with (1 + n x `exit_live_reprice_step_frac`) times the spread buffer, up to `exit_live_reprice_attempts` times (an integer >= 0; `0` sends one order a pass). The budget is one per management pass, shared by every exit the pass sends: no re-send goes out once `exit_live_reprice_max_seconds` (a number in (0, 60]) have passed since the pass began, whichever position it is for, and none once the session is no longer the one the exit was priced for (a regular-session order is not re-sent past the close). Each exit's first order always goes out, and the order in flight still runs its poll and cancel, so a pass can run that much longer, and the positions managed after a missed exit wait while its re-sends run. Any other outcome ends the attempt as before: a fill of any size, a rejection, or a cancel the broker does not confirm (that order is tracked). With `exit_live_market_fallback: true`, a regular-session exit whose limits all missed then goes out as a MARKET order under the same two limits, left working and tracked if it does not fill; it needs `market_exit_regular_hours: false` (with it true every regular-session exit is a MARKET order already), or the config is refused. The result's message says what happened (`;exit_limits_missed=<n>`, then `;exit_market_fallback` or `;stopped=attempts|time_budget|session:<now>|missing_or_stale_quotes`), in the `Exit attempt` log line and EXIT_CONTEXT's `result_message`, and EXIT_CONTEXT carries the count as `exit_limits_missed` too. A dry run never misses (it fills at the bid, or the ask for a cover, of the quote the exit read), so these change no dry run. Every preset ships `2` / `0.5` / `12.0` / `false`: with the presets' 2 s fill timeout and 0.25 s poll, three missed limits take about 7.7 s at a 0.1 s broker round trip and 10.8 s at 0.3 s, and a fallback MARKET order goes out at about 7.8 s and 11.1 s, so one missed exit alone rarely meets the budget. When several miss in the same pass it binds: with four positions whose limits all miss, the fourth's first order goes out about 15-19 s into the pass (0.1-0.5 s round trip), against 7.6-11 s with one order per exit and 23-35 s with a budget per exit. Until 2026-09-28 the first miss ended the attempt and the next order went out on the next cycle, about 24 s later on top_tier days (options exits are unchanged: one order a pass).
+- `exit_live_reprice_attempts` / `exit_live_reprice_step_frac` / `exit_live_reprice_max_seconds` / `exit_live_market_fallback`: a live LIMIT exit that has not filled after `entry_live_fill_timeout_seconds` is cancelled, and once the broker confirms it dead with nothing filled it is re-sent in the same management pass, priced off a fresh quote with (1 + n x `exit_live_reprice_step_frac`) times the spread buffer, up to `exit_live_reprice_attempts` times (an integer >= 0; `0` sends one order a pass). The budget is one per management pass, shared by every exit the pass sends: no re-send goes out once `exit_live_reprice_max_seconds` (a number in (0, 60]) have passed since the pass began, whichever position it is for, and none once the session is no longer the one the exit was priced for (a regular-session order is not re-sent past the close). Each exit's first order always goes out, and the order in flight still runs its poll and cancel, so a pass can run that much longer, and the positions managed after a missed exit wait while its re-sends run. Only an order the broker confirmed `CANCELED` with nothing filled is followed. Any other outcome ends the attempt: a fill of any size, a refused submit, a cancel the broker does not confirm (that order is tracked), an order the broker `REJECTED` or `EXPIRED` after accepting it (logged at ERROR, `;stopped=status:<STATUS>`), and one `REPLACED` at the broker (changed in the app: its replacement is tracked in its place when the broker names it; when it does not, `ORDER REPLACED UNTRACKED` is logged at CRITICAL and the next pass looks the replacement up among the day's orders, the one exit order of its kind on the symbol entered after it, and tracks it, holding the position meanwhile with no exit or re-protect and `ORDER REPLACED UNTRACKED` again every `disaster_stop_escalation_attempts`-th pass until the orders show it; a tracked exit order found `REPLACED` on a later pass is followed the same way). So no second exit order for the same shares goes out while one may still fill, except after a submit whose outcome is unknown (a POST that times out), which the queued shared unknown-outcome path is to cover. Each order is recorded as the position's working exit, and saved, before it is polled, so a stop signal during the poll leaves it tracked for the next cycle or a restart to settle; an attempt whose orders all died unfilled leaves nothing tracked, and the position's disaster stop goes back in the same pass. With `exit_live_market_fallback: true`, a regular-session exit whose limits all missed then goes out as a MARKET order under the same two limits, left working and tracked if it does not fill; it needs `market_exit_regular_hours: false` (with it true every regular-session exit is a MARKET order already), or the config is refused. The result's message says what happened (`;exit_limits_missed=<n>`, then `;exit_market_fallback` or `;stopped=attempts|time_budget|session:<now>|missing_or_stale_quotes`), in the `Exit attempt` log line and EXIT_CONTEXT's `result_message`, and EXIT_CONTEXT carries the count as `exit_limits_missed` too. A dry run never misses (it fills at the bid, or the ask for a cover, of the quote the exit read), so these change no dry run. Every preset ships `2` / `0.5` / `12.0` / `false`: with the presets' 2 s fill timeout and 0.25 s poll, three missed limits take about 7.7 s at a 0.1 s broker round trip and 10.8 s at 0.3 s, and a fallback MARKET order goes out at about 7.8 s and 11.1 s, so one missed exit alone rarely meets the budget. When several miss in the same pass it binds: with four positions whose limits all miss, the fourth's first order goes out about 15-19 s into the pass (0.1-0.5 s round trip), against 7.6-11 s with one order per exit and 23-35 s with a budget per exit. Until 2026-09-28 the first miss ended the attempt and the next order went out on the next cycle, about 24 s later on top_tier days (options exits are unchanged: one order a pass).
 - `bracket_orders_enabled`: submit equity entries as a broker-side bracket. See below.
 - `bracket_sync_mode`: `static` | `replace` — who owns the resting levels after entry.
 - `bracket_legs`: `stop_and_target` | `stop_only` — which children rest at the broker.
@@ -493,7 +493,7 @@ Behavior and valid values:
 - `disaster_stop_enabled`: rest a static disaster stop at the broker for each equity position. See below. On unless a config says `false`: on in every equity preset, off in the two option presets (an options config must say `false`, or it is refused).
 - `disaster_stop_r`: how far beyond the initial stop the disaster stop rests, in units of the trade's initial R. A finite number above 0.
 - `disaster_stop_min_pct`: the least that distance can be, as a fraction of the entry price (0 turns the floor off). A finite number in [0, 1].
-- `disaster_stop_escalation_attempts`: every this-many consecutive attempts that leave a position without its disaster stop log a CRITICAL naming it. An integer >= 1.
+- `disaster_stop_escalation_attempts`: every this-many consecutive attempts that leave a position without its disaster stop log a CRITICAL naming it (`DISASTER STOP DEGRADED`), every this-many consecutive failed reads of a closed position's post-close sweep too (`EXIT ORDERS LEFT`), and every this-many consecutive passes a position is held because an exit order changed in the app has a replacement the day's orders do not show (`ORDER REPLACED UNTRACKED`). An integer >= 1.
 
 #### Broker-side bracket orders
 
@@ -569,11 +569,12 @@ slippage at the cost of a no-fill tail: if price gaps straight through the
 limit, the stop triggers without filling and the position is still open. The
 child is still a working order, and nothing the bot reads tells it from a
 resting stop, so the engine's own stop check, on its next cycle, is what gets
-the position out (see **What the engine still does**). `bracket_stop_limit_offset_r` sets how far beyond the
-trigger the limit sits, in units of the trade's initial R (entry to initial
-stop), wherever the stop has moved since: a stop at break-even keeps the offset
-it had at entry. Until 2026-09-28 the offset was measured to the stop being
-placed, so after break-even it was about 0 and the limit sat on the trigger.
+the position out (see **What the engine still does**).
+`bracket_stop_limit_offset_r` sets how far beyond the trigger the limit sits,
+in units of the trade's initial R (entry to initial stop), wherever the stop has
+moved since: a stop at break-even keeps the offset it had at entry. Until
+2026-09-28 the offset was measured to the stop being placed, so after
+break-even it was about 0 and the limit sat on the trigger.
 
 **Extended hours**
 
@@ -640,22 +641,40 @@ off from the broker.
   the first management cycle after 09:30.
 - **When it goes out.** Right after the entry fills and the position is saved,
   and on any later cycle that decides no exit while the position is still owed
-  one. A submit the broker refuses is tried again a minute later. A submit whose
-  outcome is unknown (a transport failure, a response that timed out, or an
-  accepted order without its id) is never simply re-sent: a minute later the
-  day's working orders are read, and the exit `STOP` resting at exactly the
-  price and quantity sent is adopted; only when no exit stop is listed on the
-  symbol is one placed. Beside an exit stop on the symbol that is not the one
-  sent (one placed by hand in the app, say), none is adopted and none placed,
-  so a position never rests two stops. The record reads `unconfirmed` before
-  anything is sent, so an error anywhere after that leaves a stop that is
-  looked for before another goes out. A placement that raises after an entry
-  is logged against that position, and the entry pass goes on.
-- **Escalation.** Each attempt that leaves a position without its disaster
-  stop logs on its own line: a refused or unknown-outcome submit, an order
-  list that cannot be read or holds a stop it cannot tell for its own, and a
-  cancel before an exit that cannot be confirmed (which holds the exit while
-  the engine's own level may be breached). Every
+  one; before 09:30 nothing is sent or saved each cycle. A submit the broker
+  refuses (a 4xx) is tried again a minute later. A submit whose outcome is
+  unknown (a transport failure, a response that timed out, a 5xx gateway error,
+  a status that is neither 2xx nor 4xx or is not a number, or an accepted order
+  without its id) is never simply re-sent: a minute later the day's orders
+  entered from a minute before the submit are read, whatever their status, for
+  the exit `STOP` at exactly the price and quantity sent. What it filled, in
+  part or in full, is booked as a `disaster_stop` exit at the broker's price,
+  so the position is closed or reduced as the broker's own fill reconcile
+  would. A status is read failing closed: only `FILLED`, `CANCELED`,
+  `REJECTED`, `EXPIRED` and `REPLACED` end an order, and one in any other
+  status (`WORKING`, `PENDING_CANCEL`, `PENDING_REPLACE`, `NEW`,
+  `AWAITING_RELEASE_TIME`, `UNKNOWN`, one never seen before, none at all) is
+  adopted as still resting (resized to what is held). One `REPLACED` (moved in
+  the app) is followed to its replacement, the one its payload names or else
+  the one exit stop entered after it; while that cannot be found none is
+  placed, as a miss. One that died, or none, lets a stop be placed. Every
+  placement first reads the day's orders: an exit stop no record tracks that
+  may still work on the symbol for the side (one moved in the app, which Schwab
+  replaces under a new id, or one placed there) is adopted instead of placing
+  another beside it, and logged. The record reads `unconfirmed`, with the time
+  of the submit, before anything is sent, so an error anywhere after that
+  leaves a stop that is looked for before another goes out. A placement that
+  raises after an entry is logged against that position, and the entry pass
+  goes on.
+- **Escalation.** Each attempt that leaves a position without its disaster stop
+  logs on its own line: a refused or unknown-outcome submit, an order list that
+  cannot be read, an unconfirmed stop moved in the app whose replacement is not
+  found, a stop that went down with the position held (one the broker rejected
+  after accepting it, one that died again, one cancelled for an exit that did
+  not follow), one resting more shares than are held that neither resizes nor
+  cancels, and a cancel before an exit that cannot be confirmed (which holds
+  the exit while the engine's own level may be breached). The count ends once
+  the broker lists the stop working. Every
   `disaster_stop_escalation_attempts`-th consecutive one for a position logs
   `DISASTER STOP DEGRADED` at CRITICAL, the line to page on.
 - **What the engine does with it.** It is kept as the position's bracket
@@ -663,32 +682,55 @@ off from the broker.
   a filled disaster stop as a `disaster_stop` exit; every engine exit (stop,
   giveback, time stop, CHoCH, force flatten, a scale-out) cancels it first and
   books what it sold before the cancel landed (a cancel that cannot be
-  confirmed defers the exit a cycle, as for a bracket); a scale-out's remainder
-  gets a fresh one at the same price, sized to what is held; a stop that died
-  at the broker (a `DAY` order that expired, one cancelled in the app) is
-  re-placed once, never after a `REJECTED` one. Unlike a bracket's stop, it
-  never stands the engine's stop down.
-- **After a full close.** Once a position that had live broker protection
-  is closed in full, the day's working orders are read once, and any exit
-  order still working on the symbol for its side is cancelled: a stop whose
-  unknown-outcome submit landed after all, a replacement a replace left
-  untracked, a stop moved in the app. Filled, it would open a position the bot
-  does not track; one that cannot be cancelled, or filled first, logs
-  `EXIT ORDERS LEFT` at CRITICAL. The bot takes the account's position in a
-  symbol it trades as its own, as the startup reconcile does.
-- **Restarts.** A restore adopts a disaster stop still resting for the
-  position (resized to what is held) rather than placing a second one, and
-  places one at the saved price when none rests; `restore_basic` prices it off
-  its default-distance stop. The position's own disaster stop is never counted
-  as a foreign order. A restore that cannot read the working-order list
-  restores nothing, as in bracket mode. `runtime.reconcile_on_startup: false`,
-  or `startup_reconcile_mode: ignore` or `log_only`, would forget the stops a
-  restart finds resting, so with `schwab.dry_run: false` they are refused at
-  load beside the disaster stop (the error names both keys): use `block`,
-  `restore_basic` or `restore_hybrid`, or turn the disaster stop off.
-- **Costs.** Each engine exit pays a cancel round trip first. While any
-  position holds a live disaster stop, each cycle reads `account_orders` once
-  (the fill reconcile).
+  confirmed defers the exit a cycle, as for a bracket); an `unconfirmed` one is
+  looked up first, at once: its fills are booked, and one that may still rest
+  (a moved one's replacement too) is adopted so the cancel takes it down (the
+  orders unreadable, or a moved one's replacement not found: the exit waits a
+  cycle, as a miss); a broker fill larger than the position (a stop listed only
+  after a slice sold beside it) is booked as the whole position and logged
+  `EXIT OVERFILLED` at CRITICAL, naming the shares the account now holds the
+  other way; a scale-out's remainder gets a fresh one at the same price, sized
+  to what is held, and so does an exit whose orders all died unfilled, in the
+  same pass; a stop that died at the broker (a `DAY` order that expired, one
+  cancelled in the app) is re-placed at once, and one that dies again, or that
+  the broker `REJECTED`, a retry interval later, as a miss; one the broker
+  would not resize is resized again, then cancelled and placed at the held
+  size. Unlike a bracket's stop, it never stands the engine's stop down.
+- **After a full close.** Once a position that had live broker protection is
+  closed in full, the day's orders are read, and any exit order that may still
+  work on the symbol for its side (any status but a terminal one) is cancelled:
+  a stop whose unknown-outcome submit landed after all, a replacement a replace
+  left untracked, a stop moved in the app. Filled, it would open a position the
+  bot does not track; one that cannot be cancelled, or filled first, and an
+  unconfirmed stop (or its replacement) that filled beside the exit, log `EXIT
+  ORDERS LEFT` at CRITICAL. A close whose stop was still unconfirmed sweeps
+  again at the start of each pass until a minute after the stop's submit, so a
+  stop the broker lists late is still cancelled. When the orders cannot be read
+  the sweep is tried again at the start of every management pass; while a sweep
+  is owed the symbol takes no entry, and every
+  `disaster_stop_escalation_attempts`-th consecutive failed read logs `EXIT
+  ORDERS LEFT` too (a restart forgets an owed sweep). The bot takes the
+  account's position in a symbol it trades as its own, as the startup reconcile
+  does.
+- **Restarts.** A restore adopts a disaster stop still resting for the position
+  (resized to what is held) rather than placing a second one, and places one at
+  the saved price when none rests; `restore_basic` prices it off its
+  default-distance stop. A saved `unconfirmed` record adopts the stop at
+  exactly the price and quantity it sent, in any status but a terminal one,
+  never merely the first exit stop on the symbol; a restore that cannot
+  re-establish the stop leaves the record `unconfirmed` as sent at the restart,
+  so its lookup never takes an earlier position's filled stop for its own. A
+  working exit order changed in the app still covers its shares. The position's
+  own disaster stop is never counted as a foreign order. A restore that cannot
+  read the working-order list restores nothing, as in bracket mode.
+  `runtime.reconcile_on_startup: false`, or `startup_reconcile_mode: ignore` or
+  `log_only`, would forget the stops a restart finds resting, so with
+  `schwab.dry_run: false` they are refused at load beside the disaster stop
+  (the error names both keys): use `block`, `restore_basic` or
+  `restore_hybrid`, or turn the disaster stop off.
+- **Costs.** Each engine exit pays a cancel round trip first, and each
+  placement a read of the day's orders. While any position holds a live
+  disaster stop, each cycle reads `account_orders` once (the fill reconcile).
 - **Refused at load** beside `bracket_orders_enabled` (the bracket's stop
   already rests at the engine's own, tighter, level, and two resting stops on
   the same shares both sell when a flush takes out both), for an options

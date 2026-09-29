@@ -538,9 +538,8 @@ class TradeManager:
         # reads tells a triggered stop from a resting one, and the mark at or
         # through the stop, the one sign the engine sees each cycle, is
         # exactly when that deferral applied, so it is gone rather than
-        # qualified. A
-        # resting TARGET child still owns the target: a limit in the trade's
-        # favour with the stop still resting beside it.
+        # qualified. A resting TARGET child still owns the target: a limit in
+        # the trade's favour with the stop still resting beside it.
         bracket = active_broker_bracket(position)
         broker_owns_target = bracket is not None and bracket.get("target_order_id") is not None
 

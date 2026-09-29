@@ -19,15 +19,18 @@ from .broker_payloads import (
     collect_protective_fills,
     extract_bracket_children,
     extract_broker_positions,
-    extract_working_orders,
+    extract_orders,
     flatten_order_tree,
     is_disaster_stop,
     order_fill_price,
     order_filled_qty,
     order_is_filled,
     order_is_terminal_failure,
+    order_may_be_live,
+    order_replacement_id,
     order_status,
     protective_stop_reason,
+    resting_exit_stop,
 )
 from .config import BotConfig
 from .data_feed import EXECUTION_LAST_KEYS
@@ -53,9 +56,52 @@ from .schwab_api import SCHWAB_WRITE_UNKNOWN_OUTCOME, call_schwab_client, call_s
 LOG = logging.getLogger(__name__)
 
 # A live order that did not fill in its poll window and whose cancel the
-# broker confirmed, with nothing filled: nothing of it can still fill, so it
-# is the one outcome another order for the same shares may follow.
+# broker confirmed CANCELED, with nothing filled: nothing of it can still
+# fill, so it is the one outcome another order for the same shares may
+# follow in the same call (the exit re-send).
 LIVE_UNFILLED_CANCELED = "live_unfilled_canceled"
+# The same order found REJECTED or EXPIRED instead, after the broker had
+# accepted it: nothing of it can fill either, but the broker refused or
+# ended it, so no order follows it in the same call (2026-09-29). Until then
+# every terminal status read as LIVE_UNFILLED_CANCELED, and the exit re-send
+# followed a rejection too.
+LIVE_UNFILLED_REJECTED = "live_unfilled_rejected"
+LIVE_UNFILLED_EXPIRED = "live_unfilled_expired"
+# The order was REPLACED at the broker (changed in the app): its shares live
+# on in the replacement, which the result's ``order_id`` names when the
+# broker's payload does (``may_still_be_working``: the caller tracks it).
+# The message is ``live_order_replaced:<original>-><replacement>``, with
+# ``REPLACEMENT_UNNAMED`` for a payload that names none: then ``order_id``
+# is the original's, whose state reads REPLACED, and the caller looks the
+# replacement up from there.
+LIVE_ORDER_REPLACED = "live_order_replaced"
+REPLACEMENT_UNNAMED = "unknown"
+_LIVE_UNFILLED_BY_STATUS = {
+    "CANCELED": LIVE_UNFILLED_CANCELED,
+    "CANCELLED": LIVE_UNFILLED_CANCELED,
+    "REJECTED": LIVE_UNFILLED_REJECTED,
+    "EXPIRED": LIVE_UNFILLED_EXPIRED,
+}
+
+
+def order_result_left_nothing_live(message: Any) -> bool:
+    """True when a result's last order is confirmed dead at the broker with
+    nothing filled (CANCELED, REJECTED or EXPIRED): nothing of it rests or
+    can fill, so the position's broker stop can go back at once. Read off
+    the message's prefix, before any ``;`` suffix."""
+    prefix = str(message or "").split(";", 1)[0]
+    return prefix in (LIVE_UNFILLED_CANCELED, LIVE_UNFILLED_REJECTED, LIVE_UNFILLED_EXPIRED)
+
+
+def order_result_names_replacement(message: Any) -> bool:
+    """True when a result's last order was REPLACED at the broker and its
+    ``order_id`` is the replacement the payload named: an order that has
+    filled nothing of its own yet. False for any other result, one whose
+    payload named no replacement included (its ``order_id`` is the
+    original's, with the original's fills). Read off the message's prefix,
+    before any ``;`` suffix."""
+    prefix = str(message or "").split(";", 1)[0]
+    return prefix.startswith(f"{LIVE_ORDER_REPLACED}:") and not prefix.endswith(f"->{REPLACEMENT_UNNAMED}")
 
 # The caller's rule for the levels an entry fill leaves the trade with: the
 # fill price in, ``(stop, target, fallback_reason)`` out, the reason None when
@@ -130,6 +176,11 @@ class SchwabExecutor:
             ts,
             extended_hours_enabled=bool(self.config.execution.extended_hours_enabled),
         )
+
+    def regular_session_open(self, ts=None) -> bool:
+        """True in the regular equity session, the only one a STOP rests in
+        (Schwab rejects one outside it)."""
+        return self._equity_session(ts) == "NORMAL"
 
     def _equity_session_blackout_reason(self, ts=None) -> str:
         state = equity_session_state(
@@ -370,13 +421,62 @@ class SchwabExecutor:
             fill_price *= float(price_scale)
         return OrderResult(ok=(filled_qty or 0) > 0, order_id=order_id, raw=payload or spec, message=message, fill_price=fill_price, filled_qty=filled_qty, simulated=False)
 
+    def _replaced_order_result(self, spec: dict[str, Any], payload: dict[str, Any] | None, order_id: str,
+                               *, price_scale: float) -> OrderResult | None:
+        """The result of an order found REPLACED at the broker, or None when
+        *payload* is not REPLACED.
+
+        A REPLACED order is one someone changed at the broker (in the app):
+        its shares live on in the replacement, so the result names that order
+        (``order_replacement_id``) and ``may_still_be_working``, and the
+        caller tracks it rather than send another order for the same shares.
+        A payload that does not name its replacement logs ``ORDER REPLACED
+        UNTRACKED`` at CRITICAL and names the original
+        (``REPLACEMENT_UNNAMED``): the replacement may still work, and the
+        caller looks it up among the day's orders from the original
+        (``PositionManager._exit_order_in_flight``). Fills the replaced order
+        made before the replace are in the result, to book."""
+        if order_status(payload) != "REPLACED":
+            return None
+        replacement = order_replacement_id(payload)
+        leg = (spec.get("orderLegCollection") or [{}])[0]
+        what = f"{leg.get('instruction')} {(leg.get('instrument') or {}).get('symbol')} qty={leg.get('quantity')}"
+        if replacement:
+            LOG.error("Order %s (%s) was REPLACED at the broker by order %s, which is tracked in its place; no "
+                      "other order follows it", order_id, what, replacement)
+        else:
+            LOG.critical("ORDER REPLACED UNTRACKED — order %s (%s) was REPLACED at the broker and its payload does "
+                         "not name the replacement, which may still work untracked; it is looked up among the "
+                         "day's orders. Check the account.", order_id, what)
+        result = self._finalize_live_polled_order_result(
+            spec, payload, replacement or order_id,
+            f"{LIVE_ORDER_REPLACED}:{order_id}->{replacement or REPLACEMENT_UNNAMED}", price_scale=price_scale,
+        )
+        result.may_still_be_working = True
+        return result
+
     def _submit_live_single_order_with_poll(
         self,
         spec: dict[str, Any],
         *,
         cancel_on_timeout: bool,
         price_scale: float = 1.0,
+        on_order_sent: Callable[[str], None] | None,
     ) -> OrderResult:
+        """Send one order, poll it, and cancel what is left of it unfilled
+        (``cancel_on_timeout``; otherwise it is left working).
+
+        ``on_order_sent`` is called with the new order's id before it is
+        polled, so the caller can record the order as working first: a stop
+        signal during the poll (it is not an Exception) leaves it recorded,
+        and a restart settles it (2026-09-29). An exit passes it; an entry
+        passes None.
+
+        An order the broker ended without filling is labelled by its status:
+        ``LIVE_UNFILLED_CANCELED`` (the cancel landed), ``LIVE_UNFILLED_
+        REJECTED`` or ``LIVE_UNFILLED_EXPIRED`` (the broker ended it after
+        accepting it, logged at ERROR), and a REPLACED one is
+        ``_replaced_order_result``'s."""
         timeout_seconds = max(0.5, float(self.config.execution.entry_live_fill_timeout_seconds))
         poll_seconds = max(0.1, float(self.config.execution.entry_live_poll_seconds))
         response = self._submit_live_order_spec(spec)
@@ -385,13 +485,21 @@ class SchwabExecutor:
         order_id = self._response_order_id(response)
         if not order_id:
             return OrderResult(ok=False, order_id=None, raw=getattr(response, 'text', spec), message="live_missing_order_id", simulated=False)
+        if on_order_sent is not None:
+            on_order_sent(order_id)
         payload, status = self._poll_equity_order(order_id, timeout_seconds, poll_seconds)
+        replaced = self._replaced_order_result(spec, payload, order_id, price_scale=price_scale)
+        if replaced is not None:
+            return replaced
         if payload is not None and order_is_filled(payload):
             return self._finalize_live_polled_order_result(spec, payload, order_id, f"live_fill:{status}", price_scale=price_scale)
         filled_qty = order_filled_qty(payload) or 0
         if filled_qty > 0:
             cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
             latest_payload = cancel_payload or payload
+            replaced = self._replaced_order_result(spec, latest_payload, order_id, price_scale=price_scale)
+            if replaced is not None:
+                return replaced
             result = self._finalize_live_polled_order_result(spec, latest_payload, order_id, f"live_partial_fill:{cancel_msg}", price_scale=price_scale)
             if not result.ok:
                 result = OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message=f"partial_fill_finalize_failed:{cancel_msg}", simulated=False)
@@ -402,6 +510,9 @@ class SchwabExecutor:
                                may_still_be_working=True)
         cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
         latest_payload = cancel_payload or payload
+        replaced = self._replaced_order_result(spec, latest_payload, order_id, price_scale=price_scale)
+        if replaced is not None:
+            return replaced
         if latest_payload is not None and order_is_filled(latest_payload):
             return self._finalize_live_polled_order_result(spec, latest_payload, order_id, f"live_fill_after_cancel:{cancel_msg}", price_scale=price_scale)
         latest_filled_qty = order_filled_qty(latest_payload) or 0
@@ -414,7 +525,14 @@ class SchwabExecutor:
         if not cancel_ok:
             return OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message=f"live_unfilled_cancel_failed:{cancel_msg}", simulated=False,
                                may_still_be_working=True)
-        return OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message=LIVE_UNFILLED_CANCELED, simulated=False)
+        dead_status = order_status(latest_payload)
+        message = _LIVE_UNFILLED_BY_STATUS[dead_status]
+        if message != LIVE_UNFILLED_CANCELED:
+            leg = (spec.get("orderLegCollection") or [{}])[0]
+            LOG.error("Order %s (%s %s qty=%s) was %s at the broker after it was accepted; nothing of it filled",
+                      order_id, leg.get("instruction"), (leg.get("instrument") or {}).get("symbol"),
+                      leg.get("quantity"), dead_status)
+        return OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message=message, simulated=False)
 
     def _submit_live_equity_entry_with_reprice(self, initial_request: OrderRequest, data=None) -> OrderResult:
         timeout_seconds = max(0.5, float(self.config.execution.entry_live_fill_timeout_seconds))
@@ -499,33 +617,41 @@ class SchwabExecutor:
             return f"session:{session}"
         return None
 
-    def _submit_live_equity_exit_with_reprice(self, request: OrderRequest, data, deadline: float) -> OrderResult:
+    def _submit_live_equity_exit_with_reprice(self, request: OrderRequest, data, deadline: float, *,
+                                              on_order_sent: Callable[[str], None]) -> OrderResult:
         """A live marketable LIMIT exit, re-sent at a fresh quote while it misses.
 
         Each order is ``_submit_live_single_order_with_poll``'s: polled for
-        ``entry_live_fill_timeout_seconds``, then cancelled. Another follows
-        only an order the broker confirmed dead with nothing filled
-        (``LIVE_UNFILLED_CANCELED``). A fill of any size, a rejection, a
-        missing order id or a cancel the broker did not confirm is returned
-        as it is, so two exit orders for the same shares are never live
-        together. A re-send is priced off the quote read then, its spread
-        buffer ``1 + n * exit_live_reprice_step_frac`` times the first's.
-        There are at most ``exit_live_reprice_attempts`` of them, and none
-        once the management pass's ``deadline`` (``exit_reprice_deadline``,
-        shared by every exit of the pass) has passed or the session is no
-        longer the one the exit was priced for. The first order always goes
-        out. Then, with ``exit_live_market_fallback``, a regular-session exit
-        goes out as a MARKET order under the same two limits, left working
-        if it does not fill.
+        ``entry_live_fill_timeout_seconds``, then cancelled, and handed to
+        ``on_order_sent`` before it is polled. Another follows only an order
+        the broker confirmed CANCELED with nothing filled
+        (``LIVE_UNFILLED_CANCELED``). Any other outcome is returned as it is:
+        a fill of any size, a refused submit, a missing order id, a cancel the
+        broker did not confirm, and an order the broker REJECTED or EXPIRED
+        after accepting it, or that was REPLACED at the broker (its
+        replacement tracked in its place), the last three with
+        ``;stopped=status:<STATUS>``. So no second exit order for the same
+        shares goes out while one may still fill, except after an order whose
+        submit's outcome is unknown (a POST that times out raises; the shared
+        unknown-outcome path is queued). A re-send is priced off the quote
+        read then, its spread buffer ``1 + n * exit_live_reprice_step_frac``
+        times the first's. There are at most ``exit_live_reprice_attempts``
+        of them, and none once the management pass's ``deadline``
+        (``exit_reprice_deadline``, shared by every exit of the pass) has
+        passed or the session is no longer the one the exit was priced for.
+        The first order always goes out. Then, with
+        ``exit_live_market_fallback``, a regular-session exit goes out as a
+        MARKET order under the same two limits, left working if it does not
+        fill.
 
         The result's ``exit_limits_missed`` counts the limits that missed (0
-        when the first order settled it). Once a limit has missed, the
+        when the first order settled it): the ones confirmed CANCELED with
+        nothing filled, never a rejection. Once a limit has missed, the
         message carries ``;exit_limits_missed=<n>`` too, then
         ``;exit_market_fallback`` for the MARKET order, or ``;stopped=<why>``
-        when nothing filled (``attempts``, ``time_budget``,
-        ``session:<now>`` or ``missing_or_stale_quotes``). Its prefix is the
-        last order's own, so the position manager settles the result as it
-        did before. Until
+        when nothing filled (``attempts``, ``time_budget``, ``session:<now>``
+        or ``missing_or_stale_quotes``). Its prefix is the last order's own,
+        so the position manager settles the result as it did before. Until
         2026-09-28 the first miss ended the exit attempt, and the next order
         went out on the next cycle: about 24 s later on top_tier days
         (study B).
@@ -537,8 +663,14 @@ class SchwabExecutor:
         missed = 0
         while True:
             result = self._submit_live_single_order_with_poll(self._build_order(current), cancel_on_timeout=True,
-                                                              price_scale=1.0)
+                                                              price_scale=1.0, on_order_sent=on_order_sent)
             if result.message != LIVE_UNFILLED_CANCELED:
+                if result.message.startswith((LIVE_UNFILLED_REJECTED, LIVE_UNFILLED_EXPIRED, LIVE_ORDER_REPLACED)):
+                    # The broker ended or someone changed the order: nothing
+                    # follows it this pass (logged where it was read).
+                    return replace(result, message=f"{result.message};exit_limits_missed={missed};"
+                                                   f"stopped=status:{order_status(result.raw)}",
+                                   exit_limits_missed=missed)
                 if missed == 0:
                     return replace(result, exit_limits_missed=0)
                 return replace(result, message=f"{result.message};exit_limits_missed={missed}",
@@ -570,7 +702,7 @@ class SchwabExecutor:
                 market = OrderRequest(symbol=request.symbol, qty=request.qty, intent=request.intent,
                                       order_type="MARKET", session=request.session)
                 result = self._submit_live_single_order_with_poll(self._build_order(market), cancel_on_timeout=False,
-                                                                  price_scale=1.0)
+                                                                  price_scale=1.0, on_order_sent=on_order_sent)
                 return replace(result, message=f"{result.message};exit_limits_missed={missed};exit_market_fallback",
                                exit_limits_missed=missed)
         return replace(result, message=f"{result.message};exit_limits_missed={missed};stopped={stopped}",
@@ -671,12 +803,13 @@ class SchwabExecutor:
         return self._submit_live_equity_entry_with_reprice(request, data=data)
 
     def submit_equity_exit(self, symbol: str, qty: int, intent: OrderIntent, data=None, market_snapshot: Any | None = None,
-                           *, reprice_deadline: float) -> OrderResult:
+                           *, reprice_deadline: float, on_order_sent: Callable[[str], None]) -> OrderResult:
         """An engine exit for ``qty`` shares: a MARKET order in the regular
         session with ``market_exit_regular_hours``, a marketable LIMIT
         otherwise. A live LIMIT that misses is re-sent until
         ``reprice_deadline``, the management pass's (``exit_reprice_deadline``;
-        ``_submit_live_equity_exit_with_reprice``)."""
+        ``_submit_live_equity_exit_with_reprice``). Each live order's id goes
+        to ``on_order_sent`` before the order is polled."""
         if not str(symbol or "").strip():
             return OrderResult(ok=False, order_id=None, raw=None, message="invalid_symbol", simulated=self.config.schwab.dry_run)
         if int(qty) <= 0:
@@ -689,7 +822,8 @@ class SchwabExecutor:
             request = OrderRequest(symbol=symbol, qty=qty, intent=intent, order_type="MARKET", session=session)
             if self.config.schwab.dry_run:
                 return self._simulate_equity_fill(request, data, refresh_quotes=market is None, market_snapshot=market)
-            return self._submit_live_single_order_with_poll(self._build_order(request), cancel_on_timeout=False, price_scale=1.0)
+            return self._submit_live_single_order_with_poll(self._build_order(request), cancel_on_timeout=False,
+                                                            price_scale=1.0, on_order_sent=on_order_sent)
         if market is None:
             market = self._equity_market(symbol, data, refresh_quotes=True)
         if market is None:
@@ -701,7 +835,7 @@ class SchwabExecutor:
         request = OrderRequest(symbol=symbol, qty=qty, intent=intent, order_type="LIMIT", price=limit_price, session=session)
         if self.config.schwab.dry_run:
             return self._simulate_equity_fill(request, data, refresh_quotes=False, market_snapshot=market)
-        return self._submit_live_equity_exit_with_reprice(request, data, reprice_deadline)
+        return self._submit_live_equity_exit_with_reprice(request, data, reprice_deadline, on_order_sent=on_order_sent)
 
     # ------------------------------------------------------------------
     # Broker-side bracket (first-triggers-OCO) orders
@@ -971,18 +1105,36 @@ class SchwabExecutor:
             LOG.warning("account_details read failed: %s", exc)
             return None
 
-    def fetch_working_orders(self, from_ts: str, to_ts: str) -> list[dict[str, Any]] | None:
-        """The account's working orders entered between the two ISO
-        timestamps (``extract_working_orders``), or None when they could not
-        be read."""
+    def fetch_orders(self, from_ts: str, to_ts: str) -> list[dict[str, Any]] | None:
+        """The account's orders entered between the two ISO timestamps,
+        whatever their status (``extract_orders``), or None when they could
+        not be read."""
         try:
             payload = call_schwab_json(
                 self.client, "account_orders", self.account_hash, fromEnteredTime=from_ts, toEnteredTime=to_ts,
             )
-            return extract_working_orders(payload)
+            return extract_orders(payload)
         except Exception as exc:
-            LOG.warning("account_orders read failed: %s", exc)
+            LOG.warning("account_orders read failed (%s: %s)", type(exc).__name__, exc)
             return None
+
+    def fetch_working_orders(self, from_ts: str, to_ts: str) -> list[dict[str, Any]] | None:
+        """``fetch_orders``' rows of the orders that may still work
+        (``order_may_be_live``: any status but a terminal one), or None when
+        they could not be read."""
+        orders = self.fetch_orders(from_ts, to_ts)
+        return None if orders is None else [order for order in orders if order_may_be_live(order["status"])]
+
+    def todays_orders(self, since: datetime.datetime | None = None) -> list[dict[str, Any]] | None:
+        """``fetch_orders`` from *since* (midnight ET when None; a DAY order
+        entered before today no longer works) to now, or None when they could
+        not be read."""
+        now = sessions.now_et()
+        start = since if since is not None else now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return self.fetch_orders(
+            *(stamp.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+              for stamp in (start, now)),
+        )
 
     def order_state(self, order_id: str) -> dict[str, Any] | None:
         """One order's state row (the ``fetch_order_states`` shape) via
@@ -1078,7 +1230,12 @@ class SchwabExecutor:
         session, never a target, adopted, resized and mirrored in a dry run as
         a bracket's stop is, and placed by ``_place_disaster_stop``; neither
         ``initial_risk`` nor ``parent_order_id`` (a bracketed entry's) is read
-        for it.
+        for it. Before one is placed in the regular session the day's orders
+        are read: an exit stop no record tracks that may still work on the
+        symbol for the side (``resting_exit_stop``: one moved in the app, or
+        placed there, in any status but a terminal one) is adopted and
+        resized instead, and logged; orders that cannot be read place nothing
+        (``unprotected``, retried) (2026-09-29).
 
         Returns the bracket state dict, or None when neither brackets nor the
         disaster stop are on.
@@ -1126,6 +1283,28 @@ class SchwabExecutor:
             }
             return {**base, **mirrored, "active": False, "simulated": True, "state": "dry_run"}
         existing = self._adoptable_protection(None if disaster else parent_order_id, known_bracket)
+        if existing is None and disaster and self.regular_session_open():
+            # A stop no record tracks already rests on the symbol for the
+            # side: one moved in the app (Schwab REPLACES it under a new id)
+            # or placed there. A disaster stop placed beside it sells the
+            # same shares twice, so it is adopted instead (2026-09-29).
+            # Outside the regular session nothing is placed, so nothing is
+            # read either.
+            orders = self.todays_orders()
+            if orders is None:
+                LOG.error(
+                    "Disaster stop for %s qty=%s: the day's orders could not be read to look for a stop already "
+                    "resting on it, so none is placed until they can be", symbol, qty,
+                )
+                return {**base, **dict.fromkeys(BRACKET_ID_KEYS), "child_order_ids": [], "active": False,
+                        "state": "unprotected", "attempted_at": sessions.now_et().isoformat()}
+            resting = resting_exit_stop(orders, symbol, side)
+            if resting is not None:
+                LOG.warning(
+                    "Disaster stop for %s: exit stop %s already rests on it (moved or placed at the broker); "
+                    "adopting it instead of placing another beside it", symbol, resting["stop_order_id"],
+                )
+                existing = self._adoptable_protection(None, resting)
         if existing is not None:
             resting_qty = existing.pop("resting_qty", None)
             adopted = {**base, **existing, "active": True, "state": "adopted"}
@@ -1169,22 +1348,29 @@ class SchwabExecutor:
         - Outside the regular session nothing is sent (Schwab rejects a STOP
           there): ``pending_session``, placed by the first regular-session
           cycle (``PositionManager.ensure_disaster_stop``).
-        - A submit the broker refused (a non-2xx status: nothing was
-          placed): ``unprotected``, which the position manager retries.
-        - A submit whose outcome is unknown -- a transport failure or a
-          timed-out response (``SCHWAB_WRITE_UNKNOWN_OUTCOME``: a POST whose
-          response times out raises ``ReadTimeout``, since the client never
-          retries a POST), or a 2xx without the new order's id -- may have
-          left the stop resting, and a second one beside it sells the shares
-          twice: ``unconfirmed``. The record keeps the price and quantity
-          sent, and the position manager looks for exactly that stop among
-          the working orders before it places another.
+        - A submit the broker refused (a 4xx status: the request was turned
+          down, nothing was placed): ``unprotected``, which the position
+          manager retries.
+        - A submit whose outcome is unknown may have left the stop resting,
+          and a second one beside it sells the shares twice: ``unconfirmed``.
+          That is a transport failure or a timed-out response
+          (``SCHWAB_WRITE_UNKNOWN_OUTCOME``: a POST whose response times out
+          raises ``ReadTimeout``, since the client never retries a POST), a
+          5xx (a gateway error on a POST says nothing of whether the order
+          landed; the client retries only GET, PUT and DELETE, 2026-09-29), a
+          status that cannot be read as a number or is neither 2xx nor 4xx,
+          and a 2xx without the new order's id. The record keeps the price
+          and quantity sent, and the position manager looks for exactly that
+          stop among the day's orders before it places another.
 
         Both carry the attempt's time (``attempted_at``), which the retry
-        waits on.
+        waits on; an unconfirmed one carries it as its submit's time too
+        (``sent_at``, required on every unconfirmed record since
+        2026-09-29), which the lookup's window starts from and a miss never
+        moves.
         """
         no_ids = {**dict.fromkeys(BRACKET_ID_KEYS), "child_order_ids": []}
-        if self._equity_session() != "NORMAL":
+        if not self.regular_session_open():
             return {**base, **no_ids, "active": False, "state": "pending_session"}
         attempted_at = sessions.now_et().isoformat()
         stop_price = float(base["stop_price"])
@@ -1195,24 +1381,35 @@ class SchwabExecutor:
         except SCHWAB_WRITE_UNKNOWN_OUTCOME as exc:
             LOG.error(
                 "Disaster stop for %s qty=%s at %s: the submit's outcome is unknown (%s: %s), so it may rest at "
-                "the broker or not; the working orders are read for it before another is sent",
+                "the broker or not; the day's orders are read for it before another is sent",
                 symbol, qty, stop_price, type(exc).__name__, exc,
             )
-            return {**base, **no_ids, "active": False, "state": "unconfirmed", "attempted_at": attempted_at}
+            return {**base, **no_ids, "active": False, "state": "unconfirmed", "attempted_at": attempted_at,
+                    "sent_at": attempted_at}
         status_code = getattr(response, "status_code", None)
-        if not response_ok(response):
+        status = safe_int(status_code)
+        if status is not None and 400 <= status < 500:
             LOG.error(
                 "Disaster stop for %s qty=%s at %s was refused (status=%s); the position has no broker stop "
                 "until a retry places one", symbol, qty, stop_price, status_code,
             )
             return {**base, **no_ids, "active": False, "state": "unprotected", "attempted_at": attempted_at}
+        if status is None or not 200 <= status < 300:
+            LOG.error(
+                "Disaster stop for %s qty=%s at %s: the submit's outcome is unknown (status=%s), so it may rest "
+                "at the broker or not; the day's orders are read for it before another is sent",
+                symbol, qty, stop_price, status_code,
+            )
+            return {**base, **no_ids, "active": False, "state": "unconfirmed", "attempted_at": attempted_at,
+                    "sent_at": attempted_at}
         order_id = self._response_order_id(response)
         if not order_id:
             LOG.error(
-                "Disaster stop for %s qty=%s at %s was accepted (status=%s) without its order id; the working "
+                "Disaster stop for %s qty=%s at %s was accepted (status=%s) without its order id; the day's "
                 "orders are read for it before another is sent", symbol, qty, stop_price, status_code,
             )
-            return {**base, **no_ids, "active": False, "state": "unconfirmed", "attempted_at": attempted_at}
+            return {**base, **no_ids, "active": False, "state": "unconfirmed", "attempted_at": attempted_at,
+                    "sent_at": attempted_at}
         LOG.info("Disaster stop for %s qty=%s rests at %s (order %s)", symbol, qty, stop_price, order_id)
         return {**base, **no_ids, "stop_order_id": str(order_id), "child_order_ids": [str(order_id)],
                 "active": True, "state": "disaster_stop"}
@@ -1813,14 +2010,16 @@ class SchwabExecutor:
             return self._simulate_vertical_fill(spec, metadata, data)
         if self._vertical_market(metadata, data, refresh_quotes=True) is None:
             return OrderResult(ok=False, order_id=None, raw=spec, message="live_missing_or_stale_quotes", simulated=False)
-        return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0)
+        return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0,
+                                                        on_order_sent=None)
 
     def submit_option_single(self, spec: dict[str, Any], metadata: dict[str, Any], data=None) -> OrderResult:
         if self.config.schwab.dry_run:
             return self._simulate_single_option_fill(spec, metadata, data)
         if self._single_option_market(metadata, data, refresh_quotes=True) is None:
             return OrderResult(ok=False, order_id=None, raw=spec, message="live_missing_or_stale_quotes", simulated=False)
-        return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0)
+        return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0,
+                                                        on_order_sent=None)
 
     def can_close_position_now(self, position: Position, ts=None) -> bool:
         if is_option_asset(position.metadata):
@@ -1828,7 +2027,7 @@ class SchwabExecutor:
         return self._equity_session(ts) is not None
 
     def close_position(self, position: Position, qty: int, data=None, market_snapshot: Any | None = None,
-                       *, reprice_deadline: float) -> OrderResult:
+                       *, reprice_deadline: float, on_order_sent: Callable[[str], None]) -> OrderResult:
         """Close ``qty`` units of ``position`` -- all of it, or a scale-out slice.
 
         ``qty`` is required: until 2026-09-24 this always sent ``position.qty``,
@@ -1836,6 +2035,9 @@ class SchwabExecutor:
         sized request, already clamped to the position. ``reprice_deadline``
         is the management pass's (``exit_reprice_deadline``): an equity
         exit's live re-sends stop there; an option's close sends one order.
+        ``on_order_sent`` gets each live order's id before the order is
+        polled (the position manager records it as the position's working
+        exit, 2026-09-29).
         """
         if not 1 <= int(qty) <= int(position.qty):
             raise ValueError(f"close_position qty {qty!r} outside 1..{position.qty} for {position.symbol}")
@@ -1853,7 +2055,8 @@ class SchwabExecutor:
             spec = build_vertical_close_order(position.metadata, int(qty), limit_price=limit_price)
             if self.config.schwab.dry_run:
                 return self._simulate_vertical_fill(spec, position.metadata, data, refresh_quotes=False)
-            return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0)
+            return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0,
+                                                            on_order_sent=on_order_sent)
         if asset_type == ASSET_TYPE_OPTION_SINGLE:
             symbol = str(position.metadata.get("option_symbol") or "")
             if data and symbol:
@@ -1865,10 +2068,11 @@ class SchwabExecutor:
             spec = build_single_option_close_order(position.metadata, int(qty), limit_price=limit_price)
             if self.config.schwab.dry_run:
                 return self._simulate_single_option_fill(spec, position.metadata, data, refresh_quotes=False)
-            return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0)
+            return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0,
+                                                            on_order_sent=on_order_sent)
         intent = self.order_intent_for_exit(position.side)
         return self.submit_equity_exit(position.symbol, int(qty), intent, data=data, market_snapshot=market_snapshot,
-                                       reprice_deadline=reprice_deadline)
+                                       reprice_deadline=reprice_deadline, on_order_sent=on_order_sent)
 
     @staticmethod
     def _build_order(request: OrderRequest) -> dict[str, Any]:

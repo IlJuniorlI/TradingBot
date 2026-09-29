@@ -61,10 +61,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Each attempt of a live LIMIT exit carries `exit_limits_missed` on
     EXIT_CONTEXT: how many of its limits missed in the pass
     (`OrderResult.exit_limits_missed`, set by the re-send loop; 0 when the
-    first order settled it). The result message's
-    `;exit_limits_missed=<n>` suffix stays (the settle reads the prefix
-    only). A dry run, a MARKET exit and an option's close carry none, so no
-    dry-run record changes.
+    first order settled it; a rejection is not a miss). An order the
+    attempt left working keeps the count on its `working_exit_order`
+    record, and the EXIT_CONTEXT of the fill a later pass books from it
+    carries it too (`_book_broker_exit`'s `exit_limits_missed`). The result
+    message's `;exit_limits_missed=<n>` suffix stays (the settle reads the
+    prefix only). A dry run, a MARKET exit and an option's close carry
+    none, so no dry-run record changes.
   - The session archive copies CYCLE_TIMING and POSITION_MARK into
     `events.jsonl` (`_STRUCTURED_PREFIXES`). The existing lines and records
     are unchanged but for the added fields.
@@ -88,10 +91,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `tests/runtime/test_management_instrumentation.py` (new: the pass
     before on each record, a pass without a price, a bracket fill, a
     disaster stop's fill, a new position under the same key, the marks and
-    the knob, the level and the slippage per exit, the broker child codes
-    pinned against the booking's), `tests/runtime/test_exit_reprice.py`
-    (the count per outcome, on the records, and absent from a MARKET or
-    dry-run exit's), `tests/reporting/test_session_archive.py` (the two
+    the knob, the level and the slippage per exit, none for a working exit
+    the broker filled with no price, the broker child codes pinned against
+    the booking's), `tests/runtime/test_exit_reprice.py` (the count per
+    outcome, on the records, the settle's record of a tracked order, and
+    absent from a MARKET or dry-run exit's), `tests/reporting/test_session_archive.py` (the two
     DEBUG records reach `events.jsonl`), `tests/guards/test_preset_parity.py`
     (the knob on in every preset and the local config). The engine shells
     in `tests/composition/test_engine_shutdown.py` and
@@ -113,17 +117,69 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   small_cap days), provided the exit still fired. A dry run cannot show
   this: it fills at the bid of the quote the exit read.
   - `SchwabExecutor._submit_live_equity_exit_with_reprice`: an order the
-    broker confirmed dead with nothing filled (`live_unfilled_canceled`,
+    broker confirmed CANCELED with nothing filled (`live_unfilled_canceled`,
     now `execution.LIVE_UNFILLED_CANCELED`) is followed by another, priced
     off the quote read then, its spread buffer (1 + n x
     `exit_live_reprice_step_frac`) times the first's, up to
     `exit_live_reprice_attempts` re-sends. None goes out once the equity
     session is no longer the one the exit was priced for (a NORMAL order is
     not re-sent past 16:00, nor an AM one past 09:25). Any other outcome
-    ends the call as before: a fill of any size (a partial books and the
-    next cycle exits the rest), a rejection, a missing order id, or a cancel
-    the broker did not confirm (tracked as a working exit). So two exit
-    orders for the same shares are never live together.
+    ends the call: a fill of any size (a partial books and the next cycle
+    exits the rest), a refused submit, a missing order id, a cancel the
+    broker did not confirm (tracked as a working exit), and an order the
+    broker `REJECTED` or `EXPIRED` after accepting it or that was `REPLACED`
+    at the broker (`;stopped=status:<STATUS>`, below). So no second exit
+    order for the same shares goes out while one may still fill, except
+    after a submit whose outcome is unknown: a re-send's POST that times out
+    raises out of the call as the single exit's did, with the order perhaps
+    live and untracked, which the queued shared unknown-outcome path is to
+    cover.
+  - Only `CANCELED` is followed (2026-09-29, a verifier's finding). The
+    single-order submit read every terminal status the cancel's check saw as
+    `live_unfilled_canceled`, a 400 on the cancel of an order already dead
+    included, so an order the broker accepted and then `REJECTED` was re-sent
+    twice more, each counted as a missed limit, and one `REPLACED` in the
+    app was followed by two more exit orders for the same shares while its
+    replacement worked. Now `_submit_live_single_order_with_poll` labels a
+    dead order by its status: `LIVE_UNFILLED_REJECTED` and
+    `LIVE_UNFILLED_EXPIRED`, logged at ERROR, end the call; a REPLACED
+    order's result names its replacement when the broker's payload does
+    (`broker_payloads.order_replacement_id`, `replacingOrderCollection`,
+    `LIVE_ORDER_REPLACED`, `may_still_be_working`), so the position manager
+    tracks that order in its place (booked from its own fills), and logs
+    `ORDER REPLACED UNTRACKED` at CRITICAL when it does not; an order
+    REPLACED between its poll and the bot's cancel, after a partial fill or
+    none, is read the same way. Options' closes get the same labels.
+  - An exit order REPLACED at the broker is followed to its replacement
+    wherever it is read (2026-09-29, the verifier's second probe). One whose
+    payload names none is looked up among the day's orders on the next pass
+    (`PositionManager._follow_replaced_exit`,
+    `broker_payloads.replacement_order`: the one exit order of its kind on
+    the symbol for the side entered after it) and tracked in its place;
+    while none is found (none listed, several that fit, or the orders
+    unreadable) the position is held, no exit or re-protect sent for it and
+    the others managed as usual, and every
+    `disaster_stop_escalation_attempts`-th pass logs `ORDER REPLACED
+    UNTRACKED` at CRITICAL until the orders show it. A tracked exit order
+    found REPLACED on a later pass is followed the same way (the one its
+    payload names, else looked up), and a restore counts the shares of a
+    REPLACED working exit as still covered. Until then the pass after read
+    the replaced original as settled, dropped it and re-protected the
+    position in full beside the replacement, and a re-decided exit could go
+    out beside it too; and a partial fill before an unnamed replace was
+    booked twice (the original was tracked with nothing booked).
+  - Each live order of an exit goes to the position manager before it is
+    polled (`close_position`'s and `submit_equity_exit`'s required
+    keyword-only `on_order_sent`), which records it as the position's
+    `working_exit_order` and saves it (2026-09-29): a stop signal (it is not
+    an Exception) or an error during the poll leaves the order tracked for
+    the next cycle, or a restart, to settle. Until then a KeyboardInterrupt
+    in a re-send's poll left it working and untracked, and a restart rested
+    a full-size disaster stop beside it. A result whose last order the
+    broker confirmed dead with nothing filled
+    (`execution.order_result_left_nothing_live`) is no longer tracked as a
+    working exit: the protection the exit took down goes back in the same
+    pass, not on the next.
   - One budget per management pass. `PositionManager.manage_positions`
     takes one deadline as it starts
     (`SchwabExecutor.exit_reprice_deadline`: `exit_live_reprice_max_seconds`
@@ -184,7 +240,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     two microcap presets included); `tests/guards/test_preset_parity.py`
     pins them.
   - Tests: `tests/runtime/test_exit_reprice.py` (new; `TestOneDeadlinePerPass`
-    runs several positions through `manage_positions`),
+    runs several positions through `manage_positions`; an order the broker
+    rejects or expires after accepting it, one replaced in the app (before
+    its first status read or its cancel, named or looked up, found or held,
+    after a partial fill), the hand-over before each poll, a stop signal in
+    a re-send's poll, an attempt that left nothing live),
     `tests/runtime/test_partial_exit.py` (the deadline reaches the equity
     exit), `tests/domain/test_config_validation.py`,
     `tests/guards/test_preset_parity.py`; every stand-in executor that
@@ -216,48 +276,137 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     flavour of its own (`static` is refused with the adaptive modes, whose
     stop ratchets). So the fill reconcile books a filled one as a
     `disaster_stop` exit; a scale-out's remainder gets a fresh one at the
-    same price; one that died at the broker is re-placed once, never after
-    `REJECTED`; and the restore adopts one still resting (resized to what is
-    held), places one at the saved price when none rests, and never counts it
-    as a foreign order. With it on, a restore waits for the working-order
-    list, as in bracket mode.
+    same price; one that died at the broker is re-placed at once, and one
+    that dies again, or that the broker `REJECTED`, is owed again a retry
+    interval later and counted (below); and the restore adopts one still
+    resting (resized to what is held), places one at the saved price when
+    none rests, and never counts it as a foreign order. With it on, a restore
+    waits for the working-order list, as in bracket mode.
   - It goes out right after the entry fills and the position is saved.
     Outside the regular session nothing is sent (Schwab rejects a `STOP`
-    there), and the first cycle after 09:30 places it. A refused submit is
-    tried again a minute later.
+    there), nor written or saved each cycle (a new position gets a
+    `pending_session` record in memory), and the first cycle after 09:30
+    places it. A submit the broker refused (a 4xx) is tried again a minute
+    later.
   - A submit whose outcome is unknown is never re-sent blind: a transport
     failure, a response that timed out (`schwab_api.
     SCHWAB_WRITE_UNKNOWN_OUTCOME`: schwabdev never retries a POST, so a
     `place_order` whose response times out raises `requests`' `ReadTimeout`,
-    which the read-side `SCHWAB_TRANSPORT_ERRORS` does not name), or an
-    accepted order without its id. A minute later the day's working orders
-    are read (`broker_payloads.sent_exit_stop`): the exit `STOP` resting at
-    exactly the price and quantity sent is adopted; with no exit stop on the
-    symbol one is placed; beside an exit stop that is not the one sent (one
-    placed by hand in the app) none is adopted and none placed, so a position
-    never rests two stops. `PositionManager.ensure_disaster_stop` saves the
-    record as `unconfirmed`, at the price and quantity about to be sent,
-    before it sends anything, so an error anywhere after that leaves a stop
-    that is looked for before another goes out. A restore whose protection
-    step raises leaves it `unconfirmed` at the saved price for the shares
-    held.
+    which the read-side `SCHWAB_TRANSPORT_ERRORS` does not name), a 5xx (a
+    gateway error on a POST says nothing of whether the order landed:
+    schwabdev retries GET, PUT and DELETE only; until 2026-09-29 a 5xx read
+    as refused, and the retry placed a second stop beside one that had
+    landed), a status that is neither 2xx nor 4xx, that is not a number
+    (until 2026-09-29 `schwab_api.response_ok` raised ValueError on one, out
+    of the placement) or that the response does not carry, or an accepted
+    order without its id. A minute later the day's orders are read, whatever
+    their status (`broker_payloads.extract_orders`,
+    `SchwabExecutor.fetch_orders` / `todays_orders`, from a minute before the
+    submit on: `sent_at`, which every unconfirmed record carries and a miss
+    never moves; `sent_exit_stop`), for the exit `STOP` at exactly the price
+    and quantity sent (the quantity sent, whatever the position holds since).
+    What it filled, in part or in full, and the record has not booked, is
+    booked as a `disaster_stop` exit at the broker's price (the level sent
+    when it gives none), so the position is closed or reduced as the fill
+    reconcile would; one in any status but a terminal one is adopted
+    (resized to what is held); one REPLACED at the broker (moved in the app)
+    is followed to its replacement (the one its payload names, else the one
+    exit stop entered after it), and while that cannot be found none is
+    placed, as a miss; one that died, or none, lets one be placed
+    (`PositionManager._look_up_unconfirmed_stop`). A status is read failing
+    closed (`broker_payloads.order_status_class`): only FILLED, CANCELED,
+    REJECTED, EXPIRED and REPLACED end an order, and any other one,
+    PENDING_CANCEL, PENDING_REPLACE, NEW, AWAITING_RELEASE_TIME, UNKNOWN, an
+    unknown or a missing one, may still rest. Until 2026-09-29 only working
+    orders were read: a stop that landed and filled before the lookup was
+    never booked, the bot kept shares the account no longer held, and placed
+    a full-size stop for them; and a stop outside the working allowlist
+    (PENDING_REPLACE while a user edits it in the app, NEW) or one moved in
+    the app read as dead, so a second went in beside it.
+    `PositionManager.ensure_disaster_stop` saves the record as `unconfirmed`,
+    at the price and quantity about to be sent, before it sends anything, so
+    an error anywhere after that leaves a stop that is looked for before
+    another goes out. A restore whose protection step raises leaves it
+    `unconfirmed` at the saved price for the shares no working exit covers,
+    sent at the restart (until 2026-09-29 it had no submit time, so its
+    lookup read the day from midnight and could book an earlier position's
+    filled stop at the same price and size against the position), and a
+    restored `unconfirmed` record adopts the stop at exactly the price and
+    quantity it sent, in any status but a terminal one, never merely the
+    first exit stop on the symbol (which may be one placed by hand).
+  - Before an exit or a slice, an `unconfirmed` record is looked up at once
+    (2026-09-29): its fills are booked and the exit sells only the rest, and
+    a stop that may still work is adopted (a moved one's replacement too), so
+    the cancel before the exit takes it down first, and a slice's re-protect
+    rests one stop for what is left. Orders that cannot be read, or a moved
+    stop whose replacement is not found, defer the exit a cycle, counted as
+    a miss. Until then the exit went out beside it with no cancel, and a
+    stop that filled in the same flush sold the shares twice; a slice left
+    the full-size stop resting against what was left.
+  - Every placement first reads the day's orders
+    (`SchwabExecutor.ensure_position_protected`): an exit stop no record
+    tracks that may still work on the symbol for the side (in any status but
+    a terminal one: one moved in the app, which Schwab replaces under a new
+    id, or one placed there) is adopted, resized to what is held and logged,
+    instead of placing another beside it; orders that cannot be read place
+    nothing (`unprotected`, retried). This replaces
+    the lookup's rule that neither adopted nor placed beside a stop it could
+    not tell for its own. Until 2026-09-29 a scale-out after the user moved
+    the stop in the app placed a stop for the rest beside the moved one: 150
+    shares of stops against 50 held.
+  - A stop resting more shares than are held (`qty_mismatch`, an adopted one
+    the broker would not resize; `qty_unverified`, one whose size could not
+    be read) is owed too: the next cycle resizes it again, then cancels it
+    and places one at the held size; one that neither resizes nor cancels is
+    a miss. Until then it stayed, larger than the position, never retried,
+    cancelled or escalated.
   - Isolated per position at entry: a placement that raises right after an
     entry is logged against that position with its type and traceback
     (`EntryGatekeeper._ensure_disaster_stop_after_entry`), and the entry pass
     goes on; the next management cycle places the stop still owed.
   - Escalated: each attempt that leaves a position without its stop logs on
     its own line (a refused or unknown-outcome submit, an order list that
-    cannot be read or holds a stop it cannot tell for its own, a cancel
-    before an exit that cannot be confirmed, which holds the exit), and every
-    `disaster_stop_escalation_attempts`-th consecutive one logs
-    `DISASTER STOP DEGRADED` at CRITICAL naming the position.
+    cannot be read, an unconfirmed stop moved in the app whose replacement
+    is not found, a stop that went down with the position held and no
+    exit working, one resting more than is held that neither resizes nor
+    cancels, a cancel before an exit that cannot be confirmed, which holds
+    the exit), and every `disaster_stop_escalation_attempts`-th consecutive
+    one logs `DISASTER STOP DEGRADED` at CRITICAL naming the position. The
+    count ends when the broker lists the stop working (the fill reconcile),
+    not when a submit is accepted. A stop that went down counts: one the
+    broker `REJECTED` after accepting it or that died again (placed again a
+    retry interval later), and one the cancel before an exit took down when
+    the exit did not follow (an exit whose submit raised, or whose order got
+    no id; placed again on the next cycle that decides no exit). Until
+    2026-09-29 none of these was placed again, and a rejected one logged a
+    WARNING only.
+  - A broker fill larger than the position (the fill reconcile, the
+    unconfirmed lookup, a cancel's fills, a working exit's) is booked as the
+    whole position and logged `EXIT OVERFILLED` at CRITICAL naming the extra
+    (`PositionManager._held_part_of_fill`, 2026-09-29): a stop the broker
+    listed only after a slice had sold beside it leaves the account short
+    the rest, untracked. Until then each booking capped it at the position,
+    with a WARNING at most.
   - After a full close of a position that had live broker protection, the
-    day's working orders are read once and any exit order still working on
-    the symbol for its side is cancelled (`PositionManager.
-    _sweep_exit_orders`): a stop whose unknown-outcome submit landed after
-    all, a replacement a replace left untracked (`new_id_unknown`), a stop
-    moved in the app. One that cannot be cancelled, or that filled first,
-    logs `EXIT ORDERS LEFT` at CRITICAL. A dry run reads nothing.
+    day's orders are read and any exit order that may still work on the
+    symbol for its side (any status but a terminal one) is cancelled
+    (`PositionManager._sweep_exit_orders`): a stop whose unknown-outcome
+    submit landed after all, a replacement a replace left untracked
+    (`new_id_unknown`), a stop moved in the app. One that cannot be
+    cancelled, or that filled first, and an unconfirmed stop (or its
+    replacement) that filled beside the exit, log `EXIT ORDERS LEFT` at
+    CRITICAL, each order's fills once. A close whose record was still
+    unconfirmed keeps its sweep owed until a retry interval after the
+    stop's submit, run again at the start of each pass until then, so a
+    stop the broker lists only after the close is still cancelled
+    (2026-09-29). A read that fails is owed too (`_run_exit_sweep`): tried
+    again at the start of every management pass, and every
+    `disaster_stop_escalation_attempts`-th consecutive failure logs `EXIT
+    ORDERS LEFT`; while a sweep is owed the symbol takes no entry
+    (`exit_sweep_owed`, skip reason `exit_orders_unswept`). Until 2026-09-29
+    the sweep read once, cancelled only the working allowlist, and a failed
+    read logged an ERROR once and was dropped. An owed sweep is not saved: a
+    restart forgets it. A dry run reads nothing.
   - Measured on the archive (study B's trade table and the archived 1m tapes:
     176 trades on 22 equity days): at 1.0R it would have fired on none of
     them while the engine held the trade (whole 1m bars). Counting every
@@ -284,16 +433,41 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     local `config.yaml` when it exists.
   - Also: `broker_payloads.collect_protective_fills` takes the stop leg's
     reason (`stop_reason`); `StartupReconciler._resting_stop_for` is
-    `broker_payloads.resting_exit_stop`, on top of the new
-    `working_exit_orders`; `extract_working_orders` rows carry `stopPrice`,
-    `quantity` and `filledQuantity`; `SchwabExecutor.ensure_position_protected`
+    `broker_payloads.resting_exit_stop`, on top of the new `exit_orders`;
+    `extract_orders` rows (`extract_working_orders` keeps the ones that may
+    still work) carry `stopPrice`, `quantity`, `filledQuantity`, `fillPrice`
+    and `replacementId`, and `flatten_order_tree`'s states `replaced_by`;
+    `broker_payloads.order_status_class` (with `order_may_be_live`) is the
+    one reading of whether an order may still rest, so the startup
+    reconcile's working-order snapshot (`fetch_working_orders`: its
+    foreign-order check, its `working_orders_present` block and the
+    restore's adoption) keeps every status but a terminal one too, where it
+    kept an allowlist (a PENDING_CANCEL, NEW or UNKNOWN order was not
+    counted); `replacement_order`, `order_entered_at` and
+    `order_row_filled_qty` read the rows; `schwab_api.response_ok` reads a
+    status that is not a number as a failure;
+    `PositionManager.ensure_disaster_stop` takes the cycle's bars (a fill
+    the lookup books reads them); `SchwabExecutor.regular_session_open` says
+    whether a STOP can rest now; `SchwabExecutor.ensure_position_protected`
     takes the level the protection rests at (`resting_stop_price`; the
     engine's stop for a bracket), and `protective_stop_level` rounds a level
     as a protective order is sent; and the restore's warning when it cannot
     re-establish protection names the error's type.
-  - Tests: `tests/runtime/test_disaster_stop.py`, the timed-out POST in
-    `tests/foundation/test_schwab_api.py`, and the preset, number and
-    bracket-mode tests that now name the switch.
+  - Tests: `tests/runtime/test_disaster_stop.py` (with the 5xx and the
+    status answers, a stop that landed and filled in full or in part or
+    died, the quantity sent, the record saved before the send, the lookup
+    before an exit or a slice, the oversized stop, the stops that went down,
+    the moved stop, the premarket cycles, the owed sweep and the entry hold,
+    the restore's exact match; each status that is not terminal through the
+    lookup, an exit, a placement, the restore and the sweep; an unconfirmed
+    stop moved in the app, its replacement found or not; a fill beyond the
+    holding; the sweep kept owed through the retry interval; the submit time
+    on every unconfirmed record), the timed-out POST and a status that is
+    not a number in `tests/foundation/test_schwab_api.py`,
+    `tests/domain/test_broker_payloads.py` (every Schwab status and an
+    unknown or missing one, the rows of every status, the exact match's
+    order, the replacement), and the preset, number and bracket-mode tests
+    that now name the switch.
 
 - **`shared_exit.adaptive_ladder_touch_hold` (off in every preset and by
   default) and `adaptive_ladder_touch_hold_timeout_seconds` (45).**
@@ -624,11 +798,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Replayed on the harness (the real `step()` on four archived top_tier
     days, 2026-09-22 to 09-25, from 09:41, 30 steps each at real-time pace
     after two warm-up steps, network waits emulated; the two trees run one
-    at a time, the order alternating by day), medians of the day medians,
-    first against 1157622 alone: the three maps 5.39 s → 2.38 s a step
-    (frames 1.70 → 0.71 s, S/R 1.30 → 0.57 s, contexts 2.39 → 1.10 s;
+    at a time, the order alternating by day), the means of the four days'
+    medians, first against 1157622 alone: the three maps 5.39 s → 2.38 s a
+    step (frames 1.70 → 0.71 s, S/R 1.30 → 0.57 s, contexts 2.39 → 1.10 s;
     2.0-2.5x by day); the span from the screener's return to the quote
-    batch 5.44 → 2.50 s (2.18x; 1.95x to 2.39x by day); the whole step
+    batch 5.44 → 2.50 s (2.18x; 1.95x to 2.39x by day; the median of the
+    day medians, 5.36 → 2.49 s, is 2.15x); the whole step
     8.28 → 5.13 s, its CPU time 8.12 → 4.71 s. The entry pass (1.25 →
     1.19 s) and the dashboard publish (0.99 s both) did not change. The
     share of entry-pass frames a stream bar had already overtaken fell from
@@ -636,11 +811,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     Re-run on this change alone (the same harness, the tree before it
     against the tree with it, the HTF refresh points and the daily prefetch
     in both) while the machine was shared (load 19-47 against 1.3-10 for
-    the first run): the three maps 5.14 s → 3.56 s a step (frames 1.60 →
-    1.11 s, S/R 1.19 → 0.83 s, contexts 2.35 → 1.62 s), the span from the
-    screener's return to the quote batch 5.27 → 3.70 s (1.42x; 1.28x to
-    1.65x by day, 1.65x on the quietest), the whole step 9.82 → 7.67 s, its
-    CPU time 8.42 → 6.97 s. The entry pass and the publish, which the
+    the first run), the means of the day medians again: the three maps
+    5.14 s → 3.56 s a step (frames 1.60 → 1.11 s, S/R 1.19 → 0.83 s,
+    contexts 2.35 → 1.62 s), the span from the screener's return to the
+    quote batch 5.27 → 3.70 s (1.42x; 1.28x to 1.65x by day, 1.65x on the
+    quietest; the median of the day medians, 5.05 → 3.84 s, is 1.32x), the
+    whole step 9.82 → 7.67 s, its CPU time 8.42 → 6.97 s. The entry pass and
+    the publish, which the
     change does not touch, moved 1.15x and 1.19x, so part of that is the
     load; the gain is smaller on a loaded machine, and holds on every day.
   - Production: the archived top_tier days (all on 4 workers) spent a
@@ -682,7 +859,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     thread runs. The strategy's context caches (`_strategies/contexts.py`)
     keep theirs too; whether any thread but the engine's still reaches them
     was not settled here.
-  - Tests: `tests/composition/test_cycle_symbol_maps.py` (new),
+  - Tests: `tests/composition/test_cycle_symbol_maps.py` (new; the
+    history-fetch decisions run on the engine thread),
     `tests/composition/test_htf_refresh_points.py` (the HTF refresh and the
     daily prefetch fetch on the pool),
     `tests/domain/test_config_validation.py`,
@@ -773,7 +951,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     cycles in which the bar settles between cycles make the same decisions,
     signals, positions and trades as before, every HTF read seeing the same
     frame; where it settles inside a cycle no read is older than before, and
-    only those cycles' skip reasons change.
+    on those two days only those cycles' skip reasons changed.
+  - A decision change by design, the second of this group's with the daily
+    trim (see Fixed): a signal the entries make in a cycle in which the bar
+    settles reads the new bar, so its stop, target and score can move, and
+    management reads it too. Over 2026-09-22 09:29:30-11:00 on the same
+    harness (237 steps of 23 s, the bar settling inside the cycle) two
+    steps made a different signal: PANW's SHORT
+    (`top_tier_vwap_reclaim_short`) at 10:15:07 rested its stop at 371.1578
+    instead of 370.5726 and its target at 360.4333 instead of 363.035 (its
+    S/R hint `bearish_breakdown`, not `range_between_levels`; its runner
+    target 2.06R, not 1.58R), and the position kept them to 11:00 (118
+    steps), and NVDA's LONG at 10:45:01 its target at 228.2877 instead of
+    228.2841. Every symbol's actions were the same, and no read was older
+    (0 older, 160 newer, 25,345 equal).
 
 - **top_tier's daily history is fetched on the fetch pool from the prewarm
   on, not inside the first entry pass, and a failed fetch is retried until
@@ -3856,9 +4047,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   open there is no bar for today. A response with only today's bar is no
   history (a WARNING, cached for the day). The trim rests on Schwab
   stamping a daily candle at its day's midnight Central, which the replays'
-  synthetic daily bars cannot check: on the first dry-run day each `Daily
-  history for X: N sessions` line should show N one lower than the
-  archived days' (124-125).
+  synthetic daily bars cannot check. The prewarm's 09:15 fetch cannot check
+  it either: before the open there is no bar for today, so its `Daily
+  history for X: N sessions` line shows N one lower than the archived days'
+  in-session 124-125 whether the trim works or not. Only a fetch made after
+  the open does: on the first dry-run day, restart the bot once after 09:30
+  (or read the line of a symbol that joins the watchlist mid-session) and
+  check that its N equals the same symbol's 09:15 N. One higher means the
+  forming bar was kept, and the stamp is not what the trim assumes.
 
 - **A filled exit's slippage reaches its record, for every exit on a level,
   signed; and a stop moved while a scale-out slice works is logged.**

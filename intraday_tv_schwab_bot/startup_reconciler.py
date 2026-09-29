@@ -57,11 +57,15 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from .broker_payloads import (
     DISASTER_SYNC_MODE,
+    ORDER_REPLACED,
     active_broker_bracket,
     bracket_order_ids,
     broker_position_side_qty,
     broker_quantity,
+    is_disaster_stop,
+    order_status_class,
     resting_exit_stop,
+    sent_exit_stop,
     working_exit_outstanding_qty,
 )
 from .config import BotConfig
@@ -349,10 +353,22 @@ class StartupReconciler:
         # the live one, and both sold the position net short (2026-09-25).
         saved = stale if stale and stale.get("stop_order_id") else None
         listed = {str(order.get("orderId")) for order in working_orders}
-        known = (
-            saved if saved is not None and str(saved["stop_order_id"]) in listed
-            else resting_exit_stop(working_orders, position.symbol, position.side) or saved
+        # A saved record that carries no id but the price and quantity it
+        # sent (an unconfirmed disaster stop: the submit's outcome was
+        # unknown, or the process ended before it was looked up) knows its
+        # stop exactly: that one is adopted first, never another stop on the
+        # symbol, which may be one placed by hand (2026-09-29).
+        sent = (
+            sent_exit_stop(working_orders, position.symbol, position.side, stop_price=stale.get("stop_price"),
+                           qty=stale.get("qty"))
+            if stale and is_disaster_stop(stale) and not stale.get("stop_order_id") else None
         )
+        if saved is not None and str(saved["stop_order_id"]) in listed:
+            known = saved
+        elif sent is not None:
+            known = {"stop_order_id": str(sent["orderId"]), "child_order_ids": [str(sent["orderId"])]}
+        else:
+            known = resting_exit_stop(working_orders, position.symbol, position.side) or saved
         disaster = self.executor.disaster_stop_enabled()
         initial_stop = safe_float(metadata.get("initial_stop_price"), None, finite=True)
         level: float | None = None
@@ -382,9 +398,13 @@ class StartupReconciler:
                     position.symbol, type(exc).__name__, exc,
                 )
                 # The stop a restore rests: the saved price, for the shares
-                # held. The lookup adopts only that one (sent_exit_stop).
+                # held, sent at the restart. The lookup adopts only that one
+                # (sent_exit_stop), entered from a minute before the restart
+                # on: an earlier stop at that price and size (a closed
+                # position's, filled) is never taken for it (2026-09-29).
                 metadata["bracket"] = {"sync_mode": DISASTER_SYNC_MODE, "legs": "stop_only", "active": False,
-                                       "state": "unconfirmed", "stop_price": level, "qty": uncovered}
+                                       "state": "unconfirmed", "stop_price": level, "qty": uncovered,
+                                       "sent_at": sessions.now_et().isoformat()}
                 return
             LOG.warning(
                 "Could not re-establish broker protection for restored position %s: %s: %s; "
@@ -455,13 +475,16 @@ class StartupReconciler:
         already left the account. Reading the saved record alone left the
         shares a dead order no longer covered without a broker stop until the
         first cycle settled it (2026-09-25). An unreadable state reads as
-        live."""
+        live, and so does a REPLACED order (changed in the app): its
+        replacement may still sell them, and the first cycle tracks it
+        (``PositionManager._follow_replaced_exit``, 2026-09-29)."""
         outstanding = working_exit_outstanding_qty(position)
         tracked = self._working_exit_order_state(position) if outstanding > 0 else None
         if tracked is None:
             return outstanding
         record, state = tracked
-        if state is None or not (state.get("is_filled") or state.get("is_terminal_failure")):
+        if (state is None or order_status_class(state.get("status")) == ORDER_REPLACED
+                or not (state.get("is_filled") or state.get("is_terminal_failure"))):
             return outstanding
         return max(0, int(state.get("filled_qty") or 0) - int(record.get("booked_qty") or 0))
 
