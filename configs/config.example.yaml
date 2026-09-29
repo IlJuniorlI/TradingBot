@@ -194,6 +194,18 @@ execution:
   entry_live_reprice_step_frac: 0.33
   extended_hours_enabled: true
   market_exit_regular_hours: false
+  # A live LIMIT exit still unfilled after entry_live_fill_timeout_seconds
+  # is cancelled and, once the broker confirms nothing filled, re-sent at a
+  # fresh quote with (1 + n * step) times the spread buffer: up to
+  # exit_live_reprice_attempts re-sends while exit_live_reprice_max_seconds
+  # have not passed since the management pass began (one budget per pass,
+  # shared by every exit in it). exit_live_market_fallback then sends a
+  # MARKET order in the regular session (needs market_exit_regular_hours:
+  # false). A dry run never misses.
+  exit_live_reprice_attempts: 2
+  exit_live_reprice_step_frac: 0.5
+  exit_live_reprice_max_seconds: 12.0
+  exit_live_market_fallback: false
   # Broker-side bracket orders: the entry goes out as a Schwab TRIGGER order
   # whose child OCO rests the protective stop (and optionally the target) at
   # the broker. Off = fully engine-managed exits.

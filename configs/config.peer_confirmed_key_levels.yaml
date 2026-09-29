@@ -145,6 +145,12 @@ execution:
   entry_live_reprice_step_frac: 0.33
   extended_hours_enabled: true
   market_exit_regular_hours: false
+  # A missed live LIMIT exit is re-sent at a fresh quote (README, execution);
+  # a dry run never misses.
+  exit_live_reprice_attempts: 2
+  exit_live_reprice_step_frac: 0.5
+  exit_live_reprice_max_seconds: 12.0
+  exit_live_market_fallback: false
   # Static disaster stop (a dry run places nothing): a far STOP rests at the
   # broker for each position, max(disaster_stop_r x initial R,
   # disaster_stop_min_pct x entry) beyond its initial stop, and is never moved;

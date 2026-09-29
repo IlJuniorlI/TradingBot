@@ -312,6 +312,13 @@ class IntradayBot:
         where the loop spends most of its time) raised out of ``run`` with a
         traceback and skipped the cleanup, so no session report was written
         (2026-09-26).
+
+        An error that ends the run (one raised by the start-up, or by the
+        loop outside a cycle) still escapes ``run``, so the process exits
+        nonzero (``cli`` logs it) and ``Restart=on-failure`` restarts the
+        bot, but it no longer skips the cleanup: the dashboard and the stream
+        stop and the session report is written first, with stop signals held
+        (2026-09-28).
         """
         with _StopSignals() as stop_signals:
             try:
@@ -325,10 +332,14 @@ class IntradayBot:
                 # started the hold.
                 stop_signals.hold()
                 LOG.info("Interrupted, shutting down.")
-            self._shutdown_cleanup()
-            if stop_signals.ignored:
-                LOG.warning("Ignored %s during the shutdown", ", ".join(stop_signals.ignored))
-            LOG.info("Shutdown complete.")
+            finally:
+                # An error escaping the start-up or the loop has started no
+                # hold either.
+                stop_signals.hold()
+                self._shutdown_cleanup()
+                if stop_signals.ignored:
+                    LOG.warning("Ignored %s during the shutdown", ", ".join(stop_signals.ignored))
+                LOG.info("Shutdown complete.")
 
     def _start_up(self) -> None:
         """The dashboard, the start-up reconcile and the start-up log lines."""

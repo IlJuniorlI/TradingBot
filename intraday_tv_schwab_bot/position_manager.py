@@ -1445,7 +1445,14 @@ class PositionManager:
         cycles in a row escalates to a CRITICAL naming it
         (``_escalate_failures``). A stop signal (KeyboardInterrupt) is not an
         Exception, so it still stops the cycle and reaches the engine.
+
+        The pass takes one re-price deadline as it starts
+        (``executor.exit_reprice_deadline``) and every exit it sends shares
+        it: a live LIMIT exit that misses is re-sent only until then, so the
+        wait the re-sends add to the pass is bounded whatever the number of
+        positions that miss together (2026-09-28).
         """
+        reprice_deadline = self.executor.exit_reprice_deadline()
         # Book any exit the broker already executed BEFORE evaluating anything.
         # A filled resting child means the position is gone at the broker, and
         # managing or exiting a phantom position sends a duplicate order that
@@ -1457,7 +1464,7 @@ class PositionManager:
             if key not in self.positions or key in failures:
                 continue
             try:
-                self._manage_position(_now, key, position, bars, order_states, failures)
+                self._manage_position(_now, key, position, bars, order_states, failures, reprice_deadline)
             except Exception as exc:
                 self._position_failed(key, "its management", exc, failures, rest_runs=False)
         self._escalate_failures(failures)
@@ -1502,9 +1509,10 @@ class PositionManager:
                              key, streak, failures[key])
 
     def _manage_position(self, now: datetime, key: str, position: Position, bars, order_states: dict[str, Any],
-                         failures: dict[str, str]) -> None:
+                         failures: dict[str, str], reprice_deadline: float) -> None:
         """One position's management cycle; see ``manage_positions``. It
-        returns where the position's cycle ends."""
+        returns where the position's cycle ends. ``reprice_deadline`` is the
+        pass's, for the exit it sends."""
         if self._settle_pending(position):
             self.audit.log_cycle(
                 f"exit_gate:{key}", "settle_pending",
@@ -1671,7 +1679,8 @@ class PositionManager:
                 return
             # A child that filled before the cancel shrank the position.
             requested_qty = min(requested_qty, int(position.qty))
-        result = self.executor.close_position(position, requested_qty, data=self.data, market_snapshot=market_snapshot)
+        result = self.executor.close_position(position, requested_qty, data=self.data, market_snapshot=market_snapshot,
+                                              reprice_deadline=reprice_deadline)
         # The remainder is owed a resting stop when this cycle cancelled
         # the bracket, or an earlier one left it down (2026-09-24): an
         # attempt that failed before reaching the broker used to leave

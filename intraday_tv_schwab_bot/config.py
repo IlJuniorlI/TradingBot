@@ -623,6 +623,29 @@ class EquityExecutionConfig:
     extended_hours_enabled: bool = True
     market_exit_regular_hours: bool = True
 
+    # --- A live LIMIT exit that misses (2026-09-28) ---
+    # Every engine exit outside the regular session, and inside it unless
+    # market_exit_regular_hours, is a marketable LIMIT. One still unfilled
+    # after entry_live_fill_timeout_seconds is cancelled, and once the broker
+    # confirms it dead with nothing filled it is re-sent at a fresh quote,
+    # in the same management pass, up to this many times (0: the next cycle
+    # sends the next one). A dry run never misses: it fills at the bid (the
+    # ask, for a cover) of the quote the exit read.
+    exit_live_reprice_attempts: int = 2
+    # Each re-send's spread buffer is (1 + n * this) times the first's.
+    exit_live_reprice_step_frac: float = 0.5
+    # One budget per management pass, shared by every position in it: no
+    # re-send (and no fallback) goes out once this many seconds have passed
+    # since the pass began, so the wait a pass adds is bounded whatever the
+    # number of positions that miss together. The order in flight still runs
+    # its poll and cancel, and each exit's first order always goes out. The
+    # positions managed after a missed exit wait while its re-sends run.
+    exit_live_reprice_max_seconds: float = 12.0
+    # Regular session only: once the limits have missed, send a MARKET order
+    # (left working and tracked if it does not fill, as the MARKET exits of
+    # market_exit_regular_hours are). Off: the next cycle sends a new limit.
+    exit_live_market_fallback: bool = False
+
     # --- Broker-side bracket (first-triggers-OCO) orders ---
     # When enabled the entry is submitted as a single Schwab TRIGGER order
     # whose child OCO carries the protective stop (and optionally the target),
@@ -1812,6 +1835,11 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         "entry_live_poll_seconds": _ABOVE_ZERO,
         "entry_live_reprice_attempts": _COUNT_OR_ZERO,
         "entry_live_reprice_step_frac": _AT_LEAST_ZERO,
+        "exit_live_reprice_attempts": _COUNT_OR_ZERO,
+        "exit_live_reprice_step_frac": _AT_LEAST_ZERO,
+        # The management pass waits on its missed exits' re-sends, the other
+        # positions with it: past a minute that is several cycles unmanaged.
+        "exit_live_reprice_max_seconds": _Number(low=0, low_open=True, high=60),
         # A NaN offset priced the resting STOP_LIMIT at "nan".
         "bracket_stop_limit_offset_r": _AT_LEAST_ZERO,
         "bracket_replace_min_price_delta": _AT_LEAST_ZERO,
@@ -2015,9 +2043,18 @@ def _validate_execution_config(execution: EquityExecutionConfig, risk: RiskConfi
     the numbers, the bracket modes and the switches (``_NUMBER_CHECKS`` /
     ``_CHOICES["execution"]``), the bracket combinations the risk
     management mode and the adaptive ladder's touch hold rule out
-    (``shared_exit`` is checked before this), and the disaster stop's: not
-    beside brackets, and not for the options ``strategy``."""
+    (``shared_exit`` is checked before this), the disaster stop's: not
+    beside brackets, and not for the options ``strategy``, and the exit
+    MARKET fallback beside regular-session MARKET exits, where it could never
+    act."""
     errors = _section_errors("execution", execution)
+    if execution.exit_live_market_fallback is True and execution.market_exit_regular_hours is True:
+        errors.append(
+            "execution.exit_live_market_fallback needs market_exit_regular_hours: false: "
+            "with it true every regular-session exit is a MARKET order already, and "
+            "outside the regular session no MARKET order is sent, so the fallback "
+            "could never act"
+        )
     if execution.bracket_orders_enabled is True:  # anything but a bool is refused above
         # A resting target limit fills at the touched rung, through the
         # adaptive ladder's touch hold, so the hold could never promote a

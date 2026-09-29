@@ -5,7 +5,7 @@ import copy
 import datetime
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import time as time_module
 from typing import Any, Callable
 
@@ -31,6 +31,7 @@ from .broker_payloads import (
 )
 from .config import BotConfig
 from .data_feed import EXECUTION_LAST_KEYS
+from .log_setup import TRADEFLOW_LEVEL
 from .models import (
     ASSET_TYPE_EQUITY,
     ASSET_TYPE_OPTION_SINGLE,
@@ -50,6 +51,11 @@ from .sessions import UTC, classify_equity_session, equity_session_state, is_reg
 from .schwab_api import SCHWAB_WRITE_UNKNOWN_OUTCOME, call_schwab_client, call_schwab_json, response_ok
 
 LOG = logging.getLogger(__name__)
+
+# A live order that did not fill in its poll window and whose cancel the
+# broker confirmed, with nothing filled: nothing of it can still fill, so it
+# is the one outcome another order for the same shares may follow.
+LIVE_UNFILLED_CANCELED = "live_unfilled_canceled"
 
 # The caller's rule for the levels an entry fill leaves the trade with: the
 # fill price in, ``(stop, target, fallback_reason)`` out, the reason None when
@@ -309,13 +315,13 @@ class SchwabExecutor:
         ok, msg, _payload = self._cancel_live_equity_order(str(order_id))
         return ok, msg
 
-    def _build_repriced_equity_request(self, request: OrderRequest, data, attempt_index: int) -> OrderRequest | None:
+    def _build_repriced_equity_request(self, request: OrderRequest, data, buffer_mult: float) -> OrderRequest | None:
+        """``request`` at a limit priced off a fresh quote, its spread buffer
+        ``buffer_mult`` times the first's; None without a fresh, usable quote."""
         market = self._equity_market(request.symbol, data, refresh_quotes=True)
         if market is None:
             return None
         bid, ask, last = market
-        step_frac = max(0.05, float(self.config.execution.entry_live_reprice_step_frac))
-        buffer_mult = 1.0 + (attempt_index * step_frac)
         new_price = self._equity_limit_price(request.intent, bid, ask, last, buffer_mult=buffer_mult)
         if new_price is None:
             return None
@@ -408,7 +414,7 @@ class SchwabExecutor:
         if not cancel_ok:
             return OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message=f"live_unfilled_cancel_failed:{cancel_msg}", simulated=False,
                                may_still_be_working=True)
-        return OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message="live_unfilled_canceled", simulated=False)
+        return OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message=LIVE_UNFILLED_CANCELED, simulated=False)
 
     def _submit_live_equity_entry_with_reprice(self, initial_request: OrderRequest, data=None) -> OrderResult:
         timeout_seconds = max(0.5, float(self.config.execution.entry_live_fill_timeout_seconds))
@@ -449,7 +455,7 @@ class SchwabExecutor:
                 if not cancel_ok:
                     return OrderResult(ok=False, order_id=order_id, raw=latest_payload or current_spec, message=f"live_unfilled_cancel_failed:{cancel_msg}", simulated=False,
                                        may_still_be_working=True)
-                return OrderResult(ok=False, order_id=order_id, raw=latest_payload or current_spec, message="live_unfilled_canceled", simulated=False)
+                return OrderResult(ok=False, order_id=order_id, raw=latest_payload or current_spec, message=LIVE_UNFILLED_CANCELED, simulated=False)
             cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
             latest_payload = cancel_payload or payload
             if latest_payload is not None and order_is_filled(latest_payload):
@@ -463,12 +469,107 @@ class SchwabExecutor:
             if not cancel_ok:
                 return OrderResult(ok=False, order_id=order_id, raw=latest_payload or current_spec, message=f"live_reprice_cancel_failed:{cancel_msg}", simulated=False,
                                    may_still_be_working=True)
-            next_request = self._build_repriced_equity_request(current_request, data, attempt_index=attempt + 1)
+            step_frac = max(0.05, float(self.config.execution.entry_live_reprice_step_frac))
+            next_request = self._build_repriced_equity_request(current_request, data,
+                                                               buffer_mult=1.0 + (attempt + 1) * step_frac)
             if next_request is None:
                 return OrderResult(ok=False, order_id=order_id, raw=payload or current_spec, message="live_reprice_missing_or_stale_quotes", simulated=False)
             current_request = next_request
             current_spec = self._build_order(current_request)
         return OrderResult(ok=False, order_id=None, raw=current_spec, message="live_reprice_exhausted", simulated=False)
+
+    def exit_reprice_deadline(self) -> float:
+        """The deadline (monotonic seconds) a management pass starting now
+        gives its missed live exits' re-sends: ``exit_live_reprice_max_seconds``
+        from now. The position manager takes one per pass and hands it to
+        every exit it sends in that pass, so the wait the re-sends add to the
+        pass is bounded whatever the number of positions that miss together
+        (2026-09-28)."""
+        return time_module.monotonic() + float(self.config.execution.exit_live_reprice_max_seconds)
+
+    def _exit_resend_refusal(self, request: OrderRequest, deadline: float) -> str | None:
+        """Why no further order may follow ``request``'s missed exit, or None:
+        the pass's time budget is spent (``deadline``, monotonic), or the
+        equity session is no longer the one the exit was priced for (a NORMAL
+        order past the close)."""
+        if time_module.monotonic() >= deadline:
+            return "time_budget"
+        session = self._equity_session()
+        if session != request.session:
+            return f"session:{session}"
+        return None
+
+    def _submit_live_equity_exit_with_reprice(self, request: OrderRequest, data, deadline: float) -> OrderResult:
+        """A live marketable LIMIT exit, re-sent at a fresh quote while it misses.
+
+        Each order is ``_submit_live_single_order_with_poll``'s: polled for
+        ``entry_live_fill_timeout_seconds``, then cancelled. Another follows
+        only an order the broker confirmed dead with nothing filled
+        (``LIVE_UNFILLED_CANCELED``). A fill of any size, a rejection, a
+        missing order id or a cancel the broker did not confirm is returned
+        as it is, so two exit orders for the same shares are never live
+        together. A re-send is priced off the quote read then, its spread
+        buffer ``1 + n * exit_live_reprice_step_frac`` times the first's.
+        There are at most ``exit_live_reprice_attempts`` of them, and none
+        once the management pass's ``deadline`` (``exit_reprice_deadline``,
+        shared by every exit of the pass) has passed or the session is no
+        longer the one the exit was priced for. The first order always goes
+        out. Then, with ``exit_live_market_fallback``, a regular-session exit
+        goes out as a MARKET order under the same two limits, left working
+        if it does not fill.
+
+        Once a limit has missed, the message carries
+        ``;exit_limits_missed=<n>``, then ``;exit_market_fallback`` for the
+        MARKET order, or ``;stopped=<why>`` when nothing filled
+        (``attempts``, ``time_budget``, ``session:<now>`` or
+        ``missing_or_stale_quotes``). Its prefix is the last order's own, so
+        the position manager settles the result as it did before. Until
+        2026-09-28 the first miss ended the exit attempt, and the next order
+        went out on the next cycle: about 24 s later on top_tier days
+        (study B).
+        """
+        cfg = self.config.execution
+        attempts = int(cfg.exit_live_reprice_attempts)
+        started = time_module.monotonic()
+        current = request
+        missed = 0
+        while True:
+            result = self._submit_live_single_order_with_poll(self._build_order(current), cancel_on_timeout=True,
+                                                              price_scale=1.0)
+            if result.message != LIVE_UNFILLED_CANCELED:
+                if missed == 0:
+                    return result
+                return replace(result, message=f"{result.message};exit_limits_missed={missed}")
+            missed += 1
+            stopped = "attempts" if missed > attempts else self._exit_resend_refusal(request, deadline)
+            if stopped is None:
+                repriced = self._build_repriced_equity_request(
+                    current, data, buffer_mult=1.0 + missed * float(cfg.exit_live_reprice_step_frac))
+                if repriced is None:
+                    stopped = "missing_or_stale_quotes"
+                else:
+                    LOG.log(TRADEFLOW_LEVEL, "Exit %s %s qty=%s: limit %.4f unfilled and cancelled (order %s) at "
+                            "%.1fs; re-sending at %.4f (%d of %d)", request.intent.value, request.symbol,
+                            request.qty, current.price, result.order_id, time_module.monotonic() - started,
+                            repriced.price, missed, attempts)
+                    current = repriced
+                    continue
+            break
+        # The MARKET order follows limits that ran out or could not be priced
+        # (it needs no quote), under the same budget and session checks.
+        if (cfg.exit_live_market_fallback and request.session == "NORMAL"
+                and stopped in ("attempts", "missing_or_stale_quotes")):
+            stopped = self._exit_resend_refusal(request, deadline)
+            if stopped is None:
+                LOG.log(TRADEFLOW_LEVEL, "Exit %s %s qty=%s: %d limit order(s) unfilled and cancelled at %.1fs; "
+                        "sending MARKET", request.intent.value, request.symbol, request.qty, missed,
+                        time_module.monotonic() - started)
+                market = OrderRequest(symbol=request.symbol, qty=request.qty, intent=request.intent,
+                                      order_type="MARKET", session=request.session)
+                result = self._submit_live_single_order_with_poll(self._build_order(market), cancel_on_timeout=False,
+                                                                  price_scale=1.0)
+                return replace(result, message=f"{result.message};exit_limits_missed={missed};exit_market_fallback")
+        return replace(result, message=f"{result.message};exit_limits_missed={missed};stopped={stopped}")
 
     def preview_equity_entry(self, symbol: str, intent: OrderIntent, data=None) -> dict[str, Any] | None:
         session = self._equity_session()
@@ -564,7 +665,13 @@ class SchwabExecutor:
                                                    post_fill_levels=post_fill_levels, data=data)
         return self._submit_live_equity_entry_with_reprice(request, data=data)
 
-    def submit_equity_exit(self, symbol: str, qty: int, intent: OrderIntent, data=None, market_snapshot: Any | None = None) -> OrderResult:
+    def submit_equity_exit(self, symbol: str, qty: int, intent: OrderIntent, data=None, market_snapshot: Any | None = None,
+                           *, reprice_deadline: float) -> OrderResult:
+        """An engine exit for ``qty`` shares: a MARKET order in the regular
+        session with ``market_exit_regular_hours``, a marketable LIMIT
+        otherwise. A live LIMIT that misses is re-sent until
+        ``reprice_deadline``, the management pass's (``exit_reprice_deadline``;
+        ``_submit_live_equity_exit_with_reprice``)."""
         if not str(symbol or "").strip():
             return OrderResult(ok=False, order_id=None, raw=None, message="invalid_symbol", simulated=self.config.schwab.dry_run)
         if int(qty) <= 0:
@@ -589,7 +696,7 @@ class SchwabExecutor:
         request = OrderRequest(symbol=symbol, qty=qty, intent=intent, order_type="LIMIT", price=limit_price, session=session)
         if self.config.schwab.dry_run:
             return self._simulate_equity_fill(request, data, refresh_quotes=False, market_snapshot=market)
-        return self._submit_live_single_order_with_poll(self._build_order(request), cancel_on_timeout=True, price_scale=1.0)
+        return self._submit_live_equity_exit_with_reprice(request, data, reprice_deadline)
 
     # ------------------------------------------------------------------
     # Broker-side bracket (first-triggers-OCO) orders
@@ -1715,12 +1822,15 @@ class SchwabExecutor:
             return self._is_regular_options_session(ts)
         return self._equity_session(ts) is not None
 
-    def close_position(self, position: Position, qty: int, data=None, market_snapshot: Any | None = None) -> OrderResult:
+    def close_position(self, position: Position, qty: int, data=None, market_snapshot: Any | None = None,
+                       *, reprice_deadline: float) -> OrderResult:
         """Close ``qty`` units of ``position`` -- all of it, or a scale-out slice.
 
         ``qty`` is required: until 2026-09-24 this always sent ``position.qty``,
         so a partial exit could not be expressed at all. It is the caller's
-        sized request, already clamped to the position.
+        sized request, already clamped to the position. ``reprice_deadline``
+        is the management pass's (``exit_reprice_deadline``): an equity
+        exit's live re-sends stop there; an option's close sends one order.
         """
         if not 1 <= int(qty) <= int(position.qty):
             raise ValueError(f"close_position qty {qty!r} outside 1..{position.qty} for {position.symbol}")
@@ -1752,7 +1862,8 @@ class SchwabExecutor:
                 return self._simulate_single_option_fill(spec, position.metadata, data, refresh_quotes=False)
             return self._submit_live_single_order_with_poll(spec, cancel_on_timeout=True, price_scale=100.0)
         intent = self.order_intent_for_exit(position.side)
-        return self.submit_equity_exit(position.symbol, int(qty), intent, data=data, market_snapshot=market_snapshot)
+        return self.submit_equity_exit(position.symbol, int(qty), intent, data=data, market_snapshot=market_snapshot,
+                                       reprice_deadline=reprice_deadline)
 
     @staticmethod
     def _build_order(request: OrderRequest) -> dict[str, Any]:

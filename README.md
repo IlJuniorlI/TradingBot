@@ -58,6 +58,20 @@ with `python main.py`, an editable install and a regular `pip install .`
 report the same version. `--version` prints it, and the bot logs it at
 start-up, right after `Logging to ...`.
 
+A config the loader refuses stops the bot before it starts, with exit status
+1. The refusal names the key and is logged at CRITICAL to the console and to
+the day's log, `.logs/bot_<ET date>.log` under the working directory (a
+refused config's own `runtime.log_dir` is not read), with its traceback in
+the log only. A bot that cannot be built from a loaded config (a strategy
+param or `blackout_file` refused when the strategy is built) and an error
+that ends a run are logged the same way, to the configured log; an error
+that ends a run does so after the run's own shutdown (the dashboard and the
+stream stopped, the session report written), which it used to skip.
+`start_trading_bot.bat` then waits for a key before its window closes; a
+clean stop closes it as before. Until 2026-09-28 each raised out as a
+traceback on stderr, which no log recorded, and the `.bat`'s window closed on
+it at once.
+
 An sdist carries the package, `pyproject.toml`, `README.md` and `LICENSE`.
 `MANIFEST.in` keeps out `tests/`, `configs/config.yaml`, any `.env`,
 `.schwabdev/` and `.logs/`, even when the build runs in a working checkout.
@@ -438,6 +452,10 @@ This block controls how equity orders are priced and managed after submission.
 | `entry_live_reprice_step_frac`    | `0.5`        |
 | `extended_hours_enabled`          | `true`       |
 | `market_exit_regular_hours`       | `true`       |
+| `exit_live_reprice_attempts`      | `2`          |
+| `exit_live_reprice_step_frac`     | `0.5`        |
+| `exit_live_reprice_max_seconds`   | `12.0`       |
+| `exit_live_market_fallback`       | `false`      |
 | `bracket_orders_enabled`          | `false`      |
 | `bracket_sync_mode`               | `static`     |
 | `bracket_legs`                    | `stop_and_target` |
@@ -454,12 +472,13 @@ Behavior and valid values:
 
 - `entry_limit_min_buffer` / `entry_limit_max_buffer`: lower and upper limit-price offsets used for marketable-limit stock entries.
 - `entry_limit_spread_frac`: spread fraction used when converting the current quote into a limit price.
-- `entry_live_fill_timeout_seconds`: how long to wait for an equity entry fill before cancel/reprice logic can kick in.
-- `entry_live_poll_seconds`: polling interval while waiting on an equity entry.
+- `entry_live_fill_timeout_seconds`: how long to wait for a live equity order's fill (an entry's, an exit's, and an option order's) before it is cancelled and, for an entry or a LIMIT exit, re-priced.
+- `entry_live_poll_seconds`: polling interval while waiting on that fill.
 - `entry_live_reprice_attempts`: number of live reprice attempts before giving up.
 - `entry_live_reprice_step_frac`: size of each reprice step as a fraction of the entry buffer.
 - `extended_hours_enabled`: allow equity orders outside regular hours when the broker permits it.
-- `market_exit_regular_hours`: when `true`, stock exits during regular hours can use market orders.
+- `market_exit_regular_hours`: when `true`, stock exits during regular hours are MARKET orders, left working and tracked if they do not fill in the poll window. When `false`, and outside regular hours always, an exit is a marketable LIMIT at the bid less the entry buffer (the ask plus it, for a cover).
+- `exit_live_reprice_attempts` / `exit_live_reprice_step_frac` / `exit_live_reprice_max_seconds` / `exit_live_market_fallback`: a live LIMIT exit that has not filled after `entry_live_fill_timeout_seconds` is cancelled, and once the broker confirms it dead with nothing filled it is re-sent in the same management pass, priced off a fresh quote with (1 + n x `exit_live_reprice_step_frac`) times the spread buffer, up to `exit_live_reprice_attempts` times (an integer >= 0; `0` sends one order a pass). The budget is one per management pass, shared by every exit the pass sends: no re-send goes out once `exit_live_reprice_max_seconds` (a number in (0, 60]) have passed since the pass began, whichever position it is for, and none once the session is no longer the one the exit was priced for (a regular-session order is not re-sent past the close). Each exit's first order always goes out, and the order in flight still runs its poll and cancel, so a pass can run that much longer, and the positions managed after a missed exit wait while its re-sends run. Any other outcome ends the attempt as before: a fill of any size, a rejection, or a cancel the broker does not confirm (that order is tracked). With `exit_live_market_fallback: true`, a regular-session exit whose limits all missed then goes out as a MARKET order under the same two limits, left working and tracked if it does not fill; it needs `market_exit_regular_hours: false` (with it true every regular-session exit is a MARKET order already), or the config is refused. The result's message says what happened (`;exit_limits_missed=<n>`, then `;exit_market_fallback` or `;stopped=attempts|time_budget|session:<now>|missing_or_stale_quotes`), in the `Exit attempt` log line and EXIT_CONTEXT's `result_message`. A dry run never misses (it fills at the bid, or the ask for a cover, of the quote the exit read), so these change no dry run. Every preset ships `2` / `0.5` / `12.0` / `false`: with the presets' 2 s fill timeout and 0.25 s poll, three missed limits take about 7.7 s at a 0.1 s broker round trip and 10.8 s at 0.3 s, and a fallback MARKET order goes out at about 7.8 s and 11.1 s, so one missed exit alone rarely meets the budget. When several miss in the same pass it binds: with four positions whose limits all miss, the fourth's first order goes out about 15-19 s into the pass (0.1-0.5 s round trip), against 7.6-11 s with one order per exit and 23-35 s with a budget per exit. Until 2026-09-28 the first miss ended the attempt and the next order went out on the next cycle, about 24 s later on top_tier days (options exits are unchanged: one order a pass).
 - `bracket_orders_enabled`: submit equity entries as a broker-side bracket. See below.
 - `bracket_sync_mode`: `static` | `replace` — who owns the resting levels after entry.
 - `bracket_legs`: `stop_and_target` | `stop_only` — which children rest at the broker.

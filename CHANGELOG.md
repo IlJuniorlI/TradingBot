@@ -9,6 +9,98 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A live LIMIT exit that misses is re-sent at a fresh quote in the same
+  management pass, within one time budget per pass:
+  `execution.exit_live_reprice_attempts` (2), `exit_live_reprice_step_frac`
+  (0.5), `exit_live_reprice_max_seconds` (12) and `exit_live_market_fallback`
+  (off).** *2026-09-28* — study B's O1. Every engine exit outside the
+  regular session, and inside it unless `market_exit_regular_hours`, is a
+  marketable LIMIT at the bid less the entry buffer (the ask plus it, for a
+  cover). Live, one still unfilled after `entry_live_fill_timeout_seconds`
+  was cancelled and the attempt ended: the next order went out on the next
+  management cycle, a median 24.4 s later on top_tier days (3.8 s on
+  small_cap days), provided the exit still fired. A dry run cannot show
+  this: it fills at the bid of the quote the exit read.
+  - `SchwabExecutor._submit_live_equity_exit_with_reprice`: an order the
+    broker confirmed dead with nothing filled (`live_unfilled_canceled`,
+    now `execution.LIVE_UNFILLED_CANCELED`) is followed by another, priced
+    off the quote read then, its spread buffer (1 + n x
+    `exit_live_reprice_step_frac`) times the first's, up to
+    `exit_live_reprice_attempts` re-sends. None goes out once the equity
+    session is no longer the one the exit was priced for (a NORMAL order is
+    not re-sent past 16:00, nor an AM one past 09:25). Any other outcome
+    ends the call as before: a fill of any size (a partial books and the
+    next cycle exits the rest), a rejection, a missing order id, or a cancel
+    the broker did not confirm (tracked as a working exit). So two exit
+    orders for the same shares are never live together.
+  - One budget per management pass. `PositionManager.manage_positions`
+    takes one deadline as it starts
+    (`SchwabExecutor.exit_reprice_deadline`: `exit_live_reprice_max_seconds`
+    from then) and hands it to every exit it sends (`close_position` and
+    `submit_equity_exit` take a required keyword-only `reprice_deadline`); no
+    re-send, nor the fallback, goes out past it, whichever position it is
+    for. Each exit's first order always goes out. A budget per exit let
+    positions that missed together run theirs one after another: with four
+    whose limits all miss, the fourth's first order went out 23-35 s into
+    the pass (7.6-11 s with one order per exit). With one per pass it goes
+    out at 15.4 / 17.9 / 19.0 s at a 0.1 / 0.3 / 0.5 s broker round trip,
+    and the pass ends at 17.8-22.0 s (17.5-24.5 s with the fallback on),
+    against 30.8-46.0 s (40.0-56.0 s) with a budget per exit (the live-prep
+    critic's four-position probe on the scripted broker, re-run on this
+    code).
+  - `exit_live_market_fallback` (regular session only): once the limits
+    have run out, or a re-send could not be priced for want of a fresh
+    quote, a MARKET order goes out under the same budget and session
+    checks, left working and tracked if it does not fill in the poll window,
+    as `market_exit_regular_hours`' MARKET exits are. Off in every preset: it
+    trades a limit's no-fill for a MARKET order's slippage, a go-live
+    decision per strategy.
+  - The result's message says what happened, in the `Exit attempt` log line
+    and EXIT_CONTEXT's `result_message`: `;exit_limits_missed=<n>` once a
+    limit has missed, then `;exit_market_fallback`, or
+    `;stopped=attempts|time_budget|session:<now>|missing_or_stale_quotes`
+    when nothing filled. The prefix is the last order's own, so the
+    position manager settles the result exactly as before. Each re-send and
+    the fallback log a TRADEFLOW line (`Exit SELL ABCD qty=900: limit 9.9700
+    unfilled and cancelled (order 7001) at 2.6s; re-sending at 9.8500 (1 of
+    2)`).
+  - Measured on a scripted broker for one exit (the presets' 2 s fill
+    timeout and 0.25 s poll; `LP4_exit_reprice_start_tools/live_exit_timing.py`):
+    at a 0.1 / 0.3 / 0.5 s broker round trip the second order goes out
+    2.6 / 3.7 / 4.0 s after the first (before: the next cycle), three missed
+    limits end the call at 7.7 / 10.8 / 11.5 s, and the fallback MARKET order
+    goes out at 7.8 / 11.1 / 12.0 s. Over that wait a top_tier exit's price
+    moves a median 0.064-0.076R (one standard deviation) against 0.189R over
+    the 24.4 s cycle; small_cap's 3.8 s cycle is about one re-send already
+    (study F's diffusion model on 108 of study B's regular-hours level exits,
+    those with a 1m ATR; a floor, since a miss is not a random moment;
+    `miss_exposure.py`).
+  - Dry runs are unchanged: 26,400 dry-run exits (5 presets, 10 times across
+    every session and blackout, extended hours on and off, both intents, 8
+    quote shapes, the 3 snapshot forms, refused quantities and symbols,
+    through `submit_equity_exit` and `close_position`) are byte-identical to
+    the previous code under five knob settings, and none reaches the broker.
+  - The entry re-price loop shares the re-pricing helper
+    (`_build_repriced_equity_request` now takes the buffer multiple) and
+    keeps its own knobs, the 0.05 floor on its step included. Options exits
+    are unchanged (one order a pass; they ignore the deadline).
+  - Checked at load: the attempts an integer >= 0, the step a finite number
+    >= 0, the budget a finite number in (0, 60] (the pass waits on it), the
+    fallback true or false, and the fallback on with
+    `market_exit_regular_hours: true` is refused (every regular-session exit
+    is a MARKET order already, so it could never act). Every preset declares
+    the four at the code defaults (the local `configs/config.yaml` and the
+    two microcap presets included); `tests/guards/test_preset_parity.py`
+    pins them.
+  - Tests: `tests/runtime/test_exit_reprice.py` (new; `TestOneDeadlinePerPass`
+    runs several positions through `manage_positions`),
+    `tests/runtime/test_partial_exit.py` (the deadline reaches the equity
+    exit), `tests/domain/test_config_validation.py`,
+    `tests/guards/test_preset_parity.py`; every stand-in executor that
+    `manage_positions` drives answers `exit_reprice_deadline`
+    (`tests/support/brokers.py::_executor_stub`), and every stand-in
+    `close_position` takes the keyword.
+
 - **A static disaster stop rests at the broker for each live equity position
   (`execution.disaster_stop_enabled`, on by default and in every equity
   preset, with `disaster_stop_r: 1.0`, `disaster_stop_min_pct: 0.0025` and
@@ -3410,6 +3502,46 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `levels_shared.find_divergence` a required `bar_clock`.
 
 ### Fixed
+
+- **A startup refusal is logged to the day's log, `start_trading_bot.bat`
+  keeps its window open after a failed run, and an error that ends the run
+  no longer skips the shutdown cleanup.** *2026-09-28* — `cli.main` let a
+  config the loader refused raise out as a traceback on stderr. The log is
+  set up once the config has loaded (`IntradayBot.__init__`), so no log
+  recorded the refusal, and the `.bat`'s window, double-clicked, closed on it
+  at once: a config error could not be read. A bot that could not be built
+  from a loaded config (a strategy param or `blackout_file` refused when the
+  strategy is built) and an error that ended the run also reached no log.
+  - Each is now logged at CRITICAL, with the error's type, to the console
+    and the day's log (`Startup refused: the config configs/config.yaml
+    could not be loaded: ValueError: ...`, `Startup refused: the bot could
+    not be built: ...`, `The bot stopped on an error: ...`), its traceback at
+    DEBUG to the log only, and the bot exits with status 1, as before. A
+    refused config has no `runtime.log_dir` to read: its refusal goes to the
+    default, `.logs/bot_<ET date>.log` under the working directory (every
+    preset's; the start scripts `cd` to the checkout). A stop signal while
+    the config loads is not a refusal and is not caught.
+  - `IntradayBot.run` runs `_shutdown_cleanup` in a `finally`: an exception
+    escaping the start-up (the start-up reconcile) or the loop outside a
+    cycle (the daily archive, the housekeeping) skipped it, so the
+    dashboard and the stream were never stopped and no session report was
+    written. The cleanup now runs once, with stop signals held as on a stop,
+    and the exception still escapes `run`, so the process exits nonzero and
+    `Restart=on-failure` restarts the bot.
+  - `start_trading_bot.bat` ends `if %ERRORLEVEL% neq 0 pause`: after a run
+    that exits nonzero the window waits for a key, and a clean stop closes it
+    as before. `neq 0` also catches a crash's negative NTSTATUS exit, which
+    `if errorlevel 1` misses. Its header says so, and that a scheduled start
+    (Task Scheduler) should run `.venv\Scripts\python.exe main.py` itself.
+    `start_trading_bot.sh` is unchanged: it runs in a terminal, which stays
+    open.
+  - README.md ("Running") and README_LINUX_DEPLOY.md (a failed or
+    restarting unit) say where the refusal is.
+  - Tests: `tests/composition/test_startup_refusal.py` (new; one runs
+    `python main.py` on a refused config from another directory and reads
+    the day's log), `tests/composition/test_start_scripts.py`,
+    `tests/composition/test_engine_shutdown.py` (`TestACrashIsNotAStop`: one
+    cleanup before the crash escapes, and a signal during it is held).
 
 - **A broker bracket's `STOP_LIMIT` limit sits `bracket_stop_limit_offset_r`
   x the position's initial R past its trigger, wherever the stop has moved.**

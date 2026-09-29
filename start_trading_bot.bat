@@ -21,7 +21,16 @@
 @REM its cleanup can finish.
 @REM cmd.exe has no exec, so python runs as a child of the cmd.exe running
 @REM this file, and ending that cmd.exe alone leaves the bot running.
+@REM
+@REM A run that fails exits nonzero: a startup refusal (a config the bot will
+@REM not run on, naming the key), or an error that stops it. The window then
+@REM waits for a key, so the reason can be read; it is in the day's log
+@REM too, .logs\bot_<date>.log. A clean stop closes the window as before. A
+@REM scheduled start (Task Scheduler) should run
+@REM .venv\Scripts\python.exe main.py itself: after a failed run this file
+@REM waits for a key that never comes.
 @REM ======================================================================
 cd /D "%~dp0"
 call .venv\Scripts\activate
 python main.py --config configs\config.yaml %*
+if %ERRORLEVEL% neq 0 pause

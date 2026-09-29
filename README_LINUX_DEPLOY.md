@@ -287,10 +287,14 @@ systemctl --user status intraday-bot
 ```
 
 The status output should show `active (running)` and the bot's startup
-log lines. If it's `failed`, the journal has the traceback:
+log lines. If it's `failed` (or restarting every 30 s), the journal has the
+reason, a `CRITICAL ... Startup refused: ...` line for a config the bot will
+not run on, naming the key:
 ```bash
 journalctl --user -u intraday-bot -n 100 --no-pager
 ```
+The day's log, `.logs/bot_$(TZ=America/New_York date +%F).log`, has it too,
+with its traceback.
 
 ---
 
