@@ -505,7 +505,15 @@ class RuntimeConfig:
     # sessions.
     session_reconcile_on_resume: bool = True
     auto_exit_after_session: bool = False
-    cycle_precompute_workers: int = 4
+    # Thread-pool size for the cycle's network fetches: the 1m history, the
+    # HTF refresh points and the daily-history prefetch
+    # (engine._fetch_symbol_map), and the single-quote fallbacks of a quote
+    # refresh (MarketDataStore._parallel_quote_fetch). The cycle's CPU work
+    # (the history-fetch decisions, the step frames, the S/R and context
+    # pre-warms) runs serially on the engine thread
+    # (engine._compute_symbol_map). Replaced cycle_precompute_workers, which
+    # sized one pool for both, 2026-09-28.
+    cycle_fetch_workers: int = 4
     # Per-symbol quote-fetch failure threshold. When a symbol fails this
     # many consecutive quote fetches (typically Schwab 401/403/404), it
     # is blacklisted from quote refresh for the remainder of the session.
@@ -1522,6 +1530,10 @@ _RETIRED_SECTION_KEYS: dict[str, dict[str, str]] = {
             "removed 2026-09-26; the bot trades US sessions and every configured "
             "time is America/New_York (sessions.EXCHANGE_TZ)"
         ),
+        "cycle_precompute_workers": (
+            "replaced by runtime.cycle_fetch_workers (2026-09-28), which sizes the "
+            "network fetches' pool only; the cycle's CPU precompute runs serially"
+        ),
     },
 }
 
@@ -1793,9 +1805,10 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         # and on every failed cycle by the engine's. A null used to turn the
         # engine's off, and a typo raised out of its error path (2026-09-26).
         "error_escalation_cycles": _Number(integer=True, low=0, note=" (0 turns the escalation off)"),
-        # The engine read ``int(value or 4)`` behind a silent except until
-        # 2026-09-26.
-        "cycle_precompute_workers": _COUNT,
+        # Sizes the engine's fetch pool and the quote fallbacks' pool. Its
+        # predecessor, cycle_precompute_workers, was read as
+        # ``int(value or 4)`` behind a silent except until 2026-09-26.
+        "cycle_fetch_workers": _COUNT,
         # Read by every quote refresh (MarketDataStore._parallel_quote_fetch),
         # where a typo used to read as 5 and null or a negative count as 0.
         "max_consecutive_quote_failures": _Number(integer=True, low=0, note=" (0 turns the gate off)"),

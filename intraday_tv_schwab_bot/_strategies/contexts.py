@@ -62,8 +62,8 @@ class ContextBuildersMixin:
     # invocation of each builder ON ONE OF THE CYCLE'S BARS FRAMES (see
     # _observe_context). The engine reads this set every cycle
     # (after _prime_cycle_support_cache) to drive _prime_cycle_context_cache,
-    # which pre-warms the observed contexts in parallel via
-    # _parallel_symbol_map. Cycle 1 is lazy (set is empty); cycles 2+ benefit.
+    # which pre-warms the observed contexts one symbol at a time via
+    # _compute_symbol_map. Cycle 1 is lazy (set is empty); cycles 2+ benefit.
     # __init_subclass__ gives each subclass its own set so different strategy
     # classes don't cross-contaminate.
     _observed_contexts: ClassVar[set[tuple]] = set()
@@ -78,11 +78,12 @@ class ContextBuildersMixin:
         self._technical_context_cache: dict[tuple[Any, ...], tuple[pd.DataFrame | None, Any]] = {}
         self._structure_context_cache: dict[tuple[Any, ...], tuple[pd.DataFrame | None, Any]] = {}
         self._chart_context_cache: dict[tuple[Any, ...], tuple[pd.DataFrame | None, Any]] = {}
-        # Locks protect the 3 context dicts when the engine pre-warms them
-        # in parallel via _parallel_symbol_map. Different worker threads
-        # write distinct cache_keys, but the dict mutations themselves still
-        # need protection. Compute happens outside the locks, so threads
-        # never wait on each other for the heavy work.
+        # Locks around the 3 context dicts' mutations. They were added for
+        # the engine's four-worker pre-warm pool, which wrote distinct
+        # cache_keys concurrently; since 2026-09-28 the pre-warm runs on the
+        # engine thread (_compute_symbol_map), and the locks still keep any
+        # other thread's build safe. Compute happens outside the locks, so a
+        # thread never waits on another for the heavy work.
         self._chart_context_lock = RLock()
         self._structure_context_lock = RLock()
         self._technical_context_lock = RLock()
@@ -96,7 +97,7 @@ class ContextBuildersMixin:
         """Cycle-boundary cache cleanup for the three pre-warmed context caches.
 
         Public API for the engine. Called inside `_prime_cycle_context_cache`
-        before the parallel dispatch populates caches for the new cycle's
+        before the pre-warm populates caches for the new cycle's
         frames. Without this reset the caches would grow unboundedly across
         the session (one entry per (symbol, timeframe) per cycle), and every
         entry pins its frame (see _technical_context_cache_key), so this is
@@ -140,8 +141,8 @@ class ContextBuildersMixin:
         Public API for the engine. Replays each entry in `observed` against
         the per-symbol frame, hitting the appropriate internal builder
         (`_chart_context`, `_structure_context`, `_technical_context`).
-        Each builder is self-caching under its own RLock, so this is safe
-        to call from worker threads in parallel across watchlist symbols.
+        Each builder is self-caching under its own RLock; the engine calls
+        this for one symbol at a time (``_compute_symbol_map``).
         """
         if frame is None or frame.empty:
             return
@@ -161,8 +162,7 @@ class ContextBuildersMixin:
         # Per-cycle cache keyed like _technical_context (see
         # _technical_context_cache_key). Records the call signature in
         # _observed_contexts (on a bars frame only, see _observe_context) so
-        # the engine can pre-warm this context in parallel for next cycle's
-        # watchlist.
+        # the engine can pre-warm this context for next cycle's watchlist.
         self._observe_context(frame, ("chart",))
         cache_key = self._technical_context_cache_key(frame)
         with self._chart_context_lock:

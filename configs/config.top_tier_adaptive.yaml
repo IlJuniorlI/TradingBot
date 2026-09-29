@@ -143,7 +143,7 @@ runtime:
   idle_sleep_seconds: 60.0
   symbol_state_prune_seconds: 1800.0
   session_reconcile_on_resume: true
-  cycle_precompute_workers: 4
+  cycle_fetch_workers: 4
   max_consecutive_quote_failures: 5
   # Per-day debug archive: on session shutdown, write
   # {log_dir}/sessions/{YYYY-MM-DD}/ with bars/{SYMBOL}.csv (RTH+indicators),

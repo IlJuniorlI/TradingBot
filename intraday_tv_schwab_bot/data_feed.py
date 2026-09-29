@@ -1327,8 +1327,9 @@ class MarketDataStore:
                     sym, failure_threshold, exc,
                 )
 
-        # Validated at load: an integer >= 1.
-        workers = min(self.config.runtime.cycle_precompute_workers, len(symbols))
+        # runtime.cycle_fetch_workers, which also sizes the engine's fetch
+        # pool; validated at load: an integer >= 1.
+        workers = min(self.config.runtime.cycle_fetch_workers, len(symbols))
         if workers < 2:
             for sym in symbols:
                 try:

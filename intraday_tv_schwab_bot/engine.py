@@ -4,9 +4,9 @@ from __future__ import annotations
 import logging
 import signal
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 from schwabdev import Client
 import pandas as pd
@@ -57,6 +57,21 @@ RECONCILE_SETTLE_RETRY_SECONDS = 10.0
 # row and on every DASHBOARD_TRACEBACK_EVERY-th after it (about once a minute
 # at the 2 s cycle), and a DEBUG line in between; see _publish_state.
 DASHBOARD_TRACEBACK_EVERY = 30
+
+
+def _unique_symbol_keys(symbols: Iterable[str]) -> list[str]:
+    """``symbols`` upper-cased and stripped, blanks and repeats dropped, in
+    their first order: the keys of the step's watchlist and of every
+    per-symbol map (``IntradayBot._compute_symbol_map`` and
+    ``_fetch_symbol_map``)."""
+    keys: list[str] = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        key = str(symbol or "").upper().strip()
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+    return keys
 
 
 class _CycleTimer:
@@ -980,26 +995,15 @@ class IntradayBot:
                 )
             timer.enter("watchlist")
             watchlist = self.strategy.active_watchlist(self.last_candidates, self.positions)
-            # Normalize symbols to upper().strip() at the source so every
-            # downstream consumer (parallel maps, bars.setdefault fallback,
-            # warmup tracker, API state) sees the same canonical form.
-            # Without this, a non-uppercase symbol from a strategy could
-            # produce two bars dict entries — one keyed uppercase from
-            # _parallel_symbol_map, one keyed original-case from
-            # bars.setdefault — with different frame ids and so different
-            # context-cache keys, causing pre-warm hits to miss in
-            # entry_signals' per-candidate loop.
+            # Normalized at the source with the per-symbol maps' own keying
+            # (_unique_symbol_keys), so every downstream consumer (the maps,
+            # the warmup tracker, the API state) sees the same canonical form
+            # and the step frames are keyed by exactly these symbols: a symbol
+            # missing from `bars` is one whose frame build failed.
             if gate_state.idle_closed_market:
                 self.last_watchlist = []
             else:
-                normalized: list[str] = []
-                seen: set[str] = set()
-                for sym in watchlist:
-                    key = str(sym or "").upper().strip()
-                    if key and key not in seen:
-                        seen.add(key)
-                        normalized.append(key)
-                self.last_watchlist = sorted(normalized)
+                self.last_watchlist = sorted(_unique_symbol_keys(watchlist))
             if gate_state.idle_closed_market:
                 self.audit.log_cycle(
                     f"watchlist_idle:{self.config.strategy}",
@@ -1014,32 +1018,31 @@ class IntradayBot:
             timer.facts["watchlist"] = len(self.last_watchlist)
             timer.enter("history")
 
-            # Per-symbol history fetch decisions are made serially (they read
-            # warmup_tracker state and are cheap), but the actual HTTP fetches
-            # run in parallel — the bot was previously paying ~watchlist_size
-            # network round-trips serially during refresh cycles.
-            #
-            # Keys are normalized to the same uppercase+strip form that
-            # _parallel_symbol_map applies before dispatching, so the lambda's
-            # dict lookup is guaranteed to match the symbol it receives.
-            history_fetch_targets: dict[str, int] = {}
-            for symbol in self.last_watchlist:
-                symbol_key = str(symbol or "").upper().strip()
-                if not symbol_key:
-                    continue
-                should_fetch, required_bars = self.warmup_tracker.should_fetch_symbol_history(
+            # Per-symbol history fetch decisions are made on the engine
+            # thread (they read warmup_tracker state and are cheap), each
+            # symbol isolated (_compute_symbol_map): until 2026-09-28 one that
+            # raised failed the cycle before management. The HTTP fetches run
+            # on the fetch pool (_fetch_symbol_map). Both maps key the
+            # symbols alike, so the lambda's dict lookup matches the symbol
+            # it receives.
+            def _history_lookback(symbol: str) -> int | None:
+                should_fetch, _required_bars = self.warmup_tracker.should_fetch_symbol_history(
                     symbol,
                     context_refresh_active=gate_state.context_refresh_active,
                     streaming_active=gate_state.streaming_active,
                 )
-                if should_fetch:
-                    history_fetch_targets[symbol_key] = self.warmup_tracker.history_fetch_lookback_minutes(
-                        now,
-                        streaming_active=gate_state.streaming_active,
-                        required_bars=self.warmup_tracker.desired_history_bars(symbol),
-                    )
+                if not should_fetch:
+                    return None
+                return self.warmup_tracker.history_fetch_lookback_minutes(
+                    now,
+                    streaming_active=gate_state.streaming_active,
+                    required_bars=self.warmup_tracker.desired_history_bars(symbol),
+                )
+
+            decided = self._compute_symbol_map(self.last_watchlist, _history_lookback, label="History fetch decision")
+            history_fetch_targets = {symbol: minutes for symbol, minutes in decided.items() if minutes is not None}
             if history_fetch_targets:
-                self._parallel_symbol_map(
+                self._fetch_symbol_map(
                     list(history_fetch_targets),
                     lambda symbol: self.data.fetch_history(
                         symbol,
@@ -1064,13 +1067,16 @@ class IntradayBot:
                 self.data.stop_streaming()
 
             timer.enter("frame")
-            bars = self._parallel_symbol_map(
+            # The step frames. A symbol whose build raises is left out of
+            # `bars` (logged, PRECOMPUTE_FAILURES): it gets no pre-warm, no
+            # entry and no frame-based exit this cycle, and a position in it
+            # is still managed on its quote (the stop, the target, force
+            # flatten).
+            bars = self._compute_symbol_map(
                 self.last_watchlist,
                 lambda symbol: self.data.get_merged(symbol, with_indicators=True),
                 label="Merged frame precompute",
             )
-            for symbol in self.last_watchlist:
-                bars.setdefault(symbol, self.data.get_merged(symbol, with_indicators=True))
             timer.enter("sr")
             self._prime_cycle_support_cache(bars)
             timer.enter("contexts")
@@ -1194,43 +1200,73 @@ class IntradayBot:
                 prices[key] = float(mark)
         return prices
 
-    def _cycle_precompute_workers(self) -> int:
-        # An integer >= 1 (_validate_runtime_config).
-        return self.config.runtime.cycle_precompute_workers
+    def _compute_symbol_map(self, symbols: Iterable[str], func, *, label: str) -> dict[str, Any]:
+        """``func(symbol)`` for each symbol, one at a time on the engine
+        thread, keyed by ``_unique_symbol_keys``: the cycle's CPU work (the
+        history-fetch decisions, the step frames, the S/R and context
+        pre-warms), which never waits on the network.
 
-    def _parallel_symbol_map(self, symbols: list[str], func, *, label: str) -> dict[str, Any]:
-        ordered: list[str] = []
-        seen: set[str] = set()
-        for sym in symbols:
-            key = str(sym or "").upper().strip()
-            if key and key not in seen:
-                seen.add(key)
-                ordered.append(key)
-        if not ordered:
-            return {}
-        workers = min(self._cycle_precompute_workers(), len(ordered))
-        if workers <= 1:
-            return {symbol: func(symbol) for symbol in ordered}
+        Until 2026-09-28 this work ran on the fetches' thread pool
+        (``runtime.cycle_precompute_workers``, 4 in every preset). It is
+        pandas / numpy / TA-Lib on small frames and holds the GIL nearly all
+        the time, so the pool never overlapped it and made it slower: replayed
+        on four archived top_tier days, the three maps took a median 5.4 s a
+        step with 4 workers and 2.4 s run this way (``CHANGELOG.md``,
+        2026-09-28).
+
+        A symbol whose call raises is logged with its error's type and
+        traceback and left out of the result, and the cycle's failures are
+        named in one PRECOMPUTE_FAILURES audit event; the other symbols still
+        run. The pool's one-worker branch had no such isolation: one raising
+        symbol failed the cycle.
+        """
+        keys = _unique_symbol_keys(symbols)
         results: dict[str, Any] = {}
         failed: list[str] = []
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bot-precompute") as executor:
-            futures = {executor.submit(func, symbol): symbol for symbol in ordered}
-            for future in as_completed(futures):
-                symbol = futures[future]
+        for symbol in keys:
+            try:
+                results[symbol] = func(symbol)
+            except Exception as exc:
+                failed.append(symbol)
+                LOG.warning("%s failed for %s: %s: %s", label, symbol, type(exc).__name__, exc, exc_info=True)
+        self._audit_symbol_map_failures(label, len(keys), failed)
+        return results
+
+    def _fetch_symbol_map(self, symbols: Iterable[str], func, *, label: str) -> dict[str, Any]:
+        """``func(symbol)`` for each symbol on a pool of up to
+        ``runtime.cycle_fetch_workers`` threads, keyed by
+        ``_unique_symbol_keys``: the cycle's network fetches (the 1m history,
+        the HTF refresh points and the daily-history prefetch), which spend
+        their time waiting on Schwab, so the pool overlaps them. The pool
+        runs whatever the count, one worker included. A symbol whose call
+        raises is isolated as in ``_compute_symbol_map``. The results are
+        read in the symbols' order."""
+        keys = _unique_symbol_keys(symbols)
+        if not keys:
+            return {}
+        results: dict[str, Any] = {}
+        failed: list[str] = []
+        workers = min(self.config.runtime.cycle_fetch_workers, len(keys))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bot-fetch") as executor:
+            futures = {symbol: executor.submit(func, symbol) for symbol in keys}
+            for symbol, future in futures.items():
                 try:
                     results[symbol] = future.result()
                 except Exception as exc:
                     failed.append(symbol)
-                    LOG.warning("%s failed for %s: %s", label, symbol, exc, exc_info=True)
+                    LOG.warning("%s failed for %s: %s: %s", label, symbol, type(exc).__name__, exc, exc_info=True)
+        self._audit_symbol_map_failures(label, len(keys), failed)
+        return results
+
+    def _audit_symbol_map_failures(self, label: str, total: int, failed: list[str]) -> None:
+        """One audit event per map that dropped symbols, so operators can see
+        a cycle skipping them; each failure's own WARNING carries its
+        traceback."""
         if failed:
-            # Emit an aggregate audit event so operators can see when a
-            # precompute cycle is silently dropping symbols. Individual
-            # per-symbol log lines above carry the traceback for debugging.
             self.audit.log_structured(
                 "PRECOMPUTE_FAILURES",
-                {"label": label, "total": len(ordered), "failed_count": len(failed), "failed_symbols": failed},
+                {"label": label, "total": total, "failed_count": len(failed), "failed_symbols": failed},
             )
-        return results
 
     def _htf_symbols(self) -> list[str]:
         """Every symbol whose HTF frame a read can ask for this cycle: the
@@ -1246,7 +1282,7 @@ class IntradayBot:
             symbols.add(str(position.metadata.get("underlying") or position.symbol))
             if position.reference_symbol:
                 symbols.add(position.reference_symbol)
-        return sorted({str(symbol or "").upper().strip() for symbol in symbols} - {""})
+        return sorted(_unique_symbol_keys(symbols))
 
     def _refresh_htf_frames(self, gate_state: CycleGateState, attempted: set[str], *, where: str,
                             bars: dict[str, pd.DataFrame] | None = None) -> None:
@@ -1282,7 +1318,7 @@ class IntradayBot:
         attempted.update(due)
         lookback_days = self.strategy.htf_lookback_days()
         started = time.monotonic()
-        stored = self._parallel_symbol_map(
+        stored = self._fetch_symbol_map(
             due,
             lambda symbol: self.data.refresh_htf_frame(symbol, timeframe_minutes=tf, lookback_days=lookback_days),
             label="HTF refresh",
@@ -1318,7 +1354,7 @@ class IntradayBot:
         due = [symbol for symbol in self.strategy.daily_history_symbols(self.last_watchlist)
                if self.data.daily_history_due(symbol, retry_failed=retry_failed)]
         if due:
-            self._parallel_symbol_map(due, self.data.fetch_daily_history, label="Daily history fetch")
+            self._fetch_symbol_map(due, self.data.fetch_daily_history, label="Daily history fetch")
 
     def _prime_cycle_support_cache(self, bars: dict[str, pd.DataFrame]) -> None:
         sr_cfg = getattr(self.config, "support_resistance", None)
@@ -1343,22 +1379,20 @@ class IntradayBot:
                 use_prior_week_high_low=bool(getattr(sr_cfg, "use_prior_week_high_low", True)),
             )
 
-        self._parallel_symbol_map(symbols, _compute, label="Support/resistance precompute")
+        self._compute_symbol_map(symbols, _compute, label="Support/resistance precompute")
 
     def _prime_cycle_context_cache(self, bars: dict[str, pd.DataFrame]) -> None:
-        """Pre-warm strategy chart/structure/technical caches in parallel.
+        """Pre-warm strategy chart/structure/technical caches, one symbol
+        at a time (``_compute_symbol_map``).
 
         Strategies populate three per-symbol context caches lazily inside
-        their per-candidate entry_signals loop. Each context build does
-        non-trivial GIL-releasing work — TA-Lib chart-pattern detection,
-        pivot/ATR market-structure analysis, and the
-        Fibonacci/trendline/channel/Bollinger technical-levels stack —
-        and the per-candidate frame is a fresh `.copy()` from
-        get_merged() so different candidates always cache-miss. Running
-        the builders in parallel across the watchlist before
-        entry_signals starts amortizes that work across cycle_precompute
-        workers instead of paying it serially in the entry-window
-        critical path.
+        their per-candidate entry_signals loop: TA-Lib chart-pattern
+        detection, pivot/ATR market-structure analysis, and the
+        Fibonacci/trendline/channel/Bollinger technical-levels stack.
+        Building them here, before entry_signals starts, lets the entry pass
+        read them from the caches. Until 2026-09-28 the builds ran on
+        a four-worker thread pool; they hold the GIL nearly all the time, and
+        the pool made them slower, not faster (``_compute_symbol_map``).
 
         Auto-detect: each context builder (`_strategies/contexts.py`)
         records its call signature in its strategy class's
@@ -1372,13 +1406,12 @@ class IntradayBot:
         and technical build per watchlist symbol per cycle that nothing read.
         On cycle 1 the set is empty and nothing is pre-warmed — the strategy
         runs lazy. From cycle 2 onward, only the contexts the strategy
-        actually invokes on its bars frames are pre-warmed, in parallel
-        across the watchlist via `_parallel_symbol_map`. New code paths
-        that hit a previously-unseen context register on first invocation
-        and join the pre-warm set thereafter (self-healing).
+        actually invokes on its bars frames are pre-warmed, across the
+        watchlist. New code paths that hit a previously-unseen context
+        register on first invocation and join the pre-warm set thereafter
+        (self-healing).
 
-        Cache writes inside each builder are guarded by per-cache RLocks,
-        so distinct workers writing distinct keys don't race.
+        Cache writes inside each builder stay guarded by per-cache RLocks.
         """
         self.strategy.set_prewarm_frames(bars.values())
         # Cycle-boundary reset — owned by the engine now, NOT by entry_signals.
@@ -1388,11 +1421,12 @@ class IntradayBot:
         # not anything is observed: every entry pins its frame, and a
         # strategy whose builds are all on non-bars frames observes nothing.
         self.strategy.reset_context_caches()
-        # Snapshot the observed set so workers iterating it can't trip on
-        # a concurrent mutation if a builder happens to record a previously-
-        # unseen tuple mid-cycle. In practice, pre-warm only replays known
-        # entries (idempotent set.add → no size change), but a frozenset
-        # eliminates any race-window doubt for the cost of one shallow copy.
+        # Snapshot the observed set so the loop iterating it can't trip on a
+        # mutation if a builder records a previously-unseen tuple mid-cycle
+        # (a set changing size during its iteration raises). In practice,
+        # pre-warm only replays known entries (idempotent set.add → no size
+        # change), but a frozenset removes the doubt for the cost of one
+        # shallow copy.
         observed = frozenset(type(self.strategy)._observed_contexts)
         if not observed:
             return
@@ -1407,7 +1441,7 @@ class IntradayBot:
             self.strategy.prime_cycle_contexts(frame, observed)
             return None
 
-        self._parallel_symbol_map(symbols, _warm, label="Strategy context precompute")
+        self._compute_symbol_map(symbols, _warm, label="Strategy context precompute")
 
     def _publish_state(self, now: datetime, message: str, *, screening_active: bool, streaming_active: bool, management_active: bool, gate_state: CycleGateState | None = None, warmup_summary: dict[str, Any] | None = None) -> None:
         """Build the dashboard state and publish it. The gate is evaluated

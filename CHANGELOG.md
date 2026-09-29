@@ -596,6 +596,103 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The cycle's CPU work runs serially on the engine thread, and
+  `runtime.cycle_fetch_workers` replaces `runtime.cycle_precompute_workers`
+  (Stage 1c of the fast-management study).** *2026-09-28* — every step
+  builds each watchlist symbol's 1m frame with its indicators (the step
+  frame), then pre-warms the S/R levels and the strategy's chart, structure
+  and technical contexts on those frames. The three maps ran on the same
+  thread pool as the step's network fetches (the 1m history, the HTF
+  refresh points and the daily-history prefetch), sized by
+  `cycle_precompute_workers` (4 in every preset). The work is pandas, numpy
+  and TA-Lib on small frames and holds the GIL nearly all the time, so the
+  pool never overlapped it: it added CPU time and made the maps slower. The
+  fetches wait on Schwab, where a pool does overlap, so they keep theirs.
+  - `IntradayBot._compute_symbol_map` runs a map one symbol at a time on the
+    engine thread (the history-fetch decisions, the step frames, the S/R
+    pre-warm and its mid-cycle rebuild, the context pre-warm);
+    `_fetch_symbol_map` runs one on a pool of `cycle_fetch_workers` threads
+    (the 1m history fetch, the HTF refresh points and the daily-history
+    prefetch), whatever the count, and reads the results in the
+    watchlist's order. Both isolate a symbol whose call raises (see Fixed).
+    `_parallel_symbol_map` and `_cycle_precompute_workers` are gone, and
+    the step's watchlist, the HTF refresh's symbols and both maps key their
+    symbols with one helper, `engine._unique_symbol_keys`. The quote
+    refresh's single-quote fallbacks
+    (`MarketDataStore._parallel_quote_fetch`) keep their pool, sized by
+    `cycle_fetch_workers`.
+  - Replayed on the harness (the real `step()` on four archived top_tier
+    days, 2026-09-22 to 09-25, from 09:41, 30 steps each at real-time pace
+    after two warm-up steps, network waits emulated; the two trees run one
+    at a time, the order alternating by day), medians of the day medians,
+    first against 1157622 alone: the three maps 5.39 s → 2.38 s a step
+    (frames 1.70 → 0.71 s, S/R 1.30 → 0.57 s, contexts 2.39 → 1.10 s;
+    2.0-2.5x by day); the span from the screener's return to the quote
+    batch 5.44 → 2.50 s (2.18x; 1.95x to 2.39x by day); the whole step
+    8.28 → 5.13 s, its CPU time 8.12 → 4.71 s. The entry pass (1.25 →
+    1.19 s) and the dashboard publish (0.99 s both) did not change. The
+    share of entry-pass frames a stream bar had already overtaken fell from
+    6.9% to 4.2% (the four days' mean).
+    Re-run on this change alone (the same harness, the tree before it
+    against the tree with it, the HTF refresh points and the daily prefetch
+    in both) while the machine was shared (load 19-47 against 1.3-10 for
+    the first run): the three maps 5.14 s → 3.56 s a step (frames 1.60 →
+    1.11 s, S/R 1.19 → 0.83 s, contexts 2.35 → 1.62 s), the span from the
+    screener's return to the quote batch 5.27 → 3.70 s (1.42x; 1.28x to
+    1.65x by day, 1.65x on the quietest), the whole step 9.82 → 7.67 s, its
+    CPU time 8.42 → 6.97 s. The entry pass and the publish, which the
+    change does not touch, moved 1.15x and 1.19x, so part of that is the
+    load; the gain is smaller on a loaded machine, and holds on every day.
+  - Production: the archived top_tier days (all on 4 workers) spent a
+    median 19.3-20.0 s from the screener to the quote batch
+    (`Candidate cycle` to `Quote refresh source=engine:quote_watchlist`,
+    2026-09-21 to 09-25) and stepped every 24.5-27.4 s. That machine ran the
+    pooled block about 3x slower than the harness and the serial phases
+    1.3-2x slower (Study F), so the saving there is expected to be larger;
+    the first dry-run day is the check (CYCLE_TIMING's `frame_s`, `sr_s`
+    and `contexts_s` against the day before this change).
+  - No decision changes. Replayed on a stepped clock (the whole session,
+    09:30:30-15:59:30, a step every 29 s of replayed time; bars delivered
+    between steps; the same inputs for both trees) on four archived top_tier
+    days against 1157622 alone (3,220 steps: 36,132 audit events, 354
+    signals, 105 trades), every audit event, entry decision, signal,
+    position and trade, and every log line at INFO or above, was identical
+    before and after; only the fetch pool's own `Fetching ...
+    price_history` lines, which both trees write from a pool, came in
+    another order at some 15-minute steps. Replayed again on this change
+    alone (the tree before it against the tree with it), over 2026-09-24
+    09:30:30-11:30 (248 steps, 19 trades): the same, with pool-written
+    lines in another order at four steps and the HTF refresh line's
+    measured seconds apart; and over the whole session of
+    2026-09-25 (805 steps: 9,918 audit events, 21,063 log lines, 25
+    trades, -$428.72), the same, with pool-written lines in another order
+    at six steps. What changes is when: each step's decisions come sooner,
+    on fresher frames, which is the point.
+  - Config: `runtime.cycle_fetch_workers`, default 4, an integer of at least
+    1, checked at load (`config._NUMBER_CHECKS["runtime"]`). A config that
+    still sets `cycle_precompute_workers` refuses to start and names the
+    replacement (`_RETIRED_SECTION_KEYS["runtime"]`); rename the key in a
+    deployed config before upgrading. Every preset and `config.example.yaml`
+    ship `cycle_fetch_workers: 4`, the pool the fetches ran on before, as
+    do the local `configs/config.yaml` and the two microcap presets, which
+    are not tracked (`tests/guards/test_preset_parity.py`). The README
+    documents the knob.
+  - The chart-pattern helper cache keeps its lock: the dashboard's HTTP
+    thread runs chart-pattern analysis for `/api/chart` while the engine
+    thread runs. The strategy's context caches (`_strategies/contexts.py`)
+    keep theirs too; whether any thread but the engine's still reaches them
+    was not settled here.
+  - Tests: `tests/composition/test_cycle_symbol_maps.py` (new),
+    `tests/composition/test_htf_refresh_points.py` (the HTF refresh and the
+    daily prefetch fetch on the pool),
+    `tests/domain/test_config_validation.py`,
+    `tests/guards/test_shared_knob_contract.py`,
+    `tests/guards/test_preset_parity.py`, and the knob's and the map's new
+    names in `tests/analysis/test_silent_excepts_data_levels.py`,
+    `tests/strategies/top_tier_adaptive/test_bug_regressions.py`,
+    `tests/strategies/test_peer_shared_entry.py` and
+    `tests/strategies/framework/test_strategy_requests.py`.
+
 - **No read fetches HTF bars: the engine fetches them on its fetch pool, at
   the start of the cycle and again before management, the entries and the
   dashboard publish (study F, Stage 1a).** *2026-09-28* — until now the
@@ -613,7 +710,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it before the next management pass.
   - `MarketDataStore.refresh_htf_frame` is the only HTF fetch.
     `IntradayBot._refresh_htf_frames` runs it on the fetch pool
-    (`runtime.cycle_precompute_workers`) for each symbol a read can ask
+    (`runtime.cycle_fetch_workers`) for each symbol a read can ask
     for (the watchlist, the quote watchlist, the candidates, each
     position's underlying and reference symbol; the feed keeps frames for
     S/R symbols only) whose HTF bar settled (`htf_refresh_due`: the
@@ -3711,6 +3808,37 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `levels_shared.find_divergence` a required `bar_clock`.
 
 ### Fixed
+
+- **A symbol whose step frame or history-fetch decision cannot be built no
+  longer fails the cycle.** *2026-09-28* — after the pooled frame map, the
+  step read every watchlist symbol's frame again (`bars.setdefault(symbol,
+  get_merged(...))`, whose default is built before the lookup). For a
+  symbol whose build had raised in the pool (logged, and named in
+  PRECOMPUTE_FAILURES), that read raised again outside any isolation and
+  failed `step()` before position management: no position was managed that
+  cycle (stops included), no entry was taken, and while it lasted the
+  loop's sleep doubled up to 60 s and the engine escalated. The history-fetch
+  decisions ahead of the fetch (`WarmupTracker.should_fetch_symbol_history`
+  and the lookback, per watchlist symbol) were a loop with no isolation
+  either, with the same effect. With `cycle_precompute_workers: 1` the
+  pool's serial branch had no isolation at all, for the S/R and context
+  pre-warms too. No archived day logged a PRECOMPUTE_FAILURES event
+  (2026-05-01 to 09-25).
+  - Now each symbol of the CPU maps is isolated (`_compute_symbol_map`):
+    the error is logged at WARNING with its type and traceback (`Merged
+    frame precompute failed for XYZ: ValueError: ...`, `History fetch
+    decision failed for XYZ: ...`), the symbol is left out of the map's
+    result, one PRECOMPUTE_FAILURES event names the map's failures, and the
+    other symbols run as usual. A symbol without a frame gets no pre-warm,
+    no entry and no frame-based exit that cycle; a position in it is still
+    managed on its quote (stop, target, force flatten). A symbol whose
+    history decision failed is not fetched that cycle. The fetch pool's
+    failures are logged the same way, with the type.
+  - The second read is gone. It copied every symbol's frame each step and
+    threw the copy away, and for a symbol a stream bar reached between the
+    map and the read it rebuilt the whole frame with its indicators and
+    threw that away.
+  - Tests: `tests/composition/test_cycle_symbol_maps.py`.
 
 - **The daily history holds completed sessions only.** *2026-09-28* —
   during the session Schwab's daily `price_history` ends with today's

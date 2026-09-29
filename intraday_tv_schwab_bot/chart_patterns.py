@@ -87,10 +87,11 @@ def _clear_chart_cache() -> None:
     those addresses are gone in the same breath.
 
     Both clears run under ``_CHART_CACHE_LOCK``, the lock every
-    ``_cache_put`` takes. The cache is shared by threads: the engine's
-    precompute pool fans chart contexts across workers
-    (engine._prime_cycle_contexts) and the dashboard thread runs its own,
-    all outside contexts.py's chart lock. Without the lock a thread switch
+    ``_cache_put`` takes. The cache is shared by threads: the engine
+    thread builds chart contexts (its pre-warm, which a four-worker pool
+    fanned out until 2026-09-28, and the entry pass) and the dashboard's
+    HTTP thread runs its own for ``/api/chart``, all outside contexts.py's
+    chart lock. Without the lock a thread switch
     between the two clears let another worker's ``_cache_put`` land in
     between: its entry survived the first clear and its pin was dropped by
     the second, so the frame it named -- often a temporary like
