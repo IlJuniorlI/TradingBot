@@ -282,28 +282,10 @@ class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
         snapped = float(int(scaled + 0.5))
         return max(snapped, float(base_width))
 
-    def prefetch_entry_market_data(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], data=None) -> None:
-        if data is None or not hasattr(data, "prefetch_htf_contexts"):
-            return
-        if not candidates:
-            return
-        symbols = [
-            c.symbol
-            for c in candidates
-            if c.symbol in bars and bars.get(c.symbol) is not None and not bars.get(c.symbol).empty
-        ]
-        if not symbols:
-            return
-        # The context the entry path reads (_default_htf_request, the
-        # strategy's score context), so the prefetch warms it; with only the
-        # timeframe it built a default-level context no decision read (until
-        # 2026-09-24).
-        data.prefetch_htf_contexts(symbols, **self._default_htf_request(), **self.htf_fvg_request())
-
-    def dashboard_htf_trend(self, symbol: str, data, price: float, *, allow_refresh: bool = True) -> dict[str, str] | None:
+    def dashboard_htf_trend(self, symbol: str, data, price: float) -> dict[str, str] | None:
         """The HTF trend the entry gate reads: ``_htf_trend_context``
         (``summarize_htf_trend`` on the continuous ema9_all / ema20_all)."""
-        summary = self._htf_trend_context(symbol, data, allow_refresh=allow_refresh)
+        summary = self._htf_trend_context(symbol, data)
         if not bool(summary.get("available")):
             return {"state": "neutral", "label": "—"}
         return {"state": str(summary.get("state", "neutral")), "label": str(summary.get("label", "—"))}

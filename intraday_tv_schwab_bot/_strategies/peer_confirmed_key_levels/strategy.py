@@ -193,20 +193,18 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         htf_minutes = self.htf_minutes()
         sr_ctx = None
         if data is not None and hasattr(data, "get_support_resistance"):
-            # A failed HTF fetch is logged and absorbed inside the feed
-            # (get_htf_context). Any other error here reaches the position
-            # manager, which skips this position's exit policy for the cycle
-            # and still checks its stop and target (manage_positions).
+            # A read of the stored frame (the engine fetches it). An error
+            # here reaches the position manager, which skips this position's
+            # exit policy for the cycle and still checks its stop and target
+            # (manage_positions).
             sr_ctx = data.get_support_resistance(
                 symbol,
                 current_price=close,
                 flip_frame=frame,
                 mode="trading",
                 timeframe_minutes=htf_minutes,
-                lookback_days=self.htf_lookback_days(),
                 use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
                 use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
-                allow_refresh=True,
             )
         buffer = max(
             defense_zone_width * 0.25,
@@ -270,14 +268,12 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         return self._clamp_weight(self.params.get("level_score_raw_htf_weight", 0.65), 0.60)
 
     def _symbol_htf_request(self) -> dict[str, Any]:
-        """The HTF context this strategy family trades on -- the symbol's own,
-        each peer's and the prefetch's. One definition, so the three share
-        the data feed's cache entry: until 2026-09-24 the prefetch left out
-        the FVG arguments and warmed a context no decision read."""
+        """The HTF context this strategy family trades on -- the symbol's own
+        and each peer's. One definition, so they share the data feed's cache
+        entry."""
         fast, slow = htf_ema_spans(self.params)
         return {
             "timeframe_minutes": self.htf_minutes(),
-            "lookback_days": self.htf_lookback_days(),
             "pivot_span": int(self.params.get("htf_pivot_span", 2)),
             "max_levels_per_side": int(self.params.get("htf_max_levels_per_side", 6)),
             "atr_tolerance_mult": float(self.params.get("htf_atr_tolerance_mult", 0.35)),
@@ -289,13 +285,12 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             "use_prior_week_high_low": bool(self._support_resistance_setting("use_prior_week_high_low", True)),
         }
 
-    def dashboard_htf_trend(self, symbol: str, data, price: float, *, allow_refresh: bool = True) -> dict[str, str] | None:
+    def dashboard_htf_trend(self, symbol: str, data, price: float) -> dict[str, str] | None:
         """The HTF EMA trend key_levels' gate (and trend_continuation's
         score) read, off the same context they read it from."""
         if data is None or not price:
             return None
-        htf = self._htf_context(symbol, data, current_price=float(price), allow_refresh=allow_refresh,
-                                **self._symbol_htf_request())
+        htf = self._htf_context(symbol, data, current_price=float(price), **self._symbol_htf_request())
         return self._htf_trend_row(*self._htf_bias(htf, float(price)))
 
     @staticmethod
@@ -1255,20 +1250,6 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 **self._htf_lists(htf),
             },
         )
-
-    def prefetch_entry_market_data(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], data=None) -> None:
-        if data is None or not hasattr(data, "prefetch_htf_contexts"):
-            return
-        if not candidates:
-            return
-        universe = [
-            symbol
-            for symbol in self._confirmation_universe()
-            if symbol in bars and bars.get(symbol) is not None and not bars.get(symbol).empty
-        ]
-        if not universe:
-            return
-        data.prefetch_htf_contexts(universe, **self._symbol_htf_request(), **self.htf_fvg_request())
 
     def strategy_exit_signal(self, position: Position, bars: dict[str, pd.DataFrame], tape: ExitTape, data=None) -> ExitDecision | None:
         # Only the ladder defence is peer-specific. The technical exits this

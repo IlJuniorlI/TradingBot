@@ -209,12 +209,30 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             return -weight
         return 0.0
 
-    def dashboard_htf_trend(self, symbol: str, data, price: float, *, allow_refresh: bool = True) -> dict[str, str] | None:
+    def dashboard_htf_trend(self, symbol: str, data, price: float) -> dict[str, str] | None:
         """The HTF EMA trend the gate and score read, off the same context
-        (``_default_htf_context_for_score``, which never refreshes)."""
+        (``_default_htf_context_for_score``)."""
         if data is None or not price:
             return None
         return self._htf_trend_row(*self._htf_bias(self._default_htf_context_for_score(symbol, data), float(price)))
+
+    def daily_history_symbols(self, watchlist: list[str]) -> list[str]:
+        """The symbols ``_symbol_daily_stats`` reads the daily history of,
+        for a candidate from ``watchlist``: the symbol itself and its
+        benchmark, the first of its index ETFs (``_indices_for_symbol``).
+        The engine fetches them on its fetch pool from the prewarm on
+        (``IntradayBot._prefetch_daily_history``); until 2026-09-28 the
+        day's first entry pass fetched them, one at a time."""
+        symbols: set[str] = set()
+        for symbol in watchlist:
+            key = str(symbol).upper().strip()
+            if not key:
+                continue
+            symbols.add(key)
+            indices = self._indices_for_symbol(key)
+            if indices:
+                symbols.add(indices[0])
+        return sorted(symbols)
 
     # ------------------------------------------------------------------
     # Watchlist — include all configured index confirmation ETFs so they

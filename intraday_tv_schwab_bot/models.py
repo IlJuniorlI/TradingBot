@@ -79,6 +79,12 @@ class StrategySchedule:
     def can_enter(self, t: time) -> bool:
         return any(w.contains(t) for w in self.entry_windows)
 
+    def before_first_entry(self, t: time) -> bool:
+        """True while ``t`` is before the day's first entry window: earlier
+        than every entry window's start and inside none (an overnight window
+        holds the small hours). False when there is no entry window."""
+        return bool(self.entry_windows) and not self.can_enter(t) and all(t < w.start for w in self.entry_windows)
+
     def can_manage(self, t: time) -> bool:
         return any(w.contains(t) for w in self.management_windows)
 

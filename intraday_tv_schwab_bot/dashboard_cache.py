@@ -245,7 +245,6 @@ class DashboardCache:
         quote_watchlist: list[str],
         entry_decisions: Mapping[str, Any],
         warmup_summary: Mapping[str, Any],
-        allow_refresh: bool,
     ) -> dict[str, Any]:
         """The symbol part of the dashboard state the engine publishes each
         cycle, which adds its own status fields: the account's performance
@@ -254,10 +253,11 @@ class DashboardCache:
         strategy's symbol lists, and the chart settings. The symbols shown are
         the positions', the watchlist, the quote watchlist, the candidates and
         the S/R rows', in that order; the caches drop every other symbol.
-        ``allow_refresh`` is the gate's context refresh: the S/R rows and
-        snapshots refresh their HTF reads only while it is on. Until
-        2026-09-27 this was the engine's ``_dashboard_state`` (refactor cut
-        C40)."""
+        Every HTF read here returns the frame the feed holds: the engine
+        refreshes them before the publish (``IntradayBot._refresh_htf_frames``;
+        until 2026-09-28 these reads fetched while the gate refreshed market
+        context, one symbol at a time). Until 2026-09-27 this was the
+        engine's ``_dashboard_state`` (refactor cut C40)."""
         performance = self.account.snapshot_copy(positions)
         candidates = []
         entry_decision_by_symbol = {str(symbol or '').upper().strip(): copy.deepcopy(payload) for symbol, payload in entry_decisions.items() if str(symbol or '').upper().strip()}
@@ -374,7 +374,7 @@ class DashboardCache:
         sr_levels = []
         sr_by_symbol: dict[str, dict[str, Any]] = {}
         for symbol in sr_symbols:
-            row = self.sr_row(symbol, allow_refresh=allow_refresh)
+            row = self.sr_row(symbol)
             if row is None:
                 continue
             sr_levels.append(row)
@@ -384,7 +384,7 @@ class DashboardCache:
             enriched_positions = []
             for row in performance["positions"]:
                 symbol = str(row.get("underlying") or row.get("symbol") or "").upper().strip()
-                sr_row = sr_by_symbol.get(symbol) or self.sr_row(symbol, allow_refresh=allow_refresh)
+                sr_row = sr_by_symbol.get(symbol) or self.sr_row(symbol)
                 new_row = copy.deepcopy(row)
                 if sr_row is not None:
                     new_row.update({
@@ -443,7 +443,6 @@ class DashboardCache:
                 position_row=position_by_symbol.get(symbol),
                 entry_decision=entry_decision_by_symbol.get(symbol),
                 warmup=warmup_by_symbol.get(symbol),
-                allow_refresh=allow_refresh,
             )
             for symbol in dashboard_symbol_order
         ]
@@ -474,8 +473,6 @@ class DashboardCache:
         position_row: dict[str, Any] | None = None,
         entry_decision: dict[str, Any] | None = None,
         warmup: dict[str, Any] | None = None,
-        *,
-        allow_refresh: bool = True,
     ) -> dict[str, Any]:
         """Assemble the full dashboard snapshot payload for a single symbol:
         quote, bars, S/R ladder, technicals, overlays and position markers in
@@ -491,7 +488,7 @@ class DashboardCache:
         max_quote_age = max(1.0, float(self.config.runtime.quote_cache_seconds))
         quote_is_fresh = bool(symbol and quote and self.data.quotes_are_fresh([symbol], max_quote_age))
         if sr_row is None and symbol:
-            sr_row = self.sr_row(symbol, allow_refresh=allow_refresh)
+            sr_row = self.sr_row(symbol)
         frame = self.data.get_merged(symbol, with_indicators=True) if symbol else None
         snapshot_signature = self.symbol_snapshot_signature(
             symbol,
@@ -503,11 +500,10 @@ class DashboardCache:
             position_row=position_row,
             entry_decision=entry_decision,
             warmup=warmup,
-            allow_refresh=allow_refresh,
         )
         with self.lock:
             cached_snapshot = self.snapshot_cache.get(symbol)
-            if cached_snapshot is not None and cached_snapshot.get("signature") == snapshot_signature and not self.snapshot_should_bypass_cache(symbol, allow_refresh=allow_refresh):
+            if cached_snapshot is not None and cached_snapshot.get("signature") == snapshot_signature:
                 # Shallow copy on cache hit instead of deepcopy. The
                 # snapshot is a flat-ish dict of pre-computed values;
                 # downstream serialization (`json_safe`) creates new
@@ -538,7 +534,6 @@ class DashboardCache:
             broken_resistance_price=safe_float((sr_row or {}).get("broken_resistance")),
             pending_support_price=safe_float((sr_row or {}).get("pending_support")),
             pending_resistance_price=safe_float((sr_row or {}).get("pending_resistance")),
-            allow_htf_refresh=allow_refresh,
         )
         compact_chart_profile = self.chart_profile("compact")
         expanded_chart_profile = self.chart_profile("expanded")
@@ -546,7 +541,7 @@ class DashboardCache:
         # the RSI divergence lines), and the divergence lines reuse it.
         chart_wants_rsi_div = bool(compact_chart_profile.show_rsi_divergence) or bool(expanded_chart_profile.show_rsi_divergence)
         htf_ctx, htf_fair_value_gaps = self._snapshot_htf_overlays(
-            symbol, compact_chart_profile, expanded_chart_profile, chart_wants_rsi_div, allow_refresh=allow_refresh,
+            symbol, compact_chart_profile, expanded_chart_profile, chart_wants_rsi_div,
         )
 
         # The LTF FVG and order block overlays are the contexts the strategy
@@ -1007,8 +1002,6 @@ class DashboardCache:
         compact_chart_profile: DashboardChartConfig,
         expanded_chart_profile: DashboardChartConfig,
         chart_wants_rsi_div: bool,
-        *,
-        allow_refresh: bool,
     ) -> tuple[HTFContext | None, list[dict[str, Any]]]:
         """The HTF context, read if a chart draws its FVGs (and the strategy's
         request builds them) or its RSI divergence lines, and its FVG overlay.
@@ -1026,9 +1019,7 @@ class DashboardCache:
                 htf_ctx = self.data.get_htf_context(
                     symbol,
                     timeframe_minutes=self.strategy.htf_minutes(),
-                    lookback_days=self.strategy.htf_lookback_days(),
                     **self._chart_htf_level_request(),
-                    allow_refresh=allow_refresh,
                     use_prior_day_high_low=bool(getattr(self.config.support_resistance, "use_prior_day_high_low", True)),
                     use_prior_week_high_low=bool(getattr(self.config.support_resistance, "use_prior_week_high_low", True)),
                     **htf_fvg_request,
@@ -1263,7 +1254,6 @@ class DashboardCache:
         broken_resistance_price: float | None = None,
         pending_support_price: float | None = None,
         pending_resistance_price: float | None = None,
-        allow_htf_refresh: bool = True,
     ) -> list[dict[str, Any]]:
         """The chart's key-level zones: the strategy's level candidates (the S/R
         row's levels for a strategy that allows the generic fallback) as zones
@@ -1308,8 +1298,9 @@ class DashboardCache:
         if close is None or close <= 0:
             return []
 
-        tf = max(1, int(level_ctx.get("timeframe_minutes", 60) or 60))
-        lookback_days = max(1, int(level_ctx.get("lookback_days", 60) or 60))
+        # The strategy's HTF frame, the one the engine refreshes: a level
+        # spec cannot name another timeframe, which nothing would fetch.
+        tf = self.strategy.htf_minutes()
         pivot_span = max(1, int(level_ctx.get("pivot_span", 2) or 2))
         max_lvls = max(1, int(level_ctx.get("max_levels_per_side", 6) or 6))
         # The spec's tolerances as it gives them (support_resistance's, checked
@@ -1328,7 +1319,6 @@ class DashboardCache:
         htf = self.data.get_htf_context(
             symbol,
             timeframe_minutes=tf,
-            lookback_days=lookback_days,
             pivot_span=pivot_span,
             max_levels_per_side=max_lvls,
             atr_tolerance_mult=atr_tol,
@@ -1336,7 +1326,6 @@ class DashboardCache:
             stop_buffer_atr_mult=stop_atr,
             ema_fast_span=ema_fast_span,
             ema_slow_span=ema_slow_span,
-            allow_refresh=allow_htf_refresh,
             use_prior_day_high_low=use_prior_day_high_low,
             use_prior_week_high_low=use_prior_week_high_low,
             **self.strategy.htf_fvg_request(),
@@ -1472,13 +1461,13 @@ class DashboardCache:
             timeframe_minutes=tf,
         )
 
-    def sr_row(self, symbol: str, price: float | None = None, *, allow_refresh: bool = True) -> dict[str, Any] | None:
+    def sr_row(self, symbol: str, price: float | None = None) -> dict[str, Any] | None:
         """The dashboard's support/resistance row: ``symbol``'s S/R snapshot
         (``sr_snapshot.sr_snapshot``, which the exit record reads too) and the
         strategy's LTF label, which the expanded chart's LTF toggle shows
         ("5m LTF" rather than a hardcoded "1M LTF"), third in the row."""
         snapshot = sr_snapshot(self.config, self.data, symbol, price=price, strategy=self.strategy,
-                               account=self.account, allow_refresh=allow_refresh)
+                               account=self.account)
         if snapshot is None:
             return None
         return {
@@ -1487,20 +1476,6 @@ class DashboardCache:
             "ltf_timeframe": f"{max(1, self.strategy.ltf_minutes())}m",
             **snapshot,
         }
-
-    def snapshot_should_bypass_cache(self, symbol: str, *, allow_refresh: bool) -> bool:
-        """True when support-resistance or HTF context needs a fresh refresh.
-
-        Callers (dashboard snapshot builders) use this to decide whether a
-        cached snapshot can be returned or must be recomputed."""
-        if not allow_refresh:
-            return False
-        sr_tf = self.strategy.htf_minutes()
-        if self.data.should_refresh_support_resistance(symbol, timeframe_minutes=sr_tf):
-            return True
-        if self.data.should_refresh_htf_context(symbol, sr_tf):
-            return True
-        return False
 
     def symbol_snapshot_signature(
         self,
@@ -1514,7 +1489,6 @@ class DashboardCache:
         position_row: Mapping[str, Any] | None,
         entry_decision: Mapping[str, Any] | None,
         warmup: Mapping[str, Any] | None,
-        allow_refresh: bool,
     ) -> tuple[Any, ...]:
         """Tuple signature for the per-symbol dashboard snapshot cache. Any
         change in timestamps, quote, SR row, candidate, position, or trades
@@ -1543,7 +1517,6 @@ class DashboardCache:
             cache_json_signature(entry_decision or {}),
             cache_json_signature(warmup or {}),
             symbol_trade_signature(self.account, symbol_key),
-            bool(allow_refresh),
         )
 
     def current_pattern_payload(self, frame: pd.DataFrame | None) -> dict[str, Any]:
@@ -1790,18 +1763,11 @@ class DashboardCache:
         minute_frame: pd.DataFrame | None = None
         forming_start: pd.Timestamp | None = None
         if resolved_mode == "htf" and symbol_key:
-            # HTTP handler path: only read cached HTF data, never trigger a
-            # Schwab fetch here. Forcing a refresh from the HTTP thread races
-            # with the engine's per-cycle prefetch (the HTF frame refresh runs
-            # under self._lock on the engine thread) and risks rate-limit
-            # hits. If the cache is empty, return an empty chart — the next
-            # engine cycle will populate it and the next poll will render.
-            stored_frame = self.data.get_htf_frame(
-                symbol_key,
-                timeframe_minutes=htf_min,
-                lookback_days=self.strategy.htf_lookback_days(),
-                allow_refresh=False,
-            )
+            # HTTP handler path: the stored HTF frame (a read never fetches;
+            # the engine refreshes it). If none is stored yet, return an
+            # empty chart — the next engine cycle will populate it and the
+            # next poll will render.
+            stored_frame = self.data.get_htf_frame(symbol_key, timeframe_minutes=htf_min)
             minute_frame = self.data.get_merged(symbol_key, with_indicators=False)
             frame, forming_start = htf_chart_frame(
                 stored_frame,

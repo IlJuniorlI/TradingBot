@@ -288,11 +288,14 @@ class ConfirmationMixin:
         symbol's own sector ETF (the expected share of a sector move).
 
         Costs one Schwab daily ``price_history`` call per symbol per ET day
-        via ``MarketDataStore.get_daily_history``; everything after that is a
-        dict lookup. Returns ``None`` when the feed is unavailable or the
+        via ``MarketDataStore.get_daily_history``, which the engine makes
+        from the prewarm on (``TopTierAdaptiveStrategy.daily_history_symbols``);
+        everything after that is a dict lookup. Returns ``None`` when the feed is unavailable or the
         fetch failed — callers must gate on that explicitly instead of
         assuming a default ADR or a beta of 1.0. The feed reports a failed
-        fetch as ``None`` (logged, and cached for the day); anything it
+        fetch as ``None`` (logged; a read never fetches it again that day,
+        and the engine's prefetch retries it until the first entry window,
+        ``MarketDataStore.daily_history_due``); anything it
         raises is not a failed fetch and propagates. Until 2026-09-26 it was
         read as one, which skipped the relative-strength gate in silence.
         """

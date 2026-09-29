@@ -494,7 +494,7 @@ Scaled params: `default_stop_pct`, `momentum_min_day_strength`, `sr_scalp_min_di
 
 **ATR-multiple params (`*_atr_mult`) are NOT scaled** - they are already volatility-relative and scaling them would square the adjustment.
 
-Data comes from `MarketDataStore.get_daily_history` (one Schwab daily `price_history` call per symbol per ET day) via `daily_stats.build_symbol_stats`. When the fetch fails or returns too few sessions, `vol_scale` is 1.0 and thresholds are exactly as written - the pre-scaling behaviour, not an invented default.
+Data comes from `MarketDataStore.get_daily_history` (one Schwab daily `price_history` call per symbol per ET day, completed sessions only) via `daily_stats.build_symbol_stats`. The engine makes those calls on its fetch pool from the prewarm on, for each watchlist symbol and its benchmark (`daily_history_symbols`), so the day's first entry pass does not wait on them (since 2026-09-28; until then it fetched them one at a time, about 10 s at 09:35, and the ADR and beta took today's forming bar as it stood at that fetch). A fetch that raises is fetched again a minute later until the first entry window opens (09:35 on the preset, 20 minutes after the 09:15 prewarm); from then on it stays failed for the day, as before. When the fetch fails or returns too few sessions, `vol_scale` is 1.0 and thresholds are exactly as written - the pre-scaling behaviour, not an invented default.
 
 This also retires the hand-maintained `HIGH_VOL:` overrides scattered through the preset: those exist because absolute thresholds do not survive a volatility regime change, whereas ADR-relative ones largely do.
 

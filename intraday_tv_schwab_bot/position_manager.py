@@ -26,11 +26,11 @@ Design notes:
 - Each position is managed on its own: an exception while managing one is
   logged against it, and escalated when it persists, and the others are
   managed as usual (``manage_positions``).
-- The HTF timeframe / lookback of the trade manager's S/R reads are the
-  strategy's (``strategy.htf_minutes()`` / ``htf_lookback_days()``), the one
-  resolution the engine, the entry gatekeeper and the dashboard read too.
-  HTF refresh cadence is now bar-aligned in ``MarketDataStore.should_refresh_htf_context``
-  so there's no longer a refresh-seconds knob on the strategy side.
+- The HTF timeframe of the trade manager's S/R reads is the strategy's
+  (``strategy.htf_minutes()``), the one resolution the engine, the entry
+  gatekeeper and the dashboard read too. The reads never fetch: the engine
+  refreshes the frames before management (``IntradayBot._refresh_htf_frames``,
+  bar-aligned by ``MarketDataStore.htf_refresh_due``).
 """
 from __future__ import annotations
 
@@ -525,7 +525,6 @@ class PositionManager:
                     price=underlying_price or current_price,
                     strategy=self.strategy,
                     account=self.account,
-                    allow_refresh=False,
                 )
             except Exception:
                 # A diagnostic read for the exit record: it runs the S/R

@@ -77,7 +77,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
             return 2.25
         return 1.9
 
-    def dashboard_htf_trend(self, symbol: str, data, price: float, *, allow_refresh: bool = True) -> dict[str, str] | None:
+    def dashboard_htf_trend(self, symbol: str, data, price: float) -> dict[str, str] | None:
         """None: this strategy trades on no HTF EMA trend of the symbol's own
         (its HTF read is the S/R market-structure bias, which the sidebar
         shows as structure); the family's EMA vote reaches it only through
@@ -1187,8 +1187,8 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         # structure veto applies; a refusal lands under this side's failure
         # key with the gate snapshots and the near-miss payload. The HTF
         # divergence score term reads this family's own HTF context -- the
-        # 60m one its peer votes use and the prefetch warms
-        # (_symbol_htf_request) -- so the strategy has one HTF read. Until
+        # 60m one its peer votes use (_symbol_htf_request) -- so the
+        # strategy has one HTF read. Until
         # 2026-09-24 it asked for the support_resistance timeframe (15m), a
         # frame nothing stored for this 60m strategy, so the context was None
         # on every cycle and the term was always 0.

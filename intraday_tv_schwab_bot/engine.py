@@ -19,7 +19,7 @@ from .dashboard import DashboardServer
 from .data_feed import MarketDataStore
 from .entry_gatekeeper import EntryGatekeeper
 from .execution import SchwabExecutor
-from .models import Candidate, Position
+from .models import Candidate, Position, StrategySchedule
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .position_store import ReconcileMetadataStore, SessionRiskStateStore
@@ -552,11 +552,14 @@ class IntradayBot:
         (study F, stage 0). The phases, in the order they run: ``reconcile``
         (the session reconcile check), ``screener`` (the cycle gate and the
         screener), ``watchlist``, ``history`` (the 1m history fetch),
-        ``sr_fetch`` (the HTF fetch), ``stream``, ``frame`` (the step's
-        merged frames), ``sr`` and ``contexts`` (their precompute),
-        ``warmup``, ``quotes`` (the quote batch and the account marks),
-        ``manage`` (the entry-order settle and ``manage_positions``, a
-        missed live exit's re-sends included), ``entries``, ``publish`` (the dashboard), ``error`` (the error path
+        ``daily_history`` (the daily-history prefetch), ``htf_refresh`` (the
+        HTF fetch, entered at the start of the cycle and again before
+        management, the entries and the publish: the four add up),
+        ``stream``, ``frame`` (the step's merged frames), ``sr`` and
+        ``contexts`` (their precompute), ``warmup``, ``quotes`` (the quote
+        batch and the account marks), ``manage`` (the entry-order settle and
+        ``manage_positions``, a missed live exit's re-sends included),
+        ``entries``, ``publish`` (the dashboard), ``error`` (the error path
         of a pass whose step raised, in ``failed_phase``), ``housekeeping``
         (the auto-exit check, the archive, the rollover, the prune) and
         ``sleep``. The session archive copies the records into
@@ -1045,32 +1048,14 @@ class IntradayBot:
                     label="History fetch",
                 )
 
-            timer.enter("sr_fetch")
-            if gate_state.context_refresh_active and getattr(self.config, "support_resistance", None) is not None and bool(self.config.support_resistance.enabled):
-                sr_tf = self.strategy.htf_minutes()
-                sr_lookback = self.strategy.htf_lookback_days()
-                # Pre-normalize so the should_refresh check and the threaded
-                # fetch agree on cache keys (data_feed._symbol_key applies the
-                # same upper().strip()).
-                sr_fetch_targets: list[str] = []
-                for symbol in self.last_watchlist:
-                    symbol_key = str(symbol or "").upper().strip()
-                    if not symbol_key:
-                        continue
-                    if self.data.should_refresh_support_resistance(
-                        symbol_key, timeframe_minutes=sr_tf,
-                    ):
-                        sr_fetch_targets.append(symbol_key)
-                if sr_fetch_targets:
-                    self._parallel_symbol_map(
-                        sr_fetch_targets,
-                        lambda symbol: self.data.fetch_support_resistance(
-                            symbol,
-                            timeframe_minutes=sr_tf,
-                            lookback_days=sr_lookback,
-                        ),
-                        label="Support/resistance fetch",
-                    )
+            timer.enter("daily_history")
+            self._prefetch_daily_history(gate_state, now, schedule)
+            # The cycle's HTF fetches: here, and again before management, the
+            # entries and the publish, so a bar that closes mid-cycle is
+            # fetched at the next of them. Each symbol at most once a cycle.
+            timer.enter("htf_refresh")
+            htf_attempted: set[str] = set()
+            self._refresh_htf_frames(gate_state, htf_attempted, where="cycle start")
 
             timer.enter("stream")
             if gate_state.streaming_active and self.last_watchlist:
@@ -1087,7 +1072,7 @@ class IntradayBot:
             for symbol in self.last_watchlist:
                 bars.setdefault(symbol, self.data.get_merged(symbol, with_indicators=True))
             timer.enter("sr")
-            self._prime_cycle_support_cache(bars, allow_refresh=False)
+            self._prime_cycle_support_cache(bars)
             timer.enter("contexts")
             self._prime_cycle_context_cache(bars)
             timer.enter("warmup")
@@ -1107,6 +1092,8 @@ class IntradayBot:
 
             self.account.mark_prices(self._extract_last_prices(bars))
             self.account.mark_prices(self._extract_position_marks())
+            timer.enter("htf_refresh")
+            self._refresh_htf_frames(gate_state, htf_attempted, where="before management", bars=bars)
             timer.facts["managed"] = gate_state.management_active
             if gate_state.management_active:
                 manage_started = timer.enter("manage")
@@ -1118,6 +1105,8 @@ class IntradayBot:
                 self.entry_gatekeeper.settle_unsettled_entry_orders()
                 timer.facts["positions"] = len(self.positions)
                 self.position_manager.manage_positions(now, bars)
+            timer.enter("htf_refresh")
+            self._refresh_htf_frames(gate_state, htf_attempted, where="before entries", bars=bars)
             timer.enter("entries")
             if self.startup_reconciler.trading_blocked_reason:
                 candidate_symbols = [c.symbol for c in self.last_candidates]
@@ -1158,6 +1147,8 @@ class IntradayBot:
                     level=logging.DEBUG,
                 )
 
+            timer.enter("htf_refresh")
+            self._refresh_htf_frames(gate_state, htf_attempted, where="before publish", bars=bars)
             timer.enter("publish")
             # Re-mark only position marks — bar closes haven't changed since the earlier
             # mark_prices call above. Skipping _extract_last_prices here avoids iterating
@@ -1241,7 +1232,95 @@ class IntradayBot:
             )
         return results
 
-    def _prime_cycle_support_cache(self, bars: dict[str, pd.DataFrame], *, allow_refresh: bool) -> None:
+    def _htf_symbols(self) -> list[str]:
+        """Every symbol whose HTF frame a read can ask for this cycle: the
+        watchlist (the step frames, the entries and the peers they vote
+        with), the quote watchlist and the candidates (the dashboard's
+        symbols, the entry gatekeeper's candidate snapshots) and each
+        position's underlying and reference symbol (its management, the
+        dashboard's position rows). The data feed keeps HTF frames for S/R
+        symbols only (``MarketDataStore.htf_refresh_due``)."""
+        symbols = set(self.last_watchlist) | set(self.last_quote_watchlist)
+        symbols.update(candidate.symbol for candidate in self.last_candidates)
+        for position in self.positions.values():
+            symbols.add(str(position.metadata.get("underlying") or position.symbol))
+            if position.reference_symbol:
+                symbols.add(position.reference_symbol)
+        return sorted({str(symbol or "").upper().strip() for symbol in symbols} - {""})
+
+    def _refresh_htf_frames(self, gate_state: CycleGateState, attempted: set[str], *, where: str,
+                            bars: dict[str, pd.DataFrame] | None = None) -> None:
+        """Fetch, on the fetch pool, the HTF frame of every ``_htf_symbols``
+        symbol whose HTF bar has closed (``MarketDataStore.htf_refresh_due``
+        on the strategy's ``htf_minutes()``: 10 s after the boundary) and that
+        this cycle has not tried yet (``attempted``, which it extends): the
+        only HTF fetch (``MarketDataStore.refresh_htf_frame``); no read
+        fetches.
+
+        ``step`` calls it at the start of the cycle and again before
+        management, the entries and the publish (``where``), so a bar that
+        closes mid-cycle reaches the rest of the cycle at the next of those
+        points. Until 2026-09-28 the cycle fetched at its start only, and a
+        read after the boundary fetched its own symbol, one at a time: most
+        of a boundary's fetches ran in the dashboard publish, which held the
+        next management 15-30 s (study F, section 1.3). A symbol whose fetch
+        failed is not retried until the next cycle, as each read used to
+        retry it: an outage costs one fetch per symbol per cycle.
+
+        Mid-cycle (``bars`` given) the refreshed symbols' S/R contexts are
+        built again as the cycle's pre-warm builds them
+        (``_prime_cycle_support_cache``): the refresh dropped them, and the
+        cycle serves every later read the build of its first read. Only
+        while the gate refreshes market context, as the cycle's fetch always
+        was."""
+        if not gate_state.context_refresh_active:
+            return
+        tf = self.strategy.htf_minutes()
+        due = self.data.htf_refresh_due([symbol for symbol in self._htf_symbols() if symbol not in attempted], tf)
+        if not due:
+            return
+        attempted.update(due)
+        lookback_days = self.strategy.htf_lookback_days()
+        started = time.monotonic()
+        stored = self._parallel_symbol_map(
+            due,
+            lambda symbol: self.data.refresh_htf_frame(symbol, timeframe_minutes=tf, lookback_days=lookback_days),
+            label="HTF refresh",
+        )
+        refreshed = [symbol for symbol in due if stored.get(symbol) is True]
+        failed = [symbol for symbol in due if stored.get(symbol) is not True]
+        LOG.info("HTF refresh (%s): %d/%d %sm frame(s) in %.2fs%s", where, len(refreshed), len(due), tf,
+                 time.monotonic() - started, f"; failed: {','.join(failed)}" if failed else "")
+        if bars is not None and refreshed:
+            self._prime_cycle_support_cache({symbol: bars[symbol] for symbol in refreshed if symbol in bars})
+
+    def _prefetch_daily_history(self, gate_state: CycleGateState, now: datetime, schedule: StrategySchedule) -> None:
+        """Fetch, on the fetch pool, the daily history the strategy's
+        entries read (``strategy.daily_history_symbols``) for each such
+        symbol not fetched yet today (``MarketDataStore.daily_history_due``):
+        from the prewarm on, so the day's first entry pass finds it cached,
+        and later for a symbol that joins the watchlist; nothing once every
+        symbol has it. Until 2026-09-28 top_tier fetched each symbol's 180
+        days inside ``entry_signals``, one at a time: the day's first entry
+        pass (09:35) waited about 10 s on 28 fetches, nothing managed
+        meanwhile. Only while the gate refreshes market context.
+
+        A fetch that raised is fetched again, ``DAILY_HISTORY_RETRY_SECONDS``
+        apart, until the day's first entry window opens
+        (``StrategySchedule.before_first_entry``); from then on it stays
+        cached for the day, as a read keeps it. On the top_tier preset the
+        prewarm starts 20 minutes before that window (09:15, 09:35), room for
+        a transient failure to clear; until then a failure was cached for the
+        day at the first fetch."""
+        if not gate_state.context_refresh_active:
+            return
+        retry_failed = schedule.before_first_entry(now.time())
+        due = [symbol for symbol in self.strategy.daily_history_symbols(self.last_watchlist)
+               if self.data.daily_history_due(symbol, retry_failed=retry_failed)]
+        if due:
+            self._parallel_symbol_map(due, self.data.fetch_daily_history, label="Daily history fetch")
+
+    def _prime_cycle_support_cache(self, bars: dict[str, pd.DataFrame]) -> None:
         sr_cfg = getattr(self.config, "support_resistance", None)
         if sr_cfg is None or not bool(sr_cfg.enabled):
             return
@@ -1260,8 +1339,6 @@ class IntradayBot:
                 flip_frame=frame,
                 mode="trading",
                 timeframe_minutes=self.strategy.htf_minutes(),
-                lookback_days=self.strategy.htf_lookback_days(),
-                allow_refresh=allow_refresh,
                 use_prior_day_high_low=bool(getattr(sr_cfg, "use_prior_day_high_low", True)),
                 use_prior_week_high_low=bool(getattr(sr_cfg, "use_prior_week_high_low", True)),
             )
@@ -1397,7 +1474,6 @@ class IntradayBot:
             quote_watchlist=self.last_quote_watchlist,
             entry_decisions=self.entry_gatekeeper.last_entry_decisions,
             warmup_summary=warmup_summary,
-            allow_refresh=gate_state.context_refresh_active,
         )
         return {
             "status": "running" if self.last_error is None else "error",
@@ -1418,8 +1494,8 @@ class IntradayBot:
             "quote_watchlist": self.last_quote_watchlist,
             "data": symbol_state["data"],
             "warmup": warmup_summary,
-            # Read after the build, so it counts the Schwab calls the build's
-            # HTF refreshes made.
+            # Read after the cycle's last HTF refresh (before the publish), so
+            # it counts the Schwab calls that made.
             "api_usage": self.api_usage.snapshot(now),
             "performance": symbol_state["performance"],
             "tracked_capital_label": self._tracked_capital_label(),

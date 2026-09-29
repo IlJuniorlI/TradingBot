@@ -70,15 +70,9 @@ def structure_event_label(ms_ctx: Any) -> str:
     return "—"
 
 
-def _htf_trend(data: MarketDataStore, strategy: BaseStrategy, symbol: str, *, allow_refresh: bool) -> dict[str, Any]:
+def _htf_trend(data: MarketDataStore, strategy: BaseStrategy, symbol: str) -> dict[str, Any]:
     tf = strategy.htf_minutes()
-    lookback_days = strategy.htf_lookback_days()
-    frame = data.get_htf_frame(
-        symbol,
-        timeframe_minutes=tf,
-        lookback_days=lookback_days,
-        allow_refresh=allow_refresh,
-    )
+    frame = data.get_htf_frame(symbol, timeframe_minutes=tf)
     summary = summarize_htf_trend(
         frame,
         min_bars=20,
@@ -106,12 +100,14 @@ def sr_snapshot(
     price: float | None,
     strategy: BaseStrategy,
     account: PaperAccount,
-    allow_refresh: bool,
 ) -> dict[str, Any] | None:
     """``symbol``'s S/R snapshot at ``price`` (``symbol_price`` when None) on
-    the strategy's HTF (``strategy.htf_minutes()`` / ``htf_lookback_days()``),
-    or None when support_resistance is off or the feed has no context for it.
-    ``allow_refresh`` False reads only what the feed holds."""
+    the strategy's HTF frame (``strategy.htf_minutes()``), or None when
+    support_resistance is off or the feed has no context for it. It reads
+    only what the feed holds: the engine refreshes the HTF frames
+    (``IntradayBot._refresh_htf_frames``). Until 2026-09-28 the dashboard's
+    reads passed ``allow_refresh`` and fetched a symbol whose HTF bar had
+    closed, one at a time."""
     cfg = config.support_resistance
     if not bool(cfg.enabled):
         return None
@@ -129,8 +125,6 @@ def sr_snapshot(
         flip_frame=data.get_merged(symbol, with_indicators=False),
         mode="trading",
         timeframe_minutes=strategy.htf_minutes(),
-        lookback_days=strategy.htf_lookback_days(),
-        allow_refresh=allow_refresh,
     )
     if ctx is None:
         return None
@@ -143,7 +137,7 @@ def sr_snapshot(
     def _level_price(level: Any) -> float | None:
         return None if level is None else float(level.price)
 
-    trend_row = _htf_trend(data, strategy, symbol, allow_refresh=allow_refresh)
+    trend_row = _htf_trend(data, strategy, symbol)
     htf_trend_bias = "neutral"
     # The strategy's own HTF trend -- the read its gates and scores use --
     # when it has one; the generic 50/200 read below only for the rest.
@@ -152,7 +146,7 @@ def sr_snapshot(
     trend_price = display_price if display_price is not None else float(getattr(ctx, "current_price", 0.0) or 0.0)
     if callable(own_trend_hook) and trend_price:
         try:
-            own_trend = own_trend_hook(symbol, data, trend_price, allow_refresh=allow_refresh)
+            own_trend = own_trend_hook(symbol, data, trend_price)
         except Exception:
             LOG.debug("Failed to read the strategy's HTF trend for %s; using the generic read.", symbol, exc_info=True)
     try:
@@ -160,7 +154,6 @@ def sr_snapshot(
             htf_ctx = data.get_htf_context(
                 symbol,
                 timeframe_minutes=strategy.htf_minutes(),
-                lookback_days=strategy.htf_lookback_days(),
                 pivot_span=int(getattr(cfg, "pivot_span", 2) or 2),
                 max_levels_per_side=int(getattr(cfg, "max_levels_per_side", 3) or 3),
                 atr_tolerance_mult=float(cfg.atr_tolerance_mult),  # checked at load (above 0)
@@ -168,7 +161,6 @@ def sr_snapshot(
                 stop_buffer_atr_mult=float(getattr(cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
                 ema_fast_span=50,
                 ema_slow_span=200,
-                allow_refresh=allow_refresh,
                 use_prior_day_high_low=bool(getattr(cfg, "use_prior_day_high_low", True)),
                 use_prior_week_high_low=bool(getattr(cfg, "use_prior_week_high_low", True)),
                 **strategy.htf_fvg_request(),

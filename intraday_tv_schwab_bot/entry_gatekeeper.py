@@ -322,7 +322,7 @@ class EntryGatekeeper:
                 if isinstance(ms_ltf_fields, Mapping):
                     out.update({k: v for k, v in ms_ltf_fields.items() if v is not None})
                 current_price = safe_float(out.get('close'), None)
-                sr_ctx = self.data.get_support_resistance(candidate.symbol, current_price=current_price, flip_frame=frame, mode="trading", timeframe_minutes=self.strategy.htf_minutes(), lookback_days=self.strategy.htf_lookback_days())
+                sr_ctx = self.data.get_support_resistance(candidate.symbol, current_price=current_price, flip_frame=frame, mode="trading", timeframe_minutes=self.strategy.htf_minutes())
                 mshtf_ctx = getattr(sr_ctx, 'market_structure', None) if sr_ctx is not None else None
                 if mshtf_ctx is not None:
                     mshtf_fields = structure_lists(mshtf_ctx, prefix='mshtf')
@@ -965,7 +965,6 @@ class EntryGatekeeper:
         if not candidates_for_signals:
             return
         candidate_by_symbol = {c.symbol: c for c in candidates_for_signals}
-        self.strategy.prefetch_entry_market_data(candidates_for_signals, bars, self.positions, data=self.data)
         signals = self.strategy.entry_signals(candidates_for_signals, bars, self.positions, client=self.client, data=self.data)
         policy = self.strategy.entry_policy
         # The opt-in divergence-only entries (shared_entry.use_divergence_

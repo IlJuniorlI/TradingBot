@@ -22,7 +22,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     file, not the console): `start`, `total_s` and a `<phase>_s` for each
     phase that took a millisecond or more, in the order they run:
     `reconcile`, `screener` (with the cycle gate), `watchlist`, `history`,
-    `sr_fetch`, `stream`, `frame`, `sr`, `contexts`, `warmup`, `quotes`
+    `daily_history`, `htf_refresh` (the HTF refresh points, added up),
+    `stream`, `frame`, `sr`, `contexts`, `warmup`, `quotes`
     (with the account marks), `manage` (the entry-order settle and
     `manage_positions`, a live exit's re-sends included), `entries`,
     `publish`, `error`, `housekeeping` and `sleep`; the phases are
@@ -594,6 +595,124 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gates ran, which were exempt and what the shared score was.
 
 ### Changed
+
+- **No read fetches HTF bars: the engine fetches them on its fetch pool, at
+  the start of the cycle and again before management, the entries and the
+  dashboard publish (study F, Stage 1a).** *2026-09-28* — until now the
+  cycle fetched its watchlist's HTF frames at its start, when a bar had
+  closed 10 s before, and every read after that settle that passed
+  `allow_refresh` fetched its own symbol, one at a time: the dashboard
+  publish (the S/R rows, the HTF trend, each snapshot's HTF overlays and
+  level zones, while the gate refreshed market context), the adaptive
+  ladder's and `sr_flip`'s S/R reads, key_levels' ladder exit, the
+  strategies' entry reads (`_sr_context`, `_htf_context`, zero_dte's HTF
+  trend, the entry gatekeeper's candidate snapshot) and key_levels' and
+  zero_dte's entry prefetch (`prefetch_htf_contexts`). On the archived
+  top_tier days 64-76% of a day's 15m fetches ran in the publish, one symbol
+  at a time, and a 15m cycle took 30-53 s against the usual 20-27 s, all of
+  it before the next management pass.
+  - `MarketDataStore.refresh_htf_frame` is the only HTF fetch.
+    `IntradayBot._refresh_htf_frames` runs it on the fetch pool
+    (`runtime.cycle_precompute_workers`) for each symbol a read can ask
+    for (the watchlist, the quote watchlist, the candidates, each
+    position's underlying and reference symbol; the feed keeps frames for
+    S/R symbols only) whose HTF bar settled (`htf_refresh_due`: the
+    strategy's `htf_minutes()`, 10 s after the boundary): at the start of
+    the cycle and again before management, the entries and the publish, so
+    a bar that settles mid-cycle reaches the rest of the cycle at the next
+    of them. Each refresh point that fetches logs `HTF refresh (<point>):
+    <fetched>/<due> <tf>m frame(s) in <s>s[; failed: <symbols>]` at INFO.
+  - A symbol is fetched at most once a cycle. A failed fetch is logged with
+    its type (`HTF frame refresh failed for AAPL (15m): ConnectionError:
+    ...`), the frame keeps its bars and stays due, and the next cycle
+    retries it: in an outage one fetch per symbol per cycle, where each read
+    used to retry it.
+  - After a mid-cycle refresh the refreshed symbols' trading-mode S/R
+    contexts are built again as the cycle's pre-warm builds them (on the
+    step frame, at its close): the cycle serves every later read the build
+    of its first read, which was otherwise whichever read came first.
+  - The reads lose `allow_refresh` and the arguments only a read-time fetch
+    used: `get_htf_frame`'s level arguments and lookback, and the
+    `lookback_days` of `get_htf_context`, `get_support_resistance`, the
+    strategies' `_default_htf_request` / `_symbol_htf_request` and
+    `_htf_context`, and the dashboard level spec (with its
+    `timeframe_minutes`: the zones read the strategy's own HTF frame, and a
+    manifest's `capabilities.dashboard.level_context` naming either key is
+    refused at load, naming it). Gone with them: `fetch_support_resistance`
+    (the cycle's old fetch, which also built a default-mode S/R context
+    only `sr_cache` held, and nothing read), `prefetch_htf_contexts`,
+    `should_refresh_support_resistance`, `DashboardCache.
+    snapshot_should_bypass_cache` (it rebuilt a snapshot whose read would
+    have fetched) and `BaseStrategy.prefetch_entry_market_data` with its
+    two overrides (below).
+  - CYCLE_TIMING: the `sr_fetch` phase (the old fetch at the cycle start)
+    is gone. `htf_refresh` holds the four refresh points, each entered
+    where it runs and added up (a mid-cycle point's S/R rebuild included),
+    and `daily_history` the daily-history prefetch (below), so neither
+    lands in the `quotes`, `manage`, `entries` or `publish` phases the
+    stage 1c comparison reads.
+  - What changes. A cycle that starts after the settle reads the frames it
+    read before: the refresh covers every symbol a read asked for, with the
+    same lookback. When a bar settles mid-cycle, management, the entries
+    and the publish after the next refresh point read the new bar; before,
+    their S/R reads kept the cycle's older pre-warmed context and only the
+    reads that fetched saw the new bar. A bar that settles during the entry
+    pass or the publish reaches the next cycle, where a read-time fetch
+    would have given the rest of that pass the new bar (the entry pass is
+    0.7-1.9 s on production; accepted until Stage 2's tick points). The
+    support_resistance-level HTF context the old fetch built as a side
+    effect is built by its first reader, at that read's close.
+  - Measured on study F's harness (the real step on 2026-09-24's archived
+    bars, a price_history call 0.40 s, 4 workers; 9 boundaries a side, at
+    10:15, 11:00 and 13:30, three start offsets each): before, the 15m cycle
+    took 12.8-22.3 s against 8.4 s (21.5-22.3 s when the bar settled inside
+    it and the publish fetched the 28 symbols one at a time), the management
+    gap across the boundary 12.7-24.3 s (median 19.2) and the last frame
+    landed 4.9-21.4 s after the settle (median 11.1). With the refresh
+    points the cycle takes 12.3-15.6 s wherever the bar settles, the gap
+    15.1-17.4 s (median 16.0), and the frames land 4.0-7.1 s after the
+    settle (median 5.2), all fetched at a refresh point. Replayed step by
+    step under a virtual clock (09-24 whole day, 09-25 to 12:30), the 1,477
+    cycles in which the bar settles between cycles make the same decisions,
+    signals, positions and trades as before, every HTF read seeing the same
+    frame; where it settles inside a cycle no read is older than before, and
+    only those cycles' skip reasons change.
+
+- **top_tier's daily history is fetched on the fetch pool from the prewarm
+  on, not inside the first entry pass, and a failed fetch is retried until
+  the first entry window (study F, Stage 1b).** *2026-09-28* —
+  `BaseStrategy.prefetch_entry_market_data`, a hook the entry pass called,
+  is replaced by `daily_history_symbols(watchlist)`: the symbols whose daily
+  history the strategy's entries read. top_tier's (small_cap_squeeze's too)
+  names each watchlist symbol and its benchmark, the first of its index
+  ETFs; the base names none. `IntradayBot._prefetch_daily_history` fetches
+  those not fetched yet today (`MarketDataStore.daily_history_due`) on the
+  fetch pool while the gate refreshes market context: from the prewarm
+  (09:15 on the top_tier preset), and later for a symbol that joins the
+  watchlist. Until now `_symbol_daily_stats` fetched each symbol's 180 days
+  inside `entry_signals`, one at a time: on 2026-09-24 and 09-25 the 09:35
+  entry pass waited about 10 s on 28 fetches, with nothing managed
+  meanwhile. key_levels' and zero_dte's overrides of the old hook (a serial
+  HTF prefetch inside the entry pass) are gone: the engine refreshes those
+  frames before the entries. On study F's harness (09-24 and 09-25, 0.40 s
+  a call) the 09:35 entry pass took 14.4 / 14.6 s (13.6 s of it the daily
+  fetches), its cycle 18.9 / 19.5 s and the management gap after it 23.0 /
+  24.0 s; now 2.5 s, 7.1 / 7.2 s and 11.5 / 11.8 s, and the pooled fetch
+  takes 3.3-3.4 s of one prewarm cycle.
+  - A fetch that raises is no longer cached as failed for the day at once:
+    the prefetch fetches it again `DAILY_HISTORY_RETRY_SECONDS` (60 s) after
+    it failed, cycle after cycle, until one answers or the day's first
+    entry window opens (`StrategySchedule.before_first_entry`; 09:35 on the
+    preset, 20 minutes after the prewarm); from then on a failure stays
+    cached for the day, as before. A read
+    (`get_daily_history`) never fetches a failed symbol again that day, and
+    a response with no completed session is an answer, cached for the day.
+    `MarketDataStore.fetch_daily_history` is the fetch (the prefetch's, and
+    a read's when nothing is stored for today);
+    `daily_history_due(symbol, *, retry_failed)` says which symbols are
+    due. The failure's WARNING names the error type and no longer carries a
+    traceback: `Daily price_history fetch failed for NVDA: ReadTimeout:
+    ...; no daily stats for it until a fetch succeeds.`
 
 - **`execution.bracket_stop_order_type` defaults to `STOP` (was
   `STOP_LIMIT`).** *2026-09-28* — a broker bracket's resting protective stop
@@ -3592,6 +3711,26 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `levels_shared.find_divergence` a required `bar_clock`.
 
 ### Fixed
+
+- **The daily history holds completed sessions only.** *2026-09-28* —
+  during the session Schwab's daily `price_history` ends with today's
+  forming bar (every archived fetch of 2026-09-18..25 counted it), and
+  `MarketDataStore.get_daily_history` cached it for the day as it stood at
+  the fetch. top_tier's 20-session ADR (its `vol_scale`) and 60-session
+  sector beta therefore took five minutes of the session at the 09:35 entry
+  pass, fifteen at 09:45 (09-21, 09-22) and three hours after the 12:35
+  restart (09-23). On the archived days that partial bar's true range was a
+  median 0.62 of a full session's (0.28-1.33, p10-p90), so it moved the ADR
+  by a median -1.9% (-3.6% to +1.6%), and `vol_scale` and every threshold it
+  scales with it (a decision change on top_tier and small_cap_squeeze). The
+  bars dated today (ET) are left out now, so the frame no longer depends on
+  when it was fetched, which the prewarm fetch needs (above): before the
+  open there is no bar for today. A response with only today's bar is no
+  history (a WARNING, cached for the day). The trim rests on Schwab
+  stamping a daily candle at its day's midnight Central, which the replays'
+  synthetic daily bars cannot check: on the first dry-run day each `Daily
+  history for X: N sessions` line should show N one lower than the
+  archived days' (124-125).
 
 - **A filled exit's slippage reaches its record, for every exit on a level,
   signed; and a stop moved while a scale-out slice works is logged.**

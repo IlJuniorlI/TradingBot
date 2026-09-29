@@ -728,7 +728,7 @@ class TradeManager:
         if frame is None or frame.empty or last_price <= 0:
             return
         symbol = str(position.metadata.get("underlying") or position.symbol)
-        sr_ctx = self.data.get_support_resistance(symbol, current_price=last_price, flip_frame=frame, mode="trading", timeframe_minutes=self.strategy.htf_minutes(), lookback_days=self.strategy.htf_lookback_days()) if self.data is not None else None
+        sr_ctx = self.data.get_support_resistance(symbol, current_price=last_price, flip_frame=frame, mode="trading", timeframe_minutes=self.strategy.htf_minutes()) if self.data is not None else None
         if sr_ctx is None:
             return
         last = frame.iloc[-1]
@@ -940,7 +940,7 @@ class TradeManager:
                                     f"unknown ({price_at!r}); taking the target without a hold")
             return
         symbol = str(meta.get("underlying") or position.symbol)
-        sr_ctx = self.data.get_support_resistance(symbol, current_price=last_price, flip_frame=frame, mode="trading", timeframe_minutes=self.strategy.htf_minutes(), lookback_days=self.strategy.htf_lookback_days(), allow_refresh=True) if self.data is not None else None
+        sr_ctx = self.data.get_support_resistance(symbol, current_price=last_price, flip_frame=frame, mode="trading", timeframe_minutes=self.strategy.htf_minutes()) if self.data is not None else None
         # A level buffer that is not a finite number is no buffer, and one at
         # or below 0 never beats the price term: the zone and price terms set
         # the stop buffer then.

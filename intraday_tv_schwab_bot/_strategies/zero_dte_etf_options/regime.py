@@ -168,17 +168,12 @@ class RegimeMixin:
             return 0.0
         return max(0.0, float(recent["high"].max()) - float(recent["low"].min())) / ref
 
-    def _htf_trend_context(self, symbol: str, data, *, allow_refresh: bool = True) -> dict[str, Any]:
+    def _htf_trend_context(self, symbol: str, data) -> dict[str, Any]:
         p = self.params
         if data is None or not hasattr(data, "get_htf_frame"):
             return {"available": False, "reason": "no_data_feed"}
         htf_tf = self.htf_minutes()
-        frame = data.get_htf_frame(
-            symbol,
-            timeframe_minutes=htf_tf,
-            lookback_days=self.htf_lookback_days(),
-            allow_refresh=allow_refresh,
-        )
+        frame = data.get_htf_frame(symbol, timeframe_minutes=htf_tf)
         min_bars = int(p.get("htf_min_bars", 20))
         summary = summarize_htf_trend(
             frame,

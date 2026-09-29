@@ -409,17 +409,17 @@ class BaseStrategy(ContextBuildersMixin):
         return bool(self._capability("dashboard.allow_generic_level_fallback", False))
 
     def dashboard_level_context_spec(self) -> dict[str, Any] | None:
-        """The HTF level build the dashboard's key-level zones use. A level
-        parameter the strategy does not declare as ``htf_*`` comes from
-        ``support_resistance``, the values it trades on; until 2026-09-23 it
-        fell back to 60m / 60 days / 6 levels / 0.35 ATR, so top_tier's zones
-        (and every other preset without htf_* params) were a build the
-        strategy never used."""
+        """The HTF level build the dashboard's key-level zones use, on the
+        strategy's own HTF frame (``htf_minutes()``, the one the engine
+        refreshes; the spec names no timeframe or lookback since 2026-09-28,
+        as no read fetches another). A level parameter the strategy does not
+        declare as ``htf_*`` comes from ``support_resistance``, the values it
+        trades on; until 2026-09-23 it fell back to 60m / 60 days / 6 levels
+        / 0.35 ATR, so top_tier's zones (and every other preset without htf_*
+        params) were a build the strategy never used."""
         params = self.params if isinstance(self.params, dict) else {}
         sr_cfg = self.config.support_resistance
         spec = {
-            "timeframe_minutes": max(1, self.htf_minutes()),
-            "lookback_days": max(1, self.htf_lookback_days()),
             "pivot_span": max(1, int(params.get("htf_pivot_span", sr_cfg.pivot_span))),
             "max_levels_per_side": max(1, int(params.get("htf_max_levels_per_side", sr_cfg.max_levels_per_side))),
             "atr_tolerance_mult": float(params.get("htf_atr_tolerance_mult", sr_cfg.atr_tolerance_mult)),
@@ -1120,8 +1120,16 @@ class BaseStrategy(ContextBuildersMixin):
     def entry_signals(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], client=None, data=None) -> list[Signal]:
         raise NotImplementedError
 
-    def prefetch_entry_market_data(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], data=None) -> None:
-        return None
+    def daily_history_symbols(self, watchlist: list[str]) -> list[str]:
+        """Symbols whose daily history (``MarketDataStore.get_daily_history``)
+        this strategy's entries read, given the cycle's watchlist: the engine
+        fetches them on its fetch pool from the prewarm on
+        (``IntradayBot._prefetch_daily_history``), so no entry pass waits on
+        them. None here. Replaced ``prefetch_entry_market_data`` (2026-09-28),
+        which ran inside the entry pass; its two overrides fetched HTF frames
+        there one symbol at a time, which the engine's HTF refresh now does
+        before the entries."""
+        return []
 
     def should_force_flatten(self, position: Position) -> bool:
         return False

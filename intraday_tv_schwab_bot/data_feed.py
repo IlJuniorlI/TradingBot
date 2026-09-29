@@ -48,6 +48,12 @@ MANAGEMENT_PRICE_KEYS = ("mark", "last", "close")
 EXECUTION_LAST_KEYS = ("last", "mark", "close")
 DISPLAY_PRICE_KEYS = ("last", "mark", "mid", "close", "bid", "ask")
 
+# A daily-history fetch that raised is fetched again this long after it by
+# the engine's prefetch while the day's first entry window has not opened
+# (``MarketDataStore.daily_history_due``, ``IntradayBot._prefetch_daily_history``);
+# from the window on it stays cached for the day.
+DAILY_HISTORY_RETRY_SECONDS = 60.0
+
 
 @dataclass(slots=True)
 class MergeStats:
@@ -96,9 +102,11 @@ class MarketDataStore:
         # date, not "not fetched yet" — last_daily_refresh distinguishes.
         self.daily_history: dict[str, pd.DataFrame | None] = {}
         self.last_daily_refresh: dict[str, date] = {}
+        # When today's fetch of a symbol raised, while no later fetch has
+        # answered (daily_history_due retries it).
+        self.daily_history_failed_at: dict[str, datetime] = {}
         self.live: dict[str, pd.DataFrame] = {}
         self.quote_cache: dict[str, dict] = {}
-        self.sr_cache: dict[tuple[str, int], SupportResistanceContext] = {}
         # One HTF frame per (symbol, tf): completed bars only, inside the
         # 07:00-20:00 equity stream window (see _refresh_htf_frame).
         self.history_htf: dict[tuple[str, int], pd.DataFrame] = {}
@@ -210,14 +218,6 @@ class MarketDataStore:
     def _symbol_key(symbol: str) -> str:
         return str(symbol).upper().strip()
 
-    def should_refresh_support_resistance(self, symbol: str, *, timeframe_minutes: int | None = None) -> bool:
-        cfg = getattr(self.config, "support_resistance", None)
-        if cfg is None or not bool(cfg.enabled) or not is_support_resistance_symbol(symbol):
-            return False
-        tf = int(timeframe_minutes or getattr(cfg, "timeframe_minutes", 15) or 15)
-        return self.should_refresh_htf_context(symbol, tf)
-
-
     @staticmethod
     def _htf_key(symbol: str, timeframe_minutes: int) -> tuple[str, int]:
         return str(symbol).upper().strip(), int(timeframe_minutes)
@@ -273,7 +273,6 @@ class MarketDataStore:
             self.history_htf = {k: v for k, v in self.history_htf.items() if k[0] not in stale}
             self.htf_cache = {k: v for k, v in self.htf_cache.items() if k[0] not in stale}
             self.last_htf_refresh = {k: v for k, v in self.last_htf_refresh.items() if k[0] not in stale}
-            self.sr_cache = {k: v for k, v in self.sr_cache.items() if k[0] not in stale}
         return len(stale)
 
     def begin_cycle(self) -> None:
@@ -359,7 +358,12 @@ class MarketDataStore:
         return 1
 
     def should_refresh_htf_context(self, symbol: str, timeframe_minutes: int) -> bool:
-        """Bar-aligned HTF refresh gate.
+        """Bar-aligned HTF refresh gate: True once an HTF bar has closed
+        (+10 s) since ``symbol``'s frame was fetched, or when none was; never
+        for a symbol with no S/R (``is_support_resistance_symbol``: a market
+        internal such as $TICK, an option), which keeps no HTF frame. The
+        engine's HTF refresh (``IntradayBot._refresh_htf_frames``) acts on
+        it; no read does (``refresh_htf_frame``).
 
         New HTF data only arrives at HTF bar boundaries — within a single bar
         window the broker has nothing new to give us. This replaces the prior
@@ -378,18 +382,29 @@ class MarketDataStore:
         A 10-second settle buffer is applied so we don't fetch at exactly
         ``:30:00`` — gives the broker time to aggregate the just-closed bar.
         """
-        key = self._htf_key(symbol, timeframe_minutes)
-        last = self.last_htf_refresh.get(key)
-        if last is None:
-            return True
+        return bool(self.htf_refresh_due([symbol], timeframe_minutes))
+
+    def htf_refresh_due(self, symbols: Iterable[str], timeframe_minutes: int) -> list[str]:
+        """The ``symbols`` (in their order) whose ``timeframe_minutes`` frame
+        ``should_refresh_htf_context`` says is due, the clock and its bucket
+        read once: the engine asks for every symbol at each refresh point
+        (``IntradayBot._refresh_htf_frames``), and a bucket floor costs about
+        0.3 ms. A frame fetched before the current bucket started is fetched
+        in an earlier bucket: the buckets tile the day, so that is the
+        comparison of the two buckets' starts, with one floor fewer."""
         tf_min = max(1, int(timeframe_minutes))
-        last_bucket = session_bucket_floor(last, tf_min)
         now = sessions.now_et()
         now_bucket = session_bucket_floor(now, tf_min)
-        if now_bucket <= last_bucket:
-            return False
-        settle_buffer = timedelta(seconds=10)
-        return (now - now_bucket) >= settle_buffer
+        settled = (now - now_bucket) >= timedelta(seconds=10)
+        due: list[str] = []
+        for symbol in symbols:
+            if not is_support_resistance_symbol(symbol):
+                continue
+            with self._lock:
+                last = self.last_htf_refresh.get(self._htf_key(symbol, tf_min))
+            if last is None or (settled and last < now_bucket):
+                due.append(symbol)
+        return due
 
     @staticmethod
     def _ohlcv_columns(frame: pd.DataFrame | None) -> pd.DataFrame:
@@ -481,6 +496,37 @@ class MarketDataStore:
             return None
         return max(last_dt - timedelta(minutes=overlap_minutes), min_start)
 
+    def refresh_htf_frame(self, symbol: str, *, timeframe_minutes: int, lookback_days: int) -> bool:
+        """Fetch ``symbol``'s ``timeframe_minutes`` HTF bars now and store
+        them (``_refresh_htf_frame``): True when stored, False when the fetch
+        failed.
+
+        The only HTF fetch. The engine runs it on its fetch pool over every
+        symbol a read path reads, at each refresh point of its cycle, once
+        the symbol's HTF bar has closed (``should_refresh_htf_context``;
+        ``IntradayBot._refresh_htf_frames``). Every read (``get_htf_frame``,
+        ``get_htf_context``, ``get_support_resistance``) returns what is
+        stored and never fetches. Until 2026-09-28 a read could fetch: the
+        first read of a symbol after the boundary fetched it, one symbol at a
+        time, and the dashboard publish did most of a boundary's fetches,
+        which held the next management pass 15-30 s.
+
+        ``lookback_days`` sizes the window a full fetch requests and the
+        frame keeps (the strategy's ``htf_lookback_days()``). A failure is
+        logged with its type and absorbed, so one symbol's failed fetch fails
+        neither the cycle nor another symbol's fetch: the frame keeps its
+        bars, its refresh stays due, and the next cycle retries it. Broad
+        because the fetch goes through the Schwab client, which raises any
+        type (``_fetch_price_history_payload_with_aliases`` re-raises the
+        last one).
+        """
+        try:
+            self._refresh_htf_frame(symbol, timeframe_minutes, lookback_days)
+        except Exception as exc:
+            LOG.warning("HTF frame refresh failed for %s (%sm): %s: %s", symbol, timeframe_minutes, type(exc).__name__, exc)
+            return False
+        return True
+
     def _refresh_htf_frame(self, symbol: str, timeframe_minutes: int, lookback_days: int) -> None:
         """Fetch the (symbol, tf) HTF frame from Schwab and store it.
 
@@ -546,7 +592,6 @@ class MarketDataStore:
             # the 10:00 bucket it told should_refresh_htf_context the 09:45
             # bar was in, keeping it out of every context until 10:15.
             self.last_htf_refresh[key] = end
-            self.sr_cache.pop(key, None)
         self._invalidate_cycle_htf(symbol, tf)
 
     def _htf_context_from_stored_frame(
@@ -592,69 +637,11 @@ class MarketDataStore:
             self.htf_cache[cache_key] = _HTFCacheEntry(frame, as_of, session_open, ctx)
         return ctx
 
-    def prefetch_htf_contexts(
-        self,
-        symbols: Iterable[str],
-        *,
-        timeframe_minutes: int,
-        lookback_days: int = 60,
-        pivot_span: int = 2,
-        max_levels_per_side: int = 6,
-        atr_tolerance_mult: float = 0.35,
-        pct_tolerance: float = 0.0030,
-        stop_buffer_atr_mult: float = 0.25,
-        ema_fast_span: int = 50,
-        ema_slow_span: int = 200,
-        flip_confirmation_bars: int = 1,
-        use_prior_day_high_low: bool = True,
-        use_prior_week_high_low: bool = True,
-        include_fair_value_gaps: bool = True,
-        fair_value_gap_max_per_side: int = 4,
-        fair_value_gap_min_atr_mult: float = 0.05,
-        fair_value_gap_min_pct: float = 0.0005,
-    ) -> None:
-        requested = sorted({str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()})
-        if not requested:
-            return
-        stale_symbols = [
-            symbol
-            for symbol in requested
-            if self.should_refresh_htf_context(symbol, int(timeframe_minutes))
-        ]
-        if not stale_symbols:
-            return
-        LOG.info("Prefetching HTF context timeframe=%sm symbols=%s", int(timeframe_minutes), ",".join(stale_symbols))
-        for symbol in stale_symbols:
-            try:
-                self.get_htf_context(
-                    symbol,
-                    timeframe_minutes=int(timeframe_minutes),
-                    lookback_days=int(lookback_days),
-                    pivot_span=int(pivot_span),
-                    max_levels_per_side=int(max_levels_per_side),
-                    atr_tolerance_mult=float(atr_tolerance_mult),
-                    pct_tolerance=float(pct_tolerance),
-                    stop_buffer_atr_mult=float(stop_buffer_atr_mult),
-                    ema_fast_span=int(ema_fast_span),
-                    ema_slow_span=int(ema_slow_span),
-                    flip_confirmation_bars=int(flip_confirmation_bars),
-                    allow_refresh=True,
-                    use_prior_day_high_low=bool(use_prior_day_high_low),
-                    use_prior_week_high_low=bool(use_prior_week_high_low),
-                    include_fair_value_gaps=bool(include_fair_value_gaps),
-                    fair_value_gap_max_per_side=int(fair_value_gap_max_per_side),
-                    fair_value_gap_min_atr_mult=float(fair_value_gap_min_atr_mult),
-                    fair_value_gap_min_pct=float(fair_value_gap_min_pct),
-                )
-            except Exception as exc:
-                LOG.warning("HTF prefetch failed for %s (%sm): %s", symbol, timeframe_minutes, exc)
-
     def get_htf_context(
         self,
         symbol: str,
         *,
         timeframe_minutes: int,
-        lookback_days: int = 60,
         pivot_span: int = 2,
         max_levels_per_side: int = 6,
         atr_tolerance_mult: float = 0.35,
@@ -663,7 +650,6 @@ class MarketDataStore:
         ema_fast_span: int = 50,
         ema_slow_span: int = 200,
         flip_confirmation_bars: int = 1,
-        allow_refresh: bool = True,
         use_prior_day_high_low: bool = True,
         use_prior_week_high_low: bool = True,
         include_fair_value_gaps: bool = True,
@@ -673,11 +659,13 @@ class MarketDataStore:
     ) -> HTFContext | None:
         """HTF context for ``symbol`` built from its stored (symbol, tf) frame.
 
-        The frame is fetched at most once per HTF bar, by the first read with
-        ``allow_refresh`` after the boundary (``should_refresh_htf_context``);
-        ``lookback_days`` sizes that fetch. Every read then gets a context
-        built from the frame currently stored, rebuilt without an API call
-        the first time its cache key is read after the frame changed.
+        A read: it never fetches. The engine refreshes the frame once per HTF
+        bar (``refresh_htf_frame``); every read gets a context built from the
+        frame currently stored, rebuilt without an API call the first time
+        its cache key is read after the frame changed, and None while no
+        frame is stored. Until 2026-09-28 a read passing ``allow_refresh``
+        (every caller but the score context and the archive) fetched the
+        frame itself when its HTF bar had closed, one symbol at a time.
 
         Until 2026-09-23 a fetch rebuilt only the fetching caller's cache key
         but stamped the refresh clock every key shares, so every other key
@@ -687,10 +675,10 @@ class MarketDataStore:
         because the engine's default-FVG S/R refresh won every boundary.
 
         The HTF RSI divergence knobs are global: they are read here, from
-        ``technical_levels``, not passed by the caller, so every strategy,
-        the prefetch and the dashboard build the same divergence
-        (2026-09-24). Until then no caller passed them, and every build ran
-        with divergence on and a 6-bar age whatever the config said.
+        ``technical_levels``, not passed by the caller, so every strategy
+        and the dashboard build the same divergence (2026-09-24). Until then
+        no caller passed them, and every build ran with divergence on and a
+        6-bar age whatever the config said.
 
         The HTF pairs its pivots with the LTF's thresholds
         (``divergence_pivot_lookback``, ``divergence_min_price_move_pct``,
@@ -733,11 +721,6 @@ class MarketDataStore:
         with self._lock:
             if self._cycle_active and cache_key in self._cycle_htf_context_cache:
                 return self._cycle_htf_context_cache[cache_key]
-        if allow_refresh and is_support_resistance_symbol(symbol) and self.should_refresh_htf_context(symbol, tf):
-            try:
-                self._refresh_htf_frame(symbol, tf, int(lookback_days))
-            except Exception as exc:
-                LOG.warning("HTF frame refresh failed for %s (%sm): %s", symbol, tf, exc)
         ctx = self._htf_context_from_stored_frame(symbol, tf, cache_key, build_kwargs)
         with self._lock:
             if self._cycle_active:
@@ -868,41 +851,13 @@ class MarketDataStore:
                 self._cycle_ob_cache[cache_key] = copy.deepcopy(ctx)
         return copy.deepcopy(ctx)
 
-    def get_htf_frame(
-        self,
-        symbol: str,
-        *,
-        timeframe_minutes: int,
-        lookback_days: int = 60,
-        pivot_span: int = 2,
-        max_levels_per_side: int = 6,
-        atr_tolerance_mult: float = 0.35,
-        pct_tolerance: float = 0.0030,
-        stop_buffer_atr_mult: float = 0.25,
-        ema_fast_span: int = 50,
-        ema_slow_span: int = 200,
-        flip_confirmation_bars: int = 1,
-        allow_refresh: bool = True,
-    ) -> pd.DataFrame | None:
+    def get_htf_frame(self, symbol: str, *, timeframe_minutes: int) -> pd.DataFrame | None:
         """Copy of the stored (symbol, tf) HTF frame: completed bars built
-        from 07:00-20:00 bars only (see ``_refresh_htf_frame``). A refresh
-        due at this read goes through ``get_htf_context`` with these level
-        parameters, so it also primes the context they describe."""
-        if allow_refresh and self.should_refresh_htf_context(symbol, timeframe_minutes):
-            self.get_htf_context(
-                symbol,
-                timeframe_minutes=timeframe_minutes,
-                lookback_days=lookback_days,
-                pivot_span=pivot_span,
-                max_levels_per_side=max_levels_per_side,
-                atr_tolerance_mult=atr_tolerance_mult,
-                pct_tolerance=pct_tolerance,
-                stop_buffer_atr_mult=stop_buffer_atr_mult,
-                ema_fast_span=ema_fast_span,
-                ema_slow_span=ema_slow_span,
-                flip_confirmation_bars=flip_confirmation_bars,
-                allow_refresh=True,
-            )
+        from 07:00-20:00 bars only (see ``_refresh_htf_frame``), or None
+        while none is stored. A read: it never fetches (``refresh_htf_frame``).
+        Until 2026-09-28 a read passing ``allow_refresh`` fetched the frame
+        when its HTF bar had closed, with level parameters and a lookback
+        that only that fetch used."""
         with self._lock:
             frame = self.history_htf.get(self._htf_key(symbol, timeframe_minutes))
         return frame.copy() if frame is not None else None
@@ -1149,30 +1104,71 @@ class MarketDataStore:
             LOG.info("price_history returned no candles for %s outside regular session; using slower retry cadence", symbol)
         return self.get_merged(symbol)
 
+    def daily_history_due(self, symbol: str, *, retry_failed: bool) -> bool:
+        """True while ``symbol``'s daily history is not fetched for today's
+        ET date, and, with ``retry_failed``, while today's fetch raised
+        ``DAILY_HISTORY_RETRY_SECONDS`` or more ago and nothing has answered
+        since: the symbols the engine's daily prefetch fetches
+        (``IntradayBot._prefetch_daily_history``, which retries a failure
+        until the day's first entry window opens). A response with no
+        completed session is an answer, cached for the day."""
+        key = self._symbol_key(symbol)
+        now = sessions.now_et()
+        with self._lock:
+            if self.last_daily_refresh.get(key) != now.date():
+                return True
+            failed_at = self.daily_history_failed_at.get(key)
+        return retry_failed and failed_at is not None and (now - failed_at).total_seconds() >= DAILY_HISTORY_RETRY_SECONDS
+
     def get_daily_history(self, symbol: str, calendar_days: int = 180) -> pd.DataFrame | None:
-        """Daily OHLC bars for *symbol*, fetched at most once per ET date.
+        """Daily OHLC bars for *symbol*: what ``fetch_daily_history`` stored
+        for today's ET date (in memory; a new date fetches again), fetched
+        now when it has not run today.
 
         Feeds ``daily_stats`` (per-symbol ADR scale + benchmark beta), which
         needs a horizon the intraday store cannot provide — ``history`` spans
         ``runtime.history_lookback_minutes`` (hours, not months).
 
-        One Schwab ``price_history`` call per symbol per day, cached in
-        memory for the process lifetime and re-fetched when the ET date
-        rolls. Returns ``None`` on a failed or empty fetch; the caller must
-        treat that as "no stats available" rather than substituting a
-        default. A failure is cached for the day too, so a delisted or
-        mis-typed symbol does not retry on every cycle. A payload whose
-        candles do not read is a failed fetch; until 2026-09-26 its error
-        escaped uncached, so the fetch was retried every cycle.
+        Returns ``None`` on a failed or empty fetch; the caller must treat
+        that as "no stats available" rather than substituting a default. A
+        read never fetches again on the day of a failed fetch, so a delisted
+        or mis-typed symbol does not retry on every read; the engine's
+        prefetch retries a failure until the day's first entry window
+        (``daily_history_due``).
         """
         key = self._symbol_key(symbol)
-        today = sessions.now_et().date()
         with self._lock:
-            if self.last_daily_refresh.get(key) == today:
+            if self.last_daily_refresh.get(key) == sessions.now_et().date():
                 cached = self.daily_history.get(key)
                 return None if cached is None else cached.copy()
-        end = sessions.now_et()
-        start = end - timedelta(days=max(1, int(calendar_days)))
+        return self.fetch_daily_history(symbol, calendar_days)
+
+    def fetch_daily_history(self, symbol: str, calendar_days: int = 180) -> pd.DataFrame | None:
+        """Fetch *symbol*'s daily OHLC bars now (one Schwab ``price_history``
+        call) and store them for today's ET date; returns them, or ``None``.
+
+        A payload whose candles do not read is a failed fetch; until
+        2026-09-26 its error escaped uncached, so the fetch was retried every
+        cycle. A failed fetch is logged with its type and stored as ``None``
+        for the day with the time it failed (``daily_history_due``); one
+        with no completed session is logged and stored as ``None`` too, as
+        an answer. Broad because the fetch goes through the Schwab client,
+        which raises any type.
+
+        Completed sessions only: the bars dated before today (ET). During the
+        session Schwab's daily response ends with today's forming bar (the
+        archived 09:35 fetches of 2026-09-18..25 each counted it), and the
+        bar was cached for the day as of the fetch, so the ADR and the beta
+        took whatever the session had printed by then: five minutes of it at
+        the 09:35 entry pass, three hours after a 12:35 restart. Since
+        2026-09-28 the engine fetches in the prewarm, before the open
+        (``IntradayBot._prefetch_daily_history``), so the frame no longer
+        depends on when the fetch ran.
+        """
+        key = self._symbol_key(symbol)
+        now = sessions.now_et()
+        today = now.date()
+        start = now - timedelta(days=max(1, int(calendar_days)))
         try:
             payload, source_symbol = self._fetch_price_history_payload_with_aliases(
                 symbol,
@@ -1180,19 +1176,23 @@ class MarketDataStore:
                 frequencyType="daily",
                 frequency=1,
                 startDate=start,
-                endDate=end,
+                endDate=now,
                 needExtendedHoursData=False,
                 needPreviousClose=False,
             )
             frame = self._history_candles_to_frame(payload.get("candles", []))
-        except Exception:
-            LOG.warning("Daily price_history fetch failed for %s; daily stats unavailable today.", symbol, exc_info=True)
+        except Exception as exc:
+            LOG.warning("Daily price_history fetch failed for %s: %s: %s; no daily stats for it until a fetch succeeds.",
+                        symbol, type(exc).__name__, exc)
             with self._lock:
                 self.daily_history[key] = None
                 self.last_daily_refresh[key] = today
+                self.daily_history_failed_at[key] = now
             return None
+        if not frame.empty:
+            frame = frame.loc[frame.index < pd.Timestamp(today).tz_localize(EXCHANGE_TZ)]
         if frame.empty:
-            LOG.warning("Daily price_history returned no candles for %s (via %s).", symbol, source_symbol)
+            LOG.warning("Daily price_history returned no completed session for %s (via %s).", symbol, source_symbol)
             frame_or_none = None
         else:
             frame_or_none = frame
@@ -1200,81 +1200,8 @@ class MarketDataStore:
         with self._lock:
             self.daily_history[key] = frame_or_none
             self.last_daily_refresh[key] = today
+            self.daily_history_failed_at.pop(key, None)
         return None if frame_or_none is None else frame_or_none.copy()
-
-    def fetch_support_resistance(
-        self,
-        symbol: str,
-        *,
-        timeframe_minutes: int | None = None,
-        lookback_days: int | None = None,
-        use_prior_day_high_low: bool | None = None,
-        use_prior_week_high_low: bool | None = None,
-        allow_refresh: bool = True,
-    ) -> SupportResistanceContext | None:
-        cfg = getattr(self.config, "support_resistance", None)
-        if cfg is None or not bool(cfg.enabled) or not is_support_resistance_symbol(symbol):
-            return None
-        tf = int(timeframe_minutes or getattr(cfg, "timeframe_minutes", 15) or 15)
-        frame = self.get_htf_frame(
-            symbol,
-            timeframe_minutes=tf,
-            lookback_days=int(lookback_days or getattr(cfg, "lookback_days", 10) or 10),
-            pivot_span=int(getattr(cfg, "pivot_span", 2) or 2),
-            max_levels_per_side=int(getattr(cfg, "max_levels_per_side", 3) or 3),
-            atr_tolerance_mult=float(cfg.atr_tolerance_mult),
-            pct_tolerance=float(cfg.pct_tolerance),
-            stop_buffer_atr_mult=float(getattr(cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
-            allow_refresh=allow_refresh,
-        )
-        key = self._htf_key(symbol, tf)
-        resolved_use_prior_day_high_low = bool(
-            getattr(cfg, "use_prior_day_high_low", True)
-            if use_prior_day_high_low is None
-            else use_prior_day_high_low
-        )
-        resolved_use_prior_week_high_low = bool(
-            getattr(cfg, "use_prior_week_high_low", True)
-            if use_prior_week_high_low is None
-            else use_prior_week_high_low
-        )
-        use_cache = use_prior_day_high_low is None and use_prior_week_high_low is None
-        if frame is None or frame.empty:
-            if not use_cache:
-                return None
-            with self._lock:
-                return self.sr_cache.get(key)
-        current = None
-        merged = self.get_merged(symbol, with_indicators=False)
-        if merged is not None and not merged.empty:
-            current = float(merged.iloc[-1].close)
-        ctx = build_support_resistance_context(
-            frame,
-            current_price=current,
-            pivot_span=int(cfg.pivot_span),
-            max_levels_per_side=int(cfg.max_levels_per_side),
-            atr_tolerance_mult=float(cfg.atr_tolerance_mult),
-            pct_tolerance=float(cfg.pct_tolerance),
-            same_side_min_gap_atr_mult=float(cfg.same_side_min_gap_atr_mult),
-            same_side_min_gap_pct=float(cfg.same_side_min_gap_pct),
-            fallback_reference_max_drift_atr_mult=float(getattr(cfg, "fallback_reference_max_drift_atr_mult", 1.0) or 1.0),
-            fallback_reference_max_drift_pct=float(getattr(cfg, "fallback_reference_max_drift_pct", 0.01) or 0.01),
-            proximity_atr_mult=float(cfg.proximity_atr_mult),
-            breakout_atr_mult=float(cfg.breakout_atr_mult),
-            breakout_buffer_pct=float(cfg.breakout_buffer_pct),
-            stop_buffer_atr_mult=float(cfg.stop_buffer_atr_mult),
-            structure_eq_atr_mult=float(getattr(cfg, "structure_eq_atr_mult", 0.25)),
-            structure_event_max_age_bars=cfg.htf_structure_event_lookback(),
-            structure_min_range_atr_mult=float(getattr(cfg, "structure_min_range_atr_mult", 1.5) or 0.0),
-            use_prior_day_high_low=resolved_use_prior_day_high_low,
-            use_prior_week_high_low=resolved_use_prior_week_high_low,
-            timeframe_minutes=tf,
-        )
-        if use_cache:
-            with self._lock:
-                self.sr_cache[key] = ctx
-        return ctx
-
 
     def get_support_resistance(
         self,
@@ -1284,11 +1211,21 @@ class MarketDataStore:
         flip_frame: pd.DataFrame | None = None,
         mode: str = "default",
         timeframe_minutes: int | None = None,
-        lookback_days: int | None = None,
         use_prior_day_high_low: bool | None = None,
         use_prior_week_high_low: bool | None = None,
-        allow_refresh: bool = True,
     ) -> SupportResistanceContext | None:
+        """``symbol``'s S/R context on its stored (symbol, tf) HTF frame, or
+        None while none is stored (or support_resistance is off).
+
+        A read: it never fetches (``refresh_htf_frame``). Cached for the
+        cycle per (symbol, tf, mode, prior day, prior week): the first read
+        of a cycle builds it, with its ``current_price`` and ``flip_frame``,
+        and every later read in the cycle gets that build, until a refresh
+        of the frame drops it (``_invalidate_cycle_htf``). Until 2026-09-28
+        a read passing ``allow_refresh`` fetched the frame when its HTF bar
+        had closed, and a default-mode read without a price could be served
+        a context the step's own fetch had built (``sr_cache``, gone with
+        that fetch)."""
         cfg = getattr(self.config, "support_resistance", None)
         if cfg is None or not bool(cfg.enabled):
             return None
@@ -1300,39 +1237,18 @@ class MarketDataStore:
             self._symbol_key(symbol),
             tf,
             normalized_mode,
-            None if lookback_days is None else int(lookback_days),
             resolved_use_prior_day_high_low,
             resolved_use_prior_week_high_low,
         )
         with self._lock:
             if self._cycle_active and cycle_key in self._cycle_sr_cache:
                 return self._cycle_sr_cache[cycle_key]
-        key = self._htf_key(symbol, tf)
-        frame = self.get_htf_frame(
-            symbol,
-            timeframe_minutes=tf,
-            lookback_days=int(lookback_days or getattr(cfg, "lookback_days", 10) or 10),
-            pivot_span=int(getattr(cfg, "pivot_span", 2) or 2),
-            max_levels_per_side=int(getattr(cfg, "max_levels_per_side", 3) or 3),
-            atr_tolerance_mult=float(cfg.atr_tolerance_mult),
-            pct_tolerance=float(cfg.pct_tolerance),
-            stop_buffer_atr_mult=float(getattr(cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
-            allow_refresh=allow_refresh,
-        )
-        use_cache = use_prior_day_high_low is None and use_prior_week_high_low is None
-        with self._lock:
-            cached = self.sr_cache.get(key) if use_cache else None
+        frame = self.get_htf_frame(symbol, timeframe_minutes=tf)
         if frame is None or frame.empty:
-            result = cached
             with self._lock:
                 if self._cycle_active:
-                    self._cycle_sr_cache[cycle_key] = result
-            return result
-        if use_cache and current_price is None and cached is not None and normalized_mode == "default" and flip_frame is None and not self.should_refresh_support_resistance(symbol, timeframe_minutes=tf):
-            with self._lock:
-                if self._cycle_active:
-                    self._cycle_sr_cache[cycle_key] = cached
-            return cached
+                    self._cycle_sr_cache[cycle_key] = None
+            return None
         flip_1m, flip_5m = cfg.flip_confirmation_bars() if normalized_mode == "trading" else (0, 0)
         ctx = build_support_resistance_context(
             frame,
@@ -1359,9 +1275,6 @@ class MarketDataStore:
             flip_confirmation_5m_bars=flip_5m,
             timeframe_minutes=tf,
         )
-        if use_cache and normalized_mode == "default" and flip_frame is None:
-            with self._lock:
-                self.sr_cache[key] = ctx
         with self._lock:
             if self._cycle_active:
                 self._cycle_sr_cache[cycle_key] = ctx

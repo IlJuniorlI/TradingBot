@@ -261,7 +261,8 @@ class ContextBuildersMixin:
         return int(self.params.get("htf_minutes", fallback))
 
     def htf_lookback_days(self) -> int:
-        """Days of HTF history a refresh fetches: `params.htf_lookback_days`,
+        """Days of HTF history the engine's HTF refresh fetches and keeps
+        (``IntradayBot._refresh_htf_frames``): `params.htf_lookback_days`,
         else `support_resistance.lookback_days`."""
         fallback = int(self._support_resistance_setting("lookback_days", 10))
         return int(self.params.get("htf_lookback_days", fallback))
@@ -300,7 +301,6 @@ class ContextBuildersMixin:
             flip_frame=frame,
             mode="trading",
             timeframe_minutes=timeframe_minutes,
-            lookback_days=self.htf_lookback_days(),
             use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
             use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
         )
@@ -337,20 +337,19 @@ class ContextBuildersMixin:
 
     def _default_htf_request(self) -> dict[str, Any]:
         """The level arguments of the HTF context a strategy scores on: its
-        own HTF frame (``htf_minutes()`` / ``htf_lookback_days()``, the frame
-        the engine refreshes), the support_resistance level settings and its
-        HTF EMA spans. ``_htf_context`` adds the FVG arguments.
+        own HTF frame (``htf_minutes()``, the frame the engine refreshes),
+        the support_resistance level settings and its HTF EMA spans.
+        ``_htf_context`` adds the FVG arguments.
 
         The score context (``_default_htf_context_for_score``), the shared
-        FVG score term and zero_dte's entry read and prefetch all ask for it,
-        so they share one data-feed cache entry. Until 2026-09-27 each built
+        FVG score term and zero_dte's entry read all ask for it, so they
+        share one data-feed cache entry. Until 2026-09-27 each built
         its own copy, and the score context left out the FVG arguments (part
         of the cache key): with any FVG setting off its default, every
         preset's, it was a second build of the same frame."""
         ema_fast_span, ema_slow_span = htf_ema_spans(self.params)
         return {
             "timeframe_minutes": self.htf_minutes(),
-            "lookback_days": self.htf_lookback_days(),
             "pivot_span": int(self._support_resistance_setting("pivot_span", 2) or 2),
             "max_levels_per_side": int(self._support_resistance_setting("max_levels_per_side", 6) or 6),
             # Checked at load (above 0); a 0 read as 0.35 / 0.003 until
@@ -370,7 +369,7 @@ class ContextBuildersMixin:
 
     def _default_htf_context_for_score(self, symbol: str, data) -> HTFContext:
         """The HTF context a strategy scores on (``_default_htf_request``,
-        through ``_htf_context``). It never refreshes.
+        through ``_htf_context``).
 
         The shared entry policy scores a proposal's HTF RSI divergence on it
         when the proposal brings no HTF context of its own
@@ -388,7 +387,7 @@ class ContextBuildersMixin:
         None, which ``require_htf_ema_alignment`` reads as a neutral trend,
         so the error let the entry through.
         """
-        return self._htf_context(symbol, data, allow_refresh=False, **self._default_htf_request())
+        return self._htf_context(symbol, data, **self._default_htf_request())
 
     def _htf_context(
             self,
@@ -396,7 +395,6 @@ class ContextBuildersMixin:
         data,
         *,
         timeframe_minutes: int,
-        lookback_days: int,
         pivot_span: int,
         max_levels_per_side: int,
         atr_tolerance_mult: float,
@@ -407,14 +405,17 @@ class ContextBuildersMixin:
         current_price: float | None = None,
         use_prior_day_high_low: bool = True,
         use_prior_week_high_low: bool = True,
-        allow_refresh: bool = True,
     ) -> HTFContext:
+        """The HTF context of ``symbol``'s stored frame for these level
+        arguments and the strategy's FVG arguments (``htf_fvg_request``), or
+        the empty context while no frame is stored. A read: the engine
+        refreshes the frames (``IntradayBot._refresh_htf_frames``); until
+        2026-09-28 this read fetched a frame whose HTF bar had closed."""
         if data is None or not hasattr(data, "get_htf_context"):
             return empty_htf_context(current_price or 0.0, timeframe_minutes=timeframe_minutes)
         ctx = data.get_htf_context(
             symbol,
             timeframe_minutes=timeframe_minutes,
-            lookback_days=lookback_days,
             pivot_span=pivot_span,
             max_levels_per_side=max_levels_per_side,
             atr_tolerance_mult=atr_tolerance_mult,
@@ -424,7 +425,6 @@ class ContextBuildersMixin:
             ema_slow_span=ema_slow_span,
             use_prior_day_high_low=bool(use_prior_day_high_low),
             use_prior_week_high_low=bool(use_prior_week_high_low),
-            allow_refresh=bool(allow_refresh),
             **self.htf_fvg_request(),
         )
         if ctx is None:
@@ -433,10 +433,9 @@ class ContextBuildersMixin:
 
     def htf_fvg_request(self) -> dict[str, Any]:
         """The FVG arguments ``_htf_context`` builds every context with. They
-        are part of the data feed's context cache key, so a prefetch meant to
-        warm a context the strategy reads has to pass them too, and so does
-        the dashboard's HTF context read (until 2026-09-27 it resolved them
-        from the config itself)."""
+        are part of the data feed's context cache key, so the dashboard's HTF
+        context read passes them too (until 2026-09-27 it resolved them from
+        the config itself)."""
         return {
             "include_fair_value_gaps": bool(self._support_resistance_setting("htf_fair_value_gaps_enabled", True)),
             "fair_value_gap_max_per_side": int(self._support_resistance_setting("fair_value_gap_max_per_side", 4) or 4),
@@ -507,7 +506,7 @@ class ContextBuildersMixin:
         label = "Bullish" if bias == "bullish" else ("Bearish" if bias == "bearish" else "—")
         return {"state": bias, "label": label, "votes": f"{bull}v{bear}"}
 
-    def dashboard_htf_trend(self, symbol: str, data, price: float, *, allow_refresh: bool = True) -> dict[str, str] | None:
+    def dashboard_htf_trend(self, symbol: str, data, price: float) -> dict[str, str] | None:
         """The HTF trend the dashboard sidebar shows: ``{"state", "label"}``
         from the same read the strategy's decisions use, or None when the
         strategy has none (the sidebar then shows its generic read). Until

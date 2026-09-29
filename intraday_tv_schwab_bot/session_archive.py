@@ -915,8 +915,8 @@ def _export_htf_frames(data: Any, symbols: set[str], htf_minutes: int, htf_dir: 
     it -- it spans only the days the 1m history covers (09-21 07:00 onward
     in the 09-22 AAPL archive, against a 10-day HTF lookback) -- so without
     this folder an HTF level could not be traced to the bar that made it
-    (2026-09-23). allow_refresh=False: the exporter reads what the bot held
-    and never fetches.
+    (2026-09-23). The exporter reads what the bot held; a read never fetches
+    (``MarketDataStore.get_htf_frame``).
 
     ``(written, skipped)``, or None when the folder cannot be created (the
     manifest then has no entry for it).
@@ -931,7 +931,7 @@ def _export_htf_frames(data: Any, symbols: set[str], htf_minutes: int, htf_dir: 
     skipped = 0
     for symbol in sorted(symbols):
         try:
-            frame = data.get_htf_frame(symbol, timeframe_minutes=htf_minutes, allow_refresh=False) if data is not None else None
+            frame = data.get_htf_frame(symbol, timeframe_minutes=htf_minutes) if data is not None else None
         except Exception as exc:
             LOG.warning("Could not read the HTF frame for %s/%s: %s", symbol, htf_label, exc)
             frame = None
@@ -1260,8 +1260,8 @@ def export_session_archive(
     data
         DataFeed instance — used via ``data.get_merged(symbol, timeframe)``
         to pull the merged history+live frame for each symbol, and via
-        ``data.get_htf_frame(..., allow_refresh=False)`` for the stored HTF
-        frame (never a Schwab fetch from the exporter).
+        ``data.get_htf_frame(...)`` for the stored HTF frame (a read, never
+        a Schwab fetch).
     account
         PaperAccount (or live account tracker). Used to read
         ``account.realized_pnl`` and ``account.trades`` so closed-position
