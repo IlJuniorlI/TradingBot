@@ -177,6 +177,10 @@ runtime:
   # trades.csv for the day, and manifest.json. Disable to save disk if not
   # using dashboard/post-session analysis tooling.
   export_session_archive: true
+  # One POSITION_MARK record per held position per management pass (the
+  # mark, its bid / ask and quote time, the stop and target, the seconds
+  # since the pass before), at DEBUG: the log file, not the console.
+  log_position_marks: true
   reconcile_on_startup: true
   startup_reconcile_mode: block
   startup_order_lookback_days: 2

@@ -37,6 +37,7 @@ from __future__ import annotations
 import copy
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -61,7 +62,9 @@ from .position_metrics import (
     LADDER_TOUCH_HOLD_KEY,
     STOP_SOURCE_KEY,
     append_management_adjustment,
+    exit_level,
     exit_reason_details,
+    exit_slippage,
     favorable_move,
     initial_risk_per_unit,
     position_return_pct_at_price,
@@ -114,6 +117,36 @@ DISASTER_STOP_RETRY_SECONDS = 60.0
 POSITION_ERROR_TRACEBACK_EVERY = 10
 
 
+@dataclass(frozen=True, slots=True)
+class _Look:
+    """One management pass's read of a position's price: when (the wall
+    clock at the read), and the mark its levels were checked against.
+    ``entry_time`` ties it to the position it read, so a position opened
+    later under the same key never inherits it."""
+
+    entry_time: datetime
+    at: datetime
+    mark: float
+
+
+def _look_fields(previous: _Look | None, current: _Look | None) -> dict[str, Any]:
+    """The fields an EXIT_CONTEXT or POSITION_ADJUSTMENT record carries for
+    the management passes around it: ``managed_at``, the pass that decided
+    it (absent for an exit the broker filled); ``prev_managed_at`` and
+    ``prev_mark_price``, the pass before it, or for an exit the broker filled
+    the last pass before it was booked; ``managed_gap_s``, the seconds
+    between the two. A position's first pass has no pass before it."""
+    fields: dict[str, Any] = {}
+    if current is not None:
+        fields["managed_at"] = current.at.isoformat(timespec="milliseconds")
+    if previous is not None:
+        fields["prev_managed_at"] = previous.at.isoformat(timespec="milliseconds")
+        fields["prev_mark_price"] = previous.mark
+        if current is not None:
+            fields["managed_gap_s"] = round((current.at - previous.at).total_seconds(), 3)
+    return fields
+
+
 def _bar_time(frame: pd.DataFrame) -> pd.Timestamp | None:
     """The open time of ``frame``'s last bar in the exchange's time zone (a
     naive index is exchange time, as the feed's frames are), or None when the
@@ -157,6 +190,9 @@ class PositionManager:
         # Position key -> consecutive management cycles in which managing
         # that position raised; see _position_failed.
         self._failure_streaks: dict[str, int] = {}
+        # Position key -> the last management pass that read its price; see
+        # _take_look.
+        self._looks: dict[str, _Look] = {}
 
     # ------------------------------------------------------------------
     # Mark-price resolution for open positions.
@@ -476,6 +512,7 @@ class PositionManager:
                 stop_r = favorable_move(position.side, entry_price, stop_price) / initial_risk_per_unit
             if peak_price is not None:
                 peak_r = favorable_move(position.side, entry_price, peak_price) / initial_risk_per_unit
+        level, level_kind = exit_level(position, decision)
         management_symbol = str(meta.get('underlying') or position.symbol)
         management_frame = bars.get(management_symbol) if bars else None
         sr_fields = None
@@ -562,6 +599,10 @@ class PositionManager:
             'decision_last': safe_float((market_snapshot or {}).get('last'), None) if isinstance(market_snapshot, dict) else None,
             'decision_price': safe_float((market_snapshot or {}).get('decision_price'), None) if isinstance(market_snapshot, dict) else None,
             **exit_reason_details(decision),
+            # The level the exit is on (exit_level); a filled record adds how
+            # far past it the fill landed (_exit_fill_fields).
+            'exit_level': level,
+            'exit_level_kind': level_kind,
             **self._exit_bar_snapshot(management_frame),
         }
         if sr_fields is not None:
@@ -581,6 +622,75 @@ class PositionManager:
         extra = structured_metadata_snapshot(meta)
         payload.update({k: v for k, v in extra.items() if k not in payload and v is not None})
         return {k: v for k, v in payload.items() if v is not None}
+
+    @staticmethod
+    def _exit_fill_fields(position: Position, exit_context: dict[str, Any], fill_price: float) -> dict[str, Any]:
+        """A filled exit's ``exit_slippage``: how far its fill landed past
+        ``exit_level``, per unit, positive when worse for the position (see
+        ``position_metrics.exit_slippage``), and ``exit_slippage_r``, that in
+        the trade's initial R. Absent for an exit on no level, and for one
+        whose fill price is estimated."""
+        level = exit_context.get('exit_level')
+        if level is None:
+            return {}
+        slippage = exit_slippage(position.side, float(level), float(fill_price))
+        fields: dict[str, Any] = {'exit_slippage': round(slippage, 6)}
+        risk = exit_context.get('initial_risk_per_unit')
+        if risk is not None and risk > 0:
+            fields['exit_slippage_r'] = round(slippage / risk, 4)
+        return fields
+
+    # ------------------------------------------------------------------
+    # The management passes' reads of each position's price.
+    # ------------------------------------------------------------------
+
+    def _last_look(self, key: str, position: Position) -> _Look | None:
+        """The last management pass that read ``position``'s price, or None
+        (none has yet, or the last read was of an earlier position under
+        ``key``)."""
+        look = self._looks.get(key)
+        return look if look is not None and look.entry_time == position.entry_time else None
+
+    def _take_look(self, key: str, position: Position, last_price: float | None,
+                   market_snapshot: dict[str, Any] | None) -> tuple[_Look | None, _Look | None]:
+        """Record this pass's read of ``position``'s price; returns the pass
+        before it and this one. A pass without a price records nothing, and
+        the read before it stays the last. With ``runtime.log_position_marks``
+        on, logs the read (``_log_position_mark``)."""
+        previous = self._last_look(key, position)
+        if last_price is None:
+            return previous, None
+        look = _Look(position.entry_time, sessions.now_et(), float(last_price))
+        self._looks[key] = look
+        if self.config.runtime.log_position_marks:
+            self._log_position_mark(key, position, look, previous, market_snapshot)
+        return previous, look
+
+    def _log_position_mark(self, key: str, position: Position, look: _Look, previous: _Look | None,
+                           market_snapshot: dict[str, Any] | None) -> None:
+        """One POSITION_MARK record, at DEBUG (the log file, not the console):
+        when the pass read the price (``at``), the mark, the seconds since the
+        pass before (``gap_s``), the stop and target coming into the pass (a
+        ratchet this pass moves them: POSITION_ADJUSTMENT), and the quote the
+        mark came from, its ``source`` and its ``price_at`` (absent for a
+        strategy's own mark, the 0DTE strategies')."""
+        snapshot = market_snapshot if isinstance(market_snapshot, dict) else {}
+        payload = {
+            'symbol': key,
+            'side': position.side.value,
+            'at': look.at.isoformat(timespec="milliseconds"),
+            'mark': look.mark,
+            'gap_s': None if previous is None else round((look.at - previous.at).total_seconds(), 3),
+            'stop': safe_float(position.stop_price, None),
+            'target': safe_float(position.target_price, None),
+            'bid': safe_float(snapshot.get('bid'), None),
+            'ask': safe_float(snapshot.get('ask'), None),
+            'last': safe_float(snapshot.get('last'), None),
+            'source': snapshot.get('source'),
+            'price_at': snapshot.get('price_at'),
+        }
+        self.audit.log_structured("POSITION_MARK", {k: v for k, v in payload.items() if v is not None},
+                                  level=logging.DEBUG)
 
     # ------------------------------------------------------------------
     # Broker-side bracket lifecycle
@@ -632,7 +742,14 @@ class PositionManager:
         -- mirroring the manage_positions tail. Returns the realized P&L of
         the slice."""
         reason = decision.reason
-        exit_context = self._position_exit_context(position, decision, exit_price, exit_price, None, bars)
+        # The broker filled it: the pass before is the last one that read the
+        # price before it was booked.
+        exit_context = {
+            **self._position_exit_context(position, decision, exit_price, exit_price, None, bars),
+            **_look_fields(self._last_look(key, position), None),
+        }
+        if not fill_price_estimated:
+            exit_context.update(self._exit_fill_fields(position, exit_context, exit_price))
         exited_position = copy.copy(position)
         exited_position.qty = int(exit_qty)
         remaining_qty_after_exit = max(0, int(position.qty) - int(exit_qty))
@@ -1468,6 +1585,7 @@ class PositionManager:
             except Exception as exc:
                 self._position_failed(key, "its management", exc, failures, rest_runs=False)
         self._escalate_failures(failures)
+        self._looks = {key: look for key, look in self._looks.items() if key in self.positions}
         self._save_reconcile_metadata()
 
     def _position_failed(self, key: str, step: str, exc: Exception, failures: dict[str, str], *,
@@ -1508,6 +1626,29 @@ class PositionManager:
                 LOG.critical("POSITION DEGRADED — %s: its management failed %d consecutive cycles. Last: %s",
                              key, streak, failures[key])
 
+    def _log_position_adjustments(self, key: str, position: Position, last_price: float | None,
+                                  previous_look: _Look | None, look: _Look | None) -> None:
+        """One POSITION_ADJUSTMENT record per level move this pass's managers
+        made (``management_adjustments``), with the passes around it
+        (``_look_fields``)."""
+        adjustments = position.metadata.get("management_adjustments") if isinstance(position.metadata, dict) else None
+        for adj in adjustments or ():
+            if not isinstance(adj, dict):
+                continue
+            self.audit.log_structured("POSITION_ADJUSTMENT", {
+                "symbol": key,
+                "underlying": str(position.metadata.get("underlying") or position.symbol),
+                "asset_type": asset_type_of(position.metadata),
+                "manager": str(adj.get("manager") or "unknown"),
+                "kind": str(adj.get("kind") or "unknown"),
+                "reason": str(adj.get("reason") or "unknown"),
+                "from": safe_float(adj.get("from"), None),
+                "to": safe_float(adj.get("to"), None),
+                "source_level": safe_float(adj.get("source_level"), None),
+                "last_price": safe_float(last_price, None),
+                **_look_fields(previous_look, look),
+            })
+
     def _manage_position(self, now: datetime, key: str, position: Position, bars, order_states: dict[str, Any],
                          failures: dict[str, str], reprice_deadline: float) -> None:
         """One position's management cycle; see ``manage_positions``. It
@@ -1521,7 +1662,18 @@ class PositionManager:
             )
             return
         last_price, market_snapshot = self._position_management_snapshot(position, bars)
+        previous_look, look = self._take_look(key, position, last_price, market_snapshot)
+        # Always reset management_adjustments at the start of each cycle to
+        # prevent stale adjustments from persisting when price is unavailable.
+        # Ahead of the working-exit check: its risk check on a working
+        # slice's remainder can move the stop too.
+        if isinstance(position.metadata, dict):
+            position.metadata["management_adjustments"] = []
         if self._exit_order_in_flight(key, position, last_price, bars, order_states):
+            # A ratchet the remainder's risk check made while the slice works
+            # (_working_slice_remainder_exit) is on the record like any
+            # other. Until 2026-09-28 the next pass reset it unlogged.
+            self._log_position_adjustments(key, position, last_price, previous_look, look)
             return
         management_symbol = str(position.metadata.get("underlying") or position.symbol)
         management_frame = bars.get(management_symbol)
@@ -1531,10 +1683,6 @@ class PositionManager:
             underlying_price = self.underlying_price_for_position(position, bars, None)
             if underlying_price is None:
                 underlying_price = first_float(self.data.get_quote(management_symbol), "mark", positive=True)
-        # Always reset management_adjustments at the start of each cycle to
-        # prevent stale adjustments from persisting when price is unavailable.
-        if isinstance(position.metadata, dict):
-            position.metadata["management_adjustments"] = []
         decision: ExitDecision | None = None
         if last_price is not None:
             # The in-trade managers only move this position's levels, and the
@@ -1570,23 +1718,7 @@ class PositionManager:
             self._sync_bracket_children(key, position, last_price, bars)
             if key not in self.positions:
                 return
-            adjustments = position.metadata.get("management_adjustments") if isinstance(position.metadata, dict) else None
-            if adjustments:
-                for adj in adjustments:
-                    if not isinstance(adj, dict):
-                        continue
-                    self.audit.log_structured("POSITION_ADJUSTMENT", {
-                        "symbol": key,
-                        "underlying": str(position.metadata.get("underlying") or position.symbol),
-                        "asset_type": asset_type_of(position.metadata),
-                        "manager": str(adj.get("manager") or "unknown"),
-                        "kind": str(adj.get("kind") or "unknown"),
-                        "reason": str(adj.get("reason") or "unknown"),
-                        "from": safe_float(adj.get("from"), None),
-                        "to": safe_float(adj.get("to"), None),
-                        "source_level": safe_float(adj.get("source_level"), None),
-                        "last_price": safe_float(last_price, None),
-                    })
+            self._log_position_adjustments(key, position, last_price, previous_look, look)
         if decision is None:
             # The shared exits and the strategy's own only propose an exit. One
             # that raises proposes none this cycle; force flatten still applies.
@@ -1627,7 +1759,10 @@ class PositionManager:
                 interval=60.0, level=TRADEFLOW_LEVEL,
             )
             return
-        exit_context = self._position_exit_context(position, decision, last_price, underlying_price, market_snapshot, bars)
+        exit_context = {
+            **self._position_exit_context(position, decision, last_price, underlying_price, market_snapshot, bars),
+            **_look_fields(previous_look, look),
+        }
         if not self.executor.can_close_position_now(position, now):
             self.audit.log_cycle(
                 f"exit_gate:{key}",
@@ -1681,6 +1816,10 @@ class PositionManager:
             requested_qty = min(requested_qty, int(position.qty))
         result = self.executor.close_position(position, requested_qty, data=self.data, market_snapshot=market_snapshot,
                                               reprice_deadline=reprice_deadline)
+        if result.exit_limits_missed is not None:
+            # A live LIMIT exit's re-sends: how many of its limits missed, on
+            # every record of this attempt (the message's suffix says it too).
+            exit_context["exit_limits_missed"] = int(result.exit_limits_missed)
         # The remainder is owed a resting stop when this cycle cancelled
         # the bracket, or an earlier one left it down (2026-09-24): an
         # attempt that failed before reaching the broker used to leave
@@ -1747,12 +1886,8 @@ class PositionManager:
             # estimated, so the quantity is right and P&L reads flat.
             LOG.error("Exit fill price unavailable for %s after a filled close_position(); booking at entry price (estimated)", key)
             exit_price = float(position.entry_price)
-        # Exit slippage: how far the fill was from the intended level
-        if isinstance(position.metadata, dict):
-            if reason == "stop":
-                position.metadata["exit_slippage"] = round(abs(exit_price - float(position.stop_price)), 6)
-            elif reason == "target" and position.target_price is not None:
-                position.metadata["exit_slippage"] = round(abs(exit_price - float(position.target_price)), 6)
+        if fill_price is not None:
+            exit_context.update(self._exit_fill_fields(position, exit_context, fill_price))
         exited_position = copy.copy(position)
         exited_position.qty = exit_qty
         remaining_qty_after_exit = max(0, int(position.qty) - int(exit_qty))

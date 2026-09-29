@@ -59,6 +59,56 @@ RECONCILE_SETTLE_RETRY_SECONDS = 10.0
 DASHBOARD_TRACEBACK_EVERY = 30
 
 
+class _CycleTimer:
+    """Where one pass of the engine loop spent its wall time, phase by phase:
+    the CYCLE_TIMING record (``IntradayBot._log_cycle_timing``).
+
+    ``enter`` starts a phase and closes the one before it, so the phases are
+    contiguous and add up to the pass, from the reconcile check to the end of
+    the sleep; a phase entered again adds to its time. ``fail`` names the
+    phase a failed pass raised in and starts the error path's. ``facts`` are
+    the pass's counts (the watchlist, the positions management ran for, the
+    time since the last management pass). Durations are ``time.monotonic``;
+    only ``start`` is the wall clock.
+    """
+
+    def __init__(self) -> None:
+        self.started_at = sessions.now_et()
+        self.facts: dict[str, Any] = {}
+        self._seconds: dict[str, float] = {}
+        self._phase: str | None = None
+        self._since = self._started = time.monotonic()
+
+    def enter(self, phase: str) -> float:
+        """Start ``phase``; returns the monotonic time it started at."""
+        now = time.monotonic()
+        if self._phase is not None:
+            self._seconds[self._phase] = self._seconds.get(self._phase, 0.0) + (now - self._since)
+        self._phase, self._since = phase, now
+        return now
+
+    def fail(self) -> None:
+        self.facts["failed_phase"] = self._phase
+        self.enter("error")
+
+    def payload(self) -> dict[str, Any]:
+        """The record: ``start``, ``total_s``, a ``<phase>_s`` for each phase
+        that took a millisecond or more (one under that, or one the pass never
+        reached, is absent), and the facts. Counts the phase in progress up to
+        now."""
+        end = time.monotonic()
+        seconds = dict(self._seconds)
+        if self._phase is not None:
+            seconds[self._phase] = seconds.get(self._phase, 0.0) + (end - self._since)
+        record: dict[str, Any] = {
+            "start": self.started_at.isoformat(timespec="milliseconds"),
+            "total_s": round(end - self._started, 3),
+        }
+        record.update({f"{phase}_s": round(value, 3) for phase, value in seconds.items() if round(value, 3) > 0})
+        record.update(self.facts)
+        return record
+
+
 class _StopSignals:
     """SIGINT, SIGTERM, SIGHUP and SIGBREAK for the life of ``IntradayBot.run``.
 
@@ -181,6 +231,11 @@ class IntradayBot:
         self.last_error: str | None = None
         # Dashboard updates that failed in a row; see _publish_state.
         self._dashboard_failures = 0
+        # The loop pass in progress, whose phases step() times (_run_cycles
+        # starts one per pass), and when the last management pass started
+        # (time.monotonic), for the gap CYCLE_TIMING reports.
+        self._cycle_timer = _CycleTimer()
+        self._last_manage_monotonic: float | None = None
         # Memory-pressure prune cadence. Symbol-keyed state in
         # MarketDataStore + DashboardCache grows unbounded across cycles
         # as the screener returns new symbols day to day. Every
@@ -406,78 +461,107 @@ class IntradayBot:
         auto_exit = bool(self.config.runtime.auto_exit_after_session)
         consecutive_errors = 0
         while True:
+            # One CYCLE_TIMING record per pass, however it ends: a stop
+            # signal or the auto-exit included.
+            timer = self._cycle_timer = _CycleTimer()
             try:
-                # Ahead of the cycle: at 07:00 the first premarket cycle
-                # otherwise managed, and sent exits for, positions closed in
-                # the app overnight before the session-boundary reconcile
-                # dropped them (2026-09-25).
-                self._maybe_session_reconcile()
-                self.step()
-                self.last_error = None
-                consecutive_errors = 0
-            except Exception as exc:
-                consecutive_errors += 1
-                self.last_error = str(exc)
-                # Throttle log volume during sustained API outages: full
-                # tracebacks for the first few errors and every 10th after,
-                # otherwise a one-line warning. Keeps a single flapping API
-                # from filling the log file overnight.
-                first_line = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
-                if consecutive_errors <= 3 or consecutive_errors % 10 == 0:
-                    LOG.exception("Unhandled engine error (consecutive=%d): %s", consecutive_errors, exc)
-                else:
-                    LOG.warning("Engine error (consecutive=%d): %s", consecutive_errors, first_line)
-                # Escalation. The backoff below keeps retrying forever, which
-                # is right, but a sustained outage with positions open means
-                # nothing is managing them and a throttled WARNING is easy to
-                # miss. Say so loudly, and name what is exposed.
-                status_message = f"Error: {exc}"
-                escalation_message = self._error_escalation_message(consecutive_errors, first_line)
-                if escalation_message is not None:
-                    LOG.critical("%s", escalation_message)
-                    status_message = escalation_message
-                # The status publish evaluates the gate itself and logs its
-                # own failure (_publish_state). Until 2026-09-26 one that
-                # failed here escaped run() and stopped the bot on an error it
-                # only meant to report.
-                self._publish_state(
-                    sessions.now_et(),
-                    status_message,
-                    screening_active=False,
-                    streaming_active=self.data.has_stream_symbols(),
-                    management_active=False,
-                )
-            if auto_exit and not self.positions:
-                now = sessions.now_et()
-                now_t = now.time()
-                session = equity_session_state(now)
-                if not session.is_trading_day:
-                    # Non-trading day (weekend/holiday) — exit immediately
-                    LOG.info("Auto-exit: non-trading day, no open positions — shutting down")
-                    return
-                schedule = self.config.active_strategy.schedule()
-                # Exit after the latest of: RTH close, management window end,
-                # entry window end, screener window end.  This respects
-                # post-market windows configured in the strategy schedule.
-                all_ends = [session.rth_close_time]
-                for w in schedule.management_windows + schedule.entry_windows + schedule.screener_windows:
-                    all_ends.append(w.end)
-                exit_after = max(all_ends)
-                if now_t > exit_after:
-                    LOG.info("Auto-exit: all windows closed at %s, no open positions — shutting down", exit_after.strftime("%H:%M"))
-                    return
-            self._maybe_export_session_archive()
-            self._maybe_session_rollover_reset()
-            self._maybe_prune_inactive_symbols()
-            sleep_secs = self._cycle_sleep_seconds()
-            if consecutive_errors > 0:
-                # Exponential backoff: 2× per consecutive error, capped at
-                # 60s. Prevents tight-loop hammering of a flapping API.
-                # Each successful step() resets `consecutive_errors` to 0
-                # above, returning to normal cadence immediately.
-                backoff = min(60.0, sleep_secs * (2.0 ** min(consecutive_errors - 1, 5)))
-                sleep_secs = max(sleep_secs, backoff)
-            time.sleep(sleep_secs)
+                try:
+                    # Ahead of the cycle: at 07:00 the first premarket cycle
+                    # otherwise managed, and sent exits for, positions closed in
+                    # the app overnight before the session-boundary reconcile
+                    # dropped them (2026-09-25).
+                    timer.enter("reconcile")
+                    self._maybe_session_reconcile()
+                    self.step()
+                    self.last_error = None
+                    consecutive_errors = 0
+                except Exception as exc:
+                    timer.fail()
+                    consecutive_errors += 1
+                    self.last_error = str(exc)
+                    # Throttle log volume during sustained API outages: full
+                    # tracebacks for the first few errors and every 10th after,
+                    # otherwise a one-line warning. Keeps a single flapping API
+                    # from filling the log file overnight.
+                    first_line = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+                    if consecutive_errors <= 3 or consecutive_errors % 10 == 0:
+                        LOG.exception("Unhandled engine error (consecutive=%d): %s", consecutive_errors, exc)
+                    else:
+                        LOG.warning("Engine error (consecutive=%d): %s", consecutive_errors, first_line)
+                    # Escalation. The backoff below keeps retrying forever, which
+                    # is right, but a sustained outage with positions open means
+                    # nothing is managing them and a throttled WARNING is easy to
+                    # miss. Say so loudly, and name what is exposed.
+                    status_message = f"Error: {exc}"
+                    escalation_message = self._error_escalation_message(consecutive_errors, first_line)
+                    if escalation_message is not None:
+                        LOG.critical("%s", escalation_message)
+                        status_message = escalation_message
+                    # The status publish evaluates the gate itself and logs its
+                    # own failure (_publish_state). Until 2026-09-26 one that
+                    # failed here escaped run() and stopped the bot on an error it
+                    # only meant to report.
+                    self._publish_state(
+                        sessions.now_et(),
+                        status_message,
+                        screening_active=False,
+                        streaming_active=self.data.has_stream_symbols(),
+                        management_active=False,
+                    )
+                timer.enter("housekeeping")
+                if auto_exit and not self.positions:
+                    now = sessions.now_et()
+                    now_t = now.time()
+                    session = equity_session_state(now)
+                    if not session.is_trading_day:
+                        # Non-trading day (weekend/holiday) — exit immediately
+                        LOG.info("Auto-exit: non-trading day, no open positions — shutting down")
+                        return
+                    schedule = self.config.active_strategy.schedule()
+                    # Exit after the latest of: RTH close, management window end,
+                    # entry window end, screener window end.  This respects
+                    # post-market windows configured in the strategy schedule.
+                    all_ends = [session.rth_close_time]
+                    for w in schedule.management_windows + schedule.entry_windows + schedule.screener_windows:
+                        all_ends.append(w.end)
+                    exit_after = max(all_ends)
+                    if now_t > exit_after:
+                        LOG.info("Auto-exit: all windows closed at %s, no open positions — shutting down", exit_after.strftime("%H:%M"))
+                        return
+                self._maybe_export_session_archive()
+                self._maybe_session_rollover_reset()
+                self._maybe_prune_inactive_symbols()
+                sleep_secs = self._cycle_sleep_seconds()
+                if consecutive_errors > 0:
+                    # Exponential backoff: 2× per consecutive error, capped at
+                    # 60s. Prevents tight-loop hammering of a flapping API.
+                    # Each successful step() resets `consecutive_errors` to 0
+                    # above, returning to normal cadence immediately.
+                    backoff = min(60.0, sleep_secs * (2.0 ** min(consecutive_errors - 1, 5)))
+                    sleep_secs = max(sleep_secs, backoff)
+                timer.enter("sleep")
+                time.sleep(sleep_secs)
+            finally:
+                self._log_cycle_timing(timer)
+
+    def _log_cycle_timing(self, timer: _CycleTimer) -> None:
+        """One CYCLE_TIMING record for the pass ``timer`` timed, at DEBUG (the
+        log file, not the console): where the pass spent its time, phase by
+        phase, and ``manage_gap_s``, the time between two management passes,
+        which is how often an open position's stop and target are checked
+        (study F, stage 0). The phases, in the order they run: ``reconcile``
+        (the session reconcile check), ``screener`` (the cycle gate and the
+        screener), ``watchlist``, ``history`` (the 1m history fetch),
+        ``sr_fetch`` (the HTF fetch), ``stream``, ``frame`` (the step's
+        merged frames), ``sr`` and ``contexts`` (their precompute),
+        ``warmup``, ``quotes`` (the quote batch and the account marks),
+        ``manage`` (the entry-order settle and ``manage_positions``, a
+        missed live exit's re-sends included), ``entries``, ``publish`` (the dashboard), ``error`` (the error path
+        of a pass whose step raised, in ``failed_phase``), ``housekeeping``
+        (the auto-exit check, the archive, the rollover, the prune) and
+        ``sleep``. The session archive copies the records into
+        events.jsonl."""
+        self.audit.log_structured("CYCLE_TIMING", timer.payload(), level=logging.DEBUG)
 
     def _error_escalation_message(self, consecutive_errors: int, first_line: str) -> str | None:
         """Alarm text once the engine has failed ``error_escalation_cycles`` in
@@ -874,7 +958,9 @@ class IntradayBot:
         )
 
     def step(self) -> None:
-
+        # The phases CYCLE_TIMING reports (_log_cycle_timing).
+        timer = self._cycle_timer
+        timer.enter("screener")
         self.data.begin_cycle()
         try:
             now = sessions.now_et()
@@ -889,6 +975,7 @@ class IntradayBot:
                     f"Candidate cycle strategy={self.config.strategy} count={len(candidate_symbols)} symbols={','.join(candidate_symbols) if candidate_symbols else 'none'}",
                     interval=45.0,
                 )
+            timer.enter("watchlist")
             watchlist = self.strategy.active_watchlist(self.last_candidates, self.positions)
             # Normalize symbols to upper().strip() at the source so every
             # downstream consumer (parallel maps, bars.setdefault fallback,
@@ -921,6 +1008,8 @@ class IntradayBot:
             else:
                 watchlist_trace = self.strategy.watchlist_trace("active", self.last_candidates, self.positions)
                 self.audit.log_watchlist_trace("active", watchlist_trace)
+            timer.facts["watchlist"] = len(self.last_watchlist)
+            timer.enter("history")
 
             # Per-symbol history fetch decisions are made serially (they read
             # warmup_tracker state and are cheap), but the actual HTTP fetches
@@ -956,6 +1045,7 @@ class IntradayBot:
                     label="History fetch",
                 )
 
+            timer.enter("sr_fetch")
             if gate_state.context_refresh_active and getattr(self.config, "support_resistance", None) is not None and bool(self.config.support_resistance.enabled):
                 sr_tf = self.strategy.htf_minutes()
                 sr_lookback = self.strategy.htf_lookback_days()
@@ -982,11 +1072,13 @@ class IntradayBot:
                         label="Support/resistance fetch",
                     )
 
+            timer.enter("stream")
             if gate_state.streaming_active and self.last_watchlist:
                 self.data.start_streaming(self.last_watchlist)
             else:
                 self.data.stop_streaming()
 
+            timer.enter("frame")
             bars = self._parallel_symbol_map(
                 self.last_watchlist,
                 lambda symbol: self.data.get_merged(symbol, with_indicators=True),
@@ -994,10 +1086,14 @@ class IntradayBot:
             )
             for symbol in self.last_watchlist:
                 bars.setdefault(symbol, self.data.get_merged(symbol, with_indicators=True))
+            timer.enter("sr")
             self._prime_cycle_support_cache(bars, allow_refresh=False)
+            timer.enter("contexts")
             self._prime_cycle_context_cache(bars)
+            timer.enter("warmup")
             warmup_summary = self.warmup_tracker.warmup_summary(self.last_watchlist, bars=bars)
             self.warmup_tracker.log_warmup_summary(warmup_summary)
+            timer.enter("quotes")
 
             if gate_state.idle_closed_market:
                 self.last_quote_watchlist = []
@@ -1011,11 +1107,18 @@ class IntradayBot:
 
             self.account.mark_prices(self._extract_last_prices(bars))
             self.account.mark_prices(self._extract_position_marks())
+            timer.facts["managed"] = gate_state.management_active
             if gate_state.management_active:
+                manage_started = timer.enter("manage")
+                if self._last_manage_monotonic is not None:
+                    timer.facts["manage_gap_s"] = round(manage_started - self._last_manage_monotonic, 3)
+                self._last_manage_monotonic = manage_started
                 # Settle entry orders an earlier cycle could not, first, so a
                 # position they turn out to have opened is managed this cycle.
                 self.entry_gatekeeper.settle_unsettled_entry_orders()
+                timer.facts["positions"] = len(self.positions)
                 self.position_manager.manage_positions(now, bars)
+            timer.enter("entries")
             if self.startup_reconciler.trading_blocked_reason:
                 candidate_symbols = [c.symbol for c in self.last_candidates]
                 reasons: list[str] = []
@@ -1055,6 +1158,7 @@ class IntradayBot:
                     level=logging.DEBUG,
                 )
 
+            timer.enter("publish")
             # Re-mark only position marks — bar closes haven't changed since the earlier
             # mark_prices call above. Skipping _extract_last_prices here avoids iterating
             # the full bars dict a second time per tick.

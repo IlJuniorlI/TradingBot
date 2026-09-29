@@ -9,6 +9,96 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Every engine pass and every management pass is on the record:
+  CYCLE_TIMING, POSITION_MARK, the pass before on EXIT_CONTEXT and
+  POSITION_ADJUSTMENT, and a live exit's missed limits as a number.**
+  *2026-09-28* — logging only; no decision changes, live or dry run.
+  Studies B (O6) and F (stage 0) had to rebuild the management cadence and
+  the engine's previous look at a position from 1m bars and from log lines
+  that appear in only some phases; a top_tier pass takes about 24 s, which
+  sets how far past a level an exit is seen.
+  - **CYCLE_TIMING**, one per pass of the engine loop
+    (`IntradayBot._run_cycles`), light passes included, at DEBUG (the log
+    file, not the console): `start`, `total_s` and a `<phase>_s` for each
+    phase that took a millisecond or more, in the order they run:
+    `reconcile`, `screener` (with the cycle gate), `watchlist`, `history`,
+    `sr_fetch`, `stream`, `frame`, `sr`, `contexts`, `warmup`, `quotes`
+    (with the account marks), `manage` (the entry-order settle and
+    `manage_positions`, a live exit's re-sends included), `entries`,
+    `publish`, `error`, `housekeeping` and `sleep`; the phases are
+    contiguous and add up to `total_s`. It also carries `watchlist`,
+    `managed`, `positions` (those management ran for) and `manage_gap_s`,
+    the seconds between two management passes. A pass whose step raises
+    names the phase (`failed_phase`) and times its error path; a pass the
+    auto-exit or a stop signal ends is recorded too (the loop body is in a
+    `try` / `finally`). `step()` times its phases on the pass's
+    `_CycleTimer`.
+  - **POSITION_MARK** (`runtime.log_position_marks`, on in every preset,
+    the local `configs/config.yaml` included, and by default): one per held
+    position per management pass that read a price, at DEBUG: `at` (when
+    the pass read it), `mark`, `gap_s`, `stop` and `target` coming into the
+    pass, and the quote's `bid`, `ask`, `last`, `source` and `price_at`
+    (absent for the 0DTE strategies' own marks). Checked at load: `true` or
+    `false` (the runtime section's switches).
+  - **EXIT_CONTEXT and POSITION_ADJUSTMENT** carry `managed_at` (the pass
+    that decided them), `prev_managed_at` and `prev_mark_price` (the pass
+    before it and the mark it read) and `managed_gap_s`. An exit the broker
+    filled (a bracket child, the disaster stop, a working exit order)
+    carries the last pass before its booking and no `managed_at`; a
+    position's first pass has no pass before. `PositionManager` keeps the
+    last pass per position in memory (`_looks`, tied to the position's entry
+    time, dropped with it), not in the position store, so a restart starts
+    over and the store is not rewritten every pass.
+  - EXIT_CONTEXT names the level the exit is on: `exit_level` and
+    `exit_level_kind` (`stop`, `target`, `peak_giveback_floor`,
+    `touch_hold_guard`, `broker_stop`, `broker_target`, `disaster_stop`;
+    `position_metrics.exit_level`). A broker child's level is the price its
+    record says it rested at, the static disaster stop's included. The peak
+    giveback's three reason codes are named in `position_metrics`
+    (`PEAK_GIVEBACK`, `_HIGH_CONVICTION`, `_LOW_TIER`), which
+    `TradeManager.update_position` emits.
+  - Each attempt of a live LIMIT exit carries `exit_limits_missed` on
+    EXIT_CONTEXT: how many of its limits missed in the pass
+    (`OrderResult.exit_limits_missed`, set by the re-send loop; 0 when the
+    first order settled it). The result message's
+    `;exit_limits_missed=<n>` suffix stays (the settle reads the prefix
+    only). A dry run, a MARKET exit and an option's close carry none, so no
+    dry-run record changes.
+  - The session archive copies CYCLE_TIMING and POSITION_MARK into
+    `events.jsonl` (`_STRUCTURED_PREFIXES`). The existing lines and records
+    are unchanged but for the added fields.
+  - Log volume on the archived days (`review_scratch/liveprep/
+    LP3_instrumentation_tools/log_volume.py`: the passes are the quote
+    batches inside their span and inferred from the throttled markers
+    outside it; the line sizes are the patched code's own, from the real
+    loop on 2026-09-24's bars): CYCLE_TIMING about 390 bytes on a full pass
+    and 245 on a light one, a median 1.7 MB a day on the 18 top_tier days
+    (0.4-2.8 MB, 7.4% of the log), 3.3-5.4 MB on the small_cap and 0DTE
+    days (whose 3-5 s loops write logs of 2-6 MB); POSITION_MARK about 325
+    bytes, a median 0.1 MB a day on top_tier (0-1.3 MB), up to 2.0 MB on a
+    0DTE day; the new EXIT_CONTEXT and POSITION_ADJUSTMENT fields under 14
+    KB a day. A record per light pass is kept (they are DEBUG and
+    file-only); logging only the managed or entry passes would cut
+    top_tier's CYCLE_TIMING to about 0.4 MB a day and lose the premarket
+    and after-close cadence.
+  - Tests: `tests/composition/test_cycle_timing.py` (new: the real loop
+    over a real bot, a record per pass, the phases adding up, a failed
+    pass, a stop signal mid-step, the auto-exit's pass; the timer),
+    `tests/runtime/test_management_instrumentation.py` (new: the pass
+    before on each record, a pass without a price, a bracket fill, a
+    disaster stop's fill, a new position under the same key, the marks and
+    the knob, the level and the slippage per exit, the broker child codes
+    pinned against the booking's), `tests/runtime/test_exit_reprice.py`
+    (the count per outcome, on the records, and absent from a MARKET or
+    dry-run exit's), `tests/reporting/test_session_archive.py` (the two
+    DEBUG records reach `events.jsonl`), `tests/guards/test_preset_parity.py`
+    (the knob on in every preset and the local config). The engine shells
+    in `tests/composition/test_engine_shutdown.py` and
+    `tests/runtime/test_startup_reconciler.py` carry an `AuditLogger`, and
+    the recording audits in `tests/support/brokers.py` and
+    `tests/runtime/test_partial_exit.py` take the `level` a record is
+    logged at.
+
 - **A live LIMIT exit that misses is re-sent at a fresh quote in the same
   management pass, within one time budget per pass:
   `execution.exit_live_reprice_attempts` (2), `exit_live_reprice_step_frac`
@@ -3502,6 +3592,40 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `levels_shared.find_divergence` a required `bar_clock`.
 
 ### Fixed
+
+- **A filled exit's slippage reaches its record, for every exit on a level,
+  signed; and a stop moved while a scale-out slice works is logged.**
+  *2026-09-28* — `exit_slippage` was stamped for `stop` and `target` exits
+  only, as `abs(fill - level)`, and into the position metadata after the
+  exit's EXIT_CONTEXT had been built, where no record read it: the
+  structured snapshot does not carry it, so none of the 33 archived days
+  has it. The peak giveback, whose floor is the level a third of the
+  top_tier exits turn on (study B), had none.
+  - A filled EXIT_CONTEXT (the engine's, and one the broker filled) now
+    carries `exit_slippage`, measured from `exit_level`: the fill's
+    distance past it per unit, positive when worse for the position (a LONG
+    sold below it, a SHORT covered above it), negative when better; and
+    `exit_slippage_r`, that over the trade's initial risk. The profit
+    lock, trail and break-even exits are `stop` exits on the level they
+    set (`stop_source` names it); the peak giveback's is its floor; a
+    bracket child's, or the static disaster stop's, is the price it rested
+    at.
+  - None for an exit on no level (a time stop, a shared or strategy exit,
+    force flatten, the touch hold's close and timeout verdicts), nor for a
+    fill whose price is estimated. The position metadata no longer carries
+    it.
+  - While a scale-out slice works at the broker, the pass ends at the
+    working-exit check, whose risk check on the shares outside the slice
+    (`_working_slice_remainder_exit`) can still move the stop. That move
+    reached no record: the pass returned before the POSITION_ADJUSTMENT
+    records, and the next pass reset `management_adjustments` first. The
+    list is now reset ahead of the check and the pass logs what it moved
+    (`PositionManager._log_position_adjustments`, the one writer of the
+    record), with the pass before. The stop move itself applied before as
+    now; live only (a dry-run exit never works).
+  - Tests: `tests/runtime/test_management_instrumentation.py`
+    (`TestTheExitLevelAndSlippage`, `TestExitLevel`,
+    `TestAWorkingSlicesRatchet`).
 
 - **A startup refusal is logged to the day's log, `start_trading_bot.bat`
   keeps its window open after a failed run, and an error that ends the run

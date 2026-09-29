@@ -94,12 +94,14 @@ def _config_to_dict(config: Any) -> dict:
     return _redact_secrets(raw)
 
 
-# Recognized structured-event prefixes emitted by engine._log_structured.
-# Used by the events.jsonl extractor.
+# Recognized structured-event prefixes emitted by AuditLogger.log_structured.
+# Used by the events.jsonl extractor. CYCLE_TIMING (one per engine loop pass)
+# and POSITION_MARK (one per held position per management pass) are DEBUG
+# lines, in the log file only (2026-09-28).
 _STRUCTURED_PREFIXES = (
     "ENTRY_CONTEXT", "EXIT_CONTEXT", "TRADE_SUMMARY",
     "SKIP_SUMMARY", "SESSION_REPORT", "POSITION_ADJUSTMENT",
-    "ENTRY_CYCLE_SUMMARY",
+    "ENTRY_CYCLE_SUMMARY", "CYCLE_TIMING", "POSITION_MARK",
 )
 
 
@@ -1237,8 +1239,9 @@ def export_session_archive(
       moment of export (end-of-day daily fire or shutdown): equity
       curve, realized PnL by symbol, open positions, etc.
     - ``events.jsonl`` — structured events (ENTRY_CONTEXT, EXIT_CONTEXT,
-      TRADE_SUMMARY, SKIP_SUMMARY) extracted from the log file as
-      one-per-line JSON. Easier to parse with jq/pandas than grepping
+      TRADE_SUMMARY, SKIP_SUMMARY, the engine's CYCLE_TIMING, the position
+      manager's POSITION_MARK, ...: ``_STRUCTURED_PREFIXES``) extracted
+      from the log file as one-per-line JSON. Easier to parse with jq/pandas than grepping
       the raw text log.
     - ``decisions.csv`` — every entry-decision event from the engine as
       a queryable CSV (timestamp, symbol, action, regime, primary/

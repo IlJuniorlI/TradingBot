@@ -108,6 +108,7 @@ runtime:
   # trades.csv for the day, and manifest.json. Disable to save disk if not
   # using dashboard/post-session analysis tooling.
   export_session_archive: true
+  log_position_marks: true
   reconcile_on_startup: true
   startup_reconcile_mode: ignore
   startup_order_lookback_days: 2

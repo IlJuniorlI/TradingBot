@@ -217,3 +217,9 @@ class OrderResult:
     # caller must track ``order_id`` until it is terminal rather than send a
     # second order for the same shares.
     may_still_be_working: bool = False
+    # A live LIMIT exit's re-send loop
+    # (SchwabExecutor._submit_live_equity_exit_with_reprice): how many of its
+    # limit orders missed, 0 when the first one settled the call. None for
+    # every other order (a dry run, a MARKET exit, an entry, an option's).
+    # EXIT_CONTEXT carries it as ``exit_limits_missed`` (2026-09-28).
+    exit_limits_missed: int | None = None

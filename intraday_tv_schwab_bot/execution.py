@@ -518,12 +518,14 @@ class SchwabExecutor:
         goes out as a MARKET order under the same two limits, left working
         if it does not fill.
 
-        Once a limit has missed, the message carries
-        ``;exit_limits_missed=<n>``, then ``;exit_market_fallback`` for the
-        MARKET order, or ``;stopped=<why>`` when nothing filled
-        (``attempts``, ``time_budget``, ``session:<now>`` or
-        ``missing_or_stale_quotes``). Its prefix is the last order's own, so
-        the position manager settles the result as it did before. Until
+        The result's ``exit_limits_missed`` counts the limits that missed (0
+        when the first order settled it). Once a limit has missed, the
+        message carries ``;exit_limits_missed=<n>`` too, then
+        ``;exit_market_fallback`` for the MARKET order, or ``;stopped=<why>``
+        when nothing filled (``attempts``, ``time_budget``,
+        ``session:<now>`` or ``missing_or_stale_quotes``). Its prefix is the
+        last order's own, so the position manager settles the result as it
+        did before. Until
         2026-09-28 the first miss ended the exit attempt, and the next order
         went out on the next cycle: about 24 s later on top_tier days
         (study B).
@@ -538,8 +540,9 @@ class SchwabExecutor:
                                                               price_scale=1.0)
             if result.message != LIVE_UNFILLED_CANCELED:
                 if missed == 0:
-                    return result
-                return replace(result, message=f"{result.message};exit_limits_missed={missed}")
+                    return replace(result, exit_limits_missed=0)
+                return replace(result, message=f"{result.message};exit_limits_missed={missed}",
+                               exit_limits_missed=missed)
             missed += 1
             stopped = "attempts" if missed > attempts else self._exit_resend_refusal(request, deadline)
             if stopped is None:
@@ -568,8 +571,10 @@ class SchwabExecutor:
                                       order_type="MARKET", session=request.session)
                 result = self._submit_live_single_order_with_poll(self._build_order(market), cancel_on_timeout=False,
                                                                   price_scale=1.0)
-                return replace(result, message=f"{result.message};exit_limits_missed={missed};exit_market_fallback")
-        return replace(result, message=f"{result.message};exit_limits_missed={missed};stopped={stopped}")
+                return replace(result, message=f"{result.message};exit_limits_missed={missed};exit_market_fallback",
+                               exit_limits_missed=missed)
+        return replace(result, message=f"{result.message};exit_limits_missed={missed};stopped={stopped}",
+                       exit_limits_missed=missed)
 
     def preview_equity_entry(self, symbol: str, intent: OrderIntent, data=None) -> dict[str, Any] | None:
         session = self._equity_session()

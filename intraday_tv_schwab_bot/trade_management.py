@@ -43,6 +43,9 @@ from .models import ExitDecision, Position, Side, is_option_asset
 from .numeric import safe_float
 from .position_metrics import (
     LADDER_TOUCH_HOLD_KEY,
+    PEAK_GIVEBACK,
+    PEAK_GIVEBACK_HIGH_CONVICTION,
+    PEAK_GIVEBACK_LOW_TIER,
     TARGET_HOLD_GUARD,
     TARGET_HOLD_TIMEOUT,
     TARGET_WEAK_CLOSE,
@@ -455,11 +458,11 @@ class TradeManager:
                 meta.pop("_peak_giveback_override_active", None)
                 meta.pop("_peak_giveback_low_tier_active", None)
             if low_tier_active:
-                reason_tag = "peak_giveback_low_tier"
+                reason_tag = PEAK_GIVEBACK_LOW_TIER
             elif override_active:
-                reason_tag = "peak_giveback_high_conviction"
+                reason_tag = PEAK_GIVEBACK_HIGH_CONVICTION
             else:
-                reason_tag = "peak_giveback"
+                reason_tag = PEAK_GIVEBACK
             return True, (
                 f"{reason_tag}:peak{peak_r:.2f}R_floor{(floor_r or 0.0):.2f}R"
                 f"_minR{min_r_used:.2f}"

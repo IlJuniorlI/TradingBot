@@ -123,6 +123,7 @@ runtime:
   # trades.csv for the day, and manifest.json. Disable to save disk if not
   # using dashboard/post-session analysis tooling.
   export_session_archive: true
+  log_position_marks: true
   reconcile_on_startup: true
   # restore_hybrid: on startup (and on each new ET trading day via
   # session_reconcile_on_resume) the bot pulls broker positions and

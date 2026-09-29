@@ -138,6 +138,63 @@ TARGET_WEAK_CLOSE = "target_weak_close"
 TARGET_HOLD_GUARD = "target_hold_guard"
 TARGET_HOLD_TIMEOUT = "target_hold_timeout"
 
+# The peak giveback's exit codes (TradeManager.update_position): the main
+# tier, the high-conviction override's and the low tier's.
+PEAK_GIVEBACK = "peak_giveback"
+PEAK_GIVEBACK_HIGH_CONVICTION = "peak_giveback_high_conviction"
+PEAK_GIVEBACK_LOW_TIER = "peak_giveback_low_tier"
+_PEAK_GIVEBACK_CODES = frozenset({PEAK_GIVEBACK, PEAK_GIVEBACK_HIGH_CONVICTION, PEAK_GIVEBACK_LOW_TIER})
+# The exits the position manager books from a resting broker child that
+# filled (a bracket's stop or target, the static disaster stop), and the
+# bracket record's field holding the price the child rested at.
+_BROKER_CHILD_LEVELS = {"broker_stop": "stop_price", "broker_target": "target_price", "disaster_stop": "stop_price"}
+
+
+def exit_level(position: Position, decision: ExitDecision) -> tuple[float | None, str | None]:
+    """The price level ``decision`` exits on, and which level it is: what
+    EXIT_CONTEXT records as ``exit_level`` / ``exit_level_kind``, and what
+    its ``exit_slippage`` is measured from.
+
+    - ``stop``: the position's stop, whichever step set it (the initial
+      stop, a break-even, the profit lock, the trail, a promoted rung:
+      ``stop_source`` names it);
+    - ``target``: its target;
+    - ``peak_giveback_floor``: a peak giveback's floor,
+      ``peak_giveback_floor_price``, stamped by the exit;
+    - ``touch_hold_guard``: the adaptive ladder's guard, the price in the
+      ``target_hold_guard`` reason;
+    - ``broker_stop`` / ``broker_target`` / ``disaster_stop``: the price
+      the resting child that filled rested at (a bracket's, or the static
+      disaster stop's).
+
+    ``(None, None)`` for an exit no price level triggers (a time stop, a
+    shared or strategy exit, force flatten, the touch hold's close and
+    timeout verdicts) and for a level that is not a finite number."""
+    code = exit_reason_code(decision.reason)
+    meta = position.metadata if isinstance(position.metadata, dict) else {}
+    if code == "stop":
+        level, kind = position.stop_price, "stop"
+    elif code == "target":
+        level, kind = position.target_price, "target"
+    elif code in _PEAK_GIVEBACK_CODES:
+        level, kind = meta.get("peak_giveback_floor_price"), "peak_giveback_floor"
+    elif code == TARGET_HOLD_GUARD:
+        level, kind = decision.reason.partition(":")[2], "touch_hold_guard"
+    elif code in _BROKER_CHILD_LEVELS:
+        bracket = meta.get("bracket")
+        level, kind = (bracket.get(_BROKER_CHILD_LEVELS[code]) if isinstance(bracket, dict) else None), code
+    else:
+        return None, None
+    number = safe_float(level, None, finite=True)
+    return (number, kind) if number is not None else (None, None)
+
+
+def exit_slippage(side: Side, level: float, fill: float) -> float:
+    """How far ``fill`` landed past ``level``, per unit: positive when it is
+    worse for the position than the level (a LONG sold below it, a SHORT
+    covered above it), negative when better."""
+    return (level - fill) if side == Side.LONG else (fill - level)
+
 
 def exit_reason_details(decision: ExitDecision) -> dict[str, Any]:
     """The exit fields of the structured exit record (EXIT_CONTEXT) for

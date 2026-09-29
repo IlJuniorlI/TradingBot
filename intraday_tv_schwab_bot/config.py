@@ -525,6 +525,15 @@ class RuntimeConfig:
     # session_archive.export_session_archive for the full list. Disable to
     # save disk space if running without dashboard/analysis needs.
     export_session_archive: bool = True
+    # One POSITION_MARK record per held position per management pass, at
+    # DEBUG (the log file, not the console): the mark the pass read, its
+    # bid / ask and when the quote was fetched, the stop and target coming
+    # into the pass, and the seconds since the pass before
+    # (PositionManager._log_position_mark). About 325 bytes a line: a median
+    # 0.1 MB a day on the archived top_tier days (up to 1.3 MB), up to 2 MB
+    # on a 0DTE day (2026-09-28). EXIT_CONTEXT and POSITION_ADJUSTMENT carry
+    # the pass before theirs either way.
+    log_position_marks: bool = True
 
 
 @dataclass(slots=True)
