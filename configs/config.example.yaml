@@ -205,8 +205,9 @@ execution:
   # with shared_exit.adaptive_ladder_touch_hold on, which holds the target at
   # a touched rung, rolls it to the next one and clears it for a runner).
   bracket_legs: stop_and_target
-  # STOP_LIMIT bounds slippage at the cost of a no-fill tail; STOP always fills.
-  bracket_stop_order_type: STOP_LIMIT
+  # STOP always fills (the protective default); STOP_LIMIT bounds slippage at
+  # the cost of a no-fill tail, its limit this many initial R past the trigger.
+  bracket_stop_order_type: STOP
   bracket_stop_limit_offset_r: 0.5
   # Schwab rejects STOP orders outside the NORMAL session; true rejects a
   # bracketed pre/post-market entry instead of sending it naked.

@@ -50,6 +50,23 @@ def position_return_pct_at_price(position: Position, price: float | None) -> flo
     return return_pct(position.side, float(position.entry_price), float(price))
 
 
+def initial_risk_per_unit(position: Position) -> float | None:
+    """The per-unit risk ``position`` was opened with: |entry - initial
+    stop|, from ``metadata['initial_stop_price']`` (stamped at entry, and
+    since 2026-09-28 at a ``restore_basic`` restore). Unlike
+    ``position_r_multiple`` it never falls back to the current stop, which
+    break-even and the trail move toward the entry. None when the position
+    carries no initial stop or the distance is not a positive finite number.
+    """
+    meta = position.metadata if isinstance(position.metadata, dict) else {}
+    entry = safe_float(position.entry_price, finite=True)
+    initial_stop = safe_float(meta.get("initial_stop_price"), finite=True)
+    if entry is None or initial_stop is None:
+        return None
+    risk = abs(entry - initial_stop)
+    return risk if risk > 0 else None
+
+
 def position_r_multiple(position: Position, close: float) -> float | None:
     """Open profit at ``close`` in initial-risk (R) units.
 

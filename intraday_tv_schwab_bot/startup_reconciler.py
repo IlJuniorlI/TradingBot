@@ -68,6 +68,7 @@ from .data_feed import MANAGEMENT_PRICE_KEYS, MarketDataStore
 from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side, asset_type_of
 from .paper_account import PaperAccount
 from .numeric import first_float, safe_float
+from .position_metrics import initial_risk_per_unit
 from .position_store import ReconcileMetadataStore
 from .risk import RiskManager
 from .trade_management import default_levels
@@ -300,8 +301,9 @@ class StartupReconciler:
         The hybrid path rehydrates metadata written before the restart, so a
         restored position can carry a ``bracket`` dict whose child order ids
         were cancelled or filled while the bot was down. Left alone, that stale
-        dict makes TradeManager suppress the engine's stop exit for a position
-        that has nothing resting at the broker -- unprotected AND unmanaged.
+        dict makes TradeManager leave the target exit to a child that no longer
+        rests (until 2026-09-28 the stop exit too: unprotected AND unmanaged),
+        and the manager replace and cancel orders that are gone.
 
         ``ensure_position_protected`` adopts the children when they are still
         working and submits fresh protection when they are not; it returns None
@@ -345,15 +347,15 @@ class StartupReconciler:
         try:
             refreshed = self.executor.ensure_position_protected(
                 str(metadata.get("underlying") or position.symbol),
-                uncovered, position.side, float(position.entry_price),
-                float(position.stop_price), position.target_price,
+                uncovered, position.side, float(position.stop_price), position.target_price,
+                initial_risk=initial_risk_per_unit(position),
                 parent_order_id=str(parent_order_id) if parent_order_id else None,
                 known_bracket=known,
             )
         except Exception as exc:
             LOG.warning(
-                "Could not re-establish broker protection for restored position %s: %s; "
-                "dropping stale bracket so the engine owns the exits", position.symbol, exc,
+                "Could not re-establish broker protection for restored position %s: %s: %s; "
+                "dropping stale bracket so the engine owns the exits", position.symbol, type(exc).__name__, exc,
             )
             metadata.pop("bracket", None)
             return
@@ -837,6 +839,10 @@ class StartupReconciler:
                     "broker_avg_price": entry_price,
                 }
                 stop_price, target_price, highest_price, lowest_price, trail_pct = self._restore_levels_for_stock_position(side, entry_price, current_price, metadata)
+                # The stop this position starts from is its initial stop, the
+                # R anchor every entered position carries (2026-09-28):
+                # without it a resting STOP_LIMIT's offset had no initial R.
+                metadata["initial_stop_price"] = float(stop_price)
                 position = Position(
                     symbol=symbol,
                     strategy=self.config.strategy,

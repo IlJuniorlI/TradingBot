@@ -441,7 +441,7 @@ This block controls how equity orders are priced and managed after submission.
 | `bracket_orders_enabled`          | `false`      |
 | `bracket_sync_mode`               | `static`     |
 | `bracket_legs`                    | `stop_and_target` |
-| `bracket_stop_order_type`         | `STOP_LIMIT` |
+| `bracket_stop_order_type`         | `STOP`       |
 | `bracket_stop_limit_offset_r`     | `0.5`        |
 | `bracket_require_normal_session`  | `true`       |
 | `bracket_replace_min_price_delta` | `0.01`       |
@@ -460,7 +460,7 @@ Behavior and valid values:
 - `bracket_sync_mode`: `static` | `replace` — who owns the resting levels after entry.
 - `bracket_legs`: `stop_and_target` | `stop_only` — which children rest at the broker.
 - `bracket_stop_order_type`: `STOP` | `STOP_LIMIT` — the resting protective stop's order type.
-- `bracket_stop_limit_offset_r`: `STOP_LIMIT` only; limit offset beyond the trigger, in units of initial R.
+- `bracket_stop_limit_offset_r`: `STOP_LIMIT` only; limit offset beyond the trigger, in units of the position's initial R (entry to initial stop), wherever the stop has moved since.
 - `bracket_require_normal_session`: reject a bracketed entry outside regular hours rather than send it unprotected.
 - `bracket_replace_min_price_delta`: `replace` mode debounce, in dollars.
 
@@ -482,9 +482,12 @@ behaviour.
 
 **Choosing a sync mode**
 
-- `static` — submit once and never touch. The broker owns the resting levels
-  for the life of the trade. Correct for fixed-stop/fixed-target scalps that do
-  no in-trade level management.
+- `static` — the resting levels stay where the entry put them for the life of
+  the trade (an entry that fills through its levels moves them onto the
+  fallback once; see **What the engine still does**). A resting target owns
+  the target exit, but the engine still checks its own stop every cycle and
+  exits through the cancel-first path. Correct for fixed-stop/fixed-target
+  scalps that do no in-trade level management.
 - `replace` — the engine keeps managing levels, and every stop or target move
   issues a `replace_order` against the corresponding child. Required for any
   strategy whose edge is the in-trade ratchet (breakeven moves, profit locks,
@@ -503,7 +506,7 @@ order would already be in flight.
 `adaptive_ladder` — the engine ratchets `stop_price` in-trade (breakeven moves,
 profit locks, trailing) and `static` never replaces the resting child, so the
 broker would sit on the entry-time stop for the life of the trade while the
-engine believed it had tightened. Use `replace`.
+engine tightened its own. Use `replace`.
 
 `bracket_legs: stop_and_target` with `trade_management_mode: adaptive_ladder`
 and `shared_exit.adaptive_ladder_touch_hold` on — the hold declines the target
@@ -529,12 +532,17 @@ execution:
 
 **Stop order type**
 
-`STOP` fills wherever a flush ends, which is punishing on thin names.
-`STOP_LIMIT` bounds that slippage at the cost of a no-fill tail: if price gaps
-straight through the limit, the stop does not fill and the position is still
-open. `bracket_stop_limit_offset_r` sets how far beyond the trigger the limit
-sits, in units of the trade's initial R — wider tolerates more slippage in
-exchange for a smaller no-fill risk.
+`STOP`, the default since 2026-09-28, fills wherever a flush ends, which can be
+well past the level on a thin name, but it fills. `STOP_LIMIT` bounds that
+slippage at the cost of a no-fill tail: if price gaps straight through the
+limit, the stop triggers without filling and the position is still open. The
+child is still a working order, and nothing the bot reads tells it from a
+resting stop, so the engine's own stop check, on its next cycle, is what gets
+the position out (see **What the engine still does**). `bracket_stop_limit_offset_r` sets how far beyond the
+trigger the limit sits, in units of the trade's initial R (entry to initial
+stop), wherever the stop has moved since: a stop at break-even keeps the offset
+it had at entry. Until 2026-09-28 the offset was measured to the stop being
+placed, so after break-even it was about 0 and the limit sat on the trigger.
 
 **Extended hours**
 
@@ -547,11 +555,31 @@ only if you knowingly accept naked extended-hours entries.
 
 Resting protection does not make the position unmanaged. Each cycle the engine
 reconciles the bracket against the broker: it notices when a child filled and
-books the exit, keeps the resting levels in step in `replace` mode, and cancels
-the children before marketing out for any engine-side reason (time stop,
-structure break, force-flatten). While a child is confirmed resting, the risk
-manager suppresses the engine-side exit that the broker now owns, so the two
-cannot both fire.
+books the exit, records the levels the working children actually rest at, keeps
+them in step with the engine's in `replace` mode, and cancels the children
+before marketing out for any engine-side reason (time stop, structure break,
+force-flatten).
+
+The engine also checks its own stop every cycle, whatever rests at the broker
+(since 2026-09-28). A stop exit goes out like any other engine exit: the
+bracket is cancelled first, what its children filled before the cancel landed
+is booked as `broker_stop` at the broker's price, and only the rest is sold, so
+the two never both fill. A cancel that cannot be confirmed defers the exit. So
+the position keeps a stop when the resting one no longer stands for the
+engine's: a replace that failed (the broker still rests at an older level), or
+a `STOP_LIMIT` that triggered with the price through its limit and sits
+unfilled. Until then a resting stop child stood the engine's stop down, and
+either left the position unprotected until something else exited it. A resting
+target child still owns the target: the risk manager leaves the target exit to
+it, and the stop still rests beside it.
+
+An entry that fills through one of the signal's levels is booked with the
+default-distance fallback levels (`risk.default_stop_pct` /
+`default_target_pct`), and its protection follows: children that rest at the
+signal's levels are replaced onto the fallback at once (in either sync mode),
+and protection placed afresh goes in at it. A replace that fails leaves the
+bracket recording the signal's level, and the engine enforces the fallback stop
+itself.
 
 Dry runs keep exits engine-side. The bracket is recorded on the `OrderResult`
 for parity and inspection, but nothing rests at a broker and the recorded state

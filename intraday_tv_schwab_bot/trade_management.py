@@ -6,8 +6,8 @@ exit, lives here:
 
 - ``update_position``: the peak give-back floor, the option premium ratchet,
   the adaptive breakeven / profit lock / runner extension / trail, and the
-  stop and target exits themselves (deferring to a broker-held bracket leg
-  and to the adaptive ladder's touch hold);
+  stop and target exits themselves (the target deferring to a broker-held
+  bracket leg and to the adaptive ladder's touch hold);
 - ``manage_sr_flip``: ``risk.trade_management_mode: sr_flip``, the stop to a
   flipped level and the target to the next one;
 - ``manage_adaptive_ladder``: the adaptive ladder's touch hold
@@ -523,15 +523,22 @@ class TradeManager:
         # the target is not taken here. It only ever sets the key when on.
         touch_hold = ladder_management_enabled and isinstance(meta.get(LADDER_TOUCH_HOLD_KEY), dict)
 
-        # Broker-side bracket: whichever legs are actually RESTING at the broker
-        # are owned by the broker, and the engine must not also fire them --
-        # both fills would land and take the strategy net short. Keyed on the
-        # resting child ids rather than the config, so a bracket that failed to
-        # establish (state "unprotected") correctly falls back to engine exits.
-        # Engine-only exits above/below this (peak giveback, trailing, time stop)
-        # are unaffected; position_manager cancels the bracket before those.
+        # Broker-side bracket. The stop is checked here every cycle, whatever
+        # rests at the broker: an engine stop exit, like every engine exit,
+        # cancels the bracket first and books what its children filled
+        # (PositionManager._manage_position), so the two never both fill.
+        # Until 2026-09-28 a resting stop child stood the engine's stop down,
+        # which left the position unprotected whenever the child no longer
+        # stood for the engine's level: a replace that failed left it at an
+        # older level, and a STOP_LIMIT that triggered with the price through
+        # its limit stayed a working order, unfilled. No order state the bot
+        # reads tells a triggered stop from a resting one, and the mark at or
+        # through the stop, the one sign the engine sees each cycle, is
+        # exactly when that deferral applied, so it is gone rather than
+        # qualified. A
+        # resting TARGET child still owns the target: a limit in the trade's
+        # favour with the stop still resting beside it.
         bracket = active_broker_bracket(position)
-        broker_owns_stop = bracket is not None and bracket.get("stop_order_id") is not None
         broker_owns_target = bracket is not None and bracket.get("target_order_id") is not None
 
         def _meta_float(key: str, default: float | None = None) -> float | None:
@@ -617,7 +624,7 @@ class TradeManager:
                     position.stop_price = candidate_stop
                     if isinstance(meta, dict) and candidate_stop > prior_stop + 1e-12:
                         append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "trail", "from": prior_stop, "to": float(candidate_stop)})
-            if last_price <= position.stop_price and not broker_owns_stop:
+            if last_price <= position.stop_price:
                 return True, "stop"
             if position.target_price is not None and last_price >= position.target_price and not touch_hold and not broker_owns_target:
                 return True, "target"
@@ -695,7 +702,7 @@ class TradeManager:
                     position.stop_price = candidate_stop
                     if isinstance(meta, dict) and candidate_stop < prior_stop - 1e-12:
                         append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "trail", "from": prior_stop, "to": float(candidate_stop)})
-            if last_price >= position.stop_price and not broker_owns_stop:
+            if last_price >= position.stop_price:
                 return True, "stop"
             if position.target_price is not None and last_price <= position.target_price and not touch_hold and not broker_owns_target:
                 return True, "target"

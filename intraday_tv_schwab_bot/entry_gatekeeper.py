@@ -33,6 +33,7 @@ import logging
 import time
 from collections.abc import Mapping
 from datetime import datetime, timedelta
+from functools import partial
 from typing import TYPE_CHECKING, Any, Callable
 
 from schwabdev import Client
@@ -55,6 +56,7 @@ from .models import (
 from .options_mode import realized_max_loss_per_contract
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
+from .position_metrics import initial_risk_per_unit
 from .numeric import safe_float
 from .reasons import reason_gate
 from .risk import RiskManager
@@ -250,6 +252,21 @@ class EntryGatekeeper:
             if target is not None and target >= entry:
                 return False, "target_not_below_entry"
         return True, None
+
+    def _post_fill_levels(self, side: Side, stop_price: float, target_price: float | None,
+                          fill_price: float) -> tuple[float, float | None, str | None]:
+        """The stop and target a stock entry filled at ``fill_price`` is
+        booked with, and why the signal's no longer fit the fill (None when
+        they do). A fill through one of them gets the default-distance
+        fallback (``trade_management.default_levels``): the shares are held,
+        so the position is always tracked. A bracketed entry's protection is
+        placed at the same levels: ``SchwabExecutor._finalize_bracket_protection``
+        calls this with the fill it reads (``PostFillLevels``)."""
+        levels_ok, levels_reason = self._entry_levels_valid(side, fill_price, stop_price, target_price)
+        if levels_ok:
+            return float(stop_price), safe_float(target_price, None), None
+        stop, target = default_levels(side, fill_price, self.config.risk)
+        return stop, target, levels_reason
 
     @staticmethod
     def _scaled_order_spec(spec: dict[str, Any], qty: int) -> dict[str, Any]:
@@ -605,7 +622,7 @@ class EntryGatekeeper:
             if bracket is not None:
                 resized, msg = self.executor.resize_bracket_children(
                     bracket, str(position.metadata.get("underlying") or position.symbol), position.side,
-                    total_qty, float(position.entry_price), str(bracket.get("session") or "NORMAL"),
+                    total_qty, str(bracket.get("session") or "NORMAL"), initial_risk=initial_risk_per_unit(position),
                 )
                 if not resized:
                     LOG.error("Could not resize %s's resting protection to %s after late entry fills (%s)",
@@ -631,12 +648,11 @@ class EntryGatekeeper:
             trail_pct = None
             reference_symbol = signal.reference_symbol or (signal.metadata or {}).get("confirm_index")
         else:
-            stop_price = float(signal.stop_price)
-            target_price = safe_float(signal.target_price, None)
-            levels_ok, levels_reason = self._entry_levels_valid(signal.side, entry_price, stop_price, target_price)
+            stop_price, target_price, levels_reason = self._post_fill_levels(
+                signal.side, signal.stop_price, signal.target_price, entry_price,
+            )
             position_metadata = dict(signal.metadata or {})
-            if not levels_ok:
-                stop_price, target_price = default_levels(signal.side, entry_price, self.config.risk)
+            if levels_reason is not None:
                 position_metadata["emergency_fallback_levels"] = True
                 position_metadata["original_levels_reason"] = levels_reason
             position_metadata.setdefault("initial_stop_price", float(stop_price))
@@ -644,11 +660,19 @@ class EntryGatekeeper:
             position_metadata.setdefault("trail_armed", False)
             # The children of a bracketed entry may or may not have
             # materialised; adopt them if they are working, protect if not.
+            initial_risk = abs(float(entry_price) - float(stop_price))
             bracket = self.executor.ensure_position_protected(
-                signal.symbol, int(qty), signal.side, float(entry_price),
-                float(stop_price), target_price, parent_order_id=str(record["order_id"]),
+                signal.symbol, int(qty), signal.side, float(stop_price), target_price,
+                initial_risk=initial_risk, parent_order_id=str(record["order_id"]),
             )
             if bracket is not None:
+                if levels_reason is not None and bracket.get("active") and not bracket.get("simulated"):
+                    # Children adopted off the order rest at the signal's
+                    # levels, which the fill went through: they move to the
+                    # fallback the position is booked with, as a filled
+                    # entry's do (SchwabExecutor._finalize_bracket_protection).
+                    self.executor.sync_bracket_levels(bracket, signal.symbol, signal.side, int(qty), float(stop_price),
+                                                      target_price, initial_risk=initial_risk)
                 position_metadata["bracket"] = bracket
             trail_pct = self.risk.stock_position_trail_pct(position_metadata)
             reference_symbol = signal.reference_symbol
@@ -1125,6 +1149,7 @@ class EntryGatekeeper:
                 side=signal.side,
                 stop_price=signal.stop_price,
                 target_price=signal.target_price,
+                post_fill_levels=partial(self._post_fill_levels, signal.side, signal.stop_price, signal.target_price),
             )
             filled_qty = int(result.filled_qty or 0) if result.ok else 0
             if result.ok and filled_qty <= 0:
@@ -1153,8 +1178,6 @@ class EntryGatekeeper:
             # as a missing one does; a NaN one booked the position at NaN
             # (2026-09-26).
             entry_price = safe_float(result.fill_price, signal_entry_price, finite=True)
-            stop_price = float(signal.stop_price)
-            target_price = safe_float(signal.target_price, None)
 
             # Post-fill level revalidation. The pre-order check above ran
             # against the PREVIEWED price; a fill that slipped through its own
@@ -1163,20 +1186,22 @@ class EntryGatekeeper:
             # warning — initial_risk uses abs() so it still reads positive and
             # the stop simply fires on the next management cycle. The options
             # path has always revalidated here; equities now match it.
-            levels_ok, levels_reason = self._entry_levels_valid(
-                signal.side, entry_price, stop_price, target_price,
+            # Already filled at the broker — we MUST track the position, so
+            # a fill the signal's levels no longer fit falls back to the
+            # configured default distances rather than orphaning it or
+            # keeping levels the fill has invalidated. A bracketed entry's
+            # protection was placed at the same levels (post_fill_levels).
+            stop_price, target_price, levels_reason = self._post_fill_levels(
+                signal.side, signal.stop_price, signal.target_price, entry_price,
             )
+            levels_ok = levels_reason is None
             if not levels_ok:
-                # Already filled at the broker — we MUST track the position, so
-                # fall back to the configured default distances rather than
-                # orphaning it or keeping levels the fill has invalidated.
                 LOG.error(
                     "Post-fill level validation FAILED for %s (reason=%s side=%s fill=%.4f "
                     "signal_entry=%.4f stop=%.4f target=%s); applying default-distance fallback levels.",
                     signal.symbol, levels_reason, signal.side.value, entry_price,
-                    signal_entry_price, stop_price, target_price,
+                    signal_entry_price, float(signal.stop_price), safe_float(signal.target_price, None),
                 )
-                stop_price, target_price = default_levels(signal.side, entry_price, self.config.risk)
 
             position_metadata = dict(signal.metadata or {})
             position_metadata.setdefault("initial_stop_price", stop_price)

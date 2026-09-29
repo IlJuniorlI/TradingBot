@@ -310,6 +310,21 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`execution.bracket_stop_order_type` defaults to `STOP` (was
+  `STOP_LIMIT`).** *2026-09-28* — a broker bracket's resting protective stop
+  (`bracket_orders_enabled`, off in every preset) is a plain stop unless a
+  config asks for `STOP_LIMIT`, which stays supported. A `STOP` fills
+  wherever a flush ends, but it fills. A `STOP_LIMIT` whose limit the price
+  gaps through triggers without filling and stays a working order, so only
+  the engine's next cycle gets the position out (see **Fixed**). Study B
+  (2026-09-26): on the 35 archived moved-stop exits, 25 recorded fills sat
+  past the limit the old offset gave and 4 past the one an initial-R offset
+  gives. `config.example.yaml`, the only preset that lists the key, sets
+  `STOP`; README.md's `execution` table and **Stop order type** say so, and
+  its `static` sync mode no longer says the broker owns the resting levels
+  (the engine checks its own stop in every sync mode; see **Fixed**). No
+  preset enables brackets, so nothing that trades changes.
+
 - **The tests are organised by the module under test (refactor cut C48).**
   *2026-09-28* — `tests/` (source tree only; no build ships it) now has one
   directory per layer of the plan's import order: `foundation`,
@@ -3292,6 +3307,99 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `levels_shared.find_divergence` a required `bar_clock`.
 
 ### Fixed
+
+- **A broker bracket's `STOP_LIMIT` limit sits `bracket_stop_limit_offset_r`
+  x the position's initial R past its trigger, wherever the stop has moved.**
+  *2026-09-28* — the offset is documented in units of initial R, but every
+  caller of `SchwabExecutor.bracket_stop_limit_price` measured R from the
+  entry to the stop being placed: the entry, a partial fill's resize, the
+  `replace` sync, a re-protect after a partial exit, the runner's stop-only
+  re-protect, a late-fill resize and a restore. Once break-even moved the stop
+  to the entry (+0.02R) the offset was 0.01R, and 0 at partial break-even: the
+  limit sat on the trigger, so the first print through the stop left it
+  unfilled (study B 3.3 #1: a median 0.025R on the archive's 35 moved-stop
+  exits).
+  - `bracket_stop_limit_price(side, stop_price, *, initial_risk)` takes the
+    per-share initial R, and so, keyword-only, do `_bracket_exit_children`,
+    `build_protective_oco_order`, `submit_protective_oco`,
+    `ensure_position_protected`, `resize_bracket_children` and
+    `sync_bracket_levels`; their `entry_price` parameter is gone. The callers
+    pass `position_metrics.initial_risk_per_unit(position)` (|entry -
+    `metadata['initial_stop_price']`|, never the current stop), the TRIGGER
+    entry its limit's distance to the stop (no fill yet), the fill its
+    distance to the post-fill stop, an adopted entry the same.
+  - A `STOP_LIMIT` child with no positive initial R is refused with a
+    `ValueError` rather than priced at a made-up offset (a `STOP` needs none).
+    A `restore_basic` position now carries `initial_stop_price`, the stop it is
+    restored with, as every entered position does; its R-based reads (the
+    trail's activation, the peak give-back) no longer re-base on a moved stop.
+    A restored row saved without one (only a `restore_basic` row from before
+    this change) gets no `STOP_LIMIT` protection: the restore logs the error
+    with its type and the engine owns the exits.
+- **The engine checks its own stop every cycle, whatever rests at the
+  broker.** *2026-09-28* — `TradeManager.update_position` stood the stop
+  exit down whenever a live bracket tracked a stop child. Two states left the
+  position with no working stop: a `STOP_LIMIT` that triggered with the price
+  through its limit, which stays a working order with nothing filled (study B
+  3.3 #2), and a replace that failed, which left the child at an older level
+  (3.3 #3). No order state the bot reads tells a triggered stop from a
+  resting one (the bot's working statuses include both `WORKING` and
+  `AWAITING_STOP_CONDITION`; which Schwab shows for each was never verified),
+  and a partial fill shows only on some. The one sign the engine sees every
+  cycle is its mark at or through the stop, and that is exactly when the
+  deferral applied, so it is gone rather than qualified.
+  - A stop exit goes out as every engine exit does (`_manage_position`): the
+    bracket is cancelled first, what its children filled before the cancel
+    landed is booked as `broker_stop` at the broker's price, and only the rest
+    is sold; a cancel that cannot be confirmed defers the exit. A stop that
+    fills as the cancel arrives is booked, and nothing else is sent.
+  - A resting target child still owns the target exit (the stop rests beside
+    it). While a scale-out slice works beside a remainder stop, a stop hit on
+    the shares outside the slice now cancels the slice, and the full exit
+    follows once it settles.
+  - Dry runs are unchanged: their bracket is simulated, and the engine always
+    owned every exit.
+- **A bracket records the levels its working children actually rest at.**
+  *2026-09-28* — `bracket['stop_price']` and `['target_price']` were written
+  only by the bot: the entry, an adoption, a replace the broker acknowledged.
+  The fill reconcile now reads them off each cycle's order state
+  (`PositionManager._track_resting_levels`, for a child still working whose
+  level reads as a finite number) and logs a WARNING naming both levels when
+  the broker holds another. The `replace` sync then compares the engine's
+  level with what rests and puts it back, and a fill reported without a price
+  is booked at it. A failed replace's WARNING names the stop the engine now
+  enforces.
+- **An entry that fills through its levels is protected at the post-fill
+  fallback levels.** *2026-09-28* — the entry gatekeeper books such a fill
+  with `trade_management.default_levels`, but the bracket kept the signal's:
+  the TRIGGER's children rested at its stop, on the wrong side of the fill,
+  until a `replace` sync moved them a cycle later (never, in `static` mode),
+  and protection placed afresh when no child materialised went in there too
+  (study B 3.3 #4).
+  - `submit_equity_entry` takes `post_fill_levels`, required for a bracketed
+    entry (a `ValueError` without it): the gatekeeper's `_post_fill_levels`
+    rule, the signal's levels or the fallback with the reason they no longer
+    fit, which also books the position. `_finalize_bracket_protection` places
+    fresh protection at the post-fill levels, and replaces resting children
+    onto them after any resize, in either sync mode. A replace that fails
+    leaves the bracket recording the signal's level, with an ERROR, and the
+    engine enforces the fallback stop itself.
+  - An entry adopted from its order's fill record after its submit returned
+    moves the children it adopts the same way. A dry run's simulated bracket
+    records the post-fill levels. A child the fill already triggered cannot be
+    moved; the reconcile books its fill.
+  - Tests: `tests/runtime/test_bracket_defects.py` (21, marked `regression`)
+    runs the real `SchwabExecutor` in live mode against a fake Schwab order
+    book: the offset at every call site; a triggered, unfilled `STOP_LIMIT`
+    taken over (cancel first, then the exit), with its partial fill booked
+    first, and one that fills as the cancel arrives; the engine's stop above
+    a stale broker level; the tracked levels; the fallback on resting,
+    fresh, adopted and dry-run protection. Each of 18 mutants re-introducing
+    a defect fails at least one. `test_bracket_orders.py`,
+    `test_execution_invariants.py`, `test_sweep_fixes.py`,
+    `test_partial_exit.py`, `test_asset_type.py` and `test_broker_payloads.py`
+    call the new signatures; the old stop-suppression test now pins the
+    engine's stop.
 
 - **A network error or a body that is not a JSON object on a 0DTE
   option-chain read no longer fails the engine's cycle.** *2026-09-28* —

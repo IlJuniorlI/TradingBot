@@ -7,7 +7,7 @@ import logging
 import math
 from dataclasses import dataclass
 import time as time_module
-from typing import Any
+from typing import Any, Callable
 
 from schwabdev import Client
 
@@ -46,6 +46,11 @@ from .sessions import UTC, classify_equity_session, equity_session_state, is_reg
 from .schwab_api import call_schwab_client, call_schwab_json, response_ok
 
 LOG = logging.getLogger(__name__)
+
+# The caller's rule for the levels an entry fill leaves the trade with: the
+# fill price in, ``(stop, target, fallback_reason)`` out, the reason None when
+# the signal's levels still fit the fill (``EntryGatekeeper._post_fill_levels``).
+PostFillLevels = Callable[[float], tuple[float, float | None, str | None]]
 
 
 @dataclass(slots=True)
@@ -483,7 +488,16 @@ class SchwabExecutor:
 
     def submit_equity_entry(self, symbol: str, qty: int, intent: OrderIntent, data=None, market_snapshot: Any | None = None,
                             side: Side | None = None, stop_price: float | None = None,
-                            target_price: float | None = None) -> OrderResult:
+                            target_price: float | None = None,
+                            post_fill_levels: PostFillLevels | None = None) -> OrderResult:
+        """Send an equity entry: a marketable limit, or in bracket mode (with
+        ``side`` and ``stop_price``) the entry with its resting protection.
+
+        A bracketed entry needs ``post_fill_levels``, the caller's rule for
+        the stop and target a fill leaves the trade with
+        (``_finalize_bracket_protection``); without it the entry is refused
+        with a ValueError rather than protected at levels the fill may have
+        invalidated."""
         if not str(symbol or "").strip():
             return OrderResult(ok=False, order_id=None, raw=None, message="invalid_symbol", simulated=self.config.schwab.dry_run)
         if int(qty) <= 0:
@@ -492,6 +506,8 @@ class SchwabExecutor:
         if session is None:
             return OrderResult(ok=False, order_id=None, raw=None, message=self._equity_session_blackout_reason(), simulated=self.config.schwab.dry_run)
         bracketed = self.bracket_orders_enabled() and side is not None and stop_price is not None
+        if bracketed and post_fill_levels is None:
+            raise ValueError(f"bracketed entry for {symbol} needs post_fill_levels, the caller's post-fill level rule")
         if bracketed and session != "NORMAL" and bool(self.config.execution.bracket_require_normal_session):
             # Schwab rejects STOP orders outside the NORMAL session. Refuse the
             # entry rather than silently opening it without resting protection.
@@ -513,17 +529,20 @@ class SchwabExecutor:
                 # decides stop/target identically), so the bracket is recorded
                 # for parity/inspection but nothing rests at a broker. Live
                 # fills at the resting limit will beat these poll-priced exits.
-                assert side is not None and stop_price is not None
+                # It records the levels a live entry's protection ends at: the
+                # post-fill ones (_finalize_bracket_protection).
+                assert side is not None and post_fill_levels is not None
+                protect_stop, protect_target, _levels_reason = post_fill_levels(float(result.fill_price))
                 direction = self._bracket_round_direction(side)
                 result.bracket = {
                     "parent_order_id": None,
                     "sync_mode": str(self.config.execution.bracket_sync_mode),
                     "legs": str(self.config.execution.bracket_legs),
                     "session": str(session),
-                    "stop_price": self._round_equity_price(stop_price, direction),
+                    "stop_price": self._round_equity_price(protect_stop, direction),
                     "target_price": (
-                        self._round_equity_price(target_price, direction)
-                        if (self.bracket_carries_target() and target_price is not None) else None
+                        self._round_equity_price(protect_target, direction)
+                        if (self.bracket_carries_target() and protect_target is not None) else None
                     ),
                     "qty": int(result.filled_qty or qty),
                     "oco_order_id": None,
@@ -536,8 +555,9 @@ class SchwabExecutor:
                 }
             return result
         if bracketed:
-            assert side is not None and stop_price is not None
-            return self._submit_live_bracket_entry(request, side=side, stop_price=stop_price, target_price=target_price, data=data)
+            assert side is not None and stop_price is not None and post_fill_levels is not None
+            return self._submit_live_bracket_entry(request, side=side, stop_price=stop_price, target_price=target_price,
+                                                   post_fill_levels=post_fill_levels, data=data)
         return self._submit_live_equity_entry_with_reprice(request, data=data)
 
     def submit_equity_exit(self, symbol: str, qty: int, intent: OrderIntent, data=None, market_snapshot: Any | None = None) -> OrderResult:
@@ -626,18 +646,27 @@ class SchwabExecutor:
             "instrument": {"symbol": symbol, "assetType": ASSET_TYPE_EQUITY},
         }
 
-    def bracket_stop_limit_price(self, side: Side, entry_price: float, stop_price: float) -> float | None:
+    def bracket_stop_limit_price(self, side: Side, stop_price: float, *, initial_risk: float | None) -> float | None:
         """Limit price for a STOP_LIMIT protective child (None for plain STOP).
 
         Offset below (LONG) / above (SHORT) the trigger by
-        ``bracket_stop_limit_offset_r`` units of initial R, bounding slippage
-        on a flush without making the order unfillable in normal conditions.
+        ``bracket_stop_limit_offset_r`` units of the position's INITIAL R:
+        ``initial_risk``, the per-share |entry - initial stop| the trade was
+        opened with (``position_metrics.initial_risk_per_unit``), wherever
+        the stop now rests. Until 2026-09-28 every caller measured R to the
+        stop being placed, so once break-even moved the stop to about the
+        entry the offset collapsed to about 0 and the limit sat on the
+        trigger: a triggered stop left unfilled by the first tick through
+        it. A STOP_LIMIT child without a positive initial R is refused
+        (ValueError) rather than priced at a made-up offset.
         """
         cfg = self.config.execution
         if cfg.bracket_stop_order_type != "STOP_LIMIT":
             return None
-        initial_risk = abs(float(entry_price) - float(stop_price))
-        offset = initial_risk * float(cfg.bracket_stop_limit_offset_r)
+        risk = safe_float(initial_risk, None, finite=True)
+        if risk is None or risk <= 0:
+            raise ValueError(f"a STOP_LIMIT protective child needs the position's initial risk, got {initial_risk!r}")
+        offset = risk * float(cfg.bracket_stop_limit_offset_r)
         if side == Side.LONG:
             return max(0.0001, self._round_equity_price(float(stop_price) - offset, "down"))
         return self._round_equity_price(float(stop_price) + offset, "up")
@@ -670,19 +699,20 @@ class SchwabExecutor:
             "orderLegCollection": [self._equity_order_leg(symbol, qty, exit_intent)],
         }
 
-    def _bracket_exit_children(self, symbol: str, qty: int, side: Side, entry_price: float,
-                               stop_price: float, target_price: float | None,
-                               session: str) -> tuple[list[dict[str, Any]], float, float | None]:
+    def _bracket_exit_children(self, symbol: str, qty: int, side: Side, stop_price: float,
+                               target_price: float | None, session: str, *,
+                               initial_risk: float | None) -> tuple[list[dict[str, Any]], float, float | None]:
         """Build the protective child order(s) plus the rounded levels used.
 
         Returns ``(children, rounded_stop, rounded_target_or_None)``. The
         target child is omitted in ``stop_only`` leg mode or when the strategy
         supplied no target (runner signals carry ``target_price=None``).
+        ``initial_risk`` prices a STOP_LIMIT child (``bracket_stop_limit_price``).
         """
         exit_intent = self.order_intent_for_exit(side)
         direction = self._bracket_round_direction(side)
         rounded_stop = self._round_equity_price(stop_price, direction)
-        stop_limit = self.bracket_stop_limit_price(side, entry_price, rounded_stop)
+        stop_limit = self.bracket_stop_limit_price(side, rounded_stop, initial_risk=initial_risk)
         children = [self._bracket_stop_child(symbol, qty, exit_intent, rounded_stop, stop_limit, session)]
         rounded_target: float | None = None
         if self.bracket_carries_target() and target_price is not None:
@@ -704,19 +734,22 @@ class SchwabExecutor:
 
     def build_bracket_order(self, request: OrderRequest, *, side: Side, stop_price: float,
                             target_price: float | None) -> dict[str, Any]:
-        """One-order first-triggers-OCO bracket: entry + protective exit(s)."""
+        """One-order first-triggers-OCO bracket: entry + protective exit(s).
+
+        The fill is not known yet, so the initial R that prices a STOP_LIMIT
+        child is measured from the entry's limit price."""
         children, _rounded_stop, _rounded_target = self._bracket_exit_children(
-            request.symbol, request.qty, side, float(request.price or 0.0),
-            stop_price, target_price, request.session,
+            request.symbol, request.qty, side, stop_price, target_price, request.session,
+            initial_risk=abs(float(request.price or 0.0) - float(stop_price)),
         )
         spec = self._build_order(request)
         spec["orderStrategyType"] = "TRIGGER"
         spec["childOrderStrategies"] = self._wrap_oco(children)
         return spec
 
-    def build_protective_oco_order(self, symbol: str, qty: int, side: Side, entry_price: float,
-                                   stop_price: float, target_price: float | None,
-                                   session: str) -> dict[str, Any]:
+    def build_protective_oco_order(self, symbol: str, qty: int, side: Side, stop_price: float,
+                                   target_price: float | None, session: str, *,
+                                   initial_risk: float | None) -> dict[str, Any]:
         """Standalone protective OCO for an ALREADY-OPEN position.
 
         Used when a bracketed entry only partially filled and the broker
@@ -724,7 +757,7 @@ class SchwabExecutor:
         startup reconcile to re-protect an adopted position.
         """
         children, _rounded_stop, _rounded_target = self._bracket_exit_children(
-            symbol, qty, side, entry_price, stop_price, target_price, session,
+            symbol, qty, side, stop_price, target_price, session, initial_risk=initial_risk,
         )
         wrapped = self._wrap_oco(children)
         return wrapped[0] if len(wrapped) == 1 else {"orderStrategyType": "OCO", "childOrderStrategies": children}
@@ -813,16 +846,17 @@ class SchwabExecutor:
                 children["child_order_ids"] = [str(order_id)]
         return children
 
-    def submit_protective_oco(self, symbol: str, qty: int, side: Side, entry_price: float,
-                              stop_price: float, target_price: float | None,
-                              session: str) -> OrderResult:
+    def submit_protective_oco(self, symbol: str, qty: int, side: Side, stop_price: float,
+                              target_price: float | None, session: str, *,
+                              initial_risk: float | None) -> OrderResult:
         """Submit standalone protection for an already-open position.
 
         Used when a bracketed entry filled but its children never materialised
         (partial-fill cancel path), and on startup reconcile to re-protect an
         adopted position.
         """
-        spec = self.build_protective_oco_order(symbol, qty, side, entry_price, stop_price, target_price, session)
+        spec = self.build_protective_oco_order(symbol, qty, side, stop_price, target_price, session,
+                                               initial_risk=initial_risk)
         if self.config.schwab.dry_run:
             LOG.info("DRY RUN protective OCO: %s", spec)
             return OrderResult(ok=True, order_id=None, raw=spec, message="dry_run_protective_oco", simulated=True)
@@ -839,8 +873,8 @@ class SchwabExecutor:
         return OrderResult(ok=True, order_id=str(order_id), raw=spec, message="protective_oco_submitted",
                            simulated=False, bracket=self._bracket_state_from_order(str(order_id)))
 
-    def ensure_position_protected(self, symbol: str, qty: int, side: Side, entry_price: float,
-                                  stop_price: float, target_price: float | None,
+    def ensure_position_protected(self, symbol: str, qty: int, side: Side, stop_price: float,
+                                  target_price: float | None, *, initial_risk: float | None,
                                   parent_order_id: str | None = None,
                                   known_bracket: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Guarantee an open position has resting broker protection.
@@ -864,6 +898,10 @@ class SchwabExecutor:
         simulated, as a dry-run entry's is, so the engine owns every exit. It
         keeps the ids ``known_bracket`` tracks, which the reconcile reads as
         the position's own rather than as foreign orders.
+
+        ``initial_risk`` is the position's initial R per share
+        (``position_metrics.initial_risk_per_unit``), which prices a
+        STOP_LIMIT child's limit (``bracket_stop_limit_price``).
 
         Returns the bracket state dict, or None when bracket mode is off.
         """
@@ -906,7 +944,8 @@ class SchwabExecutor:
             # left a 10-share stop resting against 7 held shares.
             if resting_qty is None or int(resting_qty) != int(qty):
                 adopted["qty"] = None if resting_qty is None else int(resting_qty)
-                resized, msg = self.resize_bracket_children(adopted, symbol, side, int(qty), entry_price, session)
+                resized, msg = self.resize_bracket_children(adopted, symbol, side, int(qty), session,
+                                                            initial_risk=initial_risk)
                 if not resized:
                     adopted["state"] = "qty_mismatch" if resting_qty is not None else "qty_unverified"
                     LOG.error(
@@ -916,7 +955,7 @@ class SchwabExecutor:
                     )
             return adopted
         replacement = self.submit_protective_oco(
-            symbol, int(qty), side, entry_price, float(base["stop_price"]), target_price, session,
+            symbol, int(qty), side, float(base["stop_price"]), target_price, session, initial_risk=initial_risk,
         )
         if not replacement.ok:
             LOG.error(
@@ -1036,12 +1075,13 @@ class SchwabExecutor:
         return True, f"replaced:{status_code}"
 
     def resize_bracket_children(self, bracket: dict[str, Any], symbol: str, side: Side, qty: int,
-                                entry_price: float, session: str) -> tuple[bool, str]:
+                                session: str, *, initial_risk: float | None) -> tuple[bool, str]:
         """Re-issue the resting protective children at a new share count.
 
         The short-flip guard: children are submitted for the REQUESTED entry
         quantity, so a partial entry fill leaves an oversized resting exit that
         would take a long-only strategy net short when it triggers.
+        ``initial_risk`` prices a STOP_LIMIT child (``bracket_stop_limit_price``).
         """
         exit_intent = self.order_intent_for_exit(side)
         stop_price = float(bracket.get("stop_price") or 0.0)
@@ -1049,7 +1089,7 @@ class SchwabExecutor:
         messages: list[str] = []
         ok = True
         if bracket.get("stop_order_id") and stop_price > 0:
-            stop_limit = self.bracket_stop_limit_price(side, entry_price, stop_price)
+            stop_limit = self.bracket_stop_limit_price(side, stop_price, initial_risk=initial_risk)
             spec = self._bracket_stop_child(symbol, qty, exit_intent, stop_price, stop_limit, session)
             child_ok, msg = self.replace_bracket_child(bracket, "stop_order_id", spec)
             ok = ok and child_ok
@@ -1064,14 +1104,20 @@ class SchwabExecutor:
         return ok, ",".join(messages) if messages else "no_children_to_resize"
 
     def sync_bracket_levels(self, bracket: dict[str, Any], symbol: str, side: Side, qty: int,
-                            entry_price: float, stop_price: float,
-                            target_price: float | None) -> list[dict[str, Any]]:
+                            stop_price: float, target_price: float | None, *,
+                            initial_risk: float | None) -> list[dict[str, Any]]:
         """Replace resting children whose level has moved beyond the debounce.
 
         Returns one management-adjustment record per child actually replaced,
         so the caller can log them alongside the engine's own adjustments. The
         debounce keeps a per-cycle trail ratchet from spending the Schwab rate
-        budget on sub-penny moves.
+        budget on sub-penny moves. ``initial_risk`` prices a STOP_LIMIT child
+        (``bracket_stop_limit_price``).
+
+        A replace that fails leaves the bracket recording the level that still
+        rests. Nothing defers to it: the engine checks its own stop every
+        cycle (``TradeManager.update_position``), and the next cycle tries the
+        replace again.
         """
         min_delta = float(self.config.execution.bracket_replace_min_price_delta)
         exit_intent = self.order_intent_for_exit(side)
@@ -1083,7 +1129,7 @@ class SchwabExecutor:
             resting_stop = bracket.get("stop_price")
             rounded = self._round_equity_price(stop_price, direction)
             if resting_stop is None or abs(rounded - float(resting_stop)) >= min_delta:
-                stop_limit = self.bracket_stop_limit_price(side, entry_price, rounded)
+                stop_limit = self.bracket_stop_limit_price(side, rounded, initial_risk=initial_risk)
                 spec = self._bracket_stop_child(symbol, int(qty), exit_intent, rounded, stop_limit, session)
                 ok, msg = self.replace_bracket_child(bracket, "stop_order_id", spec)
                 if ok:
@@ -1091,8 +1137,8 @@ class SchwabExecutor:
                     adjustments.append({"manager": "bracket_sync", "kind": "stop", "reason": "replace_child",
                                         "from": resting_stop, "to": rounded})
                 else:
-                    LOG.warning("Bracket stop replace failed for %s (%s); broker still rests at %s",
-                                symbol, msg, resting_stop)
+                    LOG.warning("Bracket stop replace failed for %s (%s); the broker still rests at %s and "
+                                "the engine enforces its own stop at %s", symbol, msg, resting_stop, rounded)
 
         if bracket.get("target_order_id") is not None and target_price is not None:
             resting_target = bracket.get("target_price")
@@ -1174,8 +1220,30 @@ class SchwabExecutor:
 
     def _finalize_bracket_protection(self, result: OrderResult, request: OrderRequest, side: Side,
                                      stop_price: float, target_price: float | None,
-                                     parent_order_id: str, payload: dict[str, Any] | None) -> OrderResult:
-        """Attach bracket state to an entry result and make the sizing correct."""
+                                     parent_order_id: str, payload: dict[str, Any] | None,
+                                     post_fill_levels: PostFillLevels) -> OrderResult:
+        """Attach bracket state to an entry result, and make the protection
+        match the fill.
+
+        ``stop_price`` / ``target_price`` are the signal's levels: the
+        children were submitted at them, for the requested quantity, before
+        the fill was known. Once it is:
+
+        - a partial fill resizes the children to the shares held;
+        - ``post_fill_levels(fill)`` gives the levels the fill leaves the
+          trade with: the signal's, or the default-distance fallback when the
+          fill went through one of them (the entry gatekeeper's
+          ``_post_fill_levels``, which books the position at the same
+          levels). Resting children are replaced onto the fallback, and
+          protection placed afresh (no children materialised) goes in at it.
+          Until 2026-09-28 the children kept the signal's stop, on the wrong
+          side of a fill through it, until a ``replace`` sync moved them a
+          cycle later (never, in ``static`` mode), and fresh protection was
+          placed at it too.
+
+        The bracket records the levels that rest: a replace that fails leaves
+        the signal's, and the engine enforces the fallback stop itself.
+        """
         children = extract_bracket_children(payload)
         direction = self._bracket_round_direction(side)
         bracket: dict[str, Any] = {
@@ -1195,16 +1263,30 @@ class SchwabExecutor:
             result.bracket = {**bracket, "active": False, "qty": 0, "state": "no_fill"}
             return result
         bracket["qty"] = filled_qty
-        entry_price = float(result.fill_price if result.fill_price is not None else (request.price or 0.0))
+        # Read as the entry gatekeeper reads it, so both derive the same levels.
+        entry_price = safe_float(result.fill_price, float(request.price or 0.0), finite=True)
+        protect_stop, protect_target, levels_reason = post_fill_levels(entry_price)
+        initial_risk = abs(entry_price - float(protect_stop))
+        if levels_reason is not None:
+            LOG.warning(
+                "Bracket entry %s filled at %.4f through its levels (%s): protecting at the post-fill "
+                "fallback stop %.4f instead of the signal's %.4f",
+                request.symbol, entry_price, levels_reason, protect_stop, stop_price,
+            )
 
         if not children["child_order_ids"]:
             # Parent filled but no children are resting -- either the broker
             # never materialised them, or they were cancelled alongside the
             # parent on the partial-fill path. The position is OPEN AND
             # UNPROTECTED, so submit standalone protection immediately.
+            bracket["stop_price"] = self._round_equity_price(protect_stop, direction)
+            bracket["target_price"] = (
+                self._round_equity_price(protect_target, direction)
+                if (self.bracket_carries_target() and protect_target is not None) else None
+            )
             replacement = self.submit_protective_oco(
-                request.symbol, filled_qty, side, entry_price,
-                float(bracket["stop_price"]), target_price, request.session,
+                request.symbol, filled_qty, side, float(bracket["stop_price"]), protect_target, request.session,
+                initial_risk=initial_risk,
             )
             if replacement.ok:
                 bracket.update(replacement.bracket or {})
@@ -1224,7 +1306,7 @@ class SchwabExecutor:
 
         if filled_qty != int(request.qty):
             resized, msg = self.resize_bracket_children(
-                bracket, request.symbol, side, filled_qty, entry_price, request.session,
+                bracket, request.symbol, side, filled_qty, request.session, initial_risk=initial_risk,
             )
             bracket["active"] = True
             bracket["state"] = "resized" if resized else "qty_mismatch"
@@ -1237,11 +1319,21 @@ class SchwabExecutor:
         else:
             bracket["active"] = True
             bracket["state"] = "attached"
+        if levels_reason is not None:
+            self.sync_bracket_levels(bracket, request.symbol, side, filled_qty, protect_stop, protect_target,
+                                     initial_risk=initial_risk)
+            if bracket["stop_price"] != self._round_equity_price(protect_stop, direction):
+                LOG.error(
+                    "Bracket entry %s: its stop still rests at the signal's %s, not the post-fill %.4f the fill at "
+                    "%.4f left the trade with; the engine enforces the post-fill stop itself",
+                    request.symbol, bracket["stop_price"], protect_stop, entry_price,
+                )
         result.bracket = bracket
         return result
 
     def _submit_live_bracket_entry(self, request: OrderRequest, *, side: Side, stop_price: float,
-                                   target_price: float | None, data=None) -> OrderResult:
+                                   target_price: float | None, post_fill_levels: PostFillLevels,
+                                   data=None) -> OrderResult:
         """Submit the one-order bracket and reconcile the resting protection.
 
         No reprice loop: cancel/replace churn on a TRIGGER parent with live
@@ -1263,7 +1355,8 @@ class SchwabExecutor:
         payload, status = self._poll_equity_order(order_id, timeout_seconds, poll_seconds)
         if payload is not None and order_is_filled(payload):
             result = self._finalize_live_equity_entry_result(request, spec, payload, order_id, f"live_bracket_fill:{status}", data=data)
-            return self._finalize_bracket_protection(result, request, side, stop_price, target_price, order_id, payload)
+            return self._finalize_bracket_protection(result, request, side, stop_price, target_price, order_id, payload,
+                                                    post_fill_levels)
         if (order_filled_qty(payload) or 0) > 0:
             # Partial fill: stop further shares arriving BEFORE sizing the
             # protection, so the resize target quantity cannot move underneath.
@@ -1275,17 +1368,20 @@ class SchwabExecutor:
                                    message=f"bracket_partial_fill_finalize_failed:{cancel_msg}", simulated=False,
                                    may_still_be_working=not cancel_ok)
             result.may_still_be_working = not cancel_ok
-            return self._finalize_bracket_protection(result, request, side, stop_price, target_price, order_id, latest)
+            return self._finalize_bracket_protection(result, request, side, stop_price, target_price, order_id, latest,
+                                                    post_fill_levels)
         cancel_ok, cancel_msg, cancel_payload = self._cancel_live_equity_order(order_id)
         latest = cancel_payload or payload
         if latest is not None and order_is_filled(latest):
             result = self._finalize_live_equity_entry_result(request, spec, latest, order_id, f"live_bracket_fill_after_cancel:{cancel_msg}", data=data)
-            return self._finalize_bracket_protection(result, request, side, stop_price, target_price, order_id, latest)
+            return self._finalize_bracket_protection(result, request, side, stop_price, target_price, order_id, latest,
+                                                    post_fill_levels)
         if (order_filled_qty(latest) or 0) > 0:
             result = self._finalize_live_equity_entry_result(request, spec, latest, order_id, f"live_bracket_partial_fill_after_cancel:{cancel_msg}", data=data)
             if result.ok:
                 result.may_still_be_working = not cancel_ok
-                return self._finalize_bracket_protection(result, request, side, stop_price, target_price, order_id, latest)
+                return self._finalize_bracket_protection(result, request, side, stop_price, target_price, order_id,
+                                                         latest, post_fill_levels)
         if not cancel_ok:
             return OrderResult(ok=False, order_id=order_id, raw=latest or spec,
                                message=f"bracket_unfilled_cancel_failed:{cancel_msg}", simulated=False,

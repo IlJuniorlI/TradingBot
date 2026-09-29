@@ -630,9 +630,11 @@ class EquityExecutionConfig:
     # management poll. Off by default: every existing preset keeps today's
     # fully engine-managed exits.
     bracket_orders_enabled: bool = False
-    # static  = submit once, never touch. Broker owns the resting levels for
-    #           the life of the trade. Correct for fixed-stop/fixed-target
-    #           scalps that do no in-trade level management.
+    # static  = the resting levels stay where the entry put them (a fill
+    #           through them moves them onto the fallback once). A resting
+    #           target owns the target exit; the engine still checks its own
+    #           stop every cycle. Correct for fixed-stop/fixed-target scalps
+    #           that do no in-trade level management.
     # replace = engine keeps managing levels; every stop/target move issues a
     #           replace_order against the corresponding child. Required for the
     #           adaptive/ladder strategies whose edge is the in-trade ratchet.
@@ -647,11 +649,16 @@ class EquityExecutionConfig:
     #   With the hold off the ladder's first rung is a plain take-profit,
     #   which a resting target serves as well.
     bracket_legs: str = "stop_and_target"
-    # STOP fills wherever a flush ends — punishing on thin small caps.
-    # STOP_LIMIT bounds the slippage at the cost of a no-fill tail risk.
-    bracket_stop_order_type: str = "STOP_LIMIT"
+    # STOP (the default since 2026-09-28) fills wherever a flush ends, which
+    # can be well past the level on a thin small cap, but it fills: the stop
+    # protects the position. STOP_LIMIT bounds the slippage at the cost of a
+    # no-fill tail: a flush through its limit leaves it triggered and
+    # unfilled, and only the engine's own stop check (its next cycle) gets
+    # the position out.
+    bracket_stop_order_type: str = "STOP"
     # STOP_LIMIT only: limit offset below (LONG) / above (SHORT) the stop
-    # trigger, expressed in units of initial R.
+    # trigger, in units of the position's INITIAL R (entry to initial stop),
+    # wherever the stop has moved since.
     bracket_stop_limit_offset_r: float = 0.5
     # Schwab rejects STOP orders outside the NORMAL session. With this true a
     # bracketed entry is REJECTED pre/post market rather than silently sent

@@ -63,6 +63,7 @@ from .position_metrics import (
     append_management_adjustment,
     exit_reason_details,
     favorable_move,
+    initial_risk_per_unit,
     position_return_pct_at_price,
     position_unrealized_at_price,
 )
@@ -759,10 +760,40 @@ class PositionManager:
                     )
             break
         else:
+            self._track_resting_levels(key, bracket, child_states)
             # The child that protects the position: its stop, or once an
             # unconfirmed retire dropped a dead stop, what is left of it.
             guard_key = "stop_order_id" if bracket.get("stop_order_id") else "target_order_id"
             self._retire_dead_bracket(key, position, bracket, guard_key, child_states.get(guard_key), bars)
+
+    @staticmethod
+    def _track_resting_levels(key: str, bracket: dict[str, Any],
+                              child_states: dict[str, dict[str, Any] | None]) -> None:
+        """Record the levels the broker's working children actually rest at.
+
+        ``bracket['stop_price']`` and ``['target_price']`` are what the
+        replace sync compares the engine's levels against (it replaces a
+        child whose level differs) and what a fill reported without a price
+        is booked at. Until 2026-09-28 only the bot's own writes set them (the
+        entry, an adoption, a replace the broker acknowledged); each cycle's
+        order state now does, for a child still working whose level reads as
+        a finite number, and a level that differs from the recorded one is
+        logged. A filled or dead child is left to the fill booking and the
+        retire."""
+        for child_key, level_key, state_key in (("stop_order_id", "stop_price", "stop_price"),
+                                                ("target_order_id", "target_price", "price")):
+            state = child_states.get(child_key)
+            if not isinstance(state, dict) or state.get("is_filled") or state.get("is_terminal_failure"):
+                continue
+            resting = safe_float(state.get(state_key), None, finite=True)
+            if resting is None:
+                continue
+            recorded = safe_float(bracket.get(level_key), None, finite=True)
+            if recorded is not None and abs(resting - recorded) < 1e-9:
+                continue
+            LOG.warning("Bracket %s %s for %s rests at %s at the broker, not the recorded %s; recording the broker's",
+                        level_key.removesuffix("_price"), bracket.get(child_key), key, resting, recorded)
+            bracket[level_key] = resting
 
     _DEAD_STOP_STATUSES = frozenset({"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"})
 
@@ -913,7 +944,7 @@ class PositionManager:
         if str(bracket.get("sync_mode") or "static") != "replace":
             return
         symbol = str(position.metadata.get("underlying") or position.symbol)
-        entry_price = float(position.entry_price)
+        initial_risk = initial_risk_per_unit(position)
 
         engine_target = safe_float(position.target_price, None)
         resting_target = safe_float(bracket.get("target_price"), None)
@@ -934,14 +965,15 @@ class PositionManager:
             if key not in self.positions:
                 return
             replacement = self.executor.ensure_position_protected(
-                symbol, int(position.qty), position.side, entry_price, float(position.stop_price), None,
+                symbol, int(position.qty), position.side, float(position.stop_price), None, initial_risk=initial_risk,
             )
             if replacement is not None and isinstance(position.metadata, dict):
                 position.metadata["bracket"] = replacement
             return
 
         for adjustment in self.executor.sync_bracket_levels(
-            bracket, symbol, position.side, int(position.qty), entry_price, float(position.stop_price), engine_target,
+            bracket, symbol, position.side, int(position.qty), float(position.stop_price), engine_target,
+            initial_risk=initial_risk,
         ):
             append_management_adjustment(position.metadata, adjustment)
 
@@ -1005,8 +1037,9 @@ class PositionManager:
         (2026-09-24)."""
         reprotected = self.executor.ensure_position_protected(
             str(position.metadata.get("underlying") or position.symbol),
-            int(position.qty) if qty is None else int(qty), position.side, float(position.entry_price),
+            int(position.qty) if qty is None else int(qty), position.side,
             float(position.stop_price), position.target_price,
+            initial_risk=initial_risk_per_unit(position),
             known_bracket=active_broker_bracket(position),
         )
         if reprotected is not None:
@@ -1157,8 +1190,10 @@ class PositionManager:
         lookup that keeps failing (2026-09-24). The caller cancels the slice;
         the cycle that settles it sends the full exit. A full exit's order
         covers every share and is not checked. In bracket mode the resting
-        stop placed beside the slice owns the stop exit, so the risk check
-        leaves it to the broker (see TradeManager.update_position)."""
+        stop placed beside the slice may fill first; the reconcile books it,
+        and the stop exit that follows cancels what still rests (since
+        2026-09-28 the risk check no longer leaves the stop to the broker,
+        see TradeManager.update_position)."""
         outstanding = working_exit_outstanding_qty(position)
         if last_price is None or outstanding >= int(position.qty):
             return False
