@@ -429,8 +429,6 @@ class DashboardCache:
 
         for row in performance.get("positions", []):
             remember_exchange(row.get("underlying") or row.get("symbol"))
-        for trade in performance.get("recent_trades", []):
-            remember_exchange(trade.get("underlying") or trade.get("symbol"))
         for symbol in dashboard_symbol_order:
             remember_exchange(symbol)
 

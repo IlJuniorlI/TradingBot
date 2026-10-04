@@ -1454,6 +1454,16 @@
     .tv-link:active,
     .tv-link:focus,
     .tv-link:focus-visible { color: inherit; text-decoration: none; }
+    .chart-symbol-link {
+      padding: 0;
+      border: 0;
+      background: none;
+      color: inherit;
+      font: inherit;
+      cursor: pointer;
+    }
+    .chart-symbol-link:hover,
+    .chart-symbol-link:focus-visible { text-decoration: underline; }
     .tv-link-icon {
       display: inline-flex;
       align-items: center;

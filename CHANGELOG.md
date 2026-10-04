@@ -829,6 +829,24 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Clicking a symbol in the dashboard's completed trades dock switches the
+  chart to it.** *2026-10-04* — it opened the symbol's TradingView page
+  (user report, 2026-09-29). The cell is a button for a symbol the
+  dashboard charts (for an option trade, its underlying). A symbol that has
+  left the dashboard (no longer a position's, on the watchlist or the quote
+  watchlist, a candidate or an S/R row) has no chart and stays plain text.
+  In the stacked layout, where the chart sits above the dock, a click
+  scrolls the chart's head (symbol, price) into view when it is off screen.
+  - The table is rewritten only when its rows change. It was rewritten on
+    every poll (1.5 s on the live config), which replaced a button under a
+    click in progress, losing the click, and dropped its keyboard focus.
+  - The focus events list a closed option trade under its underlying, the
+    symbol its cell and its position card chart. They matched the option's
+    own symbol, which no snapshot carries, so they never listed it.
+  - `DashboardCache.build_payload` no longer looks up an exchange for a
+    closed trade's symbol: only the TradingView links read one, and the
+    watchlist cards and the selected symbol keep theirs.
+
 - **The cycle's CPU work runs serially on the engine thread, and
   `runtime.cycle_fetch_workers` replaces `runtime.cycle_precompute_workers`
   (Stage 1c of the fast-management study).** *2026-09-28* — every step

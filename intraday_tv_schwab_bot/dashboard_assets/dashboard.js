@@ -51,6 +51,7 @@ const appState = {
   dockTab: 'events',
   refreshInFlight: false,
   mainPanelExpanded: false,
+  tradesHtml: null,
   expandedChart: {
     symbol: null,
     bars: null,
@@ -370,18 +371,26 @@ function symbolLink(symbol, exchangeMap, displaySymbol, rowExchange) {
   return `<a class="tv-link" href="${href}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`;
 }
 
-function tradeSymbolCell(trade, exchangeMap) {
+// A closed trade's symbol switches the chart to it. A symbol the dashboard no
+// longer carries (it left the watchlist) has no chart, so it stays plain text.
+function chartSymbolButton(symbol, snapshots) {
+  const safeSymbol = escapeHtml(symbol);
+  if (!snapshots.has(symbol)) return `<span title="No chart: ${safeSymbol} is not on the dashboard">${safeSymbol}</span>`;
+  return `<button class="chart-symbol-link" type="button" data-select-symbol="${safeSymbol}" title="Show ${safeSymbol} on the chart">${safeSymbol}</button>`;
+}
+
+function tradeSymbolCell(trade, snapshots) {
   const assetType = String(trade?.asset_type || '').toUpperCase().trim();
   const tradeSymbol = String(trade?.symbol || '').toUpperCase().trim();
   const underlying = String(trade?.underlying || '').toUpperCase().trim();
   if (assetType.startsWith('OPTION')) {
     if (underlying) {
-      const underlyingLink = symbolLink(underlying, exchangeMap, underlying);
-      return `${underlyingLink}<div class="table-sub">${escapeHtml(tradeSymbol || assetType)}</div>`;
+      return `${chartSymbolButton(underlying, snapshots)}<div class="table-sub">${escapeHtml(tradeSymbol || assetType)}</div>`;
     }
     return escapeHtml(tradeSymbol || '—');
   }
-  return symbolLink(tradeSymbol, exchangeMap, tradeSymbol, trade?.exchange);
+  if (!tradeSymbol) return '—';
+  return chartSymbolButton(tradeSymbol, snapshots);
 }
 
 function warmupTone(warmup) {
@@ -1386,6 +1395,15 @@ function mainPanelElement() {
   return document.querySelector('.main-panel.chart-panel');
 }
 
+// In the stacked layout the chart sits above the dock and is taller than most
+// screens: scroll its head (symbol, price) into view when it is off screen.
+function revealSelectedChart() {
+  const panel = mainPanelElement();
+  if (!panel) return;
+  const top = panel.getBoundingClientRect().top;
+  if (top < 0 || top > window.innerHeight) panel.scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+
 function pointInsideRect(pointX, pointY, rect) {
   if (!rect) return false;
   return pointX >= rect.left && pointX <= rect.right && pointY >= rect.top && pointY <= rect.bottom;
@@ -1819,7 +1837,6 @@ function renderKpiAndGauges(data) {
 function renderPositions(data) {
   const perf = data?.performance || {};
   const positions = perf.positions || [];
-  const exchangeMap = data?.symbol_exchanges || {};
   document.getElementById('positions-meta').textContent = `${positions.length} open positions`;
   const html = positions.length ? positions.map(pos => {
     const baseSymbol = String(pos.underlying || pos.symbol || '').toUpperCase();
@@ -4134,7 +4151,7 @@ function buildEvents(data, snapshot) {
       });
     }
   }
-  const trades = (data?.performance?.recent_trades || []).filter(item => !snapshot || String(item.symbol || '').toUpperCase() === snapshot.symbol).slice(0, 4);
+  const trades = (data?.performance?.recent_trades || []).filter(item => !snapshot || String(item.underlying || item.symbol || '').toUpperCase() === snapshot.symbol).slice(0, 4);
   trades.forEach(trade => {
     events.push({
       tone: pnlTone(trade.realized_pnl),
@@ -4154,7 +4171,8 @@ function buildEvents(data, snapshot) {
 
 function renderEventsAndDock() {
   const data = appState.data;
-  const snapshot = activeSnapshotMap(data).get(appState.selectedSymbol) || null;
+  const snapshots = activeSnapshotMap(data);
+  const snapshot = snapshots.get(appState.selectedSymbol) || null;
   const events = buildEvents(data, snapshot);
   document.getElementById('dock-meta').textContent = snapshot ? `${snapshot.symbol} focus · ${events.length} generated events` : 'Global bot view';
   document.getElementById('events-list').innerHTML = events.length ? events.map(event => `
@@ -4167,12 +4185,11 @@ function renderEventsAndDock() {
     </div>
   `).join('') : `<div class="empty-state">No event context available yet.</div>`;
 
-  const exchangeMap = data?.symbol_exchanges || {};
   const trades = data?.performance?.recent_trades || [];
-  document.getElementById('trades-table-body').innerHTML = trades.length ? trades.map(trade => `
+  const tradesHtml = trades.length ? trades.map(trade => `
     <tr>
       <td>${escapeHtml(safe(trade.exit_time).replace('T',' ').slice(0,16))}</td>
-      <td>${tradeSymbolCell(trade, exchangeMap)}</td>
+      <td>${tradeSymbolCell(trade, snapshots)}</td>
       <td>${escapeHtml(safe(trade.regime) || safe(trade.strategy) || '—')}</td>
       <td>${escapeHtml(fmtSide(trade))}</td>
       <td>${escapeHtml(safe(trade.qty))}</td>
@@ -4184,6 +4201,18 @@ function renderEventsAndDock() {
       <td>${escapeHtml(safe(trade.reason))}</td>
     </tr>
   `).join('') : `<tr><td colspan="11"><div class="empty-state" style="min-height:96px;">No closed trades yet.</div></td></tr>`;
+  // Rewritten only when a row changes: a rewrite on every poll replaced the
+  // symbol buttons under a click in progress, which lost the click, and
+  // dropped their keyboard focus.
+  if (tradesHtml !== appState.tradesHtml) {
+    appState.tradesHtml = tradesHtml;
+    const tradesBody = document.getElementById('trades-table-body');
+    tradesBody.innerHTML = tradesHtml;
+    tradesBody.querySelectorAll('[data-select-symbol]').forEach(node => node.addEventListener('click', () => {
+      setSelectedSymbol(node.dataset.selectSymbol);
+      revealSelectedChart();
+    }));
+  }
 
   const perf = data?.performance || {};
   const diag = [
@@ -4395,6 +4424,7 @@ function initPositionsAutoResize() {
 function renderDisconnected(message) {
   appState.data = null;
   appState.snapshotMap = new Map();
+  appState.tradesHtml = null;
   resetExpandedChartCache();
   resetCompactChartCache();
   document.getElementById('app-root').classList.add('status-disconnected');
