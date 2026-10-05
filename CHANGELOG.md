@@ -858,7 +858,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `cycle_precompute_workers` (4 in every preset). The work is pandas, numpy
   and TA-Lib on small frames and holds the GIL nearly all the time, so the
   pool never overlapped it: it added CPU time and made the maps slower. The
-  fetches wait on Schwab, where a pool does overlap, so they keep theirs.
+  fetches keep their pool, but it overlaps no HTTP either (corrected
+  2026-10-05; this said a pool overlaps them): schwabdev 4.0.0's
+  `Client._request` holds one lock around every request, its retries
+  included, so the fetches reach Schwab one at a time. The dry-run days of
+  2026-09-29 to 10-02 show it: a 15m boundary's 28 HTF fetches took 5.9 to
+  9.8 s (22.0 s once, while Schwab was slow), one starting about every
+  0.24 s.
   - `IntradayBot._compute_symbol_map` runs a map one symbol at a time on the
     engine thread (the history-fetch decisions, the step frames, the S/R
     pre-warm and its mid-cycle rebuild, the context pre-warm);
