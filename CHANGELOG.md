@@ -829,6 +829,42 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The dashboard's bars are read a column at a time, and the candle caches
+  are sized to a pass.** *2026-10-05* — every publish builds 48 bars for
+  each of the 28 dashboard symbols, and every `/api/chart` up to 480.
+  - `dashboard_payloads.bars_from_frame` reads each of its 23 columns once
+    (`_BAR_COLUMNS`) instead of a row Series per bar (`iterrows`), and
+    builds the same dicts, keys in the same order; a column the frame lacks
+    reads None on every bar, as before. The tail is no longer copied
+    (nothing writes it).
+  - `candles._ohlc_subset`, behind every candle detector (the dashboard's
+    per-bar tags and the strategies' candle context): when open, high, low
+    and close are float64 it drops the rows with a missing field on the
+    array; any other dtype takes the pandas path, unchanged.
+  - `_talib_pattern_array_from_key` keeps 4,096 entries (was 1,024): a pass
+    asks for 1,344 (28 symbols x 48 TA-Lib patterns), so the old size
+    evicted every one before the next pass and a pass without a new bar
+    recomputed them all; now it hits. `_ohlc_arrays_from_key` keeps 256
+    (was 4,096): a key only hits inside its minute, and the old size
+    filled with dead keys (29 a minute) until about 11:50.
+  - Measured (PURE-DASH verifier, base 9c2a8d2, 9 interleaved pairs): the
+    publish 1.155 → 1.025 s a pass (saved 0.140 s, 0.112-0.154), about
+    0.19 s at production's pace; step CPU -0.165 s; `/api/chart`'s bars
+    5.25x faster on the HTTP thread (18.2 → 3.5 ms a chart); process RSS at
+    11:30 239 MB against 290 MB.
+  - Identical: every publish's payload digest on a stepped replay of
+    2026-10-01 09:30-11:30 (361 steps, 20 trades); 7,252 in-situ
+    `bars_from_frame` calls, 15,379 subsets and 7,252 per-bar maps compared
+    with the old code; every 1m and 15m frame of 37 archived days. Only
+    frames the bot never builds differ: a duplicate column name or
+    MultiIndex columns now raise (they published blank fields).
+  - Tests: `tests/reporting/test_dashboard_bars_columns.py` and
+    `tests/analysis/test_candle_subset_arrays.py` (new, 60 tests) pin the
+    bars and the subset to frozen copies of the old code on recorded tapes
+    and odd frames, `_BAR_COLUMNS` to the fields the bars read, the per-bar
+    map to the per-value side rule, a second pass that must not miss, and
+    the arrays cache's cap; 12 mutants, all killed.
+
 - **The hot bar helpers read arrays instead of building pandas objects per
   call.** *2026-10-05* — the S/R build, the strategy contexts, the entry
   pass and the dashboard call the same small helpers thousands of times a

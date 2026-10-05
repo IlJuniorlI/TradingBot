@@ -234,6 +234,8 @@ def _normalize_allowed_patterns(allowed_patterns: Iterable[str] | None, bullish:
     return tuple(sorted(selected))
 
 
+_OHLC_COLUMNS = ["open", "high", "low", "close"]
+
 # One bar of a frame key: (open, high, low, close). The key is the hashable
 # form of an _ohlc_subset, the lru_cache key of every detector below.
 _Bar = tuple[float, float, float, float]
@@ -250,10 +252,19 @@ def _ohlc_subset(frame: pd.DataFrame | None, lookback: int, *, min_bars: int) ->
     """
     if frame is None or frame.empty:
         return None
-    subset = frame[["open", "high", "low", "close"]].tail(max(int(lookback), min_bars)).copy()
-    for col in ("open", "high", "low", "close"):
+    tail = frame.tail(max(int(lookback), min_bars))
+    if all(tail[col].dtype == np.float64 for col in _OHLC_COLUMNS):
+        # Already numbers: drop the rows with a missing field on the array
+        # (the pandas conversion and dropna cost ~1 ms on these few bars).
+        values = np.column_stack([tail[col].to_numpy() for col in _OHLC_COLUMNS])
+        keep = ~np.isnan(values).any(axis=1)
+        if not keep.any():
+            return None
+        return pd.DataFrame(values[keep], index=tail.index[keep], columns=_OHLC_COLUMNS)
+    subset = tail[_OHLC_COLUMNS].copy()
+    for col in _OHLC_COLUMNS:
         subset[col] = pd.to_numeric(subset[col], errors="coerce")
-    subset = subset.dropna(subset=["open", "high", "low", "close"])
+    subset = subset.dropna(subset=_OHLC_COLUMNS)
     return None if subset.empty else subset
 
 
@@ -269,7 +280,9 @@ def _ohlc_frame_key(frame: pd.DataFrame | None, lookback: int = CANDLE_CONTEXT_B
     return tuple() if subset is None else _key_from_subset(subset)
 
 
-@lru_cache(maxsize=4096)
+# A key hits only while its bars are unchanged (inside one minute), so a
+# few minutes of keys is enough; each holds its ~11 KB key tuple.
+@lru_cache(maxsize=256)
 def _ohlc_arrays_from_key(frame_key: _FrameKey) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if not frame_key:
         empty = np.asarray([], dtype=float)
@@ -559,7 +572,9 @@ def detect_candle_context(
     return _copy_candle_context(_detect_candle_context_cached(frame_key, bullish, bearish))
 
 
-@lru_cache(maxsize=1024)
+# Above one pass's working set (dashboard symbols x TA-Lib tokens: 28 x 48
+# on top_tier), so a pass without a new bar hits.
+@lru_cache(maxsize=4096)
 def _talib_pattern_array_from_key(
     frame_key: _FrameKey,
     func_name: str,

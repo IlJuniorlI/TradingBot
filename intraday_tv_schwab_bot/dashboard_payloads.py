@@ -289,6 +289,12 @@ def symbol_trade_signature(account: PaperAccount, symbol: str) -> tuple[Any, ...
     return count, latest_exit, latest_entry, latest_reason
 
 
+# The frame columns ``bars_from_frame`` reads, each once per call.
+_BAR_COLUMNS = ("open", "high", "low", "close", "volume", "ema9", "ema20", "vwap", "atr14", "ret1", "ret5", "ret15",
+                "bb_mid", "bb_upper", "bb_lower", "bb_width_pct", "bb_percent_b", "bb_zscore", "adx14",
+                "plus_di14", "minus_di14", "obv", "obv_ema20")
+
+
 def bars_from_frame(
     frame: pd.DataFrame | None,
     *,
@@ -311,16 +317,29 @@ def bars_from_frame(
     bars: list[dict[str, Any]] = []
     if frame is None or frame.empty:
         return bars
-    tail = frame.tail(capped_bars).copy()
-    tail_offset = max(0, len(frame) - len(tail))
+    tail = frame.tail(capped_bars)
+    n = len(tail)
+    tail_offset = max(0, len(frame) - n)
     per_bar_candles = per_bar_candles or {}
-    for rel_idx, (idx, row) in enumerate(tail.iterrows()):
-        close_val = safe_float(row.get("close"))
-        atr14 = safe_float(row.get("atr14"))
-        plus_di = safe_float(row.get("plus_di14"))
-        minus_di = safe_float(row.get("minus_di14"))
-        obv = safe_float(row.get("obv"))
-        obv_ema = safe_float(row.get("obv_ema20"))
+    # One read per column instead of a row Series per bar; a column the
+    # frame lacks reads as None on every bar.
+    present = tail.columns
+    col = {name: ([safe_float(v) for v in tail[name].tolist()] if name in present else [None] * n)
+           for name in _BAR_COLUMNS}
+    opens, highs, lows, closes, volumes = col["open"], col["high"], col["low"], col["close"], col["volume"]
+    ema9s, ema20s, vwaps, atr14s = col["ema9"], col["ema20"], col["vwap"], col["atr14"]
+    ret1s, ret5s, ret15s = col["ret1"], col["ret5"], col["ret15"]
+    bb_mids, bb_uppers, bb_lowers = col["bb_mid"], col["bb_upper"], col["bb_lower"]
+    bb_widths, bb_percent_bs, bb_zscores = col["bb_width_pct"], col["bb_percent_b"], col["bb_zscore"]
+    adxs, plus_dis, minus_dis, obvs, obv_emas = (col["adx14"], col["plus_di14"], col["minus_di14"], col["obv"],
+                                                 col["obv_ema20"])
+    for rel_idx, idx in enumerate(tail.index):
+        close_val = closes[rel_idx]
+        atr14 = atr14s[rel_idx]
+        plus_di = plus_dis[rel_idx]
+        minus_di = minus_dis[rel_idx]
+        obv = obvs[rel_idx]
+        obv_ema = obv_emas[rel_idx]
         # DMI bias: bullish if +DI > -DI, bearish if -DI > +DI, else neutral.
         # None when either reading is unavailable (warmup bars).
         if plus_di is not None and minus_di is not None:
@@ -351,26 +370,26 @@ def bars_from_frame(
             # True only on a chart's still-forming last bucket, which
             # chart_payload marks; every bar built here is complete.
             "in_progress": False,
-            "open": safe_float(row.get("open")),
-            "high": safe_float(row.get("high")),
-            "low": safe_float(row.get("low")),
+            "open": opens[rel_idx],
+            "high": highs[rel_idx],
+            "low": lows[rel_idx],
             "close": close_val,
-            "volume": safe_float(row.get("volume")),
-            "ema9": safe_float(row.get("ema9")),
-            "ema20": safe_float(row.get("ema20")),
-            "vwap": safe_float(row.get("vwap")),
+            "volume": volumes[rel_idx],
+            "ema9": ema9s[rel_idx],
+            "ema20": ema20s[rel_idx],
+            "vwap": vwaps[rel_idx],
             "atr14": atr14,
             "atr_pct": (atr14 / close_val) if atr14 is not None and close_val not in (None, 0.0) else None,
-            "ret1": safe_float(row.get("ret1")),
-            "ret5": safe_float(row.get("ret5")),
-            "ret15": safe_float(row.get("ret15")),
-            "bb_mid": safe_float(row.get("bb_mid")),
-            "bb_upper": safe_float(row.get("bb_upper")),
-            "bb_lower": safe_float(row.get("bb_lower")),
-            "bb_width_pct": safe_float(row.get("bb_width_pct")),
-            "bb_percent_b": safe_float(row.get("bb_percent_b")),
-            "bb_zscore": safe_float(row.get("bb_zscore")),
-            "adx": safe_float(row.get("adx14")),
+            "ret1": ret1s[rel_idx],
+            "ret5": ret5s[rel_idx],
+            "ret15": ret15s[rel_idx],
+            "bb_mid": bb_mids[rel_idx],
+            "bb_upper": bb_uppers[rel_idx],
+            "bb_lower": bb_lowers[rel_idx],
+            "bb_width_pct": bb_widths[rel_idx],
+            "bb_percent_b": bb_percent_bs[rel_idx],
+            "bb_zscore": bb_zscores[rel_idx],
+            "adx": adxs[rel_idx],
             "plus_di": plus_di,
             "minus_di": minus_di,
             "dmi_bias": dmi_bias,
