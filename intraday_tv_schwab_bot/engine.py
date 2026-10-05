@@ -233,6 +233,7 @@ class IntradayBot:
                 port=config.dashboard.port,
                 refresh_ms=config.dashboard.refresh_ms,
                 state_path=config.dashboard.state_path,
+                state_write_seconds=config.dashboard.state_write_seconds,
                 theme=config.dashboard.theme,
                 https=config.dashboard.https,
                 ssl_certfile=config.dashboard.ssl_certfile,

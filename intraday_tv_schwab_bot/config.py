@@ -621,6 +621,9 @@ class DashboardConfig:
     port: int = 8765
     refresh_ms: int = 2000
     state_path: str = ".logs/dashboard_state.json"
+    # The state file's rewrite cadence: at once when the status or message
+    # changes, otherwise at most every this many seconds (0: every publish).
+    state_write_seconds: float = 30.0
     theme: str = "default"
     https: bool = False
     ssl_certfile: str = ""
@@ -1825,6 +1828,7 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
     "dashboard": {
         "port": _Number(integer=True, low=1, high=65535),
         "refresh_ms": _COUNT,
+        "state_write_seconds": _AT_LEAST_ZERO,
     },
     "dashboard.charting.compact": {"max_bars": _Number(integer=True, low=1, high=480)},
     "dashboard.charting.expanded": {"max_bars": _Number(integer=True, low=1, high=480)},

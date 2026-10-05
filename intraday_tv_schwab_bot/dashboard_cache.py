@@ -115,9 +115,9 @@ class DashboardCache:
     def prune_inactive_symbols(self, active_symbols: set[str]) -> int:
         """Drop cached snapshot + chart payloads for symbols no longer in the
         active set. Mirrors `MarketDataStore.prune_inactive_symbols` on the
-        dashboard side. Each entry is a deep-copied serialized payload —
-        kilobytes each — so a long-running bot with high symbol churn
-        accumulates real memory here too. Returns count evicted."""
+        dashboard side. Each entry holds a serialized payload -- kilobytes
+        each -- so a long-running bot with high symbol churn accumulates
+        real memory here too. Returns count evicted."""
         active = {str(s).upper().strip() for s in (active_symbols or set()) if s}
         with self.lock:
             snap_stale = {sym for sym in self.snapshot_cache.keys() if str(sym).upper().strip() not in active}
@@ -610,8 +610,11 @@ class DashboardCache:
             "bars": bars,
             "chart": chart_payload,
         }
+        # Stored as handed out, not copied: no reader changes a snapshot (the
+        # engine puts it in the state, and the publish's json_safe builds new
+        # containers), and only the engine thread reads this cache.
         with self.lock:
-            self.snapshot_cache[symbol] = {"signature": snapshot_signature, "payload": copy.deepcopy(payload)}
+            self.snapshot_cache[symbol] = {"signature": snapshot_signature, "payload": payload}
         return payload
 
     def _snapshot_bars(self, symbol: str, frame: pd.DataFrame | None) -> tuple[list[dict[str, Any]], tuple[int, int]]:
@@ -1938,8 +1941,8 @@ class DashboardCache:
             },
         }
         # Isolate cache entry from the outgoing payload so concurrent
-        # pollers that hit this cache_key can't observe/mutate each other.
-        # The same deep copy on store as symbol_snapshot's cache.
+        # pollers that hit this cache_key can't observe/mutate each other:
+        # the HTTP threads serve it, and a hit's shallow copy is stamped.
         with self.lock:
             self.chart_cache[cache_key] = {"signature": chart_signature, "payload": copy.deepcopy(payload)}
         return payload

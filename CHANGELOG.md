@@ -829,6 +829,68 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The dashboard publish keeps the state it serves without copying,
+  signing or indenting it; the state file is compact and throttled
+  (`dashboard.state_write_seconds`); and `/api/state` answers an unchanged
+  state with a 304.** *2026-10-05* — the publish took 1.54 s of a 7.9 s
+  production pass, a quarter of it for the state file alone.
+  - `DashboardServer.publish` serialized the state compactly for
+    `/api/state`, then deep-copied the tree into `DashboardState`, built a
+    sorted signature of the whole state (to skip a file rewrite when only
+    `last_update` and the API rates had moved) and serialized it once more,
+    indented, for the file. Now `DashboardState` keeps the tree `json_safe`
+    built (`get` still copies, for `publish_stale`), and the file gets the
+    compact bytes `/api/state` serves. `_disk_state_signature` and
+    `_API_USAGE_RATE_FIELDS` are gone.
+  - The file is written at once when the status or the message differs
+    from the last one written, so every `stale` and `error` state is
+    written as before (its message carries the failure count and time),
+    and otherwise at most every `dashboard.state_write_seconds` (new,
+    default 30; `0` writes on every publish; a number of at least 0,
+    checked at load). `stop()` writes the last state the throttle held
+    back; a failed write there is logged with its type and the server
+    still stops. Nothing in the bot reads the file.
+  - `DashboardCache.symbol_snapshot` stores the payload it hands out, not a
+    deep copy: nothing changes a snapshot it is handed. The chart cache
+    keeps its copy (the HTTP threads serve it).
+  - `/api/state` sends an `ETag`: a random nonce for the process and the
+    publish's number, read with the bytes under one lock. A request whose
+    `If-None-Match` is that ETag gets `304 Not Modified`, no body,
+    `Cache-Control: no-store`. Both pages send it back. On a 304 the
+    desktop page skips the parse and the redraw and runs only what moves
+    with the clock (the uptime, a chart whose forming bar has ended, the
+    chart cache's expiry); the phone page has nothing to redraw. A page
+    keeps the ETag only once the state is drawn and drops it on any error
+    or disconnect, so the next poll redraws in full.
+  - Measured: publish CPU 422 → 99 ms a pass (IO-2 verifier, an in-process
+    A/B on 2026-09-24 and 09-22 on a loaded host; about 0.22 s a pass on a
+    quiet one); the snapshot store 28-35 ms a pass (IO-4); state-file
+    writes about 1.6 → 0.17 GB an hour. The server's cost per poll does not
+    move (0.59 ms over keep-alive, mostly kernel time); the desktop page
+    re-downloads the 1.4 MB state 70-93% less often.
+  - Identical: `/api/state`'s bytes on every step of the verifiers'
+    replays (IO-2 125 steps, IO-4 106 steps and 9 idle steps with 175
+    cache hits, IO-8 2 x 37 steps fetched over HTTP), and a stepped replay
+    of 2026-10-01 09:40-10:40 against 21032f8 in everything but the state
+    file. The pages were checked by their source only (the build host has
+    no browser or JS engine): load both in a browser before relying on
+    them.
+  - README: the `dashboard` table, `refresh_ms`, `state_path` and
+    `state_write_seconds`; `dashboard_assets/README.md`: the endpoint;
+    `config.example.yaml` ships `state_write_seconds: 30`.
+  - Tests: `tests/reporting/test_dashboard.py` drops the signature's tests
+    and pins the throttle (the cadence, a new status or message at once,
+    `0`, the write at stop and its failure logged with its type, the knob
+    at load), the stored payload, the ETag (a new one each publish, never
+    repeated by another process, read with its bytes), the 304 through
+    the real server over `http.client` (keep-alive included), and both
+    pages' conditional poll by their source;
+    `tests/reporting/test_dashboard_cache.py` replaces the deep-copy test;
+    `tests/composition/test_dashboard_state.py` pins that no publish
+    changes a cached snapshot and that the engine passes the knob;
+    `tests/domain/test_config_validation.py` lists it. 32 mutants, all
+    killed.
+
 - **The dashboard's bars are read a column at a time, and the candle caches
   are sized to a pass.** *2026-10-05* — every publish builds 48 bars for
   each of the 28 dashboard symbols, and every `/api/chart` up to 480.

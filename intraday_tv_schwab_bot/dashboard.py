@@ -6,9 +6,11 @@ import inspect
 import json
 import logging
 import re
+import secrets
 import socket
 import ssl
 import sys
+import time
 from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,43 +28,6 @@ LOG = logging.getLogger(__name__)
 
 def _json_dumps_compact(value: Any) -> str:
     return json.dumps(value, default=str, allow_nan=False, separators=(",", ":"))
-
-
-_API_USAGE_RATE_FIELDS = frozenset({
-    'calls_per_minute_1m',
-    'calls_per_minute_5m',
-    'calls_per_minute_15m',
-    'calls_per_minute_30m',
-    'calls_window_1m',
-    'calls_window_5m',
-    'calls_window_15m',
-    'calls_window_30m',
-    'lifetime_calls_per_minute',
-})
-
-
-def _disk_state_signature(value: Any) -> str:
-    def _normalize(node: Any, path: tuple[str, ...] = ()) -> Any:
-        if isinstance(node, dict):
-            normalized: dict[str, Any] = {}
-            for key in sorted(str(k) for k in node.keys()):
-                if path == () and key == 'last_update':
-                    continue
-                # All sliding-window rate / count fields change on every
-                # refresh; excluded from the disk-state signature so the
-                # snapshot file doesn't get rewritten on every cycle just
-                # because the rate ticked. total_calls and last_call_at
-                # are kept in the signature — they only change when an
-                # actual API call happens.
-                if path == ('api_usage',) and key in _API_USAGE_RATE_FIELDS:
-                    continue
-                normalized[key] = _normalize(node[key], path + (key,))
-            return normalized
-        if isinstance(node, list):
-            return [_normalize(item, path) for item in node]
-        return node
-
-    return json.dumps(_normalize(value), default=str, allow_nan=False, sort_keys=True, separators=(",", ":"))
 
 
 @lru_cache(maxsize=1)
@@ -200,6 +165,9 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
 
 
 class DashboardState:
+    """The state the server serves: the last published payload, its compact
+    JSON, and the ETag that names that publish."""
+
     def __init__(self):
         self._lock = RLock()
         self._state: dict[str, Any] = {
@@ -207,19 +175,33 @@ class DashboardState:
             "message": "Dashboard booting",
         }
         self._serialized_json: bytes | None = None
+        # An ETag is this process's random nonce and the publish's number,
+        # so a restarted bot never names a state the way its predecessor
+        # named another.
+        self._etag_nonce = secrets.token_hex(8)
+        self._version = 0
+        self._etag: str | None = None
 
     def update(self, payload: dict[str, Any], serialized_json: str | None = None) -> None:
+        """Keep ``payload`` itself: the publisher hands over a tree it no
+        longer touches (``json_safe`` builds every container anew), and
+        ``get`` copies it for anyone who would change it."""
         with self._lock:
-            self._state = copy.deepcopy(payload)
+            self._state = payload
             self._serialized_json = serialized_json.encode("utf-8") if isinstance(serialized_json, str) else None
+            self._version += 1
+            self._etag = f'"{self._etag_nonce}-{self._version}"' if self._serialized_json is not None else None
 
     def get(self) -> dict[str, Any]:
         with self._lock:
             return copy.deepcopy(self._state)
 
-    def get_serialized(self) -> bytes | None:
+    def get_serialized(self) -> tuple[bytes | None, str | None]:
+        """The served JSON and its ETag, read together: read apart, a publish
+        in between would pair one state's bytes with the next one's tag, and
+        a client would then be told that the old bytes are current."""
         with self._lock:
-            return bytes(self._serialized_json) if self._serialized_json is not None else None
+            return self._serialized_json, self._etag
 
 
 class DashboardServer:
@@ -234,6 +216,7 @@ class DashboardServer:
         ssl_certfile: str = "",
         ssl_keyfile: str = "",
         chart_payload_provider: Callable[..., dict[str, Any]] | None = None,
+        state_write_seconds: float = 30.0,
     ):
         self.host = host
         self.port = int(port)
@@ -251,7 +234,13 @@ class DashboardServer:
         self.thread: Thread | None = None
         scheme = "https" if self.https else "http"
         self.url = f"{scheme}://{self.host}:{self.port}"
-        self._last_state_signature: str | None = None
+        # The state file is rewritten at once when the status or the message
+        # changes (a stale or error state among them), and otherwise at most
+        # every state_write_seconds (0: on every publish).
+        self.state_write_seconds = float(state_write_seconds)
+        self._last_state_write: float | None = None
+        self._last_written_headline: tuple[Any, Any] | None = None
+        self._unwritten_state: str | None = None
         self.chart_payload_provider = chart_payload_provider
 
     @staticmethod
@@ -322,6 +311,7 @@ class DashboardServer:
         LOG.info("Dashboard listening at %s", self.url)
 
     def stop(self) -> None:
+        self._write_unwritten_state()
         if self.httpd is None:
             return
         self.httpd.shutdown()
@@ -340,14 +330,31 @@ class DashboardServer:
             self.state.update(safe_payload, serialized)
             if not self.state_path:
                 return
-            state_signature = _disk_state_signature(safe_payload)
-            if state_signature == self._last_state_signature:
+            now = time.monotonic()
+            headline = (safe_payload.get("status"), safe_payload.get("message"))
+            if (self._last_state_write is not None and now - self._last_state_write < self.state_write_seconds
+                    and headline == self._last_written_headline):
+                self._unwritten_state = serialized
                 return
-            pretty_serialized = json.dumps(safe_payload, indent=2, default=str, allow_nan=False)
-            atomic_write_text(self.state_path, pretty_serialized)
-            self._last_state_signature = state_signature
+            atomic_write_text(self.state_path, serialized)
+            self._last_state_write = now
+            self._last_written_headline = headline
+            self._unwritten_state = None
         except Exception as exc:
             LOG.warning("Dashboard publish failed: %s", exc, exc_info=True)
+
+    def _write_unwritten_state(self) -> None:
+        """At stop, the last state the throttle held back, so the file ends
+        on the state the bot last published. Before the server's shutdown,
+        which can wait, and guarded as the publish is: a failed write must
+        not keep the server from stopping."""
+        serialized, self._unwritten_state = self._unwritten_state, None
+        if serialized is None or not self.state_path:
+            return
+        try:
+            atomic_write_text(self.state_path, serialized)
+        except Exception as exc:
+            LOG.warning("Dashboard state file write at stop failed: %s: %s", type(exc).__name__, exc, exc_info=True)
 
     def publish_stale(self, status: str, message: str) -> None:
         """Republish the last state with ``status`` and ``message`` in place
@@ -369,8 +376,9 @@ class DashboardServer:
             # HTTP/1.1 keeps the TCP+TLS connection open across requests so
             # the dashboard's polling loop and asset fetches share one
             # handshake instead of paying for a fresh one per request. All
-            # response paths in this class set Content-Length explicitly,
-            # so keep-alive framing is well-defined.
+            # response paths in this class set Content-Length explicitly (a
+            # 304 has no body by definition, and must not claim the 200's
+            # length), so keep-alive framing is well-defined.
             protocol_version = "HTTP/1.1"
             # Bound idle keep-alive lifetime so abandoned browser tabs don't
             # hold a worker thread + socket open indefinitely. Active polls
@@ -413,15 +421,34 @@ class DashboardServer:
                 payload = _json_dumps_compact(json_safe(payload_obj, non_finite="null")).encode("utf-8")
                 self._write_json_bytes(payload, status)
 
-            def _write_json_bytes(self, payload: bytes, status: HTTPStatus = HTTPStatus.OK) -> None:
+            def _write_json_bytes(self, payload: bytes, status: HTTPStatus = HTTPStatus.OK, *, etag: str | None = None) -> None:
                 try:
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_header("Cache-Control", "no-store")
+                    if etag is not None:
+                        self.send_header("ETag", etag)
                     self.send_header("Content-Length", str(len(payload)))
                     self._security_headers()
                     self.end_headers()
                     self.wfile.write(payload)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
+                    LOG.info(
+                        "Dashboard client disconnected while sending %s to %s: %s",
+                        self.path,
+                        self.client_address[0] if self.client_address else "unknown",
+                        exc,
+                    )
+
+            def _not_modified(self, etag: str) -> None:
+                """304 for a client that already holds the current state (its
+                If-None-Match names it): the ETag again, and no body."""
+                try:
+                    self.send_response(HTTPStatus.NOT_MODIFIED)
+                    self.send_header("ETag", etag)
+                    self.send_header("Cache-Control", "no-store")
+                    self._security_headers()
+                    self.end_headers()
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
                     LOG.info(
                         "Dashboard client disconnected while sending %s to %s: %s",
@@ -547,11 +574,13 @@ class DashboardServer:
                     self._serve_html(body)
                     return
                 if parsed.path.startswith("/api/state"):
-                    cached_payload = state.get_serialized()
-                    if cached_payload is not None:
-                        self._write_json_bytes(cached_payload)
-                    else:
+                    cached_payload, etag = state.get_serialized()
+                    if cached_payload is None:
                         self._write_json(state.get())
+                    elif etag is not None and self.headers.get("If-None-Match") == etag:
+                        self._not_modified(etag)
+                    else:
+                        self._write_json_bytes(cached_payload, etag=etag)
                     return
                 if parsed.path.startswith("/api/chart"):
                     if chart_payload_provider is None:

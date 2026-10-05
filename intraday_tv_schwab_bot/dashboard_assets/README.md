@@ -120,6 +120,10 @@ The backend contract is just the existing JSON API:
 | `GET /api/chart?symbol=XYZ&bars=120&timeframe=1m` or `timeframe=htf` | OHLC + indicator payload for the requested symbol                  |
 | `GET /health`                                                        | `{"ok": true}` liveness probe                                      |
 
+`/api/state` answers with an `ETag` naming the published state. A request whose `If-None-Match` is that `ETag` gets
+`304 Not Modified` with no body until the next publish; the base pages send it, and a page that does not always gets
+the state.
+
 Four template substitutions are applied to your `index.html` at serve time:
 
 | Token             | Replaced with                                 |

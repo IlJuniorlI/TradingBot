@@ -836,24 +836,26 @@ Behavior:
 
 Controls the local dashboard server and its charting profiles.
 
-| Option         | Code default                 |
-|----------------|------------------------------|
-| `enabled`      | `true`                       |
-| `host`         | `127.0.0.1`                  |
-| `port`         | `8765`                       |
-| `refresh_ms`   | `2000`                       |
-| `state_path`   | `.logs/dashboard_state.json` |
-| `theme`        | `default`                    |
-| `https`        | `false`                      |
-| `ssl_certfile` | `""`                         |
-| `ssl_keyfile`  | `""`                         |
+| Option                | Code default                 |
+|-----------------------|------------------------------|
+| `enabled`             | `true`                       |
+| `host`                | `127.0.0.1`                  |
+| `port`                | `8765`                       |
+| `refresh_ms`          | `2000`                       |
+| `state_path`          | `.logs/dashboard_state.json` |
+| `state_write_seconds` | `30`                         |
+| `theme`               | `default`                    |
+| `https`               | `false`                      |
+| `ssl_certfile`        | `""`                         |
+| `ssl_keyfile`         | `""`                         |
 
 Behavior:
 
 - `enabled`: turn the dashboard server on or off.
 - `host` / `port`: bind address and port.
-- `refresh_ms`: browser refresh interval in milliseconds.
-- `state_path`: JSON state snapshot used by the dashboard.
+- `refresh_ms`: browser refresh interval in milliseconds. Each poll of `/api/state` sends back the `ETag` of the state on screen (`If-None-Match`); while no new state has been published the server answers `304 Not Modified` with no body, and the page redraws only what moves with the clock (the uptime, a chart whose forming bar has ended). Since 2026-10-05; the page fetched and redrew the whole state (1.4-2.1 MB on top_tier) on every poll.
+- `state_path`: a file holding the state the page shows, as the compact JSON `/api/state` serves. Nothing in the bot reads it. It is rewritten at once when the status or the message changes (a `stale` or `error` state among them, see below), otherwise at most every `state_write_seconds`, and once more at shutdown if the throttle held the last state back. Until 2026-10-05 it was indented JSON, rewritten whenever anything but `last_update` and the API rate fields changed, which was almost every cycle.
+- `state_write_seconds`: the most seconds the state file lags the page while the status and message stay the same; `0` rewrites it on every publish. A number of at least 0; anything else refuses to start.
 - A failed dashboard update (building the state the engine publishes each cycle: a symbol snapshot or S/R row that raises) is the dashboard's failure, not the cycle's: the cycle's management, entries and exits have run, and the loop keeps its normal cadence. It is logged as `Dashboard update failed (consecutive=N)`, with the traceback on the first failure in a row and every 30th, a DEBUG line otherwise, and `Dashboard update recovered` once one succeeds. Meanwhile the page and `state_path` keep the last state, with the status `stale` (`error` while the cycles themselves fail) and a message naming the error and the time of the last failure; `Updated` stays the time of that state. Until 2026-09-26 it failed the cycle, and the error path's own update then failed the same way and stopped the bot.
 - `theme`: dashboard theme. Set to the folder name of any theme under `intraday_tv_schwab_bot/dashboard_assets/themes/`. Shipped themes:
   - `default` — blue-tinted dark with glow gradients (the original look).

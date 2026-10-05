@@ -52,6 +52,9 @@ const appState = {
   refreshInFlight: false,
   mainPanelExpanded: false,
   tradesHtml: null,
+  // The ETag of the state on screen, sent as If-None-Match: while it is the
+  // current state the server answers 304 with no body (2026-10-05).
+  stateEtag: null,
   expandedChart: {
     symbol: null,
     bars: null,
@@ -4238,7 +4241,7 @@ function renderEventsAndDock() {
   document.getElementById('diagnostics-grid').innerHTML = diag.map(([k, v]) => `
     <div class="detail-card">
       <div class="tiny-label">${escapeHtml(k)}</div>
-      <div class="value-big" style="font-size:22px; margin-top:8px;">${escapeHtml(v)}</div>
+      <div class="value-big" style="font-size:22px; margin-top:8px;"${k === 'Bot Uptime' ? ' data-uptime' : ''}>${escapeHtml(v)}</div>
     </div>
   `).join('');
   syncDockViewport();
@@ -4423,6 +4426,7 @@ function initPositionsAutoResize() {
 
 function renderDisconnected(message) {
   appState.data = null;
+  appState.stateEtag = null;
   appState.snapshotMap = new Map();
   appState.tradesHtml = null;
   resetExpandedChartCache();
@@ -4463,6 +4467,17 @@ function renderApp() {
   syncPositionsViewport();
 }
 
+// What moves with the clock rather than the state: the uptime, and the
+// chart fetches that come due when a forming bar ends (or retry an aborted
+// one). A poll answered 304 (the state on screen is current) runs only this.
+function renderClockParts() {
+  const uptime = document.querySelector('#diagnostics-grid [data-uptime]');
+  if (uptime) uptime.textContent = fmtUptime(appState.data?.started_at);
+  pruneExpandedChartCache();
+  if (appState.mainPanelExpanded) scheduleExpandedChartRefresh(false);
+  else ensureCompactChartBars(false).catch(err => console.warn('Compact chart fetch failed', err));
+}
+
 async function refresh() {
   if (appState.refreshInFlight) return;
   appState.refreshInFlight = true;
@@ -4474,10 +4489,24 @@ async function refresh() {
   const timeoutMs = Math.max(4000, REFRESH_MS * 5);
   const timeoutId = setTimeout(() => abortCtl.abort(), timeoutMs);
   try {
-    const res = await fetch('/api/state?ts=' + Date.now(), { cache: 'no-store', signal: abortCtl.signal });
+    const headers = appState.stateEtag ? { 'If-None-Match': appState.stateEtag } : {};
+    const res = await fetch('/api/state?ts=' + Date.now(), { cache: 'no-store', signal: abortCtl.signal, headers });
+    // Before !res.ok, which a 304 is not.
+    if (res.status === 304) {
+      if (!appState.data) throw new Error('HTTP 304 with no state on screen');
+      try {
+        renderClockParts();
+      } catch (renderErr) {
+        console.error('Dashboard render failed', renderErr);
+        renderDisconnected('Dashboard render failed: ' + renderErr);
+      }
+      return;
+    }
     if (!res.ok) throw new Error('HTTP ' + res.status);
+    const etag = res.headers.get('ETag');
     const data = await res.json();
     appState.data = data;
+    appState.stateEtag = null;
     try {
       renderApp();
       pruneExpandedChartCache();
@@ -4486,6 +4515,9 @@ async function refresh() {
       // Until 2026-09-23 this ran only while the expanded chart had no bars,
       // so an expanded HTF chart never refreshed after it loaded.
       if (appState.mainPanelExpanded) scheduleExpandedChartRefresh(false);
+      // Only once the state is on screen: a page that failed to draw it must
+      // not be told it holds it.
+      appState.stateEtag = etag;
     } catch (renderErr) {
       console.error('Dashboard render failed', renderErr);
       renderDisconnected('Dashboard render failed: ' + renderErr);

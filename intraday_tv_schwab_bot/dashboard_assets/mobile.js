@@ -33,6 +33,11 @@
     return String(value);
   }
 
+  // The ETag of the state on screen, sent as If-None-Match: while it is the
+  // current state the server answers 304 with no body, and nothing on this
+  // page moves with the clock, so there is nothing to redraw (2026-10-05).
+  let stateEtag = null;
+
   // ---- renderers (mirror dashboard.js but only for mobile DOM) ----
 
   function renderTopbar(data) {
@@ -354,15 +359,20 @@
     }).join('');
   }
 
+  // Whether every section drew.
   function render(data) {
-    try { renderTopbar(data); } catch (err) { console.error('renderTopbar failed', err); }
-    try { renderKpiAndGauges(data); } catch (err) { console.error('renderKpiAndGauges failed', err); }
-    try { renderPositions(data); } catch (err) { console.error('renderPositions failed', err); }
-    try { renderCandidates(data); } catch (err) { console.error('renderCandidates failed', err); }
-    try { renderTrades(data); } catch (err) { console.error('renderTrades failed', err); }
+    let ok = true;
+    try { renderTopbar(data); } catch (err) { ok = false; console.error('renderTopbar failed', err); }
+    try { renderKpiAndGauges(data); } catch (err) { ok = false; console.error('renderKpiAndGauges failed', err); }
+    try { renderPositions(data); } catch (err) { ok = false; console.error('renderPositions failed', err); }
+    try { renderCandidates(data); } catch (err) { ok = false; console.error('renderCandidates failed', err); }
+    try { renderTrades(data); } catch (err) { ok = false; console.error('renderTrades failed', err); }
+    return ok;
   }
 
   function renderDisconnectedBadge(message) {
+    // The next poll's 200 redraws the badge (a 304 would leave it).
+    stateEtag = null;
     const statusWrap = document.getElementById('status-badge-wrap');
     if (!statusWrap) return;
     // statusBadge() already routes 'disconnected' to .status-error styling.
@@ -376,14 +386,21 @@
     const timeoutMs = Math.max(4000, refreshMs * 5);
     const timeoutId = setTimeout(() => abortCtl.abort(), timeoutMs);
     try {
-      const resp = await fetch('/api/state', { cache: 'no-store', credentials: 'same-origin', signal: abortCtl.signal });
+      const headers = stateEtag ? { 'If-None-Match': stateEtag } : {};
+      const resp = await fetch('/api/state', { cache: 'no-store', credentials: 'same-origin', signal: abortCtl.signal, headers });
+      // Before !resp.ok, which a 304 is not.
+      if (resp.status === 304 && stateEtag) return;
       if (!resp.ok) {
         console.warn('mobile dashboard: /api/state returned', resp.status);
         renderDisconnectedBadge(`HTTP ${resp.status}`);
         return;
       }
+      const etag = resp.headers.get('ETag');
       const data = await resp.json();
-      render(data);
+      stateEtag = null;
+      // Only once every section drew: one that failed draws again on the
+      // next poll's 200.
+      if (render(data)) stateEtag = etag;
     } catch (err) {
       const isAbort = err && (err.name === 'AbortError' || String(err).includes('abort'));
       console.error('mobile dashboard fetch failed', err);

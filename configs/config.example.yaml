@@ -299,6 +299,10 @@ dashboard:
   port: 8765
   refresh_ms: 1500
   state_path: .logs/dashboard_state.json
+  # The state file is compact JSON, rewritten at once when the status or
+  # message changes (a stale or error state) and otherwise at most every
+  # state_write_seconds (0: on every publish).
+  state_write_seconds: 30
   # Theme: default, dark, light, nexus (mint), solstice (amber), nebula (violet). See intraday_tv_schwab_bot/dashboard_assets/README.md for the full catalog.
   theme: default
   # HTTPS: set to true and provide cert/key paths to serve over HTTPS
