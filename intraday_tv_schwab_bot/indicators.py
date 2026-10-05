@@ -2,6 +2,7 @@
 """Indicators: the process-wide session-indicator mode, EMA span scaling,
 the TA-Lib wrappers, the session stitch and masks, ATR reads, and
 ``add_indicators``."""
+import copy
 import math
 from collections.abc import Mapping
 from datetime import time
@@ -481,6 +482,52 @@ def htf_ema_spans(params: Any) -> tuple[int, int]:
     return fast, slow
 
 
+def _wall_day_keys(index_dt: pd.DatetimeIndex) -> npt.NDArray[np.int64]:
+    """Each bar's wall-clock date as an int64 key: the same partition, in the
+    same order, as ``ts.date()`` per bar, without boxing a Timestamp per bar."""
+    local = index_dt.tz_localize(None) if index_dt.tz is not None else index_dt
+    return local.normalize().asi8
+
+
+def _nan_where_zero(values: FloatArray) -> FloatArray:
+    return np.where(values == 0.0, np.nan, values)
+
+
+def _session_reset_ema(values: FloatArray, in_session: npt.NDArray[np.bool_], day: npt.NDArray[np.int64], span: int) -> FloatArray:
+    """The session-reset EMA: pandas' ``ewm(span, adjust=False)`` over each
+    day's session bars alone, restarting on the day's first session bar, NaN
+    elsewhere. The bars are time-ordered, so each day's session bars are one
+    run of ``flatnonzero(in_session)``."""
+    out = np.full(len(values), np.nan)
+    pos = np.flatnonzero(in_session)
+    if not len(pos):
+        return out
+    run_day = day[pos]
+    starts = np.flatnonzero(np.r_[True, run_day[1:] != run_day[:-1]])
+    ends = np.r_[starts[1:], len(pos)]
+    for start, end in zip(starts, ends):
+        seg = pos[start:end]
+        out[seg] = pd.Series(values[seg]).ewm(span=int(span), adjust=False).mean().to_numpy()
+    return out
+
+
+def _lagged_ratio_change(values: FloatArray, periods: int) -> FloatArray:
+    """``Series.pct_change(periods)``: values / values shifted by ``periods`` - 1."""
+    shifted = np.full(len(values), np.nan)
+    if periods < len(values):
+        shifted[periods:] = values[:-periods]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return values / shifted - 1
+
+
+def _lagged_difference(values: FloatArray, periods: int) -> FloatArray:
+    """``Series.diff(periods)``."""
+    out = np.full(len(values), np.nan)
+    if periods < len(values):
+        out[periods:] = values[periods:] - values[:-periods]
+    return out
+
+
 def add_indicators(
     frame: pd.DataFrame,
     *,
@@ -504,13 +551,6 @@ def add_indicators(
     frame = ensure_ohlcv_frame(frame)
     if frame.empty:
         return frame
-    out = frame.copy()
-    # Stamp the scale before anything else so every return path carries it and
-    # a consumer can tell a stretched frame from a native one. Set
-    # unconditionally, including at 1.0: a frame resampled from a stretched one
-    # inherits its attrs through pandas' __finalize__, so only an unconditional
-    # write clears a stale scale when the indicators are rebuilt natively.
-    out.attrs[INDICATOR_SPAN_SCALE_ATTR] = float(span_scale)
     ta = _require_talib()
     # ``span_scale`` stretches every bar-count lookback so a finer timeframe can
     # preserve a coarser timeframe's wall-clock horizon. Default 1.0 = the
@@ -534,61 +574,48 @@ def add_indicators(
     rsi_period = _span(14)
     ret_fast_period = _span(5)
     ret_slow_period = _span(15)
-    close = out["close"].astype(float)
-    high = out["high"].astype(float)
-    low = out["low"].astype(float)
-    volume = out["volume"].fillna(0.0).astype(float)
 
-    session_keys = pd.Index(out.index.map(lambda ts: ts.date()), name="session_date")
-    tpv = ((high + low + close) / 3.0) * volume
-    cum_vol = volume.groupby(session_keys).cumsum().replace(0, math.nan)
-    cum_tpv = tpv.groupby(session_keys).cumsum()
-    out["vwap_all"] = cum_tpv / cum_vol
-    out["ema9_all"] = talib_ema(close, span=ema_fast_span)
-    out["ema20_all"] = talib_ema(close, span=ema_slow_span)
+    # Every kernel below runs on float64 arrays read once from the frame; the
+    # columns are collected in ``cols`` and the frame is assembled once at the
+    # end (a column insert per indicator left a ~32-block frame and ran
+    # pandas' per-insert checks ~30 times a call).
+    open_ = _to_float64_array(frame["open"])
+    high = _to_float64_array(frame["high"])
+    low = _to_float64_array(frame["low"])
+    close = _to_float64_array(frame["close"])
+    volume = _to_float64_array(frame["volume"])
+    volume = np.where(np.isnan(volume), 0.0, volume)
 
-    index_dt = pd.DatetimeIndex(out.index)
+    index_dt = pd.DatetimeIndex(frame.index)
+    # Each bar's session: its wall-clock date (ts.date()).
+    day = _wall_day_keys(index_dt)
     # Session mask for the per-session VWAP/EMA reset and the TA-Lib session
-    # overlay below. Variable name kept as rth_mask — it is the "session"
-    # mask downstream regardless of which window defines it.
-    rth_mask = pd.Series(indicator_session_mask(index_dt), index=out.index, dtype=bool)
-    rth_volume = volume.where(rth_mask, 0.0)
-    rth_tpv = tpv.where(rth_mask, 0.0)
-    rth_cum_vol = rth_volume.groupby(session_keys).cumsum().replace(0, math.nan)
-    rth_cum_tpv = rth_tpv.groupby(session_keys).cumsum()
-    out["vwap_rth"] = rth_cum_tpv / rth_cum_vol
-
-    def _session_rth_ema(series: pd.Series, span: int) -> pd.Series:
-        result = pd.Series(math.nan, index=series.index, dtype=float)
-        grouped = pd.Series(session_keys, index=series.index)
-        for _, idx in grouped.groupby(grouped).groups.items():
-            session_series = series.loc[idx]
-            session_mask = rth_mask.loc[idx]
-            session_rth = session_series.loc[session_mask]
-            if session_rth.empty:
-                continue
-            # Keep the session-reset EMA path aligned with the bot's historical behavior:
-            # reset on the first RTH bar of each session and produce values immediately,
-            # instead of inheriting TA-Lib's leading-lookback NaNs for this custom signal EMA.
-            result.loc[session_rth.index] = session_rth.astype(float).ewm(span=int(span), adjust=False).mean()
-        return result
-
-    out["ema9_rth"] = _session_rth_ema(close, span=ema_fast_span)
-    out["ema20_rth"] = _session_rth_ema(close, span=ema_slow_span)
-    rth_only_vwap = out["vwap_rth"].combine_first(out["vwap_all"])
-    rth_only_ema9 = out["ema9_rth"].combine_first(out["ema9_all"])
-    rth_only_ema20 = out["ema20_rth"].combine_first(out["ema20_all"])
-    out["vwap_signal"] = out["vwap_all"].where(~rth_mask, rth_only_vwap)
-    out["ema9_signal"] = out["ema9_all"].where(~rth_mask, rth_only_ema9)
-    out["ema20_signal"] = out["ema20_all"].where(~rth_mask, rth_only_ema20)
-    if get_runtime_indicator_mode():
-        out["vwap"] = out["vwap_signal"]
-        out["ema9"] = out["ema9_signal"]
-        out["ema20"] = out["ema20_signal"]
-    else:
-        out["vwap"] = out["vwap_all"]
-        out["ema9"] = out["ema9_all"]
-        out["ema20"] = out["ema20_all"]
+    # overlay below. Variable name kept as rth -- it is the "session" mask
+    # downstream regardless of which window defines it.
+    rth = np.asarray(indicator_session_mask(index_dt), dtype=bool)
+    tpv = ((high + low + close) / 3.0) * volume
+    sums = pd.DataFrame({
+        "volume": volume, "tpv": tpv,
+        "rth_volume": np.where(rth, volume, 0.0), "rth_tpv": np.where(rth, tpv, 0.0),
+    }).groupby(pd.Index(day)).cumsum()
+    cols: dict[str, FloatArray] = {}
+    cols["vwap_all"] = sums["tpv"].to_numpy() / _nan_where_zero(sums["volume"].to_numpy())
+    cols["ema9_all"] = np.asarray(ta.EMA(close, timeperiod=int(ema_fast_span)), dtype=np.float64)
+    cols["ema20_all"] = np.asarray(ta.EMA(close, timeperiod=int(ema_slow_span)), dtype=np.float64)
+    cols["vwap_rth"] = sums["rth_tpv"].to_numpy() / _nan_where_zero(sums["rth_volume"].to_numpy())
+    # Keep the session-reset EMA path aligned with the bot's historical
+    # behavior: reset on the first session bar of each day and produce values
+    # immediately, instead of inheriting TA-Lib's leading-lookback NaNs for
+    # this custom signal EMA.
+    cols["ema9_rth"] = _session_reset_ema(close, rth, day, ema_fast_span)
+    cols["ema20_rth"] = _session_reset_ema(close, rth, day, ema_slow_span)
+    for name in ("vwap", "ema9", "ema20"):
+        session_value = cols[f"{name}_rth"]
+        rth_only = np.where(np.isnan(session_value), cols[f"{name}_all"], session_value)
+        cols[f"{name}_signal"] = np.where(rth, rth_only, cols[f"{name}_all"])
+    series_kind = "signal" if get_runtime_indicator_mode() else "all"
+    for name in ("vwap", "ema9", "ema20"):
+        cols[name] = cols[f"{name}_{series_kind}"]
 
     # --- All-hours TA-Lib indicators (always computed) ---
     # Bollinger Bands: TA-Lib's BBANDS uses a strict 20-bar warmup and
@@ -601,41 +628,32 @@ def add_indicators(
     # match TA-Lib exactly (full 20-bar window); before that they use
     # whatever bars are available, with the std dev floor at 10 samples
     # to keep the band statistically meaningful.
-    upper, middle, lower_band = ta.BBANDS(
-        _to_float64_array(close),
-        timeperiod=bb_length,
-        nbdevup=2.0,
-        nbdevdn=2.0,
-        matype=ta.MA_Type.SMA,
-    )
-    out["bb_mid"] = _series_from_talib(out.index, middle)
-    out["bb_upper"] = _series_from_talib(out.index, upper)
-    out["bb_lower"] = _series_from_talib(out.index, lower_band)
-    bb_warmup_mid = close.rolling(bb_length, min_periods=bb_warmup_min).mean()
-    bb_warmup_std = close.rolling(bb_length, min_periods=bb_warmup_min).std(ddof=0)
-    bb_warmup_upper = bb_warmup_mid + 2.0 * bb_warmup_std
-    bb_warmup_lower = bb_warmup_mid - 2.0 * bb_warmup_std
-    out["bb_mid"] = out["bb_mid"].fillna(bb_warmup_mid)
-    out["bb_upper"] = out["bb_upper"].fillna(bb_warmup_upper)
-    out["bb_lower"] = out["bb_lower"].fillna(bb_warmup_lower)
-    out["bb_width"] = out["bb_upper"] - out["bb_lower"]
-    out["bb_width_pct"] = out["bb_width"] / out["bb_mid"].replace(0.0, math.nan)
-    out["bb_percent_b"] = (close - out["bb_lower"]) / out["bb_width"].replace(0.0, math.nan)
-    out["bb_zscore"] = (close - out["bb_mid"]) / bb_warmup_std.replace(0.0, math.nan)
+    upper, middle, lower_band = (np.asarray(band, dtype=np.float64) for band in ta.BBANDS(
+        close, timeperiod=bb_length, nbdevup=2.0, nbdevdn=2.0, matype=ta.MA_Type.SMA,
+    ))
+    close_series = pd.Series(close)
+    bb_warmup_mid = close_series.rolling(bb_length, min_periods=bb_warmup_min).mean().to_numpy()
+    bb_warmup_std = close_series.rolling(bb_length, min_periods=bb_warmup_min).std(ddof=0).to_numpy()
+    cols["bb_mid"] = np.where(np.isnan(middle), bb_warmup_mid, middle)
+    cols["bb_upper"] = np.where(np.isnan(upper), bb_warmup_mid + 2.0 * bb_warmup_std, upper)
+    cols["bb_lower"] = np.where(np.isnan(lower_band), bb_warmup_mid - 2.0 * bb_warmup_std, lower_band)
+    cols["bb_width"] = cols["bb_upper"] - cols["bb_lower"]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cols["bb_width_pct"] = cols["bb_width"] / _nan_where_zero(cols["bb_mid"])
+        cols["bb_percent_b"] = (close - cols["bb_lower"]) / _nan_where_zero(cols["bb_width"])
+        cols["bb_zscore"] = (close - cols["bb_mid"]) / _nan_where_zero(bb_warmup_std)
 
-    out["atr14"] = _series_from_talib(out.index, ta.ATR(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=atr_period))
-    out["plus_di14"] = _series_from_talib(out.index, ta.PLUS_DI(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=di_period))
-    out["minus_di14"] = _series_from_talib(out.index, ta.MINUS_DI(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=di_period))
-    out["adx14"] = _series_from_talib(out.index, ta.ADX(_to_float64_array(high), _to_float64_array(low), _to_float64_array(close), timeperiod=di_period))
-
-    out["obv"] = _series_from_talib(out.index, ta.OBV(_to_float64_array(close), _to_float64_array(volume)))
-    out["obv_ema20"] = talib_ema(out["obv"], span=obv_ema_span)
-    out["obv_delta5"] = out["obv"].diff(obv_delta_period)
-    out["rsi14"] = _series_from_talib(out.index, ta.RSI(_to_float64_array(close), timeperiod=rsi_period))
-
-    out["ret1"] = close.pct_change()
-    out["ret5"] = close.pct_change(ret_fast_period)
-    out["ret15"] = close.pct_change(ret_slow_period)
+    cols["atr14"] = np.asarray(ta.ATR(high, low, close, timeperiod=atr_period), dtype=np.float64)
+    cols["plus_di14"] = np.asarray(ta.PLUS_DI(high, low, close, timeperiod=di_period), dtype=np.float64)
+    cols["minus_di14"] = np.asarray(ta.MINUS_DI(high, low, close, timeperiod=di_period), dtype=np.float64)
+    cols["adx14"] = np.asarray(ta.ADX(high, low, close, timeperiod=di_period), dtype=np.float64)
+    cols["obv"] = np.asarray(ta.OBV(close, volume), dtype=np.float64)
+    cols["obv_ema20"] = np.asarray(ta.EMA(cols["obv"], timeperiod=int(obv_ema_span)), dtype=np.float64)
+    cols["obv_delta5"] = _lagged_difference(cols["obv"], obv_delta_period)
+    cols["rsi14"] = np.asarray(ta.RSI(close, timeperiod=rsi_period), dtype=np.float64)
+    cols["ret1"] = _lagged_ratio_change(close, 1)
+    cols["ret5"] = _lagged_ratio_change(close, ret_fast_period)
+    cols["ret15"] = _lagged_ratio_change(close, ret_slow_period)
 
     # --- Session overlay for the TA-Lib indicators ---
     # When use_rth_session_indicators is enabled, every session bar (RTH, or
@@ -663,38 +681,32 @@ def add_indicators(
     # lookback keeps all-hours values on those leading bars, where the
     # stitched series is still NaN.
     if get_runtime_indicator_mode():
-        session_pos = np.flatnonzero(rth_mask.to_numpy())
+        session_pos = np.flatnonzero(rth)
         if len(session_pos):
-            s_index = out.index[session_pos]
-            factor = _session_stitch_factor(
-                _to_float64_array(out["open"])[session_pos],
-                _to_float64_array(close)[session_pos],
-                index_dt.normalize().asi8[session_pos],
-            )
-            s_h = _to_float64_array(high)[session_pos] * factor
-            s_l = _to_float64_array(low)[session_pos] * factor
-            s_c = _to_float64_array(close)[session_pos] * factor
-            s_close = pd.Series(s_c, index=s_index, dtype=float)
-            # ATR and the band levels are linear in price: dividing by the
-            # bar's factor puts them back on that bar's own price level.
-            unscale = pd.Series(factor, index=s_index, dtype=float)
+            factor = _session_stitch_factor(open_[session_pos], close[session_pos], index_dt.normalize().asi8[session_pos])
+            s_h = high[session_pos] * factor
+            s_l = low[session_pos] * factor
+            s_c = close[session_pos] * factor
+            # ATR and the band levels are linear in price: dividing them by
+            # the bar's factor (below) puts them back on that bar's own price
+            # level.
 
-            def _overlay(columns: dict[str, pd.Series], anchor: pd.Series) -> None:
+            def _overlay(columns: dict[str, FloatArray], anchor: FloatArray) -> None:
                 """Write ``columns`` onto the session bars where ``anchor`` is
                 valid. Columns read against each other (obv vs obv_ema20, the
                 band family) share one anchor so no bar pairs a stitched value
                 with an all-hours one."""
-                valid = anchor.notna().to_numpy()
+                valid = ~np.isnan(anchor)
                 pos = session_pos[valid]
-                for col, series in columns.items():
-                    values = out[col].to_numpy(dtype=np.float64, copy=True)
-                    values[pos] = series.to_numpy(dtype=np.float64)[valid]
-                    out[col] = values
+                for col, values in columns.items():
+                    merged = cols[col].copy()
+                    merged[pos] = values[valid]
+                    cols[col] = merged
 
-            s_obv = _series_from_talib(s_index, ta.OBV(s_c, _to_float64_array(volume)[session_pos]))
-            s_obv_ema = talib_ema(s_obv, span=obv_ema_span)
-            s_plus_di = _series_from_talib(s_index, ta.PLUS_DI(s_h, s_l, s_c, timeperiod=di_period))
-            s_minus_di = _series_from_talib(s_index, ta.MINUS_DI(s_h, s_l, s_c, timeperiod=di_period))
+            s_obv = np.asarray(ta.OBV(s_c, volume[session_pos]), dtype=np.float64)
+            s_obv_ema = np.asarray(ta.EMA(s_obv, timeperiod=int(obv_ema_span)), dtype=np.float64)
+            s_plus_di = np.asarray(ta.PLUS_DI(s_h, s_l, s_c, timeperiod=di_period), dtype=np.float64)
+            s_minus_di = np.asarray(ta.MINUS_DI(s_h, s_l, s_c, timeperiod=di_period), dtype=np.float64)
             # Returns are NOT overlaid. They are price-true momentum ("how far
             # did price move over the last N bars"), and on contiguous session
             # bars the all-hours pct_change already equals a session-only one;
@@ -702,36 +714,57 @@ def add_indicators(
             # is what the old today-only overlay produced too. Stitching them
             # would compare today's opening bars with yesterday's close with the
             # gap divided out -- a move that never happened.
-            for col, series in (
-                ("obv_delta5", s_obv.diff(obv_delta_period)),
-                ("atr14", _series_from_talib(s_index, ta.ATR(s_h, s_l, s_c, timeperiod=atr_period)) / unscale),
-                ("adx14", _series_from_talib(s_index, ta.ADX(s_h, s_l, s_c, timeperiod=di_period))),
-                ("rsi14", _series_from_talib(s_index, ta.RSI(s_c, timeperiod=rsi_period))),
+            for col, values in (
+                ("obv_delta5", _lagged_difference(s_obv, obv_delta_period)),
+                ("atr14", np.asarray(ta.ATR(s_h, s_l, s_c, timeperiod=atr_period), dtype=np.float64) / factor),
+                ("adx14", np.asarray(ta.ADX(s_h, s_l, s_c, timeperiod=di_period), dtype=np.float64)),
+                ("rsi14", np.asarray(ta.RSI(s_c, timeperiod=rsi_period), dtype=np.float64)),
             ):
-                _overlay({col: series}, series)
+                _overlay({col: values}, values)
             _overlay({"obv": s_obv, "obv_ema20": s_obv_ema}, s_obv_ema)
             _overlay({"plus_di14": s_plus_di, "minus_di14": s_minus_di}, s_plus_di)
 
-            s_upper, s_middle, s_lower = ta.BBANDS(
-                s_c, timeperiod=bb_length,
-                nbdevup=2.0, nbdevdn=2.0, matype=ta.MA_Type.SMA,
-            )
-            s_bb_mid = _series_from_talib(s_index, s_middle)
-            s_bb_upper = _series_from_talib(s_index, s_upper)
-            s_bb_lower = _series_from_talib(s_index, s_lower)
-            s_bb_width = s_bb_upper - s_bb_lower
-            s_std = s_close.rolling(bb_length, min_periods=bb_warmup_min).std(ddof=0)
-            _overlay(
-                {
-                    "bb_mid": s_bb_mid / unscale,
-                    "bb_upper": s_bb_upper / unscale,
-                    "bb_lower": s_bb_lower / unscale,
-                    "bb_width": s_bb_width / unscale,
-                    "bb_width_pct": s_bb_width / s_bb_mid.replace(0.0, math.nan),
-                    "bb_percent_b": (s_close - s_bb_lower) / s_bb_width.replace(0.0, math.nan),
-                    "bb_zscore": (s_close - s_bb_mid) / s_std.replace(0.0, math.nan),
-                },
-                s_bb_mid,
-            )
+            s_upper, s_middle, s_lower = (np.asarray(band, dtype=np.float64) for band in ta.BBANDS(
+                s_c, timeperiod=bb_length, nbdevup=2.0, nbdevdn=2.0, matype=ta.MA_Type.SMA,
+            ))
+            s_width = s_upper - s_lower
+            s_std = pd.Series(s_c).rolling(bb_length, min_periods=bb_warmup_min).std(ddof=0).to_numpy()
+            with np.errstate(divide="ignore", invalid="ignore"):
+                _overlay(
+                    {
+                        "bb_mid": s_middle / factor,
+                        "bb_upper": s_upper / factor,
+                        "bb_lower": s_lower / factor,
+                        "bb_width": s_width / factor,
+                        "bb_width_pct": s_width / _nan_where_zero(s_middle),
+                        "bb_percent_b": (s_c - s_lower) / _nan_where_zero(s_width),
+                        "bb_zscore": (s_c - s_middle) / _nan_where_zero(s_std),
+                    },
+                    s_middle,
+                )
 
+    # One assembly instead of a column insert per indicator. A column the
+    # frame already carries (a recompute over an enriched frame) keeps its
+    # place, as an in-place write kept it; the new ones follow in the order
+    # they were first written.
+    if any(col in frame.columns for col in cols):
+        data: dict[str, Any] = {}
+        for col in frame.columns:
+            data[col] = cols.pop(col) if col in cols else frame[col]
+        data.update(cols)
+        out = pd.DataFrame(data, index=frame.index)
+        out.columns.name = frame.columns.name
+    else:
+        out = pd.concat([frame, pd.DataFrame(cols, index=frame.index)], axis=1)
+    out.attrs = copy.deepcopy(frame.attrs)
+    # The span-scale marker is written only for a stretched frame, and cleared
+    # on a native rebuild (a frame resampled from a stretched one inherits it
+    # through pandas' __finalize__): indicator_span_scale reads an absent
+    # marker as 1.0, and pandas deep-copies a non-empty attrs dict into every
+    # Series and frame derived from this one (~15k copies a step when every
+    # canonical frame carried it).
+    if span_scale == 1.0:
+        out.attrs.pop(INDICATOR_SPAN_SCALE_ATTR, None)
+    else:
+        out.attrs[INDICATOR_SPAN_SCALE_ATTR] = float(span_scale)
     return out

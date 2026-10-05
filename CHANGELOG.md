@@ -829,6 +829,50 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`add_indicators` builds its columns on float64 arrays and assembles the
+  frame once.** *2026-10-05* — every step builds 84 indicator frames (28
+  symbols x the 1m step frame, the span-5 LTF and the 5m structure frame),
+  about 21 ms each, on every pass whether or not a bar closed, plus the HTF
+  frames at a boundary. The build inserted ~30 columns one at a time, each a
+  pandas Series operation, and grouped the session sums on a `ts.date()`
+  per bar.
+  - Now the same TA-Lib, rolling, `ewm` and grouped-cumsum kernels run on
+    the same inputs in the same order, on arrays read once: the session key
+    is each bar's wall-clock date as an int64, the session-reset EMAs run
+    per day's run of session bars, `np.where` stands in for `combine_first`
+    / `where` / `fillna` / `replace(0, nan)` with the same NaN rules, and
+    the returns and differences are array shifts. The frame is assembled
+    once (6-8 blocks instead of 31-32); a column the input already carries
+    keeps its place. `vwap_signal` / `vwap` and the other derived pairs are
+    no longer one shared array.
+  - The span-scale stamp (`attrs["indicator_span_scale"]`) is written only
+    for a stretched frame and dropped on a native build.
+    `indicator_span_scale`, its only reader, reads an absent stamp as 1.0.
+    pandas deep-copies a non-empty `attrs` into every frame and Series
+    derived from a frame: about 37,600 copies a step, now about 700.
+  - Measured (PURE-IND verifier, base 9c2a8d2): 21.05 → 4.65 ms a call over
+    1,130 recorded inputs; step CPU 4.76 → 3.22 s a pass on the harness (12
+    interleaved pairs on 09-30..10-02, saved 1.51 s, 1.11-1.70), new-bar and
+    no-bar passes alike (frame 0.69 → 0.21 s, contexts 1.05 → 0.56, entries
+    1.26 → 0.86, publish 1.20 → 1.08); an HTF boundary pass 3.3 s less CPU;
+    the first step after a start 1.6 s less. Alone it would take a
+    production pass from about 7.9 to 6.4 s.
+  - Identical: the 4,520 outputs of the 1,130 recorded inputs (the real
+    `step()`'s, four indicator modes) bit for bit, and three stepped replays
+    (top_tier 2026-10-01 09:30-11:30, 361 steps, 20 trades; small_cap 06-02;
+    zero_dte 05-20) in every event, decision, frame and dashboard digest.
+    Two differences remain on frames the bot never builds: a row stamped NaT
+    gets its own one-bar VWAP (NaN before), and a named column index loses
+    its name.
+  - Tests: `tests/market_data/test_add_indicators_pinned.py` (new) runs a
+    frozen copy of the old build beside `add_indicators`, bit for bit in all
+    four modes, on 23 recorded frames (36 inputs, distilled into
+    `tests/fixtures/indicator_corpus/`, new), on enriched frames, and on
+    winter, DST, Thanksgiving and Christmas frames with bars to 20:00 (in
+    EST the evening bars fall on the next UTC date). Its 12 mutants are all
+    killed; 4 of the verifier's 6 had passed the suite.
+    `test_indicator_span_scale.py`: a native rebuild carries no stamp.
+
 - **The Schwab candle parse floors every stamp to its minute at once.**
   *2026-10-05* — `MarketDataStore._history_candles_to_frame`, the parse of
   every `price_history` answer (the 1m history, the HTF frames, the daily
