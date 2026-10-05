@@ -1284,7 +1284,10 @@ class IntradayBot:
         ``runtime.cycle_fetch_workers`` threads, keyed by
         ``_unique_symbol_keys``: the cycle's network fetches (the 1m history,
         the HTF refresh points and the daily-history prefetch), which spend
-        their time waiting on Schwab, so the pool overlaps them. The pool
+        their time waiting on Schwab. The pool overlaps no HTTP, though:
+        schwabdev 4.0.0's ``Client._request`` holds one lock around every
+        request, its retries included, so the fetches reach Schwab one at a
+        time (until 2026-10-05 this said the pool overlaps them). The pool
         runs whatever the count, one worker included. A symbol whose call
         raises is isolated as in ``_compute_symbol_map``. The results are
         read in the symbols' order.

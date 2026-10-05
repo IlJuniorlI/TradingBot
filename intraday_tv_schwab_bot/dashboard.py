@@ -236,7 +236,8 @@ class DashboardServer:
         self.url = f"{scheme}://{self.host}:{self.port}"
         # The state file is rewritten at once when the status or the message
         # changes (a stale or error state among them), and otherwise at most
-        # every state_write_seconds (0: on every publish).
+        # every state_write_seconds (0: on every publish). _unwritten_state is
+        # the last published state the file does not hold yet.
         self.state_write_seconds = float(state_write_seconds)
         self._last_state_write: float | None = None
         self._last_written_headline: tuple[Any, Any] | None = None
@@ -349,18 +350,23 @@ class DashboardServer:
                     and headline == self._last_written_headline):
                 self._unwritten_state = serialized
                 return
+            # Pending until it is written: a write that raises leaves this
+            # state, not an older held-back one, for the next due publish and
+            # for stop().
+            self._unwritten_state = serialized
             atomic_write_text(self.state_path, serialized)
             self._last_state_write = now
             self._last_written_headline = headline
             self._unwritten_state = None
         except Exception as exc:
-            LOG.warning("Dashboard publish failed: %s", exc, exc_info=True)
+            LOG.warning("Dashboard publish failed: %s: %s", type(exc).__name__, exc, exc_info=True)
 
     def _write_unwritten_state(self) -> None:
-        """At stop, the last state the throttle held back, so the file ends
-        on the state the bot last published. Before the server's shutdown,
-        which can wait, and guarded as the publish is: a failed write must
-        not keep the server from stopping."""
+        """At stop, the last published state the file does not hold (the
+        throttle held it back, or its write failed), so the file ends on the
+        state the bot last published. Before the server's shutdown, which can
+        wait, and guarded as the publish is: a failed write must not keep the
+        server from stopping."""
         serialized, self._unwritten_state = self._unwritten_state, None
         if serialized is None or not self.state_path:
             return

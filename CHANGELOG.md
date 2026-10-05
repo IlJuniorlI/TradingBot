@@ -1170,7 +1170,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   signing or indenting it; the state file is compact and throttled
   (`dashboard.state_write_seconds`); and `/api/state` answers an unchanged
   state with a 304.** *2026-10-05* — the publish took 1.54 s of a 7.9 s
-  production pass, a quarter of it for the state file alone.
+  production pass; on the harness `DashboardServer.publish` took 0.22 s of
+  a 1.18 s publish, about two thirds of that for the state file (its
+  signature, the indented dump and the write).
   - `DashboardServer.publish` serialized the state compactly for
     `/api/state`, then deep-copied the tree into `DashboardState`, built a
     sorted signature of the whole state (to skip a file rewrite when only
@@ -1184,9 +1186,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     written as before (its message carries the failure count and time),
     and otherwise at most every `dashboard.state_write_seconds` (new,
     default 30; `0` writes on every publish; a number of at least 0,
-    checked at load). `stop()` writes the last state the throttle held
-    back; a failed write there is logged with its type and the server
-    still stops. Nothing in the bot reads the file.
+    checked at load). A state stays pending until a write of it succeeds:
+    `stop()` writes the last published state the file does not hold (one
+    the throttle held back, or one whose write failed); a failed write
+    there is logged with its type and the server still stops. Nothing in
+    the bot reads the file.
   - `DashboardCache.symbol_snapshot` stores the payload it hands out, not a
     deep copy: nothing changes a snapshot it is handed. The chart cache
     keeps its copy (the HTTP threads serve it).
@@ -1202,9 +1206,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Measured: publish CPU 422 → 99 ms a pass (IO-2 verifier, an in-process
     A/B on 2026-09-24 and 09-22 on a loaded host; about 0.22 s a pass on a
     quiet one); the snapshot store 28-35 ms a pass (IO-4); state-file
-    writes about 1.6 → 0.17 GB an hour. The server's cost per poll does not
-    move (0.59 ms over keep-alive, mostly kernel time); the desktop page
-    re-downloads the 1.4 MB state 70-93% less often.
+    writes about 1.6 → 0.17 GB an hour. The GIL time per poll does not
+    move (about 0.1 ms of user time for a 200 and a 304 alike; over
+    keep-alive a 304 takes 0.14 ms against 0.59 ms, the difference kernel
+    send time). With a page open every pass publishes a new state, so a
+    desktop page polling every 1.5 s gets a 304 instead of the 1.4 MB
+    state on about 1 - 1.5/P of its polls for a P-second pass: about 40%
+    at the ~2.5 s pass of this release, and nearly all while the loop
+    idles; `/mobile` polls every 4 s and gains only from passes longer
+    than that.
   - Identical: `/api/state`'s bytes on every step of the verifiers'
     replays (IO-2 125 steps, IO-4 106 steps and 9 idle steps with 175
     cache hits, IO-8 2 x 37 steps fetched over HTTP), and a stepped replay
@@ -1217,11 +1227,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `config.example.yaml` ships `state_write_seconds: 30`.
   - Tests: `tests/reporting/test_dashboard.py` drops the signature's tests
     and pins the throttle (the cadence, a new status or message at once,
-    `0`, the write at stop and its failure logged with its type, the knob
-    at load), the stored payload, the ETag (a new one each publish, never
-    repeated by another process, read with its bytes), the 304 through
-    the real server over `http.client` (keep-alive included), and both
-    pages' conditional poll by their source;
+    `0`, the write at stop and its failure logged with its type, a state
+    whose write failed left pending for the next write and the stop, the
+    knob at load), the stored payload, the ETag (a new one each publish,
+    never repeated by another process, read with its bytes), the 304
+    through the real server over `http.client` (keep-alive included), and
+    both pages' conditional poll by their source;
     `tests/reporting/test_dashboard_cache.py` replaces the deep-copy test;
     `tests/composition/test_dashboard_state.py` pins that no publish
     changes a cached snapshot and that the engine passes the knob;
@@ -1397,7 +1408,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     answers (dates-mode duplicates, off-minute stamps, NaN, shuffled, both
     2026 DST changes, float stamps, no volume key, string prices, a stray
     `timestamp` key, a year of daily bars) and pins the minute floor in ET,
-    the index name and the bar columns.
+    the index name, the bar columns, and the per-candle parse's error for a
+    stamp in the repeated fall-back hour.
 
 - **One quote request per refresh: `runtime.quote_batch_size` is 50, in
   the code default and every preset (it was 20).** *2026-10-05* — top_tier
@@ -1430,6 +1442,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - A deployed config that sets `quote_batch_size: 20` keeps two requests;
     set it to 50 to take the change. The knob is still an integer of at
     least 1, checked at load. README: the defaults table and the knob.
+  - Tests: `tests/domain/test_config_validation.py` pins the default and
+    every shipped preset at 50.
 
 - **Clicking a symbol in the dashboard's completed trades dock switches the
   chart to it.** *2026-10-04* — it opened the symbol's TradingView page
