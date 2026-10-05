@@ -180,10 +180,12 @@ runtime:
   # bot restart. Set to 0 to disable (always retry).
   max_consecutive_quote_failures: 5
   # Shadow check of the S/R, FVG, order-block and strategy context memos:
-  # every N-th memo hit is rebuilt and compared; a difference logs CRITICAL
-  # ("Context memo ...") and the rebuilt context is used. 20 (about 5% of
-  # hits) for the memos' first dry-run day; set 0 once a day has logged no
-  # such line, and back on for a day after a change to a builder.
+  # each memo hit is rebuilt with probability 1/N and compared; a
+  # difference logs CRITICAL ("Context memo ...") and the rebuilt context
+  # is used. 20 (about 5% of hits) for the memos' first dry-run day; 1
+  # rebuilds every hit (after a CRITICAL line, until the key is fixed); set
+  # 0 once a day has logged no such line, and back on for a day after a
+  # change to a builder.
   context_memo_shadow_every: 20
   # Per-day debug archive: on session shutdown, write
   # {log_dir}/sessions/{YYYY-MM-DD}/ with bars/{SYMBOL}.csv (RTH+indicators),

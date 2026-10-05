@@ -854,7 +854,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     not.
   - Measured (CACHE-PASS verifier, base 9c2a8d2, 9 interleaved pairs on
     09-30..10-02): entries 1.28 → 1.01 s, step CPU -0.23 s; on top of the
-    array helpers above -0.13 s a pass (entries 0.85 → 0.73 s); the path
+    array helpers below -0.13 s a pass (entries 0.85 → 0.73 s); the path
     resolve 181 → 10.5 µs a call.
   - Identical: the verifier's stepped replays (top_tier 10-01 09:30-11:30
     with 20 trades, 10-02 across the 15:00 entry close, small_cap 06-02)
@@ -863,12 +863,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     21032f8.
   - Tests: `tests/strategies/top_tier_adaptive/test_entry_pass_memo.py`
     (new): each peer and ETF frame read once a pass, both sides from one
-    posture, a frame grown in place within a pass and a new date or
-    session switch read fresh, a second pass and a frame changed after a
-    pass read again, the memo open only during the pass and dropped when
-    it raises, one memo per strategy, and the path resolve's three cases.
-    9 mutants killed; the two the verifier found equivalent survive as
-    expected.
+    posture, a frame grown in place within a pass, a new date and a
+    flipped `leg_anchored_confirmation` read fresh, a second pass and a
+    frame changed after a pass read again, the memo open only during the
+    pass and dropped when it raises, one memo per strategy, and the path
+    resolve's three cases. 9 mutants killed; the two the verifier found
+    equivalent survive as expected.
 
 - **The dashboard snapshot's bars and the HTF trend row are kept across
   passes and rebuilt only on a new bar or HTF refresh.** *2026-10-05* —
@@ -893,7 +893,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     change; the build gets a shallow copy. `sr_snapshot._htf_trend` goes
     through it, so the dashboard's S/R row and the exit record's HTF trend
     read it, and the prune drops it.
-  - The LTF fair-value-gap overlay is served by the FVG memo above; the
+  - The LTF fair-value-gap overlay is served by the FVG memo below; the
     technical overlay is still built at the live quote every publish.
   - Measured (CACHE-DASH verifier, on 9c2a8d2 with the kept step frames,
     interleaved): a built publish with no new bar 1.05 → 0.72 s, a pass
@@ -953,15 +953,26 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (no reader writes into one). `get_support_resistance` reads the stored
     HTF frame itself, once, instead of a copy through `get_htf_frame`.
   - `runtime.context_memo_shadow_every` (new; default `20`, and `20` in
-    every preset): every N-th memo hit is rebuilt and compared with what
-    the memo would serve, field by field and floats by bits; a difference
-    logs CRITICAL `Context memo <name> served a context a rebuild does not
-    give: slot=... key=...` and the rebuilt context is served and kept.
-    At 20 it rebuilds about 5% of the hits (5-6 of top_tier's 112 on a
-    pass with no new bar, under 0.01 s of CPU there). It is on for the
-    memos' first dry-run day; a day whose log holds no such line is the
-    proof, and then `0` turns it off (README).
-    An integer of at least 0, checked at load.
+    every preset): each memo hit is rebuilt with probability 1/N, drawn
+    from a generator seeded on the memo's name, and compared with what the
+    memo would serve, field by field and floats by bits; a difference logs
+    CRITICAL `Context memo <name> served a context a rebuild does not
+    give: slot=... key=...` and the rebuilt context is served and kept. A
+    rebuild the clock key moved under is served, not compared or kept.
+    Every 30 minutes with hits, each memo logs `Memo shadow <name>: R of H
+    hits re-checked ... on S of the T slots hit, D differed` at DEBUG. At
+    20 it rebuilds about 5% of the hits (5-6 of top_tier's 112 on a pass
+    with no new bar, under 0.01 s of CPU there), and only detects: a hit
+    it does not draw is served from the memo, so `1` (every hit rebuilt)
+    is the setting after a CRITICAL line, until the key is fixed. It is on
+    for the memos' first dry-run day; a day whose log holds no such line
+    is the evidence, and then `0` turns it off (README). An integer of at
+    least 0, checked at load. As first built (the stage's review fixed
+    it), every N-th hit of a memo was re-checked: a pass reads its slots
+    in a fixed order, so a fixed subset of them was re-checked pass after
+    pass (on 10-01, 21 of top_tier's 28 S/R and chart slots never were);
+    a per-slot count reset at each new key would have re-checked only the
+    20th hit of a key, never the end of a 1m slot's minute.
   - Measured (CACHE-CTX verifier, on 9c2a8d2 with the kept step frames,
     interleaved): a pass with no new bar 3.07 → 1.83 s of CPU (sr 0.61 →
     0.008, contexts 0.44 → 0.02, publish 1.06 → 0.86 s), the new-bar pass
@@ -976,19 +987,26 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - README: `context_memo_shadow_every`; `config.example.yaml` and every
     preset ship it.
   - Tests: `tests/market_data/test_context_memo.py` (new): each memo
-    rebuilds exactly when one of its inputs moves (the flip frame's bars
-    and 5m slot, the stored HTF frame, a rewritten older bar, the session
+    rebuilds when an input its key holds moves (the flip frame's bars and
+    5m slot, the stored HTF frame, a rewritten older bar, the session
     date, the session switch, a forming bar completing, the 5m bucket, a
-    new bar) and serves a fresh build's equal otherwise; the fair value
-    gaps key on the frame they read, not the store after it; the prune and
-    the generation turn; one slot per variant; the chart mark replay; a
-    written step frame neither served nor kept by the structure memo; the
-    shadow's CRITICAL line, its every-N-th cadence and its knob in both
-    memos; a build the clock moved under is not kept; floats by bits; the
-    default and every preset at 20. `test_config_validation.py` (the
-    knob), `test_module_layering.py` (`context_memo` in layer 1),
-    `test_sr_tolerance_reads.py` (the S/R build reads the stored frame).
-    30 mutants, all killed.
+    new bar; and, added in the stage's review, the structure memo's frame
+    token on a bar inside a forming 5m bucket and its session switch
+    alone, the order blocks on a new bar, a 5m FVG's completion) and
+    serves a fresh build's equal otherwise; the fair value gaps key on the
+    frame they read, not the store after it; the prune and the generation
+    turn, and a slot read once a cycle built once; one slot per variant;
+    the chart mark replay; a written step frame neither served nor kept by
+    the structure memo; the shadow's CRITICAL line, its draws (about one
+    hit in N, every slot whatever the pass order, every moment of a key's
+    life), a rebuild the clock moved under served without an alarm, its
+    half-hourly counts and its knob in both memos; a build the clock moved
+    under is not kept; floats by bits; the default and every preset at 20.
+    `test_config_validation.py` (the knob), `test_module_layering.py`
+    (`context_memo` in layer 1), `test_sr_tolerance_reads.py` (the S/R
+    build reads the stored frame). 30 mutants, all killed, and the
+    review's 20 (the sampling, the clock guard, the summary, the five key
+    parts and the carry-over), all killed.
 
 - **The step frames are kept across passes: `get_merged` rebuilds a frame
   only when the store's bars for it change.** *2026-10-05* — every pass
@@ -1048,7 +1066,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     only writer (a static check of the package); the versions tell a
     pair's variants apart; and a step frame written after its hand-out
     (six kinds of write) gets the structure context of the bars it holds;
-    a frame freed at shutdown drops its entry without an error.
+    a new bar replaces the symbol's structure frame and frees the old one
+    (added in the stage's review, its mutant killed); a frame freed at
+    shutdown drops its entry without an error.
     `test_hot_helpers_pinned.py` compares the cycle cache's pairs. 29
     mutants, all killed (the verifier's 14 and 15 for the versions, the
     cycle cache's pairs, the bars check and the registry's shutdown).
@@ -1091,13 +1111,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (new, default 30; above 0 and at least the slowest page's poll,
     `max(refresh_ms, 4000) / 1000`, since `/mobile` polls no faster than
     every 4 s; checked at load). It is also built on a new status or
-    message, while a build is
-    failing, on a failed cycle's error path, and otherwise once every
-    `dashboard.idle_publish_seconds` (new, default 60; above 0, checked at
-    load). Unwatched, `/api/state`, the state file and a page that opens
-    first are up to that old; the pass after the page's first poll builds a
-    fresh one. With the dashboard off nothing is built, so a broken build is
-    no longer logged there.
+    message, while a build is failing, on a failed cycle's error path, and
+    otherwise once every `dashboard.idle_publish_seconds` (new, default
+    60; above 0, checked at load). Unwatched, `/api/state`, the state file
+    and a page that opens first are up to that old; the pass after the
+    page's first poll builds a fresh one. With the dashboard off nothing is
+    built, so a broken build is no longer logged there.
   - `PaperAccount.record_equity_point` (new) samples the peak, the max
     drawdown and the equity curve, and the engine calls it on every pass,
     before it decides on the build. `PaperAccount.snapshot` (new) reads the

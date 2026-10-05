@@ -23,16 +23,26 @@ it ran never files a context under a clock it did not read. A slot not read
 for a whole cycle is dropped at the next (``next_generation``), so the memo
 holds at most two cycles' worth of slots.
 
-``shadow_every`` (``runtime.context_memo_shadow_every``) re-checks every
-N-th hit: it rebuilds, compares the two contexts field by field (floats by
-bits), logs CRITICAL on a difference and serves the rebuilt one. It is the
-guard against an input a builder starts reading that the key does not hold.
+``shadow_every`` (``runtime.context_memo_shadow_every``) re-checks each hit
+with probability 1/N (N = 1: every hit): it rebuilds, compares the two
+contexts field by field (floats by bits), logs CRITICAL on a difference and
+serves the rebuilt one. It is the guard against an input a builder starts
+reading that the key does not hold. The draws come from a generator seeded
+on the memo's name, one per hit, so every slot and every moment of a key's
+life is sampled: until 2026-10-05 (the stage-3 review) every N-th hit of the
+memo was re-checked, and since a pass reads its slots in a fixed order a
+fixed subset of them was re-checked pass after pass (21 of top_tier's 28
+S/R slots never were). Every ``SHADOW_SUMMARY_SECONDS`` of the bot's clock
+with hits, a memo logs at DEBUG (the log file) how many hits and slots its
+shadow re-checked (``Memo shadow ...``), so a day with no CRITICAL line also
+shows the check ran.
 """
 from __future__ import annotations
 
 import dataclasses
 import enum
 import logging
+import random
 import threading
 from datetime import date, datetime
 from typing import Any, Callable, Hashable
@@ -40,9 +50,14 @@ from typing import Any, Callable, Hashable
 import numpy as np
 import pandas as pd
 
+from . import sessions
 from .indicators import get_runtime_indicator_mode, get_session_indicator_window, indicator_session_open
 
 LOG = logging.getLogger(__name__)
+
+# How often, on the bot's clock, a memo whose shadow re-checked anything logs
+# its counts.
+SHADOW_SUMMARY_SECONDS = 1800.0
 
 
 def indicator_clock_key() -> tuple:
@@ -91,6 +106,21 @@ def same_context(a: Any, b: Any) -> bool:
     return _canon(a) == _canon(b)
 
 
+class _ShadowWindow:
+    """The shadow's counts since a memo's last summary, from its first hit
+    on (``sessions.now_et``)."""
+
+    __slots__ = ("started", "hits", "rechecks", "mismatches", "slots_hit", "slots_rechecked")
+
+    def __init__(self, started: datetime) -> None:
+        self.started = started
+        self.hits = 0
+        self.rechecks = 0
+        self.mismatches = 0
+        self.slots_hit: set[Hashable] = set()
+        self.slots_rechecked: set[Hashable] = set()
+
+
 class ContextMemo:
     """One build per slot across cycles; see the module docstring."""
 
@@ -102,12 +132,33 @@ class ContextMemo:
         self._current: dict[Hashable, tuple[tuple, Any, tuple]] = {}
         self._previous: dict[Hashable, tuple[tuple, Any, tuple]] = {}
         self._hits = 0
+        # One draw a hit, seeded on the name: a replay re-checks the same hits.
+        self._shadow_draws = random.Random(f"context_memo:{name}")
+        # The counts since the last summary; opened by the shadow's first
+        # hit after it, so a memo without the shadow or without hits logs
+        # nothing.
+        self._shadow_window: _ShadowWindow | None = None
 
     def next_generation(self) -> None:
-        """A cycle starts: slots not read since the last call are dropped."""
+        """A cycle starts: slots not read since the last call are dropped,
+        and the shadow's counts are logged once ``SHADOW_SUMMARY_SECONDS``
+        have passed on the bot's clock since its first hit after the last
+        summary."""
         with self._lock:
             self._previous = self._current
             self._current = {}
+            window = self._shadow_window
+            if window is None:
+                return
+            minutes = (sessions.now_et() - window.started).total_seconds() / 60.0
+            if minutes * 60.0 < SHADOW_SUMMARY_SECONDS:
+                return
+            self._shadow_window = None
+        LOG.debug(
+            "Memo shadow %s: %d of %d hits re-checked (1 in %d drawn) on %d of the %d slots hit, %d differed, "
+            "in %.0f min", self.name, window.rechecks, window.hits, self.shadow_every, len(window.slots_rechecked),
+            len(window.slots_hit), window.mismatches, minutes,
+        )
 
     def retain(self, keep: Callable[[Hashable], bool]) -> None:
         """Drop every slot ``keep`` refuses (the store's symbol prune)."""
@@ -133,10 +184,18 @@ class ContextMemo:
         memo's when its key matches, else ``build(clock)``, filed when the
         clock key still reads the same after it. A build that takes a
         clock-derived value as an argument takes it from ``clock``, the very
-        value the key holds."""
+        value the key holds.
+
+        With the shadow on, a hit drawn for a re-check (probability
+        1/``shadow_every``) is rebuilt: a rebuild that differs is logged
+        CRITICAL and served and filed in place of the memo's; one the clock
+        moved under (a minute or session boundary crossed while it ran) is
+        compared with nothing, since the two read different clocks: it is
+        served, as a miss's build would be, and not filed."""
         clock = clock_key()
         key = (static_key, clock)
         shadow = False
+        window: _ShadowWindow | None = None
         with self._lock:
             entry = self._current.get(slot)
             if entry is None:
@@ -145,7 +204,16 @@ class ContextMemo:
                     self._current[slot] = entry
             if entry is not None and entry[0] == key:
                 self._hits += 1
-                shadow = self.shadow_every > 0 and self._hits % self.shadow_every == 0
+                if self.shadow_every > 0:
+                    shadow = self._shadow_draws.randrange(self.shadow_every) == 0
+                    window = self._shadow_window
+                    if window is None:
+                        window = self._shadow_window = _ShadowWindow(sessions.now_et())
+                    window.hits += 1
+                    window.slots_hit.add(slot)
+                    if shadow:
+                        window.rechecks += 1
+                        window.slots_rechecked.add(slot)
                 if not shadow:
                     return entry[1]
         fresh = build(clock)
@@ -156,6 +224,8 @@ class ContextMemo:
                     "Context memo %s served a context a rebuild does not give: slot=%r key=%r; "
                     "serving the rebuilt one.", self.name, slot, key,
                 )
+                with self._lock:
+                    window.mismatches += 1
             elif still:
                 return entry[1]
         if still:
