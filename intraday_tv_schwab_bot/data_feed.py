@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from threading import RLock
-from typing import Any, Iterable, Mapping, NamedTuple
+from typing import Any, Callable, Iterable, Mapping, NamedTuple
 
 import pandas as pd
 from schwabdev import Client, Stream
@@ -131,6 +131,10 @@ class MarketDataStore:
         # Contexts per _htf_context_cache_key, each tagged with the frame it
         # was built from (see _HTFCacheEntry / get_htf_context).
         self.htf_cache: dict[tuple, _HTFCacheEntry] = {}
+        # derive_from_htf_frame's results per ((symbol, tf), slot): (the
+        # stored frame object it was built from, the indicator settings, the
+        # result).
+        self._htf_derived_memo: dict[tuple[tuple[str, int], str], tuple[pd.DataFrame | None, tuple, Any]] = {}
         self.last_htf_refresh: dict[tuple[str, int], datetime] = {}
         self.last_quote_refresh: dict[str, datetime] = {}
         # Per-symbol quote-failure tracking. Counter increments on each
@@ -313,6 +317,7 @@ class MarketDataStore:
             # Tuple-keyed dicts: drop any (sym, *) entry where sym is stale.
             self.history_htf = {k: v for k, v in self.history_htf.items() if k[0] not in stale}
             self.htf_cache = {k: v for k, v in self.htf_cache.items() if k[0] not in stale}
+            self._htf_derived_memo = {k: v for k, v in self._htf_derived_memo.items() if k[0][0] not in stale}
             self.last_htf_refresh = {k: v for k, v in self.last_htf_refresh.items() if k[0] not in stale}
         return len(stale)
 
@@ -930,6 +935,35 @@ class MarketDataStore:
         with self._lock:
             frame = self.history_htf.get(self._htf_key(symbol, timeframe_minutes))
         return frame.copy(deep=False) if frame is not None else None
+
+    def derive_from_htf_frame(
+        self,
+        symbol: str,
+        *,
+        timeframe_minutes: int,
+        slot: str,
+        build: Callable[[pd.DataFrame | None], Any],
+    ) -> Any:
+        """``build`` of the stored (symbol, tf) HTF frame (a shallow copy of
+        it, or None while none is stored), kept per ``slot`` until the stored
+        frame object or the indicator settings change. Every refresh stores a
+        new object and nothing writes into a stored one
+        (``_refresh_htf_frame``), so ``build`` must read nothing but the
+        frame's bars and those settings: no clock, no other feed state. The
+        entry holds the object it was built from (compared by identity, so a
+        freed object's id never matches) until the next read of the slot or
+        the prune."""
+        key = self._htf_key(symbol, timeframe_minutes)
+        settings = (get_runtime_indicator_mode(), get_session_indicator_window())
+        with self._lock:
+            stored = self.history_htf.get(key)
+            entry = self._htf_derived_memo.get((key, slot))
+        if entry is not None and entry[0] is stored and entry[1] == settings:
+            return entry[2]
+        result = build(None if stored is None else stored.copy(deep=False))
+        with self._lock:
+            self._htf_derived_memo[(key, slot)] = (stored, settings, result)
+        return result
 
     def _stream_history_due(self, symbol: str) -> bool:
         now = sessions.now_et()

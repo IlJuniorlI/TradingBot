@@ -19,6 +19,8 @@ from .htf_levels import summarize_htf_trend
 from .numeric import first_float, safe_float
 
 if TYPE_CHECKING:
+    import pandas as pd
+
     from .config import BotConfig
     from .paper_account import PaperAccount
     from ._strategies.strategy_base import BaseStrategy
@@ -71,8 +73,16 @@ def structure_event_label(ms_ctx: Any) -> str:
 
 
 def _htf_trend(data: MarketDataStore, strategy: BaseStrategy, symbol: str) -> dict[str, Any]:
+    """The generic trend row of the strategy's stored HTF frame, built once
+    per stored frame (``derive_from_htf_frame``): the frame changes once a
+    bar, at its refresh, and the row reads nothing else."""
     tf = strategy.htf_minutes()
-    frame = data.get_htf_frame(symbol, timeframe_minutes=tf)
+    row = data.derive_from_htf_frame(symbol, timeframe_minutes=tf, slot="sr_snapshot.htf_trend",
+                                     build=lambda frame: _htf_trend_row(frame, tf))
+    return dict(row)
+
+
+def _htf_trend_row(frame: pd.DataFrame | None, tf: int) -> dict[str, Any]:
     summary = summarize_htf_trend(
         frame,
         min_bars=20,

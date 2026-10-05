@@ -829,6 +829,51 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The dashboard snapshot's bars and the HTF trend row are kept across
+  passes and rebuilt only on a new bar or HTF refresh.** *2026-10-05* —
+  with the step frames and contexts kept (below), a built publish with no
+  new bar still rebuilt every shown symbol's snapshot bars (the bars, the
+  per-bar candle map, the strategy's LTF EMAs from a second frame read)
+  and its HTF trend row from frames that had not changed.
+  - `DashboardCache._snapshot_bars` keeps one build per symbol, keyed on
+    the 1m frame's version (`bars.frame_version`: the store frames it was
+    built from and its variant), its length, last bar and columns, the bar
+    count, the strategy's LTF and LTF EMA request, the indicator settings
+    and the candle lists. A build is kept only when the strategy's LTF
+    EMAs came from the same store frames as the 1m frame (a stream bar can
+    land between the two reads) and its candle map did not fail. Hits and
+    keeps copy each bar and its candle lists. A frame with no version is
+    built every time, as before. The publish's and the engine's prunes
+    drop a symbol's entry. `_apply_strategy_ltf_emas` returns the source
+    token of the frame its EMAs came from.
+  - `MarketDataStore.derive_from_htf_frame` (new) keeps a build of the
+    stored HTF frame per symbol, timeframe and slot until the stored
+    object (every refresh stores a new one) or the indicator settings
+    change; the build gets a shallow copy. `sr_snapshot._htf_trend` goes
+    through it, so the dashboard's S/R row and the exit record's HTF trend
+    read it, and the prune drops it.
+  - The LTF fair-value-gap overlay is served by the FVG memo above; the
+    technical overlay is still built at the live quote every publish.
+  - Measured (CACHE-DASH verifier, on 9c2a8d2 with the kept step frames,
+    interleaved): a built publish with no new bar 1.05 → 0.72 s, a pass
+    -0.32 s weighted; real-time manage_gap 5.29 → 5.01 s. With the context
+    memos too, the no-bar publish took 0.54 s (probe).
+  - Identical: the verifier's three stepped replays (the 09-30 open with
+    16 trades, 10-01 across the entry cutoff and the close, a peer preset)
+    with every bars-memo hit and every HTF-memo call compared with a fresh
+    build (0 mismatches in 10,724 and 16,585), and 672 `/api/chart`
+    payloads equal; here, the 10-01 09:40-10:40 stepped replay against
+    21032f8 with a page open.
+  - Tests: `tests/reporting/test_snapshot_frame_memo.py` (new): a hit
+    equals a rebuild without building; a new bar, a revised old bar and
+    every other key input rebuild; a span-5 hand-out of the same store
+    frames is not served the canonical bars; EMAs read from other store
+    frames and a failed candle map are not kept; a frame without a version
+    builds every time; hand-outs never share the memo's bars; the prunes;
+    the whole snapshot equals a fresh cache's; the HTF trend memo's object,
+    settings, slot, copy and prune. `tests/support/brokers.py`'s fake feed
+    answers `derive_from_htf_frame`. 22 mutants, all killed.
+
 - **The S/R, fair-value-gap, order-block and strategy contexts are kept
   across passes and rebuilt only when what they read changes; a shadow
   check (`runtime.context_memo_shadow_every`, on at 20) re-proves them.**

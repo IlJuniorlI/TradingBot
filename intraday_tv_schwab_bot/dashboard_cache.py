@@ -59,8 +59,8 @@ from .sr_snapshot import sr_snapshot, structure_event_label
 from .support_resistance import analyze_market_structure
 from .symbols import NON_STREAMABLE
 from .technical_levels import TechnicalLevelsContext, build_technical_levels_context
-from .bars import last_bucket_forming, session_bucket_ends
-from .indicators import htf_ema_spans, last_bar_atr, ltf_ema_spans
+from .bars import frame_source_token, frame_version, last_bucket_forming, session_bucket_ends
+from .indicators import get_runtime_indicator_mode, get_session_indicator_window, htf_ema_spans, last_bar_atr, ltf_ema_spans
 from . import sessions
 from .levels_shared import collapse_price_ladder, effective_side_tolerance
 
@@ -109,6 +109,9 @@ class DashboardCache:
         self.account = account
         self.snapshot_cache: dict[str, dict[str, Any]] = {}
         self.chart_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
+        # symbol -> (key, bars, ema spans): the snapshot bars of the last
+        # frame version built (_snapshot_bars).
+        self._snapshot_bars_memo: dict[str, tuple[tuple, list[dict[str, Any]], tuple[int, int]]] = {}
         self.lock = RLock()
         self.log_component_failure = ComponentFailureLog(LOG)
 
@@ -121,9 +124,11 @@ class DashboardCache:
         active = {str(s).upper().strip() for s in (active_symbols or set()) if s}
         with self.lock:
             snap_stale = {sym for sym in self.snapshot_cache.keys() if str(sym).upper().strip() not in active}
+            snap_stale |= {sym for sym in self._snapshot_bars_memo.keys() if str(sym).upper().strip() not in active}
             chart_stale = {key for key in self.chart_cache.keys() if str(key[0]).upper().strip() not in active}
             for sym in snap_stale:
                 self.snapshot_cache.pop(sym, None)
+                self._snapshot_bars_memo.pop(sym, None)
             for key in chart_stale:
                 self.chart_cache.pop(key, None)
         # Distinct symbol count, not entry count, so the engine has a
@@ -206,9 +211,11 @@ class DashboardCache:
         bars: list[dict[str, Any]],
         *,
         timeframe: str,
-    ) -> tuple[int, int]:
+    ) -> tuple[tuple[int, int], tuple | None]:
         """Put the strategy's own LTF fast/slow EMA on ``bars`` (the tail of
-        ``frame``, a ``timeframe`` frame) and return the two spans.
+        ``frame``, a ``timeframe`` frame) and return the two spans and the
+        source token (``bars.frame_source_token``) of the frame they were
+        read from: ``frame``'s own when its 9/20 are the strategy's.
 
         The strategy reads ema9/ema20 off ``get_merged(timeframe,
         span_scale=ltf_indicator_span_scale, ema_spans=ltf_ema_spans(params))``:
@@ -225,16 +232,18 @@ class DashboardCache:
         params = getattr(self.strategy, "params", {}) or {}
         scale = float(params.get("ltf_indicator_span_scale", 1.0))
         spans = ltf_ema_spans(params)
+        source = frame_source_token(frame)
         # The frame the caller built is canonical (scale 1, EMA 9/20); fetch
         # the strategy's own whenever either differs.
         if bars and (scale != 1.0 or spans != (9, 20)):
             scaled = self.data.get_merged(symbol, timeframe=timeframe, with_indicators=True,
                                           span_scale=scale, ema_spans=spans)
+            source = frame_source_token(scaled)
             emas = scaled[["ema9", "ema20"]].reindex(frame.index[-len(bars):])
             for bar, fast, slow in zip(bars, emas["ema9"], emas["ema20"]):
                 bar["ema9"] = safe_float(fast)
                 bar["ema20"] = safe_float(slow)
-        return spans
+        return spans, source
 
     def build_payload(
         self,
@@ -618,14 +627,31 @@ class DashboardCache:
         return payload
 
     def _snapshot_bars(self, symbol: str, frame: pd.DataFrame | None) -> tuple[list[dict[str, Any]], tuple[int, int]]:
-        """The snapshot's newest bars of ``frame``, each with its candle tags,
-        and the spans of their ema9 / ema20: the strategy's own LTF EMAs when
-        its LTF is 1m, else the frame's 9 / 20."""
+        """The snapshot's newest bars of ``frame`` (the symbol's canonical
+        1m frame, ``get_merged(symbol, with_indicators=True)``), each with its
+        candle tags, and the spans of their ema9 / ema20: the strategy's own
+        LTF EMAs when its LTF is 1m, else the frame's 9 / 20.
+
+        They are a function of the frame's bars and the settings in
+        ``_snapshot_bars_key``, so a frame of the version last built
+        (``bars.frame_version``: the same store frames, the same variant)
+        gets those bars again instead of a rebuild; the frame changes once a
+        bar, the snapshot every cycle. A build is kept only when its EMAs
+        came from the same store frames as ``frame`` (its source token: a
+        stream bar can land between the two reads) and its candle map did
+        not fail."""
+        snapshot_bars_count = self.snapshot_max_bars()
+        memo_key = self._snapshot_bars_key(frame, snapshot_bars_count)
+        if memo_key is not None:
+            with self.lock:
+                entry = self._snapshot_bars_memo.get(symbol)
+            if entry is not None and entry[0] == memo_key:
+                return [_copy_bar(bar) for bar in entry[1]], entry[2]
         # Per-bar candle pattern map (completion-bar only, tier cascade).
         # Drives the tooltip's "Candle Patterns (this bar)" section. Computed
         # before bars are built so each bar dict can carry its own matched
         # patterns, for every bar the snapshot carries.
-        snapshot_bars_count = self.snapshot_max_bars()
+        candles_failed = False
         snapshot_per_bar_candles: dict[Any, dict[str, list[str]]] = {}
         if frame is not None and not frame.empty:
             try:
@@ -637,6 +663,7 @@ class DashboardCache:
                     symbol,
                 )
                 snapshot_per_bar_candles = {}
+                candles_failed = True
         bars = bars_from_frame(
             frame,
             max_bars=snapshot_bars_count,
@@ -645,9 +672,38 @@ class DashboardCache:
         # Snapshot bars are 1m bars; they are the strategy's LTF bars (and are
         # merged into the LTF chart) only when its LTF is 1m.
         snapshot_ema_spans = (9, 20)
+        source = None if memo_key is None else memo_key[0][0]
+        ema_source = source
         if bars and self.strategy.ltf_minutes() == 1:
-            snapshot_ema_spans = self._apply_strategy_ltf_emas(symbol, frame, bars, timeframe="1min")
+            snapshot_ema_spans, ema_source = self._apply_strategy_ltf_emas(symbol, frame, bars, timeframe="1min")
+        if memo_key is not None and not candles_failed and ema_source == source:
+            with self.lock:
+                self._snapshot_bars_memo[symbol] = (memo_key, [_copy_bar(bar) for bar in bars], snapshot_ema_spans)
         return bars, snapshot_ema_spans
+
+    def _snapshot_bars_key(self, frame: pd.DataFrame | None, bars_count: int) -> tuple | None:
+        """What ``_snapshot_bars`` builds from: ``frame``'s version (its
+        source token and variant), the bar count, the strategy's LTF and its
+        EMA request, the indicator settings and the candle lists; None for a
+        frame with no version (built every time)."""
+        version = frame_version(frame)
+        if version is None or frame is None or frame.empty:
+            return None
+        params = getattr(self.strategy, "params", {}) or {}
+        return (
+            version,
+            len(frame),
+            frame.index[-1],
+            tuple(frame.columns),
+            int(bars_count),
+            self.strategy.ltf_minutes(),
+            float(params.get("ltf_indicator_span_scale", 1.0)),
+            ltf_ema_spans(params),
+            get_runtime_indicator_mode(),
+            get_session_indicator_window(),
+            tuple(self.config.candles.bullish_patterns or ()),
+            tuple(self.config.candles.bearish_patterns or ()),
+        )
 
     def _snapshot_quote(
         self,
@@ -1907,7 +1963,8 @@ class DashboardCache:
         # session-reset EMA45 / EMA100), exactly as the snapshot bars merged
         # over these carry them.
         elif resolved_mode == "ltf" and bars:
-            ema_fast_span, ema_slow_span = self._apply_strategy_ltf_emas(symbol_key, frame, bars, timeframe=f"{ltf_min}min")
+            (ema_fast_span, ema_slow_span), _source = self._apply_strategy_ltf_emas(
+                symbol_key, frame, bars, timeframe=f"{ltf_min}min")
         pattern_payload = self.current_pattern_payload(context_frame)
         # Rendered on the chart as the event marker + reference level line
         # (until 2026-09-23 it was computed per payload and never drawn).
@@ -1946,3 +2003,12 @@ class DashboardCache:
         with self.lock:
             self.chart_cache[cache_key] = {"signature": chart_signature, "payload": copy.deepcopy(payload)}
         return payload
+
+
+def _copy_bar(bar: dict[str, Any]) -> dict[str, Any]:
+    """A snapshot bar no other holder shares: its values are scalars but
+    for the two candle lists."""
+    out = dict(bar)
+    out["candles_bullish"] = list(bar["candles_bullish"])
+    out["candles_bearish"] = list(bar["candles_bearish"])
+    return out
