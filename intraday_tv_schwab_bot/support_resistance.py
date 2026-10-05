@@ -561,10 +561,15 @@ def flip_frame_clock_key(flip_frame: pd.DataFrame | None, now: datetime | pd.Tim
     1m bars, and the cutoff's 5-minute slot, which fixes whether the last
     5m bucket has completed (bucket ends lie on the 5-minute grid). A memo
     keyed on it misses when a bar completes or a 5m slot turns, not every
-    minute. None without a flip frame (the build reads no clock through it).
+    minute. None without a flip frame or with an empty one: the build reads
+    no clock through either (``_completed_1m_bars`` returns before its
+    comparison). ``get_merged`` hands a symbol whose 1m bars have not
+    arrived an empty frame on a ``RangeIndex``, which cannot be compared
+    with a stamp: until 2026-10-05 its key raised TypeError there, where a
+    build gives the context.
     The cutoff is floored on UTC, which equals the ET floor and cannot raise
     on the fall-back hour."""
-    if flip_frame is None:
+    if flip_frame is None or flip_frame.empty:
         return None
     moment = pd.Timestamp(now)
     cutoff = moment.floor("1min") if moment.tzinfo is None else moment.tz_convert("UTC").floor("1min")

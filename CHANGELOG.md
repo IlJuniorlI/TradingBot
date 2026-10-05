@@ -930,13 +930,22 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     object, read once and pinned), the request, and the clock only as the
     build reads it: the completed bars (`bars.forming_positions` for the
     fair value gaps, `support_resistance.flip_frame_clock_key` for the S/R
-    flip frame: its completed 1m bars and the 5-minute slot), the session
-    date (S/R), the structure frame's forming last bucket, and
-    `indicator_clock_key` (the session indicator mode and window and
-    whether the clock is inside that session, which the ATR and the
-    divergence clocks switch on). A build is kept only when the clock part
-    reads the same after it as before, so a minute or session boundary
-    crossed mid-build files nothing.
+    flip frame: its completed 1m bars and the 5-minute slot, none for an
+    empty one), the session date (S/R), the structure frame's forming last
+    bucket, and `indicator_clock_key` (the session indicator mode and
+    window and whether the clock is inside that session, which the ATR and
+    the divergence clocks switch on). A build is kept only when the clock
+    part reads the same after it as before, so a minute or session
+    boundary crossed mid-build files nothing.
+  - An empty flip frame has no clock key: the build reads no clock through
+    it. As first built (fixed in the cut's final review), the S/R key
+    compared its index with the clock anyway, and `get_merged` hands a
+    symbol whose 1m bars have not arrived an empty frame on a RangeIndex,
+    so the read raised TypeError where 21032f8 built the context: on
+    small_cap_squeeze 2026-06-02, with two candidates new at 09:30:40, two
+    dashboard updates failed and their decision records lost 19 `mshtf_*`
+    fields (no order, signal or trade changed). Every other key the cut
+    added reads an empty frame as its build does.
   - The store (`MarketDataStore._level_memo`: S/R, FVG, order blocks) and
     each strategy instance (`_context_memo`: chart, structure, technical)
     have one. A slot not read for a whole cycle is dropped at the next
@@ -993,20 +1002,24 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     new bar; and, added in the stage's review, the structure memo's frame
     token on a bar inside a forming 5m bucket and its session switch
     alone, the order blocks on a new bar, a 5m FVG's completion) and
-    serves a fresh build's equal otherwise; the fair value gaps key on the
-    frame they read, not the store after it; the prune and the generation
-    turn, and a slot read once a cycle built once; one slot per variant;
-    the chart mark replay; a written step frame neither served nor kept by
-    the structure memo; the shadow's CRITICAL line, its draws (about one
-    hit in N, every slot whatever the pass order, every moment of a key's
-    life), a rebuild the clock moved under served without an alarm, its
-    half-hourly counts and its knob in both memos; a build the clock moved
-    under is not kept; floats by bits; the default and every preset at 20.
+    serves a fresh build's equal otherwise; an empty flip frame gets a
+    build's context, kept across a 5m slot until the bars arrive (added in
+    the final review); the fair value gaps key on the frame they read, not
+    the store after it; the prune and the generation turn, and a slot read
+    once a cycle built once; one slot per variant; the chart mark replay; a
+    written step frame neither served nor kept by the structure memo; the
+    shadow's CRITICAL line, its draws (about one hit in N, every slot
+    whatever the pass order, every moment of a key's life), a rebuild the
+    clock moved under served without an alarm, its half-hourly counts and
+    its knob in both memos; a build the clock moved under is not kept;
+    floats by bits; the default and every preset at 20.
     `test_config_validation.py` (the knob), `test_module_layering.py`
     (`context_memo` in layer 1), `test_sr_tolerance_reads.py` (the S/R
-    build reads the stored frame). 30 mutants, all killed, and the
-    review's 20 (the sampling, the clock guard, the summary, the five key
-    parts and the carry-over), all killed.
+    build reads the stored frame). 30 mutants, all killed; the review's 17
+    (the sampling, the clock guard, the summary, the four key parts and
+    the carry-over), all killed, the three sampling counts also by the
+    sampling tests alone; and the final review's 2 (the empty flip frame's
+    key), killed.
 
 - **The step frames are kept across passes: `get_merged` rebuilds a frame
   only when the store's bars for it change.** *2026-10-05* — every pass
@@ -1206,14 +1219,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     HTF context build is the contexts phase's, watched or not, on top_tier
     and on a peer preset, whose own context is among them; a refresh before
     the entries or the publish builds the refreshed contexts at once);
+    `tests/reporting/test_sr_snapshot.py` (the generic trend's request: EMA
+    50/200 on the support_resistance levels and the strategy's HTF minutes,
+    the arguments 21032f8's S/R row passed; added in the final review);
     `tests/reporting/test_dashboard.py` (the requests that stamp, through
     the real server); `tests/domain/test_config_validation.py` (both knobs
     and the slowest-poll cross-check, `/mobile`'s floor pinned to
-    `mobile.js`); `test_dashboard_update_failure.py`,
-    `test_cycle_timing.py` and `test_engine_shutdown.py` keep a page open or
-    give their shell a dashboard and an account, and the dashboard-off test
-    now pins that nothing is built and the account is still sampled. 51
-    mutants, all killed.
+    `mobile.js`); `test_dashboard_update_failure.py`, `test_cycle_timing.py`
+    and `test_engine_shutdown.py` keep a page open or give their shell a
+    dashboard and an account, and the dashboard-off test now pins that
+    nothing is built and the account is still sampled. 51 mutants, all
+    killed, and the final review's 12 on the generic trend's request.
 
 - **The dashboard publish keeps the state it serves without copying,
   signing or indenting it; the state file is compact and throttled

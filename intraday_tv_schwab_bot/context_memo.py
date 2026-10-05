@@ -131,7 +131,6 @@ class ContextMemo:
         # slot -> (key, context, pins)
         self._current: dict[Hashable, tuple[tuple, Any, tuple]] = {}
         self._previous: dict[Hashable, tuple[tuple, Any, tuple]] = {}
-        self._hits = 0
         # One draw a hit, seeded on the name: a replay re-checks the same hits.
         self._shadow_draws = random.Random(f"context_memo:{name}")
         # The counts since the last summary; opened by the shadow's first
@@ -203,7 +202,6 @@ class ContextMemo:
                 if entry is not None:
                     self._current[slot] = entry
             if entry is not None and entry[0] == key:
-                self._hits += 1
                 if self.shadow_every > 0:
                     shadow = self._shadow_draws.randrange(self.shadow_every) == 0
                     window = self._shadow_window
