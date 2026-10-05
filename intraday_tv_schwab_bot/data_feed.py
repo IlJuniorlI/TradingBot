@@ -23,8 +23,24 @@ from .order_blocks import OrderBlockContext, build_order_block_context, empty_or
 from .numeric import first_float, safe_float
 from .symbols import QUOTE_SYMBOL_ALIASES, STREAMABLE_EQUITY_RE, is_streamable_equity, is_support_resistance_symbol
 from .schwab_api import call_schwab_client, call_schwab_json, response_ok
-from .bars import completed_bucket_mask, ensure_ohlcv_frame, equity_stream_window_bars, floor_minute, resample_bars, session_bucket_floor
-from .indicators import ensure_standard_indicator_frame, indicator_session_open, resolve_ema_spans
+from .bars import (
+    completed_bucket_mask,
+    ensure_ohlcv_frame,
+    equity_stream_window_bars,
+    floor_minute,
+    next_source_generation,
+    register_frame_source,
+    resample_bars,
+    retain_derived_frames,
+    session_bucket_floor,
+)
+from .indicators import (
+    ensure_standard_indicator_frame,
+    get_runtime_indicator_mode,
+    get_session_indicator_window,
+    indicator_session_open,
+    resolve_ema_spans,
+)
 from . import sessions
 from .sessions import (
     EQUITY_STREAM_HISTORY_REFRESH_READY,
@@ -147,8 +163,20 @@ class MarketDataStore:
         self._forced_premarket_history_refresh_date: dict[str, date] = {}
         self._cycle_active = False
         # Keys: base OHLCV = (symbol, tf, False); enriched =
-        # (symbol, tf, True, span_scale, (ema fast, ema slow)).
-        self._cycle_merged_cache: dict[tuple, pd.DataFrame] = {}
+        # (symbol, tf, True, span_scale, (ema fast, ema slow)). Values:
+        # (frame, the (source token, variant) it was built as; see get_merged).
+        self._cycle_merged_cache: dict[tuple, tuple[pd.DataFrame, tuple]] = {}
+        # get_merged's frames across cycles, under the cycle cache's keys:
+        # (history frame, live frame, indicator settings, frame). Every write
+        # to `history` / `live` stores a new object and none writes into one
+        # (fetch_history, on_stream_message, prune_inactive_symbols), so the
+        # same two objects hold the same bars and the frame built from them
+        # is the one a rebuild would make. The entry holds both objects, so
+        # their ids cannot be reused while it lives.
+        self._merged_memo: dict[tuple, tuple[pd.DataFrame | None, pd.DataFrame | None, tuple, pd.DataFrame]] = {}
+        # symbol -> (history frame, live frame, generation): the provenance
+        # generation of the symbol's current pair (bars.register_frame_source).
+        self._source_generations: dict[str, tuple[pd.DataFrame | None, pd.DataFrame | None, int]] = {}
         self._cycle_htf_context_cache: dict[tuple, HTFContext | None] = {}
         self._cycle_fvg_cache: dict[tuple, FairValueGapContext] = {}
         self._cycle_ob_cache: dict[tuple, OrderBlockContext] = {}
@@ -245,7 +273,13 @@ class MarketDataStore:
         # Capture victim symbol set from the primary `history` keyspace —
         # any symbol with state but not active. Then remove it from every
         # per-symbol dict in one pass so we never leave dangling entries.
+        retain_derived_frames(active)
         with self._lock:
+            # get_merged's memo and provenance generations can hold a symbol
+            # the store does not (a read of an unknown symbol, or one in
+            # flight across a prune), so they keep only the active symbols.
+            self._merged_memo = {k: v for k, v in self._merged_memo.items() if k[0] in active}
+            self._source_generations = {k: v for k, v in self._source_generations.items() if k in active}
             stale = {sym for sym in self.history.keys() if sym not in active}
             stale |= {sym for sym in self.live.keys() if sym not in active}
             stale |= {sym for sym in self.quote_cache.keys() if sym not in active}
@@ -857,7 +891,7 @@ class MarketDataStore:
         that only that fetch used."""
         with self._lock:
             frame = self.history_htf.get(self._htf_key(symbol, timeframe_minutes))
-        return frame.copy() if frame is not None else None
+        return frame.copy(deep=False) if frame is not None else None
 
     def _stream_history_due(self, symbol: str) -> bool:
         now = sessions.now_et()
@@ -1968,24 +2002,58 @@ class MarketDataStore:
         # (9/20 at scale 1) on that same entry.
         base_key = (cache_key, tf, False)
         indicator_key = (cache_key, tf, True, float(span_scale), resolve_ema_spans(span_scale, ema_spans))
+        key = indicator_key if with_indicators else base_key
+        settings = (get_runtime_indicator_mode(), get_session_indicator_window())
+        # Every frame handed out is a shallow copy registered with its
+        # version: the source token of the store frames it was built from and
+        # the variant it is (this key's request and the indicator settings).
+        # Copy-on-write (always on in pandas 3) keeps a caller's writes out of
+        # the cached frame, and the version travels with a cycle-cache entry,
+        # so a frame built before a stream bar landed never carries the token
+        # of the store after it.
         with self._lock:
             if self._cycle_active:
-                cached = self._cycle_merged_cache.get(indicator_key if with_indicators else base_key)
+                cached = self._cycle_merged_cache.get(key)
                 if cached is not None:
-                    return cached.copy()
+                    return self._hand_out(cached[0], cached[1])
             history_frame = self.history.get(cache_key)
             live_frame = self.live.get(cache_key)
-        merged = self._merge_frames(history_frame, live_frame)
-        if tf != "1min":
-            rule = {"5min": "5min", "15min": "15min", "30min": "30min"}.get(tf, tf)
-            merged = resample_bars(merged, rule)
-        with self._lock:
-            if self._cycle_active:
-                self._cycle_merged_cache[base_key] = merged.copy()
+            source = self._source_generations.get(cache_key)
+            if source is None or source[0] is not history_frame or source[1] is not live_frame:
+                source = (history_frame, live_frame, next_source_generation())
+                self._source_generations[cache_key] = source
+            token = (cache_key, source[2], tf)
+            memo = self._merged_memo.get(key)
+            if memo is not None and memo[0] is history_frame and memo[1] is live_frame and memo[2] == settings:
+                version = (token, (key[2:], memo[2]))
+                if self._cycle_active:
+                    self._cycle_merged_cache[key] = (memo[3], version)
+                return self._hand_out(memo[3], version)
+            base_memo = self._merged_memo.get(base_key) if with_indicators else None
+        base_version = (token, (base_key[2:], settings))
+        if base_memo is not None and base_memo[0] is history_frame and base_memo[1] is live_frame:
+            merged = base_memo[3]
+        else:
+            merged = self._merge_frames(history_frame, live_frame)
+            if tf != "1min":
+                rule = {"5min": "5min", "15min": "15min", "30min": "30min"}.get(tf, tf)
+                merged = resample_bars(merged, rule)
+            with self._lock:
+                self._merged_memo[base_key] = (history_frame, live_frame, settings, merged)
+                if self._cycle_active:
+                    self._cycle_merged_cache[base_key] = (merged, base_version)
         if not with_indicators:
-            return merged.copy()
+            return self._hand_out(merged, base_version)
         enriched = ensure_standard_indicator_frame(merged, span_scale=span_scale, ema_spans=ema_spans)
+        version = (token, (indicator_key[2:], settings))
         with self._lock:
+            self._merged_memo[indicator_key] = (history_frame, live_frame, settings, enriched)
             if self._cycle_active:
-                self._cycle_merged_cache[indicator_key] = enriched.copy()
-        return enriched.copy()
+                self._cycle_merged_cache[indicator_key] = (enriched, version)
+        return self._hand_out(enriched, version)
+
+    @staticmethod
+    def _hand_out(frame: pd.DataFrame, version: tuple) -> pd.DataFrame:
+        out = frame.copy(deep=False)
+        register_frame_source(out, version[0], version[1], frame)
+        return out

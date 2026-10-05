@@ -2,10 +2,13 @@
 """Bar frames: OHLCV normalization, the session bucket grid and resampling,
 bucket completion, the equity stream-window slice, bar geometry, the
 same-day, opening-range and session-open slices, and the live-price read."""
+import itertools
 import logging
 import math
+import threading
+import weakref
 from datetime import date, datetime, time, timedelta
-from typing import Any
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import numpy.typing as npt
@@ -217,6 +220,134 @@ def resample_bars(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
         agg = frame[list(agg_spec)].groupby(starts).agg(agg_spec)
         agg.index = pd.DatetimeIndex(agg.index, name=frame.index.name)
     return agg.dropna(subset=["open", "high", "low", "close"])
+
+
+# ---------------------------------------------------------------- provenance
+# ``MarketDataStore.get_merged`` registers every frame it hands out with a
+# token naming the store frames it was built from: (symbol, generation,
+# timeframe). A generation names one (history, live) frame-object pair of a
+# symbol and is never reused in the process; the store replaces those objects
+# on every write and never writes into one, so two frames with one token
+# hold the same bars. A function of a frame's bars alone can then memo its
+# result on the token (``derived_frame``) instead of hashing the bars.
+#
+# The registry is keyed by id(frame) and holds a weak reference: an entry
+# dies with its frame, so a freed frame's id taken by a new object never
+# reads the dead frame's token. A frame written into after it was handed
+# out keeps its token, so a caller must not change a registered frame's bars
+# and pass it on (none does; tests/market_data pins the store side). The
+# structure context does not rely on that: it reads its frame through
+# ``verified_frame``. An entry also holds the frame the hand-out was copied
+# from (shared arrays, so it costs no bar memory), which keeps every write
+# into the hand-out a copy-on-write copy that ``verified_frame`` sees.
+_SOURCE_GENERATIONS = itertools.count(1)
+_FRAME_SOURCES: dict[int, tuple[weakref.ref, tuple, tuple, pd.DataFrame]] = {}
+# (symbol, source timeframe, *variant) -> (token, frame): one entry per
+# variant of a symbol's source frame, replaced when the generation changes.
+_DERIVED_FRAMES: dict[tuple, tuple[tuple, pd.DataFrame]] = {}
+_DERIVED_LOCK = threading.Lock()
+
+
+def next_source_generation() -> int:
+    return next(_SOURCE_GENERATIONS)
+
+
+def register_frame_source(frame: pd.DataFrame, token: tuple, variant: tuple, source: pd.DataFrame) -> None:
+    """Register ``frame``, a shallow copy of ``source``, as built from the
+    store frames ``token`` names, as the ``variant`` of them it is:
+    ``get_merged``'s request (indicators or not, the span scale and EMA
+    spans) and the process-wide indicator settings it was built under. One
+    token covers every variant of a symbol's source pair; ``frame_version``
+    tells them apart."""
+    key = id(frame)
+
+    # The callback holds the registry itself, not the module global: a frame
+    # freed while the interpreter shuts down (the module's globals already
+    # None) still drops its own entry, without an "Exception ignored" line.
+    def _forget(ref: weakref.ref, key: int = key, sources: dict = _FRAME_SOURCES) -> None:
+        entry = sources.get(key)
+        if entry is not None and entry[0] is ref:
+            sources.pop(key, None)
+
+    _FRAME_SOURCES[key] = (weakref.ref(frame, _forget), token, variant, source)
+
+
+def _registered(frame: pd.DataFrame | None) -> tuple | None:
+    if frame is None:
+        return None
+    entry = _FRAME_SOURCES.get(id(frame))
+    if entry is None or entry[0]() is not frame:
+        return None
+    return entry
+
+
+def _shares_bars(frame: pd.DataFrame, source: pd.DataFrame) -> bool:
+    """Do ``frame``'s index and OHLCV columns still share memory with
+    ``source``'s? Copy-on-write gives a written column, a replaced index and
+    an appended row arrays of their own."""
+    if not isinstance(frame.index, pd.DatetimeIndex) or not np.may_share_memory(frame.index.asi8, source.index.asi8):
+        return False
+    for col in _OHLCV_COLUMNS:
+        if col not in frame.columns or not np.may_share_memory(frame[col].to_numpy(), source[col].to_numpy()):
+            return False
+    return True
+
+
+def frame_source_token(frame: pd.DataFrame | None) -> tuple | None:
+    """The token ``register_frame_source`` gave this very object, or None."""
+    entry = _registered(frame)
+    if entry is None:
+        return None
+    return entry[1]
+
+
+def verified_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """``frame`` itself, unless it is a registered hand-out whose bars may
+    no longer be the ones it was handed out with: its index or an OHLCV
+    column no longer shares memory with the frame it was copied from (a
+    ``.loc`` / ``.iloc`` / ``.at`` write, a replaced column or index, an
+    appended row). Then a shallow copy, which carries no token or version,
+    so nothing kept on them is served for bars the frame no longer holds.
+    Added or written indicator columns are not looked at. About 0.18 ms a
+    registered frame."""
+    entry = _registered(frame)
+    if entry is None or _shares_bars(frame, entry[3]):
+        return frame
+    return frame.copy(deep=False)
+
+
+def frame_version(frame: pd.DataFrame | None) -> tuple | None:
+    """``(token, variant)`` of a registered frame, or None: two frames with
+    one version hold the same bars and the same indicator columns, so a pure
+    function of a frame can memo its result on the version."""
+    entry = _registered(frame)
+    if entry is None:
+        return None
+    return entry[1], entry[2]
+
+
+def derived_frame(token: tuple, variant: tuple, build: Callable[[], pd.DataFrame]) -> pd.DataFrame:
+    """``build()``, memoized on the source ``token`` of the frame it reads
+    and on ``variant`` (every other input of ``build``: its arguments and
+    the process-wide settings it reads). A hit hands out a shallow copy; the
+    memo's frame never leaves (copy-on-write keeps a caller's writes out)."""
+    key = (token[0], token[2]) + tuple(variant)
+    with _DERIVED_LOCK:
+        entry = _DERIVED_FRAMES.get(key)
+    if entry is not None and entry[0] == token:
+        return entry[1].copy(deep=False)
+    out = build()
+    with _DERIVED_LOCK:
+        _DERIVED_FRAMES[key] = (token, out)
+    return out.copy(deep=False)
+
+
+def retain_derived_frames(symbols: Iterable[str]) -> None:
+    """Keep only the derived frames of ``symbols`` (the store's prune)."""
+    keep = set(symbols)
+    with _DERIVED_LOCK:
+        for key in [k for k in _DERIVED_FRAMES if k[0] not in keep]:
+            del _DERIVED_FRAMES[key]
 
 
 def session_bucket_floor(ts: datetime | pd.Timestamp, minutes: int) -> pd.Timestamp:

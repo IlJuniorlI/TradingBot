@@ -829,6 +829,69 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The step frames are kept across passes: `get_merged` rebuilds a frame
+  only when the store's bars for it change.** *2026-10-05* — every pass
+  merged and rebuilt the indicators of 84 frames (28 symbols x the 1m step
+  frame, the strategy's span-5 LTF and the 5m structure frame) whether or
+  not a bar had closed; about six of seven passes have no new bar.
+  - `MarketDataStore.get_merged` keeps each frame it builds
+    (`_merged_memo`, under the per-cycle cache's keys) with the stored
+    history and live objects it was built from and the two process-wide
+    indicator settings, and serves it while the store holds those very
+    objects. Every writer of the 1m store (`fetch_history`, the stream's
+    `on_stream_message`, the prune) stores a new object and never writes
+    into one, so the same two objects hold the same bars. The enriched
+    build reuses the base build of the same objects. The per-cycle cache
+    stays the first level.
+  - Every frame handed out is a shallow copy (pandas 3 copy-on-write keeps
+    a caller's writes out of the kept frame) registered with its version:
+    a token naming the (history, live) pair it was built from (a
+    generation never reused in the process) and the timeframe, and the
+    variant (indicators or not, span scale, EMA spans, the indicator
+    settings). Each per-cycle cache entry is a `(frame, version)` pair, so
+    a frame built before a stream bar landed keeps the pre-bar token for
+    the rest of that cycle, never the store's newer one.
+    `bars.frame_source_token` and `bars.frame_version` read them; the
+    registry also holds the frame each hand-out was copied from (shared
+    arrays, no bar memory), and an entry goes with its frame, at shutdown
+    too. `get_htf_frame` hands out a shallow copy too.
+  - The strategy's 5m structure frame (`_resampled_frame` without `data`)
+    is kept on the step frame's token and its own inputs (`tf`, span
+    scale, EMA spans, the indicator settings; `bars.derived_frame`). The
+    structure context reads its frame through `bars.verified_frame`: a
+    step frame whose index or OHLCV columns no longer share memory with
+    the frame it was handed out from (a `.loc` / `.iloc` / `.at` write, a
+    replaced column or index, an appended row) is analysed as an
+    unregistered copy, so its structure frame is built from the bars it
+    holds, never served a kept one (28 checks a pass, about 5 ms; no code
+    writes into a step frame today).
+  - `prune_inactive_symbols` drops a pruned symbol's kept frames,
+    generation and structure frames.
+  - Measured (CACHE-FRAME verifier, base 9c2a8d2, interleaved): a pass
+    with no new bar 4.87 → 3.03 s of CPU, the new-bar pass +0.16 s (it
+    builds what it built before while the old frames are still held);
+    real-time pace, manage_gap 7.40 → 5.31 s; no-bar `add_indicators`
+    calls 84 → 0; max RSS +23-30 MB (the kept frames, 17 MB at the open
+    to 21 MB at the close).
+  - Identical: the verifier's stepped replays (10-02 10:15-12:15 with 16
+    trades, the whole 10-01 session, a peer preset's day) with every
+    audited hand-out, kept frame and structure frame compared with a fresh
+    build (0 mismatches) and every stored frame re-digested on every
+    sighting (0 in-place writes); here, the 10-01 09:40-10:40 stepped
+    replay against 21032f8.
+  - Tests: `tests/market_data/test_merged_frame_memo.py` (new): every
+    writer of the store replaces its object; the kept frames, their
+    variants, the indicator settings, a caller's writes, the prune, the
+    tokens and a bar landing mid-build; every per-cycle cache write on
+    every read path is a `(frame, version)` pair and `get_merged` is its
+    only writer (a static check of the package); the versions tell a
+    pair's variants apart; and a step frame written after its hand-out
+    (six kinds of write) gets the structure context of the bars it holds;
+    a frame freed at shutdown drops its entry without an error.
+    `test_hot_helpers_pinned.py` compares the cycle cache's pairs. 29
+    mutants, all killed (the verifier's 14 and 15 for the versions, the
+    cycle cache's pairs, the bars check and the registry's shutdown).
+
 - **The engine idles whenever nothing needs its watchlist, inside the stream
   window too, and builds the dashboard state only for a reader
   (`dashboard.client_idle_seconds`, `dashboard.idle_publish_seconds`).**

@@ -29,12 +29,24 @@ from typing import Any, ClassVar, Iterable
 import pandas as pd
 
 from .. import sessions
-from ..bars import frame_bar_minutes, last_bucket_forming, resample_bars
+from ..bars import (
+    derived_frame,
+    frame_bar_minutes,
+    frame_source_token,
+    last_bucket_forming,
+    resample_bars,
+    verified_frame,
+)
 from ..candles import CANDLE_CONTEXT_BARS, detect_candle_context, directional_candle_signal
 from ..chart_patterns import analyze_chart_pattern_context
 from ..fair_value_gaps import FairValueGapContext, build_fair_value_gap_context, empty_fvg_context
 from ..htf_levels import HTFContext, empty_htf_context
-from ..indicators import ensure_standard_indicator_frame, htf_ema_spans
+from ..indicators import (
+    ensure_standard_indicator_frame,
+    get_runtime_indicator_mode,
+    get_session_indicator_window,
+    htf_ema_spans,
+)
 from ..models import Side
 from ..numeric import safe_float, safe_int
 from ..order_blocks import OrderBlockContext, build_order_block_context, empty_order_block_context
@@ -713,8 +725,23 @@ class ContextBuildersMixin:
                 LOG.debug("Failed to load cached %s-minute merged frame for %s; resampling from base frame.", tf, symbol, exc_info=True)
         if tf <= 1:
             return ensure_standard_indicator_frame(frame.copy(), span_scale=span_scale, ema_spans=ema_spans)
-        out = resample_bars(frame, f"{tf}min")
-        return ensure_standard_indicator_frame(out, span_scale=span_scale, ema_spans=ema_spans)
+
+        def build() -> pd.DataFrame:
+            return ensure_standard_indicator_frame(resample_bars(frame, f"{tf}min"), span_scale=span_scale,
+                                                   ema_spans=ema_spans)
+
+        # A step frame from get_merged carries its source token: the resample
+        # reads only its OHLCV bars, so the token names the result, which is
+        # then built once per new bar instead of every cycle (the structure
+        # context's call above passes no `data`). The source frame's own
+        # indicator columns and span never reach the result: the resample
+        # keeps OHLCV only and add_indicators restamps the span attr.
+        token = frame_source_token(frame)
+        if token is None:
+            return build()
+        spans = None if ema_spans is None else tuple(ema_spans)
+        variant = (tf, span_scale, spans, get_runtime_indicator_mode(), get_session_indicator_window())
+        return derived_frame(token, variant, build)
 
     def _structure_context(self, frame: pd.DataFrame | None, timeframe: str = "ltf"):
         # Per-cycle cache. Timeframe goes in the key because the pivot_span /
@@ -740,7 +767,12 @@ class ContextBuildersMixin:
             return empty_ctx
         pivot_span = int(self._support_resistance_setting("pivot_span", 2) or 2)
         is_ltf_analysis = self._is_ltf_token(timeframe_token)
-        analysis_frame = frame
+        # A step frame written after its hand-out (its index or OHLCV columns
+        # no longer the ones get_merged handed out) is analysed as an
+        # unregistered copy: nothing kept on its token (the 5m structure
+        # frame) is served for bars it no longer holds.
+        bars_frame = verified_frame(frame)
+        analysis_frame = bars_frame
         bar_minutes: int | None = None
         if is_ltf_analysis:
             pivot_span = int(self._support_resistance_setting("structure_ltf_pivot_span", max(2, pivot_span)) or max(2, pivot_span))
@@ -750,7 +782,7 @@ class ContextBuildersMixin:
             # raw 1m stream. 0/1 = use the frame as-is (original behavior).
             ltf_tf_min = int(self._support_resistance_setting("structure_ltf_timeframe_minutes", 0) or 0)
             if ltf_tf_min > 1:
-                resampled = self._resampled_frame(frame, ltf_tf_min)
+                resampled = self._resampled_frame(bars_frame, ltf_tf_min)
                 if resampled is not None and not resampled.empty:
                     analysis_frame = resampled
                     bar_minutes = ltf_tf_min
