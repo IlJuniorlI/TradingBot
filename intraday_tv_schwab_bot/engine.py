@@ -260,6 +260,17 @@ class IntradayBot:
         # (time.monotonic), for the gap CYCLE_TIMING reports.
         self._cycle_timer = _CycleTimer()
         self._last_manage_monotonic: float | None = None
+        # Whether the pass's gate idled it (CycleGate), and when the gate
+        # next needs a pass (None: no window in the next week): step() sets
+        # both from its gate, _run_cycles clears them at the start of every
+        # pass (a pass that fails before its gate keeps the fast cadence),
+        # and _cycle_sleep_seconds reads them.
+        self._cycle_idle = False
+        self._cycle_idle_wake_at: datetime | None = None
+        # The last dashboard build (time.monotonic) and the status it showed
+        # (message, no error); see _dashboard_build_due.
+        self._dashboard_built_monotonic: float | None = None
+        self._dashboard_built_status: tuple[str, bool] | None = None
         # Memory-pressure prune cadence. Symbol-keyed state in
         # MarketDataStore + DashboardCache grows unbounded across cycles
         # as the screener returns new symbols day to day. Every
@@ -488,6 +499,8 @@ class IntradayBot:
             # One CYCLE_TIMING record per pass, however it ends: a stop
             # signal or the auto-exit included.
             timer = self._cycle_timer = _CycleTimer()
+            self._cycle_idle = False
+            self._cycle_idle_wake_at = None
             try:
                 try:
                     # Ahead of the cycle: at 07:00 the first premarket cycle
@@ -531,6 +544,7 @@ class IntradayBot:
                         screening_active=False,
                         streaming_active=self.data.has_stream_symbols(),
                         management_active=False,
+                        always=True,
                     )
                 timer.enter("housekeeping")
                 if auto_exit and not self.positions:
@@ -862,7 +876,9 @@ class IntradayBot:
         Two cadences:
         - **Stream window (7am–8pm ET on trading days)**: fast cycle.
           Entries fire, management runs, dashboard updates from live
-          ticks.
+          ticks. Idle while the cycle gate idles the pass (no position,
+          window, stream or prewarm: 15:55-20:00 on top_tier, and 07:00 to
+          the prewarm), waking for the gate's next prewarm or window start.
         - **Outside the stream window (8pm–7am, weekends, holidays)**:
           idle. Both streaming and order acceptance are off; even with
           open positions, `can_close_position_now()` returns False so
@@ -889,14 +905,20 @@ class IntradayBot:
             sessions.now_et(),
             extended_hours_enabled=bool(self.config.execution.extended_hours_enabled),
         )
-        # Stream available: fast cycle — live ticks + order session both
-        # gated by the same 7am-8pm window, so any actionable work
-        # happens here.
-        if state.stream_available:
-            return base
         # Outside the stream window: nothing actionable. Idle even with
         # open positions; management is blocked anyway.
-        return idle
+        if not state.stream_available:
+            return idle
+        # Inside it, the fast cycle unless the pass's gate idled (no
+        # position, window, stream or prewarm: CycleGate), and then no later
+        # than the gate's next wake, so the prewarm or the window starts on
+        # time. A step that failed before its gate leaves the fast cycle.
+        if not self._cycle_idle:
+            return base
+        if self._cycle_idle_wake_at is None:
+            return idle
+        until_wake = (self._cycle_idle_wake_at - sessions.now_et()).total_seconds()
+        return min(idle, max(base, until_wake))
 
     def _shutdown_cleanup(self) -> None:
         """Three-step cleanup with per-step isolation so a failure in one
@@ -993,6 +1015,8 @@ class IntradayBot:
             now = sessions.now_et()
             schedule = self.config.active_strategy.schedule()
             gate_state = self.cycle_gate.evaluate(now, schedule)
+            self._cycle_idle = gate_state.idle_closed_market
+            self._cycle_idle_wake_at = self.cycle_gate.idle_wake_at(now, schedule) if self._cycle_idle else None
             if gate_state.screening_active:
                 self.last_candidates = self.screener.get_candidates(self.config.strategy)
                 candidate_symbols = [c.symbol for c in self.last_candidates]
@@ -1016,8 +1040,8 @@ class IntradayBot:
             if gate_state.idle_closed_market:
                 self.audit.log_cycle(
                     f"watchlist_idle:{self.config.strategy}",
-                    "closed_market",
-                    f"Watchlist idle strategy={self.config.strategy} reason=market_closed_outside_broker_session",
+                    "idle_no_window_or_position",
+                    f"Watchlist idle strategy={self.config.strategy} reason=idle_no_window_or_position",
                     interval=300.0,
                     level=logging.INFO,
                 )
@@ -1090,6 +1114,17 @@ class IntradayBot:
             self._prime_cycle_support_cache(bars)
             timer.enter("contexts")
             self._prime_cycle_context_cache(bars)
+            # The HTF context the strategy trades on, built here, at a fixed
+            # point of the cycle: the first build after an HTF refresh fixes
+            # the price its trend and levels are read at until the next one
+            # (MarketDataStore._htf_context_from_stored_frame), and since
+            # 2026-10-05 the dashboard build, which was that first build on
+            # most symbols, runs only on demand (_dashboard_build_due).
+            self._compute_symbol_map(
+                list(bars),
+                lambda symbol: self.strategy._default_htf_context_for_score(symbol, self.data),
+                label="HTF context precompute",
+            )
             timer.enter("warmup")
             warmup_summary = self.warmup_tracker.warmup_summary(self.last_watchlist, bars=bars)
             self.warmup_tracker.log_warmup_summary(warmup_summary)
@@ -1174,7 +1209,6 @@ class IntradayBot:
                 management_active=gate_state.management_active,
                 streaming_active=gate_state.streaming_active,
                 context_refresh_active=gate_state.context_refresh_active,
-                idle_closed_market=gate_state.idle_closed_market,
                 position_monitoring_active=gate_state.position_monitoring_active,
             )
             # Last, and inside the cycle, so it reads the frames the cycle
@@ -1490,7 +1524,7 @@ class IntradayBot:
 
         self._compute_symbol_map(symbols, _warm, label="Strategy context precompute")
 
-    def _publish_state(self, now: datetime, message: str, *, screening_active: bool, streaming_active: bool, management_active: bool, gate_state: CycleGateState | None = None, warmup_summary: dict[str, Any] | None = None) -> None:
+    def _publish_state(self, now: datetime, message: str, *, screening_active: bool, streaming_active: bool, management_active: bool, gate_state: CycleGateState | None = None, warmup_summary: dict[str, Any] | None = None, always: bool = False) -> None:
         """Build the dashboard state and publish it. The gate is evaluated
         here when the caller has none (the error path).
 
@@ -1506,8 +1540,17 @@ class IntradayBot:
         when; its ``last_update`` stays the time of that state. Broad
         because the build runs strategy hooks; a stop signal
         (KeyboardInterrupt) is not an Exception and reaches the shutdown.
+
+        Every pass samples the paper account's equity first (its peak, max
+        drawdown and curve, which the session report and archive read),
+        watched or not. The state itself is built only when someone or
+        something reads it (``_dashboard_build_due``), and on the error path
+        (``always``) whatever the demand.
         """
         try:
+            self.account.record_equity_point(self.positions)
+            if not self._dashboard_build_due(message, always=always):
+                return
             if gate_state is None:
                 gate_state = self.cycle_gate.evaluate(now, self.config.active_strategy.schedule())
             payload = self._dashboard_state(
@@ -1541,6 +1584,34 @@ class IntradayBot:
             self._dashboard_failures = 0
         if self.dashboard is not None:
             self.dashboard.publish(payload)
+
+    def _dashboard_build_due(self, message: str, *, always: bool) -> bool:
+        """Whether this pass builds the dashboard state: never with the
+        dashboard off (nothing reads it); else on the error path (``always``),
+        while the last build failed (as every pass retried it), on the first
+        build, when the status (``message``, error or not)
+        changed, while a client polls (a page or API request within
+        ``dashboard.client_idle_seconds``), and once every
+        ``dashboard.idle_publish_seconds`` (the heartbeat that keeps
+        ``/api/state`` and the state file at most that old). Until
+        2026-10-05 every pass built it, about 1.5 s of an 8 s RTH pass
+        (2.3 s after 15:00), watched or not. Stamps the build it allows."""
+        if self.dashboard is None:
+            return False
+        status = (message, self.last_error is None)
+        mono = time.monotonic()
+        due = (
+            always
+            or self._dashboard_failures > 0
+            or self._dashboard_built_monotonic is None
+            or status != self._dashboard_built_status
+            or self.dashboard.client_seen_within(self.config.dashboard.client_idle_seconds)
+            or mono - self._dashboard_built_monotonic >= self.config.dashboard.idle_publish_seconds
+        )
+        if due:
+            self._dashboard_built_monotonic = mono
+            self._dashboard_built_status = status
+        return due
 
     def _dashboard_state(self, now: datetime, message: str, *, screening_active: bool, streaming_active: bool, management_active: bool, gate_state: CycleGateState, warmup_summary: dict[str, Any] | None) -> dict[str, Any]:
         """The dashboard state ``_publish_state`` publishes: the engine's

@@ -151,9 +151,12 @@ runtime:
   stream_health_log_seconds: 90
   # Auto-exit: shut down cleanly when market closes and no positions are open
   auto_exit_after_session: true
-  # Always-on idle cadence: outside the 7am-8pm ET stream window the loop
-  # sleeps this long instead of `loop_sleep_seconds`. Cuts overnight CPU
-  # by ~95% (60s vs 2s per cycle). Set <= loop_sleep_seconds to disable.
+  # Always-on idle cadence: outside the 7am-8pm ET stream window, and
+  # inside it while no position, window, stream or prewarm needs the
+  # watchlist (the cycle gate idles it), the loop sleeps this long instead
+  # of `loop_sleep_seconds`, waking in time for the next prewarm. Cuts the
+  # idle hours' CPU by ~95% (60s vs 2s per cycle). Set <= loop_sleep_seconds
+  # to disable.
   idle_sleep_seconds: 60.0
   # Cadence at which the engine evicts per-symbol state (history frames,
   # HTF/SR caches, dashboard payloads) for symbols no longer in the
@@ -299,6 +302,11 @@ dashboard:
   port: 8765
   refresh_ms: 1500
   state_path: .logs/dashboard_state.json
+  # The state (the page, /api/state and the state file) is built while a
+  # client polls, a page or API request in the last client_idle_seconds (at
+  # least refresh_ms / 1000), and otherwise once every idle_publish_seconds.
+  client_idle_seconds: 30.0
+  idle_publish_seconds: 60.0
   # The state file is compact JSON, rewritten at once when the status or
   # message changes (a stale or error state) and otherwise at most every
   # state_write_seconds (0: on every publish).

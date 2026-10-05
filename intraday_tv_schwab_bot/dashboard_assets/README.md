@@ -124,6 +124,11 @@ The backend contract is just the existing JSON API:
 `304 Not Modified` with no body until the next publish; the base pages send it, and a page that does not always gets
 the state.
 
+A request for the page, `/mobile`, `/api/state` (a 304 included) or `/api/chart` tells the bot a client is watching:
+the engine builds the state on every pass while one came in the last `dashboard.client_idle_seconds`, and otherwise
+only once every `dashboard.idle_publish_seconds` (2026-10-05). A page that polls `/api/state` at least that often
+always gets the current state; `/health` and the assets do not count.
+
 Four template substitutions are applied to your `index.html` at serve time:
 
 | Token             | Replaced with                                 |

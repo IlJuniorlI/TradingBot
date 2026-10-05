@@ -621,6 +621,11 @@ class DashboardConfig:
     port: int = 8765
     refresh_ms: int = 2000
     state_path: str = ".logs/dashboard_state.json"
+    # The engine builds the state while a client polls (a page or API
+    # request within client_idle_seconds, at least the page's refresh) and
+    # otherwise once every idle_publish_seconds (IntradayBot._dashboard_build_due).
+    client_idle_seconds: float = 30.0
+    idle_publish_seconds: float = 60.0
     # The state file's rewrite cadence: at once when the status or message
     # changes, otherwise at most every this many seconds (0: every publish).
     state_write_seconds: float = 30.0
@@ -1828,6 +1833,8 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
     "dashboard": {
         "port": _Number(integer=True, low=1, high=65535),
         "refresh_ms": _COUNT,
+        "client_idle_seconds": _ABOVE_ZERO,
+        "idle_publish_seconds": _ABOVE_ZERO,
         "state_write_seconds": _AT_LEAST_ZERO,
     },
     "dashboard.charting.compact": {"max_bars": _Number(integer=True, low=1, high=480)},
@@ -2239,15 +2246,22 @@ def _validate_events_config(events: EventsConfig, config_path: Path) -> None:
 
 
 def _validate_dashboard_config(dashboard: DashboardConfig, config_path: Path) -> None:
-    """The dashboard's port, refresh, theme and switches, the compact
-    chart's timeframe, and each chart profile's ``max_bars`` (1-480) and
-    switches. The server read the port and the refresh with ``int()`` when
-    the bot was built; it lowercased and stripped the theme, so ``Nebula``
-    or `` dark `` served that theme, and read one that was malformed or
-    named no folder there as ``default``, with a WARNING (a null without
-    one); a chart profile read an unreadable ``max_bars`` as its default
-    and any string as a switch that is on."""
+    """The dashboard's port, refresh, theme and switches, its build and
+    state-file cadences (the client window at least the page's refresh:
+    shorter, the builds would lapse between an open page's polls), the
+    compact chart's timeframe, and each chart profile's ``max_bars``
+    (1-480) and switches. The server read the port and the refresh with
+    ``int()`` when the bot was built; it lowercased and stripped the theme,
+    so ``Nebula`` or `` dark `` served that theme, and read one that was
+    malformed or named no folder there as ``default``, with a WARNING (a
+    null without one); a chart profile read an unreadable ``max_bars`` as
+    its default and any string as a switch that is on."""
     errors = _section_errors("dashboard", dashboard)
+    if not errors and dashboard.client_idle_seconds * 1000 < dashboard.refresh_ms:
+        # A page polls every refresh_ms; a shorter window lets the builds
+        # lapse between its polls while it is open.
+        errors.append(f"dashboard.client_idle_seconds must be at least refresh_ms / 1000 "
+                      f"({dashboard.refresh_ms / 1000:g}), got {dashboard.client_idle_seconds!r}")
     themes = dashboard_themes()
     if dashboard.theme not in themes:
         errors.append(

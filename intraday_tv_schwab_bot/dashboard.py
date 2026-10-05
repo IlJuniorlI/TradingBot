@@ -242,6 +242,19 @@ class DashboardServer:
         self._last_written_headline: tuple[Any, Any] | None = None
         self._unwritten_state: str | None = None
         self.chart_payload_provider = chart_payload_provider
+        # time.monotonic() of the last page, /api/state or /api/chart
+        # request (the handler threads write it, the engine reads it; one
+        # float, so no lock): the engine builds the state while a client
+        # polls (IntradayBot._dashboard_build_due).
+        self._last_client_request: float | None = None
+
+    def note_client_request(self) -> None:
+        self._last_client_request = time.monotonic()
+
+    def client_seen_within(self, seconds: float) -> bool:
+        """Whether a page or API request came in the last ``seconds``."""
+        last = self._last_client_request
+        return last is not None and time.monotonic() - last <= seconds
 
     @staticmethod
     def _call_chart_payload_provider(provider: Callable[..., dict[str, Any]], symbol: str, max_bars: int, timeframe_mode: str = 'ltf') -> dict[str, Any]:
@@ -367,6 +380,7 @@ class DashboardServer:
         self.publish(state)
 
     def _make_handler(self) -> type[BaseHTTPRequestHandler]:
+        dashboard_server = self
         state = self.state
         refresh_ms = self.refresh_ms
         theme = self.theme
@@ -570,10 +584,12 @@ class DashboardServer:
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
                 if parsed.path in ("/mobile", "/mobile/", "/m", "/m/"):
+                    dashboard_server.note_client_request()
                     body = _mobile_html(refresh_ms, theme=theme).encode("utf-8")
                     self._serve_html(body)
                     return
                 if parsed.path.startswith("/api/state"):
+                    dashboard_server.note_client_request()
                     cached_payload, etag = state.get_serialized()
                     if cached_payload is None:
                         self._write_json(state.get())
@@ -583,6 +599,7 @@ class DashboardServer:
                         self._write_json_bytes(cached_payload, etag=etag)
                     return
                 if parsed.path.startswith("/api/chart"):
+                    dashboard_server.note_client_request()
                     if chart_payload_provider is None:
                         self._write_json({"error": "chart provider unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
                         return
@@ -615,6 +632,7 @@ class DashboardServer:
                 # desktop one. Assets, /api/* and /health are all handled
                 # earlier, so a redirect here can never catch the mobile page's
                 # own polling.
+                dashboard_server.note_client_request()
                 if not _wants_desktop_override(parsed.query) and _is_phone_user_agent(
                     self.headers.get("User-Agent")
                 ):

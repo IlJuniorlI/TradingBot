@@ -829,6 +829,119 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The engine idles whenever nothing needs its watchlist, inside the stream
+  window too, and builds the dashboard state only for a reader
+  (`dashboard.client_idle_seconds`, `dashboard.idle_publish_seconds`).**
+  *2026-10-05* — from 15:55 to 20:00, and from 07:00 to the prewarm after an
+  overnight run, every 2 s pass built every symbol's frame, S/R and contexts
+  on frames nothing changed or read: 4.9-5.1 s of work every 7 s, about 70%
+  of a core for 4-6 hours a day (the core seen at 100% while the bot sat
+  idle). And every RTH pass built the dashboard state, 1.54 s of a 7.9 s
+  production pass, whether or not a page was open.
+  - The cycle gate (`CycleGate._should_idle_closed_market_watchlists`)
+    idles the watchlist whenever nothing consumes it: no position, and no
+    screener, management or entry window, stream or prewarm. Until now the
+    broker's 07:00-20:00 stream window kept it. It never idles with a
+    position, a window, the stream or the prewarm. An idle pass has an
+    empty watchlist and quote watchlist, as after 20:00: no frame, S/R or
+    context is built, and the dashboard keeps the last screener
+    candidates' cards and drops the rest (25 of top_tier's 28 symbols on
+    10-01). The stored bars stay, as they did overnight.
+  - An idle pass sleeps `runtime.idle_sleep_seconds` (60) inside the stream
+    window too, but no later than the gate's next wake
+    (`CycleGate.idle_wake_at`: the next window's start less
+    `prewarm_before_windows_minutes`), so the prewarm, or a window with no
+    prewarm, starts on time; top_tier wakes at 09:15:00. A pass that fails
+    before its gate keeps `loop_sleep_seconds` and its backoff.
+    Housekeeping that falls due while idle (the 20:00 archive, a reconcile
+    retry, the auto-exit check) comes up to a minute later.
+  - The idle status reads `Idle until next session window`, day and night
+    (the night read `Market closed`, which from 15:55 would be said of an
+    open market); `CycleGate.runtime_status_message` takes no idle flag.
+    The log line is `Watchlist idle strategy=<name>
+    reason=idle_no_window_or_position`, every 5 minutes while idle (it was
+    `reason=market_closed_outside_broker_session`, at night).
+  - The dashboard state (the page, `/api/state` and the state file) is
+    built while a client polls: a request for the page, `/mobile`,
+    `/api/state` or `/api/chart` in the last `dashboard.client_idle_seconds`
+    (new, default 30; above 0 and at least `refresh_ms / 1000`, checked at
+    load). It is also built on a new status or message, while a build is
+    failing, on a failed cycle's error path, and otherwise once every
+    `dashboard.idle_publish_seconds` (new, default 60; above 0, checked at
+    load). Unwatched, `/api/state`, the state file and a page that opens
+    first are up to that old; the pass after the page's first poll builds a
+    fresh one. With the dashboard off nothing is built, so a broken build is
+    no longer logged there.
+  - `PaperAccount.record_equity_point` (new) samples the peak, the max
+    drawdown and the equity curve, and the engine calls it on every pass,
+    before it decides on the build. `PaperAccount.snapshot` (new) reads the
+    account without sampling it; `snapshot_copy`, the dashboard's read,
+    uses it, and `capture_snapshot`, the session report's and the
+    archive's, does both. The build used to sample the account, so built on
+    demand it would have left the report's max drawdown and the archive's
+    curve to whether a page was open. Off-window the curve now gets one
+    point a minute instead of one every 7-8 s, so the 2,000 points the
+    20:00 archive writes are mostly the session's, not the flat
+    after-hours.
+  - The cycle builds the strategy's HTF context
+    (`_default_htf_context_for_score`) for every step-frame symbol in its
+    contexts phase. That context carries the price of its first build until
+    the next HTF refresh (the price is not part of the
+    `MarketDataStore.htf_cache` key), and the dashboard build was that
+    first build on 52 of 56 contexts. Skipped, the first read would have
+    moved into a later entry or management pass, at a later price: every
+    logged `htf_ema_votes` changed, and with `require_htf_ema_alignment` or
+    `htf_ema_alignment_score` on (off in every preset) entries would have
+    depended on whether a page was open. Built at a fixed point of the
+    cycle, it no longer does. The staleness itself predates this and is
+    logged separately.
+  - Measured (IDLE-1 verifier on 9c2a8d2, interleaved A/Bs): an off-window
+    pass 3.25 → 1.46 s of CPU, sleeping 60 s instead of 2 s, 62% → 2.4% of
+    a core; on the stage-1 tree above, 0.40 s a minute (0.7%). The idle
+    heartbeat equals the idle cadence, so every idle pass still builds the
+    state, at night too. RTH: step CPU 4.95 → 3.79 s unwatched, 4.97 s
+    watched (unchanged); H:'s logged polls replayed on its passes save
+    1.43-1.65 s a pass on an unwatched day (0.89 s on watched 09-29); on the
+    stage-1 tree, manage_gap 3.88 → 3.50 s on the harness.
+  - Identical: stepped replays of 2026-10-01 against 9c2a8d2, the page
+    open (09:40-10:40, 145 steps, the payload hash equal on every step) and
+    unwatched with the HTF prime (09:40-11:40, 289 steps, every category,
+    the account and the dashboard on all 97 shared builds); a loop replay
+    from 10-01 15:45 through the night to 10-02 09:40, identical on every
+    pass from the 09:15:00 prewarm through the 09:35 entries; a gate sweep
+    of 19 presets x 5 days x every minute, flat and holding: 0 idle passes
+    with a consumer. And here, stepped replays against 21032f8: 10-01
+    09:40-10:40 with a page open, identical; 10-01 15:30-16:30, identical
+    through 15:55:00 and then different only by the idle passes (the page's
+    empty watchlist, the idle line every 5 minutes; the status message is
+    the one the base showed), and unwatched also by the builds the demand
+    gate skips (each heartbeat build equal to the base's at that step);
+    10-02 08:50-09:40, identical from the 09:15:00 prewarm on, its trade
+    included.
+  - README: `idle_sleep_seconds`, `prewarm_before_windows_minutes`,
+    `max_equity_points`, the `dashboard` table, `client_idle_seconds`,
+    `idle_publish_seconds` and the failed-update note;
+    `dashboard_assets/README.md`: which requests count as a client;
+    `config.example.yaml` ships both knobs.
+  - Tests: `tests/runtime/test_cycle_gate.py` (the gate idles inside the
+    stream window; each window, the prewarm, a position and each consumer
+    alone keep the watchlist; the wake; the idle message);
+    `tests/composition/test_idle_gate.py` (new: the cadence through the real
+    loop, each consumer's fast cadence, the wake cap and its floor, a failed
+    pass, the idle wait that blocks the loop thread instead of spinning it,
+    the candidates' cards; the build's heartbeat, client window, status,
+    retry and error path, and the account sampled on every pass);
+    `tests/runtime/test_paper_account_sampling.py` (new);
+    `tests/composition/test_htf_refresh_points.py` (the strategy's HTF
+    context is first read in the contexts phase, watched or not);
+    `tests/reporting/test_dashboard.py` (the requests that stamp, through
+    the real server); `tests/domain/test_config_validation.py` (both knobs
+    and the refresh cross-check); `test_dashboard_update_failure.py`,
+    `test_cycle_timing.py` and `test_engine_shutdown.py` keep a page open or
+    give their shell a dashboard and an account, and the dashboard-off test
+    now pins that nothing is built and the account is still sampled. 51
+    mutants, all killed.
+
 - **The dashboard publish keeps the state it serves without copying,
   signing or indenting it; the state file is compact and throttled
   (`dashboard.state_write_seconds`); and `/api/state` answers an unchanged

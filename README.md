@@ -369,7 +369,7 @@ Behavior and valid values:
 - `warmup_minutes`: minimum history seeded when a symbol is first watched. The bot now also respects each strategy's required bar warmup and will request a deeper preload when the active strategy needs more bars than the current session has provided yet.
 - Startup before premarket history is available now schedules a one-shot retry at **7:01 AM ET** for that session, so aliases/index-like symbols can recover promptly once Schwab starts serving candles.
 - Dashboard/API state now includes a `warmup` summary and per-symbol readiness payloads so the UI can show `Not Ready`, `Loading`, and `Ready` without digging through skip logs.
-- `prewarm_before_windows_minutes`: outside all active windows, skip routine refresh work until the next active window is this close.
+- `prewarm_before_windows_minutes`: outside all active windows, skip routine refresh work until the next active window is this close. With no position open, the cycle gate idles the watchlist until then, and the idle cadence wakes the loop on time for it (see `idle_sleep_seconds`).
 - `log_dir`: log/state directory.
 - `stream_fields`: Schwab stream field IDs to subscribe to.
 - `stream_connect_timeout_seconds`: how long to wait for the stream to come up before treating it as unavailable.
@@ -398,6 +398,9 @@ Behavior and valid values:
 - `startup_reconcile_metadata_db_path`: SQLite metadata path used by hybrid restore.
 - `auto_exit_after_session`: when `true`, the bot shuts down cleanly after the trading session ends and all positions are closed. Exits after the latest of RTH close and any configured strategy window end. On non-trading days (weekends/holidays), exits immediately. Designed for use with Windows Task Scheduler or cron to start the bot daily.
 - `idle_sleep_seconds`: outside the 7am–8pm ET equity stream window (when neither streaming nor order acceptance is available), the loop sleeps this long between iterations instead of `loop_sleep_seconds`. Cuts overnight CPU waste by ~95% on always-on bots — the loop wakes every minute by default to recheck whether streaming has resumed instead of every 2s. Set to a value `<= loop_sleep_seconds`, `0` included, to disable the optimization entirely (until 2026-09-26 a `0` or `null` read as `60`).
+  - Inside the stream window too (since 2026-10-05), on a pass whose cycle gate idles the watchlist: no position open, and no screener, management or entry window, stream or prewarm consumes it (on top_tier 15:55-20:00, and 07:00 to the 09:15 prewarm after an overnight run; on a preset with a gap between its windows, the gap). There an idle sleep ends no later than the next window's start less `prewarm_before_windows_minutes`, so the prewarm, or the window itself, starts on time. A pass whose gate does not idle (a position, a window, the stream or the prewarm), or that fails before its gate, keeps `loop_sleep_seconds`.
+  - While the gate idles, the watchlist and the quote watchlist are empty, as they were after 20:00: no frame, S/R or context is built, the dashboard keeps the last screener candidates' cards and drops the rest, its status reads `Idle until next session window` (day and night; the night read `Market closed` until 2026-10-05), and `Watchlist idle strategy=<name> reason=idle_no_window_or_position` is logged every 5 minutes. Housekeeping that falls due while idle (the 20:00 session archive, a reconcile retry, the auto-exit check) comes up to this long later, and the paper account's equity curve gets one point a pass, so one a minute.
+  - Until 2026-10-05 the stream window kept the watchlist, so from 15:55 to 20:00 (and from 07:00 to the prewarm after an overnight run) the loop built every symbol's frame, S/R and contexts every `loop_sleep_seconds` on frames nothing changed or read: about 5 s of work every 7 s, 70% of a core for 4-6 hours a day.
 - `symbol_state_prune_seconds`: cadence at which the engine evicts per-symbol state (history frames, HTF/SR caches, dashboard snapshot/chart payloads) for symbols that have dropped out of the active set (streamed symbols + last watchlist + open positions). Long-running multi-day bots otherwise accumulate history dicts (~240KB per 1m frame at default lookback) for every symbol the screener has ever returned. Set to `0` to disable pruning entirely.
 - `session_reconcile_on_resume`: when `true`, the engine re-runs the startup reconcile at the first cycle on each new ET trading day where streaming is back online (i.e., the first cycle past 7am ET). Catches positions that closed overnight via the Schwab app or broker-side stops — without this, an always-on bot would wake at 7am still believing those positions are open and try to manage phantoms. Honors the same `reconcile_on_startup` and `startup_reconcile_mode` knobs as the startup reconcile (no separate mode). Set to `false` to disable if you handle reconciliation externally or only run single-day sessions. A failed reconcile is retried either way; this knob turns off only the new-day re-run.
 - `cycle_fetch_workers`: thread-pool size for each cycle's network fetches: the 1m history per watchlist symbol, the HTF refresh points (every symbol the bot reads) and the daily-history prefetch, and the single-quote fallbacks of a quote refresh. The fetches wait on Schwab, so the pool overlaps them, and a stop signal (Ctrl+C, a service stop) drops the fetches not started yet, so the shutdown waits only for the ones in flight. The cycle's CPU work (the history-fetch decisions, every symbol's step frame with its indicators, the S/R and strategy-context pre-warms) runs serially on the engine thread; a symbol whose build (or fetch) raises is logged with its error's type (its traceback on the first failure of a run and every tenth after, one line in between), left out of the cycle (no pre-warm, entry or frame-based exit; a position in it keeps its stop, target and force flatten on its quote) and named in a `PRECOMPUTE_FAILURES` event, and the other symbols run as usual. An integer of at least 1; anything else refuses to start. It replaced `cycle_precompute_workers` (2026-09-28), which sized one pool for both kinds of work: the CPU work holds the GIL, so the pool never overlapped it and made the cycle slower (replayed on four archived top_tier days, the step frames and the two pre-warms took 5.4 s a step with four workers and 2.4 s serially, the means of the four days' medians). A config that still sets `cycle_precompute_workers` refuses to start and names the replacement.
@@ -829,25 +832,27 @@ Paper-account storage and dashboard-history settings.
 Behavior:
 
 - `starting_equity`: starting paper-equity balance used in dry-run/paper mode. In live mode, the dashboard tracked-capital baseline uses `max_total_notional` and is labeled `Allocated Capital`.
-- `max_equity_points`: max equity-curve points retained for the dashboard.
+- `max_equity_points`: max equity-curve points retained for the dashboard (and the session archive's `account_snapshot.json`). The engine samples one point a pass, so one a minute while the loop idles (`runtime.idle_sleep_seconds`). Until 2026-10-05 the passes from 15:55 to 20:00 sampled one every 7-8 s, so by 20:00 the 2,000 points held only the flat after-hours curve; now most of them are the session's.
 - `max_trade_history`: max closed trades kept in the paper account history.
 
 ### `dashboard`
 
 Controls the local dashboard server and its charting profiles.
 
-| Option                | Code default                 |
-|-----------------------|------------------------------|
-| `enabled`             | `true`                       |
-| `host`                | `127.0.0.1`                  |
-| `port`                | `8765`                       |
-| `refresh_ms`          | `2000`                       |
-| `state_path`          | `.logs/dashboard_state.json` |
-| `state_write_seconds` | `30`                         |
-| `theme`               | `default`                    |
-| `https`               | `false`                      |
-| `ssl_certfile`        | `""`                         |
-| `ssl_keyfile`         | `""`                         |
+| Option                 | Code default                 |
+|------------------------|------------------------------|
+| `enabled`              | `true`                       |
+| `host`                 | `127.0.0.1`                  |
+| `port`                 | `8765`                       |
+| `refresh_ms`           | `2000`                       |
+| `state_path`           | `.logs/dashboard_state.json` |
+| `client_idle_seconds`  | `30.0`                       |
+| `idle_publish_seconds` | `60.0`                       |
+| `state_write_seconds`  | `30`                         |
+| `theme`                | `default`                    |
+| `https`                | `false`                      |
+| `ssl_certfile`         | `""`                         |
+| `ssl_keyfile`          | `""`                         |
 
 Behavior:
 
@@ -855,8 +860,10 @@ Behavior:
 - `host` / `port`: bind address and port.
 - `refresh_ms`: browser refresh interval in milliseconds. Each poll of `/api/state` sends back the `ETag` of the state on screen (`If-None-Match`); while no new state has been published the server answers `304 Not Modified` with no body, and the page redraws only what moves with the clock (the uptime, a chart whose forming bar has ended). Since 2026-10-05; the page fetched and redrew the whole state (1.4-2.1 MB on top_tier) on every poll.
 - `state_path`: a file holding the state the page shows, as the compact JSON `/api/state` serves. Nothing in the bot reads it. It is rewritten at once when the status or the message changes (a `stale` or `error` state among them, see below), otherwise at most every `state_write_seconds`, and once more at shutdown if the throttle held the last state back. Until 2026-10-05 it was indented JSON, rewritten whenever anything but `last_update` and the API rate fields changed, which was almost every cycle.
+- `client_idle_seconds`: the engine builds the state (the page, `/api/state` and the state file) on every pass while a client polls: a request for the page, `/mobile`, `/api/state` or `/api/chart` in the last this many seconds. A number above 0 and at least `refresh_ms / 1000`, since an open page polls that often (a shorter window would let the builds lapse between its polls); anything else refuses to start.
+- `idle_publish_seconds`: while no client polls, the state is built once every this many seconds (the heartbeat) and at once when the status or the message changes, so `/api/state`, the state file and a page that opens first are up to this old; the pass after a page's first poll builds a fresh one. A failed build is retried on every pass, and the error path of a failed cycle always builds. With `enabled: false` nothing is built. The paper account's equity peak, drawdown and curve, which the session report and the archive read, are sampled on every pass either way. A number above 0; anything else refuses to start. Since 2026-10-05: until then every pass built the state, about 1.5 s of a 7.9 s RTH pass in production (2.3 s after 15:00), watched or not.
 - `state_write_seconds`: the most seconds the state file lags the page while the status and message stay the same; `0` rewrites it on every publish. A number of at least 0; anything else refuses to start.
-- A failed dashboard update (building the state the engine publishes each cycle: a symbol snapshot or S/R row that raises) is the dashboard's failure, not the cycle's: the cycle's management, entries and exits have run, and the loop keeps its normal cadence. It is logged as `Dashboard update failed (consecutive=N)`, with the traceback on the first failure in a row and every 30th, a DEBUG line otherwise, and `Dashboard update recovered` once one succeeds. Meanwhile the page and `state_path` keep the last state, with the status `stale` (`error` while the cycles themselves fail) and a message naming the error and the time of the last failure; `Updated` stays the time of that state. Until 2026-09-26 it failed the cycle, and the error path's own update then failed the same way and stopped the bot.
+- A failed dashboard update (building the state the engine publishes: a symbol snapshot or S/R row that raises) is the dashboard's failure, not the cycle's: the cycle's management, entries and exits have run, and the loop keeps its normal cadence. It is logged as `Dashboard update failed (consecutive=N)`, with the traceback on the first failure in a row and every 30th, a DEBUG line otherwise, and `Dashboard update recovered` once one succeeds. Meanwhile the page and `state_path` keep the last state, with the status `stale` (`error` while the cycles themselves fail) and a message naming the error and the time of the last failure; `Updated` stays the time of that state. Until 2026-09-26 it failed the cycle, and the error path's own update then failed the same way and stopped the bot.
 - `theme`: dashboard theme. Set to the folder name of any theme under `intraday_tv_schwab_bot/dashboard_assets/themes/`. Shipped themes:
   - `default` — blue-tinted dark with glow gradients (the original look).
   - `dark` — pure black background with translucent glass panels and subtle white edge lighting.

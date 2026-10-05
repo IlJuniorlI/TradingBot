@@ -42,6 +42,10 @@ class CycleGateState:
     management_active: bool
     streaming_active: bool
     context_refresh_active: bool
+    # Nothing consumes the watchlist: no position, and no screener,
+    # management, stream or prewarm (_should_idle_closed_market_watchlists).
+    # The market may be open: since 2026-10-05 the gate idles inside the
+    # broker's 07:00-20:00 stream window too.
     idle_closed_market: bool
 
 
@@ -118,17 +122,31 @@ class CycleGate:
     def _should_idle_closed_market_watchlists(
         self,
         *,
-        market_session_open: bool,
         screening_active: bool,
         management_active: bool,
         streaming_active: bool,
         context_refresh_active: bool,
     ) -> bool:
+        """Idle the watchlist when nothing consumes it: no position, and no
+        screener, management, stream or prewarm. Inside the broker's
+        07:00-20:00 stream window too: until 2026-10-05 that window kept the
+        watchlist, and 15:55-20:00 (and 07:00 to the prewarm after an
+        overnight run) ran the frame, S/R and context maps on frames nothing
+        changed or read, about 70% of a core."""
         if bool(self.positions):
             return False
-        if market_session_open:
-            return False
         return not (screening_active or management_active or streaming_active or context_refresh_active)
+
+    def idle_wake_at(self, now: datetime, schedule: Any) -> datetime | None:
+        """When an idle gate next needs a pass: the next window's start, less
+        the prewarm (``_should_refresh_market_context``); None with no window
+        in the next week. The idle cadence sleeps no later than this, so the
+        prewarm, or the window itself with no prewarm, starts on time."""
+        next_start = self._next_schedule_window_start(now, schedule)
+        if next_start is None:
+            return None
+        prewarm_minutes = max(0, int(self.config.runtime.prewarm_before_windows_minutes))
+        return next_start - timedelta(minutes=prewarm_minutes)
 
     def evaluate(self, now: datetime, schedule: Any) -> CycleGateState:
         session_state = equity_session_state(now, extended_hours_enabled=bool(self.config.execution.extended_hours_enabled))
@@ -153,7 +171,6 @@ class CycleGate:
             streaming_active=streaming_active,
         )
         idle_closed_market = self._should_idle_closed_market_watchlists(
-            market_session_open=session_state.stream_available,
             screening_active=screening_active,
             management_active=management_active,
             streaming_active=streaming_active,
@@ -179,15 +196,18 @@ class CycleGate:
         management_active: bool,
         streaming_active: bool,
         context_refresh_active: bool,
-        idle_closed_market: bool,
         position_monitoring_active: bool = False,
     ) -> str:
+        """The dashboard's status message. An idle gate (no position,
+        screener, management, stream or prewarm) reads "Idle until next
+        session window", day and night. Until 2026-10-05 the night read
+        "Market closed"; the gate now idles inside the stream window too
+        (15:55-20:00 on top_tier, with the market open until 16:00), where
+        that would be wrong."""
         if self.startup_reconciler.trading_blocked_message:
             return str(self.startup_reconciler.trading_blocked_message)
         if self.startup_reconciler.trading_blocked_reason:
             return str(self.startup_reconciler.trading_blocked_reason)
-        if idle_closed_market:
-            return "Market closed"
         if position_monitoring_active and not (screening_active or management_active or streaming_active or context_refresh_active):
             return "Position monitor only"
         if context_refresh_active and not (screening_active or management_active or streaming_active):

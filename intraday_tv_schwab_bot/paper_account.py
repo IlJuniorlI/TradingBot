@@ -412,18 +412,25 @@ class PaperAccount:
             "bought_strike": metadata.get("bought_strike"),
         }
 
-    def capture_snapshot(self, positions: dict[str, Position], timestamp: datetime | None = None) -> dict[str, Any]:
+    def _equity_rows(self, positions: dict[str, Position]) -> tuple[list[dict[str, Any]], float, float]:
+        """The position rows, their market value and the total equity, at the
+        marked prices. Under the lock."""
+        position_rows = [self._position_summary(position) for position in positions.values()]
+        market_value = sum(row["market_value"] for row in position_rows)
+        return position_rows, market_value, self.cash + market_value
+
+    def record_equity_point(self, positions: dict[str, Position], timestamp: datetime | None = None) -> None:
+        """Sample the equity at ``timestamp`` (now by default): the peak, the
+        max drawdown and the curve's point. The engine samples once a pass,
+        before the dashboard build (``IntradayBot._publish_state``), whether
+        or not the build runs; until 2026-10-05 the build itself sampled, so
+        the drawdown was sampled only as often as the dashboard was built."""
         ts = timestamp or sessions.now_et()
         with self._lock:
-            position_rows = [self._position_summary(position) for position in positions.values()]
-            market_value = sum(row["market_value"] for row in position_rows)
-            gross_market_value = sum(abs(float(row["market_value"])) for row in position_rows)
-            gross_max_risk = sum(abs(float(row["max_risk"])) for row in position_rows if row.get("max_risk") is not None)
+            position_rows, market_value, total_equity = self._equity_rows(positions)
             unrealized_pnl = sum(row["unrealized_pnl"] for row in position_rows)
-            total_equity = self.cash + market_value
             self.peak_equity = max(self.peak_equity, total_equity)
-            current_drawdown = self.peak_equity - total_equity
-            self.max_drawdown = max(self.max_drawdown, current_drawdown)
+            self.max_drawdown = max(self.max_drawdown, self.peak_equity - total_equity)
             unrealized_by_symbol: dict[str, float] = {}
             for row in position_rows:
                 symbol = str(row["symbol"])
@@ -448,6 +455,25 @@ class PaperAccount:
             else:
                 self.equity_curve[-1] = point
 
+    def capture_snapshot(self, positions: dict[str, Position], timestamp: datetime | None = None) -> dict[str, Any]:
+        """``record_equity_point``, then the ``snapshot``: the session
+        report's and the archive's read."""
+        with self._lock:
+            self.record_equity_point(positions, timestamp)
+            return self.snapshot(positions)
+
+    def snapshot(self, positions: dict[str, Position]) -> dict[str, Any]:
+        """The account at the marked prices, without sampling it (the
+        dashboard's read; ``capture_snapshot`` samples first)."""
+        with self._lock:
+            position_rows, market_value, total_equity = self._equity_rows(positions)
+            gross_market_value = sum(abs(float(row["market_value"])) for row in position_rows)
+            gross_max_risk = sum(abs(float(row["max_risk"])) for row in position_rows if row.get("max_risk") is not None)
+            unrealized_pnl = sum(row["unrealized_pnl"] for row in position_rows)
+            peak_equity = max(self.peak_equity, total_equity)
+            current_drawdown = peak_equity - total_equity
+            max_drawdown = max(self.max_drawdown, current_drawdown)
+
             trade_events = list(self.trades)
             closed = closed_trade_lifecycles(trade_events)
             wins = sum(1 for trade in closed if trade.realized_pnl > 0)
@@ -463,11 +489,11 @@ class PaperAccount:
                 "gross_market_value": gross_market_value,
                 "gross_max_risk": gross_max_risk,
                 "total_equity": total_equity,
-                "peak_equity": self.peak_equity,
+                "peak_equity": peak_equity,
                 "realized_pnl": self.realized_pnl,
                 "unrealized_pnl": unrealized_pnl,
                 "drawdown": current_drawdown,
-                "max_drawdown": self.max_drawdown,
+                "max_drawdown": max_drawdown,
                 "open_positions": len(position_rows),
                 "closed_trades": len(closed),
                 "total_trades": len(closed) + len(position_rows),
@@ -513,4 +539,4 @@ class PaperAccount:
         return payload
 
     def snapshot_copy(self, positions: dict[str, Position]) -> dict[str, Any]:
-        return copy.deepcopy(self.capture_snapshot(positions))
+        return copy.deepcopy(self.snapshot(positions))
