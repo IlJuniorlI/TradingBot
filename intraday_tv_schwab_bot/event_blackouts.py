@@ -71,8 +71,15 @@ def weekday_token(value: Any) -> str | None:
 def _resolve_path(path_value: str) -> Path:
     """Resolve a configured path against cwd, then the package and project
     roots — the same search the 0DTE loader used, so existing relative
-    ``./macro_events.auto.yaml`` settings keep working from any cwd."""
+    ``./macro_events.auto.yaml`` settings keep working from any cwd.
+
+    The path as given is the first candidate, and the one chosen whenever it
+    exists, so the other two are built only when it does not: their four
+    ``resolve()`` calls were ~150 of the ~180 us a call took, and it runs
+    for every candidate of every entry pass (``earnings_block_reason``)."""
     raw = Path(path_value).expanduser()
+    if raw.exists():
+        return raw
     candidates = [raw]
     if not raw.is_absolute():
         package_root = Path(__file__).resolve().parent

@@ -875,7 +875,19 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         side vote and the relative-strength filter), ``_score_sides`` (pass 1),
         ``_queue_builds`` (pass 2) and ``_run_build_queue`` (the per-regime
         gates, the armed retest and the builds; the first signal wins), and
-        ``_record_candidate`` records the outcome."""
+        ``_record_candidate`` records the outcome.
+
+        The pass's frame-read memo (``_pass_memo_read``) is open for exactly
+        this call."""
+        self._entry_pass_memo = {}
+        try:
+            return self._entry_pass(candidates, bars, positions, data)
+        finally:
+            self._entry_pass_memo = None
+
+    def _entry_pass(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame],
+                    positions: dict[str, Position], data) -> list[Signal]:
+        """``entry_signals``' body, run with the pass memo open."""
         self._reset_entry_decisions()
         self._prune_armed_retests()
         out: list[Signal] = []

@@ -829,6 +829,47 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **top_tier's entry pass reads each sector frame's posture and session
+  open once a pass; the event calendars' path is resolved without four
+  `resolve()` calls.** *2026-10-05* — the entry pass scanned each of the
+  ~25 peer and ETF frames ~17 times (every candidate of its sector, for
+  both sides: ~390 posture reads and the leg-anchor scan behind each) and
+  read the session open of ~28 frames 86 times.
+  - `ConfirmationMixin._pass_memo_read` (new) keeps a frame read for the
+    rest of one `entry_signals` call, keyed on the frame's context-cache
+    key (id, length, last bar) and every other input the read uses, and
+    pinning the frame. `entry_signals` opens it and drops it in a
+    `finally` (its body is now `_entry_pass`); outside a pass every read
+    runs as before.
+  - `_frame_agrees` compares the side with `_frame_posture` (new), the
+    side-free `bar_posture` of the latest bar against the leg-anchor
+    reference, memoized on the clock's date, the session start and the
+    three `leg_*` params. `_day_strength_session_open` (now an instance
+    method) is memoized on the date and the session start; it also serves
+    the momentum regime's per-side lookups. `SmallCapSqueezeStrategy`
+    inherits both.
+  - `event_blackouts._resolve_path` returns the configured path as given
+    when it exists, which the candidate search always chose then; the
+    package- and project-root candidates are built only when it does
+    not.
+  - Measured (CACHE-PASS verifier, base 9c2a8d2, 9 interleaved pairs on
+    09-30..10-02): entries 1.28 → 1.01 s, step CPU -0.23 s; on top of the
+    array helpers above -0.13 s a pass (entries 0.85 → 0.73 s); the path
+    resolve 181 → 10.5 µs a call.
+  - Identical: the verifier's stepped replays (top_tier 10-01 09:30-11:30
+    with 20 trades, 10-02 across the 15:00 entry close, small_cap 06-02)
+    with every one of 103,539 memo hits recomputed and compared, 0
+    mismatches; here, the 10-01 09:40-10:40 stepped replay against
+    21032f8.
+  - Tests: `tests/strategies/top_tier_adaptive/test_entry_pass_memo.py`
+    (new): each peer and ETF frame read once a pass, both sides from one
+    posture, a frame grown in place within a pass and a new date or
+    session switch read fresh, a second pass and a frame changed after a
+    pass read again, the memo open only during the pass and dropped when
+    it raises, one memo per strategy, and the path resolve's three cases.
+    9 mutants killed; the two the verifier found equivalent survive as
+    expected.
+
 - **The dashboard snapshot's bars and the HTF trend row are kept across
   passes and rebuilt only on a new bar or HTF refresh.** *2026-10-05* —
   with the step frames and contexts kept (below), a built publish with no

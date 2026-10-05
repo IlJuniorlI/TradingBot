@@ -11,6 +11,7 @@ widening and soft-bias penalty.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -48,6 +49,34 @@ class ConfirmationMixin:
     """Confirmation, bias and scaling reads the entry loop and the regimes
     share. Mixed into ``TopTierAdaptiveStrategy`` (``strategy.py``), whose
     ``BaseStrategy`` supplies ``params``, ``config`` and the contexts."""
+
+    # The entry pass's memo of the frame reads that do not depend on the
+    # candidate (``_pass_memo_read``): a dict while ``entry_signals`` runs,
+    # ``None`` outside it, so a read made outside a pass is never served
+    # from one.
+    _entry_pass_memo: dict[tuple[Any, ...], tuple[pd.DataFrame | None, Any]] | None = None
+
+    def _pass_memo_read(self, kind: str, frame: pd.DataFrame | None, inputs: tuple[Any, ...],
+                        read: Callable[[], Any]) -> Any:
+        """``read()``, kept for the rest of the entry pass under *kind*, the
+        frame's context-cache key (``_technical_context_cache_key``: id,
+        length, last bar) and the other *inputs* ``read`` uses. Within one
+        pass the bars are fixed, so every candidate whose sector holds a
+        frame reads it once instead of once per candidate and side.
+
+        Each entry holds its frame, so no other frame can take its id while
+        the entry exists, and the memo is dropped as the pass ends. Outside
+        a pass ``read()`` runs every time."""
+        memo = self._entry_pass_memo
+        if memo is None:
+            return read()
+        key = (kind, *self._technical_context_cache_key(frame), *inputs)
+        hit = memo.get(key)
+        if hit is not None and hit[0] is frame:
+            return hit[1]
+        value = read()
+        memo[key] = (frame, value)
+        return value
 
     # ------------------------------------------------------------------
     # Index confirmation
@@ -145,8 +174,9 @@ class ConfirmationMixin:
         #
         # Taken by POSITION: today's bars are a contiguous tail of a
         # time-ordered frame, and `same_day_mask` maps a Python lambda over
-        # EVERY bar of the merged frame. This runs once per peer per side, so
-        # on a 12-peer group that was ~15ms of per-candidate overhead for a
+        # EVERY bar of the merged frame. This ran once per peer per side
+        # (once per frame per entry pass since ``_frame_posture``), so on a
+        # 12-peer group that was ~15ms of per-candidate overhead for a
         # slice `searchsorted` does in microseconds. `tz=index.tz` covers
         # tz-aware and naive indexes identically.
         index = frame.index
@@ -190,8 +220,26 @@ class ConfirmationMixin:
         """
         if frame is None or frame.empty:
             return None
-        reference = self._leg_anchor_vwap(frame) if bool(self.params.get("leg_anchored_confirmation", False)) else None
-        return bar_posture(frame.iloc[-1], reference) == side
+        return self._frame_posture(frame) == side
+
+    def _frame_posture(self, frame: pd.DataFrame) -> Side | None:
+        """The ``bar_posture`` of *frame*'s latest bar against
+        ``_frame_agrees``' reference. It depends on neither the side nor the
+        candidate, and ``_index_confirms`` asks it of every sector peer for
+        every candidate and side (~390 reads of ~28 frames a top_tier pass),
+        so an entry pass reads it once per frame (``_pass_memo_read``), keyed
+        also on what the leg anchor reads: the clock's date, the session
+        start and the three ``leg_*`` params."""
+        leg_anchored = bool(self.params.get("leg_anchored_confirmation", False))
+
+        def read() -> Side | None:
+            reference = self._leg_anchor_vwap(frame) if leg_anchored else None
+            return bar_posture(frame.iloc[-1], reference)
+
+        inputs = (sessions.now_et().date(), indicator_session_start(), leg_anchored,
+                  int(self.params.get("leg_anchor_min_age_bars", 20)),
+                  float(self.params.get("leg_anchor_min_impulse_pct", 0.005)))
+        return self._pass_memo_read("posture", frame, inputs, read)
 
     def _index_confirms(self, side: Side, symbol: str, bars: dict[str, pd.DataFrame], _data=None) -> bool:
         """Return True when *symbol*'s sector tape agrees with *side*.
@@ -800,10 +848,17 @@ class ConfirmationMixin:
         magnitude_factor = min(1.0, abs(ds) / saturate_at)
         return penalty_base * magnitude_factor
 
-    @staticmethod
-    def _day_strength_session_open(frame: pd.DataFrame) -> float | None:
+    def _day_strength_session_open(self, frame: pd.DataFrame) -> float | None:
         """Session-open anchor for the live ``day_strength`` bias: today's
         first open from where the VWAP/EMA session reset starts
         (``indicator_session_start``) -- the 07:00 equity-stream open in
-        extended-hours indicator mode, otherwise the RTH 09:30 open."""
-        return session_open_price(frame, sessions.now_et().date(), session_start=indicator_session_start())
+        extended-hours indicator mode, otherwise the RTH 09:30 open.
+
+        Read for the candidate (its bias, and the momentum regime once per
+        side) and for its sector ETF by every candidate the ETF covers
+        (``_sector_day_strength``), so an entry pass reads it once per
+        frame (``_pass_memo_read``)."""
+        day = sessions.now_et().date()
+        session_start = indicator_session_start()
+        return self._pass_memo_read("session_open", frame, (day, session_start),
+                                    lambda: session_open_price(frame, day, session_start=session_start))
