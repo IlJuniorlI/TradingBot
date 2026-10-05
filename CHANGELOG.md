@@ -829,6 +829,38 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **One quote request per refresh: `runtime.quote_batch_size` is 50, in
+  the code default and every preset (it was 20).** *2026-10-05* — top_tier
+  quotes 28 symbols, so every engine pass refreshed them in two requests
+  (20 + 8), one after the other. The second cost about 0.2 s of each 7.9 s
+  pass, and the pair made up 87% of a day's Schwab calls (2026-09-29 to
+  10-02, about 5,800-6,000 quote requests a day). One request now carries
+  all 28.
+  - Measured: the quotes phase 0.43 → 0.23 s a pass on the harness (the
+    real `step()` at real-time pace, schwabdev's request lock emulated, 9
+    run pairs, each 0.200-0.202 s apart). In production the second request
+    took a median 0.193-0.207 s and a 20-symbol request 0.003-0.005 s more
+    than an 8-symbol one, so about 0.19-0.20 s a pass: about 570-600 s of
+    pass time and 2,900-3,000 fewer requests a day (-43% of the day's
+    calls).
+  - No decision changes. A stepped replay of 2026-10-01 09:35-11:35 (481
+    steps, 25 trades) was identical, every cached quote and its refresh
+    stamp included; only the quote request count halved. In real time the
+    28 quotes share one fetch stamp, so the split refreshes of 09:33-09:35
+    (20 and 8 symbols on alternate passes, when a pass sits just under
+    `quote_cache_seconds`) are gone, and the dashboard's `api_usage` counts
+    fewer quote calls.
+  - A refused batch costs fewer requests (its retries are paid once, not
+    once a chunk); the single-quote fallback is unchanged. Schwab served
+    24-symbol requests in production (2026-05-12 and 05-13, at 25). The
+    order path's quotes are one or two symbols and never split. The other
+    presets' quote watchlists peaked at 4-18 symbols in the archive and
+    already sent one request; small_cap's can pass 20 with held positions
+    and now stays at one.
+  - A deployed config that sets `quote_batch_size: 20` keeps two requests;
+    set it to 50 to take the change. The knob is still an integer of at
+    least 1, checked at load. README: the defaults table and the knob.
+
 - **Clicking a symbol in the dashboard's completed trades dock switches the
   chart to it.** *2026-10-04* — it opened the symbol's TradingView page
   (user report, 2026-09-29). The cell is a button for a symbol the

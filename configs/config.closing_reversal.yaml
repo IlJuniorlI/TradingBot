@@ -75,7 +75,7 @@ runtime:
   history_poll_seconds: 300
   quote_poll_seconds: 6
   quote_cache_seconds: 6
-  quote_batch_size: 20
+  quote_batch_size: 50
   history_lookback_minutes: 390
   use_extended_hours_history: true
   use_rth_session_indicators: true

@@ -323,7 +323,7 @@ This block controls loop timing, quote/history refresh cadence, stream fallback 
 | `history_poll_seconds`               | `300`                                     |
 | `quote_poll_seconds`                 | `6`                                       |
 | `quote_cache_seconds`                | `6`                                       |
-| `quote_batch_size`                   | `20`                                      |
+| `quote_batch_size`                   | `50`                                      |
 | `history_lookback_minutes`           | `390`                                     |
 | `use_extended_hours_history`         | `true`                                    |
 | `use_rth_session_indicators`         | `true`                                    |
@@ -357,7 +357,7 @@ Behavior and valid values:
 - `history_poll_seconds`: cadence for history refreshes. A finite number of seconds above 0, unquoted; anything else refuses to start.
 - `quote_poll_seconds`: cadence for quote refreshes when polling is used.
 - `quote_cache_seconds`: max age of cached quotes before forcing a refresh.
-- `quote_batch_size`: max symbols grouped into one quote request.
+- `quote_batch_size`: max symbols grouped into one quote request. A refresh of more symbols sends one request per batch, one after the other, each about 0.2 s. `50` (since 2026-10-05; it was `20`) keeps every shipped preset's quote watchlist in one request: top_tier's 28 symbols took two (20 + 8) on every pass. An integer of at least 1; anything else refuses to start.
 - `history_lookback_minutes`: intraday history depth retained for signal generation.
 - `use_extended_hours_history`: include premarket/after-hours minute bars in warmup and backfill.
   - **Overnight ECN data lag (Schwab API).** Even with `use_extended_hours_history: true`, Schwab's `price_history` minute endpoint does **not** include bars for the most recent weekday overnight (~8:00 PM ET → 7:00 AM ET) at any frequency (verified at `frequency=1`, `5`, `15`, and `30`). Those overnight ECN bars become available with roughly a 1-trading-day lag — older overnights (e.g. `Wed 8 PM → Thu 7 AM`) do return continuous bars at all frequencies once they've aged. The Sunday → Monday transition is an exception: weekend ECN bars are released without the lag and appear immediately under Sunday's evening startDate.

@@ -465,7 +465,7 @@ class RuntimeConfig:
     history_poll_seconds: int = 300
     quote_poll_seconds: int = 6
     quote_cache_seconds: int = 6
-    quote_batch_size: int = 20
+    quote_batch_size: int = 50
     history_lookback_minutes: int = 390
     use_extended_hours_history: bool = True
     use_rth_session_indicators: bool = True
