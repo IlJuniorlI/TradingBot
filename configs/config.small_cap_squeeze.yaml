@@ -98,6 +98,7 @@ runtime:
   session_reconcile_on_resume: true
   cycle_fetch_workers: 4
   max_consecutive_quote_failures: 5
+  context_memo_shadow_every: 20
   export_session_archive: true
   log_position_marks: true
   reconcile_on_startup: true

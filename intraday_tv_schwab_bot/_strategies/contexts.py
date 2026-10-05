@@ -33,12 +33,14 @@ from ..bars import (
     derived_frame,
     frame_bar_minutes,
     frame_source_token,
+    frame_version,
     last_bucket_forming,
     resample_bars,
     verified_frame,
 )
 from ..candles import CANDLE_CONTEXT_BARS, detect_candle_context, directional_candle_signal
-from ..chart_patterns import analyze_chart_pattern_context
+from ..chart_patterns import analyze_chart_pattern_context, clean_input_marked, mark_clean_input
+from ..context_memo import ContextMemo, indicator_clock_key
 from ..fair_value_gaps import FairValueGapContext, build_fair_value_gap_context, empty_fvg_context
 from ..htf_levels import HTFContext, empty_htf_context
 from ..indicators import (
@@ -104,6 +106,15 @@ class ContextBuildersMixin:
         # in _observed_contexts only for one of them. Holding the frames keeps
         # their ids from being handed to another frame mid-cycle.
         self._prewarm_frames: dict[int, pd.DataFrame] = {}
+        # The three contexts across cycles (context_memo), for frames handed
+        # out by get_merged: slots (builder, timeframe token, symbol, source
+        # timeframe, variant), keyed on the frame's version and what each
+        # build reads of the clock. Per instance: two instances of a class
+        # can carry different settings.
+        self._context_memo = ContextMemo(
+            f"{type(self).__name__} contexts",
+            shadow_every=self.config.runtime.context_memo_shadow_every,
+        )
 
     def reset_context_caches(self) -> None:
         """Cycle-boundary cache cleanup for the three pre-warmed context caches.
@@ -121,6 +132,7 @@ class ContextBuildersMixin:
             self._structure_context_cache = {}
         with self._technical_context_lock:
             self._technical_context_cache = {}
+        self._context_memo.next_generation()
 
     def _reset_candle_context_cache(self) -> None:
         """Empty the candle-context cache as each ``entry_signals`` starts
@@ -181,24 +193,39 @@ class ContextBuildersMixin:
             cached = self._chart_context_cache.get(cache_key)
             if cached is not None:
                 return cached[1]
+        version = frame_version(frame)
+        if version is None:
+            ctx = self._build_chart_context(frame)
+        else:
+            # A pure function of the frame (and the fixed config): no clock,
+            # no process-wide setting (tools/clock_audit). The clean-frame mark
+            # is an input, and the one effect a build has on the frame is
+            # replayed on a hit.
+            marked = clean_input_marked(frame)
+            ctx = self._context_memo.serve(
+                ("chart", None, version[0][0], version[0][2], version[1]),
+                (version, marked),
+                tuple,
+                lambda _clock: self._build_chart_context(frame),
+            )
+            mark_clean_input(frame)
+        with self._chart_context_lock:
+            self._chart_context_cache[cache_key] = (frame, ctx)
+        return ctx
+
+    def _build_chart_context(self, frame: pd.DataFrame):
         if not bool(self._chart_pattern_setting("enabled", True)):
-            ctx = analyze_chart_pattern_context(frame, bullish_allowed=[], bearish_allowed=[], lookback_bars=0)
-            with self._chart_context_lock:
-                self._chart_context_cache[cache_key] = (frame, ctx)
-            return ctx
+            return analyze_chart_pattern_context(frame, bullish_allowed=[], bearish_allowed=[], lookback_bars=0)
         cfg = getattr(self.config, "chart_patterns", None)
         bullish_allowed = list(getattr(cfg, "bullish_patterns", []))
         bearish_allowed = list(getattr(cfg, "bearish_patterns", []))
         lookback_bars = int(self._chart_pattern_setting("lookback_bars", getattr(cfg, "lookback_bars", 32) if cfg is not None else 32))
-        ctx = analyze_chart_pattern_context(
+        return analyze_chart_pattern_context(
             frame,
             bullish_allowed=bullish_allowed,
             bearish_allowed=bearish_allowed,
             lookback_bars=lookback_bars,
         )
-        with self._chart_context_lock:
-            self._chart_context_cache[cache_key] = (frame, ctx)
-        return ctx
 
     @staticmethod
     def _chart_lists(ctx) -> dict[str, list[str]]:
@@ -769,8 +796,9 @@ class ContextBuildersMixin:
         is_ltf_analysis = self._is_ltf_token(timeframe_token)
         # A step frame written after its hand-out (its index or OHLCV columns
         # no longer the ones get_merged handed out) is analysed as an
-        # unregistered copy: nothing kept on its token (the 5m structure
-        # frame) is served for bars it no longer holds.
+        # unregistered copy: nothing kept on its token or version (the 5m
+        # structure frame, the memoized context below) is served for bars it
+        # no longer holds, and its build is not kept.
         bars_frame = verified_frame(frame)
         analysis_frame = bars_frame
         bar_minutes: int | None = None
@@ -796,24 +824,44 @@ class ContextBuildersMixin:
         # dashboard's forming bucket and data_feed._completed_bars
         # (bars.last_bucket_forming / completed_bucket_mask); a frame of
         # completed 1m bars never reads as forming.
-        last_bar_forming = last_bucket_forming(analysis_frame.index, bar_minutes, sessions.now_et())
+        def clock_key() -> tuple:
+            return last_bucket_forming(analysis_frame.index, bar_minutes, sessions.now_et()), indicator_clock_key()
+
         pct_tolerance = float(self.config.support_resistance.pct_tolerance)  # checked at load (above 0)
         if is_ltf_analysis:
             pct_tolerance *= 0.60
         structure_event_max_age_bars = int(self._support_resistance_setting("structure_event_lookback_bars", 6) or 6)
-        ctx = analyze_market_structure(
-            analysis_frame,
-            current_price=current_price,
-            pivot_span=pivot_span,
-            eq_atr_mult=float(self._support_resistance_setting("structure_eq_atr_mult", 0.25) or 0.25),
-            pct_tolerance=pct_tolerance,
-            breakout_atr_mult=float(self._support_resistance_setting("breakout_atr_mult", 0.35) or 0.35),
-            breakout_buffer_pct=float(self._support_resistance_setting("breakout_buffer_pct", 0.0015) or 0.0015),
-            structure_event_max_age_bars=structure_event_max_age_bars,
-            min_range_atr_mult=float(self._support_resistance_setting("structure_min_range_atr_mult", 1.5) or 0.0),
-            min_pivot_gap_bars=int(self._support_resistance_setting("structure_min_pivot_gap_bars", 0) or 0),
-            last_bar_forming=last_bar_forming,
-        )
+
+        def build(clock: tuple):
+            return analyze_market_structure(
+                analysis_frame,
+                current_price=current_price,
+                pivot_span=pivot_span,
+                eq_atr_mult=float(self._support_resistance_setting("structure_eq_atr_mult", 0.25) or 0.25),
+                pct_tolerance=pct_tolerance,
+                breakout_atr_mult=float(self._support_resistance_setting("breakout_atr_mult", 0.35) or 0.35),
+                breakout_buffer_pct=float(self._support_resistance_setting("breakout_buffer_pct", 0.0015) or 0.0015),
+                structure_event_max_age_bars=structure_event_max_age_bars,
+                min_range_atr_mult=float(self._support_resistance_setting("structure_min_range_atr_mult", 1.5) or 0.0),
+                min_pivot_gap_bars=int(self._support_resistance_setting("structure_min_pivot_gap_bars", 0) or 0),
+                last_bar_forming=clock[0],
+            )
+
+        # The analysis frame (the frame, or its memoized resample) is a
+        # function of the frame's version, so the version and the clock as
+        # the build reads it (the forming last bucket, the ATR's session
+        # switch) are every input. The forming flag is read once, into the
+        # key and the build alike.
+        version = frame_version(bars_frame)
+        if version is None:
+            ctx = build(clock_key())
+        else:
+            ctx = self._context_memo.serve(
+                ("structure", timeframe_token, version[0][0], version[0][2], version[1]),
+                (version,),
+                clock_key,
+                build,
+            )
         with self._structure_context_lock:
             self._structure_context_cache[cache_key] = (frame, ctx)
         return ctx
@@ -887,15 +935,33 @@ class ContextBuildersMixin:
             if cached is not None:
                 return cached[1]
         current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
-        cfg = getattr(self.config, "technical_levels", None)
-        sr_cfg = getattr(self.config, "support_resistance", None)
         if frame is None or frame.empty or not bool(self._technical_level_setting("enabled", True)):
             empty_ctx = empty_technical_levels_context(current_price)
             with self._technical_context_lock:
                 self._technical_context_cache[cache_key] = (frame, empty_ctx)
             return empty_ctx
+        version = frame_version(frame)
+        if version is None:
+            ctx = self._build_technical_context(frame, current_price)
+        else:
+            # Reads the clock only through the ATR's and the divergence
+            # clocks' session switch (tools/clock_audit), plus the session
+            # indicator settings: indicator_clock_key.
+            ctx = self._context_memo.serve(
+                ("technical", None, version[0][0], version[0][2], version[1]),
+                (version,),
+                indicator_clock_key,
+                lambda _clock: self._build_technical_context(frame, current_price),
+            )
+        with self._technical_context_lock:
+            self._technical_context_cache[cache_key] = (frame, ctx)
+        return ctx
+
+    def _build_technical_context(self, frame: pd.DataFrame, current_price: float) -> TechnicalLevelsContext:
+        cfg = getattr(self.config, "technical_levels", None)
+        sr_cfg = getattr(self.config, "support_resistance", None)
         pivot_span = int(self._support_resistance_setting("structure_ltf_pivot_span", self._support_resistance_setting("pivot_span", 2)) or 2) if sr_cfg is not None else 2
-        ctx = build_technical_levels_context(
+        return build_technical_levels_context(
             frame,
             current_price=current_price,
             pivot_span=max(1, pivot_span),
@@ -944,9 +1010,6 @@ class ContextBuildersMixin:
             divergence_enabled=bool(self._technical_level_setting("divergence_enabled", True)),
             bollinger_enabled=bool(self._technical_level_setting("bollinger_enabled", True)),
         )
-        with self._technical_context_lock:
-            self._technical_context_cache[cache_key] = (frame, ctx)
-        return ctx
 
     def _technical_lists(self, ctx, prefix: str = "tech") -> dict[str, Any]:
         cfg_enabled = bool(self._technical_level_setting("enabled", True))

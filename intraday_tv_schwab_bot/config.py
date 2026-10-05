@@ -523,6 +523,14 @@ class RuntimeConfig:
     # securities like KNRX 2026-04-29: 457 wasted 401 retries) without
     # blacklisting on transient hiccups.
     max_consecutive_quote_failures: int = 5
+    # Shadow check of the level and context memos (context_memo): every
+    # N-th memo hit is rebuilt and compared with what the memo served; a
+    # difference logs CRITICAL ("Context memo ...") and the rebuilt context
+    # is used. On at 20 (about 5% of hits rebuilt: 5-6 of top_tier's 112 a
+    # no-bar pass, under 0.01 s of CPU) for the memos' first dry-run day; 0
+    # turns it off once a day has logged no such line, and it goes back on
+    # for a day after a change to a builder.
+    context_memo_shadow_every: int = 20
     # When True, the engine writes a per-day archive to
     # {log_dir}/sessions/{YYYY-MM-DD}/ (once per ET trading day after 20:00,
     # and again on shutdown) containing bars/1m/{SYMBOL}.csv (the full merged
@@ -1824,6 +1832,8 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         # Read by every quote refresh (MarketDataStore._parallel_quote_fetch),
         # where a typo used to read as 5 and null or a negative count as 0.
         "max_consecutive_quote_failures": _Number(integer=True, low=0, note=" (0 turns the gate off)"),
+        # Read when the store and the strategy are built (ContextMemo).
+        "context_memo_shadow_every": _Number(integer=True, low=0, note=" (0 turns the shadow check off)"),
     },
     "paper": {
         "starting_equity": _ABOVE_ZERO,

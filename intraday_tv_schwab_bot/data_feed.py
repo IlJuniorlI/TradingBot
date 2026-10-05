@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import math
@@ -16,7 +15,7 @@ import pandas as pd
 from schwabdev import Client, Stream
 
 from .config import BotConfig
-from .support_resistance import SupportResistanceContext, build_support_resistance_context
+from .support_resistance import SupportResistanceContext, build_support_resistance_context, flip_frame_clock_key
 from .htf_levels import HTFContext, build_htf_context
 from .fair_value_gaps import FairValueGapContext, build_fair_value_gap_context, empty_fvg_context
 from .order_blocks import OrderBlockContext, build_order_block_context, empty_order_block_context
@@ -28,6 +27,8 @@ from .bars import (
     ensure_ohlcv_frame,
     equity_stream_window_bars,
     floor_minute,
+    forming_positions,
+    frame_version,
     next_source_generation,
     register_frame_source,
     resample_bars,
@@ -42,6 +43,7 @@ from .indicators import (
     resolve_ema_spans,
 )
 from . import sessions
+from .context_memo import ContextMemo, indicator_clock_key
 from .sessions import (
     EQUITY_STREAM_HISTORY_REFRESH_READY,
     EXCHANGE_TZ,
@@ -181,6 +183,10 @@ class MarketDataStore:
         self._cycle_fvg_cache: dict[tuple, FairValueGapContext] = {}
         self._cycle_ob_cache: dict[tuple, OrderBlockContext] = {}
         self._cycle_sr_cache: dict[tuple, SupportResistanceContext | None] = {}
+        # The S/R, FVG and order-block builds across cycles (context_memo):
+        # slots ("sr" | "fvg" | "ob", symbol, *request), each keyed on the
+        # frame its build read and the clock as the build reads it.
+        self._level_memo = ContextMemo("levels", shadow_every=config.runtime.context_memo_shadow_every)
         # Resolved Schwab API alias cache: original_symbol_upper -> resolved_alias.
         # Populated lazily after the first successful single-symbol fetch
         # (quote or price_history). Lets the batch quote path substitute
@@ -280,6 +286,7 @@ class MarketDataStore:
             # flight across a prune), so they keep only the active symbols.
             self._merged_memo = {k: v for k, v in self._merged_memo.items() if k[0] in active}
             self._source_generations = {k: v for k, v in self._source_generations.items() if k in active}
+            self._level_memo.retain(lambda slot: slot[1] in active)
             stale = {sym for sym in self.history.keys() if sym not in active}
             stale |= {sym for sym in self.live.keys() if sym not in active}
             stale |= {sym for sym in self.quote_cache.keys() if sym not in active}
@@ -310,6 +317,7 @@ class MarketDataStore:
         return len(stale)
 
     def begin_cycle(self) -> None:
+        self._level_memo.next_generation()
         with self._lock:
             self._cycle_active = True
             self._cycle_merged_cache.clear()
@@ -779,7 +787,7 @@ class MarketDataStore:
         )
         with self._lock:
             if self._cycle_active and cache_key in self._cycle_fvg_cache:
-                return copy.deepcopy(self._cycle_fvg_cache[cache_key])
+                return self._cycle_fvg_cache[cache_key]
         # Fetch the right frame: 1m via get_merged(no timeframe), LTF/HTF via the
         # explicit timeframe lookup that triggers internal resampling. Mirrors
         # `get_order_block_context` so a 5m FVG context computes on 5m bars,
@@ -793,18 +801,38 @@ class MarketDataStore:
             ctx = empty_fvg_context(float(current_price or 0.0), timeframe_minutes=tf)
         else:
             close = float(current_price if current_price is not None else merged.iloc[-1].get('close', 0.0) or 0.0)
-            ctx = build_fair_value_gap_context(
-                merged,
-                timeframe_minutes=tf,
-                current_price=close,
-                max_per_side=max(0, int(max_per_side or 0)),
-                min_gap_atr_mult=float(min_gap_atr_mult),
-                min_gap_pct=float(min_gap_pct),
-            )
+
+            def build() -> FairValueGapContext:
+                return build_fair_value_gap_context(
+                    merged,
+                    timeframe_minutes=tf,
+                    current_price=close,
+                    max_per_side=max(0, int(max_per_side or 0)),
+                    min_gap_atr_mult=float(min_gap_atr_mult),
+                    min_gap_pct=float(min_gap_pct),
+                )
+
+            # Keyed on the frame read (its version), never on the store's
+            # current objects: a bar landing while get_merged built it leaves
+            # the cycle holding the pre-bar frame, and its context must not be
+            # filed under the post-bar store. The build reads the clock only
+            # through completed_bars and the ATR's session switch.
+            version = frame_version(merged)
+            if version is None:
+                ctx = build()
+            else:
+                ctx = self._level_memo.serve(
+                    ("fvg", *cache_key),
+                    (version,),
+                    lambda: (forming_positions(merged.index, tf, sessions.now_et()), indicator_clock_key()),
+                    lambda _clock: build(),
+                )
+        # Shared, not copied: no reader writes into a context (the HTF
+        # contexts have been shared across cycles all along).
         with self._lock:
             if self._cycle_active:
-                self._cycle_fvg_cache[cache_key] = copy.deepcopy(ctx)
-        return copy.deepcopy(ctx)
+                self._cycle_fvg_cache[cache_key] = ctx
+        return ctx
 
     def get_order_block_context(
         self,
@@ -849,7 +877,7 @@ class MarketDataStore:
         )
         with self._lock:
             if self._cycle_active and cache_key in self._cycle_ob_cache:
-                return copy.deepcopy(self._cycle_ob_cache[cache_key])
+                return self._cycle_ob_cache[cache_key]
         # Fetch the right frame: 1m via get_merged(no timeframe), HTF via the
         # explicit timeframe lookup that triggers internal resampling.
         tf = max(1, int(timeframe_minutes))
@@ -865,22 +893,32 @@ class MarketDataStore:
             )
         else:
             close = float(current_price if current_price is not None else merged.iloc[-1].get("close", 0.0) or 0.0)
-            ctx = build_order_block_context(
-                merged,
-                timeframe_minutes=tf,
-                current_price=close,
-                mode=mode,
-                max_per_side=max(0, int(max_per_side or 0)),
-                min_block_atr_mult=float(min_block_atr_mult),
-                min_block_pct=float(min_block_pct),
-                min_thrust_atr_mult=float(min_thrust_atr_mult),
-                pivot_span=int(pivot_span),
-                new_high_lookback=int(new_high_lookback),
-            )
+
+            def build() -> OrderBlockContext:
+                return build_order_block_context(
+                    merged,
+                    timeframe_minutes=tf,
+                    current_price=close,
+                    mode=mode,
+                    max_per_side=max(0, int(max_per_side or 0)),
+                    min_block_atr_mult=float(min_block_atr_mult),
+                    min_block_pct=float(min_block_pct),
+                    min_thrust_atr_mult=float(min_thrust_atr_mult),
+                    pivot_span=int(pivot_span),
+                    new_high_lookback=int(new_high_lookback),
+                )
+
+            # Keyed on the frame read, as get_fair_value_gap_context; the
+            # build reads the clock only through the ATR's session switch.
+            version = frame_version(merged)
+            if version is None:
+                ctx = build()
+            else:
+                ctx = self._level_memo.serve(("ob", *cache_key), (version,), indicator_clock_key, lambda _clock: build())
         with self._lock:
             if self._cycle_active:
-                self._cycle_ob_cache[cache_key] = copy.deepcopy(ctx)
-        return copy.deepcopy(ctx)
+                self._cycle_ob_cache[cache_key] = ctx
+        return ctx
 
     def get_htf_frame(self, symbol: str, *, timeframe_minutes: int) -> pd.DataFrame | None:
         """Copy of the stored (symbol, tf) HTF frame: completed bars built
@@ -1256,7 +1294,13 @@ class MarketDataStore:
         a read passing ``allow_refresh`` fetched the frame when its HTF bar
         had closed, and a default-mode read without a price could be served
         a context the step's own fetch had built (``sr_cache``, gone with
-        that fetch)."""
+        that fetch).
+
+        Across cycles the build is kept in the level memo (context_memo),
+        keyed on the stored frame object, the price, the flip frame's version
+        and what the build reads of the clock (the flip frame's completed
+        bars, the session date, the ATR's session switch): a cycle without a
+        new bar or HTF refresh reads the last build instead of redoing it."""
         cfg = getattr(self.config, "support_resistance", None)
         if cfg is None or not bool(cfg.enabled):
             return None
@@ -1274,15 +1318,59 @@ class MarketDataStore:
         with self._lock:
             if self._cycle_active and cycle_key in self._cycle_sr_cache:
                 return self._cycle_sr_cache[cycle_key]
-        frame = self.get_htf_frame(symbol, timeframe_minutes=tf)
-        if frame is None or frame.empty:
+            # Read once: the memo keys on this object and the build reads a
+            # copy of it, so the two cannot come from different refreshes.
+            stored = self.history_htf.get(self._htf_key(symbol, tf))
+        if stored is None or stored.empty:
             with self._lock:
                 if self._cycle_active:
                     self._cycle_sr_cache[cycle_key] = None
             return None
         flip_1m, flip_5m = cfg.flip_confirmation_bars() if normalized_mode == "trading" else (0, 0)
-        ctx = build_support_resistance_context(
-            frame,
+        flip_version = None if flip_frame is None else frame_version(flip_frame)
+
+        def build() -> SupportResistanceContext:
+            return self._build_support_resistance(stored, cfg, tf, current_price, flip_frame, flip_1m, flip_5m,
+                                                  resolved_use_prior_day_high_low, resolved_use_prior_week_high_low)
+
+        def clock_key() -> tuple:
+            now = sessions.now_et()
+            return flip_frame_clock_key(flip_frame, now), latest_session_date(now), indicator_clock_key()
+
+        if flip_frame is not None and flip_version is None:
+            # A flip frame that is no get_merged hand-out has no version to
+            # key on: built every cycle, as before the memo.
+            ctx = build()
+        else:
+            # The stored HTF object is keyed by id and pinned by the entry, so
+            # its id cannot be reused while the entry lives; every refresh
+            # stores a new object (_refresh_htf_frame).
+            ctx = self._level_memo.serve(
+                ("sr", *cycle_key),
+                (id(stored), None if current_price is None else float(current_price), flip_version, flip_1m, flip_5m),
+                clock_key,
+                lambda _clock: build(),
+                pins=(stored,),
+            )
+        with self._lock:
+            if self._cycle_active:
+                self._cycle_sr_cache[cycle_key] = ctx
+        return ctx
+
+    @staticmethod
+    def _build_support_resistance(
+        stored: pd.DataFrame,
+        cfg: Any,
+        tf: int,
+        current_price: float | None,
+        flip_frame: pd.DataFrame | None,
+        flip_1m: int,
+        flip_5m: int,
+        use_prior_day_high_low: bool,
+        use_prior_week_high_low: bool,
+    ) -> SupportResistanceContext:
+        return build_support_resistance_context(
+            stored.copy(deep=False),
             current_price=current_price,
             pivot_span=int(cfg.pivot_span),
             max_levels_per_side=int(cfg.max_levels_per_side),
@@ -1299,17 +1387,13 @@ class MarketDataStore:
             structure_eq_atr_mult=float(getattr(cfg, "structure_eq_atr_mult", 0.25)),
             structure_event_max_age_bars=cfg.htf_structure_event_lookback(),
             structure_min_range_atr_mult=float(getattr(cfg, "structure_min_range_atr_mult", 1.5) or 0.0),
-            use_prior_day_high_low=resolved_use_prior_day_high_low,
-            use_prior_week_high_low=resolved_use_prior_week_high_low,
+            use_prior_day_high_low=use_prior_day_high_low,
+            use_prior_week_high_low=use_prior_week_high_low,
             flip_frame=flip_frame,
             flip_confirmation_1m_bars=flip_1m,
             flip_confirmation_5m_bars=flip_5m,
             timeframe_minutes=tf,
         )
-        with self._lock:
-            if self._cycle_active:
-                self._cycle_sr_cache[cycle_key] = ctx
-        return ctx
 
 
     def _quote_batch_chunks(self, symbols: list[str]) -> list[list[str]]:

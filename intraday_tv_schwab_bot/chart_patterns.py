@@ -107,6 +107,27 @@ def _clear_chart_cache() -> None:
         _CHART_CACHE_KEEPALIVE.clear()
 
 
+def clean_input_marked(frame: pd.DataFrame | None) -> bool:
+    """Does ``frame`` carry the clean-frame mark ``_clean_price_frame``
+    trusts? A frame that does is analyzed as it stands, so the mark is an
+    input of ``analyze_chart_pattern_context``."""
+    attrs = getattr(frame, "attrs", None)
+    return bool(attrs is not None and attrs.get(_CHART_CLEAN_SENTINEL))
+
+
+def mark_clean_input(frame: pd.DataFrame | None) -> None:
+    """The one effect ``analyze_chart_pattern_context`` has on the frame it
+    is given (``_clean_price_frame``'s second fast path): a frame carrying
+    the standard indicator columns gets the clean-frame mark. A memo that
+    serves a context without the build replays it, so the frame leaves as a
+    build would leave it."""
+    if frame is None or frame.empty:
+        return
+    attrs = getattr(frame, "attrs", None)
+    if attrs is not None and not attrs.get(_CHART_CLEAN_SENTINEL) and has_standard_indicator_columns(frame):
+        attrs[_CHART_CLEAN_SENTINEL] = True
+
+
 def _clean_price_frame(frame: pd.DataFrame | None) -> pd.DataFrame:
     if frame is None or frame.empty:
         return pd.DataFrame()

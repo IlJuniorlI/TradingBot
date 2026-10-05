@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 import logging
 
+import numpy as np
 import pandas as pd
 
 from .levels_shared import (
@@ -551,6 +552,23 @@ def _minutes_since_level_touch(completed_1m: pd.DataFrame, level: float, *, pric
     if len(hits) == 0:
         return None
     return float((completed_1m.index[-1] - hits[-1]) / pd.Timedelta(minutes=1))
+
+
+def flip_frame_clock_key(flip_frame: pd.DataFrame | None, now: datetime | pd.Timestamp) -> tuple[int, int] | None:
+    """What a build reads of the clock through its flip frame
+    (``_completed_flip_frames``, ``_completed_1m_bars``): how many of the
+    frame's labels lie before the cutoff minute, which fixes the completed
+    1m bars, and the cutoff's 5-minute slot, which fixes whether the last
+    5m bucket has completed (bucket ends lie on the 5-minute grid). A memo
+    keyed on it misses when a bar completes or a 5m slot turns, not every
+    minute. None without a flip frame (the build reads no clock through it).
+    The cutoff is floored on UTC, which equals the ET floor and cannot raise
+    on the fall-back hour."""
+    if flip_frame is None:
+        return None
+    moment = pd.Timestamp(now)
+    cutoff = moment.floor("1min") if moment.tzinfo is None else moment.tz_convert("UTC").floor("1min")
+    return int(np.count_nonzero(flip_frame.index < cutoff)), int(cutoff.value // 300_000_000_000)
 
 
 def _completed_flip_frames(flip_frame: pd.DataFrame | None) -> tuple[pd.DataFrame, pd.DataFrame]:

@@ -319,7 +319,8 @@ def verified_frame(frame: pd.DataFrame) -> pd.DataFrame:
 def frame_version(frame: pd.DataFrame | None) -> tuple | None:
     """``(token, variant)`` of a registered frame, or None: two frames with
     one version hold the same bars and the same indicator columns, so a pure
-    function of a frame can memo its result on the version."""
+    function of a frame can memo its result on the version (the context
+    memos, ``context_memo``)."""
     entry = _registered(frame)
     if entry is None:
         return None
@@ -427,6 +428,17 @@ def completed_bars(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
     base.index = datetime_index(base.index)
     tf = max(1, int(minutes))
     return base[completed_bucket_mask(base.index, tf, sessions.now_et())]
+
+
+def forming_positions(index: pd.DatetimeIndex | pd.Index, minutes: int, now: datetime | pd.Timestamp) -> tuple[int, ...]:
+    """The positions in ``index`` whose ``minutes`` bucket has not ended by
+    ``now``: the rows ``completed_bars`` drops from a frame labelled at
+    ``index``. A memo of a build that reads ``completed_bars`` keys on this
+    instead of the clock: it changes only when a bar completes."""
+    if len(index) == 0:
+        return ()
+    mask = completed_bucket_mask(datetime_index(index), max(1, int(minutes)), now)
+    return tuple(int(i) for i in np.flatnonzero(~mask))
 
 
 def bar_closed_after(label: Any, moment: Any, bar_minutes: int) -> bool:

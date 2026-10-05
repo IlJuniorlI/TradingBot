@@ -118,6 +118,7 @@ runtime:
   session_reconcile_on_resume: true
   cycle_fetch_workers: 4
   max_consecutive_quote_failures: 5
+  context_memo_shadow_every: 20
   # Per-day debug archive: on session shutdown, write
   # {log_dir}/sessions/{YYYY-MM-DD}/ with bars/{SYMBOL}.csv (RTH+indicators),
   # trades.csv for the day, and manifest.json. Disable to save disk if not

@@ -829,6 +829,81 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The S/R, fair-value-gap, order-block and strategy contexts are kept
+  across passes and rebuilt only when what they read changes; a shadow
+  check (`runtime.context_memo_shadow_every`, on at 20) re-proves them.**
+  *2026-10-05* — with the step frames kept (below), a pass with no new bar
+  still rebuilt every symbol's S/R, its LTF fair value gaps and the
+  strategy's chart, structure and technical contexts from frames that had
+  not changed: the S/R and contexts phases, 0.67 + 1.13 s of a production
+  pass.
+  - `context_memo.ContextMemo` (new) keeps one build per slot (a builder
+    and the request it answered: symbol, timeframe, parameters, the
+    frame's variant) under a key of every input the build read: the frame
+    it read (its `bars.frame_version`, or for the S/R the stored HTF frame
+    object, read once and pinned), the request, and the clock only as the
+    build reads it: the completed bars (`bars.forming_positions` for the
+    fair value gaps, `support_resistance.flip_frame_clock_key` for the S/R
+    flip frame: its completed 1m bars and the 5-minute slot), the session
+    date (S/R), the structure frame's forming last bucket, and
+    `indicator_clock_key` (the session indicator mode and window and
+    whether the clock is inside that session, which the ATR and the
+    divergence clocks switch on). A build is kept only when the clock part
+    reads the same after it as before, so a minute or session boundary
+    crossed mid-build files nothing.
+  - The store (`MarketDataStore._level_memo`: S/R, FVG, order blocks) and
+    each strategy instance (`_context_memo`: chart, structure, technical)
+    have one. A slot not read for a whole cycle is dropped at the next
+    (`begin_cycle`, `reset_context_caches`), the prune drops a pruned
+    symbol's slots, and the per-cycle caches stay the first level. A frame
+    without a version (a copy, a strategy-built frame) is built every pass,
+    as before. The structure context keys on its frame after
+    `bars.verified_frame`, so a step frame written after its hand-out is
+    neither served nor kept.
+  - A chart hit replays the build's one effect on its input (the
+    clean-frame mark, `chart_patterns.mark_clean_input`), which is in the
+    chart's key (`clean_input_marked`). The fair-value-gap and order-block
+    contexts are shared instead of deep-copied, like every other context
+    (no reader writes into one). `get_support_resistance` reads the stored
+    HTF frame itself, once, instead of a copy through `get_htf_frame`.
+  - `runtime.context_memo_shadow_every` (new; default `20`, and `20` in
+    every preset): every N-th memo hit is rebuilt and compared with what
+    the memo would serve, field by field and floats by bits; a difference
+    logs CRITICAL `Context memo <name> served a context a rebuild does not
+    give: slot=... key=...` and the rebuilt context is served and kept.
+    At 20 it rebuilds about 5% of the hits (5-6 of top_tier's 112 on a
+    pass with no new bar, under 0.01 s of CPU there). It is on for the
+    memos' first dry-run day; a day whose log holds no such line is the
+    proof, and then `0` turns it off (README).
+    An integer of at least 0, checked at load.
+  - Measured (CACHE-CTX verifier, on 9c2a8d2 with the kept step frames,
+    interleaved): a pass with no new bar 3.07 → 1.83 s of CPU (sr 0.61 →
+    0.008, contexts 0.44 → 0.02, publish 1.06 → 0.86 s), the new-bar pass
+    unchanged; at real-time pace manage_gap 5.32 → 4.17 s; memory flat.
+  - Identical: the verifier's four stepped replays (10-02 10:15-12:15 with
+    16 trades, the 09-30 open, the 10-01 close across 16:00, a preset with
+    order blocks on) with every one of 78,333 memo hits rebuilt and
+    compared, 0 mismatches, and 7,472 more at real-time pace with bars
+    landing mid-pass; here, the 10-01 09:40-10:40 stepped replay against
+    21032f8 with the shadow on at 20, and no `Context memo` line in its
+    log.
+  - README: `context_memo_shadow_every`; `config.example.yaml` and every
+    preset ship it.
+  - Tests: `tests/market_data/test_context_memo.py` (new): each memo
+    rebuilds exactly when one of its inputs moves (the flip frame's bars
+    and 5m slot, the stored HTF frame, a rewritten older bar, the session
+    date, the session switch, a forming bar completing, the 5m bucket, a
+    new bar) and serves a fresh build's equal otherwise; the fair value
+    gaps key on the frame they read, not the store after it; the prune and
+    the generation turn; one slot per variant; the chart mark replay; a
+    written step frame neither served nor kept by the structure memo; the
+    shadow's CRITICAL line, its every-N-th cadence and its knob in both
+    memos; a build the clock moved under is not kept; floats by bits; the
+    default and every preset at 20. `test_config_validation.py` (the
+    knob), `test_module_layering.py` (`context_memo` in layer 1),
+    `test_sr_tolerance_reads.py` (the S/R build reads the stored frame).
+    30 mutants, all killed.
+
 - **The step frames are kept across passes: `get_merged` rebuilds a frame
   only when the store's bars for it change.** *2026-10-05* — every pass
   merged and rebuilt the indicators of 84 frames (28 symbols x the 1m step
