@@ -310,7 +310,8 @@ dashboard:
   state_path: .logs/dashboard_state.json
   # The state (the page, /api/state and the state file) is built while a
   # client polls, a page or API request in the last client_idle_seconds (at
-  # least refresh_ms / 1000), and otherwise once every idle_publish_seconds.
+  # least the slowest page's poll: refresh_ms / 1000, and 4 for /mobile), and
+  # otherwise once every idle_publish_seconds.
   client_idle_seconds: 30.0
   idle_publish_seconds: 60.0
   # The state file is compact JSON, rewritten at once when the status or

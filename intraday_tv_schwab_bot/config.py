@@ -630,8 +630,9 @@ class DashboardConfig:
     refresh_ms: int = 2000
     state_path: str = ".logs/dashboard_state.json"
     # The engine builds the state while a client polls (a page or API
-    # request within client_idle_seconds, at least the page's refresh) and
-    # otherwise once every idle_publish_seconds (IntradayBot._dashboard_build_due).
+    # request within client_idle_seconds, at least the slowest page's poll:
+    # max(refresh_ms, 4000 for /mobile)) and otherwise once every
+    # idle_publish_seconds (IntradayBot._dashboard_build_due).
     client_idle_seconds: float = 30.0
     idle_publish_seconds: float = 60.0
     # The state file's rewrite cadence: at once when the status or message
@@ -1973,6 +1974,9 @@ _CHOICES: dict[str, dict[str, tuple[str, ...]]] = {
 # the dashboard serves (README "Custom themes"), "default" among them.
 DASHBOARD_THEMES_DIR = Path(__file__).with_name("dashboard_assets") / "themes"
 THEME_NAME_PATTERN = re.compile(r"^[a-z0-9_-]{1,40}$")
+# The /mobile page polls every max(refresh_ms, this) ms (dashboard_assets/
+# mobile.js, MOBILE_REFRESH_MS): the slowest poll of an open page.
+MOBILE_MIN_REFRESH_MS = 4000
 
 
 def dashboard_themes() -> list[str]:
@@ -2257,21 +2261,27 @@ def _validate_events_config(events: EventsConfig, config_path: Path) -> None:
 
 def _validate_dashboard_config(dashboard: DashboardConfig, config_path: Path) -> None:
     """The dashboard's port, refresh, theme and switches, its build and
-    state-file cadences (the client window at least the page's refresh:
-    shorter, the builds would lapse between an open page's polls), the
-    compact chart's timeframe, and each chart profile's ``max_bars``
-    (1-480) and switches. The server read the port and the refresh with
-    ``int()`` when the bot was built; it lowercased and stripped the theme,
-    so ``Nebula`` or `` dark `` served that theme, and read one that was
-    malformed or named no folder there as ``default``, with a WARNING (a
-    null without one); a chart profile read an unreadable ``max_bars`` as
-    its default and any string as a switch that is on."""
+    state-file cadences (the client window at least the slowest page's
+    poll, /mobile's 4 s floor included: shorter, the builds would lapse
+    between an open page's polls), the compact chart's timeframe, and each
+    chart profile's ``max_bars`` (1-480) and switches. The server read the
+    port and the refresh with ``int()`` when the bot was built; it
+    lowercased and stripped the theme, so ``Nebula`` or `` dark `` served
+    that theme, and read one that was malformed or named no folder there as
+    ``default``, with a WARNING (a null without one); a chart profile read
+    an unreadable ``max_bars`` as its default and any string as a switch
+    that is on."""
     errors = _section_errors("dashboard", dashboard)
-    if not errors and dashboard.client_idle_seconds * 1000 < dashboard.refresh_ms:
-        # A page polls every refresh_ms; a shorter window lets the builds
-        # lapse between its polls while it is open.
-        errors.append(f"dashboard.client_idle_seconds must be at least refresh_ms / 1000 "
-                      f"({dashboard.refresh_ms / 1000:g}), got {dashboard.client_idle_seconds!r}")
+    if not errors:
+        # The desktop page polls every refresh_ms and /mobile every
+        # max(refresh_ms, 4000) ms; a shorter window lets the builds lapse
+        # between an open page's polls. Until 2026-10-05 (the review) the
+        # check left out /mobile's floor.
+        slowest_poll_ms = max(dashboard.refresh_ms, MOBILE_MIN_REFRESH_MS)
+        if dashboard.client_idle_seconds * 1000 < slowest_poll_ms:
+            errors.append(f"dashboard.client_idle_seconds must be at least the slowest page's poll, "
+                          f"max(refresh_ms, {MOBILE_MIN_REFRESH_MS} for /mobile) / 1000 ({slowest_poll_ms / 1000:g}), "
+                          f"got {dashboard.client_idle_seconds!r}")
     themes = dashboard_themes()
     if dashboard.theme not in themes:
         errors.append(

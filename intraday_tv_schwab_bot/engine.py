@@ -267,10 +267,10 @@ class IntradayBot:
         # and _cycle_sleep_seconds reads them.
         self._cycle_idle = False
         self._cycle_idle_wake_at: datetime | None = None
-        # The last dashboard build (time.monotonic) and the status it showed
-        # (message, no error); see _dashboard_build_due.
-        self._dashboard_built_monotonic: float | None = None
-        self._dashboard_built_status: tuple[str, bool] | None = None
+        # The last dashboard build: its time.monotonic() and the status it
+        # showed (message, no error), None before the first; see
+        # _dashboard_build_due.
+        self._dashboard_last_build: tuple[float, tuple[str, bool]] | None = None
         # Memory-pressure prune cadence. Symbol-keyed state in
         # MarketDataStore + DashboardCache grows unbounded across cycles
         # as the screener returns new symbols day to day. Every
@@ -1114,17 +1114,7 @@ class IntradayBot:
             self._prime_cycle_support_cache(bars)
             timer.enter("contexts")
             self._prime_cycle_context_cache(bars)
-            # The HTF context the strategy trades on, built here, at a fixed
-            # point of the cycle: the first build after an HTF refresh fixes
-            # the price its trend and levels are read at until the next one
-            # (MarketDataStore._htf_context_from_stored_frame), and since
-            # 2026-10-05 the dashboard build, which was that first build on
-            # most symbols, runs only on demand (_dashboard_build_due).
-            self._compute_symbol_map(
-                list(bars),
-                lambda symbol: self.strategy._default_htf_context_for_score(symbol, self.data),
-                label="HTF context precompute",
-            )
+            self._prime_strategy_htf_contexts(list(bars))
             timer.enter("warmup")
             warmup_summary = self.warmup_tracker.warmup_summary(self.last_watchlist, bars=bars)
             self.warmup_tracker.log_warmup_summary(warmup_summary)
@@ -1390,9 +1380,12 @@ class IntradayBot:
         Mid-cycle (``bars`` given) the refreshed symbols' S/R contexts are
         built again as the cycle's pre-warm builds them
         (``_prime_cycle_support_cache``): the refresh dropped them, and the
-        cycle serves every later read the build of its first read. Only
-        while the gate refreshes market context, as the cycle's fetch always
-        was."""
+        cycle serves every later read the build of its first read. So are
+        their strategy HTF contexts (``_prime_strategy_htf_contexts``), whose
+        first build fixes their price until the next refresh: left to the
+        next reader, that was the publish when a page was open and the next
+        pass's contexts phase when not (2026-10-05). Only while the gate
+        refreshes market context, as the cycle's fetch always was."""
         if not gate_state.context_refresh_active:
             return
         tf = self.strategy.htf_minutes()
@@ -1412,7 +1405,39 @@ class IntradayBot:
         LOG.info("HTF refresh (%s): %d/%d %sm frame(s) in %.2fs%s", where, len(refreshed), len(due), tf,
                  time.monotonic() - started, f"; failed: {','.join(failed)}" if failed else "")
         if bars is not None and refreshed:
-            self._prime_cycle_support_cache({symbol: bars[symbol] for symbol in refreshed if symbol in bars})
+            stepped = {symbol: bars[symbol] for symbol in refreshed if symbol in bars}
+            self._prime_cycle_support_cache(stepped)
+            self._prime_strategy_htf_contexts(list(stepped))
+
+    def _prime_strategy_htf_contexts(self, symbols: list[str]) -> None:
+        """Build, for each of ``symbols``, the HTF context of every request
+        the strategy and its dashboard rows read
+        (``strategy.htf_context_requests``): in the contexts phase for every
+        step-frame symbol, and after a mid-cycle HTF refresh for the symbols
+        it refreshed (``_refresh_htf_frames``).
+
+        A context carries the price of its first build until the next HTF
+        refresh (``MarketDataStore._htf_context_from_stored_frame``: the price
+        is not part of the cache key), so its first build is made here, at a
+        fixed point of the cycle, not by whichever reader comes first. The
+        dashboard build was that first reader on most symbols, and since
+        2026-10-05 it runs only on demand (``_dashboard_build_due``), so the
+        price the strategy trades on would have followed whether a page was
+        open. Until 2026-10-05 (the stage-2 review) only the score context
+        was built here: the peer family's own context
+        (``_symbol_htf_request``), which its gates, votes and scores read,
+        and htf_pivots' generic S/R-row trend still went to their first
+        reader, and a mid-cycle refresh rebuilt none.
+
+        One map per request, labelled with its name, so a build that raises
+        (logged with its type, ``_compute_symbol_map``) leaves the other
+        requests built and keeps its own run of failures."""
+        for name, request in self.strategy.htf_context_requests().items():
+            self._compute_symbol_map(
+                symbols,
+                lambda symbol, request=request: self.strategy._htf_context(symbol, self.data, **request),
+                label=f"HTF context precompute ({name})",
+            )
 
     def _prefetch_daily_history(self, gate_state: CycleGateState, now: datetime, schedule: StrategySchedule) -> None:
         """Fetch, on the fetch pool, the daily history the strategy's
@@ -1603,17 +1628,17 @@ class IntradayBot:
             return False
         status = (message, self.last_error is None)
         mono = time.monotonic()
+        last = self._dashboard_last_build
         due = (
             always
             or self._dashboard_failures > 0
-            or self._dashboard_built_monotonic is None
-            or status != self._dashboard_built_status
+            or last is None
+            or status != last[1]
             or self.dashboard.client_seen_within(self.config.dashboard.client_idle_seconds)
-            or mono - self._dashboard_built_monotonic >= self.config.dashboard.idle_publish_seconds
+            or mono - last[0] >= self.config.dashboard.idle_publish_seconds
         )
         if due:
-            self._dashboard_built_monotonic = mono
-            self._dashboard_built_status = status
+            self._dashboard_last_build = (mono, status)
         return due
 
     def _dashboard_state(self, now: datetime, message: str, *, screening_active: bool, streaming_active: bool, management_active: bool, gate_state: CycleGateState, warmup_summary: dict[str, Any] | None) -> dict[str, Any]:

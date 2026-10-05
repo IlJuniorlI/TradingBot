@@ -161,18 +161,11 @@ def sr_snapshot(
             LOG.debug("Failed to read the strategy's HTF trend for %s; using the generic read.", symbol, exc_info=True)
     try:
         if own_trend is None:
+            # The strategy lists this request (htf_context_requests), so the
+            # engine builds its context at a fixed point of the cycle.
             htf_ctx = data.get_htf_context(
                 symbol,
-                timeframe_minutes=strategy.htf_minutes(),
-                pivot_span=int(getattr(cfg, "pivot_span", 2) or 2),
-                max_levels_per_side=int(getattr(cfg, "max_levels_per_side", 3) or 3),
-                atr_tolerance_mult=float(cfg.atr_tolerance_mult),  # checked at load (above 0)
-                pct_tolerance=float(cfg.pct_tolerance),
-                stop_buffer_atr_mult=float(getattr(cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
-                ema_fast_span=50,
-                ema_slow_span=200,
-                use_prior_day_high_low=bool(getattr(cfg, "use_prior_day_high_low", True)),
-                use_prior_week_high_low=bool(getattr(cfg, "use_prior_week_high_low", True)),
+                **strategy.generic_htf_trend_request(),
                 **strategy.htf_fvg_request(),
             )
             htf_trend_bias = str(getattr(htf_ctx, "trend_bias", "neutral") or "neutral").strip().lower()

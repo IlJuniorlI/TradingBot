@@ -406,6 +406,52 @@ class ContextBuildersMixin:
             "use_prior_week_high_low": bool(self._support_resistance_setting("use_prior_week_high_low", True)),
         }
 
+    def htf_context_requests(self) -> dict[str, dict[str, Any]]:
+        """The level arguments of every HTF context the strategy and its
+        dashboard rows read (``_htf_context``), by name: ``score``, the score
+        context's (``_default_htf_request``), which the shared score terms,
+        top_tier's EMA trend and zero_dte's regime read, and the dashboard's
+        HTF overlays and level zones ask for too; and ``generic_trend``
+        (``generic_htf_trend_request``) for a class that shows no HTF trend
+        of its own (it keeps this ``dashboard_htf_trend``, which returns
+        None), whose S/R row reads that trend. A strategy that reads another
+        HTF build adds it (the peer family's ``symbol``,
+        ``_symbol_htf_request``), and one whose own ``dashboard_htf_trend``
+        returns None adds ``generic_trend`` (peer_confirmed_htf_pivots).
+
+        A context carries the price of its first build until the next HTF
+        refresh (the price is not part of ``MarketDataStore.htf_cache``'s
+        key), so the engine builds every listed one for each step-frame
+        symbol at fixed points of the cycle
+        (``IntradayBot._prime_strategy_htf_contexts``), never leaving that
+        first build to whichever reader comes first: since 2026-10-05 the
+        dashboard build, the first reader of most symbols, runs only on
+        demand. A read whose arguments are not listed carries the price of
+        its own first reader."""
+        requests = {"score": self._default_htf_request()}
+        if type(self).dashboard_htf_trend is ContextBuildersMixin.dashboard_htf_trend:
+            requests["generic_trend"] = self.generic_htf_trend_request()
+        return requests
+
+    def generic_htf_trend_request(self) -> dict[str, Any]:
+        """The level arguments of the generic HTF trend, which the
+        dashboard's S/R row (``sr_snapshot``) shows when the strategy shows
+        none of its own (``dashboard_htf_trend`` returns None): EMA 50/200 on
+        the strategy's HTF frame, with the support_resistance levels."""
+        cfg = self.config.support_resistance
+        return {
+            "timeframe_minutes": self.htf_minutes(),
+            "pivot_span": int(getattr(cfg, "pivot_span", 2) or 2),
+            "max_levels_per_side": int(getattr(cfg, "max_levels_per_side", 3) or 3),
+            "atr_tolerance_mult": float(cfg.atr_tolerance_mult),  # checked at load (above 0)
+            "pct_tolerance": float(cfg.pct_tolerance),
+            "stop_buffer_atr_mult": float(getattr(cfg, "stop_buffer_atr_mult", 0.25) or 0.25),
+            "ema_fast_span": 50,
+            "ema_slow_span": 200,
+            "use_prior_day_high_low": bool(getattr(cfg, "use_prior_day_high_low", True)),
+            "use_prior_week_high_low": bool(getattr(cfg, "use_prior_week_high_low", True)),
+        }
+
     def _default_htf_context_for_score(self, symbol: str, data) -> HTFContext:
         """The HTF context a strategy scores on (``_default_htf_request``,
         through ``_htf_context``).

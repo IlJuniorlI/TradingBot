@@ -84,6 +84,12 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         other symbols' peer votes."""
         return None
 
+    def htf_context_requests(self) -> dict[str, dict[str, Any]]:
+        """The family's requests and ``generic_trend``: with no HTF trend of
+        its own (``dashboard_htf_trend``), its S/R row shows the generic one
+        (``generic_htf_trend_request``)."""
+        return {**super().htf_context_requests(), "generic_trend": self.generic_htf_trend_request()}
+
     def dashboard_overlay_candidates(
         self,
         side: Side,

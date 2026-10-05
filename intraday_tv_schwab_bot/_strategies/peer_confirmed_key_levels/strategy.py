@@ -285,6 +285,15 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             "use_prior_week_high_low": bool(self._support_resistance_setting("use_prior_week_high_low", True)),
         }
 
+    def htf_context_requests(self) -> dict[str, dict[str, Any]]:
+        """The score context's request and the family's own, ``symbol``
+        (``_symbol_htf_request``), which its entry gates, peer votes and
+        scores read, and the dashboard's HTF trend, overlays and level zones
+        (2026-10-05: the engine built only the score context, so this one's
+        price followed whichever reader came first, the dashboard build
+        among them)."""
+        return {**super().htf_context_requests(), "symbol": self._symbol_htf_request()}
+
     def dashboard_htf_trend(self, symbol: str, data, price: float) -> dict[str, str] | None:
         """The HTF EMA trend key_levels' gate (and trend_continuation's
         score) read, off the same context they read it from."""

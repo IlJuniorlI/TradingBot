@@ -1088,8 +1088,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - The dashboard state (the page, `/api/state` and the state file) is
     built while a client polls: a request for the page, `/mobile`,
     `/api/state` or `/api/chart` in the last `dashboard.client_idle_seconds`
-    (new, default 30; above 0 and at least `refresh_ms / 1000`, checked at
-    load). It is also built on a new status or message, while a build is
+    (new, default 30; above 0 and at least the slowest page's poll,
+    `max(refresh_ms, 4000) / 1000`, since `/mobile` polls no faster than
+    every 4 s; checked at load). It is also built on a new status or
+    message, while a build is
     failing, on a failed cycle's error path, and otherwise once every
     `dashboard.idle_publish_seconds` (new, default 60; above 0, checked at
     load). Unwatched, `/api/state`, the state file and a page that opens
@@ -1106,19 +1108,38 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     curve to whether a page was open. Off-window the curve now gets one
     point a minute instead of one every 7-8 s, so the 2,000 points the
     20:00 archive writes are mostly the session's, not the flat
-    after-hours.
-  - The cycle builds the strategy's HTF context
-    (`_default_htf_context_for_score`) for every step-frame symbol in its
-    contexts phase. That context carries the price of its first build until
-    the next HTF refresh (the price is not part of the
+    after-hours. In the session it gets one a pass, about every 2.5 s
+    with this release's other steps, so the 2,000 points span the
+    session's last 80-90 minutes: the dashboard's sparkline is that
+    rolling window, and the 20:00 archive's curve starts about 14:40 on
+    top_tier. The peak and the max drawdown cover the whole day.
+  - The cycle builds every HTF context the strategy and its dashboard rows
+    read (`htf_context_requests`, new: the score context's
+    `_default_htf_request`; the peer family's own `_symbol_htf_request`;
+    and `generic_htf_trend_request`, the trend the S/R row shows for a
+    strategy with none of its own, which `sr_snapshot` now reads from the
+    strategy) for every step-frame symbol in its contexts phase
+    (`IntradayBot._prime_strategy_htf_contexts`), and again, for the
+    symbols it refreshed, after an HTF refresh before management, the
+    entries or the publish. A context carries the price of its first build
+    until the next HTF refresh (the price is not part of the
     `MarketDataStore.htf_cache` key), and the dashboard build was that
-    first build on 52 of 56 contexts. Skipped, the first read would have
-    moved into a later entry or management pass, at a later price: every
-    logged `htf_ema_votes` changed, and with `require_htf_ema_alignment` or
-    `htf_ema_alignment_score` on (off in every preset) entries would have
-    depended on whether a page was open. Built at a fixed point of the
-    cycle, it no longer does. The staleness itself predates this and is
-    logged separately.
+    first build on 52 of top_tier's 56 contexts. Skipped, the first read
+    would have moved into a later entry or management pass, at a later
+    price: every logged `htf_ema_votes` changed, and with
+    `require_htf_ema_alignment` or `htf_ema_alignment_score` on (off in
+    every preset) entries would have depended on whether a page was open.
+    Built at fixed points of the cycle, no HTF context's price depends on
+    whether a page is open: in every shipped preset the dashboard reads no
+    HTF context the strategy does not list. As first built, the step
+    primed the score context only, in the contexts phase only (fixed after
+    the stage's review): the peer family's gates, votes and scores read its
+    own context, which then still went to its first reader (a GOOG long on
+    2026-05-05 scored 1.25 higher with the dashboard off), a refresh before
+    the publish left the refreshed contexts to the publish with a page open
+    and to the next pass without one, and htf_pivots' S/R-row trend went to
+    its first reader. The staleness itself predates this and is logged
+    separately.
   - Measured (IDLE-1 verifier on 9c2a8d2, interleaved A/Bs): an off-window
     pass 3.25 → 1.46 s of CPU, sleeping 60 s instead of 2 s, 62% → 2.4% of
     a core; on the stage-1 tree above, 0.40 s a minute (0.7%). The idle
@@ -1131,6 +1152,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     open (09:40-10:40, 145 steps, the payload hash equal on every step) and
     unwatched with the HTF prime (09:40-11:40, 289 steps, every category,
     the account and the dashboard on all 97 shared builds); a loop replay
+    of the gate alone (without the demand-gated build and the HTF prime)
     from 10-01 15:45 through the night to 10-02 09:40, identical on every
     pass from the 09:15:00 prewarm through the 09:35 entries; a gate sweep
     of 19 presets x 5 days x every minute, flat and holding: 0 idle passes
@@ -1141,7 +1163,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the one the base showed), and unwatched also by the builds the demand
     gate skips (each heartbeat build equal to the base's at that step);
     10-02 08:50-09:40, identical from the 09:15:00 prewarm on, its trade
-    included.
+    included, but for the two `Watchlist trace` lines, logged at 09:15:00
+    (the first non-empty watchlist) instead of 08:50:00. After the review's
+    fixes, peer_confirmed_key_levels 2026-05-04 09:40-10:40 across its
+    10:30 refresh: decisions, signals and trades identical, watched and
+    unwatched.
   - README: `idle_sleep_seconds`, `prewarm_before_windows_minutes`,
     `max_equity_points`, the `dashboard` table, `client_idle_seconds`,
     `idle_publish_seconds` and the failed-update note;
@@ -1151,16 +1177,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     stream window; each window, the prewarm, a position and each consumer
     alone keep the watchlist; the wake; the idle message);
     `tests/composition/test_idle_gate.py` (new: the cadence through the real
-    loop, each consumer's fast cadence, the wake cap and its floor, a failed
-    pass, the idle wait that blocks the loop thread instead of spinning it,
-    the candidates' cards; the build's heartbeat, client window, status,
-    retry and error path, and the account sampled on every pass);
+    loop, each consumer's fast cadence, the wake cap and its floor, a wake
+    passed while the pass ran, a failed pass, the idle wait that blocks the
+    loop thread instead of spinning it, the candidates' cards; the build's
+    heartbeat, client window, status, retry and error path, and the
+    account, its open positions at their marks, sampled on every pass);
     `tests/runtime/test_paper_account_sampling.py` (new);
-    `tests/composition/test_htf_refresh_points.py` (the strategy's HTF
-    context is first read in the contexts phase, watched or not);
+    `tests/composition/test_htf_refresh_points.py` (after a refresh every
+    HTF context build is the contexts phase's, watched or not, on top_tier
+    and on a peer preset, whose own context is among them; a refresh before
+    the entries or the publish builds the refreshed contexts at once);
     `tests/reporting/test_dashboard.py` (the requests that stamp, through
     the real server); `tests/domain/test_config_validation.py` (both knobs
-    and the refresh cross-check); `test_dashboard_update_failure.py`,
+    and the slowest-poll cross-check, `/mobile`'s floor pinned to
+    `mobile.js`); `test_dashboard_update_failure.py`,
     `test_cycle_timing.py` and `test_engine_shutdown.py` keep a page open or
     give their shell a dashboard and an account, and the dashboard-off test
     now pins that nothing is built and the account is still sampled. 51
