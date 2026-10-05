@@ -829,6 +829,36 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The Schwab candle parse floors every stamp to its minute at once.**
+  *2026-10-05* — `MarketDataStore._history_candles_to_frame`, the parse of
+  every `price_history` answer (the 1m history, the HTF frames, the daily
+  bars), mapped `floor_minute` over the candles one at a time, about
+  0.15 ms a candle. It now floors the whole index in one call
+  (`DatetimeIndex.floor("1min")`), names it `timestamp` and drops the
+  `datetime` and any `timestamp` key, as before.
+  - Measured on the parse alone (Schwab-shaped answers, each regular-hours
+    minute sent twice): a 1,134-candle 1m answer 167 → 6 ms, a top_tier
+    15m HTF answer (10 days, 864 candles) 131 → 5 ms, a 34-candle boundary
+    refresh 9.3 → 3.5 ms. So the 09:15 prewarm's parses take about 0.3 s of
+    CPU instead of 8.3 s, a 15m boundary pass about 0.1 s less, and the
+    09:30 stream-start backfill (every watchlist symbol's 1m history,
+    fetched again inside the management window) about 4.5 s less CPU; a
+    harness run without schwabdev's lock measured that pass's fetch map
+    9.65 → 4.62 s and a cold start about 8.7 s sooner.
+  - The frames are identical: on 5,475 archived frames (every 1m and 15m
+    tape of 33 days, each as archived and Schwab-shaped with duplicate
+    minutes, off-minute stamps, NaN prices and volumes, and shuffled), equal
+    exactly in values, dtypes, index stamps, name and time zone, and block
+    layout; a stamp in the ambiguous DST hour raises the same error. A
+    stepped replay of 2026-09-23 09:58-10:50 with duplicate minutes in
+    every answer (28 full HTF parses, 12 trades) was identical.
+  - Tests: `tests/market_data/test_history_candle_parse.py` (new) compares
+    the parse with a frozen copy of the per-candle one on Schwab-shaped
+    answers (dates-mode duplicates, off-minute stamps, NaN, shuffled, both
+    2026 DST changes, float stamps, no volume key, string prices, a stray
+    `timestamp` key, a year of daily bars) and pins the minute floor in ET,
+    the index name and the bar columns.
+
 - **One quote request per refresh: `runtime.quote_batch_size` is 50, in
   the code default and every preset (it was 20).** *2026-10-05* — top_tier
   quotes 28 symbols, so every engine pass refreshed them in two requests

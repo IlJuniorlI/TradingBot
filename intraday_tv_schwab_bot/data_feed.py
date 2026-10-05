@@ -1771,9 +1771,7 @@ class MarketDataStore:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
         df = pd.DataFrame.from_records(candles)
         timestamps = pd.DatetimeIndex(pd.to_datetime(df["datetime"], unit="ms", utc=True)).tz_convert(EXCHANGE_TZ)
-        df["timestamp"] = timestamps
-        df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"})
-        df = df.set_index(df["timestamp"].map(floor_minute)).drop(columns=["timestamp", "datetime"], errors="ignore")
+        df = df.set_index(timestamps.floor("1min").rename("timestamp")).drop(columns=["timestamp", "datetime"], errors="ignore")
         return ensure_ohlcv_frame(df)
 
     def start_streaming(self, symbols: Iterable[str]) -> None:
