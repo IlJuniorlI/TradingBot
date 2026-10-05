@@ -829,6 +829,63 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The equity curve samples by time, not by pass
+  (`paper.equity_point_seconds`, new, default 15).** *2026-10-05* — the
+  engine samples the paper account once a pass (the idle entry below: the
+  dashboard build used to), and every sample added a curve point, so at
+  this release's ~2.5 s RTH passes the 2,000 points of
+  `paper.max_equity_points` held only the session's last 80-90 minutes
+  (4-4.5 hours at 21032f8's 7.6-8.2 s passes): the dashboard's sparkline
+  showed them, and the 20:00 archive's `account_snapshot.json` curve
+  started about 14:40.
+  - `PaperAccount.record_equity_point` moves the peak and the max drawdown
+    on every call, as before, but adds a curve point only when the curve
+    is empty, its last point is at least `equity_point_seconds` old, or
+    that point is stamped after the call (a clock set back, as in the
+    fall-back hour of a wall clock: the cadence restarts from the new time
+    instead of leaving the curve without points until the clock passes the
+    old one). A call at the last point's time still replaces it, and a
+    call that adds no point builds none. Its new keyword `force_point`,
+    required, adds the point whatever the interval: the engine's pass
+    passes False and `capture_snapshot` (the session report's and the
+    archive's read) True, so the archive's curve ends on the capture
+    moment and the cadence runs on from it. `PaperAccount` takes
+    `equity_point_seconds` (default 15, the config's); the engine passes
+    the config's.
+  - `paper.equity_point_seconds`: a number of at least 0, checked at load
+    like the section's other numbers; 0 adds a point on every sample, the
+    behaviour before. At 15 the session's ~2.5 s passes add a point every
+    15-17.5 s, so the 2,000 points span at least 8.3 hours, and the idle
+    passes add one a minute: both the dashboard's curve and the 20:00
+    archive's hold the whole session. The sparkline's last point is up to
+    that old; the equity figures beside it are read live, as before.
+    `config.example.yaml` and README's `paper` table carry it; the other
+    presets take the default.
+  - Identical: the 10-01 09:40-10:40 stepped replay with a page open,
+    against 21032f8 and against the previous commit, in every category,
+    the dashboard's included: its passes are 20 s apart, so each still
+    adds its point. Stepped at 5 s (10-01 09:40-09:50), only the
+    dashboard's payloads differ from 21032f8's, by their curve (a point
+    every third pass); with the knob at 0 that window is identical.
+  - README: `max_equity_points`, `equity_point_seconds`, and the idle
+    cadence's and the heartbeat's notes on the curve; the idle entry below
+    says what the curve held as first built.
+  - Tests: `tests/runtime/test_paper_account_sampling.py` (calls 5 s apart
+    at 15 add points at 0, 15, 30 and 45 s, each its own call's equity; a
+    call that adds no point still moves the peak and the max drawdown; 0
+    adds one on every call, one stamped before the last included; a clock
+    set back adds one at once; the capture always adds its point and the
+    cadence runs on from it; `force_point` has no default; the account's
+    default is the config's), `tests/composition/test_idle_gate.py` (2.5 s
+    passes through the real engine add a point every 15 s, and a loss on a
+    pass that adds none reaches the max drawdown),
+    `tests/composition/test_dashboard_state.py` (the engine builds the
+    account with the config's cadence) and
+    `tests/domain/test_config_validation.py` (the knob's number check; a
+    negative, a word and a null refused at load; 0, 2.5 and 60 load);
+    `test_dashboard_update_failure.py` and `test_engine_shutdown.py`
+    follow. 22 mutants, all killed, each by its test alone.
+
 - **top_tier's entry pass reads each sector frame's posture and session
   open once a pass; the event calendars' path is resolved without four
   `resolve()` calls.** *2026-10-05* — the entry pass scanned each of the
@@ -1137,14 +1194,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     uses it, and `capture_snapshot`, the session report's and the
     archive's, does both. The build used to sample the account, so built on
     demand it would have left the report's max drawdown and the archive's
-    curve to whether a page was open. Off-window the curve now gets one
-    point a minute instead of one every 7-8 s, so the 2,000 points the
-    20:00 archive writes are mostly the session's, not the flat
-    after-hours. In the session it gets one a pass, about every 2.5 s
-    with this release's other steps, so the 2,000 points span the
-    session's last 80-90 minutes: the dashboard's sparkline is that
-    rolling window, and the 20:00 archive's curve starts about 14:40 on
-    top_tier. The peak and the max drawdown cover the whole day.
+    curve to whether a page was open. Off-window the account is now
+    sampled once a minute instead of every 7-8 s, so the after-hours
+    passes no longer push the session out of the 2,000 points the 20:00
+    archive writes. The peak and the max drawdown follow every sample and
+    cover the whole day; the curve gets a point every
+    `paper.equity_point_seconds` (the curve entry above). As first built
+    every sample added a point, which at this release's ~2.5 s passes held
+    only the session's last 80-90 minutes: the 20:00 archive's curve
+    started about 14:40 on top_tier.
   - The cycle builds every HTF context the strategy and its dashboard rows
     read (`htf_context_requests`, new: the score context's
     `_default_htf_request`; the peer family's own `_symbol_htf_request`;

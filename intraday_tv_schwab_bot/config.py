@@ -557,6 +557,15 @@ class RuntimeConfig:
 class PaperConfig:
     starting_equity: float = 25_000.0
     max_equity_points: int = 2000
+    # The equity curve gets a point at most this often (seconds). The engine
+    # samples the account every pass and the peak and the max drawdown
+    # follow every sample, but the curve gets a point only once its last one
+    # is this old (the session report's and the archive's capture always
+    # adds one). At 15, the 2,000 points of max_equity_points span at least
+    # 8.3 hours of ~2.5 s RTH passes, so the dashboard's curve and the 20:00
+    # archive's hold the whole session; one a pass would hold its last 80-90
+    # minutes. 0 adds a point on every sample (2026-10-05).
+    equity_point_seconds: float = 15.0
     max_trade_history: int = 200
 
 
@@ -1840,6 +1849,12 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
     "paper": {
         "starting_equity": _ABOVE_ZERO,
         "max_equity_points": _COUNT,
+        # Read as float() when the account is built and on every sample
+        # (PaperAccount._curve_point_due). Unchecked, a word would stop the
+        # start-up, true would read as 1 s, an infinity would leave the curve
+        # no point after the first but the captures', and a NaN or a
+        # negative number would add one on every sample.
+        "equity_point_seconds": _Number(low=0, note=" (0 adds a curve point on every sample)"),
         "max_trade_history": _COUNT,
     },
     "dashboard": {

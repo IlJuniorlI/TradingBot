@@ -223,6 +223,7 @@ class IntradayBot:
             starting_equity=self._tracked_capital_baseline(),
             max_equity_points=config.paper.max_equity_points,
             max_trade_history=config.paper.max_trade_history,
+            equity_point_seconds=config.paper.equity_point_seconds,
         )
         self.dashboard_cache = DashboardCache(
             config, data=self.data, strategy=self.strategy, account=self.account,
@@ -1576,7 +1577,7 @@ class IntradayBot:
         (``always``) whatever the demand.
         """
         try:
-            self.account.record_equity_point(self.positions)
+            self.account.record_equity_point(self.positions, force_point=False)
             if not self._dashboard_build_due(message, always=always):
                 return
             if gate_state is None:

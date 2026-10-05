@@ -48,6 +48,11 @@ tradingview:
 paper:
   starting_equity: 25000.0
   max_equity_points: 2000
+  # The equity curve gets a point at most every this many seconds; the
+  # peak and the max drawdown follow every pass. At 15 the 2,000 points
+  # span at least 8.3 hours of passes: the whole session. 0 adds a point
+  # every pass.
+  equity_point_seconds: 15
   max_trade_history: 200
 
 # Position sizing, exposure caps, and trade-management defaults.

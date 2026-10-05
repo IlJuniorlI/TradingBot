@@ -176,7 +176,8 @@ class PaperAccount:
         base = str(meta.get("position_key") or position.symbol)
         return f"{base}|{position.entry_time.isoformat()}"
 
-    def __init__(self, starting_equity: float, max_equity_points: int = 2000, max_trade_history: int = 200):
+    def __init__(self, starting_equity: float, max_equity_points: int = 2000, max_trade_history: int = 200,
+                 equity_point_seconds: float = 15.0):
         self.starting_equity = float(starting_equity)
         self.cash = float(starting_equity)
         self.realized_pnl = 0.0
@@ -184,6 +185,7 @@ class PaperAccount:
         self.realized_pnl_by_symbol: dict[str, float] = {}
         self.trades: deque[TradeRecord] = deque(maxlen=max_trade_history)
         self.equity_curve: deque[EquityPoint] = deque(maxlen=max_equity_points)
+        self.equity_point_seconds = float(equity_point_seconds)
         self.peak_equity = float(starting_equity)
         self.max_drawdown = 0.0
         self._lock = RLock()
@@ -419,18 +421,42 @@ class PaperAccount:
         market_value = sum(row["market_value"] for row in position_rows)
         return position_rows, market_value, self.cash + market_value
 
-    def record_equity_point(self, positions: dict[str, Position], timestamp: datetime | None = None) -> None:
-        """Sample the equity at ``timestamp`` (now by default): the peak, the
-        max drawdown and the curve's point. The engine samples once a pass,
-        before the dashboard build (``IntradayBot._publish_state``), whether
-        or not the build runs; until 2026-10-05 the build itself sampled, so
-        the drawdown was sampled only as often as the dashboard was built."""
+    def _curve_point_due(self, ts: datetime) -> bool:
+        """Whether a sample at ``ts`` adds a curve point (or, at the last
+        point's time, replaces it): the curve is empty, its last point is at
+        least ``equity_point_seconds`` old, or that point is stamped after
+        ``ts`` (a clock set back: the cadence restarts from the new time
+        instead of waiting for the clock to pass the old point, and at 0
+        every sample keeps its point, as before 2026-10-05). Under the lock."""
+        if not self.equity_curve:
+            return True
+        age = (ts - self.equity_curve[-1].timestamp).total_seconds()
+        return not 0 < age < self.equity_point_seconds
+
+    def record_equity_point(self, positions: dict[str, Position], timestamp: datetime | None = None, *,
+                            force_point: bool) -> None:
+        """Sample the equity at ``timestamp`` (now by default). Every call
+        moves the peak and the max drawdown; the curve gets the point when
+        one is due (``_curve_point_due``: one every ``equity_point_seconds``,
+        every call at 0) or with ``force_point`` (``capture_snapshot``, so
+        the session report's and the archive's curve end on their own
+        moment). A point stamped at the last point's time replaces it.
+
+        The engine samples once a pass, before the dashboard build
+        (``IntradayBot._publish_state``), whether or not the build runs;
+        until 2026-10-05 the build itself sampled, so the drawdown was
+        sampled only as often as the dashboard was built. Every sample also
+        added a point until then: at this release's ~2.5 s passes the 2,000
+        points of ``max_equity_points`` would hold only the session's last
+        80-90 minutes; at one every 15 s they hold at least 8.3 hours."""
         ts = timestamp or sessions.now_et()
         with self._lock:
             position_rows, market_value, total_equity = self._equity_rows(positions)
-            unrealized_pnl = sum(row["unrealized_pnl"] for row in position_rows)
             self.peak_equity = max(self.peak_equity, total_equity)
             self.max_drawdown = max(self.max_drawdown, self.peak_equity - total_equity)
+            if not (force_point or self._curve_point_due(ts)):
+                return
+            unrealized_pnl = sum(row["unrealized_pnl"] for row in position_rows)
             unrealized_by_symbol: dict[str, float] = {}
             for row in position_rows:
                 symbol = str(row["symbol"])
@@ -456,10 +482,11 @@ class PaperAccount:
                 self.equity_curve[-1] = point
 
     def capture_snapshot(self, positions: dict[str, Position], timestamp: datetime | None = None) -> dict[str, Any]:
-        """``record_equity_point``, then the ``snapshot``: the session
-        report's and the archive's read."""
+        """``record_equity_point`` with its point whatever the interval, then
+        the ``snapshot``: the session report's and the archive's read, whose
+        curve ends on the capture moment."""
         with self._lock:
-            self.record_equity_point(positions, timestamp)
+            self.record_equity_point(positions, timestamp, force_point=True)
             return self.snapshot(positions)
 
     def snapshot(self, positions: dict[str, Position]) -> dict[str, Any]:
