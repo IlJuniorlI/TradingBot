@@ -26,7 +26,7 @@ from . import sessions
 from .bars import ensure_ohlcv_frame
 from .models import Side
 from .numeric import safe_float
-from .sessions import EQUITY_RTH_OPEN, EQUITY_STREAM_START, session_mask
+from .sessions import EQUITY_RTH_OPEN, EQUITY_STREAM_START, session_mask, session_open_at
 
 _USE_RTH_SESSION_INDICATORS = True
 # Which session window the per-session indicator reset (VWAP/EMA/TA-Lib
@@ -347,8 +347,7 @@ def indicator_session_open() -> bool:
     09:45 (15m) or 10:30 (60m), and a reader already in the session must
     not read it as a premarket reader would (2026-09-24).
     """
-    return get_runtime_indicator_mode() and bool(
-        session_mask(pd.DatetimeIndex([sessions.now_et()]), get_session_indicator_window())[0])
+    return get_runtime_indicator_mode() and session_open_at(sessions.now_et(), get_session_indicator_window())
 
 
 def latest_atr14(frame: pd.DataFrame, *, in_session: npt.NDArray[np.bool_] | None = None) -> float | None:
@@ -371,13 +370,25 @@ def latest_atr14(frame: pd.DataFrame, *, in_session: npt.NDArray[np.bool_] | Non
     if frame is None or frame.empty or "atr14" not in frame.columns:
         return None
     series = frame["atr14"]
+    if series.dtype != np.float64:
+        if indicator_session_open():
+            if in_session is None:
+                in_session = indicator_session_mask(frame.index)
+            if in_session.any():
+                series = series[in_session]
+        clean = series.dropna()
+        return float(clean.iloc[-1]) if not clean.empty else None
+    # float64 (every add_indicators frame): the last non-NaN value, among the
+    # session bars when they apply, read on the array.
+    values = series.to_numpy()
+    usable = ~np.isnan(values)
     if indicator_session_open():
         if in_session is None:
             in_session = indicator_session_mask(frame.index)
         if in_session.any():
-            series = series[in_session]
-    clean = series.dropna()
-    return float(clean.iloc[-1]) if not clean.empty else None
+            usable &= in_session
+    last = np.flatnonzero(usable)
+    return float(values[last[-1]]) if len(last) else None
 
 
 def atr_with_floor(

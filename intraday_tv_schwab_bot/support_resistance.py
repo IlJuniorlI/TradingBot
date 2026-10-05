@@ -12,7 +12,8 @@ from .levels_shared import (
     Level,
     cluster_levels,
     collapse_same_side_levels,
-    confirm_by_bars,
+    confirm_by_values,
+    confirm_tail,
     detect_broken_levels,
     drop_levels_near_price,
     extend_unique_levels,
@@ -594,12 +595,19 @@ def _flip_checker(
     bars_1m = int(confirm_1m_bars or 0)
     bars_5m = int(confirm_5m_bars or 0)
     tol = float(eps)
+    # The bars confirm_by_bars would read, taken once per build too: every
+    # reference level is tested twice.
+    tails = {
+        (field_name, frame_key): confirm_tail(frame, field_name, count)
+        for field_name in ("low", "high")
+        for frame_key, frame, count in (("1m", completed_1m, bars_1m), ("5m", completed_5m, bars_5m))
+    }
 
     def check(level_price: float, direction: str) -> bool:
         field_name, comparator = ("low", "above") if direction == "reclaim" else ("high", "below")
         if (
-            confirm_by_bars(completed_1m, field_name, comparator, level_price, bars_1m, tol)
-            or confirm_by_bars(completed_5m, field_name, comparator, level_price, bars_5m, tol)
+            confirm_by_values(tails[(field_name, "1m")], comparator, level_price, tol)
+            or confirm_by_values(tails[(field_name, "5m")], comparator, level_price, tol)
         ):
             return True
         if overlay_requested or fallback_bar is None:

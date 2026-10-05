@@ -375,10 +375,23 @@ def previous_regular_close(anchor: datetime | pd.Timestamp) -> datetime:
 _SESSION_WINDOWS = ("rth", "extended")
 
 
+def _wall_clock(index: pd.DatetimeIndex) -> np.ndarray:
+    """Each timestamp's wall-clock reading (datetime64, tz dropped): the
+    fields ``.hour``, ``.minute`` and ``.date()`` read on an aware index."""
+    return (index.tz_localize(None) if index.tz is not None else index).to_numpy()
+
+
+def _session_days(wall_day: np.ndarray) -> tuple[list[date], np.ndarray]:
+    """The distinct dates of ``wall_day`` (datetime64[D]) and, per
+    timestamp, the position of its date among them."""
+    uniq, inverse = np.unique(wall_day, return_inverse=True)
+    return [day.item() for day in uniq], inverse.reshape(-1)
+
+
 def _per_session_day(index: pd.DatetimeIndex, value: Callable[[date], object], dtype: type) -> np.ndarray:
     """``value(day)`` for each timestamp's wall-clock date, computed once per date."""
-    codes, days = pd.factorize(index.normalize())
-    return np.array([value(day.date()) for day in days], dtype=dtype)[codes]
+    days, inverse = _session_days(_wall_clock(index).astype("datetime64[D]"))
+    return np.array([value(day) for day in days], dtype=dtype)[inverse]
 
 
 def _close_minute(day: date) -> int:
@@ -405,14 +418,33 @@ def session_mask(index: pd.Index, window: str) -> npt.NDArray[np.bool_]:
     if window not in _SESSION_WINDOWS:
         raise ValueError(f"session window must be one of {_SESSION_WINDOWS}, got {window!r}")
     idx = pd.DatetimeIndex(index)
-    minute = np.asarray(idx.hour * 60 + idx.minute, dtype=np.int64)
-    trading = _per_session_day(idx, is_weekday_session_day, bool)
+    wall = _wall_clock(idx)
+    wall_day = wall.astype("datetime64[D]")
+    days, inverse = _session_days(wall_day)
+    minute = ((wall - wall_day) // np.timedelta64(1, "m")).astype(np.int64)
+    trading = np.array([is_weekday_session_day(day) for day in days], dtype=bool)[inverse]
     if window == "extended":
         start = EQUITY_STREAM_START.hour * 60 + EQUITY_STREAM_START.minute
         end = EQUITY_STREAM_END.hour * 60 + EQUITY_STREAM_END.minute
         return trading & (minute >= start) & (minute < end)
     rth_open = EQUITY_RTH_OPEN.hour * 60 + EQUITY_RTH_OPEN.minute
-    return trading & (minute >= rth_open) & (minute < rth_close_minute(idx))
+    close = np.array([_close_minute(day) for day in days], dtype=np.int64)[inverse]
+    return trading & (minute >= rth_open) & (minute < close)
+
+
+def session_open_at(ts: datetime | pd.Timestamp, window: str) -> bool:
+    """``session_mask`` for one instant, read on its own wall clock."""
+    if window not in _SESSION_WINDOWS:
+        raise ValueError(f"session window must be one of {_SESSION_WINDOWS}, got {window!r}")
+    day = ts.date()
+    if not is_weekday_session_day(day):
+        return False
+    minute = ts.hour * 60 + ts.minute
+    if window == "extended":
+        start = EQUITY_STREAM_START.hour * 60 + EQUITY_STREAM_START.minute
+        end = EQUITY_STREAM_END.hour * 60 + EQUITY_STREAM_END.minute
+        return start <= minute < end
+    return EQUITY_RTH_OPEN.hour * 60 + EQUITY_RTH_OPEN.minute <= minute < _close_minute(day)
 
 
 def datetime_index(index: pd.Index) -> pd.DatetimeIndex:

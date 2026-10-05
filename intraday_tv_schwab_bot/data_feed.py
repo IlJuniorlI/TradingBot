@@ -1930,6 +1930,20 @@ class MarketDataStore:
             return merged[ohlcv_cols + extra_cols]
         return ensure_ohlcv_frame(merged)
 
+    def history_warmup_counts(self, symbol: str) -> tuple[bool, bool, int]:
+        """``(history known, history has rows, merged 1m bars)``: what
+        ``get_history`` and ``get_merged(symbol, with_indicators=False)``
+        report for the warm-up decision. The history is read in place, not
+        copied; the merged count comes from ``get_merged`` itself, so its
+        merge lands in the cycle cache as it did."""
+        cache_key = self._symbol_key(symbol)
+        with self._lock:
+            history_frame = self.history.get(cache_key)
+            history_known = history_frame is not None
+            history_has_rows = history_known and not history_frame.empty
+        merged = self.get_merged(symbol, with_indicators=False)
+        return history_known, history_has_rows, len(merged)
+
     def get_history(self, symbol: str) -> pd.DataFrame | None:
         with self._lock:
             frame = self.history.get(self._symbol_key(symbol))

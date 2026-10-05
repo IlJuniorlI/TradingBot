@@ -829,6 +829,67 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The hot bar helpers read arrays instead of building pandas objects per
+  call.** *2026-10-05* — the S/R build, the strategy contexts, the entry
+  pass and the dashboard call the same small helpers thousands of times a
+  pass (a cProfile census of one top_tier pass: `ensure_ohlcv_frame` 361
+  calls, `session_mask` 560, the flip confirmation 1,106,
+  `indicator_session_open` 252, `latest_atr14` 168). Each now does its work
+  on numpy arrays, with the same result:
+  - `bars.ensure_ohlcv_frame`: a frame already clean (OHLCV leading as
+    float64, unique columns, a strictly increasing unique index, no missing
+    OHLC or volume) is returned as a deep copy; every other frame takes the
+    rebuild, unchanged.
+  - `sessions.session_mask` and `rth_close_minute`: one `np.unique` of the
+    wall-clock dates and one calendar lookup per date; the minute of day by
+    integer division. New `sessions.session_open_at(ts, window)`, the mask
+    for one instant, which `indicators.indicator_session_open` reads instead
+    of building a one-element index.
+  - `indicators.latest_atr14`: the last non-NaN value on the float64 array
+    (among the session bars when they apply).
+  - `bars.same_day_mask` / `time_gte_mask` on the wall-clock array;
+    `session_open_price` finds the first bar by position;
+    `session_bucket_floor` on scalars.
+  - The S/R flip check takes the four bar tails it compares once per build
+    (`levels_shared.confirm_tail` / `confirm_by_values`; `confirm_by_bars`
+    keeps its signature for the HTF levels).
+  - `fair_value_gaps.detect_fair_value_gaps` tests every triplet's formation
+    and session at once and runs its loop on the candidates only;
+    `technical_levels._populate_atr_context` reads the true range on arrays
+    (a NaN-skipping max and mean, as the frame's `max(axis=1)` / `mean()`
+    did); `EntryGatekeeper._safe_series_last` reads the column, then the
+    last position.
+  - `MarketDataStore.history_warmup_counts` gives the warm-up decision
+    (`WarmupTracker.should_fetch_symbol_history`) what `get_history` and
+    `get_merged(with_indicators=False)` reported, reading the history in
+    place instead of copying it; the merged count still comes from
+    `get_merged`, so the cycle cache holds what it did.
+  - `same_day_mask` takes a date: a `datetime` or `Timestamp` raises
+    `TypeError` (it matched no bar before, silently). Every caller passes a
+    date.
+  - Measured (PURE-HELPERS verifier, base 9c2a8d2, 12 interleaved pairs on
+    09-30..10-02): step CPU 4.81 → 3.40 s a pass (saved 1.36 s,
+    0.82-1.56); on top of the array `add_indicators` above 3.24 → 1.90 s
+    (saved 1.33 s): sr 0.55 → 0.21, entries 0.86 → 0.39, publish
+    1.07 → 0.74, contexts 0.55 → 0.34 s.
+  - Identical: the 15 helpers were called 2,026,980 times inside the real
+    `step()` (four windows, three presets) and each call compared with the
+    old code on the same input, 0 mismatches; four stepped replays
+    (top_tier 10-01 morning and 14:50-16:05, small_cap 06-02, zero_dte
+    05-20) identical. On inputs no path builds: a NaT stamp in an index now
+    raises in the RTH mask (it was masked off), and `time_gte_mask` reads
+    one as False (it raised).
+  - Tests: `tests/market_data/test_hot_helpers_pinned.py` (new) pins the
+    session masks, `rth_close_minute`, `session_open_at` and
+    `indicator_session_open` to frozen copies on every minute of the DST,
+    holiday, early-close and weekend days; `ensure_ohlcv_frame` to its
+    rebuild on frames with NaN prices or volume, unsorted or duplicate
+    stamps and other dtypes; the ATR context to its frame-based body with
+    NaN bars; and the warm-up counts to the two reads, with live bars, in
+    and out of a cycle. 15 mutants, all killed; 5 of the verifier's 16 had
+    passed the suite. `tests/runtime/test_warmup_tracker.py`'s fake store
+    answers `history_warmup_counts`.
+
 - **`add_indicators` builds its columns on float64 arrays and assembles the
   frame once.** *2026-10-05* — every step builds 84 indicator frames (28
   symbols x the 1m step frame, the span-5 LTF and the 5m structure frame),

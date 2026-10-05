@@ -266,20 +266,35 @@ def confirm_by_bars(
     (``"above"`` / ``"below"``) comparators so the htf and sr modules can
     share a single body without rewriting their direction strings.
     """
+    return confirm_by_values(confirm_tail(frame, field, count), comparator, level_price, eps)
+
+
+def confirm_tail(frame: pd.DataFrame | None, field: str, count: int) -> np.ndarray | None:
+    """The values ``confirm_by_bars(frame, field, ..., count, ...)`` tests:
+    the last ``count`` of ``frame[field]`` as float64, or None where it
+    confirms nothing (no count, no frame, no column, too few bars). A caller
+    testing many levels against one frame takes it once."""
     if count <= 0 or frame is None or frame.empty or field not in frame.columns:
-        return False
-    series = frame[field].astype(float).tail(int(count))
-    if len(series) < int(count):
+        return None
+    values = frame[field].to_numpy(dtype=np.float64)
+    if len(values) < int(count):
+        return None
+    return values[-int(count):]
+
+
+def confirm_by_values(values: np.ndarray | None, comparator: str, level_price: float, eps: float) -> bool:
+    """``confirm_by_bars`` on the tail ``confirm_tail`` took."""
+    if values is None:
         return False
     cmp = str(comparator).strip().lower()
     if cmp in (">", "above"):
-        return bool((series > float(level_price) + eps).all())
+        return bool((values > float(level_price) + eps).all())
     if cmp in ("<", "below"):
-        return bool((series < float(level_price) - eps).all())
+        return bool((values < float(level_price) - eps).all())
     if cmp == ">=":
-        return bool((series >= float(level_price) + eps).all())
+        return bool((values >= float(level_price) + eps).all())
     if cmp == "<=":
-        return bool((series <= float(level_price) - eps).all())
+        return bool((values <= float(level_price) - eps).all())
     return False
 
 

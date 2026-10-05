@@ -123,7 +123,7 @@ class EntryGatekeeper:
     def _safe_series_last(frame, field: str, default: float | None = None) -> float | None:
         if frame is None or frame.empty or field not in frame.columns:
             return default
-        return safe_float(frame.iloc[-1][field], default)
+        return safe_float(frame[field].iloc[-1], default)
 
     # ------------------------------------------------------------------
     # Retry-backoff for option entries that failed to fill.

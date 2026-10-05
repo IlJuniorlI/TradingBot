@@ -832,24 +832,33 @@ def _populate_atr_context(
     above 0.8 on 100%, dead in both directions. The baseline is taken BEFORE
     the window so the recent bars do not dilute their own denominator.
     """
-    last = frame.iloc[-1]
-    ctx.atr14 = float(last["atr14"]) if pd.notna(last.get("atr14", math.nan)) else None
+    def _last(col: str) -> float | None:
+        if col not in frame.columns:
+            return None
+        value = frame[col].iloc[-1]
+        return float(value) if pd.notna(value) else None
+
+    ctx.atr14 = _last("atr14")
     ctx.atr_pct = (ctx.atr14 / close) if ctx.atr14 is not None and close > 0 else None
     if ctx.atr14 and ctx.atr14 > 0:
         expansion_lb = max(1, int(atr_expansion_lookback))
         if len(frame) > expansion_lb + 1:
-            window = frame.iloc[-(expansion_lb + 1):]
-            high = window["high"].astype(float)
-            low = window["low"].astype(float)
-            prev_close = window["close"].astype(float).shift(1)
-            true_range = pd.concat(
-                [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1,
-            ).max(axis=1).iloc[1:]
+            # The true range of the last ``expansion_lb`` bars, each against
+            # the close before it, on the arrays: a NaN-skipping max per bar
+            # and a NaN-skipping mean, as a frame's max(axis=1) / mean() read
+            # them.
+            high = frame["high"].to_numpy(dtype=np.float64)[-expansion_lb:]
+            low = frame["low"].to_numpy(dtype=np.float64)[-expansion_lb:]
+            prev_close = frame["close"].to_numpy(dtype=np.float64)[-(expansion_lb + 1):-1]
+            with np.errstate(invalid="ignore"):
+                true_range = np.fmax(np.fmax(high - low, np.abs(high - prev_close)), np.abs(low - prev_close))
             baseline_atr = frame["atr14"].iloc[-(expansion_lb + 1)]
             if pd.notna(baseline_atr) and float(baseline_atr) > 0:
-                ctx.atr_expansion_mult = float(true_range.mean()) / float(baseline_atr)
-        ema20 = float(last["ema20"]) if pd.notna(last.get("ema20", math.nan)) else None
-        vwap = float(last["vwap"]) if pd.notna(last.get("vwap", math.nan)) else None
+                valid = ~np.isnan(true_range)
+                mean_tr = float(np.where(valid, true_range, 0.0).sum() / valid.sum()) if valid.any() else math.nan
+                ctx.atr_expansion_mult = mean_tr / float(baseline_atr)
+        ema20 = _last("ema20")
+        vwap = _last("vwap")
         if ema20 is not None:
             ctx.atr_stretch_ema20_mult = abs(close - ema20) / ctx.atr14
         if vwap is not None:

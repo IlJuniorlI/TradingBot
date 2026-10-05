@@ -31,9 +31,32 @@ def floor_minute(ts: pd.Timestamp) -> pd.Timestamp:
     return ts.floor("1min")
 
 
+_OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
+
+
+def _already_clean_ohlcv(df: pd.DataFrame) -> bool:
+    """Whether ``ensure_ohlcv_frame`` would hand ``df`` back unchanged:
+    OHLCV leading as float64, unique columns, a strictly increasing index, no
+    missing OHLC and no missing volume. The rebuild below copies, sorts,
+    converts five columns, drops and reorders; on such a frame every one of
+    those is a no-op, so a copy is the same frame for a tenth of the cost."""
+    if tuple(df.columns[:5]) != _OHLCV_COLUMNS or not df.columns.is_unique:
+        return False
+    index = df.index
+    if not (index.is_monotonic_increasing and index.is_unique):
+        return False
+    for col in _OHLCV_COLUMNS:
+        values = df[col]
+        if values.dtype != np.float64 or np.isnan(values.to_numpy()).any():
+            return False
+    return True
+
+
 def ensure_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    if _already_clean_ohlcv(df):
+        return df.copy()
     frame = df.copy()
     frame = frame.sort_index()
     for col in ["open", "high", "low", "close", "volume"]:
@@ -199,9 +222,24 @@ def resample_bars(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
 def session_bucket_floor(ts: datetime | pd.Timestamp, minutes: int) -> pd.Timestamp:
     """Start of the ``minutes`` bucket holding ``ts`` on ``resample_bars``'
     grid (``session_bucket_bounds``). A clock floor put regular-session 60m
-    boundaries on the hour, half a bar from the XX:30 bars it gates."""
-    starts, _ends = session_bucket_bounds(pd.DatetimeIndex([pd.Timestamp(ts)]), max(1, int(minutes)))
-    return starts[0]
+    boundaries on the hour, half a bar from the XX:30 bars it gates.
+
+    One timestamp, read on scalars: the same wall-clock arithmetic as
+    ``session_bucket_bounds`` without building a one-element index."""
+    stamp = pd.Timestamp(ts)
+    length = max(1, int(minutes))
+    step_ns = int(round(float(length) * _MINUTE_NS))
+    wall_clock = stamp.tz_convert(EXCHANGE_TZ).tz_localize(None) if stamp.tzinfo is not None else stamp
+    wall = int((wall_clock - wall_clock.normalize()).value)
+    if _on_the_open_grid(float(length)):
+        offset = (wall - _RTH_OPEN_MINUTE * _MINUTE_NS) % step_ns
+        return stamp - pd.Timedelta(offset, unit="ns")
+    close = sessions._close_minute(wall_clock.date()) * _MINUTE_NS
+    bounds = (0, _PREMARKET_OPEN_MINUTE * _MINUTE_NS, _RTH_OPEN_MINUTE * _MINUTE_NS, close,
+              _STREAM_END_MINUTE * _MINUTE_NS, 1440 * _MINUTE_NS)
+    seg_start = max(bound for bound in bounds if bound <= wall)
+    bucket_start = seg_start + ((wall - seg_start) // step_ns) * step_ns
+    return stamp - pd.Timedelta(wall - bucket_start, unit="ns")
 
 
 def session_bucket_ends(index: pd.DatetimeIndex | pd.Index, minutes: int) -> pd.DatetimeIndex:
@@ -410,15 +448,37 @@ def bar_wick_fractions(frame: pd.DataFrame | None) -> tuple[float, float, float,
 # Session slices
 # ---------------------------------------------------------------------------
 
+def _index_wall_clock(frame: pd.DataFrame) -> np.ndarray:
+    """The frame's bar times on their own wall clock (datetime64, tz dropped):
+    the reading ``ts.date()`` / ``ts.time()`` give per bar."""
+    index = pd.DatetimeIndex(frame.index)
+    return (index.tz_localize(None) if index.tz is not None else index).to_numpy()
+
+
 def same_day_mask(frame: pd.DataFrame, day: date) -> pd.Series:
     """Boolean mask selecting bars whose timestamp falls on ``day``, read on
-    the index's own wall clock (ET for the feed's frames)."""
-    return frame.index.to_series().map(lambda ts: ts.date() == day)
+    the index's own wall clock (ET for the feed's frames). ``day`` is a
+    calendar date: a ``datetime`` or ``Timestamp`` names an instant and is
+    refused (before 2026-10-05 it matched no bar, without a word)."""
+    if isinstance(day, datetime):
+        raise TypeError(f"same_day_mask takes a date, not a {type(day).__name__}: {day!r}")
+    if frame.empty:
+        # An empty frame keeps the element-wise map's result: a non-boolean
+        # empty Series, which as a frame key selects no columns either.
+        return frame.index.to_series().map(lambda ts: ts.date() == day)
+    wall_day = _index_wall_clock(frame).astype("datetime64[D]")
+    return pd.Series(wall_day == np.datetime64(day, "D"), index=frame.index, name=frame.index.name)
 
 
 def time_gte_mask(frame: pd.DataFrame, t: time) -> pd.Series:
-    """Boolean mask selecting bars at or after time-of-day ``t``."""
-    return frame.index.to_series().map(lambda ts: ts.time() >= t)
+    """Boolean mask selecting bars at or after time-of-day ``t``. Compared in
+    whole microseconds, as ``ts.time()`` reads a bar."""
+    if frame.empty:
+        return frame.index.to_series().map(lambda ts: ts.time() >= t)
+    wall = _index_wall_clock(frame)
+    since_midnight = (wall - wall.astype("datetime64[D]")).astype("timedelta64[us]")
+    cutoff = np.timedelta64(((t.hour * 60 + t.minute) * 60 + t.second) * 1_000_000 + t.microsecond, "us")
+    return pd.Series(since_midnight >= cutoff, index=frame.index, name=frame.index.name)
 
 
 def rth_open_plus(minutes: int) -> time:
@@ -465,10 +525,10 @@ def opening_range(
     return high, low, bars
 
 
-def _first_open(rows: pd.DataFrame) -> float | None:
-    if "open" not in rows.columns:
+def _open_at(frame: pd.DataFrame, pos: int) -> float | None:
+    if "open" not in frame.columns:
         return None
-    return safe_float(rows.iloc[0]["open"])
+    return safe_float(frame["open"].iloc[pos])
 
 
 def session_open_price(
@@ -495,18 +555,21 @@ def session_open_price(
     included."""
     if frame is None or frame.empty:
         return None
-    same_day = frame[same_day_mask(frame, day)]
-    if same_day.empty:
+    # Positions in frame order: the first same-day bar, and the first one at
+    # or after the cutoff.
+    same_day = same_day_mask(frame, day).to_numpy()
+    if not same_day.any():
         return None
+    first = int(np.argmax(same_day))
     cutoff = session_start if session_start is not None else (EQUITY_RTH_OPEN if regular_session_only else None)
-    rows = same_day
+    pos = first
     if cutoff is not None:
-        windowed = same_day[time_gte_mask(same_day, cutoff)]
-        if not windowed.empty:
-            rows = windowed
-    value = _first_open(rows)
+        windowed = same_day & time_gte_mask(frame, cutoff).to_numpy()
+        if windowed.any():
+            pos = int(np.argmax(windowed))
+    value = _open_at(frame, pos)
     if value is None and fallback_to_premarket_on_nan:
-        value = _first_open(same_day)
+        value = _open_at(frame, first)
     return value
 
 

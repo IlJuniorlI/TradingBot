@@ -184,11 +184,20 @@ def detect_fair_value_gaps(
         hits = np.flatnonzero(touched[pos + 1:])
         return _stamp(pos + 1 + int(hits[-1])) if hits.size else _stamp(pos)
 
-    for idx in range(2, n):
-        if high_arr is None or low_arr is None:
-            break
-        if segments[idx - 2] != segments[idx]:
-            continue
+    if high_arr is None or low_arr is None:
+        candidates = np.zeros(0, dtype=np.intp)
+    else:
+        # Only a triplet that passes the formation tests below can add a gap:
+        # the same tests, taken over every triplet at once, pick the
+        # candidates (a NaN fails them here as it does there).
+        left_high_all = high_arr[:-2]
+        left_low_all = low_arr[:-2]
+        with np.errstate(invalid="ignore"):
+            bullish_ok = (low_arr[2:] > left_high_all + eps) & ((low_arr[2:] - left_high_all) >= min_gap_size)
+            bearish_ok = (high_arr[2:] < left_low_all - eps) & ((left_low_all - high_arr[2:]) >= min_gap_size)
+        same_session = segments[:-2] == segments[2:]
+        candidates = np.flatnonzero((bullish_ok | bearish_ok) & same_session) + 2
+    for idx in candidates.tolist():
         # No NaN substitution. ensure_ohlcv_frame above has already dropped
         # NaN OHLC rows, and a NaN that did get here fails both comparisons
         # below and yields no gap -- the safe outcome. The old guard replaced

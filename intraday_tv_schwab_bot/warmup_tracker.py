@@ -137,11 +137,7 @@ class WarmupTracker:
         return desired
 
     def should_fetch_symbol_history(self, symbol: str, *, context_refresh_active: bool, streaming_active: bool) -> tuple[bool, int]:
-        history_frame = self.data.get_history(symbol)
-        merged_frame = self.data.get_merged(symbol, with_indicators=False)
-        history_known = history_frame is not None
-        history_has_rows = history_known and not history_frame.empty
-        merged_bars = 0 if merged_frame is None else len(merged_frame)
+        history_known, history_has_rows, merged_bars = self.data.history_warmup_counts(symbol)
         required_bars = self._required_history_bars(symbol)
         should_fetch = context_refresh_active and not history_known
         if context_refresh_active and not should_fetch and required_bars > 0 and merged_bars < required_bars:
