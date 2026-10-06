@@ -4830,6 +4830,88 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **One stream thread: a pass inside schwabdev's reconnect window no longer
+  starts a second stream, a stop there stops it, and a failed subscription
+  send no longer fails the pass.** *2026-10-06* — schwabdev 4.0.0's
+  `Stream.active` turns False when a reconnect's backoff ends and True again
+  only at the new connection's LOGIN response, while its thread runs all the
+  while: through the streamer-info fetch (25 s on 10-02, 11:12:38-11:13:03),
+  the connect and the login.
+  - `start_streaming` started the stream whenever `active` was False, and
+    `Stream.start` refuses only while `active`: a pass in the window ran a
+    second thread and connection over the first one's websocket and event
+    loop. None is archived (on 10-02 the engine was blocked in a REST call
+    through the window). It now starts one only when none runs
+    (`MarketDataStore._stream_running`): `active` is False and the thread of
+    the store's last start is not alive. That is schwabdev's private
+    `Stream._thread`, read right after `Stream.start` (pinned against
+    schwabdev 4.0.0 by a test); the store keeps the reference itself because
+    `Stream.stop` waits 5 s for the thread and then drops its own, while a
+    thread sleeping out a backoff (up to 120 s) lives on, and a new start
+    would wake it into the new stream's loop: no stream starts until it
+    ends. A pass that finds the stream reconnecting logs that at DEBUG.
+    Each such pass also re-stamped the start (`stream_start_requested_at`)
+    and cleared the first-bar bookkeeping; now only a start does, so
+    `stream_connect_timeout_seconds` counts from the start and a stream slow
+    to come up falls back to `price_history` as that setting says (the
+    re-stamp held the fallback off unless a pass outlasted the timeout). The
+    clearing also made the first bar after a reconnect fetch the bars the
+    outage cost, but only when a pass happened to land in the window;
+    without it a reconnect's missing bars stay missing, as they did on 10-02
+    (every symbol's 11:11 bar, to the day's end). Fetching them after every
+    reconnect's login is queued.
+  - `stop_streaming` stopped the stream only while `active`: in the window
+    it did nothing, and schwabdev's thread reconnected with the recorded
+    subscriptions and kept merging bars into `live`. It now stops it
+    whenever it is active or its thread runs, and logs a WARNING when the
+    thread outlives the stop (schwabdev's 5 s join). With nothing running
+    (every idle pass) it does nothing and logs nothing, as before.
+  - A stream send's failure raised out of the engine's pass, ahead of
+    management: schwabdev builds each request from its streamer info, which a
+    failed reconnect leaves None (10-02 11:13:03), and its `basic_request`
+    then fetches the info on the engine's thread (a blocking REST call) and
+    raises `ConnectionError("Streamer info unavailable")` when that fails
+    too. `start_streaming` now catches any error building or sending the
+    CHART_EQUITY change, keeps the subscription as it was (`stream_symbols`,
+    so the same change goes out next time), and logs it with its type, at
+    WARNING for the first failure of a run (`Schwab stream send failed
+    (ConnectionError: Streamer info unavailable): CHART_EQUITY ADD of 2; ...`),
+    DEBUG for the rest and INFO for the send that ends the run. After a
+    failure no stream send is tried for 60 s (`STREAM_SEND_RETRY_SECONDS`),
+    nor while the stream is not active (schwabdev's reconnect fetches the
+    info on its own thread): `MarketDataStore._stream_send_due`, which the
+    LEVELONE_EQUITIES subscription is to share.
+  - The `stream_fields` comment in `config.example.yaml` and the top_tier
+    preset gave another order (1=ts ... 7=seq, 8=chart_time); it now states
+    schwabdev's corrected one, which the bar parser reads: 0=symbol,
+    1=sequence, 2=open, 3=high, 4=low, 5=close, 6=volume, 7=chart_time,
+    8=chart_day. The other presets carry no such comment.
+  - Identical: the 10-01 09:40-10:40 stepped replay (top_tier, a page open)
+    and the peer_confirmed_key_levels 05-04 09:40-10:40 window, against
+    2d70ab2, in every category (the harness's stream is active throughout
+    both).
+  - README: `stream_fields` and `stream_connect_timeout_seconds`.
+  - Tests: `tests/market_data/test_stream_lifecycle.py` (new): a start only
+    when no stream thread runs (active; inactive with its thread alive, the
+    start's bookkeeping kept; a thread that ended or was dropped; a stopped
+    thread still running holds the next start off until it ends); a stop
+    while the thread reconnects, of an active stream, and with nothing
+    running (quiet); a failed send never raising, logged with its type, the
+    next held 60 s and while inactive, a run's WARNING then DEBUG then INFO, a
+    failing `send`, and an UNSUBS failing after its ADD went out. Through
+    schwabdev's own connection loop on the fake streamer (no network): a pin
+    of 4.0.0's `Stream._thread` and `active` through the window (its `start`
+    runs a second thread there; its `stop` drops the reference); a store's
+    start in the window running no second thread; its stop there ending the
+    thread with nothing replayed; and 10-02's failed streamer-info fetch,
+    the send's error caught with no second blocking fetch until the stream is
+    back and 60 s have passed. `tests/market_data/test_stream_receiver.py`
+    (the parser reads schwabdev's CHART_EQUITY order),
+    `tests/guards/test_preset_parity.py` (every `stream_fields` comment states
+    it), `tests/support/brokers.py` (`_FakeStream` keeps schwabdev's
+    `_thread`; `_FakeStreamer` holds a stream thread's fetch). 31 mutants, all
+    killed, each by its named test.
+
 - **A malformed stream message no longer reconnects the stream: the
   CHART_EQUITY receiver never raises into schwabdev, and a malformed bar is
   dropped instead of merged.** *2026-10-06* — schwabdev 4.0.0 reads an

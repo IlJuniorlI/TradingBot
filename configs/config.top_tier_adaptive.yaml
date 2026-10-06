@@ -131,8 +131,9 @@ runtime:
   warmup_minutes: 150
   prewarm_before_windows_minutes: 15
   log_dir: .logs
-  # Schwab CHART_EQUITY stream field indices: 0=symbol, 1=ts, 2=open,
-  # 3=high, 4=low, 5=close, 6=volume, 7=seq, 8=chart_time.
+  # Schwab CHART_EQUITY stream field indices, in schwabdev's corrected
+  # order (the one the bar parser reads): 0=symbol, 1=sequence, 2=open,
+  # 3=high, 4=low, 5=close, 6=volume, 7=chart_time, 8=chart_day.
   stream_fields: [0, 1, 2, 3, 4, 5, 6, 7, 8]
   stream_connect_timeout_seconds: 20
   stream_fallback_poll_seconds: 25

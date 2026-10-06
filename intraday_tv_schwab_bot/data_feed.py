@@ -8,7 +8,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from threading import RLock
+from threading import RLock, Thread
 from typing import Any, Callable, Iterable, Mapping, NamedTuple
 
 import pandas as pd
@@ -74,6 +74,10 @@ DAILY_HISTORY_RETRY_SECONDS = 60.0
 
 # The longest a stream message, packet or item quoted in a log line gets.
 STREAM_LOG_TEXT_CHARS = 400
+
+# After a stream subscription send fails, none is tried again for this long,
+# nor while the stream is not active (``MarketDataStore._stream_send_due``).
+STREAM_SEND_RETRY_SECONDS = 60.0
 
 # A CHART_EQUITY bar is stamped with its minute's start, so a real bar's
 # chart time is before its receipt; one stamped more than this after it is
@@ -180,6 +184,13 @@ class MarketDataStore:
         # refetches once to close it.
         self._stream_first_bar_time: dict[str, pd.Timestamp] = {}
         self.last_stream_health_log: dict[str, datetime] = {}
+        # The thread of this store's last Stream.start (schwabdev's private
+        # Stream._thread, read right after it): see _stream_running.
+        self._stream_thread: Thread | None = None
+        # The open run of failed stream sends: the last failure's time and
+        # how many in a row (main thread only; see _stream_send_due).
+        self._stream_send_failed_at: datetime | None = None
+        self._stream_send_failures = 0
         self._lock = RLock()
         self.started_at = sessions.now_et()
         self._forced_premarket_history_refresh_date: dict[str, date] = {}
@@ -1942,6 +1953,62 @@ class MarketDataStore:
         df = df.set_index(timestamps.floor("1min").rename("timestamp")).drop(columns=["timestamp", "datetime"], errors="ignore")
         return ensure_ohlcv_frame(df)
 
+    def _stream_running(self) -> bool:
+        """Whether a stream thread runs, so ``start_streaming`` starts none.
+
+        schwabdev's ``Stream.active`` alone does not say. It turns False when
+        a reconnect's backoff ends and True again at the new connection's
+        LOGIN response, a window that spans the streamer-info fetch (25 s on
+        2026-10-02, 11:12:38-11:13:03), and ``Stream.start`` refuses only
+        while ``active``: a start in that window ran a second thread and
+        connection over the first one's websocket and event loop (until
+        2026-10-06). The thread says: the one this store's last start made,
+        schwabdev's private ``Stream._thread`` read right after
+        ``Stream.start`` (pinned against schwabdev 4.0.0 by
+        tests/market_data/test_stream_lifecycle.py). The store keeps its own
+        reference because ``Stream.stop`` drops schwabdev's after a 5 s join,
+        while a thread sleeping out a reconnect backoff lives on and would
+        wake into the next start's loop."""
+        if self.stream.active:
+            return True
+        thread = self._stream_thread
+        return thread is not None and thread.is_alive()
+
+    def _stream_send_due(self, now: datetime) -> bool:
+        """Whether a stream subscription send may go out (every send to the
+        stream shares this): always, unless the last one failed; then not
+        for ``STREAM_SEND_RETRY_SECONDS`` after that failure, nor while the
+        stream is not active. A send fails while it is not: schwabdev builds
+        each request from its streamer info, which a failed reconnect leaves
+        None, and ``basic_request`` then fetches it on the calling thread (a
+        blocking REST call, ahead of management) and raises
+        ``ConnectionError("Streamer info unavailable")`` when that fails;
+        schwabdev's own reconnect fetches it on the stream's thread."""
+        failed_at = self._stream_send_failed_at
+        if failed_at is None:
+            return True
+        return bool(self.stream.active) and (now - failed_at).total_seconds() >= STREAM_SEND_RETRY_SECONDS
+
+    def _stream_send_failed(self, what: str, exc: Exception, now: datetime) -> None:
+        """A failed stream send: the next waits (``_stream_send_due``); a
+        WARNING with the error's type for the first failure of a run, DEBUG
+        for the rest."""
+        self._stream_send_failed_at = now
+        self._stream_send_failures += 1
+        if self._stream_send_failures == 1:
+            LOG.warning("Schwab stream send failed (%s: %s): %s; no stream send is tried for %.0f s, nor while the "
+                        "stream is not active", type(exc).__name__, exc, what, STREAM_SEND_RETRY_SECONDS)
+        else:
+            LOG.debug("Schwab stream send failed again (%s: %s): %s; %d failures in a row", type(exc).__name__, exc,
+                      what, self._stream_send_failures)
+
+    def _stream_send_succeeded(self, what: str) -> None:
+        """A stream send went out: it ends a run of failures."""
+        if self._stream_send_failures:
+            LOG.info("Schwab stream send succeeded after %d failures: %s", self._stream_send_failures, what)
+        self._stream_send_failed_at = None
+        self._stream_send_failures = 0
+
     def start_streaming(self, symbols: Iterable[str]) -> None:
         # Lock only wraps state mutations — network I/O (stream.start/send)
         # is kept outside so the schwabdev callback thread (which reads this
@@ -1949,13 +2016,17 @@ class MarketDataStore:
         symbols = sorted({self._symbol_key(s) for s in set(symbols) if is_streamable_equity(s)})
         if not symbols:
             return
-        if not self.stream.active:
+        if not self._stream_running():
             with self._lock:
                 self.stream_start_requested_at = sessions.now_et()
                 self._stream_seen_symbols.clear()
                 self._stream_first_bar_time.clear()
             LOG.info("Starting Schwab stream for symbols: %s", symbols)
             self.stream.start(receiver=self.on_stream_message)
+            self._stream_thread = self.stream._thread
+        elif not self.stream.active:
+            LOG.debug("Schwab stream not active while its thread runs (reconnecting, or ending after a stop): no "
+                      "second stream started")
         wanted = set(symbols)
         with self._lock:
             current = set(self.stream_symbols)
@@ -1966,12 +2037,25 @@ class MarketDataStore:
                 self._stream_first_bar_time.pop(stale_symbol, None)
         add = sorted(wanted - current)
         remove = sorted(current - wanted)
-        if add:
-            req = self.stream.chart_equity(add, self.config.runtime.stream_fields, command="ADD" if current else "SUBS")
-            self.stream.send(req)
-        if remove:
-            req = self.stream.chart_equity(remove, self.config.runtime.stream_fields, command="UNSUBS")
-            self.stream.send(req)
+        if add or remove:
+            now = sessions.now_et()
+            if not self._stream_send_due(now):
+                return
+            command = "ADD" if current else "SUBS"
+            what = "CHART_EQUITY " + ", ".join(f"{name} of {len(keys)}" for name, keys in ((command, add),
+                                                                                         ("UNSUBS", remove)) if keys)
+            try:
+                if add:
+                    self.stream.send(self.stream.chart_equity(add, self.config.runtime.stream_fields, command=command))
+                if remove:
+                    self.stream.send(self.stream.chart_equity(remove, self.config.runtime.stream_fields,
+                                                              command="UNSUBS"))
+            except Exception as exc:
+                # ``stream_symbols`` keeps the subscription as it was, so the
+                # same change goes out at the next pass the send is due.
+                self._stream_send_failed(what, exc, now)
+                return
+            self._stream_send_succeeded(what)
         with self._lock:
             # Atomic replacement — Python attribute assignment is atomic, so
             # any lock-free reader (e.g. should_backfill_stream_symbol at
@@ -1981,9 +2065,17 @@ class MarketDataStore:
             self.stream_symbols = set(wanted)
 
     def stop_streaming(self) -> None:
-        if self.stream.active:
+        # In schwabdev's reconnect window ``active`` is False while its thread
+        # runs (_stream_running). A stop that checked ``active`` alone skipped
+        # it there, and the thread reconnected with the recorded subscriptions
+        # and its bars kept merging into ``live`` (until 2026-10-06).
+        thread = self.stream._thread
+        if self.stream.active or (thread is not None and thread.is_alive()):
             LOG.info("Stopping Schwab stream")
             self.stream.stop(clear_subscriptions=True)
+            if thread is not None and thread.is_alive():
+                LOG.warning("Schwab stream thread still running after the stop (schwabdev waits 5 s for it); no "
+                            "stream starts until it ends")
         with self._lock:
             self.stream_symbols.clear()
             self.stream_start_requested_at = None
