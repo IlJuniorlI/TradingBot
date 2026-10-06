@@ -276,13 +276,18 @@ class MarketDataStore:
             interval = max(interval, 900.0)
         return (now - last).total_seconds() >= interval
 
+    def _quote_ttl(self) -> float:
+        """The quote cache's TTL: ``runtime.quote_cache_seconds``, at least
+        1 s. A cached quote this old is fetched again by the engine's refresh
+        (``should_refresh_quote``)."""
+        return max(1.0, float(self.config.runtime.quote_cache_seconds))
+
     def should_refresh_quote(self, symbol: str) -> bool:
         key = self._symbol_key(symbol)
         last = self.last_quote_refresh.get(key)
         if last is None:
             return True
-        ttl = max(1.0, float(self.config.runtime.quote_cache_seconds))
-        return (sessions.now_et() - last).total_seconds() >= ttl
+        return (sessions.now_et() - last).total_seconds() >= self._quote_ttl()
 
     @staticmethod
     def _symbol_key(symbol: str) -> str:
@@ -1785,22 +1790,12 @@ class MarketDataStore:
                     fetched = raw_fetched
             fetched_at = sessions.now_et()
             for symbol, quote_payload in fetched.items():
-                normalized = self._normalize_quote(symbol, quote_payload)
-                normalized["fetched_at"] = fetched_at
-                with self._lock:
-                    self.quote_cache[symbol] = normalized
-                    self.last_quote_refresh[symbol] = fetched_at
-                out[symbol] = normalized
+                out[symbol] = self._store_rest_quote(symbol, self._normalize_quote(symbol, quote_payload), fetched_at)
                 batch_hits += 1
             fallback_targets = [symbol for symbol in chunk if symbol not in fetched]
             fallback_results, fallback_failed = self._parallel_quote_fetch(fallback_targets)
             for symbol, normalized in fallback_results.items():
-                fetched_at = sessions.now_et()
-                normalized["fetched_at"] = fetched_at
-                with self._lock:
-                    self.quote_cache[symbol] = normalized
-                    self.last_quote_refresh[symbol] = fetched_at
-                out[symbol] = normalized
+                out[symbol] = self._store_rest_quote(symbol, normalized, sessions.now_et())
                 fallback_hits += 1
             for symbol in fallback_failed:
                 failures += 1
@@ -1810,12 +1805,7 @@ class MarketDataStore:
 
         alias_results, alias_failed = self._parallel_quote_fetch(alias_pending)
         for symbol, normalized in alias_results.items():
-            fetched_at = sessions.now_et()
-            normalized["fetched_at"] = fetched_at
-            with self._lock:
-                self.quote_cache[symbol] = normalized
-                self.last_quote_refresh[symbol] = fetched_at
-            out[symbol] = normalized
+            out[symbol] = self._store_rest_quote(symbol, normalized, sessions.now_et())
             fallback_hits += 1
         for symbol in alias_failed:
             failures += 1
@@ -1839,6 +1829,18 @@ class MarketDataStore:
                 force_cooldown_hits,
             )
         return out
+
+    def _store_rest_quote(self, symbol: str, normalized: dict, fetched_at: datetime) -> dict:
+        """Cache one REST quote (``_normalize_quote``'s dict): stamped
+        ``fetched_at``, with the symbol's ``last_quote_refresh``, under the
+        store's lock. Every REST write of ``fetch_quotes`` (the batch, the
+        single-quote fallback, the alias fetch) goes through it, each with
+        its own ``fetched_at``. Returns the stored dict."""
+        normalized["fetched_at"] = fetched_at
+        with self._lock:
+            self.quote_cache[symbol] = normalized
+            self.last_quote_refresh[symbol] = fetched_at
+        return normalized
 
     def get_quote(self, symbol: str) -> dict | None:
         # Shallow copy is sufficient: callers only read top-level scalar keys

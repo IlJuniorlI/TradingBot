@@ -911,6 +911,22 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`MarketDataStore.fetch_quotes` writes every REST quote through one
+  helper, `_store_rest_quote`, and reads the quote TTL from `_quote_ttl`.**
+  *2026-10-06* — the batch, the single-quote fallback and the alias fetch
+  each stamped `fetched_at` and cached the quote and the symbol's
+  `last_quote_refresh` in a copy of the same block; they call the helper now,
+  each with its own `fetched_at`. `_quote_ttl()` is
+  `max(1, runtime.quote_cache_seconds)`, which `should_refresh_quote` computed
+  inline. No behavior change: the stream quotes' publication (the L1 cut)
+  builds on both.
+  - Identical: the 10-01 09:40-10:40 stepped replay (top_tier, a page open)
+    against 2d70ab2, in every category.
+  - Tests: `tests/market_data/test_quote_store.py` (new: the TTL and its
+    floor, a quote due at exactly the TTL, each REST path's stamp, the
+    helper's, a failed fetch leaving the cache as it was). 9 mutants, all
+    killed, each by its named test.
+
 - **The equity curve samples by time, not by pass
   (`paper.equity_point_seconds`, new, default 15).** *2026-10-05* — the
   engine samples the paper account once a pass (the idle entry below: the
