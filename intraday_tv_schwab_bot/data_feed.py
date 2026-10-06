@@ -113,9 +113,12 @@ STREAM_QUOTE_TRANSITION_QUIET_SECONDS = 300.0
 # outage still holds the engine loop for its request's whole retry chain
 # (schwabdev 4.0.0's Retry at the presets' `timeout: 10`): about 31 s when
 # reads time out, 43 s or more when connects time out (the full timeout for
-# each address the name resolves to), up to about 43 s for slow 5xx answers,
-# and longer when the name lookup hangs, which the timeout does not bound
-# (about 110 s a request on 2026-10-02). The back-off spaces those holds out.
+# each address the name resolves to), up to about 43 s for slow 5xx answers
+# (longer for a 429 or 503 that carries Retry-After: schwabdev's Retry keeps
+# urllib3's respect_retry_after_header=True, and urllib3 2.8.0 sleeps the
+# header's value, up to 6 hours, before each retry), and longer when the name
+# lookup hangs, which the timeout does not bound (about 110 s a request on
+# 2026-10-02). The back-off spaces those holds out.
 STREAM_QUOTE_SHADOW_BACKOFF_SECONDS = 60.0
 STREAM_QUOTE_SHADOW_BACKOFF_MAX_SECONDS = 900.0
 STREAM_QUOTE_SHADOW_SLOW_SECONDS = 2.0

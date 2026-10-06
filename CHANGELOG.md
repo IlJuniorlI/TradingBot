@@ -193,19 +193,22 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     loop for its request's whole retry chain (schwabdev 4.0.0's retries at
     the presets' `timeout: 10`): about 31 s when reads time out, 43 s or more
     when connects time out (each address the name resolves to gets the full
-    timeout), up to about 43 s for slow 5xx answers, and longer when the
-    name lookup hangs, which the timeout does not bound (about 110 s a
-    request on 10-02). The back-off spaces those holds out: in the first 15
-    minutes of an outage four checks at most. Off the engine thread it
-    would hold the engine's own REST requests, an exit's included, behind
-    schwabdev's one request lock. The fetch pool's single quotes hand their
-    outcomes to the engine thread, which folds a call's once its requests
-    are done, in the symbols' order (a pool request's own time includes its
-    wait for that lock, so the pool is judged slow by its average, never by
-    one request), and stores their quotes in that order. At 20 on 2.5-4 s
-    passes, one batch request every 50-80 s, about 300-470 a day; the
-    setting is revisited after the dry-run day. A check that raises
-    otherwise is logged with its type and never fails the pass.
+    timeout), up to about 43 s for slow 5xx answers (longer for a 429 or 503
+    that carries `Retry-After`: schwabdev's Retry keeps urllib3's
+    `respect_retry_after_header=True`, and urllib3 2.8.0 sleeps the header's
+    value, up to 6 hours, before each retry), and longer when the name
+    lookup hangs, which the timeout does not bound (about 110 s a request on
+    10-02). The back-off spaces those holds out: in the first 15 minutes of
+    an outage four checks at most. Off the engine thread it would hold the
+    engine's own REST requests, an exit's included, behind schwabdev's one
+    request lock. The fetch pool's single quotes hand their outcomes to the
+    engine thread, which folds a call's once its requests are done, in the
+    symbols' order (a pool request's own time includes its wait for that
+    lock, so the pool is judged slow by its average, never by one request),
+    and stores their quotes in that order. At 20 on 2.5-4 s passes, one
+    batch request every 50-80 s, about 300-470 a day; the setting is
+    revisited after the dry-run day. A check that raises otherwise is logged
+    with its type and never fails the pass.
   - Logs: `Quote refresh ... stream=N` (mode `stream` when no REST request
     was needed; the other modes as before;
     `source=engine:position_management_stream` for management's stream
@@ -225,13 +228,22 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     per process, `Schwab quote entitlement (first REST quote, SYM): ...`;
     the shadow's `Stream quote shadow: ...` lines (INFO, and a WARNING for
     a lagging book or a failed check).
-  - `runtime.stream_quotes` (new; `true` in every preset, right after
-    `quote_cache_seconds`, and by default): `true` or `false`, checked at
-    load; `false` subscribes nothing and every quote is REST, as before. Only
-    streamable equities are served: the 0DTE presets' refresh requests none
-    (`$VIX`, `$SPX`, `$COMPX`, `$RUT`, option legs), so there the switch only
-    subscribes their watchlist's equities (SPY, QQQ) and logs their lines,
-    and `serving 0 of N requested symbols` is expected.
+  - `runtime.stream_quotes` (new; `true` by default and in every preset but
+    the three below, right after `quote_cache_seconds`): `true` or `false`,
+    checked at load; `false` subscribes nothing and every quote is REST, as
+    before. Only streamable equities are served: the 0DTE presets' refresh
+    requests none (`$VIX`, `$SPX`, `$COMPX`, `$RUT`, option legs), so there
+    `true` would only subscribe their watchlist's equities (SPY, QQQ) and
+    log their lines, with `serving 0 of N requested symbols`.
+  - Three presets ship `stream_quotes: false`, with a comment line above the
+    key saying why: `small_cap_squeeze`, which would manage its premarket
+    positions from the books while the extended-hours LEVELONE_EQUITIES
+    fields' meanings are unproven and no broker stop rests before 09:30 (a
+    premarket dry run with the stream quotes reads its `Stream quote check`
+    and `Stream quote shadow` lines before they are turned on), and
+    `zero_dte_etf_options` and `zero_dte_etf_long_options`, whose quote
+    watchlist holds no streamable equity, so the stream would serve nothing
+    there.
   - `runtime.stream_quote_shadow_every` (new; `20` in every preset, right
     after `stream_quotes`, and by default): an integer of at least 0,
     checked at load; `0` turns the shadow off.
@@ -320,14 +332,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     after REST answers; `rest_s`; 0 off; the skip after an engine request
     that raised, answered 500 or took 2.5 s, its minute and its one line a
     run; a refused argument form no trouble; one request form a check,
-    stopping at the first chunk in trouble; the back-off's 60, 120, 240,
-    480 and 900 s when the check's request raises, answers 503 or takes
-    2.5 s, and its end at a REST answer, the engine's too, after which a
-    new run of skips logs again; a request in trouble restarting the wait,
-    a slow answer ending nothing; an undecodable body; the fetch pool's
-    trouble named in the symbols' order and judged by its average; a failed
-    check and a lock timeout never failing the pass); the tests of the store's
-    single-quote and batch helpers follow their new arguments
+    stopping at the first chunk in trouble, whether its request raised,
+    answered 503 or took 2.5 s; the back-off's 60, 120, 240, 480 and 900 s
+    when the check's request raises, answers 503 or takes 2.5 s, and its end
+    at a REST answer, the engine's too, after which a new run of skips logs
+    again; a request in trouble restarting the wait, a slow answer ending
+    nothing; an undecodable body; the fetch pool's trouble named in the
+    symbols' order and judged by its average; a failed check and a lock
+    timeout never failing the pass); the tests of the store's single-quote
+    and batch helpers follow their new arguments
     (`tests/foundation/test_schwab_api.py`,
     `tests/strategies/top_tier_adaptive/test_bug_regressions.py`,
     `tests/domain/test_config_validation.py`,
@@ -336,16 +349,19 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     beside the watchlist), `tests/composition/test_cycle_timing.py` (the
     shadow after the entries, in its own phase),
     `tests/domain/test_config_validation.py` and
-    `tests/guards/test_preset_parity.py` (the switch and the shadow's
-    count), `tests/guards/test_module_layering.py` (`stream_quotes` in the
+    `tests/guards/test_preset_parity.py` (the switch, off in the three
+    presets above, and the shadow's count),
+    `tests/guards/test_module_layering.py` (`stream_quotes` in the
     market-data layer, importing the standard library only);
     `tests/support/brokers.py`'s fake stream records schwabdev's
-    subscriptions and its fake streamer can hold a replay. 243 mutants (77
+    subscriptions and its fake streamer can hold a replay. 250 mutants (77
     for the subscription and the books, 35 for the serving, 30 for the
     checks, 18 for management's stream read, 9 for the entitlement line, 31
     for the shadow, 20 for the review's fixes to the books, the serving and
-    the checks, 23 for its fixes to the shadow and the entitlement line),
-    all killed, each by its named test.
+    the checks, 23 for its fixes to the shadow and the entitlement line, 7
+    for the final review's: the shadow's stop at a first chunk that answered
+    503 or slowly, and the switch's value and place in the presets), all
+    killed, each by its named test.
 
 - **Every engine pass and every management pass is on the record:
   CYCLE_TIMING, POSITION_MARK, the pass before on EXIT_CONTEXT and
