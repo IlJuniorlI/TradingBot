@@ -4830,6 +4830,58 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A malformed stream message no longer reconnects the stream: the
+  CHART_EQUITY receiver never raises into schwabdev, and a malformed bar is
+  dropped instead of merged.** *2026-10-06* — schwabdev 4.0.0 reads an
+  exception out of its receiver as a broken connection (`stream.py:133-136`):
+  it logs `Stream unknown exception`, tears the websocket down and reconnects
+  after its backoff, and every symbol's bars stop until the new connection
+  replays the subscriptions. `MarketDataStore.on_stream_message` raised on
+  any malformed CHART_EQUITY message: one that is not a JSON object, a `data`
+  packet or item that is not one, `content` that is not a list, a chart time
+  that is not epoch milliseconds. Two kinds of chart time raised nothing and
+  were merged into the 1m frame: ±2**63 ms, which parse to NaT (the row sorts
+  last, and every indicator read of the symbol's frame then raises on it),
+  and one past the message's receipt, which stays the frame's last bar from
+  then on (every later bar sorts before it, and the symbol's latest bar never
+  ages). None
+  of H:'s 72 logs (2026-05-01 to 10-02) shows a receiver exception: their one
+  `Stream unknown exception` (10-02 11:13:03) is schwabdev's own, on a failed
+  streamer-info fetch.
+  - Each item is now parsed on its own (`MarketDataStore._merge_chart_equity`,
+    new): a malformed one is dropped with a WARNING naming the error's type
+    (`Dropped a malformed CHART_EQUITY item (ValueError: ...): {...}`, the
+    item cut to 400 characters, `STREAM_LOG_TEXT_CHARS`), and the message's
+    other items and packets merge as they would without it. A message, `data`,
+    packet or `content` of the wrong type is dropped with a WARNING naming the
+    type it was. A chart time that parses to NaT, or that is more than 60 s
+    after the message's receipt (`STREAM_BAR_MAX_LEAD_SECONDS`: a bar is
+    stamped with its minute's start, so a real one is before its receipt; the
+    minute allows for a local clock behind Schwab's), is malformed. Anything
+    else that raises (a defect, not the data) is caught in
+    `on_stream_message` and logged at ERROR with its type; the stream stays
+    connected. The DEBUG line of a payload that is not JSON names the error's
+    type too.
+  - Unchanged: a well-formed message's bars and frames, the stale-candle
+    WARNING, an item with no symbol or chart time or whose symbol is not an
+    equity ticker (skipped without a word), and a field that is not a finite
+    number (read as 0.0).
+  - Identical: the 10-01 09:40-10:40 stepped replay (top_tier, a page open)
+    and the peer_confirmed_key_levels 05-04 09:40-10:40 window, against
+    2d70ab2, in every category.
+  - Tests: `tests/market_data/test_stream_receiver.py` (new): 27 malformed
+    shapes, each dropped with one WARNING naming it and nothing merged; a
+    malformed item or packet beside well-formed ones, which merge exactly as
+    without it; the silent skips as before; the 60 s bound at 60 and 61 s; an
+    injected merge defect caught at ERROR with its type, the store's lock
+    freed; the cut of a long item; the non-JSON DEBUG line. Through
+    schwabdev's own connection loop on a fake streamer (no network): a pin
+    that a receiver that raises makes schwabdev reconnect, and every
+    malformed shape in turn leaving the one connection up and the next
+    well-formed bar merged. `tests/support/brokers.py` gains `_FakeStreamer`
+    (schwabdev's websocket and streamer-info fetch, scripted). 22 mutants,
+    all killed, each by its named test.
+
 - **A symbol whose step frame or history-fetch decision cannot be built no
   longer fails the cycle.** *2026-09-28* — after the pooled frame map, the
   step read every watchlist symbol's frame again (`bars.setdefault(symbol,

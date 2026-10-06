@@ -72,6 +72,22 @@ DISPLAY_PRICE_KEYS = ("last", "mark", "mid", "close", "bid", "ask")
 # from the window on it stays cached for the day.
 DAILY_HISTORY_RETRY_SECONDS = 60.0
 
+# The longest a stream message, packet or item quoted in a log line gets.
+STREAM_LOG_TEXT_CHARS = 400
+
+# A CHART_EQUITY bar is stamped with its minute's start, so a real bar's
+# chart time is before its receipt; one stamped more than this after it is
+# malformed (the allowance covers a local clock up to a minute behind
+# Schwab's). Kept, such a bar would be the frame's last bar from then on:
+# every later bar sorts before it, and the symbol's latest bar never ages.
+STREAM_BAR_MAX_LEAD_SECONDS = 60.0
+
+
+def _stream_log_text(value: Any) -> str:
+    """``value``'s repr for a log line, cut to ``STREAM_LOG_TEXT_CHARS``."""
+    text = repr(value)
+    return text if len(text) <= STREAM_LOG_TEXT_CHARS else text[:STREAM_LOG_TEXT_CHARS] + "..."
+
 
 @dataclass(slots=True)
 class MergeStats:
@@ -1975,32 +1991,88 @@ class MarketDataStore:
             self._stream_first_bar_time.clear()
 
     def on_stream_message(self, message: str) -> None:
+        """schwabdev's receiver: each stream message, on the stream thread.
+
+        It never raises. schwabdev reads an exception out of its receiver as
+        a broken connection (schwabdev 4.0.0 ``stream.py:133-136``): it logs
+        "Stream unknown exception", tears the websocket down and reconnects
+        after its backoff, so every subscription's data stops until the new
+        connection replays them. A malformed item is dropped with a WARNING
+        naming the error's type (``_merge_chart_equity``); anything else that
+        raises (a defect, not the data) ends the message's handling there,
+        with an ERROR naming the type."""
         try:
             payload = json.loads(message)
-        except Exception:
-            LOG.debug("Ignoring non-json stream payload: %s", message)
+        except Exception as exc:
+            LOG.debug("Ignoring non-json stream payload (%s: %s): %s", type(exc).__name__, exc,
+                      _stream_log_text(message))
+            return
+        try:
+            self._merge_chart_equity(payload)
+        except Exception as exc:
+            LOG.error("Stream message handling failed (%s: %s); the rest of the message is dropped and the stream "
+                      "stays connected: %s", type(exc).__name__, exc, _stream_log_text(message))
+
+    def _merge_chart_equity(self, payload: Any) -> None:
+        """Merge one stream message's CHART_EQUITY bars into ``live``.
+
+        Each item is parsed on its own: a malformed one (an item that is not
+        a JSON object, a chart time that is not epoch milliseconds or is more
+        than ``STREAM_BAR_MAX_LEAD_SECONDS`` after the message's receipt) is
+        dropped with a WARNING naming the error's type, and the message's
+        other items merge as they would without it. A message that is not a
+        JSON object, ``data`` that is not a list, and a packet or ``content``
+        of the wrong type are dropped the same way. Until 2026-10-06 these
+        raised into schwabdev, which reconnected the stream, except the chart
+        times past the receipt and the two (+-2**63 ms) that parse to NaT,
+        which were merged into the frame. An item without a symbol or chart
+        time, or whose symbol is not an equity ticker, is skipped without a
+        word, as before."""
+        if not isinstance(payload, dict):
+            LOG.warning("Ignoring a stream message that is not a JSON object (%s): %s", type(payload).__name__,
+                        _stream_log_text(payload))
             return
         data = payload.get("data") or []
         if not data:
+            return
+        if not isinstance(data, list):
+            LOG.warning("Ignoring a stream message whose data is not a list (%s): %s", type(data).__name__,
+                        _stream_log_text(payload))
             return
         received_at = sessions.now_et()
         # Parse and merge outside the lock to avoid blocking the main bot loop.
         parsed_updates: list[tuple[str, pd.DataFrame, pd.Timestamp]] = []
         stale_symbols: list[tuple[str, pd.Timestamp]] = []
         for packet in data:
+            if not isinstance(packet, dict):
+                LOG.warning("Ignoring a stream data packet that is not a JSON object (%s): %s",
+                            type(packet).__name__, _stream_log_text(packet))
+                continue
             if packet.get("service") != "CHART_EQUITY":
                 continue
-            for item in packet.get("content", []):
-                bar = self._chart_item_to_row(item)
-                if bar is None:
-                    continue
-                symbol, ts, row = bar
-                cache_key = self._symbol_key(symbol)
-                if not self._is_fresh_stream_bar_timestamp(ts, now=received_at):
-                    stale_symbols.append((cache_key, ts))
-                    continue
-                new_df = pd.DataFrame([row], index=[ts])
-                parsed_updates.append((cache_key, new_df, pd.Timestamp(ts)))
+            content = packet.get("content", [])
+            if not isinstance(content, list):
+                LOG.warning("Ignoring a CHART_EQUITY packet whose content is not a list (%s): %s",
+                            type(content).__name__, _stream_log_text(packet))
+                continue
+            for item in content:
+                try:
+                    bar = self._chart_item_to_row(item)
+                    if bar is None:
+                        continue
+                    symbol, ts, row = bar
+                    cache_key = self._symbol_key(symbol)
+                    lead_seconds = (ts - received_at).total_seconds()
+                    if lead_seconds > STREAM_BAR_MAX_LEAD_SECONDS:
+                        raise ValueError(f"chart time {ts} is {lead_seconds:.0f} s after its receipt")
+                    if not self._is_fresh_stream_bar_timestamp(ts, now=received_at):
+                        stale_symbols.append((cache_key, ts))
+                        continue
+                    new_df = pd.DataFrame([row], index=[ts])
+                    parsed_updates.append((cache_key, new_df, pd.Timestamp(ts)))
+                except Exception as exc:
+                    LOG.warning("Dropped a malformed CHART_EQUITY item (%s: %s): %s", type(exc).__name__, exc,
+                                _stream_log_text(item))
         for cache_key, ts in stale_symbols:
             LOG.warning("Ignoring stale CHART_EQUITY candle for %s ts=%s", cache_key, ts)
         if not parsed_updates:
@@ -2034,6 +2106,11 @@ class MarketDataStore:
         if not STREAMABLE_EQUITY_RE.match(sym):
             return None
         ts = floor_minute(pd.to_datetime(int(ts_ms), unit="ms", utc=True).tz_convert(EXCHANGE_TZ))
+        if pd.isna(ts):
+            # +-2**63 ms parse to NaT without raising; a NaT row in ``live``
+            # sorts last, and every later indicator read of the symbol's
+            # frame raises on it.
+            raise ValueError(f"chart time {ts_ms!r} is not a timestamp")
         row = {
             "sequence": safe_float(item.get("1", 0.0), 0.0, finite=True),
             "open": safe_float(item.get("2", 0.0), 0.0, finite=True),
