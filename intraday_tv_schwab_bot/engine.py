@@ -1191,8 +1191,12 @@ class IntradayBot:
                 )
 
             # The stream quotes' REST shadow: after management and the entries,
-            # never in the quotes phase, so a REST request it waits on holds
-            # neither up (settled M4).
+            # never in the quotes phase. Its request runs on this thread: one
+            # that meets a REST outage holds this pass for its whole retry
+            # chain (about 31 s when reads time out at the presets'
+            # timeout: 10; 43 s or more when connects time out; longer when
+            # the name lookup hangs), and the shadow then waits 60 s, doubling
+            # to 15 minutes, until a REST quote request answers.
             timer.enter("shadow")
             self.data.run_stream_quote_shadow()
             timer.enter("htf_refresh")

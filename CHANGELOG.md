@@ -61,11 +61,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     counts even when another of its fields is rejected, so a snapshot (the
     only item that carries the flag) rejected for one field leaves its book
     to complete from the deltas that follow; net change and net percent
-    change are signed; data that names no symbol empties every book. A read copies the fresh books under the lock. The
-    receiver never raises into schwabdev, which would tear the websocket
-    down and reconnect (`stream.py:133-136`), CHART_EQUITY with it: a
-    failure past the per-item checks drops every book and logs an ERROR with
-    its type, and a failing log handler is swallowed.
+    change are signed; data that names no symbol empties every book. A read
+    copies the fresh books under the lock. The receiver never raises into
+    schwabdev, which would tear the websocket down and reconnect
+    (`stream.py:133-136`), CHART_EQUITY with it: a failure past the per-item
+    checks drops every book and logs an ERROR with its type, and a failing log
+    handler is swallowed.
   - Fresh: a symbol's book serves while it is subscribed, a login started
     the current epoch, its bid, ask, last and mark have arrived since its
     subscription in that epoch, Schwab marked it `"delayed": false`, and
@@ -94,25 +95,30 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     published quote, so the stream's when it served (a quote that aged past
     `quote_cache_seconds` within the pass is read from the stream's book
     when the stream serves the symbol, and refreshed by a forced REST fetch
-    otherwise: see Management); a live exit's re-sends, the startup restore
-    and option quotes from forced REST quotes. When a forced fetch fails (or
+    otherwise; with no cached quote and no fresh book, the bar close as
+    before: see Management); a live exit's re-sends, the startup restore and
+    option quotes from forced REST quotes. When a forced fetch fails (or
     skips a blacklisted symbol), its reader takes a cached quote younger than
     `quote_cache_seconds`, as before; since the stream quotes that is usually
     the stream's, so the fetch logs one WARNING per such symbol, `Forced quote
     fetch failed for SYM (source=...); the cached rest|stream quote, N s old,
     stands in for it (limit M s)`; none for a cached quote too old for the
     reader.
-  - Management reads the stream first (settled U3): a position whose quote
-    aged past `quote_cache_seconds` within the pass (the HTF refresh before
+  - Management reads the stream first: a position whose quote aged past
+    `quote_cache_seconds` within the pass (the HTF refresh before
     management, a live entry's settle, an earlier position's exit
     re-sends), or that has none cached, is read from its symbol's book when
     the stream serves it (`MarketDataStore.stream_quote_fresh`, new: the
     publication's freshness for one symbol, False with the switch off; it
     logs no transition, and a lock timeout or a failure answers False): a
     non-forced refresh, `source=engine:position_management_stream`,
-    publishes the book, and the management snapshot prices from it. The
-    forced REST refresh (`engine:position_management_snapshot`) runs,
-    unchanged, only when the quote is still stale after that. The stream
+    publishes the book, and the management snapshot prices from it. That
+    one-symbol refresh can log the stream's live/silent change and the
+    health line too (`serving 1 of 1 requested symbols`). The forced REST
+    refresh (`engine:position_management_snapshot`) runs, unchanged, only
+    when an aged cached quote is still stale after that; with no cached
+    quote and no fresh book the snapshot prices from the bar close, as
+    before. The stream
     read is wrapped: a failure is logged with its type (`Management's stream
     quote read for SYM failed (TYPE: ...); the forced REST refresh decides`,
     WARNING at most once a minute, DEBUG between) and the forced refresh
@@ -143,7 +149,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     start over at each line; one that fails is logged and the refresh goes
     on. What the dry-run day reads for the heartbeat cadence, the data rate
     and the quiet periods.
-  - The entitlement line (settled L8): once per process, the first REST
+  - The entitlement line: once per process, the first REST
     quote of a streamable equity logs `Schwab quote entitlement (first REST
     quote, SYM): realtime=... quoteType=... top_keys=[...] quote_keys=[...]
     reference_keys=[...]`, what Schwab says the account's equity quotes are
@@ -153,32 +159,53 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     values, so it never is the line, nor is a stream quote. The dry-run day
     reads `realtime=True`, and `netPercentChange` among the quote keys: the
     name the stream's adapter gives field 42 (the percent change itself
-    stays as it is, queued with critique H1's evidence).
-  - The REST shadow (settled Q2, with M4's fix), the standing check that a
-    book is not frozen: every `runtime.stream_quote_shadow_every`-th
-    publication of stream quotes, the engine, once management and the
-    entries ran (`MarketDataStore.run_stream_quote_shadow`; never in the
-    quotes phase; CYCLE_TIMING times it as `shadow`, between `entries` and
-    `publish`), fetches the symbols the stream served since the last check
-    by REST in uncached batches and compares the books, read right after
-    REST answers: `Stream quote shadow: checked=K of N served symbols (epoch
-    E) lagging=... rest_missing=... not_fresh=... differ=...
-    max_abs_d_bid=... max_abs_d_ask=... max_abs_d_last=... max_abs_d_mark=...
-    max_lag_ms=... rest_s=...` (INFO; each largest stream-minus-REST
+    stays as it is: `_normalize_quote` reads `netPercentChangeInDouble` and
+    `percentChange`, neither of which Schwab's quotes carry; queued).
+  - The REST shadow, the standing check that a book is not frozen: every
+    `runtime.stream_quote_shadow_every`-th publication of stream quotes,
+    the engine, once management and the entries ran
+    (`MarketDataStore.run_stream_quote_shadow`; never in the quotes phase;
+    CYCLE_TIMING times it as `shadow`, between `entries` and `publish`),
+    fetches the symbols the stream served since the last check by REST, one
+    uncached `quotes` batch per `quote_batch_size` chunk and no other form,
+    and compares the books, read right after REST answers: `Stream quote
+    shadow: checked=K of N served symbols (epoch E) lagging=...
+    rest_missing=... not_fresh=... differ=... max_abs_d_bid=...
+    max_abs_d_ask=... max_abs_d_last=... max_abs_d_mark=... max_lag_ms=...
+    rest_s=...` (INFO; each largest stream-minus-REST
     difference with its symbol when it is not zero, the lag REST's
     `quoteTime` minus the book's field 34). A book whose quote time lags
     REST's by more than `quote_cache_seconds` is dropped and REST's quote
     cached in its place (`Stream quote shadow: SYM lags REST by N ms ...`,
     WARNING), so a frozen book is neither published nor served from the
     cache; it serves again once its bid, ask, last and mark arrive again.
-    Within 60 s of a REST quote request (the refresh's, a forced fetch's or
-    the shadow's own) that raised, answered a non-2xx status or took longer
-    than 2 s, it skips, logged once per run of skips (`Stream quote shadow:
-    skipped while REST quotes are in trouble (...)`), and checks at the
-    first pass after: in a REST outage it adds no request to wait out. At 20
-    on 2.5-4 s passes, one batch request every 50-80 s, about 300-470 a day;
-    the setting is revisited after the dry-run day. A failed check is logged
-    with its type and never fails the pass.
+    After a REST quote request in trouble (the refresh's, a forced fetch's
+    or the shadow's own; one that raised, answered a non-2xx status or took
+    longer than 2 s) it skips for 60 s from it, doubled for each further
+    check of its own in trouble, at most 15 minutes, logged once per run of
+    skips (`Stream quote shadow: skipped while REST quotes are in trouble
+    (...); it checks N s after the last such request`); a call whose
+    requests all answered 2xx within 2 s ends the back-off. A check whose
+    request is in trouble stops at that chunk, compares nothing and logs
+    one WARNING (`Stream quote shadow: the check of N served symbols failed
+    (...) after X s; it checks W s after the last such request`). The check
+    runs on the engine thread, so one that meets a REST outage holds the
+    loop for its request's whole retry chain (schwabdev 4.0.0's retries at
+    the presets' `timeout: 10`): about 31 s when reads time out, 43 s or more
+    when connects time out (each address the name resolves to gets the full
+    timeout), up to about 43 s for slow 5xx answers, and longer when the
+    name lookup hangs, which the timeout does not bound (about 110 s a
+    request on 10-02). The back-off spaces those holds out: in the first 15
+    minutes of an outage four checks at most. Off the engine thread it
+    would hold the engine's own REST requests, an exit's included, behind
+    schwabdev's one request lock. The fetch pool's single quotes hand their
+    outcomes to the engine thread, which folds a call's once its requests
+    are done, in the symbols' order (a pool request's own time includes its
+    wait for that lock, so the pool is judged slow by its average, never by
+    one request), and stores their quotes in that order. At 20 on 2.5-4 s
+    passes, one batch request every 50-80 s, about 300-470 a day; the
+    setting is revisited after the dry-run day. A check that raises
+    otherwise is logged with its type and never fails the pass.
   - Logs: `Quote refresh ... stream=N` (mode `stream` when no REST request
     was needed; the other modes as before;
     `source=engine:position_management_stream` for management's stream
@@ -196,7 +223,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (epoch N)`; WARNINGs for a delayed symbol and a rejected item (once per
     symbol and epoch, DEBUG after) and for data that names no symbol; once
     per process, `Schwab quote entitlement (first REST quote, SYM): ...`;
-    the shadow's `Stream quote shadow: ...` lines.
+    the shadow's `Stream quote shadow: ...` lines (INFO, and a WARNING for
+    a lagging book or a failed check).
   - `runtime.stream_quotes` (new; `true` in every preset, right after
     `quote_cache_seconds`, and by default): `true` or `false`, checked at
     load; `false` subscribes nothing and every quote is REST, as before. Only
@@ -224,7 +252,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     signals, positions, events, frames, the dashboard and the cached
     quotes. Timed in real time (10-01 from 10:43, three runs of 120 s each
     way, a page open, the harness streaming L1, against the same tree with
-    `stream_quotes: false`; settled M5's gate, at most +0.10 s): the median
+    `stream_quotes: false`; the gate was at most +0.10 s): the median
     pass 0.531 s to 0.576 s (+0.045 s), the mean 0.633 s to 0.628 s (no REST
     batch on one pass in three, every watched pass rebuilding the
     dashboard's snapshots: publish +0.03 s), the median management gap
@@ -277,19 +305,33 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     fakes a position manager reads (`tests/runtime/test_exit_reprice.py`,
     `tests/runtime/test_quote_price_reads.py`, `tests/domain/test_asset_type.py`)
     gain `stream_quote_fresh`;
-    `tests/market_data/test_quote_entitlement.py` (new: the line once, from
-    a batch or a single quote, at WARNING unless `realtime` is true, never
-    from an index's, an option's or a stream quote, a payload without its
-    sections);
+    `tests/market_data/test_quote_entitlement.py` (new: the line once, a
+    WARNING too, from a batch or a single quote, at WARNING unless
+    `realtime` is true, never from an index's, an option's or a stream
+    quote, a payload without its sections; the fetch pool's quotes stored in
+    the symbols' order whichever thread finishes first);
     `tests/market_data/test_stream_quote_shadow.py` (new: every N-th
     publication checked after the pass, never in the quotes phase, nothing
-    cached; a lagging book dropped and REST's quote cached until its fields
-    arrive again; the limit; differences without quote times; symbols REST
-    lacks or the stream no longer serves; the books read after REST
-    answers; 0 off; the skip after a request that raised, answered 500 or
-    took 2.5 s, its minute and its one line a run; a refused argument form
-    no trouble; the shadow's own failed request; a failed check and a lock
-    timeout never failing the pass);
+    cached, every symbol served since the last check, REST-only refreshes
+    no publication; a lagging book dropped and REST's quote cached, before
+    the drop, until its fields arrive again; a book newer than REST kept;
+    the limit; differences without quote times, a quote time that is a
+    bool; symbols REST lacks or the stream no longer serves; the books read
+    after REST answers; `rest_s`; 0 off; the skip after an engine request
+    that raised, answered 500 or took 2.5 s, its minute and its one line a
+    run; a refused argument form no trouble; one request form a check,
+    stopping at the first chunk in trouble; the back-off's 60, 120, 240,
+    480 and 900 s when the check's request raises, answers 503 or takes
+    2.5 s, and its end at a REST answer, the engine's too, after which a
+    new run of skips logs again; a request in trouble restarting the wait,
+    a slow answer ending nothing; an undecodable body; the fetch pool's
+    trouble named in the symbols' order and judged by its average; a failed
+    check and a lock timeout never failing the pass); the tests of the store's
+    single-quote and batch helpers follow their new arguments
+    (`tests/foundation/test_schwab_api.py`,
+    `tests/strategies/top_tier_adaptive/test_bug_regressions.py`,
+    `tests/domain/test_config_validation.py`,
+    `tests/analysis/test_silent_excepts_data_levels.py`);
     `tests/composition/test_cycle_symbol_maps.py` (the held equity streamed
     beside the watchlist), `tests/composition/test_cycle_timing.py` (the
     shadow after the entries, in its own phase),
@@ -298,11 +340,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     count), `tests/guards/test_module_layering.py` (`stream_quotes` in the
     market-data layer, importing the standard library only);
     `tests/support/brokers.py`'s fake stream records schwabdev's
-    subscriptions and its fake streamer can hold a replay. 220 mutants (77
+    subscriptions and its fake streamer can hold a replay. 243 mutants (77
     for the subscription and the books, 35 for the serving, 30 for the
     checks, 18 for management's stream read, 9 for the entitlement line, 31
     for the shadow, 20 for the review's fixes to the books, the serving and
-    the checks), all killed, each by its named test.
+    the checks, 23 for its fixes to the shadow and the entitlement line),
+    all killed, each by its named test.
 
 - **Every engine pass and every management pass is on the record:
   CYCLE_TIMING, POSITION_MARK, the pass before on EXIT_CONTEXT and
@@ -1131,8 +1174,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `last_quote_refresh` in a copy of the same block; they call the helper now,
   each with its own `fetched_at`. `_quote_ttl()` is
   `max(1, runtime.quote_cache_seconds)`, which `should_refresh_quote` computed
-  inline. No behavior change: the stream quotes' publication (the L1 cut)
-  builds on both.
+  inline. No behavior change: the publication of stream quotes (under
+  Added) builds on both.
   - Identical: the 10-01 09:40-10:40 stepped replay (top_tier, a page open)
     against 2d70ab2, in every category.
   - Tests: `tests/market_data/test_quote_store.py` (new: the TTL and its

@@ -475,11 +475,17 @@ class RuntimeConfig:
     # The stream quotes' REST shadow (MarketDataStore.run_stream_quote_shadow;
     # 2026-10-06): every N-th publication of stream quotes, once management
     # and the entries ran, the symbols the stream served since the last check
-    # are fetched by REST in one uncached batch and compared with their books;
-    # a book whose quote time lags REST's by more than quote_cache_seconds is
-    # dropped and REST's quote cached in its place. It skips for 60 s after a
-    # REST quote request that failed or took longer than 2 s. 0 turns it off.
-    # An integer of at least 0, checked at load.
+    # are fetched by REST in uncached `quotes` batches (one per quote_batch_size
+    # chunk, no other request form, stopping at the first chunk in trouble) and
+    # compared with their books; a book whose
+    # quote time lags REST's by more than quote_cache_seconds is dropped and
+    # REST's quote cached in its place. After a REST quote request that failed
+    # or took longer than 2 s it waits 60 s, doubling with each further check
+    # of its own in trouble, at most 15 minutes, until a request answers. A
+    # check that meets a REST outage holds the loop for its request's retry
+    # chain (about 31 s when reads time out at timeout: 10, longer for connect
+    # timeouts and hanging name lookups). 0 turns it off. An integer of at
+    # least 0, checked at load.
     stream_quote_shadow_every: int = 20
     quote_batch_size: int = 50
     history_lookback_minutes: int = 390

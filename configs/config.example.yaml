@@ -144,7 +144,10 @@ runtime:
   stream_quotes: true
   # The stream quotes' REST shadow: every N-th publication, after management
   # and the entries, the served symbols' books are compared with one REST
-  # batch; a book whose quote time lags REST's is dropped. 0 turns it off.
+  # batch; a book whose quote time lags REST's by more than
+  # quote_cache_seconds is dropped. After a REST quote request in trouble it
+  # waits 60 s, doubling to 15 minutes while its own checks fail. 0 turns it
+  # off.
   stream_quote_shadow_every: 20
   quote_batch_size: 50
   history_lookback_minutes: 780

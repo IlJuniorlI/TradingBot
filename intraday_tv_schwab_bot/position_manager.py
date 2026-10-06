@@ -231,8 +231,9 @@ class PositionManager:
         position's exit re-sends), or none cached, is read from the stream's
         book first when the stream serves the symbol
         (``_read_management_stream_quote``); the forced REST refresh runs
-        only when the quote is still stale after that (settled U3). The
-        snapshot's bid, ask and last are what an exit it decides is priced
+        only when an aged cached quote is still stale after that, and with no
+        cached quote and no fresh book the price is the bar close, as before.
+        The snapshot's bid, ask and last are what an exit it decides is priced
         from (``SchwabExecutor.submit_equity_exit``)."""
         mark = self.strategy.position_mark_price(position, self.data)
         if mark is not None:
