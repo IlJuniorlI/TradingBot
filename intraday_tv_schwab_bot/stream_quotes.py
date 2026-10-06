@@ -179,11 +179,15 @@ class StreamQuoteBook:
 
     ``values`` holds the kept fields by L1 id; ``delayed`` the last
     ``"delayed"`` flag seen (None before any); ``announced`` whether the
-    first-complete line was logged."""
+    first-complete line was logged; ``item_at`` the receipt time of the last
+    item merged into it (a drop keeps it), which the REST shadow's lag
+    warning names, so the log tells a book that stopped receiving items from
+    one whose quote time alone stood still."""
 
     values: dict[str, Any] = field(default_factory=dict)
     delayed: bool | None = None
     announced: bool = False
+    item_at: datetime | None = None
 
     @property
     def complete(self) -> bool:
@@ -261,16 +265,19 @@ def _gap(previous: datetime | None, now: datetime) -> float:
 @dataclass(frozen=True, slots=True)
 class StreamQuoteRead:
     """One read of the books: ``books`` holds a copy of the values of each
-    requested symbol that is fresh; ``at`` is the receipt time of the last
-    LEVELONE_EQUITIES data message of this epoch (None before any); ``live``
-    whether that is within the read's limit; ``epoch`` the LOGIN responses
-    seen; ``subscribed`` how many symbols are subscribed."""
+    requested symbol that is fresh, and ``item_at`` the receipt time of the
+    last item merged into each of those books (``StreamQuoteBook.item_at``);
+    ``at`` is the receipt time of the last LEVELONE_EQUITIES data message of
+    this epoch (None before any); ``live`` whether that is within the read's
+    limit; ``epoch`` the LOGIN responses seen; ``subscribed`` how many
+    symbols are subscribed."""
 
     books: dict[str, dict[str, Any]]
     at: datetime | None
     live: bool
     epoch: int
     subscribed: int
+    item_at: dict[str, datetime] = field(default_factory=dict)
 
 
 class StreamQuoteState:
@@ -433,12 +440,16 @@ class StreamQuoteState:
             at = self._last_data_at
             live = self._epoch >= 1 and at is not None and (now - at).total_seconds() < ttl
             books: dict[str, dict[str, Any]] = {}
+            item_at: dict[str, datetime] = {}
             if live:
                 for symbol in symbols:
                     book = self._books.get(symbol)
                     if book is not None and book.complete:
                         books[symbol] = dict(book.values)
-            return StreamQuoteRead(books=books, at=at, live=live, epoch=self._epoch, subscribed=len(self._symbols))
+                        if book.item_at is not None:      # always, on a complete book: for the type
+                            item_at[symbol] = book.item_at
+            return StreamQuoteRead(books=books, at=at, live=live, epoch=self._epoch, subscribed=len(self._symbols),
+                                   item_at=item_at)
 
     # ------------------------------------------------------------ stream thread
     def on_message(self, payload: Any, now: datetime) -> None:
@@ -548,9 +559,9 @@ class StreamQuoteState:
                 lag = now.timestamp() * 1000.0 - stamp
                 period.max_lag_ms = lag if period.max_lag_ms is None else max(period.max_lag_ms, lag)
             for item in content:
-                self._on_item_locked(item, lines)
+                self._on_item_locked(item, now, lines)
 
-    def _on_item_locked(self, item: Any, lines: list) -> None:
+    def _on_item_locked(self, item: Any, now: datetime, lines: list) -> None:
         symbol = _item_symbol(item)
         if symbol is None:
             # A missed delta could leave any book stale.
@@ -580,6 +591,7 @@ class StreamQuoteState:
                                    "Stream quotes: %s item rejected (%s: %s); its book waits for its fields again",
                                    (symbol, type(exc).__name__, exc))
             return
+        book.item_at = now
         if book.delayed is True and not was_delayed:
             self._warn_once_locked(symbol, "delayed", lines, "Stream quotes: %s is delayed; its quotes stay on REST",
                                    (symbol,))

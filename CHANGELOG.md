@@ -5199,6 +5199,21 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The REST shadow's lag warning names the book's last item and its own
+  prices against REST's.** *2026-10-06* — H:'s first stream-quotes day
+  logged 14 `Stream quote shadow: SYM lags REST by N ms` warnings (6-21 s, on
+  AMD, MSFT, AMZN, ORCL and others) while the stream delivered about one
+  packet a second, but nothing said whether a lagging book had stopped
+  receiving items (frozen) or only its quote time had stood still. Each book
+  now records when its last item merged (`StreamQuoteBook.item_at`, kept by a
+  drop; `StreamQuoteRead.item_at` for the served books), and the warning adds
+  `its last item N s before this check; stream minus REST: bid ... ask ...
+  last ... mark ...`: an old item with prices apart is a book that stopped
+  receiving items, prices equal a current book whose quote time alone stood
+  still. The warnings are logged even when the drop meets a lock timeout
+  (whose reset replaces every book), where they were lost. Nothing is served
+  or dropped differently.
+
 - **The dashboard's symbol cards show the current entry state when no entry
   cycle runs, the API rates read right after a start, and a stream- or
   cache-served `Quote refresh` line is DEBUG.**

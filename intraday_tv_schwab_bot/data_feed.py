@@ -2331,7 +2331,7 @@ class MarketDataStore:
         read = self.stream_quotes.read(symbols, now, ttl)
         largest: dict[str, tuple[float, str]] = {}
         max_lag: tuple[int, str] | None = None
-        lagging: list[tuple[str, int, int, int, dict]] = []
+        lagging: list[tuple[str, int, int, int, dict, dict, datetime | None]] = []
         checked = rest_missing = not_fresh = differ = 0
         for symbol in symbols:
             payload = rest.get(symbol)
@@ -2359,17 +2359,42 @@ class MarketDataStore:
                 if max_lag is None or lag > max_lag[0]:
                     max_lag = (lag, symbol)
                 if lag > ttl * 1000.0:
-                    lagging.append((symbol, lag, int(stream_time), rest_time, normalized))
+                    # .get: a served book always has its time, and the
+                    # warning's diagnosis must never stand in the drop's way.
+                    lagging.append((symbol, lag, int(stream_time), rest_time, normalized, values,
+                                    read.item_at.get(symbol)))
         if lagging:
             # REST's quotes first: a lock timeout on the drop (which replaces
             # the books) leaves the cache holding them all the same.
-            for symbol, _lag, _stream_time, _rest_time, normalized in lagging:
+            for symbol, _lag, _stream_time, _rest_time, normalized, _values, _item_at in lagging:
                 self._store_rest_quote(symbol, normalized, now)
-            self.stream_quotes.drop([entry[0] for entry in lagging])
-            for symbol, lag, stream_time, rest_time, _normalized in lagging:
-                LOG.warning("Stream quote shadow: %s lags REST by %d ms (quote time %d against REST's %d, limit "
-                            "%.0f s); its book is dropped and REST's quote cached in its place, and it serves again "
-                            "once its bid, ask, last and mark arrive again", symbol, lag, stream_time, rest_time, ttl)
+
+            def _warn_lagging() -> None:
+                # The book's last item and its own prices against REST's tell
+                # a book that stopped receiving items (an old item, prices
+                # apart) from a current one whose quote time alone stood
+                # still (prices equal): the dry-run question of 2026-10-06.
+                # An item merged between this check's now and its read reads
+                # 0.0 s.
+                for symbol, lag, stream_time, rest_time, normalized, values, item_at in lagging:
+                    item_age = (f"{max(0.0, (now - item_at).total_seconds()):.1f} s" if item_at is not None
+                                else "na")
+                    gaps = " ".join(f"{name} {float(values[fid]) - float(normalized[name]):+.4f}"
+                                    for name, fid in (("bid", "1"), ("ask", "2"), ("last", "3"), ("mark", "33")))
+                    LOG.warning("Stream quote shadow: %s lags REST by %d ms (quote time %d against REST's %d, limit "
+                                "%.0f s; its last item %s before this check; stream minus REST: %s); its book is "
+                                "dropped and REST's quote cached in its place, and it serves again once its bid, ask, "
+                                "last and mark arrive again", symbol, lag, stream_time, rest_time, ttl, item_age, gaps)
+
+            try:
+                self.stream_quotes.drop([entry[0] for entry in lagging])
+            except StreamQuoteLockTimeout:
+                # The reset that follows replaces every book, so each is
+                # dropped all the same: the lines a stuck stream thread's day
+                # needs most.
+                _warn_lagging()
+                raise
+            _warn_lagging()
 
         def _largest(name: str) -> str:
             if name not in largest:
