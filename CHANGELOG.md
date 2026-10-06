@@ -132,6 +132,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     start over at each line; one that fails is logged and the refresh goes
     on. What the dry-run day reads for the heartbeat cadence, the data rate
     and the quiet periods.
+  - The entitlement line (settled L8): once per process, the first REST
+    quote of a streamable equity logs `Schwab quote entitlement (first REST
+    quote, SYM): realtime=... quoteType=... top_keys=[...] quote_keys=[...]
+    reference_keys=[...]`, what Schwab says the account's equity quotes are
+    and the names its payload carries (`none` for a section it lacks); INFO
+    when `realtime` is true, WARNING otherwise (a delayed entitlement, or a
+    payload without the flag). An index's or an option's quote names other
+    values, so it never is the line, nor is a stream quote. The dry-run day
+    reads `realtime=True`, and `netPercentChange` among the quote keys: the
+    name the stream's adapter gives field 42 (the percent change itself
+    stays as it is, queued with critique H1's evidence).
   - Logs: `Quote refresh ... stream=N` (mode `stream` when no REST request
     was needed; the other modes as before;
     `source=engine:position_management_stream` for management's stream
@@ -147,7 +158,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     heartbeat; `Stream quotes: first LEVELONE_EQUITIES item of epoch N:
     {...}`; `Stream quotes: first complete LEVELONE_EQUITIES book for SYM
     (epoch N)`; WARNINGs for a delayed symbol and a rejected item (once per
-    symbol and epoch, DEBUG after) and for data that names no symbol.
+    symbol and epoch, DEBUG after) and for data that names no symbol; once
+    per process, `Schwab quote entitlement (first REST quote, SYM): ...`.
   - `runtime.stream_quotes` (new; `true` in every preset, right after
     `quote_cache_seconds`, and by default): `true` or `false`, checked at
     load; `false` subscribes nothing and every quote is REST, as before.
@@ -163,7 +175,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Identical: the 10-01 09:40-10:40 stepped replay (top_tier, a page open)
     and the peer_confirmed_key_levels 05-04 09:40-10:40 window, no stream
     quote data, against 2d70ab2 in every category but the ` stream=0` every
-    `Quote refresh` line gains and every cached quote's `quote_source`.
+    `Quote refresh` line gains, every cached quote's `quote_source` and the
+    entitlement line at the first step (a WARNING: the harness's quote
+    carries no `realtime`).
   - README: `stream_quotes`, `quote_cache_seconds` and the runtime table.
   - Tests: `tests/market_data/test_stream_quotes.py` (new: the subscription,
     its revert and shared back-off, the service keys, the books, the epoch,
@@ -189,14 +203,18 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     fakes a position manager reads (`tests/runtime/test_exit_reprice.py`,
     `tests/runtime/test_quote_price_reads.py`, `tests/domain/test_asset_type.py`)
     gain `stream_quote_fresh`;
+    `tests/market_data/test_quote_entitlement.py` (new: the line once, from
+    a batch or a single quote, at WARNING unless `realtime` is true, never
+    from an index's, an option's or a stream quote, a payload without its
+    sections);
     `tests/composition/test_cycle_symbol_maps.py` (the held equity streamed
     beside the watchlist), `tests/domain/test_config_validation.py` and
     `tests/guards/test_preset_parity.py` (the switch);
     `tests/support/brokers.py`'s fake stream records schwabdev's
-    subscriptions and its fake streamer can hold a replay. 160 mutants (77
+    subscriptions and its fake streamer can hold a replay. 169 mutants (77
     for the subscription and the books, 35 for the serving, 30 for the
-    checks, 18 for management's stream read), all killed, each by its named
-    test.
+    checks, 18 for management's stream read, 9 for the entitlement line),
+    all killed, each by its named test.
 
 - **Every engine pass and every management pass is on the record:
   CYCLE_TIMING, POSITION_MARK, the pass before on EXIT_CONTEXT and

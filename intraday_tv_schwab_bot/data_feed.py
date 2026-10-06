@@ -228,6 +228,9 @@ class MarketDataStore:
         self._stream_quotes_live: bool | None = None
         self._stream_quote_transitions = 0
         self._stream_quote_transition_logged: dict[bool, datetime] = {}
+        # Whether the entitlement line (_log_quote_entitlement) was logged:
+        # once, from the first REST quote of a streamable equity.
+        self._quote_entitlement_logged = False
         self._lock = RLock()
         self.started_at = sessions.now_et()
         self._forced_premarket_history_refresh_date: dict[str, date] = {}
@@ -2073,14 +2076,41 @@ class MarketDataStore:
         ``fetched_at`` and ``quote_source`` "rest", with the symbol's
         ``last_quote_refresh``, under the store's lock. Every REST write of
         ``fetch_quotes`` (the batch, the single-quote fallback, the alias
-        fetch) goes through it, each with its own ``fetched_at``. Returns the
-        stored dict."""
+        fetch) goes through it, each with its own ``fetched_at``; the first
+        of a streamable equity logs the entitlement line
+        (``_log_quote_entitlement``). Returns the stored dict."""
         normalized["fetched_at"] = fetched_at
         normalized["quote_source"] = "rest"
         with self._lock:
             self.quote_cache[symbol] = normalized
             self.last_quote_refresh[symbol] = fetched_at
+        if not self._quote_entitlement_logged and is_streamable_equity(symbol):
+            self._log_quote_entitlement(symbol, normalized.get("raw"))
         return normalized
+
+    def _log_quote_entitlement(self, symbol: str, raw: Any) -> None:
+        """Once per store (the bot has one), from its first REST quote of a
+        streamable equity (settled L8: an index's or an option's payload
+        names other values): ``Schwab quote entitlement (first REST quote,
+        SYM): realtime=... quoteType=... top_keys=[...] quote_keys=[...]
+        reference_keys=[...]``, what Schwab says the account's equity quotes
+        are and the names its payload carries (the payload's own keys, its
+        ``quote`` section's and its ``reference`` section's: the names the
+        stream's adapter and ``_normalize_quote`` rely on, such as
+        ``netPercentChange``; ``none`` for a section the payload lacks). INFO
+        when ``realtime`` is True, WARNING otherwise (a delayed entitlement,
+        or a payload without the flag)."""
+        self._quote_entitlement_logged = True
+        payload = raw if isinstance(raw, Mapping) else {}
+
+        def keys(section: Any) -> str:
+            return f"[{','.join(sorted(str(key) for key in section))}]" if isinstance(section, Mapping) else "none"
+
+        realtime = payload.get("realtime")
+        LOG.log(logging.INFO if realtime is True else logging.WARNING,
+                "Schwab quote entitlement (first REST quote, %s): realtime=%s quoteType=%s top_keys=%s quote_keys=%s "
+                "reference_keys=%s", symbol, realtime, payload.get("quoteType"), keys(raw), keys(payload.get("quote")),
+                keys(payload.get("reference")))
 
     def get_quote(self, symbol: str) -> dict | None:
         # Shallow copy is sufficient: callers only read top-level scalar keys
