@@ -5110,6 +5110,69 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A stream reconnect no longer leaves the bars it missed out of the 1m
+  frames, and a stream backfill that fails waits before it asks again.**
+  *2026-10-06* — schwabdev reconnects inside its own thread with the same
+  subscriptions, and the bars that closed while it was down never reached
+  the 1m frames: on 2026-10-02 (reconnect 11:12:36-11:13:08) every symbol
+  lacked its 11:11 bar to the day's end. The first-bar backfill
+  (`should_backfill_stream_symbol`'s `price_history predates the first
+  CHART_EQUITY bar`) covered only a start.
+  - The store's receiver now notes each connection's ADMIN LOGIN response
+    (`MarketDataStore._note_stream_login`, whatever `stream_quotes` says;
+    schwabdev passes it before it replays the subscriptions, so before the
+    connection's first bar): every symbol seen since the start awaits its
+    first bar of the connection. When that bar is more than a minute after
+    the symbol's previous one, it re-arms the first-bar backfill, whose one
+    price_history fetch, cut after it, fills the gap (`price_history
+    predates the first CHART_EQUITY bar HH:MM; backfilling the gap [SYM]`,
+    INFO, then `Fetching price_history for SYM ...`). A reconnect within the
+    minute costs no request. The start's bookkeeping stays as it is: the
+    seen symbols (an entry's live-bar check does not wait for a first bar
+    again, and the unseen-symbol fallback stays shut) and the start's stamp
+    (the connect timeout's fallback is not re-armed).
+  - A 1m price_history request that raised did not advance
+    `last_history_refresh`, the backfill's throttle, so every branch of
+    `should_backfill_stream_symbol` asked again at the next pass: in an
+    outage every pass waited out each due symbol's request, one at a time on
+    schwabdev's request lock with its retries (about 31 s a request when
+    reads time out at the presets' `timeout: 10`), ahead of management. Now
+    a request that raises holds its symbol's stream backfill off for 60 s,
+    doubling with each further failure in a row up to 15 minutes
+    (`STREAM_BACKFILL_RETRY_SECONDS`, `STREAM_BACKFILL_RETRY_MAX_SECONDS`;
+    in `_stream_history_due`, which every branch asks), logged once per run
+    of failures: `price_history for SYM failed (TYPE: ...); its stream
+    backfill waits 60 s, doubling while it fails (at most 900 s)` (WARNING),
+    DEBUG for the rest, and `price_history for SYM answered again after N
+    failure(s) in a row` (INFO). The engine still names each failure
+    (`History fetch failed for SYM ...`).
+  - The reconnect window's fallback (`Schwab stream still inactive after
+    20s; falling back to price_history`) fires while the stream reconnects
+    when a subscribed symbol has had no bar since the start (an illiquid
+    premarket name, small_cap's case): the start's stamp stays set until
+    every symbol printed. On top_tier every symbol prints by 09:31, so it
+    does not fire there mid-day. A failed fallback now waits as above
+    instead of asking again every pass.
+  - Replays: the 10-01 09:40-10:40 stepped replay (top_tier, a page open)
+    and the peer_confirmed_key_levels 05-04 09:40-10:40 window, without
+    stream quote data and with the harness streaming LEVELONE_EQUITIES, are
+    as before this change in every category (the harness's logins come
+    before any missed bar, and its price_history never fails).
+  - README: `stream_connect_timeout_seconds`, `stream_fallback_poll_seconds`.
+  - Tests: `tests/market_data/test_stream_reconnect_bars.py` (new): a
+    reconnect that missed a bar backfills it once, with the stream quotes on
+    and off, keeping the seen symbols, the start's stamp and the live-bar
+    check; a bar sent again after the login leaves the symbol waiting; a
+    reconnect within the minute and a quiet symbol's later gap fetch
+    nothing; the symbols awaiting their reconnect bar stay seen ones
+    through a watchlist change, a prune, a restart and a stop; a login note
+    that fails never raises and the message's bars still merge; a failed
+    backfill waits 60, 120, 240, 480 and 900 s, logged once a run; every
+    branch waits; the prune drops a symbol's failures.
+    `tests/market_data/test_stream_lifecycle.py`: idle stops after a stop
+    that could not join its thread call nothing and log nothing. 26
+    mutants, all killed, each by its named test.
+
 - **One stream thread: a pass inside schwabdev's reconnect window no longer
   starts a second stream, a stop there stops it, and a failed subscription
   send no longer fails the pass.** *2026-10-06* — schwabdev 4.0.0's
@@ -5136,10 +5199,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     to come up falls back to `price_history` as that setting says (the
     re-stamp held the fallback off unless a pass outlasted the timeout). The
     clearing also made the first bar after a reconnect fetch the bars the
-    outage cost, but only when a pass happened to land in the window;
-    without it a reconnect's missing bars stay missing, as they did on 10-02
-    (every symbol's 11:11 bar, to the day's end). Fetching them after every
-    reconnect's login is queued.
+    outage cost, but only when a pass happened to land in the window, as it
+    did not on 10-02 (every symbol's 11:11 bar missing to the day's end);
+    each reconnect's login now re-arms that backfill (the entry above).
   - `stop_streaming` stopped the stream only while `active`: in the window
     it did nothing, and schwabdev's thread reconnected with the recorded
     subscriptions and kept merging bars into `live`. It now stops it
@@ -5219,11 +5281,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     type it was. A chart time that parses to NaT, or that is more than 60 s
     after the message's receipt (`STREAM_BAR_MAX_LEAD_SECONDS`: a bar is
     stamped with its minute's start, so a real one is before its receipt; the
-    minute allows for a local clock behind Schwab's), is malformed. Anything
-    else that raises (a defect, not the data) is caught in
-    `on_stream_message` and logged at ERROR with its type; the stream stays
-    connected. The DEBUG line of a payload that is not JSON names the error's
-    type too.
+    minute allows for a local clock behind Schwab's), is malformed. The
+    per-item catch also wraps the parse's own code, so a defect there drops
+    the item the same way (a WARNING per item); anything else that raises (a
+    defect outside the per-item code) is caught in `on_stream_message` and
+    logged at ERROR with its type; the stream stays connected. The DEBUG line
+    of a payload that is not JSON names the error's type too.
   - Unchanged: a well-formed message's bars and frames, the stale-candle
     WARNING, an item with no symbol or chart time or whose symbol is not an
     equity ticker (skipped without a word), and a field that is not a finite

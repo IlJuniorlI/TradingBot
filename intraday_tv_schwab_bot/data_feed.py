@@ -88,6 +88,14 @@ STREAM_LOG_TEXT_CHARS = 400
 # nor while the stream is not active (``MarketDataStore._stream_send_due``).
 STREAM_SEND_RETRY_SECONDS = 60.0
 
+# A 1m price_history request that raised (``MarketDataStore.fetch_history``)
+# holds the stream backfill of its symbol off (``_stream_history_due``, every
+# branch of ``should_backfill_stream_symbol``) for this long, doubling with
+# each further failure in a row up to STREAM_BACKFILL_RETRY_MAX_SECONDS; a
+# request that answers ends the run.
+STREAM_BACKFILL_RETRY_SECONDS = 60.0
+STREAM_BACKFILL_RETRY_MAX_SECONDS = 900.0
+
 # A stream quote transition (live to silent, or back) is logged at WARNING
 # (silent) or INFO (live) unless one of its kind was logged that loudly this
 # long before; then at DEBUG (settled L6: flaps in quiet periods).
@@ -134,6 +142,14 @@ def _stream_log_text(value: Any) -> str:
     """``value``'s repr for a log line, cut to ``STREAM_LOG_TEXT_CHARS``."""
     text = repr(value)
     return text if len(text) <= STREAM_LOG_TEXT_CHARS else text[:STREAM_LOG_TEXT_CHARS] + "..."
+
+
+def _backfill_retry_seconds(failures: int) -> float:
+    """How long the stream backfill of a symbol waits after the
+    ``failures``-th failed price_history request in a row:
+    ``STREAM_BACKFILL_RETRY_SECONDS``, doubled for each failure after the
+    first, at most ``STREAM_BACKFILL_RETRY_MAX_SECONDS``."""
+    return min(STREAM_BACKFILL_RETRY_MAX_SECONDS, STREAM_BACKFILL_RETRY_SECONDS * 2.0 ** min(failures - 1, 16))
 
 
 @dataclass(slots=True)
@@ -222,10 +238,23 @@ class MarketDataStore:
         self.stream_start_requested_at: datetime | None = None
         self._stream_seen_symbols: set[str] = set()
         # Timestamp of each symbol's first CHART_EQUITY bar since the stream
-        # (re)started or the symbol was (re)subscribed. History fetched before
-        # that bar leaves a hole up to it; should_backfill_stream_symbol
-        # refetches once to close it.
+        # (re)started or the symbol was (re)subscribed, or of its first bar
+        # after a reconnect that missed bars. History fetched before that bar
+        # leaves a hole up to it; should_backfill_stream_symbol refetches once
+        # to close it.
         self._stream_first_bar_time: dict[str, pd.Timestamp] = {}
+        # The seen symbols whose first CHART_EQUITY bar since the stream's
+        # last ADMIN LOGIN response (each connection, schwabdev's reconnects
+        # included: _note_stream_login) has not arrived yet. When that bar is
+        # more than a minute after the symbol's previous one, the bars between
+        # closed while the stream was down, and _merge_chart_equity re-arms the
+        # first-bar backfill to fetch them. Always a subset of
+        # _stream_seen_symbols.
+        self._stream_awaiting_reconnect_bar: set[str] = set()
+        # The 1m price_history requests that raised, per symbol: the last
+        # failure's time and how many in a row (fetch_history); the stream
+        # backfill waits after them (_stream_history_due).
+        self._history_fetch_failures: dict[str, tuple[datetime, int]] = {}
         self.last_stream_health_log: dict[str, datetime] = {}
         # The thread of this store's last Stream.start (schwabdev's private
         # Stream._thread, read right after it): see _stream_running.
@@ -397,6 +426,8 @@ class MarketDataStore:
             stale = {sym for sym in self.history.keys() if sym not in active}
             stale |= {sym for sym in self.live.keys() if sym not in active}
             stale |= {sym for sym in self.quote_cache.keys() if sym not in active}
+            # A symbol whose every price_history request failed has no history.
+            stale |= {sym for sym in self._history_fetch_failures if sym not in active}
             if not stale:
                 return 0
             # Single-key dicts
@@ -417,6 +448,8 @@ class MarketDataStore:
                 self.merge_stats.pop(sym, None)
                 self._stream_seen_symbols.discard(sym)
                 self._stream_first_bar_time.pop(sym, None)
+                self._stream_awaiting_reconnect_bar.discard(sym)
+                self._history_fetch_failures.pop(sym, None)
             # Tuple-keyed dicts: drop any (sym, *) entry where sym is stale.
             self.history_htf = {k: v for k, v in self.history_htf.items() if k[0] not in stale}
             self.htf_cache = {k: v for k, v in self.htf_cache.items() if k[0] not in stale}
@@ -1069,8 +1102,20 @@ class MarketDataStore:
         return result
 
     def _stream_history_due(self, symbol: str) -> bool:
+        """Whether a stream backfill of ``symbol`` may fetch price_history now
+        (every branch of ``should_backfill_stream_symbol`` asks): not within
+        ``_backfill_retry_seconds`` of a request for it that raised, and at
+        least ``stream_fallback_poll_seconds`` (10 at the least) after its last
+        answered fetch. Only an answered fetch advances
+        ``last_history_refresh``, so until 2026-10-06 a failed backfill was
+        due again at the next pass: in an outage every pass waited out every
+        due symbol's request, serialized on schwabdev's request lock with its
+        retries, ahead of management."""
         now = sessions.now_et()
         key = self._symbol_key(symbol)
+        failure = self._history_fetch_failures.get(key)
+        if failure is not None and (now - failure[0]).total_seconds() < _backfill_retry_seconds(failure[1]):
+            return False
         last = self.last_history_refresh.get(key)
         if last is None:
             return True
@@ -1224,7 +1269,8 @@ class MarketDataStore:
         # every day (and on a multi-day run the whole premarket). One fetch
         # cut after the first bar started closes the hole; its cut time
         # (fetch_history stamps ``end``) then passes this check for good
-        # (2026-09-23).
+        # (2026-09-23). A reconnect that missed bars re-arms it with its
+        # first bar after the reconnect (_merge_chart_equity, 2026-10-06).
         first_bar = self._stream_first_bar_time.get(cache_key)
         last_history = self.last_history_refresh.get(cache_key)
         if first_bar is not None and history_due and (last_history is None or pd.Timestamp(last_history) < first_bar):
@@ -1245,20 +1291,30 @@ class MarketDataStore:
         return False
 
     def fetch_history(self, symbol: str, lookback_minutes: int | None = None) -> pd.DataFrame:
+        """``symbol``'s 1m price_history cut at the clock, merged into its
+        history frame. A request that raises is noted for the stream
+        backfill's back-off (``_history_fetch_failed``) and raises on to the
+        caller; one that answers ends a run of failures
+        (``_history_fetch_answered``)."""
         cache_key = self._symbol_key(symbol)
         lookback = lookback_minutes or self.config.runtime.history_lookback_minutes
         end = sessions.now_et()
         start = end - timedelta(minutes=lookback)
         LOG.info("Fetching price_history for %s from %s to %s", symbol, start, end)
-        payload, source_symbol = self._fetch_price_history_payload_with_aliases(
-            symbol,
-            frequencyType="minute",
-            frequency=1,
-            startDate=start,
-            endDate=end,
-            needExtendedHoursData=bool(self.config.runtime.use_extended_hours_history),
-            needPreviousClose=True,
-        )
+        try:
+            payload, source_symbol = self._fetch_price_history_payload_with_aliases(
+                symbol,
+                frequencyType="minute",
+                frequency=1,
+                startDate=start,
+                endDate=end,
+                needExtendedHoursData=bool(self.config.runtime.use_extended_hours_history),
+                needPreviousClose=True,
+            )
+        except Exception as exc:
+            self._history_fetch_failed(cache_key, exc)
+            raise
+        self._history_fetch_answered(cache_key)
         if str(source_symbol).upper().strip() != str(symbol).upper().strip():
             LOG.debug("Resolved price_history alias for %s via %s", symbol, source_symbol)
         df = self._completed_bars(self._history_candles_to_frame(payload.get("candles", [])), 1, end)
@@ -1309,6 +1365,34 @@ class MarketDataStore:
         if df.empty and not self.is_regular_session(fetched_at):
             LOG.info("price_history returned no candles for %s outside regular session; using slower retry cadence", symbol)
         return self.get_merged(symbol)
+
+    def _history_fetch_failed(self, key: str, exc: Exception) -> None:
+        """A 1m price_history request for ``key`` raised: the stream backfill
+        of it waits ``_backfill_retry_seconds`` (``_stream_history_due``).
+        The first failure of a run logs a WARNING with the error's type, the
+        rest DEBUG (the engine's own ``History fetch failed`` line names each
+        one). It runs on the fetch pool's threads, each symbol on one: its
+        entry is written under the store's lock, the line logged after it."""
+        now = sessions.now_et()
+        with self._lock:
+            failures = self._history_fetch_failures.get(key, (now, 0))[1] + 1
+            self._history_fetch_failures[key] = (now, failures)
+        wait = _backfill_retry_seconds(failures)
+        if failures == 1:
+            LOG.warning("price_history for %s failed (%s: %s); its stream backfill waits %.0f s, doubling while it "
+                        "fails (at most %.0f s)", key, type(exc).__name__, exc, wait,
+                        STREAM_BACKFILL_RETRY_MAX_SECONDS)
+        else:
+            LOG.debug("price_history for %s failed again (%s: %s): %d failures in a row; its stream backfill waits "
+                      "%.0f s", key, type(exc).__name__, exc, failures, wait)
+
+    def _history_fetch_answered(self, key: str) -> None:
+        """A 1m price_history request for ``key`` answered: it ends a run of
+        failures (INFO, naming how many)."""
+        with self._lock:
+            failure = self._history_fetch_failures.pop(key, None)
+        if failure is not None:
+            LOG.info("price_history for %s answered again after %d failure(s) in a row", key, failure[1])
 
     def daily_history_due(self, symbol: str, *, retry_failed: bool) -> bool:
         """True while ``symbol``'s daily history is not fetched for today's
@@ -2511,6 +2595,7 @@ class MarketDataStore:
                 self.stream_start_requested_at = sessions.now_et()
                 self._stream_seen_symbols.clear()
                 self._stream_first_bar_time.clear()
+                self._stream_awaiting_reconnect_bar.clear()
             # Each service's key exists before the stream's thread replays the
             # recorded subscriptions at its LOGIN response (schwabdev 4.0.0
             # ``stream.py:95-105`` iterates ``subscriptions`` across awaits):
@@ -2531,6 +2616,7 @@ class MarketDataStore:
         with self._lock:
             current = set(self.stream_symbols)
             self._stream_seen_symbols.intersection_update(wanted)
+            self._stream_awaiting_reconnect_bar.intersection_update(wanted)
             for stale_symbol in sorted(current - wanted):
                 self.last_stream_update.pop(stale_symbol, None)
                 self.last_stream_bar_time.pop(stale_symbol, None)
@@ -2637,6 +2723,7 @@ class MarketDataStore:
             self.stream_start_requested_at = None
             self._stream_seen_symbols.clear()
             self._stream_first_bar_time.clear()
+            self._stream_awaiting_reconnect_bar.clear()
         self._stream_quotes_live = None
         # Whatever ran: an item after the stop finds nothing subscribed.
         try:
@@ -2651,13 +2738,15 @@ class MarketDataStore:
         a broken connection (schwabdev 4.0.0 ``stream.py:133-136``): it logs
         "Stream unknown exception", tears the websocket down and reconnects
         after its backoff, so every subscription's data stops until the new
-        connection replays them. A malformed item is dropped with a WARNING
-        naming the error's type (``_merge_chart_equity``); anything else that
-        raises (a defect, not the data) ends the message's handling there,
-        with an ERROR naming the type. With ``runtime.stream_quotes`` the
-        message goes to the quote books first
+        connection replays them. Anything that raises while an item is parsed
+        (a malformed item, or a defect in that code) drops the item with a
+        WARNING naming the error's type (``_merge_chart_equity``); anything
+        else that raises (a defect outside the per-item code) ends the
+        message's handling there, with an ERROR naming the type. With
+        ``runtime.stream_quotes`` the message goes to the quote books first
         (``stream_quotes.StreamQuoteState.on_message``, which never raises
-        and never waits for this store's lock)."""
+        and never waits for this store's lock); then an ADMIN LOGIN response
+        is noted for the bars (``_note_stream_login``), in its own try."""
         try:
             payload = json.loads(message)
         except Exception as exc:
@@ -2667,10 +2756,39 @@ class MarketDataStore:
         if self.config.runtime.stream_quotes:
             self.stream_quotes.on_message(payload, sessions.now_et())
         try:
+            self._note_stream_login(payload)
+        except Exception as exc:
+            LOG.error("Stream login handling failed (%s: %s); the stream stays connected: %s", type(exc).__name__,
+                      exc, _stream_log_text(message))
+        try:
             self._merge_chart_equity(payload)
         except Exception as exc:
             LOG.error("Stream message handling failed (%s: %s); the rest of the message is dropped and the stream "
                       "stays connected: %s", type(exc).__name__, exc, _stream_log_text(message))
+
+    def _note_stream_login(self, payload: Any) -> None:
+        """An ADMIN LOGIN response starts a connection: the stream's first,
+        or one of schwabdev's reconnects, which it makes inside its own
+        thread with the same subscriptions. schwabdev passes the response to
+        the receiver before it replays the subscriptions, so before the
+        connection's first bar (``stream.py:91``, then ``:95``). Each symbol
+        seen since the start then awaits its first bar of the connection
+        (``_stream_awaiting_reconnect_bar``), which ``_merge_chart_equity``
+        judges against the symbol's previous bar. The start's own
+        bookkeeping (the seen symbols, the start's stamp) stays as it is.
+        Until 2026-10-06 a reconnect left the bars that closed while it was
+        down out of every 1m frame for the rest of the day (every symbol's
+        11:11 bar on 2026-10-02)."""
+        if not isinstance(payload, dict):
+            return
+        responses = payload.get("response")
+        if not isinstance(responses, list):
+            return
+        if not any(isinstance(response, dict) and response.get("service") == "ADMIN"
+                   and response.get("command") == "LOGIN" for response in responses):
+            return
+        with self._lock:
+            self._stream_awaiting_reconnect_bar = set(self._stream_seen_symbols)
 
     def _merge_chart_equity(self, payload: Any) -> None:
         """Merge one stream message's CHART_EQUITY bars into ``live``.
@@ -2679,14 +2797,24 @@ class MarketDataStore:
         a JSON object, a chart time that is not epoch milliseconds or is more
         than ``STREAM_BAR_MAX_LEAD_SECONDS`` after the message's receipt) is
         dropped with a WARNING naming the error's type, and the message's
-        other items merge as they would without it. A message that is not a
-        JSON object, ``data`` that is not a list, and a packet or ``content``
-        of the wrong type are dropped the same way. Until 2026-10-06 these
-        raised into schwabdev, which reconnected the stream, except the chart
-        times past the receipt and the two (+-2**63 ms) that parse to NaT,
-        which were merged into the frame. An item without a symbol or chart
-        time, or whose symbol is not an equity ticker, is skipped without a
-        word, as before."""
+        other items merge as they would without it; so is an item whose
+        parse meets a defect, since the per-item catch wraps that code too.
+        A message that is not a JSON object, ``data`` that is not a list, and
+        a packet or ``content`` of the wrong type are dropped the same way.
+        Until 2026-10-06 these raised into schwabdev, which reconnected the
+        stream, except the chart times past the receipt and the two (+-2**63
+        ms) that parse to NaT, which were merged into the frame. An item
+        without a symbol or chart time, or whose symbol is not an equity
+        ticker, is skipped without a word, as before.
+
+        A seen symbol's first new bar since the connection's LOGIN response
+        (``_note_stream_login``) that is more than a minute after its
+        previous bar marks bars missed while the stream reconnected: it
+        re-arms the first-bar backfill (``_stream_first_bar_time``), whose
+        one price_history fetch then fills the gap
+        (``should_backfill_stream_symbol``). One a minute after it missed
+        nothing and costs no request; a bar no newer than the previous one
+        (a bar sent again) leaves the symbol waiting."""
         if not isinstance(payload, dict):
             LOG.warning("Ignoring a stream message that is not a JSON object (%s): %s", type(payload).__name__,
                         _stream_log_text(payload))
@@ -2739,6 +2867,7 @@ class MarketDataStore:
         # Acquire lock only for the cache mutation phase.
         with self._lock:
             for cache_key, new_df, bar_ts in parsed_updates:
+                previous_bar = self.last_stream_bar_time.get(cache_key)
                 self.live[cache_key] = self._retain_window(
                     self._merge_frames(self.live.get(cache_key), new_df),
                     self._history_window_rows.get(cache_key),
@@ -2750,6 +2879,13 @@ class MarketDataStore:
                     self._stream_seen_symbols.add(cache_key)
                     self._stream_first_bar_time[cache_key] = bar_ts
                     LOG.info("CHART_EQUITY first candle received: %s", cache_key)
+                elif cache_key in self._stream_awaiting_reconnect_bar and (previous_bar is None
+                                                                           or bar_ts > previous_bar):
+                    self._stream_awaiting_reconnect_bar.discard(cache_key)
+                    if previous_bar is not None and bar_ts - previous_bar > pd.Timedelta(minutes=1):
+                        # Bars closed while the stream reconnected: the
+                        # first-bar backfill fetches them.
+                        self._stream_first_bar_time[cache_key] = bar_ts
                 if self.stream_start_requested_at is not None and self.stream_symbols and self._stream_seen_symbols.issuperset(self.stream_symbols):
                     self.stream_start_requested_at = None
                 self._invalidate_cycle_symbol(cache_key)
