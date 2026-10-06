@@ -83,7 +83,37 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     published quote, so the stream's when it served (a quote that aged past
     `quote_cache_seconds` within the pass is refreshed by a forced REST
     fetch, as before); a live exit's re-sends, the startup restore and
-    option quotes from forced REST quotes.
+    option quotes from forced REST quotes. When a forced fetch fails (or skips
+    a blacklisted symbol), its reader takes a cached quote younger than
+    `quote_cache_seconds`, as before; since the stream quotes that is usually
+    the stream's, so the fetch logs one WARNING per such symbol, `Forced quote
+    fetch failed for SYM (source=...); the cached rest|stream quote, N s old,
+    stands in for it (limit M s)`; none for a cached quote too old for the
+    reader.
+  - The checks: on every forced REST fetch of a symbol whose book is fresh,
+    one `Stream quote check symbol=... source=... epoch=... stream_age_s=...
+    bid=REST/stream ask=... last=... mark=... d_bid=... d_ask=... d_last=...
+    d_mark=... quote_time_lag_ms=... exchange=REST/stream` line (`d_` is
+    stream minus REST; the lag is REST's `quoteTime` minus the book's quote
+    time; the two raw exchange names: the dashboard's exchange link reads
+    the stream's when it served, so a form it does not map shows here).
+    None for a force-cooldown hit, a symbol without a fresh book, or
+    with the switch off; a check that raises is logged with its type and the
+    fetch goes on.
+  - The health line, every 5 minutes after a login while anything is
+    subscribed (from the engine's refresh): `Stream quotes health: epoch=N
+    live=yes|no data_age_s=... subscribed=... complete=...
+    rest=[SYM(waiting|partial:<core ids>|no-delayed-flag|delayed),...]
+    messages=... data=... heartbeats=... responses=... items=...
+    unsubscribed_items=... bad_items=... delayed_items=... max_gap_s=...
+    max_data_gap_s=... max_heartbeat_gap_s=... max_lag_ms=... transitions=...`:
+    the period's counts, each subscribed symbol whose book cannot serve and
+    why, the longest gaps between messages, data packets and heartbeats
+    (each measured when it ends), the largest lag of a data packet's receipt
+    behind its Schwab timestamp, and the silent/live changes. The counts
+    start over at each line; one that fails is logged and the refresh goes
+    on. What the dry-run day reads for the heartbeat cadence, the data rate
+    and the quiet periods.
   - Logs: `Quote refresh ... stream=N` (mode `stream` when no REST request
     was needed; the other modes as before); `Stream quotes live: epoch N,
     serving K of M requested symbols` and `Stream quotes silent: no
@@ -126,13 +156,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `quote_source`, the normalization, the carry-over, the age, prune, the
     switch, the isolation of a publication and a read, the transitions and
     their damping, the two locks, a two-thread publication under churn),
+    `tests/market_data/test_stream_quote_checks.py` (new: the health line's
+    cadence, counts, gaps, lag, reasons and transitions; the forced-fetch
+    check line and when there is none; the failed forced fetch's WARNING),
     `tests/composition/test_cycle_symbol_maps.py` (the held equity streamed
     beside the watchlist), `tests/domain/test_config_validation.py` and
     `tests/guards/test_preset_parity.py` (the switch);
     `tests/support/brokers.py`'s fake stream records schwabdev's
-    subscriptions and its fake streamer can hold a replay. 112 mutants (77
-    for the subscription and the books, 35 for the serving), all killed,
-    each by its named test.
+    subscriptions and its fake streamer can hold a replay. 142 mutants (77
+    for the subscription and the books, 35 for the serving, 30 for the
+    checks), all killed, each by its named test.
 
 - **Every engine pass and every management pass is on the record:
   CYCLE_TIMING, POSITION_MARK, the pass before on EXIT_CONTEXT and

@@ -81,6 +81,8 @@ CARRY_OVER_FIELDS = ("12", "15", "17", "18", "25", "42")
 STREAM_OK_CODES = frozenset({0, 26, 27, 28, 29})
 # The longest an engine-thread acquire of the books' lock waits.
 LOCK_TIMEOUT_SECONDS = 0.5
+# The health line's cadence (``StreamQuoteState.maybe_log_health``).
+HEALTH_LOG_SECONDS = 300.0
 # The longest a message, item or notice quoted in a log line gets.
 LOG_TEXT_CHARS = 400
 
@@ -220,6 +222,34 @@ class StreamQuoteBook:
         self.values.clear()
 
 
+@dataclass(slots=True)
+class HealthCounters:
+    """What the stream delivered since the last health line: messages of any
+    kind, LEVELONE_EQUITIES data packets, heartbeats, responses; items
+    merged into a book, for a symbol not subscribed, rejected or without a
+    symbol (bad), and delayed; the longest gap between two messages, two
+    LEVELONE_EQUITIES data packets and two heartbeats (each measured when
+    the later one arrives); and the largest lag of a data packet's receipt
+    behind its Schwab timestamp (None before any)."""
+
+    messages: int = 0
+    data: int = 0
+    heartbeats: int = 0
+    responses: int = 0
+    items: int = 0
+    unsubscribed_items: int = 0
+    bad_items: int = 0
+    delayed_items: int = 0
+    max_gap_s: float = 0.0
+    max_data_gap_s: float = 0.0
+    max_heartbeat_gap_s: float = 0.0
+    max_lag_ms: float | None = None
+
+
+def _gap(previous: datetime | None, now: datetime) -> float:
+    return 0.0 if previous is None else max(0.0, (now - previous).total_seconds())
+
+
 @dataclass(frozen=True, slots=True)
 class StreamQuoteRead:
     """One read of the books: ``books`` holds a copy of the values of each
@@ -249,6 +279,14 @@ class StreamQuoteState:
         self._last_data_at: datetime | None = None
         self._warned: set[tuple[str, str]] = set()
         self._first_item_logged = False
+        # The health line: the period's counters, when the last line was
+        # logged, and the receipt of the last message, data packet and
+        # heartbeat (for the gaps; a LOGIN does not reset them).
+        self._period = HealthCounters()
+        self._last_health_at: datetime | None = None
+        self._last_message_at: datetime | None = None
+        self._last_data_received_at: datetime | None = None
+        self._last_heartbeat_at: datetime | None = None
 
     def successor(self) -> StreamQuoteState:
         """An empty state to replace this one when its lock is stuck
@@ -300,6 +338,9 @@ class StreamQuoteState:
             self._symbols = frozenset()
             self._books = {}
             self._last_data_at = None
+            self._last_data_received_at = None
+            self._last_heartbeat_at = None
+            self._last_message_at = None
 
     def prune(self, active: Iterable[str]) -> int:
         """Empty the book of every subscribed symbol outside ``active`` (the
@@ -327,6 +368,49 @@ class StreamQuoteState:
     def subscribed(self) -> frozenset[str]:
         with self._engine_lock("subscribed"):
             return self._symbols
+
+    def maybe_log_health(self, now: datetime, ttl: float, transitions: int) -> bool:
+        """Every ``HEALTH_LOG_SECONDS`` after a login while anything is
+        subscribed, one INFO line (``Stream quotes health: ...``) of the
+        period's counters and the state of every book: the symbols that
+        cannot serve and why (``waiting`` for their snapshot,
+        ``partial:<the core ids missing>``, ``no-delayed-flag``, ``delayed``);
+        ``live=no`` means none serves (no LEVELONE_EQUITIES data within
+        ``ttl``). ``transitions`` is the store's count of silent/live changes
+        in the period. True when it logged (the counters start over)."""
+        with self._engine_lock("health"):
+            if self._epoch < 1 or not self._symbols:
+                return False
+            if self._last_health_at is not None and (now - self._last_health_at).total_seconds() < HEALTH_LOG_SECONDS:
+                return False
+            period, self._period = self._period, HealthCounters()
+            self._last_health_at = now
+            at = self._last_data_at
+            live = at is not None and (now - at).total_seconds() < ttl
+            rest = []
+            complete = 0
+            for symbol in sorted(self._symbols):
+                book = self._books[symbol]
+                if book.complete:
+                    complete += 1
+                elif book.delayed is True:
+                    rest.append(f"{symbol}(delayed)")
+                elif not book.values:
+                    rest.append(f"{symbol}(waiting)")
+                else:
+                    missing = ",".join(fid for fid in CORE_FIELDS if fid not in book.values)
+                    rest.append(f"{symbol}(partial:{missing})" if missing else f"{symbol}(no-delayed-flag)")
+            args = (self._epoch, "yes" if live else "no",
+                    "na" if at is None else f"{(now - at).total_seconds():.1f}", len(self._symbols), complete,
+                    ",".join(rest), period.messages, period.data, period.heartbeats, period.responses, period.items,
+                    period.unsubscribed_items, period.bad_items, period.delayed_items, period.max_gap_s,
+                    period.max_data_gap_s, period.max_heartbeat_gap_s,
+                    "na" if period.max_lag_ms is None else f"{period.max_lag_ms:.0f}", transitions)
+        _emit([(logging.INFO, "Stream quotes health: epoch=%d live=%s data_age_s=%s subscribed=%d complete=%d "
+                              "rest=[%s] messages=%d data=%d heartbeats=%d responses=%d items=%d "
+                              "unsubscribed_items=%d bad_items=%d delayed_items=%d max_gap_s=%.1f "
+                              "max_data_gap_s=%.1f max_heartbeat_gap_s=%.1f max_lag_ms=%s transitions=%d", args)])
+        return True
 
     def read(self, symbols: Iterable[str], now: datetime, ttl: float) -> StreamQuoteRead:
         """The fresh books among ``symbols`` (each a copy made under the lock):
@@ -369,12 +453,16 @@ class StreamQuoteState:
     def _on_message_locked(self, payload: Any, now: datetime, lines: list) -> None:
         if not isinstance(payload, dict):
             return                       # not a Schwab message: the CHART_EQUITY handler warns
+        period = self._period
+        period.messages += 1
+        period.max_gap_s = max(period.max_gap_s, _gap(self._last_message_at, now))
+        self._last_message_at = now
         responses = payload.get("response")
         if responses is not None:
             self._on_responses_locked(responses, lines)
         notices = payload.get("notify")
         if notices is not None:
-            self._on_notices_locked(notices, lines)
+            self._on_notices_locked(notices, now, lines)
         data = payload.get("data")
         if data:
             self._on_data_locked(data, now, lines)
@@ -384,6 +472,7 @@ class StreamQuoteState:
             lines.append((logging.WARNING, "Schwab stream response not understood: %s", (_log_text(responses),)))
             return
         for response in responses:
+            self._period.responses += 1
             if not isinstance(response, dict):
                 lines.append((logging.WARNING, "Schwab stream response not understood: %s", (_log_text(response),)))
                 continue
@@ -401,24 +490,30 @@ class StreamQuoteState:
                 lines.append((level, "Schwab stream response service=%s command=%s code=%r msg=%s",
                               (response.get("service"), response.get("command"), code, msg)))
 
-    def _on_notices_locked(self, notices: Any, lines: list) -> None:
+    def _on_notices_locked(self, notices: Any, now: datetime, lines: list) -> None:
         if not isinstance(notices, list):
             lines.append((logging.WARNING, "Schwab stream notice: %s", (_log_text(notices),)))
             return
         for notice in notices:
             if isinstance(notice, dict) and "heartbeat" in notice:
+                period = self._period
+                period.heartbeats += 1
+                period.max_heartbeat_gap_s = max(period.max_heartbeat_gap_s, _gap(self._last_heartbeat_at, now))
+                self._last_heartbeat_at = now
                 continue
             lines.append((logging.WARNING, "Schwab stream notice: %s", (_log_text(notice),)))
 
     def _on_data_locked(self, data: Any, now: datetime, lines: list) -> None:
         if not isinstance(data, list):
             self._drop_all_locked()
+            self._period.bad_items += 1
             lines.append((logging.WARNING, "Stream quotes: unattributable stream data (not a list); every book "
                                            "dropped: %s", (_log_text(data),)))
             return
         for packet in data:
             if not isinstance(packet, dict):
                 self._drop_all_locked()
+                self._period.bad_items += 1
                 lines.append((logging.WARNING, "Stream quotes: unattributable stream data (a packet that is not an "
                                                "object); every book dropped: %s", (_log_text(packet),)))
                 continue
@@ -427,10 +522,19 @@ class StreamQuoteState:
             content = packet.get("content")
             if not isinstance(content, list):
                 self._drop_all_locked()
+                self._period.bad_items += 1
                 lines.append((logging.WARNING, "Stream quotes: unattributable LEVELONE_EQUITIES data (content is "
                                                "not a list); every book dropped: %s", (_log_text(packet),)))
                 continue
             self._last_data_at = now
+            period = self._period
+            period.data += 1
+            period.max_data_gap_s = max(period.max_data_gap_s, _gap(self._last_data_received_at, now))
+            self._last_data_received_at = now
+            stamp = packet.get("timestamp")
+            if isinstance(stamp, int) and not isinstance(stamp, bool) and stamp > 0:
+                lag = now.timestamp() * 1000.0 - stamp
+                period.max_lag_ms = lag if period.max_lag_ms is None else max(period.max_lag_ms, lag)
             for item in content:
                 self._on_item_locked(item, lines)
 
@@ -439,6 +543,7 @@ class StreamQuoteState:
         if symbol is None:
             # A missed delta could leave any book stale.
             self._drop_all_locked()
+            self._period.bad_items += 1
             lines.append((logging.WARNING, "Stream quotes: unattributable LEVELONE_EQUITIES item (no symbol); every "
                                            "book dropped: %s", (_log_text(item),)))
             return
@@ -448,12 +553,17 @@ class StreamQuoteState:
                           (self._epoch, _log_text(item))))
         book = self._books.get(symbol)
         if book is None:
+            self._period.unsubscribed_items += 1
             return                       # not subscribed (an UNSUBS in flight, or one that failed)
+        self._period.items += 1
+        if item.get("delayed") is True:
+            self._period.delayed_items += 1
         was_delayed = book.delayed is True
         try:
             book.merge(item)
         except Exception as exc:
             book.drop()
+            self._period.bad_items += 1
             self._warn_once_locked(symbol, "rejected", lines,
                                    "Stream quotes: %s item rejected (%s: %s); its book waits for its fields again",
                                    (symbol, type(exc).__name__, exc))

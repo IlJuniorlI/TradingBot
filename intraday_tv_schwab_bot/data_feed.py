@@ -100,6 +100,19 @@ STREAM_QUOTE_TRANSITION_QUIET_SECONDS = 300.0
 STREAM_BAR_MAX_LEAD_SECONDS = 60.0
 
 
+def _check_text(value: Any) -> str:
+    """A price on the ``Stream quote check`` line: its repr, or ``na``."""
+    return "na" if value is None else repr(value)
+
+
+def _check_delta(rest: Any, stream: Any) -> str:
+    """Stream minus REST on the ``Stream quote check`` line, or ``na``."""
+    try:
+        return f"{float(stream) - float(rest):+.4f}"
+    except (TypeError, ValueError):
+        return "na"
+
+
 def _stream_log_text(value: Any) -> str:
     """``value``'s repr for a log line, cut to ``STREAM_LOG_TEXT_CHARS``."""
     text = repr(value)
@@ -1766,6 +1779,7 @@ class MarketDataStore:
         failures = 0
         force_cooldown_hits = 0
         stream_hits = 0
+        rest_stored: list[str] = []
         stream = self._stream_quote_read(requested, force=force)
         for symbol in requested:
             if stream is not None:
@@ -1827,11 +1841,13 @@ class MarketDataStore:
             fetched_at = sessions.now_et()
             for symbol, quote_payload in fetched.items():
                 out[symbol] = self._store_rest_quote(symbol, self._normalize_quote(symbol, quote_payload), fetched_at)
+                rest_stored.append(symbol)
                 batch_hits += 1
             fallback_targets = [symbol for symbol in chunk if symbol not in fetched]
             fallback_results, fallback_failed = self._parallel_quote_fetch(fallback_targets)
             for symbol, normalized in fallback_results.items():
                 out[symbol] = self._store_rest_quote(symbol, normalized, sessions.now_et())
+                rest_stored.append(symbol)
                 fallback_hits += 1
             for symbol in fallback_failed:
                 failures += 1
@@ -1842,6 +1858,7 @@ class MarketDataStore:
         alias_results, alias_failed = self._parallel_quote_fetch(alias_pending)
         for symbol, normalized in alias_results.items():
             out[symbol] = self._store_rest_quote(symbol, normalized, sessions.now_et())
+            rest_stored.append(symbol)
             fallback_hits += 1
         for symbol in alias_failed:
             failures += 1
@@ -1849,6 +1866,9 @@ class MarketDataStore:
             if cached is not None:
                 out[symbol] = cached
 
+        if force:
+            self._warn_forced_fetch_fallbacks(source, pending, rest_stored)
+            self._log_stream_quote_checks(source, rest_stored)
         if requested:
             served = not pending and not failures and cached_hits + stream_hits == len(requested)
             mode = ("stream" if stream_hits else "all_cached") if served else "refresh"
@@ -1889,7 +1909,86 @@ class MarketDataStore:
             LOG.error("Stream quotes: the quote read failed (%s: %s); this refresh serves REST", type(exc).__name__, exc)
             return None
         self._log_stream_quote_transition(read, now, ttl, len(requested))
+        try:
+            if self.stream_quotes.maybe_log_health(now, ttl, self._stream_quote_transitions):
+                self._stream_quote_transitions = 0
+        except StreamQuoteLockTimeout as exc:
+            self._reset_stream_quotes("the health line", exc)
+        except Exception as exc:
+            LOG.error("Stream quotes: the health line failed (%s: %s)", type(exc).__name__, exc)
         return read
+
+    def _warn_forced_fetch_fallbacks(self, source: str | None, pending: list[str], rest_stored: list[str]) -> None:
+        """A forced fetch that stored no REST quote for a symbol (its
+        request failed, or the symbol is blacklisted) leaves the cache as it
+        was, and its readers (an entry's market read, the management
+        snapshot) take a cached quote younger than ``_quote_ttl``: since the
+        stream quotes, usually the stream's. One WARNING per such symbol
+        naming that quote's source and age (settled U2); none for a cached
+        quote too old for them."""
+        stored = set(rest_stored)
+        missed = [symbol for symbol in pending if symbol not in stored]
+        if not missed:
+            return
+        now = sessions.now_et()
+        ttl = self._quote_ttl()
+        for symbol in missed:
+            with self._lock:
+                cached = self.quote_cache.get(symbol)
+            fetched_at = (cached or {}).get("fetched_at")
+            if fetched_at is None:
+                continue
+            age = max(0.0, (now - fetched_at).total_seconds())
+            if age > ttl:
+                continue
+            LOG.warning("Forced quote fetch failed for %s (source=%s); the cached %s quote, %.1f s old, stands in for "
+                        "it (limit %.0f s)", symbol, str(source or "unspecified"), cached.get("quote_source", "unknown"),
+                        age, ttl)
+
+    def _log_stream_quote_checks(self, source: str | None, symbols: list[str]) -> None:
+        """For each symbol a forced fetch stored by REST whose stream book is
+        fresh now, one INFO line setting the two side by side: ``Stream quote
+        check symbol=... source=... epoch=... stream_age_s=... bid=REST/stream
+        ask=... last=... mark=... d_bid=... d_ask=... d_last=... d_mark=...
+        quote_time_lag_ms=... exchange=REST/stream`` (``d_`` is stream minus
+        REST; the lag is REST's ``quoteTime`` minus the book's field 34; the
+        exchanges are the two raw names). It never fails the fetch: an error
+        is logged with its type."""
+        if not symbols or not self.config.runtime.stream_quotes:
+            return
+        now = sessions.now_et()
+        try:
+            read = self.stream_quotes.read(symbols, now, self._quote_ttl())
+        except StreamQuoteLockTimeout as exc:
+            self._reset_stream_quotes("the forced-fetch check", exc)
+            return
+        except Exception as exc:
+            LOG.error("Stream quotes: the forced-fetch check failed (%s: %s)", type(exc).__name__, exc)
+            return
+        for symbol in symbols:
+            values = read.books.get(symbol)
+            if values is None or read.at is None:
+                continue
+            try:
+                with self._lock:
+                    rest = dict(self.quote_cache.get(symbol) or {})
+                raw = rest.get("raw") if isinstance(rest.get("raw"), dict) else {}
+                pairs = [(name, rest.get(name), values.get(fid)) for name, fid in
+                         (("bid", "1"), ("ask", "2"), ("last", "3"), ("mark", "33"))]
+                rest_time = (raw.get("quote") or {}).get("quoteTime") if isinstance(raw.get("quote"), dict) else None
+                stream_time = values.get("34")
+                lag = (str(int(rest_time) - int(stream_time)) if isinstance(rest_time, (int, float))
+                       and not isinstance(rest_time, bool) and stream_time is not None else "na")
+                reference = raw.get("reference") if isinstance(raw.get("reference"), dict) else {}
+                LOG.info("Stream quote check symbol=%s source=%s epoch=%d stream_age_s=%.2f %s %s "
+                         "quote_time_lag_ms=%s exchange=%s/%s", symbol, str(source or "unspecified"), read.epoch,
+                         max(0.0, (now - read.at).total_seconds()),
+                         " ".join(f"{name}={_check_text(r)}/{_check_text(s)}" for name, r, s in pairs),
+                         " ".join(f"d_{name}={_check_delta(r, s)}" for name, r, s in pairs), lag,
+                         reference.get("exchangeName"), values.get("25"))
+            except Exception as exc:
+                LOG.error("Stream quotes: the forced-fetch check of %s failed (%s: %s)", symbol, type(exc).__name__,
+                          exc)
 
     def _log_stream_quote_transition(self, read: StreamQuoteRead, now: datetime, ttl: float, requested: int) -> None:
         """Log the stream quotes going silent (no LEVELONE_EQUITIES data
