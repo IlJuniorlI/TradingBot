@@ -114,7 +114,7 @@ Current code defaults:
 | `range_ema_gap_pct`                  | `0.0007`             |
 | `range_max_intraday_move_pct`        | `0.009`              |
 | `credit_max_day_move_pct`            | `0.008`              |
-| `credit_max_vix_change_pct`          | `0.01`               |
+| `credit_max_vix_change_pct`          | `0.05`               |
 | `chop_flip_min`                      | `4`                  |
 | `chop_flip_max_for_trend`            | `3`                  |
 | `chaos_intraday_range_pct`           | `0.016`              |
@@ -168,6 +168,7 @@ Common parameter families:
   - `trend_vwap_distance_pct`, `trend_ema_gap_pct`, `trend_above_vwap_frac`, `trend_min_ret5`, `trend_min_ret15`
 - Range / chop scoring:
   - `range_vwap_distance_pct`, `range_ema_gap_pct`, `range_max_intraday_move_pct`, `credit_max_day_move_pct`, `credit_max_vix_change_pct`, `chop_flip_min`, `chop_flip_max_for_trend`, `chaos_intraday_range_pct`, `min_range_score`
+  - `credit_max_vix_change_pct` (`0.05`): the range score loses 1 while VIX's day change since the prior close, up or down, is at least this fraction (`0.05` = 5%; the same read as `options.vix_spike_pct`, which refuses the entry outright when VIX cannot be read). A number in (0, 1], checked at load. Until 2026-10-06 the VIX change always read 0, so this never fired.
 - Regime separation:
   - `min_trend_score`, `min_score_gap`
 - ORB confirmation:

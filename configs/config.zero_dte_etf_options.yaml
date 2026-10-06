@@ -531,7 +531,12 @@ options:
   # floor here. Long-only premium strategies (see config.zero_dte_etf
   # _long_options.yaml) should set this to ~12.0.
   min_vix: 0.0
-  vix_spike_pct: 0.011
+  # Refuse an entry while VIX's day change since the prior close, either
+  # way, is at least this fraction (0.10 = 10%).
+  vix_spike_pct: 0.10
+  # The oldest VIX quote the regime reads (seconds); an older one, or none,
+  # refuses every entry (vix_unavailable).
+  max_vix_quote_age_seconds: 30
   # IV-rank gate (2026-05-14). Credit spreads sell premium — RICHEST in
   # the upper half of the 52w VIX range. Floor min_iv_rank at 0.30 so
   # we don't sell premium at the bottom of the range (skinny credits).
@@ -627,7 +632,7 @@ strategies:
       chop_flip_min: 4
       credit_end_time: "13:40"
       credit_max_day_move_pct: 0.0075
-      credit_max_vix_change_pct: 0.009
+      credit_max_vix_change_pct: 0.05
       credit_start_time: "11:10"
       flip_lookback: 14
       fvg_context_weight_scale: 0.9

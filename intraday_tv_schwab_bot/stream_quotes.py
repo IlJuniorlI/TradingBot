@@ -50,10 +50,9 @@ LEVELONE_EQUITIES = "LEVELONE_EQUITIES"
 # (the section of Schwab's REST quote that names the same value, its name
 # there, its kind). The core four (bid, ask, last, mark), the fields
 # ``MarketDataStore._normalize_quote`` reads (volume, close, open, net change,
-# description), the exchange name the dashboard prefers, the quote time, and
-# the net percent change, kept under Schwab's REST name, which nothing reads
-# yet. Net change and net percent change are signed: a symbol below its
-# previous close sends negative ones.
+# net percent change, description), the exchange name the dashboard prefers
+# and the quote time. Net change and net percent change are signed: a symbol
+# below its previous close sends negative ones.
 FIELDS: dict[str, tuple[str, str, str]] = {
     "1": ("quote", "bidPrice", "price"),
     "2": ("quote", "askPrice", "price"),
@@ -74,10 +73,13 @@ STREAM_QUOTE_FIELDS: tuple[int, ...] = (0, *sorted(int(fid) for fid in FIELDS))
 CORE_FIELDS = ("1", "2", "3", "33")
 # The fields a book may lack that its symbol's previous cached quote fills in
 # when the book is published: open, close, description, exchange name, net
-# change and net percent change, display-only. A book can complete
-# from deltas alone (after a rejected item or a prune, or an ADD Schwab answers
-# without a snapshot), and these rarely change. The core prices never carry
-# over: a book serves only with all four received in its epoch.
+# change and net percent change. They are display fields, except that the
+# 0DTE regime reads its volatility symbol's close, net change and percent
+# change (``RegimeMixin._vix_read``): a carried value is then the previous
+# quote's (the shipped presets' VIX is an index, which never streams). A book
+# can complete from deltas alone (after a rejected item or a prune, or an ADD
+# Schwab answers without a snapshot), and these rarely change. The core prices
+# never carry over: a book serves only with all four received in its epoch.
 CARRY_OVER_FIELDS = ("12", "15", "17", "18", "25", "42")
 # Schwab's success codes: 0 (LOGIN, LOGOUT), 26-29 (SUBS, UNSUBS, ADD, VIEW).
 STREAM_OK_CODES = frozenset({0, 26, 27, 28, 29})

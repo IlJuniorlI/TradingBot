@@ -158,9 +158,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     payload without the flag). An index's or an option's quote names other
     values, so it never is the line, nor is a stream quote. The dry-run day
     reads `realtime=True`, and `netPercentChange` among the quote keys: the
-    name the stream's adapter gives field 42 (the percent change itself
-    stays as it is: `_normalize_quote` reads `netPercentChangeInDouble` and
-    `percentChange`, neither of which Schwab's quotes carry; queued).
+    name the stream's adapter gives field 42, and since the 0DTE VIX gate
+    fix (under Fixed) the one every quote's `percent_change` is read from.
   - The REST shadow, the standing check that a book is not frozen: every
     `runtime.stream_quote_shadow_every`-th publication of stream quotes,
     the engine, once management and the entries ran
@@ -5199,6 +5198,72 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `levels_shared.find_divergence` a required `bar_clock`.
 
 ### Fixed
+
+- **The 0DTE VIX gates read VIX's real day change and fail closed: every
+  quote's `percent_change` is Schwab's `netPercentChange`, the regime divides
+  it by 100, a VIX quote it cannot vouch for refuses the entry, and the
+  thresholds are re-set for that reading (`options.vix_spike_pct` 0.10,
+  `credit_max_vix_change_pct` 0.05, new `options.max_vix_quote_age_seconds`
+  30).**
+  *2026-10-06* — `_normalize_quote` read TDA's `netPercentChangeInDouble`
+  and `percentChange`, which Schwab's quotes never carry, so every quote's
+  `percent_change` was None and the 0DTE regime read VIX's change as 0:
+  neither `vix_spike_pct` nor `credit_max_vix_change_pct` ever fired (the 9
+  `vix_pct` values H: archived, 2026-05-20 to 05-22, are all 0.0). And the
+  read failed open: a missing VIX quote, or one older than
+  `runtime.quote_cache_seconds`, passed every VIX gate silently (`max_vix`,
+  `min_vix`, the IV-rank band and both change gates). The refresh refetches
+  a quote only once it is that old (4 s on the 0DTE presets), so the regime,
+  reading after management and the chain prefetch, often found one just
+  past it: 39% of the 0DTE regime checks on 2026-05-22 (7% on 05-21), and 5
+  of the 9 archived 0DTE entries, which so passed an IV-rank floor that had
+  refused the cycle before.
+  - `_normalize_quote` reads `netPercentChange`, in percent (1.5 is +1.5%),
+    from a REST quote and from a stream book (field 42, kept under that
+    name); the TDA names are gone.
+  - The regime's `_vix_read` divides it by 100. `_safe_pct` is gone: it
+    divided only a value above 1, so a +0.5% day would have read as +50%.
+  - The read fails closed. Each 0DTE entry is refused, with a WARNING at
+    most once a minute per kind (`0DTE VIX read refused: REASON
+    (volatility_symbol=VIX); every 0DTE entry is refused while it lasts`),
+    when no quote is cached, it is older than the new
+    `options.max_vix_quote_age_seconds` (30: above the refresh interval, so
+    a refusal means the refresh has failed that long) or has no price
+    (`vix_unavailable`), when it lacks its percent change, net change or
+    prior close (`vix_change_unavailable`), or when its percent change
+    differs from 100 x net change / prior close by more than 0.05
+    percentage points (`vix_change_mismatch`: Schwab derives both from one
+    quote, so only a unit or a field change parts them; no REST $VIX value
+    had been seen when this landed). A refused read is the only VIX reason;
+    the regime metrics' `vix` and `vix_pct` are then null. The dashboard
+    names the three (`no vix`, `vix chg n/a`, `vix chg bad`).
+  - `vix_spike_pct` (the default, both 0DTE presets, the example config)
+    0.011 -> 0.10, still both ways: an entry is refused while VIX is 10% or
+    more from its prior close. At 0.011 the change, once read, would have
+    refused 0DTE entries on almost every day: on CBOE's daily VIX history
+    (2004-2026) the close was 1.1% or more from the prior close on 83% of
+    days and touched it intraday on 99.9%; 10% is 13-14% of days at the
+    close and 26-30% touched.
+  - `credit_max_vix_change_pct` (both 0DTE manifests and presets) 0.009 /
+    0.01 -> 0.05: the range score's penalty while VIX's day change is 5% or
+    more either way (38% of days at the close; at some time of the day on
+    70%).
+  - Checked at load: `options.vix_spike_pct` in (0, 1] (`10` meant as 10%
+    refuses to start); `options.max_vix_quote_age_seconds` above 0;
+    `options.volatility_symbol` a ticker (a blank one turned the VIX gates
+    off silently); `credit_max_vix_change_pct` in (0, 1], in the 0DTE
+    strategies' `normalize_params`, which `load_config` runs before the
+    Schwab client is made. The regime reads `credit_max_vix_change_pct` with
+    no default (its 0.015 matched neither manifest).
+  - Upgrading: a 0DTE config kept as an own copy still loads with the old
+    0.011 / 0.009 / 0.01, which now refuse or dock on most days: set
+    `vix_spike_pct: 0.10` and `credit_max_vix_change_pct: 0.05`
+    (`max_vix_quote_age_seconds` defaults to 30).
+  - The dashboard's Day % now shows the quote's own change since the prior
+    close: in the regular session it showed the candidate's change from the
+    open, or, without one, the change it computed from the last price and
+    the quote's prior close (which also followed the bar close of a quote
+    gone stale; it now holds that quote's value).
 
 - **A stream reconnect no longer leaves the bars it missed out of the 1m
   frames, and a stream backfill that fails waits before it asks again.**

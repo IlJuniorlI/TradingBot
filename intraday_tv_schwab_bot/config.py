@@ -1418,7 +1418,14 @@ class ZeroDteOptionsConfig:
     # Credit-spread strategies should leave this at 0.0 since low-VIX
     # juicy environments are by design.
     min_vix: float = 0.0
-    vix_spike_pct: float = 0.0110
+    # The 0DTE strategies refuse an entry while VIX's day change since the
+    # prior close, either way, is at least this fraction (0.10 is 10%).
+    vix_spike_pct: float = 0.10
+    # The oldest volatility quote the 0DTE regime reads, in seconds; an older
+    # one (or none) refuses every 0DTE entry (vix_unavailable). Above the
+    # quote refresh interval, which a cached quote often just passed by the
+    # time the regime reads it.
+    max_vix_quote_age_seconds: float = 30.0
     # IV-rank gates (2026-05-14). Compute current VIX position within a
     # user-provided 52-week range. Rank 0.0 = at vix_52w_low, 1.0 = at
     # vix_52w_high. Long-premium strategies want low rank (cheap IV);
@@ -1964,6 +1971,8 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         "options_breakeven_stop_mult": _ABOVE_ZERO,
         "options_profit_lock_mark_mult": _ABOVE_ZERO,
         "options_profit_lock_stop_mult": _ABOVE_ZERO,
+        "vix_spike_pct": _Number(low=0, low_open=True, high=1, note=" (a fraction: 0.10 is a 10% VIX day change)"),
+        "max_vix_quote_age_seconds": _ABOVE_ZERO,
     },
 }
 
@@ -2243,7 +2252,8 @@ def _validate_shared_exit_config(shared_exit: SharedExitLogicConfig, risk: RiskC
 
 def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path) -> None:
     """Plausibility checks for options sizing, quote-freshness, the levels,
-    the switches and the times (``_NUMBER_CHECKS["options"]``).
+    the switches, the times (``_NUMBER_CHECKS["options"]``) and the
+    volatility symbol.
 
     max_quote_age_seconds was previously read via ``getattr(..., 10)``
     fallback in the engine before Phase 1 validators landed; validation
@@ -2269,6 +2279,12 @@ def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path)
             if not isinstance(symbol, str) or len(symbol.split()) != 1 or "," in symbol or ";" in symbol
             or not normalize_symbol_list([symbol])
         ]
+    # The 0DTE regime refuses every entry without a quote of it (2026-10-06):
+    # a blank one silently skipped every VIX gate before.
+    vol_symbol = options.volatility_symbol
+    if (not isinstance(vol_symbol, str) or len(vol_symbol.split()) != 1 or "," in vol_symbol or ";" in vol_symbol
+            or not normalize_symbol_list([vol_symbol])):
+        errors.append(f"options.volatility_symbol must be a ticker, got {vol_symbol!r}{ticker_quote_hint(vol_symbol)}")
     # The times fail here, naming the key, instead of where they are read:
     # force_flatten_time when an options strategy is built, the other three
     # at their first read, mid-session. A blank force_flatten_time meant

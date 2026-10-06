@@ -51,7 +51,7 @@
     "range_ema_gap_pct": 0.0007,
     "range_max_intraday_move_pct": 0.009,
     "credit_max_day_move_pct": 0.008,
-    "credit_max_vix_change_pct": 0.01,
+    "credit_max_vix_change_pct": 0.05,
     "chop_flip_min": 4,
     "chop_flip_max_for_trend": 3,
     "chaos_intraday_range_pct": 0.016,

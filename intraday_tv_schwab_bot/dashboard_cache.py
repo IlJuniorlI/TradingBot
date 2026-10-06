@@ -748,8 +748,8 @@ class DashboardCache:
         quote_close = safe_float(quote.get("close"))
         quote_total_volume = safe_float(quote.get("total_volume")) if quote_is_fresh else None
         # data_feed._normalize_quote reads percent_change / net_change with
-        # numeric.first_float, which yields None (not 0.0) when both Schwab
-        # fields are absent or NaN, so a 0.0 here is always a real
+        # numeric.first_float, which yields None (not 0.0) when Schwab's
+        # field is absent or NaN, so a 0.0 here is always a real
         # flat-session reading rather than a sentinel.
         cached_percent_change = safe_float(quote.get("percent_change"))
         cached_net_change = safe_float(quote.get("net_change"))

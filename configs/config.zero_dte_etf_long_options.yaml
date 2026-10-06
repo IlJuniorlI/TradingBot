@@ -522,7 +522,12 @@ options:
   # math for 0DTE long options thin: premium is cheap but moves are
   # too small to overcome theta + commissions. Set to 0.0 to disable.
   min_vix: 12.0
-  vix_spike_pct: 0.011
+  # Refuse an entry while VIX's day change since the prior close, either
+  # way, is at least this fraction (0.10 = 10%).
+  vix_spike_pct: 0.10
+  # The oldest VIX quote the regime reads (seconds); an older one, or none,
+  # refuses every entry (vix_unavailable).
+  max_vix_quote_age_seconds: 30
   # IV-rank gate (2026-05-14). Long-premium pays MORE when implied vol is
   # at the top of its 52w range — expensive entry, vega-crush risk on
   # mean reversion. Cap max_iv_rank to skip entries when VIX is in the
@@ -592,7 +597,7 @@ strategies:
       chop_flip_max_for_trend: 3
       chop_flip_min: 4
       credit_max_day_move_pct: 0.008
-      credit_max_vix_change_pct: 0.01
+      credit_max_vix_change_pct: 0.05
       flip_lookback: 14
       fvg_context_weight_scale: 0.9
       htf_ema_gap_pct: 0.0007

@@ -168,6 +168,24 @@ class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
     # build loop (_prefetch_option_chains).
     _PREFETCH_OPTION_CHAINS = True
 
+    @classmethod
+    def normalize_params(cls, params: dict[str, Any]) -> dict[str, Any]:
+        """Checks ``credit_max_vix_change_pct`` at load (``load_config``
+        runs this on every ``strategies.<name>.params`` a config sets): a
+        fraction of VIX's level, as ``options.vix_spike_pct``. 0 docked
+        every credit setup's range score, and a value above 1 (5 meant as
+        5%) never fires; the bounds refuse a NaN and an infinity too. Until
+        2026-10-06 the knob was checked when the strategy was built, after
+        the Schwab client's token refresh."""
+        out = super().normalize_params(params)
+        vix_change = out.get("credit_max_vix_change_pct")
+        if isinstance(vix_change, bool) or not isinstance(vix_change, (int, float)) or not 0 < vix_change <= 1:
+            raise ValueError(
+                f"strategies.{cls.strategy_name}.params.credit_max_vix_change_pct must be a finite number in (0, 1] "
+                f"(a fraction: 0.05 is a 5% VIX day change), got {vix_change!r}"
+            )
+        return out
+
     def required_history_bars(self, symbol: str | None = None, positions: dict[str, Position] | None = None) -> int:
         capability_bars = self._manifest_required_history_bars()
         if capability_bars is not None:
@@ -198,6 +216,9 @@ class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
                 f"strategies.{self.strategy_name}.params.orb_opening_window_end must not be before "
                 f"orb_opening_window_start ({start.strftime('%H:%M')}), got {self.params.get('orb_opening_window_end')!r}"
             )
+        # When each kind of refused VIX read last logged its WARNING
+        # (regime.RegimeMixin._vix_refused): at most once a minute a kind.
+        self._vix_refusal_warned_at: dict[str, float] = {}
 
     def _options_enabled(self) -> bool:
         return bool(self.optcfg.enabled)
@@ -390,7 +411,7 @@ class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
         Returns e.g. ``1.23`` for +1.23% — matches the unit produced by
         TradingView's ``change_from_open`` field (which equity screeners
         still surface via candidate metadata) and the Schwab quote's
-        ``netPercentChangeInDouble`` / ``percentChange`` field that the
+        ``netPercentChange`` (the quote's ``percent_change``) that the
         dashboard's fallback chain prefers. Returning a percent (not a
         0..1 ratio) lets the dashboard concatenate ``%`` without unit
         translation.

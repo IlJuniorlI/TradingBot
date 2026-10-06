@@ -2481,8 +2481,8 @@ class MarketDataStore:
         are and the names its payload carries (the payload's own keys, its
         ``quote`` section's and its ``reference`` section's: the REST names
         the stream's adapter gives the book's fields, such as
-        ``netPercentChange``, field 42's, which nothing reads yet; ``none``
-        for a section the payload lacks). INFO when ``realtime`` is True,
+        ``netPercentChange``, field 42's, the quote's ``percent_change``;
+        ``none`` for a section the payload lacks). INFO when ``realtime`` is True,
         WARNING otherwise (a delayed entitlement, or a payload without the
         flag)."""
         self._quote_entitlement_logged = True
@@ -2629,7 +2629,13 @@ class MarketDataStore:
             "close": first_float(quote, "closePrice", finite=True),
             "open": first_float(quote, "openPrice", finite=True),
             "net_change": first_float(quote, "netChange", finite=True),
-            "percent_change": first_float(quote, "netPercentChangeInDouble", "percentChange", finite=True),
+            # The day change since the prior close, in percent (1.5 is
+            # +1.5%): Schwab's netPercentChange, the stream book's field 42
+            # under the same name. Until 2026-10-06 this read TDA's
+            # netPercentChangeInDouble and percentChange, which Schwab's
+            # quotes never carry, so it was always None (the 0DTE VIX gates
+            # read 0).
+            "percent_change": first_float(quote, "netPercentChange", finite=True),
             "total_volume": total_volume,
             "description": payload.get("description") or reference.get("description"),
             "raw": payload,

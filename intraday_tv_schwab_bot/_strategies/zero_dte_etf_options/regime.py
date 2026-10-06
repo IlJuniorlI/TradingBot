@@ -5,8 +5,9 @@ The regime classifies the underlying as bullish_trend, bearish_trend or
 range, or refuses it. Its stages run in this order:
 
 1. read the underlying's tape and the confirmation index;
-2. read VIX and the live activity score, and apply the hard gates (VIX,
-   IV rank, a VIX spike, a dead tape, a chaotic range, the index);
+2. read VIX and the live activity score, and apply the hard gates (VIX
+   that cannot be read, VIX, IV rank, a VIX spike, a dead tape, a chaotic
+   range, the index);
 3. build the entry contexts;
 4. read the HTF trend confirmation and the FVG scores;
 5. score each regime, pick the top one if it clears its floor and the gap
@@ -18,6 +19,8 @@ out of ``strategy.py`` on 2026-09-27, and ``_regime_confirm`` stopped being a
 single 465-line method at the same time; the stages are the method's own
 blocks, unchanged.
 """
+import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,10 +30,17 @@ from ...bars import session_open_price
 from ...htf_levels import summarize_htf_trend
 from ...models import Candidate, Side
 from ...numeric import first_float, safe_float
-from ...reasons import fmt_metric, insufficient_bars_reason, reason_with_values
+from ...reasons import detail_fields, fmt_metric, insufficient_bars_reason, reason_with_values
 from ...support_resistance import empty_market_structure_context
 from ... import sessions
 from ..shared_entry import EntryContexts
+
+LOG = logging.getLogger(__name__)
+
+# The most a VIX quote's percent change may differ from its own net change /
+# prior close, in percentage points. Schwab derives both from one quote, so
+# they agree to its rounding unless a unit or a field changes.
+VIX_CHANGE_TOLERANCE_PP = 0.05
 
 
 def _ambiguous_regime_reason(
@@ -106,6 +116,18 @@ class _RegimeContexts:
 
 
 @dataclass(frozen=True)
+class _VixRead:
+    """VIX for the hard gates: its last price and its day change since the
+    prior close as a fraction (0.10 is +10%), or the reason the volatility
+    quote cannot be read (``refusal``, which refuses the entry; ``last`` and
+    ``change`` are then None)."""
+
+    last: float | None
+    change: float | None
+    refusal: str | None
+
+
+@dataclass(frozen=True)
 class _HtfTrend:
     """The HTF trend confirmation: whether it is on and required, the
     context (``{"available": False, "reason": "disabled"}`` when off) and
@@ -125,12 +147,9 @@ class RegimeMixin:
     strategy's ``params``, ``optcfg`` and ``config``, its ``entry_policy``
     (the FVG scores), the context builders with the HTF timeframe and
     request (``ContextBuildersMixin``), and one hook the strategy keeps:
-    ``live_activity_score`` (also a dashboard hook)."""
-
-    @staticmethod
-    def _safe_pct(value: Any) -> float:
-        pct = safe_float(value, 0.0)
-        return pct / 100.0 if abs(pct) > 1.0 else pct
+    ``live_activity_score`` (also a dashboard hook). The strategy also keeps
+    ``_vix_refusal_warned_at``: when each kind of refused VIX read last
+    logged its WARNING (``_vix_refused``)."""
 
     @staticmethod
     def _fraction_relative(frame: pd.DataFrame, column: str, lookback: int, direction: str) -> float:
@@ -208,7 +227,7 @@ class RegimeMixin:
 
         tape = self._underlying_tape(u)
         index = self._confirm_index_tape(idx)
-        vix_last, vix_pct = self._vix_read(data)
+        vix = self._vix_read(data)
         # Live activity score (2026-05-14) — replaces TV cumulative RVOL
         # for 0DTE gating and bonus scoring. Self-normalizing against
         # the symbol's own last 20 bars, so it works the same morning
@@ -218,13 +237,13 @@ class RegimeMixin:
         # were stub-only after the local-synthesis switch and no longer
         # influenced any gate. Dashboard rings now use this live score.
         activity_score = self.live_activity_score(u)
-        reasons = self._regime_gate_reasons(tape, index, idx, confirm_symbol, vix_last, vix_pct, activity_score)
+        reasons = self._regime_gate_reasons(tape, index, idx, confirm_symbol, vix, activity_score)
         contexts = self._regime_contexts(underlying, u, data, tape.close)
         htf = self._htf_trend_confirmation(underlying, data)
         if htf.use and htf.require and not htf.available:
             reasons.append(str(htf.ctx.get("reason") or "insufficient_htf_bars"))
         htf_fvg_score, fvg_ltf_score = self._fvg_regime_scores(underlying, u, data, tape.close)
-        scores = self._regime_scores(tape, index, activity_score, vix_pct, contexts, htf, htf_fvg_score, fvg_ltf_score)
+        scores = self._regime_scores(tape, index, activity_score, vix, contexts, htf, htf_fvg_score, fvg_ltf_score)
         regime, no_trade = self._select_regime(scores, reasons)
         no_trade = self._regime_vetoes(regime, no_trade, htf, contexts.market_structure, reasons)
 
@@ -240,7 +259,7 @@ class RegimeMixin:
             # chart contexts): admit gates on the same reads.
             "entry_contexts": EntryContexts(sr=contexts.sr, ms=contexts.ms_ltf, chart=contexts.pattern),
             "scores": scores,
-            "metrics": self._regime_metrics(tape, index, htf, activity_score, vix_last, vix_pct, contexts,
+            "metrics": self._regime_metrics(tape, index, htf, activity_score, vix, contexts,
                                             htf_fvg_score, fvg_ltf_score),
         }
 
@@ -289,29 +308,72 @@ class RegimeMixin:
         return _IndexTape(min_bars=min_confirm_bars, available=idx_available, bullish=idx_bullish, bearish=idx_bearish,
                           range=idx_range, vwap_dist=idx_vwap_dist, ema_gap=idx_ema_gap, flip_count=idx_flip_count)
 
-    def _vix_read(self, data) -> tuple[float | None, float]:
-        """VIX's last price (None without a fresh quote) and its percent
-        change as a fraction."""
+    def _vix_read(self, data) -> _VixRead:
+        """VIX's last price and its day change since the prior close as a
+        fraction (0.10 is +10%), from the cached volatility quote. It fails
+        closed (2026-10-06): the read is refused, and with it the entry, when
+        - no quote is cached, it is older than
+          ``options.max_vix_quote_age_seconds``, it carries no fetch time, or
+          it has no price: ``vix_unavailable``;
+        - it lacks its percent change, its net change or its prior close:
+          ``vix_change_unavailable``;
+        - its percent change (Schwab's ``netPercentChange``, in percent)
+          differs from 100 x net change / prior close by more than
+          ``VIX_CHANGE_TOLERANCE_PP`` percentage points, a unit or a field
+          that changed: ``vix_change_mismatch``.
+        Until 2026-10-06 a missing quote, or one older than
+        ``runtime.quote_cache_seconds`` (the interval it is refreshed at, so
+        the read often came just after it expired: 39% of 2026-05-22's
+        regime checks), passed every VIX gate silently; the percent change
+        was never filled, so the change gates read 0; and its unit was
+        guessed by size (a +0.5% day would have read +50%)."""
         vol_symbol = self.optcfg.volatility_symbol
-        q = data.get_quote(vol_symbol) if data else None
-        # No guard: until 2026-09-26 a freshness check that raised kept the
-        # quote it could not vouch for, and the VIX gates read it.
-        if data is not None and vol_symbol:
-            max_age = max(1.0, float(self.config.runtime.quote_cache_seconds))
-            if not data.quotes_are_fresh([vol_symbol], max_age):
-                q = None
+        limit = float(self.optcfg.max_vix_quote_age_seconds)
+        q = data.get_quote(vol_symbol) if data is not None else None
+        if q is None:
+            return self._vix_refused("vix_unavailable", f"vix_unavailable({detail_fields(quote='none')})")
+        fetched_at = q.get("fetched_at")
+        if fetched_at is None:
+            return self._vix_refused("vix_unavailable", f"vix_unavailable({detail_fields(fetched_at='none')})")
+        age = (sessions.now_et() - fetched_at).total_seconds()
+        if age > limit:
+            return self._vix_refused(
+                "vix_unavailable", reason_with_values("vix_unavailable", current=age, required=limit, op="<=", digits=1))
         vix_last = first_float(q, "last", "mid", "mark", positive=True)
-        vix_pct = self._safe_pct(q.get("percent_change")) if q is not None and q.get("percent_change") is not None else 0.0
-        return vix_last, vix_pct
+        if vix_last is None:
+            return self._vix_refused("vix_unavailable", f"vix_unavailable({detail_fields(price='none')})")
+        percent_change = first_float(q, "percent_change", finite=True)
+        net_change = first_float(q, "net_change", finite=True)
+        prior_close = first_float(q, "close", positive=True)
+        missing = [name for name, value in (("percent_change", percent_change), ("net_change", net_change),
+                                            ("close", prior_close)) if value is None]
+        if missing:
+            return self._vix_refused("vix_change_unavailable",
+                                     f"vix_change_unavailable({detail_fields(missing='+'.join(missing))})")
+        net_over_close = 100.0 * net_change / prior_close
+        if abs(percent_change - net_over_close) > VIX_CHANGE_TOLERANCE_PP:
+            detail = detail_fields(percent_change=percent_change, net_over_close=net_over_close,
+                                   limit_pp=VIX_CHANGE_TOLERANCE_PP)
+            return self._vix_refused("vix_change_mismatch", f"vix_change_mismatch({detail})")
+        return _VixRead(last=vix_last, change=percent_change / 100.0, refusal=None)
 
-    def _regime_gate_reasons(self, tape: _UnderlyingTape, index: _IndexTape, idx: pd.DataFrame | None,
-                             confirm_symbol: str | None, vix_last: float | None, vix_pct: float,
-                             activity_score: float) -> list[str]:
-        """The hard gates' refusals: VIX, IV rank, a VIX spike, a dead tape,
-        a chaotic range, the confirmation index."""
-        p = self.params
-        u_vwap_dist, u_flip_count, u_range_pct = tape.vwap_dist, tape.flip_count, tape.range_pct
-        idx_available, idx_vwap_dist, min_confirm_bars = index.available, index.vwap_dist, index.min_bars
+    def _vix_refused(self, kind: str, reason: str) -> _VixRead:
+        """A refused VIX read: ``reason`` refuses the entry. Logged at
+        WARNING at most once a minute per ``kind``, at DEBUG in between."""
+        now_ts = time.monotonic()
+        last = self._vix_refusal_warned_at.get(kind)
+        level = logging.DEBUG
+        if last is None or now_ts - last >= 60.0:
+            self._vix_refusal_warned_at[kind] = now_ts
+            level = logging.WARNING
+        LOG.log(level, "0DTE VIX read refused: %s (volatility_symbol=%s); every 0DTE entry is refused while it lasts",
+                reason, self.optcfg.volatility_symbol)
+        return _VixRead(last=None, change=None, refusal=reason)
+
+    def _vix_gate_reasons(self, vix_last: float, vix_change: float) -> list[str]:
+        """The gates on a VIX read that was not refused: VIX above
+        ``max_vix`` or below ``min_vix``, its IV rank outside the band, and
+        a day change of ``vix_spike_pct`` or more either way."""
         max_vix = float(self.optcfg.max_vix)
         # Lower-bound VIX floor. 0.0 (default) disables the gate for
         # backward-compat. Long-premium strategies should set this to
@@ -321,33 +383,43 @@ class RegimeMixin:
         # since low-VIX is their target environment.
         min_vix = float(getattr(self.optcfg, "min_vix", 0.0) or 0.0)
         vix_spike_pct = float(self.optcfg.vix_spike_pct)
-        chaos_intraday_range_pct = float(p.get("chaos_intraday_range_pct", 0.016))
-        chop_flip_min = int(p.get("chop_flip_min", 4))
-        trend_vwap_distance_pct = float(p.get("trend_vwap_distance_pct", 0.0016))
-
         reasons: list[str] = []
-        if vix_last is not None and vix_last > max_vix:
+        if vix_last > max_vix:
             reasons.append(reason_with_values("vix_above_limit", current=vix_last, required=max_vix, op="<=", digits=2))
-        if vix_last is not None and min_vix > 0.0 and vix_last < min_vix:
+        if min_vix > 0.0 and vix_last < min_vix:
             reasons.append(reason_with_values("vix_below_floor", current=vix_last, required=min_vix, op=">=", digits=2))
         # IV-rank gate (2026-05-14). Normalize current VIX against the
         # user-provided 52-week range. Long-premium strategies should
         # cap max_iv_rank to avoid buying expensive premium; credit-
         # spread strategies should floor min_iv_rank to ensure juicy
         # credits. Defaults (min=0.0, max=1.0) disable the gate.
-        if vix_last is not None:
-            vix_52w_low = float(getattr(self.optcfg, "vix_52w_low", 12.0))
-            vix_52w_high = float(getattr(self.optcfg, "vix_52w_high", 30.0))
-            min_iv_rank = float(getattr(self.optcfg, "min_iv_rank", 0.0) or 0.0)
-            max_iv_rank = float(getattr(self.optcfg, "max_iv_rank", 1.0) or 1.0)
-            iv_range = max(0.01, vix_52w_high - vix_52w_low)
-            iv_rank = max(0.0, min(1.0, (vix_last - vix_52w_low) / iv_range))
-            if min_iv_rank > 0.0 and iv_rank < min_iv_rank:
-                reasons.append(reason_with_values("iv_rank_too_low", current=iv_rank, required=min_iv_rank, op=">=", digits=2))
-            if max_iv_rank < 1.0 and iv_rank > max_iv_rank:
-                reasons.append(reason_with_values("iv_rank_too_high", current=iv_rank, required=max_iv_rank, op="<=", digits=2))
-        if abs(vix_pct) >= vix_spike_pct:
-            reasons.append(reason_with_values("vix_spike", current=abs(vix_pct), required=vix_spike_pct, op="<", digits=4))
+        vix_52w_low = float(getattr(self.optcfg, "vix_52w_low", 12.0))
+        vix_52w_high = float(getattr(self.optcfg, "vix_52w_high", 30.0))
+        min_iv_rank = float(getattr(self.optcfg, "min_iv_rank", 0.0) or 0.0)
+        max_iv_rank = float(getattr(self.optcfg, "max_iv_rank", 1.0) or 1.0)
+        iv_range = max(0.01, vix_52w_high - vix_52w_low)
+        iv_rank = max(0.0, min(1.0, (vix_last - vix_52w_low) / iv_range))
+        if min_iv_rank > 0.0 and iv_rank < min_iv_rank:
+            reasons.append(reason_with_values("iv_rank_too_low", current=iv_rank, required=min_iv_rank, op=">=", digits=2))
+        if max_iv_rank < 1.0 and iv_rank > max_iv_rank:
+            reasons.append(reason_with_values("iv_rank_too_high", current=iv_rank, required=max_iv_rank, op="<=", digits=2))
+        if abs(vix_change) >= vix_spike_pct:
+            reasons.append(reason_with_values("vix_spike", current=abs(vix_change), required=vix_spike_pct, op="<", digits=4))
+        return reasons
+
+    def _regime_gate_reasons(self, tape: _UnderlyingTape, index: _IndexTape, idx: pd.DataFrame | None,
+                             confirm_symbol: str | None, vix: _VixRead, activity_score: float) -> list[str]:
+        """The hard gates' refusals: a VIX read that was refused (the other
+        VIX gates are then not asked), VIX, IV rank, a VIX spike, a dead
+        tape, a chaotic range, the confirmation index."""
+        p = self.params
+        u_vwap_dist, u_flip_count, u_range_pct = tape.vwap_dist, tape.flip_count, tape.range_pct
+        idx_available, idx_vwap_dist, min_confirm_bars = index.available, index.vwap_dist, index.min_bars
+        chaos_intraday_range_pct = float(p.get("chaos_intraday_range_pct", 0.016))
+        chop_flip_min = int(p.get("chop_flip_min", 4))
+        trend_vwap_distance_pct = float(p.get("trend_vwap_distance_pct", 0.0016))
+
+        reasons = [vix.refusal] if vix.refusal is not None else self._vix_gate_reasons(vix.last, vix.change)
         # Live activity gate (replaces legacy weak_relative_volume gate that
         # used TV cumulative RVOL — see live_activity_score docstring for
         # why that was unreachable for benchmark ETFs).
@@ -421,7 +493,7 @@ class RegimeMixin:
         # stamping below reads unconditionally.
         return self.entry_policy.fvg_regime_scores(u_close, htf_fvg_ctx, fvg_ltf_ctx)
 
-    def _regime_scores(self, tape: _UnderlyingTape, index: _IndexTape, activity_score: float, vix_pct: float,
+    def _regime_scores(self, tape: _UnderlyingTape, index: _IndexTape, activity_score: float, vix: _VixRead,
                        contexts: _RegimeContexts, htf: _HtfTrend, htf_fvg_score: dict[str, Any],
                        fvg_ltf_score: dict[str, Any]) -> dict[str, float]:
         """The bullish_trend, bearish_trend and range scores."""
@@ -539,7 +611,10 @@ class RegimeMixin:
         # incoming, not range).
         range_score -= 1.0 if activity_score >= float(p.get("credit_activity_max", 1.30)) else 0.0
         range_score -= 1.0 if abs(candidate_day_move) >= float(p.get("credit_max_day_move_pct", 0.010)) else 0.0
-        range_score -= 1.0 if abs(vix_pct) >= float(p.get("credit_max_vix_change_pct", 0.015)) else 0.0
+        # Checked at load (ZeroDteEtfOptionsStrategy.normalize_params). A
+        # refused VIX read (no change) refuses the entry at the gates and
+        # docks nothing here.
+        range_score -= 1.0 if vix.change is not None and abs(vix.change) >= p["credit_max_vix_change_pct"] else 0.0
         range_score += sr_weight * 0.30 if sr_ctx.near_support and sr_ctx.near_resistance else 0.0
         range_score += sr_weight * 0.20 if sr_ctx.regime_hint == "range_between_levels" else 0.0
         range_score -= sr_weight * 0.35 if sr_ctx.breakout_above_resistance or sr_ctx.breakdown_below_support else 0.0
@@ -664,7 +739,7 @@ class RegimeMixin:
         return no_trade
 
     def _regime_metrics(self, tape: _UnderlyingTape, index: _IndexTape, htf: _HtfTrend, activity_score: float,
-                        vix_last: float | None, vix_pct: float, contexts: _RegimeContexts,
+                        vix: _VixRead, contexts: _RegimeContexts,
                         htf_fvg_score: dict[str, Any], fvg_ltf_score: dict[str, Any]) -> dict[str, Any]:
         """What the regime read, as the signal stamps it (``regime_metrics``)
         and the credit pivot-buffer gate reads it."""
@@ -700,8 +775,9 @@ class RegimeMixin:
             "confirm_flip_count": idx_flip_count,
             "live_activity_score": activity_score,
             "candidate_change_from_open": candidate_day_move,
-            "vix": vix_last,
-            "vix_pct": vix_pct,
+            # None when the read was refused (the entry then is too).
+            "vix": vix.last,
+            "vix_pct": vix.change,
             "chart_pattern_bias_score": float(pattern_ctx.bias_score),
             "chart_pattern_regime_hint": str(pattern_ctx.regime_hint),
             "candle_bias_score": float(candle_ctx["candle_bias_score"]),

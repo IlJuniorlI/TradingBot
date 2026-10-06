@@ -871,7 +871,12 @@ options:
   max_vix: 22.5
   # Long-premium VIX floor (0.0 = off; ~12 skips dead-grind tape).
   min_vix: 0.0
-  vix_spike_pct: 0.011
+  # Refuse an entry while VIX's day change since the prior close, either
+  # way, is at least this fraction (0.10 = 10%).
+  vix_spike_pct: 0.10
+  # The oldest VIX quote the regime reads (seconds); an older one, or none,
+  # refuses every entry (vix_unavailable).
+  max_vix_quote_age_seconds: 30
   # IV-rank gate: VIX's position inside the 52-week range you supply here
   # (refresh quarterly). 0.0 = at vix_52w_low, 1.0 = at vix_52w_high.
   # min 0.0 / max 1.0 = disabled.
