@@ -70,6 +70,13 @@ FIELDS: dict[str, tuple[str, str, str]] = {
 STREAM_QUOTE_FIELDS: tuple[int, ...] = (0, *sorted(int(fid) for fid in FIELDS))
 # A book serves only with every one of these received in its epoch.
 CORE_FIELDS = ("1", "2", "3", "33")
+# The fields a book may lack that its symbol's previous cached quote fills in
+# when the book is published (settled L7): open, close, description, exchange
+# name, net change and net percent change, display-only. A book can complete
+# from deltas alone (after a rejected item or a prune, or an ADD Schwab answers
+# without a snapshot), and these rarely change. The core prices never carry
+# over: a book serves only with all four received in its epoch.
+CARRY_OVER_FIELDS = ("12", "15", "17", "18", "25", "42")
 # Schwab's success codes: 0 (LOGIN, LOGOUT), 26-29 (SUBS, UNSUBS, ADD, VIEW).
 STREAM_OK_CODES = frozenset({0, 26, 27, 28, 29})
 # The longest an engine-thread acquire of the books' lock waits.
@@ -124,6 +131,28 @@ def _checked(fid: str, kind: str, value: Any) -> Any:
     if kind in ("price", "count") and number < 0:
         raise MalformedStreamItem(f"field {fid} is negative: {value!r}")
     return value
+
+
+def rest_payload(symbol: str, values: Mapping[str, Any], previous: Any = None) -> dict:
+    """A book's values as Schwab's REST quote names them (``{"symbol",
+    "quote": {...}, "reference": {...}}``), so ``MarketDataStore._normalize_quote``
+    reads a stream quote exactly as a REST one. Each ``CARRY_OVER_FIELDS``
+    field the book lacks is taken from ``previous`` (the raw payload of the
+    symbol's previous cached quote, REST- or stream-made) where it holds one."""
+    payload: dict[str, Any] = {"symbol": symbol, "quote": {}, "reference": {}}
+    for fid, value in values.items():
+        spec = FIELDS.get(fid)
+        if spec is not None:
+            payload[spec[0]][spec[1]] = value
+    if isinstance(previous, Mapping):
+        for fid in CARRY_OVER_FIELDS:
+            if fid in values:
+                continue
+            section, name, _kind = FIELDS[fid]
+            source = previous.get(section)
+            if isinstance(source, Mapping) and source.get(name) is not None:
+                payload[section][name] = source[name]
+    return payload
 
 
 def _item_symbol(item: Any) -> str | None:
@@ -285,6 +314,15 @@ class StreamQuoteState:
                     book.drop()
                     dropped += 1
             return dropped
+
+    def drop(self, symbols: Iterable[str]) -> None:
+        """Empty these symbols' books (a publication that failed): each
+        serves again once its bid, ask, last and mark have arrived again."""
+        with self._engine_lock("drop"):
+            for symbol in symbols:
+                book = self._books.get(symbol)
+                if book is not None:
+                    book.drop()
 
     def subscribed(self) -> frozenset[str]:
         with self._engine_lock("subscribed"):

@@ -137,8 +137,9 @@ runtime:
   history_poll_seconds: 300
   quote_poll_seconds: 6
   quote_cache_seconds: 6
-  # Stream quotes: LEVELONE_EQUITIES beside CHART_EQUITY on the same stream,
-  # one book per symbol (watchlist + held equities). false subscribes nothing.
+  # Stream quotes: LEVELONE_EQUITIES beside CHART_EQUITY on the same stream
+  # serves the engine's quotes (watchlist + held equities); REST the rest.
+  # false subscribes nothing: every quote is REST.
   stream_quotes: true
   quote_batch_size: 50
   history_lookback_minutes: 780

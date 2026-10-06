@@ -467,9 +467,10 @@ class RuntimeConfig:
     quote_cache_seconds: int = 6
     # The stream that carries CHART_EQUITY also subscribes LEVELONE_EQUITIES
     # for the watchlist and every held equity position and keeps one quote
-    # book per symbol (MarketDataStore.stream_quotes; 2026-10-06). Nothing
-    # reads the books yet: every quote is REST. false subscribes nothing.
-    # true or false (the runtime section's switches, checked at load).
+    # book per symbol (MarketDataStore.stream_quotes; 2026-10-06); every
+    # non-forced quote refresh serves the fresh books, REST the rest. false
+    # subscribes nothing: every quote is REST. true or false (the runtime
+    # section's switches, checked at load).
     stream_quotes: bool = True
     quote_batch_size: int = 50
     history_lookback_minutes: int = 390

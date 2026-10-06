@@ -9,15 +9,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **The stream subscribes LEVELONE_EQUITIES beside CHART_EQUITY and keeps
-  a quote book per symbol (`runtime.stream_quotes`, on); nothing reads the
-  books yet.** *2026-10-06* — every quote is REST, refreshed once older
-  than `runtime.quote_cache_seconds` (6 s): one batch request per refresh
-  (2,966 on 2026-10-01, 2,907 on 10-02), each holding schwabdev's one
-  request lock about 0.2 s, and at the perf cut's 2.5-4 s passes only one
-  pass in two or three refreshes, so management reads a quote up to 6 s old
-  on the others. This lays the stream side of the L1 stream-quotes cut; the
-  quotes are served from it in a later change.
+- **Quotes come from the stream: LEVELONE_EQUITIES serves every streamable
+  equity quote the engine's refresh reads, on every pass; REST is the
+  fallback, and forced fetches stay REST (`runtime.stream_quotes`, on).**
+  *2026-10-06* — every quote was REST, refreshed once older than
+  `runtime.quote_cache_seconds` (6 s): one batch request per refresh (2,966
+  on 2026-10-01, 2,907 on 10-02), each holding schwabdev's one request lock
+  about 0.2 s, and at the perf cut's 2.5-4 s passes only one pass in two or
+  three refreshes, so management read a quote up to 6 s old on the others.
   - The subscription: `MarketDataStore.start_streaming(symbols, *,
     stream_quote_symbols)` keeps CHART_EQUITY on the streamable equities of
     `symbols` (the watchlist, unchanged) and subscribes those of
@@ -46,50 +45,94 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     call runs under it (the lines are emitted after it is released), and an
     engine-thread acquire waits 0.5 s at most, after which the store replaces
     the books with an empty state (ERROR) and the next pass subscribes
-    afresh. A book is complete when bid, ask, last and mark have arrived
-    since its subscription in the current epoch and Schwab marked it
-    `"delayed": false`; it is fresh while it is complete and a
-    LEVELONE_EQUITIES data message arrived within the reader's limit
-    (heartbeats, responses and CHART_EQUITY bars do not count). Each ADMIN
-    LOGIN response starts an epoch and empties every book; an UNSUBS, a stop
-    and the symbol-state prune empty theirs; `"delayed": true` empties its
-    symbol's, and so does an item the book cannot take (a non-finite or
-    negative price, a non-integer quote time, a wrong type), until its
-    fields arrive again; data that names no symbol empties every book. A
-    read copies the fresh books under the lock.
-  - The receiver never raises into schwabdev, which would tear the websocket
+    afresh. Each ADMIN LOGIN response starts an epoch and empties every book;
+    an UNSUBS, a stop and the symbol-state prune empty theirs;
+    `"delayed": true` empties its symbol's, and so does an item the book
+    cannot take (a non-finite or negative price, a non-integer quote time, a
+    wrong type), until its fields arrive again; data that names no symbol
+    empties every book. A read copies the fresh books under the lock. The
+    receiver never raises into schwabdev, which would tear the websocket
     down and reconnect (`stream.py:133-136`), CHART_EQUITY with it: a
     failure past the per-item checks drops every book and logs an ERROR with
     its type, and a failing log handler is swallowed.
-  - Logs (`intraday_tv_schwab_bot.stream_quotes`): `Schwab stream login:
-    epoch N code=... msg=...` at each connection; `Schwab stream response
-    service=... command=... code=... msg=...` for every response, at WARNING
-    when the code is not 0 or 26-29 or not an integer; `Schwab stream
-    notice: ...` (WARNING) for a notice that is not a heartbeat; `Stream
-    quotes: first LEVELONE_EQUITIES item of epoch N: {...}`; `Stream quotes:
-    first complete LEVELONE_EQUITIES book for SYM (epoch N)`; WARNINGs for a
-    delayed symbol and a rejected item (once per symbol and epoch, DEBUG
-    after) and for data that names no symbol.
+  - Fresh: a symbol's book serves while it is subscribed, a login started
+    the current epoch, its bid, ask, last and mark have arrived since its
+    subscription in that epoch, Schwab marked it `"delayed": false`, and
+    LEVELONE_EQUITIES data arrived within `quote_cache_seconds` (heartbeats,
+    responses and CHART_EQUITY bars do not count: a stalled quote service on
+    a live connection falls back to REST).
+  - Served: every non-forced `fetch_quotes` (the engine's per-pass refresh)
+    publishes each requested fresh book into `quote_cache` on the engine
+    thread, with no `quote_cache_seconds` wait, through `_normalize_quote`
+    like a REST quote (`stream_quotes.rest_payload` names the book's fields
+    as Schwab's REST quote does), stamped (`fetched_at`,
+    `last_quote_refresh`) with the receipt of the stream's last
+    LEVELONE_EQUITIES data message, so a quote's age stays honest and never
+    exceeds a cached REST quote's; never over a newer quote (a forced REST
+    fetch after that message). A display field the book lacks (open, close,
+    description, exchange name, net change and percent change) carries over
+    from the symbol's cached quote; the prices never do. Each symbol's
+    publication is isolated: one that raises drops that book (ERROR with
+    the type) and REST serves the symbol; a read that fails serves REST for
+    the call. Every other symbol takes the TTL/REST path as before. Every
+    cached quote names its source (`quote_source`: `rest` or `stream`).
+  - What prices what: an entry (its preview, its order and its dry-run fill)
+    from a forced REST quote; management, and the exits it decides (the
+    order and its dry-run fill, `execution.submit_equity_exit` reading the
+    management snapshot), from the quote management reads, the pass's
+    published quote, so the stream's when it served (a quote that aged past
+    `quote_cache_seconds` within the pass is refreshed by a forced REST
+    fetch, as before); a live exit's re-sends, the startup restore and
+    option quotes from forced REST quotes.
+  - Logs: `Quote refresh ... stream=N` (mode `stream` when no REST request
+    was needed; the other modes as before); `Stream quotes live: epoch N,
+    serving K of M requested symbols` and `Stream quotes silent: no
+    LEVELONE_EQUITIES data for X s (limit Y s, epoch N); ...` once per change
+    (INFO and WARNING; another of the same kind within 5 minutes at DEBUG);
+    the receiver's lines (`intraday_tv_schwab_bot.stream_quotes`): `Schwab
+    stream login: epoch N code=... msg=...` at each connection; `Schwab
+    stream response service=... command=... code=... msg=...` for every
+    response, at WARNING when the code is not 0 or 26-29 or not an integer;
+    `Schwab stream notice: ...` (WARNING) for a notice that is not a
+    heartbeat; `Stream quotes: first LEVELONE_EQUITIES item of epoch N:
+    {...}`; `Stream quotes: first complete LEVELONE_EQUITIES book for SYM
+    (epoch N)`; WARNINGs for a delayed symbol and a rejected item (once per
+    symbol and epoch, DEBUG after) and for data that names no symbol.
   - `runtime.stream_quotes` (new; `true` in every preset, right after
     `quote_cache_seconds`, and by default): `true` or `false`, checked at
-    load; `false` subscribes nothing.
+    load; `false` subscribes nothing and every quote is REST, as before.
+  - Not changed: bars and frames, the forced quotes, `quote_cache_seconds`.
+    A network outage still blocks the REST fallback (the stream goes silent
+    with it, as on 10-02 11:12); a REST-only outage no longer blocks the
+    quotes phase.
+  - Measured (the replay harness streaming L1 valued as its REST quotes):
+    10-01 09:40-10:40 (top_tier, 28 symbols) takes 1 batch quote request
+    instead of 181, the 11 forced entry quotes unchanged, and is otherwise
+    identical in decisions, signals, positions, events, frames, the
+    dashboard and the cached quotes.
   - Identical: the 10-01 09:40-10:40 stepped replay (top_tier, a page open)
     and the peer_confirmed_key_levels 05-04 09:40-10:40 window, no stream
-    quote data, against 2d70ab2 in every category (the harness's stream
-    records the SUBS; nothing reads the books).
-  - README: `stream_quotes` and the runtime table.
+    quote data, against 2d70ab2 in every category but the ` stream=0` every
+    `Quote refresh` line gains and every cached quote's `quote_source`.
+  - README: `stream_quotes`, `quote_cache_seconds` and the runtime table.
   - Tests: `tests/market_data/test_stream_quotes.py` (new: the subscription,
     its revert and shared back-off, the service keys, the books, the epoch,
     liveness, rejected, delayed and unattributable data, the receiver's
     isolation and lines, stop, prune, the lock's timeout and its
     discipline, a two-thread read under churn, and schwabdev 4.0.0's replay
     pinned with a reconnect it causes and the store's send that does not),
+    `tests/market_data/test_stream_quote_serving.py` (new: serving, no TTL
+    wait, never over a newer REST quote, forced fetches, the refresh line,
+    `quote_source`, the normalization, the carry-over, the age, prune, the
+    switch, the isolation of a publication and a read, the transitions and
+    their damping, the two locks, a two-thread publication under churn),
     `tests/composition/test_cycle_symbol_maps.py` (the held equity streamed
     beside the watchlist), `tests/domain/test_config_validation.py` and
     `tests/guards/test_preset_parity.py` (the switch);
     `tests/support/brokers.py`'s fake stream records schwabdev's
-    subscriptions and its fake streamer can hold a replay. 77 mutants, all
-    killed, each by its named test.
+    subscriptions and its fake streamer can hold a replay. 112 mutants (77
+    for the subscription and the books, 35 for the serving), all killed,
+    each by its named test.
 
 - **Every engine pass and every management pass is on the record:
   CYCLE_TIMING, POSITION_MARK, the pass before on EXIT_CONTEXT and

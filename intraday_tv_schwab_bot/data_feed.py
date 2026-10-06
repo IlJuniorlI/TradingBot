@@ -22,7 +22,14 @@ from .order_blocks import OrderBlockContext, build_order_block_context, empty_or
 from .numeric import first_float, safe_float
 from .symbols import QUOTE_SYMBOL_ALIASES, STREAMABLE_EQUITY_RE, is_streamable_equity, is_support_resistance_symbol
 from .schwab_api import call_schwab_client, call_schwab_json, response_ok
-from .stream_quotes import LEVELONE_EQUITIES, STREAM_QUOTE_FIELDS, StreamQuoteLockTimeout, StreamQuoteState
+from .stream_quotes import (
+    LEVELONE_EQUITIES,
+    STREAM_QUOTE_FIELDS,
+    StreamQuoteLockTimeout,
+    StreamQuoteRead,
+    StreamQuoteState,
+    rest_payload,
+)
 from .bars import (
     completed_bucket_mask,
     ensure_ohlcv_frame,
@@ -79,6 +86,11 @@ STREAM_LOG_TEXT_CHARS = 400
 # After a stream subscription send fails, none is tried again for this long,
 # nor while the stream is not active (``MarketDataStore._stream_send_due``).
 STREAM_SEND_RETRY_SECONDS = 60.0
+
+# A stream quote transition (live to silent, or back) is logged at WARNING
+# (silent) or INFO (live) unless one of its kind was logged that loudly this
+# long before; then at DEBUG (settled L6: flaps in quiet periods).
+STREAM_QUOTE_TRANSITION_QUIET_SECONDS = 300.0
 
 # A CHART_EQUITY bar is stamped with its minute's start, so a real bar's
 # chart time is before its receipt; one stamped more than this after it is
@@ -196,6 +208,13 @@ class MarketDataStore:
         # (runtime.stream_quotes): the stream thread merges each message into
         # them under their own lock, never this store's.
         self.stream_quotes = StreamQuoteState()
+        # Whether the stream quotes were live at the last non-forced read
+        # (None: nothing to judge, no login or nothing subscribed), the
+        # transitions since, and when each kind was last logged loudly
+        # (_log_stream_quote_transition).
+        self._stream_quotes_live: bool | None = None
+        self._stream_quote_transitions = 0
+        self._stream_quote_transition_logged: dict[bool, datetime] = {}
         self._lock = RLock()
         self.started_at = sessions.now_et()
         self._forced_premarket_history_refresh_date: dict[str, date] = {}
@@ -1729,6 +1748,15 @@ class MarketDataStore:
         min_force_interval_seconds: float | None = None,
         source: str | None = None,
     ) -> dict[str, dict]:
+        """Quotes for ``symbols``, cached in ``quote_cache``. A non-forced
+        call (the engine's refresh) serves each requested symbol whose stream
+        quote book is fresh from the book (``_serve_stream_quote``, no TTL
+        wait); every other symbol is served from the cache while its quote is
+        younger than ``_quote_ttl`` and fetched by REST otherwise. A forced
+        call fetches REST (a symbol fetched less than
+        ``min_force_interval_seconds`` ago, which only option callers pass, is
+        served from the cache). One ``Quote refresh`` INFO line per call
+        counts each way."""
         out: dict[str, dict] = {}
         requested = sorted({self._symbol_key(s) for s in symbols if str(s).strip()})
         pending: list[str] = []
@@ -1737,7 +1765,15 @@ class MarketDataStore:
         fallback_hits = 0
         failures = 0
         force_cooldown_hits = 0
+        stream_hits = 0
+        stream = self._stream_quote_read(requested, force=force)
         for symbol in requested:
+            if stream is not None:
+                published = self._serve_stream_quote(symbol, stream)
+                if published is not None:
+                    out[symbol] = published
+                    stream_hits += 1
+                    continue
             if force:
                 cached = self.quote_cache.get(symbol)
                 last_refresh = self.last_quote_refresh.get(symbol)
@@ -1814,9 +1850,10 @@ class MarketDataStore:
                 out[symbol] = cached
 
         if requested:
-            mode = "all_cached" if not pending and not failures and cached_hits == len(requested) else "refresh"
+            served = not pending and not failures and cached_hits + stream_hits == len(requested)
+            mode = ("stream" if stream_hits else "all_cached") if served else "refresh"
             LOG.info(
-                "Quote refresh source=%s mode=%s requested=%d cached=%d pending=%d batch=%d fallback=%d failed=%d force=%s force_cooldown_cached=%d",
+                "Quote refresh source=%s mode=%s requested=%d cached=%d pending=%d batch=%d fallback=%d failed=%d force=%s force_cooldown_cached=%d stream=%d",
                 str(source or "unspecified"),
                 mode,
                 len(requested),
@@ -1827,16 +1864,120 @@ class MarketDataStore:
                 failures,
                 force,
                 force_cooldown_hits,
+                stream_hits,
             )
         return out
 
+    def _stream_quote_read(self, requested: list[str], *, force: bool) -> StreamQuoteRead | None:
+        """The stream quote books a non-forced ``fetch_quotes`` may serve:
+        a read of the fresh books among ``requested``
+        (``StreamQuoteState.read``, at ``_quote_ttl``), after which the
+        stream's silent/live transition is logged. None for a forced fetch,
+        with ``runtime.stream_quotes`` off or nothing requested, and when the
+        read fails: logged with the error's type, the call then serves REST
+        (settled L2; a lock timeout replaces the books, ``_reset_stream_quotes``)."""
+        if force or not requested or not self.config.runtime.stream_quotes:
+            return None
+        now = sessions.now_et()
+        ttl = self._quote_ttl()
+        try:
+            read = self.stream_quotes.read(requested, now, ttl)
+        except StreamQuoteLockTimeout as exc:
+            self._reset_stream_quotes("the quote read", exc)
+            return None
+        except Exception as exc:
+            LOG.error("Stream quotes: the quote read failed (%s: %s); this refresh serves REST", type(exc).__name__, exc)
+            return None
+        self._log_stream_quote_transition(read, now, ttl, len(requested))
+        return read
+
+    def _log_stream_quote_transition(self, read: StreamQuoteRead, now: datetime, ttl: float, requested: int) -> None:
+        """Log the stream quotes going silent (no LEVELONE_EQUITIES data
+        within ``ttl``: every symbol takes the REST path) or live again,
+        judged once per non-forced read. Nothing is judged before a login or
+        with nothing subscribed (the state is None, as after a stop), and the
+        wait for an epoch's first data is no transition. A transition logs at
+        WARNING (silent) or INFO (live), or at DEBUG when one of its kind was
+        logged that loudly less than ``STREAM_QUOTE_TRANSITION_QUIET_SECONDS``
+        before (settled L6: quiet periods flap); each counts in
+        ``_stream_quote_transitions``."""
+        if read.epoch == 0 or read.subscribed == 0:
+            self._stream_quotes_live = None
+            return
+        previous, self._stream_quotes_live = self._stream_quotes_live, read.live
+        if previous == read.live or (previous is None and not read.live):
+            return
+        self._stream_quote_transitions += 1
+        last = self._stream_quote_transition_logged.get(read.live)
+        loud = last is None or (now - last).total_seconds() >= STREAM_QUOTE_TRANSITION_QUIET_SECONDS
+        if loud:
+            self._stream_quote_transition_logged[read.live] = now
+        if read.live:
+            LOG.log(logging.INFO if loud else logging.DEBUG, "Stream quotes live: epoch %d, serving %d of %d requested "
+                    "symbols", read.epoch, len(read.books), requested)
+            return
+        since = "since the login" if read.at is None else f"for {(now - read.at).total_seconds():.1f} s"
+        LOG.log(logging.WARNING if loud else logging.DEBUG, "Stream quotes silent: no LEVELONE_EQUITIES data %s "
+                "(limit %.0f s, epoch %d); %d requested symbols take the REST path", since, ttl, read.epoch, requested)
+
+    def _serve_stream_quote(self, symbol: str, read: StreamQuoteRead) -> dict | None:
+        """``symbol``'s fresh book published (``_publish_stream_quote``), or
+        None: no fresh book, a newer cached quote, or a publication that
+        failed. A failure is logged with its type and drops the book
+        (settled L2), so the symbol takes the REST path and its book serves
+        again once its bid, ask, last and mark have arrived again."""
+        values = read.books.get(symbol)
+        if values is None or read.at is None:
+            return None
+        try:
+            return self._publish_stream_quote(symbol, values, read.at)
+        except Exception as exc:
+            LOG.error("Stream quotes: publishing %s failed (%s: %s); its book is dropped and REST serves it", symbol,
+                      type(exc).__name__, exc)
+            try:
+                self.stream_quotes.drop([symbol])
+            except StreamQuoteLockTimeout as again:
+                self._reset_stream_quotes("the book drop", again)
+            return None
+
+    def _publish_stream_quote(self, symbol: str, values: Mapping[str, Any], at: datetime) -> dict | None:
+        """Cache ``symbol``'s stream book as its quote, through
+        ``_normalize_quote`` like a REST quote (the book in Schwab's REST
+        names, ``stream_quotes.rest_payload``, a display field it lacks
+        carried over from the cached quote's raw payload: settled L7),
+        stamped ``fetched_at`` and ``last_quote_refresh`` with ``at`` (the
+        receipt of the stream's last LEVELONE_EQUITIES data message, so the
+        quote's age is honest and never more than ``_quote_ttl``) and
+        ``quote_source`` "stream". Never over a newer quote: when the cached
+        one's ``last_quote_refresh`` is later than ``at`` (a forced REST
+        fetch after the stream's last message) nothing is written and None
+        is returned; the symbol then takes the TTL path, which serves it."""
+        with self._lock:
+            cached = self.quote_cache.get(symbol)
+            last = self.last_quote_refresh.get(symbol)
+        if last is not None and last > at:
+            return None
+        normalized = self._normalize_quote(symbol, rest_payload(symbol, values,
+                                                                (cached or {}).get("raw")))
+        normalized["fetched_at"] = at
+        normalized["quote_source"] = "stream"
+        with self._lock:
+            last = self.last_quote_refresh.get(symbol)
+            if last is not None and last > at:
+                return None
+            self.quote_cache[symbol] = normalized
+            self.last_quote_refresh[symbol] = at
+        return normalized
+
     def _store_rest_quote(self, symbol: str, normalized: dict, fetched_at: datetime) -> dict:
         """Cache one REST quote (``_normalize_quote``'s dict): stamped
-        ``fetched_at``, with the symbol's ``last_quote_refresh``, under the
-        store's lock. Every REST write of ``fetch_quotes`` (the batch, the
-        single-quote fallback, the alias fetch) goes through it, each with
-        its own ``fetched_at``. Returns the stored dict."""
+        ``fetched_at`` and ``quote_source`` "rest", with the symbol's
+        ``last_quote_refresh``, under the store's lock. Every REST write of
+        ``fetch_quotes`` (the batch, the single-quote fallback, the alias
+        fetch) goes through it, each with its own ``fetched_at``. Returns the
+        stored dict."""
         normalized["fetched_at"] = fetched_at
+        normalized["quote_source"] = "rest"
         with self._lock:
             self.quote_cache[symbol] = normalized
             self.last_quote_refresh[symbol] = fetched_at
@@ -2170,6 +2311,7 @@ class MarketDataStore:
             self.stream_start_requested_at = None
             self._stream_seen_symbols.clear()
             self._stream_first_bar_time.clear()
+        self._stream_quotes_live = None
         # Whatever ran: an item after the stop finds nothing subscribed.
         try:
             self.stream_quotes.clear()
