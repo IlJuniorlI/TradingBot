@@ -50,8 +50,10 @@ LEVELONE_EQUITIES = "LEVELONE_EQUITIES"
 # (the section of Schwab's REST quote that names the same value, its name
 # there, its kind). The core four (bid, ask, last, mark), the fields
 # ``MarketDataStore._normalize_quote`` reads (volume, close, open, net change,
-# net percent change, description), the exchange name the dashboard prefers,
-# and the quote time.
+# description), the exchange name the dashboard prefers, the quote time, and
+# the net percent change, kept under Schwab's REST name, which nothing reads
+# yet. Net change and net percent change are signed: a symbol below its
+# previous close sends negative ones.
 FIELDS: dict[str, tuple[str, str, str]] = {
     "1": ("quote", "bidPrice", "price"),
     "2": ("quote", "askPrice", "price"),
@@ -71,8 +73,8 @@ STREAM_QUOTE_FIELDS: tuple[int, ...] = (0, *sorted(int(fid) for fid in FIELDS))
 # A book serves only with every one of these received in its epoch.
 CORE_FIELDS = ("1", "2", "3", "33")
 # The fields a book may lack that its symbol's previous cached quote fills in
-# when the book is published (settled L7): open, close, description, exchange
-# name, net change and net percent change, display-only. A book can complete
+# when the book is published: open, close, description, exchange name, net
+# change and net percent change, display-only. A book can complete
 # from deltas alone (after a rejected item or a prune, or an ADD Schwab answers
 # without a snapshot), and these rarely change. The core prices never carry
 # over: a book serves only with all four received in its epoch.
@@ -188,12 +190,16 @@ class StreamQuoteBook:
         return self.delayed is False and all(fid in self.values for fid in CORE_FIELDS)
 
     def merge(self, item: Mapping[str, Any]) -> None:
-        """Apply one item whole or not at all: every kept field is checked
-        first (``MalformedStreamItem`` names the field and its value). A
-        ``"delayed": true`` empties the values whatever else the item holds,
+        """Apply one item's fields whole or not at all: every kept field is
+        checked first (``MalformedStreamItem`` names the field and its value).
+        The item's ``"delayed"`` flag is taken before its fields are checked:
+        a ``"delayed": true`` empties the values whatever else the item holds,
         and none accumulate until a ``"delayed": false`` arrives (its item's
-        fields with it). Field ids the books do not keep and the item's other
-        keys (``key``, ``assetMainType``, ...) are ignored."""
+        fields with it); a ``"delayed": false`` counts even when another field
+        of its item is rejected, so a snapshot rejected for one field (Schwab
+        sends the flag in the snapshot only) leaves its book to complete from
+        the deltas that follow. Field ids the books do not keep and the item's
+        other keys (``key``, ``assetMainType``, ...) are ignored."""
         delayed = item.get("delayed", _ABSENT)
         if delayed is not _ABSENT and not isinstance(delayed, bool):
             raise MalformedStreamItem(f"delayed is not true or false: {delayed!r}")
@@ -201,6 +207,8 @@ class StreamQuoteBook:
             self.values.clear()
             self.delayed = True
             return
+        if delayed is False:
+            self.delayed = False
         updates: dict[str, Any] = {}
         for fid, value in item.items():
             spec = FIELDS.get(fid) if isinstance(fid, str) else None
@@ -209,8 +217,6 @@ class StreamQuoteBook:
             checked = _checked(fid, spec[2], value)
             if checked is not _ABSENT:
                 updates[fid] = checked
-        if delayed is False:
-            self.delayed = False
         if self.delayed is True:
             return
         self.values.update(updates)
@@ -292,11 +298,15 @@ class StreamQuoteState:
         """An empty state to replace this one when its lock is stuck
         (``MarketDataStore._reset_stream_quotes``): nothing subscribed, no
         book, but this state's epoch count, read without the lock (the stuck
-        thread holds it; one int read is atomic). The connection whose login
-        started that epoch is still the stream's, so once the next
-        subscription's snapshot fills the new books they serve, with no new
-        login."""
-        return StreamQuoteState(epoch=self._epoch)
+        thread holds it; one int read is atomic), and at least 1. The
+        connection whose login started that epoch is still the stream's, so
+        once the next subscription's snapshot fills the new books they serve,
+        with no new login. At least 1: when the stuck thread is inside the
+        stream's first LOGIN response, the count read is still 0, and a state
+        at 0 would serve nothing until the next reconnect; a new state's books
+        fill only from data that arrives after it exists, which flows only on
+        a logged-in connection."""
+        return StreamQuoteState(epoch=max(1, self._epoch))
 
     # ------------------------------------------------------------ engine thread
     @contextmanager

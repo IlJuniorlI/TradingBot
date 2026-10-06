@@ -98,7 +98,7 @@ STREAM_BACKFILL_RETRY_MAX_SECONDS = 900.0
 
 # A stream quote transition (live to silent, or back) is logged at WARNING
 # (silent) or INFO (live) unless one of its kind was logged that loudly this
-# long before; then at DEBUG (settled L6: flaps in quiet periods).
+# long before; then at DEBUG (a quiet period's flaps).
 STREAM_QUOTE_TRANSITION_QUIET_SECONDS = 300.0
 
 # The stream quotes' REST shadow (MarketDataStore.run_stream_quote_shadow)
@@ -2042,7 +2042,7 @@ class MarketDataStore:
         stream's silent/live transition is logged. None for a forced fetch,
         with ``runtime.stream_quotes`` off or nothing requested, and when the
         read fails: logged with the error's type, the call then serves REST
-        (settled L2; a lock timeout replaces the books, ``_reset_stream_quotes``)."""
+        (a lock timeout replaces the books, ``_reset_stream_quotes``)."""
         if force or not requested or not self.config.runtime.stream_quotes:
             return None
         now = sessions.now_et()
@@ -2071,8 +2071,8 @@ class MarketDataStore:
         was, and its readers (an entry's market read, the management
         snapshot) take a cached quote younger than ``_quote_ttl``: since the
         stream quotes, usually the stream's. One WARNING per such symbol
-        naming that quote's source and age (settled U2); none for a cached
-        quote too old for them."""
+        naming that quote's source and age; none for a cached quote too old
+        for them."""
         stored = set(rest_stored)
         missed = [symbol for symbol in pending if symbol not in stored]
         if not missed:
@@ -2258,7 +2258,7 @@ class MarketDataStore:
         wait for an epoch's first data is no transition. A transition logs at
         WARNING (silent) or INFO (live), or at DEBUG when one of its kind was
         logged that loudly less than ``STREAM_QUOTE_TRANSITION_QUIET_SECONDS``
-        before (settled L6: quiet periods flap); each counts in
+        before (quiet periods flap); each counts in
         ``_stream_quote_transitions``."""
         if read.epoch == 0 or read.subscribed == 0:
             self._stream_quotes_live = None
@@ -2282,9 +2282,9 @@ class MarketDataStore:
     def _serve_stream_quote(self, symbol: str, read: StreamQuoteRead) -> dict | None:
         """``symbol``'s fresh book published (``_publish_stream_quote``), or
         None: no fresh book, a newer cached quote, or a publication that
-        failed. A failure is logged with its type and drops the book
-        (settled L2), so the symbol takes the REST path and its book serves
-        again once its bid, ask, last and mark have arrived again."""
+        failed. A failure is logged with its type and drops the book, so the
+        symbol takes the REST path and its book serves again once its bid,
+        ask, last and mark have arrived again."""
         values = read.books.get(symbol)
         if values is None or read.at is None:
             return None
@@ -2303,7 +2303,7 @@ class MarketDataStore:
         """Cache ``symbol``'s stream book as its quote, through
         ``_normalize_quote`` like a REST quote (the book in Schwab's REST
         names, ``stream_quotes.rest_payload``, a display field it lacks
-        carried over from the cached quote's raw payload: settled L7),
+        carried over from the cached quote's raw payload),
         stamped ``fetched_at`` and ``last_quote_refresh`` with ``at`` (the
         receipt of the stream's last LEVELONE_EQUITIES data message, so the
         quote's age is honest and never more than ``_quote_ttl``) and
@@ -2602,7 +2602,12 @@ class MarketDataStore:
             # a send that recorded a new service there, the first
             # LEVELONE_EQUITIES one behind a slow pass, changed the dict's size
             # mid-iteration, and schwabdev reconnected. An empty service sends
-            # nothing (``stream.py:102``).
+            # nothing (``stream.py:102``). This closes the race on the
+            # services only: an ADD or UNSUBS recorded into a service's keys
+            # while schwabdev iterates them (``stream.py:97``) still raises
+            # there, and schwabdev reconnects (rare: a new epoch, every book
+            # emptied, CHART_EQUITY dark for the backoff); a SUBS replaces the
+            # service's keys and is safe.
             self.stream.subscriptions.setdefault("CHART_EQUITY", {})
             if self.config.runtime.stream_quotes:
                 self.stream.subscriptions.setdefault(LEVELONE_EQUITIES, {})
@@ -2644,8 +2649,8 @@ class MarketDataStore:
             self._stream_send_succeeded(what)
         with self._lock:
             # Atomic replacement — Python attribute assignment is atomic, so
-            # any lock-free reader (e.g. should_backfill_stream_symbol at
-            # line 834) always observes either the old set or the new set,
+            # any lock-free reader (e.g. should_backfill_stream_symbol)
+            # always observes either the old set or the new set,
             # never a mid-update partial. All known callers do fresh
             # `self.stream_symbols` lookups rather than caching the ref.
             self.stream_symbols = set(wanted)

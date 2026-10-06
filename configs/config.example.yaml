@@ -138,8 +138,9 @@ runtime:
   quote_poll_seconds: 6
   quote_cache_seconds: 6
   # Stream quotes: LEVELONE_EQUITIES beside CHART_EQUITY on the same stream
-  # serves the engine's quotes (watchlist + held equities); REST the rest.
-  # false subscribes nothing: every quote is REST.
+  # serves the engine's quotes of streamable equities (watchlist + held
+  # equities); indices and option legs stay REST, as does every symbol while
+  # the stream is silent. false subscribes nothing: every quote is REST.
   stream_quotes: true
   # The stream quotes' REST shadow: every N-th publication, after management
   # and the entries, the served symbols' books are compared with one REST

@@ -38,19 +38,30 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     it across awaits (`stream.py:95-105`), and the first LEVELONE_EQUITIES
     send of a stream, recorded behind a slow pass, would have added a key
     mid-iteration ("dictionary changed size during iteration": a reconnect).
-    An empty service sends nothing. Pinned against schwabdev 4.0.0.
+    An empty service sends nothing. Pinned against schwabdev 4.0.0. This
+    closes the race on the services only: an ADD or UNSUBS recorded into a
+    service's keys while schwabdev iterates them still raises there and
+    reconnects the stream (rare: a new epoch, every book emptied,
+    CHART_EQUITY dark for the backoff); a SUBS, which replaces the keys, is
+    safe.
   - The books (`stream_quotes.StreamQuoteState`, new, market-data layer):
     the stream thread merges each message into one book per subscribed
     symbol under the books' own `threading.Lock`, never the store's; no log
     call runs under it (the lines are emitted after it is released), and an
     engine-thread acquire waits 0.5 s at most, after which the store replaces
     the books with an empty state (ERROR) and the next pass subscribes
-    afresh. Each ADMIN LOGIN response starts an epoch and empties every book;
-    an UNSUBS, a stop and the symbol-state prune empty theirs;
-    `"delayed": true` empties its symbol's, and so does an item the book
-    cannot take (a non-finite or negative price, a non-integer quote time, a
-    wrong type), until its fields arrive again; data that names no symbol
-    empties every book. A read copies the fresh books under the lock. The
+    afresh; the new state keeps the epoch count, at least 1, so its books
+    serve from the next snapshot with no new login (a count still 0 inside
+    the stream's first LOGIN would have served nothing until a reconnect).
+    Each ADMIN LOGIN response starts an epoch and empties every book; an
+    UNSUBS, a stop and the symbol-state prune empty theirs; `"delayed": true`
+    empties its symbol's, and so does an item the book cannot take (a
+    non-finite price, a negative price or volume, a non-integer quote time, a
+    wrong type), until its fields arrive again; an item's `"delayed": false`
+    counts even when another of its fields is rejected, so a snapshot (the
+    only item that carries the flag) rejected for one field leaves its book
+    to complete from the deltas that follow; net change and net percent
+    change are signed; data that names no symbol empties every book. A read copies the fresh books under the lock. The
     receiver never raises into schwabdev, which would tear the websocket
     down and reconnect (`stream.py:133-136`), CHART_EQUITY with it: a
     failure past the per-item checks drops every book and logs an ERROR with
@@ -188,14 +199,23 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the shadow's `Stream quote shadow: ...` lines.
   - `runtime.stream_quotes` (new; `true` in every preset, right after
     `quote_cache_seconds`, and by default): `true` or `false`, checked at
-    load; `false` subscribes nothing and every quote is REST, as before.
+    load; `false` subscribes nothing and every quote is REST, as before. Only
+    streamable equities are served: the 0DTE presets' refresh requests none
+    (`$VIX`, `$SPX`, `$COMPX`, `$RUT`, option legs), so there the switch only
+    subscribes their watchlist's equities (SPY, QQQ) and logs their lines,
+    and `serving 0 of N requested symbols` is expected.
   - `runtime.stream_quote_shadow_every` (new; `20` in every preset, right
     after `stream_quotes`, and by default): an integer of at least 0,
     checked at load; `0` turns the shadow off.
   - Not changed: bars and frames, the forced quotes, `quote_cache_seconds`.
     A network outage still blocks the REST fallback (the stream goes silent
-    with it, as on 10-02 11:12); a REST-only outage no longer blocks the
-    quotes phase.
+    with it, as on 10-02 11:12). In a REST-only outage the quotes phase no
+    longer waits on REST for the symbols the stream serves; a symbol it does
+    not serve (an index such as the peer presets' NYICDX and VIX, the 0DTE
+    presets' indices, an option leg, or a book not complete yet) still takes
+    REST there every `quote_cache_seconds`, ahead of management, as before
+    (on the peer presets about 2 minutes a pass when every request's reads
+    time out, about 1 minute once their single quotes are blacklisted).
   - Measured (the replay harness streaming L1 valued as its REST quotes):
     10-01 09:40-10:40 (top_tier, 28 symbols) takes 10 batch quote requests
     instead of 181 (the first pass's, before the books fill, and the
@@ -225,19 +245,28 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - README: `stream_quotes`, `stream_quote_shadow_every`,
     `quote_cache_seconds`, the runtime table and the cycle timing's phases.
   - Tests: `tests/market_data/test_stream_quotes.py` (new: the subscription,
-    its revert and shared back-off, the service keys, the books, the epoch,
-    liveness, rejected, delayed and unattributable data, the receiver's
-    isolation and lines, stop, prune, the lock's timeout and its
-    discipline, a two-thread read under churn, and schwabdev 4.0.0's replay
-    pinned with a reconnect it causes and the store's send that does not),
+    its revert and shared back-off, the service keys, the books with
+    negative changes, the epoch, liveness, rejected, delayed and
+    unattributable data, a rejected snapshot's delayed flag, the receiver's
+    isolation and lines, stop, prune, the lock's timeout (inside the
+    stream's first login too) and its discipline, a two-thread read under
+    churn whose packets split each quote across two items, at the shortest
+    thread switch, and schwabdev 4.0.0's replay pinned with a reconnect it
+    causes and the store's send that does not),
     `tests/market_data/test_stream_quote_serving.py` (new: serving, no TTL
     wait, never over a newer REST quote, forced fetches, the refresh line,
     `quote_source`, the normalization, the carry-over, the age, prune, the
-    switch, the isolation of a publication and a read, the transitions and
-    their damping, the two locks, a two-thread publication under churn),
+    switch, the isolation of a publication and a read, the lock timeout at
+    every engine call into the books (the prune, the health line, the
+    forced-fetch check, a failed publication's drop, a failed send's
+    revert), the transitions and their damping, the two locks, a two-thread
+    publication under churn),
     `tests/market_data/test_stream_quote_checks.py` (new: the health line's
-    cadence, counts, gaps, lag, reasons and transitions; the forced-fetch
-    check line and when there is none; the failed forced fetch's WARNING),
+    cadence, counts, gaps, lag (the largest, in any order), reasons and
+    transitions, and a stop starting the gaps and the data time over; the
+    forced-fetch check line and when there is none, a symbol REST did not
+    store included; the failed forced fetch's WARNING, at exactly the limit
+    too, and none for a cooldown hit),
     `tests/runtime/test_management_stream_quotes.py` (new: an aged quote read
     from the stream without REST, a silent stream, a book that does not
     serve and the switch off forcing REST as before, a fresh quote reading
@@ -266,12 +295,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     shadow after the entries, in its own phase),
     `tests/domain/test_config_validation.py` and
     `tests/guards/test_preset_parity.py` (the switch and the shadow's
-    count);
+    count), `tests/guards/test_module_layering.py` (`stream_quotes` in the
+    market-data layer, importing the standard library only);
     `tests/support/brokers.py`'s fake stream records schwabdev's
-    subscriptions and its fake streamer can hold a replay. 200 mutants (77
+    subscriptions and its fake streamer can hold a replay. 220 mutants (77
     for the subscription and the books, 35 for the serving, 30 for the
     checks, 18 for management's stream read, 9 for the entitlement line, 31
-    for the shadow), all killed, each by its named test.
+    for the shadow, 20 for the review's fixes to the books, the serving and
+    the checks), all killed, each by its named test.
 
 - **Every engine pass and every management pass is on the record:
   CYCLE_TIMING, POSITION_MARK, the pass before on EXIT_CONTEXT and
