@@ -141,6 +141,10 @@ runtime:
   # serves the engine's quotes (watchlist + held equities); REST the rest.
   # false subscribes nothing: every quote is REST.
   stream_quotes: true
+  # The stream quotes' REST shadow: every N-th publication, after management
+  # and the entries, the served symbols' books are compared with one REST
+  # batch; a book whose quote time lags REST's is dropped. 0 turns it off.
+  stream_quote_shadow_every: 20
   quote_batch_size: 50
   history_lookback_minutes: 780
   use_extended_hours_history: true

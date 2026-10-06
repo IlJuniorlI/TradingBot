@@ -82,6 +82,7 @@ runtime:
   quote_poll_seconds: 8
   quote_cache_seconds: 8
   stream_quotes: true
+  stream_quote_shadow_every: 20
   quote_batch_size: 50
   history_lookback_minutes: 390
   use_extended_hours_history: true

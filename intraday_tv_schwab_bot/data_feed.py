@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -92,6 +93,14 @@ STREAM_SEND_RETRY_SECONDS = 60.0
 # long before; then at DEBUG (settled L6: flaps in quiet periods).
 STREAM_QUOTE_TRANSITION_QUIET_SECONDS = 300.0
 
+# The stream quotes' REST shadow (MarketDataStore.run_stream_quote_shadow)
+# skips for STREAM_QUOTE_SHADOW_BACKOFF_SECONDS after a REST quote request
+# that failed (raised or answered a non-2xx status) or took longer than
+# STREAM_QUOTE_SHADOW_SLOW_SECONDS (settled M4): in a REST outage it adds no
+# request to wait out.
+STREAM_QUOTE_SHADOW_BACKOFF_SECONDS = 60.0
+STREAM_QUOTE_SHADOW_SLOW_SECONDS = 2.0
+
 # A CHART_EQUITY bar is stamped with its minute's start, so a real bar's
 # chart time is before its receipt; one stamped more than this after it is
 # malformed (the allowance covers a local clock up to a minute behind
@@ -111,6 +120,14 @@ def _check_delta(rest: Any, stream: Any) -> str:
         return f"{float(stream) - float(rest):+.4f}"
     except (TypeError, ValueError):
         return "na"
+
+
+def _quote_time(value: Any) -> int | None:
+    """A quote time in epoch milliseconds, or None when ``value`` is not a
+    finite number (a bool is not)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return int(value)
 
 
 def _stream_log_text(value: Any) -> str:
@@ -231,6 +248,14 @@ class MarketDataStore:
         # Whether the entitlement line (_log_quote_entitlement) was logged:
         # once, from the first REST quote of a streamable equity.
         self._quote_entitlement_logged = False
+        # The stream quotes' REST shadow (run_stream_quote_shadow): the
+        # publications of stream quotes since its last check and the symbols
+        # they served; the last REST quote request in trouble (when, what),
+        # and whether the shadow's skip for it was logged.
+        self._stream_quote_publications = 0
+        self._stream_quote_served: set[str] = set()
+        self._rest_quote_trouble: tuple[datetime, str] | None = None
+        self._stream_quote_shadow_skipping = False
         self._lock = RLock()
         self.started_at = sessions.now_et()
         self._forced_premarket_history_refresh_date: dict[str, date] = {}
@@ -1651,7 +1676,8 @@ class MarketDataStore:
             LOG.debug("Quote alias attempts for %s: %s", symbol, aliases)
         for request_symbol in aliases:
             try:
-                payload = call_schwab_json(self.client, "quote", request_symbol)
+                payload = self._quote_request(f"quote {request_symbol}", call_schwab_json, self.client, "quote",
+                                              request_symbol)
                 extracted = self._extract_quote_payloads(payload, [request_symbol, symbol])
                 quote_payload = extracted.get(symbol) or extracted.get(request_symbol)
                 if quote_payload is None and isinstance(payload, dict):
@@ -1711,6 +1737,32 @@ class MarketDataStore:
                 _maybe_store(sym, item)
         return out
 
+    def _quote_request(self, what: str, call: Callable[..., Any], *args: Any) -> Any:
+        """One REST quote request, ``call(*args)``, timed. A request that
+        raises, answers a non-2xx status or takes longer than
+        ``STREAM_QUOTE_SHADOW_SLOW_SECONDS`` is noted
+        (``_rest_quote_trouble``), and the stream quotes' REST shadow skips
+        for ``STREAM_QUOTE_SHADOW_BACKOFF_SECONDS`` after it. A TypeError is
+        not noted: it is the client refusing the argument's form before any
+        request goes out, which ``_try_batch_quote_request`` answers with the
+        next form. It runs on the fetch pool's threads too (the single-quote
+        fallbacks): the note is one attribute assignment."""
+        started = time.monotonic()
+        try:
+            result = call(*args)
+        except TypeError:
+            raise
+        except Exception as exc:
+            self._rest_quote_trouble = (sessions.now_et(), f"{what} raised {type(exc).__name__}")
+            raise
+        elapsed = time.monotonic() - started
+        status = getattr(result, "status_code", None)
+        if status is not None and not response_ok(result):
+            self._rest_quote_trouble = (sessions.now_et(), f"{what} answered status {status}")
+        elif elapsed > STREAM_QUOTE_SHADOW_SLOW_SECONDS:
+            self._rest_quote_trouble = (sessions.now_et(), f"{what} took {elapsed:.1f} s")
+        return result
+
     def _try_batch_quote_request(self, symbols: list[str]) -> dict[str, dict]:
         if not symbols:
             return {}
@@ -1729,7 +1781,8 @@ class MarketDataStore:
 
             for arg in attempts:
                 try:
-                    response = call_schwab_client(self.client, method_name, arg)
+                    response = self._quote_request(f"{method_name} of {len(symbols)}", call_schwab_client, self.client,
+                                                   method_name, arg)
                     if not response_ok(response):
                         status_code = getattr(response, "status_code", None)
                         body_preview = str(getattr(response, "text", "") or "")[:240]
@@ -1783,6 +1836,7 @@ class MarketDataStore:
         force_cooldown_hits = 0
         stream_hits = 0
         rest_stored: list[str] = []
+        stream_served: list[str] = []
         stream = self._stream_quote_read(requested, force=force)
         for symbol in requested:
             if stream is not None:
@@ -1790,6 +1844,7 @@ class MarketDataStore:
                 if published is not None:
                     out[symbol] = published
                     stream_hits += 1
+                    stream_served.append(symbol)
                     continue
             if force:
                 cached = self.quote_cache.get(symbol)
@@ -1872,6 +1927,11 @@ class MarketDataStore:
         if force:
             self._warn_forced_fetch_fallbacks(source, pending, rest_stored)
             self._log_stream_quote_checks(source, rest_stored)
+        if stream_served and self.config.runtime.stream_quote_shadow_every > 0:
+            # Counted here for the REST shadow, which never runs here, in the
+            # quotes phase (run_stream_quote_shadow).
+            self._stream_quote_publications += 1
+            self._stream_quote_served.update(stream_served)
         if requested:
             served = not pending and not failures and cached_hits + stream_hits == len(requested)
             mode = ("stream" if stream_hits else "all_cached") if served else "refresh"
@@ -1992,6 +2052,119 @@ class MarketDataStore:
             except Exception as exc:
                 LOG.error("Stream quotes: the forced-fetch check of %s failed (%s: %s)", symbol, type(exc).__name__,
                           exc)
+
+    def run_stream_quote_shadow(self) -> None:
+        """The stream quotes' REST shadow (settled Q2, with M4's fix), which
+        the engine runs once a pass after management and the entries, never
+        in the quotes phase. Every ``runtime.stream_quote_shadow_every``-th
+        publication of stream quotes (0: never), the symbols the stream served
+        since the last check are fetched by REST in uncached batches and
+        compared with their books (``_check_stream_quotes_against_rest``).
+        Within ``STREAM_QUOTE_SHADOW_BACKOFF_SECONDS`` of a REST quote request
+        that failed or was slow (``_quote_request``) it skips, logging that
+        once per run of skips, and checks at the first pass after. It never
+        fails the pass: an error is logged with its type (a lock timeout
+        replaces the books, ``_reset_stream_quotes``)."""
+        every = self.config.runtime.stream_quote_shadow_every
+        if every <= 0 or self._stream_quote_publications < every:
+            return
+        now = sessions.now_et()
+        trouble = self._rest_quote_trouble
+        if trouble is not None and (now - trouble[0]).total_seconds() < STREAM_QUOTE_SHADOW_BACKOFF_SECONDS:
+            if not self._stream_quote_shadow_skipping:
+                self._stream_quote_shadow_skipping = True
+                LOG.info("Stream quote shadow: skipped while REST quotes are in trouble (%s at %s); it checks %.0f s "
+                         "after the last such request", trouble[1], trouble[0].strftime("%H:%M:%S"),
+                         STREAM_QUOTE_SHADOW_BACKOFF_SECONDS)
+            return
+        self._stream_quote_shadow_skipping = False
+        symbols = sorted(self._stream_quote_served)
+        self._stream_quote_publications = 0
+        self._stream_quote_served = set()
+        try:
+            self._check_stream_quotes_against_rest(symbols)
+        except StreamQuoteLockTimeout as exc:
+            self._reset_stream_quotes("the REST shadow", exc)
+        except Exception as exc:
+            LOG.error("Stream quote shadow: the check failed (%s: %s)", type(exc).__name__, exc)
+
+    def _check_stream_quotes_against_rest(self, symbols: list[str]) -> None:
+        """The shadow's check of ``symbols`` (the stream served each since the
+        last check): one REST batch per ``quote_batch_size`` chunk
+        (``_try_batch_quote_request``: no single-quote fallback, nothing
+        cached), then the books read at once (the closest instant to REST's
+        answer). For each symbol with both, the four prices' differences
+        (stream minus REST) and the quote-time lag (REST's ``quoteTime``
+        minus the book's field 34, when both carry one). A book that lags by
+        more than ``_quote_ttl`` is dropped before it is served again and
+        REST's quote is cached in its place (WARNING each): a frozen book is
+        then neither published nor served from the cache, and serves again
+        once its bid, ask, last and mark arrive again. One INFO line per
+        check, ``Stream quote shadow: checked=... lagging=... rest_missing=...
+        not_fresh=... differ=... max_abs_d_bid=... max_abs_d_ask=...
+        max_abs_d_last=... max_abs_d_mark=... max_lag_ms=... rest_s=...``
+        (each largest difference with its symbol when it is not zero)."""
+        ttl = self._quote_ttl()
+        started = time.monotonic()
+        rest: dict[str, dict] = {}
+        for chunk in self._quote_batch_chunks(symbols):
+            rest.update(self._try_batch_quote_request(chunk))
+        rest_seconds = time.monotonic() - started
+        now = sessions.now_et()
+        read = self.stream_quotes.read(symbols, now, ttl)
+        largest: dict[str, tuple[float, str]] = {}
+        max_lag: tuple[int, str] | None = None
+        lagging: list[tuple[str, int, int, int, dict]] = []
+        checked = rest_missing = not_fresh = differ = 0
+        for symbol in symbols:
+            payload = rest.get(symbol)
+            values = read.books.get(symbol)
+            if payload is None:
+                rest_missing += 1
+                continue
+            if values is None:
+                not_fresh += 1
+                continue
+            checked += 1
+            normalized = self._normalize_quote(symbol, payload)
+            differs = False
+            for name, fid in (("bid", "1"), ("ask", "2"), ("last", "3"), ("mark", "33")):
+                delta = abs(float(values[fid]) - float(normalized[name]))
+                differs = differs or delta != 0.0
+                if name not in largest or delta > largest[name][0]:
+                    largest[name] = (delta, symbol)
+            if differs:
+                differ += 1
+            section = payload.get("quote") if isinstance(payload.get("quote"), Mapping) else {}
+            rest_time, stream_time = _quote_time(section.get("quoteTime")), values.get("34")
+            if rest_time is not None and stream_time is not None:
+                lag = rest_time - int(stream_time)
+                if max_lag is None or lag > max_lag[0]:
+                    max_lag = (lag, symbol)
+                if lag > ttl * 1000.0:
+                    lagging.append((symbol, lag, int(stream_time), rest_time, normalized))
+        if lagging:
+            # REST's quotes first: a lock timeout on the drop (which replaces
+            # the books) leaves the cache holding them all the same.
+            for symbol, _lag, _stream_time, _rest_time, normalized in lagging:
+                self._store_rest_quote(symbol, normalized, now)
+            self.stream_quotes.drop([entry[0] for entry in lagging])
+            for symbol, lag, stream_time, rest_time, _normalized in lagging:
+                LOG.warning("Stream quote shadow: %s lags REST by %d ms (quote time %d against REST's %d, limit "
+                            "%.0f s); its book is dropped and REST's quote cached in its place, and it serves again "
+                            "once its bid, ask, last and mark arrive again", symbol, lag, stream_time, rest_time, ttl)
+
+        def _largest(name: str) -> str:
+            if name not in largest:
+                return "na"
+            delta, which = largest[name]
+            return f"{delta:.4f}@{which}" if delta > 0 else f"{delta:.4f}"
+
+        LOG.info("Stream quote shadow: checked=%d of %d served symbols (epoch %d) lagging=%d rest_missing=%d "
+                 "not_fresh=%d differ=%d max_abs_d_bid=%s max_abs_d_ask=%s max_abs_d_last=%s max_abs_d_mark=%s "
+                 "max_lag_ms=%s rest_s=%.2f", checked, len(symbols), read.epoch, len(lagging), rest_missing, not_fresh,
+                 differ, _largest("bid"), _largest("ask"), _largest("last"), _largest("mark"),
+                 "na" if max_lag is None else f"{max_lag[0]}@{max_lag[1]}", rest_seconds)
 
     def _log_stream_quote_transition(self, read: StreamQuoteRead, now: datetime, ttl: float, requested: int) -> None:
         """Log the stream quotes going silent (no LEVELONE_EQUITIES data

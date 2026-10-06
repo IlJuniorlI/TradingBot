@@ -472,6 +472,15 @@ class RuntimeConfig:
     # subscribes nothing: every quote is REST. true or false (the runtime
     # section's switches, checked at load).
     stream_quotes: bool = True
+    # The stream quotes' REST shadow (MarketDataStore.run_stream_quote_shadow;
+    # 2026-10-06): every N-th publication of stream quotes, once management
+    # and the entries ran, the symbols the stream served since the last check
+    # are fetched by REST in one uncached batch and compared with their books;
+    # a book whose quote time lags REST's by more than quote_cache_seconds is
+    # dropped and REST's quote cached in its place. It skips for 60 s after a
+    # REST quote request that failed or took longer than 2 s. 0 turns it off.
+    # An integer of at least 0, checked at load.
+    stream_quote_shadow_every: int = 20
     quote_batch_size: int = 50
     history_lookback_minutes: int = 390
     use_extended_hours_history: bool = True
@@ -1852,6 +1861,9 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         "max_consecutive_quote_failures": _Number(integer=True, low=0, note=" (0 turns the gate off)"),
         # Read when the store and the strategy are built (ContextMemo).
         "context_memo_shadow_every": _Number(integer=True, low=0, note=" (0 turns the shadow check off)"),
+        # Read once a pass by the stream quotes' REST shadow
+        # (MarketDataStore.run_stream_quote_shadow) and by every publication.
+        "stream_quote_shadow_every": _Number(integer=True, low=0, note=" (0 turns the shadow check off)"),
     },
     "paper": {
         "starting_equity": _ABOVE_ZERO,

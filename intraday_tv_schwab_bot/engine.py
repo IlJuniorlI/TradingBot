@@ -598,7 +598,9 @@ class IntradayBot:
         ``contexts`` (their precompute), ``warmup``, ``quotes`` (the quote
         batch and the account marks), ``manage`` (the entry-order settle and
         ``manage_positions``, a missed live exit's re-sends included),
-        ``entries``, ``publish`` (the dashboard), ``error`` (the error path
+        ``entries``, ``shadow`` (the stream quotes' REST shadow,
+        ``MarketDataStore.run_stream_quote_shadow``), ``publish`` (the
+        dashboard), ``error`` (the error path
         of a pass whose step raised, in ``failed_phase``), ``housekeeping``
         (the auto-exit check, the archive, the rollover, the prune) and
         ``sleep``. The session archive copies the records into
@@ -1188,6 +1190,11 @@ class IntradayBot:
                     level=logging.DEBUG,
                 )
 
+            # The stream quotes' REST shadow: after management and the entries,
+            # never in the quotes phase, so a REST request it waits on holds
+            # neither up (settled M4).
+            timer.enter("shadow")
+            self.data.run_stream_quote_shadow()
             timer.enter("htf_refresh")
             self._refresh_htf_frames(gate_state, htf_attempted, where="before publish", bars=bars)
             timer.enter("publish")

@@ -143,12 +143,37 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     reads `realtime=True`, and `netPercentChange` among the quote keys: the
     name the stream's adapter gives field 42 (the percent change itself
     stays as it is, queued with critique H1's evidence).
+  - The REST shadow (settled Q2, with M4's fix), the standing check that a
+    book is not frozen: every `runtime.stream_quote_shadow_every`-th
+    publication of stream quotes, the engine, once management and the
+    entries ran (`MarketDataStore.run_stream_quote_shadow`; never in the
+    quotes phase; CYCLE_TIMING times it as `shadow`, between `entries` and
+    `publish`), fetches the symbols the stream served since the last check
+    by REST in uncached batches and compares the books, read right after
+    REST answers: `Stream quote shadow: checked=K of N served symbols (epoch
+    E) lagging=... rest_missing=... not_fresh=... differ=...
+    max_abs_d_bid=... max_abs_d_ask=... max_abs_d_last=... max_abs_d_mark=...
+    max_lag_ms=... rest_s=...` (INFO; each largest stream-minus-REST
+    difference with its symbol when it is not zero, the lag REST's
+    `quoteTime` minus the book's field 34). A book whose quote time lags
+    REST's by more than `quote_cache_seconds` is dropped and REST's quote
+    cached in its place (`Stream quote shadow: SYM lags REST by N ms ...`,
+    WARNING), so a frozen book is neither published nor served from the
+    cache; it serves again once its bid, ask, last and mark arrive again.
+    Within 60 s of a REST quote request (the refresh's, a forced fetch's or
+    the shadow's own) that raised, answered a non-2xx status or took longer
+    than 2 s, it skips, logged once per run of skips (`Stream quote shadow:
+    skipped while REST quotes are in trouble (...)`), and checks at the
+    first pass after: in a REST outage it adds no request to wait out. At 20
+    on 2.5-4 s passes, one batch request every 50-80 s, about 300-470 a day;
+    the setting is revisited after the dry-run day. A failed check is logged
+    with its type and never fails the pass.
   - Logs: `Quote refresh ... stream=N` (mode `stream` when no REST request
     was needed; the other modes as before;
     `source=engine:position_management_stream` for management's stream
-    read); `Stream quotes live: epoch N,
-    serving K of M requested symbols` and `Stream quotes silent: no
-    LEVELONE_EQUITIES data for X s (limit Y s, epoch N); ...` once per change
+    read); `Stream quotes live: epoch N, serving K of M requested symbols`
+    and `Stream quotes silent: no LEVELONE_EQUITIES data for X s (limit Y s,
+    epoch N); ...` once per change
     (INFO and WARNING; another of the same kind within 5 minutes at DEBUG);
     the receiver's lines (`intraday_tv_schwab_bot.stream_quotes`): `Schwab
     stream login: epoch N code=... msg=...` at each connection; `Schwab
@@ -159,26 +184,46 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     {...}`; `Stream quotes: first complete LEVELONE_EQUITIES book for SYM
     (epoch N)`; WARNINGs for a delayed symbol and a rejected item (once per
     symbol and epoch, DEBUG after) and for data that names no symbol; once
-    per process, `Schwab quote entitlement (first REST quote, SYM): ...`.
+    per process, `Schwab quote entitlement (first REST quote, SYM): ...`;
+    the shadow's `Stream quote shadow: ...` lines.
   - `runtime.stream_quotes` (new; `true` in every preset, right after
     `quote_cache_seconds`, and by default): `true` or `false`, checked at
     load; `false` subscribes nothing and every quote is REST, as before.
+  - `runtime.stream_quote_shadow_every` (new; `20` in every preset, right
+    after `stream_quotes`, and by default): an integer of at least 0,
+    checked at load; `0` turns the shadow off.
   - Not changed: bars and frames, the forced quotes, `quote_cache_seconds`.
     A network outage still blocks the REST fallback (the stream goes silent
     with it, as on 10-02 11:12); a REST-only outage no longer blocks the
     quotes phase.
   - Measured (the replay harness streaming L1 valued as its REST quotes):
-    10-01 09:40-10:40 (top_tier, 28 symbols) takes 1 batch quote request
-    instead of 181, the 11 forced entry quotes unchanged, and is otherwise
-    identical in decisions, signals, positions, events, frames, the
-    dashboard and the cached quotes.
+    10-01 09:40-10:40 (top_tier, 28 symbols) takes 10 batch quote requests
+    instead of 181 (the first pass's, before the books fill, and the
+    shadow's 9 checks of the 28 served symbols, each `differ=0`), the 11
+    forced entry quotes unchanged, and is otherwise identical in decisions,
+    signals, positions, events, frames, the dashboard and the cached
+    quotes. Timed in real time (10-01 from 10:43, three runs of 120 s each
+    way, a page open, the harness streaming L1, against the same tree with
+    `stream_quotes: false`; settled M5's gate, at most +0.10 s): the median
+    pass 0.531 s to 0.576 s (+0.045 s), the mean 0.633 s to 0.628 s (no REST
+    batch on one pass in three, every watched pass rebuilding the
+    dashboard's snapshots: publish +0.03 s), the median management gap
+    2.545 s to 2.582 s, REST quote requests 8.0 to 1.1 a minute.
   - Identical: the 10-01 09:40-10:40 stepped replay (top_tier, a page open)
     and the peer_confirmed_key_levels 05-04 09:40-10:40 window, no stream
     quote data, against 2d70ab2 in every category but the ` stream=0` every
     `Quote refresh` line gains, every cached quote's `quote_source` and the
     entitlement line at the first step (a WARNING: the harness's quote
-    carries no `realtime`).
-  - README: `stream_quotes`, `quote_cache_seconds` and the runtime table.
+    carries no `realtime`); so is the whole 10-01 session (09:00-16:30, the
+    stream stopped at 09:00, restarted at 09:30 and stopped at 15:55:20).
+    With the harness streaming L1, the whole session is identical in
+    decisions, signals, positions, events, frames, the dashboard and the
+    cached quotes, the stream serving from 09:30:20 to 15:54:00 and REST
+    before it and after the tapes end (one silent line), with 106 batch
+    quote requests instead of 1,201 (49 refreshes and the shadow's 57
+    checks); every line it adds pinned in count before the run.
+  - README: `stream_quotes`, `stream_quote_shadow_every`,
+    `quote_cache_seconds`, the runtime table and the cycle timing's phases.
   - Tests: `tests/market_data/test_stream_quotes.py` (new: the subscription,
     its revert and shared back-off, the service keys, the books, the epoch,
     liveness, rejected, delayed and unattributable data, the receiver's
@@ -207,14 +252,26 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     a batch or a single quote, at WARNING unless `realtime` is true, never
     from an index's, an option's or a stream quote, a payload without its
     sections);
+    `tests/market_data/test_stream_quote_shadow.py` (new: every N-th
+    publication checked after the pass, never in the quotes phase, nothing
+    cached; a lagging book dropped and REST's quote cached until its fields
+    arrive again; the limit; differences without quote times; symbols REST
+    lacks or the stream no longer serves; the books read after REST
+    answers; 0 off; the skip after a request that raised, answered 500 or
+    took 2.5 s, its minute and its one line a run; a refused argument form
+    no trouble; the shadow's own failed request; a failed check and a lock
+    timeout never failing the pass);
     `tests/composition/test_cycle_symbol_maps.py` (the held equity streamed
-    beside the watchlist), `tests/domain/test_config_validation.py` and
-    `tests/guards/test_preset_parity.py` (the switch);
+    beside the watchlist), `tests/composition/test_cycle_timing.py` (the
+    shadow after the entries, in its own phase),
+    `tests/domain/test_config_validation.py` and
+    `tests/guards/test_preset_parity.py` (the switch and the shadow's
+    count);
     `tests/support/brokers.py`'s fake stream records schwabdev's
-    subscriptions and its fake streamer can hold a replay. 169 mutants (77
+    subscriptions and its fake streamer can hold a replay. 200 mutants (77
     for the subscription and the books, 35 for the serving, 30 for the
-    checks, 18 for management's stream read, 9 for the entitlement line),
-    all killed, each by its named test.
+    checks, 18 for management's stream read, 9 for the entitlement line, 31
+    for the shadow), all killed, each by its named test.
 
 - **Every engine pass and every management pass is on the record:
   CYCLE_TIMING, POSITION_MARK, the pass before on EXIT_CONTEXT and
