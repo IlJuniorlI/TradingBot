@@ -223,7 +223,17 @@ class PositionManager:
         from. An equity's snapshot names the price's time as ``price_at``:
         the quote's ``fetched_at``, or the open time of the bar whose close
         it is (the adaptive ladder's touch hold attributes a touch to that
-        1m bar); the account's cached price has none."""
+        1m bar); the account's cached price has none.
+
+        An equity is priced from its cached quote while that is younger than
+        ``runtime.quote_cache_seconds``. One that aged within the pass (the
+        HTF refresh before management, a live entry's settle, an earlier
+        position's exit re-sends), or none cached, is read from the stream's
+        book first when the stream serves the symbol
+        (``_read_management_stream_quote``); the forced REST refresh runs
+        only when the quote is still stale after that (settled U3). The
+        snapshot's bid, ask and last are what an exit it decides is priced
+        from (``SchwabExecutor.submit_equity_exit``)."""
         mark = self.strategy.position_mark_price(position, self.data)
         if mark is not None:
             price = float(mark)
@@ -233,6 +243,9 @@ class PositionManager:
         if self.data is not None:
             max_age = max(1.0, float(self.config.runtime.quote_cache_seconds))
             quote = self.data.get_quote(position.symbol) or {}
+            if not (quote and self.data.quotes_are_fresh([position.symbol], max_age)) \
+                    and self._read_management_stream_quote(position.symbol):
+                quote = self.data.get_quote(position.symbol) or quote
             if quote and not self.data.quotes_are_fresh([position.symbol], max_age):
                 try:
                     self.data.fetch_quotes([position.symbol], force=True, source="engine:position_management_snapshot")
@@ -272,6 +285,27 @@ class PositionManager:
             price = float(cached)
             return price, {"bid": price, "ask": price, "last": price, "source": "account_cache", "decision_price": price}
         return None, None
+
+    def _read_management_stream_quote(self, symbol: str) -> bool:
+        """When the stream serves ``symbol`` (``MarketDataStore.stream_quote_fresh``),
+        publish its book into the quote cache through a non-forced refresh
+        (source ``engine:position_management_stream``) instead of forcing a
+        REST quote. Returns whether that refresh was asked for, so the caller
+        reads the cache again. A failure is logged with its type (WARNING at
+        most once a minute, DEBUG between) and the caller goes on to its
+        forced REST refresh, as it did before the stream was read."""
+        asked = False
+        try:
+            if self.data.stream_quote_fresh(symbol):
+                asked = True
+                self.data.fetch_quotes([symbol], source="engine:position_management_stream")
+        except Exception as exc:
+            self._log_component_failure(
+                "management_stream_quote",
+                "Management's stream quote read for %s failed (%s: %s); the forced REST refresh decides",
+                symbol, type(exc).__name__, exc,
+            )
+        return asked
 
     def _option_position_management_snapshot(self, position: Position) -> tuple[float | None, dict[str, Any] | None]:
         """Fetch fresh quotes for option legs and compute a mark price for position management."""

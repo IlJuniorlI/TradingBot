@@ -81,15 +81,33 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     order and its dry-run fill, `execution.submit_equity_exit` reading the
     management snapshot), from the quote management reads, the pass's
     published quote, so the stream's when it served (a quote that aged past
-    `quote_cache_seconds` within the pass is refreshed by a forced REST
-    fetch, as before); a live exit's re-sends, the startup restore and
-    option quotes from forced REST quotes. When a forced fetch fails (or skips
-    a blacklisted symbol), its reader takes a cached quote younger than
+    `quote_cache_seconds` within the pass is read from the stream's book
+    when the stream serves the symbol, and refreshed by a forced REST fetch
+    otherwise: see Management); a live exit's re-sends, the startup restore
+    and option quotes from forced REST quotes. When a forced fetch fails (or
+    skips a blacklisted symbol), its reader takes a cached quote younger than
     `quote_cache_seconds`, as before; since the stream quotes that is usually
     the stream's, so the fetch logs one WARNING per such symbol, `Forced quote
     fetch failed for SYM (source=...); the cached rest|stream quote, N s old,
     stands in for it (limit M s)`; none for a cached quote too old for the
     reader.
+  - Management reads the stream first (settled U3): a position whose quote
+    aged past `quote_cache_seconds` within the pass (the HTF refresh before
+    management, a live entry's settle, an earlier position's exit
+    re-sends), or that has none cached, is read from its symbol's book when
+    the stream serves it (`MarketDataStore.stream_quote_fresh`, new: the
+    publication's freshness for one symbol, False with the switch off; it
+    logs no transition, and a lock timeout or a failure answers False): a
+    non-forced refresh, `source=engine:position_management_stream`,
+    publishes the book, and the management snapshot prices from it. The
+    forced REST refresh (`engine:position_management_snapshot`) runs,
+    unchanged, only when the quote is still stale after that. The stream
+    read is wrapped: a failure is logged with its type (`Management's stream
+    quote read for SYM failed (TYPE: ...); the forced REST refresh decides`,
+    WARNING at most once a minute, DEBUG between) and the forced refresh
+    decides. On 2026-10-01 management forced nine REST quotes: four after
+    an 8 s HTF refresh before management (09:45:19-20), and five at the TTL
+    edge, which the per-pass publication already removes.
   - The checks: on every forced REST fetch of a symbol whose book is fresh,
     one `Stream quote check symbol=... source=... epoch=... stream_age_s=...
     bid=REST/stream ask=... last=... mark=... d_bid=... d_ask=... d_last=...
@@ -115,7 +133,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     on. What the dry-run day reads for the heartbeat cadence, the data rate
     and the quiet periods.
   - Logs: `Quote refresh ... stream=N` (mode `stream` when no REST request
-    was needed; the other modes as before); `Stream quotes live: epoch N,
+    was needed; the other modes as before;
+    `source=engine:position_management_stream` for management's stream
+    read); `Stream quotes live: epoch N,
     serving K of M requested symbols` and `Stream quotes silent: no
     LEVELONE_EQUITIES data for X s (limit Y s, epoch N); ...` once per change
     (INFO and WARNING; another of the same kind within 5 minutes at DEBUG);
@@ -159,13 +179,24 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `tests/market_data/test_stream_quote_checks.py` (new: the health line's
     cadence, counts, gaps, lag, reasons and transitions; the forced-fetch
     check line and when there is none; the failed forced fetch's WARNING),
+    `tests/runtime/test_management_stream_quotes.py` (new: an aged quote read
+    from the stream without REST, a silent stream, a book that does not
+    serve and the switch off forcing REST as before, a fresh quote reading
+    neither, an empty cache priced from the stream or its bar close, a book
+    that lapses after the check, a stream read that fails before or after
+    its publication, and `stream_quote_fresh` itself: the boundary, the
+    switch, no transition line, a failed read and a lock timeout); the quote
+    fakes a position manager reads (`tests/runtime/test_exit_reprice.py`,
+    `tests/runtime/test_quote_price_reads.py`, `tests/domain/test_asset_type.py`)
+    gain `stream_quote_fresh`;
     `tests/composition/test_cycle_symbol_maps.py` (the held equity streamed
     beside the watchlist), `tests/domain/test_config_validation.py` and
     `tests/guards/test_preset_parity.py` (the switch);
     `tests/support/brokers.py`'s fake stream records schwabdev's
-    subscriptions and its fake streamer can hold a replay. 142 mutants (77
+    subscriptions and its fake streamer can hold a replay. 160 mutants (77
     for the subscription and the books, 35 for the serving, 30 for the
-    checks), all killed, each by its named test.
+    checks, 18 for management's stream read), all killed, each by its named
+    test.
 
 - **Every engine pass and every management pass is on the record:
   CYCLE_TIMING, POSITION_MARK, the pass before on EXIT_CONTEXT and

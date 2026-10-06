@@ -2159,6 +2159,30 @@ class MarketDataStore:
                     return False
         return True
 
+    def stream_quote_fresh(self, symbol: str) -> bool:
+        """Whether ``symbol``'s stream quote book would be served now: the
+        freshness every non-forced ``fetch_quotes`` publishes by
+        (``StreamQuoteState.read`` at ``_quote_ttl``), for one symbol; False
+        with ``runtime.stream_quotes`` off. The management snapshot asks it
+        before it forces a REST quote. It logs no silent/live transition and
+        no health line (the engine's refresh does). A lock timeout replaces
+        the books (``_reset_stream_quotes``) and any other failure is logged
+        with its type: both answer False, so the caller takes REST (settled
+        M2)."""
+        if not self.config.runtime.stream_quotes:
+            return False
+        key = self._symbol_key(symbol)
+        try:
+            read = self.stream_quotes.read([key], sessions.now_et(), self._quote_ttl())
+        except StreamQuoteLockTimeout as exc:
+            self._reset_stream_quotes("the freshness check", exc)
+            return False
+        except Exception as exc:
+            LOG.error("Stream quotes: the freshness check of %s failed (%s: %s); it takes REST", key,
+                      type(exc).__name__, exc)
+            return False
+        return key in read.books
+
     @staticmethod
     def _normalize_quote(symbol: str, payload: dict | None) -> dict:
         payload = payload or {}
