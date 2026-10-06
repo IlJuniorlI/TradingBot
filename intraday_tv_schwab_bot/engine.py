@@ -19,7 +19,7 @@ from .dashboard import DashboardServer
 from .data_feed import MarketDataStore
 from .entry_gatekeeper import EntryGatekeeper
 from .execution import SchwabExecutor
-from .models import Candidate, Position, StrategySchedule
+from .models import Candidate, Position, StrategySchedule, is_option_asset
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .position_store import ReconcileMetadataStore, SessionRiskStateStore
@@ -1096,7 +1096,7 @@ class IntradayBot:
 
             timer.enter("stream")
             if gate_state.streaming_active and self.last_watchlist:
-                self.data.start_streaming(self.last_watchlist)
+                self.data.start_streaming(self.last_watchlist, stream_quote_symbols=self._stream_quote_symbols())
             else:
                 self.data.stop_streaming()
 
@@ -1342,6 +1342,17 @@ class IntradayBot:
                 "PRECOMPUTE_FAILURES",
                 {"label": label, "total": total, "failed_count": len(failed), "failed_symbols": failed},
             )
+
+    def _stream_quote_symbols(self) -> list[str]:
+        """The stream's quote symbols (LEVELONE_EQUITIES,
+        ``runtime.stream_quotes``): the watchlist and every held non-option
+        position's symbol, the key the management snapshot reads its quote
+        under, so a manifest whose watchlist leaves a position out still
+        streams its quotes. The store keeps the streamable equities."""
+        symbols = set(self.last_watchlist)
+        symbols.update(position.symbol for position in self.positions.values()
+                       if not is_option_asset(position.metadata))
+        return sorted(_unique_symbol_keys(symbols))
 
     def _htf_symbols(self) -> list[str]:
         """Every symbol whose HTF frame a read can ask for this cycle: the

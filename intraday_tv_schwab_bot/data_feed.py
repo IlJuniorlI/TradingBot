@@ -22,6 +22,7 @@ from .order_blocks import OrderBlockContext, build_order_block_context, empty_or
 from .numeric import first_float, safe_float
 from .symbols import QUOTE_SYMBOL_ALIASES, STREAMABLE_EQUITY_RE, is_streamable_equity, is_support_resistance_symbol
 from .schwab_api import call_schwab_client, call_schwab_json, response_ok
+from .stream_quotes import LEVELONE_EQUITIES, STREAM_QUOTE_FIELDS, StreamQuoteLockTimeout, StreamQuoteState
 from .bars import (
     completed_bucket_mask,
     ensure_ohlcv_frame,
@@ -191,6 +192,10 @@ class MarketDataStore:
         # how many in a row (main thread only; see _stream_send_due).
         self._stream_send_failed_at: datetime | None = None
         self._stream_send_failures = 0
+        # The LEVELONE_EQUITIES subscription and its quote books
+        # (runtime.stream_quotes): the stream thread merges each message into
+        # them under their own lock, never this store's.
+        self.stream_quotes = StreamQuoteState()
         self._lock = RLock()
         self.started_at = sessions.now_et()
         self._forced_premarket_history_refresh_date: dict[str, date] = {}
@@ -311,6 +316,12 @@ class MarketDataStore:
         # any symbol with state but not active. Then remove it from every
         # per-symbol dict in one pass so we never leave dangling entries.
         retain_derived_frames(active)
+        # The stream quote books of inactive symbols go too, under the books'
+        # own lock (never inside this store's).
+        try:
+            self.stream_quotes.prune(active)
+        except StreamQuoteLockTimeout as exc:
+            self._reset_stream_quotes("prune", exc)
         with self._lock:
             # get_merged's memo and provenance generations can hold a symbol
             # the store does not (a read of an unknown symbol, or one in
@@ -2009,7 +2020,17 @@ class MarketDataStore:
         self._stream_send_failed_at = None
         self._stream_send_failures = 0
 
-    def start_streaming(self, symbols: Iterable[str]) -> None:
+    def start_streaming(self, symbols: Iterable[str], *, stream_quote_symbols: Iterable[str]) -> None:
+        """Start the stream when none runs (``_stream_running``), then bring
+        its CHART_EQUITY subscription (the 1m bars) to the streamable equities
+        of ``symbols`` and, with ``runtime.stream_quotes``, its
+        LEVELONE_EQUITIES subscription (the quote books,
+        ``_subscribe_stream_quotes``) to those of ``stream_quote_symbols``.
+
+        With no streamable equity in ``symbols`` it returns at once: nothing
+        starts and neither subscription changes, LEVELONE_EQUITIES included
+        (each keeps its symbols). The engine streams only with a watchlist
+        and stops the stream without one."""
         # Lock only wraps state mutations — network I/O (stream.start/send)
         # is kept outside so the schwabdev callback thread (which reads this
         # same state inside self._lock) isn't blocked waiting for Schwab.
@@ -2021,6 +2042,16 @@ class MarketDataStore:
                 self.stream_start_requested_at = sessions.now_et()
                 self._stream_seen_symbols.clear()
                 self._stream_first_bar_time.clear()
+            # Each service's key exists before the stream's thread replays the
+            # recorded subscriptions at its LOGIN response (schwabdev 4.0.0
+            # ``stream.py:95-105`` iterates ``subscriptions`` across awaits):
+            # a send that recorded a new service there, the first
+            # LEVELONE_EQUITIES one behind a slow pass, changed the dict's size
+            # mid-iteration, and schwabdev reconnected. An empty service sends
+            # nothing (``stream.py:102``).
+            self.stream.subscriptions.setdefault("CHART_EQUITY", {})
+            if self.config.runtime.stream_quotes:
+                self.stream.subscriptions.setdefault(LEVELONE_EQUITIES, {})
             LOG.info("Starting Schwab stream for symbols: %s", symbols)
             self.stream.start(receiver=self.on_stream_message)
             self._stream_thread = self.stream._thread
@@ -2063,6 +2094,62 @@ class MarketDataStore:
             # never a mid-update partial. All known callers do fresh
             # `self.stream_symbols` lookups rather than caching the ref.
             self.stream_symbols = set(wanted)
+        if self.config.runtime.stream_quotes:
+            self._subscribe_stream_quotes(stream_quote_symbols)
+
+    def _subscribe_stream_quotes(self, symbols: Iterable[str]) -> None:
+        """Bring the LEVELONE_EQUITIES subscription to the streamable
+        equities of ``symbols``, on CHART_EQUITY's rule: SUBS when nothing is
+        subscribed (it also replaces whatever Schwab kept), else ADD and
+        UNSUBS for the difference, in one send, under the stream sends'
+        shared back-off (``_stream_send_due``). The change is committed to the
+        books before the send, so the snapshot Schwab sends after a SUBS or
+        ADD lands in the symbol's new book and a removed symbol's book is
+        dropped at once; a failed send reverts it, so the next pass sends it
+        again."""
+        wanted = frozenset(self._symbol_key(s) for s in symbols if is_streamable_equity(s))
+        try:
+            add, remove, was_empty = self.stream_quotes.diff(wanted)
+            if not (add or remove):
+                return
+            now = sessions.now_et()
+            if not self._stream_send_due(now):
+                return
+            self.stream_quotes.apply(add=add, remove=remove)
+        except StreamQuoteLockTimeout as exc:
+            self._reset_stream_quotes("the subscription change", exc)
+            return
+        command = "SUBS" if was_empty else "ADD"
+        what = LEVELONE_EQUITIES + " " + ", ".join(f"{name} of {len(keys)}" for name, keys in ((command, add),
+                                                                                             ("UNSUBS", remove)) if keys)
+        try:
+            stream_requests = []
+            if add:
+                stream_requests.append(self.stream.level_one_equities(add, list(STREAM_QUOTE_FIELDS), command=command))
+            if remove:
+                stream_requests.append(self.stream.level_one_equities(remove, list(STREAM_QUOTE_FIELDS),
+                                                                      command="UNSUBS"))
+            self.stream.send(stream_requests)
+        except Exception as exc:
+            try:
+                self.stream_quotes.apply(add=remove, remove=add)
+            except StreamQuoteLockTimeout as again:
+                self._reset_stream_quotes("the subscription change's revert", again)
+            self._stream_send_failed(what, exc, now)
+            return
+        self._stream_send_succeeded(what)
+        LOG.debug("Stream quotes: %s sent (added %s, removed %s)", what, add, remove)
+
+    def _reset_stream_quotes(self, what: str, exc: Exception) -> None:
+        """The engine thread could not take the stream quote books' lock
+        within ``stream_quotes.LOCK_TIMEOUT_SECONDS``: a stuck stream thread
+        holds it. Replace the books with an empty state (nothing subscribed,
+        no book; the epoch count kept: ``StreamQuoteState.successor``), so no
+        later pass waits on that lock: every quote is REST until the next pass
+        subscribes afresh (SUBS) and Schwab's snapshot fills the books."""
+        self.stream_quotes = self.stream_quotes.successor()
+        LOG.error("Stream quotes: %s failed (%s: %s); the books are replaced by empty ones, and the next pass "
+                  "subscribes afresh", what, type(exc).__name__, exc)
 
     def stop_streaming(self) -> None:
         # In schwabdev's reconnect window ``active`` is False while its thread
@@ -2081,6 +2168,11 @@ class MarketDataStore:
             self.stream_start_requested_at = None
             self._stream_seen_symbols.clear()
             self._stream_first_bar_time.clear()
+        # Whatever ran: an item after the stop finds nothing subscribed.
+        try:
+            self.stream_quotes.clear()
+        except StreamQuoteLockTimeout as exc:
+            self._reset_stream_quotes("the stop's clear", exc)
 
     def on_stream_message(self, message: str) -> None:
         """schwabdev's receiver: each stream message, on the stream thread.
@@ -2092,13 +2184,18 @@ class MarketDataStore:
         connection replays them. A malformed item is dropped with a WARNING
         naming the error's type (``_merge_chart_equity``); anything else that
         raises (a defect, not the data) ends the message's handling there,
-        with an ERROR naming the type."""
+        with an ERROR naming the type. With ``runtime.stream_quotes`` the
+        message goes to the quote books first
+        (``stream_quotes.StreamQuoteState.on_message``, which never raises
+        and never waits for this store's lock)."""
         try:
             payload = json.loads(message)
         except Exception as exc:
             LOG.debug("Ignoring non-json stream payload (%s: %s): %s", type(exc).__name__, exc,
                       _stream_log_text(message))
             return
+        if self.config.runtime.stream_quotes:
+            self.stream_quotes.on_message(payload, sessions.now_et())
         try:
             self._merge_chart_equity(payload)
         except Exception as exc:

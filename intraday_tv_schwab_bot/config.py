@@ -465,6 +465,12 @@ class RuntimeConfig:
     history_poll_seconds: int = 300
     quote_poll_seconds: int = 6
     quote_cache_seconds: int = 6
+    # The stream that carries CHART_EQUITY also subscribes LEVELONE_EQUITIES
+    # for the watchlist and every held equity position and keeps one quote
+    # book per symbol (MarketDataStore.stream_quotes; 2026-10-06). Nothing
+    # reads the books yet: every quote is REST. false subscribes nothing.
+    # true or false (the runtime section's switches, checked at load).
+    stream_quotes: bool = True
     quote_batch_size: int = 50
     history_lookback_minutes: int = 390
     use_extended_hours_history: bool = True
