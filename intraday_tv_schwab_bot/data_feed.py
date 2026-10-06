@@ -1990,9 +1990,10 @@ class MarketDataStore:
         younger than ``_quote_ttl`` and fetched by REST otherwise. A forced
         call fetches REST (a symbol fetched less than
         ``min_force_interval_seconds`` ago, which only option callers pass, is
-        served from the cache). One ``Quote refresh`` INFO line per call
-        counts each way. The call's REST requests are folded once they are
-        done, for the stream quotes' REST shadow (``_note_rest_quote_outcomes``)."""
+        served from the cache). One ``Quote refresh`` line per call counts
+        each way, at INFO when the call asked REST (or failed) and at DEBUG
+        when the stream or the cache served it all. The call's REST requests
+        are folded once they are done, for the stream quotes' REST shadow (``_note_rest_quote_outcomes``)."""
         out: dict[str, dict] = {}
         outcomes: list[_QuoteOutcome] = []
         requested = sorted({self._symbol_key(s) for s in symbols if str(s).strip()})
@@ -2106,7 +2107,12 @@ class MarketDataStore:
         if requested:
             served = not pending and not failures and cached_hits + stream_hits == len(requested)
             mode = ("stream" if stream_hits else "all_cached") if served else "refresh"
-            LOG.info(
+            # INFO only for a refresh that asked REST (or failed): a stream or
+            # cache served one runs every pass (~25 a minute with the stream
+            # quotes) and is DEBUG since 2026-10-06; the stream's health line
+            # and the shadow say how it served.
+            LOG.log(
+                logging.INFO if mode == "refresh" else logging.DEBUG,
                 "Quote refresh source=%s mode=%s requested=%d cached=%d pending=%d batch=%d fallback=%d failed=%d force=%s force_cooldown_cached=%d stream=%d",
                 str(source or "unspecified"),
                 mode,

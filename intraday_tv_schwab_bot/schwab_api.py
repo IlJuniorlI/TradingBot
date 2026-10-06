@@ -95,11 +95,21 @@ class SchwabdevApiUsageTracker:
             calls_30m = self._calls_in_window(current, 1800.0)
             # The dashboard reads `calls_per_minute_5m` — short enough to be
             # responsive (a 1-minute spike shows up by the second minute) and
-            # smoothed enough not to jitter on every individual call.
-            calls_per_minute_1m = float(calls_1m)               # last 60s
-            calls_per_minute_5m = float(calls_5m) / 5.0         # 5min-avg
-            calls_per_minute_15m = float(calls_15m) / 15.0      # 15min-avg
-            calls_per_minute_30m = float(calls_30m) / 30.0      # 30min-avg
+            # smoothed enough not to jitter on every individual call. Each
+            # window's rate divides by the time it covers: the tracker's
+            # uptime until that reaches the window, at least a minute (a
+            # first partial minute reads as its count). Until 2026-10-06 the
+            # 5-, 15- and 30-minute rates divided by the whole window, so each
+            # read low until the uptime reached it: one minute up, the
+            # 5-minute rate showed the startup burst at a fifth of its pace.
+            # The 1-minute rate is unchanged.
+            def per_minute(calls: int, window_minutes: float) -> float:
+                return float(calls) / max(1.0, min(window_minutes, elapsed_minutes))
+
+            calls_per_minute_1m = per_minute(calls_1m, 1.0)       # last 60s
+            calls_per_minute_5m = per_minute(calls_5m, 5.0)       # 5min-avg
+            calls_per_minute_15m = per_minute(calls_15m, 15.0)    # 15min-avg
+            calls_per_minute_30m = per_minute(calls_30m, 30.0)    # 30min-avg
             snapshot = {
                 'started_at': self.started_at.isoformat(),
                 "last_call_at": (

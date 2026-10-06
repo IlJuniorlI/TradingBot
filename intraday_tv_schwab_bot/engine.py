@@ -1153,10 +1153,11 @@ class IntradayBot:
             timer.enter("entries")
             if self.startup_reconciler.trading_blocked_reason:
                 candidate_symbols = [c.symbol for c in self.last_candidates]
+                blocked = [part for part in str(self.startup_reconciler.trading_blocked_reason).split(",") if part]
                 reasons: list[str] = []
                 if not candidate_symbols:
                     reasons.append("no_candidates")
-                reasons.extend([part for part in str(self.startup_reconciler.trading_blocked_reason).split(",") if part])
+                reasons.extend(blocked)
                 reason_text = ",".join(reasons) if reasons else str(self.startup_reconciler.trading_blocked_reason)
                 self.audit.log_cycle(
                     f"entry_gate:{self.config.strategy}",
@@ -1165,6 +1166,7 @@ class IntradayBot:
                     interval=60.0,
                     level=TRADEFLOW_LEVEL,
                 )
+                self.entry_gatekeeper.hold_entry_decisions(blocked)
             elif gate_state.intraday_session_day and gate_state.entry_actionable:
                 self.entry_gatekeeper.open_positions(self.last_candidates, bars)
             elif gate_state.intraday_session_day and gate_state.entry_window_open:
@@ -1175,6 +1177,7 @@ class IntradayBot:
                     interval=60.0,
                     level=TRADEFLOW_LEVEL,
                 )
+                self.entry_gatekeeper.hold_entry_decisions(["entry_session_closed"])
             elif gate_state.intraday_session_day and not gate_state.entry_window_open:
                 # Downgraded to DEBUG: this fires every ~60 seconds before
                 # the entry window opens and after it closes. It's expected
@@ -1189,6 +1192,11 @@ class IntradayBot:
                     interval=60.0,
                     level=logging.DEBUG,
                 )
+                self.entry_gatekeeper.hold_entry_decisions(["outside_entry_window"])
+            else:
+                # Not a trading day: the branches above take every pass of
+                # one. No cycle line, as before.
+                self.entry_gatekeeper.hold_entry_decisions(["non_trading_day"])
 
             # The stream quotes' REST shadow: after management and the entries,
             # never in the quotes phase. Its request runs on this thread: one

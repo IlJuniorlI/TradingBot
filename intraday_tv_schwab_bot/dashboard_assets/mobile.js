@@ -73,7 +73,8 @@
     if (warmupEl) warmupEl.textContent = warmup.total ? `${fmtInteger(warmup.ready_count || 0)} / ${fmtInteger(warmup.total || 0)}` : '—';
 
     // Schwabdev API rate-limit telemetry (mirrors desktop's metric-api-cpm).
-    // ``calls_per_minute_5m`` is the 5-minute rolling average; the rate-limit
+    // ``calls_per_minute_5m`` is the calls a minute over the last 5 minutes
+    // (over the uptime while that is shorter); the rate-limit
     // ceiling is ~120/min, so a single number here is enough on mobile.
     if (apiCpmEl) apiCpmEl.textContent = fmtNum(data?.api_usage?.calls_per_minute_5m, 1);
 

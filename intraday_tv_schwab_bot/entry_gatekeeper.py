@@ -917,6 +917,39 @@ class EntryGatekeeper:
             self.audit.log_structured('SKIP_SUMMARY', payload)
         return True
 
+    def hold_entry_decisions(self, reasons: list[str]) -> None:
+        """Keeps the dashboard's per-symbol entry decisions current on a
+        cycle that runs no entries. ``reasons`` say why: the startup
+        reconcile's block, ``entry_session_closed``,
+        ``outside_entry_window`` or ``non_trading_day``. Each stored
+        decision becomes ``skipped`` for ``reasons``, with ``cooldown``
+        after them while its symbol is on cooldown; ``open_positions``
+        rebuilds them all at the next entry cycle. Until 2026-10-06 they kept
+        the last cycle's: after ``no_new_entries_after`` (15:00) a position
+        that closed still read ``in position`` (TSM on H: 2026-10-06, out at
+        15:04:22) and an expired cooldown still read ``cooldown`` (PLTR,
+        expired 15:05:56), and an always-on process showed the day before's
+        until the window opened. Nothing is logged or tallied (on a trading
+        day the engine's cycle line names the reason once a minute), and a
+        decision whose reasons stand keeps its ``updated_at``, so the
+        dashboard's symbol memo holds."""
+        if not reasons:
+            raise ValueError("hold_entry_decisions needs the reason no entry cycle runs")
+        for symbol, prior in list(self.last_entry_decisions.items()):
+            held = list(reasons) + (["cooldown"] if self.risk.is_symbol_on_cooldown(symbol) else [])
+            if prior.get("action") == "skipped" and prior.get("reasons") == held:
+                continue
+            self.last_entry_decisions[symbol] = {
+                'symbol': symbol,
+                'strategy': prior.get('strategy', str(self.config.strategy)),
+                'action': 'skipped',
+                'reasons': held,
+                'primary_reason': held[0],
+                'secondary_reason': held[1] if len(held) > 1 else None,
+                'market_side': None,
+                'updated_at': sessions.now_et().isoformat(),
+            }
+
     # ------------------------------------------------------------------
     # Main entry point — runs every entry-actionable cycle.
     # ------------------------------------------------------------------

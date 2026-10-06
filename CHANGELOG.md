@@ -5199,6 +5199,41 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The dashboard's symbol cards show the current entry state when no entry
+  cycle runs, the API rates read right after a start, and a stream- or
+  cache-served `Quote refresh` line is DEBUG.**
+  *2026-10-06* — from H:'s first dry-run day on the stream quotes.
+  - Each card's decision label comes from
+    `EntryGatekeeper.last_entry_decisions`, which only an entry cycle
+    (`open_positions`) rebuilt. After `no_new_entries_after` (15:00) the cards
+    kept the last cycle's decisions: TSM read `in position` after its 15:04:22
+    exit and PLTR `cooldown` after its cooldown expired at 15:05:56, and an
+    always-on process showed the day before's until the window opened. Every
+    pass that runs no entries now holds them at its reason
+    (`EntryGatekeeper.hold_entry_decisions`: the startup reconcile's block,
+    `entry_session_closed`, `outside_entry_window`, or `non_trading_day` on a
+    weekend or holiday), with `cooldown` after it while the symbol's cooldown
+    is active. Nothing is logged or tallied (on a trading day the cycle line
+    names the reason once a minute), and a decision whose reasons stand keeps
+    its `updated_at`, so the dashboard's symbol memo holds.
+  - The 5-, 15- and 30-minute API usage rates
+    (`api_usage.calls_per_minute_5m`, the dashboard's
+    `Schwabdev Calls / Min (5m)`, and the 15m and 30m ones) divide each
+    window's calls by the time it covers: the tracker's uptime until that
+    reaches the window, at least a minute. Each divided by its whole window,
+    so each read low until the uptime reached it: one minute up, the startup
+    burst (86 calls in about 20 s on 10-06) showed at a fifth of its pace.
+    The 1-minute rate was right.
+    The counts were right: the 186 calls of H:'s first 29 minutes match the
+    log one for one (1 linked_accounts, 140 price_history, 34 quotes, 11
+    quote). They count calls, not HTTP requests: schwabdev's retries (up to 3
+    on a 429, a 5xx or a timeout) and the stream's connection-info fetch are
+    not in them.
+  - `Quote refresh` lines log at INFO only when the refresh asked REST (or
+    failed); one the stream or the cache served is DEBUG. With the stream
+    quotes every pass logged one at INFO, 669 of 681 in H:'s first 29 minutes
+    asking nothing (about 25 a minute, against 7 before).
+
 - **The 0DTE VIX gates read VIX's real day change and fail closed: every
   quote's `percent_change` is Schwab's `netPercentChange`, the regime divides
   it by 100, a VIX quote it cannot vouch for refuses the entry, and the
