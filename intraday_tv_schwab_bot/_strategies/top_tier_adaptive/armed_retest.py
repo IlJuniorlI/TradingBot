@@ -184,10 +184,13 @@ class ArmedRetestMixin:
         So qualification no longer means "enter". It means "remember the level
         that was cleared and wait for price to come back to it". Three outcomes:
 
-        ``none``   feature off, no usable trigger level, or no arm yet and the
-                   close has not crossed the level -- the builder decides, and
-                   its fresh-breakout check rejects the cycle.
-        ``wait``   armed, retest not yet confirmed. The cycle skips; other
+        ``none``   feature off, no usable trigger level, or no live arm (none
+                   yet, or the one there was just invalidated) and the close
+                   has not crossed the current level -- the builder decides,
+                   and its fresh-breakout check rejects the cycle.
+        ``wait``   armed, retest not yet confirmed; a close through the
+                   current level after an invalidation arms anew on that
+                   level and waits like a first arm. The cycle skips; other
                    regimes in the build queue are unaffected, so arming trend
                    does not stop a pullback firing on the same symbol.
         ``enter``  price returned to within ``armed_retest_zone_atr`` of the
@@ -226,24 +229,36 @@ class ArmedRetestMixin:
         invalidation_atr = max(0.0, float(self.params.get("armed_retest_invalidation_atr", 0.75)))
         max_minutes = float(self.params.get("armed_retest_max_minutes", 12.0))
 
-        # A close well back through the level means the breakout failed; the
-        # arm is dead. No rejection is raised here -- the builder's own
-        # fresh-breakout check owns that message, and duplicating it would put
-        # two different reasons on the same condition.
+        # A close well back through the armed level means the breakout
+        # failed; the arm is dead. No rejection is raised here -- the
+        # builder's own fresh-breakout check owns that message, and
+        # duplicating it would put two different reasons on the same
+        # condition.
         #
         # Measured against the ARMED level, not the current one. The N-bar
         # reference walks up as new highs print, so testing against it would
         # move the invalidation line away from price on exactly the setups
         # that are still working, and drag it along behind a rolling-over one.
         # The level we are waiting for is the level we armed on.
-        reference = float(arm["trigger_level"]) if arm is not None else float(trigger_level)
-        if side == Side.LONG:
-            invalidated = close < reference - invalidation_atr * atr
-        else:
-            invalidated = close > reference + invalidation_atr * atr
-        if invalidated:
-            self._armed_retests.pop(key, None)
-            return out
+        #
+        # The dead arm is dropped and the cycle is then judged as a cycle
+        # with no arm, against the CURRENT level. Returning `none` at once
+        # handed a close through the current level to the builder, whose
+        # fresh-breakout check passes it: a momentum arm whose bar has left
+        # the 6-bar window can see price fall through it and print a new
+        # 6-bar high below it inside its 12 minutes, and that bar entered at
+        # market with no arm and no retest -- the chase the arm exists to
+        # prevent. With no arm there is nothing to invalidate: a close that
+        # has not crossed the level is refused by the crossing test below.
+        if arm is not None:
+            armed_level = float(arm["trigger_level"])
+            if side == Side.LONG:
+                invalidated = close < armed_level - invalidation_atr * atr
+            else:
+                invalidated = close > armed_level + invalidation_atr * atr
+            if invalidated:
+                # The branch below either replaces this key or drops it.
+                arm = None
 
         if arm is None or arm.get("session_date") != now.date():
             # Only a close THROUGH the level is a breakout to arm on -- the

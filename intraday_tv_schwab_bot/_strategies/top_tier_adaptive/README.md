@@ -731,8 +731,9 @@ against 21% from an arbitrary moment in the same session.
 records the level it cleared and waits (`_armed_retest_verdict`). Four
 outcomes:
 
-- `none` — feature off, no usable trigger level, or no arm yet and the close
-  has not crossed the level. The builder decides, as before; on an uncrossed
+- `none` — feature off, no usable trigger level, or no live arm (none yet, or
+  the one there was just invalidated) and the close has not crossed the
+  current level. The builder decides, as before; on an uncrossed
   close its fresh-breakout check refuses the cycle with `no_fresh_breakout` /
   `no_fresh_breakdown`.
 - `wait` — armed, retest not confirmed. The cycle records
@@ -758,6 +759,17 @@ side, and across 09-29 to 10-02 394 of the 737 arm creations logged in
 `decisions.csv` (every reason on a row, not only the primary) had the close
 at or on the wrong side of the level. An existing arm is unaffected: a close
 back under its level is the retest in progress.
+
+**An invalidated arm is replaced, not skipped.** A close more than
+`armed_retest_invalidation_atr` ATR back through the armed level drops the
+arm, and the same cycle is then judged as one with no arm, against the current
+level: a close through it arms anew and waits, and one that has not crossed it
+returns `none` and the builder refuses it. Until then the verdict returned
+`none` at once, and a close that was through the current level passed the
+builder's fresh-breakout check and entered at market with no arm and no retest.
+On the shipped preset only `momentum` gets there: its 6-bar window can lose
+the arm bar inside the 12-minute wait, where trend's 25-bar window still holds
+it.
 
 The market fallback is deliberate, not a hedge: a strong trend day never offers
 the retest, and those are exactly the setups worth having. Forfeiting them
