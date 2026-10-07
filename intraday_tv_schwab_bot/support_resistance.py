@@ -714,6 +714,55 @@ def zone_flip_confirmed(
     return check(float(upper), 'reclaim')
 
 
+def _role_level(role: str, close: float, nearest: Level | None, broken: Level | None) -> Level | None:
+    """The nearest level playing ``role`` on its side of ``close``: for
+    ``"resistance"`` the nearer of ``nearest`` (nearest_resistance) and
+    ``broken`` (broken_support, a lost support now acting as resistance),
+    the flip a candidate when it lies at or above ``close`` and below
+    ``nearest`` or there is no ``nearest``; for ``"support"`` the mirror,
+    nearest_support and broken_resistance at or below ``close``. A flip at
+    ``close`` counts, as a ladder level at price does (no room); a flip on
+    the wrong side of price (``detect_broken_levels`` keeps one within the
+    merge tolerance across it) is no candidate; a tie goes to ``nearest``.
+    ``role_level`` reads it off a built context; the builder's ``near_*``
+    read it here."""
+    if role == "resistance":
+        flip_counts = broken is not None and float(broken.price) >= close and (
+            nearest is None or float(broken.price) < float(nearest.price))
+    elif role == "support":
+        flip_counts = broken is not None and float(broken.price) <= close and (
+            nearest is None or float(broken.price) > float(nearest.price))
+    else:
+        raise ValueError(f"role must be 'support' or 'resistance', not {role!r}")
+    return broken if flip_counts else nearest
+
+
+def role_level(sr_ctx: SupportResistanceContext, role: str) -> Level | None:
+    """The nearest level playing ``role`` on its side of price in
+    ``sr_ctx`` (``_role_level``): the resistance over a LONG is
+    ``nearest_resistance`` or a lost support (``broken_support``) between
+    price and it, the support under a SHORT ``nearest_support`` or a
+    reclaimed resistance (``broken_resistance``) between it and price.
+
+    A ladder rung is a cluster published at its strongest member's price,
+    so a confirmed flip can sit between price and the nearest rung as a
+    member of that rung's cluster (TSM 2026-10-06 15:17: broken_support
+    485.42 inside nearest_resistance's cluster at 485.62). Of 6,500
+    archived checkpoints a lost support sat between price and
+    nearest_resistance on 18%, a reclaimed resistance between
+    nearest_support and price on 12%. Until 2026-10-07 the gates measuring
+    the room toward the opposing level read ``nearest_*`` alone: a LONG at
+    484.30 read 0.273% of room to 485.62 and passed the 0.25% minimum,
+    where the flip left 0.231%. Readers: the S/R clearance veto and the
+    proximity score (``shared_entry._htf_clearance``, after a pending
+    level), the refinement's target caps, ``near_*``, top_tier's Fix G and
+    sr_scalp's target. The stop anchors, the ladders and the published
+    ``nearest_*`` with their distances still read the clusters."""
+    if role == "resistance":
+        return _role_level(role, float(sr_ctx.current_price), sr_ctx.nearest_resistance, sr_ctx.broken_support)
+    return _role_level(role, float(sr_ctx.current_price), sr_ctx.nearest_support, sr_ctx.broken_resistance)
+
+
 def _compute_level_proximity_metrics(
     *,
     supports: list,
@@ -752,17 +801,22 @@ def _compute_level_proximity_metrics(
         and close <= float(broken_support.price) - breakout_buffer
         and last_high < float(broken_support.price) - flip_eps
     )
+    # near_* read the nearest level playing each role (``role_level``): a
+    # confirmed flip between price and nearest_* is the level price is near
+    # (2026-10-07). The distances above stay nearest_*'s.
+    support_role = _role_level("support", close, nearest_support, broken_resistance)
+    resistance_role = _role_level("resistance", close, nearest_resistance, broken_support)
     near_support = bool(
-        nearest_support
-        and support_distance_atr is not None
-        and support_distance_atr <= float(proximity_atr_mult)
-        and close >= nearest_support.price - level_buffer
+        support_role is not None
+        and atr > 0
+        and (close - support_role.price) / atr <= float(proximity_atr_mult)
+        and close >= support_role.price - level_buffer
     )
     near_resistance = bool(
-        nearest_resistance
-        and resistance_distance_atr is not None
-        and resistance_distance_atr <= float(proximity_atr_mult)
-        and close <= nearest_resistance.price + level_buffer
+        resistance_role is not None
+        and atr > 0
+        and (resistance_role.price - close) / atr <= float(proximity_atr_mult)
+        and close <= resistance_role.price + level_buffer
     )
     return {
         "nearest_support": nearest_support,
@@ -797,12 +851,15 @@ def _compute_bias_and_regime(proximity: dict) -> tuple[float, str]:
         bias += 0.75
     if breakdown_below_support:
         bias -= 0.75
-    # near_* is about nearest_support / nearest_resistance, which always sit
-    # on their own side of price; the breakdown / breakout flags are about a
-    # broken level on the far side (a support now above price, a resistance
-    # now below it). Until 2026-09-23 either flag switched the near term
-    # off, so on about half of all checkpoints an unrelated old level below
-    # price dropped the -0.35 resistance-pressure term (and the mirror).
+    # near_* is about the nearest level playing each role on its own side of
+    # price (``role_level``: nearest_* or a confirmed flip between price and
+    # it); the breakdown / breakout flags are about a broken level that price
+    # has crossed (a support now above price, a resistance now below it), so
+    # one reclaimed resistance just under price can give both the breakout
+    # and the near-support terms. Until 2026-09-23 either flag switched the
+    # near term off, so on about half of all checkpoints an unrelated old
+    # level below price dropped the -0.35 resistance-pressure term (and the
+    # mirror).
     if near_support:
         bias += 0.35
     if near_resistance:

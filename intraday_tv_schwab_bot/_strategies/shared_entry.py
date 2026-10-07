@@ -61,9 +61,11 @@ from ..indicators import last_bar_atr
 from .. import sessions
 from ..numeric import safe_float
 from ..reasons import detail_fields, reason_head, reason_with_values
+from ..support_resistance import role_level
 from .plugin_api import VETO_GATES
 
 if TYPE_CHECKING:
+    from ..levels_shared import Level
     from .strategy_base import BaseStrategy
 
 
@@ -332,9 +334,11 @@ class AdmittedEntry:
 # S/R clearance (module-level: the veto and the proximity score share them)
 # ---------------------------------------------------------------------------
 
-def _htf_clearance(sr_ctx, kind: str) -> tuple[float | None, float | None]:
-    """``(pct, atr)`` room between price and the HTF ``kind`` level an entry
-    must not crowd: the support under a SHORT, the resistance over a LONG.
+def _htf_clearance(sr_ctx, kind: str) -> tuple[float | None, float | None, Level | None]:
+    """``(pct, atr, flip)``: the room between price and the HTF ``kind``
+    level an entry must not crowd -- the support under a SHORT, the
+    resistance over a LONG -- and the confirmed flip it was measured to, None
+    when it was a pending level or ``nearest_*``.
 
     A pending level -- a support price has crossed below (a resistance it has
     crossed above) whose flip is not yet confirmed -- still plays its original
@@ -350,20 +354,31 @@ def _htf_clearance(sr_ctx, kind: str) -> tuple[float | None, float | None]:
     pending level sits close by construction (p99 0.51 ATR for supports, 0.88
     for resistances), so "always too close" differs from an absolute-distance
     rule in 5 of those 573 samples.
+
+    Without a pending level the room is measured to the nearest level playing
+    the role (``support_resistance.role_level``): a confirmed flip between
+    price and ``nearest_*`` -- a lost support under the resistance over a
+    LONG, a reclaimed resistance over the support under a SHORT -- is that
+    level. Until 2026-10-07 the room was measured to ``nearest_*``, a cluster
+    published at its strongest member's price, past a flip inside it (TSM
+    2026-10-06: a LONG at 484.30 read 0.273% to 485.62 and passed the 0.25%
+    minimum; the lost support at 485.42 left 0.231%). The room to
+    ``nearest_*`` itself is the context's own distance.
     """
     close = float(sr_ctx.current_price)
-    if kind == "support":
-        pending = sr_ctx.pending_support
-        if pending is None:
-            return sr_ctx.support_distance_pct, sr_ctx.support_distance_atr
-        room = close - float(pending.price)
-    else:
-        pending = sr_ctx.pending_resistance
-        if pending is None:
-            return sr_ctx.resistance_distance_pct, sr_ctx.resistance_distance_atr
-        room = float(pending.price) - close
+    support = kind == "support"
+    level = sr_ctx.pending_support if support else sr_ctx.pending_resistance
+    flip = None
+    if level is None:
+        level = role_level(sr_ctx, kind)
+        flip = sr_ctx.broken_resistance if support else sr_ctx.broken_support
+        if level is None or level is not flip:
+            if support:
+                return sr_ctx.support_distance_pct, sr_ctx.support_distance_atr, None
+            return sr_ctx.resistance_distance_pct, sr_ctx.resistance_distance_atr, None
+    room = close - float(level.price) if support else float(level.price) - close
     atr = float(sr_ctx.current_atr or 0.0)
-    return (room / close if close > 0 else None), (room / atr if atr > 0 else None)
+    return (room / close if close > 0 else None), (room / atr if atr > 0 else None), flip
 
 
 def _sr_flag_blocks(sr_ctx, side: Side) -> bool:
@@ -1690,7 +1705,7 @@ class SharedEntryPolicy:
         if _sr_flag_blocks(sr_ctx, Side.LONG):
             return True
 
-        dist_pct, dist_atr = _htf_clearance(sr_ctx, "resistance")
+        dist_pct, dist_atr, _flip = _htf_clearance(sr_ctx, "resistance")
         too_close = False
         if dist_pct is not None and dist_pct <= float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)):
             too_close = True
@@ -1709,7 +1724,7 @@ class SharedEntryPolicy:
         if _sr_flag_blocks(sr_ctx, Side.SHORT):
             return True
 
-        dist_pct, dist_atr = _htf_clearance(sr_ctx, "support")
+        dist_pct, dist_atr, _flip = _htf_clearance(sr_ctx, "support")
         too_close = False
         if dist_pct is not None and dist_pct <= float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)):
             too_close = True
@@ -1729,8 +1744,12 @@ class SharedEntryPolicy:
                     close, stop, max(float(stop), support_stop),
                     last_bar_atr(frame, close),
                 )
-        if target is not None and sr_ctx.nearest_resistance and close < float(sr_ctx.nearest_resistance.price):
-            capped_target = max(close * 1.001, float(sr_ctx.nearest_resistance.price) - level_buffer)
+        # The cap reads the nearest level playing the resistance role: a
+        # lost support between price and nearest_resistance caps it
+        # (``role_level``, 2026-10-07). The stop anchor stays nearest_support.
+        resistance = role_level(sr_ctx, "resistance") if target is not None else None
+        if resistance is not None and close < float(resistance.price):
+            capped_target = max(close * 1.001, float(resistance.price) - level_buffer)
             proposed_target = min(float(target), capped_target)
             # R:R floor: only accept the cap if the resulting reward is still
             # tradeable. Without this guard, a nearby resistance can crush
@@ -1750,8 +1769,11 @@ class SharedEntryPolicy:
                     close, stop, min(float(stop), resistance_stop),
                     last_bar_atr(frame, close),
                 )
-        if target is not None and sr_ctx.nearest_support and close > float(sr_ctx.nearest_support.price):
-            capped_target = min(close * 0.999, float(sr_ctx.nearest_support.price) + level_buffer)
+        # Mirror: a reclaimed resistance between nearest_support and price
+        # caps it.
+        support = role_level(sr_ctx, "support") if target is not None else None
+        if support is not None and close > float(support.price):
+            capped_target = min(close * 0.999, float(support.price) + level_buffer)
             proposed_target = max(float(target), capped_target)
             # R:R floor — see comment on the bullish twin above.
             if self._target_meets_min_rr(Side.SHORT, close, stop, proposed_target):
@@ -1769,17 +1791,7 @@ class SharedEntryPolicy:
                     f"nearest_support={float(nearest.price) if nearest is not None else 'none'})")
         # Same clearance the check read: negative when price is above a
         # pending (unconfirmed-broken) resistance.
-        dist_pct, dist_atr = _htf_clearance(sr_ctx, "resistance")
-        return reason_with_values(
-            "too_close_to_htf_resistance",
-            current=dist_pct,
-            required=float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)),
-            op=">",
-            digits=4,
-            extras={
-                "clearance_atr": (dist_atr, ">", float(self._support_resistance_setting("entry_min_clearance_atr", 0.85))),
-            },
-        )
+        return self._sr_clearance_reason("too_close_to_htf_resistance", sr_ctx, "resistance")
 
     def _bearish_sr_block_reason(self, sr_ctx) -> str:
         if _sr_flag_blocks(sr_ctx, Side.SHORT):
@@ -1790,9 +1802,16 @@ class SharedEntryPolicy:
                     f"nearest_resistance={float(nearest.price) if nearest is not None else 'none'})")
         # Same clearance the check read: negative when price is below a
         # pending (unconfirmed-lost) support.
-        dist_pct, dist_atr = _htf_clearance(sr_ctx, "support")
-        return reason_with_values(
-            "too_close_to_htf_support",
+        return self._sr_clearance_reason("too_close_to_htf_support", sr_ctx, "support")
+
+    def _sr_clearance_reason(self, name: str, sr_ctx, kind: str) -> str:
+        """The clearance refusal ``name(...)``: the room ``_htf_clearance``
+        measured against both minimums, and, when it measured to a
+        confirmed flip, the flip by its field and price as the last detail
+        (``...,broken_support=485.4198)``); the name stays the tallies' key."""
+        dist_pct, dist_atr, flip = _htf_clearance(sr_ctx, kind)
+        reason = reason_with_values(
+            name,
             current=dist_pct,
             required=float(self._support_resistance_setting("entry_min_clearance_pct", 0.0038)),
             op=">",
@@ -1801,6 +1820,10 @@ class SharedEntryPolicy:
                 "clearance_atr": (dist_atr, ">", float(self._support_resistance_setting("entry_min_clearance_atr", 0.85))),
             },
         )
+        if flip is None:
+            return reason
+        flip_field = "broken_resistance" if kind == "support" else "broken_support"
+        return f"{reason[:-1]},{detail_fields(**{flip_field: float(flip.price)})})"
 
     @staticmethod
     def _dual_counter_divergence_reason(side: Side, tech_ctx) -> str | None:
@@ -2091,10 +2114,11 @@ class SharedEntryPolicy:
         # is at, so it counts as near at the clearance the gates read
         # (``_htf_clearance``: negative, a full proximity score). Reading
         # nearest_* alone, a bounce testing a just-pierced support got no
-        # favorable bonus (2026-09-23). The breakdown / breakout flags do
-        # not switch these off: they describe a broken level on the far
-        # side of price, never the near one, and they are set on about
-        # half of all checkpoints (2026-09-23).
+        # favorable bonus (2026-09-23). Otherwise near_* and the distance
+        # are the nearest level playing the role (``role_level``), a
+        # confirmed flip between price and nearest_* included (2026-10-07).
+        # The breakdown / breakout flags do not switch these off: they are
+        # set on about half of all checkpoints (2026-09-23).
         support_near = (
             bool(getattr(sr_ctx, "near_support", False)) or getattr(sr_ctx, "pending_support", None) is not None
         )

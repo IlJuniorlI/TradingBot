@@ -7,6 +7,7 @@ import pandas as pd
 from ....bars import bar_wick_fractions, same_day_mask
 from ....models import Candidate, Side, Signal
 from ....numeric import safe_float
+from ....support_resistance import role_level
 from .... import sessions
 
 
@@ -168,7 +169,7 @@ class SrScalpRegimeMixin:
                                data=None, vol_widening: float = 1.0, vol_scale: float = 1.0) -> Signal | None:
         """Build an HTF S/R scalp signal (2026-05-29 redesign).
 
-        Two LONG setups (SHORT mirrors), both riding to the next rung:
+        Two LONG setups (SHORT mirrors), both riding to the next level:
           A. BOUNCE — price at/just off a HOLDING nearest support zone,
              target the nearest resistance above (the next rung up).
           B. FLIP-CONTINUATION — price holding just above a confirmed-
@@ -176,7 +177,11 @@ class SrScalpRegimeMixin:
              as support), target the nearest resistance above. SHORT uses
              ``broken_support`` (a confirmed support break, now resistance).
         The higher (more immediate) of the two floors is used when both are
-        in proximity. SHORT is the exact mirror with ceilings.
+        in proximity. SHORT is the exact mirror with ceilings. The target
+        level is the nearest one playing the opposite role
+        (``support_resistance.role_level``): ``nearest_resistance``, or a
+        lost support (``broken_support``) between price and it, which a
+        LONG's target cannot ride past (since 2026-10-07; mirror for SHORT).
 
         Uses the bot's existing S/R machinery — NO strategy-local level
         creation. Level prices come from ``sr_ctx.nearest_support`` /
@@ -190,17 +195,18 @@ class SrScalpRegimeMixin:
           1. An entry-side floor (LONG) / ceiling (SHORT) exists in
              proximity — either the nearest level or a confirmed flip level
              (within ``sr_scalp_max_distance_from_zone_atr*atr`` of its edge).
-          2. A next rung exists in the trade direction (LONG: a resistance
-             ABOVE close; SHORT: a support BELOW close).
-          3. Inner gap from the floor/ceiling zone to the target rung clears
+          2. A target level exists in the trade direction (LONG: a
+             resistance-role level ABOVE close; SHORT: a support-role level
+             BELOW close).
+          3. Inner gap from the floor/ceiling zone to the target level clears
              BOTH the % floor (``sr_scalp_min_distance_pct*close``) and the
              ATR floor (``sr_scalp_min_distance_atr*atr``).
           4. Price hasn't broken through the floor/ceiling zone (holding,
              not breaking).
 
         Stop = floor_zone_lower − buffer (LONG) / ceiling_zone_upper + buffer
-        (SHORT). Target = the next rung's inner edge ∓ buffer — matching the
-        bot's structural-exit conventions everywhere else.
+        (SHORT). Target = the target level zone's inner edge ∓ buffer —
+        matching the bot's structural-exit conventions everywhere else.
         """
         sr_ctx = self._sr_context(c.symbol, frame, data)
         sup = getattr(sr_ctx, "nearest_support", None)
@@ -237,6 +243,16 @@ class SrScalpRegimeMixin:
             self._pct_param("sr_scalp_min_distance_pct", 0.008, vol_scale) * close,
             float(self.params.get("sr_scalp_min_distance_atr", 2.5)) * atr,
         )
+        # The target: the nearest level playing the opposite role
+        # (``role_level``), a confirmed flip between price and nearest_*
+        # included (2026-10-07); a refusal that measured to a flip names it.
+        target_level = role_level(sr_ctx, "resistance" if side == Side.LONG else "support")
+        target_px = float(getattr(target_level, "price", 0.0) or 0.0) if target_level is not None else 0.0
+        target_name = "res" if side == Side.LONG else "sup"
+        target_flip_detail = ""
+        if target_level is not None and target_level is (bsup if side == Side.LONG else bres):
+            target_name = "broken_support" if side == Side.LONG else "broken_resistance"
+            target_flip_detail = f",{target_name}={target_px:.4f}"
 
         if side == Side.LONG:
             # Entry-side floor: the nearest support (mean-reversion bounce) OR
@@ -264,23 +280,25 @@ class SrScalpRegimeMixin:
                     f"long_no_holding_support_or_flip(close={close:.4f},sup={sup_px:.4f},flipped_res={bres_px:.4f})",
                 )
                 return None
-            # Target = nearest resistance ABOVE close (the next rung up the ladder).
-            if res_px <= close:
+            # Target = the nearest resistance ABOVE close (the next rung up
+            # the ladder), or a lost support between price and it, which
+            # acts as resistance (``role_level``, 2026-10-07).
+            if target_px <= close:
                 self._set_build_failure(
                     c.symbol, "sr_scalp",
-                    f"long_no_resistance_above(res={res_px:.4f}<=close={close:.4f})",
+                    f"long_no_resistance_above({target_name}={target_px:.4f}<=close={close:.4f})",
                 )
                 return None
-            inner_gap = (res_px - zone_half_width) - (floor_px + zone_half_width)
+            inner_gap = (target_px - zone_half_width) - (floor_px + zone_half_width)
             if inner_gap < required_gap:
                 self._set_build_failure(
                     c.symbol, "sr_scalp",
-                    f"htf_zones_too_close(inner_gap={inner_gap:.4f}<{required_gap:.4f})",
+                    f"htf_zones_too_close(inner_gap={inner_gap:.4f}<{required_gap:.4f}{target_flip_detail})",
                 )
                 return None
             entry_level = floor_px
             stop = (floor_px - zone_half_width) - level_buffer
-            target = (res_px - zone_half_width) - level_buffer
+            target = (target_px - zone_half_width) - level_buffer
         else:
             # Entry-side ceiling: the nearest resistance (rejection) OR a
             # confirmed-flipped support now acting as resistance
@@ -302,23 +320,24 @@ class SrScalpRegimeMixin:
                     f"short_no_holding_resistance_or_flip(close={close:.4f},res={res_px:.4f},flipped_sup={bsup_px:.4f})",
                 )
                 return None
-            # Target = nearest support BELOW close (the next rung down the ladder).
-            if sup_px <= 0.0 or sup_px >= close:
+            # Target = the nearest support BELOW close (the next rung down
+            # the ladder), or a reclaimed resistance between it and price.
+            if target_px <= 0.0 or target_px >= close:
                 self._set_build_failure(
                     c.symbol, "sr_scalp",
-                    f"short_no_support_below(sup={sup_px:.4f}>=close={close:.4f})",
+                    f"short_no_support_below({target_name}={target_px:.4f}>=close={close:.4f})",
                 )
                 return None
-            inner_gap = (ceil_px - zone_half_width) - (sup_px + zone_half_width)
+            inner_gap = (ceil_px - zone_half_width) - (target_px + zone_half_width)
             if inner_gap < required_gap:
                 self._set_build_failure(
                     c.symbol, "sr_scalp",
-                    f"htf_zones_too_close(inner_gap={inner_gap:.4f}<{required_gap:.4f})",
+                    f"htf_zones_too_close(inner_gap={inner_gap:.4f}<{required_gap:.4f}{target_flip_detail})",
                 )
                 return None
             entry_level = ceil_px
             stop = (ceil_px + zone_half_width) + level_buffer
-            target = (sup_px + zone_half_width) + level_buffer
+            target = (target_px + zone_half_width) + level_buffer
 
         # Noise floor on the scalp stop: it must sit beyond the deepest recent
         # violation of the level it leans on, not beyond a flat ATR multiple.

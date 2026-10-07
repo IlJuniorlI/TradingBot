@@ -35,6 +35,7 @@ from ...models import Candidate, Position, Side, Signal
 from ...sessions import EQUITY_RTH_OPEN, equity_session_state, parse_hhmm
 from ...numeric import safe_float
 from ...reasons import insufficient_bars_reason
+from ...support_resistance import role_level
 from ... import sessions
 from ..shared_entry import EntryContexts, EntryProposal
 from ..strategy_base import BaseStrategy
@@ -777,21 +778,26 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         ):
             target_max_sr_ratio = float(self.params.get("target_max_sr_ratio", 0.8))
             tgt = float(target)
+            # The opposing level is the nearest one playing the role
+            # (``role_level``): a confirmed flip between price and
+            # nearest_* -- a lost support under the resistance, a reclaimed
+            # resistance over the support -- is the level a target past it
+            # must punch through, and the refusal names it (2026-10-07).
             if side == Side.LONG:
-                near = getattr(admitted.sr, "nearest_resistance", None)
+                near = role_level(admitted.sr, "resistance")
                 level_price = float(getattr(near, "price", 0.0) or 0.0)
                 valid = level_price > close
                 dist_to_sr = level_price - close if valid else 0.0
                 dist_to_target = tgt - close
-                level_name = "resistance"
+                level_name = "broken_support" if near is not None and near is admitted.sr.broken_support else "resistance"
                 reason_prefix = "long_target_beyond_resistance"
             else:
-                near = getattr(admitted.sr, "nearest_support", None)
+                near = role_level(admitted.sr, "support")
                 level_price = float(getattr(near, "price", 0.0) or 0.0)
                 valid = 0.0 < level_price < close
                 dist_to_sr = close - level_price if valid else 0.0
                 dist_to_target = close - tgt
-                level_name = "support"
+                level_name = "broken_resistance" if near is not None and near is admitted.sr.broken_resistance else "support"
                 reason_prefix = "short_target_beyond_support"
             # A first ladder rung ON the nearest level is the ladder's own
             # take-profit at that level (with shared_exit's touch hold on,
@@ -803,7 +809,9 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             # 2026-09-25, and trend traded only as a trail runner. A nearest
             # level under ladder_min_target_rr that rung 1 skipped is still
             # an unmanaged level short of the target, and the ratio still
-            # refuses it. The tolerance covers the rung builder's
+            # refuses it. A confirmed flip inside nearest_*'s cluster is no
+            # rung, so rung 1 never sits on it and a target past it is
+            # refused the same way. The tolerance covers the rung builder's
             # round(price, 6).
             if valid and ladder_meta and abs(tgt - level_price) <= 1e-6:
                 valid = False
