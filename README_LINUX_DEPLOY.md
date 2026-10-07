@@ -547,7 +547,10 @@ before is the last warning you can act on outside a session. The line above
 was logged on Thu 2026-10-08; the same token logs INFO through Fri 10-09,
 then `before the session after the coming one ends (2026-10-13 16:00:00
 EDT)` on Mon 10-12 and `before the coming session ends (2026-10-13
-16:00:00 EDT)` on Tue 10-13. A `tokens.db` it cannot read is a
+16:00:00 EDT)` on Tue 10-13. Once the login time has passed (a bot started
+after it, or after the token expired), the WARNING says so: `..., expires
+(or expired) ...; schwabdev has asked for a new login since ...: log in
+again now. ...`. A `tokens.db` it cannot read is a
 WARNING naming the error's type (`Schwab refresh token: could not read
 schwabdev's token store ...`). Neither blocks entries. Watch for them in
 the day's log, or in the journal:
@@ -561,11 +564,24 @@ Not `journalctl -p warning`: the bot writes its lines to stdout as plain
 text, so the journal files every one of them at priority `info`, its
 WARNINGs included, and a priority filter drops them all.
 
-To renew ahead of time, outside the session: stop the bot, move
-`.schwabdev/tokens.db` aside, redo the OAuth flow ("First-time Schwab
-OAuth" above, on a desktop, then SCP the new `tokens.db` over), and start
-the bot again. The new token is good for 7 days from that login. A bot
-stopped for more than 7 days needs the same.
+To renew ahead of time, outside the session:
+
+1. Stop the bot.
+2. On the machine you log in from (the desktop of "First-time Schwab
+   OAuth" above, or the server if you log in there), move
+   `.schwabdev/tokens.db` aside. schwabdev starts its login only for an
+   empty store or one in its last hour (the 3630 s above): over a store
+   with more left, the run just renews the access token, and the
+   `tokens.db` you copy back holds the old refresh token, which still
+   expires when it did.
+3. Redo that flow there. From a desktop, SCP the new `tokens.db` over the
+   server's (move the server's aside first to keep a copy).
+4. Start the bot and check that its `Schwab refresh token issued ...` line
+   shows the time of the new login. The old issue time means the old token
+   came back: start again from step 2.
+
+The new token is good for 7 days from that login. A bot stopped for more
+than 7 days needs the same.
 
 ### TradingView session expiry
 

@@ -727,7 +727,8 @@ class IntradayBot:
         when schwabdev will ask for a new login (``schwab_api.RefreshTokenWindow``),
         read from its token store with no request and no login flow. INFO,
         or WARNING when that login falls before the session after the coming
-        one ends (``_session_ends_after``): an interactive run then waits at
+        one ends (``_session_ends_after``), or has already passed (the line
+        then says so and to log in now): an interactive run then waits at
         schwabdev's prompt inside an API call, and a systemd run's prompt
         fails (EOFError) on every call, which fail (401) once the access
         token lapses (``schwab_api.SCHWABDEV_LOGIN_LEAD``). A day ahead, not
@@ -748,12 +749,23 @@ class IntradayBot:
                         "when schwabdev will ask for a new login is unknown",
                         tokens_db, type(exc).__name__, exc)
             return
+        login_at = window.login_at.astimezone(EXCHANGE_TZ)
+        expires_at = window.expires_at.astimezone(EXCHANGE_TZ)
+        stamp = "%Y-%m-%d %H:%M:%S %Z"
+        issued = f"issued {window.issued_at.astimezone(EXCHANGE_TZ):{stamp}}"
+        if now > login_at:
+            # schwabdev's check is strict (less than 3630 s left), so its
+            # login flow starts after login_at, not at it; the token expires
+            # the same way.
+            expiry = "expired" if now > expires_at else "expires"
+            LOG.warning("Schwab refresh token %s, %s %s; schwabdev has asked for a new login since %s: log in "
+                        "again now. Until then an API call on a terminal waits at schwabdev's prompt; under systemd "
+                        "the prompt fails (EOFError) and the calls fail (401) once the access token lapses.",
+                        issued, expiry, f"{expires_at:{stamp}}", f"{login_at:{stamp}}")
+            return
         ends = self._session_ends_after(now)
         coming_end, following_end = next(ends), next(ends)
-        login_at = window.login_at.astimezone(EXCHANGE_TZ)
-        stamp = "%Y-%m-%d %H:%M:%S %Z"
-        times = (f"issued {window.issued_at.astimezone(EXCHANGE_TZ):{stamp}}, "
-                 f"expires {window.expires_at.astimezone(EXCHANGE_TZ):{stamp}}; "
+        times = (f"{issued}, expires {expires_at:{stamp}}; "
                  f"schwabdev asks for a new login from {login_at:{stamp}}")
         if login_at < following_end:
             which, end = ("the coming session", coming_end) if login_at < coming_end else \
