@@ -9,6 +9,30 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The session archive's manifest and the SESSION REPORT name the price
+  the paper account marked held equities at (`equity_mark_basis`).**
+  *2026-10-07* — the account now marks a held equity at the price
+  management read for it in the pass; an earlier version marked the step
+  frame's last 1m close. The SESSION REPORT's `max_drawdown`, the
+  archive's `account_snapshot.json` and the dashboard curve value the
+  positions at those marks, so the dry-run evaluation series changes basis
+  on the day the change is deployed (a max drawdown $0-32 a day larger on
+  the archived days 2026-09-29 to 10-06, 09-30 the largest), and nothing
+  in an archive or a report said which basis a day was valued at.
+  - `position_manager.EQUITY_MARK_BASIS` (`management_price`), beside the
+    marking code, names it. The manifest carries it as
+    `equity_mark_basis`; the SESSION REPORT line ends with
+    `equity_mark_basis=management_price` and its JSON payload has the key.
+  - Reading a series across the change: an archive whose manifest has no
+    `equity_mark_basis`, and a report without it, were written by an
+    earlier version, which valued held equities at their 1m close;
+    compare their `max_drawdown`, peak and curve with a
+    `management_price` day knowing the 1m-close figures miss the moves
+    inside the minute. Trades, realized P&L and everything a trade
+    records are the same on both bases.
+  - Decisions: none. The manifest gains one key (its snapshot test's
+    fixture with it), the report line one field.
+
 - **Quotes come from the stream: LEVELONE_EQUITIES serves every streamable
   equity quote the engine's refresh reads, on every pass; REST is the
   fallback, and forced fetches stay REST (`runtime.stream_quotes`, on).**
@@ -1181,6 +1205,62 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gates ran, which were exempt and what the shared score was.
 
 ### Changed
+
+- **The paper account marks a held equity at the price management read
+  for it in the pass, not at its last 1m close.** *2026-10-07* — the only
+  mark an equity position had was the engine's quotes-phase mark, its step
+  frame's last 1m close (`IntradayBot._extract_last_prices`), while
+  management, its stops, targets and exits, and the dry-run exit fill
+  priced the same position from its quote. On the archived top_tier days
+  2026-09-29 to 10-06 (5,290 management reads over 88 positions, every one
+  from a quote) the close the account showed was a median 30 s old at the
+  pass (p90 54 s, at most 60 s plus the bar's delivery) and a median 3.9
+  bps from management's price (p99 35, max 107): a median $4.75 of a
+  position's unrealized P&L (p99 $35, max $119). The peak and the max
+  drawdown missed the moves inside the minute: rebuilt at management's
+  price, 09-30's max drawdown is $210.68 against the $179.04 archived, and
+  the other days move by $0-5.36. The position row's last price also
+  disagreed with POSITION_MARK and the exit record.
+  - `PositionManager._manage_position` marks the account
+    (`PaperAccount.mark_prices`) at each equity's price as soon as
+    `_take_look` records it: the quote, else the bar close, else the
+    account's own mark, the same price the pass checks the levels at and
+    POSITION_MARK logs. A position with a working exit is marked too
+    (before that check returns). A read without a price writes no mark.
+  - The engine's quotes-phase 1m-close mark stays: it is the mark of a
+    held equity that management does not price in a pass (its settle
+    pending, its bracket fills unbooked, management off, as outside its
+    order session) and of every symbol without a position (the S/R
+    snapshot's last fallback).
+  - Options are unchanged: management never marks one, and it keeps its
+    strategy's mark from fresh legs (`position_mark_price`).
+  - What follows the new mark: the dashboard's position rows (last price,
+    unrealized P&L, market value, return), the equity, its peak and max
+    drawdown and the equity curve (`record_equity_point`, sampled once a
+    pass by the publish, after management), the SESSION REPORT's
+    `max_drawdown` and the archive's `account_snapshot.json` (both
+    captured at the day close, after the pass). On 10-01 09:40-10:40 a
+    replay of top_tier differs only in the dashboard state, from the first
+    publish holding a managed equity (176 of 181 steps): the trades, the
+    realized P&L, every decision and every quote request are identical.
+  - Decisions: management's last-resort price for an equity
+    (`account_cache`: no fresh quote after the stream read and the forced
+    REST refresh, and no frame) is the last pass's management price
+    instead of its 1m close (0 of the 5,290 archived reads reached it).
+    The session reconcile's `closed_outside_bot` (the start-up reconcile
+    re-run on each trading day, and its retries; live only) books the
+    shares the broker no longer holds, and counts an estimated loss toward
+    `max_daily_loss`, at the last management price instead of the last 1m
+    close. Nothing else reads the marks but the reconciler's last-resort
+    bracket-cancel fill price (live only, unreachable while a bracket
+    carries its level): entries, stops, targets, exits, the other fills
+    and the risk gates are unchanged.
+  - Upgrade note: the account's figures change basis on the day this
+    lands: from then on the dashboard's rows and curve, the SESSION
+    REPORT's `max_drawdown` and `account_snapshot.json` value a held
+    equity at management's price, so an evaluation series that spans the
+    day compares a 1m-close drawdown with a management-price one (on the
+    archived days the latter is $0-32 larger).
 
 - **The S/R gates measure to the nearest level playing each role: a
   confirmed flip between price and `nearest_support` / `nearest_resistance`
@@ -5294,6 +5374,332 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `levels_shared.find_divergence` a required `bar_clock`.
 
 ### Fixed
+
+- **trades.csv is read and written under one lock, so processes sharing
+  `log_dir` take turns at its schema rotation.** *2026-10-07* — the schema
+  guard's rotation (`session_report._rotate_trades_csv`) wrote the fresh file
+  to one fixed staging name, copied the old file aside and replaced it, with
+  no lock. Two processes that met an older header at once (a dry-run and a
+  live process of one strategy sharing `.logs`, closing the day after an
+  upgrade) each wrote the staging file over the other's and replaced
+  `trades.csv` with a copy that lacked the other's carried or new rows, and
+  an append another process had opened on the old file landed in the file
+  the replace unlinked while it returned True. Only an upgrade day with two
+  appenders meets it; H: runs one process.
+  - Every append (`append_trades_csv`: its read, its check against the file,
+    and its write or rotation) and the archive's read of the day's rows
+    (`read_trade_rows`) hold `.logs/trades.csv.lock`
+    (`session_report._trades_csv_lock`): `fcntl.flock` on POSIX, a lock on
+    its first byte through `msvcrt.locking` on Windows. The operating system
+    frees it when its holder exits, however it exits.
+  - A lock another holder keeps 5 s (`TRADES_CSV_LOCK_WAIT_SECONDS`; a
+    holder keeps it for one read and one write, milliseconds) appends
+    nothing, with a WARNING naming `TimeoutError`, and the day stays owed:
+    the close retries it on a pass a minute later and at shutdown, as any
+    failed append. A retry inside a later trading day's 7 AM-8 PM stream
+    window tries the lock once instead of waiting up to 5 s for it on the
+    engine thread, which a lock kept through the session would cost a pass
+    of management every minute: a busy lock fails that attempt at once. The
+    day's 8 PM close and the shutdown still wait. The archive's read
+    records it in `trades_export_error`.
+  - A new `trades.csv` is written with its header and its rows in one
+    exclusive create, which fails, and is retried, when another writer made
+    the file since the read. The hard-link staging that kept two first
+    appends to one header is gone (the lock does that), and with it the need
+    for a filesystem with hard links: elsewhere every first append failed.
+    An empty `trades.csv` (a first write that failed before any of it
+    landed, on a full disk) is written as a new one, its header then its
+    rows; until now the next append rotated it to
+    `trades.archive-<date>.csv` as a file under an older header, with a
+    false `trades.csv schema changed` WARNING (no row was lost).
+  - Upgrade note: an empty `.logs/trades.csv.lock` appears beside
+    `trades.csv`; leave it in place (a process that opens it after it was
+    deleted locks a new file, not the one another process holds). New
+    WARNING: `Could not lock <log_dir>/trades.csv.lock, so N trades were not
+    appended: <type>: ...` (`TimeoutError: another holder kept ... for 5
+    s`, or, on a retry inside a later session, `another holder has ...
+    (tried once, not waited for)`).
+
+- **The shutdown appends every owed day's trades before any archive, and
+  starts no archive export 12 s or more after the stop signal; a day it
+  leaves is written by the next start.** *2026-10-07* — the shutdown closed
+  each owed day in turn: its summary, its `trades.csv` append, then its
+  archive. An export takes 5-13 s on H: (2026-09-29 to 10-06) and cannot be
+  cut short, so several owed days whose exports fail at the manifest (a full
+  disk keeps each day owed into the next) ran past the deploy guide's
+  `TimeoutStopSec=30s` and were SIGKILLed. The days not reached lost their
+  archives for good, since a day's close was owed only in the stopped
+  process's memory and a next start picks up only the evening it starts in,
+  and a later day's append waited behind the earlier days' exports.
+  - `IntradayBot._shutdown_cleanup` writes every owed day's summary and
+    append first, then the archives (`_shutdown_exports`): the days the
+    process ran first, then the others (a late start's, one an earlier
+    shutdown left owed), oldest first within each, so a day an earlier
+    shutdown left owed, which a start inside a session carries to 8 PM,
+    cannot use up the budget of the day the stopping process ran. They
+    run whatever their back-off says, each started only within 12 s
+    (`SHUTDOWN_EXPORT_START_SECONDS`) of the first stop signal
+    (`_StopSignals.received_at`, kept whether the signal raised or came
+    during the shutdown): at H:'s longest measured export (12.7 s, 10-02)
+    the last ends by about 25 s. A shutdown no signal started (the
+    auto-exit, an error that ends the run) has no timeout pending and
+    exports every day.
+  - A day whose export the shutdown does not start, or whose export fails
+    there, is left owed in `.logs/sessions/<date>/archive_owed.json`
+    (`session_archive.leave_session_archive_owed`, naming why), with
+    `Shutdown: the <date> archive is not written (<why>): the next start
+    writes it` (WARNING; an ERROR ending `and could not be left owed for the
+    next start: <type>: ...` when the file cannot be written). The next start
+    that exports archives owes each such day that has ended and writes it as
+    a late start would, with `exporter_ran_session: false`, on a pass
+    outside the trading days' 7 AM-8 PM stream windows (its first export
+    counts as a retry, `_archive_due`); with archives off it stays owed. A
+    day still running when the process starts (a restart before 8 PM) is its
+    own close at 8 PM. The file makes a day owed even when the day has an
+    archive (an earlier process's noon export, say), at a start and for a
+    day a held loop missed; any process's export of the day removes it
+    (`export_session_archive` fails when it cannot).
+  - Upgrade note: `archive_owed.json` can appear in a day's archive folder
+    until its archive is written: a folder holding it and no
+    `manifest.json` has no archive yet. New lines: `Shutdown: the <date>
+    archive is not written ...` (above), and at start (INFO) `The <date>
+    archive was left owed by an earlier shutdown: this process writes it
+    (exporter_ran_session=false), outside the trading days' stream
+    windows` and `The <date> archive an earlier shutdown left owed stays
+    owed: archives are off`. `Session archive for <date> failed at shutdown:
+    <type>` is now followed by the `not written` line. The ERROR
+    `Shutdown: the trades.csv append failed (the <date> close) ...` comes
+    before the shutdown's exports, no longer after the day's own.
+
+- **A late start runs the day's append on its first pass, an upgrade day
+  rotates `trades.csv` with no trade to append, and an archive the next
+  start writes for a stopped process keeps that day's skip tally.**
+  *2026-10-07* — three edges the 10-06 day-close change left.
+  - A process started after a trading day's 8 PM that owed the day no
+    archive (the day had one, or archives are off) ran the day's
+    `trades.csv` append only at its shutdown. It now owes the day that
+    append, written on its first pass (`ET trading day <date> ended:
+    writing its trades.csv rows`), as it already was when it wrote the
+    archive; with `auto_exit_after_session` on, that pass ends the run
+    before the day close, and the shutdown writes it. A safeguard: its
+    start-up reconcile books no trade (it tracks no position until that
+    reconcile restores them, and a dry run books none), so it holds none
+    of that evening.
+  - On an upgrade day on which the new process traded nothing, the rows
+    the old process had appended under the older header were never rotated
+    (the rotation ran only with a trade to append), so the day's archive
+    read them as an error: `trades_export_error` `ValueError: ... under a
+    header of N columns`, `trades_today` 0, `realized_pnl` unknown. The
+    first append after an upgrade (a day close or a shutdown) now rotates
+    the file with or without a trade to write. With nothing to append, the
+    append is done whatever the rotation does: a file it cannot read
+    (`Could not read <path> to check its header: <type>: ...`, WARNING) or
+    a rotation that fails is logged, and the archive's read names it, as
+    before.
+  - An archive the next start writes for a day a stopped process left owed
+    holds the skip tally that process left in `archive_owed.json`
+    (`session_skip_counts`): the tally lives only in the memory of the
+    process that ran the day. A marker whose tally cannot be read still
+    makes its day owed, with an empty tally and a WARNING naming the error's
+    type. A late start after a process killed before 8 PM still archives an
+    empty tally, since nothing the dead process left holds it, and the log
+    cannot rebuild it: an unchanged `Decision` line is logged once per
+    120 s and a noisy reason at DEBUG, while the tally counts symbol-minutes
+    (H:'s 10-06 archive: 9,715 in the tally against 356 skipped rows in
+    `decisions.csv`; `long_build_failed_trend_index_not_confirmed` 918 in
+    the tally against 16 rows with it as the primary reason).
+  - Upgrade note: a late start that owes the day no archive logs `ET
+    trading day <date> ended: writing its trades.csv rows` on its first
+    pass (not with `auto_exit_after_session` on: its shutdown appends).
+    `archive_owed.json` gains `session_skip_counts`. The rotation's
+    failure WARNING drops `, so 0 trades were not appended` when it had
+    nothing to append, and a rotation with nothing to append logs no
+    `Session trades appended ... (0 rows)`.
+
+- **A shutdown leaves a day owed until its export ends, a start writes a
+  weekend or holiday day a shutdown left owed, an append with nothing to
+  write is not failed by the lock, and `trades.csv.lock` is opened
+  read-only.** *2026-10-07* — four edges in the three changes above.
+  - A shutdown export that systemd's SIGKILL cut off (one started just
+    under 12 s after the stop signal that ran past 30 s) left a folder with
+    neither `manifest.json` nor `archive_owed.json`, and no start owed the
+    day again. `IntradayBot._shutdown_exports` now writes the day's
+    `archive_owed.json` (`its export started at shutdown and did not
+    finish`, with the day's skip tally) before each export starts; the
+    export removes it after its manifest, and one that fails rewrites it
+    with its reason. A file that cannot be written then is logged and the
+    export runs. When a failed export's file cannot be rewritten but one is
+    there (written before the export, or by an earlier shutdown), the day
+    is still owed, and the log now says so instead of the ERROR that it
+    could not be left owed.
+  - A start skipped every `archive_owed.json` of a day later than the
+    latest ended trading day, so one left on a Saturday or a holiday was
+    passed over in silence until a start after the next trading day's 8 PM.
+    Only today's is skipped now (its 8 PM close owes it on a trading day,
+    as does a shutdown today); an earlier day has ended, a trading day or
+    not, and the start writes it like any other.
+  - An append with no trade to write (a late start's first pass, a
+    shutdown of a closed day) still takes the lock, to rotate an older
+    header, and a lock another holder kept 5 s failed it: the day stayed
+    owed, retried each minute (each retry up to 5 s on the engine thread),
+    and the shutdown logged `Shutdown: the trades.csv append failed ...`
+    (ERROR) though no trade was left out. With nothing to append, a lock
+    it cannot take is a WARNING and the append is done; the day's archive
+    read records the error if it meets it too.
+  - The lock file was opened read-write, which neither `fcntl.flock` nor
+    `msvcrt.locking` needs (it calls LockFile, whose handle needs read or
+    write access), so a lock file this user cannot write (a `sudo` run
+    leaves it root's, 0644) failed every append for good. It is opened
+    read-only. On NFS, whose flock is a byte-range lock that needs a
+    writable open, `.logs` needs the mount option `local_lock=flock`. The
+    bot takes and frees the lock once at start-up
+    (`session_report.check_trades_csv_lock`), so a lock the log directory
+    cannot give is an ERROR naming that option when the bot starts, not
+    first at the 8 PM close, whose append then fails on every retry; the
+    bot starts all the same.
+  - Upgrade note: `archive_owed.json` is also in a day's folder while a
+    shutdown exports it, and stays there if the export is cut off. New
+    lines: `Could not lock <log_dir>/trades.csv.lock to check trades.csv's
+    header: <type>: ...` (WARNING, in place of `..., so 0 trades were not
+    appended: ...`); `Shutdown: the <date> archive could not be left owed
+    before its export, so a kill during the export would lose it: <type>:
+    ...` (WARNING); and `Shutdown: the <date> archive is not written (...):
+    the next start writes it, though its archive_owed.json could not be
+    rewritten: <type>: ...` (WARNING); at start, `Could not lock
+    <log_dir>/trades.csv.lock at start-up: <type>: ...` (ERROR) when the
+    lock cannot be taken. A start logs `The <date> archive was left owed by
+    an earlier shutdown ...` for a weekend or holiday day too.
+
+- **An HTF context is built at the price its reader acts on: every read
+  names it, and the price-free part of the build is kept per stored HTF
+  frame.** *2026-10-07* — `MarketDataStore.get_htf_context` kept one context
+  per request for the whole HTF bar, built at the 1m close of its first read
+  after each refresh: the price was no argument, and the `current_price` the
+  strategies passed to `_htf_context` reached only the empty context. Every
+  field that reads a price (which side of price each level is on, the
+  nearest / broken / pending levels, the FVGs, the trend bias, the floored
+  ATR, the level buffer) was up to one HTF bar old (15 minutes on
+  top_tier's 15m frame, an hour on the peers' 60m), and which price it held
+  depended on which reader came first (since 2026-10-05 the engine's prime in
+  the contexts phase, but the price still held for the bucket). Replayed on
+  top_tier 2026-10-01 09:40-10:40, the context's trend vote at the entry
+  bar's close differs on 7 of the 10 entries (`htf_ema_votes` 2v0 against
+  3v0, and so on).
+  - `get_htf_context(symbol, *, current_price, ...)`: the price is required.
+    The strategies read at the close of the bar they decide on (top_tier's
+    entry and LTF score read, the shared entry stage's HTF divergence and FVG
+    terms and its divergence candidates, the peers, zero_dte); the engine's
+    prime at each step frame's close
+    (`IntradayBot._prime_strategy_htf_contexts(bars)`, so those reads find
+    it built); the dashboard's chart overlay and level
+    zones at the close of the 1m frame's last bar; the S/R row's HTF trend
+    reads, the strategy's own and the generic one, at the price of the S/R
+    context the row shows. Two reads at one price get one context, whatever
+    their order.
+  - The build is split in two (`htf_levels.prepare_htf_levels` and
+    `htf_context_at(frame, inputs, price)`; `build_htf_context` is both in
+    one call). The price-free part (the pivots, the prior day / week, the
+    EMAs, the RSI divergences, the unfloored ATR) is kept while its frame is
+    the stored one and the clock reads the same, and the context at each
+    price in a slot of its own per price, both in the level memo
+    (`_htf_context_from_stored_frame`), whose shadow re-checks each part as
+    it does the S/R context, with a full rebuild of the part. A new 1m close
+    builds only the price-dependent part: 5.2 ms of the 8.5 ms build
+    (medians over 28 symbols on 10-01), about 0.15 s per new bar on a
+    28-symbol watchlist. The split gives the old build's context on 8,640
+    archive cases (3 days, 8 symbols, 3 clocks, 3 indicator settings, 4
+    argument sets, 8-10 prices each) and on every snapshot.
+  - `indicators.floor_atr`: `atr_with_floor`'s floors on an ATR already read.
+  - Decisions: none changed in two replayed hours (top_tier, watched,
+    2026-10-01 09:40-10:40 and 2026-10-02 13:28-14:28): the same 9 and 2
+    trades, the same PnL, the same quote requests. What moved is recorded:
+    `htf_ema_votes` (14 events, 10 signals, 289 position rows, 3 decision
+    rows; no `htf_ema_trend` changed), one EXIT_CONTEXT's `sr_state` /
+    `sr_trend_state`, and the dashboard on 163 and 58 of 181 steps. With
+    `require_htf_ema_alignment` or `htf_ema_alignment_score` on (off in every
+    shipped preset and on H:) the vote reaches the gate and the score.
+    peer_confirmed_key_levels reads its HTF levels and zones at its own close
+    now: replayed 2026-05-04 09:40-10:40 (watched), it enters nothing either
+    way, and 318 of its 1,448 decision rows give another refusal (which zone
+    price sits in and which level is scored: `price_not_in_htf_zone` and
+    `long_level_score_below_min` trade places 243 times). zero_dte's HTF FVG
+    read now judges at the underlying's close (0DTE presets cannot be
+    replayed).
+  - Display: the S/R row's HTF trend votes at the S/R context's price, not
+    the display price.
+
+- **An entry pass reads the 1m bars of its step frames and no others: a
+  strategy's LTF and its other timeframes are built from its step frame,
+  and its LTF fair value gaps and order blocks on the frame it passes, so
+  the S/R context a signal reads is the one built on the signal's bar.**
+  *2026-10-07* — `_resampled_frame` gave a strategy that passed the data
+  feed the store's frame of the timeframe (`get_merged`), read when it
+  asked, and the feed built the LTF fair value gaps and order blocks
+  (`get_fair_value_gap_context`, `get_order_block_context`) on its own frame
+  of the LTF, read when they were. A stream bar that landed after the engine
+  built the step frame, and the S/R context on it
+  (`_prime_cycle_support_cache`, which every later read of the cycle is
+  served), reached those frames and not the step frame: top_tier built its
+  signal on the new bar (its LTF's close) and read an S/R context priced at,
+  and flip-confirmed on, the bar before, with structure, technical and chart
+  contexts and ENTRY_CONTEXT's `bar_time` and `close` from that bar too; and
+  top_tier's and key_levels' FVG terms sized the newer bar's gaps at the step
+  frame's close. In the session archive: 10 of the 88 top_tier entries of
+  2026-09-29 .. 10-06 (37 of 137 on code with 22-27 s passes), each
+  filling 3-6 s into the minute, its S/R distances measured
+  from the step frame's close.
+  - `ContextBuildersMixin._resampled_frame(frame, minutes, *, span_scale,
+    ema_spans)` builds from the frame it is given and never reads the store.
+    The `symbol` and `data` arguments are gone, and with them a fallback that
+    logged a failed store read at DEBUG and resampled instead.
+  - A step frame (`get_merged`'s canonical 1m hand-out, read through
+    `bars.verified_frame`) is built from once per new bar and variant
+    (`bars.derived_frame`, whose hand-outs can now carry a version), and
+    each hand-out carries the version `get_merged` gives the same bars,
+    which it equals (pinned for top_tier's 1m LTF, the 1m, 5m, 15m and 60m
+    frames), so the context memos serve it as before. Any other frame (a
+    written step frame, a hand-out of another timeframe or with other
+    indicators) is built on every call and carries no version.
+  - `MarketDataStore.get_fair_value_gap_context(symbol, frame, ...)` and
+    `get_order_block_context(symbol, frame, ...)` build on the frame they
+    are given, kept for the cycle per frame object and across cycles under
+    its version, so a strategy's read and the dashboard's overlay of the
+    same bars share one build. `_ltf_fvg_context` and
+    `_ltf_order_block_context` pass the frame's bars at the LTF
+    (`_ltf_frame`: the frame, or its resample when its bars are finer, as
+    key_levels' 1m zone frame of its 5m LTF), `_htf_order_block_context` its
+    bars at the HTF, the dashboard's overlays the frame they draw on. A
+    failed feed read is no longer logged at DEBUG and built again by the
+    strategy.
+  - The dashboard builds the frames of its overlays (the LTF gaps and
+    order blocks, the HTF order blocks, the technicals, the key-level
+    zones' ATR) and the strategy's LTF EMAs from the snapshot's 1m frame as
+    the strategy builds its own from its step frame
+    (`DashboardCache._overlay_frame`, `_resampled_frame`), so each frame is
+    one build a bar for the strategy and the dashboard, as when both asked
+    `get_merged`.
+  - The callers: top_tier's LTF and its ORB 5m follow-through frame, the
+    peers' LTFs, key_levels' peer votes and macro frames, the HTF order
+    blocks (`_htf_order_block_context`), the LTF structure resample, and
+    every shared FVG and order-block read. A guard test keeps every
+    strategy module and the entry gatekeeper, every data-feed method they
+    call and every function of the package's other modules they call, each
+    with what it calls in turn, off the store's 1m bars and the merged
+    frames it keeps of them; the feed's other reads of an entry pass are of
+    the stored HTF frame, the daily bars, the quotes and the stream's
+    bookkeeping.
+  - Decisions, only in a pass whose step frame a bar landed after: top_tier's
+    signal on that bar is evaluated on the next pass, whose step frame holds
+    the bar, with that bar's S/R, structure, technical and chart contexts
+    (the pass before reads the bar before, as it already did; the
+    2026-10-06 dry run's passes came a median 2.3 s apart); key_levels' and
+    the peers' LTFs, and the setups read on them, hold the step frame's
+    bars; and every strategy's FVG terms (the score adjustment, the FVG and
+    order-block retest admission) read the step frame's gaps, where
+    top_tier's and key_levels' held the newer bar at the step frame's close.
+    Nothing else changes: three replayed hours (top_tier 2026-10-01 and
+    10-02, peer_confirmed_key_levels 2026-05-04) are identical to the code
+    before it, since a stepped replay delivers every bar before its step.
 
 - **The S/R builder keeps each confirmed flip's own rung when a reclaimed
   resistance and a lost support sit within `side_tolerance` either side of
