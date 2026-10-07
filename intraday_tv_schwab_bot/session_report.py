@@ -20,9 +20,11 @@ and inside the SESSION_REPORT structured JSON payload (under top-level keys
 ``per_hour``, ``mae_mfe``, ``post_stop_continuation``, ``filter_rejections``) so
 downstream tooling can parse them without re-scraping.
 
-The per-day archive under ``{log_dir}/sessions/`` (bars, decisions, the
-manifest's regime-call outcomes and gate attribution) is ``session_archive``'s;
-it writes its trades.csv with ``TRADE_CSV_COLUMNS`` and ``trade_csv_row``.
+The persistent trades.csv is ``append_trades_csv``'s: every closed trade the
+process holds, once, under its exit's ET date. The per-day archive under
+``{log_dir}/sessions/`` (bars, decisions, the manifest's regime-call outcomes
+and gate attribution) is ``session_archive``'s; its trades.csv is the day's
+rows of the persistent trades.csv, the exporting strategy's.
 """
 from __future__ import annotations
 
@@ -31,6 +33,8 @@ import dataclasses
 import json
 import logging
 import math
+import os
+import shutil
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
@@ -38,7 +42,6 @@ from typing import Any, Iterable
 
 from .paper_account import PaperAccount, TradeRecord, closed_trade_lifecycles
 from .models import Position
-from . import sessions
 from .reasons import SKIP_COUNT_UNIT, exit_reason_code, reason_gate
 
 LOG = logging.getLogger(__name__)
@@ -91,9 +94,9 @@ def trade_csv_row(trade: TradeRecord, session_date: str) -> dict[str, Any]:
 
 # The columns that make one day's trades.csv row one trade's exit: its
 # lifecycle (position key and entry time; the symbol and entry time stand in
-# for a record that has none) and when it closed. A process's end-of-day
-# report and its shutdown, or two processes, can each hold a day's trade;
-# its row is written once.
+# for a record that has none) and when it closed. A process's day closes and
+# its shutdown, or two processes, can each hold a trade; its row is written
+# once.
 TRADE_CSV_KEY = ("lifecycle_id", "symbol", "entry_time", "exit_time")
 
 
@@ -110,7 +113,8 @@ def read_trade_rows(csv_path: Path, session_date: str) -> list[dict[str, str]]:
     Raises OSError, csv.Error or UnicodeDecodeError on a file it cannot read,
     and ValueError when a row of that day sits under a header other than
     ``TRADE_CSV_COLUMNS`` (a file an older version wrote, which the next
-    append rotates away): those rows cannot be read as today's columns.
+    append of a trade rotates, carrying the rows of the day it closes):
+    those rows cannot be read as the current columns.
     """
     if not csv_path.exists():
         return []
@@ -125,26 +129,32 @@ def read_trade_rows(csv_path: Path, session_date: str) -> list[dict[str, str]]:
     return rows
 
 
-def _exited_on(trade: TradeRecord, day: date) -> bool:
-    """Whether ``trade`` exited on the ET date ``day``.
+def _exit_date(trade: TradeRecord) -> date | None:
+    """``trade``'s exit ET date; None, with a WARNING, when its exit
+    timestamp cannot be read.
 
-    A trade whose exit timestamp cannot be read is DROPPED, matching
-    `export_session_archive`. Keeping it looks like the more careful choice
-    -- "unevaluable is not the same as absent" -- and here it is the
-    opposite: `trade_csv_row` calls `exit_time.isoformat()`, so one
-    unreadable record raises inside the report's broad try/except and costs
-    the ENTIRE report, every aggregate and the CSV append with it. Losing one
-    row beats losing the session.
+    Such a trade is DROPPED from the report, the archive and the trades.csv
+    append alike. Keeping it looks like the more careful choice --
+    "unevaluable is not the same as absent" -- and here it is the opposite:
+    `trade_csv_row` calls `exit_time.isoformat()`, so one unreadable record
+    raises inside the report's broad try/except and costs the ENTIRE report,
+    every aggregate with it. Losing one row beats losing the session.
     """
     exit_time = getattr(trade, "exit_time", None)
     try:
-        return exit_time.date() == day
+        return exit_time.date()
     except (AttributeError, TypeError):
         LOG.warning(
             "Dropping %s from the day's trades: unreadable exit_time %r",
             getattr(trade, "symbol", "?"), exit_time,
         )
-        return False
+        return None
+
+
+def _exited_on(trade: TradeRecord, day: date) -> bool:
+    """Whether ``trade`` exited on the ET date ``day`` (``_exit_date``: a
+    trade whose exit cannot be read did not)."""
+    return _exit_date(trade) == day
 
 
 def trades_closed_on(trades: Iterable[TradeRecord], day: date) -> list[TradeRecord]:
@@ -819,26 +829,26 @@ def write_session_report(
     account: PaperAccount,
     positions: dict[str, Position],
     *,
+    session_date: date,
     strategy: str,
     dry_run: bool,
-    log_dir: str,
     structured_logger: Any | None = None,
     skip_counts: dict[str, int] | None = None,
     bars_for: Any | None = None,
     post_stop_window_minutes: int = 30,
     entry_timing_window_minutes: int = 15,
 ) -> None:
-    """Write an end-of-session summary to the log, append trades to a
-    persistent CSV file in the log directory, and emit a structured
-    SESSION_REPORT JSON payload containing per-regime / per-symbol /
-    per-exit-reason / per-hour breakdowns, MAE/MFE aggregates, and the
-    filter-rejection tally.
+    """Write ``session_date``'s end-of-session summary to the log and emit a
+    structured SESSION_REPORT JSON payload containing per-regime /
+    per-symbol / per-exit-reason / per-hour breakdowns, MAE/MFE aggregates,
+    and the filter-rejection tally.
 
-    The session is today's (ET): the trades in ``account`` that closed today.
-    The engine writes it when a trading day's stream window closes (20:00
-    ET) and at shutdown, once a day (``IntradayBot._close_session_day``).
-    The append writes a trade's row only when trades.csv does not hold it
-    yet, so a second call for a day adds only trades closed since.
+    The session is the ET date ``session_date``: the trades in ``account``
+    that closed on it. The engine writes it once a day, when a trading day's
+    stream window closes (20:00 ET) or at a shutdown before then
+    (``IntradayBot._close_session_day``), and appends the trades to the
+    persistent trades.csv after it (``append_trades_csv``). A failure is
+    logged with its type and never raised: the summary is a log record.
 
     Parameters
     ----------
@@ -846,12 +856,12 @@ def write_session_report(
         The paper/live account tracker with trade history.
     positions : dict[str, Position]
         Currently open positions (should be empty at session end).
+    session_date : date
+        The ET trading day reported.
     strategy : str
         Active strategy name.
     dry_run : bool
         Whether the bot ran in dry-run mode.
-    log_dir : str
-        Path to the log directory for the CSV file.
     structured_logger : callable, optional
         A ``(prefix, payload)`` callable for structured JSON logging
         (e.g., ``engine._log_structured``).
@@ -861,17 +871,10 @@ def write_session_report(
         gate refused counts under that gate alone). Used to emit the
         filter-rejection summary.
     """
-    # Initialized before the try so the CSV-append path below (outside the
-    # try) can safely early-return if the report build raised before these
-    # were populated. The linter flags a "might be referenced before
-    # assignment" otherwise.
-    closed: list = []
-    session_date: str = sessions.now_et().date().isoformat()
+    session_date_str = session_date.isoformat()
     try:
         performance = account.capture_snapshot(positions)
         trades = list(account.trades)
-        today = sessions.now_et().date()
-        session_date = today.isoformat()
 
         # Scoped to the SESSION, not the account. `account.realized_pnl` is a
         # lifetime accumulator -- set to 0.0 once in `PaperAccount.__init__`,
@@ -884,14 +887,13 @@ def write_session_report(
         # The date filter matters for the same reason it does in
         # `session_archive.export_session_archive`: a bot that runs across
         # midnight without restarting keeps the prior day's records in
-        # `account.trades`, so without it the headline mixes days AND the
-        # persistent trades.csv re-appends yesterday's rows under today's date.
+        # `account.trades`, so without it the headline mixes days.
         # `trades_closed_on` folds a trade's partial exits into it and drops
         # a trade whose exit timestamp cannot be read (`_exited_on`).
-        closed = trades_closed_on(trades, today)
-        # The slices that closed part of a trade today, whether or not the
-        # rest of it has closed yet: their P&L is realized today.
-        partial_slices = [t for t in trades if bool(t.partial_exit) and _exited_on(t, today)]
+        closed = trades_closed_on(trades, session_date)
+        # The slices that closed part of a trade that day, whether or not
+        # the rest of it has closed yet: their P&L is realized that day.
+        partial_slices = [t for t in trades if bool(t.partial_exit) and _exited_on(t, session_date)]
 
         # --- Log summary ---
         wins = sum(1 for t in closed if t.realized_pnl > 0)
@@ -910,7 +912,7 @@ def write_session_report(
         max_dd = float(performance.get("max_drawdown", 0.0) or 0.0)
         LOG.info(
             "SESSION REPORT %s: strategy=%s pnl=%.2f trades=%d wins=%d losses=%d win_rate=%s pf=%s avg_trade=%s max_drawdown=%.2f",
-            session_date, strategy, total_pnl, len(closed), wins, losses,
+            session_date_str, strategy, total_pnl, len(closed), wins, losses,
             f"{win_rate:.1%}" if win_rate is not None else "n/a",
             f"{profit_factor:.2f}" if profit_factor is not None else "n/a",
             f"${avg_trade:.2f}" if avg_trade is not None else "n/a",
@@ -954,7 +956,7 @@ def write_session_report(
 
         # --- Structured JSON log ---
         report_payload = {
-            "date": session_date,
+            "date": session_date_str,
             "strategy": strategy,
             "dry_run": dry_run,
             "realized_pnl": round(total_pnl, 2),
@@ -983,85 +985,131 @@ def write_session_report(
     except Exception as exc:
         LOG.warning("Could not write session report: %s: %s", type(exc).__name__, exc)
 
-    # --- Append to persistent CSV ---
-    # Kept outside the broad try/except above so that ValueError raised by
-    # DictWriter(extrasaction="raise") — our TradeRecord field-drift guard —
-    # propagates instead of being silently swallowed. Only I/O errors are
-    # caught here.
-    if not closed:
-        return
+
+def append_trades_csv(trades: Iterable[TradeRecord], *, log_dir: str, session_date: date) -> bool:
+    """Append to ``{log_dir}/trades.csv`` every closed trade in ``trades``
+    that the file lacks, each under its exit's ET date; True when the file
+    then holds every one of them.
+
+    The engine calls it at each day close and at shutdown with every trade
+    the process holds, whatever its exit date: a trade booked after the
+    day's 20:00 report (a late start's start-up reconcile books an exit that
+    evening) or one an earlier append failed to write goes in the next
+    time. A row already in the file (the same date and ``TRADE_CSV_KEY``)
+    is not written again, so a repeat, a shutdown after the 20:00 close, or
+    a second process holding the same trade adds nothing. A trade still
+    open (a partial exit without its final slice) waits for its close:
+    ``closed_trade_lifecycles`` folds its slices into one row then.
+
+    False, with a WARNING naming the error's type, when the log directory,
+    the file, its rotation or the write fails: a file that cannot be read
+    appends nothing, since its rows could not be told apart from ours. The
+    caller retries. A row ``trade_csv_row`` builds with a column the header
+    lacks raises ValueError (``extrasaction="raise"``): that is field drift,
+    a bug, not an I/O error.
+
+    Schema guard: a file under a header other than ``TRADE_CSV_COLUMNS``
+    (an upgrade added or renamed a column) is copied to
+    ``trades.archive-<session_date>.csv`` as it is, and replaced by a fresh
+    file under the current header that starts with its rows of
+    ``session_date``, mapped by column name (a new column empty, a column the
+    header no longer has left out, named in the WARNING), so the day's
+    archive and manifest still hold the rows an earlier process wrote that
+    day. The fresh file is written before it replaces the old one, so a
+    failure leaves the old file in place.
+    """
+    rows: list[dict[str, Any]] = []
+    for trade in closed_trade_lifecycles(trades):
+        exit_day = _exit_date(trade)
+        if exit_day is not None:
+            rows.append(trade_csv_row(trade, exit_day.isoformat()))
+    if not rows:
+        return True
     log_path = Path(log_dir)
+    csv_path = log_path / "trades.csv"
     try:
         log_path.mkdir(parents=True, exist_ok=True)
-    except (OSError, PermissionError) as exc:
-        LOG.warning("Could not create log directory %s: %s: %s", log_path, type(exc).__name__, exc)
-        return
-    csv_path = log_path / "trades.csv"
+    except OSError as exc:
+        LOG.warning("Could not create log directory %s, so %d trades were not appended: %s: %s",
+                    log_path, len(rows), type(exc).__name__, exc)
+        return False
 
-    # Schema guard: if an existing trades.csv has a different column
-    # set than what we're about to write, appending would produce a
-    # malformed file (header with N cols, rows with M cols). When a
-    # mismatch is detected, rotate the old file to
-    # trades.archive-<date>.csv and start fresh so historical data is
-    # preserved but today's rows stay consistent with the header.
-    #
-    # The append is idempotent: a row already in the file (``trade_csv_key``)
-    # is not written again, so the shutdown after the end-of-day report, a
-    # repeat, or a second process holding the same trade adds nothing. A
-    # file that cannot be read appends nothing: its rows could not be told
-    # apart from ours.
-    write_header = True
-    existing_keys: set[tuple[str, ...]] = set()
+    day = session_date.isoformat()
+    header: list[str] | None = None
+    file_rows: list[dict[str, Any]] = []
     if csv_path.exists():
         try:
-            with open(csv_path, newline="", encoding="utf-8") as f:
-                existing_header = next(csv.reader(f), None)
-            if existing_header == TRADE_CSV_COLUMNS:
-                existing_keys = {trade_csv_key(row) for row in read_trade_rows(csv_path, session_date)}
+            with open(csv_path, newline="", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                file_rows = list(reader)
+                header = list(reader.fieldnames) if reader.fieldnames is not None else None
         except (OSError, csv.Error, UnicodeDecodeError) as exc:
-            LOG.warning("Could not read %s, so the session's %d trades were not appended: %s: %s",
-                        csv_path, len(closed), type(exc).__name__, exc)
-            return
-        if existing_header == TRADE_CSV_COLUMNS:
-            write_header = False
-        else:
-            archive = csv_path.with_name(f"trades.archive-{session_date}.csv")
-            # If today already archived once (rare), suffix with a counter.
-            counter = 2
-            while archive.exists():
-                archive = csv_path.with_name(f"trades.archive-{session_date}-{counter}.csv")
-                counter += 1
-            LOG.warning(
-                "trades.csv schema changed (old=%s cols, new=%d cols). "
-                "Rotating existing file to %s and writing today's trades to a fresh trades.csv.",
-                len(existing_header) if existing_header else "?",
-                len(TRADE_CSV_COLUMNS),
-                archive.name,
-            )
-            try:
-                csv_path.rename(archive)
-            except (OSError, PermissionError) as exc:
-                LOG.warning("Could not rotate trades.csv to %s: %s: %s", archive, type(exc).__name__, exc)
-                return
-
-    rows = [trade_csv_row(trade, session_date) for trade in closed]
-    new_rows = [row for row in rows if trade_csv_key(row) not in existing_keys]
+            LOG.warning("Could not read %s, so %d trades were not appended: %s: %s",
+                        csv_path, len(rows), type(exc).__name__, exc)
+            return False
+    rotate = csv_path.exists() and header != TRADE_CSV_COLUMNS
+    carried: list[dict[str, Any]] = []
+    if rotate:
+        carried = [{name: row.get(name) or "" for name in TRADE_CSV_COLUMNS}
+                   for row in file_rows if row.get("date") == day]
+        file_rows = carried
+    held = {(str(row.get("date") or ""), trade_csv_key(row)) for row in file_rows}
+    new_rows = [row for row in rows if (row["date"], trade_csv_key(row)) not in held]
     if len(new_rows) < len(rows):
-        LOG.info("%d of the session's %d trades already in %s", len(rows) - len(new_rows), len(rows), csv_path)
+        LOG.info("%d of this process's %d trades already in %s", len(rows) - len(new_rows), len(rows), csv_path)
     if not new_rows:
-        return
+        return True
+    if rotate:
+        return _rotate_trades_csv(csv_path, header, carried, new_rows, day)
     try:
-        f = open(csv_path, "a", newline="", encoding="utf-8")
-    except (OSError, PermissionError) as exc:
-        LOG.warning("Could not open trades.csv for append: %s: %s", type(exc).__name__, exc)
-        return
-    try:
-        writer = csv.DictWriter(f, fieldnames=TRADE_CSV_COLUMNS, extrasaction="raise")
-        if write_header:
-            writer.writeheader()
-        for row in new_rows:
-            # ValueError from extrasaction="raise" propagates — field-drift is a bug.
-            writer.writerow(row)
-    finally:
-        f.close()
+        with open(csv_path, "a", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=TRADE_CSV_COLUMNS, extrasaction="raise")
+            if header is None:
+                writer.writeheader()
+            for row in new_rows:
+                # ValueError from extrasaction="raise" propagates — field-drift is a bug.
+                writer.writerow(row)
+    except OSError as exc:
+        LOG.warning("Could not append %d trades to %s: %s: %s", len(new_rows), csv_path, type(exc).__name__, exc)
+        return False
     LOG.info("Session trades appended to %s (%d rows)", csv_path, len(new_rows))
+    return True
+
+
+def _rotate_trades_csv(csv_path: Path, header: list[str] | None, carried: list[dict[str, Any]],
+                       new_rows: list[dict[str, Any]], day: str) -> bool:
+    """``append_trades_csv``'s schema guard: keep the old file as
+    ``trades.archive-<day>[-N].csv`` and replace it with one under the
+    current header holding ``carried`` (its rows of ``day``) and
+    ``new_rows``."""
+    archive = csv_path.with_name(f"trades.archive-{day}.csv")
+    # If the day already rotated once (rare), suffix with a counter.
+    counter = 2
+    while archive.exists():
+        archive = csv_path.with_name(f"trades.archive-{day}-{counter}.csv")
+        counter += 1
+    dropped = [name for name in (header or []) if name not in TRADE_CSV_COLUMNS]
+    LOG.warning(
+        "trades.csv schema changed (old=%s cols, new=%d cols). Rotating existing file to %s and writing a fresh "
+        "trades.csv that starts with its %d rows of %s (new columns empty%s).",
+        len(header) if header else "?", len(TRADE_CSV_COLUMNS), archive.name, len(carried), day,
+        f"; left out: {', '.join(dropped)}" if dropped else "",
+    )
+    fresh = csv_path.with_name("trades.csv.rotating")
+    try:
+        with open(fresh, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=TRADE_CSV_COLUMNS, extrasaction="raise")
+            writer.writeheader()
+            writer.writerows(carried)
+            writer.writerows(new_rows)
+        shutil.copy2(csv_path, archive)
+        os.replace(fresh, csv_path)
+    except OSError as exc:
+        LOG.warning("Could not rotate trades.csv to %s, so %d trades were not appended: %s: %s",
+                    archive, len(new_rows), type(exc).__name__, exc)
+        # Nothing replaced the old file: drop the copies of it.
+        fresh.unlink(missing_ok=True)
+        archive.unlink(missing_ok=True)
+        return False
+    LOG.info("Session trades appended to %s (%d rows)", csv_path, len(new_rows))
+    return True

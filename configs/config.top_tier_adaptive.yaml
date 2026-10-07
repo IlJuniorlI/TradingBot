@@ -149,10 +149,12 @@ runtime:
   cycle_fetch_workers: 4
   max_consecutive_quote_failures: 5
   context_memo_shadow_every: 20
-  # Per-day debug archive: on session shutdown, write
-  # {log_dir}/sessions/{YYYY-MM-DD}/ with bars/{SYMBOL}.csv (RTH+indicators),
-  # trades.csv for the day, and manifest.json. Disable to save disk if not
-  # using dashboard/post-session analysis tooling.
+  # Per-day debug archive: after a trading day's 20:00 ET end, or at a
+  # shutdown before it, write {log_dir}/sessions/{YYYY-MM-DD}/ with bars/
+  # (the merged 1m frame with indicators, its resamples and the stored HTF
+  # frame, per symbol), the day's rows of the persistent trades.csv, and
+  # manifest.json. Disable to save disk if not using dashboard/post-session
+  # analysis tooling.
   export_session_archive: true
   log_position_marks: true
   reconcile_on_startup: true

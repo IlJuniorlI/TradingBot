@@ -17,7 +17,8 @@ The manifest also carries two analyses of the archive's own decisions and bars:
 
 The end-of-session report and the persistent trades.csv are
 ``session_report``'s. The archive's trades.csv is the day's rows of that
-persistent file, so the two files read the same.
+persistent file that the exporting strategy wrote, so the two files read the
+same.
 """
 from __future__ import annotations
 
@@ -1018,31 +1019,36 @@ def _copy_daily_log(log_src: Path, log_dst: Path) -> bool:
 
 
 def _export_trades(account: Any, trades_src: Path, trades_dst: Path,
-                   session_date: date) -> tuple[int, float | None, str | None]:
-    """Write the day's rows of the persistent trades.csv (``trades_src``) to
-    ``trades_dst``.
+                   session_date: date, strategy_name: str) -> tuple[int, float | None, str | None]:
+    """Write the day's rows of the persistent trades.csv (``trades_src``)
+    that ``strategy_name`` wrote to ``trades_dst``.
 
     Returns ``(trades_today, realized_pnl, trades_export_error)``.
 
-    The rows are every process's: the engine appends the day's closed trades
-    to the persistent file (``write_session_report``) before it exports, at
-    the end of the day and at shutdown, so a process that restarted during
-    the day, and the one before it, each put their trades in. Until
-    2026-10-06 the rows came from the exporting process's in-memory account,
-    because the append ran only at shutdown: the 20:00 export of an
+    The rows are those of every process of the strategy that appended to the
+    file: the engine appends its closed trades (``append_trades_csv``) before
+    it exports, at the end of the day and at shutdown, so a process that
+    restarted during the day, and the one before it, each put their trades
+    in. A process killed before either (SIGKILL, an OOM kill, a crash) never
+    appended, and its trades are in no archive. Other strategies' rows, from
+    a process sharing the log directory, are left out; a dry-run and a live
+    process of one strategy share theirs, since trades.csv has no mode
+    column.
+
+    Until 2026-10-06 the rows came from the exporting process's in-memory
+    account, because the append ran only at shutdown: the 20:00 export of an
     always-on bot found the persistent file a day behind (observed live
     2026-05-20: 2 SPY credit-spread closes in account + log, 0 rows in
     archive trades.csv). The account copy had its own gap: a restart later
     the same day, or a start after 20:00, re-exported the day with the new
-    process's trades (none) over the old one's. The end-of-day path now
-    appends too, so the persistent file is the whole day. A process that
-    starts after a trading day's 20:00 writes that day's archive only when
-    the day has none (``exporter_ran_session`` false in the manifest): its
-    bars, account snapshot and skip tally are not the session's.
+    process's trades (none) over the old one's. A process that starts after
+    a trading day's 20:00 writes that day's archive only when the day has
+    none (``exporter_ran_session`` false in the manifest): its bars, account
+    snapshot and skip tally are not the session's.
 
     ``account`` (the exporting process's) is checked against the file: a
-    trade of the day that it holds and the file does not (an append that
-    failed) is an error, not a quietly shorter day.
+    trade of the day and the strategy that it holds and the file does not
+    (an append that failed) is an error, not a quietly shorter day.
 
     Today's realized PnL is summed from the SAME rows that produce trades.csv
     and trades_today. The manifest used to report `account.realized_pnl`, a
@@ -1055,7 +1061,7 @@ def _export_trades(account: Any, trades_src: Path, trades_dst: Path,
     """
     session_date_str = session_date.isoformat()
     try:
-        rows = read_trade_rows(trades_src, session_date_str)
+        rows = [row for row in read_trade_rows(trades_src, session_date_str) if row.get("strategy") == strategy_name]
         with open(trades_dst, "w", newline="", encoding="utf-8") as dst_fh:
             writer = csv.DictWriter(dst_fh, fieldnames=TRADE_CSV_COLUMNS, extrasaction="raise")
             writer.writeheader()
@@ -1071,7 +1077,8 @@ def _export_trades(account: Any, trades_src: Path, trades_dst: Path,
         return len(rows), realized_pnl_today, None
     try:
         held = {trade_csv_key(trade_csv_row(trade, session_date_str))
-                for trade in trades_closed_on(getattr(account, "trades", []) or [], session_date)}
+                for trade in trades_closed_on(getattr(account, "trades", []) or [], session_date)
+                if trade.strategy == strategy_name}
     except Exception as exc:
         # A record the row cannot be built from (one missing a TradeRecord
         # field, rehydrated from an older store, say) failed the append too.
@@ -1163,13 +1170,13 @@ def _export_decisions(log_path: Path, archive_root: Path) -> int:
 
 
 def _write_manifest(manifest: dict[str, Any], archive_root: Path) -> None:
-    try:
-        atomic_write_text(
-            archive_root / "manifest.json",
-            json.dumps(manifest, indent=2, default=str),
-        )
-    except Exception as exc:
-        LOG.warning("Could not write session manifest: %s", exc)
+    """Write ``manifest.json``, the archive's last file. An error propagates:
+    an archive without its manifest is not written, and the engine retries
+    it (``IntradayBot._close_session_day``)."""
+    atomic_write_text(
+        archive_root / "manifest.json",
+        json.dumps(manifest, indent=2, default=str),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1188,6 +1195,7 @@ def session_archive_manifest_path(log_dir: str, session_date: date) -> Path:
 
 def export_session_archive(
     *,
+    session_date: date,
     log_dir: str,
     strategy_name: str,
     dry_run: bool,
@@ -1224,9 +1232,10 @@ def export_session_archive(
       not archived and ``bars/15m`` was described as that frame, so an
       HTF level could not be traced to the bars that made it after the
       session.
-    - ``trades.csv`` — today's rows of the cumulative ``{log_dir}/trades.csv``
-      (entry/exit/PnL/MFE/MAE per trade), every process's that ran today:
-      the engine appends before it exports (``_export_trades``).
+    - ``trades.csv`` — the day's rows of the cumulative ``{log_dir}/trades.csv``
+      (entry/exit/PnL/MFE/MAE per trade) that ``strategy_name`` wrote: those
+      of every process of the strategy that appended its trades, since the
+      engine appends before it exports (``_export_trades``).
     - ``bot_{YYYY-MM-DD}.log`` — copy of the daily log file (original
       stays in log_dir; copying avoids file-lock issues on Windows where
       the FileHandler still owns the original).
@@ -1247,8 +1256,16 @@ def export_session_archive(
     - ``manifest.json`` — strategy, dry_run, summary stats, skip counts,
       timeframes exported, write-flags for each archive component.
 
+    Raises OSError when the archive directory or ``manifest.json`` cannot
+    be written: the archive is then not written, and the engine retries it.
+    Every other stage logs its own failure and the stages after it run.
+
     Parameters
     ----------
+    session_date
+        The ET day archived: its folder, its ``bot_<date>.log`` and its
+        trades.csv rows. The engine passes the day it closes, which after a
+        retry past midnight is not today.
     log_dir
         Path to the bot's log directory (where bars/, trades.csv,
         bot_*.log already live). The archive subdirectory is created
@@ -1292,15 +1309,10 @@ def export_session_archive(
         day without an archive): its bars, account snapshot and skip tally
         are its own. Recorded in the manifest.
     """
-    session_date = sessions.now_et().date()
     log_dir_path = Path(str(log_dir or ".logs"))
     archive_root = session_archive_root(log_dir, session_date)
     bars_dir = archive_root / "bars"
-    try:
-        bars_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as exc:
-        LOG.warning("Could not create session archive directory %s: %s", archive_root, exc)
-        return
+    bars_dir.mkdir(parents=True, exist_ok=True)
 
     symbols = _archive_symbols(strategy, last_candidates, positions, account)
     timeframes_sorted, bars_written_by_tf, bars_skipped_by_tf = _export_bars(data, symbols, strategy, bars_dir)
@@ -1312,7 +1324,7 @@ def export_session_archive(
     log_dst = archive_root / f"bot_{session_date.isoformat()}.log"
     log_copied = _copy_daily_log(log_src, log_dst)
     trades_today, realized_pnl_today, trades_export_error = _export_trades(
-        account, log_dir_path / "trades.csv", archive_root / "trades.csv", session_date)
+        account, log_dir_path / "trades.csv", archive_root / "trades.csv", session_date, str(strategy_name))
     config_snapshot_written = _write_config_snapshot(config, archive_root)
     account_snapshot_written = _write_account_snapshot(account, positions, archive_root)
 

@@ -208,10 +208,10 @@ ExecStart=%h/TradingBot/.venv/bin/python main.py --config configs/config.yaml
 # Clean shutdown: once the bot is built, SIGTERM, like Ctrl+C, takes it to
 # its shutdown wherever it lands (the start-up reconcile, a cycle, the sleep
 # between cycles): it stops the dashboard and the stream, writes the session
-# report (appending its closed trades to trades.csv) and the day's archive
-# unless it wrote them at 8pm ET, then exits 0. The reconcile metadata needs
-# no shutdown step: it is saved whenever the tracked positions change. Give
-# it 30s, then SIGKILL if it's still hung.
+# report and the day's archive unless it wrote them at 8pm ET, appends to
+# trades.csv every closed trade it holds that the file lacks, then exits 0.
+# The reconcile metadata needs no shutdown step: it is saved whenever the
+# tracked positions change. Give it 30s, then SIGKILL if it's still hung.
 KillSignal=SIGTERM
 TimeoutStopSec=30s
 
@@ -254,13 +254,14 @@ A few of these values to know about:
   SIGTERM, shutting down.` (the signal's name: `SIGINT` for a Ctrl+C,
   `SIGHUP` for a terminal hangup) once the work the stop interrupted has
   unwound (a cycle's thread pool first finishes its queued work, broker
-  reads included) and `Shutdown complete.` when the cleanup is done. Stop signals after the
-  first are ignored until then, since one would abandon the session report
-  half-written, and the log names any it ignored. A stop with no
-  `Shutdown complete.` in the journal means systemd SIGKILLed a shutdown
-  that ran past 30s (a hung broker read, a large archive export, a slow
-  stream stop): raise the timeout. In a terminal, a second Ctrl+C does
-  nothing while the bot shuts down; `kill -9` ends one that hangs.
+  reads included) and `Shutdown complete.` when the cleanup is done. Stop
+  signals after the first are ignored until then, since one would abandon
+  the session report half-written, and the log names any it ignored. A
+  stop with no `Shutdown complete.` in the journal means systemd
+  SIGKILLed a shutdown that ran past 30s (a hung broker read, a large
+  archive export, a slow stream stop): raise the timeout. In a terminal, a
+  second Ctrl+C does nothing while the bot shuts down; `kill -9` ends one
+  that hangs.
 - **`Restart=on-failure`** restarts on crash but NOT on clean exit
   (Ctrl+C / `systemctl stop`). If you want restart on any exit, use
   `Restart=always` — but that re-starts after a clean `auto_exit_after_session`
@@ -314,7 +315,8 @@ ls ~/TradingBot/.logs/sessions/$(TZ=America/New_York date +%F)/
 # Status snapshot
 systemctl --user status intraday-bot
 
-# Stop cleanly (writes session report, archives day)
+# Stop cleanly (writes session report, archives day, unless it wrote them
+# at 8pm ET; appends its trades to trades.csv)
 systemctl --user stop intraday-bot
 
 # Restart (e.g. after editing config.yaml)
@@ -454,18 +456,21 @@ own rotation governed by `/etc/systemd/journald.conf`.
 
 ### Daily session archives
 
-At 8pm ET each trading day the bot writes the day's session report
-(appending its closed trades to `.logs/trades.csv`) and then a per-day
+At 8pm ET each trading day the bot writes the day's session report,
+appends its closed trades to `.logs/trades.csv` and then writes a per-day
 bundle to `.logs/sessions/{YYYY-MM-DD}/`, once a day: a stop later that
-day writes neither again. A bot started after 8pm never writes that day's
-report, and writes its archive only when the day has none (no
+day writes neither again, though it appends any trade booked since. One
+that fails (a full disk) is retried a minute or more later and at
+shutdown, past midnight too. A bot started after 8pm never writes that
+day's report, and writes its archive only when the day has none (no
 `manifest.json`: the bot that ran the day died before 8pm), with
 `exporter_ran_session: false` in the manifest, since its bars, account
 snapshot and skip counts are its own. No cron needed. Each archive
 contains:
 
 - `bars/{Nm}/{SYMBOL}.csv` — full merged frame with indicators per timeframe
-- `trades.csv` — the day's rows of `.logs/trades.csv` (every process that ran that day)
+- `trades.csv` — the day's rows of `.logs/trades.csv` that the strategy
+  wrote (every process that appended them)
 - `bot_YYYY-MM-DD.log` — copy of the daily log
 - `events.jsonl` — structured events extracted from the log
 - `decisions.csv` — every entry decision as queryable rows
@@ -474,9 +479,14 @@ contains:
 - `manifest.json` — strategy + summary stats
 
 After a restart on the same day, `trades.csv`, `trades_today` and
-`realized_pnl` cover every process that ran the day, but the manifest's
-`session_skip_counts` and `account_snapshot.json` are the last process's
-alone.
+`realized_pnl` cover every process of the strategy that appended its
+trades, but the manifest's `session_skip_counts` and
+`account_snapshot.json` are the last process's alone. A process killed
+before it appended (`kill -9`, an OOM kill, systemd's SIGKILL after
+`TimeoutStopSec`, a crash before 8pm) leaves its trades out of
+`.logs/trades.csv` and every archive. `trades.csv` has no mode column:
+a dry-run and a live process of one strategy that share `.logs` on one
+day archive each other's rows, under the exporting process's `dry_run`.
 
 Disable globally with `runtime.export_session_archive: false` in your
 config if you're tight on disk.
@@ -582,7 +592,8 @@ git pull
 systemctl --user restart intraday-bot
 ```
 
-The clean-shutdown path runs first (writes session report + archive),
+The clean-shutdown path runs first (writes session report + archive
+unless it wrote them at 8pm ET, and appends its trades to trades.csv),
 then the new code starts. Any open positions are preserved via the
 reconcile metadata SQLite store.
 

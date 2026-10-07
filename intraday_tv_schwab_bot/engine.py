@@ -6,6 +6,7 @@ import signal
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import date, datetime, time as dt_time, timedelta
 from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
@@ -30,10 +31,10 @@ from .startup_reconciler import StartupReconciler
 from .warmup_tracker import WarmupTracker
 from ._strategies.factory import build_strategy
 from .session_archive import export_session_archive, session_archive_manifest_path
-from .session_report import write_session_report
+from .session_report import append_trades_csv, write_session_report
 from .schwab_api import SchwabdevApiUsageTracker, read_refresh_token_window, register_schwab_api_tracker
 from .log_setup import TRADEFLOW_LEVEL, setup_logging
-from .sessions import EQUITY_STREAM_END, EXCHANGE_TZ, EquitySessionState, equity_session_state
+from .sessions import EQUITY_STREAM_END, EXCHANGE_TZ, EquitySessionState, equity_session_state, is_weekday_session_day
 from . import __version__, sessions
 
 if TYPE_CHECKING:
@@ -205,6 +206,26 @@ class _StopSignals:
         raise self._interrupt
 
 
+# A day close that failed is retried on a pass at least this long after it:
+# a close owed past midnight can fall in the next day's stream window, whose
+# passes run every couple of seconds, and the archive export is heavy.
+DAY_CLOSE_RETRY_SECONDS = 60.0
+
+
+@dataclass(slots=True)
+class _DayClose:
+    """What this process still owes an ended ET day (``IntradayBot._day_closes``).
+
+    The trades.csv append is owed until one succeeds; it runs at every close
+    attempt (and at shutdown) whatever these say."""
+    summary: bool          # the SESSION REPORT summary (once: a retry would log a second one)
+    archive: bool          # the day's session archive
+    ran_session: bool      # False: a late start's archive (exporter_ran_session)
+    skip_counts: dict[str, int] = field(default_factory=dict)   # the day's skip tally, taken when it ended
+    append: bool = True    # the trades.csv append has not succeeded yet
+    failed_at: datetime | None = None   # the last failed attempt, for DAY_CLOSE_RETRY_SECONDS
+
+
 class IntradayBot:
     def __init__(self, config: BotConfig):
         self.config = config
@@ -310,22 +331,28 @@ class IntradayBot:
         # (``settle_pending``); see _reconcile_retry_delay.
         self._settle_hold_failures = 0
         self._last_reconcile_attempt_monotonic: float = 0.0
-        # ET dates whose session report (the summary and the trades.csv
-        # append) and archive this process has written: once a day each,
-        # when a trading day's stream window closes (8pm ET,
-        # `_maybe_close_session_day`) or at shutdown, whichever comes first
-        # (`_close_session_day`). A process that starts after a trading
-        # day's stream window closed did not run that day's session: it
-        # never writes that day's report, and writes its archive only when
-        # the day has none (no manifest.json, e.g. the process that ran it
-        # was killed before 20:00), marked `exporter_ran_session: false`,
-        # since the bars, account snapshot and skip tally are its own; an
-        # archive the day has is the session's and is left as it is.
-        ended = self._ended_trading_day(sessions.now_et())
-        # The late start's day whose archive this process writes, if any.
-        self._late_archive_date: date | None = None
-        archive_date: date | None = ended
-        if ended is not None:
+        # The ended ET days this process still owes a close, oldest first
+        # when closed: the SESSION REPORT summary, the append of its trades
+        # to the persistent trades.csv and the day's archive (`_DayClose`).
+        # A trading day is owed one at its 20:00 ET end (`_maybe_close_session_day`
+        # schedules every trading day whose 20:00 has passed since
+        # `_closes_scheduled_through`, so a loop held past midnight still
+        # closes it) and today at a shutdown before then. A day stays owed
+        # until its summary was written, an append succeeded and its archive
+        # was written, and is retried on later passes and at shutdown,
+        # whatever the date. A process that starts after a trading day's
+        # stream window closed did not run that day's session: it never
+        # writes that day's summary, and owes its archive only when the day
+        # has none (no manifest.json, e.g. the process that ran it was killed
+        # before 20:00), marked `exporter_ran_session: false`, since the
+        # bars, account snapshot and skip tally are its own; an archive the
+        # day has is the session's and is left as it is. Its trades go to
+        # trades.csv at its shutdown either way (`_append_trades_csv`).
+        self._day_closes: dict[date, _DayClose] = {}
+        started = sessions.now_et()
+        self._closes_scheduled_through: date = self._latest_ended_trading_day(started)
+        ended = self._closes_scheduled_through
+        if ended == started.date():
             if not self.config.runtime.export_session_archive:
                 LOG.info("Started after the %s session ended: its session report is left as it is", ended)
             elif session_archive_manifest_path(self.config.runtime.log_dir, ended).exists():
@@ -334,10 +361,7 @@ class IntradayBot:
             else:
                 LOG.info("Started after the %s session ended: its session report is left as it is; the day has no "
                          "archive, so this process writes one (exporter_ran_session=false)", ended)
-                self._late_archive_date = ended
-                archive_date = None
-        self._last_session_report_date: date | None = ended
-        self._last_session_archive_date: date | None = archive_date
+                self._day_closes[ended] = _DayClose(summary=False, archive=True, ran_session=False)
         # ET session date last seen by `_maybe_session_rollover_reset`.
         # Used to clear `entry_gatekeeper.session_skip_counts` when the
         # ET date rolls. Without this, an always-on bot accumulates
@@ -896,77 +920,119 @@ class IntradayBot:
         self._last_skip_counts_reset_date = today
 
     @staticmethod
-    def _ended_trading_day(now: datetime) -> date | None:
-        """``now``'s ET date when it is a trading day whose stream window
-        has closed (20:00 ET), else None."""
-        state = equity_session_state(now)
-        if not state.is_trading_day or now.time() < EQUITY_STREAM_END:
-            return None
-        return now.date()
+    def _latest_ended_trading_day(now: datetime) -> date:
+        """The latest ET trading day whose stream window (20:00 ET) has
+        closed by ``now``: today from its 20:00, else an earlier day."""
+        day = now.date() if now.time() >= EQUITY_STREAM_END else now.date() - timedelta(days=1)
+        while not is_weekday_session_day(day):
+            day -= timedelta(days=1)
+        return day
+
+    def _schedule_day_closes(self, now: datetime) -> None:
+        """Owe a close for every trading day whose 20:00 ET end has passed
+        since the last one this process scheduled: the day itself on the
+        first pass after its 20:00, and every day a loop held past midnight
+        (or longer) missed."""
+        latest = self._latest_ended_trading_day(now)
+        day = self._closes_scheduled_through + timedelta(days=1)
+        while day <= latest:
+            if is_weekday_session_day(day):
+                self._day_closes[day] = _DayClose(
+                    summary=True, archive=bool(self.config.runtime.export_session_archive), ran_session=True,
+                    skip_counts=dict(self.entry_gatekeeper.session_skip_counts))
+            day += timedelta(days=1)
+        self._closes_scheduled_through = max(self._closes_scheduled_through, latest)
 
     def _maybe_close_session_day(self) -> None:
-        """Write the session report and archive once the ET trading day ends.
+        """Write each ended trading day's session report, trades.csv rows and
+        archive.
 
-        Fires once per ET trading day after the stream window closes (8pm
-        ET) so an always-on bot reports and archives each day while it keeps
-        running. Until 2026-10-06 only the archive was written here and the
-        session report (the SESSION REPORT summary and the append of the
-        day's trades to the persistent trades.csv) only at shutdown, so a bot
-        that ran through a day without stopping lost that day's report and
-        its rows in trades.csv (2026-10-01: 22 trades in the archive, none in
-        trades.csv, no SESSION REPORT).
+        A trading day is owed its close from the first pass after its 20:00
+        ET end, so an always-on bot reports and archives each day while it
+        keeps running. Until 2026-10-06 only the archive was written here
+        and the session report (the SESSION REPORT summary and the append of
+        the day's trades to the persistent trades.csv) only at shutdown, so a
+        bot that ran through a day without stopping lost that day's report
+        and its rows in trades.csv (2026-10-01: 22 trades in the archive,
+        none in trades.csv, no SESSION REPORT), and a close not finished by
+        midnight was never finished. A day whose close failed is retried on
+        a pass ``DAY_CLOSE_RETRY_SECONDS`` or more later and at shutdown,
+        whatever the date.
         """
-        day = self._ended_trading_day(sessions.now_et())
-        if day is None or self._session_day_closed(day):
-            return
-        parts = [part for part, due in (
-            ("session report", self._last_session_report_date != day),
-            ("archive", bool(self.config.runtime.export_session_archive) and self._last_session_archive_date != day),
-        ) if due]
-        LOG.info("ET trading day %s ended: writing its %s", day, " and ".join(parts))
-        self._close_session_day(day)
+        now = sessions.now_et()
+        self._schedule_day_closes(now)
+        for day in sorted(self._day_closes):
+            owed = self._day_closes[day]
+            if owed.failed_at is not None and timedelta(0) <= now - owed.failed_at < timedelta(
+                    seconds=DAY_CLOSE_RETRY_SECONDS):
+                continue
+            parts = [part for part, due in (
+                ("session report", owed.summary),
+                ("trades.csv rows", owed.append and not owed.summary),
+                ("archive", owed.archive),
+            ) if due]
+            LOG.info("ET trading day %s ended: writing its %s", day, " and ".join(parts))
+            if not self._close_session_day(day, final=False):
+                owed.failed_at = now
 
-    def _session_day_closed(self, day: date) -> bool:
-        """Whether this process has written ``day``'s session report and,
-        when archives are on, its archive."""
-        return self._last_session_report_date == day and (
-            self._last_session_archive_date == day or not self.config.runtime.export_session_archive)
+    def _close_session_day(self, day: date, *, final: bool) -> bool:
+        """Write what this process owes ``day`` (``_day_closes``): the
+        summary, then the append of every trade it holds that trades.csv
+        lacks, then the archive. True, and the day is no longer owed, when
+        all three are done.
 
-    def _close_session_day(self, day: date) -> None:
-        """Write ``day``'s session report unless this process has, then its
-        archive; the callers skip a day ``_session_day_closed`` says is done.
-
-        The report is written once a day: its date is stamped before the
-        write, so one that raises an error is logged, not repeated every
-        cycle, and a shutdown after the 20:00 report writes no second
-        SESSION REPORT. A stop signal (KeyboardInterrupt) or any other
-        BaseException during the write restores the previous date and
-        propagates, so the shutdown that follows writes the report; the
-        trades.csv append skips the rows the file already holds, so rows the
-        interrupted write appended are not written twice. The archive
-        follows the report, since its trades.csv is the day's rows of the
-        persistent file, and an export that raises is retried on the next
-        cycle and at shutdown, without the report.
+        The summary is written once: it is marked done before the append, so
+        one that raises is logged and not repeated, and a stop signal (or any
+        other error) in the append or the archive leaves no second SESSION
+        REPORT for the shutdown to log. A stop signal (KeyboardInterrupt) or
+        any other BaseException during the summary leaves it owed and
+        propagates, so the shutdown that follows writes it. The archive's
+        trades.csv is the day's rows of the persistent file, so it waits for
+        an append that succeeded; at shutdown (``final``) it is written
+        anyway, its manifest naming the trades the file lacks. An append or
+        an archive that fails leaves the day owed, retried on a later pass
+        and at shutdown.
         """
-        if self._last_session_report_date != day:
-            previous = self._last_session_report_date
-            self._last_session_report_date = day
+        owed = self._day_closes[day]
+        if owed.summary:
             try:
-                self._write_session_report()
+                self._write_session_report(day, owed.skip_counts)
             except Exception as exc:
                 LOG.exception("Session report for %s failed: %s", day, type(exc).__name__)
-            except BaseException:
-                self._last_session_report_date = previous
-                raise
-        if not bool(self.config.runtime.export_session_archive):
-            return
+            owed.summary = False
+        if self._append_trades_csv(day):
+            owed.append = False
+        elif not final:
+            LOG.warning("trades.csv lacks some of this process's trades: the %s close is retried on a later pass "
+                        "and at shutdown", day)
+            return False
+        if owed.archive:
+            try:
+                self._export_session_archive(day, owed)
+            except Exception as exc:
+                # Archive export is a debug aid — never let it crash the main
+                # loop or the shutdown.
+                LOG.exception("Session archive for %s failed%s: %s", day,
+                              " at shutdown" if final else " (retried on a later pass and at shutdown)",
+                              type(exc).__name__)
+                return False
+            owed.archive = False
+        if owed.append:
+            LOG.error("Shutdown: the trades.csv append failed (the %s close), so the trades it could not write are "
+                      "only in this process's log", day)
+            return False
+        del self._day_closes[day]
+        return True
+
+    def _append_trades_csv(self, day: date) -> bool:
+        """Append every trade this process holds that trades.csv lacks; True
+        when the file holds them all. An error is logged with its type:
+        False then (the append logs its own I/O errors)."""
         try:
-            self._export_session_archive()
-            self._last_session_archive_date = day
+            return append_trades_csv(self.account.trades, log_dir=self.config.runtime.log_dir, session_date=day)
         except Exception as exc:
-            # Archive export is a debug aid — never let it crash the main
-            # loop or the shutdown.
-            LOG.exception("Session archive for %s failed (retried next cycle): %s", day, type(exc).__name__)
+            LOG.exception("trades.csv append for %s failed: %s", day, type(exc).__name__)
+            return False
 
     def _maybe_prune_inactive_symbols(self) -> None:
         """Evict per-symbol state for symbols no longer in the active set.
@@ -1084,13 +1150,29 @@ class IntradayBot:
             self.data.stop_streaming()
         except Exception:
             LOG.exception("Stream stop failed during shutdown")
-        today = sessions.now_et().date()
-        if self._session_day_closed(today):
+        # The days this process still owes a close, oldest first, then
+        # today's when its 20:00 close has not run (a stop before 20:00, or
+        # on a non-trading day): each writes its summary, trades.csv rows and
+        # archive. A day this process already closed writes no second
+        # SESSION REPORT or archive, but the append still runs, so a trade
+        # booked since (a late start's start-up reconcile books one that
+        # evening) reaches trades.csv. Each step logs its own failures.
+        now = sessions.now_et()
+        today = now.date()
+        self._schedule_day_closes(now)
+        if today > self._closes_scheduled_through:
+            self._day_closes[today] = _DayClose(
+                summary=True, archive=bool(self.config.runtime.export_session_archive), ran_session=True,
+                skip_counts=dict(self.entry_gatekeeper.session_skip_counts))
+        if not self._day_closes:
             LOG.info("Session %s already closed (at its 20:00 ET end, or before this process started): "
                      "no report at shutdown", today)
+            if not self._append_trades_csv(today):
+                LOG.error("Shutdown: the trades.csv append failed, so the trades it could not write are only in "
+                          "this process's log")
             return
-        # Logs its own failures: the report's and the archive's.
-        self._close_session_day(today)
+        for day in sorted(self._day_closes):
+            self._close_session_day(day, final=True)
 
     def _session_report_bars(self, symbol: str):
         """1m bars for the post-stop continuation aggregate.
@@ -1108,22 +1190,22 @@ class IntradayBot:
             LOG.debug("Session-report bar lookup failed for %s", symbol, exc_info=True)
             return None
 
-    def _write_session_report(self) -> None:
+    def _write_session_report(self, day: date, skip_counts: dict[str, int]) -> None:
         write_session_report(
             self.account,
             self.positions,
+            session_date=day,
             strategy=self.config.strategy,
             dry_run=self.config.schwab.dry_run,
-            log_dir=self.config.runtime.log_dir,
             structured_logger=self.audit.log_structured,
-            skip_counts=dict(self.entry_gatekeeper.session_skip_counts),
+            skip_counts=dict(skip_counts),
             # Post-stop continuation needs bars AFTER each stop-out. Passed as
             # a callable so session_report stays a pure aggregator over
             # TradeRecords and doesn't take a DataFeed dependency.
             bars_for=self._session_report_bars,
         )
 
-    def _export_session_archive(self) -> None:
+    def _export_session_archive(self, day: date, owed: _DayClose) -> None:
         """Thin wrapper that delegates to ``session_archive.export_session_archive``.
 
         Kept on the engine so the call site in ``_close_session_day``
@@ -1131,6 +1213,7 @@ class IntradayBot:
         I/O lives in ``session_archive.py``.
         """
         export_session_archive(
+            session_date=day,
             log_dir=self.config.runtime.log_dir,
             strategy_name=self.config.strategy,
             dry_run=self.config.schwab.dry_run,
@@ -1139,9 +1222,9 @@ class IntradayBot:
             positions=self.positions,
             strategy=self.strategy,
             last_candidates=self.last_candidates,
-            session_skip_counts=dict(self.entry_gatekeeper.session_skip_counts),
+            session_skip_counts=dict(owed.skip_counts),
             config=self.config,
-            exporter_ran_session=self._late_archive_date != sessions.now_et().date(),
+            exporter_ran_session=owed.ran_session,
         )
 
     def step(self) -> None:
