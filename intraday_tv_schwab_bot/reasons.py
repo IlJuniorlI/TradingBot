@@ -191,3 +191,37 @@ def reason_gate(reason: Any) -> str:
     there, is part of the gate. ``'none'`` when nothing names one."""
     _side, name = split_side_prefix(reason)
     return exit_reason_code(reason_head(name)) or "none"
+
+
+_BLOCKED_SIDES = frozenset(side.value for side in Side)
+
+
+def blocked_side(reason: Any, *, market_side: Any = None, side_pref: Any = None) -> str | None:
+    """The side a skip reason blocked, ``'LONG'`` or ``'SHORT'``, as gate
+    attribution scores it and the session's skip tally keys it: on a signal
+    an engine gate refused, the way the signal bet (``market_side``);
+    otherwise the side the reason names (:func:`reason_side`), and only for a
+    reason that names none the candidate's screener bias (``side_pref``).
+    None when none of them is a side."""
+    refused = _side_name(market_side)
+    if refused in _BLOCKED_SIDES:
+        return refused
+    named = reason_side(reason)
+    if named is not None:
+        return named.value
+    preferred = _side_name(side_pref)
+    return preferred if preferred in _BLOCKED_SIDES else None
+
+
+def _side_name(value: Any) -> str:
+    """``'LONG'`` for ``Side.LONG`` and for ``' long'`` alike (``str()`` of a
+    ``Side`` reads ``'Side.LONG'``)."""
+    return value.value if isinstance(value, Side) else str(value or "").strip().upper()
+
+
+# What one count of the session's skip tally is (``EntryGatekeeper.
+# session_skip_counts``): a symbol skipped on a gate on a side
+# (:func:`reason_gate`, :func:`blocked_side`) in one ET minute, however many
+# entry passes that minute ran. The session report's filter rejections and
+# the archive manifest state it beside the counts.
+SKIP_COUNT_UNIT = "symbol_minutes"

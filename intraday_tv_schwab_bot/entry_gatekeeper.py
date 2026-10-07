@@ -58,7 +58,7 @@ from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .position_metrics import initial_risk_per_unit
 from .numeric import safe_float
-from .reasons import reason_gate
+from .reasons import blocked_side, reason_gate
 from .risk import RiskManager
 from .trade_management import default_levels
 from .log_setup import TRADEFLOW_LEVEL
@@ -112,7 +112,13 @@ class EntryGatekeeper:
         # Per-session state (was on IntradayBot before Phase 5 Step 10).
         self.last_entry_decisions: dict[str, dict[str, Any]] = {}
         self._last_entry_decision_log: dict[str, tuple[str, tuple[str, ...], float, str | None]] = {}
+        # The session's skip tally, in symbol-minutes (``SKIP_COUNT_UNIT``):
+        # ``_count_skips``. The engine clears it when the ET date rolls
+        # (``reset_skip_tally``).
         self.session_skip_counts: dict[str, int] = {}
+        # The minute ``_skips_counted`` holds the (symbol, side, gate) keys of.
+        self._skip_count_minute: datetime | None = None
+        self._skips_counted: set[tuple[str, str | None, str]] = set()
         self._option_entry_retry_until: dict[str, datetime] = {}
         self._option_entry_retry_counts: dict[str, int] = {}
         # Entry orders whose outcome the submit call could not settle, keyed
@@ -820,6 +826,42 @@ class EntryGatekeeper:
         LOG.log(TRADEFLOW_LEVEL, 'Entry cycle summary strategy=%s candidates=%s actions=%s top_skips=%s', strategy_name, candidate_count, action_counts, summary['top_skip_reasons'] or 'none')
         self.audit.log_structured('ENTRY_CYCLE_SUMMARY', summary)
 
+    def reset_skip_tally(self) -> None:
+        """Start a new day's skip tally: the counts and the current minute's
+        keys (the engine's ET date rollover)."""
+        self.session_skip_counts.clear()
+        self._skip_count_minute = None
+        self._skips_counted.clear()
+
+    def _count_skips(self, symbol: str, reasons: list[str], *, market_side: Side | None,
+                     side_pref: str | None) -> None:
+        """Add a skip of ``symbol`` on each of ``reasons`` to
+        ``session_skip_counts``, once per symbol, side and gate in an ET
+        minute: the count is in symbol-minutes (``SKIP_COUNT_UNIT``), a
+        symbol's gate on a side once a minute. The gate is
+        ``reasons.reason_gate``; the side is ``reasons.blocked_side``, the
+        one gate attribution scores the block on (its key is the same
+        symbol, minute, gate and side), so the peer family's ``long.x`` and
+        ``short.x`` on one decision count apart, and a reason with no side
+        known keys on None. It is kept under the raw reason the minute first
+        gave, so the report's ``variants`` sample the details and the sides.
+
+        Until 2026-10-06 every entry pass added one, so the tally scaled with
+        the pass rate: H: passed every ~2.3 s on 10-06 against 7.9 s on
+        10-02, 883 skips a minute against 300. Only the current minute's
+        keys are held.
+        """
+        minute = sessions.now_et().replace(second=0, microsecond=0)
+        if minute != self._skip_count_minute:
+            self._skip_count_minute = minute
+            self._skips_counted.clear()
+        for reason in reasons:
+            key = (symbol, blocked_side(reason, market_side=market_side, side_pref=side_pref), reason_gate(reason))
+            if key in self._skips_counted:
+                continue
+            self._skips_counted.add(key)
+            self.session_skip_counts[reason] = self.session_skip_counts.get(reason, 0) + 1
+
     def _log_entry_decision(
         self,
         strategy_name: Any,
@@ -848,6 +890,10 @@ class EntryGatekeeper:
             token = str(item or "").strip()
             if token and token not in cleaned:
                 cleaned.append(token)
+        dashboard_symbol = str(symbol or '').upper().strip()
+        context_payload = copy.deepcopy({str(k): v for k, v in context.items() if v is not None}) if isinstance(context, Mapping) else {}
+        details_payload = copy.deepcopy({str(k): v for k, v in details.items() if v is not None}) if isinstance(details, Mapping) else {}
+        side_pref = self._decision_side_preference(context_payload, details_payload)
         # Tally session-wide skip reasons so session_report can surface a
         # filter-rejection summary at EOD. Each reason gets credit even
         # when multiple fire on the same decision. A refused signal's own
@@ -855,11 +901,8 @@ class EntryGatekeeper:
         # the gate after it is tallied. Until 2026-09-26 both were, so each
         # refusal counted twice.
         if str(action).lower() == "skipped":
-            for reason in cleaned[1:] if market_side is not None else cleaned:
-                self.session_skip_counts[reason] = self.session_skip_counts.get(reason, 0) + 1
-        dashboard_symbol = str(symbol or '').upper().strip()
-        context_payload = copy.deepcopy({str(k): v for k, v in context.items() if v is not None}) if isinstance(context, Mapping) else {}
-        details_payload = copy.deepcopy({str(k): v for k, v in details.items() if v is not None}) if isinstance(details, Mapping) else {}
+            self._count_skips(dashboard_symbol, cleaned[1:] if market_side is not None else cleaned,
+                              market_side=market_side, side_pref=side_pref)
         if dashboard_symbol:
             payload: dict[str, Any] = {
                 'symbol': dashboard_symbol,
@@ -887,7 +930,6 @@ class EntryGatekeeper:
                 return False
         primary_reason = cleaned[0] if cleaned else 'none'
         secondary_reason = cleaned[1] if len(cleaned) > 1 else None
-        side_pref = self._decision_side_preference(context_payload, details_payload)
         entry_family = self._decision_entry_family(context_payload, details_payload)
         # Low-signal skip reasons log at DEBUG (and suppress SKIP_SUMMARY) to
         # keep the TRADEFLOW log focused on real decision events. The skips

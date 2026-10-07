@@ -805,7 +805,7 @@ class IntradayBot:
                 "Skip-counts session rollover %s -> %s: resetting %d counters",
                 last, today, existing,
             )
-        self.entry_gatekeeper.session_skip_counts.clear()
+        self.entry_gatekeeper.reset_skip_tally()
         self._last_skip_counts_reset_date = today
 
     @staticmethod

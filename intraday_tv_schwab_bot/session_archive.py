@@ -36,9 +36,9 @@ from typing import Any, Iterable
 
 import yaml
 
-from .models import Position, Side
+from .models import Position
 from . import sessions
-from .reasons import reason_gate, reason_side, split_side_prefix
+from .reasons import SKIP_COUNT_UNIT, blocked_side, reason_gate, split_side_prefix
 from .serialization import atomic_write_text
 from .session_report import (
     TRADE_CSV_COLUMNS,
@@ -473,19 +473,21 @@ def _gate_attribution(
                     # (`order_failed:...cancel_error:{exc}`) can hold a comma
                     # outside parentheses, which until 2026-09-26 split off
                     # a second, spurious gate.
-                    gates = [(gate, Side(market_side)) for gate in _reason_tokens(reasons, maxsplit=1)[1:]]
+                    gates = _reason_tokens(reasons, maxsplit=1)[1:]
                 else:
                     tokens = _reason_tokens(reasons) or [primary]
-                    gates = [(primary, reason_side(primary))] + [
-                        (token, reason_side(token)) for token in tokens[1:]
+                    gates = [primary] + [
+                        token for token in tokens[1:]
                         if _BUILD_FAILED_SIDE_RE.match(token.lower()) or split_side_prefix(token.lower())[0] is not None
                     ]
                 family = str(row.get("family", "") or "none").strip() or "none"
                 excursion: tuple[float, float, float] | None = None
                 excursion_read = False
-                for token, token_side in gates:
-                    side = token_side.value if token_side is not None else side_pref
-                    if side not in {"LONG", "SHORT"}:
+                for token in gates:
+                    # ``reasons.blocked_side``: the rule above, which the
+                    # session's skip tally keys its minutes on too.
+                    side = blocked_side(token, market_side=market_side, side_pref=side_pref)
+                    if side is None:
                         continue
                     # One gate can stop both sides on a row (the peer
                     # family's `long.x` and `short.x` are gate `x`): two blocks.
@@ -1276,7 +1278,9 @@ def export_session_archive(
         ``active_watchlist`` so dynamic-discovery strategies emit the
         right set of symbols.
     session_skip_counts
-        Engine's session-wide skip-reason tally. Recorded in manifest.
+        Engine's session-wide skip-reason tally, in symbol-minutes (a
+        symbol's gate on a side counted once a minute). Recorded in manifest, beside
+        ``session_skip_counts_unit``.
     config
         Optional resolved BotConfig instance. If provided, a
         ``config_snapshot.yaml`` is written to the archive with secret
@@ -1356,6 +1360,7 @@ def export_session_archive(
         "realized_pnl": realized_pnl_today,
         "trades_export_error": trades_export_error,
         "session_skip_counts": dict(session_skip_counts or {}),
+        "session_skip_counts_unit": SKIP_COUNT_UNIT,
         "regime_call_outcomes": regime_outcomes,
         "gate_attribution": gate_attribution,
     }

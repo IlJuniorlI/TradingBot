@@ -39,7 +39,7 @@ from typing import Any, Iterable
 from .paper_account import PaperAccount, TradeRecord, closed_trade_lifecycles
 from .models import Position
 from . import sessions
-from .reasons import exit_reason_code, reason_gate
+from .reasons import SKIP_COUNT_UNIT, exit_reason_code, reason_gate
 
 LOG = logging.getLogger(__name__)
 
@@ -644,9 +644,16 @@ def _filter_rejection_summary(skip_counts: dict[str, int] | None) -> dict[str, A
       * ``variants`` — the raw reasons as logged, preserved so a tuner
         can inspect the full parameter distribution (and the sides) of a
         specific bucket.
+
+    The counts are symbol-minutes (``unit``, ``reasons.SKIP_COUNT_UNIT``): a
+    symbol skipped on a gate on a side (``reasons.blocked_side``) in one
+    minute counts once, however many entry passes ran in it, so a bucket
+    counts the peer family's ``long.x`` and ``short.x`` of one minute twice,
+    as gate attribution does. Until 2026-10-06 every pass counted, so the totals
+    scaled with the pass rate.
     """
     if not skip_counts:
-        return {"total_skips": 0, "top_reasons": [], "all_reasons": {}, "variants": {}}
+        return {"unit": SKIP_COUNT_UNIT, "total_skips": 0, "top_reasons": [], "all_reasons": {}, "variants": {}}
     total = sum(int(v) for v in skip_counts.values())
     # Group by normalized reason.
     normalized: dict[str, int] = {}
@@ -660,7 +667,8 @@ def _filter_rejection_summary(skip_counts: dict[str, int] | None) -> dict[str, A
     sorted_items = sorted(normalized.items(), key=lambda kv: (-kv[1], kv[0]))
     top = [{"reason": reason, "count": int(count)} for reason, count in sorted_items[:10]]
     all_ = {reason: int(count) for reason, count in sorted_items}
-    return {"total_skips": total, "top_reasons": top, "all_reasons": all_, "variants": variants}
+    return {"unit": SKIP_COUNT_UNIT, "total_skips": total, "top_reasons": top, "all_reasons": all_,
+            "variants": variants}
 
 
 # ---------------------------------------------------------------------------
@@ -796,7 +804,8 @@ def _log_filter_rejections(summary: dict[str, Any]) -> None:
     total = int(summary.get("total_skips", 0))
     if total == 0:
         return
-    LOG.info("  Filter rejections (%d total skips; showing top %d):", total, min(10, len(summary.get("top_reasons", []))))
+    LOG.info("  Filter rejections (%d skips in %s, a symbol's gate on a side counted once a minute; showing top %d):",
+             total, summary["unit"], min(10, len(summary.get("top_reasons", []))))
     for item in summary.get("top_reasons", []):
         LOG.info("    %-40s %6d", str(item.get("reason", ""))[:40], int(item.get("count", 0)))
 
@@ -847,9 +856,9 @@ def write_session_report(
         (e.g., ``engine._log_structured``).
     skip_counts : dict[str, int], optional
         Session-wide tally of per-candidate skip reasons from
-        ``engine.session_skip_counts`` (a signal an engine gate refused
-        counts under that gate alone). Used to emit the filter-rejection
-        summary.
+        ``engine.session_skip_counts``, in symbol-minutes (a signal an engine
+        gate refused counts under that gate alone). Used to emit the
+        filter-rejection summary.
     """
     # Initialized before the try so the CSV-append path below (outside the
     # try) can safely early-return if the report build raised before these

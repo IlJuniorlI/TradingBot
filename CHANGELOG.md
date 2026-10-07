@@ -5199,6 +5199,36 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The session's skip tally counts symbol-minutes: a symbol's gate on a side
+  counts once a minute, however many entry passes ran in it.** *2026-10-06* —
+  `EntryGatekeeper.session_skip_counts` (the session report's filter
+  rejections and the archive manifest's `session_skip_counts`) added one per
+  symbol per reason on every entry pass, so it scaled with the pass rate: H:
+  passed every ~2.3 s on 10-06 against 7.9 s on 10-02, 883 skips a minute
+  against 300, and the two days' tallies could not be compared. A skip now
+  counts once per symbol, side and gate in the ET minute the pass runs in:
+  the gate is `reasons.reason_gate`, the key the filter rejections bucket by,
+  and the side is `reasons.blocked_side`, the side gate attribution scores
+  the block on (the reason's own, a refused signal's `market_side`, else the
+  candidate's bias; gate attribution now reads it from the same function),
+  so the peer family's `long.x` and `short.x` on one decision count apart,
+  as gate attribution's (symbol, minute, gate, side) does. The count is kept
+  under the raw reason that minute first gave, so `variants` sample the
+  details and the sides; only the current minute's keys are held. The day
+  rollover still starts a new tally (`EntryGatekeeper.reset_skip_tally`, which
+  clears the minute's keys too), only skipped decisions count, and a refused
+  signal still counts its gate alone. The readers state the unit:
+  `filter_rejections.unit` in `SESSION_REPORT`, `session_skip_counts_unit` in
+  `manifest.json` (both `symbol_minutes`) and the log line `Filter rejections
+  (N skips in symbol_minutes, a symbol's gate on a side counted once a
+  minute; showing top 10)`. The `Decision` lines, `SKIP_SUMMARY` and
+  `ENTRY_CYCLE_SUMMARY` are per pass as before.
+  - Upgrade note: `session_skip_counts` and `filter_rejections` counts from
+    before this change are per pass and read several times higher than the
+    new ones; an archive or report without the unit field holds the old
+    counts. The `Filter rejections (... total skips; ...)` log line now
+    reads `Filter rejections (N skips in symbol_minutes, ...)`.
+
 - **The shutdown line names the stop signal: `Interrupted by SIGHUP, shutting
   down.`** *2026-10-06* — the stop-signal handler raised a bare
   KeyboardInterrupt and `run` logged `Interrupted, shutting down.`, so a
