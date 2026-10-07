@@ -1024,14 +1024,13 @@ def append_trades_csv(trades: Iterable[TradeRecord], *, log_dir: str, session_da
     then holds every one of them.
 
     The engine calls it at each day close and at shutdown with every trade
-    the process holds, whatever its exit date: a trade booked after the
-    day's 20:00 report (a late start's start-up reconcile books an exit that
-    evening) or one an earlier append failed to write goes in the next
-    time. A row already in the file (the same date and ``TRADE_CSV_KEY``)
-    is not written again, so a repeat, a shutdown after the 20:00 close, or
-    a second process holding the same trade adds nothing. A trade still
-    open (a partial exit without its final slice) waits for its close:
-    ``closed_trade_lifecycles`` folds its slices into one row then.
+    the process holds, whatever its exit date: one an earlier append
+    failed to write goes in the next time. A row already in the file (the
+    same date and ``TRADE_CSV_KEY``) is not written again, so a repeat, a
+    shutdown after the 20:00 close, or a second process holding the same
+    trade adds nothing. A trade still open (a partial exit without its
+    final slice) waits for its close: ``closed_trade_lifecycles`` folds
+    its slices into one row then.
 
     The read, the check against the file and the write (or the rotation)
     run under the file's lock (``_trades_csv_lock``), so processes sharing

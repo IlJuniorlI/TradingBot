@@ -386,14 +386,15 @@ class IntradayBot:
         # before 20:00), marked `exporter_ran_session: false`, since the
         # bars, account snapshot and skip tally are its own; an archive the
         # day has is the session's and is left as it is. It owes the day the
-        # append either way, so its own trades of that evening (an exit its
-        # start-up reconcile books) reach trades.csv on its first pass, not
-        # only at its shutdown (`_append_trades_csv`). An archive an earlier
-        # shutdown left owed (it ran out of time, or the export failed or
-        # was cut off: `archive_owed.json`) of a day that has ended, a
-        # trading day or not, is written the same way, with the skip tally
-        # that shutdown left with it, outside the trading days' stream
-        # windows.
+        # append either way and writes it on its first pass, not only at its
+        # shutdown (`_append_trades_csv`); with auto_exit_after_session on,
+        # that pass ends the run before the day close, and the shutdown
+        # writes it. A safeguard: its start-up reconcile books no trade, so
+        # it holds none of that evening. An archive an earlier shutdown left
+        # owed (it ran out of time, or the export failed or was cut off:
+        # `archive_owed.json`) of a day that has ended, a trading day or
+        # not, is written the same way, with the skip tally that shutdown
+        # left with it, outside the trading days' stream windows.
         self._day_closes: dict[date, _DayClose] = {}
         # `run`'s stop signals, while it runs: the shutdown's export budget
         # counts from the first (`_since_stop_signal`).
@@ -1312,9 +1313,9 @@ class IntradayBot:
         # every day's before any archive (an export takes about 12 s on H:,
         # an append milliseconds), then the archives (`_shutdown_exports`).
         # A day this process already closed writes no second SESSION REPORT
-        # or archive, but the append still runs, so a trade booked since (a
-        # late start's start-up reconcile books one that evening) reaches
-        # trades.csv. Each step logs its own failures.
+        # or archive; its append runs again and finds nothing to add (the
+        # day closed once an append wrote every trade, and nothing is booked
+        # after 20:00). Each step logs its own failures.
         now = sessions.now_et()
         today = now.date()
         self._schedule_day_closes(now)

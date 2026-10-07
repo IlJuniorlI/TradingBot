@@ -488,9 +488,11 @@ bot started after 8pm never writes that day's report, and writes its
 archive only when the day has none (no `manifest.json`: the bot that ran
 the day died before 8pm), with `exporter_ran_session: false` in the
 manifest, since its bars, account snapshot and skip counts are its own
-(the dead bot's skip counts went with it). It appends its own trades of
-that evening (an exit its start-up reconcile books) on its first pass.
-No cron needed. Each archive contains:
+(the dead bot's skip counts went with it). It still runs the day's
+trades.csv append on its first pass (with `auto_exit_after_session`
+on, that pass ends the run and its shutdown runs it), a safeguard:
+its start-up reconcile books no trade, so it holds none of that
+evening. No cron needed. Each archive contains:
 
 - `bars/{Nm}/{SYMBOL}.csv` — full merged frame with indicators per timeframe
 - `trades.csv` — the day's rows of `.logs/trades.csv` that the strategy

@@ -1445,7 +1445,9 @@ class DashboardCache:
         selected_zone_match_tolerance = max(float(base_zone_half_width) * 0.75, float(close) * float(tolerance_pct) * 0.5, 0.01)
 
         try:
-            if not ltf.empty:
+            # No LTF (the strategy's resample of an empty frame is None): the
+            # zones are the HTF candidates', as for an empty one.
+            if ltf is not None and not ltf.empty:
                 overlay_long = self.strategy.dashboard_overlay_candidates(Side.LONG, float(close), ltf, htf)
                 overlay_short = self.strategy.dashboard_overlay_candidates(Side.SHORT, float(close), ltf, htf)
                 if overlay_long is not None:
