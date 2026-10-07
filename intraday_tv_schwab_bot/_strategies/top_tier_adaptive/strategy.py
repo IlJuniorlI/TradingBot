@@ -553,19 +553,23 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 pivot_bias = str(getattr(mshtf_ctx, "pivot_bias", "neutral") or "neutral").lower()
                 last_high = str(getattr(mshtf_ctx, "last_high_label", "") or "")
                 last_low = str(getattr(mshtf_ctx, "last_low_label", "") or "")
+                # The rule that set the bias leads the reason: the labels
+                # beside it can read the other way (MRVL 2026-10-06, HH / HL
+                # refused as bearish by the midpoint rule).
+                bias_source = mshtf_ctx.bias_source
                 # Layer 1 — explicit opposing bias (applies to all regimes)
                 if side == Side.LONG and htf_bias == "bearish":
                     self._set_build_failure(
                         c.symbol, regime,
-                        f"htf_bias_bearish(last_high={last_high or 'na'},"
-                        f"last_low={last_low or 'na'})",
+                        f"htf_bias_bearish(source={bias_source},"
+                        f"last_high={last_high or 'na'},last_low={last_low or 'na'})",
                     )
                     return None
                 if side == Side.SHORT and htf_bias == "bullish":
                     self._set_build_failure(
                         c.symbol, regime,
-                        f"htf_bias_bullish(last_high={last_high or 'na'},"
-                        f"last_low={last_low or 'na'})",
+                        f"htf_bias_bullish(source={bias_source},"
+                        f"last_high={last_high or 'na'},last_low={last_low or 'na'})",
                     )
                     return None
                 # Layer 2 — pullback + trend regimes: block when the HTF

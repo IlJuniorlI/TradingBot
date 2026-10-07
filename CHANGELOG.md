@@ -5199,6 +5199,28 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **top_tier's HTF bias refusal names the rule that set the bias.**
+  *2026-10-06* — on H:'s 10-06 MRVL, the day's top candidate, was refused
+  LONG as `htf_bias_bearish(last_high=HH,last_low=HL)` (for example at
+  14:51:04): labels that read bullish, over a bias the midpoint rule had set.
+  `_resolve_structure_bias` tests a close through a reference, then the
+  tight-range neutral, then the midpoint of the reference pair, then the
+  newer live BoS, and only then the pivot labels, and nothing in the reason
+  said which of them decided. The resolver now returns the rule with the bias,
+  `MarketStructureContext.bias_source` carries it (`breakout`, `tight_range`,
+  `midpoint`, `recent_bos`, `pivots`; `none` when no structure was analysed),
+  and the reason leads with it:
+  `htf_bias_bearish(source=midpoint,last_high=HH,last_low=HL)`, mirrored for
+  `htf_bias_bullish`. No decision changes. The top_tier README's
+  `require_htf_bias_alignment` entry describes the reason.
+  - Upgrade note: the `long_build_failed_htf_bias_bearish(...)` /
+    `short_build_failed_htf_bias_bullish(...)` reason in decisions.csv, the
+    log and the dashboard gains a leading `source=` field inside its
+    parentheses; the session report tallies it under the same gate
+    (`long_build_failed_htf_bias_bearish` /
+    `short_build_failed_htf_bias_bullish`) as before. The structure context
+    gains the `bias_source` field.
+
 - **top_tier's armed retest arms a `trend` or `momentum` setup only on a close
   through its trigger level.** *2026-10-06* — `_armed_retest_verdict` is
   consulted after the index and confirmation-bar gates and before the

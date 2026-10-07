@@ -51,6 +51,15 @@ class MarketStructureContext:
     last_pivot_label: str | None = None
     pivot_bias: str = "neutral"
     bias: str = "neutral"
+    # The rule in ``_resolve_structure_bias`` that set ``bias``: "breakout"
+    # (the close through the reference high or low), "tight_range" (neutral
+    # in a tight EQH+EQL range), "midpoint" (the close's side of the
+    # reference pair's midpoint), "recent_bos" (the newer live BoS) or
+    # "pivots" (the last high / low labels, ``pivot_bias``). "none" when no
+    # structure was analysed. Named in a refusal's reason, since the labels
+    # beside it can read the other way (an HH / HL pair below its midpoint
+    # reads bearish).
+    bias_source: str = "none"
     bos_up: bool = False
     bos_down: bool = False
     choch_up: bool = False
@@ -212,7 +221,10 @@ def _resolve_structure_bias(
     bos_down_age: int | None,
     max_event_age_bars: int | None,
     tight_structure_range: bool = False,
-) -> str:
+) -> tuple[str, str]:
+    """The structure bias and the rule that set it (``MarketStructureContext.
+    bias`` / ``bias_source``), in order: a close through a reference, the
+    tight-range neutral, the midpoint, the newer live BoS, the pivot labels."""
     above_high = reference_high is not None and close >= float(reference_high) + breakout_buffer
     below_low = reference_low is not None and close <= float(reference_low) - breakout_buffer
     if above_high and below_low:
@@ -230,11 +242,11 @@ def _resolve_structure_bias(
         up_age = -1 if bos_up_age is None else int(bos_up_age)
         down_age = -1 if bos_down_age is None else int(bos_down_age)
         if up_age != down_age:
-            return "bullish" if up_age < down_age else "bearish"
+            return ("bullish" if up_age < down_age else "bearish"), "breakout"
     elif above_high:
-        return "bullish"
+        return "bullish", "breakout"
     elif below_low:
-        return "bearish"
+        return "bearish", "breakout"
 
     # Tight EQH+EQL consolidation suppresses the midpoint / pivot / recent-
     # event bias paths — a 0.3-ATR range produces noise-driven bias flips
@@ -243,7 +255,7 @@ def _resolve_structure_bias(
     # catch real breakouts. CHoCH is computed in analyze_market_structure
     # from bos_up/down + pivot_bias, also unaffected.
     if tight_structure_range:
-        return "neutral"
+        return "neutral", "tight_range"
 
     midpoint_bias = "neutral"
     if reference_high is not None and reference_low is not None and float(reference_high) > float(reference_low):
@@ -268,10 +280,10 @@ def _resolve_structure_bias(
             recent_event_bias = "bearish"
 
     if midpoint_bias != "neutral":
-        return midpoint_bias
+        return midpoint_bias, "midpoint"
     if recent_event_bias != "neutral":
-        return recent_event_bias
-    return pivot_bias
+        return recent_event_bias, "recent_bos"
+    return pivot_bias, "pivots"
 def _last_cross_age(series: list[float], threshold: float, direction: str) -> int | None:
     if len(series) < 2:
         return None
@@ -392,7 +404,7 @@ def analyze_market_structure(
         and structure_range_atr < float(min_range_atr_mult)
     )
 
-    bias = _resolve_structure_bias(
+    bias, bias_source = _resolve_structure_bias(
         pivot_bias=pivot_bias,
         close=close,
         reference_high=reference_high,
@@ -429,6 +441,7 @@ def analyze_market_structure(
         last_pivot_label=last_pivot_label,
         pivot_bias=pivot_bias,
         bias=bias,
+        bias_source=bias_source,
         bos_up=bos_up,
         bos_down=bos_down,
         choch_up=choch_up,
