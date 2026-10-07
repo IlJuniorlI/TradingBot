@@ -557,9 +557,13 @@ class RegimeMixin:
         bull_score -= 1.0 if u_flip_count > int(p.get("chop_flip_max_for_trend", 3)) else 0.0
         bull_score -= 1.0 if u_range_pct > float(p.get("chaos_intraday_range_pct", 0.016)) else 0.0
         bull_score += sr_weight if sr_ctx.breakout_above_resistance else 0.0
-        # near_* is the level on price's own side; the breakdown / breakout
-        # flags are about a broken level on the far side, so they no longer
-        # switch the near terms off (2026-09-23).
+        # near_* is the nearest level playing each role on price's own side
+        # (support_resistance.role_level: nearest_* or, since 2026-10-07, a
+        # confirmed flip between price and it); the breakdown / breakout
+        # flags are about a broken level price has crossed, which can be
+        # that same near level (a reclaimed resistance just under price can
+        # set both). The flags no longer switch the near terms off
+        # (2026-09-23).
         bull_score += sr_weight * 0.40 if sr_ctx.near_support else 0.0
         bull_score -= sr_weight * 0.45 if sr_ctx.near_resistance else 0.0
         bull_score += candle_weight * bullish_candle_scale if bullish_candle_confirm and u_vwap_dist >= -candle_anchor else 0.0

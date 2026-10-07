@@ -560,7 +560,11 @@ def _reconcile_flipped_levels(
     as before, so the ladder changes only in this geometry: a wide cluster
     holding a reclaimed resistance more than the tolerance under the lost
     support, published at a member within the tolerance of the lost
-    support, still goes.
+    support, still goes. A kept rung is the only one the drop leaves within
+    the tolerance of the other flip, which is how ``_flip_rung`` finds it;
+    the refinement's stop anchors and target caps and top_tier's Fix G try
+    the next rung after it when it fails them (``nearest_levels``), the
+    level ``nearest_*`` was until then.
 
     Until 2026-09-27 the builder cut each side before this step, and this
     step collapsed the survivors a second time, even with no broken level. A
@@ -780,38 +784,113 @@ def role_level(sr_ctx: SupportResistanceContext, role: str, *, price: float) -> 
     484.30 read 0.273% of room to 485.62 and passed the 0.25% minimum,
     where the flip left 0.231%. Readers: the S/R clearance veto and the
     proximity score (``shared_entry._htf_clearance``, after a pending
-    level), ``near_*``, sr_scalp's target and its scorer's room to ride,
-    and, through ``role_levels`` (``nearest_*`` after a flip), the
-    refinement's target caps and top_tier's Fix G. The stop anchors, the
-    ladders and the published ``nearest_*`` with their distances still
-    read the clusters."""
+    level); ``near_*``, and through them ``regime_hint`` and
+    ``bias_score``, which top_tier's vol_squeeze S/R-alignment gate reads
+    (``vol_squeeze_min_sr_bias_alignment``); sr_scalp's target and its
+    scorer's room to ride; and, through ``role_levels``, the refinement's
+    target caps and top_tier's Fix G. Under top_tier's shipped knobs a
+    flip that sets ``near_*`` changes only which refusal the vol_squeeze
+    gate leaves on record: wherever it turns the gate's verdict, the level
+    the trade faces (the resistance role over a LONG, the support role
+    under a SHORT) is near, inside the 0.70-ATR proximity window
+    (``proximity_atr_mult``) and so within the veto's 0.72-ATR minimum
+    clearance (``entry_min_clearance_atr``), and the veto refuses the entry
+    either way. The stop anchors, the ladders and the published
+    ``nearest_*`` with their distances still read the clusters."""
     if role == "resistance":
         return _role_level(role, float(price), sr_ctx.nearest_resistance, sr_ctx.broken_support)
     return _role_level(role, float(price), sr_ctx.nearest_support, sr_ctx.broken_resistance)
 
 
+def _flip_rung(sr_ctx: SupportResistanceContext, role: str) -> Level | None:
+    """The rung of ``role``'s ladder that the S/R build kept for a confirmed
+    flip of that role (``_reconcile_flipped_levels``), or None: with the
+    two flips within ``side_tolerance`` of each other either side of price,
+    the resistance rung holding the lost support (``broken_support``),
+    which the drop near the reclaimed resistance (``broken_resistance``)
+    would take, and the support rung holding the reclaimed resistance,
+    which the drop near the lost support would take. That drop takes every
+    other rung of the side within ``side_tolerance`` of its flip, as
+    ``drop_levels_near_price`` measures, so a published rung within it is
+    the kept one; no field marks it."""
+    rungs, flip = (
+        (sr_ctx.resistances, sr_ctx.broken_resistance) if role == "resistance"
+        else (sr_ctx.supports, sr_ctx.broken_support))
+    if flip is None:
+        return None
+    return next((rung for rung in rungs
+                 if not drop_levels_near_price([rung], float(flip.price), tolerance=sr_ctx.side_tolerance)), None)
+
+
+def nearest_levels(sr_ctx: SupportResistanceContext, role: str) -> tuple[Level, ...]:
+    """``nearest_*`` of ``role``'s ladder (``nearest_resistance`` for
+    ``"resistance"``, ``nearest_support`` for ``"support"``) and, when it is
+    the rung the S/R build kept for a flip (``_flip_rung``), the next rung
+    of the ladder after it: the levels a reader of ``nearest_*`` that needs
+    one strictly on its side of the close tries in turn. Where a reclaimed
+    resistance under price and a lost support over it lie within
+    ``side_tolerance`` of each other, the build keeps each flip's own rung
+    (2026-10-07), 0.2-0.3 ATR from price, where the drop had left the next
+    cluster as ``nearest_*``; that next rung follows the kept one, so a
+    reader the kept rung fails reads the level it read before, not no
+    level. Readers: the refinement's stop anchors, which take the first
+    one strictly under (over) the proposal's close, and, through
+    ``role_levels``, its target caps and top_tier's Fix G. The anchor
+    under a kept rung sits nearer the close than the one under the next
+    rung, so a stop is anchored as before 2026-10-07 or nearer. With
+    ``max_levels_per_side`` 1 the kept rung is the whole ladder and there
+    is no next rung. An unknown role raises."""
+    if role == "resistance":
+        nearest, rungs = sr_ctx.nearest_resistance, sr_ctx.resistances
+    elif role == "support":
+        nearest, rungs = sr_ctx.nearest_support, sr_ctx.supports
+    else:
+        raise ValueError(f"role must be 'support' or 'resistance', not {role!r}")
+    if nearest is None:
+        return ()
+    if nearest is not _flip_rung(sr_ctx, role):
+        return (nearest,)
+    after = next((rungs[index + 1] for index in range(len(rungs) - 1) if rungs[index] is nearest), None)
+    return (nearest,) if after is None else (nearest, after)
+
+
 def role_levels(sr_ctx: SupportResistanceContext, role: str, *, price: float) -> tuple[Level, ...]:
     """The levels playing ``role`` in ``sr_ctx`` that a reader tries in
-    turn at its ``price``: the role level (``role_level``) and, when that
-    is a confirmed flip, ``nearest_*`` after it. A reader takes the first
-    one that passes its own test, so a flip it cannot use leaves it
-    ``nearest_*``, the level it read before 2026-10-07.
+    turn at its ``price``: the role level (``role_level``) when it is a
+    confirmed flip, then ``nearest_levels``: ``nearest_*`` and, when the
+    S/R build kept that rung for a flip, the next rung. A reader takes the
+    first one that passes its own test, so a level it cannot use leaves it
+    the next, down to the level it read before 2026-10-07.
 
     The refinement's target caps take the first one strictly on the target
-    side of the proposal's close whose cap meets the R:R floor. A LONG at
-    100.00, stop 99.50, target 103.00, nearest_resistance 101.00, a lost
-    support at 100.30, level_buffer 0.10: the cap under the flip (100.20,
-    0.4R) fails the 1.0 floor and the cap under 101.00 (100.90, 1.8R)
-    holds; with the flip's cap alone the target stayed at 103.00, past both
-    levels. top_tier's Fix G judges the target against the first one
-    strictly on the target side of the signal's close: a flip exactly at
-    the close leaves ``nearest_*`` to judge. Read alone, the flip at the
-    close switched the gate off, and the veto need not refuse such an
-    entry: it reads the role level at the context's own price, and a
-    context priced past the flip measures to ``nearest_*``."""
-    nearest = sr_ctx.nearest_resistance if role == "resistance" else sr_ctx.nearest_support
+    side of the proposal's close whose cap meets the R:R floor, and keep
+    the strategy's target when none does. A LONG at 100.00, stop 99.50,
+    target 103.00, nearest_resistance 101.00, a lost support at 100.30,
+    level_buffer 0.10: the cap under the flip (100.20, 0.4R) fails the 1.0
+    floor and the cap under 101.00 (100.90, 1.8R) holds; with the flip's
+    cap alone the target stayed at 103.00, past both levels. NVDA
+    2026-09-29 13:10 at 229.2116: nearest_resistance 229.67 is the rung
+    kept for the lost support at 229.67, beside the reclaimed 229.0444, and
+    the next rung is 231.3349; level_buffer 0.2332, a LONG's stop 228.8112
+    under the support rung kept for the reclaimed level. The cap under
+    229.67 (229.4408, 0.57R) fails and the cap under 231.3349 (231.1017)
+    holds, the target the cap set before 2026-10-07; under the kept rung
+    alone the strategy's 231.4503 stayed, past both. Each cap is at or
+    inside the one after it and the stop is anchored as before or nearer,
+    so a cap that held before holds now: no target ends further out than
+    before, wherever the ladder holds the next rung. top_tier's Fix G
+    judges the target against the first one strictly on the target side
+    of the signal's close: a flip exactly at the close leaves ``nearest_*``
+    to judge, and a kept rung the close has reached leaves the next rung.
+    Read alone, the flip at the close switched the gate off, and the veto
+    need not refuse such an entry: it reads the role level at the
+    context's own price, and a context priced past the flip measures to
+    ``nearest_*``."""
     level = role_level(sr_ctx, role, price=price)
-    return tuple(lv for lv in ((level,) if level is nearest else (level, nearest)) if lv is not None)
+    rungs = nearest_levels(sr_ctx, role)
+    if level is None or (rungs and level is rungs[0]):
+        return rungs
+    return (level, *rungs)
 
 
 def _compute_level_proximity_metrics(

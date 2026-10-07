@@ -61,7 +61,7 @@ from ..indicators import last_bar_atr
 from .. import sessions
 from ..numeric import safe_float
 from ..reasons import detail_fields, reason_head, reason_with_values
-from ..support_resistance import role_level, role_levels
+from ..support_resistance import nearest_levels, role_level, role_levels
 from .plugin_api import VETO_GATES
 
 if TYPE_CHECKING:
@@ -1738,8 +1738,15 @@ class SharedEntryPolicy:
         if not self.config.shared_entry.use_sr_stop_target_refinement:
             return float(stop), (None if target is None else float(target))
         level_buffer = float(sr_ctx.level_buffer or 0.0)
-        if sr_ctx.nearest_support and close > float(sr_ctx.nearest_support.price):
-            support_stop = float(sr_ctx.nearest_support.price) - level_buffer
+        # The stop anchor: just under nearest_support, or, when that is the
+        # rung the S/R build kept for a reclaimed resistance beside a lost
+        # support and the close has reached it, under the next rung,
+        # nearest_support before 2026-10-07
+        # (``support_resistance.nearest_levels``): never wider than before.
+        # A confirmed flip is no anchor.
+        support = next((level for level in nearest_levels(sr_ctx, "support") if close > float(level.price)), None)
+        if support is not None:
+            support_stop = float(support.price) - level_buffer
             if support_stop < close:
                 stop = self._clamp_refined_stop(
                     close, stop, max(float(stop), support_stop),
@@ -1748,9 +1755,11 @@ class SharedEntryPolicy:
         # The cap: just under the resistance over the close, the nearest
         # level playing the role at the close first, then nearest_resistance
         # when that was a confirmed flip at the close or one whose cap failed
-        # the R:R floor (``support_resistance.role_levels``, 2026-10-07): a
-        # flip never leaves the target further out than nearest_resistance
-        # capped it. The stop anchor stays nearest_support.
+        # the R:R floor, then, when nearest_resistance is the rung the S/R
+        # build kept for a lost support beside a reclaimed resistance, the
+        # next rung, nearest_resistance before 2026-10-07
+        # (``support_resistance.role_levels``): with the stop no wider than
+        # before, no target ends further out than before.
         if target is not None:
             for resistance in role_levels(sr_ctx, "resistance", price=close):
                 if close >= float(resistance.price):
@@ -1769,15 +1778,20 @@ class SharedEntryPolicy:
         if not self.config.shared_entry.use_sr_stop_target_refinement:
             return float(stop), (None if target is None else float(target))
         level_buffer = float(sr_ctx.level_buffer or 0.0)
-        if sr_ctx.nearest_resistance and close < float(sr_ctx.nearest_resistance.price):
-            resistance_stop = float(sr_ctx.nearest_resistance.price) + level_buffer
+        # Mirror: just over nearest_resistance, or over the next rung after a
+        # resistance rung kept for a lost support that the close has reached.
+        resistance = next((level for level in nearest_levels(sr_ctx, "resistance") if close < float(level.price)),
+                          None)
+        if resistance is not None:
+            resistance_stop = float(resistance.price) + level_buffer
             if resistance_stop > close:
                 stop = self._clamp_refined_stop(
                     close, stop, min(float(stop), resistance_stop),
                     last_bar_atr(frame, close),
                 )
         # Mirror: just over the support under the close, a reclaimed
-        # resistance between nearest_support and the close first.
+        # resistance between nearest_support and the close first, and the
+        # next rung after a support rung kept for a reclaimed resistance.
         if target is not None:
             for support in role_levels(sr_ctx, "support", price=close):
                 if close <= float(support.price):

@@ -786,7 +786,9 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             # names it (2026-10-07). A flip the close has already passed is
             # no candidate, and one exactly at the close leaves nearest_* to
             # judge, as in the refinement's caps: read alone, it switched
-            # the gate off.
+            # the gate off. Where nearest_* is the rung the S/R build kept
+            # for a flip and the close has reached it, the next rung is
+            # judged, nearest_* before 2026-10-07, not no level.
             if side == Side.LONG:
                 near = next((level for level in role_levels(admitted.sr, "resistance", price=close)
                              if float(level.price) > close), None)
