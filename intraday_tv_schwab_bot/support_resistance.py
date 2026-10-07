@@ -12,6 +12,7 @@ from .levels_shared import (
     FlipCheck,
     Level,
     cluster_levels,
+    cluster_levels_by_tolerance,
     collapse_same_side_levels,
     confirm_by_values,
     confirm_tail,
@@ -507,10 +508,29 @@ def _merge_level_group(group: list[Level], current_price: float) -> Level:
 
 
 
+def _rung_holding(rungs: list[Level], candidates: list[Level], level: Level | None, tolerance: float) -> Level | None:
+    """The rung of ``rungs`` -- a ladder side collapsed from ``candidates``
+    at ``tolerance`` (``collapse_same_side_levels``) -- whose cluster holds
+    the candidate at ``level``'s price. None without ``level``, or when no
+    candidate sits at its price (a confirmed flip on the far side of price
+    is in no rung of this side). The clusters are contiguous price ranges,
+    each published at one of its own members' prices, so the cluster's rung
+    is the one inside its range."""
+    if level is None:
+        return None
+    for group in cluster_levels_by_tolerance(candidates, tolerance):
+        prices = [float(member.price) for member in group]
+        if float(level.price) in prices:
+            return next((rung for rung in rungs if prices[0] <= float(rung.price) <= prices[-1]), None)
+    return None
+
+
 def _reconcile_flipped_levels(
     supports: list[Level],
     resistances: list[Level],
     *,
+    support_candidates: list[Level],
+    resistance_candidates: list[Level],
     broken_support: Level | None,
     broken_resistance: Level | None,
     tolerance: float,
@@ -519,7 +539,23 @@ def _reconcile_flipped_levels(
     (``broken_support``) and the resistance rungs within it of the reclaimed
     resistance (``broken_resistance``): the same zone, already flipped. A
     drop only. The builder collapses each side once, on its whole candidate
-    pool, before this step and cuts it to ``max_levels_per_side`` after it.
+    pool (``support_candidates`` / ``resistance_candidates``), before this
+    step and cuts it to ``max_levels_per_side`` after it.
+
+    A flip's own rung survives the other flip's drop: the support rung whose
+    cluster holds the reclaimed resistance, the resistance rung whose cluster
+    holds the lost support (``_rung_holding``). When the two flips lie within
+    ``tolerance`` of each other either side of price, each one's rung lies
+    within the tolerance of the other, and until 2026-10-07 the drop took
+    both: GOOG 2026-09-29 10:55 at 336.745, supports [336.298, 334.03] became
+    [334.03] and resistances [336.84, 338.19] became [338.19], so every gate
+    measured to levels about 1.1 ATR away while the flips sat 0.2-0.3 ATR
+    from price (3.1% of 6,500 archived checkpoints). The rung kept is the one
+    holding the flip, not every rung within the tolerance of it: a plain
+    support between the reclaimed resistance and price, in a cluster of its
+    own, sits within the tolerance of both flips and is a stale member of the
+    lost zone, so it still goes; and a cluster holding the flip but published
+    at a stronger member's price is still the flip's rung, so it stays.
 
     Until 2026-09-27 the builder cut each side before this step, and this
     step collapsed the survivors a second time, even with no broken level. A
@@ -527,21 +563,17 @@ def _reconcile_flipped_levels(
     rungs could sit within ``tolerance``; the second pass merged them and
     summed their touches and score again. And a rung dropped here left the
     side one short while deeper candidates existed."""
-    reconciled_supports = list(supports)
-    reconciled_resistances = list(resistances)
-    if broken_support is not None:
-        reconciled_supports = drop_levels_near_price(
-            reconciled_supports,
-            float(broken_support.price),
-            tolerance=tolerance,
-        )
-    if broken_resistance is not None:
-        reconciled_resistances = drop_levels_near_price(
-            reconciled_resistances,
-            float(broken_resistance.price),
-            tolerance=tolerance,
-        )
-    return reconciled_supports, reconciled_resistances
+
+    def drop_near(rungs: list[Level], flip: Level | None, own: Level | None) -> list[Level]:
+        if flip is None:
+            return list(rungs)
+        survivors = drop_levels_near_price(rungs, float(flip.price), tolerance=tolerance)
+        return [rung for rung in rungs if rung is own or rung in survivors]
+
+    return (
+        drop_near(supports, broken_support, _rung_holding(supports, support_candidates, broken_resistance, tolerance)),
+        drop_near(resistances, broken_resistance, _rung_holding(resistances, resistance_candidates, broken_support, tolerance)),
+    )
 
 
 
@@ -1007,6 +1039,8 @@ def build_support_resistance_context(
     supports, resistances = _reconcile_flipped_levels(
         supports,
         resistances,
+        support_candidates=support_candidates,
+        resistance_candidates=resistance_candidates,
         broken_support=broken_support,
         broken_resistance=broken_resistance,
         tolerance=side_tolerance,
