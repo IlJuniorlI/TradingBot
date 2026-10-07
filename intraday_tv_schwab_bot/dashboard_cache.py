@@ -1320,7 +1320,8 @@ class DashboardCache:
         its spec names, then classified and picked by
         ``dashboard_zones.build_level_zones``, which draws a broken level
         within the row's ``side_tolerance`` of the row's nearest level of its
-        new role in that level's zone."""
+        new role in that level's zone, unless a zone of the other kind is
+        priced between them."""
         try:
             level_ctx = self.strategy.dashboard_level_context_spec() or {}
         except Exception:
@@ -1340,9 +1341,10 @@ class DashboardCache:
         # support anchor was tagged nearest_htf_support, so a confirmed
         # breakout-retest level drew as an ordinary "HS · Original" support,
         # and pending levels were not drawn at all. A flipped or pending level
-        # is listed ahead of a plain one at the same price, which it labels
-        # more precisely; a flipped one inside the nearest level's cluster
-        # (within the row's side_tolerance) is drawn in that level's zone.
+        # is listed ahead of a plain one at the same price: a pending one
+        # labels that price alone, a flipped one shares its zone with the
+        # plain one (level_anchors), as does a flipped one within the row's
+        # side_tolerance of the nearest level of its new role.
         support_anchors = level_anchors([
             (broken_resistance_price, "broken_htf_resistance", True),
             (pending_support_price, "pending_htf_support", False),
