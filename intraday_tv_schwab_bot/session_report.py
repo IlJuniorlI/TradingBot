@@ -30,11 +30,13 @@ from __future__ import annotations
 
 import csv
 import dataclasses
+import io
 import json
 import logging
 import math
 import os
 import shutil
+import uuid
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
@@ -1004,7 +1006,10 @@ def append_trades_csv(trades: Iterable[TradeRecord], *, log_dir: str, session_da
     False, with a WARNING naming the error's type, when the log directory,
     the file, its rotation or the write fails: a file that cannot be read
     appends nothing, since its rows could not be told apart from ours. The
-    caller retries. A row ``trade_csv_row`` builds with a column the header
+    rows go in one write in append mode, safe beside another process
+    appending to the same file; one that fails part-way can leave the rows
+    written before it, and the next append ends a cut-off last line before
+    its own. The caller retries. A row ``trade_csv_row`` builds with a column the header
     lacks raises ValueError (``extrasaction="raise"``): that is field drift,
     a bug, not an I/O error.
 
@@ -1061,19 +1066,55 @@ def append_trades_csv(trades: Iterable[TradeRecord], *, log_dir: str, session_da
         return True
     if rotate:
         return _rotate_trades_csv(csv_path, header, carried, new_rows, day)
+    # One write in append mode (O_APPEND), so processes sharing log_dir never
+    # overwrite each other's rows. A write that fails part-way (a full disk)
+    # can leave the rows written before it and a cut-off last line; the next
+    # append ends that line first, so its rows never run on into it.
+    text = io.StringIO()
+    writer = csv.DictWriter(text, fieldnames=TRADE_CSV_COLUMNS, extrasaction="raise")
+    for row in new_rows:
+        # ValueError from extrasaction="raise" propagates — field-drift is a bug.
+        writer.writerow(row)
     try:
+        if header is None:
+            _create_trades_csv(csv_path)
         with open(csv_path, "a", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=TRADE_CSV_COLUMNS, extrasaction="raise")
-            if header is None:
-                writer.writeheader()
-            for row in new_rows:
-                # ValueError from extrasaction="raise" propagates — field-drift is a bug.
-                writer.writerow(row)
+            line_break = "" if _ends_with_newline(csv_path) else "\n"
+            fh.write(line_break + text.getvalue())
     except OSError as exc:
         LOG.warning("Could not append %d trades to %s: %s: %s", len(new_rows), csv_path, type(exc).__name__, exc)
         return False
     LOG.info("Session trades appended to %s (%d rows)", csv_path, len(new_rows))
     return True
+
+
+def _create_trades_csv(csv_path: Path) -> None:
+    """Create ``csv_path`` holding the header alone, at once: the header is
+    written to a file of its own that is then linked into place, which
+    fails when another process created the file first (its header, then,
+    stands). Two first appends at once would otherwise both write one. It
+    needs a filesystem with hard links (ext4, NTFS); elsewhere the append
+    fails with its WARNING."""
+    # A name of its own, created like any file (the umask's mode, as the
+    # append's own creation had).
+    staged = csv_path.with_name(f"trades.csv.{os.getpid()}.{uuid.uuid4().hex}.new")
+    try:
+        with open(staged, "x", newline="", encoding="utf-8") as fh:
+            csv.DictWriter(fh, fieldnames=TRADE_CSV_COLUMNS).writeheader()
+        try:
+            os.link(staged, csv_path)
+        except FileExistsError:
+            pass
+    finally:
+        if staged.exists():
+            staged.unlink()
+
+
+def _ends_with_newline(path: Path) -> bool:
+    """Whether the non-empty file ``path`` ends with a line break."""
+    with open(path, "rb") as fh:
+        fh.seek(-1, os.SEEK_END)
+        return fh.read(1) == b"\n"
 
 
 def _rotate_trades_csv(csv_path: Path, header: list[str] | None, carried: list[dict[str, Any]],

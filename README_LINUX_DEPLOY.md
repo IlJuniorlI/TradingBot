@@ -457,16 +457,18 @@ own rotation governed by `/etc/systemd/journald.conf`.
 ### Daily session archives
 
 At 8pm ET each trading day the bot writes the day's session report,
-appends its closed trades to `.logs/trades.csv` and then writes a per-day
-bundle to `.logs/sessions/{YYYY-MM-DD}/`, once a day: a stop later that
-day writes neither again, though it appends any trade booked since. One
-that fails (a full disk) is retried a minute or more later and at
-shutdown, past midnight too. A bot started after 8pm never writes that
-day's report, and writes its archive only when the day has none (no
-`manifest.json`: the bot that ran the day died before 8pm), with
-`exporter_ran_session: false` in the manifest, since its bars, account
-snapshot and skip counts are its own. No cron needed. Each archive
-contains:
+appends its closed trades to `.logs/trades.csv` and then writes a
+per-day bundle to `.logs/sessions/{YYYY-MM-DD}/`, once a day: a stop
+later that day writes neither again, though it appends any trade booked
+since. The report is written once; an append that fails (a full disk) is
+retried a minute or more later, an archive export after 1 minute, then
+waits doubling to 30 minutes, a retry never during a later trading day's
+7am-8pm stream window; both at shutdown too, past midnight too. A bot
+started after 8pm never writes that day's report, and writes its archive
+only when the day has none (no `manifest.json`: the bot that ran the day
+died before 8pm), with `exporter_ran_session: false` in the manifest,
+since its bars, account snapshot and skip counts are its own. No cron
+needed. Each archive contains:
 
 - `bars/{Nm}/{SYMBOL}.csv` — full merged frame with indicators per timeframe
 - `trades.csv` — the day's rows of `.logs/trades.csv` that the strategy
