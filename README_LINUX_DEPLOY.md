@@ -267,10 +267,10 @@ A few of these values to know about:
   signal, so the last ends by about 25s. A day whose export the shutdown
   does not start, or whose export fails there, is logged (`Shutdown: the
   <date> archive is not written (...): the next start writes it`) and
-  left owed in `.logs/sessions/<date>/archive_owed.json`; the next start
-  writes it, outside the trading days' 7am-8pm stream windows, with
-  `exporter_ran_session: false`. Raising the timeout leaves that 12s as
-  it is. In a terminal, a second Ctrl+C does nothing while the bot shuts
+  left owed in `.logs/sessions/<date>/archive_owed.json`, with the day's
+  skip counts; the next start writes it, outside the trading days'
+  7am-8pm stream windows, with `exporter_ran_session: false` and those
+  skip counts. Raising the timeout leaves that 12s as it is. In a terminal, a second Ctrl+C does nothing while the bot shuts
   down; `kill -9` ends one that hangs.
 - **`Restart=on-failure`** restarts on crash but NOT on clean exit
   (Ctrl+C / `systemctl stop`). If you want restart on any exit, use
@@ -479,7 +479,9 @@ stop signal, see `TimeoutStopSec` above) is written by the next start. A
 bot started after 8pm never writes that day's report, and writes its
 archive only when the day has none (no `manifest.json`: the bot that ran
 the day died before 8pm), with `exporter_ran_session: false` in the
-manifest, since its bars, account snapshot and skip counts are its own.
+manifest, since its bars, account snapshot and skip counts are its own
+(the dead bot's skip counts went with it). It appends its own trades of
+that evening (an exit its start-up reconcile books) on its first pass.
 No cron needed. Each archive contains:
 
 - `bars/{Nm}/{SYMBOL}.csv` — full merged frame with indicators per timeframe

@@ -1043,8 +1043,9 @@ def _export_trades(account: Any, trades_src: Path, trades_dst: Path,
     the same day, or a start after 20:00, re-exported the day with the new
     process's trades (none) over the old one's. A process that starts after
     a trading day's 20:00 writes that day's archive only when the day has
-    none (``exporter_ran_session`` false in the manifest): its bars, account
-    snapshot and skip tally are not the session's.
+    none or an earlier shutdown left it owed (``archive_owed.json``), with
+    ``exporter_ran_session`` false in the manifest: its bars and account
+    snapshot are not the session's.
 
     ``account`` (the exporting process's) is checked against the file: a
     trade of the day and the strategy that it holds and the file does not
@@ -1200,28 +1201,43 @@ def session_archive_owed_path(log_dir: str, session_date: date) -> Path:
     return session_archive_root(log_dir, session_date) / "archive_owed.json"
 
 
-def leave_session_archive_owed(log_dir: str, session_date: date, why: str) -> None:
+def leave_session_archive_owed(log_dir: str, session_date: date, why: str,
+                               session_skip_counts: dict[str, int]) -> None:
     """Leave ``session_date``'s archive owed to the next start that exports
-    archives: write its ``archive_owed.json``, naming ``why``. Raises
-    OSError."""
+    archives: write its ``archive_owed.json``, naming ``why``, with the
+    day's skip tally (empty for a day the process did not run), which lives
+    only in the memory of the process that ran the day. Raises OSError."""
     atomic_write_text(
         session_archive_owed_path(log_dir, session_date),
         json.dumps({"session_date": session_date.isoformat(), "left_at": sessions.now_et().isoformat(),
-                    "why": why}, indent=2),
+                    "why": why, "session_skip_counts": dict(session_skip_counts)}, indent=2, sort_keys=True),
     )
 
 
-def owed_session_archives(log_dir: str) -> list[date]:
+def owed_session_archives(log_dir: str) -> dict[date, dict[str, int]]:
     """The days whose archive an earlier shutdown left owed (an
-    ``archive_owed.json`` in its folder), oldest first. A marker in a folder
-    whose name is not a date is skipped with a WARNING."""
-    days = []
+    ``archive_owed.json`` in its folder), oldest first, each with the skip
+    tally that shutdown left. A marker in a folder whose name is not a date
+    is skipped, and one whose tally cannot be read still makes its day owed,
+    with an empty tally; each with a WARNING."""
+    owed: dict[date, dict[str, int]] = {}
     for marker in (Path(str(log_dir or ".logs")) / "sessions").glob("*/archive_owed.json"):
         try:
-            days.append(date.fromisoformat(marker.parent.name))
+            day = date.fromisoformat(marker.parent.name)
         except ValueError:
             LOG.warning("Ignoring %s: its folder is not named for a session date", marker)
-    return sorted(days)
+            continue
+        try:
+            counts = json.loads(marker.read_text(encoding="utf-8"))["session_skip_counts"]
+            if not (isinstance(counts, dict)
+                    and all(isinstance(reason, str) and type(count) is int for reason, count in counts.items())):
+                raise ValueError(f"session_skip_counts is not a tally: {counts!r}")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            LOG.warning("Could not read the skip tally in %s, so the %s archive's is empty: %s: %s",
+                        marker, day, type(exc).__name__, exc)
+            counts = {}
+        owed[day] = counts
+    return dict(sorted(owed.items()))
 
 
 def export_session_archive(
@@ -1343,8 +1359,9 @@ def export_session_archive(
         False when the exporting process did not run the session: it
         started after the day's 20:00 ET end (the engine then exports only a
         day without an archive), or writes a day an earlier shutdown left
-        owed (``archive_owed.json``). Its bars, account snapshot and skip
-        tally are then its own. Recorded in the manifest.
+        owed (``archive_owed.json``). Its bars and account snapshot are then
+        its own, and so is the skip tally (empty) but for the one such a
+        shutdown left. Recorded in the manifest.
     """
     log_dir_path = Path(str(log_dir or ".logs"))
     archive_root = session_archive_root(log_dir, session_date)

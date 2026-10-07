@@ -382,11 +382,14 @@ class IntradayBot:
         # has none (no manifest.json, e.g. the process that ran it was killed
         # before 20:00), marked `exporter_ran_session: false`, since the
         # bars, account snapshot and skip tally are its own; an archive the
-        # day has is the session's and is left as it is. Its trades go to
-        # trades.csv at its shutdown either way (`_append_trades_csv`). An
-        # archive an earlier shutdown left owed (it ran out of time, or the
-        # export failed: `archive_owed.json`) of a day that has ended is
-        # written the same way, outside the trading days' stream windows.
+        # day has is the session's and is left as it is. It owes the day the
+        # append either way, so its own trades of that evening (an exit its
+        # start-up reconcile books) reach trades.csv on its first pass, not
+        # only at its shutdown (`_append_trades_csv`). An archive an earlier
+        # shutdown left owed (it ran out of time, or the export failed:
+        # `archive_owed.json`) of a day that has ended is written the same
+        # way, with the skip tally that shutdown left with it, outside the
+        # trading days' stream windows.
         self._day_closes: dict[date, _DayClose] = {}
         # `run`'s stop signals, while it runs: the shutdown's export budget
         # counts from the first (`_since_stop_signal`).
@@ -397,7 +400,7 @@ class IntradayBot:
         self._last_pass_day: date = started.date()
         self._closes_scheduled_through: date = self._latest_ended_trading_day(started)
         ended = self._closes_scheduled_through
-        for day in owed_session_archives(self.config.runtime.log_dir):
+        for day, skip_counts in owed_session_archives(self.config.runtime.log_dir).items():
             if day > ended:
                 continue          # still running: this process closes it at its 20:00
             if not self.config.runtime.export_session_archive:
@@ -406,8 +409,9 @@ class IntradayBot:
             LOG.info("The %s archive was left owed by an earlier shutdown: this process writes it "
                      "(exporter_ran_session=false), outside the trading days' stream windows", day)
             self._day_closes[day] = _DayClose(summary=False, archive=True, ran_session=False, append=False,
-                                              carried=True)
+                                              skip_counts=skip_counts, carried=True)
         if ended == started.date() and ended not in self._day_closes:
+            archive = False
             if not self.config.runtime.export_session_archive:
                 LOG.info("Started after the %s session ended: its session report is left as it is", ended)
             elif session_archive_manifest_path(self.config.runtime.log_dir, ended).exists():
@@ -416,7 +420,8 @@ class IntradayBot:
             else:
                 LOG.info("Started after the %s session ended: its session report is left as it is; the day has no "
                          "archive, so this process writes one (exporter_ran_session=false)", ended)
-                self._day_closes[ended] = _DayClose(summary=False, archive=True, ran_session=False)
+                archive = True
+            self._day_closes[ended] = _DayClose(summary=False, archive=archive, ran_session=False)
         # ET session date last seen by `_maybe_session_rollover_reset`.
         # Used to clear `entry_gatekeeper.session_skip_counts` when the
         # ET date rolls. Without this, an always-on bot accumulates
@@ -1337,9 +1342,9 @@ class IntradayBot:
 
     def _leave_archive_owed(self, day: date, why: str) -> None:
         """Leave ``day``'s archive, which this shutdown did not write, to the
-        next start (``archive_owed.json``)."""
+        next start (``archive_owed.json``), with the day's skip tally."""
         try:
-            leave_session_archive_owed(self.config.runtime.log_dir, day, why)
+            leave_session_archive_owed(self.config.runtime.log_dir, day, why, self._day_closes[day].skip_counts)
         except OSError as exc:
             LOG.error("Shutdown: the %s archive is not written (%s) and could not be left owed for the next start: "
                       "%s: %s", day, why, type(exc).__name__, exc)

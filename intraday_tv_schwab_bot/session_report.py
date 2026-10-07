@@ -135,8 +135,8 @@ def read_trade_rows(csv_path: Path, session_date: str) -> list[dict[str, str]]:
     (TimeoutError, an OSError, on a lock it could not take), and ValueError
     when a row of that day sits under a header other than
     ``TRADE_CSV_COLUMNS`` (a file an older version wrote, which the next
-    append of a trade rotates, carrying the rows of the day it closes):
-    those rows cannot be read as the current columns.
+    append rotates, carrying the rows of the day it closes, unless the
+    rotation failed): those rows cannot be read as the current columns.
     """
     if not csv_path.exists():
         return []
@@ -1046,16 +1046,19 @@ def append_trades_csv(trades: Iterable[TradeRecord], *, log_dir: str, session_da
     header no longer has left out, named in the WARNING), so the day's
     archive and manifest still hold the rows an earlier process wrote that
     day. The fresh file is written before it replaces the old one, so a
-    failure leaves the old file in place.
+    failure leaves the old file in place. It runs at the first append after
+    the upgrade whether or not there is a trade to write: with none, the
+    append is True whatever the rotation did (a file it cannot read, or a
+    rotation that fails, is logged, and the archive's read then names it).
     """
     rows: list[dict[str, Any]] = []
     for trade in closed_trade_lifecycles(trades):
         exit_day = _exit_date(trade)
         if exit_day is not None:
             rows.append(trade_csv_row(trade, exit_day.isoformat()))
-    if not rows:
-        return True
     log_path = Path(log_dir)
+    if not rows and not (log_path / "trades.csv").exists():
+        return True
     try:
         log_path.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -1074,7 +1077,8 @@ def append_trades_csv(trades: Iterable[TradeRecord], *, log_dir: str, session_da
 
 def _append_rows(csv_path: Path, rows: list[dict[str, Any]], day: str) -> bool:
     """``append_trades_csv`` under the lock: write the ``rows`` that
-    ``csv_path`` lacks, rotating a file under an older header."""
+    ``csv_path`` lacks, rotating a file under an older header (with no
+    ``rows`` too; True then, whether or not the rotation could run)."""
     header: list[str] | None = None
     file_rows: list[dict[str, Any]] = []
     if csv_path.exists():
@@ -1084,6 +1088,9 @@ def _append_rows(csv_path: Path, rows: list[dict[str, Any]], day: str) -> bool:
                 file_rows = list(reader)
                 header = list(reader.fieldnames) if reader.fieldnames is not None else None
         except (OSError, csv.Error, UnicodeDecodeError) as exc:
+            if not rows:
+                LOG.warning("Could not read %s to check its header: %s: %s", csv_path, type(exc).__name__, exc)
+                return True
             LOG.warning("Could not read %s, so %d trades were not appended: %s: %s",
                         csv_path, len(rows), type(exc).__name__, exc)
             return False
@@ -1097,10 +1104,11 @@ def _append_rows(csv_path: Path, rows: list[dict[str, Any]], day: str) -> bool:
     new_rows = [row for row in rows if (row["date"], trade_csv_key(row)) not in held]
     if len(new_rows) < len(rows):
         LOG.info("%d of this process's %d trades already in %s", len(rows) - len(new_rows), len(rows), csv_path)
+    if rotate:
+        # With nothing to append too, so the day's archive reads its rows.
+        return _rotate_trades_csv(csv_path, header, carried, new_rows, day) or not new_rows
     if not new_rows:
         return True
-    if rotate:
-        return _rotate_trades_csv(csv_path, header, carried, new_rows, day)
     # One write in append mode (O_APPEND), a new file's header with it. A
     # write that fails part-way (a full disk) can leave the rows written
     # before it and a cut-off last line; the next append ends that line
@@ -1212,11 +1220,12 @@ def _rotate_trades_csv(csv_path: Path, header: list[str] | None, carried: list[d
         shutil.copy2(csv_path, archive)
         os.replace(fresh, csv_path)
     except OSError as exc:
-        LOG.warning("Could not rotate trades.csv to %s, so %d trades were not appended: %s: %s",
-                    archive, len(new_rows), type(exc).__name__, exc)
+        LOG.warning("Could not rotate trades.csv to %s%s: %s: %s", archive,
+                    f", so {len(new_rows)} trades were not appended" if new_rows else "", type(exc).__name__, exc)
         # Nothing replaced the old file: drop the copies of it.
         fresh.unlink(missing_ok=True)
         archive.unlink(missing_ok=True)
         return False
-    LOG.info("Session trades appended to %s (%d rows)", csv_path, len(new_rows))
+    if new_rows:
+        LOG.info("Session trades appended to %s (%d rows)", csv_path, len(new_rows))
     return True
