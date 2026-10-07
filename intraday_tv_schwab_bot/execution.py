@@ -132,6 +132,10 @@ class BracketCancel:
     filled_qty: int = 0
     fill_price: float | None = None
     fill_reason: str | None = None
+    # True when fill_price is not an execution price for every fill it
+    # averages (broker_payloads.order_fill_price_estimated): the exit is
+    # booked at it, but no slippage is measured from it.
+    fill_price_estimated: bool = False
 
 
 class SchwabExecutor:
@@ -1652,7 +1656,9 @@ class SchwabExecutor:
         A stop that triggered after this cycle's fill reconcile has already
         sold those shares; the caller must book them and exit only the rest.
         A disaster stop's fills carry ``disaster_stop``, a bracket stop's
-        ``broker_stop`` (``protective_stop_reason``).
+        ``broker_stop`` (``protective_stop_reason``). Their price is flagged
+        estimated when any of them was reported without executions
+        (``collect_protective_fills``).
         """
         if not isinstance(bracket, dict):
             return BracketCancel(True, "no_bracket")
@@ -1663,7 +1669,7 @@ class SchwabExecutor:
             return BracketCancel(True, "no_resting_orders")
         ok = True
         messages: list[str] = []
-        fills: dict[str, tuple[int, float | None, str]] = {}
+        fills: dict[str, tuple[int, float | None, str, bool]] = {}
         stop_reason = protective_stop_reason(bracket)
         if wrapper_id:
             cancel_ok, msg, payload = self._cancel_live_equity_order(wrapper_id)
@@ -1687,20 +1693,24 @@ class SchwabExecutor:
         # still carries it and reports them again (2026-09-25).
         for oid, booked in (bracket.get("booked_child_fills") or {}).items():
             if str(oid) in fills:
-                qty, px, kind = fills[str(oid)]
+                qty, px, kind, estimated = fills[str(oid)]
                 if qty - int(booked) > 0:
-                    fills[str(oid)] = (qty - int(booked), px, kind)
+                    fills[str(oid)] = (qty - int(booked), px, kind, estimated)
                 else:
                     del fills[str(oid)]
         if ok:
             bracket["active"] = False
             bracket["state"] = "canceled"
-        filled_qty = sum(qty for qty, _px, _kind in fills.values())
-        priced = [(qty, px) for qty, px, _kind in fills.values() if px is not None]
+        filled_qty = sum(qty for qty, _px, _kind, _estimated in fills.values())
+        priced = [(qty, px) for qty, px, _kind, _estimated in fills.values() if px is not None]
         priced_qty = sum(qty for qty, _px in priced)
         fill_price = sum(qty * px for qty, px in priced) / priced_qty if priced_qty > 0 else None
         fill_reason = max(fills.values(), key=lambda fill: fill[0])[2] if fills else None
-        return BracketCancel(ok, ",".join(messages), int(filled_qty), fill_price, fill_reason)
+        # Estimated when any fill it covers is: one priced off its order's
+        # own price, or one with no price at all.
+        fill_price_estimated = any(estimated for _qty, _px, _kind, estimated in fills.values())
+        return BracketCancel(ok, ",".join(messages), int(filled_qty), fill_price, fill_reason,
+                             fill_price_estimated)
 
     def _finalize_bracket_protection(self, result: OrderResult, request: OrderRequest, side: Side,
                                      stop_price: float, target_price: float | None,

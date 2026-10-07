@@ -5199,6 +5199,60 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An exit fill the broker reports without execution legs is booked
+  flagged estimated, with no exit slippage, and a later slice of an exit
+  order is priced as its own fills (`fill_price_estimated`,
+  `exit_slippage`, `exit_slippage_r`).** *2026-10-06* —
+  `broker_payloads.order_fill_price` has always fallen back to the order's
+  own price (a LIMIT's limit, `filledPrice`, `averagePrice`) when a payload
+  reports no execution legs, and since the entry slippage fix
+  `order_fill_price_estimated` says so, but the exits decided the flag from
+  a missing price alone: an exit booked at its order's limit read as a
+  real fill, so `trades.csv`'s `fill_price_estimated` was false and
+  EXIT_CONTEXT's `exit_slippage` / `exit_slippage_r` were measured with
+  the limit standing in for the fill. Such an exit is still booked at the
+  same price; only the flag and the slippage fields change. Whether the
+  broker reported execution legs is read off the order's
+  `orderActivityCollection`; that reading has not yet been checked against
+  a live Schwab fill payload.
+  - The engine's own exit reads `OrderResult.fill_price_estimated`, and
+    stamps the slippage only at an execution price.
+  - A resting bracket child that filled, an exit order left working that
+    filled later, and a dead stop's own fills booked while its bracket's
+    cancel is unconfirmed read the order row's `fill_price_estimated`; a
+    row without the flag reads as estimated.
+  - What a bracket's children filled before its cancel landed:
+    `collect_protective_fills` records each fill's flag, and
+    `BracketCancel.fill_price_estimated` (new) is true when any fill it
+    covers was reported without execution legs or without a price. The
+    startup reconcile's settle books those fills through the same path.
+  - A disaster stop sent with an unknown outcome that filled: the
+    `extract_orders` rows carry `fillPriceEstimated` beside `fillPrice`.
+  - A paper fill (a dry run's simulated result) stays unflagged.
+  - A later fill of an order already partly booked is priced as its own
+    fills, the order's average less what the booked part was booked at
+    (`broker_payloads.unbooked_fill_price`), as the late fills of an entry
+    order are: the rest of an exit order left working after part of it was
+    booked; of a resting stop an unconfirmed stop's lookup booked from (its
+    fill, a later lookup, or its own fills when it dies with its bracket's
+    cancel unconfirmed) or the startup restore adopted with fills; and what
+    a cancel reports beyond those. It is estimated when the order's average
+    or the booked part's price is not an execution price. Until now it was
+    booked at the order's whole average, read as an execution price: 40
+    booked at 98.00 and the 60 that followed at 97.00 booked the 60 at
+    97.40, understating the loss by $24 in the realized P&L the daily-loss
+    check reads, with slippage measured from 97.40. A dead stop's own
+    fills booked with its cancel unconfirmed are also net of what was
+    booked of it already, which they booked again.
+  - Upgrade note: rows of `trades.csv` and EXIT_CONTEXT records written
+    before this change may hold an exit priced at its order's own price,
+    or a later slice at its order's average, flagged as an execution price
+    with slippage measured from it. The bracket record gains
+    `booked_child_notional` beside `booked_child_fills`, and the working
+    exit order's record `booked_notional` and `booked_price_estimated`; a
+    record saved before the upgrade carries none, so a later slice of an
+    order it booked part of is booked at the order's average, estimated.
+
 - **The Schwab refresh token's issue and expiry, and when schwabdev will ask
   for a new login, are logged at start-up and on the first pass of each
   trading day: a WARNING when that login falls before the session after the

@@ -957,7 +957,11 @@ class PositionManager:
             self._book_broker_exit(
                 key, position, exit_qty, float(fill_price), ExitDecision(reason, "risk"), bars,
                 result_message="bracket_child_filled", attempt_status="broker_bracket",
-                fill_price_estimated=state.get("fill_price") is None, exit_limits_missed=None,
+                # The resting level, or the order's own price: not an
+                # execution price (broker_payloads.order_fill_price_estimated).
+                fill_price_estimated=(state.get("fill_price") is None
+                                      or state.get("fill_price_estimated") is not False),
+                exit_limits_missed=None,
             )
             if key not in self.positions:
                 # The OCO normally takes the sibling down, but a child moved
@@ -1088,7 +1092,8 @@ class PositionManager:
                 self.book_bracket_cancel_fills(
                     key, position, bracket,
                     BracketCancel(False, leftover.message, dead_filled, safe_float(child_state.get("fill_price"), None),
-                                  protective_stop_reason(bracket) if child == "stop" else "broker_target"),
+                                  protective_stop_reason(bracket) if child == "stop" else "broker_target",
+                                  child_state.get("fill_price_estimated") is not False),
                     None, bars,
                 )
                 # The wrapper still lists the dead child; a later cancel of it
@@ -1169,7 +1174,7 @@ class PositionManager:
                                                    f"{reason} order(s) before their cancel"),
             float(fill_price), ExitDecision(reason, "risk"), bars,
             result_message="bracket_child_filled_before_cancel", attempt_status="broker_bracket",
-            fill_price_estimated=cancel.fill_price is None, exit_limits_missed=None,
+            fill_price_estimated=cancel.fill_price is None or cancel.fill_price_estimated, exit_limits_missed=None,
         )
 
     def _sync_bracket_children(self, key: str, position: Position, last_price: float | None, bars) -> None:
@@ -1584,6 +1589,9 @@ class PositionManager:
                                                 "booked_child_fills": dict(booked), "active": False,
                                                 "state": f"filled:{DISASTER_STOP_REASON}"}
                 fill_price = safe_float(match.get("fillPrice"), None, finite=True)
+                # The level sent, or the order's own price: not an execution
+                # price (broker_payloads.order_fill_price_estimated).
+                fill_price_estimated = fill_price is None or match.get("fillPriceEstimated") is not False
                 LOG.warning("Disaster stop %s for %s, sent with an unknown outcome, is %s having filled %s share(s); "
                             "booking the %s not booked yet", order_id, key, match["status"], filled, unbooked)
                 self._book_broker_exit(
@@ -1591,7 +1599,8 @@ class PositionManager:
                     float(fill_price if fill_price is not None else record["stop_price"]),
                     ExitDecision(DISASTER_STOP_REASON, "risk"), bars,
                     result_message=f"unconfirmed_disaster_stop_filled:{match['status']}",
-                    attempt_status="broker_bracket", fill_price_estimated=fill_price is None, exit_limits_missed=None,
+                    attempt_status="broker_bracket", fill_price_estimated=fill_price_estimated,
+                    exit_limits_missed=None,
                 )
                 if key not in self.positions:
                     return "closed", None
@@ -1894,7 +1903,10 @@ class PositionManager:
             self._book_broker_exit(
                 key, position, slice_qty, float(exit_price), decision, bars,
                 result_message=f"working_exit_filled:{state.get('status')}", attempt_status="broker_working_exit",
-                fill_price_estimated=broker_price is None, exit_limits_missed=record.get("exit_limits_missed"),
+                # The mark, or the order's own price: not an execution price
+                # (broker_payloads.order_fill_price_estimated).
+                fill_price_estimated=broker_price is None or state.get("fill_price_estimated") is not False,
+                exit_limits_missed=record.get("exit_limits_missed"),
             )
             if key not in self.positions:
                 # A bracket still resting beside the order that closed the
@@ -2462,12 +2474,15 @@ class PositionManager:
             # estimated, so the quantity is right and P&L reads flat.
             LOG.error("Exit fill price unavailable for %s after a filled close_position(); booking at entry price (estimated)", key)
             exit_price = float(position.entry_price)
-        if fill_price is not None:
+        # A fill priced off its order's own price (a LIMIT's limit: the
+        # broker reported no executions) is booked at it, flagged estimated,
+        # and measures no slippage (OrderResult.fill_price_estimated).
+        fill_price_estimated = fill_price is None or result.fill_price_estimated
+        if not fill_price_estimated:
             exit_context.update(self._exit_fill_fields(position, exit_context, fill_price))
         exited_position = copy.copy(position)
         exited_position.qty = exit_qty
         remaining_qty_after_exit = max(0, int(position.qty) - int(exit_qty))
-        fill_price_estimated = fill_price is None
         final_exit = exit_qty >= position.qty
         realized = self.account.record_exit(
             exited_position,

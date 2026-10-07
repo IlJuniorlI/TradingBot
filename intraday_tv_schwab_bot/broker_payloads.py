@@ -131,7 +131,9 @@ def extract_orders(payload: Any) -> list[dict[str, Any]]:
     The rows carry what the readers match on: the symbols and instructions
     of the legs, the order and strategy types, ``stopPrice``, ``quantity``,
     ``filledQuantity`` and ``fillPrice`` (None where the order does not
-    carry it as a finite number), and ``replacementId``, the order that
+    carry it as a finite number), ``fillPriceEstimated`` (True when
+    ``fillPrice`` is not an execution price: ``order_fill_price_estimated``),
+    and ``replacementId``, the order that
     REPLACED it (``order_replacement_id``). The disaster stop's
     unknown-outcome lookup reads every status, since the stop a lost
     response placed may have filled, died or been replaced since
@@ -171,6 +173,7 @@ def extract_orders(payload: Any) -> list[dict[str, Any]]:
             "quantity": safe_int(row.get("quantity")),
             "filledQuantity": order_filled_qty(row),
             "fillPrice": order_fill_price(row),
+            "fillPriceEstimated": order_fill_price_estimated(row),
             "replacementId": order_replacement_id(row),
         })
     return out
@@ -434,13 +437,15 @@ def flatten_order_tree(node: Any, out: dict[str, dict[str, Any]]) -> None:
     flatten_order_tree(node.get("childOrderStrategies"), out)
 
 
-def collect_protective_fills(payload: Any, into: dict[str, tuple[int, float | None, str]], *,
+def collect_protective_fills(payload: Any, into: dict[str, tuple[int, float | None, str, bool]], *,
                              stop_reason: str) -> None:
-    """Record ``order_id -> (filled_qty, fill_price, exit reason)`` for every
-    protective leg in *payload* that has fills: a stop leg's reason is
-    *stop_reason* (``protective_stop_reason`` of its record), a limit's
-    ``broker_target``. Keyed by order id so a leg seen both under its
-    wrapper and on its own is counted once."""
+    """Record ``order_id -> (filled_qty, fill_price, exit reason,
+    fill_price_estimated)`` for every protective leg in *payload* that has
+    fills: a stop leg's reason is *stop_reason* (``protective_stop_reason``
+    of its record), a limit's ``broker_target``; the flag is True when
+    ``fill_price`` is not an execution price (``order_fill_price_estimated``).
+    Keyed by order id so a leg seen both under its wrapper and on its own is
+    counted once."""
     if isinstance(payload, list):
         for node in payload:
             collect_protective_fills(node, into, stop_reason=stop_reason)
@@ -453,7 +458,8 @@ def collect_protective_fills(payload: Any, into: dict[str, tuple[int, float | No
         if filled_qty > 0:
             order_type = str(payload.get("orderType") or "").upper()
             reason = stop_reason if order_type in STOP_ORDER_TYPES else "broker_target"
-            into[str(order_id)] = (int(filled_qty), order_fill_price(payload), reason)
+            into[str(order_id)] = (int(filled_qty), order_fill_price(payload), reason,
+                                   order_fill_price_estimated(payload))
     collect_protective_fills(payload.get("childOrderStrategies"), into, stop_reason=stop_reason)
 
 
