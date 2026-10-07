@@ -356,21 +356,21 @@ def _htf_clearance(sr_ctx, kind: str) -> tuple[float | None, float | None, Level
     rule in 5 of those 573 samples.
 
     Without a pending level the room is measured to the nearest level playing
-    the role (``support_resistance.role_level``): a confirmed flip between
-    price and ``nearest_*`` -- a lost support under the resistance over a
-    LONG, a reclaimed resistance over the support under a SHORT -- is that
-    level. Until 2026-10-07 the room was measured to ``nearest_*``, a cluster
-    published at its strongest member's price, past a flip inside it (TSM
-    2026-10-06: a LONG at 484.30 read 0.273% to 485.62 and passed the 0.25%
-    minimum; the lost support at 485.42 left 0.231%). The room to
-    ``nearest_*`` itself is the context's own distance.
+    the role at the context's price (``support_resistance.role_level``): a
+    confirmed flip between price and ``nearest_*`` -- a lost support under
+    the resistance over a LONG, a reclaimed resistance over the support under
+    a SHORT -- is that level. Until 2026-10-07 the room was measured to
+    ``nearest_*``, a cluster published at its strongest member's price, past
+    a flip inside it (TSM 2026-10-06: a LONG at 484.30 read 0.273% to 485.62
+    and passed the 0.25% minimum; the lost support at 485.42 left 0.231%).
+    The room to ``nearest_*`` itself is the context's own distance.
     """
     close = float(sr_ctx.current_price)
     support = kind == "support"
     level = sr_ctx.pending_support if support else sr_ctx.pending_resistance
     flip = None
     if level is None:
-        level = role_level(sr_ctx, kind)
+        level = role_level(sr_ctx, kind, price=close)
         flip = sr_ctx.broken_resistance if support else sr_ctx.broken_support
         if level is None or level is not flip:
             if support:
@@ -1733,6 +1733,25 @@ class SharedEntryPolicy:
         # No breakdown escape, symmetric with the bullish path above.
         return too_close
 
+    @staticmethod
+    def _sr_cap_levels(sr_ctx, role: str, close: float) -> tuple[Level, ...]:
+        """The opposing levels the S/R refinement tries to cap a target at,
+        in turn: the nearest level playing ``role`` at the proposal's
+        ``close`` (``support_resistance.role_level``) and, when that is a
+        confirmed flip, ``nearest_*`` after it.
+
+        A flip between the close and ``nearest_*`` caps first (2026-10-07).
+        When its cap fails the R:R floor, ``nearest_*``'s cap is tried, as
+        before, so a flip never leaves a target further out than
+        ``nearest_*`` capped it. A LONG at 100.00, stop 99.50, target 103.00,
+        nearest_resistance 101.00, a lost support at 100.30, level_buffer
+        0.10: the cap under the flip (100.20, 0.4R) fails the 1.0 floor and
+        the cap under 101.00 (100.90, 1.8R) holds. With the flip's cap alone
+        the target stayed at 103.00, past both levels."""
+        nearest = sr_ctx.nearest_resistance if role == "resistance" else sr_ctx.nearest_support
+        level = role_level(sr_ctx, role, price=close)
+        return tuple(lv for lv in ((level,) if level is nearest else (level, nearest)) if lv is not None)
+
     def _refine_bullish_sr_levels(self, close: float, stop: float, target: float | None, sr_ctx, frame: pd.DataFrame | None):
         if not self.config.shared_entry.use_sr_stop_target_refinement:
             return float(stop), (None if target is None else float(target))
@@ -1744,18 +1763,21 @@ class SharedEntryPolicy:
                     close, stop, max(float(stop), support_stop),
                     last_bar_atr(frame, close),
                 )
-        # The cap reads the nearest level playing the resistance role: a
-        # lost support between price and nearest_resistance caps it
-        # (``role_level``, 2026-10-07). The stop anchor stays nearest_support.
-        resistance = role_level(sr_ctx, "resistance") if target is not None else None
-        if resistance is not None and close < float(resistance.price):
-            capped_target = max(close * 1.001, float(resistance.price) - level_buffer)
-            proposed_target = min(float(target), capped_target)
-            # R:R floor: only accept the cap if the resulting reward is still
-            # tradeable. Without this guard, a nearby resistance can crush
-            # R:R toward zero ($0.10 targets, etc.).
-            if self._target_meets_min_rr(Side.LONG, close, stop, proposed_target):
-                target = proposed_target
+        # The cap: just under the resistance over the close, the nearest
+        # level playing the role first (``_sr_cap_levels``). The stop anchor
+        # stays nearest_support.
+        if target is not None:
+            for resistance in self._sr_cap_levels(sr_ctx, "resistance", close):
+                if close >= float(resistance.price):
+                    continue
+                capped_target = max(close * 1.001, float(resistance.price) - level_buffer)
+                proposed_target = min(float(target), capped_target)
+                # R:R floor: only accept the cap if the resulting reward is still
+                # tradeable. Without this guard, a nearby resistance can crush
+                # R:R toward zero ($0.10 targets, etc.).
+                if self._target_meets_min_rr(Side.LONG, close, stop, proposed_target):
+                    target = proposed_target
+                    break
         return float(stop), (None if target is None else float(target))
 
     def _refine_bearish_sr_levels(self, close: float, stop: float, target: float | None, sr_ctx, frame: pd.DataFrame | None):
@@ -1769,15 +1791,18 @@ class SharedEntryPolicy:
                     close, stop, min(float(stop), resistance_stop),
                     last_bar_atr(frame, close),
                 )
-        # Mirror: a reclaimed resistance between nearest_support and price
-        # caps it.
-        support = role_level(sr_ctx, "support") if target is not None else None
-        if support is not None and close > float(support.price):
-            capped_target = min(close * 0.999, float(support.price) + level_buffer)
-            proposed_target = max(float(target), capped_target)
-            # R:R floor — see comment on the bullish twin above.
-            if self._target_meets_min_rr(Side.SHORT, close, stop, proposed_target):
-                target = proposed_target
+        # Mirror: just over the support under the close, a reclaimed
+        # resistance between nearest_support and the close first.
+        if target is not None:
+            for support in self._sr_cap_levels(sr_ctx, "support", close):
+                if close <= float(support.price):
+                    continue
+                capped_target = min(close * 0.999, float(support.price) + level_buffer)
+                proposed_target = max(float(target), capped_target)
+                # R:R floor — see comment on the bullish twin above.
+                if self._target_meets_min_rr(Side.SHORT, close, stop, proposed_target):
+                    target = proposed_target
+                    break
         return float(stop), (None if target is None else float(target))
 
     def _bullish_sr_block_reason(self, sr_ctx) -> str:

@@ -508,16 +508,16 @@ def _merge_level_group(group: list[Level], current_price: float) -> Level:
 
 
 
-def _rung_holding(rungs: list[Level], candidates: list[Level], level: Level | None, tolerance: float) -> Level | None:
+def _rung_holding(rungs: list[Level], candidates: list[Level], level: Level, tolerance: float) -> Level | None:
     """The rung of ``rungs`` -- a ladder side collapsed from ``candidates``
     at ``tolerance`` (``collapse_same_side_levels``) -- whose cluster holds
-    the candidate at ``level``'s price. None without ``level``, or when no
-    candidate sits at its price (a confirmed flip on the far side of price
-    is in no rung of this side). The clusters are contiguous price ranges,
-    each published at one of its own members' prices, so the cluster's rung
-    is the one inside its range."""
-    if level is None:
-        return None
+    the candidate at ``level``'s price. None when no candidate sits at its
+    price (a confirmed flip on the far side of price is in no rung of this
+    side). The clusters are contiguous price ranges, each published at one
+    of its own members' prices, so the cluster's rung is the one inside its
+    range; a cluster can span more than ``tolerance`` (each member joins
+    within it of the running mean), so the flip's cluster is found by the
+    flip's own price, not by distance."""
     for group in cluster_levels_by_tolerance(candidates, tolerance):
         prices = [float(member.price) for member in group]
         if float(level.price) in prices:
@@ -542,20 +542,25 @@ def _reconcile_flipped_levels(
     pool (``support_candidates`` / ``resistance_candidates``), before this
     step and cuts it to ``max_levels_per_side`` after it.
 
-    A flip's own rung survives the other flip's drop: the support rung whose
-    cluster holds the reclaimed resistance, the resistance rung whose cluster
-    holds the lost support (``_rung_holding``). When the two flips lie within
-    ``tolerance`` of each other either side of price, each one's rung lies
-    within the tolerance of the other, and until 2026-10-07 the drop took
-    both: GOOG 2026-09-29 10:55 at 336.745, supports [336.298, 334.03] became
-    [334.03] and resistances [336.84, 338.19] became [338.19], so every gate
-    measured to levels about 1.1 ATR away while the flips sat 0.2-0.3 ATR
-    from price (3.1% of 6,500 archived checkpoints). The rung kept is the one
-    holding the flip, not every rung within the tolerance of it: a plain
-    support between the reclaimed resistance and price, in a cluster of its
-    own, sits within the tolerance of both flips and is a stale member of the
-    lost zone, so it still goes; and a cluster holding the flip but published
-    at a stronger member's price is still the flip's rung, so it stays.
+    When a reclaimed resistance under price and a lost support over it lie
+    within ``tolerance`` of each other, each flip's own rung survives the
+    other flip's drop: the support rung whose cluster holds the reclaimed
+    resistance, the resistance rung whose cluster holds the lost support
+    (``_rung_holding``). Until 2026-10-07 the drop took both: GOOG
+    2026-09-29 10:55 at 336.745, supports [336.298, 334.03] became [334.03]
+    and resistances [336.84, 338.19] became [338.19], so every gate measured
+    to levels about 1.1 ATR away while the flips sat 0.2-0.3 ATR from price
+    (3.1% of 6,500 archived checkpoints). The rung kept is the one holding
+    the flip, not every rung within the tolerance of it: a plain support
+    between the reclaimed resistance and price, in a cluster of its own,
+    sits within the tolerance of both flips and is a stale member of the
+    lost zone, so it still goes; and a cluster holding the flip but
+    published at a stronger member's price is still the flip's rung, so it
+    stays. With the flips farther apart, or one of them alone, the drop is
+    as before, so the ladder changes only in this geometry: a wide cluster
+    holding a reclaimed resistance more than the tolerance under the lost
+    support, published at a member within the tolerance of the lost
+    support, still goes.
 
     Until 2026-09-27 the builder cut each side before this step, and this
     step collapsed the survivors a second time, even with no broken level. A
@@ -570,6 +575,13 @@ def _reconcile_flipped_levels(
         survivors = drop_levels_near_price(rungs, float(flip.price), tolerance=tolerance)
         return [rung for rung in rungs if rung is own or rung in survivors]
 
+    # The close-flips geometry, measured as the drop measures
+    # (``drop_levels_near_price``): only there does a flip keep its rung.
+    if (
+        broken_support is None or broken_resistance is None
+        or abs(float(broken_support.price) - float(broken_resistance.price)) > max(float(tolerance), 1e-9)
+    ):
+        return drop_near(supports, broken_support, None), drop_near(resistances, broken_resistance, None)
     return (
         drop_near(supports, broken_support, _rung_holding(supports, support_candidates, broken_resistance, tolerance)),
         drop_near(resistances, broken_resistance, _rung_holding(resistances, resistance_candidates, broken_support, tolerance)),
@@ -724,8 +736,8 @@ def _role_level(role: str, close: float, nearest: Level | None, broken: Level | 
     ``close`` counts, as a ladder level at price does (no room); a flip on
     the wrong side of price (``detect_broken_levels`` keeps one within the
     merge tolerance across it) is no candidate; a tie goes to ``nearest``.
-    ``role_level`` reads it off a built context; the builder's ``near_*``
-    read it here."""
+    ``role_level`` reads it off a built context at the reader's price; the
+    builder's ``near_*`` read it here at the build's close."""
     if role == "resistance":
         flip_counts = broken is not None and float(broken.price) >= close and (
             nearest is None or float(broken.price) < float(nearest.price))
@@ -737,12 +749,20 @@ def _role_level(role: str, close: float, nearest: Level | None, broken: Level | 
     return broken if flip_counts else nearest
 
 
-def role_level(sr_ctx: SupportResistanceContext, role: str) -> Level | None:
-    """The nearest level playing ``role`` on its side of price in
+def role_level(sr_ctx: SupportResistanceContext, role: str, *, price: float) -> Level | None:
+    """The nearest level playing ``role`` on its side of ``price`` in
     ``sr_ctx`` (``_role_level``): the resistance over a LONG is
     ``nearest_resistance`` or a lost support (``broken_support``) between
     price and it, the support under a SHORT ``nearest_support`` or a
     reclaimed resistance (``broken_resistance``) between it and price.
+
+    ``price`` is the reader's own. The clearance veto and the proximity
+    score measure from the context's (``sr_ctx.current_price``); the
+    refinement's target caps, top_tier's Fix G and sr_scalp's builder and
+    scorer from the close they judge. A flip on the wrong side of the
+    reader's price is no candidate, so a reader whose close has already
+    passed the flip reads ``nearest_*``, as before 2026-10-07, rather than
+    no level at all.
 
     A ladder rung is a cluster published at its strongest member's price,
     so a confirmed flip can sit between price and the nearest rung as a
@@ -755,12 +775,14 @@ def role_level(sr_ctx: SupportResistanceContext, role: str) -> Level | None:
     484.30 read 0.273% of room to 485.62 and passed the 0.25% minimum,
     where the flip left 0.231%. Readers: the S/R clearance veto and the
     proximity score (``shared_entry._htf_clearance``, after a pending
-    level), the refinement's target caps, ``near_*``, top_tier's Fix G and
-    sr_scalp's target. The stop anchors, the ladders and the published
-    ``nearest_*`` with their distances still read the clusters."""
+    level), the refinement's target caps (a flip's cap that fails the R:R
+    floor falls back to ``nearest_*``'s), ``near_*``, top_tier's Fix G,
+    and sr_scalp's target and its scorer's room to ride. The stop anchors,
+    the ladders and the published ``nearest_*`` with their distances still
+    read the clusters."""
     if role == "resistance":
-        return _role_level(role, float(sr_ctx.current_price), sr_ctx.nearest_resistance, sr_ctx.broken_support)
-    return _role_level(role, float(sr_ctx.current_price), sr_ctx.nearest_support, sr_ctx.broken_resistance)
+        return _role_level(role, float(price), sr_ctx.nearest_resistance, sr_ctx.broken_support)
+    return _role_level(role, float(price), sr_ctx.nearest_support, sr_ctx.broken_resistance)
 
 
 def _compute_level_proximity_metrics(

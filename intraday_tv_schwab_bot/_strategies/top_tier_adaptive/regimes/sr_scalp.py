@@ -50,8 +50,10 @@ class SrScalpRegimeMixin:
                   rather than a fresh nearest-level zone
           * +1.0  bounce/rejection bar character (LONG: lower wick >= 0.30 ;
                   SHORT: upper wick >= 0.30)
-          * +1.0  room to ride: inner gap to the opposite nearest zone clears
-                  the build's required distance (a ladder exists to ride to)
+          * +1.0  room to ride: inner gap to the builder's target zone (the
+                  nearest level playing the opposite role at the close,
+                  ``role_level``) clears the build's required distance (a
+                  ladder exists to ride to)
         """
         if sr_ctx is None or atr <= 0 or close <= 0:
             return 0.0
@@ -111,9 +113,18 @@ class SrScalpRegimeMixin:
 
         # Room is measured from the zone the setup leans on: a pending level
         # that price is inside of sits nearer the target than the next level
-        # beyond it, so it bounds the ride, as in the builder.
-        lower_px = psup_px if (side == Side.LONG and _near_support(psup_px)) else sup_px
-        upper_px = pres_px if (side == Side.SHORT and _near_resistance(pres_px)) else res_px
+        # beyond it, so it bounds the ride, as in the builder. The ride ends
+        # at the builder's target, the nearest level playing the opposite
+        # role at this close (``role_level``): a confirmed flip between the
+        # close and nearest_* ends it there (2026-10-07). Measured to
+        # nearest_* past it, the term paid for room the builder then refused
+        # as htf_zones_too_close.
+        target = role_level(sr_ctx, "resistance" if side == Side.LONG else "support", price=close)
+        target_px = float(getattr(target, "price", 0.0) or 0.0) if target is not None else 0.0
+        if side == Side.LONG:
+            lower_px, upper_px = (psup_px if _near_support(psup_px) else sup_px), target_px
+        else:
+            lower_px, upper_px = target_px, (pres_px if _near_resistance(pres_px) else res_px)
         if 0.0 < lower_px < upper_px:
             inner_gap = (upper_px - zone_hw) - (lower_px + zone_hw)
             required_gap = max(
@@ -178,10 +189,11 @@ class SrScalpRegimeMixin:
              ``broken_support`` (a confirmed support break, now resistance).
         The higher (more immediate) of the two floors is used when both are
         in proximity. SHORT is the exact mirror with ceilings. The target
-        level is the nearest one playing the opposite role
+        level is the nearest one playing the opposite role at the close
         (``support_resistance.role_level``): ``nearest_resistance``, or a
-        lost support (``broken_support``) between price and it, which a
+        lost support (``broken_support``) between the close and it, which a
         LONG's target cannot ride past (since 2026-10-07; mirror for SHORT).
+        The scorer's room to ride measures to the same level.
 
         Uses the bot's existing S/R machinery — NO strategy-local level
         creation. Level prices come from ``sr_ctx.nearest_support`` /
@@ -243,10 +255,11 @@ class SrScalpRegimeMixin:
             self._pct_param("sr_scalp_min_distance_pct", 0.008, vol_scale) * close,
             float(self.params.get("sr_scalp_min_distance_atr", 2.5)) * atr,
         )
-        # The target: the nearest level playing the opposite role
-        # (``role_level``), a confirmed flip between price and nearest_*
-        # included (2026-10-07); a refusal that measured to a flip names it.
-        target_level = role_level(sr_ctx, "resistance" if side == Side.LONG else "support")
+        # The target: the nearest level playing the opposite role at this
+        # close (``role_level``), a confirmed flip between the close and
+        # nearest_* included (2026-10-07); a refusal that measured to a flip
+        # names it.
+        target_level = role_level(sr_ctx, "resistance" if side == Side.LONG else "support", price=close)
         target_px = float(getattr(target_level, "price", 0.0) or 0.0) if target_level is not None else 0.0
         target_name = "res" if side == Side.LONG else "sup"
         target_flip_detail = ""
