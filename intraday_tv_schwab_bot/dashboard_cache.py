@@ -541,6 +541,7 @@ class DashboardCache:
             broken_resistance_price=safe_float((sr_row or {}).get("broken_resistance")),
             pending_support_price=safe_float((sr_row or {}).get("pending_support")),
             pending_resistance_price=safe_float((sr_row or {}).get("pending_resistance")),
+            side_tolerance=safe_float((sr_row or {}).get("side_tolerance")),
         )
         compact_chart_profile = self.chart_profile("compact")
         expanded_chart_profile = self.chart_profile("expanded")
@@ -1311,12 +1312,15 @@ class DashboardCache:
         broken_resistance_price: float | None = None,
         pending_support_price: float | None = None,
         pending_resistance_price: float | None = None,
+        side_tolerance: float | None = None,
     ) -> list[dict[str, Any]]:
         """The chart's key-level zones: the strategy's level candidates (the S/R
         row's levels for a strategy that allows the generic fallback) as zones
         sized by its hooks, read here with the HTF context and the LTF frame
         its spec names, then classified and picked by
-        ``dashboard_zones.build_level_zones``."""
+        ``dashboard_zones.build_level_zones``, which draws a broken level
+        within the row's ``side_tolerance`` of the row's nearest level of its
+        new role in that level's zone."""
         try:
             level_ctx = self.strategy.dashboard_level_context_spec() or {}
         except Exception:
@@ -1337,7 +1341,8 @@ class DashboardCache:
         # breakout-retest level drew as an ordinary "HS · Original" support,
         # and pending levels were not drawn at all. A flipped or pending level
         # is listed ahead of a plain one at the same price, which it labels
-        # more precisely.
+        # more precisely; a flipped one inside the nearest level's cluster
+        # (within the row's side_tolerance) is drawn in that level's zone.
         support_anchors = level_anchors([
             (broken_resistance_price, "broken_htf_resistance", True),
             (pending_support_price, "pending_htf_support", False),
@@ -1516,6 +1521,7 @@ class DashboardCache:
             flip_frame=frame,
             flip_confirmation_bars=self.config.support_resistance.flip_confirmation_bars(),
             timeframe_minutes=tf,
+            side_tolerance=side_tolerance,
         )
 
     def sr_row(self, symbol: str, price: float | None = None) -> dict[str, Any] | None:

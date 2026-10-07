@@ -2,11 +2,13 @@
 """The dashboard's key-level zones, from the zones the strategy's level hooks
 proposed: each zone's flip state, one zone per kind and price, a support and
 a resistance that overlap trimmed to the midpoint between them, and the
-zones drawn. ``DashboardCache.strategy_level_zones`` reads the HTF context,
-the LTF frame and the strategy's hooks and hands the zones here, where
-nothing else is read but the clock (the flip check counts the completed bars
-of the frame it is given). Until 2026-09-27 this was the second half of that
-method, as nested closures (refactor cut C40).
+zones drawn, a confirmed flip of the S/R row inside the row's nearest
+level's cluster in that level's zone. ``DashboardCache.strategy_level_zones``
+reads the HTF context, the LTF frame and the strategy's hooks and hands the
+zones here, with the S/R row's side tolerance, where nothing else is read
+but the clock (the flip check counts the completed bars of the frame it is
+given). Until 2026-09-27 this was the second half of that method, as nested
+closures (refactor cut C40).
 """
 from __future__ import annotations
 
@@ -19,13 +21,11 @@ from .support_resistance import zone_flip_confirmed
 
 # Key-level zone kinds for a level price has crossed: broken_* once the flip
 # is confirmed, pending_* while it is not. Each is drawn as its own zone, in
-# its flipped role once confirmed and marked pending until then.
-_FLIP_CANDIDATE_LEVEL_KINDS = frozenset({
-    "broken_htf_support",
-    "broken_htf_resistance",
-    "pending_htf_support",
-    "pending_htf_resistance",
-})
+# its flipped role once confirmed and marked pending until then, except a
+# broken level of the S/R row inside the row's nearest level's cluster
+# (_fold_broken_zones).
+_BROKEN_LEVEL_KINDS = frozenset({"broken_htf_support", "broken_htf_resistance"})
+_FLIP_CANDIDATE_LEVEL_KINDS = _BROKEN_LEVEL_KINDS | {"pending_htf_support", "pending_htf_resistance"}
 
 
 def level_anchors(entries: list[tuple[float | None, str, bool]]) -> list[tuple[float, str, bool]]:
@@ -178,6 +178,56 @@ def _collapse_duplicate_zones(zones: list[dict[str, Any]]) -> list[dict[str, Any
     return list(collapsed.values())
 
 
+def _is_sr_row_zone(zone: dict[str, Any]) -> bool:
+    # The generic-fallback zones, the S/R row's levels, carry the S/R
+    # builder's flip verdict; a strategy's own candidates carry None.
+    return zone.get("builder_flip_confirmed") is not None
+
+
+def _fold_broken_zones(zones: list[dict[str, Any]], *, side_tolerance: float | None) -> list[dict[str, Any]]:
+    """The drawn ``zones`` with each confirmed flip of the S/R row that lies
+    within the row's ``side_tolerance`` of the row's nearest level of its
+    new role, when that level is drawn, drawn in that level's zone.
+
+    The S/R build publishes each cluster at its strongest member's price and
+    derives broken_* from the raw levels at their own prices, never spaced
+    against the ladder, so a lost support inside the nearest resistance's
+    cluster drew as a second zone just under it (TSM 2026-10-06: BS 485.42
+    under HR 485.62, side_tolerance 1.452). The zone keeps the nearest
+    level's price (the one the strategy reads) and spans both bands; the
+    broken level's labels and sources come first and its flip state is the
+    zone's, as at a merge at one price, where a flip candidate outranks a
+    plain zone. A flip farther away, a pending level, a strategy's own
+    candidate and a zone of the other kind keep their own zones; without
+    the row's tolerance nothing folds. One plain zone of each kind is
+    drawn, so a kind holds at most one such nearest level."""
+    if side_tolerance is None or side_tolerance <= 0.0:
+        return zones
+    nearest = {
+        str(zone["kind"]): zone
+        for zone in zones
+        if _is_sr_row_zone(zone) and _zone_level_kind(zone) not in _FLIP_CANDIDATE_LEVEL_KINDS
+    }
+    drawn: list[dict[str, Any]] = []
+    for zone in zones:
+        host = nearest.get(str(zone["kind"]))
+        if (
+            host is None
+            or not _is_sr_row_zone(zone)
+            or _zone_level_kind(zone) not in _BROKEN_LEVEL_KINDS
+            or abs(float(zone["price"]) - float(host["price"])) > float(side_tolerance)
+        ):
+            drawn.append(zone)
+            continue
+        host["lower"] = min(float(host["lower"]), float(zone["lower"]))
+        host["upper"] = max(float(host["upper"]), float(zone["upper"]))
+        host["labels"] = list(dict.fromkeys([*list(zone.get("labels", []) or []), *list(host.get("labels", []) or [])]))
+        host["sources"] = list(dict.fromkeys([*list(zone.get("sources", []) or []), *list(host.get("sources", []) or [])]))
+        for key in ("original_kind", "confirmed_flip", "flip_state", "pending_flip", "pending_state", "flip_target_kind"):
+            host[key] = zone[key]
+    return drawn
+
+
 def _zone_sort_key(zone: dict[str, Any], close: float) -> tuple[float, float, float]:
     price = float(zone.get("price", 0.0) or 0.0)
     selected_delta = 0.0 if bool(zone.get("selected_for_entry", False)) else 1.0
@@ -192,6 +242,7 @@ def build_level_zones(
     flip_frame: pd.DataFrame | None,
     flip_confirmation_bars: tuple[int, int],
     timeframe_minutes: int,
+    side_tolerance: float | None,
 ) -> list[dict[str, Any]]:
     """The zones drawn, from ``candidate_zones`` (the supports, then the
     resistances, as ``DashboardCache.strategy_level_zones`` built them from
@@ -201,7 +252,9 @@ def build_level_zones(
     kind at one price merge; an overlapping support and resistance split the
     gap between them; and the drawn set is the zone selected for entry with
     the nearest opposite one, else the nearest plain zone of each kind and
-    every broken / pending level."""
+    every broken / pending level, a confirmed flip of the S/R row within
+    the row's ``side_tolerance`` of the drawn nearest level of its new role
+    drawn in that level's zone."""
     zone_flip_1m, zone_flip_5m = flip_confirmation_bars
     fallback_bar = None
     if flip_frame is not None and not flip_frame.empty:
@@ -266,8 +319,9 @@ def build_level_zones(
         display_zones = sorted(display_zones, key=lambda item: (float(item["price"]), item["kind"]))
     else:
         # The nearest plain zone of each kind, plus every broken / pending
-        # level as its own zone. A flipped level no longer competes with
-        # the nearest one for the single support / resistance slot (until
+        # level as its own zone unless it lies in the row's nearest level's
+        # cluster (below). A flipped level no longer competes with the
+        # nearest one for the single support / resistance slot (until
         # 2026-09-23 the S/R row folded a broken resistance into the
         # support ladder, so the zone drawn was whichever of the two was
         # nearer, not the level the strategy reads).
@@ -280,6 +334,10 @@ def build_level_zones(
         if nearest_resistance:
             display_zones.append(nearest_resistance[0])
         display_zones = sorted(display_zones, key=lambda item: (float(item["price"]), item["kind"]))
+        # Among the zones drawn, so a flip whose nearest level is not drawn
+        # keeps its zone, and after the trim, so each member keeps its own
+        # split against the other kind and the zone is the union of both.
+        display_zones = _fold_broken_zones(display_zones, side_tolerance=side_tolerance)
 
     return [
         {
