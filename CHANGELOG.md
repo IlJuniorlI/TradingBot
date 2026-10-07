@@ -1182,6 +1182,102 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The S/R gates measure to the nearest level playing each role: a
+  confirmed flip between price and `nearest_support` / `nearest_resistance`
+  is that level (`support_resistance.role_level`).** *2026-10-07* — a ladder
+  rung is a cluster published at its strongest member's price, so a lost
+  support can sit between price and `nearest_resistance` inside that
+  cluster (a reclaimed resistance between `nearest_support` and price,
+  mirror), and the clearance veto, the refinement's target caps, `near_*`,
+  top_tier's Fix G and sr_scalp's target measured past it. TSM 2026-10-06
+  15:17: the lost support 485.42 is a member of `nearest_resistance`'s
+  cluster at 485.62, so a LONG at 484.30 read 0.273% of room and passed the
+  0.25% minimum where the flip left 0.231%. Of 6,500 archived checkpoints a
+  lost support sat between price and `nearest_resistance` on 18%, a
+  reclaimed resistance between `nearest_support` and price on 12%.
+  - The rule: the resistance role is `nearest_resistance`, or
+    `broken_support` when it lies at or above the reader's price and below
+    `nearest_resistance` (or there is none); the support role the mirror
+    with `broken_resistance`. A flip at price counts, one across price does
+    not, a tie goes to `nearest_*`. Each reader passes its own price: the
+    veto and the proximity score the context's, the caps, Fix G and
+    sr_scalp the close they judge, so a close that has already passed the
+    flip reads `nearest_*`, as before, rather than no level.
+  - Readers: the S/R clearance veto and the proximity score (a pending level
+    keeps its precedence), both refinement target caps, `near_*` (so the
+    bias, and through it top_tier's vol_squeeze S/R-alignment gate,
+    `regime_hint`'s support_hold / resistance_pressure and the dashboard
+    state), Fix G (a flip inside the cluster is no rung, so a first rung
+    past it is refused), sr_scalp's target, its no-level and inner-gap
+    checks, and the target end of its scorer's +1.0 room to ride. The scorer
+    measures that room from the support (or the pending one) and the builder
+    its gap from its floor, which is a reclaimed resistance when that one is
+    in proximity and nearer the target, so the term can still pay for a gap
+    the builder refuses.
+  - The caps and Fix G try `nearest_*` after a flip they cannot use, and the
+    next rung after a `nearest_*` the build kept for a flip (the rung
+    protection, under Fixed; `support_resistance.role_levels`). A cap at a
+    flip that fails `min_target_rr` falls back to the cap at `nearest_*`,
+    then (after a kept rung) to the cap at the next rung, then to the
+    strategy's target; with the stop anchored as before or nearer, no target
+    ends further out than before 2026-10-07 (`max_levels_per_side` 2 or
+    more). Fix G judges the target against `nearest_*` when the flip sits
+    exactly at the signal's close, where the flip alone left it nothing over
+    the close to judge (the veto, at the context's own price, need not
+    refuse such an entry when that price is past the flip), and against the
+    next rung when the close has reached a kept rung. On 4,750 archived
+    checkpoints (risk 0.6-0.8 ATR, a 3R target) the cap fallback caps at
+    `nearest_*` on 3.7-4.9% of LONG and 2.0-3.4% of SHORT veto passes, where
+    the flip's cap alone left the strategy's target past both levels. These
+    are the targets of the path where the refined target is the take-profit
+    (see the ladder below).
+  - A refusal measured to a flip names it after its detail, the reason's
+    name unchanged: `too_close_to_htf_resistance(...,broken_support=485.4198)`,
+    `long_target_beyond_resistance(target=..,broken_support=..,ratio=..)`,
+    `htf_zones_too_close(inner_gap=..<..,broken_support=..)`,
+    `long_no_resistance_above(broken_support=..<=close=..)`; the SHORT
+    mirrors name `broken_resistance`.
+  - The role level does not reach the stop anchors (a flip is never one; the
+    rung protection under Fixed moves them), the ladder rungs, the published
+    `nearest_*` and their distances, the veto's flag branch or the
+    broken-level guard.
+  - Decisions change wherever a flip lies between price and `nearest_*`:
+    entries the veto passed are refused (the checkpoint study's estimate for
+    measuring to the role level: about 19% of LONG and 16% of SHORT passes),
+    refined targets are capped nearer, Fix G refuses trend targets past the
+    flip (in top_tier and in small_cap_squeeze, which runs top_tier's
+    engine), sr_scalp targets the flip, refuses a too-close gap and scores
+    no room to it, and the bias and the proximity score move with `near_*`.
+    The bias also feeds top_tier's vol_squeeze S/R alignment gate
+    (`vol_squeeze_min_sr_bias_alignment`, 0.20 in the preset: a LONG with
+    `bias_score` under -0.20 is refused, the SHORT mirror); under the
+    shipped knobs that changes only which refusal is recorded: wherever a
+    flip-driven `near_*` turns the gate's verdict, the level the trade faces
+    lies inside the 0.70-ATR proximity window, within the veto's 0.72-ATR
+    minimum clearance, so the veto refuses the entry either way
+    (small_cap_squeeze ships vol_squeeze off). In `adaptive_ladder` mode
+    (the top_tier and small_cap_squeeze presets) the first ladder rung
+    replaces the refined target whenever a rung qualifies (every regime but
+    range), and the rungs, unchanged, sit at or past `nearest_*`: there the
+    flip gates the entry (the veto, sr_scalp's gap and room term, Fix G for
+    trend) while rung 1 still rides to `nearest_*` or past it. `near_*` also
+    feeds the regime scores of zero_dte_etf_options and of
+    zero_dte_etf_long_options, which inherits that regime (near a support:
+    bull +0.40 x `regime_weight`, bear -0.45 x, the candle S/R term; the
+    mirror near a resistance; +0.30 x on the range score when both are near;
+    and the hint, where support_hold / resistance_pressure instead of
+    range_between_levels drops the range score's 0.20 x bonus;
+    `regime_weight` is 0.7 in both presets, and a long-options entry needs a
+    bullish_trend or bearish_trend regime), and peer_confirmed_htf_pivots'
+    +0.5 near score; the veto change reaches zero_dte_etf_long_options too.
+    The veto runs in 9 shipped presets, the refinement in 11. Replayed
+    (top_tier, 2026-09-29 13:50-14:50 and 2026-10-01 11:35-12:35): 267
+    decision records changed (sr_scalp's gap and the veto now measured to
+    the flip; two setups refused earlier by the veto, AMD and ANET; ARM's
+    sr_scalp no longer qualifies, its room to ride ending at the lost
+    support), one LONG's target capped at the lost support (MRVL; it stopped
+    out as before); no trade changed.
+
 - **`MarketDataStore.fetch_quotes` writes every REST quote through one
   helper, `_store_rest_quote`, and reads the quote TTL from `_quote_ttl`.**
   *2026-10-06* — the batch, the single-quote fallback and the alias fetch
@@ -5198,6 +5294,178 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `levels_shared.find_divergence` a required `bar_clock`.
 
 ### Fixed
+
+- **The S/R builder keeps each confirmed flip's own rung when a reclaimed
+  resistance and a lost support sit within `side_tolerance` either side of
+  price.** *2026-10-07* — `_reconcile_flipped_levels` drops the support
+  rungs within `side_tolerance` of the lost support (`broken_support`) and
+  the resistance rungs within it of the reclaimed resistance
+  (`broken_resistance`): the same zone, already flipped. With the two flips
+  that close either side of price, each flip's own rung lay within the
+  tolerance of the other flip, and the drop took both, so `nearest_support`
+  and `nearest_resistance` jumped to the next clusters: GOOG 2026-09-29
+  10:55 at 336.745, supports [336.298, 334.03] became [334.03] and
+  resistances [336.84, 338.19] became [338.19] (ORCL 2026-09-30 10:30 the
+  same). Every gate measured to levels about 1.1 ATR away while the flips
+  sat 0.2-0.3 ATR from price; 3.1% of 6,500 archived checkpoints, where a
+  LONG and a SHORT both passed the S/R veto at 130 of 200, and the 4 real
+  range LONG fills there came out at -2.48R in total.
+  - The rung kept is the one whose cluster holds the other flip
+    (`_rung_holding`, found by the flip's own price: a cluster can span
+    more than the tolerance), not every rung within the tolerance of it: a
+    plain support between the reclaimed resistance and price, in a cluster
+    of its own, is a stale member of the lost zone and still goes; a
+    cluster that holds the flip but is published at a stronger member's
+    price stays.
+  - Only in this geometry. With the flips farther apart than the
+    tolerance, or one flip alone, the drop is unchanged: a wide cluster
+    holding a reclaimed resistance more than the tolerance under the lost
+    support, published at a member within the tolerance of the lost
+    support, still goes.
+  - Decisions change only in this geometry, wherever the S/R context is
+    read: `nearest_*` and their distances, `near_*`, the bias and regime
+    hint, the shared S/R veto, the stop / target refinement and the
+    proximity score, the ladder rungs, top_tier's Fix G and sr_scalp, the
+    zero_dte regime score, the peer strategies' battleground and targets,
+    and the dashboard's S/R row and zones. On 4,750 checkpoints of five
+    archived days (top_tier's symbols, every 10 minutes) the ladder
+    changes at 134 (2.8%), all in it. Replayed (top_tier, 2026-09-29
+    13:50-14:50 and 2026-10-01 11:35-12:35): 254 decision records changed,
+    all sr_scalp's score and zone gap where the flips are now the nearest
+    levels; no action, signal or trade changed.
+  - Stops, size and targets: the refinement's stop anchor is `nearest_*`, so
+    in this geometry it pulls a stop in to just beyond the flip's rung,
+    0.2-0.3 ATR from price, instead of the next cluster. At those 134
+    checkpoints, from a strategy stop 2.0 x ATR15 away, the LONG stop moved
+    in at 120 (median 1.10 ATR15, 0.36-1.70) and the SHORT stop at 103
+    (median 1.09, 0.62-1.71): the median risk fell from 1.66 to about 0.5
+    ATR15, so the risk-sized quantity grows about threefold, up to
+    `max_notional_per_trade`. With the veto on, such an entry is refused
+    (top_tier's veto refused 133 of the 134 LONGs and all 134 SHORTs there),
+    so this reaches the entries the veto does not judge: top_tier's
+    vwap_reclaim (exempt from the S/R veto; its target only where no ladder
+    rung qualifies, since rung 1 replaces it) and the presets that refine
+    with the veto off (pairs_residual, peer_confirmed_htf_pivots,
+    peer_confirmed_trend_continuation). Where the proposal's close has
+    reached the flip's rung, the stop anchors beyond the next rung instead,
+    as before 2026-10-07 (`support_resistance.nearest_levels`), so a stop is
+    never wider than before. The target cap under the flip's rung fails
+    `min_target_rr` more often than the cap under the next cluster did; the
+    caps then try the next rung (`support_resistance.role_levels`) before
+    keeping the strategy's target, so a target is never left further out
+    than before (with `max_levels_per_side` 2 or more). NVDA 2026-09-29
+    13:10 at 229.2116, a LONG with a 0.8 x ATR15 stop and a 3R target: the
+    cap under the flip's rung 229.67 fails (0.57R) and the cap under the
+    next rung 231.3349 sets 231.1017, as before, where the flip's rung alone
+    left the strategy's 231.4503. On the 4,750 checkpoints (H:'s top_tier
+    knobs, strategy stops 0.6-2.0 x ATR15, a 3R target) no target ends
+    further out than before; read alone, the flip's rung left 27-95 of the
+    134 further out, by stop width and side, every one of them where the
+    veto refuses.
+
+- **With both S/R flags set, `regime_hint` is `range_between_levels` and
+  the S/R snapshot's state is `between_flips`.** *2026-10-07* — with
+  `breakout_above_resistance` and `breakdown_below_support` both set, price
+  sits between a reclaimed resistance under it and a lost support over it
+  and the bias nets the two to 0, yet `regime_hint` read `bullish_breakout`
+  (the breakout was tested first) and the snapshot's `state` read
+  `breakout` on bullish structure, while the confirmed breakdown stood too
+  (TSM 2026-10-06 15:17).
+  - `_compute_bias_and_regime` checks the both-flags case first and names
+    it `range_between_levels`; `bias_score` is unchanged.
+  - `sr_snapshot` checks it ahead of `breakout` / `breakdown` and names it
+    `between_flips`, whatever the structure or the trend; the dashboard
+    shows "between flips" in the neutral tone (it reads the state as a
+    token).
+  - Decisions change in the two 0DTE options presets only:
+    zero_dte_etf_options' range score adds the `range_between_levels`
+    bonus (0.20 x `support_resistance.regime_weight`, 0.7 in the preset) in
+    this state, as between two plain levels, and zero_dte_etf_long_options
+    inherits that regime unchanged (the same weight), so its range score
+    moves the same: a borderline bullish_trend or bearish_trend regime,
+    the only regimes a long-options entry is built on, can become a range
+    or an ambiguous no trade. top_tier logs the hint and reads no state.
+    Replayed (top_tier, the same two hours): only the dashboard changed.
+
+- **The dashboard draws a broken level at or near the nearest level of its
+  new role in that level's zone, labelled with both, not as a second zone
+  beside it or under its own label alone.** *2026-10-07* — the S/R build
+  publishes each level cluster at its strongest member's price and derives
+  `broken_support` / `broken_resistance` from the raw levels at their own
+  prices, never spaced against the ladder, so a lost support just under the
+  nearest resistance drew as its own zone beside it: TSM on 2026-10-06 drew
+  BS 485.42 under HR 485.62 (`side_tolerance` 1.452), one engine level as
+  two zones 0.20 apart. The zones study found a broken support hidden in the
+  nearest resistance's cluster at 27.0% of 6,500 archived checkpoints and a
+  broken resistance in the nearest support's at 24.3%. A flip the row
+  publishes at the nearest level's own price was labelled with the flip
+  alone, "BR" for the nearest support (`level_anchors` dropped the repeated
+  price): 15 of the 28 symbols of the 15:50 publish in a replay of that day.
+  `_collapse_duplicate_zones` merges only zones of one kind at an equal
+  price.
+  - `dashboard_zones.build_level_zones` takes the S/R row's
+    `side_tolerance` (a new keyword, passed by `symbol_snapshot` through
+    `DashboardCache.strategy_level_zones`). With no zone selected for
+    entry, a confirmed flip of the S/R row within that tolerance of the
+    drawn nearest level of its new role is drawn in that level's zone: at
+    the nearest level's price (the published `nearest_*`, which the stop
+    anchors and the ladder read; the S/R gates measure to the flip when it
+    lies between price and that level), from the lower member's lower edge
+    to the upper member's upper edge, labelled with both, the flip first
+    (`BS · HR`), in the flip's state ("Flipped from Support"), its sources
+    first. The tolerance is the S/R build's merge distance, so such a flip
+    is usually, not always, a member of that level's cluster.
+  - `level_anchors` keeps a plain level at a confirmed flip's price, at the
+    flip's price, so the two merge into one zone labelled with both, as a
+    near one is; a pending level still labels its price alone.
+  - A flip farther away, a pending level, a strategy's own candidate, a
+    zone of the other kind, a flip whose nearest level is not drawn, and a
+    pair with a zone of the other kind priced between them (which the zone
+    would cover: a pending level the overlap trim split them around) keep
+    their own zones. A missing, non-finite or non-positive tolerance folds
+    nothing.
+  - README: what the key-level zones and their labels are (the line said
+    "peer-confirmed zone overlays"; top_tier draws them too).
+  - No decision changes: no decision reads a zone.
+
+- **A pending support / resistance zone is labelled PS / PR, not HS / HR.**
+  *2026-10-07* — the zone label map
+  (`StrategyBase.dashboard_candidate_label`) had no entry for
+  `pending_htf_support` / `pending_htf_resistance`, so a support or
+  resistance price had crossed with the flip not yet confirmed fell
+  through to the default and was labelled HS / HR, the labels of the
+  strategy's nearest levels: the chart read "Support Zone · HS · Pending
+  Break" for a level that is not the nearest support, often beside the
+  real HS.
+  - The map labels them PS / PR. dashboard.js already names a pending
+    zone by its labels and then the flip it waits on ("Support Zone · PS ·
+    Pending Break", "Resistance Zone · PR · Pending Reclaim"), so its text
+    is unchanged; a strategy's own `dashboard.candidate_labels` still wins.
+  - README: the PS / PR labels.
+  - No decision changes: the label is read only by the dashboard.
+
+- **The dashboard's overlap trim between a support zone and a resistance
+  zone above it no longer depends on the order the zones come in, and
+  never widens a zone.** *2026-10-07* — `build_level_zones` split each
+  overlapping pair at the midpoint of their prices by recomputing both
+  zones from their original `zone_half_width`, in list order, so a later,
+  farther resistance re-widened a support a nearer one had already
+  trimmed: with half-widths of 1.0, HS 100, BS 101 and HR 101.3 drew HS
+  [99.35, 100.65] over BS [100.50, 101.50] when BS was listed first, and
+  HS [99.50, 100.50] when HR was. A zone whose own bounds are narrower
+  than its half-width (a strategy's FVG zone) was widened to it on both
+  edges by a trim. The zones study saw the order case at none of 6,500
+  archived checkpoints (it needs zones wider than half the gap to a
+  second opposite level).
+  - The pairs split nearest first, from the zones' current edges, never
+    outward: each facing edge moves to the midpoint, and each far edge in
+    to no farther from the zone's price than its facing edge, the cut about
+    the price as before. A farther pair trims only what still overlaps:
+    the example draws HS [99.50, 100.50] in every order.
+  - The skip of a crossed pair (a pending level beyond the nearer opposite
+    level, 2026-09-23), equality included, is unchanged.
+  - README: how overlapping zones are trimmed.
+  - No decision changes: no decision reads a zone.
 
 - **An exit fill the broker reports without execution legs is booked
   flagged estimated, with no exit slippage, and a later slice of an exit
