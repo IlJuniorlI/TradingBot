@@ -16,8 +16,8 @@ The manifest also carries two analyses of the archive's own decisions and bars:
                             whether a gate blocks moves or blocks losses
 
 The end-of-session report and the persistent trades.csv are
-``session_report``'s. The archive's trades.csv is written with that module's
-``TRADE_CSV_COLUMNS`` and ``trade_csv_row``, so the two files read the same.
+``session_report``'s. The archive's trades.csv is the day's rows of that
+persistent file, so the two files read the same.
 """
 from __future__ import annotations
 
@@ -36,12 +36,17 @@ from typing import Any, Iterable
 
 import yaml
 
-from .paper_account import TradeRecord, closed_trade_lifecycles
 from .models import Position, Side
 from . import sessions
 from .reasons import reason_gate, reason_side, split_side_prefix
 from .serialization import atomic_write_text
-from .session_report import TRADE_CSV_COLUMNS, trade_csv_row
+from .session_report import (
+    TRADE_CSV_COLUMNS,
+    read_trade_rows,
+    trade_csv_key,
+    trade_csv_row,
+    trades_closed_on,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -1010,95 +1015,74 @@ def _copy_daily_log(log_src: Path, log_dst: Path) -> bool:
         return False
 
 
-def _export_trades(account: Any, trades_dst: Path, session_date: date) -> tuple[int, float | None, str | None]:
-    """Write the session's closed trades to ``trades_dst``.
+def _export_trades(account: Any, trades_src: Path, trades_dst: Path,
+                   session_date: date) -> tuple[int, float | None, str | None]:
+    """Write the day's rows of the persistent trades.csv (``trades_src``) to
+    ``trades_dst``.
 
-    Returns ``(trades_today, realized_pnl, trades_export_error)``: all
-    ``(0, None, None)`` with no account, and the file is not written.
+    Returns ``(trades_today, realized_pnl, trades_export_error)``.
 
-    Written directly from the account's in-memory trade history. We
-    previously filtered the cumulative trades.csv, but that file is only
-    appended-to by write_session_report() (which runs on bot shutdown). When
-    the daily end-of-day archive fires at ~16:00 ET via
-    _maybe_export_session_archive, the cumulative CSV still has yesterday's
-    last shutdown state — so today's trades never made it into the archive
-    (observed live 2026-05-20: 2 SPY credit-spread closes in account + log, 0
-    rows in archive trades.csv).
+    The rows are every process's: the engine appends the day's closed trades
+    to the persistent file (``write_session_report``) before it exports, at
+    the end of the day and at shutdown, so a process that restarted during
+    the day, and the one before it, each put their trades in. Until
+    2026-10-06 the rows came from the exporting process's in-memory account,
+    because the append ran only at shutdown: the 20:00 export of an
+    always-on bot found the persistent file a day behind (observed live
+    2026-05-20: 2 SPY credit-spread closes in account + log, 0 rows in
+    archive trades.csv). The account copy had its own gap: a restart later
+    the same day, or a start after 20:00, re-exported the day with the new
+    process's trades (none) over the old one's. The end-of-day path now
+    appends too, so the persistent file is the whole day. A process that
+    starts after a trading day's 20:00 writes that day's archive only when
+    the day has none (``exporter_ran_session`` false in the manifest): its
+    bars, account snapshot and skip tally are not the session's.
 
-    account.trades is the source of truth. closed_trade_lifecycles folds each
-    trade's partial-exit slices into one row (dropping them instead lost
-    their P&L), and the ET-date filter matches the per-day boundary the
-    archive uses everywhere else.
+    ``account`` (the exporting process's) is checked against the file: a
+    trade of the day that it holds and the file does not (an append that
+    failed) is an error, not a quietly shorter day.
 
-    Today's realized PnL is summed from the SAME date-filtered list that
-    produces trades.csv and trades_today.
-
-    The manifest used to report `account.realized_pnl`, which is a LIFETIME
-    accumulator — set to 0.0 once in PaperAccount.__init__ and only ever
-    incremented, with no per-day reset. So an always-on bot carried prior
-    days forward into a field sitting next to `trades_today`, which is
-    date-filtered. Two scopes in one manifest. Observed on 2026-07-31:
-    manifest -80.77 against trades.csv -60.22, a gap of exactly -20.55 = the
-    previous session's PnL. Five of the ten sessions that traded disagreed
-    with their own trades.csv, in both directions.
-
-    Summing the rounded per-row values (not rounding the sum) is deliberate:
-    it is what trade_csv_row writes, so
-    `manifest.realized_pnl == sum(trades.csv.realized_pnl)` holds exactly
-    rather than within a cent.
-
-    The PnL stays None when there is no account, preserving the previous
-    contract.
+    Today's realized PnL is summed from the SAME rows that produce trades.csv
+    and trades_today. The manifest used to report `account.realized_pnl`, a
+    LIFETIME accumulator (set to 0.0 once in PaperAccount.__init__ and never
+    reset per day), so an always-on bot carried prior days into a field
+    beside the date-filtered `trades_today` (observed 2026-07-31: manifest
+    -80.77 against trades.csv -60.22, a gap of exactly the previous
+    session's -20.55). The rows hold `trade_csv_row`'s rounded values, so
+    `manifest.realized_pnl == sum(trades.csv.realized_pnl)` holds exactly.
     """
-    if account is None:
-        return 0, None, None
-    trades_today = 0
-    realized_pnl_today: float | None = 0.0
-    trades_export_error: str | None = None
     session_date_str = session_date.isoformat()
     try:
-        closed_today: list[TradeRecord] = []
-        for trade in closed_trade_lifecycles(getattr(account, "trades", []) or []):
-            exit_time = getattr(trade, "exit_time", None)
-            if exit_time is None:
-                continue
-            exit_date = None
-            try:
-                exit_date = exit_time.astimezone(sessions.now_et().tzinfo).date()
-            except Exception:
-                LOG.debug("Could not normalize exit_time for trade %s; falling back to naive date()", trade, exc_info=True)
-                # Naive datetime case — fall back to direct .date()
-                # without tz translation. Anything that doesn't have
-                # a .date() method (corrupt type) leaves exit_date
-                # as None, which won't match session_date and the
-                # trade is silently skipped (better than crashing).
-                try:
-                    exit_date = exit_time.date()
-                except (AttributeError, TypeError):
-                    pass
-            if exit_date == session_date:
-                closed_today.append(trade)
+        rows = read_trade_rows(trades_src, session_date_str)
         with open(trades_dst, "w", newline="", encoding="utf-8") as dst_fh:
             writer = csv.DictWriter(dst_fh, fieldnames=TRADE_CSV_COLUMNS, extrasaction="raise")
             writer.writeheader()
-            for trade in closed_today:
-                writer.writerow(trade_csv_row(trade, session_date_str))
-        trades_today = len(closed_today)
-        realized_pnl_today = round(
-            sum(round(float(trade.realized_pnl), 2) for trade in closed_today), 2
-        )
+            writer.writerows(rows)
+        realized_pnl_today = round(sum(float(row["realized_pnl"]) for row in rows), 2)
     except Exception as exc:
-        LOG.warning("Could not write daily trades CSV from account: %s", exc, exc_info=True)
-        # Report UNKNOWN, not flat. Leaving the initialized 0.0 in place
-        # made a failed export indistinguishable in the manifest from a
-        # genuinely flat day — and the failure is easy to hit, because
-        # `trade_csv_row` reads every TradeRecord field by name, so one
-        # record missing a field added later (rehydrated from an older
-        # store, say) raises here and is swallowed. A wrong-but-plausible
-        # zero is worse than an absent value: nobody investigates a zero.
-        trades_export_error = str(exc)
-        realized_pnl_today = None
-    return trades_today, realized_pnl_today, trades_export_error
+        LOG.warning("Could not write the day's trades CSV from %s: %s: %s",
+                    trades_src, type(exc).__name__, exc, exc_info=True)
+        # Report UNKNOWN, not flat: a wrong-but-plausible zero is worse than
+        # an absent value, since nobody investigates a zero.
+        return 0, None, f"{type(exc).__name__}: {exc}"
+    if account is None:
+        return len(rows), realized_pnl_today, None
+    try:
+        held = {trade_csv_key(trade_csv_row(trade, session_date_str))
+                for trade in trades_closed_on(getattr(account, "trades", []) or [], session_date)}
+    except Exception as exc:
+        # A record the row cannot be built from (one missing a TradeRecord
+        # field, rehydrated from an older store, say) failed the append too.
+        error = (f"this process's trades of {session_date_str} could not be checked against {trades_src}: "
+                 f"{type(exc).__name__}: {exc}")
+        LOG.warning("Session archive: %s", error)
+        return len(rows), None, error
+    missing = len(held - {trade_csv_key(row) for row in rows})
+    if missing:
+        error = f"{missing} of this process's trades closed {session_date_str} are not in {trades_src}"
+        LOG.warning("Session archive: %s", error)
+        return len(rows), None, error
+    return len(rows), realized_pnl_today, None
 
 
 def _write_config_snapshot(config: Any | None, archive_root: Path) -> bool:
@@ -1190,6 +1174,16 @@ def _write_manifest(manifest: dict[str, Any], archive_root: Path) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def session_archive_root(log_dir: str, session_date: date) -> Path:
+    """``{log_dir}/sessions/{YYYY-MM-DD}/``, the archive of ``session_date``."""
+    return Path(str(log_dir or ".logs")) / "sessions" / session_date.isoformat()
+
+
+def session_archive_manifest_path(log_dir: str, session_date: date) -> Path:
+    """The ``manifest.json`` an archive of ``session_date`` ends with."""
+    return session_archive_root(log_dir, session_date) / "manifest.json"
+
+
 def export_session_archive(
     *,
     log_dir: str,
@@ -1202,6 +1196,7 @@ def export_session_archive(
     last_candidates: Iterable[Any] | None,
     session_skip_counts: dict[str, int] | None = None,
     config: Any | None = None,
+    exporter_ran_session: bool,
 ) -> None:
     """Write a per-day archive of bars / trades / log / manifest to
     ``{log_dir}/sessions/{YYYY-MM-DD}/`` for post-session analysis.
@@ -1227,8 +1222,9 @@ def export_session_archive(
       not archived and ``bars/15m`` was described as that frame, so an
       HTF level could not be traced to the bars that made it after the
       session.
-    - ``trades.csv`` — today's trades filtered from the cumulative
-      trades.csv (entry/exit/PnL/MFE/MAE per trade).
+    - ``trades.csv`` — today's rows of the cumulative ``{log_dir}/trades.csv``
+      (entry/exit/PnL/MFE/MAE per trade), every process's that ran today:
+      the engine appends before it exports (``_export_trades``).
     - ``bot_{YYYY-MM-DD}.log`` — copy of the daily log file (original
       stays in log_dir; copying avoids file-lock issues on Windows where
       the FileHandler still owns the original).
@@ -1263,9 +1259,9 @@ def export_session_archive(
         ``data.get_htf_frame(...)`` for the stored HTF frame (a read, never
         a Schwab fetch).
     account
-        PaperAccount (or live account tracker). Used to read
-        ``account.realized_pnl`` and ``account.trades`` so closed-position
-        symbols are included even if they left the watchlist.
+        PaperAccount (or live account tracker). Its ``account.trades`` add
+        the closed-position symbols to the bars even if they left the
+        watchlist, and are checked against the day's trades.csv rows.
     positions
         Currently-open positions at the moment of export. On the
         end-of-day daily fire (8pm ET) this is whatever the bot is
@@ -1286,10 +1282,15 @@ def export_session_archive(
         ``config_snapshot.yaml`` is written to the archive with secret
         fields (app_key, app_secret, account_hash, encryption_key,
         sessionid, etc.) redacted. Pass None to skip the snapshot.
+    exporter_ran_session
+        False when the exporting process started after the day's 20:00 ET
+        end and so did not run the session (the engine then exports only a
+        day without an archive): its bars, account snapshot and skip tally
+        are its own. Recorded in the manifest.
     """
     session_date = sessions.now_et().date()
     log_dir_path = Path(str(log_dir or ".logs"))
-    archive_root = log_dir_path / "sessions" / session_date.isoformat()
+    archive_root = session_archive_root(log_dir, session_date)
     bars_dir = archive_root / "bars"
     try:
         bars_dir.mkdir(parents=True, exist_ok=True)
@@ -1307,7 +1308,7 @@ def export_session_archive(
     log_dst = archive_root / f"bot_{session_date.isoformat()}.log"
     log_copied = _copy_daily_log(log_src, log_dst)
     trades_today, realized_pnl_today, trades_export_error = _export_trades(
-        account, archive_root / "trades.csv", session_date)
+        account, log_dir_path / "trades.csv", archive_root / "trades.csv", session_date)
     config_snapshot_written = _write_config_snapshot(config, archive_root)
     account_snapshot_written = _write_account_snapshot(account, positions, archive_root)
 
@@ -1339,6 +1340,7 @@ def export_session_archive(
         "strategy": str(strategy_name),
         "dry_run": bool(dry_run),
         "exported_at": sessions.now_et().isoformat(),
+        "exporter_ran_session": bool(exporter_ran_session),
         "timeframes_exported": [f"{tf}m" for tf in timeframes_sorted],
         "symbols_exported": bars_written,
         "symbols_skipped": bars_skipped,

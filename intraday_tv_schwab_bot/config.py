@@ -555,8 +555,8 @@ class RuntimeConfig:
     # and it goes back on for a day after a change to a builder.
     context_memo_shadow_every: int = 20
     # When True, the engine writes a per-day archive to
-    # {log_dir}/sessions/{YYYY-MM-DD}/ (once per ET trading day after 20:00,
-    # and again on shutdown) containing bars/1m/{SYMBOL}.csv (the full merged
+    # {log_dir}/sessions/{YYYY-MM-DD}/ (after a trading day's 20:00 ET end,
+    # or at a shutdown before it) containing bars/1m/{SYMBOL}.csv (the full merged
     # 1m frame with indicators, extended hours and warmup included),
     # bars/{N}m/ resamples for ltf/htf minutes above 1, bars/htf_{N}m/ (the
     # stored HTF frame levels are built from), trades.csv filtered to the

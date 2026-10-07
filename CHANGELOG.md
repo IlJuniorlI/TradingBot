@@ -5199,6 +5199,129 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An always-on bot writes each trading day's session report and appends its
+  trades to `trades.csv` at the day's 8 PM ET end, once; the archive's
+  `trades.csv` is the day's rows of the persistent file that the strategy
+  wrote.** *2026-10-06* — the session report (the `SESSION REPORT` summary
+  and the append of the day's closed trades to `.logs/trades.csv`) ran only
+  at shutdown, and the 8 PM daily path exported the archive alone, so a bot
+  that ran through a day without stopping lost that day's report and its
+  rows: H: ran from 10-01 03:34 to 10-02 20:38, and 10-01 had 22 trades in
+  `sessions/2026-10-01/trades.csv`, none in `.logs/trades.csv` and no
+  `SESSION REPORT`. The archive's `trades.csv` came from the exporting
+  process's in-memory account, so a restart later the same day, or a start
+  after 8 PM on a trading day (the daily export fired at once), re-exported
+  the day with the new process's trades (none) over the old one's.
+  - At a trading day's 8 PM ET the engine owes the day its close
+    (`IntradayBot._maybe_close_session_day`): the summary, then the append,
+    then the archive, whether or not `runtime.export_session_archive` is on
+    (it gates the archive alone), and logs `ET trading day <date> ended:
+    writing its session report and archive` (`... its session report` with
+    archives off; `... its trades.csv rows and archive` or `... its archive`
+    on a retry). The day stays owed until its summary was written, an append
+    succeeded and its archive was written, whatever the date: an append that
+    fails is retried on a pass a minute or more later, an archive export
+    that fails after a minute, then after a wait doubled with each further
+    failure, at most 30 minutes; the pass that closes a day exports it
+    whenever that is, but a later export (after a failed one, or one that
+    waited for a failed append) never runs inside a later trading day's 7
+    AM-8 PM stream window, where each export (about 12 s on H:, on the
+    engine thread) would hold up a pass of management; both at shutdown too.
+    A loop held past 8 PM (at schwabdev's login prompt, say) closes every
+    trading day it missed on its next pass, or at shutdown, each under its
+    own date (`write_session_report` and `export_session_archive` take the
+    day); a day it ran no pass of is closed as one this process did not run:
+    no summary, no skip counts, `exporter_ran_session: false`, and an
+    archive only when the day has none. The summary is written once: one
+    that raises is logged and not repeated, and a shutdown on a day this
+    process already closed writes no second summary or archive (`Session
+    <date> already closed ...: no report at shutdown`). A stop signal
+    (KeyboardInterrupt) during the 8 PM summary leaves it to the shutdown;
+    one after it, in the append or the archive, leaves those to the
+    shutdown, which logs no second `SESSION REPORT`.
+  - The append (`session_report.append_trades_csv`) writes every closed
+    trade the process holds that `trades.csv` lacks, under its exit's ET
+    date, at every day close and at every shutdown, whatever its exit date:
+    a trade booked after the day's 8 PM close, or one an earlier append
+    failed to write, goes in the next time. A row whose date, lifecycle,
+    symbol, entry and exit the file already holds is not written again
+    (`session_report.TRADE_CSV_KEY`). An append that fails (a `trades.csv`
+    that cannot be read or parsed, the log directory, the open or the
+    write) appends nothing, logs a WARNING with the error's type, and keeps
+    the day owed: its archive waits for an append that succeeds, but for
+    the shutdown's, which is written anyway and names the missing trades
+    in `trades_export_error` (`Shutdown: the trades.csv append failed ...`,
+    ERROR). The rows go in one write in append mode, safe beside another
+    process appending to the same file (a new file is created with its
+    header at once); a write that fails part-way can leave the rows written
+    before it, and the next append ends a cut-off last line before its
+    own.
+  - When the schema guard finds `trades.csv` under an older header, it
+    copies the file, as it is, to `trades.archive-<date>.csv` and starts the
+    fresh file with that day's rows from the old one, mapped by column name
+    (a new column empty, a dropped one left out and named in the WARNING),
+    so the day's archive and manifest still hold the rows an earlier
+    process wrote that day; until now the day's rows before the rotation
+    were missing from its archive, with no error. The fresh file is written
+    before it replaces the old one, so a failure leaves the old file.
+  - The archive's `trades.csv`, `trades_today` and `realized_pnl` are the
+    day's rows of `.logs/trades.csv` that the exporting strategy wrote:
+    those of every process of the strategy that appended its trades that
+    day. A process killed before it appended (SIGKILL, an OOM kill, a crash
+    before 8 PM) leaves its trades out of the file and every archive.
+    `trades.csv` has no mode column, so a day run by both a dry-run and a
+    live process of one strategy archives both processes' rows. The
+    exporting process's trades of the day that the file lacks set
+    `trades_export_error` and leave the PnL unknown; so does a row of the
+    day under an older header. After a same-day restart the manifest's
+    `session_skip_counts` and `account_snapshot.json` are the last
+    process's alone. An archive whose folder or `manifest.json` cannot be
+    written is an error, retried, not a quiet success.
+  - A process that starts after a trading day's 8 PM never writes that
+    day's summary: it did not run that session. It writes the day's archive
+    only when the day has none (no `sessions/<date>/manifest.json`: the
+    process that ran the day was killed before 8 PM), and the manifest's
+    new `exporter_ran_session` is then `false`, since the bars, account
+    snapshot and skip tally are its own; an archive the day has is left as
+    it is (`Started after the <date> session ended: ...`). Its own trades
+    of that evening (an exit its start-up reconcile books) reach
+    `trades.csv` on its first pass when it writes the archive, else at its
+    shutdown.
+  - A shutdown on a day that has had its 8 PM close no longer re-exports
+    the archive; the log lines after 8 PM stay in `bot_<date>.log`.
+  - Upgrade note: `SESSION REPORT` and `Session trades appended` now appear
+    at 8 PM ET each trading day as well; a shutdown that day logs the
+    `already closed` line instead. The archive manifest's `trades_today`
+    and `realized_pnl` cover every process of the strategy that day, and it
+    gains `exporter_ran_session` (`true` but for a late start's archive).
+    The 10-01 rows missing from H:'s `.logs/trades.csv` are in
+    `.logs/sessions/2026-10-01/trades.csv`. Log lines removed or renamed:
+    - `Daily session archive: ET trading day <date> ended — exporting
+      bars/trades/manifest` is `ET trading day <date> ended: writing its
+      ...` (above).
+    - `Daily session archive failed (will retry next cycle)` and `Session
+      archive export failed: ...` are `Session archive for <date> failed
+      (retried in N s, outside the trading days' stream windows, and at
+      shutdown): <type>` (`... failed at shutdown: <type>`); `Could not
+      create session archive directory` and `Could not write session
+      manifest` are gone: the export fails with that line.
+    - `Session report write failed during shutdown` is `Session report for
+      <date> failed: <type>`.
+    - `Could not read existing trades.csv header: ...` is `Could not read
+      <path>, so N trades were not appended: <type>: ...`; `Could not open
+      trades.csv for append: ...` is `Could not append N trades to <path>:
+      <type>: ...`; `Could not create log directory <dir>: ...` and `Could
+      not rotate trades.csv to <path>: ...` gain `, so N trades were not
+      appended` and the type; the `trades.csv schema changed` WARNING ends
+      `writing a fresh trades.csv that starts with its N rows of <date>
+      (new columns empty...)`.
+    - `Could not write daily trades CSV from account: ...` is `Could not
+      write the day's trades CSV from <path>: <type>: ...`.
+    - `Dropping X from the session report: unreadable exit_time ...` is
+      `Dropping X from the day's trades: ...`.
+    - New: `trades.csv lacks some of this process's trades: the <date>
+      close is retried on a later pass and at shutdown` (WARNING).
+
 - **The REST shadow's lag warning names the book's last item and its own
   prices against REST's.** *2026-10-06* — H:'s first stream-quotes day
   logged 14 `Stream quote shadow: SYM lags REST by N ms` warnings (6-21 s, on

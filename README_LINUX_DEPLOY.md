@@ -208,10 +208,10 @@ ExecStart=%h/TradingBot/.venv/bin/python main.py --config configs/config.yaml
 # Clean shutdown: once the bot is built, SIGTERM, like Ctrl+C, takes it to
 # its shutdown wherever it lands (the start-up reconcile, a cycle, the sleep
 # between cycles): it stops the dashboard and the stream, writes the session
-# report (appending its closed trades to trades.csv) and the day's archive,
-# then exits 0. The reconcile metadata needs no shutdown step: it is saved
-# whenever the tracked positions change. Give it 30s, then SIGKILL if it's
-# still hung.
+# report (appending its closed trades to trades.csv) and the day's archive
+# unless it wrote them at 8pm ET, then exits 0. The reconcile metadata needs
+# no shutdown step: it is saved whenever the tracked positions change. Give
+# it 30s, then SIGKILL if it's still hung.
 KillSignal=SIGTERM
 TimeoutStopSec=30s
 
@@ -453,18 +453,29 @@ own rotation governed by `/etc/systemd/journald.conf`.
 
 ### Daily session archives
 
-`_maybe_export_session_archive` writes a per-day bundle to
-`.logs/sessions/{YYYY-MM-DD}/` at 8pm ET each trading day. No cron needed.
-Each archive contains:
+At 8pm ET each trading day the bot writes the day's session report
+(appending its closed trades to `.logs/trades.csv`) and then a per-day
+bundle to `.logs/sessions/{YYYY-MM-DD}/`, once a day: a stop later that
+day writes neither again. A bot started after 8pm never writes that day's
+report, and writes its archive only when the day has none (no
+`manifest.json`: the bot that ran the day died before 8pm), with
+`exporter_ran_session: false` in the manifest, since its bars, account
+snapshot and skip counts are its own. No cron needed. Each archive
+contains:
 
 - `bars/{Nm}/{SYMBOL}.csv` — full merged frame with indicators per timeframe
-- `trades.csv` — today's trades only
+- `trades.csv` — the day's rows of `.logs/trades.csv` (every process that ran that day)
 - `bot_YYYY-MM-DD.log` — copy of the daily log
 - `events.jsonl` — structured events extracted from the log
 - `decisions.csv` — every entry decision as queryable rows
 - `account_snapshot.json` — equity curve, realized PnL, etc.
 - `config_snapshot.yaml` — resolved config (secrets redacted)
 - `manifest.json` — strategy + summary stats
+
+After a restart on the same day, `trades.csv`, `trades_today` and
+`realized_pnl` cover every process that ran the day, but the manifest's
+`session_skip_counts` and `account_snapshot.json` are the last process's
+alone.
 
 Disable globally with `runtime.export_session_archive: false` in your
 config if you're tight on disk.
