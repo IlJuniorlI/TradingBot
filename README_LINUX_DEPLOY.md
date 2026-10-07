@@ -250,10 +250,11 @@ A few of these values to know about:
 - **`Type=simple`** is correct for our case (the bot is a foreground
   process that doesn't fork). `Type=notify` would require the bot to
   send sd_notify signals; we don't.
-- **`TimeoutStopSec=30s`** bounds the shutdown. The bot logs `Interrupted,
-  shutting down.` once the work the stop interrupted has unwound (a cycle's
-  thread pool first finishes its queued work, broker reads included) and
-  `Shutdown complete.` when the cleanup is done. Stop signals after the
+- **`TimeoutStopSec=30s`** bounds the shutdown. The bot logs `Interrupted by
+  SIGTERM, shutting down.` (the signal's name: `SIGINT` for a Ctrl+C,
+  `SIGHUP` for a terminal hangup) once the work the stop interrupted has
+  unwound (a cycle's thread pool first finishes its queued work, broker
+  reads included) and `Shutdown complete.` when the cleanup is done. Stop signals after the
   first are ignored until then, since one would abandon the session report
   half-written, and the log names any it ignored. A stop with no
   `Shutdown complete.` in the journal means systemd SIGKILLed a shutdown

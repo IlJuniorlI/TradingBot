@@ -5199,6 +5199,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The shutdown line names the stop signal: `Interrupted by SIGHUP, shutting
+  down.`** *2026-10-06* — the stop-signal handler raised a bare
+  KeyboardInterrupt and `run` logged `Interrupted, shutting down.`, so a
+  Ctrl+C, a `systemctl stop` and an SSH hangup read the same (H: 10-06
+  16:14:44 cannot say which ended the run). The handler records the first
+  signal's name and the KeyboardInterrupt it raised (it still logs nothing),
+  and the line names it: `SIGINT`, `SIGTERM`, `SIGHUP` or `SIGBREAK`. A
+  KeyboardInterrupt the handler did not raise (one raised by code, or a
+  handler that could not be installed) reads `Interrupted by
+  KeyboardInterrupt, shutting down.`. Signals after the first are still
+  only recorded, and named in `Ignored ... during the shutdown`.
+  - Upgrade note: anything that matches `Interrupted, shutting down.` in
+    the log should match `Interrupted by <name>, shutting down.`.
+
 - **An always-on bot writes each trading day's session report and appends its
   trades to `trades.csv` at the day's 8 PM ET end, once; the archive's
   `trades.csv` is the day's rows of the persistent file that the strategy

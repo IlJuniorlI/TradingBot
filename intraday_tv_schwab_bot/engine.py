@@ -139,7 +139,9 @@ class _StopSignals:
     session report half-appended to trades.csv); under systemd the SIGKILL at
     `TimeoutStopSec` still ends a cleanup that hangs. The handler logs
     nothing, since logging from a handler can re-enter a stream write it
-    interrupted, so ``run`` reports what it ignored once the cleanup is done.
+    interrupted, so ``run`` reports what it ignored once the cleanup is done,
+    and names the signal that stopped it (``stopped_by``): until 2026-10-06
+    a Ctrl+C and an SSH hangup both read `Interrupted, shutting down.`.
 
     SIGHUP is the terminal hanging up: an SSH disconnect or a killed tmux
     pane with the bot in the foreground. Until 2026-09-26 it killed the bot
@@ -160,6 +162,9 @@ class _StopSignals:
         self.held = False
         self.ignored: list[str] = []
         self._previous: dict[signal.Signals, Any] = {}
+        # The first signal's name and the KeyboardInterrupt it raised.
+        self._received: str | None = None
+        self._interrupt: KeyboardInterrupt | None = None
 
     def __enter__(self) -> _StopSignals:
         signums = [signal.SIGINT, signal.SIGTERM]
@@ -181,12 +186,22 @@ class _StopSignals:
     def hold(self) -> None:
         self.held = True
 
+    def stopped_by(self, interrupt: KeyboardInterrupt) -> str:
+        """The signal that raised ``interrupt``; ``KeyboardInterrupt`` for one
+        the handler did not raise."""
+        if interrupt is self._interrupt:
+            return str(self._received)
+        return "KeyboardInterrupt"
+
     def _handle(self, signum: int, _frame: Any) -> None:
+        name = signal.Signals(signum).name
         if self.held:
-            self.ignored.append(signal.Signals(signum).name)
+            self.ignored.append(name)
             return
         self.held = True
-        raise KeyboardInterrupt()
+        self._received = name
+        self._interrupt = KeyboardInterrupt()
+        raise self._interrupt
 
 
 class IntradayBot:
@@ -438,11 +453,11 @@ class IntradayBot:
                 # Still inside the try: a signal up to here raises and is
                 # caught below; from here on one is only recorded.
                 stop_signals.hold()
-            except KeyboardInterrupt:
+            except KeyboardInterrupt as interrupt:
                 # A KeyboardInterrupt the handler did not raise has not
                 # started the hold.
                 stop_signals.hold()
-                LOG.info("Interrupted, shutting down.")
+                LOG.info("Interrupted by %s, shutting down.", stop_signals.stopped_by(interrupt))
             finally:
                 # An error escaping the start-up or the loop has started no
                 # hold either.
