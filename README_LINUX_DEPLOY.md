@@ -492,27 +492,82 @@ bot was down.
 
 ### Schwab token refresh window
 
-The Schwab refresh token is good for **7 days**. As long as the bot makes
-at least one API call within that window, the refresh token rotates
-automatically. If you stop the bot for >7 days, the refresh token expires
-and you have to redo the OAuth flow on a desktop, then SCP the new
-`tokens.db` over.
+The Schwab refresh token is good for **7 days from the login that issued
+it**, and API calls do not extend it: schwabdev renews only the 30-minute
+access token by itself. A new refresh token takes a new login. Once less
+than 3630 s (60.5 minutes) of the refresh token is left, schwabdev starts
+its login flow inside whichever API call checks the token next: it prints
+`[Schwabdev] Open to authenticate: <URL>`, opens a browser where it can, and
+waits on `input()` for the redirected URL.
 
-Set a calendar reminder to either:
-- run the bot at least once a week, OR
-- redo the OAuth flow weekly
+- **On a terminal** (the bot started by hand, or in tmux), the engine waits
+  at that prompt, mid-session if that is when the hour starts, and every
+  other caller waits behind it. Paste the URL within 30 seconds of logging
+  in and the bot carries on with a new 7-day token.
+- **Under systemd** there is no stdin, so `input()` raises `EOFError`, and
+  schwabdev logs `WARNING Schwabdev The refresh token is expiring soon
+  (<60min)!` and `ERROR Schwabdev [Schwabdev] Could not update refresh
+  token (EOF when reading a line)` on every API call (from 14:07:30 on
+  2026-09-25). That check comes before the access token's, so schwabdev
+  stops renewing the access token too: every call fails with `401
+  Unauthorized` once the current one lapses (at most 30 minutes; at
+  14:08:26 that day), until the tokens are renewed and the bot is
+  restarted. Meanwhile the engine can neither read a quote nor send an
+  order; only orders already resting at Schwab protect a position.
 
-If you ever see `RefreshTokenExpiredError` in the logs, that's the symptom.
+The bot logs the token's window at start-up and on the first pass of each
+trading day, from `tokens.db`, read-only:
+
+```
+INFO Schwab refresh token issued 2026-10-06 14:48:37 EDT, expires 2026-10-13 14:48:37 EDT; schwabdev asks for a new login from 2026-10-13 13:48:07 EDT, after the session after the coming one ends (2026-10-09 16:00:00 EDT).
+```
+
+It is a WARNING when that login falls before the session after the coming
+one ends: `..., before the coming session ends (...): log in again before
+then. ...`, or `..., before the session after the coming one ends (...):
+...` when the login falls after the coming session ends. The coming session
+is today's while it lasts, else the next trading day's, and a session ends
+at the regular close (13:00 on an early-close day) or the strategy's last
+window, whichever is later; weekends and exchange holidays hold none. The
+WARNING comes a trading day ahead because a bot that exits after each
+session (`auto_exit_after_session`, on in all but one shipped preset) logs this
+once a day, at start-up, and the next day's start-up may meet schwabdev's
+prompt inside the client's own start, before the bot logs anything: the day
+before is the last warning you can act on outside a session. The line above
+was logged on Thu 2026-10-08; the same token logs INFO through Fri 10-09,
+then `before the session after the coming one ends (2026-10-13 16:00:00
+EDT)` on Mon 10-12 and `before the coming session ends (2026-10-13
+16:00:00 EDT)` on Tue 10-13. A `tokens.db` it cannot read is a
+WARNING naming the error's type (`Schwab refresh token: could not read
+schwabdev's token store ...`). Neither blocks entries. Watch for them in
+the day's log, or in the journal:
+
+```bash
+grep 'Schwab refresh token' ~/TradingBot/.logs/bot_$(TZ=America/New_York date +%F).log
+journalctl --user -u intraday-bot --since today | grep 'Schwab refresh token'
+```
+
+Not `journalctl -p warning`: the bot writes its lines to stdout as plain
+text, so the journal files every one of them at priority `info`, its
+WARNINGs included, and a priority filter drops them all.
+
+To renew ahead of time, outside the session: stop the bot, move
+`.schwabdev/tokens.db` aside, redo the OAuth flow ("First-time Schwab
+OAuth" above, on a desktop, then SCP the new `tokens.db` over), and start
+the bot again. The new token is good for 7 days from that login. A bot
+stopped for more than 7 days needs the same.
 
 ### TradingView session expiry
 
 The TV `sessionid` cookie expires periodically (usually weeks to months).
 When it does, the screener stops returning candidates and the bot logs
 warnings. With `Restart=on-failure`, the bot will keep retrying — but it
-won't actually fix itself. Watch:
+won't actually fix itself. Watch the bot's warnings and errors (filtered
+on the level in the line: the journal files all of the bot's lines at
+priority `info`, so `-p warning` would show none of them):
 
 ```bash
-journalctl --user -u intraday-bot -p warning -f
+journalctl --user -u intraday-bot -f | grep -E ' (WARNING|ERROR|CRITICAL) '
 ```
 
 When you see screener failures, refresh the cookie in your `.env` and

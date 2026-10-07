@@ -11,8 +11,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import sqlite3
 from collections import deque
-from datetime import datetime, timedelta
+from contextlib import closing
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from threading import Lock, RLock
 from typing import Any, Optional
 from urllib.parse import urlsplit
@@ -167,6 +172,56 @@ def _refresh_token_serialized(client: Any) -> None:
         return
     with _TOKEN_REFRESH_LOCK:
         client.update_tokens()
+
+
+# schwabdev 4.0.0 (tokens.py): a refresh token lives 7 days from its issue
+# (``Tokens._refresh_token_timeout``), and once less than 3630 s of it is left
+# ``Tokens.update_tokens`` starts the authorization flow inside whichever API
+# call checks it next (here under _TOKEN_REFRESH_LOCK): it prints the login
+# URL and waits on ``input()`` for the callback URL. A run on a terminal waits
+# there; one without stdin (systemd) gets EOFError, which schwabdev logs
+# ("Could not update refresh token (EOF when reading a line)") on every call.
+# The check comes before the access token's, so from then the 30-minute access
+# token is not renewed either and the calls fail (401) once it lapses: at
+# 14:08:26 on 2026-09-25, a minute after the first EOFError.
+SCHWABDEV_REFRESH_TOKEN_LIFETIME = timedelta(days=7)
+SCHWABDEV_LOGIN_LEAD = timedelta(seconds=3630)
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshTokenWindow:
+    """When schwabdev's refresh token was issued (UTC), when it expires and
+    when schwabdev starts its login flow for a new one."""
+    issued_at: datetime
+
+    @property
+    def expires_at(self) -> datetime:
+        return self.issued_at + SCHWABDEV_REFRESH_TOKEN_LIFETIME
+
+    @property
+    def login_at(self) -> datetime:
+        return self.expires_at - SCHWABDEV_LOGIN_LEAD
+
+
+def read_refresh_token_window(tokens_db: str) -> RefreshTokenWindow:
+    """The refresh token's window, read from schwabdev's token store
+    (``schwab.tokens_db``, the sqlite file its ``Tokens`` keeps; the path
+    expanded as schwabdev expands it) opened read-only: no request, no
+    authorization flow, nothing written or created. The issue time is stored
+    in clear even when the tokens are encrypted; a naive one is UTC, as
+    schwabdev reads it.
+
+    Raises ``sqlite3.Error`` for a store it cannot open or read (a missing
+    file, no ``schwabdev`` table, a lock held past the 1 s timeout while
+    schwabdev renews the tokens) and ``ValueError`` for one holding no token
+    or an issue time that does not parse."""
+    uri = Path(os.path.expanduser(tokens_db)).absolute().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
+        row = conn.execute("SELECT refresh_token_issued FROM schwabdev LIMIT 1").fetchone()
+    if row is None:
+        raise ValueError("the store holds no token")
+    issued = datetime.fromisoformat(str(row[0]))
+    return RefreshTokenWindow(issued if issued.tzinfo is not None else issued.replace(tzinfo=timezone.utc))
 
 
 def call_schwab_client(client: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:

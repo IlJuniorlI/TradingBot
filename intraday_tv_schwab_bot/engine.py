@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import logging
 import signal
+import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
-from typing import TYPE_CHECKING, Any, Iterable
+from datetime import date, datetime, time as dt_time, timedelta
+from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
 from schwabdev import Client
 import pandas as pd
@@ -30,9 +31,9 @@ from .warmup_tracker import WarmupTracker
 from ._strategies.factory import build_strategy
 from .session_archive import export_session_archive, session_archive_manifest_path
 from .session_report import write_session_report
-from .schwab_api import SchwabdevApiUsageTracker, register_schwab_api_tracker
+from .schwab_api import SchwabdevApiUsageTracker, read_refresh_token_window, register_schwab_api_tracker
 from .log_setup import TRADEFLOW_LEVEL, setup_logging
-from .sessions import EQUITY_STREAM_END, equity_session_state
+from .sessions import EQUITY_STREAM_END, EXCHANGE_TZ, EquitySessionState, equity_session_state
 from . import __version__, sessions
 
 if TYPE_CHECKING:
@@ -345,6 +346,10 @@ class IntradayBot:
         # to None so the first cycle stamps today's date without
         # firing a (no-op) reset.
         self._last_skip_counts_reset_date: date | None = None
+        # ET date the Schwab refresh token's window was last logged
+        # (`_log_refresh_token_window`): at start-up, then on the first pass
+        # of each trading day.
+        self._refresh_token_logged_date: date | None = None
         self.entry_gatekeeper = EntryGatekeeper(
             config,
             client=self.client,
@@ -468,7 +473,8 @@ class IntradayBot:
                 LOG.info("Shutdown complete.")
 
     def _start_up(self) -> None:
-        """The dashboard, the start-up reconcile and the start-up log lines."""
+        """The dashboard, the refresh token's window, the start-up reconcile
+        and the start-up log lines."""
         if self.dashboard is not None:
             try:
                 self.dashboard.start()
@@ -479,6 +485,13 @@ class IntradayBot:
                 # bot running headlessly rather than refuse to start.
                 LOG.exception("Could not start dashboard on %s:%s: %s", self.config.dashboard.host, self.config.dashboard.port, exc)
                 self.dashboard = None
+        # Ahead of the start-up reconcile: a call that finds the token inside
+        # schwabdev's login lead waits at its prompt, with this line, when it
+        # is the first such call, the last before it. Not ahead of every
+        # call: the client's own start checks the token, and so does the
+        # executor's linked-accounts lookup when schwab.account_hash is unset,
+        # both before this.
+        self._log_refresh_token_window()
         # A successful startup reconcile counts as today's reconcile: the
         # session-boundary reconcile in `_maybe_session_reconcile` won't fire
         # again until the ET date rolls over. A failed one is retried there.
@@ -544,6 +557,7 @@ class IntradayBot:
                     # the app overnight before the session-boundary reconcile
                     # dropped them (2026-09-25).
                     timer.enter("reconcile")
+                    self._maybe_log_refresh_token_window()
                     self._maybe_session_reconcile()
                     self.step()
                     self.last_error = None
@@ -591,14 +605,7 @@ class IntradayBot:
                         # Non-trading day (weekend/holiday) — exit immediately
                         LOG.info("Auto-exit: non-trading day, no open positions — shutting down")
                         return
-                    schedule = self.config.active_strategy.schedule()
-                    # Exit after the latest of: RTH close, management window end,
-                    # entry window end, screener window end.  This respects
-                    # post-market windows configured in the strategy schedule.
-                    all_ends = [session.rth_close_time]
-                    for w in schedule.management_windows + schedule.entry_windows + schedule.screener_windows:
-                        all_ends.append(w.end)
-                    exit_after = max(all_ends)
+                    exit_after = self._session_end_time(session)
                     if now_t > exit_after:
                         LOG.info("Auto-exit: all windows closed at %s, no open positions — shutting down", exit_after.strftime("%H:%M"))
                         return
@@ -665,6 +672,86 @@ class IntradayBot:
             f"ENGINE DEGRADED — {consecutive_errors} consecutive failed cycles ({exposure}). "
             f"Last error: {first_line}"
         )
+
+    def _session_end_time(self, session: EquitySessionState) -> dt_time:
+        """When this bot's trading day ``session`` ends: the latest of the
+        regular close (13:00 on an early-close day) and the strategy's
+        management, entry and screener windows' ends, so a post-market window
+        counts. The auto-exit stops after it."""
+        schedule = self.config.active_strategy.schedule()
+        ends = [session.rth_close_time]
+        for window in schedule.management_windows + schedule.entry_windows + schedule.screener_windows:
+            ends.append(window.end)
+        return max(ends)
+
+    def _session_ends_after(self, now: datetime) -> Iterator[datetime]:
+        """The ends (``_session_end_time``) of the sessions to come, in
+        order, the first the coming session's: today's while ``now`` is a
+        trading day before it ends, else the next trading day's. Weekends and
+        exchange holidays hold no session."""
+        day = now.date()
+        while True:
+            session = equity_session_state(datetime.combine(day, dt_time(12, 0), tzinfo=EXCHANGE_TZ))
+            if session.is_trading_day:
+                end = datetime.combine(day, self._session_end_time(session), tzinfo=EXCHANGE_TZ)
+                if end > now:
+                    yield end
+            day += timedelta(days=1)
+
+    def _log_refresh_token_window(self) -> None:
+        """Log when the Schwab refresh token was issued, when it expires and
+        when schwabdev will ask for a new login (``schwab_api.RefreshTokenWindow``),
+        read from its token store with no request and no login flow. INFO,
+        or WARNING when that login falls before the session after the coming
+        one ends (``_session_ends_after``): an interactive run then waits at
+        schwabdev's prompt inside an API call, and a systemd run's prompt
+        fails (EOFError) on every call, which fail (401) once the access
+        token lapses (``schwab_api.SCHWABDEV_LOGIN_LEAD``). A day ahead, not
+        only on the day: a bot started each day (``auto_exit_after_session``)
+        logs this once, at start-up, and the next day's start-up may already
+        meet the prompt inside the client's own start, before it logs
+        anything. A store that cannot be read is a WARNING naming the error's
+        type. Entries are not blocked. Called at start-up and on the first
+        pass of each trading day (``_maybe_log_refresh_token_window``); both
+        stamp the day."""
+        now = sessions.now_et()
+        self._refresh_token_logged_date = now.date()
+        tokens_db = self.config.schwab.tokens_db
+        try:
+            window = read_refresh_token_window(tokens_db)
+        except (sqlite3.Error, ValueError) as exc:
+            LOG.warning("Schwab refresh token: could not read schwabdev's token store %s (%s: %s); "
+                        "when schwabdev will ask for a new login is unknown",
+                        tokens_db, type(exc).__name__, exc)
+            return
+        ends = self._session_ends_after(now)
+        coming_end, following_end = next(ends), next(ends)
+        login_at = window.login_at.astimezone(EXCHANGE_TZ)
+        stamp = "%Y-%m-%d %H:%M:%S %Z"
+        times = (f"issued {window.issued_at.astimezone(EXCHANGE_TZ):{stamp}}, "
+                 f"expires {window.expires_at.astimezone(EXCHANGE_TZ):{stamp}}; "
+                 f"schwabdev asks for a new login from {login_at:{stamp}}")
+        if login_at < following_end:
+            which, end = ("the coming session", coming_end) if login_at < coming_end else \
+                ("the session after the coming one", following_end)
+            LOG.warning("Schwab refresh token %s, before %s ends (%s): log in again before then. From then an API "
+                        "call on a terminal waits at schwabdev's prompt; under systemd the prompt fails (EOFError) "
+                        "and the calls fail (401) once the access token lapses.",
+                        times, which, f"{end:{stamp}}")
+        else:
+            LOG.info("Schwab refresh token %s, after the session after the coming one ends (%s).",
+                     times, f"{following_end:{stamp}}")
+
+    def _maybe_log_refresh_token_window(self) -> None:
+        """``_log_refresh_token_window`` on the first pass of each trading
+        day not yet logged: the earliest point of the day, ahead of its
+        reconcile and its prewarm, whatever the strategy's schedule."""
+        now = sessions.now_et()
+        if self._refresh_token_logged_date == now.date():
+            return
+        if not equity_session_state(now).is_trading_day:
+            return
+        self._log_refresh_token_window()
 
     def _maybe_session_reconcile(self) -> None:
         """Re-run startup reconcile when a new ET trading day begins.

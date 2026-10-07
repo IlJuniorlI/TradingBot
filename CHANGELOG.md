@@ -5199,6 +5199,73 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The Schwab refresh token's issue and expiry, and when schwabdev will ask
+  for a new login, are logged at start-up and on the first pass of each
+  trading day: a WARNING when that login falls before the session after the
+  coming one ends, a trading day ahead.** *2026-10-06* — schwabdev 4.0.0
+  keeps a 7-day refresh token that API calls do not extend, and once less
+  than 3630 s of it is left it starts its interactive login flow (a printed
+  URL and `input()`) inside whichever API call checks the token next, here
+  under the token-refresh lock. A run on a terminal waits at that prompt,
+  its engine with it; under systemd `input()` raises EOFError, which
+  schwabdev logs on every call while it stops renewing the access token too,
+  so the calls fail with 401 once it lapses: on H: at 14:07:30 on 2026-09-25
+  the first EOFError, at 14:08:26 the first 401, until the last EOFError at
+  15:55 (22,610 of them). H:'s next login falls at 13:48 ET on Tue
+  2026-10-13 (token issued 10-06 18:48:37Z), mid-session. Nothing said so
+  ahead of time: schwabdev logs the time left once, when the client starts.
+  - `schwab_api.read_refresh_token_window` reads the issue time from
+    schwabdev's token store (`schwab.tokens_db`) opened read-only: no
+    request, no login flow, nothing written or created. The 7 days and the
+    3630 s are schwabdev 4.0.0's (`SCHWABDEV_REFRESH_TOKEN_LIFETIME`,
+    `SCHWABDEV_LOGIN_LEAD`); the tests pin them against its own check.
+  - The engine logs `Schwab refresh token issued ..., expires ...;
+    schwabdev asks for a new login from ..., after the session after the
+    coming one ends (...)` at INFO, or at WARNING `..., before the coming
+    session ends (...): log in again before then. ...`, or `..., before
+    the session after the coming one ends (...): ...` for a login after
+    the coming session. Once the login time has passed (a bot started
+    after it, or after the token expired), the WARNING reads `..., expires
+    (or expired) ...; schwabdev has asked for a new login since ...: log
+    in again now. ...`; past means after, as schwabdev's strict checks
+    read both times. The coming session is today's while it lasts, else
+    the next trading day's (weekends and exchange holidays hold none), and
+    a session ends at the regular close (13:00 on an early-close day) or
+    the strategy's last window, whichever is later, as the auto-exit reads
+    it (`_session_end_time`, now shared).
+  - A trading day ahead, not only on the day: a bot that exits after each
+    session (`auto_exit_after_session`, on in all but one shipped preset)
+    logs this once a day, at start-up, and the next day's start-up may meet
+    schwabdev's prompt inside the client's own start, before it logs
+    anything.
+  - When: at start-up, ahead of the start-up reconcile, and on the first
+    pass of each trading day not yet logged, ahead of that pass's
+    reconcile: the earliest point of the day, whatever the strategy's
+    schedule and prewarm. Not ahead of every API call: the client's own
+    start checks the token first, and so does the executor's
+    linked-accounts lookup when `schwab.account_hash` is unset.
+  - A store it cannot read (missing, not a database, no token row, locked
+    past 1 s, an unparseable time) logs a WARNING naming the error's type.
+    Entries are not blocked.
+  - README_LINUX_DEPLOY.md's "Schwab token refresh window" said the token
+    "rotates automatically" while the bot makes calls and named a
+    `RefreshTokenExpiredError` that does not exist; it now describes the
+    7-day renewal, the prompt, systemd's EOFError and 401s, the new lines,
+    and renewing ahead of time: the store moved aside on the machine the
+    login runs on too, since schwabdev starts the login only for an empty
+    store or one in its last hour (over one with more left the run just
+    renews the access token and the old refresh token comes back), then a
+    check that the restarted bot's `Schwab refresh token issued ...` line
+    shows the new login's time. Its commands to watch for them, and for
+    the TradingView section's warnings, dropped `journalctl -p warning`:
+    the bot writes plain lines to stdout, so the journal files all of them
+    at priority info and the filter showed none; they grep the day's log
+    or the journal for the line, or its level. README.md's `tokens_db`
+    entry names the lines.
+  - Upgrade note: two new log lines, `Schwab refresh token ...` (INFO or
+    WARNING) and `Schwab refresh token: could not read schwabdev's token
+    store ...` (WARNING).
+
 - **A stock entry's slippage is measured from the touch its order crossed,
   signed, with the limit's buffer as its own field
   (`entry_slippage_pct`, new `entry_touch_price` and
