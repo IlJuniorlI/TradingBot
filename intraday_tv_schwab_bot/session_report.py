@@ -876,8 +876,8 @@ def write_session_report(
     The max drawdown is the account's (``capture_snapshot``), which values a
     held equity at its mark; the line and the payload name the mark's basis,
     ``equity_mark_basis`` (``position_manager.EQUITY_MARK_BASIS``). A report
-    without it was written before 2026-10-07 and marked held equities at
-    their 1m close.
+    without it was written by an earlier version, which marked every held
+    equity at its 1m close.
 
     Parameters
     ----------

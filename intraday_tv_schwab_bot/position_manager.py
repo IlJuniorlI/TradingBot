@@ -135,8 +135,8 @@ DISASTER_STOP_RETRY_SECONDS = 60.0
 # archive's manifest and the SESSION REPORT name (``equity_mark_basis``): the
 # price management read for it in the pass (``_manage_position``), or, in a
 # pass that did not price it, the engine's quotes-phase mark, its step frame's
-# last 1m close. An archive or a report that does not name it was written
-# before 2026-10-07, when every held equity was marked at that 1m close alone.
+# last 1m close. An archive or a report that does not name it was written by
+# an earlier version, which marked every held equity at that 1m close alone.
 EQUITY_MARK_BASIS = "management_price"
 
 # A position whose management raises is logged with its traceback on the first
@@ -2121,12 +2121,14 @@ class PositionManager:
           still fire (a touch hold left by a failed ladder pass is dropped,
           since it keeps the target off), then force flatten and the exit
           order.
-        - Anywhere else (its bracket-fill booking, the working-exit
-          settlement, the risk check itself, the bracket sync, the exit order
-          and its booking) its cycle ends where it failed. Those steps can
-          leave its orders in a state this cycle cannot know, and a second
-          attempt risks a double exit. It is retried next cycle, and a
-          resting broker stop still protects it.
+        - Anywhere else (its bracket-fill booking, the paper account's mark
+          at the price this pass read, the working-exit settlement, the risk
+          check itself, the bracket sync, the exit order and its booking) its
+          cycle ends where it failed. Those steps but the mark can leave its
+          orders in a state this cycle cannot know, and a second attempt
+          risks a double exit; the mark, a dict write under the account's
+          lock, cannot raise. It is retried next cycle, and a resting broker
+          stop still protects it.
 
         A position whose management fails ``runtime.error_escalation_cycles``
         cycles in a row escalates to a CRITICAL naming it

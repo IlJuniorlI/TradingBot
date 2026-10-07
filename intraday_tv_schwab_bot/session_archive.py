@@ -1308,8 +1308,8 @@ def export_session_archive(
       timeframes exported, write-flags for each archive component, and
       ``equity_mark_basis``: the price the paper account marked a held
       equity at (``position_manager.EQUITY_MARK_BASIS``). An archive
-      without it was written before 2026-10-07, when held equities were
-      marked at their 1m close.
+      without it was written by an earlier version, which marked every
+      held equity at its 1m close.
     - ``archive_owed.json`` — only while the archive is owed: a shutdown
       that did not write it leaves one (``leave_session_archive_owed``), as
       does one whose export is cut off (a shutdown writes it before each
