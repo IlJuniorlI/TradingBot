@@ -69,7 +69,13 @@ class TradeRecord:
     # the session report divides them by initial risk x the folded quantity.
     max_favorable_pnl: float | None = None       # peak unrealized PnL (MFE in $)
     max_adverse_pnl: float | None = None         # trough unrealized PnL (MAE in $)
-    entry_slippage_pct: float | None = None      # |fill - signal| / signal
+    # The entry fill's slippage past the touch its order crossed (the ask
+    # for a LONG, the bid for a SHORT), as a fraction of the touch: positive
+    # when worse for the position. entry_limit_buffer_pct is how far the
+    # marketable limit lay past the same touch. Until 2026-10-06
+    # entry_slippage_pct was |fill - limit| / limit, the limit's buffer.
+    entry_slippage_pct: float | None = None
+    entry_limit_buffer_pct: float | None = None
     # Post-fill risk reconciliation (2026-09-18). realized_entry_risk is
     # qty * |fill - stop| — what the trade actually risked once the fill was
     # known, versus entry_risk_budget (max_notional_per_trade *
@@ -274,6 +280,7 @@ class PaperAccount:
                 max_favorable_pnl=first_float(metadata, "best_unrealized_pnl", "diag_best_unrealized_pnl"),
                 max_adverse_pnl=first_float(metadata, "worst_unrealized_pnl", "diag_worst_unrealized_pnl"),
                 entry_slippage_pct=first_float(metadata, "entry_slippage_pct"),
+                entry_limit_buffer_pct=first_float(metadata, "entry_limit_buffer_pct"),
                 realized_entry_risk=first_float(metadata, "realized_entry_risk"),
                 entry_risk_budget=first_float(metadata, "entry_risk_budget"),
                 entry_risk_overage_frac=first_float(metadata, "entry_risk_overage_frac"),

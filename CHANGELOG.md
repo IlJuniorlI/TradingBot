@@ -5199,6 +5199,84 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A stock entry's slippage is measured from the touch its order crossed,
+  signed, with the limit's buffer as its own field
+  (`entry_slippage_pct`, new `entry_touch_price` and
+  `entry_limit_buffer_pct`; `entry_limit_price` replaces
+  `signal_entry_price`).** *2026-10-06* — `entry_slippage_pct` was
+  `|fill - limit| / limit`, and the limit is the marketable limit (the
+  ask plus a spread-scaled buffer for a buy, the bid less it for a short),
+  so the field measured the limit's own buffer: every one of the 66 rows
+  of H:'s `trades.csv` reads 0.003%-0.044%, though a dry-run fill fills at
+  the touch and never slips. A live fill after a reprice can land past the
+  first limit, and the unsigned figure read it the same as one that
+  improved on it. `risk.entry_slippage_warn_pct` compared against that
+  number too.
+  - The touch is the ask (a LONG) or the bid (a SHORT) of the quote the
+    entry was decided and priced on, the one `submit_equity_entry` is
+    handed. `entry_slippage` / `entry_slippage_pct` are how far the fill
+    landed past it, per share and as a fraction of it, positive when worse
+    for the position and negative for price improvement
+    (`position_metrics.entry_slippage`); `entry_limit_buffer_pct` is how
+    far the limit lay past it.
+  - `entry_slippage_warn_pct` keeps its meaning and value: adverse
+    slippage beyond it is logged (`Entry slippage SYM: ask=... limit=...
+    fill=... slip=+... (...% > ...% threshold)`) and flagged
+    `entry_slippage_exceeded`; price improvement never warns.
+  - The fill is measured only at an execution price. A fill with no price
+    (the position is booked at the limit), a fill the broker reported with
+    no execution legs (its price is then the order's own `price`, the
+    limit, or a quote; `OrderResult.fill_price_estimated`, new, says so,
+    read off `broker_payloads.order_executed_price`) and a quote with no
+    touch on the entry's side (the limit priced off the last trade) stamp
+    none of `entry_touch_price`, `entry_slippage`, `entry_slippage_pct` or
+    `entry_limit_buffer_pct` (`entry_limit_price` is always stamped), log a
+    WARNING (`Entry slippage SYM not measured: ...`) and record why in
+    `entry_slippage_unmeasured` (`no_fill_price`, `fill_price_estimated`,
+    `no_touch`): measured at the limit, the fill would read the limit's
+    buffer as slippage. Whether the broker reported execution legs is read
+    off the order's `orderActivityCollection`; that reading has not yet
+    been checked against a live Schwab fill payload.
+  - Late fills of an entry order settled after its submit returned
+    (`settle_unsettled_entry_orders`): a grown position is restamped from
+    its averaged entry price against the stored touch, so the flag can set
+    or clear, and left unmeasured (`late_fill_price_estimated`) when the
+    late slice's price is not an execution price (the account's order rows
+    carry `fill_price_estimated` too); an adopted entry is measured from the
+    touch its order was priced on, as a filled one is. Until now a grown
+    position kept the first slice's figures against the averaged price and
+    an adopted one carried none. An adopted entry's
+    `entry_fill_price_estimated` is true for an estimated price, not only a
+    missing one.
+  - A dry-run fill fills at the touch of that same quote, so its
+    `entry_slippage_pct` is always 0 and its `entry_limit_buffer_pct` the
+    limit's buffer.
+  - The post-fill level ERROR names the price `limit=`, not
+    `signal_entry=`.
+  - Exit slippage (`exit_slippage`, `exit_slippage_r`) is measured from
+    `exit_level`, the stop, target, floor or resting child price the exit
+    is on, not from the order's limit, and it is already signed. An exit
+    fill the broker reports without execution legs was priced at the
+    order's own price and measured from it as if executed there: that has
+    its own entry ("An exit fill the broker reports without execution legs
+    is booked flagged estimated").
+  - Upgrade note: `trades.csv` gains the `entry_limit_buffer_pct` column
+    after `entry_slippage_pct`, so the first append of a trade after the
+    upgrade copies the old file to `trades.archive-<date>.csv` (WARNING
+    `trades.csv schema changed`) and starts a fresh one holding that day's
+    rows, carried over with the new columns empty, and the new ones. Rows
+    written before the upgrade keep the old, unsigned buffer reading under
+    `entry_slippage_pct`: all of them in the archive file, and the upgrade
+    day's carried rows in the new file too, where an empty
+    `entry_limit_buffer_pct` beside a filled `entry_slippage_pct` marks
+    them. A position entered before the upgrade and held across it (its
+    metadata carries no `entry_touch_price`) writes no `entry_slippage_pct`.
+    Position metadata (and the records that carry it, and the dashboard's
+    recent trades) lose `signal_entry_price` and gain `entry_limit_price`,
+    `entry_touch_price`, `entry_limit_buffer_pct` and, for an entry not
+    measured, `entry_slippage_unmeasured`; the `Entry slippage` WARNING's
+    text changes.
+
 - **top_tier's HTF bias refusal names the rule that set the bias.**
   *2026-10-06* — on H:'s 10-06 MRVL, the day's top candidate, was refused
   LONG as `htf_bias_bearish(last_high=HH,last_low=HL)` (for example at

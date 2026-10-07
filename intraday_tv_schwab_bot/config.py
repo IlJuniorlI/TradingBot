@@ -357,9 +357,10 @@ class RiskConfig:
     # position. Detection only — the shares are already bought, so there is
     # nothing to reject; the sizing allowance above is the preventive half.
     risk_overage_warn_frac: float = 0.15
-    # Entry slippage beyond this fraction of the signal price is logged and
-    # flagged on the position, so a routing or liquidity degradation surfaces
-    # in the log rather than only in an end-of-day report nobody diffs.
+    # Adverse entry slippage beyond this fraction of the touch the order
+    # crossed (the ask for a LONG, the bid for a SHORT) is logged and flagged
+    # on the position, so a routing or liquidity degradation surfaces in the
+    # log rather than only in an end-of-day report nobody diffs.
     entry_slippage_warn_pct: float = 0.0015
     # --- Daily loss projection (2026-09-18) ---
     # max_daily_loss gates NEW ENTRIES on REALIZED P&L only, and open

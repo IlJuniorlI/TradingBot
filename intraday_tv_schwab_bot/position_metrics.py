@@ -189,6 +189,15 @@ def exit_level(position: Position, decision: ExitDecision) -> tuple[float | None
     return (number, kind) if number is not None else (None, None)
 
 
+def entry_slippage(side: Side, touch: float, price: float) -> float:
+    """How far ``price`` lies past ``touch``, the side of the quote an entry
+    crosses (the ask for a LONG, the bid for a SHORT), per unit: positive
+    when it is worse for the position (a LONG paying above the ask, a SHORT
+    selling below the bid), negative when better. Of a fill, the entry's
+    slippage; of its limit, the buffer the limit gave it."""
+    return (price - touch) if side == Side.LONG else (touch - price)
+
+
 def exit_slippage(side: Side, level: float, fill: float) -> float:
     """How far ``fill`` landed past ``level``, per unit: positive when it is
     worse for the position than the level (a LONG sold below it, a SHORT

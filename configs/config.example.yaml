@@ -119,7 +119,8 @@ risk:
   entry_slippage_allowance_max_pct: 0.002
   # Post-fill checks (log + stamp the position, never reject — the shares
   # are already bought): realized risk more than risk_overage_warn_frac over
-  # budget, and entry slippage beyond entry_slippage_warn_pct of the signal.
+  # budget, and adverse entry slippage beyond entry_slippage_warn_pct of the
+  # touch the order crossed (the ask for a long, the bid for a short).
   risk_overage_warn_frac: 0.15
   entry_slippage_warn_pct: 0.0015
   # max_daily_loss gates new entries. When true, open positions' remaining

@@ -302,25 +302,47 @@ def _multi_leg_net_fill_price(payload: dict[str, Any], legs: list[dict[str, Any]
     return net if net > 0 else None
 
 
-def order_fill_price(payload: dict[str, Any] | None) -> float | None:
-    """Average fill price per unit: per share, or per spread for a vertical."""
+def order_executed_price(payload: dict[str, Any] | None) -> float | None:
+    """Average price per unit of the order's executions (its
+    ``orderActivityCollection`` legs): per share, or per spread for a
+    vertical. None when the payload reports no execution to price it by."""
     if not isinstance(payload, dict):
         return None
     executions = _order_executions(payload)
     legs = [leg for leg in (payload.get("orderLegCollection") or []) if isinstance(leg, dict)]
     if len(legs) > 1:
-        net = _multi_leg_net_fill_price(payload, legs, executions)
-        if net is not None:
-            return net
-    elif executions:
+        return _multi_leg_net_fill_price(payload, legs, executions)
+    if executions:
         notional = sum(value[0] for value in executions.values())
         filled = sum(value[1] for value in executions.values())
         return notional / filled
+    return None
+
+
+def order_fill_price(payload: dict[str, Any] | None) -> float | None:
+    """Average fill price per unit: per share, or per spread for a vertical.
+
+    The executions' price (``order_executed_price``) when the payload reports
+    them, else the order's own ``price`` (a LIMIT order's limit),
+    ``filledPrice`` or ``averagePrice``: a price the fill is booked at, not
+    one it was measured to execute at (``order_fill_price_estimated``)."""
+    if not isinstance(payload, dict):
+        return None
+    executed = order_executed_price(payload)
+    if executed is not None:
+        return executed
     for key in ("price", "filledPrice", "averagePrice"):
         px = safe_float(payload.get(key), finite=True)
         if px is not None and px > 0:
             return px
     return None
+
+
+def order_fill_price_estimated(payload: dict[str, Any] | None) -> bool:
+    """True when the payload reports no execution price
+    (``order_executed_price``): its ``order_fill_price`` is then the order's
+    own price, or None."""
+    return order_executed_price(payload) is None
 
 
 def order_is_filled(payload: dict[str, Any] | None) -> bool:
@@ -393,6 +415,9 @@ def flatten_order_tree(node: Any, out: dict[str, dict[str, Any]]) -> None:
             "order_type": str(node.get("orderType") or "").upper(),
             "filled_qty": order_filled_qty(node),
             "fill_price": order_fill_price(node),
+            # True when fill_price is not an execution price
+            # (order_fill_price_estimated): the order's own, or none.
+            "fill_price_estimated": order_fill_price_estimated(node),
             "is_filled": order_is_filled(node),
             "is_terminal_failure": order_is_terminal_failure(node),
             # The order that REPLACED it, when the payload names one.

@@ -229,3 +229,11 @@ class OrderResult:
     # every other order (a dry run, a MARKET exit, an entry, an option's).
     # EXIT_CONTEXT carries it as ``exit_limits_missed`` (2026-09-28).
     exit_limits_missed: int | None = None
+    # A live order's fill (SchwabExecutor._finalize_live_equity_entry_result,
+    # _finalize_live_polled_order_result): True when the broker reported no
+    # execution price for it (broker_payloads.order_fill_price_estimated), so
+    # ``fill_price`` is the order's own price (a LIMIT's limit), a quote, or
+    # None. False for every other order, a dry run's simulated fill included:
+    # that is the paper model's own price. An entry's slippage is not
+    # measured from an estimated fill (2026-10-06).
+    fill_price_estimated: bool = False

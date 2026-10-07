@@ -56,7 +56,7 @@ from .models import (
 from .options_mode import realized_max_loss_per_contract
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
-from .position_metrics import initial_risk_per_unit
+from .position_metrics import entry_slippage, initial_risk_per_unit
 from .numeric import safe_float
 from .reasons import blocked_side, reason_gate
 from .risk import RiskManager
@@ -273,6 +273,104 @@ class EntryGatekeeper:
             return float(stop_price), safe_float(target_price, None), None
         stop, target = default_levels(side, fill_price, self.config.risk)
         return stop, target, levels_reason
+
+    # The position metadata a measured stock entry's slippage is stamped in
+    # (_stamp_entry_slippage); an unmeasured one carries none of them and
+    # ``entry_slippage_unmeasured``, why.
+    _ENTRY_SLIPPAGE_KEYS = ("entry_touch_price", "entry_slippage", "entry_slippage_pct", "entry_limit_buffer_pct",
+                            "entry_slippage_exceeded")
+
+    @staticmethod
+    def _entry_touch(side: Side, quote: Mapping[str, Any]) -> float | None:
+        """The touch an entry on *side* crosses on *quote*: its ask for a
+        LONG, its bid for a SHORT; None when the quote has no positive,
+        finite one."""
+        touch = safe_float(quote.get("ask" if side == Side.LONG else "bid"), None, finite=True)
+        return touch if touch is not None and touch > 0 else None
+
+    def _stamp_entry_slippage(self, metadata: dict[str, Any], symbol: str, side: Side, touch: float,
+                              limit_price: float, fill_price: float) -> None:
+        """Stamp a stock entry's slippage on its position ``metadata``,
+        measured from ``touch``, the side of the quote the entry was decided
+        and priced on that its order crossed: the ask for a LONG, the bid for
+        a SHORT (``position_metrics.entry_slippage``). ``fill_price`` is an
+        execution price: the fill's, or the average of a position grown by
+        late fills, which restamps it.
+
+        - ``entry_touch_price``: that touch;
+        - ``entry_slippage`` / ``entry_slippage_pct``: how far the fill
+          landed past it, per unit and as a fraction of it, positive when
+          worse for the position, negative for price improvement;
+        - ``entry_limit_buffer_pct``: how far the limit lay past it, the
+          room the marketable limit gave the fill.
+
+        Adverse slippage over ``risk.entry_slippage_warn_pct`` is logged and
+        flagged ``entry_slippage_exceeded``; a restamp under it clears the
+        flag. A fill it cannot be measured from is
+        ``_entry_slippage_not_measured``.
+
+        Until 2026-10-06 ``entry_slippage_pct`` was ``|fill - limit| / limit``,
+        the limit's own buffer, unsigned: a dry-run fill at the touch read
+        the full buffer, and a live fill past a repriced limit read the same
+        as one that improved on it."""
+        slippage = entry_slippage(side, touch, fill_price)
+        slippage_pct = slippage / touch
+        metadata["entry_touch_price"] = touch
+        metadata["entry_slippage"] = round(slippage, 6)
+        metadata["entry_slippage_pct"] = round(slippage_pct, 6)
+        metadata["entry_limit_buffer_pct"] = round(entry_slippage(side, touch, limit_price) / touch, 6)
+        metadata.pop("entry_slippage_exceeded", None)
+        warn_pct = float(self.config.risk.entry_slippage_warn_pct)
+        if 0 < warn_pct < slippage_pct:
+            metadata["entry_slippage_exceeded"] = True
+            LOG.warning(
+                "Entry slippage %s: %s=%.4f limit=%.4f fill=%.4f slip=%+.4f (%.3f%% > %.3f%% threshold) — "
+                "persistent breaches point at routing or liquidity, not one bad print.",
+                symbol, "ask" if side == Side.LONG else "bid", touch, limit_price, fill_price, slippage,
+                slippage_pct * 100.0, warn_pct * 100.0,
+            )
+
+    def _entry_slippage_not_measured(self, metadata: dict[str, Any], symbol: str, reason: str, detail: str) -> None:
+        """Leave a stock entry's slippage unmeasured: none of
+        ``_ENTRY_SLIPPAGE_KEYS`` (a grown position loses those it had),
+        ``entry_slippage_unmeasured`` = *reason*, and a WARNING with
+        *detail*. Measured from a price that is not an execution price (the
+        order's own limit, a quote), it would read the limit's buffer, or the
+        quote's move, as slippage."""
+        for key in self._ENTRY_SLIPPAGE_KEYS:
+            metadata.pop(key, None)
+        metadata["entry_slippage_unmeasured"] = reason
+        LOG.warning("Entry slippage %s not measured: %s", symbol, detail)
+
+    def _measure_entry_slippage(self, metadata: dict[str, Any], signal, touch: float | None, limit_price: float,
+                                fill_price: float | None, fill_price_estimated: bool) -> None:
+        """Stamp a filled stock entry's slippage (``_stamp_entry_slippage``),
+        or leave it unmeasured, with its reason, when there is no execution
+        price or no touch to measure it by:
+
+        - ``no_fill_price``: the fill carried no price, so the position is
+          booked at the limit;
+        - ``fill_price_estimated``: the broker reported no execution price
+          (``OrderResult.fill_price_estimated``), so the fill's price is the
+          order's own limit or a quote;
+        - ``no_touch``: the entry quote had no touch on the entry's side, so
+          the limit was priced off the last trade."""
+        touch_key = "ask" if signal.side == Side.LONG else "bid"
+        if fill_price is None:
+            self._entry_slippage_not_measured(
+                metadata, signal.symbol, "no_fill_price",
+                f"the fill carried no price, so the position is booked at the limit {limit_price:.4f}.")
+        elif fill_price_estimated:
+            self._entry_slippage_not_measured(
+                metadata, signal.symbol, "fill_price_estimated",
+                f"the broker reported no execution price, so the fill price {fill_price:.4f} is the order's own "
+                f"(the limit {limit_price:.4f}) or a quote's.")
+        elif touch is None:
+            self._entry_slippage_not_measured(
+                metadata, signal.symbol, "no_touch",
+                f"the entry quote had no {touch_key}, so the limit {limit_price:.4f} was priced off the last trade.")
+        else:
+            self._stamp_entry_slippage(metadata, signal.symbol, signal.side, touch, limit_price, fill_price)
 
     @staticmethod
     def _scaled_order_spec(spec: dict[str, Any], qty: int) -> dict[str, Any]:
@@ -528,7 +626,11 @@ class EntryGatekeeper:
     # ------------------------------------------------------------------
 
     def _track_unsettled_entry(self, signal, result, *, position_key: str, asset_type: str,
-                               preview_entry_price: float, booked_qty: int) -> None:
+                               preview_entry_price: float, booked_qty: int, touch_price: float | None) -> None:
+        """Track an entry order the submit call could not settle.
+        *touch_price* is a stock entry's touch (``_entry_touch``), what its
+        late fills' slippage is measured from; None for an option entry and
+        for a quote with no touch on the entry's side."""
         self.unsettled_entry_orders[position_key] = {
             "order_id": str(result.order_id),
             "symbol": str(signal.symbol),
@@ -539,6 +641,11 @@ class EntryGatekeeper:
             # Read as the booking read it (2026-09-26): an infinite fill
             # priced the late slice at 0.0001 or at inf.
             "booked_price": safe_float(result.fill_price, finite=True) if booked_qty > 0 else None,
+            # True when booked_price is not an execution price
+            # (OrderResult.fill_price_estimated): a late slice priced off it
+            # is not one either.
+            "booked_price_estimated": bool(result.fill_price_estimated),
+            "touch_price": touch_price,
             "message": str(result.message),
         }
         LOG.warning(
@@ -588,20 +695,31 @@ class EntryGatekeeper:
                 scale = 100.0 if is_option_asset(record) else 1.0
                 average = safe_float(state.get("fill_price"), None)
                 average = average * scale if average is not None else None
+                # Not an execution price unless the row says it is one
+                # (broker_payloads.order_fill_price_estimated).
+                average_estimated = average is None or state.get("fill_price_estimated") is not False
                 extra = filled - booked
                 booked_price = record.get("booked_price")
                 if average is not None and booked > 0 and booked_price is not None:
                     # The order's average covers every fill; strip out the
                     # slice already booked to price the new one.
                     extra_price = max(0.0001, (average * filled - float(booked_price) * booked) / extra)
+                    extra_estimated = average_estimated or bool(record["booked_price_estimated"])
                 else:
+                    # With a slice booked at no price, the order's average
+                    # stands in for the new slice's own.
                     extra_price = average
+                    extra_estimated = average_estimated or booked > 0
                 if position_key in self.positions:
-                    self._grow_position(position_key, extra, extra_price, record)
+                    self._grow_position(position_key, extra, extra_price, record,
+                                        extra_price_estimated=extra_estimated)
                 else:
-                    self._adopt_entry_fill(position_key, extra, extra_price, record)
+                    self._adopt_entry_fill(position_key, extra, extra_price, record,
+                                           fill_price_estimated=extra_estimated)
                 record["booked_qty"] = filled
-                record["booked_price"] = average if average is not None else booked_price
+                if average is not None:
+                    record["booked_price"] = average
+                    record["booked_price_estimated"] = average_estimated
             if state.get("is_filled") or state.get("is_terminal_failure"):
                 del self.unsettled_entry_orders[position_key]
                 continue
@@ -611,8 +729,17 @@ class EntryGatekeeper:
                             order_id, position_key, cancel_msg)
 
     def _grow_position(self, position_key: str, extra_qty: int, extra_price: float | None,
-                       record: dict[str, Any]) -> None:
-        """Fold late fills of a partially filled entry into its open position."""
+                       record: dict[str, Any], *, extra_price_estimated: bool) -> None:
+        """Fold late fills of a partially filled entry into its open position.
+
+        A stock position whose slippage was measured (it carries
+        ``entry_touch_price``) is restamped from its new average entry price
+        (``_stamp_entry_slippage``); when the late slice's price
+        (*extra_price*, None booking it at the entry price) is not an
+        execution price, *extra_price_estimated*, neither is the average,
+        and the position's slippage is left unmeasured
+        (``late_fill_price_estimated``). Until 2026-10-06 it kept the first
+        slice's figures against the averaged price."""
         position = self.positions[position_key]
         price = float(extra_price) if extra_price is not None else float(position.entry_price)
         added = copy.copy(position)
@@ -624,6 +751,15 @@ class EntryGatekeeper:
         if isinstance(position.metadata, dict):
             position.metadata["qty"] = total_qty
             position.metadata["entry_late_fill_qty"] = int(position.metadata.get("entry_late_fill_qty") or 0) + int(extra_qty)
+            touch = position.metadata.get("entry_touch_price")
+            if touch is not None and extra_price_estimated:
+                self._entry_slippage_not_measured(
+                    position.metadata, position_key, "late_fill_price_estimated",
+                    f"{extra_qty} late share(s) of order {record['order_id']} filled at no reported execution "
+                    f"price, so the averaged entry {position.entry_price:.4f} is not one.")
+            elif touch is not None:
+                self._stamp_entry_slippage(position.metadata, position_key, position.side, float(touch),
+                                           float(position.metadata["entry_limit_price"]), float(position.entry_price))
             bracket = active_broker_bracket(position)
             if bracket is not None:
                 resized, msg = self.executor.resize_bracket_children(
@@ -664,12 +800,15 @@ class EntryGatekeeper:
             )
 
     def _adopt_entry_fill(self, position_key: str, qty: int, fill_price: float | None,
-                          record: dict[str, Any]) -> None:
+                          record: dict[str, Any], *, fill_price_estimated: bool) -> None:
         """Open the position an unsettled entry order turned out to fill.
 
         The shares exist at the broker, so the position is ALWAYS tracked: a
         fill that invalidates the signal's levels gets the post-fill fallback
         levels, as a normal filled entry would, never an untracked position.
+        A stock entry's slippage is measured from the record's touch as a
+        filled entry's is (``_measure_entry_slippage``); until 2026-10-06 an
+        adopted entry carried none.
         """
         signal = record["signal"]
         entry_price = float(fill_price) if fill_price is not None and fill_price > 0 else float(record["preview_entry_price"])
@@ -687,6 +826,12 @@ class EntryGatekeeper:
             if levels_reason is not None:
                 position_metadata["emergency_fallback_levels"] = True
                 position_metadata["original_levels_reason"] = levels_reason
+            limit_price = float(record["preview_entry_price"])
+            position_metadata["entry_limit_price"] = limit_price
+            self._measure_entry_slippage(
+                position_metadata, signal, record["touch_price"], limit_price,
+                float(fill_price) if fill_price is not None and fill_price > 0 else None, fill_price_estimated,
+            )
             position_metadata.setdefault("initial_stop_price", float(stop_price))
             position_metadata.setdefault("initial_target_price", target_price)
             position_metadata.setdefault("trail_armed", False)
@@ -716,7 +861,7 @@ class EntryGatekeeper:
         position_metadata["broker_reconciled_after_order_uncertainty"] = True
         position_metadata["broker_recovery_order_id"] = str(record["order_id"])
         position_metadata["broker_recovery_message"] = str(record["message"])
-        position_metadata["entry_fill_price_estimated"] = fill_price is None
+        position_metadata["entry_fill_price_estimated"] = fill_price is None or fill_price_estimated
         position = Position(
             symbol=position_key,
             strategy=signal.strategy,
@@ -1131,6 +1276,7 @@ class EntryGatekeeper:
                             signal, result,
                             position_key=str(signal.metadata.get("position_key") or signal.symbol),
                             asset_type=asset_type, preview_entry_price=preview_entry_price, booked_qty=0,
+                            touch_price=None,
                         )
                         self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_unsettled:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, preview_entry_price, result.message)}, market_side=signal_market_side)
                         continue
@@ -1211,7 +1357,7 @@ class EntryGatekeeper:
                     # the order may still fill and must grow this position.
                     self._track_unsettled_entry(
                         signal, result, position_key=position_key, asset_type=asset_type,
-                        preview_entry_price=preview_entry_price, booked_qty=qty_for_position,
+                        preview_entry_price=preview_entry_price, booked_qty=qty_for_position, touch_price=None,
                     )
                 self._save_reconcile_metadata()
                 self._log_entry_decision(signal.strategy, signal.symbol, "entered", [signal.reason], market_side=signal_market_side)
@@ -1227,6 +1373,9 @@ class EntryGatekeeper:
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "entry_quote_unavailable"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
                 continue
             entry_price = float(preview["limit_price"])
+            # The touch the order crosses on the quote it is priced on: what
+            # its fill's slippage is measured from.
+            entry_touch = self._entry_touch(signal.side, preview)
             levels_ok, levels_reason = self._entry_levels_valid(signal.side, entry_price, signal.stop_price, signal.target_price)
             if not levels_ok:
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, levels_reason or "invalid_levels"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, entry_price, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)}, market_side=signal_market_side)
@@ -1282,17 +1431,17 @@ class EntryGatekeeper:
                 if result.order_id and (result.may_still_be_working or order_result_needs_broker_recheck(result.message)):
                     self._track_unsettled_entry(
                         signal, result, position_key=signal.symbol, asset_type=ASSET_TYPE_EQUITY,
-                        preview_entry_price=entry_price, booked_qty=0,
+                        preview_entry_price=entry_price, booked_qty=0, touch_price=entry_touch,
                     )
                     self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_unsettled:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, entry_price, result_message=result.message, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)}, market_side=signal_market_side)
                     continue
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_failed:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, entry_price, result_message=result.message, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent), **self._risk_snapshot(signal, entry_price, qty_for_position)}, market_side=signal_market_side)
                 continue
-            signal_entry_price = float(entry_price)  # pre-fill intended price
+            limit_price = float(entry_price)  # the marketable limit the order went out at
             # A fill price that is not a finite number books at the preview,
             # as a missing one does; a NaN one booked the position at NaN
             # (2026-09-26).
-            entry_price = safe_float(result.fill_price, signal_entry_price, finite=True)
+            entry_price = safe_float(result.fill_price, limit_price, finite=True)
 
             # Post-fill level revalidation. The pre-order check above ran
             # against the PREVIEWED price; a fill that slipped through its own
@@ -1313,9 +1462,9 @@ class EntryGatekeeper:
             if not levels_ok:
                 LOG.error(
                     "Post-fill level validation FAILED for %s (reason=%s side=%s fill=%.4f "
-                    "signal_entry=%.4f stop=%.4f target=%s); applying default-distance fallback levels.",
+                    "limit=%.4f stop=%.4f target=%s); applying default-distance fallback levels.",
                     signal.symbol, levels_reason, signal.side.value, entry_price,
-                    signal_entry_price, float(signal.stop_price), safe_float(signal.target_price, None),
+                    limit_price, float(signal.stop_price), safe_float(signal.target_price, None),
                 )
 
             position_metadata = dict(signal.metadata or {})
@@ -1328,21 +1477,10 @@ class EntryGatekeeper:
             if not levels_ok:
                 position_metadata["emergency_fallback_levels"] = True
                 position_metadata["original_levels_reason"] = levels_reason
-            # Slippage tracking: signal price vs actual fill
-            entry_slippage_pct = abs(entry_price - signal_entry_price) / max(signal_entry_price, 0.01)
-            position_metadata["signal_entry_price"] = signal_entry_price
-            position_metadata["entry_slippage"] = round(abs(entry_price - signal_entry_price), 6)
-            position_metadata["entry_slippage_pct"] = round(entry_slippage_pct, 6)
-            slippage_warn_pct = float(self.config.risk.entry_slippage_warn_pct)
-            if 0 < slippage_warn_pct < entry_slippage_pct:
-                position_metadata["entry_slippage_exceeded"] = True
-                LOG.warning(
-                    "Entry slippage %s: signal=%.4f fill=%.4f slip=%.4f (%.3f%% > %.3f%% threshold) — "
-                    "persistent breaches point at routing or liquidity, not one bad print.",
-                    signal.symbol, signal_entry_price, entry_price,
-                    abs(entry_price - signal_entry_price),
-                    entry_slippage_pct * 100.0, slippage_warn_pct * 100.0,
-                )
+            position_metadata["entry_limit_price"] = limit_price
+            self._measure_entry_slippage(position_metadata, signal, entry_touch, limit_price,
+                                         safe_float(result.fill_price, None, finite=True),
+                                         result.fill_price_estimated)
 
             # Realized-risk reconciliation. Sizing happened against the
             # previewed price; this is what the trade actually risks now that
@@ -1398,7 +1536,7 @@ class EntryGatekeeper:
                 # order may still fill and must grow this position.
                 self._track_unsettled_entry(
                     signal, result, position_key=signal.symbol, asset_type=ASSET_TYPE_EQUITY,
-                    preview_entry_price=signal_entry_price, booked_qty=qty_for_position,
+                    preview_entry_price=limit_price, booked_qty=qty_for_position, touch_price=entry_touch,
                 )
             self._save_reconcile_metadata()
             # The disaster stop goes out once the position is tracked and

@@ -23,6 +23,7 @@ from .broker_payloads import (
     flatten_order_tree,
     is_disaster_stop,
     order_fill_price,
+    order_fill_price_estimated,
     order_filled_qty,
     order_is_filled,
     order_is_terminal_failure,
@@ -404,7 +405,8 @@ class SchwabExecutor:
             # Only assume full fill when the BROKER itself reported a fill price.
             # A quote-derived fallback price does not prove the order was filled.
             filled_qty = request.qty
-        return OrderResult(ok=(filled_qty or 0) > 0, order_id=order_id, raw=payload or spec, message=message, fill_price=fill_price, filled_qty=filled_qty, simulated=False)
+        return OrderResult(ok=(filled_qty or 0) > 0, order_id=order_id, raw=payload or spec, message=message, fill_price=fill_price, filled_qty=filled_qty, simulated=False,
+                           fill_price_estimated=order_fill_price_estimated(payload))
 
     def _finalize_live_polled_order_result(
         self,
@@ -419,7 +421,8 @@ class SchwabExecutor:
         fill_price = order_fill_price(payload)
         if fill_price is not None and price_scale != 1.0:
             fill_price *= float(price_scale)
-        return OrderResult(ok=(filled_qty or 0) > 0, order_id=order_id, raw=payload or spec, message=message, fill_price=fill_price, filled_qty=filled_qty, simulated=False)
+        return OrderResult(ok=(filled_qty or 0) > 0, order_id=order_id, raw=payload or spec, message=message, fill_price=fill_price, filled_qty=filled_qty, simulated=False,
+                           fill_price_estimated=order_fill_price_estimated(payload))
 
     def _replaced_order_result(self, spec: dict[str, Any], payload: dict[str, Any] | None, order_id: str,
                                *, price_scale: float) -> OrderResult | None:
