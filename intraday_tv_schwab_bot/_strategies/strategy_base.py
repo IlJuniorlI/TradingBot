@@ -458,6 +458,8 @@ class BaseStrategy(ContextBuildersMixin):
             "resistance": "HR",
             "broken_htf_resistance": "BR",
             "broken_htf_support": "BS",
+            "pending_htf_support": "PS",
+            "pending_htf_resistance": "PR",
             "bullish_htf_fvg": "BFVG",
             "bearish_htf_fvg": "RFVG",
             "bullish_continuation_trigger": "CT",
