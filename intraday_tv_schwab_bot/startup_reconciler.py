@@ -59,11 +59,13 @@ from .broker_payloads import (
     DISASTER_SYNC_MODE,
     ORDER_REPLACED,
     active_broker_bracket,
+    booked_fills_ledger,
     bracket_order_ids,
     broker_position_side_qty,
     broker_quantity,
     is_disaster_stop,
     listed_stop,
+    note_booked_child_fills,
     order_row_filled_qty,
     order_status_class,
     resting_exit_stop,
@@ -328,7 +330,9 @@ class StartupReconciler:
         so a stop replaced before the restart is adopted instead of being read
         as dead (its original, off the parent, is REPLACED) and stacked on.
         What the adopted stop sold before the snapshot is booked on it
-        (``booked_child_fills``): the shares restored are already net of it.
+        (``booked_child_fills``, at the snapshot's price:
+        ``booked_child_notional``): the shares restored are already net of
+        it.
         A dry run's disaster stop adopts nothing: every stop in the account
         is the user's (2026-09-29).
 
@@ -393,12 +397,19 @@ class StartupReconciler:
             # filled in part while the bot was down was booked in full when
             # the rest of it filled, and EXIT OVERFILLED named a short the
             # account did not hold.
-            booked = {str(oid): int(qty) for oid, qty in (known.get("booked_child_fills") or {}).items()}
+            # At the snapshot's average (fillPrice, flagged as the row flags
+            # it), which a later fill of the stop is priced net of
+            # (broker_payloads.unbooked_fill_price, 2026-10-06).
+            booked = booked_fills_ledger(known)
             for order_id in bracket_order_ids(known):
                 if order_id in listed and order_row_filled_qty(listed[order_id]) > 0:
-                    booked[order_id] = order_row_filled_qty(listed[order_id])
+                    row = listed[order_id]
+                    filled = order_row_filled_qty(row)
+                    price = safe_float(row.get("fillPrice"), None, finite=True)
+                    note_booked_child_fills(booked, order_id, filled, None if price is None else price * filled,
+                                            row.get("fillPriceEstimated") is not False)
             if booked:
-                known = {**known, "booked_child_fills": booked}
+                known = {**known, **booked}
         initial_stop = safe_float(metadata.get("initial_stop_price"), None, finite=True)
         level: float | None = None
         try:

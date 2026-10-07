@@ -87,6 +87,9 @@ from .broker_payloads import (
     ORDER_REPLACED,
     WORKING_STATUSES,
     active_broker_bracket,
+    add_booked_child_fill,
+    booked_child_part,
+    booked_fills_ledger,
     bracket_order_ids,
     exit_orders,
     is_disaster_stop,
@@ -98,6 +101,7 @@ from .broker_payloads import (
     protective_stop_reason,
     replacement_order,
     sent_exit_stop,
+    unbooked_fill_price,
     working_exit_outstanding_qty,
 )
 from .log_setup import TRADEFLOW_LEVEL, ComponentFailureLog
@@ -934,13 +938,19 @@ class PositionManager:
             child_states[child_key] = state
             if not isinstance(state, dict) or not state.get("is_filled"):
                 continue
-            # Less what an unconfirmed stop's lookup already booked from it.
-            filled_qty = (int(state.get("filled_qty") or 0)
-                          - int((bracket.get("booked_child_fills") or {}).get(str(child_id)) or 0))
+            # Less what an unconfirmed stop's lookup already booked from it,
+            # and priced as the rest's own fills (broker_payloads
+            # .unbooked_fill_price): the order's average covers both.
+            booked_qty, booked_notional, booked_estimated = booked_child_part(bracket, child_id)
+            filled = int(state.get("filled_qty") or 0)
+            filled_qty = filled - booked_qty
             if filled_qty <= 0:
                 continue
             exit_qty = self._held_part_of_fill(key, position, filled_qty, f"{reason} order {child_id}")
-            fill_price = state.get("fill_price")
+            fill_price, fill_price_estimated = unbooked_fill_price(
+                filled, safe_float(state.get("fill_price"), None, finite=True),
+                state.get("fill_price_estimated") is not False, booked_qty, booked_notional, booked_estimated,
+                what=f"{reason} order {child_id} for {key}")
             if fill_price is None:
                 # Broker reported a fill without a price; fall back to the
                 # level the child was resting at, which is what it triggered on.
@@ -959,9 +969,7 @@ class PositionManager:
                 result_message="bracket_child_filled", attempt_status="broker_bracket",
                 # The resting level, or the order's own price: not an
                 # execution price (broker_payloads.order_fill_price_estimated).
-                fill_price_estimated=(state.get("fill_price") is None
-                                      or state.get("fill_price_estimated") is not False),
-                exit_limits_missed=None,
+                fill_price_estimated=fill_price_estimated, exit_limits_missed=None,
             )
             if key not in self.positions:
                 # The OCO normally takes the sibling down, but a child moved
@@ -1086,19 +1094,26 @@ class PositionManager:
             # cancel-before-exit still sends its cancel, and only the dead
             # child is dropped, so the engine owns the stop at once. Only that
             # child's fills are booked now: a later cancel or fill of what
-            # stays tracked reports its fills again, cumulatively.
+            # stays tracked reports its fills again, cumulatively. Less what
+            # is already booked of the child (a stop adopted from an
+            # unconfirmed one's lookup), priced as the rest's own fills.
             dead_filled = int((child_state or {}).get("filled_qty") or 0)
-            if dead_filled > 0:
+            booked_qty, booked_notional, booked_estimated = booked_child_part(bracket, dead_id)
+            if dead_filled > booked_qty:
+                dead_price, dead_estimated = unbooked_fill_price(
+                    dead_filled, safe_float(child_state.get("fill_price"), None, finite=True),
+                    child_state.get("fill_price_estimated") is not False, booked_qty, booked_notional,
+                    booked_estimated, what=f"dead {child} {dead_id} for {key}")
                 self.book_bracket_cancel_fills(
                     key, position, bracket,
-                    BracketCancel(False, leftover.message, dead_filled, safe_float(child_state.get("fill_price"), None),
+                    BracketCancel(False, leftover.message, dead_filled - booked_qty, dead_price,
                                   protective_stop_reason(bracket) if child == "stop" else "broker_target",
-                                  child_state.get("fill_price_estimated") is not False),
+                                  dead_estimated),
                     None, bars,
                 )
                 # The wrapper still lists the dead child; a later cancel of it
                 # must not report these again.
-                bracket.setdefault("booked_child_fills", {})[dead_id] = dead_filled
+                add_booked_child_fill(bracket, dead_id, dead_filled - booked_qty, dead_price, dead_estimated)
             bracket[child_key] = None
             bracket["child_order_ids"] = [oid for oid in bracket.get("child_order_ids") or [] if str(oid) != dead_id]
             if child == "stop":
@@ -1236,14 +1251,21 @@ class PositionManager:
 
     @staticmethod
     def _track_working_exit(position: Position, *, order_id: str, message: str, decision: ExitDecision,
-                            booked_qty: int, requested_qty: int, bracket_cancelled: bool,
-                            exit_limits_missed: int | None) -> None:
+                            booked_qty: int, booked_notional: float | None, booked_price_estimated: bool,
+                            requested_qty: int, bracket_cancelled: bool, exit_limits_missed: int | None) -> None:
         if isinstance(position.metadata, dict):
             position.metadata["working_exit_order"] = {
                 "order_id": str(order_id),
                 "reason": str(decision.reason),
                 "message": str(message),
                 "booked_qty": int(booked_qty),
+                # What the booked shares were booked at (quantity times the
+                # order's price; None when they were booked at no price of
+                # the order's), and whether that price was not an execution
+                # price: a later fill of the order is priced net of them
+                # (broker_payloads.unbooked_fill_price, 2026-10-06).
+                "booked_notional": None if booked_notional is None else float(booked_notional),
+                "booked_price_estimated": bool(booked_price_estimated),
                 "requested_qty": int(requested_qty),
                 # The live LIMIT exit attempt's missed-limit count, for the
                 # record of the fill that settles the order (2026-09-29).
@@ -1557,8 +1579,10 @@ class PositionManager:
         Whatever it filled (in part or in full, working or dead since, or
         before it was replaced) and the record has not booked yet
         (``booked_child_fills``) is booked first as a ``disaster_stop`` exit
-        at the broker's price (the level sent when the broker gives none, as
-        the fill reconcile does): those shares are gone. A fill larger than
+        at the broker's price for those fills (the order's average net of
+        what was booked: ``broker_payloads.unbooked_fill_price``; the level
+        sent when the broker gives none, as the fill reconcile does): those
+        shares are gone. A fill larger than
         the position is booked as the whole of it and logged at CRITICAL
         (``_held_part_of_fill``). Until 2026-09-29 only working orders were
         read, so a stop that landed and then filled was never booked, and a
@@ -1573,25 +1597,31 @@ class PositionManager:
         match = sent_exit_stop(orders, symbol, position.side, stop_price=record.get("stop_price"), qty=record.get("qty"))
         if match is None:
             return "absent", None
-        booked: dict[str, int] = {str(oid): int(qty) for oid, qty in (record.get("booked_child_fills") or {}).items()}
+        # What is booked of each order, and at what (broker_payloads.booked_child_part).
+        booked = booked_fills_ledger(record)
         followed: set[str] = set()
         while True:
             order_id = str(match["orderId"])
             followed.add(order_id)
             status = order_status_class(match["status"])
             filled = order_row_filled_qty(match)
-            if filled > booked.get(order_id, 0):
-                unbooked = filled - booked.get(order_id, 0)
-                booked[order_id] = filled
+            booked_qty, booked_notional, booked_estimated = booked_child_part(booked, order_id)
+            if filled > booked_qty:
+                unbooked = filled - booked_qty
+                # The level sent, or the order's own price: not an execution
+                # price (broker_payloads.order_fill_price_estimated). Priced
+                # as the unbooked shares' own fills: the order's average
+                # covers the booked ones too.
+                fill_price, fill_price_estimated = unbooked_fill_price(
+                    filled, safe_float(match.get("fillPrice"), None, finite=True),
+                    match.get("fillPriceEstimated") is not False, booked_qty, booked_notional, booked_estimated,
+                    what=f"disaster stop {order_id} for {key}")
+                add_booked_child_fill(booked, order_id, unbooked, fill_price, fill_price_estimated)
                 # Re-pointed at the order before the booking: a close's sweep
                 # must not take this fill for one that landed beside the exit.
                 position.metadata["bracket"] = {**record, "stop_order_id": order_id, "child_order_ids": [order_id],
-                                                "booked_child_fills": dict(booked), "active": False,
+                                                **booked_fills_ledger(booked), "active": False,
                                                 "state": f"filled:{DISASTER_STOP_REASON}"}
-                fill_price = safe_float(match.get("fillPrice"), None, finite=True)
-                # The level sent, or the order's own price: not an execution
-                # price (broker_payloads.order_fill_price_estimated).
-                fill_price_estimated = fill_price is None or match.get("fillPriceEstimated") is not False
                 LOG.warning("Disaster stop %s for %s, sent with an unknown outcome, is %s having filled %s share(s); "
                             "booking the %s not booked yet", order_id, key, match["status"], filled, unbooked)
                 self._book_broker_exit(
@@ -1605,7 +1635,7 @@ class PositionManager:
                 if key not in self.positions:
                     return "closed", None
             if status == ORDER_LIVE:
-                return "working", {**listed_stop(match), **({"booked_child_fills": booked} if booked else {})}
+                return "working", {**listed_stop(match), **(booked_fills_ledger(booked) if booked else {})}
             if status != ORDER_REPLACED:
                 LOG.warning("Disaster stop %s for %s, sent with an unknown outcome, is %s at the broker", order_id, key,
                             match["status"])
@@ -1617,7 +1647,7 @@ class PositionManager:
                           "is", order_id, key, match.get("replacementId") or "not named")
                 # Still unconfirmed, with what is booked, so the next lookup
                 # books only what is new.
-                position.metadata["bracket"] = {**record, "booked_child_fills": dict(booked)} if booked else record
+                position.metadata["bracket"] = {**record, **booked_fills_ledger(booked)} if booked else record
                 return "unresolved", None
             LOG.warning("Disaster stop %s for %s, sent with an unknown outcome, was REPLACED at the broker by order "
                         "%s; that one is taken as the stop sent", order_id, key, replacement["orderId"])
@@ -1882,9 +1912,18 @@ class PositionManager:
         booked = int(record.get("booked_qty") or 0)
         if filled > booked:
             slice_qty = self._held_part_of_fill(key, position, filled - booked, f"exit order {order_id}")
-            broker_price = safe_float(state.get("fill_price"), None)
-            if broker_price is not None and is_option_asset(position.metadata):
-                broker_price *= 100.0
+            average = safe_float(state.get("fill_price"), None, finite=True)
+            if average is not None and is_option_asset(position.metadata):
+                average *= 100.0
+            # The order's average covers the shares already booked from it:
+            # the slice is priced as its own fills. A record from before
+            # 2026-10-06 carries no booked_notional, so its slice is booked
+            # at the average, estimated.
+            booked_notional = 0.0 if booked <= 0 else safe_float(record.get("booked_notional"), None, finite=True)
+            booked_estimated = booked > 0 and record.get("booked_price_estimated") is not False
+            broker_price, broker_price_estimated = unbooked_fill_price(
+                filled, average, state.get("fill_price_estimated") is not False, booked, booked_notional,
+                booked_estimated, what=f"exit order {order_id} for {key}")
             exit_price = broker_price if broker_price is not None else safe_float(last_price, None)
             if exit_price is None:
                 self.audit.log_cycle(
@@ -1900,12 +1939,16 @@ class PositionManager:
             # after which no cycle would ever book it.
             decision = ExitDecision(record["reason"], record["family"])
             record["booked_qty"] = booked + slice_qty
+            record["booked_notional"] = (None if booked_notional is None or broker_price is None
+                                         else booked_notional + broker_price * slice_qty)
+            # Estimated whenever the booked part is (unbooked_fill_price).
+            record["booked_price_estimated"] = broker_price_estimated
             self._book_broker_exit(
                 key, position, slice_qty, float(exit_price), decision, bars,
                 result_message=f"working_exit_filled:{state.get('status')}", attempt_status="broker_working_exit",
                 # The mark, or the order's own price: not an execution price
                 # (broker_payloads.order_fill_price_estimated).
-                fill_price_estimated=broker_price is None or state.get("fill_price_estimated") is not False,
+                fill_price_estimated=broker_price_estimated,
                 exit_limits_missed=record.get("exit_limits_missed"),
             )
             if key not in self.positions:
@@ -2003,7 +2046,8 @@ class PositionManager:
         record.pop("replacement_misses", None)
         # The replacement has filled nothing of its own yet, and holds what
         # the original had left.
-        record.update({"order_id": str(replacement_id), "booked_qty": 0,
+        record.update({"order_id": str(replacement_id), "booked_qty": 0, "booked_notional": 0.0,
+                       "booked_price_estimated": False,
                        "requested_qty": max(0, int(record.get("requested_qty") or 0)
                                             - int(state.get("filled_qty") or 0))})
         self._save_reconcile_metadata()
@@ -2387,7 +2431,8 @@ class PositionManager:
             # saved, so the next cycle, or a restart, settles it instead of
             # sending a second exit beside it.
             self._track_working_exit(position, order_id=order_id, message="submitted", decision=decision,
-                                     booked_qty=0, requested_qty=requested_qty, bracket_cancelled=reprotect_owed,
+                                     booked_qty=0, booked_notional=0.0, booked_price_estimated=False,
+                                     requested_qty=requested_qty, bracket_cancelled=reprotect_owed,
                                      exit_limits_missed=None)
             self._save_reconcile_metadata()
 
@@ -2422,7 +2467,8 @@ class PositionManager:
                 # record next cycle; sending another exit meanwhile is how
                 # a halted market-out fills twice.
                 self._track_working_exit(position, order_id=str(result.order_id), message=result.message,
-                                         decision=decision, booked_qty=0, requested_qty=requested_qty,
+                                         decision=decision, booked_qty=0, booked_notional=0.0,
+                                         booked_price_estimated=False, requested_qty=requested_qty,
                                          bracket_cancelled=reprotect_owed,
                                          exit_limits_missed=result.exit_limits_missed)
                 if reprotect_owed:
@@ -2520,6 +2566,9 @@ class PositionManager:
                 replaced = order_result_names_replacement(result.message)
                 self._track_working_exit(position, order_id=str(result.order_id), message=result.message,
                                          decision=decision, booked_qty=0 if replaced else exit_qty,
+                                         booked_notional=(0.0 if replaced else None if fill_price is None
+                                                          else fill_price * exit_qty),
+                                         booked_price_estimated=not replaced and fill_price_estimated,
                                          requested_qty=requested_qty - exit_qty if replaced else requested_qty,
                                          bracket_cancelled=reprotect_owed,
                                          exit_limits_missed=result.exit_limits_missed)

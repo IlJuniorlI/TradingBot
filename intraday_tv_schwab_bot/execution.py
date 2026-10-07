@@ -15,6 +15,8 @@ from .broker_payloads import (
     BRACKET_ID_KEYS,
     DISASTER_SYNC_MODE,
     STOP_ORDER_TYPES,
+    booked_child_part,
+    booked_fills_ledger,
     bracket_wrapper_and_children,
     collect_protective_fills,
     extract_bracket_children,
@@ -32,6 +34,7 @@ from .broker_payloads import (
     order_status,
     protective_stop_reason,
     resting_exit_stop,
+    unbooked_fill_price,
 )
 from .config import BotConfig
 from .data_feed import EXECUTION_LAST_KEYS
@@ -132,9 +135,10 @@ class BracketCancel:
     filled_qty: int = 0
     fill_price: float | None = None
     fill_reason: str | None = None
-    # True when fill_price is not an execution price for every fill it
-    # averages (broker_payloads.order_fill_price_estimated): the exit is
-    # booked at it, but no slippage is measured from it.
+    # True when any fill it covers was reported without execution legs or
+    # without a price (broker_payloads.order_fill_price_estimated), or is
+    # the rest of a fill partly booked at such a price: the exit is booked
+    # at fill_price, but no slippage is measured from it.
     fill_price_estimated: bool = False
 
 
@@ -1092,7 +1096,7 @@ class SchwabExecutor:
                 now - datetime.timedelta(minutes=max(1, int(lookback_minutes))), now,
             )
         except Exception as exc:
-            LOG.warning("account_orders failed during bracket reconcile: %s", exc)
+            LOG.warning("account_orders failed during bracket reconcile: %s: %s", type(exc).__name__, exc)
             return None
         out: dict[str, dict[str, Any]] = {}
         flatten_order_tree(payload, out)
@@ -1426,7 +1430,8 @@ class SchwabExecutor:
     @staticmethod
     def _tracked_protection_ids(known_bracket: dict[str, Any] | None) -> dict[str, Any] | None:
         """The protective order ids *known_bracket* tracks, with the fills
-        of them already booked (``booked_child_fills``, when it has any), or
+        of them already booked (``booked_child_fills``, when it has any, and
+        what they were booked at, ``booked_child_notional``), or
         None when it tracks no stop. The booked fills go along so the fill
         reconcile and a later cancel book only what is new (2026-09-29): an
         adopted stop that had filled in part (while the bot was down, or
@@ -1436,8 +1441,7 @@ class SchwabExecutor:
             return None
         ids: dict[str, Any] = {key: known_bracket.get(key) for key in BRACKET_ID_KEYS}
         ids["child_order_ids"] = [str(oid) for oid in (known_bracket.get("child_order_ids") or []) if oid]
-        if known_bracket.get("booked_child_fills"):
-            ids["booked_child_fills"] = {str(oid): int(qty) for oid, qty in known_bracket["booked_child_fills"].items()}
+        ids.update(booked_fills_ledger(known_bracket))
         return ids
 
     def _adoptable_protection(self, parent_order_id: str | None,
@@ -1690,12 +1694,17 @@ class SchwabExecutor:
             collect_protective_fills(payload, fills, stop_reason=stop_reason)
         # Fills already booked for a child the bracket no longer tracks (a
         # dead stop an unconfirmed retire dropped): its wrapper's payload
-        # still carries it and reports them again (2026-09-25).
-        for oid, booked in (bracket.get("booked_child_fills") or {}).items():
+        # still carries it and reports them again (2026-09-25). The rest is
+        # priced as its own fills, net of the booked ones (2026-10-06).
+        for oid in (bracket.get("booked_child_fills") or {}):
             if str(oid) in fills:
                 qty, px, kind, estimated = fills[str(oid)]
-                if qty - int(booked) > 0:
-                    fills[str(oid)] = (qty - int(booked), px, kind, estimated)
+                booked_qty, booked_notional, booked_estimated = booked_child_part(bracket, oid)
+                if qty - booked_qty > 0:
+                    rest_px, rest_estimated = unbooked_fill_price(
+                        qty, px, estimated, booked_qty, booked_notional, booked_estimated,
+                        what=f"protective order {oid}")
+                    fills[str(oid)] = (qty - booked_qty, rest_px, kind, rest_estimated)
                 else:
                     del fills[str(oid)]
         if ok:

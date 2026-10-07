@@ -12,11 +12,15 @@ were ``SchwabExecutor`` classmethods until 2026-09-27, and the module was
 """
 from __future__ import annotations
 
+import logging
+import math
 from datetime import datetime
 from typing import Any
 
 from .models import Side
 from .numeric import safe_float, safe_int
+
+LOG = logging.getLogger(__name__)
 
 # An order ``status`` the broker lists as working: what confirms that a
 # disaster stop rests (its miss count ends there). It never decides that an
@@ -461,6 +465,97 @@ def collect_protective_fills(payload: Any, into: dict[str, tuple[int, float | No
             into[str(order_id)] = (int(filled_qty), order_fill_price(payload), reason,
                                    order_fill_price_estimated(payload))
     collect_protective_fills(payload.get("childOrderStrategies"), into, stop_reason=stop_reason)
+
+
+def unbooked_fill_price(filled: int, average: float | None, average_estimated: bool, booked_qty: int,
+                        booked_notional: float | None, booked_estimated: bool, *,
+                        what: str) -> tuple[float | None, bool]:
+    """The price of an order's fills beyond the *booked_qty* shares already
+    booked from it, and whether it is not an execution price.
+
+    *average* is the order's cumulative average over all *filled* shares
+    (None when it reports no price; *average_estimated* when it is not an
+    execution price: ``order_fill_price_estimated``). The booked shares were
+    booked at *booked_notional*, the sum of quantity times price
+    (*booked_estimated* when that price was not an execution price), so the
+    new slice's own price is ``(average * filled - booked_notional) /
+    (filled - booked_qty)``, as ``EntryGatekeeper.settle_unsettled_entry_orders``
+    prices an entry's late slice; it is estimated when either part is. A
+    booked part with no recorded notional (*booked_notional* None: booked
+    before 2026-10-06) leaves the order's average standing in, estimated;
+    so does a stripped price that is not a positive number, which only a
+    booked part priced off something other than its executions can give
+    (logged as a WARNING naming *what*). Until 2026-10-06 every later slice
+    was booked at the order's whole average, unflagged."""
+    if average is None:
+        return None, True
+    if booked_qty <= 0:
+        return average, average_estimated
+    if booked_notional is None:
+        return average, True
+    price = (average * filled - booked_notional) / (filled - booked_qty)
+    if not (math.isfinite(price) and price > 0):
+        LOG.warning("%s: %s share(s) filled at an average of %s, less the %s booked at a notional of %s, leaves "
+                    "%s a share for the rest; booking the rest at the average, estimated", what, filled, average,
+                    booked_qty, booked_notional, price)
+        return average, True
+    return price, average_estimated or booked_estimated
+
+
+def booked_child_part(record: dict[str, Any], order_id: Any) -> tuple[int, float | None, bool]:
+    """``(qty, notional, estimated)`` of *order_id*'s fills that *record* (a
+    bracket record) has already booked: ``booked_child_fills``' cumulative
+    quantity and, from ``booked_child_notional`` beside it, the sum of
+    quantity times the price they were booked at and whether that price was
+    not an execution price (2026-10-06). The notional is None, estimated,
+    when a quantity is booked with none recorded: booked before then, or at
+    no price of the order's."""
+    qty = int((record.get("booked_child_fills") or {}).get(str(order_id)) or 0)
+    if qty <= 0:
+        return 0, 0.0, False
+    part = (record.get("booked_child_notional") or {}).get(str(order_id))
+    notional = safe_float(part.get("notional"), None, finite=True) if isinstance(part, dict) else None
+    if notional is None:
+        return qty, None, True
+    return qty, notional, part.get("estimated") is not False
+
+
+def booked_fills_ledger(record: dict[str, Any]) -> dict[str, Any]:
+    """A copy of what *record* has booked of its orders' fills:
+    ``booked_child_fills`` and ``booked_child_notional``
+    (``booked_child_part``), or an empty dict when it has booked none."""
+    fills = record.get("booked_child_fills") or {}
+    if not fills:
+        return {}
+    return {"booked_child_fills": {str(oid): int(qty) for oid, qty in fills.items()},
+            "booked_child_notional": {str(oid): dict(part)
+                                      for oid, part in (record.get("booked_child_notional") or {}).items()
+                                      if isinstance(part, dict)}}
+
+
+def note_booked_child_fills(record: dict[str, Any], order_id: Any, qty: int, notional: float | None,
+                            estimated: bool) -> None:
+    """Record on *record* that *qty* of *order_id*'s fills (cumulative) are
+    booked, at *notional* (``booked_child_part``); a None notional records
+    the quantity with no price, which a later slice reads as estimated."""
+    record.setdefault("booked_child_fills", {})[str(order_id)] = int(qty)
+    prices = record.setdefault("booked_child_notional", {})
+    if notional is None:
+        prices.pop(str(order_id), None)
+    else:
+        prices[str(order_id)] = {"notional": float(notional), "estimated": bool(estimated)}
+
+
+def add_booked_child_fill(record: dict[str, Any], order_id: Any, slice_qty: int, slice_price: float | None,
+                          slice_estimated: bool) -> None:
+    """Record on *record* a further *slice_qty* of *order_id*'s fills booked
+    at *slice_price* (None: at no price of the order's, which leaves the
+    booked part's notional unknown)."""
+    qty, notional, estimated = booked_child_part(record, order_id)
+    note_booked_child_fills(
+        record, order_id, qty + int(slice_qty),
+        None if notional is None or slice_price is None else notional + float(slice_price) * int(slice_qty),
+        estimated or slice_estimated)
 
 
 def is_disaster_stop(bracket: Any) -> bool:

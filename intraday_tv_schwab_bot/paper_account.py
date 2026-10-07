@@ -73,7 +73,8 @@ class TradeRecord:
     # for a LONG, the bid for a SHORT), as a fraction of the touch: positive
     # when worse for the position. entry_limit_buffer_pct is how far the
     # marketable limit lay past the same touch. Until 2026-10-06
-    # entry_slippage_pct was |fill - limit| / limit, the limit's buffer.
+    # entry_slippage_pct was |fill - limit| / limit, the limit's buffer; a
+    # position entered before then (no entry_touch_price) records none.
     entry_slippage_pct: float | None = None
     entry_limit_buffer_pct: float | None = None
     # Post-fill risk reconciliation (2026-09-18). realized_entry_risk is
@@ -279,7 +280,11 @@ class PaperAccount:
                 initial_risk_per_unit=initial_risk,
                 max_favorable_pnl=first_float(metadata, "best_unrealized_pnl", "diag_best_unrealized_pnl"),
                 max_adverse_pnl=first_float(metadata, "worst_unrealized_pnl", "diag_worst_unrealized_pnl"),
-                entry_slippage_pct=first_float(metadata, "entry_slippage_pct"),
+                # Measured from the touch only when the touch is stamped
+                # beside it: a position entered before 2026-10-06 carries the
+                # old |fill - limit| / limit reading under the same key.
+                entry_slippage_pct=(first_float(metadata, "entry_slippage_pct")
+                                    if metadata.get("entry_touch_price") is not None else None),
                 entry_limit_buffer_pct=first_float(metadata, "entry_limit_buffer_pct"),
                 realized_entry_risk=first_float(metadata, "realized_entry_risk"),
                 entry_risk_budget=first_float(metadata, "entry_risk_budget"),
