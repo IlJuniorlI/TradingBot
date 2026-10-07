@@ -21,7 +21,8 @@ and inside the SESSION_REPORT structured JSON payload (under top-level keys
 downstream tooling can parse them without re-scraping.
 
 The persistent trades.csv is ``append_trades_csv``'s: every closed trade the
-process holds, once, under its exit's ET date. The per-day archive under
+process holds, once, under its exit's ET date, each read and write of it
+under its lock (``trades.csv.lock`` beside it). The per-day archive under
 ``{log_dir}/sessions/`` (bars, decisions, the manifest's regime-call outcomes
 and gate attribution) is ``session_archive``'s; its trades.csv is the day's
 rows of the persistent trades.csv, the exporting strategy's.
@@ -36,19 +37,35 @@ import logging
 import math
 import os
 import shutil
-import uuid
+import time
 from collections import defaultdict
+from contextlib import ExitStack, contextmanager
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from .paper_account import PaperAccount, TradeRecord, closed_trade_lifecycles
 from .models import Position
 from .reasons import SKIP_COUNT_UNIT, exit_reason_code, reason_gate
 
+# trades.csv's lock (``_trades_csv_lock``) is flock on POSIX and a byte-range
+# lock on Windows, where the bot also runs (start_trading_bot.bat).
+_WINDOWS = os.name == "nt"
+if _WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
 LOG = logging.getLogger(__name__)
 
 TRADE_CSV_COLUMNS = ["date"] + [f.name for f in dataclasses.fields(TradeRecord)]
+
+# The longest a reader or writer of trades.csv waits for its lock: another
+# process holds it for one read and one write of the file (milliseconds),
+# so a wait this long is a process stuck holding it.
+TRADES_CSV_LOCK_NAME = "trades.csv.lock"
+TRADES_CSV_LOCK_WAIT_SECONDS = 5.0
+_TRADES_CSV_LOCK_POLL_SECONDS = 0.05
 
 
 def trade_csv_row(trade: TradeRecord, session_date: str) -> dict[str, Any]:
@@ -110,17 +127,20 @@ def trade_csv_key(row: dict[str, Any]) -> tuple[str, ...]:
 
 def read_trade_rows(csv_path: Path, session_date: str) -> list[dict[str, str]]:
     """The rows of the persistent trades.csv dated ``session_date``, in file
-    order; [] when there is no file.
+    order; [] when there is no file. It reads under the file's lock
+    (``_trades_csv_lock``), so another process's append or rotation is never
+    seen half-written.
 
-    Raises OSError, csv.Error or UnicodeDecodeError on a file it cannot read,
-    and ValueError when a row of that day sits under a header other than
+    Raises OSError, csv.Error or UnicodeDecodeError on a file it cannot read
+    (TimeoutError, an OSError, on a lock it could not take), and ValueError
+    when a row of that day sits under a header other than
     ``TRADE_CSV_COLUMNS`` (a file an older version wrote, which the next
     append of a trade rotates, carrying the rows of the day it closes):
     those rows cannot be read as the current columns.
     """
     if not csv_path.exists():
         return []
-    with open(csv_path, newline="", encoding="utf-8") as fh:
+    with _trades_csv_lock(csv_path.parent), open(csv_path, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         rows = [row for row in reader if row.get("date") == session_date]
         header = reader.fieldnames
@@ -1003,15 +1023,20 @@ def append_trades_csv(trades: Iterable[TradeRecord], *, log_dir: str, session_da
     open (a partial exit without its final slice) waits for its close:
     ``closed_trade_lifecycles`` folds its slices into one row then.
 
-    False, with a WARNING naming the error's type, when the log directory,
-    the file, its rotation or the write fails: a file that cannot be read
-    appends nothing, since its rows could not be told apart from ours. The
-    rows go in one write in append mode, safe beside another process
-    appending to the same file; one that fails part-way can leave the rows
-    written before it, and the next append ends a cut-off last line before
-    its own. The caller retries. A row ``trade_csv_row`` builds with a column the header
-    lacks raises ValueError (``extrasaction="raise"``): that is field drift,
-    a bug, not an I/O error.
+    The read, the check against the file and the write (or the rotation)
+    run under the file's lock (``_trades_csv_lock``), so processes sharing
+    log_dir take turns: none appends into a file another is replacing, and
+    two rotations never both replace it. False, with a WARNING naming the
+    error's type, when the log directory, the lock (another process held it
+    ``TRADES_CSV_LOCK_WAIT_SECONDS``: TimeoutError), the file, its rotation
+    or the write fails: a file that cannot be read appends nothing, since
+    its rows could not be told apart from ours. The caller retries. The rows
+    go in one write in append mode, a new file's header with them; one that
+    fails part-way can leave the rows written before it, and the next append
+    ends a cut-off last line before its own. A row ``trade_csv_row`` builds
+    with a column the header lacks raises ValueError
+    (``extrasaction="raise"``): that is field drift, a bug, not an I/O
+    error.
 
     Schema guard: a file under a header other than ``TRADE_CSV_COLUMNS``
     (an upgrade added or renamed a column) is copied to
@@ -1031,15 +1056,25 @@ def append_trades_csv(trades: Iterable[TradeRecord], *, log_dir: str, session_da
     if not rows:
         return True
     log_path = Path(log_dir)
-    csv_path = log_path / "trades.csv"
     try:
         log_path.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         LOG.warning("Could not create log directory %s, so %d trades were not appended: %s: %s",
                     log_path, len(rows), type(exc).__name__, exc)
         return False
+    with ExitStack() as held:
+        try:
+            held.enter_context(_trades_csv_lock(log_path))
+        except OSError as exc:
+            LOG.warning("Could not lock %s, so %d trades were not appended: %s: %s",
+                        log_path / TRADES_CSV_LOCK_NAME, len(rows), type(exc).__name__, exc)
+            return False
+        return _append_rows(log_path / "trades.csv", rows, session_date.isoformat())
 
-    day = session_date.isoformat()
+
+def _append_rows(csv_path: Path, rows: list[dict[str, Any]], day: str) -> bool:
+    """``append_trades_csv`` under the lock: write the ``rows`` that
+    ``csv_path`` lacks, rotating a file under an older header."""
     header: list[str] | None = None
     file_rows: list[dict[str, Any]] = []
     if csv_path.exists():
@@ -1066,20 +1101,22 @@ def append_trades_csv(trades: Iterable[TradeRecord], *, log_dir: str, session_da
         return True
     if rotate:
         return _rotate_trades_csv(csv_path, header, carried, new_rows, day)
-    # One write in append mode (O_APPEND), so processes sharing log_dir never
-    # overwrite each other's rows. A write that fails part-way (a full disk)
-    # can leave the rows written before it and a cut-off last line; the next
-    # append ends that line first, so its rows never run on into it.
+    # One write in append mode (O_APPEND), a new file's header with it. A
+    # write that fails part-way (a full disk) can leave the rows written
+    # before it and a cut-off last line; the next append ends that line
+    # first, so its rows never run on into it.
     text = io.StringIO()
     writer = csv.DictWriter(text, fieldnames=TRADE_CSV_COLUMNS, extrasaction="raise")
+    if header is None:
+        writer.writeheader()
     for row in new_rows:
         # ValueError from extrasaction="raise" propagates — field-drift is a bug.
         writer.writerow(row)
     try:
-        if header is None:
-            _create_trades_csv(csv_path)
-        with open(csv_path, "a", newline="", encoding="utf-8") as fh:
-            line_break = "" if _ends_with_newline(csv_path) else "\n"
+        # "x" for a new file: one a process without the lock (an older
+        # version) created since the read fails the append, retried.
+        with open(csv_path, "a" if header is not None else "x", newline="", encoding="utf-8") as fh:
+            line_break = "" if header is None or _ends_with_newline(csv_path) else "\n"
             fh.write(line_break + text.getvalue())
     except OSError as exc:
         LOG.warning("Could not append %d trades to %s: %s: %s", len(new_rows), csv_path, type(exc).__name__, exc)
@@ -1088,26 +1125,53 @@ def append_trades_csv(trades: Iterable[TradeRecord], *, log_dir: str, session_da
     return True
 
 
-def _create_trades_csv(csv_path: Path) -> None:
-    """Create ``csv_path`` holding the header alone, at once: the header is
-    written to a file of its own that is then linked into place, which
-    fails when another process created the file first (its header, then,
-    stands). Two first appends at once would otherwise both write one. It
-    needs a filesystem with hard links (ext4, NTFS); elsewhere the append
-    fails with its WARNING."""
-    # A name of its own, created like any file (the umask's mode, as the
-    # append's own creation had).
-    staged = csv_path.with_name(f"trades.csv.{os.getpid()}.{uuid.uuid4().hex}.new")
+@contextmanager
+def _trades_csv_lock(log_path: Path) -> Iterator[None]:
+    """Hold ``{log_path}/trades.csv.lock`` against every other holder, in
+    this process or another: each read of trades.csv and each append or
+    rotation of it runs under it. The lock file stays, empty; the operating
+    system frees the lock when its holder exits, however it exits. Raises
+    OSError when the lock file cannot be opened or locked, and TimeoutError
+    when another holder keeps it ``TRADES_CSV_LOCK_WAIT_SECONDS``."""
+    path = log_path / TRADES_CSV_LOCK_NAME
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
     try:
-        with open(staged, "x", newline="", encoding="utf-8") as fh:
-            csv.DictWriter(fh, fieldnames=TRADE_CSV_COLUMNS).writeheader()
+        deadline = time.monotonic() + TRADES_CSV_LOCK_WAIT_SECONDS
+        while not _try_lock(fd):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"another holder kept {path} for {TRADES_CSV_LOCK_WAIT_SECONDS:g} s")
+            time.sleep(_TRADES_CSV_LOCK_POLL_SECONDS)
         try:
-            os.link(staged, csv_path)
-        except FileExistsError:
-            pass
+            yield
+        finally:
+            _unlock(fd)
     finally:
-        if staged.exists():
-            staged.unlink()
+        os.close(fd)
+
+
+def _try_lock(fd: int) -> bool:
+    """Lock the open lock file ``fd`` unless another holder has it (False):
+    flock, or on Windows its first byte."""
+    if _WINDOWS:
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except PermissionError:      # EACCES: another holder has the byte
+            return False
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _unlock(fd: int) -> None:
+    if _WINDOWS:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 def _ends_with_newline(path: Path) -> bool:
@@ -1122,7 +1186,9 @@ def _rotate_trades_csv(csv_path: Path, header: list[str] | None, carried: list[d
     """``append_trades_csv``'s schema guard: keep the old file as
     ``trades.archive-<day>[-N].csv`` and replace it with one under the
     current header holding ``carried`` (its rows of ``day``) and
-    ``new_rows``."""
+    ``new_rows``. It runs under trades.csv's lock, so the staging file and
+    the archive's name are its own until the replace, and no other process
+    has the old file open to append to it."""
     archive = csv_path.with_name(f"trades.archive-{day}.csv")
     # If the day already rotated once (rare), suffix with a counter.
     counter = 2

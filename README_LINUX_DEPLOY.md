@@ -489,6 +489,9 @@ before it appended (`kill -9`, an OOM kill, systemd's SIGKILL after
 `.logs/trades.csv` and every archive. `trades.csv` has no mode column:
 a dry-run and a live process of one strategy that share `.logs` on one
 day archive each other's rows, under the exporting process's `dry_run`.
+Processes sharing `.logs` take turns at `trades.csv` through an advisory
+lock on `.logs/trades.csv.lock` (an empty file; leave it in place): an
+append that waits more than 5 s for it is retried like any failed append.
 
 Disable globally with `runtime.export_session_archive: false` in your
 config if you're tight on disk.
