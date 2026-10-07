@@ -5199,6 +5199,38 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **top_tier's armed retest arms a `trend` or `momentum` setup only on a close
+  through its trigger level.** *2026-10-06* — `_armed_retest_verdict` is
+  consulted after the index and confirmation-bar gates and before the
+  builder's own fresh-breakout check, and it created an arm on a setup's first
+  verdict without asking whether the close had crossed the level it recorded.
+  A setup that qualified on score but never broke out was armed anyway, and
+  then waited for a "retest" of a level it had not crossed; a retest entry
+  from such an arm is the breakout-bar chase the feature exists to prevent. On
+  H:'s 10-06 all four arms of the day had the close on the wrong side (ADBE
+  14:49:30, level 237.0201 against a short's close of 237.0600; CRM 14:53:03
+  and again 14:58:05; PANW 14:59:04), and across 09-29 to 10-02 394 of the 737
+  arm creations logged in the archived `decisions.csv` (every reason on a row,
+  not only the primary) had the close at or on the wrong side of the level. An
+  arm is now created only when the close is through the level (long above it,
+  short below it: the builder's own test); otherwise the verdict returns
+  `none` and the builder refuses the cycle as `no_fresh_breakout` /
+  `no_fresh_breakdown`, and a previous session's arm on the key is dropped.
+  When a close more than `armed_retest_invalidation_atr` ATR back through an
+  arm's level kills the arm, that cycle is judged the same way, against the
+  current level: a close through it arms anew and waits, where the verdict
+  used to return `none` and let the builder enter it at market with no arm
+  and no retest (reachable for `momentum`, whose 6-bar window can lose the
+  arm bar inside the 12-minute wait). The retest entry and the expiry
+  fallback are unchanged. The top_tier README's armed-retest section says so.
+  - Upgrade note: such cycles log
+    `<side>_build_failed_no_fresh_breakout(...)` /
+    `..._no_fresh_breakdown(...)` where they logged
+    `<side>_build_failed_<regime>_armed_awaiting_retest(...)` (with
+    `level=...,close=...,wait=...`), and an arm's 12-minute window starts at
+    the first close through the level, so its expiry fallback comes later
+    than before.
+
 - **The session's skip tally counts symbol-minutes: a symbol's gate on a side
   counts once a minute, however many entry passes ran in it.** *2026-10-06* —
   `EntryGatekeeper.session_skip_counts` (the session report's filter

@@ -1681,7 +1681,9 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             # back and retest it, or for the wait to expire. See
             # ``_armed_retest_verdict``. Placed AFTER the index and
             # confirmation-bar gates so a setup that would have been
-            # rejected anyway never arms.
+            # rejected anyway never arms; nor does a close that has not
+            # crossed the level, which falls through to the builder's
+            # fresh-breakout check.
             #
             # That ordering is load-bearing, not incidental. While price
             # is pulling back the last CLOSED bar is against the trade, so

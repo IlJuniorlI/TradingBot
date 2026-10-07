@@ -2,11 +2,12 @@
 """Armed retest: the wait between a breakout qualifying and the entry.
 
 ``trend`` and ``momentum`` (``ARMED_RETEST_REGIMES``) do not enter the cycle
-they qualify on. ``_armed_retest_verdict`` records the level they cleared and
-enters when price comes back to it and closes through it again;
-``_expired_armed_retests`` takes the market fallback when the wait runs out,
-and ``_prune_armed_retests`` / ``_drop_armed_retests`` reap arms nothing will
-use. The arms live on the strategy (``self._armed_retests``, set up in
+they qualify on. ``_armed_retest_verdict`` records the level they cleared --
+an arm is created only on a close through it, the builder's own
+fresh-breakout test -- and enters when price comes back to it and closes
+through it again; ``_expired_armed_retests`` takes the market fallback when
+the wait runs out, and ``_prune_armed_retests`` / ``_drop_armed_retests`` reap
+arms nothing will use. The arms live on the strategy (``self._armed_retests``, set up in
 ``TopTierAdaptiveStrategy.__init__``); the level comes from the strategy's
 ``_breakout_reference``, the same one the trend and momentum builders check.
 """
@@ -171,7 +172,8 @@ class ArmedRetestMixin:
         ltf: pd.DataFrame, frame: pd.DataFrame,
         *, regime_score: float = 0.0, regime_norm: float = 0.0,
     ) -> dict[str, Any]:
-        """Arm on qualification; enter on the retest, or at market on expiry.
+        """Arm on a qualifying breakout; enter on the retest, or at market on
+        expiry.
 
         The problem: ``trend`` and ``momentum`` fill at an N-bar extreme by
         construction, so the entry is the top of the move so far and the stop
@@ -180,9 +182,11 @@ class ArmedRetestMixin:
         to its stop, against 21% from an arbitrary moment in the same session.
 
         So qualification no longer means "enter". It means "remember the level
-        that was cleared and wait for price to come back to it". Four outcomes:
+        that was cleared and wait for price to come back to it". Three outcomes:
 
-        ``none``   feature off, or no usable trigger level -- behave as before.
+        ``none``   feature off, no usable trigger level, or no arm yet and the
+                   close has not crossed the level -- the builder decides, and
+                   its fresh-breakout check rejects the cycle.
         ``wait``   armed, retest not yet confirmed. The cycle skips; other
                    regimes in the build queue are unaffected, so arming trend
                    does not stop a pullback firing on the same symbol.
@@ -242,6 +246,19 @@ class ArmedRetestMixin:
             return out
 
         if arm is None or arm.get("session_date") != now.date():
+            # Only a close THROUGH the level is a breakout to arm on -- the
+            # builder's own fresh-breakout test. The verdict runs before the
+            # builder, so without this a setup that qualified on score but
+            # never broke out armed and then waited for a "retest" of a level
+            # it had not crossed: on 2026-10-06 all four arms had the close on
+            # the wrong side, and across 09-29..10-02 394 of the 737 arm
+            # creations in decisions.csv had not crossed it. Returning
+            # `none` hands the cycle to the builder, which reports it as
+            # no_fresh_breakout / no_fresh_breakdown.
+            crossed = close > trigger_level if side == Side.LONG else close < trigger_level
+            if not crossed:
+                self._armed_retests.pop(key, None)
+                return out
             self._armed_retests[key] = {
                 "armed_at": now,
                 "session_date": now.date(),

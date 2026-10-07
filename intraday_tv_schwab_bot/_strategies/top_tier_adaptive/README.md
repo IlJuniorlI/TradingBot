@@ -731,7 +731,10 @@ against 21% from an arbitrary moment in the same session.
 records the level it cleared and waits (`_armed_retest_verdict`). Four
 outcomes:
 
-- `none` — feature off, or no usable trigger level. Behaves as before.
+- `none` — feature off, no usable trigger level, or no arm yet and the close
+  has not crossed the level. The builder decides, as before; on an uncrossed
+  close its fresh-breakout check refuses the cycle with `no_fresh_breakout` /
+  `no_fresh_breakdown`.
 - `wait` — armed, retest not confirmed. The cycle records
   `<side>_build_failed_<regime>_armed_awaiting_retest(...)` and skips. Other
   regimes in the build queue are unaffected, so arming `trend` does not stop
@@ -743,6 +746,18 @@ outcomes:
   market**, which is the pre-2026-09-20 behaviour. Handled by
   `_expired_armed_retests`, which runs BEFORE the build queue and **skips the
   side / index-confirmation / confirmation-bar gates** — see below.
+
+**An arm needs a close through the level** (2026-10-06) — long above it,
+short below it, the builder's own fresh-breakout test. The verdict runs after
+the index and confirmation-bar gates but before the builder, so until then a
+setup that qualified on score without breaking out was armed anyway and then
+waited for a "retest" of a level it had never crossed; a retest entry from such
+an arm is the breakout-bar chase the feature exists to prevent. On 2026-10-06
+all four arms of the day (ADBE, CRM twice, PANW) had the close on the wrong
+side, and across 09-29 to 10-02 394 of the 737 arm creations logged in
+`decisions.csv` (every reason on a row, not only the primary) had the close
+at or on the wrong side of the level. An existing arm is unaffected: a close
+back under its level is the retest in progress.
 
 The market fallback is deliberate, not a hedge: a strong trend day never offers
 the retest, and those are exactly the setups worth having. Forfeiting them
