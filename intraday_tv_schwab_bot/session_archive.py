@@ -1193,6 +1193,37 @@ def session_archive_manifest_path(log_dir: str, session_date: date) -> Path:
     return session_archive_root(log_dir, session_date) / "manifest.json"
 
 
+def session_archive_owed_path(log_dir: str, session_date: date) -> Path:
+    """The ``archive_owed.json`` a shutdown leaves in the folder of an
+    archive it did not write (``leave_session_archive_owed``), so that the
+    next start writes it; ``export_session_archive`` removes it."""
+    return session_archive_root(log_dir, session_date) / "archive_owed.json"
+
+
+def leave_session_archive_owed(log_dir: str, session_date: date, why: str) -> None:
+    """Leave ``session_date``'s archive owed to the next start that exports
+    archives: write its ``archive_owed.json``, naming ``why``. Raises
+    OSError."""
+    atomic_write_text(
+        session_archive_owed_path(log_dir, session_date),
+        json.dumps({"session_date": session_date.isoformat(), "left_at": sessions.now_et().isoformat(),
+                    "why": why}, indent=2),
+    )
+
+
+def owed_session_archives(log_dir: str) -> list[date]:
+    """The days whose archive an earlier shutdown left owed (an
+    ``archive_owed.json`` in its folder), oldest first. A marker in a folder
+    whose name is not a date is skipped with a WARNING."""
+    days = []
+    for marker in (Path(str(log_dir or ".logs")) / "sessions").glob("*/archive_owed.json"):
+        try:
+            days.append(date.fromisoformat(marker.parent.name))
+        except ValueError:
+            LOG.warning("Ignoring %s: its folder is not named for a session date", marker)
+    return sorted(days)
+
+
 def export_session_archive(
     *,
     session_date: date,
@@ -1255,10 +1286,15 @@ def export_session_archive(
       secondary skip reasons).
     - ``manifest.json`` — strategy, dry_run, summary stats, skip counts,
       timeframes exported, write-flags for each archive component.
+    - ``archive_owed.json`` — only while the archive is owed: a shutdown
+      that did not write it leaves one (``leave_session_archive_owed``),
+      and the export removes it once the manifest is written.
 
     Raises OSError when the archive directory or ``manifest.json`` cannot
-    be written: the archive is then not written, and the engine retries it.
-    Every other stage logs its own failure and the stages after it run.
+    be written, or the ``archive_owed.json`` an earlier shutdown left
+    (``leave_session_archive_owed``) cannot be removed once it is: the
+    archive is then not written, and the engine retries it. Every other
+    stage logs its own failure and the stages after it run.
 
     Parameters
     ----------
@@ -1304,10 +1340,11 @@ def export_session_archive(
         fields (app_key, app_secret, account_hash, encryption_key,
         sessionid, etc.) redacted. Pass None to skip the snapshot.
     exporter_ran_session
-        False when the exporting process started after the day's 20:00 ET
-        end and so did not run the session (the engine then exports only a
-        day without an archive): its bars, account snapshot and skip tally
-        are its own. Recorded in the manifest.
+        False when the exporting process did not run the session: it
+        started after the day's 20:00 ET end (the engine then exports only a
+        day without an archive), or writes a day an earlier shutdown left
+        owed (``archive_owed.json``). Its bars, account snapshot and skip
+        tally are then its own. Recorded in the manifest.
     """
     log_dir_path = Path(str(log_dir or ".logs"))
     archive_root = session_archive_root(log_dir, session_date)
@@ -1377,6 +1414,8 @@ def export_session_archive(
         "gate_attribution": gate_attribution,
     }
     _write_manifest(manifest, archive_root)
+    # Written: no start owes it any more.
+    session_archive_owed_path(log_dir, session_date).unlink(missing_ok=True)
 
     LOG.info(
         "Session archive written to %s (%d bars CSVs, %d trades, %d events, %d decisions, log_copied=%s)",

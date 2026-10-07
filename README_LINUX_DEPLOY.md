@@ -208,10 +208,12 @@ ExecStart=%h/TradingBot/.venv/bin/python main.py --config configs/config.yaml
 # Clean shutdown: once the bot is built, SIGTERM, like Ctrl+C, takes it to
 # its shutdown wherever it lands (the start-up reconcile, a cycle, the sleep
 # between cycles): it stops the dashboard and the stream, writes the session
-# report and the day's archive unless it wrote them at 8pm ET, appends to
-# trades.csv every closed trade it holds that the file lacks, then exits 0.
-# The reconcile metadata needs no shutdown step: it is saved whenever the
-# tracked positions change. Give it 30s, then SIGKILL if it's still hung.
+# report unless it wrote it at 8pm ET, appends to trades.csv every closed
+# trade it holds that the file lacks, then writes the day's archive unless
+# it wrote it at 8pm (it starts no export 12s or more after the signal, and
+# leaves that day's archive to the next start), then exits 0. The reconcile
+# metadata needs no shutdown step: it is saved whenever the tracked
+# positions change. Give it 30s, then SIGKILL if it's still hung.
 KillSignal=SIGTERM
 TimeoutStopSec=30s
 
@@ -258,10 +260,18 @@ A few of these values to know about:
   signals after the first are ignored until then, since one would abandon
   the session report half-written, and the log names any it ignored. A
   stop with no `Shutdown complete.` in the journal means systemd
-  SIGKILLed a shutdown that ran past 30s (a hung broker read, a large
-  archive export, a slow stream stop): raise the timeout. In a terminal, a
-  second Ctrl+C does nothing while the bot shuts down; `kill -9` ends one
-  that hangs.
+  SIGKILLed a shutdown that ran past 30s (a hung broker read, a slow
+  stream stop): raise the timeout. The archive exports are kept inside
+  it: every owed day's report and `trades.csv` append run first, then the
+  exports (5-13s each on H:), each started only within 12s of the stop
+  signal, so the last ends by about 25s. A day whose export the shutdown
+  does not start, or whose export fails there, is logged (`Shutdown: the
+  <date> archive is not written (...): the next start writes it`) and
+  left owed in `.logs/sessions/<date>/archive_owed.json`; the next start
+  writes it, outside the trading days' 7am-8pm stream windows, with
+  `exporter_ran_session: false`. Raising the timeout leaves that 12s as
+  it is. In a terminal, a second Ctrl+C does nothing while the bot shuts
+  down; `kill -9` ends one that hangs.
 - **`Restart=on-failure`** restarts on crash but NOT on clean exit
   (Ctrl+C / `systemctl stop`). If you want restart on any exit, use
   `Restart=always` — but that re-starts after a clean `auto_exit_after_session`
@@ -463,12 +473,14 @@ later that day writes neither again, though it appends any trade booked
 since. The report is written once; an append that fails (a full disk) is
 retried a minute or more later, an archive export after 1 minute, then
 waits doubling to 30 minutes, a retry never during a later trading day's
-7am-8pm stream window; both at shutdown too, past midnight too. A bot
-started after 8pm never writes that day's report, and writes its archive
-only when the day has none (no `manifest.json`: the bot that ran the day
-died before 8pm), with `exporter_ran_session: false` in the manifest,
-since its bars, account snapshot and skip counts are its own. No cron
-needed. Each archive contains:
+7am-8pm stream window; both at shutdown too, past midnight too. An
+archive the shutdown leaves (it starts no export 12s or more after the
+stop signal, see `TimeoutStopSec` above) is written by the next start. A
+bot started after 8pm never writes that day's report, and writes its
+archive only when the day has none (no `manifest.json`: the bot that ran
+the day died before 8pm), with `exporter_ran_session: false` in the
+manifest, since its bars, account snapshot and skip counts are its own.
+No cron needed. Each archive contains:
 
 - `bars/{Nm}/{SYMBOL}.csv` — full merged frame with indicators per timeframe
 - `trades.csv` — the day's rows of `.logs/trades.csv` that the strategy

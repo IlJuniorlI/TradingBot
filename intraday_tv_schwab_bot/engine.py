@@ -30,7 +30,13 @@ from .screener_client import TradingViewScreenerClient
 from .startup_reconciler import StartupReconciler
 from .warmup_tracker import WarmupTracker
 from ._strategies.factory import build_strategy
-from .session_archive import export_session_archive, session_archive_manifest_path
+from .session_archive import (
+    export_session_archive,
+    leave_session_archive_owed,
+    owed_session_archives,
+    session_archive_manifest_path,
+    session_archive_owed_path,
+)
 from .session_report import append_trades_csv, write_session_report
 from .schwab_api import SchwabdevApiUsageTracker, read_refresh_token_window, register_schwab_api_tracker
 from .log_setup import TRADEFLOW_LEVEL, setup_logging
@@ -150,7 +156,11 @@ class _StopSignals:
     nothing, since logging from a handler can re-enter a stream write it
     interrupted, so ``run`` reports what it ignored once the cleanup is done,
     and names the signal that stopped it (``stopped_by``): until 2026-10-06
-    a Ctrl+C and an SSH hangup both read `Interrupted, shutting down.`.
+    a Ctrl+C and an SSH hangup both read `Interrupted, shutting down.`. It
+    also keeps when the first signal came (``received_at``, on
+    ``time.monotonic``), whether it raised or came during the shutdown:
+    systemd's `TimeoutStopSec` runs from it, and so does the shutdown's
+    export budget (``SHUTDOWN_EXPORT_START_SECONDS``).
 
     SIGHUP is the terminal hanging up: an SSH disconnect or a killed tmux
     pane with the bot in the foreground. Until 2026-09-26 it killed the bot
@@ -174,6 +184,7 @@ class _StopSignals:
         # The first signal's name and the KeyboardInterrupt it raised.
         self._received: str | None = None
         self._interrupt: KeyboardInterrupt | None = None
+        self.received_at: float | None = None
 
     def __enter__(self) -> _StopSignals:
         signums = [signal.SIGINT, signal.SIGTERM]
@@ -204,6 +215,8 @@ class _StopSignals:
 
     def _handle(self, signum: int, _frame: Any) -> None:
         name = signal.Signals(signum).name
+        if self.received_at is None:
+            self.received_at = time.monotonic()
         if self.held:
             self.ignored.append(name)
             return
@@ -222,6 +235,14 @@ DAY_CLOSE_RETRY_SECONDS = 60.0
 # further failure, at most this long, and never inside a later trading day's
 # stream window (07:00-20:00 ET), where every retry would stall management.
 ARCHIVE_RETRY_MAX_SECONDS = 1800.0
+# The shutdown starts an archive export only this long after the stop signal.
+# An export cannot be cut short and took 5-13 s on H: (2026-09-29 to 10-06),
+# so one started by then ends by about 25 s: inside the deploy guide's
+# TimeoutStopSec=30s, whose SIGKILL would cut it off half-written, with room
+# for a longer day and the exit. A day whose export the shutdown does not
+# start, or whose export fails there, is left owed to the next start
+# (``archive_owed.json`` in its archive's folder).
+SHUTDOWN_EXPORT_START_SECONDS = 12.0
 
 
 @dataclass(slots=True)
@@ -238,6 +259,7 @@ class _DayClose:
     failed_at: datetime | None = None   # the last failed attempt, for DAY_CLOSE_RETRY_SECONDS
     archive_failures: int = 0           # failed archive exports, for its back-off
     archive_retry_at: datetime | None = None   # no archive export before this
+    carried: bool = False               # an earlier shutdown left its archive owed (archive_owed.json)
 
 
 class IntradayBot:
@@ -361,15 +383,31 @@ class IntradayBot:
         # before 20:00), marked `exporter_ran_session: false`, since the
         # bars, account snapshot and skip tally are its own; an archive the
         # day has is the session's and is left as it is. Its trades go to
-        # trades.csv at its shutdown either way (`_append_trades_csv`).
+        # trades.csv at its shutdown either way (`_append_trades_csv`). An
+        # archive an earlier shutdown left owed (it ran out of time, or the
+        # export failed: `archive_owed.json`) of a day that has ended is
+        # written the same way, outside the trading days' stream windows.
         self._day_closes: dict[date, _DayClose] = {}
+        # `run`'s stop signals, while it runs: the shutdown's export budget
+        # counts from the first (`_since_stop_signal`).
+        self._stop_signals: _StopSignals | None = None
         started = sessions.now_et()
         # The day of the last pass that ran the day-close check, the start's
         # before the first (_ran_passes_on).
         self._last_pass_day: date = started.date()
         self._closes_scheduled_through: date = self._latest_ended_trading_day(started)
         ended = self._closes_scheduled_through
-        if ended == started.date():
+        for day in owed_session_archives(self.config.runtime.log_dir):
+            if day > ended:
+                continue          # still running: this process closes it at its 20:00
+            if not self.config.runtime.export_session_archive:
+                LOG.info("The %s archive an earlier shutdown left owed stays owed: archives are off", day)
+                continue
+            LOG.info("The %s archive was left owed by an earlier shutdown: this process writes it "
+                     "(exporter_ran_session=false), outside the trading days' stream windows", day)
+            self._day_closes[day] = _DayClose(summary=False, archive=True, ran_session=False, append=False,
+                                              carried=True)
+        if ended == started.date() and ended not in self._day_closes:
             if not self.config.runtime.export_session_archive:
                 LOG.info("Started after the %s session ended: its session report is left as it is", ended)
             elif session_archive_manifest_path(self.config.runtime.log_dir, ended).exists():
@@ -493,6 +531,7 @@ class IntradayBot:
         (2026-09-28).
         """
         with _StopSignals() as stop_signals:
+            self._stop_signals = stop_signals
             try:
                 self._start_up()
                 self._run_cycles()
@@ -967,16 +1006,23 @@ class IntradayBot:
         while day <= latest:
             if is_weekday_session_day(day):
                 ran = self._ran_passes_on(day)
-                # A day this process did not run gets an archive only when it
-                # has none, as a late start's: another process may have run
-                # and archived it.
-                archive = bool(self.config.runtime.export_session_archive) and (
-                    ran or not session_archive_manifest_path(self.config.runtime.log_dir, day).exists())
                 self._day_closes[day] = _DayClose(
-                    summary=ran, archive=archive, ran_session=ran,
+                    summary=ran, archive=self._owes_archive(day, ran), ran_session=ran,
                     skip_counts=dict(self.entry_gatekeeper.session_skip_counts) if ran else {})
             day += timedelta(days=1)
         self._closes_scheduled_through = max(self._closes_scheduled_through, latest)
+
+    def _owes_archive(self, day: date, ran: bool) -> bool:
+        """Whether this process writes ``day``'s archive (archives on): a
+        day it ran; one it did not run only when the day has none (no
+        manifest.json: another process may have run and archived it, as for
+        a late start) or an earlier shutdown left it owed
+        (archive_owed.json)."""
+        if not self.config.runtime.export_session_archive:
+            return False
+        log_dir = self.config.runtime.log_dir
+        return (ran or session_archive_owed_path(log_dir, day).exists()
+                or not session_archive_manifest_path(log_dir, day).exists())
 
     def _ran_passes_on(self, day: date) -> bool:
         """Whether this process ran ``day``'s passes, so the skip tally is
@@ -1027,14 +1073,15 @@ class IntradayBot:
     def _archive_due(day: date, owed: _DayClose, now: datetime) -> bool:
         """Whether ``day``'s archive export may run on this pass. The pass
         that closes the day exports it, whenever that is (a held loop's
-        catch-up included). Any later attempt (after a failed export, or
-        one that waited for a failed append) waits for its back-off
+        catch-up included). Any later attempt (after a failed export, one
+        that waited for a failed append, or one an earlier shutdown left
+        owed) waits for its back-off
         (``archive_retry_at``; a retry time further ahead than the longest
         wait is a clock stepped back, and due) and never runs inside a
         later trading day's stream window, where each export (about 12 s on
         H:, on the engine thread) would stall a pass of management. The
-        shutdown exports it whatever these say."""
-        if owed.failed_at is None and owed.archive_failures == 0:
+        shutdown exports it whatever these say, within its budget."""
+        if owed.failed_at is None and owed.archive_failures == 0 and not owed.carried:
             return True
         if owed.archive_retry_at is not None and timedelta(0) < owed.archive_retry_at - now <= timedelta(
                 seconds=ARCHIVE_RETRY_MAX_SECONDS):
@@ -1043,11 +1090,11 @@ class IntradayBot:
                          and EQUITY_STREAM_START <= now.time() < EQUITY_STREAM_END)
         return not later_session
 
-    def _close_session_day(self, day: date, *, final: bool, now: datetime, archive_due: bool = True) -> bool:
+    def _close_session_day(self, day: date, *, final: bool, now: datetime, archive_due: bool) -> bool:
         """Write what this process owes ``day`` (``_day_closes``): the
         summary, then the append of every trade it holds that trades.csv
-        lacks, then the archive. True, and the day is no longer owed, when
-        all three are done.
+        lacks, then, when ``archive_due``, the archive. True, and the day is
+        no longer owed, when all three are done.
 
         The summary is written once: it is marked done before the append, so
         one that raises is logged and not repeated, and a stop signal (or any
@@ -1056,15 +1103,15 @@ class IntradayBot:
         any other BaseException during the summary leaves it owed and
         propagates, so the shutdown that follows writes it. The archive's
         trades.csv is the day's rows of the persistent file, so it waits for
-        an append that succeeded; at shutdown (``final``) it is written
-        anyway, its manifest naming the trades the file lacks. An append or
-        an archive that fails leaves the day owed, retried on a later pass
-        and at shutdown; a pass whose ``archive_due`` is False (its back-off
-        runs, or a later day's session is open) leaves the archive owed (the
-        shutdown leaves it True: it exports whatever the back-off says). A
-        failed archive export (not at shutdown) sets its next retry ``now``
-        plus ``DAY_CLOSE_RETRY_SECONDS``, doubled with each further failure,
-        at most ``ARCHIVE_RETRY_MAX_SECONDS``.
+        an append that succeeded. An append or an archive that fails leaves
+        the day owed, retried on a later pass and at shutdown; a pass whose
+        ``archive_due`` is False (its back-off runs, or a later day's session
+        is open) leaves the archive owed. A failed archive export sets its
+        next retry ``now`` plus ``DAY_CLOSE_RETRY_SECONDS``, doubled with
+        each further failure, at most ``ARCHIVE_RETRY_MAX_SECONDS``. At
+        shutdown (``final``) a failed append is logged and the archive is
+        left to ``_shutdown_exports`` (``archive_due`` False), which writes
+        it anyway, its manifest naming the trades the file lacks.
         """
         owed = self._day_closes[day]
         if owed.summary:
@@ -1079,15 +1126,15 @@ class IntradayBot:
             LOG.warning("trades.csv lacks some of this process's trades: the %s close is retried on a later pass "
                         "and at shutdown", day)
             return False
+        else:
+            LOG.error("Shutdown: the trades.csv append failed (the %s close), so the trades it could not write are "
+                      "only in this process's log", day)
         if owed.archive and archive_due:
             try:
                 self._export_session_archive(day, owed)
             except Exception as exc:
                 # Archive export is a debug aid — never let it crash the main
-                # loop or the shutdown.
-                if final:
-                    LOG.exception("Session archive for %s failed at shutdown: %s", day, type(exc).__name__)
-                    return False
+                # loop.
                 owed.archive_failures += 1
                 wait = min(DAY_CLOSE_RETRY_SECONDS * 2.0 ** min(owed.archive_failures - 1, 5),
                            ARCHIVE_RETRY_MAX_SECONDS)
@@ -1096,12 +1143,8 @@ class IntradayBot:
                               "windows, and at shutdown): %s", day, wait, type(exc).__name__)
                 return False
             owed.archive = False
-        if owed.archive:
-            return False          # not due this pass
-        if owed.append:
-            LOG.error("Shutdown: the trades.csv append failed (the %s close), so the trades it could not write are "
-                      "only in this process's log", day)
-            return False
+        if owed.archive or owed.append:
+            return False          # the archive not due on this pass (or left to the shutdown's exports)
         del self._day_closes[day]
         return True
 
@@ -1233,20 +1276,20 @@ class IntradayBot:
             LOG.exception("Stream stop failed during shutdown")
         # The days this process still owes a close, oldest first, then
         # today's when its 20:00 close has not run (a stop before 20:00, or
-        # on a non-trading day): each writes its summary, trades.csv rows and
-        # archive. A day this process already closed writes no second
-        # SESSION REPORT or archive, but the append still runs, so a trade
-        # booked since (a late start's start-up reconcile books one that
-        # evening) reaches trades.csv. Each step logs its own failures.
+        # on a non-trading day): each writes its summary and trades.csv rows,
+        # every day's before any archive (an export takes about 12 s on H:,
+        # an append milliseconds), then the archives (`_shutdown_exports`).
+        # A day this process already closed writes no second SESSION REPORT
+        # or archive, but the append still runs, so a trade booked since (a
+        # late start's start-up reconcile books one that evening) reaches
+        # trades.csv. Each step logs its own failures.
         now = sessions.now_et()
         today = now.date()
         self._schedule_day_closes(now)
         if today > self._closes_scheduled_through:
             ran = self._ran_passes_on(today)
-            archive = bool(self.config.runtime.export_session_archive) and (
-                ran or not session_archive_manifest_path(self.config.runtime.log_dir, today).exists())
             self._day_closes[today] = _DayClose(
-                summary=ran, archive=archive, ran_session=ran,
+                summary=ran, archive=self._owes_archive(today, ran), ran_session=ran,
                 skip_counts=dict(self.entry_gatekeeper.session_skip_counts) if ran else {})
         if not self._day_closes:
             LOG.info("Session %s already closed (at its 20:00 ET end, or before this process started): "
@@ -1256,7 +1299,52 @@ class IntradayBot:
                           "this process's log")
             return
         for day in sorted(self._day_closes):
-            self._close_session_day(day, final=True, now=now)
+            self._close_session_day(day, final=True, now=now, archive_due=False)
+        self._shutdown_exports()
+
+    def _shutdown_exports(self) -> None:
+        """The shutdown's archive exports, oldest day first, each started
+        within ``SHUTDOWN_EXPORT_START_SECONDS`` of the stop signal (all of
+        them on a shutdown no signal started, such as the auto-exit), whatever
+        the back-off says. A day whose export is not started, or fails, is
+        left owed to the next start (``archive_owed.json``), with a WARNING;
+        a day whose append failed is exported anyway, its manifest naming
+        the trades the file lacks."""
+        for day in sorted(self._day_closes):
+            owed = self._day_closes[day]
+            if not owed.archive:
+                continue
+            since_stop = self._since_stop_signal()
+            if since_stop is not None and since_stop >= SHUTDOWN_EXPORT_START_SECONDS:
+                self._leave_archive_owed(day, f"not started: {since_stop:.0f} s after the stop signal, past the "
+                                              f"{SHUTDOWN_EXPORT_START_SECONDS:.0f} s the shutdown starts exports in")
+                continue
+            try:
+                self._export_session_archive(day, owed)
+            except Exception as exc:
+                # Archive export is a debug aid — never let it crash the
+                # shutdown.
+                LOG.exception("Session archive for %s failed at shutdown: %s", day, type(exc).__name__)
+                self._leave_archive_owed(day, f"its export failed at shutdown: {type(exc).__name__}")
+                continue
+            owed.archive = False
+
+    def _since_stop_signal(self) -> float | None:
+        """Seconds since this run's first stop signal; None before one."""
+        if self._stop_signals is None or self._stop_signals.received_at is None:
+            return None
+        return time.monotonic() - self._stop_signals.received_at
+
+    def _leave_archive_owed(self, day: date, why: str) -> None:
+        """Leave ``day``'s archive, which this shutdown did not write, to the
+        next start (``archive_owed.json``)."""
+        try:
+            leave_session_archive_owed(self.config.runtime.log_dir, day, why)
+        except OSError as exc:
+            LOG.error("Shutdown: the %s archive is not written (%s) and could not be left owed for the next start: "
+                      "%s: %s", day, why, type(exc).__name__, exc)
+            return
+        LOG.warning("Shutdown: the %s archive is not written (%s): the next start writes it", day, why)
 
     def _session_report_bars(self, symbol: str):
         """1m bars for the post-stop continuation aggregate.
