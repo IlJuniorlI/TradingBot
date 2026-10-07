@@ -2230,6 +2230,16 @@ class PositionManager:
             return
         last_price, market_snapshot = self._position_management_snapshot(position, bars)
         previous_look, look = self._take_look(key, position, last_price, market_snapshot)
+        if look is not None and not is_option_asset(position.metadata):
+            # The paper account marks a held equity at the price this pass
+            # manages it at (its row, the equity, the peak and the max
+            # drawdown), one with a working exit too. Until 2026-10-07 it
+            # held the quotes phase's 1m close, a median 30 s older than
+            # the quote management read; a pass that does not price the
+            # position (settle pending above, management off, its bracket
+            # fills unbooked) still leaves that close. An option keeps its
+            # strategy's mark from fresh legs (the engine's).
+            self.account.mark_prices({position.symbol: look.mark})
         # Always reset management_adjustments at the start of each cycle to
         # prevent stale adjustments from persisting when price is unavailable.
         # Ahead of the working-exit check: its risk check on a working
