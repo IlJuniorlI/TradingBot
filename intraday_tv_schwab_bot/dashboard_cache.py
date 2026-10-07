@@ -219,9 +219,13 @@ class DashboardCache:
 
         The strategy reads ema9/ema20 off its LTF, built from its step frame
         with ``span_scale=ltf_indicator_span_scale`` and
-        ``ema_spans=ltf_ema_spans(params)`` (``_resampled_frame``); the chart
-        asks ``get_merged`` for the same variant of its own frame's bars. On
-        top_tier's 1m LTF that is a 45/100-bar EMA (its
+        ``ema_spans=ltf_ema_spans(params)`` (``_resampled_frame``). On a 1m
+        ``frame`` (the snapshot's, and the 1m LTF chart's: the canonical 1m
+        frame) the same variant is built the same way, so the strategy's
+        read and this one are one build a bar (``bars.derived_frame``; until
+        2026-10-07 this asked ``get_merged``, which built it a second time);
+        a coarser chart frame asks ``get_merged`` for the variant of its own
+        bars. On top_tier's 1m LTF that is a 45/100-bar EMA (its
         ltf_ema_fast_span / ltf_ema_slow_span) that restarts on each session's
         first RTH bar. Until 2026-09-23 the chart drew a continuous 45/100 EWM across the
         prior day and premarket instead (the opposite stack to the bot's on 93
@@ -235,11 +239,14 @@ class DashboardCache:
         scale = float(params.get("ltf_indicator_span_scale", 1.0))
         spans = ltf_ema_spans(params)
         source = frame_source_token(frame)
-        # The frame the caller built is canonical (scale 1, EMA 9/20); fetch
+        # The frame the caller built is canonical (scale 1, EMA 9/20); read
         # the strategy's own whenever either differs.
         if bars and (scale != 1.0 or spans != (9, 20)):
-            scaled = self.data.get_merged(symbol, timeframe=timeframe, with_indicators=True,
-                                          span_scale=scale, ema_spans=spans)
+            if timeframe == "1min":
+                scaled = self.strategy._resampled_frame(frame, 1, span_scale=scale, ema_spans=spans)
+            else:
+                scaled = self.data.get_merged(symbol, timeframe=timeframe, with_indicators=True,
+                                              span_scale=scale, ema_spans=spans)
             source = frame_source_token(scaled)
             emas = scaled[["ema9", "ema20"]].reindex(frame.index[-len(bars):])
             for bar, fast, slow in zip(bars, emas["ema9"], emas["ema20"]):
@@ -892,12 +899,7 @@ class DashboardCache:
         # with non-1m LTF (e.g. peer_confirmed_key_levels at LTF=5m) get
         # 5m-derived fibs/AVWAP/etc. matching the LTF chart bars.
         ltf_min_for_tech = self.strategy.ltf_minutes()
-        if ltf_min_for_tech == 1:
-            tech_frame = frame
-        elif symbol:
-            tech_frame = self.data.get_merged(symbol, timeframe=f"{ltf_min_for_tech}min", with_indicators=True)
-        else:
-            tech_frame = frame
+        tech_frame = self._overlay_frame(frame, ltf_min_for_tech)
         tech_ctx = None  # Stays None when tech_frame is empty (warmup path) or build_technical_levels_context raises; downstream readers (technical_payload, divergence_lines) all guard on `tech_ctx is not None`.
         if tech_frame is not None and not tech_frame.empty:
             tl_cfg = self.config.technical_levels
@@ -1108,14 +1110,19 @@ class DashboardCache:
             htf_ctx = None
         return htf_ctx, htf_fair_value_gaps
 
-    def _overlay_frame(self, symbol: str, frame: pd.DataFrame | None, minutes: int) -> pd.DataFrame | None:
-        """The frame an FVG or order-block overlay of ``minutes`` bars is
-        built on and placed by: the snapshot's 1m ``frame`` itself, else the
-        data feed's frame of that timeframe (``get_merged``), a hand-out of
-        the same version as the strategy's frame of those bars."""
+    def _overlay_frame(self, frame: pd.DataFrame | None, minutes: int) -> pd.DataFrame | None:
+        """The frame an overlay of ``minutes`` bars (the FVGs and order
+        blocks, the technicals, the key-level zones' ATR) is built on and
+        placed by: the snapshot's canonical 1m ``frame`` itself, else its
+        bars at that timeframe, built as the strategy builds its own from its
+        step frame (``_resampled_frame``): one build a bar and timeframe for
+        the strategy's read and this one (``bars.derived_frame``), under the
+        version ``get_merged`` gives the same bars, so the contexts memoized
+        on it serve both. Until 2026-10-07 this was ``get_merged`` of the
+        timeframe, which built the frame a second time."""
         if int(minutes) <= 1:
             return frame
-        return self.data.get_merged(symbol, timeframe=f"{int(minutes)}min", with_indicators=True)
+        return self.strategy._resampled_frame(frame, int(minutes))
 
     def _snapshot_ltf_fair_value_gaps(
         self,
@@ -1136,7 +1143,7 @@ class DashboardCache:
             chart_wants_ltf_fvgs = bool(compact_chart_profile.show_ltf_fair_value_gaps) or bool(expanded_chart_profile.show_ltf_fair_value_gaps)
             if include_ltf_fvgs and chart_wants_ltf_fvgs:
                 ltf_min_for_fvg = self.strategy.ltf_minutes()
-                ltf_frame = self._overlay_frame(symbol, frame, ltf_min_for_fvg)
+                ltf_frame = self._overlay_frame(frame, ltf_min_for_fvg)
                 fvg_ctx = self.data.get_fair_value_gap_context(
                     symbol,
                     ltf_frame,
@@ -1192,7 +1199,7 @@ class DashboardCache:
                 # the same bars (_htf_order_block_context) shares it.
                 ob_ctx_htf = self.data.get_order_block_context(
                     symbol,
-                    self._overlay_frame(symbol, frame, htf_minutes),
+                    self._overlay_frame(frame, htf_minutes),
                     timeframe_minutes=htf_minutes,
                     current_price=frame_close,
                     **ob_request,
@@ -1221,7 +1228,7 @@ class DashboardCache:
                 # the same bars (_ltf_order_block_context) shares it. The
                 # frame also places each block (anchor_abs_index).
                 ltf_min_for_ob = self.strategy.ltf_minutes()
-                ltf_frame = self._overlay_frame(symbol, frame, ltf_min_for_ob)
+                ltf_frame = self._overlay_frame(frame, ltf_min_for_ob)
                 ob_ctx_ltf = self.data.get_order_block_context(
                     symbol,
                     ltf_frame,
@@ -1415,8 +1422,7 @@ class DashboardCache:
             return []
 
         ltf_min = max(1, int(level_ctx.get("ltf_minutes", 5) or 5))
-        timeframe = "1min" if ltf_min <= 1 else f"{ltf_min}min"
-        ltf = self.data.get_merged(symbol, timeframe=timeframe, with_indicators=True)
+        ltf = self._overlay_frame(frame, ltf_min)
 
         # The ATR key_levels' _select_level sizes its zones with, read by the
         # same call so the overlay cannot drift from it. Until 2026-09-26 a

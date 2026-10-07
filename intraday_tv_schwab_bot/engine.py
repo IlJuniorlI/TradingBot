@@ -38,7 +38,7 @@ from .session_archive import (
     session_archive_manifest_path,
     session_archive_owed_path,
 )
-from .session_report import append_trades_csv, write_session_report
+from .session_report import append_trades_csv, check_trades_csv_lock, write_session_report
 from .schwab_api import SchwabdevApiUsageTracker, read_refresh_token_window, register_schwab_api_tracker
 from .log_setup import TRADEFLOW_LEVEL, setup_logging
 from .sessions import (
@@ -229,16 +229,18 @@ class _StopSignals:
 
 # A day close that failed is retried on a pass at least this long after it:
 # a close owed past midnight can fall in the next day's stream window, whose
-# passes run every couple of seconds.
+# passes run every couple of seconds. There a retry's trades.csv append tries
+# the file's lock once instead of waiting for it (up to
+# TRADES_CSV_LOCK_WAIT_SECONDS on the engine thread, a minute apart).
 DAY_CLOSE_RETRY_SECONDS = 60.0
 # The archive export is heavy (about 12 s on H:, on the engine thread), so a
 # failed one is retried after DAY_CLOSE_RETRY_SECONDS, doubled with each
 # further failure, at most this long, and never inside a later trading day's
 # stream window (07:00-20:00 ET), where every retry would stall management.
 ARCHIVE_RETRY_MAX_SECONDS = 1800.0
-# The shutdown starts an archive export only this long after the stop signal.
-# An export cannot be cut short and took 5-13 s on H: (2026-09-29 to 10-06),
-# so one started by then ends by about 25 s: inside the deploy guide's
+# The shutdown starts no archive export this long or more after the stop
+# signal. An export cannot be cut short and took 5-13 s on H: (2026-09-29 to
+# 10-06), so one started by then ends by about 25 s: inside the deploy guide's
 # TimeoutStopSec=30s, whose SIGKILL would cut it off half-written, with room
 # for a longer day and the exit. A day whose export the shutdown does not
 # start, or whose export fails there or is cut off, is left owed to the next
@@ -576,6 +578,9 @@ class IntradayBot:
                 # bot running headlessly rather than refuse to start.
                 LOG.exception("Could not start dashboard on %s:%s: %s", self.config.dashboard.host, self.config.dashboard.port, exc)
                 self.dashboard = None
+        # A lock this log directory cannot give (NFS without local_lock=flock)
+        # is an ERROR at start-up, not first at the 20:00 close's append.
+        check_trades_csv_lock(self.config.runtime.log_dir)
         # Ahead of the start-up reconcile: a call that finds the token inside
         # schwabdev's login lead waits at its prompt, with this line, when it
         # is the first such call, the last before it. Not ahead of every
@@ -1058,7 +1063,10 @@ class IntradayBot:
         midnight was never finished. A day whose close failed is retried on
         a pass ``DAY_CLOSE_RETRY_SECONDS`` or more later and at shutdown,
         whatever the date; its archive export on its own back-off
-        (``_archive_due``).
+        (``_archive_due``). A retry inside a later trading day's stream
+        window tries trades.csv's lock once instead of waiting up to
+        ``TRADES_CSV_LOCK_WAIT_SECONDS`` on the engine thread: a busy lock
+        is a failed attempt, retried a minute later.
         """
         now = sessions.now_et()
         self._schedule_day_closes(now)
@@ -1077,7 +1085,9 @@ class IntradayBot:
                 ("archive", archive_due),
             ) if due]
             LOG.info("ET trading day %s ended: writing its %s", day, " and ".join(parts))
-            if not self._close_session_day(day, final=False, archive_due=archive_due, now=now):
+            wait_for_lock = owed.failed_at is None or not self._in_later_stream_window(day, now)
+            if not self._close_session_day(day, final=False, archive_due=archive_due, now=now,
+                                           wait_for_lock=wait_for_lock):
                 owed.failed_at = now
 
     @staticmethod
@@ -1097,11 +1107,18 @@ class IntradayBot:
         if owed.archive_retry_at is not None and timedelta(0) < owed.archive_retry_at - now <= timedelta(
                 seconds=ARCHIVE_RETRY_MAX_SECONDS):
             return False
-        later_session = (now.date() > day and is_weekday_session_day(now.date())
-                         and EQUITY_STREAM_START <= now.time() < EQUITY_STREAM_END)
-        return not later_session
+        return not IntradayBot._in_later_stream_window(day, now)
 
-    def _close_session_day(self, day: date, *, final: bool, now: datetime, archive_due: bool) -> bool:
+    @staticmethod
+    def _in_later_stream_window(day: date, now: datetime) -> bool:
+        """Whether ``now`` is inside the stream window (07:00-20:00 ET) of a
+        trading day after ``day``, where the passes run management every
+        couple of seconds."""
+        return (now.date() > day and is_weekday_session_day(now.date())
+                and EQUITY_STREAM_START <= now.time() < EQUITY_STREAM_END)
+
+    def _close_session_day(self, day: date, *, final: bool, now: datetime, archive_due: bool,
+                           wait_for_lock: bool) -> bool:
         """Write what this process owes ``day`` (``_day_closes``): the
         summary, then the append of every trade it holds that trades.csv
         lacks, then, when ``archive_due``, the archive. True, and the day is
@@ -1123,6 +1140,8 @@ class IntradayBot:
         shutdown (``final``) a failed append is logged and the archive is
         left to ``_shutdown_exports`` (``archive_due`` False), which writes
         it anyway, its manifest naming the trades the file lacks.
+        ``wait_for_lock`` False tries trades.csv's lock once (a retry inside a
+        later trading day's stream window).
         """
         owed = self._day_closes[day]
         if owed.summary:
@@ -1131,7 +1150,7 @@ class IntradayBot:
             except Exception as exc:
                 LOG.exception("Session report for %s failed: %s", day, type(exc).__name__)
             owed.summary = False
-        if self._append_trades_csv(day):
+        if self._append_trades_csv(day, wait_for_lock=wait_for_lock):
             owed.append = False
         elif not final:
             LOG.warning("trades.csv lacks some of this process's trades: the %s close is retried on a later pass "
@@ -1159,12 +1178,14 @@ class IntradayBot:
         del self._day_closes[day]
         return True
 
-    def _append_trades_csv(self, day: date) -> bool:
+    def _append_trades_csv(self, day: date, *, wait_for_lock: bool) -> bool:
         """Append every trade this process holds that trades.csv lacks; True
         when the file holds them all. An error is logged with its type:
-        False then (the append logs its own I/O errors)."""
+        False then (the append logs its own I/O errors). ``wait_for_lock``
+        False tries the file's lock once instead of waiting for it."""
         try:
-            return append_trades_csv(self.account.trades, log_dir=self.config.runtime.log_dir, session_date=day)
+            return append_trades_csv(self.account.trades, log_dir=self.config.runtime.log_dir, session_date=day,
+                                     wait_for_lock=wait_for_lock)
         except Exception as exc:
             LOG.exception("trades.csv append for %s failed: %s", day, type(exc).__name__)
             return False
@@ -1305,25 +1326,33 @@ class IntradayBot:
         if not self._day_closes:
             LOG.info("Session %s already closed (at its 20:00 ET end, or before this process started): "
                      "no report at shutdown", today)
-            if not self._append_trades_csv(today):
+            if not self._append_trades_csv(today, wait_for_lock=True):
                 LOG.error("Shutdown: the trades.csv append failed, so the trades it could not write are only in "
                           "this process's log")
             return
         for day in sorted(self._day_closes):
-            self._close_session_day(day, final=True, now=now, archive_due=False)
+            self._close_session_day(day, final=True, now=now, archive_due=False, wait_for_lock=True)
         self._shutdown_exports()
 
     def _shutdown_exports(self) -> None:
-        """The shutdown's archive exports, oldest day first, each started
-        within ``SHUTDOWN_EXPORT_START_SECONDS`` of the stop signal (all of
-        them on a shutdown no signal started, such as the auto-exit), whatever
-        the back-off says. A day whose export is not started, or fails, is
-        left owed to the next start (``archive_owed.json``) with a WARNING.
-        The file is written before each export starts and removed by the
-        export once its manifest is written, so a kill that cuts an export
-        off leaves its day owed too. A day whose append failed is exported
-        anyway, its manifest naming the trades the file lacks."""
-        for day in sorted(self._day_closes):
+        """The shutdown's archive exports: the days this process ran first,
+        then the others (a late start's, or one an earlier shutdown left
+        owed), oldest first within each, each started within
+        ``SHUTDOWN_EXPORT_START_SECONDS`` of the stop signal (all of them on
+        a shutdown no signal started, such as the auto-exit), whatever the
+        back-off says. Until 2026-10-07 they ran oldest first, so a day an
+        earlier shutdown left owed, which a start inside a stream window
+        does not export before 20:00, used up the budget of a stop before
+        then, and the day this process ran was left to the next start, its
+        archive then without this process's bars, account or tally
+        (``exporter_ran_session: false``). A day whose export is not
+        started, or fails, is left owed to the next start
+        (``archive_owed.json``) with a WARNING. The file is written before
+        each export starts and removed by the export once its manifest is
+        written, so a kill that cuts an export off leaves its day owed too.
+        A day whose append failed is exported anyway, its manifest naming
+        the trades the file lacks."""
+        for day in sorted(self._day_closes, key=lambda day: (not self._day_closes[day].ran_session, day)):
             owed = self._day_closes[day]
             if not owed.archive:
                 continue

@@ -539,14 +539,16 @@ class MarketDataStore:
 
     @staticmethod
     def _htf_context_cache_key(symbol: str, timeframe_minutes: int, build_kwargs: Mapping[str, Any]) -> tuple:
-        """``(symbol, tf, *every build_htf_context argument the caller sets)``.
+        """``(symbol, tf, *every HTF build argument the caller sets)``: the
+        arguments of the price-free part (``htf_levels.prepare_htf_levels``)
+        and of the context at a price (``htf_levels.htf_context_at``).
 
-        A cached context is a function of the stored (symbol, tf) frame and
-        exactly these arguments, so two callers share an entry only when a
-        fresh build would give them the same context. Until 2026-09-23 the
-        key held only the prior-day/week and FVG flags, so a caller with
-        different pivot/level/tolerance/EMA/flip settings was served a
-        context built with another caller's.
+        A cached context is a function of the stored (symbol, tf) frame,
+        exactly these arguments and its price, so two callers share an entry
+        only when a fresh build would give them the same context. Until
+        2026-09-23 the key held only the prior-day/week and FVG flags, so a
+        caller with different pivot/level/tolerance/EMA/flip settings was
+        served a context built with another caller's.
         """
         return (
             str(symbol).upper().strip(),
@@ -929,11 +931,12 @@ class MarketDataStore:
         step frame's close (``IntradayBot._prime_strategy_htf_contexts``),
         the price the strategies read them at. Until 2026-10-07 the price was
         not an argument: a context carried the 1m close of its first build
-        after each HTF refresh, for the whole HTF bar (15 minutes), so the
-        price-dependent fields were up to 15 minutes old and which price they
-        held depended on which reader came first. The price-free part is
-        built once per stored frame and clock, and the memo's shadow
-        rebuilds it in full (``_htf_context_from_stored_frame``).
+        after each HTF refresh, for the whole HTF bar, so the price-dependent
+        fields were up to one HTF bar old (15 minutes on top_tier's 15m
+        frame, an hour on the peers' 60m) and which price they held depended
+        on which reader came first. The price-free part is built once per
+        stored frame and clock, and the memo's shadow rebuilds it in full
+        (``_htf_context_from_stored_frame``).
 
         Until 2026-09-23 a fetch rebuilt only the fetching caller's cache key
         but stamped the refresh clock every key shares, so every other key

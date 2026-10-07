@@ -431,8 +431,11 @@ class ContextBuildersMixin:
         refresh (``IntradayBot._prime_strategy_htf_contexts``), so the
         strategy's reads at that price find it built. Each read names its
         price (``_htf_context``): a read whose arguments are not listed, or
-        at another price, builds its own (the price-free part of the build
-        is shared, ``MarketDataStore.get_htf_context``). Until 2026-10-07 a
+        at another price, builds its own. A read of listed arguments at
+        another price shares their price-free part, which is kept per
+        stored frame and every build argument
+        (``MarketDataStore._htf_context_from_stored_frame``); a read with
+        other arguments builds both parts. Until 2026-10-07 a
         context carried the price of its first build until the next HTF
         refresh, and this prime fixed which reader that was."""
         requests = {"score": self._default_htf_request()}
@@ -778,7 +781,8 @@ class ContextBuildersMixin:
 
         Routes through `data.get_order_block_context` when available, so the
         build is kept per frame version and shared with the dashboard's HTF
-        overlay (``get_merged`` of the HTF timeframe, the same version).
+        overlay (its frame of the same bars, built the same way:
+        ``DashboardCache._overlay_frame``).
         Until 2026-10-07 the data feed built on its stored frame of the HTF
         timeframe when the read was made."""
         current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0

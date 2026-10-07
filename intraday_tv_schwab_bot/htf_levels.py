@@ -78,7 +78,8 @@ class HTFContext:
     level_buffer: float = 0.0
     # HTF RSI divergence — same shared detector as technical_levels, but
     # walked over HTF pivots so it captures multi-timeframe confluence.
-    # Populated when build_htf_context is called with divergence_enabled.
+    # Detected by prepare_htf_levels (the price-free part of the HTF build,
+    # which the data feed runs) with divergence_enabled.
     bullish_rsi_divergence: "DivergenceMatch | None" = None
     bearish_rsi_divergence: "DivergenceMatch | None" = None
     bullish_hidden_rsi_divergence: "DivergenceMatch | None" = None

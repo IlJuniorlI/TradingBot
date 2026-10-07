@@ -263,18 +263,23 @@ A few of these values to know about:
   SIGKILLed a shutdown that ran past 30s (a hung broker read, a slow
   stream stop): raise the timeout. The archive exports are kept inside
   it: every owed day's report and `trades.csv` append run first, then the
-  exports (5-13s each on H:), each started only within 12s of the stop
-  signal, so the last ends by about 25s. A day whose export the shutdown
-  does not start, or whose export fails there, is logged (`Shutdown: the
-  <date> archive is not written (...): the next start writes it`) and
-  left owed in `.logs/sessions/<date>/archive_owed.json`, with the day's
-  skip counts; the next start writes it, outside the trading days'
-  7am-8pm stream windows, with `exporter_ran_session: false` and those
-  skip counts. The file is written before each export starts too, so a
-  SIGKILL that cuts an export off leaves its day to the next start the
-  same way. Raising the timeout leaves that 12s as it is. In a terminal,
-  a second Ctrl+C does nothing while the bot shuts down; `kill -9` ends
-  one that hangs.
+  exports (5-13s each on H:), the days the stopping process ran first,
+  then the others, oldest first within each, each started only within
+  12s of the stop signal, so the last ends by about 25s. A day whose
+  export the shutdown does not start, or whose export fails there, is
+  logged (`Shutdown: the <date> archive is not written (...): the next
+  start writes it`) and left owed in
+  `.logs/sessions/<date>/archive_owed.json`, with the day's skip counts;
+  the next start writes it, outside the trading days' 7am-8pm stream
+  windows, with `exporter_ran_session: false` and those skip counts. A
+  start before 8pm on the day the file names (a restart after a daytime
+  stop) leaves it: that process runs the rest of the day and writes the
+  day's archive at 8pm as its own (`exporter_ran_session: true`, its own
+  skip counts), which removes the file. The file is written before each
+  export starts too, so a SIGKILL that cuts an export off leaves its day
+  to the next start the same way. Raising the timeout leaves that 12s as
+  it is. In a terminal, a second Ctrl+C does nothing while the bot shuts
+  down; `kill -9` ends one that hangs.
 - **`Restart=on-failure`** restarts on crash but NOT on clean exit
   (Ctrl+C / `systemctl stop`). If you want restart on any exit, use
   `Restart=always` — but that re-starts after a clean `auto_exit_after_session`
@@ -508,10 +513,13 @@ a dry-run and a live process of one strategy that share `.logs` on one
 day archive each other's rows, under the exporting process's `dry_run`.
 Processes sharing `.logs` take turns at `trades.csv` through an advisory
 lock on `.logs/trades.csv.lock` (an empty file; leave it in place): an
-append that waits more than 5 s for it is retried like any failed append.
-The bot opens the lock file read-only, so `.logs` on an NFS mount needs
-the mount option `local_lock=flock` (NFS's own flock needs the file open
-for writing), or no append can take the lock.
+append that waits more than 5 s for it is retried like any failed append
+(a retry inside a later trading day's 7am-8pm stream window tries it once,
+without the wait). The bot opens the lock file read-only, so `.logs` on an
+NFS mount needs the mount option `local_lock=flock` (NFS's own flock needs
+the file open for writing), or no append can take the lock. The bot takes
+the lock once at start-up, and logs an ERROR naming the error and that
+option when it cannot (it starts all the same).
 
 Disable globally with `runtime.export_session_archive: false` in your
 config if you're tight on disk.
