@@ -50,10 +50,13 @@ class SrScalpRegimeMixin:
                   rather than a fresh nearest-level zone
           * +1.0  bounce/rejection bar character (LONG: lower wick >= 0.30 ;
                   SHORT: upper wick >= 0.30)
-          * +1.0  room to ride: inner gap to the builder's target zone (the
+          * +1.0  room to ride: inner gap from the nearest (or pending)
+                  entry-side zone to the builder's target zone (the
                   nearest level playing the opposite role at the close,
                   ``role_level``) clears the build's required distance (a
-                  ladder exists to ride to)
+                  ladder exists to ride to). Only the target end is the
+                  builder's: its gap starts at its floor / ceiling, which
+                  can be a confirmed flip nearer the target.
         """
         if sr_ctx is None or atr <= 0 or close <= 0:
             return 0.0
@@ -118,7 +121,12 @@ class SrScalpRegimeMixin:
         # role at this close (``role_level``): a confirmed flip between the
         # close and nearest_* ends it there (2026-10-07). Measured to
         # nearest_* past it, the term paid for room the builder then refused
-        # as htf_zones_too_close.
+        # as htf_zones_too_close. Only that end is shared: the room starts
+        # at the support (LONG; the resistance for a SHORT) or the pending
+        # one, while the builder's gap starts at its floor (ceiling), which
+        # is a reclaimed resistance (lost support) when that one is in
+        # proximity and nearer the target, so the term can still pay for a
+        # gap the builder refuses.
         target = role_level(sr_ctx, "resistance" if side == Side.LONG else "support", price=close)
         target_px = float(getattr(target, "price", 0.0) or 0.0) if target is not None else 0.0
         if side == Side.LONG:
@@ -182,18 +190,20 @@ class SrScalpRegimeMixin:
 
         Two LONG setups (SHORT mirrors), both riding to the next level:
           A. BOUNCE — price at/just off a HOLDING nearest support zone,
-             target the nearest resistance above (the next rung up).
+             target the nearest level playing the resistance role above
+             the close (the next rung up, or a lost support short of it).
           B. FLIP-CONTINUATION — price holding just above a confirmed-
              flipped resistance (``sr_ctx.broken_resistance``, now acting
-             as support), target the nearest resistance above. SHORT uses
-             ``broken_support`` (a confirmed support break, now resistance).
+             as support), the same target. SHORT uses ``broken_support``
+             (a confirmed support break, now resistance).
         The higher (more immediate) of the two floors is used when both are
         in proximity. SHORT is the exact mirror with ceilings. The target
         level is the nearest one playing the opposite role at the close
         (``support_resistance.role_level``): ``nearest_resistance``, or a
         lost support (``broken_support``) between the close and it, which a
         LONG's target cannot ride past (since 2026-10-07; mirror for SHORT).
-        The scorer's room to ride measures to the same level.
+        The scorer's room to ride ends at the same level (from its own
+        start: see ``_score_sr_scalp``).
 
         Uses the bot's existing S/R machinery — NO strategy-local level
         creation. Level prices come from ``sr_ctx.nearest_support`` /

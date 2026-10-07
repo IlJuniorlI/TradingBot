@@ -35,7 +35,7 @@ from ...models import Candidate, Position, Side, Signal
 from ...sessions import EQUITY_RTH_OPEN, equity_session_state, parse_hhmm
 from ...numeric import safe_float
 from ...reasons import insufficient_bars_reason
-from ...support_resistance import role_level
+from ...support_resistance import role_levels
 from ... import sessions
 from ..shared_entry import EntryContexts, EntryProposal
 from ..strategy_base import BaseStrategy
@@ -778,15 +778,18 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         ):
             target_max_sr_ratio = float(self.params.get("target_max_sr_ratio", 0.8))
             tgt = float(target)
-            # The opposing level is the nearest one playing the role at the
-            # signal's close (``role_level``): a confirmed flip between the
-            # close and nearest_* -- a lost support under the resistance, a
-            # reclaimed resistance over the support -- is the level a target
-            # past it must punch through, and the refusal names it
-            # (2026-10-07). A flip the close has already passed is no
-            # candidate, so nearest_* is.
+            # The opposing level is the nearest one playing the role strictly
+            # beyond the signal's close (``role_levels``): a confirmed flip
+            # between the close and nearest_* -- a lost support under the
+            # resistance, a reclaimed resistance over the support -- is the
+            # level a target past it must punch through, and the refusal
+            # names it (2026-10-07). A flip the close has already passed is
+            # no candidate, and one exactly at the close leaves nearest_* to
+            # judge, as in the refinement's caps: read alone, it switched
+            # the gate off.
             if side == Side.LONG:
-                near = role_level(admitted.sr, "resistance", price=close)
+                near = next((level for level in role_levels(admitted.sr, "resistance", price=close)
+                             if float(level.price) > close), None)
                 level_price = float(getattr(near, "price", 0.0) or 0.0)
                 valid = level_price > close
                 dist_to_sr = level_price - close if valid else 0.0
@@ -794,7 +797,8 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 level_name = "broken_support" if near is not None and near is admitted.sr.broken_support else "resistance"
                 reason_prefix = "long_target_beyond_resistance"
             else:
-                near = role_level(admitted.sr, "support", price=close)
+                near = next((level for level in role_levels(admitted.sr, "support", price=close)
+                             if 0.0 < float(level.price) < close), None)
                 level_price = float(getattr(near, "price", 0.0) or 0.0)
                 valid = 0.0 < level_price < close
                 dist_to_sr = close - level_price if valid else 0.0

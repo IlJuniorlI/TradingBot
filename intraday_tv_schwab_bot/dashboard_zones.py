@@ -216,16 +216,19 @@ def _fold_broken_zones(zones: list[dict[str, Any]], *, side_tolerance: float | N
     against the ladder, so a lost support within the merge distance of the
     nearest resistance drew as a second zone just under it (TSM 2026-10-06:
     BS 485.42 under HR 485.62, side_tolerance 1.452). The zone keeps the
-    nearest level's price (the one the strategy reads) and spans from the
-    lower member's lower edge to the upper member's upper edge; the broken
-    level's labels and sources come first and its flip state is the
-    zone's, as at a merge at one price, where a flip candidate outranks a
-    plain zone. That span would cover a zone of the other kind priced
-    between the two (a pending level the overlap trim split them around),
-    so such a pair keeps two zones, as do a flip farther away, a pending
-    level, a strategy's own candidate and a zone of the other kind; without
-    the row's finite, positive tolerance nothing folds. One plain zone of
-    each kind is drawn, so a kind holds at most one such nearest level."""
+    nearest level's price (the row's published nearest_*, which the stop
+    anchors and the ladder read; the S/R gates measure to the flip when it
+    lies between price and that level, ``support_resistance.role_level``)
+    and spans from the lower member's lower edge to the upper member's
+    upper edge; the broken level's labels and sources come first and its
+    flip state is the zone's, as at a merge at one price, where a flip
+    candidate outranks a plain zone. That span would cover a zone of the
+    other kind priced between the two (a pending level the overlap trim
+    split them around), so such a pair keeps two zones, as do a flip
+    farther away, a pending level, a strategy's own candidate and a zone of
+    the other kind; without the row's finite, positive tolerance nothing
+    folds. One plain zone of each kind is drawn, so a kind holds at most
+    one such nearest level."""
     if side_tolerance is None or not math.isfinite(side_tolerance) or side_tolerance <= 0.0:
         return zones
     nearest = {

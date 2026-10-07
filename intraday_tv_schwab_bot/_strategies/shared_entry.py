@@ -61,7 +61,7 @@ from ..indicators import last_bar_atr
 from .. import sessions
 from ..numeric import safe_float
 from ..reasons import detail_fields, reason_head, reason_with_values
-from ..support_resistance import role_level
+from ..support_resistance import role_level, role_levels
 from .plugin_api import VETO_GATES
 
 if TYPE_CHECKING:
@@ -1711,8 +1711,9 @@ class SharedEntryPolicy:
             too_close = True
         if dist_atr is not None and dist_atr <= float(self._support_resistance_setting("entry_min_clearance_atr", 0.85)):
             too_close = True
-        # No breakout escape: once a resistance breaks, nearest_resistance is
-        # the next wall above price and the clearance is measured to it
+        # No breakout escape: once a resistance breaks, the next wall above
+        # price -- nearest_resistance, or a lost support between price and it
+        # (``role_level``, 2026-10-07) -- is what the clearance is measured to
         # (2026-04-20: META/INTC/TSLA LONG'd 0.06-0.5 ATR under that wall on
         # a stale breakout flag). The escape that excused price "above
         # nearest_resistance" tested a state the builders never report
@@ -1733,25 +1734,6 @@ class SharedEntryPolicy:
         # No breakdown escape, symmetric with the bullish path above.
         return too_close
 
-    @staticmethod
-    def _sr_cap_levels(sr_ctx, role: str, close: float) -> tuple[Level, ...]:
-        """The opposing levels the S/R refinement tries to cap a target at,
-        in turn: the nearest level playing ``role`` at the proposal's
-        ``close`` (``support_resistance.role_level``) and, when that is a
-        confirmed flip, ``nearest_*`` after it.
-
-        A flip between the close and ``nearest_*`` caps first (2026-10-07).
-        When its cap fails the R:R floor, ``nearest_*``'s cap is tried, as
-        before, so a flip never leaves a target further out than
-        ``nearest_*`` capped it. A LONG at 100.00, stop 99.50, target 103.00,
-        nearest_resistance 101.00, a lost support at 100.30, level_buffer
-        0.10: the cap under the flip (100.20, 0.4R) fails the 1.0 floor and
-        the cap under 101.00 (100.90, 1.8R) holds. With the flip's cap alone
-        the target stayed at 103.00, past both levels."""
-        nearest = sr_ctx.nearest_resistance if role == "resistance" else sr_ctx.nearest_support
-        level = role_level(sr_ctx, role, price=close)
-        return tuple(lv for lv in ((level,) if level is nearest else (level, nearest)) if lv is not None)
-
     def _refine_bullish_sr_levels(self, close: float, stop: float, target: float | None, sr_ctx, frame: pd.DataFrame | None):
         if not self.config.shared_entry.use_sr_stop_target_refinement:
             return float(stop), (None if target is None else float(target))
@@ -1764,10 +1746,13 @@ class SharedEntryPolicy:
                     last_bar_atr(frame, close),
                 )
         # The cap: just under the resistance over the close, the nearest
-        # level playing the role first (``_sr_cap_levels``). The stop anchor
-        # stays nearest_support.
+        # level playing the role at the close first, then nearest_resistance
+        # when that was a confirmed flip at the close or one whose cap failed
+        # the R:R floor (``support_resistance.role_levels``, 2026-10-07): a
+        # flip never leaves the target further out than nearest_resistance
+        # capped it. The stop anchor stays nearest_support.
         if target is not None:
-            for resistance in self._sr_cap_levels(sr_ctx, "resistance", close):
+            for resistance in role_levels(sr_ctx, "resistance", price=close):
                 if close >= float(resistance.price):
                     continue
                 capped_target = max(close * 1.001, float(resistance.price) - level_buffer)
@@ -1794,7 +1779,7 @@ class SharedEntryPolicy:
         # Mirror: just over the support under the close, a reclaimed
         # resistance between nearest_support and the close first.
         if target is not None:
-            for support in self._sr_cap_levels(sr_ctx, "support", close):
+            for support in role_levels(sr_ctx, "support", price=close):
                 if close <= float(support.price):
                     continue
                 capped_target = min(close * 0.999, float(support.price) + level_buffer)

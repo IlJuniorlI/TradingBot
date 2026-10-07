@@ -727,17 +727,20 @@ def zone_flip_confirmed(
 
 
 def _role_level(role: str, close: float, nearest: Level | None, broken: Level | None) -> Level | None:
-    """The nearest level playing ``role`` on its side of ``close``: for
-    ``"resistance"`` the nearer of ``nearest`` (nearest_resistance) and
-    ``broken`` (broken_support, a lost support now acting as resistance),
-    the flip a candidate when it lies at or above ``close`` and below
-    ``nearest`` or there is no ``nearest``; for ``"support"`` the mirror,
-    nearest_support and broken_resistance at or below ``close``. A flip at
-    ``close`` counts, as a ladder level at price does (no room); a flip on
-    the wrong side of price (``detect_broken_levels`` keeps one within the
-    merge tolerance across it) is no candidate; a tie goes to ``nearest``.
-    ``role_level`` reads it off a built context at the reader's price; the
-    builder's ``near_*`` read it here at the build's close."""
+    """The nearest level playing ``role`` at ``close``: for
+    ``"resistance"`` ``broken`` (broken_support, a lost support now acting
+    as resistance) when it lies at or above ``close`` and below ``nearest``
+    (nearest_resistance) or there is no ``nearest``, else ``nearest``; for
+    ``"support"`` the mirror, broken_resistance at or below ``close`` and
+    above nearest_support. A flip at ``close`` counts, as a ladder level at
+    price does (no room); a flip on the wrong side of ``close``
+    (``detect_broken_levels`` keeps one within the merge tolerance across
+    it) is no candidate; a tie goes to ``nearest``. Only the flip is
+    checked against ``close``: ``nearest`` is returned as published, and a
+    context priced behind the reader's close can publish it at or past that
+    close, so each reader checks the side it needs. ``role_level`` reads it
+    off a built context at the reader's price; the builder's ``near_*``
+    read it here at the build's close."""
     if role == "resistance":
         flip_counts = broken is not None and float(broken.price) >= close and (
             nearest is None or float(broken.price) < float(nearest.price))
@@ -750,11 +753,13 @@ def _role_level(role: str, close: float, nearest: Level | None, broken: Level | 
 
 
 def role_level(sr_ctx: SupportResistanceContext, role: str, *, price: float) -> Level | None:
-    """The nearest level playing ``role`` on its side of ``price`` in
-    ``sr_ctx`` (``_role_level``): the resistance over a LONG is
-    ``nearest_resistance`` or a lost support (``broken_support``) between
-    price and it, the support under a SHORT ``nearest_support`` or a
-    reclaimed resistance (``broken_resistance``) between it and price.
+    """The nearest level playing ``role`` at ``price`` in ``sr_ctx``
+    (``_role_level``): the resistance over a LONG is ``nearest_resistance``
+    or a lost support (``broken_support``) between price and it, the
+    support under a SHORT ``nearest_support`` or a reclaimed resistance
+    (``broken_resistance``) between it and price. Only a flip is checked
+    against ``price``; ``nearest_*`` is returned as published, so a reader
+    checks that the level is on the side of its close it needs.
 
     ``price`` is the reader's own. The clearance veto and the proximity
     score measure from the context's (``sr_ctx.current_price``); the
@@ -775,14 +780,38 @@ def role_level(sr_ctx: SupportResistanceContext, role: str, *, price: float) -> 
     484.30 read 0.273% of room to 485.62 and passed the 0.25% minimum,
     where the flip left 0.231%. Readers: the S/R clearance veto and the
     proximity score (``shared_entry._htf_clearance``, after a pending
-    level), the refinement's target caps (a flip's cap that fails the R:R
-    floor falls back to ``nearest_*``'s), ``near_*``, top_tier's Fix G,
-    and sr_scalp's target and its scorer's room to ride. The stop anchors,
-    the ladders and the published ``nearest_*`` with their distances still
+    level), ``near_*``, sr_scalp's target and its scorer's room to ride,
+    and, through ``role_levels`` (``nearest_*`` after a flip), the
+    refinement's target caps and top_tier's Fix G. The stop anchors, the
+    ladders and the published ``nearest_*`` with their distances still
     read the clusters."""
     if role == "resistance":
         return _role_level(role, float(price), sr_ctx.nearest_resistance, sr_ctx.broken_support)
     return _role_level(role, float(price), sr_ctx.nearest_support, sr_ctx.broken_resistance)
+
+
+def role_levels(sr_ctx: SupportResistanceContext, role: str, *, price: float) -> tuple[Level, ...]:
+    """The levels playing ``role`` in ``sr_ctx`` that a reader tries in
+    turn at its ``price``: the role level (``role_level``) and, when that
+    is a confirmed flip, ``nearest_*`` after it. A reader takes the first
+    one that passes its own test, so a flip it cannot use leaves it
+    ``nearest_*``, the level it read before 2026-10-07.
+
+    The refinement's target caps take the first one strictly on the target
+    side of the proposal's close whose cap meets the R:R floor. A LONG at
+    100.00, stop 99.50, target 103.00, nearest_resistance 101.00, a lost
+    support at 100.30, level_buffer 0.10: the cap under the flip (100.20,
+    0.4R) fails the 1.0 floor and the cap under 101.00 (100.90, 1.8R)
+    holds; with the flip's cap alone the target stayed at 103.00, past both
+    levels. top_tier's Fix G judges the target against the first one
+    strictly on the target side of the signal's close: a flip exactly at
+    the close leaves ``nearest_*`` to judge. Read alone, the flip at the
+    close switched the gate off, and the veto need not refuse such an
+    entry: it reads the role level at the context's own price, and a
+    context priced past the flip measures to ``nearest_*``."""
+    nearest = sr_ctx.nearest_resistance if role == "resistance" else sr_ctx.nearest_support
+    level = role_level(sr_ctx, role, price=price)
+    return tuple(lv for lv in ((level,) if level is nearest else (level, nearest)) if lv is not None)
 
 
 def _compute_level_proximity_metrics(
