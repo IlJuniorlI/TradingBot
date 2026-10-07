@@ -131,6 +131,14 @@ UNLISTED_BRACKET_CHILD_READ_SECONDS = 60.0
 # still finds it.
 DISASTER_STOP_RETRY_SECONDS = 60.0
 
+# The price the paper account marks a held equity at, which the session
+# archive's manifest and the SESSION REPORT name (``equity_mark_basis``): the
+# price management read for it in the pass (``_manage_position``), or, in a
+# pass that did not price it, the engine's quotes-phase mark, its step frame's
+# last 1m close. An archive or a report that does not name it was written
+# before 2026-10-07, when every held equity was marked at that 1m close alone.
+EQUITY_MARK_BASIS = "management_price"
+
 # A position whose management raises is logged with its traceback on the first
 # failure of a run of consecutive failed cycles and on every
 # POSITION_ERROR_TRACEBACK_EVERY-th after, and as a one-line WARNING in
@@ -2238,7 +2246,9 @@ class PositionManager:
             # the quote management read; a pass that does not price the
             # position (settle pending above, management off, its bracket
             # fills unbooked) still leaves that close. An option keeps its
-            # strategy's mark from fresh legs (the engine's).
+            # strategy's mark from fresh legs (the engine's). The archive's
+            # manifest and the SESSION REPORT name this basis
+            # (EQUITY_MARK_BASIS).
             self.account.mark_prices({position.symbol: look.mark})
         # Always reset management_adjustments at the start of each cycle to
         # prevent stale adjustments from persisting when price is unavailable.

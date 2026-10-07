@@ -46,6 +46,7 @@ from typing import Any, Iterable, Iterator
 
 from .paper_account import PaperAccount, TradeRecord, closed_trade_lifecycles
 from .models import Position
+from .position_manager import EQUITY_MARK_BASIS
 from .reasons import SKIP_COUNT_UNIT, exit_reason_code, reason_gate
 
 # trades.csv's lock (``_trades_csv_lock``) is flock on POSIX and a byte-range
@@ -872,6 +873,12 @@ def write_session_report(
     persistent trades.csv after it (``append_trades_csv``). A failure is
     logged with its type and never raised: the summary is a log record.
 
+    The max drawdown is the account's (``capture_snapshot``), which values a
+    held equity at its mark; the line and the payload name the mark's basis,
+    ``equity_mark_basis`` (``position_manager.EQUITY_MARK_BASIS``). A report
+    without it was written before 2026-10-07 and marked held equities at
+    their 1m close.
+
     Parameters
     ----------
     account : PaperAccount
@@ -933,12 +940,13 @@ def write_session_report(
         # per-trade aggregate, and has no meaningful session-only form here.
         max_dd = float(performance.get("max_drawdown", 0.0) or 0.0)
         LOG.info(
-            "SESSION REPORT %s: strategy=%s pnl=%.2f trades=%d wins=%d losses=%d win_rate=%s pf=%s avg_trade=%s max_drawdown=%.2f",
+            "SESSION REPORT %s: strategy=%s pnl=%.2f trades=%d wins=%d losses=%d win_rate=%s pf=%s avg_trade=%s "
+            "max_drawdown=%.2f equity_mark_basis=%s",
             session_date_str, strategy, total_pnl, len(closed), wins, losses,
             f"{win_rate:.1%}" if win_rate is not None else "n/a",
             f"{profit_factor:.2f}" if profit_factor is not None else "n/a",
             f"${avg_trade:.2f}" if avg_trade is not None else "n/a",
-            max_dd,
+            max_dd, EQUITY_MARK_BASIS,
         )
         for trade in closed:
             LOG.info(
@@ -989,6 +997,7 @@ def write_session_report(
             "profit_factor": round(profit_factor, 4) if profit_factor is not None else None,
             "average_trade": round(avg_trade, 2) if avg_trade is not None else None,
             "max_drawdown": round(max_dd, 2),
+            "equity_mark_basis": EQUITY_MARK_BASIS,
             "per_regime": per_regime,
             "per_entry_path": per_entry_path,
             "per_symbol": per_symbol,

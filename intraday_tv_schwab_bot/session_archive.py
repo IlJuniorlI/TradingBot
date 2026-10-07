@@ -39,6 +39,7 @@ import yaml
 
 from .models import Position
 from . import sessions
+from .position_manager import EQUITY_MARK_BASIS
 from .reasons import SKIP_COUNT_UNIT, blocked_side, reason_gate, split_side_prefix
 from .serialization import atomic_write_text
 from .session_report import (
@@ -1292,7 +1293,9 @@ def export_session_archive(
       config.yaml has been edited since.
     - ``account_snapshot.json`` — full PaperAccount snapshot at the
       moment of export (end-of-day daily fire or shutdown): equity
-      curve, realized PnL by symbol, open positions, etc.
+      curve, realized PnL by symbol, open positions, etc., with each held
+      equity valued at the account's mark (the manifest's
+      ``equity_mark_basis``).
     - ``events.jsonl`` — structured events (ENTRY_CONTEXT, EXIT_CONTEXT,
       TRADE_SUMMARY, SKIP_SUMMARY, the engine's CYCLE_TIMING, the position
       manager's POSITION_MARK, ...: ``_STRUCTURED_PREFIXES``) extracted
@@ -1302,7 +1305,11 @@ def export_session_archive(
       a queryable CSV (timestamp, symbol, action, regime, primary/
       secondary skip reasons).
     - ``manifest.json`` — strategy, dry_run, summary stats, skip counts,
-      timeframes exported, write-flags for each archive component.
+      timeframes exported, write-flags for each archive component, and
+      ``equity_mark_basis``: the price the paper account marked a held
+      equity at (``position_manager.EQUITY_MARK_BASIS``). An archive
+      without it was written before 2026-10-07, when held equities were
+      marked at their 1m close.
     - ``archive_owed.json`` — only while the archive is owed: a shutdown
       that did not write it leaves one (``leave_session_archive_owed``), as
       does one whose export is cut off (a shutdown writes it before each
@@ -1423,6 +1430,7 @@ def export_session_archive(
         "log_file_copied": log_copied,
         "config_snapshot_written": config_snapshot_written,
         "account_snapshot_written": account_snapshot_written,
+        "equity_mark_basis": EQUITY_MARK_BASIS,
         "events_extracted": events_written,
         "decisions_extracted": decisions_written,
         "open_positions_at_close": len(positions or {}),
