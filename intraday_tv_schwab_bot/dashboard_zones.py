@@ -249,12 +249,12 @@ def build_level_zones(
     the strategy's candidates). Each takes its flip state on ``flip_frame``
     with the trading-mode ``flip_confirmation_bars`` (1m, 5m), so the chart
     and position management agree on which levels have flipped; zones of one
-    kind at one price merge; an overlapping support and resistance split the
-    gap between them; and the drawn set is the zone selected for entry with
-    the nearest opposite one, else the nearest plain zone of each kind and
-    every broken / pending level, a confirmed flip of the S/R row within
-    the row's ``side_tolerance`` of the drawn nearest level of its new role
-    drawn in that level's zone."""
+    kind at one price merge; an overlapping support and resistance above it
+    split the gap between them, the nearest pair first; and the drawn set is
+    the zone selected for entry with the nearest opposite one, else the
+    nearest plain zone of each kind and every broken / pending level, a
+    confirmed flip of the S/R row within the row's ``side_tolerance`` of the
+    drawn nearest level of its new role drawn in that level's zone."""
     zone_flip_1m, zone_flip_5m = flip_confirmation_bars
     fallback_bar = None
     if flip_frame is not None and not flip_frame.empty:
@@ -275,24 +275,35 @@ def build_level_zones(
     # pending level is drawn in its original role on the far side of
     # price (a pending support above a nearer resistance), and trimming
     # that crossed pair collapsed both zones, the strategy's own nearest
-    # level included, to zero width (2026-09-23).
-    for support in support_zones:
-        support_price = float(support.get("price", 0.0) or 0.0)
-        for resistance in resistance_zones:
-            resistance_price = float(resistance.get("price", 0.0) or 0.0)
-            if support_price >= resistance_price:
-                continue
-            support_upper = float(support.get("upper", 0.0) or 0.0)
-            resistance_lower = float(resistance.get("lower", 0.0) or 0.0)
-            if support_upper < resistance_lower:
-                continue
-            midpoint = (support_price + resistance_price) / 2.0
-            support_half_width = max(0.0, min(float(support.get("zone_half_width", 0.0) or 0.0), midpoint - support_price))
-            resistance_half_width = max(0.0, min(float(resistance.get("zone_half_width", 0.0) or 0.0), resistance_price - midpoint))
-            support["lower"] = max(0.0, support_price - support_half_width)
-            support["upper"] = support_price + support_half_width
-            resistance["lower"] = max(0.0, resistance_price - resistance_half_width)
-            resistance["upper"] = resistance_price + resistance_half_width
+    # level included, to zero width (2026-09-23). The nearest pair splits
+    # first and a split moves only the two facing edges, from where they
+    # are, never out: a farther pair trims only what still overlaps, and
+    # the bands do not depend on the order the zones came in. Until
+    # 2026-10-07 each pair was cut from the original zone_half_width on
+    # both edges, so a farther resistance listed later re-widened a
+    # support a nearer one had trimmed (HS [99.35, 100.65] over BS
+    # [100.50, 101.50]), and a band narrower than its half-width (a
+    # strategy's own bounds) was widened.
+    pairs = sorted(
+        (
+            (support, resistance)
+            for support in support_zones
+            for resistance in resistance_zones
+            if float(support.get("price", 0.0) or 0.0) < float(resistance.get("price", 0.0) or 0.0)
+        ),
+        key=lambda pair: (
+            float(pair[1].get("price", 0.0) or 0.0) - float(pair[0].get("price", 0.0) or 0.0),
+            float(pair[0].get("price", 0.0) or 0.0),
+        ),
+    )
+    for support, resistance in pairs:
+        support_upper = float(support.get("upper", 0.0) or 0.0)
+        resistance_lower = float(resistance.get("lower", 0.0) or 0.0)
+        if support_upper < resistance_lower:
+            continue
+        midpoint = (float(support.get("price", 0.0) or 0.0) + float(resistance.get("price", 0.0) or 0.0)) / 2.0
+        support["upper"] = min(support_upper, midpoint)
+        resistance["lower"] = max(resistance_lower, midpoint)
 
     support_zones = [item for item in support_zones if float(item.get("upper", 0.0) or 0.0) >= float(item.get("price", 0.0) or 0.0)]
     resistance_zones = [item for item in resistance_zones if float(item.get("lower", 0.0) or 0.0) <= float(item.get("price", 0.0) or 0.0)]
