@@ -2,8 +2,8 @@
 """The strategy's analysis contexts: ``ContextBuildersMixin``, which
 ``BaseStrategy`` inherits.
 
-Each builder reads a bars frame -- or the data feed's cycle-cached context
-for it -- into the context a strategy scores and gates on: chart patterns and
+Each builder reads a bars frame -- or the data feed's context built on it --
+into the context a strategy scores and gates on: chart patterns and
 candles; the S/R levels, the HTF levels and the HTF EMA trend; the LTF fair
 value gaps and the LTF / HTF order blocks; market structure and the
 technical levels. The ``*_lists`` helpers flatten each context into signal
@@ -32,7 +32,6 @@ from .. import sessions
 from ..bars import (
     derived_frame,
     frame_bar_minutes,
-    frame_source_token,
     frame_version,
     last_bucket_forming,
     resample_bars,
@@ -65,6 +64,11 @@ from ..technical_levels import (
 )
 
 LOG = logging.getLogger(__name__)
+
+# get_merged's request of a step frame (with indicators, span scale 1, EMA
+# 9/20), as its frames' versions name it (bars.frame_version): the only 1m
+# frame _resampled_frame derives registered frames from.
+_CANONICAL_1M_REQUEST = (True, 1.0, resolve_ema_spans(1.0))
 
 
 class ContextBuildersMixin:
@@ -682,20 +686,37 @@ class ContextBuildersMixin:
             "min_gap_pct": float(self._support_resistance_setting("fair_value_gap_min_pct", 0.0005) or 0.0005),
         }
 
+    def _ltf_frame(self, frame: pd.DataFrame) -> pd.DataFrame | None:
+        """``frame``'s bars at the strategy's LTF (``ltf_minutes``): the frame
+        itself when its bars are no finer than that (a peer's 5m LTF, a 1m
+        frame of a 1m LTF), else its resample, built from the frame alone
+        (``_resampled_frame``: key_levels' 1m zone frame of its 5m LTF). The
+        LTF fair value gaps and order blocks are built on it."""
+        ltf_min = self.ltf_minutes()
+        if ltf_min <= 1 or frame_bar_minutes(frame.index) >= ltf_min:
+            return frame
+        return self._resampled_frame(frame, ltf_min)
+
     def _ltf_fvg_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> FairValueGapContext:
+        """The LTF fair value gaps of ``frame``'s bars (``_ltf_frame``) at
+        ``frame``'s last close: the data feed's build when it is given
+        (``get_fair_value_gap_context``, kept per frame version and shared
+        with the dashboard's overlay), else built here. Until 2026-10-07 the
+        feed built them on its stored frame of the LTF when the read was
+        made, and a failed read was logged at DEBUG and built here
+        instead."""
         ltf_min = self.ltf_minutes()
         current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         if not bool(self._support_resistance_setting("ltf_fair_value_gaps_enabled", False)):
             return empty_fvg_context(current_price, timeframe_minutes=ltf_min)
-        request = self.ltf_fvg_request()
-        if data is not None and hasattr(data, "get_fair_value_gap_context") and symbol:
-            try:
-                return data.get_fair_value_gap_context(symbol, timeframe_minutes=ltf_min, current_price=current_price, **request)
-            except Exception:
-                LOG.debug("Failed to load cached fair value gap context for %s; recomputing from frame.", symbol, exc_info=True)
         if frame is None or frame.empty:
             return empty_fvg_context(current_price, timeframe_minutes=ltf_min)
-        return build_fair_value_gap_context(frame, timeframe_minutes=ltf_min, current_price=current_price, **request)
+        ltf = self._ltf_frame(frame)
+        request = self.ltf_fvg_request()
+        if data is not None and hasattr(data, "get_fair_value_gap_context") and symbol:
+            return data.get_fair_value_gap_context(symbol, ltf, timeframe_minutes=ltf_min, current_price=current_price,
+                                                   **request)
+        return build_fair_value_gap_context(ltf, timeframe_minutes=ltf_min, current_price=current_price, **request)
 
     def order_block_request(self) -> dict[str, Any]:
         """The SHARED OB tuning knobs from support_resistance config, under
@@ -728,53 +749,50 @@ class ContextBuildersMixin:
         }
 
     def _ltf_order_block_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> OrderBlockContext:
-        """LTF order block context. Runs on the strategy's
-        ``params.ltf_minutes`` frame (defaults to 1-minute streaming bars
-        when not declared). Routes through `data.get_order_block_context`
-        when available (cycle-cached, avoids redundant builds across multiple
-        candidates per cycle and the dashboard). Falls back to inline
-        `build_order_block_context` when there's no data store available."""
+        """The LTF order blocks of ``frame``'s bars (``_ltf_frame``: the
+        strategy's ``params.ltf_minutes`` bars, default 1m) at ``frame``'s
+        last close, as ``_ltf_fvg_context`` reads its gaps: through
+        ``data.get_order_block_context`` when the data feed is given (kept
+        per frame version and shared with the dashboard's overlay), else
+        built here."""
         ltf_min = self.ltf_minutes()
         current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         request = self.order_block_request()
         mode = request["mode"]
         if not bool(self._support_resistance_setting("ltf_order_blocks_enabled", False)):
             return empty_order_block_context(current_price, timeframe_minutes=ltf_min, mode=mode)
-        if data is not None and hasattr(data, "get_order_block_context") and symbol:
-            try:
-                return data.get_order_block_context(symbol, timeframe_minutes=ltf_min, current_price=current_price, **request)
-            except Exception:
-                LOG.debug("Failed to load cached order block context for %s; recomputing from frame.", symbol, exc_info=True)
         if frame is None or frame.empty:
             return empty_order_block_context(current_price, timeframe_minutes=ltf_min, mode=mode)
-        return build_order_block_context(frame, timeframe_minutes=ltf_min, current_price=current_price, **request)
+        ltf = self._ltf_frame(frame)
+        if data is not None and hasattr(data, "get_order_block_context") and symbol:
+            return data.get_order_block_context(symbol, ltf, timeframe_minutes=ltf_min, current_price=current_price,
+                                                **request)
+        return build_order_block_context(ltf, timeframe_minutes=ltf_min, current_price=current_price, **request)
 
     def _htf_order_block_context(self, symbol: str, frame: pd.DataFrame | None, data=None) -> OrderBlockContext:
         """HTF order block context. Disabled by default — opt in via
         `support_resistance.htf_order_blocks_enabled: true`. Uses the same
-        tuning knobs as 1m OBs; the only difference is the input frame is
-        resampled to the HTF timeframe (default 15m via
-        `support_resistance.timeframe_minutes`).
+        tuning knobs as 1m OBs; the only difference is the input frame,
+        ``frame``'s bars resampled to the HTF timeframe (default 15m via
+        `support_resistance.timeframe_minutes`; ``_resampled_frame``).
 
-        Routes through `data.get_order_block_context` when available so the
-        HTF resample + OB detection is shared with the dashboard via the
-        cycle-scoped cache."""
+        Routes through `data.get_order_block_context` when available, so the
+        build is kept per frame version and shared with the dashboard's HTF
+        overlay (``get_merged`` of the HTF timeframe, the same version).
+        Until 2026-10-07 the data feed built on its stored frame of the HTF
+        timeframe when the read was made."""
         current_price = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         request = self.order_block_request()
         mode = request["mode"]
         htf_minutes = self.htf_minutes()
         if not bool(self._support_resistance_setting("htf_order_blocks_enabled", False)):
             return empty_order_block_context(current_price, timeframe_minutes=htf_minutes, mode=mode)
-        if data is not None and hasattr(data, "get_order_block_context") and symbol:
-            try:
-                return data.get_order_block_context(symbol, timeframe_minutes=htf_minutes, current_price=current_price, **request)
-            except Exception:
-                LOG.debug("Failed to load cached HTF order block context for %s; recomputing from frame.", symbol, exc_info=True)
-        if frame is None or frame.empty:
-            return empty_order_block_context(current_price, timeframe_minutes=htf_minutes, mode=mode)
         htf_frame = self._resampled_frame(frame, htf_minutes)
         if htf_frame is None or htf_frame.empty:
             return empty_order_block_context(current_price, timeframe_minutes=htf_minutes, mode=mode)
+        if data is not None and hasattr(data, "get_order_block_context") and symbol:
+            return data.get_order_block_context(symbol, htf_frame, timeframe_minutes=htf_minutes,
+                                                current_price=current_price, **request)
         return build_order_block_context(htf_frame, timeframe_minutes=htf_minutes, current_price=current_price, **request)
 
     @staticmethod
@@ -796,12 +814,17 @@ class ContextBuildersMixin:
         (ltf_ema_fast_span / ltf_ema_slow_span). Defaults = canonical spans,
         unchanged for every other caller.
 
-        A step frame (a 1m ``get_merged`` hand-out, which carries its source
-        token) is built from once per new bar and variant
-        (``bars.derived_frame``), and each hand-out is registered as the
-        version ``get_merged`` gives the same bars and indicators, which it
-        equals, so a context memoized on one serves the other
-        (``context_memo``). Any other frame is built on every call.
+        A step frame (``get_merged``'s canonical 1m hand-out: EMA 9/20 at
+        scale 1 under the process's indicator settings, its bars as handed
+        out, ``bars.verified_frame``) is built from once per new bar and
+        variant (``bars.derived_frame``), and each hand-out is registered as
+        the version ``get_merged`` gives the same bars and indicators, which
+        it equals, so a context memoized on one serves the other
+        (``context_memo``). Any other frame is built on every call and
+        carries no version: a frame without one, a written step frame, a
+        hand-out of another timeframe, and a 1m hand-out with other
+        indicators (top_tier's LTF), whose columns a canonical 1m request
+        would keep as they are.
 
         Until 2026-10-07 a caller that passed the data feed got the store's
         frame of the timeframe instead (``get_merged``), read when the
@@ -814,6 +837,7 @@ class ContextBuildersMixin:
         """
         if frame is None or frame.empty:
             return None
+        bars = verified_frame(frame)
         tf = max(1, int(timeframe_minutes))
 
         def build() -> pd.DataFrame:
@@ -821,13 +845,14 @@ class ContextBuildersMixin:
             # caller's object (copy-on-write keeps a write to either apart).
             # The resample keeps only the OHLCV bars, and add_indicators
             # restamps the span attr.
-            source = frame.copy(deep=False) if tf <= 1 else resample_bars(frame, f"{tf}min")
+            source = bars.copy(deep=False) if tf <= 1 else resample_bars(bars, f"{tf}min")
             return ensure_standard_indicator_frame(source, span_scale=span_scale, ema_spans=ema_spans)
 
-        token = frame_source_token(frame)
-        if token is None or token[2] != "1min":
-            return build()
         settings = (get_runtime_indicator_mode(), get_session_indicator_window())
+        version = frame_version(bars)
+        if version is None or version[0][2] != "1min" or version[1] != (_CANONICAL_1M_REQUEST, settings):
+            return build()
+        token = version[0]
         spans = resolve_ema_spans(span_scale, ema_spans)
         return derived_frame(
             token,

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import date
 import logging
 
+import numpy as np
 import pandas as pd
 
 from .divergence import DivergenceMatch, divergence_inputs, find_divergence
@@ -35,6 +36,7 @@ from .indicators import (
     ensure_standard_indicator_frame,
     floor_atr,
     get_runtime_indicator_mode,
+    has_standard_indicator_columns,
     indicator_session_mask,
     latest_atr14,
 )
@@ -42,6 +44,8 @@ from . import sessions
 
 
 LOG = logging.getLogger(__name__)
+
+_OHLCV = ("open", "high", "low", "close", "volume")
 
 
 @dataclass(slots=True)
@@ -203,9 +207,9 @@ def _htf_flip_checker(
     With ``confirm_bars > 0``, ``"reclaim"`` needs the last ``confirm_bars``
     of the ``completed`` HTF bars' lows above the level and ``"loss"`` the
     matching highs below it; with 0 the frame's last bar decides. The
-    completed frame is cut ONCE per frame (``prepare_htf_levels``): each
-    level used to copy and cut the whole frame again, and removing the
-    pre-split cluster cap on 2026-09-23 multiplied the levels.
+    completed frame is cut ONCE per build (``htf_context_at``): each level
+    used to copy and cut the whole frame again, and removing the pre-split
+    cluster cap on 2026-09-23 multiplied the levels.
     """
     bars = max(0, int(confirm_bars or 0))
     tol = float(eps)
@@ -235,19 +239,23 @@ def _htf_flip_checker(
 @dataclass(frozen=True, slots=True)
 class HTFLevelInputs:
     """What an HTF context build reads of its frame before it needs a
-    price (``prepare_htf_levels``): the cleaned frame, its unfloored ATR,
-    the pivots, the prior day / week levels, the EMAs, the bars a flip is
-    confirmed on and the RSI divergences. Every field is a function of the
-    frame, these arguments and the clock as ``as_of`` and
+    price (``prepare_htf_levels``): the frame's unfloored ATR, the pivots,
+    the prior day / week levels, the EMAs and the RSI divergences, and the
+    flip confirmation they were prepared for. Every field is a function of
+    the frame, these arguments and the clock as ``as_of`` and
     ``context_memo.indicator_clock_key`` read it, never of a price:
-    ``htf_context_at`` builds the context at any price from it.
+    ``htf_context_at`` builds the context of the frame at any price from
+    it. It holds no frame, so two of them compare in about 2 ms (the memo
+    shadow compares a rebuild with the kept one field by field; with the
+    frame in it, a comparison took 0.7 s).
 
-    The data feed keeps it for as long as its frame is the stored one
-    (``MarketDataStore._htf_level_inputs``), so a context at a new price
-    (each 1m bar) redoes only the price-dependent part."""
+    The data feed keeps it in the level memo, in a slot of its own, while
+    its frame is the stored one and the clock reads the same
+    (``MarketDataStore._htf_context_from_stored_frame``), so a context at a
+    new price (each 1m bar) redoes only the price-dependent part, and the
+    memo's shadow rebuilds it in full."""
 
     timeframe_minutes: int
-    frame: pd.DataFrame
     atr14: float | None
     pivot_highs: list[tuple[int, pd.Timestamp, float]]
     pivot_lows: list[tuple[int, pd.Timestamp, float]]
@@ -260,11 +268,43 @@ class HTFLevelInputs:
     ema_fast: float | None
     ema_slow: float | None
     flip_confirmation_bars: int
-    flip_completed: pd.DataFrame | None
     bullish_rsi_divergence: DivergenceMatch | None
     bearish_rsi_divergence: DivergenceMatch | None
     bullish_hidden_rsi_divergence: DivergenceMatch | None
     bearish_hidden_rsi_divergence: DivergenceMatch | None
+
+
+def _htf_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """The frame an HTF build reads: ``frame``'s OHLCV bars, cleaned
+    (``ensure_ohlcv_frame``), with the standard indicators.
+    ``prepare_htf_levels`` and ``htf_context_at`` each read it, so the
+    positions in one are the positions in the other.
+
+    A frame that already is one -- OHLCV leading, unique columns, strictly
+    increasing labels, float64 OHLC and a numeric volume without a NaN, the
+    standard indicator columns: every frame the data feed stores
+    (``_refresh_htf_frame``) -- is read through a shallow copy, which holds
+    the values and dtypes the rebuild gives, for about a tenth of its cost
+    (the rebuild keeps an integer volume as it is, so ``ensure_ohlcv_frame``
+    alone does not take its own shortcut on it); ``htf_context_at`` reads
+    one per context at a price."""
+    if _is_htf_frame(frame):
+        return frame.copy(deep=False)
+    return ensure_standard_indicator_frame(ensure_ohlcv_frame(frame))
+
+
+def _is_htf_frame(frame: pd.DataFrame) -> bool:
+    if not has_standard_indicator_columns(frame) or tuple(frame.columns[:5]) != _OHLCV:
+        return False
+    if not (frame.columns.is_unique and frame.index.is_monotonic_increasing and frame.index.is_unique):
+        return False
+    for column in _OHLCV:
+        values = frame[column]
+        if column == "volume" and values.dtype == np.int64:
+            continue
+        if values.dtype != np.float64 or np.isnan(values.to_numpy()).any():
+            return False
+    return True
 
 
 def prepare_htf_levels(
@@ -284,11 +324,11 @@ def prepare_htf_levels(
     divergence_rsi_min_delta: float = 2.5,
     as_of: date | None = None,
 ) -> HTFLevelInputs | None:
-    """The price-free part of an HTF context build (``HTFLevelInputs``), or
-    None for an empty frame. ``as_of`` is the session date the prior day /
-    week are measured back from; None means the clock's
-    (``latest_session_date(sessions.now_et())``)."""
-    frame = ensure_standard_indicator_frame(ensure_ohlcv_frame(frame))
+    """The price-free part of an HTF context build of ``frame``
+    (``HTFLevelInputs``), or None for an empty frame. ``as_of`` is the
+    session date the prior day / week are measured back from; None means
+    the clock's (``latest_session_date(sessions.now_et())``)."""
+    frame = _htf_frame(frame)
     if frame.empty:
         return None
     # The session mask the ATR and the divergence read, computed once.
@@ -359,7 +399,6 @@ def prepare_htf_levels(
 
     return HTFLevelInputs(
         timeframe_minutes=int(timeframe_minutes),
-        frame=frame,
         atr14=latest_atr14(frame, in_session=in_session),
         pivot_highs=pivot_highs,
         pivot_lows=pivot_lows,
@@ -372,8 +411,6 @@ def prepare_htf_levels(
         ema_fast=ema_fast,
         ema_slow=ema_slow,
         flip_confirmation_bars=confirm_bars,
-        # Cut once per frame, not per level (``_htf_flip_checker``).
-        flip_completed=completed_bars(frame, int(timeframe_minutes)) if confirm_bars > 0 else None,
         bullish_rsi_divergence=bullish_rsi_div,
         bearish_rsi_divergence=bearish_rsi_div,
         bullish_hidden_rsi_divergence=bullish_hidden_rsi_div,
@@ -382,6 +419,7 @@ def prepare_htf_levels(
 
 
 def htf_context_at(
+    frame: pd.DataFrame,
     inputs: HTFLevelInputs | None,
     current_price: float | None,
     *,
@@ -399,18 +437,19 @@ def htf_context_at(
     fair_value_gap_min_atr_mult: float = 0.05,
     fair_value_gap_min_pct: float = 0.0005,
 ) -> HTFContext:
-    """The HTF context at ``current_price`` on ``prepare_htf_levels``'s
-    inputs (the empty context for None, an empty frame): everything that
-    reads the price -- the ATR's floors and the tolerances sized from them,
-    the level clusters, the fallbacks, the flips, which side of price each
-    level is on, the nearest / broken / pending levels, the FVGs (their
-    sizes floor at a share of the price), the trend bias and the level
-    buffer. A price that is not positive reads as the frame's last close
+    """The HTF context of ``frame`` at ``current_price`` on its
+    ``prepare_htf_levels`` inputs (the empty context for None, an empty
+    frame): everything that reads the price -- the ATR's floors and the
+    tolerances sized from them, the level clusters, the fallbacks, the
+    flips, which side of price each level is on, the nearest / broken /
+    pending levels, the FVGs (their sizes floor at a share of the price),
+    the trend bias and the level buffer. ``inputs`` must be prepared from
+    ``frame``. A price that is not positive reads as the frame's last close
     (``resolve_current_price``). ``timeframe_minutes`` labels the empty
     context only; a built one carries its inputs'."""
     if inputs is None:
         return empty_htf_context(float(current_price or 0.0), timeframe_minutes=timeframe_minutes)
-    frame = inputs.frame
+    frame = _htf_frame(frame)
     timeframe_minutes = inputs.timeframe_minutes
     close = resolve_current_price(frame, current_price)
     atr = floor_atr(inputs.atr14, close, abs_floor=0.01)
@@ -485,10 +524,12 @@ def htf_context_at(
             resistance_references = frame_extreme_side_levels(frame, side="resistance", tolerance=tolerance)
 
     eps = max(abs(close) * 1e-6, 1e-8)
+    confirm_bars = inputs.flip_confirmation_bars
     flip_active = _htf_flip_checker(
         frame,
-        completed=inputs.flip_completed,
-        confirm_bars=inputs.flip_confirmation_bars,
+        # Cut once per build, not per level (``_htf_flip_checker``).
+        completed=completed_bars(frame, int(timeframe_minutes)) if confirm_bars > 0 else None,
+        confirm_bars=confirm_bars,
         eps=eps,
     )
 
@@ -709,6 +750,7 @@ def build_htf_context(
         as_of=as_of,
     )
     return htf_context_at(
+        frame,
         inputs,
         current_price,
         timeframe_minutes=timeframe_minutes,

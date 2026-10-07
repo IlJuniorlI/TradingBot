@@ -217,9 +217,11 @@ class DashboardCache:
         source token (``bars.frame_source_token``) of the frame they were
         read from: ``frame``'s own when its 9/20 are the strategy's.
 
-        The strategy reads ema9/ema20 off ``get_merged(timeframe,
-        span_scale=ltf_indicator_span_scale, ema_spans=ltf_ema_spans(params))``:
-        on top_tier's 1m LTF that is a 45/100-bar EMA (its
+        The strategy reads ema9/ema20 off its LTF, built from its step frame
+        with ``span_scale=ltf_indicator_span_scale`` and
+        ``ema_spans=ltf_ema_spans(params)`` (``_resampled_frame``); the chart
+        asks ``get_merged`` for the same variant of its own frame's bars. On
+        top_tier's 1m LTF that is a 45/100-bar EMA (its
         ltf_ema_fast_span / ltf_ema_slow_span) that restarts on each session's
         first RTH bar. Until 2026-09-23 the chart drew a continuous 45/100 EWM across the
         prior day and premarket instead (the opposite stack to the bot's on 93
@@ -557,7 +559,8 @@ class DashboardCache:
 
         # The LTF FVG and order block overlays are the contexts the strategy
         # reads: its request, at its price, the close of the frame's last
-        # bar (the data feed's cycle cache holds them under that price). Until
+        # bar, on a frame of the same bars (the data feed keeps each build
+        # under the frame's version, the request and the price). Until
         # 2026-09-27 the dashboard asked at the quote's last, so it drew
         # blocks and gaps sized, ranked and cut at a price the strategy never
         # judged, and built them a second time.
@@ -1105,6 +1108,15 @@ class DashboardCache:
             htf_ctx = None
         return htf_ctx, htf_fair_value_gaps
 
+    def _overlay_frame(self, symbol: str, frame: pd.DataFrame | None, minutes: int) -> pd.DataFrame | None:
+        """The frame an FVG or order-block overlay of ``minutes`` bars is
+        built on and placed by: the snapshot's 1m ``frame`` itself, else the
+        data feed's frame of that timeframe (``get_merged``), a hand-out of
+        the same version as the strategy's frame of those bars."""
+        if int(minutes) <= 1:
+            return frame
+        return self.data.get_merged(symbol, timeframe=f"{int(minutes)}min", with_indicators=True)
+
     def _snapshot_ltf_fair_value_gaps(
         self,
         symbol: str,
@@ -1114,9 +1126,9 @@ class DashboardCache:
         expanded_chart_profile: DashboardChartConfig,
     ) -> list[dict[str, Any]]:
         """The LTF FVG overlay, when the config builds LTF gaps and a chart
-        draws them: the strategy's context at ``frame_close``, each gap
-        anchored on the LTF frame. A failure is logged
-        (``ltf_fair_value_gaps_collect``) and gives no gaps."""
+        draws them: the strategy's context at ``frame_close``, built on the
+        LTF frame each gap is anchored on (``_overlay_frame``). A failure is
+        logged (``ltf_fair_value_gaps_collect``) and gives no gaps."""
         ltf_fair_value_gaps: list[dict[str, Any]] = []
         try:
             sr_cfg = getattr(self.config, "support_resistance", None)
@@ -1124,22 +1136,20 @@ class DashboardCache:
             chart_wants_ltf_fvgs = bool(compact_chart_profile.show_ltf_fair_value_gaps) or bool(expanded_chart_profile.show_ltf_fair_value_gaps)
             if include_ltf_fvgs and chart_wants_ltf_fvgs:
                 ltf_min_for_fvg = self.strategy.ltf_minutes()
+                ltf_frame = self._overlay_frame(symbol, frame, ltf_min_for_fvg)
                 fvg_ctx = self.data.get_fair_value_gap_context(
                     symbol,
+                    ltf_frame,
                     timeframe_minutes=ltf_min_for_fvg,
                     current_price=frame_close,
                     **self.strategy.ltf_fvg_request(),
                 )
                 if fvg_ctx is not None:
-                    if ltf_min_for_fvg == 1:
-                        anchor_frame = frame if frame is not None and not frame.empty else self.data.get_merged(symbol, with_indicators=True)
-                    else:
-                        anchor_frame = self.data.get_merged(symbol, timeframe=f"{ltf_min_for_fvg}min", with_indicators=True)
                     for gap in list(getattr(fvg_ctx, "bullish_fvgs", []) or []) + list(getattr(fvg_ctx, "bearish_fvgs", []) or []):
                         payload_fvg = fvg_payload(gap)
                         if payload_fvg is not None:
                             payload_fvg["timeframe"] = f"{ltf_min_for_fvg}m"
-                            payload_fvg["anchor_abs_index"] = fvg_anchor_abs_index(anchor_frame, payload_fvg.get("first_seen"))
+                            payload_fvg["anchor_abs_index"] = fvg_anchor_abs_index(ltf_frame, payload_fvg.get("first_seen"))
                             ltf_fair_value_gaps.append(payload_fvg)
         except Exception:
             self.log_component_failure(
@@ -1159,8 +1169,9 @@ class DashboardCache:
         expanded_chart_profile: DashboardChartConfig,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """The HTF and LTF order-block overlays, each when the config builds it
-        and a chart draws it: the strategy's request at ``frame_close``. A
-        failure is logged (``htf_order_blocks_collect`` /
+        and a chart draws it: the strategy's request at ``frame_close``,
+        built on the frame of its timeframe (``_overlay_frame``). A failure
+        is logged (``htf_order_blocks_collect`` /
         ``ltf_order_blocks_collect``) and gives no blocks on that side."""
         # Order blocks. Same payload shape as FVGs (lower/upper/midpoint/size/
         # direction/filled_pct/first_seen/last_seen) — `fvg_payload`
@@ -1177,10 +1188,11 @@ class DashboardCache:
             chart_wants_htf_obs = bool(compact_chart_profile.show_htf_order_blocks) or bool(expanded_chart_profile.show_htf_order_blocks)
             if include_htf_obs and chart_wants_htf_obs:
                 htf_minutes = self.strategy.htf_minutes()
-                # Cycle-cached: hits get_order_block_context's cache when the
-                # strategy already computed it earlier in the same cycle.
+                # The build is kept per frame version: the strategy's read of
+                # the same bars (_htf_order_block_context) shares it.
                 ob_ctx_htf = self.data.get_order_block_context(
                     symbol,
+                    self._overlay_frame(symbol, frame, htf_minutes),
                     timeframe_minutes=htf_minutes,
                     current_price=frame_close,
                     **ob_request,
@@ -1205,22 +1217,18 @@ class DashboardCache:
             include_ltf_obs = bool(getattr(sr_cfg, "ltf_order_blocks_enabled", False)) if sr_cfg is not None else False
             chart_wants_ltf_obs = bool(compact_chart_profile.show_ltf_order_blocks) or bool(expanded_chart_profile.show_ltf_order_blocks)
             if include_ltf_obs and chart_wants_ltf_obs:
-                # Cycle-cached: same cache as the strategy uses when it calls
-                # `_ltf_order_block_context` during entry evaluation.
+                # The build is kept per frame version: the strategy's read of
+                # the same bars (_ltf_order_block_context) shares it. The
+                # frame also places each block (anchor_abs_index).
                 ltf_min_for_ob = self.strategy.ltf_minutes()
+                ltf_frame = self._overlay_frame(symbol, frame, ltf_min_for_ob)
                 ob_ctx_ltf = self.data.get_order_block_context(
                     symbol,
+                    ltf_frame,
                     timeframe_minutes=ltf_min_for_ob,
                     current_price=frame_close,
                     **ob_request,
                 )
-                # We still need an in-scope LTF frame for the anchor_abs_index
-                # lookup that drives chart placement; the OB context alone
-                # doesn't carry frame indices.
-                if ltf_min_for_ob == 1:
-                    ltf_frame = frame if frame is not None and not frame.empty else self.data.get_merged(symbol, with_indicators=True)
-                else:
-                    ltf_frame = self.data.get_merged(symbol, timeframe=f"{ltf_min_for_ob}min", with_indicators=True)
                 for ob in list(getattr(ob_ctx_ltf, "bullish_obs", []) or []) + list(getattr(ob_ctx_ltf, "bearish_obs", []) or []):
                     payload_ob = fvg_payload(ob)
                     if payload_ob is not None:

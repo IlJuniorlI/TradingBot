@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from threading import RLock, Thread
-from typing import Any, Callable, Iterable, Mapping, NamedTuple
+from typing import Any, Callable, Iterable, Mapping
 
 import pandas as pd
 from schwabdev import Client, Stream
@@ -43,6 +43,7 @@ from .bars import (
     resample_bars,
     retain_derived_frames,
     session_bucket_floor,
+    verified_frame,
 )
 from .indicators import (
     ensure_standard_indicator_frame,
@@ -209,34 +210,6 @@ _HTF_LEVEL_INPUT_ARGS = (
 )
 
 
-class _HTFCacheEntry(NamedTuple):
-    """The price-free part of an HTF context build
-    (``htf_levels.HTFLevelInputs``), the ``history_htf`` frame object it was
-    built from, and the clock as it read it: the session date its prior
-    day/week were measured back from and ``context_memo.indicator_clock_key``
-    (the session indicator settings and whether the clock is inside their
-    session).
-
-    ``_htf_level_inputs`` serves ``inputs`` only while ``frame`` IS still
-    the stored frame (identity, not equality) and the clock reads the same.
-    Every refresh stores a new frame object, so every cache key rebuilds from
-    it on its next read; and a read after midnight rebuilds even before the
-    first refresh of the day, or the dashboard's reads served yesterday's
-    prior day/week until the prewarm.
-
-    The session state is in it because a build reads the clock (2026-09-24):
-    inside the session the ATR and the divergence age come from session bars
-    only, outside it from every bar. At the open the stored frame object is
-    unchanged until the first refresh after the 09:30 boundary (and its 10 s
-    settle) succeeds, so a context built on the premarket clock was served
-    into the session until then, and for as long as that refresh failed.
-    """
-
-    frame: pd.DataFrame
-    clock: tuple
-    inputs: HTFLevelInputs | None
-
-
 class MarketDataStore:
     def __init__(self, client: Client, config: BotConfig):
         self.client = client
@@ -259,11 +232,6 @@ class MarketDataStore:
         # One HTF frame per (symbol, tf): completed bars only, inside the
         # 07:00-20:00 equity stream window (see _refresh_htf_frame).
         self.history_htf: dict[tuple[str, int], pd.DataFrame] = {}
-        # The price-free part of each _htf_context_cache_key's context, tagged
-        # with the frame it was built from (see _HTFCacheEntry /
-        # _htf_level_inputs); the contexts at each price are in the level
-        # memo.
-        self.htf_cache: dict[tuple, _HTFCacheEntry] = {}
         # derive_from_htf_frame's results per ((symbol, tf), slot): (the
         # stored frame object it was built from, the indicator settings, the
         # result).
@@ -363,13 +331,17 @@ class MarketDataStore:
         # generation of the symbol's current pair (bars.register_frame_source).
         self._source_generations: dict[str, tuple[pd.DataFrame | None, pd.DataFrame | None, int]] = {}
         self._cycle_htf_context_cache: dict[tuple, HTFContext | None] = {}
-        self._cycle_fvg_cache: dict[tuple, FairValueGapContext] = {}
-        self._cycle_ob_cache: dict[tuple, OrderBlockContext] = {}
+        # The FVG and order-block contexts of the cycle, per frame object and
+        # request: (the frame, its context); see _frame_cycle_key.
+        self._cycle_fvg_cache: dict[tuple, tuple[pd.DataFrame, FairValueGapContext]] = {}
+        self._cycle_ob_cache: dict[tuple, tuple[pd.DataFrame, OrderBlockContext]] = {}
         self._cycle_sr_cache: dict[tuple, SupportResistanceContext | None] = {}
         # The S/R, FVG, order-block and HTF context builds across cycles
-        # (context_memo): slots ("sr" | "fvg" | "ob" | "htf", symbol,
-        # *request), each keyed on the frame its build read and the clock as
-        # the build reads it (an HTF context's slot holds its price too).
+        # (context_memo): slots ("sr" | "fvg" | "ob" | "htf_inputs" | "htf",
+        # symbol, *request), each keyed on the frame its build read and the
+        # clock as the build reads it (an HTF context's slot holds its price
+        # too; "htf_inputs" holds the price-free part of its request's
+        # builds).
         self._level_memo = ContextMemo("levels", shadow_every=config.runtime.context_memo_shadow_every)
         # Resolved Schwab API alias cache: original_symbol_upper -> resolved_alias.
         # Populated lazily after the first successful single-symbol fetch
@@ -511,7 +483,6 @@ class MarketDataStore:
                 self._history_fetch_failures.pop(sym, None)
             # Tuple-keyed dicts: drop any (sym, *) entry where sym is stale.
             self.history_htf = {k: v for k, v in self.history_htf.items() if k[0] not in stale}
-            self.htf_cache = {k: v for k, v in self.htf_cache.items() if k[0] not in stale}
             self._htf_derived_memo = {k: v for k, v in self._htf_derived_memo.items() if k[0][0] not in stale}
             self.last_htf_refresh = {k: v for k, v in self.last_htf_refresh.items() if k[0] not in stale}
         return len(stale)
@@ -536,18 +507,16 @@ class MarketDataStore:
             self._cycle_sr_cache.clear()
 
     def _invalidate_cycle_symbol(self, symbol: str) -> None:
+        """A stream bar landed: drop the symbol's frames of the cycle, so its
+        next ``get_merged`` builds from the store. The FVG and order-block
+        contexts of the cycle are kept per frame object (the frame their
+        reader passed), which a new bar does not change."""
         cache_key = self._symbol_key(symbol)
         with self._lock:
             # In-place delete avoids rebuilding the entire dict on every stream bar.
             merged_victims = [k for k in self._cycle_merged_cache if k[0] == cache_key]
             for k in merged_victims:
                 del self._cycle_merged_cache[k]
-            fvg_victims = [k for k in self._cycle_fvg_cache if k[0] == cache_key]
-            for k in fvg_victims:
-                del self._cycle_fvg_cache[k]
-            ob_victims = [k for k in self._cycle_ob_cache if k[0] == cache_key]
-            for k in ob_victims:
-                del self._cycle_ob_cache[k]
 
     def _invalidate_cycle_htf(self, symbol: str, timeframe_minutes: int | None = None) -> None:
         cache_key = self._symbol_key(symbol)
@@ -844,14 +813,33 @@ class MarketDataStore:
         """The context for ``cache_key`` at ``current_price`` on the stored
         (symbol, tf) frame (no API call), or None while no frame is stored.
 
-        Built in the two parts ``htf_levels`` splits it into. The price-free
-        part (``_htf_level_inputs``) is built once per stored frame and clock.
-        The context at a price is kept in the level memo (context_memo) under
-        the stored frame object, the price and the clock its build read, in a
-        slot of its own per price, so the reads of one bar share one build, a
-        new bar's close builds only the price-dependent part, and the shadow
-        re-checks its hits like the S/R context's
-        (``runtime.context_memo_shadow_every``)."""
+        Built in the two parts ``htf_levels`` splits it into, each kept in the
+        level memo (context_memo) under the stored frame object and the clock
+        as the build reads it, in a slot of its own: the price-free part
+        (``prepare_htf_levels``, slot ``("htf_inputs", *cache_key)``) and the
+        context at each price (``htf_context_at``, a slot per price). So the
+        reads of one bar share one build, a new bar's close builds only the
+        price-dependent part, and the memo's shadow
+        (``runtime.context_memo_shadow_every``) re-checks the hits of both
+        parts like the S/R context's, each with a full rebuild of its part.
+        The price-free part is read on every read, so it lives as long as its
+        frame is the stored one; a context at a price is built from it when
+        both were read at the same clock, else from a build of its own.
+
+        The clock is the session date the prior day / week are measured back
+        from and ``context_memo.indicator_clock_key`` (the session indicator
+        settings and whether the clock is inside their session). Every
+        refresh stores a new frame object, so every request rebuilds on its
+        next read, and a read after midnight rebuilds even before the day's
+        first refresh (else the dashboard's reads served yesterday's prior
+        day / week until the prewarm). The session state is in it
+        because a build reads the clock (2026-09-24): inside the session the
+        ATR and the divergence age come from session bars only, outside it
+        from every bar. At the open the stored frame object is unchanged
+        until the first refresh after the 09:30 boundary (and its 10 s
+        settle) succeeds, so a context built on the premarket clock was
+        served into the session until then, and for as long as that refresh
+        failed."""
         key = self._htf_key(symbol, timeframe_minutes)
         with self._lock:
             frame = self.history_htf.get(key)
@@ -860,14 +848,27 @@ class MarketDataStore:
         tf = int(timeframe_minutes)
         price = float(current_price)
         sr_cfg = self.config.support_resistance
+        level_kwargs = {name: build_kwargs[name] for name in _HTF_LEVEL_INPUT_ARGS}
         view_kwargs = {name: value for name, value in build_kwargs.items() if name not in _HTF_LEVEL_INPUT_ARGS}
 
         def clock_key() -> tuple:
             return latest_session_date(sessions.now_et()), indicator_clock_key()
 
+        def prepare(clock: tuple) -> tuple[tuple, HTFLevelInputs | None]:
+            return clock, prepare_htf_levels(frame, timeframe_minutes=tf, as_of=clock[0], **level_kwargs)
+
+        # The stored HTF object is keyed by id and pinned by each entry, so
+        # its id cannot be reused while the entry lives; every refresh stores
+        # a new object (_refresh_htf_frame).
+        prepared = self._level_memo.serve(("htf_inputs", *cache_key), (id(frame),), clock_key, prepare, pins=(frame,))
+
         def build(clock: tuple) -> HTFContext:
+            # The price-free part read at this very clock: a boundary crossed
+            # between the two reads builds its own.
+            inputs = prepared[1] if prepared[0] == clock else prepare(clock)[1]
             return htf_context_at(
-                self._htf_level_inputs(frame, tf, cache_key, build_kwargs, clock),
+                frame,
+                inputs,
                 price,
                 timeframe_minutes=tf,
                 # Checked at load (above 0); a 0 read as 0.10 / 0.0015 until
@@ -879,9 +880,6 @@ class MarketDataStore:
                 **view_kwargs,
             )
 
-        # The stored HTF object is keyed by id and pinned by the entry, so its
-        # id cannot be reused while the entry lives; every refresh stores a
-        # new object (_refresh_htf_frame).
         return self._level_memo.serve(
             ("htf", *cache_key, ("current_price", price)),
             (id(frame), price),
@@ -889,34 +887,6 @@ class MarketDataStore:
             build,
             pins=(frame,),
         )
-
-    def _htf_level_inputs(
-        self,
-        frame: pd.DataFrame,
-        timeframe_minutes: int,
-        cache_key: tuple,
-        build_kwargs: Mapping[str, Any],
-        clock: tuple,
-    ) -> HTFLevelInputs | None:
-        """The price-free part of ``cache_key``'s context on the stored
-        ``frame`` (``htf_levels.prepare_htf_levels``) at ``clock`` (the session
-        date its prior day/week are measured back from, and
-        ``indicator_clock_key``): the cached one while ``frame`` is still the
-        object it was built from and the clock reads the same
-        (``_HTFCacheEntry``), else built and cached."""
-        with self._lock:
-            entry = self.htf_cache.get(cache_key)
-        if entry is not None and entry.frame is frame and entry.clock == clock:
-            return entry.inputs
-        inputs = prepare_htf_levels(
-            frame,
-            timeframe_minutes=timeframe_minutes,
-            as_of=clock[0],
-            **{name: build_kwargs[name] for name in _HTF_LEVEL_INPUT_ARGS},
-        )
-        with self._lock:
-            self.htf_cache[cache_key] = _HTFCacheEntry(frame, clock, inputs)
-        return inputs
 
     def get_htf_context(
         self,
@@ -962,7 +932,8 @@ class MarketDataStore:
         after each HTF refresh, for the whole HTF bar (15 minutes), so the
         price-dependent fields were up to 15 minutes old and which price they
         held depended on which reader came first. The price-free part is
-        built once per stored frame (``_htf_context_from_stored_frame``).
+        built once per stored frame and clock, and the memo's shadow
+        rebuilds it in full (``_htf_context_from_stored_frame``).
 
         Until 2026-09-23 a fetch rebuilt only the fetching caller's cache key
         but stamped the refresh clock every key shares, so every other key
@@ -1027,9 +998,18 @@ class MarketDataStore:
         return ctx
 
 
+    @staticmethod
+    def _frame_cycle_key(frame: pd.DataFrame) -> tuple:
+        """A non-empty frame's part of a per-cycle cache key: its id, length
+        and last label. Each entry holds its frame, so the id names no other
+        object while the entry lives; the length and the label catch a frame
+        grown in place."""
+        return id(frame), len(frame), frame.index[-1]
+
     def get_fair_value_gap_context(
         self,
         symbol: str,
+        frame: pd.DataFrame | None,
         *,
         timeframe_minutes: int = 1,
         current_price: float | None = None,
@@ -1037,66 +1017,83 @@ class MarketDataStore:
         min_gap_atr_mult: float = 0.05,
         min_gap_pct: float = 0.0005,
     ) -> FairValueGapContext:
+        """The fair value gaps of ``frame``, a frame of ``timeframe_minutes``
+        bars of ``symbol``, sized and ranked at ``current_price`` (None: the
+        frame's last close); the empty context for no bars.
+
+        Built on the frame the reader passes, never on the store: a
+        strategy passes a frame of its step frame's bars (its LTF,
+        ``ContextBuildersMixin._ltf_frame``), the dashboard the frame it
+        draws. Until 2026-10-07 the read built on the store's frame of the
+        timeframe (``get_merged``) when it was made, so a stream bar that
+        landed after the engine built the step frame reached the gaps: on
+        top_tier and key_levels they then held a bar the step frame did not,
+        sized at the step frame's close.
+
+        Kept for the cycle per frame object and request, and across cycles
+        in the level memo (context_memo) under the frame's version
+        (``bars.frame_version`` of ``bars.verified_frame(frame)``: a frame
+        written after its hand-out has none), the request, the price and the
+        clock as the build reads it (which bars have completed, the ATR's
+        session switch). A strategy's frame and a ``get_merged`` hand-out of
+        the same bars carry one version (``_resampled_frame`` registers its
+        frames as ``get_merged``'s), so the strategy's read and the
+        dashboard's overlay share one build. A frame without a version is
+        built on its first read in each cycle, and on every read outside
+        one."""
+        tf = max(1, int(timeframe_minutes))
+        if frame is None or frame.empty:
+            return empty_fvg_context(float(current_price or 0.0), timeframe_minutes=tf)
         cache_key = (
             self._symbol_key(symbol),
-            int(timeframe_minutes),
+            tf,
             None if current_price is None else round(float(current_price), 8),
             int(max_per_side),
             round(float(min_gap_atr_mult), 6),
             round(float(min_gap_pct), 6),
         )
+        cycle_key = (*self._frame_cycle_key(frame), *cache_key)
         with self._lock:
-            if self._cycle_active and cache_key in self._cycle_fvg_cache:
-                return self._cycle_fvg_cache[cache_key]
-        # Fetch the right frame: 1m via get_merged(no timeframe), LTF/HTF via the
-        # explicit timeframe lookup that triggers internal resampling. Mirrors
-        # `get_order_block_context` so a 5m FVG context computes on 5m bars,
-        # not 1m bars labeled "5m".
-        tf = max(1, int(timeframe_minutes))
-        if tf == 1:
-            merged = self.get_merged(symbol, with_indicators=True)
-        else:
-            merged = self.get_merged(symbol, timeframe=f"{tf}min", with_indicators=True)
-        if merged is None or merged.empty:
-            ctx = empty_fvg_context(float(current_price or 0.0), timeframe_minutes=tf)
-        else:
-            close = float(current_price if current_price is not None else merged.iloc[-1].get('close', 0.0) or 0.0)
+            if self._cycle_active:
+                entry = self._cycle_fvg_cache.get(cycle_key)
+                if entry is not None and entry[0] is frame:
+                    return entry[1]
+        bars = verified_frame(frame)
+        close = float(current_price if current_price is not None else bars.iloc[-1].get("close", 0.0) or 0.0)
 
-            def build() -> FairValueGapContext:
-                return build_fair_value_gap_context(
-                    merged,
-                    timeframe_minutes=tf,
-                    current_price=close,
-                    max_per_side=max(0, int(max_per_side or 0)),
-                    min_gap_atr_mult=float(min_gap_atr_mult),
-                    min_gap_pct=float(min_gap_pct),
-                )
+        def build() -> FairValueGapContext:
+            return build_fair_value_gap_context(
+                bars,
+                timeframe_minutes=tf,
+                current_price=close,
+                max_per_side=max(0, int(max_per_side or 0)),
+                min_gap_atr_mult=float(min_gap_atr_mult),
+                min_gap_pct=float(min_gap_pct),
+            )
 
-            # Keyed on the frame read (its version), never on the store's
-            # current objects: a bar landing while get_merged built it leaves
-            # the cycle holding the pre-bar frame, and its context must not be
-            # filed under the post-bar store. The build reads the clock only
-            # through completed_bars and the ATR's session switch.
-            version = frame_version(merged)
-            if version is None:
-                ctx = build()
-            else:
-                ctx = self._level_memo.serve(
-                    ("fvg", *cache_key),
-                    (version,),
-                    lambda: (forming_positions(merged.index, tf, sessions.now_et()), indicator_clock_key()),
-                    lambda _clock: build(),
-                )
+        # The build reads the clock only through completed_bars and the ATR's
+        # session switch.
+        version = frame_version(bars)
+        if version is None:
+            ctx = build()
+        else:
+            ctx = self._level_memo.serve(
+                ("fvg", *cache_key),
+                (version,),
+                lambda: (forming_positions(bars.index, tf, sessions.now_et()), indicator_clock_key()),
+                lambda _clock: build(),
+            )
         # Shared, not copied: no reader writes into a context (the HTF
         # contexts have been shared across cycles all along).
         with self._lock:
             if self._cycle_active:
-                self._cycle_fvg_cache[cache_key] = ctx
+                self._cycle_fvg_cache[cycle_key] = (frame, ctx)
         return ctx
 
     def get_order_block_context(
         self,
         symbol: str,
+        frame: pd.DataFrame | None,
         *,
         timeframe_minutes: int = 1,
         current_price: float | None = None,
@@ -1108,24 +1105,25 @@ class MarketDataStore:
         pivot_span: int = 2,
         new_high_lookback: int = 8,
     ) -> OrderBlockContext:
-        """Cycle-cached order block context — mirror of `get_fair_value_gap_context`.
-
-        For LTF OBs (``timeframe_minutes`` matches the strategy's
-        ``params.ltf_minutes``, default 1m), uses the merged frame at that
-        timeframe. For HTF OBs (e.g. 15m), the merged frame is fetched at
-        the HTF timeframe via ``get_merged(symbol, timeframe=f'{tf}min')``.
-
-        Cache invalidates per-symbol on every new stream bar via
-        ``_invalidate_cycle_symbol`` and on cycle boundaries via
-        ``begin_cycle`` / ``end_cycle``. Identical lifetime to the FVG cache.
+        """The order blocks of ``frame``, a frame of ``timeframe_minutes``
+        bars of ``symbol`` (a strategy's LTF, or its step frame's bars at the
+        HTF; the dashboard's chart frames), at ``current_price`` (None: the
+        frame's last close), in ``mode``; the empty context for no bars.
+        Built on the frame the reader passes and kept as
+        ``get_fair_value_gap_context`` keeps its gaps; until 2026-10-07 it
+        built on the store's frame of the timeframe when the read was made.
+        The build reads the clock only through the ATR's session switch.
 
         ``min_thrust_atr_mult`` is part of the cache key — different
         thrust thresholds produce different OB sets, so callers passing
         different values get separate cache entries.
         """
+        tf = max(1, int(timeframe_minutes))
+        if frame is None or frame.empty:
+            return empty_order_block_context(float(current_price or 0.0), timeframe_minutes=tf, mode=mode)
         cache_key = (
             self._symbol_key(symbol),
-            int(timeframe_minutes),
+            tf,
             None if current_price is None else round(float(current_price), 8),
             mode,
             int(max_per_side),
@@ -1135,49 +1133,37 @@ class MarketDataStore:
             int(pivot_span),
             int(new_high_lookback),
         )
-        with self._lock:
-            if self._cycle_active and cache_key in self._cycle_ob_cache:
-                return self._cycle_ob_cache[cache_key]
-        # Fetch the right frame: 1m via get_merged(no timeframe), HTF via the
-        # explicit timeframe lookup that triggers internal resampling.
-        tf = max(1, int(timeframe_minutes))
-        if tf == 1:
-            merged = self.get_merged(symbol, with_indicators=True)
-        else:
-            merged = self.get_merged(symbol, timeframe=f"{tf}min", with_indicators=True)
-        if merged is None or merged.empty:
-            ctx = empty_order_block_context(
-                float(current_price or 0.0),
-                timeframe_minutes=tf,
-                mode=mode,
-            )
-        else:
-            close = float(current_price if current_price is not None else merged.iloc[-1].get("close", 0.0) or 0.0)
-
-            def build() -> OrderBlockContext:
-                return build_order_block_context(
-                    merged,
-                    timeframe_minutes=tf,
-                    current_price=close,
-                    mode=mode,
-                    max_per_side=max(0, int(max_per_side or 0)),
-                    min_block_atr_mult=float(min_block_atr_mult),
-                    min_block_pct=float(min_block_pct),
-                    min_thrust_atr_mult=float(min_thrust_atr_mult),
-                    pivot_span=int(pivot_span),
-                    new_high_lookback=int(new_high_lookback),
-                )
-
-            # Keyed on the frame read, as get_fair_value_gap_context; the
-            # build reads the clock only through the ATR's session switch.
-            version = frame_version(merged)
-            if version is None:
-                ctx = build()
-            else:
-                ctx = self._level_memo.serve(("ob", *cache_key), (version,), indicator_clock_key, lambda _clock: build())
+        cycle_key = (*self._frame_cycle_key(frame), *cache_key)
         with self._lock:
             if self._cycle_active:
-                self._cycle_ob_cache[cache_key] = ctx
+                entry = self._cycle_ob_cache.get(cycle_key)
+                if entry is not None and entry[0] is frame:
+                    return entry[1]
+        bars = verified_frame(frame)
+        close = float(current_price if current_price is not None else bars.iloc[-1].get("close", 0.0) or 0.0)
+
+        def build() -> OrderBlockContext:
+            return build_order_block_context(
+                bars,
+                timeframe_minutes=tf,
+                current_price=close,
+                mode=mode,
+                max_per_side=max(0, int(max_per_side or 0)),
+                min_block_atr_mult=float(min_block_atr_mult),
+                min_block_pct=float(min_block_pct),
+                min_thrust_atr_mult=float(min_thrust_atr_mult),
+                pivot_span=int(pivot_span),
+                new_high_lookback=int(new_high_lookback),
+            )
+
+        version = frame_version(bars)
+        if version is None:
+            ctx = build()
+        else:
+            ctx = self._level_memo.serve(("ob", *cache_key), (version,), indicator_clock_key, lambda _clock: build())
+        with self._lock:
+            if self._cycle_active:
+                self._cycle_ob_cache[cycle_key] = (frame, ctx)
         return ctx
 
     def get_htf_frame(self, symbol: str, *, timeframe_minutes: int) -> pd.DataFrame | None:
@@ -3235,10 +3221,11 @@ class MarketDataStore:
         tf = str(timeframe or "1min")
         # Base (OHLCV-only) cache is span-independent and stays shared. The
         # enriched cache is keyed by span_scale and the resolved EMA spans so a
-        # caller asking for stretched indicators or its own EMAs (top_tier's 1m
-        # LTF: span_scale 5, ltf_ema_*_span) gets its own entry without
-        # clobbering the canonical frame the engine bars, dashboard, and other
-        # strategies read. Resolving None keeps an explicit canonical request
+        # caller asking for stretched indicators or its own EMAs (the
+        # dashboard's chart of top_tier's 1m LTF: span_scale 5,
+        # ltf_ema_*_span) gets its own entry without clobbering the canonical
+        # frame (the engine's step frames, which the strategies read, and the
+        # dashboard's). Resolving None keeps an explicit canonical request
         # (9/20 at scale 1) on that same entry.
         base_key = (cache_key, tf, False)
         indicator_key = (cache_key, tf, True, float(span_scale), resolve_ema_spans(span_scale, ema_spans))
