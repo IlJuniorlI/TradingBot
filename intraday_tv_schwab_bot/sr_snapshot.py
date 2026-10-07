@@ -188,7 +188,13 @@ def sr_snapshot(
     bullish_conflict = bearish_structure or trend_state == "bearish"
     bearish_conflict = bullish_structure or trend_state == "bullish"
 
-    if ctx.breakout_above_resistance and not bullish_conflict and (bullish_structure or trend_state == "bullish"):
+    # Both flags (a reclaimed resistance under price and a lost support over
+    # it) have their own state, ahead of either break: until 2026-10-07 the
+    # row read "breakout" on bullish structure while the confirmed breakdown
+    # stood too (TSM 2026-10-06 15:17).
+    if ctx.breakout_above_resistance and ctx.breakdown_below_support:
+        state = "between_flips"
+    elif ctx.breakout_above_resistance and not bullish_conflict and (bullish_structure or trend_state == "bullish"):
         state = "breakout"
     elif ctx.breakdown_below_support and not bearish_conflict and (bearish_structure or trend_state == "bearish"):
         state = "breakdown"

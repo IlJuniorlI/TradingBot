@@ -877,7 +877,14 @@ def _compute_bias_and_regime(proximity: dict) -> tuple[float, str]:
         elif support_distance_atr > resistance_distance_atr + 0.75:
             bias -= 0.15
 
-    if breakout_above_resistance:
+    # Both flags: price sits between a reclaimed resistance under it and a
+    # lost support over it, and neither break wins (the bias nets them to
+    # 0). Until 2026-10-07 the breakout was tested first and the hint read
+    # bullish_breakout while the confirmed breakdown stood too (TSM
+    # 2026-10-06 15:17); zero_dte's range score reads this hint.
+    if breakout_above_resistance and breakdown_below_support:
+        regime_hint = "range_between_levels"
+    elif breakout_above_resistance:
         regime_hint = "bullish_breakout"
     elif breakdown_below_support:
         regime_hint = "bearish_breakdown"
