@@ -506,7 +506,7 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             if frame is None or len(frame) < history_bars:
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), history_bars)])
                 continue
-            ltf = self._resampled_frame(frame, ltf_min, symbol=c.symbol, data=data)
+            ltf = self._resampled_frame(frame, ltf_min)
             if ltf is None or ltf.empty or len(ltf) < max(10, int(self.params.get("min_ltf_bars", 18)) + 4):
                 self._record_entry_decision(c.symbol, "skipped", ["missing_ltf_context"])
                 continue

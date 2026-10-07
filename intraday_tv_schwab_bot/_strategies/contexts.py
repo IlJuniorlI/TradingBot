@@ -48,6 +48,7 @@ from ..indicators import (
     get_runtime_indicator_mode,
     get_session_indicator_window,
     htf_ema_spans,
+    resolve_ema_spans,
 )
 from ..models import Side
 from ..numeric import safe_float, safe_int
@@ -106,11 +107,12 @@ class ContextBuildersMixin:
         # in _observed_contexts only for one of them. Holding the frames keeps
         # their ids from being handed to another frame mid-cycle.
         self._prewarm_frames: dict[int, pd.DataFrame] = {}
-        # The three contexts across cycles (context_memo), for frames handed
-        # out by get_merged: slots (builder, timeframe token, symbol, source
-        # timeframe, variant), keyed on the frame's version and what each
-        # build reads of the clock. Per instance: two instances of a class
-        # can carry different settings.
+        # The three contexts across cycles (context_memo), for frames that
+        # carry a version (get_merged's hand-outs and the frames
+        # _resampled_frame derives from them): slots (builder, timeframe
+        # token, symbol, source timeframe, variant), keyed on the frame's
+        # version and what each build reads of the clock. Per instance: two
+        # instances of a class can carry different settings.
         self._context_memo = ContextMemo(
             f"{type(self).__name__} contexts",
             shadow_every=self.config.runtime.context_memo_shadow_every,
@@ -144,7 +146,8 @@ class ContextBuildersMixin:
         """Public API for the engine: this cycle's bars frames, the ones
         `_prime_cycle_context_cache` pre-warms. Called before the pre-warm
         every cycle. A context built on any other frame -- the peers' 5m LTF,
-        key_levels_1m's get_merged copy, a test tape -- is not recorded in
+        key_levels_1m's 1m LTF (a copy, ``_resampled_frame``), a test tape --
+        is not recorded in
         `_observed_contexts` (see `_observe_context`)."""
         self._prewarm_frames = {id(frame): frame for frame in frames if frame is not None}
 
@@ -769,7 +772,7 @@ class ContextBuildersMixin:
                 LOG.debug("Failed to load cached HTF order block context for %s; recomputing from frame.", symbol, exc_info=True)
         if frame is None or frame.empty:
             return empty_order_block_context(current_price, timeframe_minutes=htf_minutes, mode=mode)
-        htf_frame = self._resampled_frame(frame, htf_minutes, symbol=symbol, data=data)
+        htf_frame = self._resampled_frame(frame, htf_minutes)
         if htf_frame is None or htf_frame.empty:
             return empty_order_block_context(current_price, timeframe_minutes=htf_minutes, mode=mode)
         return build_order_block_context(htf_frame, timeframe_minutes=htf_minutes, current_price=current_price, **request)
@@ -779,48 +782,61 @@ class ContextBuildersMixin:
         frame: pd.DataFrame | None,
         timeframe_minutes: int,
         *,
-        symbol: str | None = None,
-        data=None,
         span_scale: float = 1.0,
         ema_spans: tuple[int, int] | None = None,
     ) -> pd.DataFrame | None:
-        # span_scale stretches every indicator lookback so a fine timeframe can
-        # carry a coarser timeframe's wall-clock horizon (top_tier's 1m LTF uses
-        # span_scale=5); ema_spans sets the ema9 / ema20 spans on their own
-        # (ltf_ema_fast_span / ltf_ema_slow_span). Defaults = canonical spans,
-        # unchanged for every other caller. The merged-frame cache keys the
-        # enriched frame by both, so such a request never collides with the
-        # shared canonical frame.
+        """``frame``'s bars at ``timeframe_minutes`` with the standard
+        indicators, built from ``frame`` alone: an entry pass's LTF and other
+        timeframes hold the step frame's bars, never a bar the step frame
+        does not.
+
+        span_scale stretches every indicator lookback so a fine timeframe can
+        carry a coarser timeframe's wall-clock horizon (top_tier's 1m LTF uses
+        span_scale=5); ema_spans sets the ema9 / ema20 spans on their own
+        (ltf_ema_fast_span / ltf_ema_slow_span). Defaults = canonical spans,
+        unchanged for every other caller.
+
+        A step frame (a 1m ``get_merged`` hand-out, which carries its source
+        token) is built from once per new bar and variant
+        (``bars.derived_frame``), and each hand-out is registered as the
+        version ``get_merged`` gives the same bars and indicators, which it
+        equals, so a context memoized on one serves the other
+        (``context_memo``). Any other frame is built on every call.
+
+        Until 2026-10-07 a caller that passed the data feed got the store's
+        frame of the timeframe instead (``get_merged``), read when the
+        strategy asked: a stream bar that landed after the engine built the
+        step frame reached that frame but not the step frame, nor the S/R
+        context the engine built on it (``_prime_cycle_support_cache``). On
+        top_tier, whose signal is its LTF's last bar, the S/R context a
+        signal read was then one bar older than the signal (10 of the 88
+        entries archived 2026-09-29 .. 10-06).
+        """
         if frame is None or frame.empty:
             return None
         tf = max(1, int(timeframe_minutes))
-        if data is not None and symbol and hasattr(data, "get_merged"):
-            try:
-                cached = data.get_merged(str(symbol), timeframe=f"{tf}min", with_indicators=True,
-                                         span_scale=span_scale, ema_spans=ema_spans)
-                if cached is not None and not cached.empty:
-                    return cached
-            except Exception:
-                LOG.debug("Failed to load cached %s-minute merged frame for %s; resampling from base frame.", tf, symbol, exc_info=True)
-        if tf <= 1:
-            return ensure_standard_indicator_frame(frame.copy(), span_scale=span_scale, ema_spans=ema_spans)
 
         def build() -> pd.DataFrame:
-            return ensure_standard_indicator_frame(resample_bars(frame, f"{tf}min"), span_scale=span_scale,
-                                                   ema_spans=ema_spans)
+            # A shallow copy for the 1m variants: the kept frame is never the
+            # caller's object (copy-on-write keeps a write to either apart).
+            # The resample keeps only the OHLCV bars, and add_indicators
+            # restamps the span attr.
+            source = frame.copy(deep=False) if tf <= 1 else resample_bars(frame, f"{tf}min")
+            return ensure_standard_indicator_frame(source, span_scale=span_scale, ema_spans=ema_spans)
 
-        # A step frame from get_merged carries its source token: the resample
-        # reads only its OHLCV bars, so the token names the result, which is
-        # then built once per new bar instead of every cycle (the structure
-        # context's call above passes no `data`). The source frame's own
-        # indicator columns and span never reach the result: the resample
-        # keeps OHLCV only and add_indicators restamps the span attr.
         token = frame_source_token(frame)
-        if token is None:
+        if token is None or token[2] != "1min":
             return build()
-        spans = None if ema_spans is None else tuple(ema_spans)
-        variant = (tf, span_scale, spans, get_runtime_indicator_mode(), get_session_indicator_window())
-        return derived_frame(token, variant, build)
+        settings = (get_runtime_indicator_mode(), get_session_indicator_window())
+        spans = resolve_ema_spans(span_scale, ema_spans)
+        return derived_frame(
+            token,
+            (tf, float(span_scale), spans, *settings),
+            build,
+            # MarketDataStore.get_merged's version of these bars at this
+            # timeframe and these indicators.
+            version=((token[0], token[1], f"{tf}min"), ((True, float(span_scale), spans), settings)),
+        )
 
     def _structure_context(self, frame: pd.DataFrame | None, timeframe: str = "ltf"):
         # Per-cycle cache. Timeframe goes in the key because the pivot_span /
@@ -870,8 +886,8 @@ class ContextBuildersMixin:
         if bar_minutes is None:
             bar_minutes = frame_bar_minutes(analysis_frame.index)
         # The resample keeps the still-forming last bucket, and so does a
-        # peer's native 5m LTF frame (get_merged resamples the live 1m
-        # stream). Its first minutes must not confirm a pivot (2026-09-25,
+        # peer's 5m LTF frame (_resampled_frame resamples the step frame's
+        # 1m bars). Its first minutes must not confirm a pivot (2026-09-25,
         # see analyze_market_structure). The same clock test as the
         # dashboard's forming bucket and data_feed._completed_bars
         # (bars.last_bucket_forming / completed_bucket_mask); a frame of

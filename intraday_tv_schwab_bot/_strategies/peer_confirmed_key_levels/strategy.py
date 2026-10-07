@@ -324,7 +324,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 details[peer] = "missing"
                 continue
             close = safe_float(frame.iloc[-1]["close"], 0.0)
-            ltf = self._resampled_frame(frame, int(self.params.get("ltf_minutes", 5)), symbol=peer, data=data)
+            ltf = self._resampled_frame(frame, int(self.params.get("ltf_minutes", 5)))
             htf = self._htf_context(peer, data, current_price=close, **htf_request)
             bull_votes = 0
             bear_votes = 0
@@ -373,7 +373,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             if frame is None or frame.empty:
                 details[key] = "missing"
                 continue
-            macro = self._resampled_frame(frame, ltf_min, symbol=symbol, data=data)
+            macro = self._resampled_frame(frame, ltf_min)
             if macro is None or macro.empty:
                 details[key] = "missing"
                 continue
@@ -1358,7 +1358,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             if frame is None or len(frame) < min_bars:
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)])
                 continue
-            ltf = self._resampled_frame(frame, ltf_min, symbol=c.symbol, data=data)
+            ltf = self._resampled_frame(frame, ltf_min)
             if ltf is None or len(ltf) < min_ltf_bars:
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_ltf_bars", 0 if ltf is None else len(ltf), min_ltf_bars)])
                 continue

@@ -522,7 +522,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             # skipped the gate and let the entry through. Broad because the
             # resample runs TA-Lib, which raises a bare Exception.
             try:
-                frame_5m = self._resampled_frame(frame, 5, symbol=c.symbol, data=data)
+                frame_5m = self._resampled_frame(frame, 5)
             except Exception as exc:
                 LOG.warning("ORB 5m follow-through: could not build %s's 5m frame; refusing the %s %s entry",
                             c.symbol, side.value, regime, exc_info=True)
@@ -1040,7 +1040,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)])
             return None
 
-        ltf = self._resampled_frame(frame, ltf_min, symbol=c.symbol, data=data, span_scale=ltf_span_scale,
+        ltf = self._resampled_frame(frame, ltf_min, span_scale=ltf_span_scale,
                                     ema_spans=ltf_ema_pair)
         if ltf is None or ltf.empty or len(ltf) < min_ltf_bars:
             self._record_entry_decision(c.symbol, "skipped", ["missing_ltf_context"])

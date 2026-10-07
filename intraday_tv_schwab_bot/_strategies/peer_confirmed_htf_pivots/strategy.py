@@ -1363,7 +1363,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                     ],
                 )
                 continue
-            ltf = self._resampled_frame(frame, ltf_min, symbol=candidate.symbol, data=data)
+            ltf = self._resampled_frame(frame, ltf_min)
             if ltf is None or ltf.empty or len(ltf) < max(10, int(self.params.get("min_ltf_bars", 20)) + 3):
                 self._record_entry_decision(candidate.symbol, "skipped", ["missing_ltf_context"])
                 continue

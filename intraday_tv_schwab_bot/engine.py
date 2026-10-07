@@ -1958,7 +1958,7 @@ class IntradayBot:
         `("structure", "ltf")`) -- but only for a call on one of THIS
         cycle's bars frames, which this method hands the strategy first
         (`set_prewarm_frames`). The caches key on id(frame), so a build on
-        any other frame (the peers' 5m LTF, key_levels_1m's get_merged copy)
+        any other frame (the peers' 5m LTF, key_levels_1m's 1m LTF copy)
         could never read what this pre-warm puts on the 1m bars frames; until
         2026-09-24 such calls were recorded too, and key_levels paid a chart
         and technical build per watchlist symbol per cycle that nothing read.

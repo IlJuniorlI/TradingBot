@@ -327,20 +327,29 @@ def frame_version(frame: pd.DataFrame | None) -> tuple | None:
     return entry[1], entry[2]
 
 
-def derived_frame(token: tuple, variant: tuple, build: Callable[[], pd.DataFrame]) -> pd.DataFrame:
+def derived_frame(token: tuple, variant: tuple, build: Callable[[], pd.DataFrame], *,
+                  version: tuple | None = None) -> pd.DataFrame:
     """``build()``, memoized on the source ``token`` of the frame it reads
     and on ``variant`` (every other input of ``build``: its arguments and
-    the process-wide settings it reads). A hit hands out a shallow copy; the
-    memo's frame never leaves (copy-on-write keeps a caller's writes out)."""
+    the process-wide settings it reads). Every call hands out a shallow
+    copy; the memo's frame never leaves (copy-on-write keeps a caller's
+    writes out). With ``version`` (``(token, variant)`` as
+    ``frame_version`` reads it) each hand-out is registered as that version
+    (``register_frame_source``), so what is memoized on a frame's version
+    serves it."""
     key = (token[0], token[2]) + tuple(variant)
     with _DERIVED_LOCK:
         entry = _DERIVED_FRAMES.get(key)
     if entry is not None and entry[0] == token:
-        return entry[1].copy(deep=False)
-    out = build()
-    with _DERIVED_LOCK:
-        _DERIVED_FRAMES[key] = (token, out)
-    return out.copy(deep=False)
+        kept = entry[1]
+    else:
+        kept = build()
+        with _DERIVED_LOCK:
+            _DERIVED_FRAMES[key] = (token, kept)
+    out = kept.copy(deep=False)
+    if version is not None:
+        register_frame_source(out, version[0], version[1], kept)
+    return out
 
 
 def retain_derived_frames(symbols: Iterable[str]) -> None:
