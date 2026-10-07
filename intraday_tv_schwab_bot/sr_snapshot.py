@@ -153,7 +153,13 @@ def sr_snapshot(
     # when it has one; the generic 50/200 read below only for the rest.
     own_trend = None
     own_trend_hook = getattr(strategy, "dashboard_htf_trend", None)
-    trend_price = display_price if display_price is not None else float(getattr(ctx, "current_price", 0.0) or 0.0)
+    # Both HTF trend reads are at the price of the S/R context the row shows
+    # (in a cycle, its step frame's close, which the engine builds the
+    # strategy's HTF contexts at): the strategy reads them at the close of
+    # the bar it decides on (MarketDataStore.get_htf_context). Until
+    # 2026-10-07 the strategy's own trend voted at the display price, on a
+    # context that carried the price of its first build in the HTF bar.
+    trend_price = float(getattr(ctx, "current_price", 0.0) or 0.0)
     if callable(own_trend_hook) and trend_price:
         try:
             own_trend = own_trend_hook(symbol, data, trend_price)
@@ -165,6 +171,7 @@ def sr_snapshot(
             # engine builds its context at a fixed point of the cycle.
             htf_ctx = data.get_htf_context(
                 symbol,
+                current_price=trend_price,
                 **strategy.generic_htf_trend_request(),
                 **strategy.htf_fvg_request(),
             )

@@ -545,11 +545,14 @@ class DashboardCache:
         )
         compact_chart_profile = self.chart_profile("compact")
         expanded_chart_profile = self.chart_profile("expanded")
+        # The overlays below are read at the close of the frame's last bar,
+        # the price the strategy reads the same contexts at.
+        frame_close = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         # The HTF context is read once, if any overlay needs it (the HTF FVGs,
         # the RSI divergence lines), and the divergence lines reuse it.
         chart_wants_rsi_div = bool(compact_chart_profile.show_rsi_divergence) or bool(expanded_chart_profile.show_rsi_divergence)
         htf_ctx, htf_fair_value_gaps = self._snapshot_htf_overlays(
-            symbol, compact_chart_profile, expanded_chart_profile, chart_wants_rsi_div,
+            symbol, frame_close, compact_chart_profile, expanded_chart_profile, chart_wants_rsi_div,
         )
 
         # The LTF FVG and order block overlays are the contexts the strategy
@@ -558,7 +561,6 @@ class DashboardCache:
         # 2026-09-27 the dashboard asked at the quote's last, so it drew
         # blocks and gaps sized, ranked and cut at a price the strategy never
         # judged, and built them a second time.
-        frame_close = safe_float(frame.iloc[-1]["close"], 0.0) if frame is not None and not frame.empty else 0.0
         ltf_fair_value_gaps = self._snapshot_ltf_fair_value_gaps(
             symbol, frame, frame_close, compact_chart_profile, expanded_chart_profile,
         )
@@ -1057,13 +1059,15 @@ class DashboardCache:
     def _snapshot_htf_overlays(
         self,
         symbol: str,
+        price: float,
         compact_chart_profile: DashboardChartConfig,
         expanded_chart_profile: DashboardChartConfig,
         chart_wants_rsi_div: bool,
     ) -> tuple[HTFContext | None, list[dict[str, Any]]]:
-        """The HTF context, read if a chart draws its FVGs (and the strategy's
-        request builds them) or its RSI divergence lines, and its FVG overlay.
-        A failure is logged (``htf_fair_value_gaps_collect``) and gives no
+        """The HTF context at ``price`` (the close of the 1m frame's last
+        bar), read if a chart draws its FVGs (and the strategy's request
+        builds them) or its RSI divergence lines, and its FVG overlay. A
+        failure is logged (``htf_fair_value_gaps_collect``) and gives no
         context and no gaps."""
         htf_fair_value_gaps: list[dict[str, Any]] = []
         htf_ctx = None
@@ -1076,6 +1080,7 @@ class DashboardCache:
             if need_htf_ctx:
                 htf_ctx = self.data.get_htf_context(
                     symbol,
+                    current_price=price,
                     timeframe_minutes=self.strategy.htf_minutes(),
                     **self._chart_htf_level_request(),
                     use_prior_day_high_low=bool(getattr(self.config.support_resistance, "use_prior_day_high_low", True)),
@@ -1380,8 +1385,12 @@ class DashboardCache:
         use_prior_day_high_low = bool(getattr(sr_cfg, "use_prior_day_high_low", True)) if sr_cfg is not None else True
         use_prior_week_high_low = bool(getattr(sr_cfg, "use_prior_week_high_low", True)) if sr_cfg is not None else True
 
+        # The HTF context at the close of the frame's last bar, the price the
+        # strategy reads it at; ``close`` places the zones.
+        bar_close = safe_float(frame.iloc[-1].get("close")) if frame is not None and not frame.empty else None
         htf = self.data.get_htf_context(
             symbol,
+            current_price=close if bar_close is None else bar_close,
             timeframe_minutes=tf,
             pivot_span=pivot_span,
             max_levels_per_side=max_lvls,

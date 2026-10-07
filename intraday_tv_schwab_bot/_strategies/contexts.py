@@ -381,8 +381,8 @@ class ContextBuildersMixin:
         ``_htf_context`` adds the FVG arguments.
 
         The score context (``_default_htf_context_for_score``), the shared
-        FVG score term and zero_dte's entry read all ask for it, so they
-        share one data-feed cache entry. Until 2026-09-27 each built
+        FVG score term and zero_dte's entry read all ask for it, so at one
+        price they share one data-feed cache entry. Until 2026-09-27 each built
         its own copy, and the score context left out the FVG arguments (part
         of the cache key): with any FVG setting off its default, every
         preset's, it was a second build of the same frame."""
@@ -419,15 +419,15 @@ class ContextBuildersMixin:
         ``_symbol_htf_request``), and one whose own ``dashboard_htf_trend``
         returns None adds ``generic_trend`` (peer_confirmed_htf_pivots).
 
-        A context carries the price of its first build until the next HTF
-        refresh (the price is not part of ``MarketDataStore.htf_cache``'s
-        key), so the engine builds every listed one for each step-frame
-        symbol at fixed points of the cycle
-        (``IntradayBot._prime_strategy_htf_contexts``), never leaving that
-        first build to whichever reader comes first: since 2026-10-05 the
-        dashboard build, the first reader of most symbols, runs only on
-        demand. A read whose arguments are not listed carries the price of
-        its own first reader."""
+        The engine builds every listed one for each step-frame symbol at its
+        step frame's close, in the contexts phase and after a mid-cycle HTF
+        refresh (``IntradayBot._prime_strategy_htf_contexts``), so the
+        strategy's reads at that price find it built. Each read names its
+        price (``_htf_context``): a read whose arguments are not listed, or
+        at another price, builds its own (the price-free part of the build
+        is shared, ``MarketDataStore.get_htf_context``). Until 2026-10-07 a
+        context carried the price of its first build until the next HTF
+        refresh, and this prime fixed which reader that was."""
         requests = {"score": self._default_htf_request()}
         if type(self).dashboard_htf_trend is ContextBuildersMixin.dashboard_htf_trend:
             requests["generic_trend"] = self.generic_htf_trend_request()
@@ -452,9 +452,10 @@ class ContextBuildersMixin:
             "use_prior_week_high_low": bool(getattr(cfg, "use_prior_week_high_low", True)),
         }
 
-    def _default_htf_context_for_score(self, symbol: str, data) -> HTFContext:
+    def _default_htf_context_for_score(self, symbol: str, data, current_price: float) -> HTFContext:
         """The HTF context a strategy scores on (``_default_htf_request``,
-        through ``_htf_context``).
+        through ``_htf_context``), at ``current_price``: the close of the bar
+        the reader decides on.
 
         The shared entry policy scores a proposal's HTF RSI divergence on it
         when the proposal brings no HTF context of its own
@@ -472,7 +473,7 @@ class ContextBuildersMixin:
         None, which ``require_htf_ema_alignment`` reads as a neutral trend,
         so the error let the entry through.
         """
-        return self._htf_context(symbol, data, **self._default_htf_request())
+        return self._htf_context(symbol, data, current_price=current_price, **self._default_htf_request())
 
     def _htf_context(
             self,
@@ -487,19 +488,24 @@ class ContextBuildersMixin:
         stop_buffer_atr_mult: float,
         ema_fast_span: int,
         ema_slow_span: int,
-        current_price: float | None = None,
+        current_price: float,
         use_prior_day_high_low: bool = True,
         use_prior_week_high_low: bool = True,
     ) -> HTFContext:
         """The HTF context of ``symbol``'s stored frame for these level
-        arguments and the strategy's FVG arguments (``htf_fvg_request``), or
-        the empty context while no frame is stored. A read: the engine
-        refreshes the frames (``IntradayBot._refresh_htf_frames``); until
-        2026-09-28 this read fetched a frame whose HTF bar had closed."""
+        arguments and the strategy's FVG arguments (``htf_fvg_request``) at
+        ``current_price``, the close of the bar the reader decides on, or the
+        empty context while no frame is stored. A read: the engine refreshes
+        the frames (``IntradayBot._refresh_htf_frames``); until 2026-09-28
+        this read fetched a frame whose HTF bar had closed. Until 2026-10-07
+        the price reached only the empty context: the feed's context carried
+        the price of its first build in the HTF bar
+        (``MarketDataStore.get_htf_context``)."""
         if data is None or not hasattr(data, "get_htf_context"):
             return empty_htf_context(current_price or 0.0, timeframe_minutes=timeframe_minutes)
         ctx = data.get_htf_context(
             symbol,
+            current_price=current_price,
             timeframe_minutes=timeframe_minutes,
             pivot_span=pivot_span,
             max_levels_per_side=max_levels_per_side,

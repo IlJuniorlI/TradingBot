@@ -415,7 +415,15 @@ def atr_with_floor(
 
     ``in_session`` goes to ``latest_atr14``.
     """
-    return max(latest_atr14(frame, in_session=in_session) or 0.0, price * floor_pct if price > 0 else 0.0, abs_floor)
+    return floor_atr(latest_atr14(frame, in_session=in_session), price, floor_pct=floor_pct, abs_floor=abs_floor)
+
+
+def floor_atr(atr: float | None, price: float, *, floor_pct: float = 0.0015, abs_floor: float = 0.0) -> float:
+    """``atr_with_floor``'s floors on an ATR already read (``latest_atr14``'s
+    value; None when the frame has none). The HTF context reads its frame's
+    ATR once and floors it at each price it is built at
+    (``htf_levels.htf_context_at``)."""
+    return max(atr or 0.0, price * floor_pct if price > 0 else 0.0, abs_floor)
 
 
 def last_bar_atr(

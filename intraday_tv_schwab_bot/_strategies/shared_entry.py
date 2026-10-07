@@ -508,7 +508,7 @@ class SharedEntryPolicy:
         # own when the strategy scores on a different HTF build.
         htf = p.htf_ctx
         if htf is None and self.config.shared_entry.use_htf_divergence_score:
-            htf = strategy._default_htf_context_for_score(p.symbol, p.data)
+            htf = strategy._default_htf_context_for_score(p.symbol, p.data, float(p.close))
         zone_frame = p.zone_frame if p.zone_frame is not None else p.gate_frame
         # P2 -- the retest admission, one pass over every pending reason.
         plans = self._retest_plans(p, zone_frame)
@@ -919,7 +919,7 @@ class SharedEntryPolicy:
             if close > 0:
                 sr = self.strategy._sr_context(symbol, frame, data)
                 tech = self.strategy._technical_context(frame)
-                htf = self.strategy._default_htf_context_for_score(symbol, data)
+                htf = self.strategy._default_htf_context_for_score(symbol, data, close)
                 for side in found:
                     found[side] = self._divergence_entry_candidate(side, close, frame, sr, tech, htf)
         self._divergence_cache[key] = found

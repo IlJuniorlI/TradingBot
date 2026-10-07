@@ -1537,7 +1537,7 @@ class IntradayBot:
             self._prime_cycle_support_cache(bars)
             timer.enter("contexts")
             self._prime_cycle_context_cache(bars)
-            self._prime_strategy_htf_contexts(list(bars))
+            self._prime_strategy_htf_contexts(bars)
             timer.enter("warmup")
             warmup_summary = self.warmup_tracker.warmup_summary(self.last_watchlist, bars=bars)
             self.warmup_tracker.log_warmup_summary(warmup_summary)
@@ -1832,11 +1832,10 @@ class IntradayBot:
         built again as the cycle's pre-warm builds them
         (``_prime_cycle_support_cache``): the refresh dropped them, and the
         cycle serves every later read the build of its first read. So are
-        their strategy HTF contexts (``_prime_strategy_htf_contexts``), whose
-        first build fixes their price until the next refresh: left to the
-        next reader, that was the publish when a page was open and the next
-        pass's contexts phase when not (2026-10-05). Only while the gate
-        refreshes market context, as the cycle's fetch always was."""
+        their strategy HTF contexts, at their step frames' closes
+        (``_prime_strategy_htf_contexts``), so the reads after the refresh
+        find them built. Only while the gate refreshes market context, as
+        the cycle's fetch always was."""
         if not gate_state.context_refresh_active:
             return
         tf = self.strategy.htf_minutes()
@@ -1858,35 +1857,34 @@ class IntradayBot:
         if bars is not None and refreshed:
             stepped = {symbol: bars[symbol] for symbol in refreshed if symbol in bars}
             self._prime_cycle_support_cache(stepped)
-            self._prime_strategy_htf_contexts(list(stepped))
+            self._prime_strategy_htf_contexts(stepped)
 
-    def _prime_strategy_htf_contexts(self, symbols: list[str]) -> None:
-        """Build, for each of ``symbols``, the HTF context of every request
-        the strategy and its dashboard rows read
-        (``strategy.htf_context_requests``): in the contexts phase for every
-        step-frame symbol, and after a mid-cycle HTF refresh for the symbols
-        it refreshed (``_refresh_htf_frames``).
+    def _prime_strategy_htf_contexts(self, bars: dict[str, pd.DataFrame]) -> None:
+        """Build, for each symbol of ``bars``, the HTF context of every
+        request the strategy and its dashboard rows read
+        (``strategy.htf_context_requests``) at the close of its step frame's
+        last bar: in the contexts phase for every step-frame symbol, and
+        after a mid-cycle HTF refresh for the symbols it refreshed
+        (``_refresh_htf_frames``).
 
-        A context carries the price of its first build until the next HTF
-        refresh (``MarketDataStore._htf_context_from_stored_frame``: the price
-        is not part of the cache key), so its first build is made here, at a
-        fixed point of the cycle, not by whichever reader comes first. The
-        dashboard build was that first reader on most symbols, and since
-        2026-10-05 it runs only on demand (``_dashboard_build_due``), so the
-        price the strategy trades on would have followed whether a page was
-        open. Until 2026-10-05 (the stage-2 review) only the score context
-        was built here: the peer family's own context
-        (``_symbol_htf_request``), which its gates, votes and scores read,
-        and htf_pivots' generic S/R-row trend still went to their first
-        reader, and a mid-cycle refresh rebuilt none.
+        Every reader names the price it reads a context at
+        (``MarketDataStore.get_htf_context``), and the strategies read at the
+        close of the frame they decide on, the step frame's, so their reads
+        find these builds in the feed's caches; a read at another price builds
+        its own. Until 2026-10-07 a context carried the price of its first
+        build until the next HTF refresh, and this prime existed to make that
+        first build here rather than in whichever reader came first (the
+        dashboard, since 2026-10-05 built only on demand).
 
         One map per request, labelled with its name, so a build that raises
         (logged with its type, ``_compute_symbol_map``) leaves the other
         requests built and keeps its own run of failures."""
+        symbols = [symbol for symbol, frame in bars.items() if frame is not None and not frame.empty]
         for name, request in self.strategy.htf_context_requests().items():
             self._compute_symbol_map(
                 symbols,
-                lambda symbol, request=request: self.strategy._htf_context(symbol, self.data, **request),
+                lambda symbol, request=request: self.strategy._htf_context(
+                    symbol, self.data, current_price=float(bars[symbol].iloc[-1]["close"]), **request),
                 label=f"HTF context precompute ({name})",
             )
 

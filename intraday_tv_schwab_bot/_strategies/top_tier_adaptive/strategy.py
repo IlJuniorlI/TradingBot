@@ -212,10 +212,10 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
 
     def dashboard_htf_trend(self, symbol: str, data, price: float) -> dict[str, str] | None:
         """The HTF EMA trend the gate and score read, off the same context
-        (``_default_htf_context_for_score``)."""
+        (``_default_htf_context_for_score``), at ``price``."""
         if data is None or not price:
             return None
-        return self._htf_trend_row(*self._htf_bias(self._default_htf_context_for_score(symbol, data), float(price)))
+        return self._htf_trend_row(*self._htf_bias(self._default_htf_context_for_score(symbol, data, float(price)), float(price)))
 
     def daily_history_symbols(self, watchlist: list[str]) -> list[str]:
         """The symbols ``_symbol_daily_stats`` reads the daily history of,
@@ -335,7 +335,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         ms_ctx = self._structure_context(frame, "ltf")
         tech_ctx = self._technical_context(frame)
         ctx = self._chart_context(frame)
-        htf_ctx = self._default_htf_context_for_score(c.symbol, data)
+        htf_ctx = self._default_htf_context_for_score(c.symbol, data, close)
 
         # Single ORB-window flag reused by the _finalize_signal ORB-bypasses
         # (HTF bias, HTF EMA, ORB 5m follow-through, exhaustion). Computed
@@ -1053,8 +1053,9 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # The HTF EMA trend, read once per candidate for the score term
         # (``_score_sides``; the gate reads the same context in
         # _finalize_signal).
+        ltf_close = safe_float(ltf.iloc[-1]["close"], 0.0)
         htf_ema_read = (
-            self._htf_bias(self._default_htf_context_for_score(c.symbol, data), safe_float(ltf.iloc[-1]["close"], 0.0))
+            self._htf_bias(self._default_htf_context_for_score(c.symbol, data, ltf_close), ltf_close)
             if float(self.params.get("htf_ema_alignment_score", 0.0)) else ("neutral", 0, 0)
         )
         idx_neutral = self._index_neutral(c.symbol, bars)

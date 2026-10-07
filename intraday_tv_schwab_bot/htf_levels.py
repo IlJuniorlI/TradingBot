@@ -32,10 +32,11 @@ from .sessions import latest_session_date
 from .numeric import safe_float
 from .bars import completed_bars, ensure_ohlcv_frame, resolve_current_price
 from .indicators import (
-    atr_with_floor,
     ensure_standard_indicator_frame,
+    floor_atr,
     get_runtime_indicator_mode,
     indicator_session_mask,
+    latest_atr14,
 )
 from . import sessions
 
@@ -193,23 +194,22 @@ _BROKEN_HTF_SOURCES = ("broken_htf_support", "broken_htf_resistance")
 def _htf_flip_checker(
     frame: pd.DataFrame,
     *,
-    timeframe_minutes: int,
+    completed: pd.DataFrame | None,
     confirm_bars: int,
     eps: float,
 ) -> FlipCheck:
     """Return ``check(level_price, direction)``: is the level's flip active?
 
     With ``confirm_bars > 0``, ``"reclaim"`` needs the last ``confirm_bars``
-    completed HTF lows above the level and ``"loss"`` the matching highs below
-    it; with 0 the frame's last bar decides. The completed frame is cut ONCE
-    per build: each level used to copy and cut the whole frame again, and
-    removing the pre-split cluster cap on 2026-09-23 multiplied the levels.
+    of the ``completed`` HTF bars' lows above the level and ``"loss"`` the
+    matching highs below it; with 0 the frame's last bar decides. The
+    completed frame is cut ONCE per frame (``prepare_htf_levels``): each
+    level used to copy and cut the whole frame again, and removing the
+    pre-split cluster cap on 2026-09-23 multiplied the levels.
     """
     bars = max(0, int(confirm_bars or 0))
     tol = float(eps)
     if bars > 0:
-        completed = completed_bars(frame, timeframe_minutes)
-
         def confirmed(level_price: float, direction: str) -> bool:
             if direction == "reclaim":
                 return confirm_by_bars(completed, "low", "above", level_price, bars, tol)
@@ -232,12 +232,160 @@ def _htf_flip_checker(
     return last_bar_beyond
 
 
-def build_htf_context(
+@dataclass(frozen=True, slots=True)
+class HTFLevelInputs:
+    """What an HTF context build reads of its frame before it needs a
+    price (``prepare_htf_levels``): the cleaned frame, its unfloored ATR,
+    the pivots, the prior day / week levels, the EMAs, the bars a flip is
+    confirmed on and the RSI divergences. Every field is a function of the
+    frame, these arguments and the clock as ``as_of`` and
+    ``context_memo.indicator_clock_key`` read it, never of a price:
+    ``htf_context_at`` builds the context at any price from it.
+
+    The data feed keeps it for as long as its frame is the stored one
+    (``MarketDataStore._htf_level_inputs``), so a context at a new price
+    (each 1m bar) redoes only the price-dependent part."""
+
+    timeframe_minutes: int
+    frame: pd.DataFrame
+    atr14: float | None
+    pivot_highs: list[tuple[int, pd.Timestamp, float]]
+    pivot_lows: list[tuple[int, pd.Timestamp, float]]
+    include_prior_day: bool
+    include_prior_week: bool
+    prior_day_high: float | None
+    prior_day_low: float | None
+    prior_week_high: float | None
+    prior_week_low: float | None
+    ema_fast: float | None
+    ema_slow: float | None
+    flip_confirmation_bars: int
+    flip_completed: pd.DataFrame | None
+    bullish_rsi_divergence: DivergenceMatch | None
+    bearish_rsi_divergence: DivergenceMatch | None
+    bullish_hidden_rsi_divergence: DivergenceMatch | None
+    bearish_hidden_rsi_divergence: DivergenceMatch | None
+
+
+def prepare_htf_levels(
     frame: pd.DataFrame,
     *,
-    current_price: float | None = None,
     timeframe_minutes: int = 60,
     pivot_span: int = 2,
+    ema_fast_span: int = 50,
+    ema_slow_span: int = 200,
+    flip_confirmation_bars: int = 1,
+    use_prior_day_high_low: bool = True,
+    use_prior_week_high_low: bool = True,
+    divergence_enabled: bool = True,
+    divergence_pivot_lookback: int = 4,
+    divergence_max_age_bars: int = 6,
+    divergence_min_price_move_pct: float = 0.0015,
+    divergence_rsi_min_delta: float = 2.5,
+    as_of: date | None = None,
+) -> HTFLevelInputs | None:
+    """The price-free part of an HTF context build (``HTFLevelInputs``), or
+    None for an empty frame. ``as_of`` is the session date the prior day /
+    week are measured back from; None means the clock's
+    (``latest_session_date(sessions.now_et())``)."""
+    frame = ensure_standard_indicator_frame(ensure_ohlcv_frame(frame))
+    if frame.empty:
+        return None
+    # The session mask the ATR and the divergence read, computed once.
+    in_session = indicator_session_mask(frame.index) if get_runtime_indicator_mode() else None
+    # One detection pass serves the levels and the RSI divergence below: the
+    # divergence reads each pivot's bar position, clustering only its
+    # (timestamp, price).
+    pivot_highs, pivot_lows = pivot_points(frame, int(pivot_span), include_idx=True)
+    include_prior_day = bool(use_prior_day_high_low)
+    include_prior_week = bool(use_prior_week_high_low)
+    session_day = as_of if as_of is not None else latest_session_date(sessions.now_et())
+    prior_day_high, prior_day_low = _prior_day_levels(frame, session_day) if include_prior_day else (None, None)
+    prior_week_high, prior_week_low = _prior_week_levels(frame, session_day) if include_prior_week else (None, None)
+    confirm_bars = max(0, int(flip_confirmation_bars or 0))
+    ema_fast = float(frame["close"].ewm(span=int(ema_fast_span), adjust=False).mean().iloc[-1]) if len(frame) >= max(5, int(ema_fast_span) // 3) else None
+    ema_slow = float(frame["close"].ewm(span=int(ema_slow_span), adjust=False).mean().iloc[-1]) if len(frame) >= int(ema_slow_span) else None
+
+    # HTF RSI divergence — multi-timeframe confluence signal. Uses the
+    # level pivots' bar positions so the shared find_divergence can pull RSI
+    # values at exact pivot positions and tag age in HTF bars (session bars
+    # under the session clock: divergence.divergence_inputs). RSI series is
+    # whatever ensure_standard_indicator_frame populated under "rsi14".
+    # The thresholds and the switch arrive from technical_levels through the
+    # data feed (MarketDataStore.get_htf_context, 2026-09-25 for the
+    # thresholds); the signature defaults are the values every preset
+    # ships, for the callers that build a context directly.
+    bullish_rsi_div: DivergenceMatch | None = None
+    bearish_rsi_div: DivergenceMatch | None = None
+    bullish_hidden_rsi_div: DivergenceMatch | None = None
+    bearish_hidden_rsi_div: DivergenceMatch | None = None
+    if divergence_enabled and "rsi14" in frame.columns and len(frame) > 0:
+        rsi_series = frame["rsi14"].astype(float)
+        if not rsi_series.dropna().empty:
+            highs_idx, lows_idx, bar_clock, price_scale = divergence_inputs(
+                frame, pivot_highs, pivot_lows, in_session=in_session,
+            )
+            last_bar_pos = max(0, len(frame) - 1)
+            move_frac = max(0.0001, float(divergence_min_price_move_pct))
+            rsi_delta = max(0.0, float(divergence_rsi_min_delta))
+            bullish_rsi_div = find_divergence(
+                lows_idx, rsi_series, kind="regular", direction="bullish",
+                indicator_name="rsi", price_move_frac=move_frac,
+                indicator_delta=rsi_delta, pivot_lookback=divergence_pivot_lookback,
+                max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
+                price_scale=price_scale, bar_clock=bar_clock,
+            )
+            bearish_rsi_div = find_divergence(
+                highs_idx, rsi_series, kind="regular", direction="bearish",
+                indicator_name="rsi", price_move_frac=move_frac,
+                indicator_delta=rsi_delta, pivot_lookback=divergence_pivot_lookback,
+                max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
+                price_scale=price_scale, bar_clock=bar_clock,
+            )
+            bullish_hidden_rsi_div = find_divergence(
+                lows_idx, rsi_series, kind="hidden", direction="bullish",
+                indicator_name="rsi", price_move_frac=move_frac,
+                indicator_delta=rsi_delta, pivot_lookback=divergence_pivot_lookback,
+                max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
+                price_scale=price_scale, bar_clock=bar_clock,
+            )
+            bearish_hidden_rsi_div = find_divergence(
+                highs_idx, rsi_series, kind="hidden", direction="bearish",
+                indicator_name="rsi", price_move_frac=move_frac,
+                indicator_delta=rsi_delta, pivot_lookback=divergence_pivot_lookback,
+                max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
+                price_scale=price_scale, bar_clock=bar_clock,
+            )
+
+    return HTFLevelInputs(
+        timeframe_minutes=int(timeframe_minutes),
+        frame=frame,
+        atr14=latest_atr14(frame, in_session=in_session),
+        pivot_highs=pivot_highs,
+        pivot_lows=pivot_lows,
+        include_prior_day=include_prior_day,
+        include_prior_week=include_prior_week,
+        prior_day_high=prior_day_high,
+        prior_day_low=prior_day_low,
+        prior_week_high=prior_week_high,
+        prior_week_low=prior_week_low,
+        ema_fast=ema_fast,
+        ema_slow=ema_slow,
+        flip_confirmation_bars=confirm_bars,
+        # Cut once per frame, not per level (``_htf_flip_checker``).
+        flip_completed=completed_bars(frame, int(timeframe_minutes)) if confirm_bars > 0 else None,
+        bullish_rsi_divergence=bullish_rsi_div,
+        bearish_rsi_divergence=bearish_rsi_div,
+        bullish_hidden_rsi_divergence=bullish_hidden_rsi_div,
+        bearish_hidden_rsi_divergence=bearish_hidden_rsi_div,
+    )
+
+
+def htf_context_at(
+    inputs: HTFLevelInputs | None,
+    current_price: float | None,
+    *,
+    timeframe_minutes: int = 60,
     max_levels_per_side: int = 6,
     atr_tolerance_mult: float = 0.35,
     pct_tolerance: float = 0.0030,
@@ -246,32 +394,26 @@ def build_htf_context(
     fallback_reference_max_drift_atr_mult: float = 1.0,
     fallback_reference_max_drift_pct: float = 0.01,
     stop_buffer_atr_mult: float = 0.25,
-    ema_fast_span: int = 50,
-    ema_slow_span: int = 200,
-    flip_confirmation_bars: int = 1,
-    use_prior_day_high_low: bool = True,
-    use_prior_week_high_low: bool = True,
     include_fair_value_gaps: bool = True,
     fair_value_gap_max_per_side: int = 4,
     fair_value_gap_min_atr_mult: float = 0.05,
     fair_value_gap_min_pct: float = 0.0005,
-    divergence_enabled: bool = True,
-    divergence_pivot_lookback: int = 4,
-    divergence_max_age_bars: int = 6,
-    divergence_min_price_move_pct: float = 0.0015,
-    divergence_rsi_min_delta: float = 2.5,
-    as_of: date | None = None,
 ) -> HTFContext:
-    # ``as_of`` is the session date the prior day/week are measured back from;
-    # None means the clock's (``latest_session_date(sessions.now_et())``).
-    frame = ensure_standard_indicator_frame(ensure_ohlcv_frame(frame))
-    if frame.empty:
+    """The HTF context at ``current_price`` on ``prepare_htf_levels``'s
+    inputs (the empty context for None, an empty frame): everything that
+    reads the price -- the ATR's floors and the tolerances sized from them,
+    the level clusters, the fallbacks, the flips, which side of price each
+    level is on, the nearest / broken / pending levels, the FVGs (their
+    sizes floor at a share of the price), the trend bias and the level
+    buffer. A price that is not positive reads as the frame's last close
+    (``resolve_current_price``). ``timeframe_minutes`` labels the empty
+    context only; a built one carries its inputs'."""
+    if inputs is None:
         return empty_htf_context(float(current_price or 0.0), timeframe_minutes=timeframe_minutes)
-
-    # The session mask the ATR and the divergence read, computed once.
-    in_session = indicator_session_mask(frame.index) if get_runtime_indicator_mode() else None
+    frame = inputs.frame
+    timeframe_minutes = inputs.timeframe_minutes
     close = resolve_current_price(frame, current_price)
-    atr = atr_with_floor(frame, close, abs_floor=0.01, in_session=in_session)
+    atr = floor_atr(inputs.atr14, close, abs_floor=0.01)
     tolerance = max(atr * float(atr_tolerance_mult), close * float(pct_tolerance))
     fallback_reference_price = _safe_reference_price_for_fallback(
         frame,
@@ -289,18 +431,14 @@ def build_htf_context(
         min_gap_pct=float(same_side_min_gap_pct),
     )
 
-    # One detection pass serves the levels and the RSI divergence below: the
-    # divergence reads each pivot's bar position, clustering only its
-    # (timestamp, price).
-    pivot_highs, pivot_lows = pivot_points(frame, int(pivot_span), include_idx=True)
+    pivot_highs, pivot_lows = inputs.pivot_highs, inputs.pivot_lows
     pivot_resistances = cluster_levels([(ts, price) for _pos, ts, price in pivot_highs], "resistance", tolerance) if pivot_highs else []
     pivot_supports = cluster_levels([(ts, price) for _pos, ts, price in pivot_lows], "support", tolerance) if pivot_lows else []
 
-    include_prior_day = bool(use_prior_day_high_low)
-    include_prior_week = bool(use_prior_week_high_low)
-    session_day = as_of if as_of is not None else latest_session_date(sessions.now_et())
-    prior_day_high, prior_day_low = _prior_day_levels(frame, session_day) if include_prior_day else (None, None)
-    prior_week_high, prior_week_low = _prior_week_levels(frame, session_day) if include_prior_week else (None, None)
+    include_prior_day = inputs.include_prior_day
+    include_prior_week = inputs.include_prior_week
+    prior_day_high, prior_day_low = inputs.prior_day_high, inputs.prior_day_low
+    prior_week_high, prior_week_low = inputs.prior_week_high, inputs.prior_week_low
 
     # Prior-day/week levels are FALLBACKS, not always-on candidates. Earlier
     # commit e4abfb1 unconditionally merged them next to pivot-derived levels
@@ -349,8 +487,8 @@ def build_htf_context(
     eps = max(abs(close) * 1e-6, 1e-8)
     flip_active = _htf_flip_checker(
         frame,
-        timeframe_minutes=int(timeframe_minutes),
-        confirm_bars=int(flip_confirmation_bars or 0),
+        completed=inputs.flip_completed,
+        confirm_bars=inputs.flip_confirmation_bars,
         eps=eps,
     )
 
@@ -453,8 +591,7 @@ def build_htf_context(
         reduce=_representative_level,
     )
 
-    ema_fast = float(frame["close"].ewm(span=int(ema_fast_span), adjust=False).mean().iloc[-1]) if len(frame) >= max(5, int(ema_fast_span) // 3) else None
-    ema_slow = float(frame["close"].ewm(span=int(ema_slow_span), adjust=False).mean().iloc[-1]) if len(frame) >= int(ema_slow_span) else None
+    ema_fast, ema_slow = inputs.ema_fast, inputs.ema_slow
 
     trend_votes = 0
     if ema_fast is not None:
@@ -490,57 +627,6 @@ def build_htf_context(
             min_gap_pct=float(fair_value_gap_min_pct),
         )
 
-    # HTF RSI divergence — multi-timeframe confluence signal. Uses the
-    # level pivots' bar positions so the shared find_divergence can pull RSI
-    # values at exact pivot positions and tag age in HTF bars (session bars
-    # under the session clock: divergence.divergence_inputs). RSI series is
-    # whatever ensure_standard_indicator_frame populated under "rsi14".
-    # The thresholds and the switch arrive from technical_levels through the
-    # data feed (MarketDataStore.get_htf_context, 2026-09-25 for the
-    # thresholds); the signature defaults are the values every preset
-    # ships, for the callers that build a context directly.
-    bullish_rsi_div: DivergenceMatch | None = None
-    bearish_rsi_div: DivergenceMatch | None = None
-    bullish_hidden_rsi_div: DivergenceMatch | None = None
-    bearish_hidden_rsi_div: DivergenceMatch | None = None
-    if divergence_enabled and "rsi14" in frame.columns and len(frame) > 0:
-        rsi_series = frame["rsi14"].astype(float)
-        if not rsi_series.dropna().empty:
-            highs_idx, lows_idx, bar_clock, price_scale = divergence_inputs(
-                frame, pivot_highs, pivot_lows, in_session=in_session,
-            )
-            last_bar_pos = max(0, len(frame) - 1)
-            move_frac = max(0.0001, float(divergence_min_price_move_pct))
-            rsi_delta = max(0.0, float(divergence_rsi_min_delta))
-            bullish_rsi_div = find_divergence(
-                lows_idx, rsi_series, kind="regular", direction="bullish",
-                indicator_name="rsi", price_move_frac=move_frac,
-                indicator_delta=rsi_delta, pivot_lookback=divergence_pivot_lookback,
-                max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
-                price_scale=price_scale, bar_clock=bar_clock,
-            )
-            bearish_rsi_div = find_divergence(
-                highs_idx, rsi_series, kind="regular", direction="bearish",
-                indicator_name="rsi", price_move_frac=move_frac,
-                indicator_delta=rsi_delta, pivot_lookback=divergence_pivot_lookback,
-                max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
-                price_scale=price_scale, bar_clock=bar_clock,
-            )
-            bullish_hidden_rsi_div = find_divergence(
-                lows_idx, rsi_series, kind="hidden", direction="bullish",
-                indicator_name="rsi", price_move_frac=move_frac,
-                indicator_delta=rsi_delta, pivot_lookback=divergence_pivot_lookback,
-                max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
-                price_scale=price_scale, bar_clock=bar_clock,
-            )
-            bearish_hidden_rsi_div = find_divergence(
-                highs_idx, rsi_series, kind="hidden", direction="bearish",
-                indicator_name="rsi", price_move_frac=move_frac,
-                indicator_delta=rsi_delta, pivot_lookback=divergence_pivot_lookback,
-                max_age_bars=divergence_max_age_bars, last_bar_pos=last_bar_pos,
-                price_scale=price_scale, bar_clock=bar_clock,
-            )
-
     return HTFContext(
         timeframe_minutes=int(timeframe_minutes),
         current_price=close,
@@ -565,8 +651,77 @@ def build_htf_context(
         nearest_bearish_fvg=nearest_bearish_fvg,
         trend_bias=trend_bias,
         level_buffer=max(atr * float(stop_buffer_atr_mult), close * 0.0010),
-        bullish_rsi_divergence=bullish_rsi_div,
-        bearish_rsi_divergence=bearish_rsi_div,
-        bullish_hidden_rsi_divergence=bullish_hidden_rsi_div,
-        bearish_hidden_rsi_divergence=bearish_hidden_rsi_div,
+        bullish_rsi_divergence=inputs.bullish_rsi_divergence,
+        bearish_rsi_divergence=inputs.bearish_rsi_divergence,
+        bullish_hidden_rsi_divergence=inputs.bullish_hidden_rsi_divergence,
+        bearish_hidden_rsi_divergence=inputs.bearish_hidden_rsi_divergence,
+    )
+
+
+def build_htf_context(
+    frame: pd.DataFrame,
+    *,
+    current_price: float | None = None,
+    timeframe_minutes: int = 60,
+    pivot_span: int = 2,
+    max_levels_per_side: int = 6,
+    atr_tolerance_mult: float = 0.35,
+    pct_tolerance: float = 0.0030,
+    same_side_min_gap_atr_mult: float = 0.10,
+    same_side_min_gap_pct: float = 0.0015,
+    fallback_reference_max_drift_atr_mult: float = 1.0,
+    fallback_reference_max_drift_pct: float = 0.01,
+    stop_buffer_atr_mult: float = 0.25,
+    ema_fast_span: int = 50,
+    ema_slow_span: int = 200,
+    flip_confirmation_bars: int = 1,
+    use_prior_day_high_low: bool = True,
+    use_prior_week_high_low: bool = True,
+    include_fair_value_gaps: bool = True,
+    fair_value_gap_max_per_side: int = 4,
+    fair_value_gap_min_atr_mult: float = 0.05,
+    fair_value_gap_min_pct: float = 0.0005,
+    divergence_enabled: bool = True,
+    divergence_pivot_lookback: int = 4,
+    divergence_max_age_bars: int = 6,
+    divergence_min_price_move_pct: float = 0.0015,
+    divergence_rsi_min_delta: float = 2.5,
+    as_of: date | None = None,
+) -> HTFContext:
+    """The HTF context of ``frame`` at ``current_price`` in one call:
+    ``prepare_htf_levels`` then ``htf_context_at``. ``as_of`` is the session
+    date the prior day / week are measured back from; None means the
+    clock's."""
+    inputs = prepare_htf_levels(
+        frame,
+        timeframe_minutes=timeframe_minutes,
+        pivot_span=pivot_span,
+        ema_fast_span=ema_fast_span,
+        ema_slow_span=ema_slow_span,
+        flip_confirmation_bars=flip_confirmation_bars,
+        use_prior_day_high_low=use_prior_day_high_low,
+        use_prior_week_high_low=use_prior_week_high_low,
+        divergence_enabled=divergence_enabled,
+        divergence_pivot_lookback=divergence_pivot_lookback,
+        divergence_max_age_bars=divergence_max_age_bars,
+        divergence_min_price_move_pct=divergence_min_price_move_pct,
+        divergence_rsi_min_delta=divergence_rsi_min_delta,
+        as_of=as_of,
+    )
+    return htf_context_at(
+        inputs,
+        current_price,
+        timeframe_minutes=timeframe_minutes,
+        max_levels_per_side=max_levels_per_side,
+        atr_tolerance_mult=atr_tolerance_mult,
+        pct_tolerance=pct_tolerance,
+        same_side_min_gap_atr_mult=same_side_min_gap_atr_mult,
+        same_side_min_gap_pct=same_side_min_gap_pct,
+        fallback_reference_max_drift_atr_mult=fallback_reference_max_drift_atr_mult,
+        fallback_reference_max_drift_pct=fallback_reference_max_drift_pct,
+        stop_buffer_atr_mult=stop_buffer_atr_mult,
+        include_fair_value_gaps=include_fair_value_gaps,
+        fair_value_gap_max_per_side=fair_value_gap_max_per_side,
+        fair_value_gap_min_atr_mult=fair_value_gap_min_atr_mult,
+        fair_value_gap_min_pct=fair_value_gap_min_pct,
     )
