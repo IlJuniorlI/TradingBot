@@ -270,8 +270,11 @@ A few of these values to know about:
   left owed in `.logs/sessions/<date>/archive_owed.json`, with the day's
   skip counts; the next start writes it, outside the trading days'
   7am-8pm stream windows, with `exporter_ran_session: false` and those
-  skip counts. Raising the timeout leaves that 12s as it is. In a terminal, a second Ctrl+C does nothing while the bot shuts
-  down; `kill -9` ends one that hangs.
+  skip counts. The file is written before each export starts too, so a
+  SIGKILL that cuts an export off leaves its day to the next start the
+  same way. Raising the timeout leaves that 12s as it is. In a terminal,
+  a second Ctrl+C does nothing while the bot shuts down; `kill -9` ends
+  one that hangs.
 - **`Restart=on-failure`** restarts on crash but NOT on clean exit
   (Ctrl+C / `systemctl stop`). If you want restart on any exit, use
   `Restart=always` — but that re-starts after a clean `auto_exit_after_session`
@@ -506,6 +509,9 @@ day archive each other's rows, under the exporting process's `dry_run`.
 Processes sharing `.logs` take turns at `trades.csv` through an advisory
 lock on `.logs/trades.csv.lock` (an empty file; leave it in place): an
 append that waits more than 5 s for it is retried like any failed append.
+The bot opens the lock file read-only, so `.logs` on an NFS mount needs
+the mount option `local_lock=flock` (NFS's own flock needs the file open
+for writing), or no append can take the lock.
 
 Disable globally with `runtime.export_session_archive: false` in your
 config if you're tight on disk.

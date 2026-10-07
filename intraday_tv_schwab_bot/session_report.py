@@ -1048,8 +1048,9 @@ def append_trades_csv(trades: Iterable[TradeRecord], *, log_dir: str, session_da
     day. The fresh file is written before it replaces the old one, so a
     failure leaves the old file in place. It runs at the first append after
     the upgrade whether or not there is a trade to write: with none, the
-    append is True whatever the rotation did (a file it cannot read, or a
-    rotation that fails, is logged, and the archive's read then names it).
+    append is True whatever the rotation did (a lock it cannot take, a file
+    it cannot read, or a rotation that fails, is logged, and the archive's
+    read then names it).
     """
     rows: list[dict[str, Any]] = []
     for trade in closed_trade_lifecycles(trades):
@@ -1069,6 +1070,10 @@ def append_trades_csv(trades: Iterable[TradeRecord], *, log_dir: str, session_da
         try:
             held.enter_context(_trades_csv_lock(log_path))
         except OSError as exc:
+            if not rows:
+                LOG.warning("Could not lock %s to check trades.csv's header: %s: %s",
+                            log_path / TRADES_CSV_LOCK_NAME, type(exc).__name__, exc)
+                return True
             LOG.warning("Could not lock %s, so %d trades were not appended: %s: %s",
                         log_path / TRADES_CSV_LOCK_NAME, len(rows), type(exc).__name__, exc)
             return False
@@ -1140,9 +1145,17 @@ def _trades_csv_lock(log_path: Path) -> Iterator[None]:
     rotation of it runs under it. The lock file stays, empty; the operating
     system frees the lock when its holder exits, however it exits. Raises
     OSError when the lock file cannot be opened or locked, and TimeoutError
-    when another holder keeps it ``TRADES_CSV_LOCK_WAIT_SECONDS``."""
+    when another holder keeps it ``TRADES_CSV_LOCK_WAIT_SECONDS``.
+
+    The file is opened for reading only, so a lock file this user cannot
+    write (one another user created) still locks: flock takes a lock
+    whatever the open mode, and Windows' LockFile, under msvcrt.locking,
+    needs read or write access. NFS is the exception: it emulates flock
+    with a byte-range lock, and an exclusive one needs the file open for
+    writing (flock(2)), so there the lock fails unless the mount keeps
+    flock local (``local_lock=flock``)."""
     path = log_path / TRADES_CSV_LOCK_NAME
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o666)
     try:
         deadline = time.monotonic() + TRADES_CSV_LOCK_WAIT_SECONDS
         while not _try_lock(fd):

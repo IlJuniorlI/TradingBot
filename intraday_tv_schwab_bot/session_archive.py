@@ -1196,8 +1196,9 @@ def session_archive_manifest_path(log_dir: str, session_date: date) -> Path:
 
 def session_archive_owed_path(log_dir: str, session_date: date) -> Path:
     """The ``archive_owed.json`` a shutdown leaves in the folder of an
-    archive it did not write (``leave_session_archive_owed``), so that the
-    next start writes it; ``export_session_archive`` removes it."""
+    archive it did not write (``leave_session_archive_owed``; it writes one
+    before each of its exports too), so that the next start writes it;
+    ``export_session_archive`` removes it."""
     return session_archive_root(log_dir, session_date) / "archive_owed.json"
 
 
@@ -1303,11 +1304,13 @@ def export_session_archive(
     - ``manifest.json`` — strategy, dry_run, summary stats, skip counts,
       timeframes exported, write-flags for each archive component.
     - ``archive_owed.json`` — only while the archive is owed: a shutdown
-      that did not write it leaves one (``leave_session_archive_owed``),
-      and the export removes it once the manifest is written.
+      that did not write it leaves one (``leave_session_archive_owed``), as
+      does one whose export is cut off (a shutdown writes it before each
+      export starts), and the export removes it once the manifest is
+      written.
 
     Raises OSError when the archive directory or ``manifest.json`` cannot
-    be written, or the ``archive_owed.json`` an earlier shutdown left
+    be written, or the ``archive_owed.json`` a shutdown left
     (``leave_session_archive_owed``) cannot be removed once it is: the
     archive is then not written, and the engine retries it. Every other
     stage logs its own failure and the stages after it run.

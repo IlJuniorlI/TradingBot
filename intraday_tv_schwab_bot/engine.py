@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import sqlite3
 import time
@@ -240,8 +241,8 @@ ARCHIVE_RETRY_MAX_SECONDS = 1800.0
 # so one started by then ends by about 25 s: inside the deploy guide's
 # TimeoutStopSec=30s, whose SIGKILL would cut it off half-written, with room
 # for a longer day and the exit. A day whose export the shutdown does not
-# start, or whose export fails there, is left owed to the next start
-# (``archive_owed.json`` in its archive's folder).
+# start, or whose export fails there or is cut off, is left owed to the next
+# start (``archive_owed.json`` in its archive's folder).
 SHUTDOWN_EXPORT_START_SECONDS = 12.0
 
 
@@ -386,10 +387,11 @@ class IntradayBot:
         # append either way, so its own trades of that evening (an exit its
         # start-up reconcile books) reach trades.csv on its first pass, not
         # only at its shutdown (`_append_trades_csv`). An archive an earlier
-        # shutdown left owed (it ran out of time, or the export failed:
-        # `archive_owed.json`) of a day that has ended is written the same
-        # way, with the skip tally that shutdown left with it, outside the
-        # trading days' stream windows.
+        # shutdown left owed (it ran out of time, or the export failed or
+        # was cut off: `archive_owed.json`) of a day that has ended, a
+        # trading day or not, is written the same way, with the skip tally
+        # that shutdown left with it, outside the trading days' stream
+        # windows.
         self._day_closes: dict[date, _DayClose] = {}
         # `run`'s stop signals, while it runs: the shutdown's export budget
         # counts from the first (`_since_stop_signal`).
@@ -401,8 +403,12 @@ class IntradayBot:
         self._closes_scheduled_through: date = self._latest_ended_trading_day(started)
         ended = self._closes_scheduled_through
         for day, skip_counts in owed_session_archives(self.config.runtime.log_dir).items():
-            if day > ended:
-                continue          # still running: this process closes it at its 20:00
+            if day > ended and day >= started.date():
+                # Today, not over: owed at its 20:00 close on a trading day
+                # (`_owes_archive`) and by a shutdown today; a non-trading
+                # day this process runs past is left to a later start. An
+                # earlier day has ended, a trading day or not.
+                continue
             if not self.config.runtime.export_session_archive:
                 LOG.info("The %s archive an earlier shutdown left owed stays owed: archives are off", day)
                 continue
@@ -1312,9 +1318,11 @@ class IntradayBot:
         within ``SHUTDOWN_EXPORT_START_SECONDS`` of the stop signal (all of
         them on a shutdown no signal started, such as the auto-exit), whatever
         the back-off says. A day whose export is not started, or fails, is
-        left owed to the next start (``archive_owed.json``), with a WARNING;
-        a day whose append failed is exported anyway, its manifest naming
-        the trades the file lacks."""
+        left owed to the next start (``archive_owed.json``) with a WARNING.
+        The file is written before each export starts and removed by the
+        export once its manifest is written, so a kill that cuts an export
+        off leaves its day owed too. A day whose append failed is exported
+        anyway, its manifest naming the trades the file lacks."""
         for day in sorted(self._day_closes):
             owed = self._day_closes[day]
             if not owed.archive:
@@ -1324,6 +1332,15 @@ class IntradayBot:
                 self._leave_archive_owed(day, f"not started: {since_stop:.0f} s after the stop signal, past the "
                                               f"{SHUTDOWN_EXPORT_START_SECONDS:.0f} s the shutdown starts exports in")
                 continue
+            # Owed until the export removes it after the manifest, so a
+            # SIGKILL that cuts the export off leaves the day to the next
+            # start; an export that fails rewrites it with its reason.
+            try:
+                leave_session_archive_owed(self.config.runtime.log_dir, day,
+                                           "its export started at shutdown and did not finish", owed.skip_counts)
+            except OSError as exc:
+                LOG.warning("Shutdown: the %s archive could not be left owed before its export, so a kill during "
+                            "the export would lose it: %s: %s", day, type(exc).__name__, exc)
             try:
                 self._export_session_archive(day, owed)
             except Exception as exc:
@@ -1342,10 +1359,18 @@ class IntradayBot:
 
     def _leave_archive_owed(self, day: date, why: str) -> None:
         """Leave ``day``'s archive, which this shutdown did not write, to the
-        next start (``archive_owed.json``), with the day's skip tally."""
+        next start (``archive_owed.json``), with the day's skip tally. A
+        file that cannot be rewritten still leaves the day owed when one is
+        there (written before its export, or by an earlier shutdown), under
+        that file's reason."""
+        log_dir = self.config.runtime.log_dir
         try:
-            leave_session_archive_owed(self.config.runtime.log_dir, day, why, self._day_closes[day].skip_counts)
+            leave_session_archive_owed(log_dir, day, why, self._day_closes[day].skip_counts)
         except OSError as exc:
+            if os.path.isfile(session_archive_owed_path(log_dir, day)):
+                LOG.warning("Shutdown: the %s archive is not written (%s): the next start writes it, though its "
+                            "archive_owed.json could not be rewritten: %s: %s", day, why, type(exc).__name__, exc)
+                return
             LOG.error("Shutdown: the %s archive is not written (%s) and could not be left owed for the next start: "
                       "%s: %s", day, why, type(exc).__name__, exc)
             return
