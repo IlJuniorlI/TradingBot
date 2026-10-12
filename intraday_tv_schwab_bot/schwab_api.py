@@ -2,11 +2,12 @@
 """The Schwab HTTP client wrapper: every broker call goes through here.
 
 ``call_schwab_client`` counts the call, serializes the token refresh and logs
-a non-2xx response. ``response_ok`` is the one reading of a response status.
-``SCHWAB_TRANSPORT_ERRORS`` are the transport failures the client raises,
-and ``SCHWAB_WRITE_UNKNOWN_OUTCOME`` those an order write raises without
-telling whether the broker acted on it. ``schwab_failure_is_systemic`` and
-``schwab_status_is_systemic`` name the failures every other request would
+a non-2xx response; ``call_schwab_json`` reads its JSON body
+(``schwab_json_body``). ``response_ok`` is the one reading of a response
+status. ``SCHWAB_TRANSPORT_ERRORS`` are the transport failures the client
+raises, and ``SCHWAB_WRITE_UNKNOWN_OUTCOME`` those an order write raises
+without telling whether the broker acted on it. ``schwab_failure_is_systemic``
+and ``schwab_status_is_systemic`` name the failures every other request would
 meet too. ``PooledSchwabClient`` is the client the bot builds: schwabdev's,
 with requests that can be in flight together.
 """
@@ -353,15 +354,22 @@ def schwab_failure_is_systemic(error: BaseException) -> bool:
 
 
 def call_schwab_json(client: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
-    """Call ``method_name`` and return its decoded JSON body.
+    """Call ``method_name`` and return its decoded JSON body
+    (``schwab_json_body``). A transport failure propagates unchanged, as one
+    of ``SCHWAB_TRANSPORT_ERRORS``.
+    """
+    return schwab_json_body(method_name, call_schwab_client(client, method_name, *args, **kwargs))
+
+
+def schwab_json_body(method_name: str, response: Any) -> Any:
+    """The decoded JSON body of ``response``, which ``method_name`` returned.
 
     The response must be 2xx (``response_ok``) and its body must decode.
-    Anything else raises ``SchwabHTTPError``, so an error body is never read
-    as an empty payload. The decoded body can be any JSON value, not only an
-    object (a list, null, a string). A transport failure propagates
-    unchanged, as one of ``SCHWAB_TRANSPORT_ERRORS``.
+    Anything else raises ``SchwabHTTPError`` (from the decoding error, for a
+    body that does not decode), so an error body is never read as an empty
+    payload. The decoded body can be any JSON value, not only an object (a
+    list, null, a string).
     """
-    response = call_schwab_client(client, method_name, *args, **kwargs)
     status = getattr(response, "status_code", None)
     if not response_ok(response):
         raise SchwabHTTPError(method_name, status, f"body={_truncate_log_text(getattr(response, 'text', ''))}")

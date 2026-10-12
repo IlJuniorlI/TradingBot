@@ -539,14 +539,19 @@ class RuntimeConfig:
     # (engine._compute_symbol_map). Replaced cycle_precompute_workers, which
     # sized one pool for both, 2026-09-28.
     cycle_fetch_workers: int = 4
-    # Per-symbol quote-fetch failure threshold. When a symbol fails this
-    # many consecutive quote fetches (typically Schwab 401/403/404), it
-    # is blacklisted from quote refresh for the remainder of the session.
-    # Recovers on bot restart. Counter resets on any successful fetch.
-    # Set to 0 to disable (always retry — pre-2026-04-29 behavior). The
-    # default 5 catches symbol-specific permission errors (e.g. restricted
-    # securities like KNRX 2026-04-29: 457 wasted 401 retries) without
-    # blacklisting on transient hiccups.
+    # Per-symbol quote-fetch failure threshold. When this many of a
+    # symbol's own quote fetches failed in a row, no single quote of it is
+    # requested for the remainder of the session
+    # (MarketDataStore._note_quote_failure). A failure about the request (a
+    # 400/403/404) counts; a systemic one (a transport failure, 401, 429, a
+    # 5xx) only when no other REST request failed so since Schwab last
+    # answered one, so an outage alone blacklists none (2026-09-25: all 28
+    # until restart). Recovers on bot restart. Counter resets on any answer
+    # for the symbol, a single quote or a batch's. Set to 0 to disable
+    # (always retry — pre-2026-04-29 behavior). The default 5 catches
+    # symbol-specific permission errors (e.g. restricted securities like
+    # KNRX 2026-04-29: 457 wasted 401 retries) without blacklisting on
+    # transient hiccups.
     max_consecutive_quote_failures: int = 5
     # Shadow check of the level and context memos (context_memo): each memo
     # hit is rebuilt with probability 1/N and compared with what the memo
