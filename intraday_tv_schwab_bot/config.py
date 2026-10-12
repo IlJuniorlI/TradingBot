@@ -543,11 +543,15 @@ class RuntimeConfig:
     # symbol's own quote fetches failed in a row, no quote of it is
     # requested for the remainder of the session, alone or in a batch
     # (MarketDataStore._note_quote_failure). A failure about the request (a
-    # 400/403/404) counts; a systemic one (a transport failure, 401, 429, a
-    # 5xx) only when no other REST request failed so since Schwab last
-    # answered one, so an outage that fails every request blacklists none
-    # (2026-09-25: all 28 until restart). A held position's symbol is never
-    # blacklisted: its failed REST quote requests are spaced out instead
+    # 400/403/404) counts; a systemic one (a transport failure or a timeout,
+    # 401, 429, a 5xx) only when it is the symbol's own: a 401 or a 5xx
+    # refusal of its single quote after Schwab answered the batch it was
+    # left out of (or its round's first single), or its first quote failure
+    # since Schwab last answered a REST request, while no other request
+    # failed so since, nor another single sent with it. So an outage that
+    # fails every request blacklists none (2026-09-25: all 28 until
+    # restart). A held position's symbol is never blacklisted: its failed
+    # REST quote requests are spaced out instead
     # (data_feed.REST_RETRY_SECONDS). Recovers on bot restart. Counter
     # resets on any answer for the symbol, a single quote or a batch's. Set
     # to 0 to disable (always retry — pre-2026-04-29 behavior). The default
