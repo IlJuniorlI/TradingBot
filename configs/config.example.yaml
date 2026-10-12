@@ -198,14 +198,14 @@ runtime:
   cycle_fetch_workers: 4
   # Per-symbol quote-fetch failure threshold. After this many of a
   # symbol's own quote fetches fail in a row (typically Schwab 401/403/404
-  # on restricted securities), no single quote of it is requested for the
-  # rest of the session. A systemic failure (a transport failure, 401, 429,
-  # a 5xx) counts only when no other REST request failed so since Schwab
-  # last answered one: an outage that fails every request blacklists none.
-  # A held position's symbol is never blacklisted (its failed REST quote
-  # requests are spaced out instead). Counter resets on any answer for the
-  # symbol; blacklist clears on bot restart. Set to 0 to disable (always
-  # retry).
+  # on restricted securities), no quote of it is requested for the rest of
+  # the session, alone or in a batch. A systemic failure (a transport
+  # failure, 401, 429, a 5xx) counts only when no other REST request failed
+  # so since Schwab last answered one: an outage that fails every request
+  # blacklists none. A held position's symbol is never blacklisted (its
+  # failed REST quote requests are spaced out instead). Counter resets on
+  # any answer for the symbol; blacklist clears on bot restart. Set to 0 to
+  # disable (always retry).
   max_consecutive_quote_failures: 5
   # Shadow check of the S/R, FVG, order-block and strategy context memos:
   # each memo hit is rebuilt with probability 1/N and compared; a

@@ -540,15 +540,15 @@ class RuntimeConfig:
     # sized one pool for both, 2026-09-28.
     cycle_fetch_workers: int = 4
     # Per-symbol quote-fetch failure threshold. When this many of a
-    # symbol's own quote fetches failed in a row, no single quote of it is
-    # requested for the remainder of the session
+    # symbol's own quote fetches failed in a row, no quote of it is
+    # requested for the remainder of the session, alone or in a batch
     # (MarketDataStore._note_quote_failure). A failure about the request (a
     # 400/403/404) counts; a systemic one (a transport failure, 401, 429, a
     # 5xx) only when no other REST request failed so since Schwab last
     # answered one, so an outage that fails every request blacklists none
     # (2026-09-25: all 28 until restart). A held position's symbol is never
     # blacklisted: its failed REST quote requests are spaced out instead
-    # (data_feed.HELD_QUOTE_RETRY_SECONDS). Recovers on bot restart. Counter
+    # (data_feed.REST_RETRY_SECONDS). Recovers on bot restart. Counter
     # resets on any answer for the symbol, a single quote or a batch's. Set
     # to 0 to disable (always retry — pre-2026-04-29 behavior). The default
     # 5 catches symbol-specific permission errors (e.g. restricted

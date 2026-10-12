@@ -280,12 +280,14 @@ class _DayClose:
 @dataclass(slots=True)
 class _HtfCycle:
     """One cycle's HTF refresh (``IntradayBot._refresh_htf_frames``): the
-    symbols it tried, each once a cycle, and whether it sent its probe to a
+    symbols it tried, each once a cycle, whether it sent its probe to a
     symbol outside ``MarketDataStore.htf_failing_symbols`` and to one of
-    them."""
+    them, and whether the REST back-off held its probe back (then it sends
+    none)."""
     attempted: set[str] = field(default_factory=set)
     probed: bool = False
     probed_failing: bool = False
+    held_back: bool = False
 
 
 class IntradayBot:
@@ -1916,14 +1918,21 @@ class IntradayBot:
         before the map ends, and then they are sent at once. From then on a
         cycle sends one fetch, the probe, at its first point with a due
         symbol, until one is answered; the point whose probe is answered
-        fetches the rest of its due symbols (2026-10-11). The symbols whose
-        latest fetch failed systemically (``MarketDataStore
-        .htf_failing_symbols``) go last in every map, the one that failed
-        longest ago first, and the probe is another due symbol when there is
-        one: a symbol that fails on its own every time (a 5xx about it) is
-        fetched once a cycle and holds no other symbol (when only such
-        symbols are due the probe is one of them, and a symbol due later in
-        that cycle gets a probe of its own). Until then an outage sent every
+        fetches the rest of its due symbols (2026-10-11). While the REST
+        back-off waits (``MarketDataStore.rest_backoff_waiting``: after the
+        probe or a REST quote read of a symbol not held failed
+        systemically, 30 s doubling to 120 s, until Schwab answers a
+        request) the cycle sends no probe, at its first point with a due
+        symbol or later, so an outage costs a probe's retries once a wait,
+        not every cycle, and the frames come back at most one wait after
+        Schwab does. The symbols whose latest fetch failed systemically
+        (``MarketDataStore.htf_failing_symbols``) go last in every map, the
+        one that failed longest ago first, and the probe is another due
+        symbol when there is one: a symbol that fails on its own every time
+        (a 5xx about it) is fetched once a cycle and holds no other symbol
+        (when only such symbols are due the probe is one of them, and a
+        symbol due later in that cycle gets a probe of its own when the
+        back-off does not wait). Until then an outage sent every
         due symbol's fetch at every cycle (28 a pass on top_tier), and under
         a 429 each spent about 3 s in schwabdev's retries, one fetch at a
         time (schwabdev's lock; the pooled client's while Schwab fails).
@@ -1949,12 +1958,22 @@ class IntradayBot:
         due = others + [symbol for symbol in failing if symbol in due]
         refreshed: list[str] = []
         if self.data.htf_failing_since is not None:
+            if cycle.held_back:
+                return
             if others and not cycle.probed:
-                probe, cycle.probed = others[0], True
+                probe, outside = others[0], True
             elif not others and not cycle.probed and not cycle.probed_failing:
-                probe, cycle.probed_failing = due[0], True
+                probe, outside = due[0], False
             else:
                 return
+            if self.data.rest_backoff_waiting():
+                cycle.held_back = True
+                LOG.debug("HTF refresh (%s): the probe waits for the REST back-off", where)
+                return
+            if outside:
+                cycle.probed = True
+            else:
+                cycle.probed_failing = True
             cycle.attempted.add(probe)
             refreshed += self._fetch_htf_frames([probe], tf, lookback_days, where=f"{where}, probe", probe=True)
             due.remove(probe)
@@ -1970,13 +1989,17 @@ class IntradayBot:
                           probe: bool) -> list[str]:
         """One map of ``_refresh_htf_frames``: fetch ``symbols``' HTF frames
         on the fetch pool, log the outcome and return the symbols stored.
-        Unless it is the probe, a symbol whose turn comes while a fetch has
-        failed systemically (``MarketDataStore.htf_failing_since``) is not
-        sent; when a fetch still in flight then is answered (a symbol that
-        failed on its own while others answered), the map sends them after
-        it, at once."""
+        The probe's fetch is ``MarketDataStore.probe_htf_frame``, whose
+        systemic failure starts or extends the REST back-off. Unless it is
+        the probe, a symbol whose turn comes while a fetch has failed
+        systemically (``MarketDataStore.htf_failing_since``) is not sent;
+        when a fetch still in flight then is answered (a symbol that failed
+        on its own while others answered), the map sends them after it, at
+        once."""
         def _refresh(symbol: str) -> bool | None:
-            if not probe and self.data.htf_failing_since is not None:
+            if probe:
+                return self.data.probe_htf_frame(symbol, timeframe_minutes=tf, lookback_days=lookback_days)
+            if self.data.htf_failing_since is not None:
                 return None
             return self.data.refresh_htf_frame(symbol, timeframe_minutes=tf, lookback_days=lookback_days)
 
