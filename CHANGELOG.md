@@ -222,16 +222,18 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     value, up to 6 hours, before each retry), and longer when the name
     lookup hangs, which the timeout does not bound (about 110 s a request on
     10-02). The back-off spaces those holds out: in the first 15 minutes of
-    an outage four checks at most. Off the engine thread it would hold the
-    engine's own REST requests, an exit's included, behind schwabdev's one
-    request lock. The fetch pool's single quotes hand their outcomes to the
-    engine thread, which folds a call's once its requests are done, in the
-    symbols' order (a pool request's own time includes its wait for that
-    lock, so the pool is judged slow by its average, never by one request),
-    and stores their quotes in that order. At 20 on 2.5-4 s passes, one
-    batch request every 50-80 s, about 300-470 a day; the setting is
-    revisited after the dry-run day. A check that raises otherwise is logged
-    with its type and never fails the pass.
+    an outage four checks at most. Off the engine thread it would have held
+    the engine's own REST requests, an exit's included, behind schwabdev's
+    one request lock (since 2026-10-11 the pooled client holds them only
+    while it sends one at a time after a systemic failure). The fetch
+    pool's single quotes hand their outcomes to the engine thread, which
+    folds a call's once its requests are done, in the symbols' order, and
+    stores their quotes in that order (each request judged by its own time
+    since 2026-10-11; until then a pool request's time included its wait
+    for that lock, so the pool was judged by its average). At 20 on 2.5-4 s
+    passes, one batch request every 50-80 s, about 300-470 a day; the
+    setting is revisited after the dry-run day. A check that raises
+    otherwise is logged with its type and never fails the pass.
   - Logs: `Quote refresh ... stream=N` (mode `stream` when no REST request
     was needed; the other modes as before;
     `source=engine:position_management_stream` for management's stream
@@ -278,7 +280,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     presets' indices, an option leg, or a book not complete yet) still takes
     REST there every `quote_cache_seconds`, ahead of management, as before
     (on the peer presets about 2 minutes a pass when every request's reads
-    time out, about 1 minute once their single quotes are blacklisted).
+    timed out, about 1 minute once their single quotes were blacklisted;
+    since 2026-10-11 one batch request a refresh, about 31 s when reads time
+    out, and a symbol that goes alone, such as an index whose alias is not
+    known yet, once a wait of the REST back-off: under Fixed).
   - Measured (the replay harness streaming L1 valued as its REST quotes):
     10-01 09:40-10:40 (top_tier, 28 symbols) takes 10 batch quote requests
     instead of 181 (the first pass's, before the books fill, and the
@@ -1205,6 +1210,158 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gates ran, which were exempt and what the shared score was.
 
 ### Changed
+
+- **The Schwab client sends the fetch pool's requests together
+  (`PooledSchwabClient`), one at a time after a systemic failure until
+  Schwab answers; at most 9 `runtime.cycle_fetch_workers`.** *2026-10-11*
+  — schwabdev 4.0.0's
+  `Client._request` holds one lock over each whole HTTP request, its
+  retries and their back-off included, and the bot shares its one client
+  between the engine thread and its pools, so the fetch pool overlapped no
+  request. On 2026-10-07 each of the 27 15m boundaries' maps of 28 HTF
+  fetches started four at once, then one every 0.21-0.24 s (each map's
+  median) as the request before it finished, and took 6.0-11.1 s (median
+  6.55 s); the 09:15 pass's three maps of 28 (the 1m history, the daily
+  history, the HTF frames) took 8.1, 7.3 and 7.5 s of its 26.5 s.
+  - `schwab_api.PooledSchwabClient` (new, a `schwabdev.Client`):
+    `pool_size` `requests.Session`s, each mounted with the client's own
+    adapters (`Client.__init__`'s, https and http), so the requests share
+    their connection pools and keep schwabdev's `Retry`: GET, PUT and
+    DELETE retried, a POST never (`SCHWAB_WRITE_UNKNOWN_OUTCOME` keeps its
+    premise). Each request borrows the most recently returned session (a
+    borrower past `pool_size` waits for one), stamps the current access
+    token on it and sends with no lock held across the network.
+    `pool_size` must be an integer of at least 1, checked before
+    schwabdev reads a token; `close` (also run from `__del__`) is quiet on
+    a client schwabdev never built.
+  - After a request fails systemically (it answered 401, 429 or a 5xx,
+    or raised a transport failure or a timeout:
+    `schwab_failure_is_systemic` and `schwab_status_is_systemic`, new; a
+    400, 403 or 404, a body that does not decode and any other exception
+    are about the request) the requests that start go one at a time until
+    any request is answered otherwise. The ones already in flight when the
+    failure came, up to `cycle_fetch_workers`, meet it together, each with
+    its own retries, and a limit that answers some requests meets that
+    many at once again after each answer. Without it, 40 s in which every
+    price_history request answered 429, over a 09:15 prewarm replayed
+    through a loopback Schwab, drew 246 of them a minute through the pool
+    and failed all 28 1m fetches and 12 daily ones; with it 80 a minute
+    and 13 1m fetches failed, through schwabdev's client 62 and 10.
+  - The engine builds it with `pool_size` = `runtime.cycle_fetch_workers`
+    + 1 (a session for each fetch-pool worker and one for the engine
+    thread) and no longer imports schwabdev's `Client`; the data feed, the
+    executor and the stream share it as before.
+  - What overlaps now: the fetch pool's maps (the 1m history, the HTF
+    refresh points, the daily-history prefetch), the quote refresh's
+    single-quote fallbacks, the 0DTE chain prefetch (up to four threads)
+    and the start-up reconcile's two reads. Each pool runs while the engine
+    thread waits for it, and the stream thread (its streamer-info request
+    goes through `requests.get`) and the dashboard send nothing through the
+    client, so an order write is never in flight beside another of its
+    requests. Requests sent one after another, the engine thread's orders
+    included, take the session the one before returned, with its cookies.
+    The bot keeps up to `cycle_fetch_workers` + 1 connections to Schwab
+    where it kept one.
+  - The access token: the refresh stays serialized
+    (`_refresh_token_serialized` covers the subclass as schwabdev's
+    client), and a token another path refreshed reaches the next request.
+    The stream's (re)connect refreshes a token due for it through
+    `client.tokens` (`ClientBase._get_streamer_info`), which left
+    schwabdev's session header on the old token, lapsing within the
+    minute, until the next refresh through the client some 29 minutes
+    later; every REST request in between would have carried it (latent:
+    no 401 on the six archived days 2026-09-29 to 10-07).
+  - Measured through a loopback HTTPS Schwab at production's latencies on
+    the 2026-09-29 code (the real `step()` at real-time pace, schwabdev's
+    client against this one, alternated): over 9 boundary passes a
+    boundary's HTF map 6.67 s → 3.39 s and the worst management gap around
+    it 15.47 s → 11.88 s (medians); over 6 cold 09:15 prewarm passes the
+    daily map 6.93 s → 2.26 s, the 1m map 7.13 s → 5.69 s (the parse of
+    each answer holds the GIL) and the three maps 23.9 s → 17.4 s. A
+    regular pass, whose maps are empty and whose quote request, when it
+    makes one, is a batch on the engine thread, does not change.
+  - Config: `runtime.cycle_fetch_workers` is an integer from 1 to 9 (any
+    integer of at least 1 loaded before), checked at load, and a refusal
+    names why: the client's sessions, one more than it, stay within the 10
+    connections schwabdev's adapter keeps to a host; past them urllib3
+    closes each extra connection after its request with a WARNING
+    (`Connection pool is full, discarding connection`). Every preset ships 4. The README's
+    `cycle_fetch_workers`, `config.example.yaml`'s comment and the
+    engine's `_fetch_symbol_map` docstring say the pool's requests
+    overlap.
+  - Decisions: none. Every endpoint the bot calls sends the same request
+    through both clients (method, path and query, every header in its
+    order, the body), and the answers are read as before; what changes is
+    when a pool's answers arrive and the order of the lines its threads
+    write. The REST shadow's judgment of the fetch pool's single quotes,
+    which their overlap changes, is the quote path's change (under Fixed).
+
+- **An HTF context built at a new price no longer rebuilds its stored
+  frame's bars, and the structure context checks a step frame's bars once:
+  on top_tier about 7 ms less CPU a pass, about 40 ms less on a new 1m
+  bar's pass.** *2026-10-11* — building each HTF context at its reader's
+  price
+  and checking a step frame's bars before its memos are used (both
+  2026-10-07) made top_tier's passes heavier: a realtime replay of
+  2026-10-01 from 10:43 measured the contexts phase at 68 ms a pass against
+  42 ms before them (medians, wall time), the entries at 257 against 247.
+  Stepped profiles of 10-01 10:40-10:50 (28 symbols, a pass every 2.5 s,
+  process CPU, on integer volumes as Schwab's candles give them) put the
+  contexts phase's 25 ms in these places:
+  - each context at a new price read its stored frame through
+    `bars.ensure_ohlcv_frame` (its fair value gaps), whose shortcut for a
+    clean frame refused an integer volume, although the rebuild hands such
+    a frame back unchanged: about 1.3 ms a read, and every frame built from
+    Schwab's candles has one (the stored HTF frames, the 1m history). That
+    was 28 rebuilds on a new bar's pass and one in each shadow re-check of
+    a context at a price, and on each 15m refresh pass 112 more (each
+    stored frame's candle parse, its indicators twice, and the dashboard's
+    HTF trend rows);
+  - the structure context checked a step frame's bars
+    (`bars.verified_frame`, about 0.18 ms) and checked them again to
+    derive its 5m frame: 28 a pass, 5 ms;
+  - the context memo's shadow re-checks the HTF contexts
+    (`runtime.context_memo_shadow_every` 20: about 1.4 of the 28
+    price-free parts and 1.5 of the contexts at a price a pass, each a
+    rebuild of about 3 ms, 4.6 for a context at a price with the rebuild
+    above, and a comparison): about 15 ms a pass;
+  - the two memo reads of each HTF context a pass: about 2.5 ms.
+
+  What changed:
+  - `bars.is_clean_ohlcv_frame` (was the private `_already_clean_ohlcv`)
+    takes an int64 volume as clean: it holds no NaN and the rebuild keeps
+    it as it is, so `ensure_ohlcv_frame` copies such a frame instead of
+    rebuilding it. `htf_levels._htf_frame` reads a stored frame through the
+    same test; its own copy of it is gone.
+  - `ContextBuildersMixin._resampled_bars` is `_resampled_frame`'s build
+    from a frame its caller has just checked; the structure context
+    derives its 5m frame through it.
+  - Left as they are, each the price of its check: the shadow re-checks
+    every slot it did at the rate it did (only its rebuilds of the
+    contexts at a price got cheaper), and `verified_frame`'s other reads of
+    a step frame (the entry pass's LTF, the dashboard's gaps: about 10 ms a
+    pass) are what sees a write into the frame between them. Checking a
+    frame once a pass would let a write made after that check file builds
+    of bars the frame no longer holds into the memos that outlive the pass.
+  - What it saves, by count (about 0.18 ms a check, 1.3 ms a rebuild):
+    about 7 ms a pass with no new bar (28 checks and about 1.4 shadow
+    re-checks at a price), about 40 ms on a new 1m bar's pass (28 rebuilds
+    and 28 checks), and 112 rebuilds on each 15m refresh pass.
+  - Measured (process CPU per pass, median of three stepped runs, on
+    integer volumes as Schwab's candles give them): a pass with no new bar
+    529.5 → 519.5 ms (the contexts phase 66.4 → 57.7, against 41.3 before
+    the 2026-10-07 HTF and frame-check changes), a pass with a new bar
+    1,817 → 1,727 ms (the mean of one window's; most of that difference
+    is where gen-2 garbage collection fell, the 28 HTF contexts built at
+    the new price 132 → 94 ms, and 2026-10-06's window gave 18 ms). On the
+    archive's float volumes, which the replay harness serves, the
+    no-new-bar pass 524.7 → 520.8 ms (the contexts phase 63.8 → 57.8).
+  - Decisions: none. A stepped replay of top_tier 2026-10-01 09:40-10:40
+    is byte-identical, and so is the same window on integer volumes;
+    42,000 builds on the archive's frames of seven days with integer
+    volumes (the frames themselves, the resamples, the HTF contexts at
+    four prices, their gaps, the order blocks, the S/R contexts, on the
+    HTF and the 1m frames) give the same bytes.
 
 - **The paper account marks a held equity at the price management read
   for it in the pass, not at its last 1m close.** *2026-10-07* — the only
@@ -2142,10 +2299,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `cycle_precompute_workers` (4 in every preset). The work is pandas, numpy
   and TA-Lib on small frames and holds the GIL nearly all the time, so the
   pool never overlapped it: it added CPU time and made the maps slower. The
-  fetches keep their pool, but it overlaps no HTTP either (corrected
+  fetches keep their pool, but it overlapped no HTTP either (corrected
   2026-10-05; this said a pool overlaps them): schwabdev 4.0.0's
   `Client._request` holds one lock around every request, its retries
-  included, so the fetches reach Schwab one at a time. The dry-run days of
+  included, so the fetches reached Schwab one at a time until the pooled
+  client sent them together (2026-10-11, under Changed). The dry-run days of
   2026-09-29 to 10-02 show it: a 15m boundary's 28 HTF fetches took 5.9 to
   9.8 s (22.0 s once, while Schwab was slow), one starting about every
   0.24 s.
@@ -5374,6 +5532,291 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `levels_shared.find_divergence` a required `bar_clock`.
 
 ### Fixed
+
+- **An outage or a rate limit stops the HTF refresh's map: one probe a
+  cycle at most, spaced by the REST back-off, until Schwab answers, then
+  the rest at once; a symbol Schwab refuses on its own holds no other.**
+  *2026-10-11* — the engine's HTF refresh points sent every due symbol's
+  fetch at every pass, whatever the fetches before had met: a failed fetch
+  stayed due, and the next pass sent them all again. Stepped on the test
+  harness's synthetic tapes through a 3-minute outage across the 10:15
+  boundary (the top_tier preset's 28 HTF symbols, 8 s passes, every 15m
+  request answered 401, then again with 429), the bot sent 588 refused HTF
+  requests in 21 passes, 28 a pass. Under a real 429 schwabdev's adapter
+  sends each fetch up to four times over about 3 s of back-off, and the
+  client sends one request at a time while Schwab fails
+  (`PooledSchwabClient`), so a boundary's 28 fetches could hold their pass,
+  management included, for over a minute (24 of them one at a time, each
+  about 3 s of back-off and four answers). On the 2026-09-25 token outage
+  (an earlier version, whose reads fetched) the HTF fetches failed 60-112
+  times a minute, 9,823 from 14:15 to 15:55.
+  - `MarketDataStore.refresh_htf_frame` marks the feed failing
+    (`htf_failing_since`, new) when a fetch fails systemically
+    (`schwab_failure_is_systemic`: a transport failure or a timeout, 401,
+    429 or a 5xx, which every other fetch would meet too). Any answer
+    clears the mark: the frame, or a failure about the request (a 400, 403
+    or 404, a body that does not decode, a parameter schwabdev's validator
+    refused). Each change logs one WARNING. `htf_failing_symbols` (new)
+    keeps each symbol whose latest fetch failed systemically, with that
+    failure's time (and how many REST requests Schwab had answered by
+    then), until its own fetch is answered.
+  - `IntradayBot._refresh_htf_frames`: a fetch that fails systemically
+    stops its map, and the fetches not started yet are not sent (the ones
+    in flight, up to `cycle_fetch_workers`, finish); when one of those is
+    then answered (a symbol that failed on its own while the others
+    answered), the map sends the ones not sent at once. While the mark is
+    set a cycle sends one fetch, the probe, at its first point with a due
+    symbol; the point whose probe is answered fetches the rest of its due
+    symbols and builds their contexts as after any mid-cycle refresh. A
+    probe that fails systemically (`MarketDataStore.probe_htf_frame`, new)
+    starts or extends the REST back-off (the quote path's entry, below),
+    unless the failure is its symbol's own, by the rule a quote batch's is:
+    its fetch failed systemically the time before too, at most 120 s
+    before, and Schwab answered another REST request in between, which an
+    outage would have failed too. While the back-off waits (30 s, doubled
+    for each further such failure, at most 120 s, until Schwab answers any
+    of the data feed's requests) a cycle sends no probe, at its first point
+    with a due symbol or later, but a new bucket's first probe outside the
+    failing symbols (`MarketDataStore.htf_settled_bucket`, new) goes all
+    the same, at the first point its symbols are due, also in a cycle that
+    sent its probe before the boundary settled: a probe holds its pass for
+    its retries (about 31 s when reads time out) once a wait, and once more
+    at a boundary, instead of every cycle, and the frames come back at most
+    120 s after Schwab does, or at the next cycle once it answers another
+    request. The symbols in `htf_failing_symbols` go last in every map, the
+    one that failed longest ago first, and the probe is another due symbol
+    when there is one: a symbol whose fetch fails on its own every time (a
+    5xx about it), or two such symbols, holds no other, at a boundary and
+    at one that settles mid-cycle. Between boundaries it is fetched once a
+    cycle while Schwab answers another request between its failures (with
+    the stream quotes off, the refresh's batch); with nothing else answered
+    in between (the stream serving every quote) its failures look like an
+    outage's, and the back-off spaces its probes. When only such symbols
+    are due the probe is the one that failed longest ago, and a symbol that
+    becomes due later in that cycle gets a probe of its own when the
+    back-off does not wait or that probe is its bucket's first.
+    `_fetch_htf_frames` (new) runs one map and logs its line.
+  - The same stepped outage with this: 21 refused requests, one a pass,
+    and all 28 frames fetched at 10:18:02, the first pass after the
+    outage, as before (the quote requests were answered, and each answer
+    ends the back-off). With every quote request refused too: 4 refused
+    HTF requests (the boundary's map and probes at 10:15:22, 10:15:54 and
+    10:16:58), against 21, and the frames at 10:18:10, the second pass
+    after the outage (its first pass's probe waited; its quote refresh was
+    answered).
+  - The marks live in memory: a start begins clear, a pass outside the
+    context refresh keeps them, and a mark left open at the close costs
+    the next day's first point with a due symbol one probe before the rest.
+  - Log lines: `HTF refresh (<point>): ...` may end `; not sent, Schwab
+    failing: <symbols>` (and a second `HTF refresh (<point>): ...` line
+    follows when the map sends them after all), a probe logs `HTF refresh
+    (<point>, probe): ...`, one the back-off holds `HTF refresh (<point>):
+    the probe waits for the REST back-off` (DEBUG) and a bucket's first
+    probe sent while it waits `HTF refresh (<point>): a new bucket's first
+    probe goes while the REST back-off waits` (DEBUG), and two WARNINGs are
+    new: `HTF fetches failing systemically: one probe a cycle at most,
+    spaced by the REST back-off, until Schwab answers` and `HTF fetches
+    answered again (failing since <time>)`. The README's HTF section says
+    so.
+  - Decisions: none while Schwab answers: the same fetches at the same
+    points, the same lines (a replay of 2026-10-01 09:40-10:40 is
+    identical). In an outage a frame not fetched keeps its bars and stays
+    due, as a failed fetch's did, so every read sees the frames it saw;
+    what changes is the requests sent, the time a pass spends on them and,
+    when the probe waits for the back-off, the pass the frames come back
+    in.
+
+- **A REST quote refresh that meets an outage or a rate limit sends one
+  request, the quote blacklist counts a symbol's own failures only, a held
+  position's symbol is never blacklisted (its failed REST quote requests
+  wait instead), the REST back-off spaces out the requests that went out
+  pass after pass while Schwab failed, and a batch Schwab refuses for one
+  of its symbols no longer fails pass after pass.** *2026-10-11* — a failed
+  batch was sent again as a comma-joined string (the same request:
+  schwabdev joins a list), then to the single-symbol `quote` endpoint with
+  the joined string (its list form refused by the client before anything
+  went out), which cannot answer either, and then each symbol alone;
+  replayed through a loopback Schwab on 2026-10-04 (an earlier version),
+  one 429 refresh of top_tier's 28 symbols sent 136 requests and held the
+  cycle 105 s in schwabdev's retries. Every single's failure counted toward
+  its symbol's session-long blacklist
+  (`runtime.max_consecutive_quote_failures`), so the 401 outage of
+  2026-09-25 blacklisted all 28 symbols until restart, the held PLTR first,
+  a minute in, and its management read no REST quote until the restart; a
+  batch's answer never reset a symbol's count, only a single's did, and a
+  blacklisted symbol still rode the batch, so a batch Schwab refused for it
+  went out with its other forms and every symbol alone at every refresh.
+  Each entry's single-symbol quote read went out whenever an entry was
+  tried, holding its pass for its retries in an outage. And since the
+  fetch pool's single quotes are in flight together (`PooledSchwabClient`),
+  the REST shadow's judgment of them, the pool's time over its requests'
+  count, read about a quarter of a slow request's time.
+  - `MarketDataStore._try_batch_quote_request` sends one `quotes` request
+    with the list and returns its quotes and what came of it: Schwab
+    answered, it failed systemically (`schwab_failure_is_systemic`: a
+    transport failure or a timeout, 401, 429, a 5xx), it failed on its own
+    (below), or no answer reached the bot (the client refused it, a bug);
+    its outcome reaches the shadow's trouble state as every REST quote
+    request's does. After a systemic failure `fetch_quotes` sends none of
+    the chunk's symbols alone, since each would fail the same way: their
+    cached quotes stand (the stream's, under its rules; a forced fetch
+    warns), except that a forced call for one or two symbols (a vertical's
+    legs before its order) still tries them alone. A failure about the
+    request (a 4xx about it, a body that does not decode, a TypeError: the
+    client refusing the list before it went out, another exception) is
+    logged with its type, and the symbols are fetched alone, as before.
+  - A batch that fails systemically again while Schwab answered another
+    REST request since its last failure, at most 120 s before, failed on
+    its own (an outage would have failed that other request too): its
+    symbols go alone, one first, a symbol whose latest single quote did not
+    fail systemically when there is one, then, once Schwab answers that
+    one, the rest, a refusal among them (401, a 5xx) its symbol's own and a
+    429, a transport failure or a timeout only by the blacklist's rule
+    (below). So a batch Schwab refuses for one of its symbols costs a
+    refresh the batch and its singles, the refused symbol is blacklisted
+    after five such refreshes, and a blacklisted symbol rides no batch, the
+    refresh's or the shadow's: the batch is answered again (one that keeps
+    failing on its own while every single answers sends its singles at
+    every refresh). When that first single fails systemically as well (the
+    quotes alone failing while price_history answers), none of the rest
+    goes, and the next round starts with another symbol. A held symbol in
+    such a batch is sent alone with the others (unless it waits: below),
+    and the batch's own failures do not make it wait.
+  - The blacklist (`_note_quote_failure`): a failure about the request
+    counts; a systemic one counts when it is the symbol's own, that is when
+    Schwab answered the batch the symbol was left out of, that refresh, or
+    the first single of its round, and refused the symbol's single with a
+    401 or a 5xx, or when no other REST request the data feed made (a quote
+    batch, another symbol's quote, the shadow's batch, a price_history
+    fetch: 1m, HTF or daily) failed systemically since Schwab last answered
+    one, nor another single sent with it (a call's singles go together, and
+    are judged together), and this is the symbol's first quote failure
+    since (`_rest_failing`, kept by `_note_rest_outcome` with each
+    request's endpoint; a batch that got no answer is no evidence). A 429,
+    a transport failure or a timeout is never about one symbol, so it
+    counts only the second way: a limit that lets a round's first single
+    through, or a flaky connection, fails the rest of the round together,
+    and when two or more of the rest fail together none of them counts;
+    when the rest is one single its failure counts, so with a batch of two
+    such a limit blacklists the second symbol (when it is not held) after
+    five rounds. KNRX's case (2026-04-29:
+    its single quote answered 401 for 16 minutes while Schwab answered
+    everything else) is blacklisted after five refreshes with the stream
+    quotes off, a batch answering the rest each refresh, and so are two
+    such symbols at once. With the stream serving every other symbol a
+    symbol's own requests can be the only ones that run, and an outage then
+    looks like Schwab refusing the symbol: its failures after the first
+    wait, unconfirmed, and count all at once at its next failure right
+    after Schwab answered any request (the boundary's HTF fetches, an
+    entry's quote, the shadow's check), or are dropped once another request
+    fails systemically, whether or not Schwab refuses its price_history
+    too; its singles are spaced out by the REST back-off meanwhile (about
+    two between answers), so it is blacklisted after a few answers. An
+    outage that fails every request until it ends blacklists none; one in
+    which Schwab answers another request can count a symbol's failures as
+    its own. Accepted: with the stream on, while another symbol's own
+    systemic failures keep reading as an outage (its HTF fetch, refused on
+    its own, failing every cycle), a symbol Schwab refuses is never
+    blacklisted; the back-off then holds its singles. Any answer for a
+    symbol resets its count: its single quote, or its quote in a batch, the
+    refresh's or the shadow's.
+  - A held position's symbol (`set_held_quote_symbols`, which the engine
+    sets each pass: an equity's own, a vertical's two legs, a single
+    option's contract) is never blacklisted, nor skipped for a
+    blacklisting from before it was held, and its failures count toward
+    nothing. After a REST quote request about it failed (its single, or a
+    batch carrying it that failed systemically, not on its own) its quote
+    is requested neither alone nor in a batch of such symbols only for
+    30 s, doubled for each further failure in a row, at most 120 s
+    (`REST_RETRY_SECONDS`); its cached quote stands meanwhile, as after a
+    failed request, for management and for an order priced from it alike,
+    and any answer for it ends the wait. So neither an outage nor Schwab
+    refusing the symbol holds every pass for a request's retries (about
+    3 s under a 429 or a 5xx, about 31 s when reads time out):
+    management's refresh of a held vertical's legs sends one batch where it
+    sent the batch and both legs alone, at the wait's pace. With the stream
+    on, a held symbol whose book does not serve gets its REST quote back at
+    most 120 s after Schwab answers again.
+  - The REST back-off (`rest_backoff_waiting`) spaces out the other
+    requests that went out pass after pass while Schwab failed: the HTF
+    probe (under Fixed, the HTF refresh's entry), a forced fetch's requests
+    for symbols not held (an entry's single-symbol read, an order's legs
+    before it opens, an option chain's stability read) and the refresh's
+    single quotes of symbols not held that no answered batch speaks for
+    (with the stream on, a symbol whose book does not serve). After a
+    systemic failure that may be an outage's (the probe's, unless it was
+    its symbol's own, a forced fetch's batch for symbols not held, or a
+    single quote of a symbol not held that the blacklist cannot count as
+    its own) they wait 30 s, doubled for each further such failure, at most
+    120 s, until Schwab answers any of the data feed's REST requests;
+    meanwhile their cached quotes stand, as after a failed request (a
+    forced fetch warns; with the stream on an entry reads its stream
+    quote). The refresh's batch, a held symbol's requests, the
+    price_history fetches, the singles after a batch that failed on its own
+    and the shadow (its own back-off) never wait for it. So an outage costs
+    those requests' retries once a wait instead of every pass, and they
+    come back at most 120 s after Schwab does, sooner when another request
+    is answered first (with the stream quotes off, the refresh's batch).
+  - The slow judgment (`_quote_request`): every REST quote request is
+    judged by its own time, requests' `Response.elapsed` (from when the
+    client handed it to its adapter, a new connection's connect and TLS
+    handshake included, to its answer's headers, its retries included; the
+    body's read is not judged), on the fetch pool as on the engine thread,
+    so a request that waited for the client (one at a time after a
+    systemic failure, the token refresh) is not slow for it and a slow one
+    among the pool's is. A single quote reads its response through
+    `schwab_api.schwab_json_body` (new; `call_schwab_json` uses it), and
+    one whose 2xx body does not decode is in trouble, as the shadow's is.
+  - Replayed through a loopback Schwab (the bot's own client over HTTPS)
+    with every request answered 401 from 10:22 to 10:32 on 2026-10-01
+    (top_tier, 20 s passes, ARM and NVDA held, the 10:30 HTF boundary
+    inside), with the stream quotes off: before, 238 requests in the 10
+    minutes and all 28 symbols blacklisted, the held two 40 s in; after,
+    36 (one batch a pass, the boundary's fetches and two HTF probes; no
+    single of the held two, whose requests waited after each failed batch)
+    and none blacklisted. With the synthetic stream quotes the held two's
+    books serve and no REST quote of them is sent. Decisions, positions and
+    trades are the same in both.
+  - Log lines: `Batch quote request via quotes returned status=...` (up to
+    four, one per form) becomes one `Batch quote request returned status=N
+    for [...]`; a batch that raised logs `Batch quote request failed for
+    [...] (TYPE: ...)` at WARNING (DEBUG before), with `; the symbols are
+    fetched alone` when it is not systemic; one the client refused logs
+    `Batch quote request for [...] was refused before it went out (...);
+    the symbols are fetched alone`, and one whose 2xx body does not decode
+    `Batch quote request for [...] answered a body that did not decode
+    (...); the symbols are fetched alone` at WARNING (DEBUG before); one
+    that failed on its own adds `Batch quote request for [...] failed
+    systemically again while Schwab answered another request since its
+    last failure; its symbols are fetched alone, one first` (WARNING). A
+    forced fetch that stored no REST quote logs `Forced quote fetch failed
+    for SYM (source=...); the cached <source> quote, X s old, stands in for
+    it (limit N s)` when that quote is young enough for its readers.
+    `Quote fetch failed for SYM: TYPE: ...` and `quote alias failed ...`
+    name the error's type, and `Blacklisting SYM from quote refresh after N
+    consecutive failures of its own (last: TYPE: ...)` the count. A held
+    symbol's wait logs `REST quote of held SYM failed (...); its REST quote
+    requests wait 30 s, doubling while they fail (at most 120 s), and its
+    cached quote stands meanwhile` at WARNING (the failures after it at
+    DEBUG) and `REST quote of held SYM answered again after N failure(s) in
+    a row` at INFO. The REST back-off logs `REST back-off: REQUEST (TYPE:
+    ...) failed systemically; the HTF probe and the REST quote reads of
+    symbols not held that no answer speaks for wait 30 s, doubling while
+    they fail (at most 120 s), until Schwab answers a request` at WARNING
+    (the failures after it at DEBUG) and `REST back-off over: Schwab
+    answered a request after N failure(s) in a row` at INFO. A single quote
+    in trouble names its status (`quote SYM answered status 401`, was
+    `raised SchwabHTTPError`) in the shadow's lines. The README's
+    `max_consecutive_quote_failures`, `quote_batch_size` and
+    `stream_quote_shadow_every` say so.
+  - Decisions: none while Schwab answers (the same requests, quotes and
+    lines: replays of 2026-10-01 09:40-10:40 with the stream quotes off and
+    with the synthetic feed are identical). In an outage a refresh sends
+    one request per chunk and keeps the cached quotes it kept before, a
+    held position's management reads its cached quote, or the bar close
+    once that is too old, and an entry its cached quote, where a failed
+    request left them the same, and no symbol is blacklisted for an outage
+    that fails every request.
 
 - **trades.csv is read and written under one lock, so processes sharing
   `log_dir` take turns at its schema rotation.** *2026-10-07* — the schema
