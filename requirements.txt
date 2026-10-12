@@ -57,6 +57,17 @@
 # transport errors schwabdev's client raises (SCHWAB_TRANSPORT_ERRORS), so
 # the bot imports requests itself. The pin is the one constraints.txt held,
 # the version schwabdev and tradingview-screener already resolved.
+#
+# 2026-10-11: schwab_api.PooledSchwabClient subclasses schwabdev's Client
+# and relies on its private surface, which a bump of either pin must
+# re-check: schwabdev's Client._request (replaced), Client.__init__'s
+# _session and its mounted adapters (_session.adapters, schwabdev's urllib3
+# Retry: GET, PUT and DELETE retried, a POST never), _base_api_url,
+# timeout, tokens and update_tokens, close and _session_lock; and requests'
+# Response.elapsed (MarketDataStore._quote_request judges a REST quote's
+# own time by it). tests/foundation/test_pooled_schwab_client.py pins the
+# sources of _request, __init__, update_tokens and close; re-read the new
+# code before re-pinning.
 schwabdev==4.0.0
 requests==2.34.2
 tradingview-screener==3.2.2

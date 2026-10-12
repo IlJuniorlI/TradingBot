@@ -86,8 +86,8 @@ class OptionChainMixin:
             self._option_chain_cache.pop(key, None)
         self._option_chain_cache[key] = (sessions.now_et(), list(contracts))
         max_entries = max(1, int(self.optcfg.option_chain_cache_max_entries))
-        while len(self._option_chain_cache) > max_entries:
-            oldest = next(iter(self._option_chain_cache))
+        # A snapshot of the keys: the prefetch's threads insert concurrently.
+        for oldest in list(self._option_chain_cache)[:max(0, len(self._option_chain_cache) - max_entries)]:
             self._option_chain_cache.pop(oldest, None)
 
     def _fetch_raw_option_chain(self, client, symbol: str) -> list[OptionContract] | None:
