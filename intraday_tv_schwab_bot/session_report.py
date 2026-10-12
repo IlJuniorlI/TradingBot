@@ -13,12 +13,15 @@ aggregates closed trades along five axes to support strategy/config tuning:
   * post-stop run     — how far price ran the trade's way AFTER the stop,
                         i.e. how much of a correctly-called move a shakeout cost
   * filter rejections — tally of skip reasons the engine logged during the session
+  * target reached, closed at a loss — the trades whose mark reached their
+                        target and that still lost, whatever exit closed them
 
 All aggregate sections are emitted both in the human log (fixed-width tables)
 and inside the SESSION_REPORT structured JSON payload (under top-level keys
 ``per_regime``, ``per_symbol``, ``per_exit_reason``, ``per_partial_exit_reason``,
-``per_hour``, ``mae_mfe``, ``post_stop_continuation``, ``filter_rejections``) so
-downstream tooling can parse them without re-scraping.
+``per_hour``, ``mae_mfe``, ``post_stop_continuation``, ``filter_rejections``,
+``target_reached_losses`` with ``target_reached_loss_trades``) so downstream
+tooling can parse them without re-scraping.
 
 The persistent trades.csv is ``append_trades_csv``'s: every trade the
 process closed, once, under its exit's ET date, each read and write of it
@@ -111,6 +114,8 @@ def trade_csv_row(trade: TradeRecord, session_date: str) -> dict[str, Any]:
         "armed_retest_status": trade.armed_retest_status,
         "armed_retest_waited_minutes": _round_opt(trade.armed_retest_waited_minutes, 2),
         "partial_exit_reasons": "|".join(trade.partial_exit_reasons),
+        "best_mark_price": _round_opt(trade.best_mark_price, 4),
+        "target_reached_price": _round_opt(trade.target_reached_price, 4),
     }
 
 
@@ -399,6 +404,35 @@ def _mae_mfe_summary(trades: list[TradeRecord]) -> dict[str, Any]:
         "trades_mfe_over_2r": runup_threshold_hits,
         "sample_size": min(len(r_favorable), len(r_adverse)),
     }
+
+
+def _target_reached_losses(trades: list[TradeRecord]) -> list[dict[str, Any]]:
+    """The trades whose mark reached their target and that closed at a
+    loss, whatever exit closed them (a target, a stop or a giveback floor
+    after it, force flatten), in ``trades``' order: what a target exit that
+    must not realize a loss is judged by, since a rule that only relabels
+    such an exit cannot hide it here. A trade reached its target when a
+    management pass's mark was at or through the target it came into the
+    pass with (``TradeRecord.target_reached_price``, that target). Each
+    entry names the trade (symbol, side, entry time and price), that
+    target, its best mark, its exit reason and its P&L."""
+    def _price(value: float | None) -> float | None:
+        return None if value is None else round(float(value), 4)
+
+    return [
+        {
+            "symbol": t.symbol,
+            "side": t.side,
+            "entry_time": t.entry_time.isoformat(),
+            "entry_price": _price(t.entry_price),
+            "target_price": _price(t.target_reached_price),
+            "best_mark_price": _price(t.best_mark_price),
+            "exit_reason": t.reason,
+            "realized_pnl": round(float(t.realized_pnl), 2),
+        }
+        for t in trades
+        if t.target_reached_price is not None and t.realized_pnl < 0
+    ]
 
 
 def _post_stop_continuation(
@@ -992,6 +1026,12 @@ def write_session_report(
     the account's day ledger counts them, every process's and strategy's,
     on the line when it is not the report's count (a process killed before
     its append, say, whose trades only the ledger's row kept).
+    ``target_reached_losses`` counts the day's trades whose mark reached
+    their target and that still closed at a loss, whatever exit closed them
+    (``_target_reached_losses``), on the line, then one line per such
+    trade, and in the JSON with each trade (``target_reached_loss_trades``:
+    symbol, side, entry, target, best mark, exit reason, P&L); whole across
+    a restart, as the day's trades are.
 
     Parameters
     ----------
@@ -1055,13 +1095,16 @@ def write_session_report(
         # append left its trades in the day's row only), every strategy's
         # (the row is one per sqlite file).
         ledger_trades = None if day is None else int(day["trades"])
+        # The trades that reached their target and still closed at a loss.
+        target_reached_losses = _target_reached_losses(closed)
         LOG.info(
             "SESSION REPORT %s: strategy=%s pnl=%.2f trades=%d wins=%d losses=%d win_rate=%s pf=%s avg_trade=%s "
-            "max_drawdown=%s run_max_drawdown=%.2f equity_mark_basis=%s%s%s%s%s",
+            "target_reached_losses=%d max_drawdown=%s run_max_drawdown=%.2f equity_mark_basis=%s%s%s%s%s",
             session_date_str, strategy, total_pnl, len(closed), wins, losses,
             f"{win_rate:.1%}" if win_rate is not None else "n/a",
             f"{profit_factor:.2f}" if profit_factor is not None else "n/a",
             f"${avg_trade:.2f}" if avg_trade is not None else "n/a",
+            len(target_reached_losses),
             f"{max_dd:.2f}" if max_dd is not None else "n/a", run_max_dd, EQUITY_MARK_BASIS,
             f" day_since={day['since']}" if day is not None and day["late_start"] else "",
             "" if day is None or not day["gaps"] else
@@ -1075,6 +1118,13 @@ def write_session_report(
                 trade.symbol, trade.side, trade.strategy, trade.qty,
                 trade.entry_price, trade.exit_price, trade.realized_pnl,
                 trade.return_pct, trade.hold_minutes, trade.reason,
+            )
+        for loss in target_reached_losses:
+            LOG.info(
+                "  target reached, closed at a loss: %s %s entry=%.4f target=%.4f best_mark=%s reason=%s pnl=%.2f",
+                loss["symbol"], loss["side"], loss["entry_price"], loss["target_price"],
+                "n/a" if loss["best_mark_price"] is None else f"{loss['best_mark_price']:.4f}",
+                loss["exit_reason"], loss["realized_pnl"],
             )
 
         # --- Aggregates ---
@@ -1125,6 +1175,8 @@ def write_session_report(
             "day_ledger_trades": ledger_trades,
             "trades_source_error": trades_source_error,
             "equity_mark_basis": EQUITY_MARK_BASIS,
+            "target_reached_losses": len(target_reached_losses),
+            "target_reached_loss_trades": target_reached_losses,
             "per_regime": per_regime,
             "per_entry_path": per_entry_path,
             "per_symbol": per_symbol,

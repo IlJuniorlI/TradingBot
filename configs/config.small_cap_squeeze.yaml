@@ -659,6 +659,17 @@ strategies:
       reject_tech_bias_contradiction: false
       pullback_require_real_dip: false        # squeeze pullbacks are shallow/fast
 
+      # Entry spread guard (2026-10-12; top_tier README, 6g), at top_tier's
+      # thresholds: skip an entry whose quote at the order has a spread of at
+      # least 0.33 x its risk |limit - stop| or 0.5 x its target distance
+      # |target - limit|; a quote whose spread cannot be read is skipped too.
+      # Small-cap stops are wide, so it rarely binds: on the 55 small-cap
+      # entries of 06-01..06-03 it would have skipped 3 (HKIT, ZJYL x2), which
+      # lost -44.95 (1 win, 2 losses). Insurance against the rare wide book;
+      # the manifest keeps 0 (off), and 0 turns a test off here.
+      max_entry_spread_r: 0.33
+      max_entry_spread_target_frac: 0.5
+
       # Pullback selectivity (2026-06-01 dry-run). The pullback regime over-fired
       # (17 of 28 trades) and lost -$327 — essentially the entire day's loss —
       # by buying post-spike fades on these choppy names (many entries had MFE=0,

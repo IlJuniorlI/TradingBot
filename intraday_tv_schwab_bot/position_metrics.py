@@ -143,7 +143,7 @@ TARGET_HOLD_TIMEOUT = "target_hold_timeout"
 PEAK_GIVEBACK = "peak_giveback"
 PEAK_GIVEBACK_HIGH_CONVICTION = "peak_giveback_high_conviction"
 PEAK_GIVEBACK_LOW_TIER = "peak_giveback_low_tier"
-_PEAK_GIVEBACK_CODES = frozenset({PEAK_GIVEBACK, PEAK_GIVEBACK_HIGH_CONVICTION, PEAK_GIVEBACK_LOW_TIER})
+PEAK_GIVEBACK_CODES = frozenset({PEAK_GIVEBACK, PEAK_GIVEBACK_HIGH_CONVICTION, PEAK_GIVEBACK_LOW_TIER})
 # The exits the position manager books from a resting broker child that
 # filled (a bracket's stop or target, the static disaster stop), and the
 # bracket record's field holding the price the child rested at.
@@ -176,7 +176,7 @@ def exit_level(position: Position, decision: ExitDecision) -> tuple[float | None
         level, kind = position.stop_price, "stop"
     elif code == "target":
         level, kind = position.target_price, "target"
-    elif code in _PEAK_GIVEBACK_CODES:
+    elif code in PEAK_GIVEBACK_CODES:
         level, kind = meta.get("peak_giveback_floor_price"), "peak_giveback_floor"
     elif code == TARGET_HOLD_GUARD:
         level, kind = decision.reason.partition(":")[2], "touch_hold_guard"

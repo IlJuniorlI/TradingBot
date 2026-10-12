@@ -178,6 +178,7 @@
     "max_entry_lower_wick_frac": 0.3,
     "max_entry_spread_r": 0.0,
     "max_entry_spread_target_frac": 0.0,
+    "protective_exits_on_executable_side": false,
     "htf_fvg_entry_weight": 0.3,
     "ltf_fvg_entry_weight": 0.18,
     "opposing_fvg_entry_penalty_mult": 1.0,

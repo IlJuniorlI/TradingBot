@@ -21,10 +21,14 @@ differ, and all of that lives in config:
 The squeeze tuning — wider stops, loosened "don't chase extension" gates (a
 squeezer is always extended), hybrid scalp+runner management — lives in
 ``configs/config.small_cap_squeeze.yaml``. No engine logic is overridden here;
-this subclass exists only to bind a distinct ``strategy_name`` (and therefore
-its own manifest + params block) to the shared top_tier engine. The plugin
-factory requires the class to be defined in this module, so it cannot simply
-point at ``TopTierAdaptiveStrategy`` directly.
+this subclass exists to bind a distinct ``strategy_name`` (and therefore its
+own manifest + params block) to the shared top_tier engine, and to keep its
+protective exits on the mark: ``protective_exits_on_executable_side`` must
+be false here (checked at load) until halt handling ships, because a halted
+symbol's quote can keep moving while its last trade is frozen, and an exit
+started on it cancels the broker's disaster stop. The plugin factory
+requires the class to be defined in this module, so it cannot simply point
+at ``TopTierAdaptiveStrategy`` directly.
 """
 from __future__ import annotations
 
@@ -33,3 +37,4 @@ from ..top_tier_adaptive.strategy import TopTierAdaptiveStrategy
 
 class SmallCapSqueezeStrategy(TopTierAdaptiveStrategy):
     strategy_name = "small_cap_squeeze"
+    protective_exits_on_book_allowed = False

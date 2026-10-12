@@ -7,7 +7,10 @@ exit, lives here:
 - ``update_position``: the peak give-back floor, the option premium ratchet,
   the adaptive breakeven / profit lock / runner extension / trail, and the
   stop and target exits themselves (the target deferring to a broker-held
-  bracket leg and to the adaptive ladder's touch hold);
+  bracket leg and to the adaptive ladder's touch hold); with a strategy's
+  ``protective_exits_on_executable_side`` on, the giveback floors and a
+  stop at or past the entry are judged on the bid or the ask of the pass's
+  quote (``protective_read``), never on a price past the mark;
 - ``manage_sr_flip``: ``risk.trade_management_mode: sr_flip``, the stop to a
   flipped level and the target to the next one;
 - ``manage_adaptive_ladder``: the adaptive ladder's touch hold
@@ -27,6 +30,8 @@ from __future__ import annotations
 
 import logging
 import math
+import statistics
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -40,10 +45,11 @@ from .config import BotConfig, RiskConfig
 from .data_feed import MarketDataStore
 from .levels_shared import effective_side_tolerance, select_next_distinct_level
 from .models import ExitDecision, Position, Side, is_option_asset
-from .numeric import safe_float
+from .numeric import first_float, safe_float
 from .position_metrics import (
     LADDER_TOUCH_HOLD_KEY,
     PEAK_GIVEBACK,
+    PEAK_GIVEBACK_CODES,
     PEAK_GIVEBACK_HIGH_CONVICTION,
     PEAK_GIVEBACK_LOW_TIER,
     TARGET_HOLD_GUARD,
@@ -85,6 +91,200 @@ def trail_allowed(mode: str, meta: Mapping[str, Any], *, options: bool) -> bool:
     if options:
         return False
     return mode == "adaptive" or (mode == "adaptive_ladder" and not bool(meta.get("ladder_management_enabled")))
+
+
+# Protective exits on the executable side of the book (a strategy's
+# ``protective_exits_on_executable_side`` knob, ``BaseStrategy.
+# protective_exits_on_executable_side``): a stop at or past the entry and
+# the peak giveback floors are judged on the bid (a LONG) or the ask (a
+# SHORT) of the quote management priced the pass from, never on a price
+# past the mark, so such an exit fires on the same pass as on the mark or an
+# earlier one; the levels themselves do not move. The mark judges them
+# instead when the book is abnormal: a spread at least
+# PROTECTIVE_ABNORMAL_SPREAD_MULT x the median of the position's window
+# (its last PROTECTIVE_SPREAD_WINDOW spreads), or a window holding fewer
+# than PROTECTIVE_SPREAD_MIN_SAMPLES.
+#
+# What joins the window: a pass's spread joins only when its book moved
+# since the position's previous readable pass (its bid, its ask or the mark
+# differs), is not zero (a locked book), and, once the window holds the
+# minimum, is under the multiple of the window's median. Any other readable
+# pass is read against the window as it stands. So a book that stays wide
+# is judged on the mark for as long as it lasts, against the spreads the
+# position had before it widened, and a frozen quote (a halted symbol's)
+# adds at most one spread: frozen on a position's first passes, or still
+# frozen after a restart (the window lives in memory and starts empty),
+# it leaves the window short, and the mark judges for as long as it stays
+# frozen. A median is never zero.
+#
+# The limits: a book that is wide but moving on a position's first passes,
+# or on the first after a restart, fills the window and sets its median;
+# and a frozen book of normal width, once the window holds the minimum, is
+# read on the book (a halt's handling belongs to the live broker's).
+# 128 spreads span at least 128 passes, about 5 minutes at the 2.4 s
+# management cadence (longer when the book repeats), so the median follows
+# the trade's own book across the day. Five spreads (at least 5 passes,
+# about 12 s) is the fewest a median is read from; the first passes of a
+# position, and of one carried over a restart, are judged on the mark.
+PROTECTIVE_SPREAD_WINDOW = 128
+PROTECTIVE_SPREAD_MIN_SAMPLES = 5
+PROTECTIVE_ABNORMAL_SPREAD_MULT = 2.0
+# Why a protective read is the mark (ProtectiveRead.basis), else
+# "executable".
+PROTECTIVE_ON_BOOK = "executable"
+PROTECTIVE_NO_QUOTE = "no_quote"
+PROTECTIVE_BOOK_UNREADABLE = "book_unreadable"
+PROTECTIVE_FEW_SPREADS = "few_spreads"
+PROTECTIVE_ABNORMAL_BOOK = "abnormal_book"
+PROTECTIVE_BOOK_PAST_MARK = "book_past_mark"
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectiveRead:
+    """The price one management pass judges a position's protective exits
+    on (``protective_read``): ``side`` ``bid`` (a LONG) or ``ask`` (a SHORT)
+    with ``basis`` ``executable``, or ``mark`` with ``basis`` saying why.
+    ``spread`` is the pass's ask - bid (6 decimals) and ``spread_median``
+    the median of the position's window once the pass is read (with the
+    pass's spread when it joined: a book that did not move and a zero
+    spread never join; once the window holds the minimum an abnormal
+    spread stays out too, though the pass that brings it to the minimum
+    joins even when abnormal), each None when not read."""
+
+    side: str
+    price: float
+    basis: str
+    spread: float | None = None
+    spread_median: float | None = None
+
+    def exit_fields(self, mark: float, level: float | None, long_side: bool) -> dict[str, Any]:
+        """What EXIT_CONTEXT carries for a protective exit this read judged:
+        the side and the price it was judged on, why, the spread and the
+        window's median (each left out when not read), and whether the mark
+        itself was at or through the exit's level
+        (``protective_mark_through``; absent without a level). False says
+        only that: it does not prove the mark would have exited later. On
+        the pass where the mark reaches the target, the mark would have
+        taken the target on that same pass, often at the same fill."""
+        fields: dict[str, Any] = {
+            "protective_side": self.side,
+            "protective_price": self.price,
+            "protective_basis": self.basis,
+            "protective_spread": self.spread,
+            "protective_spread_median": self.spread_median,
+        }
+        if level is not None:
+            fields["protective_mark_through"] = bool(mark <= level if long_side else mark >= level)
+        return {key: value for key, value in fields.items() if value is not None}
+
+
+class TradeSpreads:
+    """One position's last ``PROTECTIVE_SPREAD_WINDOW`` spreads, at most
+    one a management pass whose book had both sides and moved since the
+    position's previous such pass, a zero spread left out, and, once the
+    window holds the minimum, an abnormal one too (the pass that brings it
+    to the minimum joins even when abnormal; ``protective_read``). It keeps
+    that previous pass's book (bid, ask, mark), whatever the pass's read.
+    ``entry_time`` ties it to the position, so a later one under the same
+    key starts its own."""
+
+    def __init__(self, entry_time: datetime) -> None:
+        self.entry_time = entry_time
+        self._spreads: deque[float] = deque(maxlen=PROTECTIVE_SPREAD_WINDOW)
+        self._book: tuple[float, float, float] | None = None
+
+    def add(self, spread: float) -> None:
+        self._spreads.append(float(spread))
+
+    def book_moved(self, bid: float, ask: float, mark: float) -> bool:
+        """Whether a readable pass's book (its bid, its ask and the mark)
+        differs from the position's previous readable pass's; this pass's
+        becomes the previous one."""
+        book = (bid, ask, mark)
+        moved = book != self._book
+        self._book = book
+        return moved
+
+    def median(self) -> float | None:
+        """The window's median, or None while it holds fewer than
+        ``PROTECTIVE_SPREAD_MIN_SAMPLES`` spreads."""
+        if len(self._spreads) < PROTECTIVE_SPREAD_MIN_SAMPLES:
+            return None
+        return float(statistics.median(self._spreads))
+
+
+def protective_read(side: Side, mark: float, book: Mapping[str, Any] | None, spreads: TradeSpreads) -> ProtectiveRead:
+    """The price this pass judges a position's protective exits on, for a
+    strategy with ``protective_exits_on_executable_side`` on: the
+    executable side of ``book`` (the management snapshot: the bid for a
+    LONG, the ask for a SHORT, each read as the exit order reads it, a
+    positive finite number), or ``mark`` when
+
+    - ``book`` is not a quote (no snapshot, a bar close, the account's
+      cached price): ``no_quote``;
+    - its bid or ask is missing, zero or not finite, or the ask is below the
+      bid: ``book_unreadable``;
+    - the window holds fewer than ``PROTECTIVE_SPREAD_MIN_SAMPLES`` spreads,
+      this pass's included when it joined: ``few_spreads``;
+    - the spread is at least ``PROTECTIVE_ABNORMAL_SPREAD_MULT`` x the
+      window's median: ``abnormal_book``. Once the window holds the minimum,
+      the median is the window's before the pass and such a spread stays out
+      of it, so a book that stays that wide is judged on the mark for as long
+      as it lasts; the pass that brings the window to the minimum joins it
+      even when abnormal, and is judged against the median with its own
+      spread among them;
+    - the executable side is past the mark (a bid above it, an ask below
+      it), which would judge the exit later than the mark:
+      ``book_past_mark``.
+
+    A readable pass's spread joins the window only when its book moved
+    (``TradeSpreads.book_moved``: its bid, its ask or ``mark`` differs from
+    the position's previous readable pass's) and is not zero; otherwise the
+    pass is read against the window as it stands. So a frozen quote adds at
+    most one spread, and a median is never zero. The spread is rounded to 6
+    decimals, and so is the median, so the float noise of ``ask - bid``
+    cannot carry a spread at the limit below it."""
+    if not isinstance(book, Mapping) or book.get("source") != "quote":
+        return ProtectiveRead("mark", float(mark), PROTECTIVE_NO_QUOTE)
+    bid = first_float(book, "bid", positive=True, finite=True)
+    ask = first_float(book, "ask", positive=True, finite=True)
+    if bid is None or ask is None or ask < bid:
+        return ProtectiveRead("mark", float(mark), PROTECTIVE_BOOK_UNREADABLE)
+    spread = round(ask - bid, 6)
+    moved = spreads.book_moved(bid, ask, float(mark))
+    prior = spreads.median()
+    if prior is not None:
+        prior = round(prior, 6)
+        if spread >= round(PROTECTIVE_ABNORMAL_SPREAD_MULT * prior, 6):
+            return ProtectiveRead("mark", float(mark), PROTECTIVE_ABNORMAL_BOOK, spread, prior)
+    if moved and spread > 0.0:
+        spreads.add(spread)
+    median = spreads.median()
+    if median is None:
+        return ProtectiveRead("mark", float(mark), PROTECTIVE_FEW_SPREADS, spread, None)
+    median = round(median, 6)
+    if spread >= round(PROTECTIVE_ABNORMAL_SPREAD_MULT * median, 6):
+        return ProtectiveRead("mark", float(mark), PROTECTIVE_ABNORMAL_BOOK, spread, median)
+    long_side = side == Side.LONG
+    executable = bid if long_side else ask
+    if (executable > mark) if long_side else (executable < mark):
+        return ProtectiveRead("mark", float(mark), PROTECTIVE_BOOK_PAST_MARK, spread, median)
+    return ProtectiveRead("bid" if long_side else "ask", float(executable), PROTECTIVE_ON_BOOK, spread, median)
+
+
+def protective_stop(position: Position) -> bool:
+    """Whether ``position``'s stop is at or past its entry: a break-even,
+    the profit lock, a trail or a promoted rung that has passed the entry,
+    never an initial stop. Such a stop exit is a protective exit."""
+    return favorable_move(position.side, float(position.entry_price), float(position.stop_price)) >= 0.0
+
+
+def protective_exit(position: Position, reason: str) -> bool:
+    """Whether ``reason``, an exit ``update_position`` decided, is a
+    protective exit: a peak giveback floor, or a stop at or past the
+    entry."""
+    code = exit_reason_code(reason)
+    return code in PEAK_GIVEBACK_CODES or (code == "stop" and protective_stop(position))
 
 
 def _next_unpassed_rung(rungs: list, active_index: int, close: float,
@@ -398,11 +598,25 @@ class TradeManager:
             meta["_peak_giveback_low_tier_active"] = False
         return triggered
 
-    def update_position(self, position: Position, last_price: float) -> tuple[bool, str]:
+    def update_position(self, position: Position, last_price: float,
+                        protective: ProtectiveRead | None) -> tuple[bool, str]:
+        """The level check of one pass at the mark ``last_price``: the peak
+        giveback floor, the option ratchet, the adaptive ratchets, the trail,
+        then the stop and the target. Returns whether to exit and why.
+
+        ``protective`` is the pass's read for a strategy that judges its
+        protective exits on the executable side (``protective_read``), and
+        every caller names it: None judges every level on the mark (the knob
+        off, an option). With a read, the giveback floors' current R (the
+        ``peak_giveback_current_r`` it records too), and a stop at or past
+        the entry (``protective_stop``), are judged on its price, never past
+        the mark. The peak, every ratchet's arming, the initial stop and the
+        target stay on the mark."""
         meta = position.metadata if isinstance(position.metadata, dict) else {}
         if isinstance(meta, dict):
             meta.setdefault("management_adjustments", [])
         position.update_extremes(last_price)
+        protective_price = float(last_price) if protective is None else protective.price
 
         initial_stop = safe_float(meta.get("initial_stop_price"), finite=True)
         if initial_stop is None:
@@ -419,10 +633,10 @@ class TradeManager:
             (not options_position)
             and self.config.risk.peak_giveback_enabled
             and initial_risk > 0
-            and self._peak_giveback_triggered(position, last_price, initial_risk)
+            and self._peak_giveback_triggered(position, protective_price, initial_risk)
         )
         if peak_giveback_exit:
-            peak_r, current_r = self._peak_and_current_r(position, last_price, initial_risk)
+            peak_r, current_r = self._peak_and_current_r(position, protective_price, initial_risk)
             # ``_peak_giveback_triggered`` stamped these markers right before
             # returning True; read them so we can emit a differentiated exit
             # reason across the three tiers (low / default / high-conviction).
@@ -626,7 +840,7 @@ class TradeManager:
                     position.stop_price = candidate_stop
                     if isinstance(meta, dict) and candidate_stop > prior_stop + 1e-12:
                         append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "trail", "from": prior_stop, "to": float(candidate_stop)})
-            if last_price <= position.stop_price:
+            if (protective_price if protective_stop(position) else last_price) <= position.stop_price:
                 return True, "stop"
             if position.target_price is not None and last_price >= position.target_price and not touch_hold and not broker_owns_target:
                 return True, "target"
@@ -704,7 +918,7 @@ class TradeManager:
                     position.stop_price = candidate_stop
                     if isinstance(meta, dict) and candidate_stop < prior_stop - 1e-12:
                         append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "trail", "from": prior_stop, "to": float(candidate_stop)})
-            if last_price >= position.stop_price:
+            if (protective_price if protective_stop(position) else last_price) >= position.stop_price:
                 return True, "stop"
             if position.target_price is not None and last_price <= position.target_price and not touch_hold and not broker_owns_target:
                 return True, "target"

@@ -1108,6 +1108,29 @@ strategies:
       adaptive_partial_breakeven_offset_r: 0.0
       adaptive_runner_trigger_rr: 0.90         # was 1.10
 
+      # Protective exits on the executable side (2026-10-12; top_tier README,
+      # section 12): a stop at or past the entry (the breakeven, the profit
+      # lock, a trail past the entry) and the peak giveback floors fire when
+      # the bid (a LONG) or the ask (a SHORT) reaches the level, instead of
+      # the mark, so a breakeven exit fills near the breakeven rather than
+      # half a spread under it. The levels do not move, and the initial stop,
+      # the target and force flatten stay on the mark. The mark judges
+      # instead when a side is missing, fewer than 5 spreads have been read,
+      # or the book's spread is at least 2x the median of the position's last
+      # 128 spreads. A spread joins that window only when the book moved
+      # since the position's previous readable pass (one with both sides) and
+      # is not zero, and once 5 have been read only when it is under 2x the
+      # median, so a book that stays wide is judged on the mark while it
+      # lasts, and a frozen quote (a halt, a restart during one) adds one
+      # spread at most. Its limits: a book already wide but moving on a
+      # position's first passes, or after a restart, sets the median; a
+      # frozen book of normal width is read on the book once 5 have been
+      # read. An exit is never later than on the mark. On H:'s logged passes
+      # 09-29..10-09 it changes the exit of 35 of 167 trades, +70.86 (23
+      # better, 6 worse); the 11 protective exits that lost go from -73.13 to
+      # -43.53. false judges every level on the mark.
+      protective_exits_on_executable_side: true
+
       # Adaptive ladder rung builder (used when risk.trade_management_mode
       # is "adaptive_ladder"). Walks S/R resistances (long) / supports
       # (short) and keeps only rungs that clear ladder_min_target_rr.

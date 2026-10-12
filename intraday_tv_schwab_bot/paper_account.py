@@ -126,6 +126,14 @@ class TradeRecord:
     # per_exit_reason and trades.csv as if it had only ever exited once
     # (2026-09-24).
     partial_exit_reasons: tuple[str, ...] = ()
+    # The trade's best mark (management's mark at its best unrealized P&L),
+    # and the target the first management pass whose mark was at or through
+    # it came in with, None when no pass's mark reached a target
+    # (PositionManager._update_position_diagnostics). The session report
+    # counts the trades that reached their target and closed at a loss
+    # (target_reached_losses), whatever exit closed them (2026-10-12).
+    best_mark_price: float | None = None
+    target_reached_price: float | None = None
 
 
 def closed_trade_lifecycles(trades: Iterable[Any]) -> list[Any]:
@@ -996,6 +1004,8 @@ class PaperAccount:
                 realized_entry_risk=first_float(metadata, "realized_entry_risk"),
                 entry_risk_budget=first_float(metadata, "entry_risk_budget"),
                 entry_risk_overage_frac=first_float(metadata, "entry_risk_overage_frac"),
+                best_mark_price=first_float(metadata, "diag_best_mark_price"),
+                target_reached_price=first_float(metadata, "diag_target_reached_price"),
             )
             # LIFO: newest trade at index 0 (consumers iterate from the left).
             self.trades.appendleft(trade)

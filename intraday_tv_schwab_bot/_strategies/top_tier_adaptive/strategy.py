@@ -173,6 +173,35 @@ def entry_spread_guard(bid: Any, ask: Any, limit_price: float, stop_price: float
     return f"entry_spread_too_wide({detail})"
 
 
+# The protective exits' knob (README section 12): judge a stop at or past
+# the entry and the peak giveback floors on the bid (a LONG) or the ask (a
+# SHORT) instead of the mark (``trade_management.protective_read``).
+PROTECTIVE_EXITS_KNOB = "protective_exits_on_executable_side"
+
+
+def protective_exits_knob(params: Mapping[str, Any], strategy_name: str, *, allowed: bool) -> bool:
+    """``params``' ``protective_exits_on_executable_side``: true or false,
+    else a ValueError naming the key (a missing knob, a 0 or 1, a quoted
+    word, a null). ``allowed`` False refuses true too: a strategy that runs
+    this engine but keeps its protective exits on the mark
+    (small_cap_squeeze, until halt handling ships). The load runs it on the
+    params of every strategy a config sets (``normalize_params``), and the
+    strategy again when it is built. Both manifests that run this engine
+    declare it false; the shipped top_tier preset sets it true."""
+    if PROTECTIVE_EXITS_KNOB not in params:
+        raise ValueError(f"strategies.{strategy_name}.params.{PROTECTIVE_EXITS_KNOB} is missing: the strategy's "
+                         "manifest declares it (false judges every exit on the mark)")
+    value = params[PROTECTIVE_EXITS_KNOB]
+    if not isinstance(value, bool):
+        raise ValueError(f"strategies.{strategy_name}.params.{PROTECTIVE_EXITS_KNOB} must be true or false, "
+                         f"got {value!r}")
+    if value and not allowed:
+        raise ValueError(f"strategies.{strategy_name}.params.{PROTECTIVE_EXITS_KNOB} must be false: "
+                         f"{strategy_name} judges its protective exits on the mark until halt handling ships (a "
+                         "quote that moves during a halt must not start an exit)")
+    return value
+
+
 @dataclass
 class _EntryCycle:
     """What ``entry_signals`` reads once per cycle for every candidate."""
@@ -229,24 +258,32 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
     strategy_name = "top_tier_adaptive"
     time_params = ("orb_end_time", "midday_start_time", "midday_end_time", "afternoon_start_time",
                    "no_new_entries_after", "early_session_stop_widening_until")
+    # Whether this strategy may judge its protective exits on the executable
+    # side (``protective_exits_knob``); small_cap_squeeze may not yet.
+    protective_exits_on_book_allowed = True
 
     @classmethod
     def normalize_params(cls, params: dict[str, Any]) -> dict[str, Any]:
-        """Checks the entry spread guard's knobs at load
-        (``entry_spread_limits``; ``load_config`` runs this on every
-        ``strategies.<name>.params`` a config sets), so a bad value refuses
-        to start before the Schwab client is built."""
+        """Checks the entry spread guard's knobs (``entry_spread_limits``)
+        and the protective exits' knob (``protective_exits_knob``) at load
+        (``load_config`` runs this on every ``strategies.<name>.params`` a
+        config sets), so a bad value refuses to start before the Schwab
+        client is built."""
         out = super().normalize_params(params)
         entry_spread_limits(out, cls.strategy_name)
+        protective_exits_knob(out, cls.strategy_name, allowed=cls.protective_exits_on_book_allowed)
         return out
 
     def __init__(self, config):
         super().__init__(config)
-        # The entry spread guard's limits (``entry_spread_refusal``), checked
-        # again here: params the load did not normalize (a config with no
-        # params block for this strategy, or params set after the load)
-        # reach the strategy only through its build.
+        # The entry spread guard's limits (``entry_spread_refusal``) and the
+        # protective exits' knob, checked again here: params the load did
+        # not normalize (a config with no params block for this strategy, or
+        # params set after the load) reach the strategy only through its
+        # build.
         self._entry_spread_limits = entry_spread_limits(self.params, self.strategy_name)
+        self._protective_exits_on_executable_side = protective_exits_knob(
+            self.params, self.strategy_name, allowed=self.protective_exits_on_book_allowed)
         # Per-symbol rolling window of recent LIVE directional bias
         # observations (output of ``_compute_live_directional_bias``).
         # Trailing-bias memory for Fix A (2026-04-23): when the current
@@ -994,6 +1031,14 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         max_spread_r, max_spread_target_frac = self._entry_spread_limits
         return entry_spread_guard(bid, ask, limit_price, signal.stop_price, signal.target_price,
                                   max_spread_r=max_spread_r, max_spread_target_frac=max_spread_target_frac)
+
+    def protective_exits_on_executable_side(self) -> bool:
+        """The ``protective_exits_on_executable_side`` knob (README section
+        12; the hook is ``BaseStrategy.protective_exits_on_executable_side``):
+        the position manager judges a stop at or past the entry and the peak
+        giveback floors on the bid (a LONG) or the ask (a SHORT) when it is
+        true, on the mark when false."""
+        return self._protective_exits_on_executable_side
 
     # ------------------------------------------------------------------
     # entry_signals — main loop

@@ -1150,5 +1150,17 @@ class BaseStrategy(ContextBuildersMixin):
         so small_cap_squeeze, which runs its engine, has it too."""
         return None
 
+    def protective_exits_on_executable_side(self) -> bool:
+        """Whether the position manager judges this strategy's protective
+        exits (a stop at or past the entry, the peak giveback floors) on the
+        executable side of the pass's quote, the bid for a LONG and the ask
+        for a SHORT, rather than on the mark
+        (``trade_management.protective_read``). False here: the mark judges
+        every level. top_tier_adaptive reads its
+        ``protective_exits_on_executable_side`` knob (its strategy README,
+        section 12); small_cap_squeeze, which runs its engine, keeps it
+        off."""
+        return False
+
     def position_mark_price(self, position: Position, data) -> float | None:
         return None

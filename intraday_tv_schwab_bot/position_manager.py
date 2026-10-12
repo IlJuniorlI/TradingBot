@@ -77,7 +77,7 @@ from .position_metrics import (
 )
 from .risk import RiskManager
 from .sr_snapshot import sr_snapshot
-from .trade_management import TradeManager
+from .trade_management import ProtectiveRead, TradeManager, TradeSpreads, protective_exit, protective_read
 from .broker_payloads import (
     BRACKET_ID_KEYS,
     DISASTER_STOP_REASON,
@@ -225,6 +225,10 @@ class PositionManager:
         # Position key -> the post-close sweep still owed for a closed
         # position whose orders could not be read; see _sweep_exit_orders.
         self._sweeps_owed: dict[str, dict[str, Any]] = {}
+        # Position key -> its recent spreads, the abnormal-book guard of a
+        # strategy that judges its protective exits on the executable side;
+        # see _protective_read.
+        self._trade_spreads: dict[str, TradeSpreads] = {}
 
     # ------------------------------------------------------------------
     # Mark-price resolution for open positions.
@@ -298,6 +302,35 @@ class PositionManager:
             price = float(cached)
             return price, {"bid": price, "ask": price, "last": price, "source": "account_cache", "decision_price": price}
         return None, None
+
+    def _protective_read(self, key: str, position: Position, last_price: float | None,
+                         market_snapshot: dict[str, Any] | None) -> ProtectiveRead | None:
+        """The price this pass judges ``position``'s protective exits on (a
+        stop at or past the entry, the peak giveback floors): with the
+        strategy's ``protective_exits_on_executable_side`` on, the bid (a
+        LONG) or the ask (a SHORT) of the management snapshot, the quote an
+        exit it decides is priced from, or the mark when that book is not a
+        quote, cannot be read, is abnormal against the position's recent
+        spreads or lies past the mark (``trade_management.protective_read``).
+        None, which judges every level on the mark, with the knob off, for an
+        option, and on a pass with no price. Dry run and live read the same
+        snapshot, so they take the same decision.
+
+        The position's spreads are kept here, in memory, at most one a pass
+        whose book has both sides and moved since the position's previous
+        such pass (a zero spread, and once the window holds the minimum an
+        abnormal one, left out; ``TradeSpreads``), and dropped with the
+        position. A restart starts them again, and while the window refills
+        the mark judges: a quote frozen across the restart adds one spread,
+        so the mark judges for as long as it stays frozen."""
+        if last_price is None or is_option_asset(position.metadata):
+            return None
+        if not self.strategy.protective_exits_on_executable_side():
+            return None
+        spreads = self._trade_spreads.get(key)
+        if spreads is None or spreads.entry_time != position.entry_time:
+            spreads = self._trade_spreads[key] = TradeSpreads(position.entry_time)
+        return protective_read(position.side, float(last_price), market_snapshot, spreads)
 
     def _read_management_stream_quote(self, symbol: str) -> bool:
         """When the stream serves ``symbol`` (``MarketDataStore.stream_quote_fresh``),
@@ -420,6 +453,18 @@ class PositionManager:
         CURRENT quantity, so after a scale-out the peak was measured on a
         mix of sizes, while the session report divides it by the initial
         risk times the lifecycle's full quantity.
+
+        It also records the first pass whose mark was at or through the
+        target as the pass's risk check starts (the pass calls this after
+        the sr_flip and ladder managers and ahead of
+        ``TradeManager.update_position``, whose runner extension can move
+        the target before its own target check):
+        ``diag_target_reached_price`` (that target) and
+        ``diag_target_reached_ts``. A target moved later (the runner
+        extension, a ladder promotion) does not reset it. The trade record
+        carries it with the best mark (``diag_best_mark_price``), and the
+        session report counts the trades that reached their target and
+        closed at a loss (``target_reached_losses``).
         """
         meta = position.metadata if isinstance(position.metadata, dict) else {}
         unrealized = favorable_move(position.side, float(position.entry_price), float(mark_price))
@@ -452,6 +497,11 @@ class PositionManager:
                 meta['diag_worst_underlying_price'] = float(underlying_price)
         meta['diag_best_unrealized_pnl'] = best * initial_qty
         meta['diag_worst_unrealized_pnl'] = worst * initial_qty
+        target = safe_float(position.target_price, None, finite=True)
+        if target is not None and meta.get('diag_target_reached_price') is None \
+                and favorable_move(position.side, target, float(mark_price)) >= 0.0:
+            meta['diag_target_reached_price'] = target
+            meta['diag_target_reached_ts'] = ts
 
     @staticmethod
     def underlying_price_for_position(position: Position, bars, default: float | None = None) -> float | None:
@@ -1884,9 +1934,11 @@ class PositionManager:
         markers.append({**marker, "status": status, "at": sessions.now_et().isoformat()})
 
     def _exit_order_in_flight(self, key: str, position: Position, last_price: float | None, bars,
-                              order_states: dict[str, Any]) -> bool:
+                              order_states: dict[str, Any], *, protective: ProtectiveRead | None) -> bool:
         """Settle an exit order an earlier cycle left working. True while it
         still is -- the caller must send nothing else for the position.
+        ``protective`` is the pass's read of the protective exits
+        (``_protective_read``), for the remainder's risk check.
 
         Fills booked here are the order's fills beyond what was already
         booked from it, so a partial booked at submit time is not counted
@@ -1908,7 +1960,7 @@ class PositionManager:
         if state is None:
             state = self.executor.order_state(order_id)
         if state is None:
-            if self._working_slice_remainder_exit(key, position, record, last_price):
+            if self._working_slice_remainder_exit(key, position, record, last_price, protective):
                 self._cancel_working_exit(key, order_id)
             self.audit.log_cycle(
                 f"exit_gate:{key}", "exit_order_unresolved",
@@ -1997,7 +2049,7 @@ class PositionManager:
                 self._reprotect_remainder(position)
             self._save_reconcile_metadata()
             return False
-        remainder_exit = self._working_slice_remainder_exit(key, position, record, last_price)
+        remainder_exit = self._working_slice_remainder_exit(key, position, record, last_price, protective)
         if remainder_exit or str(state.get("order_type") or "") != "MARKET":
             self._cancel_working_exit(key, order_id)
         self.audit.log_cycle(
@@ -2067,7 +2119,7 @@ class PositionManager:
             LOG.warning("Working exit %s for %s still live; cancel unconfirmed (%s)", order_id, key, cancel_msg)
 
     def _working_slice_remainder_exit(self, key: str, position: Position, record: dict[str, Any],
-                                      last_price: float | None) -> bool:
+                                      last_price: float | None, protective: ProtectiveRead | None) -> bool:
         """The engine's risk check on the shares a working scale-out slice
         does not cover. True when it wants the position out.
 
@@ -2085,7 +2137,7 @@ class PositionManager:
         outstanding = working_exit_outstanding_qty(position)
         if last_price is None or outstanding >= int(position.qty):
             return False
-        risk_exit, risk_reason = self.trade_manager.update_position(position, float(last_price))
+        risk_exit, risk_reason = self.trade_manager.update_position(position, float(last_price), protective)
         if not risk_exit:
             return False
         LOG.log(TRADEFLOW_LEVEL, "%s: %s on the %s share(s) outside working exit %s; cancelling it",
@@ -2163,6 +2215,7 @@ class PositionManager:
                 self._position_failed(key, "its management", exc, failures, rest_runs=False)
         self._escalate_failures(failures)
         self._looks = {key: look for key, look in self._looks.items() if key in self.positions}
+        self._trade_spreads = {key: spreads for key, spreads in self._trade_spreads.items() if key in self.positions}
         self._save_reconcile_metadata()
 
     def _position_failed(self, key: str, step: str, exc: Exception, failures: dict[str, str], *,
@@ -2240,6 +2293,7 @@ class PositionManager:
             return
         last_price, market_snapshot = self._position_management_snapshot(position, bars)
         previous_look, look = self._take_look(key, position, last_price, market_snapshot)
+        protective = self._protective_read(key, position, last_price, market_snapshot)
         if look is not None and not is_option_asset(position.metadata):
             # The paper account marks a held equity at the price this pass
             # manages it at (its row, the equity, the peak and the max
@@ -2258,7 +2312,7 @@ class PositionManager:
         # slice's remainder can move the stop too.
         if isinstance(position.metadata, dict):
             position.metadata["management_adjustments"] = []
-        if self._exit_order_in_flight(key, position, last_price, bars, order_states):
+        if self._exit_order_in_flight(key, position, last_price, bars, order_states, protective=protective):
             # A ratchet the remainder's risk check made while the slice works
             # (_working_slice_remainder_exit) is on the record like any
             # other. Until 2026-09-28 the next pass reset it unlogged.
@@ -2295,7 +2349,7 @@ class PositionManager:
                     position.metadata.pop(LADDER_TOUCH_HOLD_KEY, None)
                 self._position_failed(key, "the adaptive ladder", exc, failures, rest_runs=True)
             self._update_position_diagnostics(position, last_price, underlying_price)
-            risk_exit, risk_reason = self.trade_manager.update_position(position, last_price)
+            risk_exit, risk_reason = self.trade_manager.update_position(position, last_price, protective)
             if risk_exit:
                 decision = ExitDecision(risk_reason, "risk")
             elif ladder_exit is not None:
@@ -2352,6 +2406,11 @@ class PositionManager:
             **self._position_exit_context(position, decision, last_price, underlying_price, market_snapshot, bars),
             **_look_fields(previous_look, look),
         }
+        if protective is not None and decision.family == "risk" and protective_exit(position, reason):
+            # Which side judged a protective exit (the bid, the ask, or the
+            # mark and why), with the spread its guard read.
+            exit_context.update(protective.exit_fields(float(last_price), exit_context.get("exit_level"),
+                                                       position.side == Side.LONG))
         if not self.executor.can_close_position_now(position, now):
             self.audit.log_cycle(
                 f"exit_gate:{key}",
