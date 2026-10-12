@@ -32,6 +32,7 @@ import copy
 import logging
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable
@@ -58,7 +59,7 @@ from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .position_metrics import entry_slippage, initial_risk_per_unit
 from .numeric import safe_float
-from .reasons import blocked_side, reason_gate
+from .reasons import blocked_side, detail_fields, reason_gate
 from .risk import RiskManager
 from .trade_management import default_levels
 from .log_setup import TRADEFLOW_LEVEL
@@ -78,6 +79,51 @@ LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 _NOISY_SKIP_REASONS: frozenset[str] = frozenset({
     "already_in_position",
 })
+
+# The gate of a skip the entry spread watch decided on no REST quote
+# (``EntryGatekeeper._spread_watch_skip``,
+# ``EntryGatekeeper._spread_watch_rest_unanswered``): the decision's reason is
+# ``entry_spread_watch:<the book's refusal>``,
+# ``entry_spread_watch:rest_retry_wait(...)`` or
+# ``entry_spread_watch:rest_unanswered(...)``, its own gate in every tally of
+# skips (``reasons.reason_gate`` cuts the reason at the ``:``).
+SPREAD_WATCH_GATE = "entry_spread_watch"
+
+# The entry spread watch's REST quote budget. The user's limit (2026-10-12)
+# is no extra REST quote request each pass for a standing wide signal: about
+# 25 a minute a symbol at the engine's pass rate. A fresh book that fails
+# asks none. When the book passes, or is not fresh, the entry asks REST, but
+# after a REST quote the watch let it ask was refused (or was not answered),
+# the next is asked no sooner than this many seconds later: at most 7 a
+# minute while a stale book or a passing book with a refusing REST quote
+# stands. The passes in between skip as
+# ``entry_spread_watch:rest_retry_wait(...)``. A watch also holds while its
+# signal is absent for less than this (the signal not built, or refused
+# before its quote), so a signal that drops out for a pass or two is judged
+# on the book again when it returns, under the same wait.
+SPREAD_WATCH_REST_RETRY_SECONDS = 10.0
+
+
+@dataclass
+class _SpreadWatch:
+    """The entry spread watch on one signal, a symbol and a side, that the
+    strategy's entry spread guard refused on its REST quote
+    (``EntryGatekeeper._spread_watches``): when it started, the refusal that
+    started it, the passes it skipped on the symbol's fresh stream book (no
+    REST request), the REST quotes it let the entry ask since (each on a
+    pass whose book passed, or was not fresh), why the last was asked and
+    when, the passes it skipped waiting to ask again
+    (``SPREAD_WATCH_REST_RETRY_SECONDS``), and since when its signal has
+    been absent (None while it comes to its quote)."""
+
+    started_at: datetime
+    refusal: str
+    book_skips: int = 0
+    rest_quotes: int = 0
+    last_rest_quote: str = "none"
+    last_rest_at: datetime | None = None
+    rest_retry_waits: int = 0
+    absent_since: datetime | None = None
 
 
 class EntryGatekeeper:
@@ -121,6 +167,15 @@ class EntryGatekeeper:
         self._skips_counted: set[tuple[str, str | None, str]] = set()
         self._option_entry_retry_until: dict[str, datetime] = {}
         self._option_entry_retry_counts: dict[str, int] = {}
+        # The entry spread watches, by symbol and side (``_spread_watch_skip``):
+        # a stock signal the strategy's entry spread guard refused on its
+        # REST quote is judged on the symbol's fresh stream book, with no
+        # REST request, and asks REST at most once a
+        # ``SPREAD_WATCH_REST_RETRY_SECONDS`` after a refused or unanswered
+        # one, until a REST quote passes it, it is absent (not built, or not
+        # quoted) for ``SPREAD_WATCH_REST_RETRY_SECONDS``, or no entry cycle
+        # runs.
+        self._spread_watches: dict[tuple[str, Side], _SpreadWatch] = {}
         # Entry orders whose outcome the submit call could not settle, keyed
         # by position key. See settle_unsettled_entry_orders.
         self.unsettled_entry_orders: dict[str, dict[str, Any]] = {}
@@ -971,6 +1026,146 @@ class EntryGatekeeper:
         LOG.log(TRADEFLOW_LEVEL, 'Entry cycle summary strategy=%s candidates=%s actions=%s top_skips=%s', strategy_name, candidate_count, action_counts, summary['top_skip_reasons'] or 'none')
         self.audit.log_structured('ENTRY_CYCLE_SUMMARY', summary)
 
+    # ------------------------------------------------------------------
+    # The entry spread watch: a signal the guard refused, off the REST quote.
+    # ------------------------------------------------------------------
+
+    def _spread_watch_skip(self, signal, intent,
+                           watch: _SpreadWatch) -> tuple[str, float | None, dict[str, Any] | None] | None:
+        """Judge the watched stock ``signal`` on its symbol's stream quote
+        book, with no REST request. None when the entry asks its REST quote
+        on this pass, and is decided and priced on it once REST answers
+        that ask (``_spread_watch_rest_unanswered``): the book is not fresh
+        (the stream quotes are off, silent or down, or do not hold the
+        symbol) or the entry passes on it, and the watch has let the entry
+        ask no REST quote in the last ``SPREAD_WATCH_REST_RETRY_SECONDS``
+        (the first after a longer wait is asked at once). Otherwise
+        ``(reason, limit, quote)``: the skip's
+        reason, ``entry_spread_watch:<the book's refusal>`` or
+        ``entry_spread_watch:rest_retry_wait(book=passes|not_fresh,last_rest=HH:MM:SS)``,
+        the marketable limit the book prices (None when it prices none or is
+        not fresh) and the book's bid, ask and last (None when not fresh).
+
+        The book is published into the quote cache with no REST request and
+        no count for the stream quotes' REST shadow
+        (``MarketDataStore.publish_stream_book``); the cache then holds the
+        book, or a REST quote newer than the stream's last message. On it the
+        entry is priced with no request (``SchwabExecutor.preview_equity_entry``,
+        ``refresh_quotes=False``) and judged as on the REST quote: this pass's
+        signal's levels from that limit, then the strategy's guard. A fresh
+        book that prices no limit (no fresh cached quote, or no touch to
+        price one from) refuses the entry:
+        ``book_unreadable(bid=...,ask=...,last=...)``, the cached quote's.
+        Counts the pass on ``watch``: a book skip, a retry wait, or a REST
+        quote asked, why and when."""
+        symbol = signal.symbol
+        if not self.data.publish_stream_book(symbol):
+            book, limit, quote = "not_fresh", None, None
+        else:
+            preview = self.executor.preview_equity_entry(symbol, intent, data=self.data, refresh_quotes=False)
+            cached = self.data.get_quote(symbol) or {}
+            if preview is None:
+                bid, ask, last = (safe_float(cached.get(field)) for field in ("bid", "ask", "last"))
+                limit = None
+                refusal = f"book_unreadable({detail_fields(bid=bid, ask=ask, last=last)})"
+            else:
+                bid, ask, last, limit = preview["bid"], preview["ask"], preview["last"], preview["limit_price"]
+                levels_ok, levels_reason = self._entry_levels_valid(signal.side, limit, signal.stop_price,
+                                                                    signal.target_price)
+                refusal = None if levels_ok else (levels_reason or "invalid_levels")
+                if refusal is None:
+                    refusal = self.strategy.entry_spread_refusal(signal, bid, ask, limit)
+            quote = {"bid": bid, "ask": ask, "last": last, "source": f"spread_watch:{cached.get('quote_source')}"}
+            if refusal is not None:
+                watch.book_skips += 1
+                return f"{SPREAD_WATCH_GATE}:{refusal}", limit, quote
+            book = "passes"
+        now = sessions.now_et()
+        if (watch.last_rest_at is not None
+                and (now - watch.last_rest_at).total_seconds() < SPREAD_WATCH_REST_RETRY_SECONDS):
+            watch.rest_retry_waits += 1
+            wait = detail_fields(book=book, last_rest=watch.last_rest_at.strftime("%H:%M:%S"))
+            return f"{SPREAD_WATCH_GATE}:rest_retry_wait({wait})", limit, quote
+        watch.rest_quotes += 1
+        watch.last_rest_quote = f"book_{book}"
+        watch.last_rest_at = now
+        return None
+
+    def _spread_watch_rest_unanswered(self, symbol: str,
+                                      watch: _SpreadWatch) -> tuple[str, None, None] | None:
+        """After the entry's preview asked the REST quote ``watch`` let it
+        ask (``_spread_watch_skip`` returned None): None when the quote cache
+        holds a REST quote fetched by that ask (``quote_source`` "rest",
+        ``fetched_at`` at or after the ask), the quote the preview priced,
+        which then decides the entry. Otherwise the ask went unanswered: the
+        request failed or timed out, or the REST back-off held it
+        (``MarketDataStore.fetch_quotes``), and the cache holds the stream
+        book, an older quote or none, on which a watched entry is neither
+        decided nor priced. Fail closed: ``(reason, None, None)``, the skip
+        ``entry_spread_watch:rest_unanswered(book=passes|not_fresh,cached=rest|stream|none,asked=HH:MM:SS)``;
+        the watch holds, and its next ask waits
+        ``SPREAD_WATCH_REST_RETRY_SECONDS`` from this one. An unwatched
+        entry keeps the forced fetch's fallback to a cached quote
+        (``MarketDataStore._warn_forced_fetch_fallbacks``)."""
+        asked = watch.last_rest_at
+        assert asked is not None, "the watch's ask stamps last_rest_at"
+        cached = self.data.get_quote(symbol) or {}
+        if cached.get("quote_source") == "rest" and cached["fetched_at"] >= asked:
+            return None
+        detail = detail_fields(book=watch.last_rest_quote.removeprefix("book_"),
+                               cached=str(cached.get("quote_source") or "none"), asked=asked.strftime("%H:%M:%S"))
+        return f"{SPREAD_WATCH_GATE}:rest_unanswered({detail})", None, None
+
+    def _judge_spread_watch(self, key: tuple[str, Side], refusal: str | None) -> None:
+        """After the strategy's guard judged ``key``'s signal on its REST
+        quote: a refusal starts the signal's watch, with one TRADEFLOW line,
+        unless one holds; a pass ends the one that holds
+        (``rest_quote_passes``)."""
+        if refusal is None:
+            if key in self._spread_watches:
+                self._end_spread_watch(key, "rest_quote_passes")
+            return
+        if key in self._spread_watches:
+            return
+        self._spread_watches[key] = _SpreadWatch(started_at=sessions.now_et(), refusal=refusal)
+        LOG.log(TRADEFLOW_LEVEL, "Entry spread watch started symbol=%s side=%s refusal=%s: no REST quote for it "
+                "while its fresh stream book still fails", key[0], key[1].value, refusal)
+
+    def _end_spread_watch(self, key: tuple[str, Side], why: str) -> None:
+        """End ``key``'s watch with one TRADEFLOW line: why, how long it held,
+        the passes it skipped on the book, the REST quotes it let the entry
+        ask (and why the last was asked) and the passes it skipped waiting
+        to ask again."""
+        watch = self._spread_watches.pop(key)
+        held = (sessions.now_et() - watch.started_at).total_seconds()
+        LOG.log(TRADEFLOW_LEVEL, "Entry spread watch ended symbol=%s side=%s why=%s started=%s seconds=%.0f "
+                "book_skips=%d rest_quotes=%d last_rest_quote=%s rest_retry_waits=%d", key[0], key[1].value, why,
+                watch.started_at.strftime("%H:%M:%S"), held, watch.book_skips, watch.rest_quotes,
+                watch.last_rest_quote, watch.rest_retry_waits)
+
+    def _note_spread_watch_absences(self, quoted: set[tuple[str, Side]], signals: list) -> None:
+        """At a pass's end: a watch whose signal came to its quote is present;
+        one whose signal did not (none was built, or an earlier gate refused
+        it) is absent from the first such pass. An absence shorter than
+        ``SPREAD_WATCH_REST_RETRY_SECONDS`` keeps the watch, so a signal that
+        returns within it is judged on the book first, under the same wait;
+        at that length it ends the watch, why this pass's signal is absent:
+        ``no_signal``, or ``refused_before_its_quote:<gate>``."""
+        now = sessions.now_et()
+        for key, watch in list(self._spread_watches.items()):
+            if key in quoted:
+                watch.absent_since = None
+                continue
+            if watch.absent_since is None:
+                watch.absent_since = now
+            if (now - watch.absent_since).total_seconds() < SPREAD_WATCH_REST_RETRY_SECONDS:
+                continue
+            if any((signal.symbol, signal.side) == key for signal in signals):
+                decision = self.last_entry_decisions.get(key[0]) or {}
+                self._end_spread_watch(key, f"refused_before_its_quote:{reason_gate(decision.get('secondary_reason'))}")
+            else:
+                self._end_spread_watch(key, "no_signal")
+
     def reset_skip_tally(self) -> None:
         """Start a new day's skip tally: the counts and the current minute's
         keys (the engine's ET date rollover)."""
@@ -1018,10 +1213,16 @@ class EntryGatekeeper:
         context: dict[str, Any] | None = None,
         details: dict[str, Any] | None = None,
         market_side: Side | None = None,
+        skip_summary: bool = True,
     ) -> bool:
         """Record one entry decision: the dashboard's payload, the skip
         tally and the ``Decision`` log line the session archive's
-        ``decisions.csv`` is scraped from. ``market_side`` marks a decision
+        ``decisions.csv`` is scraped from, with a skip's ``SKIP_SUMMARY``
+        unless ``skip_summary`` is False (a skip of the entry spread watch,
+        on the stream book or waiting to ask REST again: the REST refusal
+        that started the watch logged the signal's context, and the watch's
+        start and end lines bound it).
+        ``market_side`` marks a decision
         about a signal the strategy built, with the way it bets on the
         symbol (``RiskManager.market_side``: an option's underlying
         direction, not its order side). The signal's reason is then the
@@ -1097,7 +1298,7 @@ class EntryGatekeeper:
             ','.join(cleaned) if cleaned else 'none',
         )
         self._last_entry_decision_log[key] = (signature[0], signature[1], now_ts, signature[2])
-        if str(action).lower() == 'skipped' and primary_reason not in _NOISY_SKIP_REASONS:
+        if skip_summary and str(action).lower() == 'skipped' and primary_reason not in _NOISY_SKIP_REASONS:
             payload = {'symbol': symbol, 'strategy': str(strategy_name), 'action': str(action), 'reasons': cleaned, **context_payload}
             if details_payload:
                 payload['details'] = details_payload
@@ -1119,9 +1320,13 @@ class EntryGatekeeper:
         until the window opened. Nothing is logged or tallied (on a trading
         day the engine's cycle line names the reason once a minute), and a
         decision whose reasons stand keeps its ``updated_at``, so the
-        dashboard's symbol memo holds."""
+        dashboard's symbol memo holds. Every entry spread watch ends
+        (``no_entry_cycle:<reasons>``), with its line: no signal comes to its
+        quote."""
         if not reasons:
             raise ValueError("hold_entry_decisions needs the reason no entry cycle runs")
+        for key in list(self._spread_watches):
+            self._end_spread_watch(key, f"no_entry_cycle:{','.join(reasons)}")
         for symbol, prior in list(self.last_entry_decisions.items()):
             held = list(reasons) + (["cooldown"] if self.risk.is_symbol_on_cooldown(symbol) else [])
             if prior.get("action") == "skipped" and prior.get("reasons") == held:
@@ -1150,7 +1355,13 @@ class EntryGatekeeper:
             interval=30.0,
         )
         self.last_entry_decisions.clear()
+        # The (symbol, side) of each stock signal that came to its quote this
+        # pass: an entry spread watch whose signal did not is absent, and
+        # ends once that lasts ``SPREAD_WATCH_REST_RETRY_SECONDS``
+        # (``_note_spread_watch_absences``).
+        quoted: set[tuple[str, Side]] = set()
         if not candidates:
+            self._note_spread_watch_absences(quoted, [])
             self.audit.log_cycle(
                 f"entry_none:{self.config.strategy}",
                 "no_candidates",
@@ -1190,6 +1401,7 @@ class EntryGatekeeper:
                 continue
             candidates_for_signals.append(candidate)
         if not candidates_for_signals:
+            self._note_spread_watch_absences(quoted, [])
             return
         candidate_by_symbol = {c.symbol: c for c in candidates_for_signals}
         signals = self.strategy.entry_signals(candidates_for_signals, bars, self.positions, client=self.client, data=self.data)
@@ -1368,17 +1580,53 @@ class EntryGatekeeper:
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "entry_frame_unavailable"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
                 continue
             intent = self.executor.order_intent_for_entry(signal.side)
-            preview = self.executor.preview_equity_entry(signal.symbol, intent, data=self.data)
-            if preview is None:
-                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "entry_quote_unavailable"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
-                continue
-            entry_price = float(preview["limit_price"])
-            # The touch the order crosses on the quote it is priced on: what
-            # its fill's slippage is measured from.
-            entry_touch = self._entry_touch(signal.side, preview)
-            levels_ok, levels_reason = self._entry_levels_valid(signal.side, entry_price, signal.stop_price, signal.target_price)
-            if not levels_ok:
-                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, levels_reason or "invalid_levels"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, entry_price, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)}, market_side=signal_market_side)
+            # The entry spread watch (2026-10-12): a signal the strategy's
+            # entry spread guard refused on its REST quote is judged on the
+            # symbol's fresh stream book first, with no REST request; while
+            # the book still fails, the pass skips it on the book
+            # (``entry_spread_watch:<refusal>``). When the book passes, or is
+            # not fresh, the entry asks its REST quote as an unwatched one
+            # does, unless the watch let it ask one less than
+            # ``SPREAD_WATCH_REST_RETRY_SECONDS`` ago
+            # (``entry_spread_watch:rest_retry_wait(...)``), and is decided
+            # and priced on it only when REST answers that ask; otherwise
+            # the pass skips it (``entry_spread_watch:rest_unanswered(...)``).
+            watch_key = (signal.symbol, signal.side)
+            quoted.add(watch_key)
+            watch = self._spread_watches.get(watch_key)
+            watch_skip = None if watch is None else self._spread_watch_skip(signal, intent, watch)
+            if watch_skip is None:
+                preview = self.executor.preview_equity_entry(signal.symbol, intent, data=self.data)
+                if watch is not None:
+                    watch_skip = self._spread_watch_rest_unanswered(signal.symbol, watch)
+            if watch_skip is None:
+                if preview is None:
+                    self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "entry_quote_unavailable"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
+                    continue
+                entry_price = float(preview["limit_price"])
+                market_snapshot = preview.get("market_snapshot")
+                # The touch the order crosses on the quote it is priced on:
+                # what its fill's slippage is measured from.
+                entry_touch = self._entry_touch(signal.side, preview)
+                # The priced entry's refusals before it is sized, one
+                # decision: levels its limit does not fit, then the
+                # strategy's entry spread guard (2026-10-12), on levels that
+                # hold. On the quote the order is priced on, a spread wide
+                # against the trade's risk or its target, both measured from
+                # this limit, refuses the entry (``entry_spread_too_wide(...)``),
+                # and so does a quote whose spread cannot be read
+                # (``entry_spread_unreadable(...)``); a refusal starts the
+                # signal's watch, a pass ends it. The guard only refuses;
+                # with its knobs at 0 the entry goes on as before.
+                levels_ok, levels_reason = self._entry_levels_valid(signal.side, entry_price, signal.stop_price, signal.target_price)
+                refusal = None if levels_ok else (levels_reason or "invalid_levels")
+                if refusal is None:
+                    refusal = self.strategy.entry_spread_refusal(signal, preview.get("bid"), preview.get("ask"), entry_price)
+                    self._judge_spread_watch(watch_key, refusal)
+            else:
+                refusal, entry_price, market_snapshot = watch_skip
+            if refusal is not None:
+                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, refusal], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, entry_price, market_snapshot=market_snapshot, order_intent=intent)}, market_side=signal_market_side, skip_summary=watch_skip is None)
                 continue
             # Size against a stop distance padded by expected slippage, so an
             # adverse fill still lands inside the per-trade risk budget. The
@@ -1545,6 +1793,7 @@ class EntryGatekeeper:
             self._ensure_disaster_stop_after_entry(signal.symbol, position, bars)
             self._log_entry_decision(signal.strategy, signal.symbol, "entered", [signal.reason], market_side=signal_market_side)
 
+        self._note_spread_watch_absences(quoted, signals)
         for symbol, payload in decision_map.items():
             if symbol in finalized:
                 continue

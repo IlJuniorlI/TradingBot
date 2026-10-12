@@ -2528,6 +2528,7 @@ Strategy-specific knobs:
 - `sector_groups`: co-movement groupings - ETF routing (`sector_index_map`) and the peer list for breadth confirmation.
 - `correlation_groups`: coarser risk groupings for the concentration guard (mega caps across tech/communication/consumer-discretionary trade as one beta book, so they share one bucket).
 - `max_same_correlation_group_same_direction`: max same-direction positions per correlation group.
+- `max_entry_spread_r` / `max_entry_spread_target_frac` (default `0`, off; `0.33` / `0.5` in the shipped preset): the entry spread guard. At the order, skip an entry whose quote's spread is at least this many × its risk |limit − stop| / its target distance |target − limit|; a quote whose spread cannot be read is skipped too. After a refusal, the signal is judged on the symbol's stream quote book with no REST quote request until the book passes or is not fresh (`entry_spread_watch:<refusal>`); the REST quote then decides, asked again at most once each 10 s while it still refuses (`entry_spread_watch:rest_retry_wait(...)`), and an ask REST does not answer skips the entry (`entry_spread_watch:rest_unanswered(...)`). Each is checked at load. See the strategy README, section 6g.
 
 Also uses these shared stock groups:
 

@@ -176,6 +176,8 @@
     "max_entry_bar_range_atr": 1.8,
     "max_entry_upper_wick_frac": 0.3,
     "max_entry_lower_wick_frac": 0.3,
+    "max_entry_spread_r": 0.0,
+    "max_entry_spread_target_frac": 0.0,
     "htf_fvg_entry_weight": 0.3,
     "ltf_fvg_entry_weight": 0.18,
     "opposing_fvg_entry_penalty_mult": 1.0,

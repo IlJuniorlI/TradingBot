@@ -721,11 +721,20 @@ class SchwabExecutor:
         return replace(result, message=f"{result.message};exit_limits_missed={missed};stopped={stopped}",
                        exit_limits_missed=missed)
 
-    def preview_equity_entry(self, symbol: str, intent: OrderIntent, data=None) -> dict[str, Any] | None:
+    def preview_equity_entry(self, symbol: str, intent: OrderIntent, data=None, *,
+                             refresh_quotes: bool = True) -> dict[str, Any] | None:
+        """An equity entry priced: its order session, the quote's bid, ask and
+        last, the marketable limit (``_equity_limit_price``) and the market
+        snapshot the order is sent on; None outside an order session, or
+        without a quote fresh within ``runtime.quote_cache_seconds`` that
+        prices a limit. ``refresh_quotes`` (the entry's) forces a REST quote
+        first (``source=execution:equity_market``); False prices the cached
+        quote with no request: the entry spread watch's stream book
+        (``MarketDataStore.publish_stream_book``)."""
         session = self._equity_session()
         if session is None:
             return None
-        market = self._equity_market(symbol, data, refresh_quotes=True)
+        market = self._equity_market(symbol, data, refresh_quotes=refresh_quotes)
         if market is None:
             return None
         bid, ask, last = market

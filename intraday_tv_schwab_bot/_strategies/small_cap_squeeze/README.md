@@ -49,6 +49,7 @@ continuously — entries run **08:05 → 11:50** with no gap.
 - **No relative-strength gate** (`relative_strength_block_threshold_pct: 0`).
 - **No HTF-structure gating** (`require_htf_bias_alignment: false`) — squeezes break prior structure.
 - **Long only** (`risk.allow_short: false`).
+- **No entry spread guard**: the manifest declares `max_entry_spread_r` and `max_entry_spread_target_frac` at `0`, which turns top_tier's guard off (top_tier README section 6g: the guard and its stream book watch). Set either in this preset to turn it on here; each is checked at load.
 
 ### 4. Timeframe + the key squeeze tuning
 - **1m LTF, native indicators** (`ltf_indicator_span_scale: 1` → 14 ATR; `ltf_ema_fast_span: 9` / `ltf_ema_slow_span: 20` EMAs) — responsive, with tight ATR-based stops that suit fast scalps. **Raise `ltf_indicator_span_scale` toward 3–5 to smooth signals and widen stops** (primary tuning knob); it no longer moves the EMAs, which the two `ltf_ema_*_span` knobs set on their own.

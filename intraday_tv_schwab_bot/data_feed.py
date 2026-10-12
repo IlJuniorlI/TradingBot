@@ -2814,7 +2814,8 @@ class MarketDataStore:
             self._log_stream_quote_checks(source, rest_stored)
         if stream_served and self.config.runtime.stream_quote_shadow_every > 0:
             # Counted here for the REST shadow, which never runs here, in the
-            # quotes phase (run_stream_quote_shadow).
+            # quotes phase (run_stream_quote_shadow). The entry spread watch's
+            # re-read of a book (publish_stream_book) is not counted.
             self._stream_quote_publications += 1
             self._stream_quote_served.update(stream_served)
         if requested:
@@ -2878,9 +2879,11 @@ class MarketDataStore:
         back-off waits: ``REST_RETRY_SECONDS``' comment)
         leaves the cache as it was, and its readers (an entry's market read, the management
         snapshot) take a cached quote younger than ``_quote_ttl``: since the
-        stream quotes, usually the stream's. One WARNING per such symbol
-        naming that quote's source and age; none for a cached quote too old
-        for them."""
+        stream quotes, usually the stream's. An entry the spread watch let
+        ask its REST quote takes none: it is skipped
+        (``EntryGatekeeper._spread_watch_rest_unanswered``). One WARNING per
+        such symbol naming that quote's source and age; none for a cached
+        quote too old for them."""
         stored = set(rest_stored)
         missed = [symbol for symbol in pending if symbol not in stored]
         if not missed:
@@ -3347,16 +3350,50 @@ class MarketDataStore:
         if not self.config.runtime.stream_quotes:
             return False
         key = self._symbol_key(symbol)
+        read = self._read_stream_book(key, "the freshness check")
+        return read is not None and key in read.books
+
+    def publish_stream_book(self, symbol: str) -> bool:
+        """Publish ``symbol``'s fresh stream quote book into the quote cache,
+        as a non-forced ``fetch_quotes`` serves it (``_serve_stream_quote``),
+        and nothing else: never a REST request, and not a publication the
+        stream quotes' REST shadow counts (``run_stream_quote_shadow``), for
+        it re-reads a book the engine's refresh serves; no silent/live line
+        and no health line. The entry spread watch reads the book through it
+        (``EntryGatekeeper._spread_watch_skip``). True when the book is fresh
+        (``stream_quote_fresh``'s freshness) and the cache now holds it, or a
+        quote newer than it (a REST quote after the stream's last message,
+        which a publication never writes over); False when the book is not
+        fresh, with ``runtime.stream_quotes`` off, or when its publication
+        failed (logged with its type, the book dropped): the caller then
+        takes REST. A lock timeout replaces the books
+        (``_reset_stream_quotes``) and any other failure of the read is
+        logged with its type: both answer False."""
+        if not self.config.runtime.stream_quotes:
+            return False
+        key = self._symbol_key(symbol)
+        read = self._read_stream_book(key, "the book read")
+        if read is None or key not in read.books:
+            return False
+        if self._serve_stream_quote(key, read) is not None:
+            return True
+        with self._lock:
+            last = self.last_quote_refresh.get(key)
+        return last is not None and read.at is not None and last > read.at
+
+    def _read_stream_book(self, key: str, what: str) -> StreamQuoteRead | None:
+        """One read of ``key``'s stream quote book at ``_quote_ttl``
+        (``StreamQuoteState.read``), or None when it failed: a lock timeout
+        replaces the books (``_reset_stream_quotes``), any other failure is
+        logged with its type, ``what`` naming the read."""
         try:
-            read = self.stream_quotes.read([key], sessions.now_et(), self._quote_ttl())
+            return self.stream_quotes.read([key], sessions.now_et(), self._quote_ttl())
         except StreamQuoteLockTimeout as exc:
-            self._reset_stream_quotes("the freshness check", exc)
-            return False
+            self._reset_stream_quotes(what, exc)
+            return None
         except Exception as exc:
-            LOG.error("Stream quotes: the freshness check of %s failed (%s: %s); it takes REST", key,
-                      type(exc).__name__, exc)
-            return False
-        return key in read.books
+            LOG.error("Stream quotes: %s of %s failed (%s: %s); it takes REST", what, key, type(exc).__name__, exc)
+            return None
 
     @staticmethod
     def _normalize_quote(symbol: str, payload: dict | None) -> dict:

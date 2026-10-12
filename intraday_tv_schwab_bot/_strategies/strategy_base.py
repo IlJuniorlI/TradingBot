@@ -1136,5 +1136,19 @@ class BaseStrategy(ContextBuildersMixin):
     def should_force_flatten(self, position: Position) -> bool:
         return False
 
+    def entry_spread_refusal(self, signal: Signal, bid: Any, ask: Any, limit_price: float) -> str | None:
+        """The strategy's entry spread guard: why ``signal``, a stock entry
+        priced at the marketable limit ``limit_price`` on the quote ``bid`` /
+        ``ask``, is refused, or None. The entry stage
+        (``EntryGatekeeper.open_positions``) asks it for every stock entry
+        whose levels fit its limit, before the entry is sized, and, while it
+        keeps a signal the guard refused off the REST quote, on the symbol's
+        stream quote book. The reason it returns is the decision's gate; the
+        guard only refuses, so it never moves, prices or sizes the signal.
+        None here: a strategy without a guard refuses nothing.
+        top_tier_adaptive declares one (its strategy README, section 6g), and
+        so small_cap_squeeze, which runs its engine, has it too."""
+        return None
+
     def position_mark_price(self, position: Position, data) -> float | None:
         return None

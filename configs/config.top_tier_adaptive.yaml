@@ -1047,6 +1047,20 @@ strategies:
       max_entry_upper_wick_frac: 0.30
       max_entry_lower_wick_frac: 0.30
 
+      # Entry spread guard (2026-10-12; top_tier README, 6g): skip an entry whose
+      # quote at the order has a spread (ask - bid) of at least this many x its
+      # risk |limit - stop|, or of at least this many x its target distance
+      # |target - limit| (a target-less runner checks the risk alone). A quote
+      # whose spread cannot be read is skipped too. On the dry run 09-21..10-09
+      # it skips 54 of 231 entries, which lost -777.51 / -35.74 R; the 177 kept
+      # averaged -0.078 R a trade against -0.214 R for all. After a refusal the
+      # signal is judged on the symbol's stream quote book with no REST quote
+      # request until the book passes, or is not fresh; then the REST quote
+      # decides, as before, asked again at most once each 10 s while it still
+      # refuses. 0 turns a test off; both 0 turns the guard off.
+      max_entry_spread_r: 0.33
+      max_entry_spread_target_frac: 0.5
+
       # FVG scoring
       htf_fvg_entry_weight: 0.30
       ltf_fvg_entry_weight: 0.18

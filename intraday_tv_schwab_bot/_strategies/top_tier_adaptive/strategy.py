@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import time
 from typing import Any
@@ -34,7 +35,7 @@ from ...indicators import get_session_indicator_window, last_bar_atr, ltf_ema_sp
 from ...models import Candidate, Position, Side, Signal
 from ...sessions import EQUITY_RTH_OPEN, equity_session_state, parse_hhmm
 from ...numeric import safe_float
-from ...reasons import insufficient_bars_reason
+from ...reasons import detail_fields, insufficient_bars_reason
 from ...support_resistance import role_levels
 from ... import sessions
 from ..shared_entry import EntryContexts, EntryProposal
@@ -88,6 +89,88 @@ REGIME_SKIP_LABELS = {
     "orb": "orb",
     "vwap_reclaim": "vwap_reclaim",
 }
+
+# The entry spread guard's knobs (README section 6g), in the order
+# ``entry_spread_limits`` returns them: the largest spread an entry may be
+# quoted at, as a multiple of its risk |limit - stop| and of its target
+# distance |target - limit|. 0 turns a test off.
+ENTRY_SPREAD_KNOBS = ("max_entry_spread_r", "max_entry_spread_target_frac")
+
+
+def entry_spread_limits(params: Mapping[str, Any], strategy_name: str) -> tuple[float, float]:
+    """The entry spread guard's limits in ``params``, ``(max_entry_spread_r,
+    max_entry_spread_target_frac)``: each a finite number >= 0, else a
+    ValueError naming the key (a NaN, an infinity, a negative, a bool, a
+    quoted number or a null), and a ValueError for a knob the params do not
+    carry. The load runs it on the params of every strategy a config sets
+    (``normalize_params``), and the strategy again when it is built. Both
+    manifests that run this engine declare both knobs at 0 (top_tier's and
+    small_cap_squeeze's), so a loaded config always carries them; the
+    shipped top_tier preset sets them, and small_cap_squeeze has the guard
+    only when its own preset does."""
+    limits: list[float] = []
+    for key in ENTRY_SPREAD_KNOBS:
+        if key not in params:
+            raise ValueError(f"strategies.{strategy_name}.params.{key} is missing: the strategy's manifest declares "
+                             f"it (0 turns the test off)")
+        value = params[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"strategies.{strategy_name}.params.{key} must be a finite number >= 0 "
+                f"(a multiple of the entry's distance from its limit; 0 turns the test off), got {value!r}"
+            )
+        limits.append(float(value))
+    return limits[0], limits[1]
+
+
+def entry_spread_guard(bid: Any, ask: Any, limit_price: float, stop_price: float, target_price: float | None,
+                       *, max_spread_r: float, max_spread_target_frac: float) -> str | None:
+    """Why the entry spread guard refuses an entry priced at the marketable
+    limit ``limit_price`` on the quote ``bid`` / ``ask``, or None:
+
+    - ``entry_spread_too_wide(...)``: the spread ``ask - bid`` is at least
+      ``max_spread_r`` x the risk ``|limit - stop|``, or at least
+      ``max_spread_target_frac`` x the target distance ``|target - limit|``.
+      The detail carries the spread, both distances, both ratios and both
+      limits (``off`` for a test at 0); a target-less runner's target terms
+      read ``na``, and only the risk test applies to it.
+    - ``entry_spread_unreadable(bid=...,ask=...)``: a test applies, but the
+      quote has no positive, finite bid or ask, or is crossed (ask below
+      bid). The guard fails closed.
+
+    No test applies, and the quote is not read, with both limits 0, or with
+    only the target test on and no target. Each ratio is rounded to 6
+    decimals before it is compared, so float noise in ``ask - bid``
+    (100.33 - 100.00 = 0.3299999999999983) cannot carry a quote that sits at
+    a limit to the side below it. The levels are checked before the guard
+    runs (``EntryGatekeeper._entry_levels_valid``); a risk or a target
+    distance of 0 raises ValueError."""
+    target_test = max_spread_target_frac > 0 and target_price is not None
+    if max_spread_r <= 0 and not target_test:
+        return None
+    bid_price = safe_float(bid, None, finite=True)
+    ask_price = safe_float(ask, None, finite=True)
+    if bid_price is None or ask_price is None or bid_price <= 0 or ask_price < bid_price:
+        return f"entry_spread_unreadable({detail_fields(bid=bid_price, ask=ask_price)})"
+    spread = ask_price - bid_price
+    risk = abs(float(limit_price) - float(stop_price))
+    target_distance = None if target_price is None else abs(float(target_price) - float(limit_price))
+    if risk <= 0 or target_distance == 0:
+        raise ValueError(f"entry spread guard on unchecked levels: limit={limit_price!r} stop={stop_price!r} "
+                         f"target={target_price!r}")
+    spread_r = round(spread / risk, 6)
+    spread_target = None if target_distance is None else round(spread / target_distance, 6)
+    too_wide_r = max_spread_r > 0 and spread_r >= max_spread_r
+    too_wide_target = (max_spread_target_frac > 0 and spread_target is not None
+                       and spread_target >= max_spread_target_frac)
+    if not (too_wide_r or too_wide_target):
+        return None
+    detail = detail_fields(
+        spread=spread, risk=risk, spread_r=spread_r, max_spread_r=max_spread_r if max_spread_r > 0 else "off",
+        target_distance=target_distance, spread_target=spread_target,
+        max_spread_target=max_spread_target_frac if max_spread_target_frac > 0 else "off",
+    )
+    return f"entry_spread_too_wide({detail})"
 
 
 @dataclass
@@ -147,8 +230,23 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
     time_params = ("orb_end_time", "midday_start_time", "midday_end_time", "afternoon_start_time",
                    "no_new_entries_after", "early_session_stop_widening_until")
 
+    @classmethod
+    def normalize_params(cls, params: dict[str, Any]) -> dict[str, Any]:
+        """Checks the entry spread guard's knobs at load
+        (``entry_spread_limits``; ``load_config`` runs this on every
+        ``strategies.<name>.params`` a config sets), so a bad value refuses
+        to start before the Schwab client is built."""
+        out = super().normalize_params(params)
+        entry_spread_limits(out, cls.strategy_name)
+        return out
+
     def __init__(self, config):
         super().__init__(config)
+        # The entry spread guard's limits (``entry_spread_refusal``), checked
+        # again here: params the load did not normalize (a config with no
+        # params block for this strategy, or params set after the load)
+        # reach the strategy only through its build.
+        self._entry_spread_limits = entry_spread_limits(self.params, self.strategy_name)
         # Per-symbol rolling window of recent LIVE directional bias
         # observations (output of ``_compute_live_directional_bias``).
         # Trailing-bias memory for Fix A (2026-04-23): when the current
@@ -878,6 +976,24 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 "htf_ema_bonus": round(htf_ema_bonus, 4),
             },
         )
+
+    # ------------------------------------------------------------------
+    # Entry spread guard — asked by the entry stage at the order
+    # ------------------------------------------------------------------
+    def entry_spread_refusal(self, signal: Signal, bid: Any, ask: Any, limit_price: float) -> str | None:
+        """The entry spread guard (README section 6g; the hook is
+        ``BaseStrategy.entry_spread_refusal``): why ``signal``, priced at the
+        marketable limit ``limit_price`` on the quote ``bid`` / ``ask``, is
+        refused, or None. The entry stage (``EntryGatekeeper.open_positions``)
+        asks once the entry's REST quote is read, its limit priced and its
+        levels checked, before it is sized, and, after a refusal, on the
+        symbol's fresh stream book until the book passes; the guard only
+        refuses. With ``max_entry_spread_r`` and
+        ``max_entry_spread_target_frac`` both 0 it refuses nothing and does
+        not read the quote (``entry_spread_guard``)."""
+        max_spread_r, max_spread_target_frac = self._entry_spread_limits
+        return entry_spread_guard(bid, ask, limit_price, signal.stop_price, signal.target_price,
+                                  max_spread_r=max_spread_r, max_spread_target_frac=max_spread_target_frac)
 
     # ------------------------------------------------------------------
     # entry_signals — main loop

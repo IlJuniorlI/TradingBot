@@ -73,6 +73,8 @@
     "pullback_require_real_dip": false,
     "reject_stretched_entries": false,
     "entry_exhaustion_filter_enabled": false,
+    "max_entry_spread_r": 0.0,
+    "max_entry_spread_target_frac": 0.0,
     "reject_oversized_entry_bar": false,
     "reject_tech_bias_contradiction": false,
     "require_entry_confirmation_bar": true,
