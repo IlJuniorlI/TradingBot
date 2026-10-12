@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time as dt_time, timedelta
 from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
-from schwabdev import Client
 import pandas as pd
 
 from .audit_logger import AuditLogger
@@ -39,7 +38,12 @@ from .session_archive import (
     session_archive_owed_path,
 )
 from .session_report import append_trades_csv, check_trades_csv_lock, write_session_report
-from .schwab_api import SchwabdevApiUsageTracker, read_refresh_token_window, register_schwab_api_tracker
+from .schwab_api import (
+    PooledSchwabClient,
+    SchwabdevApiUsageTracker,
+    read_refresh_token_window,
+    register_schwab_api_tracker,
+)
 from .log_setup import TRADEFLOW_LEVEL, setup_logging
 from .sessions import (
     EQUITY_STREAM_END,
@@ -275,7 +279,11 @@ class IntradayBot:
         LOG.info("intraday-tv-schwab-bot %s", __version__)
         self.audit = AuditLogger(config.strategy)
         self.api_usage = SchwabdevApiUsageTracker()
-        self.client = Client(
+        # A session for each fetch-pool worker and one for the engine
+        # thread, so the pool's requests are in flight together
+        # (schwabdev's own client sends one at a time).
+        self.client = PooledSchwabClient(
+            pool_size=config.runtime.cycle_fetch_workers + 1,
             app_key=config.schwab.app_key,
             app_secret=config.schwab.app_secret,
             callback_url=config.schwab.callback_url,
@@ -1744,13 +1752,15 @@ class IntradayBot:
         ``runtime.cycle_fetch_workers`` threads, keyed by
         ``_unique_symbol_keys``: the cycle's network fetches (the 1m history,
         the HTF refresh points and the daily-history prefetch), which spend
-        their time waiting on Schwab. The pool overlaps no HTTP, though:
-        schwabdev 4.0.0's ``Client._request`` holds one lock around every
-        request, its retries included, so the fetches reach Schwab one at a
-        time (until 2026-10-05 this said the pool overlaps them). The pool
-        runs whatever the count, one worker included. A symbol whose call
-        raises is isolated as in ``_compute_symbol_map``. The results are
-        read in the symbols' order.
+        their time waiting on Schwab, so the pool overlaps them: the client
+        has a session for each worker (``PooledSchwabClient``) and sends
+        one request at a time only while Schwab fails systemically. Until
+        2026-10-07 the client was schwabdev's, whose ``Client._request``
+        holds one lock around every request, its retries included, so the
+        fetches reached Schwab one at a time. The pool runs whatever the
+        count, one worker included. A symbol whose call raises is isolated
+        as in ``_compute_symbol_map``. The results are read in the symbols'
+        order.
 
         A stop signal (KeyboardInterrupt) while it waits drops the fetches
         not started yet, and the pool's shutdown waits only for the ones in

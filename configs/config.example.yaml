@@ -189,8 +189,11 @@ runtime:
   session_reconcile_on_resume: true
   # Thread-pool size for the cycle's network fetches (the 1m history, the
   # HTF refresh points, the daily-history prefetch, the single-quote
-  # fallbacks). The cycle's CPU work (step frames, S/R and context
-  # pre-warms) runs serially. Replaced cycle_precompute_workers (2026-09-28).
+  # fallbacks), 1 to 9. The Schwab client keeps one session more than this,
+  # so the fetches are in flight together; one at a time while Schwab fails
+  # (a 401, 429 or 5xx, a transport failure or a timeout). The cycle's CPU
+  # work (step frames, S/R and context pre-warms) runs serially. Replaced
+  # cycle_precompute_workers (2026-09-28).
   cycle_fetch_workers: 4
   # Per-symbol quote-fetch failure threshold. After this many consecutive
   # quote refreshes fail (typically Schwab 401/403/404 on restricted

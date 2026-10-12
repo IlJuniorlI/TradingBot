@@ -5,13 +5,17 @@
 a non-2xx response. ``response_ok`` is the one reading of a response status.
 ``SCHWAB_TRANSPORT_ERRORS`` are the transport failures the client raises,
 and ``SCHWAB_WRITE_UNKNOWN_OUTCOME`` those an order write raises without
-telling whether the broker acted on it.
+telling whether the broker acted on it. ``schwab_failure_is_systemic`` and
+``schwab_status_is_systemic`` name the failures every other request would
+meet too. ``PooledSchwabClient`` is the client the bot builds: schwabdev's,
+with requests that can be in flight together.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import queue
 import sqlite3
 from collections import deque
 from contextlib import closing
@@ -281,8 +285,9 @@ class SchwabHTTPError(RuntimeError):
 
 
 # The transport failures a Schwab read raises (every call_schwab_json call is
-# a GET). schwabdev's Client sends it on a requests Session whose adapter
-# retries a failed connect, a failed read (at most twice) and a 429, 500,
+# a GET). schwabdev's Client sends it on a requests Session whose adapter (a
+# PooledSchwabClient's sessions are mounted with the same one) retries a
+# failed connect, a failed read (at most twice) and a 429, 500,
 # 502, 503 or 504 status, within three retries in all, then hands back the
 # last status instead of raising, which call_schwab_json reads as a
 # SchwabHTTPError. A refused, reset or dropped connection, a DNS or TLS
@@ -325,6 +330,28 @@ SCHWAB_WRITE_UNKNOWN_OUTCOME: tuple[type[Exception], ...] = (
 )
 
 
+def schwab_status_is_systemic(status: Any) -> bool:
+    """True for a status every other request would get too: 401 (the access
+    token), 429 (the app key's rate limit) or a 5xx (Schwab itself). A 4xx
+    about the request (400, 403, 404: a bad or restricted symbol) is not,
+    nor is a status that does not read as a number."""
+    code = safe_int(status)
+    return code is not None and (code in (401, 429) or 500 <= code < 600)
+
+
+def schwab_failure_is_systemic(error: BaseException) -> bool:
+    """True when a Schwab request failed the way every other request would
+    too, so its caller sends no more of them for now: a transport failure,
+    a timeout included (``SCHWAB_WRITE_UNKNOWN_OUTCOME``; a read raises one
+    only once the adapter's retries are spent), or a ``SchwabHTTPError``
+    with a systemic status (``schwab_status_is_systemic``). Anything else is
+    about the request: a 4xx about it, a body that does not decode, a
+    parameter schwabdev's validator refused, a bug."""
+    if isinstance(error, SCHWAB_WRITE_UNKNOWN_OUTCOME):
+        return True
+    return isinstance(error, SchwabHTTPError) and schwab_status_is_systemic(error.status_code)
+
+
 def call_schwab_json(client: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
     """Call ``method_name`` and return its decoded JSON body.
 
@@ -342,3 +369,97 @@ def call_schwab_json(client: Any, method_name: str, *args: Any, **kwargs: Any) -
         return response.json()
     except Exception as exc:
         raise SchwabHTTPError(method_name, status, f"undecodable body: {exc}") from exc
+
+
+class PooledSchwabClient(SchwabClient):
+    """schwabdev's ``Client``, whose requests can be in flight together.
+
+    schwabdev 4.0.0's ``Client._request`` holds one lock (``_session_lock``)
+    over the whole HTTP request, its adapter's retries and their back-off
+    included, and the bot shares one client between the engine thread and
+    its pools. So the fetch pool (``runtime.cycle_fetch_workers``) sent one
+    request at a time: on 2026-10-07 each of the 27 boundary maps of 28 HTF
+    fetches started four at once, then one every 0.21-0.24 s (each map's
+    median) as the request before it finished, and took 6.0-11.1 s (median
+    6.55 s).
+
+    Here each request borrows one of ``pool_size`` ``requests.Session``s,
+    the most recently returned first, stamps the current access token on it
+    and sends with no lock held across the network. A borrower past
+    ``pool_size`` waits for a session, which bounds the requests in flight.
+    Every pooled session is mounted with the client's own adapters (one per
+    scheme, ``Client.__init__``'s), so the requests share their connection
+    pools and keep schwabdev's retry policy: GET, PUT and DELETE are
+    retried, a POST never is (``SCHWAB_WRITE_UNKNOWN_OUTCOME`` relies on
+    it). Each session keeps its own cookies (one jar shared across threads
+    is not safe in requests); requests sent one after another take the
+    session the one before returned.
+
+    While the last request to finish failed systemically (it answered 401,
+    429 or a 5xx, or raised a transport failure or a timeout:
+    ``schwab_failure_is_systemic``), the requests go one at a time, as
+    schwabdev's client sends them, until one is answered otherwise, so a
+    rate limit or an outage meets no more requests at once than it did
+    (a 429 window over the 09:15 prewarm, replayed through a loopback
+    Schwab, drew 246 requests a minute through the pool without this, 80
+    with it, and 62 through schwabdev's client).
+
+    The access-token refresh stays serialized (``_refresh_token_serialized``,
+    then schwabdev's own lock), and a token another path refreshed reaches
+    the next request: the stream's (re)connect refreshes through
+    ``client.tokens`` (``ClientBase._get_streamer_info``), which leaves
+    schwabdev's session header on the old token.
+
+    It overrides a private method of a pinned dependency:
+    tests/foundation/test_pooled_schwab_client.py pins the source of the
+    schwabdev code it replaces (``Client._request``) and builds on
+    (``Client.__init__``, ``update_tokens``, ``close``), so a schwabdev
+    upgrade fails there first.
+    """
+
+    def __init__(self, *args: Any, pool_size: int, **kwargs: Any) -> None:
+        # Checked before schwabdev's __init__ reads (or asks for) a token.
+        if isinstance(pool_size, bool) or not isinstance(pool_size, int) or pool_size < 1:
+            raise ValueError(f"pool_size must be an integer >= 1, got {pool_size!r}")
+        super().__init__(*args, **kwargs)
+        self._pooled_sessions: list[requests.Session] = []
+        self._idle_sessions: queue.LifoQueue[requests.Session] = queue.LifoQueue()
+        self._failing = False
+        self._one_at_a_time = Lock()
+        for _ in range(pool_size):
+            session = requests.Session()
+            for prefix, adapter in self._session.adapters.items():
+                session.mount(prefix, adapter)
+            self._pooled_sessions.append(session)
+            self._idle_sessions.put(session)
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        self.update_tokens()
+        session = self._idle_sessions.get()
+        try:
+            session.headers["Authorization"] = f"Bearer {self.tokens.access_token}"
+            if self._failing:
+                with self._one_at_a_time:
+                    return self._send(session, method, path, kwargs)
+            return self._send(session, method, path, kwargs)
+        finally:
+            self._idle_sessions.put(session)
+
+    def _send(self, session: requests.Session, method: str, path: str, kwargs: dict[str, Any]) -> requests.Response:
+        try:
+            response = session.request(method, f"{self._base_api_url}{path}", timeout=self.timeout, **kwargs)
+        except Exception as exc:
+            if schwab_failure_is_systemic(exc):
+                self._failing = True
+            raise
+        self._failing = schwab_status_is_systemic(response.status_code)
+        return response
+
+    def close(self) -> None:
+        # The pooled sessions hold nothing but the client's own adapters,
+        # which schwabdev's close closes. Only once schwabdev's __init__ has
+        # run (the lock is the last thing it sets): a client whose pool_size
+        # was refused holds nothing of schwabdev's, and schwabdev's close
+        # (from __del__) would raise on the missing session and logger.
+        if hasattr(self, "_session_lock"):
+            super().close()

@@ -531,8 +531,10 @@ class RuntimeConfig:
     # Thread-pool size for the cycle's network fetches: the 1m history, the
     # HTF refresh points and the daily-history prefetch
     # (engine._fetch_symbol_map), and the single-quote fallbacks of a quote
-    # refresh (MarketDataStore._parallel_quote_fetch). The cycle's CPU work
-    # (the history-fetch decisions, the step frames, the S/R and context
+    # refresh (MarketDataStore._parallel_quote_fetch). The Schwab client
+    # keeps one session more than this (schwab_api.PooledSchwabClient), so
+    # the pool's requests are in flight together. The cycle's CPU work (the
+    # history-fetch decisions, the step frames, the S/R and context
     # pre-warms) runs serially on the engine thread
     # (engine._compute_symbol_map). Replaced cycle_precompute_workers, which
     # sized one pool for both, 2026-09-28.
@@ -1866,10 +1868,14 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         # and on every failed cycle by the engine's. A null used to turn the
         # engine's off, and a typo raised out of its error path (2026-09-26).
         "error_escalation_cycles": _Number(integer=True, low=0, note=" (0 turns the escalation off)"),
-        # Sizes the engine's fetch pool and the quote fallbacks' pool. Its
-        # predecessor, cycle_precompute_workers, was read as
-        # ``int(value or 4)`` behind a silent except until 2026-09-26.
-        "cycle_fetch_workers": _COUNT,
+        # Sizes the engine's fetch pool, the quote fallbacks' pool and the
+        # Schwab client's sessions (one more than it, the requests in flight
+        # at most): at most 9, so the sessions stay within the 10 connections
+        # schwabdev's adapter keeps to a host (urllib3 closes any past them
+        # after its request, with a WARNING). Its predecessor,
+        # cycle_precompute_workers, was read as ``int(value or 4)`` behind a
+        # silent except until 2026-09-26.
+        "cycle_fetch_workers": _Number(integer=True, low=1, high=9),
         # Read by every quote refresh (MarketDataStore._parallel_quote_fetch),
         # where a typo used to read as 5 and null or a negative count as 0.
         "max_consecutive_quote_failures": _Number(integer=True, low=0, note=" (0 turns the gate off)"),
