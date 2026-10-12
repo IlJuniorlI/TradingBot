@@ -1866,7 +1866,21 @@ class IntradayBot:
         of a boundary's fetches ran in the dashboard publish, which held the
         next management 15-30 s (study F, section 1.3). A symbol whose fetch
         failed is not retried until the next cycle, as each read used to
-        retry it: an outage costs one fetch per symbol per cycle.
+        retry it.
+
+        A fetch that fails systemically (``schwab_failure_is_systemic``: a
+        transport failure or a timeout, 401, 429 or a 5xx; ``MarketDataStore
+        .htf_failing_since``) stops the rest of the map: the fetches not
+        started yet are not sent. From then on a cycle sends one fetch, the
+        probe, at its first point with a due symbol, until one is answered;
+        the point whose probe is answered fetches the rest of its due symbols
+        (2026-10-07). The probe is a symbol other than the one whose fetch
+        failed last, which goes last in the map after it: a symbol that fails
+        on its own every time (a 5xx about it) neither holds the others nor
+        is fetched more than once a cycle. Until then an outage sent every
+        due symbol's fetch at every cycle (28 a pass on top_tier), and under
+        a 429 each spent about 3 s in schwabdev's retries, one fetch at a
+        time (schwabdev's lock; the pooled client's while Schwab fails).
 
         Mid-cycle (``bars`` given) the refreshed symbols' S/R contexts are
         built again as the cycle's pre-warm builds them
@@ -1882,22 +1896,49 @@ class IntradayBot:
         due = self.data.htf_refresh_due([symbol for symbol in self._htf_symbols() if symbol not in attempted], tf)
         if not due:
             return
-        attempted.update(due)
         lookback_days = self.strategy.htf_lookback_days()
-        started = time.monotonic()
-        stored = self._fetch_symbol_map(
-            due,
-            lambda symbol: self.data.refresh_htf_frame(symbol, timeframe_minutes=tf, lookback_days=lookback_days),
-            label="HTF refresh",
-        )
-        refreshed = [symbol for symbol in due if stored.get(symbol) is True]
-        failed = [symbol for symbol in due if stored.get(symbol) is not True]
-        LOG.info("HTF refresh (%s): %d/%d %sm frame(s) in %.2fs%s", where, len(refreshed), len(due), tf,
-                 time.monotonic() - started, f"; failed: {','.join(failed)}" if failed else "")
+        refreshed: list[str] = []
+        if self.data.htf_failing_since is not None:
+            if attempted:
+                return
+            failing = self.data.htf_failing_symbol
+            probe = next((symbol for symbol in due if symbol != failing), due[0])
+            attempted.add(probe)
+            refreshed += self._fetch_htf_frames([probe], tf, lookback_days, where=f"{where}, probe", probe=True)
+            # The rest, the symbol that failed last after them.
+            due = ([symbol for symbol in due if symbol not in (probe, failing)]
+                   + [symbol for symbol in due if symbol == failing and symbol != probe])
+        if due and self.data.htf_failing_since is None:
+            attempted.update(due)
+            refreshed += self._fetch_htf_frames(due, tf, lookback_days, where=where, probe=False)
         if bars is not None and refreshed:
             stepped = {symbol: bars[symbol] for symbol in refreshed if symbol in bars}
             self._prime_cycle_support_cache(stepped)
             self._prime_strategy_htf_contexts(stepped)
+
+    def _fetch_htf_frames(self, symbols: list[str], tf: int, lookback_days: int, *, where: str,
+                          probe: bool) -> list[str]:
+        """One map of ``_refresh_htf_frames``: fetch ``symbols``' HTF frames
+        on the fetch pool, log the outcome and return the symbols stored.
+        Unless it is the probe, a symbol whose turn comes while a fetch has
+        failed systemically (``MarketDataStore.htf_failing_since``) is not
+        sent."""
+        def _refresh(symbol: str) -> bool | None:
+            if not probe and self.data.htf_failing_since is not None:
+                return None
+            return self.data.refresh_htf_frame(symbol, timeframe_minutes=tf, lookback_days=lookback_days)
+
+        started = time.monotonic()
+        stored = self._fetch_symbol_map(symbols, _refresh, label="HTF refresh")
+        # A call that raised is missing from ``stored``: failed.
+        outcome = {symbol: stored.get(symbol, False) for symbol in symbols}
+        refreshed = [symbol for symbol in symbols if outcome[symbol] is True]
+        failed = [symbol for symbol in symbols if outcome[symbol] is False]
+        unsent = [symbol for symbol in symbols if outcome[symbol] is None]
+        LOG.info("HTF refresh (%s): %d/%d %sm frame(s) in %.2fs%s%s", where, len(refreshed), len(symbols), tf,
+                 time.monotonic() - started, f"; failed: {','.join(failed)}" if failed else "",
+                 f"; not sent, Schwab failing: {','.join(unsent)}" if unsent else "")
+        return refreshed
 
     def _prime_strategy_htf_contexts(self, bars: dict[str, pd.DataFrame]) -> None:
         """Build, for each symbol of ``bars``, the HTF context of every

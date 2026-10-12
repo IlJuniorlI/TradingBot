@@ -22,7 +22,7 @@ from .fair_value_gaps import FairValueGapContext, build_fair_value_gap_context, 
 from .order_blocks import OrderBlockContext, build_order_block_context, empty_order_block_context
 from .numeric import first_float, safe_float
 from .symbols import QUOTE_SYMBOL_ALIASES, STREAMABLE_EQUITY_RE, is_streamable_equity, is_support_resistance_symbol
-from .schwab_api import call_schwab_client, call_schwab_json, response_ok
+from .schwab_api import call_schwab_client, call_schwab_json, response_ok, schwab_failure_is_systemic
 from .stream_quotes import (
     LEVELONE_EQUITIES,
     STREAM_QUOTE_FIELDS,
@@ -237,6 +237,12 @@ class MarketDataStore:
         # result).
         self._htf_derived_memo: dict[tuple[tuple[str, int], str], tuple[pd.DataFrame | None, tuple, Any]] = {}
         self.last_htf_refresh: dict[tuple[str, int], datetime] = {}
+        # When an HTF fetch failed systemically, while none has been answered
+        # since (refresh_htf_frame; the engine's refresh then sends one fetch
+        # a cycle, IntradayBot._refresh_htf_frames), and the symbol of the
+        # last fetch that failed so. None while Schwab answers.
+        self.htf_failing_since: datetime | None = None
+        self.htf_failing_symbol: str | None = None
         self.last_quote_refresh: dict[str, datetime] = {}
         # Per-symbol quote-failure tracking. Counter increments on each
         # quote-fetch failure, resets on success. Blacklist captures the
@@ -725,17 +731,42 @@ class MarketDataStore:
         frame keeps (the strategy's ``htf_lookback_days()``). A failure is
         logged with its type and absorbed, so one symbol's failed fetch fails
         neither the cycle nor another symbol's fetch: the frame keeps its
-        bars, its refresh stays due, and the next cycle retries it. Broad
+        bars, its refresh stays due, and a later cycle retries it. Broad
         because the fetch goes through the Schwab client, which raises any
         type (``_fetch_price_history_payload_with_aliases`` re-raises the
         last one).
+
+        A systemic failure (``schwab_failure_is_systemic``: a transport
+        failure or a timeout, 401, 429 or a 5xx, which every other fetch
+        would meet too) sets ``htf_failing_since``, and the engine then sends
+        no more than one HTF fetch a cycle until one is answered; any answer
+        (the frame, or a failure about the request, such as a 404) clears it
+        (2026-10-07).
         """
         try:
             self._refresh_htf_frame(symbol, timeframe_minutes, lookback_days)
         except Exception as exc:
             LOG.warning("HTF frame refresh failed for %s (%sm): %s: %s", symbol, timeframe_minutes, type(exc).__name__, exc)
+            self._note_htf_fetch_outcome(symbol, systemic_failure=schwab_failure_is_systemic(exc))
             return False
+        self._note_htf_fetch_outcome(symbol, systemic_failure=False)
         return True
+
+    def _note_htf_fetch_outcome(self, symbol: str, *, systemic_failure: bool) -> None:
+        """Keep ``htf_failing_since`` (set at the first systemic failure,
+        cleared by an answer; each change logged once) and
+        ``htf_failing_symbol``."""
+        with self._lock:
+            since = self.htf_failing_since
+            if systemic_failure:
+                self.htf_failing_symbol = self._symbol_key(symbol)
+                if since is None:
+                    self.htf_failing_since = sessions.now_et()
+                    LOG.warning("HTF fetches failing systemically: one fetch a cycle until Schwab answers")
+            elif since is not None:
+                self.htf_failing_since = None
+                self.htf_failing_symbol = None
+                LOG.warning("HTF fetches answered again (failing since %s)", since.isoformat())
 
     def _refresh_htf_frame(self, symbol: str, timeframe_minutes: int, lookback_days: int) -> None:
         """Fetch the (symbol, tf) HTF frame from Schwab and store it.
