@@ -494,7 +494,11 @@ on, that pass ends the run and its shutdown runs it), a safeguard:
 its start-up reconcile books no trade, so it holds none of that
 evening. No cron needed. Each archive contains:
 
-- `bars/{Nm}/{SYMBOL}.csv` — full merged frame with indicators per timeframe
+- `bars/1m/{SYMBOL}.csv` — the full merged 1m frame with indicators
+- `bars/{N}m_from_1m/{SYMBOL}.csv` — that frame resampled to the
+  strategy's LTF / HTF minutes when above 1
+- `bars/{N}m_schwab_htf/{SYMBOL}.csv` — the stored HTF frame (Schwab's
+  N-minute bars) that S/R and the HTF levels are built from
 - `trades.csv` — the day's rows of `.logs/trades.csv` that the strategy
   wrote (every process that appended them)
 - `bot_YYYY-MM-DD.log` — copy of the daily log
@@ -503,6 +507,16 @@ evening. No cron needed. Each archive contains:
 - `account_snapshot.json` — equity curve, realized PnL, etc.
 - `config_snapshot.yaml` — resolved config (secrets redacted)
 - `manifest.json` — strategy + summary stats
+
+Archives written before 2026-10-11 name the resamples `bars/{N}m/` and
+the stored HTF frame `bars/htf_{N}m/`. To rename them, and the
+manifest keys that name them, stop the bot after pulling the change and,
+as the user that owns `.logs`, run
+`.venv/bin/python scripts/rename_archive_bars_folders.py .logs/sessions`: it
+prints each day's plan and changes nothing. Run it again with `--apply`,
+then start the bot. A day it refuses (for example one holding both
+names of a series) is left as it was, with the reason printed, and the
+exit status is 1.
 
 After a restart on the same day, `trades.csv`, `trades_today` and
 `realized_pnl` cover every process of the strategy that appended its

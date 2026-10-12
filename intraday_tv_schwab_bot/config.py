@@ -572,8 +572,9 @@ class RuntimeConfig:
     # {log_dir}/sessions/{YYYY-MM-DD}/ (after a trading day's 20:00 ET end,
     # or at a shutdown before it) containing bars/1m/{SYMBOL}.csv (the full merged
     # 1m frame with indicators, extended hours and warmup included),
-    # bars/{N}m/ resamples for ltf/htf minutes above 1, bars/htf_{N}m/ (the
-    # stored HTF frame levels are built from), trades.csv filtered to the
+    # bars/{N}m_from_1m/ (its resamples for ltf/htf minutes above 1),
+    # bars/{N}m_schwab_htf/ (the stored HTF frame, Schwab's N-minute bars,
+    # that levels are built from), trades.csv filtered to the
     # day, decisions.csv and manifest.json with strategy + summary stats; see
     # session_archive.export_session_archive for the full list. Disable to
     # save disk space if running without dashboard/analysis needs.

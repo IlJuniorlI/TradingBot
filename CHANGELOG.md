@@ -1211,6 +1211,51 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The session archive's bars folders say what they hold:
+  `bars/{N}m_from_1m/` is the merged 1m frame resampled to N minutes and
+  `bars/{N}m_schwab_htf/` the stored HTF frame; `bars/1m/` stays.**
+  *2026-10-11* — top_tier's archive held `bars/1m/`, `bars/15m/` and
+  `bars/htf_15m/`, and nothing in the names said that `15m` was the merged
+  1m frame resampled (what the LTF triggers and the resample-based
+  contexts read, spanning only the days the 1m history covers) and
+  `htf_15m` Schwab's 15-minute price history over the HTF lookback,
+  completed bars only (what S/R, the HTF levels, mshtf and the HTF FVGs
+  are built from).
+  - `session_archive._export_bars` writes `merged_frame_folder(N)` (`1m`,
+    else `{N}m_from_1m`) and `schwab_htf_folder(N)` (`{N}m_schwab_htf`),
+    and its warnings name those folders. The bot writes only the new names,
+    with no alias, and reads only `bars/1m/` from an archive (the regime-call
+    outcomes and the gate attribution), so nothing it reads changes.
+  - The manifest's `bars_written_by_timeframe` and
+    `bars_skipped_by_timeframe` are keyed by folder, so their keys follow:
+    `1m`, `5m_from_1m`, `15m_from_1m`, `15m_schwab_htf` for an LTF of 5 and
+    an HTF of 15. `timeframes_exported` names the resample timeframes and
+    stays (`1m`, `5m`, `15m`). The manifest snapshot test's fixture has the
+    new keys.
+  - Older archives: `scripts/rename_archive_bars_folders.py SESSIONS_DIR`
+    (standard library only) prints each day's plan and changes nothing;
+    with `--apply` it renames `bars/{N}m/` (N above 1) to
+    `bars/{N}m_from_1m/`, `bars/htf_{N}m/` to `bars/{N}m_schwab_htf/`, and
+    the same keys in `manifest.json`, in their order, writing the file as
+    the bot writes it. Run it right after pulling this change, with the bot
+    stopped and before it starts again, as the user that owns the archive,
+    with the bot's Python:
+    `.venv/bin/python scripts/rename_archive_bars_folders.py .logs/sessions`,
+    read the plan, then the same with `--apply`. A folder the manifest does
+    not list (2026-05-29's `5m`) is renamed by its name. A day holding both
+    the old and the new name of a series (an owed day that a start before
+    the migration exported again, say) is refused and left as it is, never
+    merged, and the exit status is 1; the refusal names every such pair,
+    and the day prints nothing else. Another name is left alone and
+    reported. Each day is changed whole or not at all, a run killed
+    part-way is finished by a re-run, and a second run changes nothing.
+    Since the first commit every `{N}m` folder has held the merged frame's
+    resample (`get_merged` at N minutes), and since the 2026-09-25 commit
+    that added it every `htf_{N}m` folder the stored HTF frame
+    (`get_htf_frame`), so each old name maps to what it holds on every day.
+  - Decisions: none. Only the archive's folder names and the manifest's
+    keys for them change.
+
 - **The Schwab client sends the fetch pool's requests together
   (`PooledSchwabClient`), one at a time after a systemic failure until
   Schwab answers; at most 9 `runtime.cycle_fetch_workers`.** *2026-10-11*

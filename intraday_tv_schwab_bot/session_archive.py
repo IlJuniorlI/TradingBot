@@ -876,6 +876,18 @@ def _resample_timeframes(strategy_params: Any) -> list[int]:
     return sorted(timeframes_min)
 
 
+def merged_frame_folder(tf_min: int) -> str:
+    """The bars folder of the merged frame at ``tf_min`` minutes: ``1m`` for
+    the merged 1m frame itself, ``{N}m_from_1m`` for its resample to N."""
+    return "1m" if tf_min == 1 else f"{tf_min}m_from_1m"
+
+
+def schwab_htf_folder(htf_minutes: int) -> str:
+    """The bars folder of the stored HTF frame: ``{N}m_schwab_htf``, Schwab's
+    N-minute price history as the bot held it."""
+    return f"{htf_minutes}m_schwab_htf"
+
+
 def _export_merged_frames(data: Any, symbols: set[str], tf_min: int, tf_dir: Path) -> tuple[int, int] | None:
     """Write each symbol's merged frame at ``tf_min`` to ``tf_dir``.
 
@@ -920,8 +932,8 @@ def _export_htf_frames(data: Any, symbols: set[str], htf_minutes: int, htf_dir: 
     """Write each symbol's stored HTF frame to ``htf_dir``.
 
     The stored HTF frame is the series S/R levels, HTF levels, mshtf
-    structure and HTF FVGs are built from. The resampled bars/{N}m is not
-    it -- it spans only the days the 1m history covers (09-21 07:00 onward
+    structure and HTF FVGs are built from. The resampled bars/{N}m_from_1m is
+    not it -- it spans only the days the 1m history covers (09-21 07:00 onward
     in the 09-22 AAPL archive, against a 10-day HTF lookback) -- so without
     this folder an HTF level could not be traced to the bar that made it
     (2026-09-23). The exporter reads what the bot held; a read never fetches
@@ -959,11 +971,12 @@ def _export_htf_frames(data: Any, symbols: set[str], htf_minutes: int, htf_dir: 
 def _export_bars(
     data: Any, symbols: set[str], strategy: Any, bars_dir: Path,
 ) -> tuple[list[int], dict[str, int], dict[str, int]]:
-    """Every bars folder: ``bars/{N}m`` per resample timeframe, then
-    ``bars/htf_{N}m``.
+    """Every bars folder: ``bars/1m`` and ``bars/{N}m_from_1m`` per resample
+    timeframe (``merged_frame_folder``), then ``bars/{N}m_schwab_htf``
+    (``schwab_htf_folder``).
 
-    Returns the resample timeframes and, per folder written, the CSVs written
-    and the symbols skipped.
+    Returns the resample timeframes and, per folder written (keyed by the
+    folder's name), the CSVs written and the symbols skipped.
 
     The FULL merged frame is exported for each timeframe, no filters. This
     captures everything the bot had access to: warmup history (needed to
@@ -978,12 +991,12 @@ def _export_bars(
     written_by_folder: dict[str, int] = {}
     skipped_by_folder: dict[str, int] = {}
     for tf_min in timeframes_sorted:
-        tf_label = f"{tf_min}m"
+        tf_label = merged_frame_folder(tf_min)
         counts = _export_merged_frames(data, symbols, tf_min, bars_dir / tf_label)
         if counts is not None:
             written_by_folder[tf_label], skipped_by_folder[tf_label] = counts
     htf_minutes = strategy.htf_minutes()
-    htf_label = f"htf_{htf_minutes}m"
+    htf_label = schwab_htf_folder(htf_minutes)
     counts = _export_htf_frames(data, symbols, htf_minutes, bars_dir / htf_label)
     if counts is not None:
         written_by_folder[htf_label], skipped_by_folder[htf_label] = counts
@@ -1261,26 +1274,32 @@ def export_session_archive(
     ``{log_dir}/sessions/{YYYY-MM-DD}/`` for post-session analysis.
 
     Contents:
-    - ``bars/{N}m/{SYMBOL}.csv`` — the full merged 1m frame (history +
+    - ``bars/1m/{SYMBOL}.csv`` — the full merged 1m frame (history +
       live, warmup + pre-market + RTH + post-market) with all indicators
-      for every active watchlist symbol, plus its resample to
-      ``ltf_minutes`` and ``htf_minutes`` when they're set and > 1. For
-      top_tier_adaptive that's ``bars/1m/`` and ``bars/15m/``. The full
-      frame is written so debuggers can reconstruct the bot's view at any
-      moment in the session — indicators like 15m ema20 need 5+ hours of
-      warmup bars that filtering to today would drop. A resampled
-      ``bars/{N}m`` is what LTF triggers and the resample-based LTF
-      contexts read; it is NOT the frame the HTF levels are built from
-      (it only spans the days the 1m history covers).
-    - ``bars/htf_{N}m/{SYMBOL}.csv`` — the stored HTF frame
+      for every active watchlist symbol. The full frame is written so
+      debuggers can reconstruct the bot's view at any moment in the
+      session — indicators like 15m ema20 need 5+ hours of warmup bars
+      that filtering to today would drop.
+    - ``bars/{N}m_from_1m/{SYMBOL}.csv`` — that merged 1m frame resampled
+      to ``ltf_minutes`` and ``htf_minutes`` when they're set and > 1,
+      with the indicators run on the resample. For top_tier_adaptive
+      (ltf 1, htf 15) that's ``bars/15m_from_1m/``. It is what LTF
+      triggers and the resample-based LTF contexts read; it is NOT the
+      frame the HTF levels are built from (it only spans the days the 1m
+      history covers).
+    - ``bars/{N}m_schwab_htf/{SYMBOL}.csv`` — the stored HTF frame
       (``data.get_htf_frame``: Schwab's native N-minute series over the
       HTF lookback, completed bars only) that S/R levels, HTF levels, HTF
       market structure (``mshtf_*``) and HTF fair-value gaps are built
       from. N is the strategy's HTF: ``params.htf_minutes``, else
       ``support_resistance.timeframe_minutes``. Until 2026-09-23 it was
-      not archived and ``bars/15m`` was described as that frame, so an
-      HTF level could not be traced to the bars that made it after the
-      session.
+      not archived and the resampled 15m folder was described as that
+      frame, so an HTF level could not be traced to the bars that made it
+      after the session.
+    - Until 2026-10-11 the two were ``bars/{N}m/`` and ``bars/htf_{N}m/``,
+      which top_tier's ``15m`` and ``htf_15m`` did not tell apart;
+      ``scripts/rename_archive_bars_folders.py`` renames an older
+      archive's folders and manifest keys.
     - ``trades.csv`` — the day's rows of the cumulative ``{log_dir}/trades.csv``
       (entry/exit/PnL/MFE/MAE per trade) that ``strategy_name`` wrote: those
       of every process of the strategy that appended its trades, since the
@@ -1305,7 +1324,11 @@ def export_session_archive(
       a queryable CSV (timestamp, symbol, action, regime, primary/
       secondary skip reasons).
     - ``manifest.json`` — strategy, dry_run, summary stats, skip counts,
-      timeframes exported, write-flags for each archive component, and
+      timeframes exported (``timeframes_exported``: the resample
+      timeframes, ``1m`` and ``{N}m``), the CSVs written and the symbols
+      skipped per bars folder (``bars_written_by_timeframe`` and
+      ``bars_skipped_by_timeframe``, keyed by the folder's name), write-flags
+      for each archive component, and
       ``equity_mark_basis``: the price the paper account marked a held
       equity at (``position_manager.EQUITY_MARK_BASIS``). An archive
       without it was written by an earlier version, which marked every
