@@ -9,6 +9,144 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **top_tier skips an entry whose quote is wide against its risk or its
+  target (`max_entry_spread_r` / `max_entry_spread_target_frac`, 0.33 and
+  0.5 in the shipped preset, 0 in the manifests), and keeps a refused
+  signal off the REST quote while the symbol's stream book is still
+  wide.**
+  *2026-10-12* — a top_tier entry pays the spread at the far touch, and
+  every exit pays it again, so on the tight range stops the spread was a
+  large slice of R, and the dry run's outcome fell steadily with spread /
+  R: on H:'s dry run 09-21..10-09, the entries quoted under 0.1 R of
+  spread made +0.12 R a trade, those at 0.3-0.5 R -0.55 R and those at
+  0.5-0.75 R -0.83 R. Both target exits that lost money had entered on
+  spreads of about half an R (0.54 R; 0.46 R, 0.85 x the target
+  distance). Skipping at 0.33 R or 0.5 x the target distance would have
+  refused 54 of the 231 entries, which lost -777.51 / -35.74 R (15 won,
+  39 lost); the 177 kept averaged -0.078 R a trade against -0.214 R for
+  all, with the same sign in both halves of the period.
+  - The rule (`top_tier_adaptive.strategy.entry_spread_guard`): skip when
+    the decision quote's spread (ask - bid) is at least
+    `max_entry_spread_r` x the risk |limit - stop|, or at least
+    `max_entry_spread_target_frac` x the target distance |target - limit|,
+    both from the marketable limit the order would go out at; a
+    target-less runner is checked against its risk alone, and a knob at 0
+    turns its test off. Each ratio is compared at 6 decimals, so the float
+    noise of `ask - bid` cannot carry a quote at a limit below it. With a
+    test on, a quote whose spread cannot be read (no positive, finite bid
+    or ask, or the ask below the bid) is skipped as
+    `entry_spread_unreadable(bid=...,ask=...)`: none of the 304 top_tier
+    entries logged on H: had one.
+  - The hook is `BaseStrategy.entry_spread_refusal`, which refuses
+    nothing; top_tier overrides it, small_cap_squeeze inherits that, and
+    the strategy contract (`_strategies/README.md`) names it. The entry
+    stage (`EntryGatekeeper.open_positions`) calls it once a stock entry's
+    REST quote is read, its limit priced and its levels checked, before
+    the entry is sized. A refusal is a skipped decision, the signal's
+    reason then `entry_spread_too_wide(...)` with the spread, the risk,
+    `spread_r`, `max_spread_r`, the target distance, `spread_target` and
+    `max_spread_target` (a knob at 0 reads `off`, a runner's target terms
+    `na`), counted under `entry_spread_too_wide` by the skip tally, the
+    session report's filter rejections, the entry cycle summary and the
+    archive's gate attribution. The refused entry's quote was read and its
+    limit priced, but nothing is sized or sent for it, and nothing about
+    an entry that passes changes.
+  - The stream book watch (the user's rule, 2026-10-12): a refusal starts a
+    watch on the signal, by symbol and side. On each later pass the signal
+    is judged first on the symbol's fresh stream quote book, with no REST
+    quote request: the marketable limit the book prices, that pass's
+    signal's levels from it, then the guard. While the book fails, the pass
+    skips the signal as `entry_spread_watch:<refusal>`, its own gate in the
+    skip tally, the filter rejections, the cycle summary and the gate
+    attribution; a fresh book that prices no limit is
+    `book_unreadable(bid=...,ask=...,last=...)` and fails closed. When the
+    book passes, or is not fresh (the stream quotes off or down, no
+    LEVELONE_EQUITIES message for `runtime.quote_cache_seconds`, or the
+    symbol's book incomplete), the entry asks its REST quote, as it would
+    unwatched, and is decided and priced on that quote alone. A REST refusal
+    keeps the watch; a REST quote that passes ends it, and so does a cycle
+    that runs no entries (each of `entry_session_closed`,
+    `outside_entry_window`, `non_trading_day` and the start-up reconcile's
+    block).
+  - An ask REST does not answer fails closed: when the quote cache holds no
+    REST quote fetched by the ask the watch let the entry make (the request
+    failed or timed out, or the REST back-off held it, so the forced fetch
+    left the stream book or an older quote there), the entry is decided and
+    priced on neither; the pass is skipped as
+    `entry_spread_watch:rest_unanswered(book=passes|not_fresh,cached=rest|stream|none,asked=HH:MM:SS)`,
+    the same gate, with no SKIP_SUMMARY, the watch holds and its next ask
+    waits as after a refusal. An unwatched entry keeps the forced fetch's
+    fallback to a cached quote younger than `runtime.quote_cache_seconds`,
+    with its WARNING.
+  - A watch outlives a short absence of its signal: a signal not built, or
+    refused before its quote, for less than
+    `SPREAD_WATCH_REST_RETRY_SECONDS` keeps its watch, and when it returns
+    it is judged on the book first, under the same wait, so a signal that
+    drops out for a pass or two asks no REST quote while its book fails. An
+    absence that long ends the watch (`no_signal`, or
+    `refused_before_its_quote:<gate>`, the last pass's).
+  - The watch's REST budget (the user's limit: no extra 25 REST calls a
+    minute per symbol): after a REST quote the watch let the entry ask is
+    refused or goes unanswered, the next is asked no sooner than
+    `SPREAD_WATCH_REST_RETRY_SECONDS` (10 s, `entry_gatekeeper.py`) later. A
+    pass in between whose book passes or is not fresh is skipped as
+    `entry_spread_watch:rest_retry_wait(book=passes|not_fresh,last_rest=HH:MM:SS)`,
+    the same gate, with no request. The first ask after the refusal that
+    started the watch, and the first after a longer wait, go at once; a
+    fresh book that fails asks none.
+  - The book read and its price: `MarketDataStore.publish_stream_book`
+    publishes one symbol's fresh book into the quote cache with no REST
+    request and is not counted as a stream quote publication for the
+    stream quotes' REST shadow (it re-reads a book the engine's refresh
+    serves, so a watch no longer brings the shadow's check forward); the
+    executor prices it with `preview_equity_entry(...,
+    refresh_quotes=False)`, which asks no REST quote, while an entry's own
+    preview still forces its REST quote. The entry stage calls only the
+    executor's public methods.
+  - The counts: without the watch, each refused pass would ask a forced REST
+    quote again, about 25 a minute per standing wide symbol at H:'s pass
+    rate. In a minute (25 passes) of a fresh wide book the watch asks 1; of
+    a book that is not fresh, or that passes while the REST quote still
+    refuses, 6, at most 7 in any minute for one watch; a signal back after
+    10 s or more of absence starts a new watch, so one that keeps leaving
+    and returning can reach 8 a minute at H:'s 2.3 s pass rate (25 before
+    the wait). A signal that drops out every other pass of 25 on a fresh
+    wide book asks 1, every third pass 1, and every other pass on a stale
+    book 5, where each return restarting the watch asked 13, 9 and 13. Over
+    the 17 entries the guard would have refused on H: 10-07..10-09, replayed
+    pass by pass on their management quotes, 258 REST quote requests become
+    26, at most 2 a minute for one symbol (24 without the watch), and the
+    same 9 enter on the same passes; the wait moves none of them. Over 100
+    passes the REST shadow sends 5 batches with a standing watched signal,
+    as with none (9 before). On H:'s 10-06..10-09 entries the book and the
+    REST quote agreed on the guard for 79 of 81; in 2 REST passed where the
+    book refused, and such a signal now waits for the book.
+  - What the log shows: one TRADEFLOW line when a watch starts (`Entry
+    spread watch started symbol=... side=... refusal=...`) and one when it
+    ends (`Entry spread watch ended ... why=rest_quote_passes|no_signal|
+    refused_before_its_quote:<gate>|no_entry_cycle:<reasons>
+    started=HH:MM:SS seconds=... book_skips=... rest_quotes=...
+    last_rest_quote=book_passes|book_not_fresh|none rest_retry_waits=...`).
+    A skip on the book and a wait log their Decision line (the archive's
+    decision rows, under the usual fold of an identical line) but no
+    SKIP_SUMMARY and no `Quote refresh` line; an unanswered ask logs its
+    Decision line and the forced fetch's lines, and no SKIP_SUMMARY.
+  - The knobs are checked at load
+    (`TopTierAdaptiveStrategy.normalize_params`) and when the strategy is
+    built: a value that is not a finite number >= 0 refuses to start,
+    naming the key, and params without one are refused too. Both
+    manifests that run the engine declare them at 0; small_cap_squeeze
+    has the guard only when its own preset sets them. No other strategy
+    overrides the hook, and the 0DTE path is untouched.
+  - Behaviour: on the top_tier preset, entries quoted wide against their
+    risk or target are refused (on H:'s 09-21..10-09 entries, up to 9 a
+    day), and a refused signal still standing when the spread narrows
+    enters on a later pass, decided on its REST quote. Every other preset
+    is unchanged. Off: both knobs 0. Docs: the top_tier README (section
+    6g, the knobs and the defaults table), the strategy contract,
+    small_cap_squeeze's README, the README's top_tier knobs and the
+    preset's comment.
+
 - **The session archive's manifest and the SESSION REPORT name the price
   the paper account marked held equities at (`equity_mark_basis`).**
   *2026-10-07* — the account now marks a held equity at the price
@@ -21,8 +159,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in an archive or a report said which basis a day was valued at.
   - `position_manager.EQUITY_MARK_BASIS` (`management_price`), beside the
     marking code, names it. The manifest carries it as
-    `equity_mark_basis`; the SESSION REPORT line ends with
-    `equity_mark_basis=management_price` and its JSON payload has the key.
+    `equity_mark_basis`; the SESSION REPORT line carries
+    `equity_mark_basis=management_price` (since 2026-10-12 only the line's
+    optional flags follow it) and its JSON payload has the key.
   - Reading a series across the change: an archive whose manifest has no
     `equity_mark_basis`, and a report without it, were written by an
     earlier version, which valued held equities at their 1m close;
@@ -5578,6 +5717,221 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The account's money figures say whose they are: the run's trade
+  statistics cover every trade the process closed, a day ledger keeps each
+  ET trading day's P&L, realized P&L, trade statistics, drawdown and curve
+  across a restart, the day's SESSION REPORT, trades.csv and manifest lose
+  no trade, and the pages show the day's figures where they say "day".**
+  *2026-10-12* — the paper account kept one set of figures, set up once
+  per process, and an always-on bot runs for days:
+  - The dashboard's Day PnL and "% today" were `total_equity -
+    starting_equity`, the process's change: on H: at 2026-10-09 16:18 they
+    showed -336.12 (-0.67%), the 10-08 and 10-09 days summed, against the
+    day's -53.69 (-0.11% of the day's opening 49,717.57). A mid-day
+    restart showed 0 while the day stood at -60. The top bar's Profit
+    Factor, Total Trades, Wins / Losses and Win Rate beside it were the
+    process's too (47 trades, 22 / 25, against the day's 26, 13 / 13); the
+    sparkline under the pill was the run curve's last 2,000 points (after
+    a weekend, the weekend's flat line); the Max DD gauge divided by the
+    equity now, not the run's peak (1.063% against 1.056%).
+  - The trade statistics (win rate, profit factor, wins and losses, the
+    trade counts, the average trade) were folded from the last
+    `paper.max_trade_history` (200) exit slices: past them they covered the
+    last 200 slices and stopped adding up to the realized P&L, and a trade
+    whose slices straddled the cap was folded short, or flipped from a +30
+    win to a -30 loss in the statistics and the trades table. H:'s ~24
+    trades a day reach 200 slices in about 8 trading days.
+  - trades.csv was appended from the same 200 slices, at 20:00 or at
+    shutdown: more slices between two appends dropped the oldest from the
+    file, the day's archive and its manifest, and the manifest's check
+    compared the file with the same slices, so it named no error (a test
+    day of 212 slices: -348 over 200 trades, against -320 over 211).
+  - The day's SESSION REPORT folded the process's own slices, so a restart
+    split the day in two (-60 over 1 trade at the shutdown, +25 over 1 at
+    20:00, against the day's -35 over 2), and it carried the process's max
+    drawdown under the day's name: H:'s 10-09 report said 528.01, the
+    day's was about 245.6. The archive's `account_snapshot.json` held the
+    process's figures, unnamed, in the day's folder (H: 10-09: -336.12
+    over 47 trades; the day: -53.69 over 26).
+  - The trades table, the events' trades and the chart's trade markers held
+    the process's own trades: a restart dropped the day's earlier trades
+    from them. The phone's Completed Trades said `20 closed`, the list's
+    cap, on a 26-trade day, and an earlier day's trade read as today's.
+  - Every dashboard state carried the run's 2,000-point curve, each point
+    with every symbol the run had traded and its P&L, and no page drew it:
+    1.49 MB of H:'s 2.74 MB state on 10-09, and most of each build's copy
+    of the account (at a stepped day's end with 28 symbols, the copy took
+    159 ms of CPU and the published performance was 1.11 MB; now 4.6 ms
+    and 0.11 MB).
+  - The run's statistics: `PaperAccount.run_stats` (`TradeStats`), running
+    sums over every trade the process closed, each trade folded from its
+    own exit slices when its final slice books (`_close_slice`). The account
+    keeps the last `max_trade_history` exit slices (`trades`: the chart's
+    markers, the recent exit events) and closed trades
+    (`recent_lifecycles`: the trades table); `trades_outbox` holds every
+    closed trade no trades.csv append has written yet, uncapped.
+  - The day ledger (`PaperAccount.day`, a `DayLedger`): the ET trading day,
+    today on a trading day, else the last one. It rolls at the first sample
+    or exit on a new trading day's ET date, opening at the last sample's
+    equity; a weekend or a holiday rolls nothing and moves nothing, so it
+    shows the last trading day's figures until the next trading day's date
+    begins, and an equity change on such a date is in no day's figures. It
+    holds the day's P&L (the equity's change since the day opened: a
+    position held overnight moves it on the day its price moves; an exit
+    moves it at once by its fill against the price the last sample held
+    the position at), its realized P&L (the exit slices filled that day,
+    as the risk manager's tally counts them), the trades whose final exit
+    fell that day (as the report, trades.csv and the manifest count them),
+    the day's partial-exit slices, the peak and the max drawdown of the
+    samples from the day's opening equity, and a curve of a point a minute
+    (`DAY_CURVE_POINT_SECONDS`).
+  - `DayLedgerStore` (position_store.py): one row per day in the reconcile
+    metadata's sqlite file, in a table of its own (`account_day_ledger`,
+    created when missing; an older version ignores it), read by its date.
+    The account writes it at the start, on each exit, at each roll (the
+    ended day's and the new one's), at shutdown (`save_day_ledger`, after
+    the summaries and before the archives' exports) and at most once a
+    minute while the day's P&L, peak, drawdown or open positions move
+    (`DAY_LEDGER_SAVE_SECONDS`), stamped with the bot's clock. Each
+    connection waits at most 0.25 s for a lock another connection holds
+    (`DAY_LEDGER_BUSY_SECONDS`; sqlite's default, the other stores', is
+    5 s). A failed write is logged with its type (a WARNING on the first of
+    a run) and no other write but the shutdown's is tried for a minute after
+    it; an error that says the file cannot be used now ends the batch, so a
+    busy file costs the engine's pass 0.25 s at most once a minute.
+  - A start on the row's day carries the day on: realized P&L, statistics,
+    peak, drawdown and curve continue, and the day's P&L is the row's plus
+    the new process's change since its start. A day with no row starts at
+    the start (`late_start`, from `since`), logged at INFO. A row that does
+    not read (a value that is not a finite number of at most $1e12, a count
+    above 10^9, a time without its offset, a number beyond a double, a
+    nesting the parser refuses) is a WARNING naming the error's type, and
+    the day starts then: nothing in a row stops the start. A row dated after
+    the day (a clock once set ahead) is named in a WARNING and left as it
+    is. A start that cannot read the file at all (a lock held, an I/O
+    error) starts the day then and writes no row of the day until a re-read
+    at a write finds none; a row found then is left as it is, with a
+    WARNING, and that process's figures of the day are not kept.
+  - A carried row the day's trades.csv rows (every strategy's) hold an exit
+    after (its last write is older: an older version ran between two
+    starts, or its writes failed), or that the file cannot be checked
+    against, is carried on with a gap from its last write to the start
+    (`gaps`), a WARNING (`Day ledger: the <day> row stops at HH:MM, and
+    trades.csv holds the day's trades that exited after it ...`); the
+    gap's trades are in the day's report and trades.csv, not in the day's
+    figures. `partial` is true with a late start or a gap.
+  - A position the broker reconcile restores is booked at the broker's
+    average price (`PaperAccount.record_restored_entry`, from
+    `StartupReconciler._restore_broker_positions`): the run counts its move
+    since its entry, as before, but the day counts it once, from the mark
+    the day's row valued it at when the row holds a position of its key,
+    side and quantity (a restart before its first mark keeps that mark in
+    the row), else from its first mark after the restore, also when it is
+    restored or first marked in the pass that opens a new day. The row's
+    positions stay in it until the start-up reconcile ends (its first
+    success, or the day's roll), so a restart before then still matches
+    them; each one not restored then leaves the row with an INFO line
+    naming it and its move up to the restart, which stays in the day's
+    P&L, never realized and in no trade (`Day ledger: HELD LONG 100, open
+    in the 2026-10-12 row, was not restored: its move up to the restart,
+    +50.00, ...`). A dry run restores no paper position, so each one open
+    at a restart is named this way.
+  - `PaperAccount.snapshot()` (the dashboard state's `performance`) gains
+    `day` (`date`, `is_today`, `label`: `today`, else the day's `Fri 10-09`;
+    `since`, `late_start`, `gaps`, `partial`, `pnl`, `pnl_pct` of the day's
+    `opening_equity`, `realized`, `equity`, `peak_equity`, `max_drawdown`,
+    `trades`, `wins`, `losses`, `win_rate`, `profit_factor`,
+    `average_trade`, `curve`) and `run_started_at`, and loses the run's
+    `equity_curve`: `capture_snapshot` (the session report's and the
+    archive's read) adds it, and its points no longer carry
+    `per_symbol_equity`. The run's fields keep their names and meanings,
+    over every trade now (the profit factor and the average trade are
+    running sums, so they can differ from the old fold in the last bit);
+    `recent_trades` is the last 20 trades folded whole.
+  - The pages read these figures from the state and compute none of them
+    (`dashboard_payloads.dashboard_performance` adds what they show beside
+    the account's snapshot). The top bar (desktop: Day PnL, Profit Factor,
+    Total Trades, Wins / Losses, Win Rate; phone: PF, Trades, W / L, Day
+    PnL, the phone's pill labelled `Day PnL`, was `PnL`) is the day's;
+    Total Trades counts the day's closed trades and, while the day is today,
+    the positions open now (`day.total_trades`). The KPI meta line shows
+    the day's P&L, the day's realized P&L and the cash; the pill the day's
+    `pnl_pct` with its label; the sparkline the day's curve. Realized,
+    Drawdown, Win Rate, Max DD (now in % of the run's peak equity,
+    `max_drawdown_pct`) and the desktop's Diagnostics, labelled `(run)`,
+    stay the run's. Each day figure's label, the meta line, the pill and
+    the phone's Completed Trades carry the day's tag: its date on a weekend
+    or a holiday (`Fri 10-09`), and on a partial day what its figures lack
+    (`day.partial_label`: `since 22:00`, `gap 11:02-13:40`).
+  - The trades table and the events' trades (`recent_trades`) merge the
+    day's trades an earlier process appended to trades.csv, each trade once
+    (`TRADE_CSV_KEY`), newest exit first, the last 20, each with
+    `exit_today` (the phone dates the others, `10-09 14:38`); the chart's
+    markers (`recent_trade_markers`) merge today's of them by trade. The
+    engine reads the account's day's rows once at its start, every
+    strategy's (`session_report.day_trade_records`, shared with the
+    report), when the day's row is carried or the dashboard is on: for the
+    row's check and for the dashboard (`DashboardCache.earlier_trades`). A
+    file or a row that cannot be read is a WARNING naming the error's type,
+    `recent_trades_error` says what was left out (a row of the desktop's
+    table, the phone's meta line), and the bot starts all the same. The
+    phone's Completed Trades meta says what the list holds and the day's
+    count (`last 20 · 26 today`). The example custom theme reads the day.
+  - The SESSION REPORT (`write_session_report`, which now takes `log_dir`):
+    the day's trades are its trades.csv rows that the strategy wrote, every
+    process's, read back as trades (`trade_record_from_row`), and the
+    account's trades not appended yet that the file lacks, oldest exit
+    first; every aggregate reads them. `max_drawdown` is the day's (null,
+    `n/a` on the line, for a day the account does not hold, such as a
+    shutdown on a weekend), `run_max_drawdown` the process's; the
+    partial-exit table is the day ledger's slices, across a restart. The
+    line gains `run_max_drawdown=` and ends ` day_since=<time>` for a late
+    start, ` day_gaps=<from>/<to>` for the gaps, ` day_ledger_trades=<N>`
+    when the day ledger counts other than the report's trades (a process
+    killed before its append, whose trades only the row kept; another
+    strategy's on the same sqlite file) and ` trades_source_error=yes`
+    when the day's rows could not be read. The payload gains
+    `run_max_drawdown`, `day_since`, `day_partial`, `day_gaps`,
+    `day_ledger_trades` and `trades_source_error`.
+  - trades.csv is appended from the outbox, which a successful append
+    clears (`IntradayBot._append_trades_csv`); a failed one keeps them for
+    the next. The archive's check of the account against the file reads the
+    outbox; its traded symbols are the day's rows' and the outbox's;
+    `account_snapshot.json` is named (`scope: run`, with its
+    `run_started_at`) and carries the archived day's figures (`day`, also
+    when a close is retried after midnight).
+  - Not changed: nothing that gates or sizes an order reads any of these
+    figures (a guard test holds the gating and sizing modules, the executor
+    and the engine's cycle to that); the risk manager's day tally, its roll
+    and its `session_risk_state` table; the day close, the trades.csv lock,
+    the shutdown's order of its closes and appends, and its 12 s export
+    budget (the day's row is written before the exports, at most 0.25 s a
+    row on a busy file; the day's report reads trades.csv under its lock,
+    waiting up to 5 s for another process's, as the append does). Live
+    mode keeps the bot's own ledger on the allocated capital: no broker
+    balance is read.
+  - Behaviour changes: every money and trade figure above on both pages;
+    the trade statistics past 200 slices; the trades table across a
+    restart and its folds; the SESSION REPORT's headline after a restart or
+    past 200 slices, its `max_drawdown` and its new fields; trades.csv and
+    the manifest past 200 slices between appends; the archive's symbols
+    and `account_snapshot.json`; the dashboard state without the run's
+    curve; a sqlite write at most once a minute while positions move, and
+    on each exit; one trades.csv read at start-up (under its lock, at most
+    `TRADES_CSV_LOCK_WAIT_SECONDS`) when the day's row is carried or the
+    dashboard is on.
+  - Decisions (2026-10-11 and 10-12): Day PnL is the day's equity change,
+    its realized P&L beside it; the day's trade statistics are the top
+    bar's and the run's the KPI card's; a weekend or a holiday shows the
+    last trading day's figures, labelled with its date, until the next
+    trading day begins; the sparkline is the day's curve; a restart starts
+    a new run and carries the day on; the dashboard's drawdown and max
+    drawdown stay the run's and the day's report gets the day's; a carried
+    row the day's trades exited after is carried on partial, with the
+    logged reason; a dry-run paper position dropped at a restart keeps its
+    move up to the restart in the day's P&L, never realized and never in
+    the trades, and the start names each one with that amount.
+
 - **An outage or a rate limit stops the HTF refresh's map: one probe a
   cycle at most, spaced by the REST back-off, until Schwab answers, then
   the rest at once; a symbol Schwab refuses on its own holds no other.**
@@ -6727,15 +7081,19 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     day's rows of `.logs/trades.csv` that the exporting strategy wrote:
     those of every process of the strategy that appended its trades that
     day. A process killed before it appended (SIGKILL, an OOM kill, a crash
-    before 8 PM) leaves its trades out of the file and every archive.
+    before 8 PM) leaves its trades out of the file, the archive's
+    `trades.csv` and its manifest (since 2026-10-12 the account's day
+    ledger still counts them, in `account_snapshot.json`'s `day`).
     `trades.csv` has no mode column, so a day run by both a dry-run and a
     live process of one strategy archives both processes' rows. The
     exporting process's trades of the day that the file lacks set
     `trades_export_error` and leave the PnL unknown; so does a row of the
     day under an older header. After a same-day restart the manifest's
-    `session_skip_counts` and `account_snapshot.json` are the last
-    process's alone. An archive whose folder or `manifest.json` cannot be
-    written is an error, retried, not a quiet success.
+    `session_skip_counts` and `account_snapshot.json`'s run figures are
+    the last process's alone (since 2026-10-12 its `day` is the whole
+    day's, carried across the restart). An archive whose folder or
+    `manifest.json` cannot be written is an error, retried, not a quiet
+    success.
   - A process that starts after a trading day's 8 PM never writes that
     day's summary: it did not run that session. It writes the day's archive
     only when the day has none (no `sessions/<date>/manifest.json`: the
