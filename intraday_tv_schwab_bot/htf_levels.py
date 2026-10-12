@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from datetime import date
 import logging
 
-import numpy as np
 import pandas as pd
 
 from .divergence import DivergenceMatch, divergence_inputs, find_divergence
@@ -31,7 +30,7 @@ from .levels_shared import (
 from .fair_value_gaps import HTFFairValueGap, detect_fair_value_gaps
 from .sessions import latest_session_date
 from .numeric import safe_float
-from .bars import completed_bars, ensure_ohlcv_frame, resolve_current_price
+from .bars import completed_bars, ensure_ohlcv_frame, is_clean_ohlcv_frame, resolve_current_price
 from .indicators import (
     ensure_standard_indicator_frame,
     floor_atr,
@@ -44,8 +43,6 @@ from . import sessions
 
 
 LOG = logging.getLogger(__name__)
-
-_OHLCV = ("open", "high", "low", "close", "volume")
 
 
 @dataclass(slots=True)
@@ -281,31 +278,15 @@ def _htf_frame(frame: pd.DataFrame) -> pd.DataFrame:
     ``prepare_htf_levels`` and ``htf_context_at`` each read it, so the
     positions in one are the positions in the other.
 
-    A frame that already is one -- OHLCV leading, unique columns, strictly
-    increasing labels, float64 OHLC and a numeric volume without a NaN, the
-    standard indicator columns: every frame the data feed stores
-    (``_refresh_htf_frame``) -- is read through a shallow copy, which holds
-    the values and dtypes the rebuild gives, for about a tenth of its cost
-    (the rebuild keeps an integer volume as it is, so ``ensure_ohlcv_frame``
-    alone does not take its own shortcut on it); ``htf_context_at`` reads
-    one per context at a price."""
-    if _is_htf_frame(frame):
+    A frame that already is one -- a clean OHLCV frame
+    (``bars.is_clean_ohlcv_frame``) with the standard indicator columns:
+    every frame the data feed stores (``_refresh_htf_frame``) -- is read
+    through a shallow copy, which holds the values and dtypes the rebuild
+    gives without copying them; ``htf_context_at`` reads one per context at
+    a price."""
+    if has_standard_indicator_columns(frame) and is_clean_ohlcv_frame(frame):
         return frame.copy(deep=False)
     return ensure_standard_indicator_frame(ensure_ohlcv_frame(frame))
-
-
-def _is_htf_frame(frame: pd.DataFrame) -> bool:
-    if not has_standard_indicator_columns(frame) or tuple(frame.columns[:5]) != _OHLCV:
-        return False
-    if not (frame.columns.is_unique and frame.index.is_monotonic_increasing and frame.index.is_unique):
-        return False
-    for column in _OHLCV:
-        values = frame[column]
-        if column == "volume" and values.dtype == np.int64:
-            continue
-        if values.dtype != np.float64 or np.isnan(values.to_numpy()).any():
-            return False
-    return True
 
 
 def prepare_htf_levels(

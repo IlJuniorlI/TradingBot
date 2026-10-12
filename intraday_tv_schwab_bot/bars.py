@@ -37,12 +37,17 @@ def floor_minute(ts: pd.Timestamp) -> pd.Timestamp:
 _OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
 
 
-def _already_clean_ohlcv(df: pd.DataFrame) -> bool:
+def is_clean_ohlcv_frame(df: pd.DataFrame) -> bool:
     """Whether ``ensure_ohlcv_frame`` would hand ``df`` back unchanged:
-    OHLCV leading as float64, unique columns, a strictly increasing index, no
-    missing OHLC and no missing volume. The rebuild below copies, sorts,
-    converts five columns, drops and reorders; on such a frame every one of
-    those is a no-op, so a copy is the same frame for a tenth of the cost."""
+    OHLCV leading, unique columns, a strictly increasing index, float64 OHLC
+    without a NaN, and a volume that is float64 without a NaN or int64. The
+    rebuild below copies, sorts, converts five columns, drops and reorders;
+    on such a frame every one of those is a no-op (it keeps an int64 volume
+    as it is, and an int64 column holds no NaN), so a copy is the same frame
+    for a tenth of the cost. Until 2026-10-07 an int64 volume, which every
+    frame built from Schwab's candles carries (the stored HTF frames among
+    them), took the rebuild: about 1.3 ms a read of a stored 15m frame, and
+    every HTF context built at a new price reads one (its FVGs)."""
     if tuple(df.columns[:5]) != _OHLCV_COLUMNS or not df.columns.is_unique:
         return False
     index = df.index
@@ -50,6 +55,8 @@ def _already_clean_ohlcv(df: pd.DataFrame) -> bool:
         return False
     for col in _OHLCV_COLUMNS:
         values = df[col]
+        if col == "volume" and values.dtype == np.int64:
+            continue
         if values.dtype != np.float64 or np.isnan(values.to_numpy()).any():
             return False
     return True
@@ -58,7 +65,7 @@ def _already_clean_ohlcv(df: pd.DataFrame) -> bool:
 def ensure_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-    if _already_clean_ohlcv(df):
+    if is_clean_ohlcv_frame(df):
         return df.copy()
     frame = df.copy()
     frame = frame.sort_index()

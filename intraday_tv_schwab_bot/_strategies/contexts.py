@@ -841,7 +841,20 @@ class ContextBuildersMixin:
         """
         if frame is None or frame.empty:
             return None
-        bars = verified_frame(frame)
+        return ContextBuildersMixin._resampled_bars(
+            verified_frame(frame), timeframe_minutes, span_scale=span_scale, ema_spans=ema_spans)
+
+    @staticmethod
+    def _resampled_bars(
+        bars: pd.DataFrame,
+        timeframe_minutes: int,
+        *,
+        span_scale: float = 1.0,
+        ema_spans: tuple[int, int] | None = None,
+    ) -> pd.DataFrame:
+        """``_resampled_frame`` of a non-empty frame its caller has just read
+        through ``bars.verified_frame`` (``_structure_context``), which a
+        second read would only repeat (about 0.18 ms a registered frame)."""
         tf = max(1, int(timeframe_minutes))
 
         def build() -> pd.DataFrame:
@@ -907,8 +920,8 @@ class ContextBuildersMixin:
             # raw 1m stream. 0/1 = use the frame as-is (original behavior).
             ltf_tf_min = int(self._support_resistance_setting("structure_ltf_timeframe_minutes", 0) or 0)
             if ltf_tf_min > 1:
-                resampled = self._resampled_frame(bars_frame, ltf_tf_min)
-                if resampled is not None and not resampled.empty:
+                resampled = self._resampled_bars(bars_frame, ltf_tf_min)
+                if not resampled.empty:
                     analysis_frame = resampled
                     bar_minutes = ltf_tf_min
                     current_price = safe_float(analysis_frame.iloc[-1]["close"], current_price)
