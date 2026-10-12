@@ -21,7 +21,15 @@ from .dashboard import DashboardServer
 from .data_feed import MarketDataStore
 from .entry_gatekeeper import EntryGatekeeper
 from .execution import SchwabExecutor
-from .models import Candidate, Position, StrategySchedule, is_option_asset
+from .models import (
+    ASSET_TYPE_OPTION_SINGLE,
+    ASSET_TYPE_OPTION_VERTICAL,
+    Candidate,
+    Position,
+    StrategySchedule,
+    asset_type_of,
+    is_option_asset,
+)
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .position_store import ReconcileMetadataStore, SessionRiskStateStore
@@ -267,6 +275,17 @@ class _DayClose:
     archive_failures: int = 0           # failed archive exports, for its back-off
     archive_retry_at: datetime | None = None   # no archive export before this
     carried: bool = False               # an earlier shutdown left its archive owed (archive_owed.json)
+
+
+@dataclass(slots=True)
+class _HtfCycle:
+    """One cycle's HTF refresh (``IntradayBot._refresh_htf_frames``): the
+    symbols it tried, each once a cycle, and whether it sent its probe to a
+    symbol outside ``MarketDataStore.htf_failing_symbols`` and to one of
+    them."""
+    attempted: set[str] = field(default_factory=set)
+    probed: bool = False
+    probed_failing: bool = False
 
 
 class IntradayBot:
@@ -1551,8 +1570,8 @@ class IntradayBot:
             # entries and the publish, so a bar that closes mid-cycle is
             # fetched at the next of them. Each symbol at most once a cycle.
             timer.enter("htf_refresh")
-            htf_attempted: set[str] = set()
-            self._refresh_htf_frames(gate_state, htf_attempted, where="cycle start")
+            htf_cycle = _HtfCycle()
+            self._refresh_htf_frames(gate_state, htf_cycle, where="cycle start")
 
             timer.enter("stream")
             if gate_state.streaming_active and self.last_watchlist:
@@ -1580,6 +1599,10 @@ class IntradayBot:
             warmup_summary = self.warmup_tracker.warmup_summary(self.last_watchlist, bars=bars)
             self.warmup_tracker.log_warmup_summary(warmup_summary)
             timer.enter("quotes")
+            # The open positions' quote symbols: never blacklisted, their
+            # failed REST quote requests spaced out
+            # (MarketDataStore.set_held_quote_symbols).
+            self.data.set_held_quote_symbols(self._held_quote_symbols())
 
             if gate_state.idle_closed_market:
                 self.last_quote_watchlist = []
@@ -1594,7 +1617,7 @@ class IntradayBot:
             self.account.mark_prices(self._extract_last_prices(bars))
             self.account.mark_prices(self._extract_position_marks())
             timer.enter("htf_refresh")
-            self._refresh_htf_frames(gate_state, htf_attempted, where="before management", bars=bars)
+            self._refresh_htf_frames(gate_state, htf_cycle, where="before management", bars=bars)
             timer.facts["managed"] = gate_state.management_active
             if gate_state.management_active:
                 manage_started = timer.enter("manage")
@@ -1607,7 +1630,7 @@ class IntradayBot:
                 timer.facts["positions"] = len(self.positions)
                 self.position_manager.manage_positions(now, bars)
             timer.enter("htf_refresh")
-            self._refresh_htf_frames(gate_state, htf_attempted, where="before entries", bars=bars)
+            self._refresh_htf_frames(gate_state, htf_cycle, where="before entries", bars=bars)
             timer.enter("entries")
             if self.startup_reconciler.trading_blocked_reason:
                 candidate_symbols = [c.symbol for c in self.last_candidates]
@@ -1666,7 +1689,7 @@ class IntradayBot:
             timer.enter("shadow")
             self.data.run_stream_quote_shadow()
             timer.enter("htf_refresh")
-            self._refresh_htf_frames(gate_state, htf_attempted, where="before publish", bars=bars)
+            self._refresh_htf_frames(gate_state, htf_cycle, where="before publish", bars=bars)
             timer.enter("publish")
             # Re-mark only position marks — bar closes haven't changed since the earlier
             # mark_prices call above. Skipping _extract_last_prices here avoids iterating
@@ -1755,7 +1778,7 @@ class IntradayBot:
         their time waiting on Schwab, so the pool overlaps them: the client
         has a session for each worker (``PooledSchwabClient``) and sends
         one request at a time only while Schwab fails systemically. Until
-        2026-10-07 the client was schwabdev's, whose ``Client._request``
+        2026-10-11 the client was schwabdev's, whose ``Client._request``
         holds one lock around every request, its retries included, so the
         fetches reached Schwab one at a time. The pool runs whatever the
         count, one worker included. A symbol whose call raises is isolated
@@ -1833,6 +1856,24 @@ class IntradayBot:
                        if not is_option_asset(position.metadata))
         return sorted(_unique_symbol_keys(symbols))
 
+    def _held_quote_symbols(self) -> list[str]:
+        """The symbols whose quotes the open positions' management reads
+        (``PositionManager._position_management_snapshot``): an equity's own,
+        a vertical's two legs, a single option's contract. The data feed
+        never blacklists them and spaces their failed REST quote requests
+        out (``MarketDataStore.set_held_quote_symbols``)."""
+        symbols: set[str] = set()
+        for position in self.positions.values():
+            meta = position.metadata if isinstance(position.metadata, dict) else {}
+            asset_type = asset_type_of(meta)
+            if asset_type == ASSET_TYPE_OPTION_VERTICAL:
+                symbols.update((str(meta.get("long_leg_symbol") or ""), str(meta.get("short_leg_symbol") or "")))
+            elif asset_type == ASSET_TYPE_OPTION_SINGLE:
+                symbols.add(str(meta.get("option_symbol") or ""))
+            else:
+                symbols.add(position.symbol)
+        return sorted(symbol for symbol in symbols if symbol)
+
     def _htf_symbols(self) -> list[str]:
         """Every symbol whose HTF frame a read can ask for this cycle: the
         watchlist (the step frames, the entries and the peers they vote
@@ -1849,13 +1890,13 @@ class IntradayBot:
                 symbols.add(position.reference_symbol)
         return sorted(_unique_symbol_keys(symbols))
 
-    def _refresh_htf_frames(self, gate_state: CycleGateState, attempted: set[str], *, where: str,
+    def _refresh_htf_frames(self, gate_state: CycleGateState, cycle: _HtfCycle, *, where: str,
                             bars: dict[str, pd.DataFrame] | None = None) -> None:
         """Fetch, on the fetch pool, the HTF frame of every ``_htf_symbols``
         symbol whose HTF bar has closed (``MarketDataStore.htf_refresh_due``
         on the strategy's ``htf_minutes()``: 10 s after the boundary) and that
-        this cycle has not tried yet (``attempted``, which it extends): the
-        only HTF fetch (``MarketDataStore.refresh_htf_frame``); no read
+        this cycle has not tried yet (``cycle.attempted``, which it extends):
+        the only HTF fetch (``MarketDataStore.refresh_htf_frame``); no read
         fetches.
 
         ``step`` calls it at the start of the cycle and again before
@@ -1871,13 +1912,18 @@ class IntradayBot:
         A fetch that fails systemically (``schwab_failure_is_systemic``: a
         transport failure or a timeout, 401, 429 or a 5xx; ``MarketDataStore
         .htf_failing_since``) stops the rest of the map: the fetches not
-        started yet are not sent. From then on a cycle sends one fetch, the
-        probe, at its first point with a due symbol, until one is answered;
-        the point whose probe is answered fetches the rest of its due symbols
-        (2026-10-07). The probe is a symbol other than the one whose fetch
-        failed last, which goes last in the map after it: a symbol that fails
-        on its own every time (a 5xx about it) neither holds the others nor
-        is fetched more than once a cycle. Until then an outage sent every
+        started yet are not sent, unless a fetch still in flight is answered
+        before the map ends, and then they are sent at once. From then on a
+        cycle sends one fetch, the probe, at its first point with a due
+        symbol, until one is answered; the point whose probe is answered
+        fetches the rest of its due symbols (2026-10-11). The symbols whose
+        latest fetch failed systemically (``MarketDataStore
+        .htf_failing_symbols``) go last in every map, the one that failed
+        longest ago first, and the probe is another due symbol when there is
+        one: a symbol that fails on its own every time (a 5xx about it) is
+        fetched once a cycle and holds no other symbol (when only such
+        symbols are due the probe is one of them, and a symbol due later in
+        that cycle gets a probe of its own). Until then an outage sent every
         due symbol's fetch at every cycle (28 a pass on top_tier), and under
         a 429 each spent about 3 s in schwabdev's retries, one fetch at a
         time (schwabdev's lock; the pooled client's while Schwab fails).
@@ -1893,23 +1939,27 @@ class IntradayBot:
         if not gate_state.context_refresh_active:
             return
         tf = self.strategy.htf_minutes()
-        due = self.data.htf_refresh_due([symbol for symbol in self._htf_symbols() if symbol not in attempted], tf)
+        due = self.data.htf_refresh_due([symbol for symbol in self._htf_symbols() if symbol not in cycle.attempted],
+                                        tf)
         if not due:
             return
         lookback_days = self.strategy.htf_lookback_days()
+        failing = list(self.data.htf_failing_symbols)
+        others = [symbol for symbol in due if symbol not in failing]
+        due = others + [symbol for symbol in failing if symbol in due]
         refreshed: list[str] = []
         if self.data.htf_failing_since is not None:
-            if attempted:
+            if others and not cycle.probed:
+                probe, cycle.probed = others[0], True
+            elif not others and not cycle.probed and not cycle.probed_failing:
+                probe, cycle.probed_failing = due[0], True
+            else:
                 return
-            failing = self.data.htf_failing_symbol
-            probe = next((symbol for symbol in due if symbol != failing), due[0])
-            attempted.add(probe)
+            cycle.attempted.add(probe)
             refreshed += self._fetch_htf_frames([probe], tf, lookback_days, where=f"{where}, probe", probe=True)
-            # The rest, the symbol that failed last after them.
-            due = ([symbol for symbol in due if symbol not in (probe, failing)]
-                   + [symbol for symbol in due if symbol == failing and symbol != probe])
+            due.remove(probe)
         if due and self.data.htf_failing_since is None:
-            attempted.update(due)
+            cycle.attempted.update(due)
             refreshed += self._fetch_htf_frames(due, tf, lookback_days, where=where, probe=False)
         if bars is not None and refreshed:
             stepped = {symbol: bars[symbol] for symbol in refreshed if symbol in bars}
@@ -1922,7 +1972,9 @@ class IntradayBot:
         on the fetch pool, log the outcome and return the symbols stored.
         Unless it is the probe, a symbol whose turn comes while a fetch has
         failed systemically (``MarketDataStore.htf_failing_since``) is not
-        sent."""
+        sent; when a fetch still in flight then is answered (a symbol that
+        failed on its own while others answered), the map sends them after
+        it, at once."""
         def _refresh(symbol: str) -> bool | None:
             if not probe and self.data.htf_failing_since is not None:
                 return None
@@ -1938,6 +1990,10 @@ class IntradayBot:
         LOG.info("HTF refresh (%s): %d/%d %sm frame(s) in %.2fs%s%s", where, len(refreshed), len(symbols), tf,
                  time.monotonic() - started, f"; failed: {','.join(failed)}" if failed else "",
                  f"; not sent, Schwab failing: {','.join(unsent)}" if unsent else "")
+        if unsent and self.data.htf_failing_since is None:
+            # Each such map sends one fetch at least (no other HTF fetch is
+            # in flight now), so this ends.
+            refreshed += self._fetch_htf_frames(unsent, tf, lookback_days, where=where, probe=False)
         return refreshed
 
     def _prime_strategy_htf_contexts(self, bars: dict[str, pd.DataFrame]) -> None:

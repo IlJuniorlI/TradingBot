@@ -9,6 +9,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from enum import Enum
 from threading import RLock, Thread
 from typing import Any, Callable, Iterable, Mapping
 
@@ -132,6 +133,24 @@ STREAM_QUOTE_SHADOW_BACKOFF_SECONDS = 60.0
 STREAM_QUOTE_SHADOW_BACKOFF_MAX_SECONDS = 900.0
 STREAM_QUOTE_SHADOW_SLOW_SECONDS = 2.0
 
+# A held position's symbol (MarketDataStore.set_held_quote_symbols: an
+# equity's own, an option's legs) is never blacklisted. After a REST quote
+# request about it failed (its single quote, or a batch carrying it that
+# failed systemically), its quote is requested neither alone nor in a batch
+# of such symbols only for HELD_QUOTE_RETRY_SECONDS, doubled for each further
+# failure in a row, at most HELD_QUOTE_RETRY_MAX_SECONDS; its cached quote
+# stands meanwhile, as after a failed request, and any answer for it (a
+# single, or its quote in a batch) ends the wait. So neither an outage nor
+# Schwab refusing the symbol holds every pass for a request's retry chain
+# (about 3 s under a 429 or a 5xx, about 31 s when reads time out).
+HELD_QUOTE_RETRY_SECONDS = 30.0
+HELD_QUOTE_RETRY_MAX_SECONDS = 120.0
+
+# The endpoint a REST request's outcome is noted under for the quote
+# blacklist (MarketDataStore._note_rest_outcome).
+QUOTE_REQUEST = "quote"
+PRICE_HISTORY_REQUEST = "price_history"
+
 # A CHART_EQUITY bar is stamped with its minute's start, so a real bar's
 # chart time is before its receipt; one stamped more than this after it is
 # malformed (the allowance covers a local clock up to a minute behind
@@ -182,6 +201,27 @@ def _shadow_backoff_seconds(doublings: int) -> float:
     ``STREAM_QUOTE_SHADOW_BACKOFF_MAX_SECONDS``."""
     return min(STREAM_QUOTE_SHADOW_BACKOFF_MAX_SECONDS,
                STREAM_QUOTE_SHADOW_BACKOFF_SECONDS * 2.0 ** min(doublings, 16))
+
+
+def _held_quote_retry_seconds(failures: int) -> float:
+    """How long a held symbol's REST quote requests wait after its
+    ``failures``-th failed one in a row: ``HELD_QUOTE_RETRY_SECONDS``,
+    doubled for each failure after the first, at most
+    ``HELD_QUOTE_RETRY_MAX_SECONDS``."""
+    return min(HELD_QUOTE_RETRY_MAX_SECONDS, HELD_QUOTE_RETRY_SECONDS * 2.0 ** min(failures - 1, 16))
+
+
+class _BatchOutcome(Enum):
+    """What came of a batch quote request
+    (``MarketDataStore._try_batch_quote_request``): Schwab answered it (its
+    quotes, or a status or a body about the request); it failed
+    systemically (``schwab_failure_is_systemic``: a transport failure or a
+    timeout, 401, 429 or a 5xx); or no answer reached the bot (the client
+    refused the request before it went out, a bug)."""
+
+    ANSWERED = "answered"
+    FAILED_SYSTEMICALLY = "failed systemically"
+    NO_ANSWER = "no answer"
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,31 +289,43 @@ class MarketDataStore:
         self._htf_derived_memo: dict[tuple[tuple[str, int], str], tuple[pd.DataFrame | None, tuple, Any]] = {}
         self.last_htf_refresh: dict[tuple[str, int], datetime] = {}
         # When an HTF fetch failed systemically, while none has been answered
-        # since (refresh_htf_frame; the engine's refresh then sends one fetch
-        # a cycle, IntradayBot._refresh_htf_frames), and the symbol of the
-        # last fetch that failed so. None while Schwab answers.
+        # since (refresh_htf_frame; the engine's refresh then sends one probe
+        # a cycle, IntradayBot._refresh_htf_frames), None while Schwab
+        # answers; and the symbols whose latest HTF fetch failed
+        # systemically, each with that failure's time, the longest ago
+        # first: a symbol joins at its systemic failure and leaves at its own
+        # answer, so one Schwab refuses on its own stays while the others
+        # answer.
         self.htf_failing_since: datetime | None = None
-        self.htf_failing_symbol: str | None = None
+        self.htf_failing_symbols: dict[str, datetime] = {}
         self.last_quote_refresh: dict[str, datetime] = {}
         # Per-symbol quote-failure tracking (_note_quote_failure): the
         # symbol's failed quote fetches in a row that were its own, reset by
         # any answer for it (a single or a batch); the time a symbol crossed
         # `runtime.max_consecutive_quote_failures` (the blacklist: no single
-        # quote of it until bot restart); and its systemic failures that
-        # nothing has told apart from an outage's yet (only its own requests
-        # failed since Schwab last answered one), counted with its next
-        # failure right after an answer, dropped when another request fails
-        # systemically or it is answered.
+        # quote of it until bot restart, while it is not held); and its
+        # systemic failures that nothing has told apart from an outage's yet
+        # (only its own requests failed since Schwab last answered one),
+        # counted with its next failure right after an answer, dropped when
+        # another request fails systemically or it is answered. A held
+        # symbol's failures count toward none of them.
         self._consecutive_quote_failures: dict[str, int] = {}
         self._quote_blacklist: dict[str, datetime] = {}
         self._unconfirmed_quote_failures: dict[str, int] = {}
         # What the REST requests that failed systemically
         # (schwab_failure_is_systemic) since Schwab last answered one asked
-        # about: a symbol (a single quote, a price_history fetch) or None (a
-        # `quotes` batch, the engine's or the shadow's). Empty while Schwab
-        # answers (_note_rest_outcome; the fetch pool's threads write it too,
-        # under the store's lock).
-        self._rest_failing: set[str | None] = set()
+        # about, and at which endpoint: (a symbol, QUOTE_REQUEST) for a single
+        # quote, (None, QUOTE_REQUEST) for a `quotes` batch, the engine's or
+        # the shadow's, (a symbol, PRICE_HISTORY_REQUEST) for a price_history
+        # fetch. Empty while Schwab answers (_note_rest_outcome; the fetch
+        # pool's threads write it too, under the store's lock).
+        self._rest_failing: set[tuple[str | None, str]] = set()
+        # The symbols whose quotes the open positions' management reads
+        # (set_held_quote_symbols, each pass), and each one's failed REST
+        # quote requests in a row: the last one's time and how many
+        # (_note_held_quote_failure; HELD_QUOTE_RETRY_SECONDS' comment).
+        self._held_quote_symbols: frozenset[str] = frozenset()
+        self._held_quote_failures: dict[str, tuple[datetime, int]] = {}
         self.merge_stats: dict[str, MergeStats] = defaultdict(MergeStats)
         self.last_history_refresh: dict[str, datetime] = {}
         self.last_stream_update: dict[str, datetime] = {}
@@ -505,6 +557,8 @@ class MarketDataStore:
                 self._consecutive_quote_failures.pop(sym, None)
                 self._quote_blacklist.pop(sym, None)
                 self._unconfirmed_quote_failures.pop(sym, None)
+                self._held_quote_failures.pop(sym, None)
+                self.htf_failing_symbols.pop(sym, None)
                 self._forced_premarket_history_refresh_date.pop(sym, None)
                 self.merge_stats.pop(sym, None)
                 self._stream_seen_symbols.discard(sym)
@@ -763,10 +817,11 @@ class MarketDataStore:
         A systemic failure (``schwab_failure_is_systemic``: a transport
         failure or a timeout, 401, 429 or a 5xx, which every other fetch
         would meet too) sets ``htf_failing_since``, and the engine then sends
-        no more than one HTF fetch a cycle until one is answered; any answer
-        (the frame, or a failure about the request, such as a 404) clears it
-        (2026-10-07). Each outcome is the quote blacklist's evidence too
-        (``_note_rest_outcome``).
+        one probe a cycle until a fetch is answered; any answer (the frame,
+        or a failure about the request, such as a 404) clears it
+        (2026-10-11). The symbol stays in ``htf_failing_symbols`` until its
+        own fetch is answered. Each outcome is the quote blacklist's evidence
+        too (``_note_rest_outcome``).
         """
         key = self._symbol_key(symbol)
         try:
@@ -775,26 +830,29 @@ class MarketDataStore:
             LOG.warning("HTF frame refresh failed for %s (%sm): %s: %s", symbol, timeframe_minutes, type(exc).__name__, exc)
             systemic = schwab_failure_is_systemic(exc)
             self._note_htf_fetch_outcome(symbol, systemic_failure=systemic)
-            self._note_rest_outcome(key, systemic_failure=systemic)
+            self._note_rest_outcome(key, PRICE_HISTORY_REQUEST, systemic_failure=systemic)
             return False
         self._note_htf_fetch_outcome(symbol, systemic_failure=False)
-        self._note_rest_outcome(key, systemic_failure=False)
+        self._note_rest_outcome(key, PRICE_HISTORY_REQUEST, systemic_failure=False)
         return True
 
     def _note_htf_fetch_outcome(self, symbol: str, *, systemic_failure: bool) -> None:
         """Keep ``htf_failing_since`` (set at the first systemic failure,
-        cleared by an answer; each change logged once) and
-        ``htf_failing_symbol``."""
+        cleared by any answer; each change logged once) and
+        ``htf_failing_symbols`` (the symbol joins, or moves to the end, at
+        its systemic failure and leaves at any other outcome of its own)."""
+        key = self._symbol_key(symbol)
         with self._lock:
             since = self.htf_failing_since
+            self.htf_failing_symbols.pop(key, None)
             if systemic_failure:
-                self.htf_failing_symbol = self._symbol_key(symbol)
+                now = sessions.now_et()
+                self.htf_failing_symbols[key] = now
                 if since is None:
-                    self.htf_failing_since = sessions.now_et()
+                    self.htf_failing_since = now
                     LOG.warning("HTF fetches failing systemically: one fetch a cycle until Schwab answers")
             elif since is not None:
                 self.htf_failing_since = None
-                self.htf_failing_symbol = None
                 LOG.warning("HTF fetches answered again (failing since %s)", since.isoformat())
 
     def _refresh_htf_frame(self, symbol: str, timeframe_minutes: int, lookback_days: int) -> None:
@@ -1482,10 +1540,11 @@ class MarketDataStore:
             )
         except Exception as exc:
             self._history_fetch_failed(cache_key, exc)
-            self._note_rest_outcome(cache_key, systemic_failure=schwab_failure_is_systemic(exc))
+            self._note_rest_outcome(cache_key, PRICE_HISTORY_REQUEST,
+                                    systemic_failure=schwab_failure_is_systemic(exc))
             raise
         self._history_fetch_answered(cache_key)
-        self._note_rest_outcome(cache_key, systemic_failure=False)
+        self._note_rest_outcome(cache_key, PRICE_HISTORY_REQUEST, systemic_failure=False)
         if str(source_symbol).upper().strip() != str(symbol).upper().strip():
             LOG.debug("Resolved price_history alias for %s via %s", symbol, source_symbol)
         df = self._completed_bars(self._history_candles_to_frame(payload.get("candles", [])), 1, end)
@@ -1650,9 +1709,10 @@ class MarketDataStore:
                 self.daily_history[key] = None
                 self.last_daily_refresh[key] = today
                 self.daily_history_failed_at[key] = now
-            self._note_rest_outcome(key, systemic_failure=schwab_failure_is_systemic(exc))
+            self._note_rest_outcome(key, PRICE_HISTORY_REQUEST,
+                                    systemic_failure=schwab_failure_is_systemic(exc))
             return None
-        self._note_rest_outcome(key, systemic_failure=False)
+        self._note_rest_outcome(key, PRICE_HISTORY_REQUEST, systemic_failure=False)
         if not frame.empty:
             frame = frame.loc[frame.index < pd.Timestamp(today).tz_localize(EXCHANGE_TZ)]
         if frame.empty:
@@ -1795,19 +1855,24 @@ class MarketDataStore:
         batch_size = max(1, int(self.config.runtime.quote_batch_size))
         return [symbols[idx: idx + batch_size] for idx in range(0, len(symbols), batch_size)]
 
-    def _parallel_quote_fetch(self, symbols: list[str]) -> tuple[dict[str, dict], list[str], list[_QuoteOutcome]]:
-        """Run ``_fetch_single_quote_with_aliases`` for each symbol not
-        blacklisted, on the fetch pool when there are two or more. Returns, in
-        the symbols' order, the normalized payloads that answered, the symbols
-        that raised, and the outcome of every REST quote request made
-        (``_QuoteOutcome``). The results are taken in the symbols' order once
-        the requests are done, so the lines this logs, the order its caller
-        stores in and the blacklist's evidence (``_note_quote_answered``,
+    def _parallel_quote_fetch(self, symbols: list[str], *,
+                              batch_answered: bool) -> tuple[dict[str, dict], list[str], list[_QuoteOutcome]]:
+        """Run ``_fetch_single_quote_with_aliases`` for each symbol neither
+        blacklisted nor held and waiting after a failure
+        (``_held_quote_waiting``), on the fetch pool when there are two or
+        more. Returns, in the symbols' order, the normalized payloads that
+        answered, the symbols that raised or wait (their cached quotes
+        stand), and the outcome of every REST quote request made
+        (``_QuoteOutcome``). ``batch_answered``: Schwab answered the batch
+        these symbols were left out of, this refresh (``_note_quote_failure``).
+        The results are taken in the symbols' order once the requests are
+        done, so the lines this logs, the order its caller stores in and the
+        blacklist's evidence (``_note_quote_answered``,
         ``_note_quote_failure``) never depend on the threads (until
         2026-10-06 they came in completion order). Each request is judged by
         its own time (``_quote_request``), on the pool as on the engine
         thread: the pool's requests are in flight together
-        (``schwab_api.PooledSchwabClient``). Until 2026-10-07 schwabdev's
+        (``schwab_api.PooledSchwabClient``). Until 2026-10-11 schwabdev's
         request lock sent them one at a time, so a pool request's time
         included its wait for the ones before it, and the pool was judged
         slow by its requests' average instead."""
@@ -1819,60 +1884,114 @@ class MarketDataStore:
         # The blacklist (runtime.max_consecutive_quote_failures, validated at
         # load: an integer >= 0, 0 turning it off): a symbol whose own quote
         # fetches failed that many times in a row (_note_quote_failure) is
-        # skipped silently for the rest of the session. Recovers on bot
-        # restart.
+        # skipped silently for the rest of the session, unless it is held.
+        # Recovers on bot restart.
         if self.config.runtime.max_consecutive_quote_failures > 0 and self._quote_blacklist:
-            symbols = [s for s in symbols if s not in self._quote_blacklist]
+            symbols = [s for s in symbols if not self._quote_blacklisted(s)]
             if not symbols:
                 return fetched, failed, []
+        now = sessions.now_et()
+        waiting = {s for s in symbols if self._held_quote_waiting(s, now)}
 
         def _record_failure(sym: str, exc: Exception) -> None:
             LOG.warning("Quote fetch failed for %s: %s: %s", sym, type(exc).__name__, exc)
             failed.append(sym)
-            self._note_quote_failure(sym, exc)
+            self._note_quote_failure(sym, exc, batch_answered=batch_answered)
 
         # Each symbol's requests' outcomes, appended by the one thread that
         # fetches it, read after the requests are done.
-        requests: dict[str, list[_QuoteOutcome]] = {sym: [] for sym in symbols}
+        requests: dict[str, list[_QuoteOutcome]] = {sym: [] for sym in symbols if sym not in waiting}
         # runtime.cycle_fetch_workers, which also sizes the engine's fetch
-        # pool; validated at load: an integer from 1 to 9.
-        workers = min(self.config.runtime.cycle_fetch_workers, len(symbols))
+        # pool and, one more, the Schwab client's sessions; validated at
+        # load: an integer from 1 to 9.
+        workers = min(self.config.runtime.cycle_fetch_workers, len(requests))
         if workers < 2:
             for sym in symbols:
+                if sym in waiting:
+                    failed.append(sym)
+                    continue
                 try:
                     fetched[sym] = self._fetch_single_quote_with_aliases(sym, requests[sym])
                 except Exception as exc:
                     _record_failure(sym, exc)
                     continue
                 self._note_quote_answered(sym)
-            return fetched, failed, [outcome for sym in symbols for outcome in requests[sym]]
+            return fetched, failed, [outcome for sym in requests for outcome in requests[sym]]
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bot-quote-fetch") as executor:
-            futures = [(sym, executor.submit(self._fetch_single_quote_with_aliases, sym, requests[sym]))
-                       for sym in symbols]
-            for sym, future in futures:
+            futures = {sym: executor.submit(self._fetch_single_quote_with_aliases, sym, requests[sym])
+                       for sym in requests}
+            for sym in symbols:
+                if sym in waiting:
+                    failed.append(sym)
+                    continue
                 try:
-                    fetched[sym] = future.result()
+                    fetched[sym] = futures[sym].result()
                 except Exception as exc:
                     _record_failure(sym, exc)
                     continue
                 self._note_quote_answered(sym)
-        return fetched, failed, [outcome for sym in symbols for outcome in requests[sym]]
+        return fetched, failed, [outcome for sym in requests for outcome in requests[sym]]
 
-    def _note_rest_outcome(self, about: str | None, *, systemic_failure: bool) -> None:
+    def set_held_quote_symbols(self, symbols: Iterable[str]) -> None:
+        """The symbols whose quotes the open positions' management reads (an
+        equity's own, an option's legs), which the engine sets each pass
+        (``IntradayBot._held_quote_symbols``). A held symbol is never
+        blacklisted, nor skipped for a blacklisting from before it was held,
+        and after its failed REST quote requests the next ones wait
+        (``HELD_QUOTE_RETRY_SECONDS``' comment); a symbol no longer held
+        loses its wait."""
+        held = frozenset(self._symbol_key(symbol) for symbol in symbols if str(symbol).strip())
+        with self._lock:
+            self._held_quote_symbols = held
+            self._held_quote_failures = {
+                symbol: failure for symbol, failure in self._held_quote_failures.items() if symbol in held}
+
+    def _quote_blacklisted(self, symbol: str) -> bool:
+        """Whether the blacklist skips ``symbol``'s single quotes: it is on
+        it and not held."""
+        return symbol in self._quote_blacklist and symbol not in self._held_quote_symbols
+
+    def _held_quote_waiting(self, symbol: str, now: datetime) -> bool:
+        """Whether ``symbol`` is held and its REST quote requests wait after
+        its last failed one (``_note_held_quote_failure``)."""
+        with self._lock:
+            failure = self._held_quote_failures.get(symbol)
+        return failure is not None and (now - failure[0]).total_seconds() < _held_quote_retry_seconds(failure[1])
+
+    def _note_held_quote_failure(self, symbol: str, error: str) -> None:
+        """A REST quote request about held ``symbol`` failed (``error`` says
+        how): its REST quote requests wait ``_held_quote_retry_seconds`` from
+        now (``_held_quote_waiting``) and its cached quote stands. The first
+        failure of a run logs a WARNING, the rest DEBUG; an answer for the
+        symbol ends the run (``_note_quote_answered``)."""
+        now = sessions.now_et()
+        with self._lock:
+            failures = self._held_quote_failures.get(symbol, (now, 0))[1] + 1
+            self._held_quote_failures[symbol] = (now, failures)
+        wait = _held_quote_retry_seconds(failures)
+        if failures == 1:
+            LOG.warning("REST quote of held %s failed (%s); its REST quote requests wait %.0f s, doubling while they "
+                        "fail (at most %.0f s), and its cached quote stands meanwhile", symbol, error, wait,
+                        HELD_QUOTE_RETRY_MAX_SECONDS)
+        else:
+            LOG.debug("REST quote of held %s failed again (%s): %d failures in a row; its REST quote requests wait "
+                      "%.0f s", symbol, error, failures, wait)
+
+    def _note_rest_outcome(self, about: str | None, endpoint: str, *, systemic_failure: bool) -> None:
         """One REST request's outcome, the quote blacklist's evidence
         (``_note_quote_failure``): one that failed systemically
-        (``schwab_failure_is_systemic``) adds what it asked about to
-        ``_rest_failing`` (a symbol, or None for a ``quotes`` batch) and drops
-        every other symbol's unconfirmed quote failures (an outage met them);
-        any other outcome, an answer (its payload, or a failure about the
-        request such as a 404), clears ``_rest_failing``. The fetch pool's
-        threads run it for their price_history fetches: it writes under the
-        store's lock."""
+        (``schwab_failure_is_systemic``) adds what it asked about (a symbol,
+        or None for a ``quotes`` batch) and its endpoint (``QUOTE_REQUEST``,
+        ``PRICE_HISTORY_REQUEST``) to ``_rest_failing`` and drops every other
+        symbol's unconfirmed quote failures (an outage met them); any other
+        outcome, an answer (its payload, or a failure about the request such
+        as a 404), clears ``_rest_failing``. The fetch pool's threads run it
+        for their price_history fetches: it writes under the store's lock."""
         with self._lock:
             if not systemic_failure:
                 self._rest_failing.clear()
                 return
-            self._rest_failing.add(about)
+            self._rest_failing.add((about, endpoint))
             if self._unconfirmed_quote_failures:
                 self._unconfirmed_quote_failures = {
                     symbol: count for symbol, count in self._unconfirmed_quote_failures.items() if symbol == about}
@@ -1880,64 +1999,83 @@ class MarketDataStore:
     def _note_quote_answered(self, symbol: str) -> None:
         """An answer for ``symbol``'s quote (a single quote, or its quote in
         a batch's answer, the engine's or the shadow's): its failures are no
-        longer consecutive, and Schwab answers (``_note_rest_outcome``).
-        Until 2026-10-07 only a single quote's answer reset the count."""
-        self._note_rest_outcome(symbol, systemic_failure=False)
+        longer consecutive, a held symbol's REST quote requests wait no more,
+        and Schwab answers (``_note_rest_outcome``). Until 2026-10-11 only a
+        single quote's answer reset the count."""
+        self._note_rest_outcome(symbol, QUOTE_REQUEST, systemic_failure=False)
         with self._lock:
             self._consecutive_quote_failures.pop(symbol, None)
             self._unconfirmed_quote_failures.pop(symbol, None)
+            held_failure = self._held_quote_failures.pop(symbol, None)
+        if held_failure is not None:
+            LOG.info("REST quote of held %s answered again after %d failure(s) in a row", symbol, held_failure[1])
 
-    def _note_quote_failure(self, symbol: str, error: Exception) -> None:
+    def _note_quote_failure(self, symbol: str, error: Exception, *, batch_answered: bool) -> None:
         """A failed quote fetch of ``symbol`` (its single requests, an alias
         after another), toward its blacklist: once
         ``runtime.max_consecutive_quote_failures`` of its own failures came in
         a row, no single quote of it is requested until bot restart (a batch
-        may still carry it; 0 counts nothing).
+        may still carry it; 0 counts nothing), unless it is held.
+
+        A held symbol's failure counts toward nothing and drops its
+        unconfirmed ones: its REST quote requests wait instead
+        (``_note_held_quote_failure``), so its management keeps a REST quote
+        from the first answer after an outage or a refusal, whatever the
+        failures (on 2026-09-25 a 401 outage blacklisted the held PLTR a
+        minute in, and its management read bar closes until a restart).
 
         A failure about the request (a 4xx about it, a body that does not
         decode, a bug: not ``schwab_failure_is_systemic``) is the symbol's
         own. A systemic one (a transport failure or a timeout, 401, 429, a
         5xx) is what every request meets in an outage, but also what Schwab
         can answer one symbol alone: KNRX's single quote answered 401 for 16
-        minutes on 2026-04-29 while Schwab answered everything else. The REST
-        requests since Schwab last answered one tell which
-        (``_rest_failing``): when another request failed systemically too it
-        is the outage's and does not count; when none did and this is the
-        symbol's first failure since that answer, it is its own and counts,
-        with its unconfirmed ones. Otherwise only the symbol's own requests
-        ran since the answer (the stream serves the other symbols, no batch
-        is sent): unconfirmed, counted with its next failure that comes right
-        after Schwab answered any request, dropped when another request fails
-        systemically or the symbol is answered. Until 2026-10-07 every
-        failure counted, so an outage blacklisted every symbol it met until
-        restart: on 2026-09-25 a 401 outage blacklisted all 28 of top_tier's,
-        the held PLTR first, a minute in."""
+        minutes on 2026-04-29 while Schwab answered everything else. When
+        Schwab answered the batch the symbol was left out of, this refresh
+        (``batch_answered``), it is its own and counts, with its unconfirmed
+        ones. Otherwise the REST requests since Schwab last answered one tell
+        which (``_rest_failing``): when one about something else failed
+        systemically too it is the outage's and does not count; when none
+        did and this is the symbol's first quote failure since that answer,
+        it is its own and counts, with its unconfirmed ones (its own
+        price_history fetches failing too, a symbol refused on both
+        endpoints, change neither). Otherwise only the symbol's own quote
+        requests ran since the answer (the stream serves the other symbols,
+        no batch is sent): unconfirmed, counted with its next failure that
+        comes right after Schwab answered any request, dropped when another
+        request fails systemically or the symbol is answered. Until
+        2026-10-11 every failure counted, so an outage blacklisted every
+        symbol it met until restart: on 2026-09-25 a 401 outage blacklisted
+        all 28 of top_tier's, the held PLTR first, a minute in."""
         systemic = schwab_failure_is_systemic(error)
         threshold = self.config.runtime.max_consecutive_quote_failures
         blacklisted = 0
         with self._lock:
-            outage = bool(self._rest_failing - {symbol})
-            first = symbol not in self._rest_failing
-            self._note_rest_outcome(symbol, systemic_failure=systemic)
-            if threshold <= 0:
-                return
-            if not systemic:
+            held = symbol in self._held_quote_symbols
+            outage = any(about != symbol for about, _endpoint in self._rest_failing)
+            first = (symbol, QUOTE_REQUEST) not in self._rest_failing
+            self._note_rest_outcome(symbol, QUOTE_REQUEST, systemic_failure=systemic)
+            if held:
                 self._unconfirmed_quote_failures.pop(symbol, None)
-                counted = 1
-            elif outage:
-                counted = 0
-            elif not first:
-                self._unconfirmed_quote_failures[symbol] = self._unconfirmed_quote_failures.get(symbol, 0) + 1
-                counted = 0
-            else:
-                counted = self._unconfirmed_quote_failures.pop(symbol, 0) + 1
-            if counted:
-                count = self._consecutive_quote_failures.get(symbol, 0) + counted
-                self._consecutive_quote_failures[symbol] = count
-                if count >= threshold and symbol not in self._quote_blacklist:
-                    self._quote_blacklist[symbol] = sessions.now_et()
-                    blacklisted = count
-        if blacklisted:
+            elif threshold > 0:
+                if not systemic:
+                    self._unconfirmed_quote_failures.pop(symbol, None)
+                    counted = 1
+                elif batch_answered or (first and not outage):
+                    counted = self._unconfirmed_quote_failures.pop(symbol, 0) + 1
+                elif outage:
+                    counted = 0
+                else:
+                    self._unconfirmed_quote_failures[symbol] = self._unconfirmed_quote_failures.get(symbol, 0) + 1
+                    counted = 0
+                if counted:
+                    count = self._consecutive_quote_failures.get(symbol, 0) + counted
+                    self._consecutive_quote_failures[symbol] = count
+                    if count >= threshold and symbol not in self._quote_blacklist:
+                        self._quote_blacklist[symbol] = sessions.now_et()
+                        blacklisted = count
+        if held:
+            self._note_held_quote_failure(symbol, f"{type(error).__name__}: {error}")
+        elif blacklisted:
             LOG.warning("Blacklisting %s from quote refresh after %d consecutive failures of its own (last: %s: %s); "
                         "will retry on bot restart", symbol, blacklisted, type(error).__name__, error)
 
@@ -2099,14 +2237,16 @@ class MarketDataStore:
         (``_QuoteOutcome``): in trouble when it raised, answered a non-2xx
         status, or took longer than ``STREAM_QUOTE_SHADOW_SLOW_SECONDS`` of
         its own time. Its own time is requests' ``Response.elapsed``, from
-        its first byte sent to its answer's headers, its adapter's retries
-        included: nothing it waited for before it went out, for the token
-        refresh or behind another request (``schwab_api.PooledSchwabClient``
-        sends one at a time while Schwab fails), is judged slow. A response
-        requests did not build carries no ``elapsed`` and is judged by the
-        call's time, which bounds the request's own from above; so is a
-        request that raised. Until 2026-10-07 every request was judged by
-        the call's time, and the fetch pool's by their average.
+        when the client handed it to its adapter (a new connection's connect
+        and TLS handshake included) to its answer's headers, its adapter's
+        retries included; the body's read is not in it: nothing it waited for
+        before it went out, for the token refresh or behind another request
+        (``schwab_api.PooledSchwabClient`` sends one at a time while Schwab
+        fails), is judged slow. A response requests did not build carries no
+        ``elapsed`` and is judged by the call's time, which bounds the
+        request's own from above; so is a request that raised. Until
+        2026-10-11 every request was judged by the call's time, and the fetch
+        pool's by their average.
 
         A TypeError is no request: it is the client refusing the argument
         before anything goes out (``_try_batch_quote_request`` then fetches
@@ -2150,60 +2290,65 @@ class MarketDataStore:
             self._stream_quote_shadow_skipping = False
 
     def _try_batch_quote_request(self, symbols: list[str],
-                                 outcomes: list[_QuoteOutcome]) -> tuple[dict[str, dict], bool]:
+                                 outcomes: list[_QuoteOutcome]) -> tuple[dict[str, dict], _BatchOutcome]:
         """The engine's batch quote request for ``symbols``: one ``quotes``
         request with the list (schwabdev joins it), its outcome appended to
-        ``outcomes`` and noted for the blacklist (``_note_rest_outcome``).
-        Returns the quotes it answered and whether it failed systemically (a
-        transport failure or a timeout, 401, 429 or a 5xx:
-        ``schwab_failure_is_systemic``), which a single quote of each symbol
+        ``outcomes`` and, when Schwab answered or it failed systemically,
+        noted for the blacklist (``_note_rest_outcome``). Returns the quotes
+        it answered and what came of it (``_BatchOutcome``). A systemic
+        failure (a transport failure or a timeout, 401, 429 or a 5xx:
+        ``schwab_failure_is_systemic``) is one a single quote of each symbol
         would meet too. A failure about the request (a 4xx about it, a body
         that does not decode, a TypeError: the client refusing the list
         before anything went out, or another exception: a bug) returns no
-        quotes and False, and is logged with its type: the symbols are then
-        fetched alone. Until 2026-10-07 a failed batch was sent again as a
-        comma-joined string (the same request: schwabdev joins a list), then
-        to the single-symbol ``quote`` endpoint with the list and the string
-        (which cannot answer either), before each symbol was fetched alone:
-        one 429 refresh of top_tier's 28 symbols sent 136 requests and held
-        the cycle 105 s in schwabdev's retries (replayed through a loopback
-        Schwab on 2026-10-04)."""
+        quotes and is logged with its type: the symbols are then fetched
+        alone; an exception that is not systemic is no answer from Schwab
+        (``call_schwab_client`` raises none for a status), so it leaves the
+        blacklist's evidence as it was. Until 2026-10-11 a failed batch was
+        sent again as a comma-joined string (the same request: schwabdev
+        joins a list), then to the single-symbol ``quote`` endpoint with the
+        joined string (its list form refused by the client before anything
+        went out), which cannot answer either, before each symbol was
+        fetched alone: one 429 refresh of top_tier's 28 symbols sent 136
+        requests and held the cycle 105 s in schwabdev's retries (replayed
+        through a loopback Schwab on 2026-10-04)."""
         if not symbols:
-            return {}, False
+            return {}, _BatchOutcome.NO_ANSWER
         try:
             response = self._quote_request(f"quotes of {len(symbols)}", outcomes, call_schwab_client, self.client,
                                            "quotes", symbols)
         except TypeError as exc:
             LOG.warning("Batch quote request for %s was refused before it went out (%s: %s); the symbols are "
                         "fetched alone", symbols, type(exc).__name__, exc)
-            return {}, False
+            return {}, _BatchOutcome.NO_ANSWER
         except Exception as exc:
             systemic = schwab_failure_is_systemic(exc)
-            self._note_rest_outcome(None, systemic_failure=systemic)
+            if systemic:
+                self._note_rest_outcome(None, QUOTE_REQUEST, systemic_failure=True)
             LOG.warning("Batch quote request failed for %s (%s: %s)%s", symbols, type(exc).__name__, exc,
                         "" if systemic else "; the symbols are fetched alone")
-            return {}, systemic
+            return {}, _BatchOutcome.FAILED_SYSTEMICALLY if systemic else _BatchOutcome.NO_ANSWER
         status = getattr(response, "status_code", None)
         systemic = schwab_status_is_systemic(status)
-        self._note_rest_outcome(None, systemic_failure=systemic)
+        self._note_rest_outcome(None, QUOTE_REQUEST, systemic_failure=systemic)
         if not response_ok(response):
             body_preview = str(getattr(response, "text", "") or "")[:240]
             loud = systemic or not isinstance(status, int) or status in {403, 404}
             (LOG.warning if loud else LOG.debug)("Batch quote request returned status=%s for %s%s", status, symbols,
                                                  f": {body_preview}" if body_preview else "")
-            return {}, systemic
+            return {}, _BatchOutcome.FAILED_SYSTEMICALLY if systemic else _BatchOutcome.ANSWERED
         try:
             payload = response.json()
         except Exception as exc:
             LOG.warning("Batch quote request for %s answered a body that did not decode (%s: %s); the symbols are "
                         "fetched alone", symbols, type(exc).__name__, exc)
-            return {}, False
+            return {}, _BatchOutcome.ANSWERED
         extracted = self._extract_quote_payloads(payload, symbols)
         if extracted:
             LOG.debug("Fetched %d quotes via batch quotes", len(extracted))
         else:
             LOG.debug("Batch quote request returned no extractable quotes for %s", symbols)
-        return extracted, False
+        return extracted, _BatchOutcome.ANSWERED
 
     def fetch_quotes(
         self,
@@ -2231,7 +2376,11 @@ class MarketDataStore:
         same way, so none is sent and their cached quotes stand, unless a
         forced call asked for one or two symbols (a vertical's legs). A
         symbol whose cached alias is not known yet is fetched alone, its
-        aliases in turn."""
+        aliases in turn. A held symbol whose REST quote requests wait after
+        a failure (``HELD_QUOTE_RETRY_SECONDS``' comment) is not fetched
+        alone, nor in a batch of such symbols only, and its cached quote
+        stands; a systemic batch failure starts that wait for the held
+        symbols it carried."""
         out: dict[str, dict] = {}
         outcomes: list[_QuoteOutcome] = []
         requested = sorted({self._symbol_key(s) for s in symbols if str(s).strip()})
@@ -2293,9 +2442,12 @@ class MarketDataStore:
                 if resolved != symbol:
                     request_to_original[resolved] = symbol
             fetched: dict[str, dict] = {}
-            systemic_failure = False
-            if len(request_chunk) > 1:
-                raw_fetched, systemic_failure = self._try_batch_quote_request(request_chunk, outcomes)
+            batch: _BatchOutcome | None = None
+            # A batch of held symbols that all wait after a failure is not
+            # sent; one with any other symbol carries them (no request more).
+            now = sessions.now_et()
+            if len(request_chunk) > 1 and not all(self._held_quote_waiting(symbol, now) for symbol in chunk):
+                raw_fetched, batch = self._try_batch_quote_request(request_chunk, outcomes)
                 if request_to_original:
                     # Schwab returns quotes keyed by request_symbol; remap
                     # to the original cache key so downstream lookups
@@ -2311,19 +2463,27 @@ class MarketDataStore:
                 rest_stored.append(symbol)
                 batch_hits += 1
             fallback_targets = [symbol for symbol in chunk if symbol not in fetched]
-            if systemic_failure and not (force and len(chunk) <= 2):
+            if batch is _BatchOutcome.FAILED_SYSTEMICALLY:
+                # A held symbol's requests wait after it, as after its own
+                # failed single, so the exemption below sends none of them.
+                trouble = outcomes[-1]
+                for symbol in fallback_targets:
+                    if symbol in self._held_quote_symbols:
+                        self._note_held_quote_failure(symbol, f"{trouble.what} {trouble.trouble}")
+            if batch is _BatchOutcome.FAILED_SYSTEMICALLY and not (force and len(batch_pending) <= 2):
                 # Each single quote would fail as the batch did: none is
                 # sent, and the cached quotes stand (the stream's under its
                 # rules; a forced fetch warns: _warn_forced_fetch_fallbacks),
                 # a blacklisted symbol skipped as the fallback skips it. A
-                # forced refresh of one or two symbols (a vertical's legs
+                # forced call for one or two symbols (a vertical's legs
                 # before its order) still tries them alone, at most two more
                 # requests, so a failure that clears within schwabdev's
                 # retries does not cost the order a cycle.
                 fallback_results = {}
-                fallback_failed = [symbol for symbol in fallback_targets if symbol not in self._quote_blacklist]
+                fallback_failed = [symbol for symbol in fallback_targets if not self._quote_blacklisted(symbol)]
             else:
-                fallback_results, fallback_failed, fallback_outcomes = self._parallel_quote_fetch(fallback_targets)
+                fallback_results, fallback_failed, fallback_outcomes = self._parallel_quote_fetch(
+                    fallback_targets, batch_answered=batch is _BatchOutcome.ANSWERED)
                 outcomes.extend(fallback_outcomes)
             for symbol, normalized in fallback_results.items():
                 out[symbol] = self._store_rest_quote(symbol, normalized, sessions.now_et())
@@ -2335,7 +2495,7 @@ class MarketDataStore:
                 if cached is not None:
                     out[symbol] = cached
 
-        alias_results, alias_failed, alias_outcomes = self._parallel_quote_fetch(alias_pending)
+        alias_results, alias_failed, alias_outcomes = self._parallel_quote_fetch(alias_pending, batch_answered=False)
         outcomes.extend(alias_outcomes)
         for symbol, normalized in alias_results.items():
             out[symbol] = self._store_rest_quote(symbol, normalized, sessions.now_et())
@@ -2412,8 +2572,9 @@ class MarketDataStore:
 
     def _warn_forced_fetch_fallbacks(self, source: str | None, pending: list[str], rest_stored: list[str]) -> None:
         """A forced fetch that stored no REST quote for a symbol (its
-        request failed, or the symbol is blacklisted) leaves the cache as it
-        was, and its readers (an entry's market read, the management
+        request failed, the symbol is blacklisted, or it is held and its
+        requests wait after a failure: ``HELD_QUOTE_RETRY_SECONDS``' comment)
+        leaves the cache as it was, and its readers (an entry's market read, the management
         snapshot) take a cached quote younger than ``_quote_ttl``: since the
         stream quotes, usually the stream's. One WARNING per such symbol
         naming that quote's source and age; none for a cached quote too old
@@ -2502,7 +2663,7 @@ class MarketDataStore:
         range); on another thread it would hold the engine's own REST
         requests, an exit's included, behind it all the same: while Schwab
         fails the client sends one request at a time
-        (``schwab_api.PooledSchwabClient``; until 2026-10-07 schwabdev's
+        (``schwab_api.PooledSchwabClient``; until 2026-10-11 schwabdev's
         request lock always did)."""
         every = self.config.runtime.stream_quote_shadow_every
         if every <= 0 or self._stream_quote_publications < every:
@@ -2561,9 +2722,13 @@ class MarketDataStore:
             except TypeError:
                 raise
             except Exception as exc:
-                self._note_rest_outcome(None, systemic_failure=schwab_failure_is_systemic(exc))
+                # A systemic failure is the outage's evidence; any other
+                # exception is no answer from Schwab, evidence of nothing
+                # (_try_batch_quote_request).
+                if schwab_failure_is_systemic(exc):
+                    self._note_rest_outcome(None, QUOTE_REQUEST, systemic_failure=True)
                 break                          # its outcome says why
-            self._note_rest_outcome(None, systemic_failure=schwab_status_is_systemic(
+            self._note_rest_outcome(None, QUOTE_REQUEST, systemic_failure=schwab_status_is_systemic(
                 getattr(response, "status_code", None)))
             if outcomes[-1].trouble is not None:
                 break

@@ -44,7 +44,7 @@ def is_clean_ohlcv_frame(df: pd.DataFrame) -> bool:
     rebuild below copies, sorts, converts five columns, drops and reorders;
     on such a frame every one of those is a no-op (it keeps an int64 volume
     as it is, and an int64 column holds no NaN), so a copy is the same frame
-    for a tenth of the cost. Until 2026-10-07 an int64 volume, which every
+    for a tenth of the cost. Until 2026-10-11 an int64 volume, which every
     frame built from Schwab's candles carries (the stored HTF frames among
     them), took the rebuild: about 1.3 ms a read of a stored 15m frame, and
     every HTF context built at a new price reads one (its FVGs)."""

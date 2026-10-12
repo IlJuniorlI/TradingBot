@@ -545,13 +545,15 @@ class RuntimeConfig:
     # (MarketDataStore._note_quote_failure). A failure about the request (a
     # 400/403/404) counts; a systemic one (a transport failure, 401, 429, a
     # 5xx) only when no other REST request failed so since Schwab last
-    # answered one, so an outage alone blacklists none (2026-09-25: all 28
-    # until restart). Recovers on bot restart. Counter resets on any answer
-    # for the symbol, a single quote or a batch's. Set to 0 to disable
-    # (always retry — pre-2026-04-29 behavior). The default 5 catches
-    # symbol-specific permission errors (e.g. restricted securities like
-    # KNRX 2026-04-29: 457 wasted 401 retries) without blacklisting on
-    # transient hiccups.
+    # answered one, so an outage that fails every request blacklists none
+    # (2026-09-25: all 28 until restart). A held position's symbol is never
+    # blacklisted: its failed REST quote requests are spaced out instead
+    # (data_feed.HELD_QUOTE_RETRY_SECONDS). Recovers on bot restart. Counter
+    # resets on any answer for the symbol, a single quote or a batch's. Set
+    # to 0 to disable (always retry — pre-2026-04-29 behavior). The default
+    # 5 catches symbol-specific permission errors (e.g. restricted
+    # securities like KNRX 2026-04-29: 457 wasted 401 retries) without
+    # blacklisting on transient hiccups.
     max_consecutive_quote_failures: int = 5
     # Shadow check of the level and context memos (context_memo): each memo
     # hit is rebuilt with probability 1/N and compared with what the memo
@@ -1880,7 +1882,9 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         # after its request, with a WARNING). Its predecessor,
         # cycle_precompute_workers, was read as ``int(value or 4)`` behind a
         # silent except until 2026-09-26.
-        "cycle_fetch_workers": _Number(integer=True, low=1, high=9),
+        "cycle_fetch_workers": _Number(integer=True, low=1, high=9,
+                                       note=" (the Schwab client's sessions, one more, stay within the 10 connections "
+                                            "schwabdev's adapter keeps to a host)"),
         # Read by every quote refresh (MarketDataStore._parallel_quote_fetch),
         # where a typo used to read as 5 and null or a negative count as 0.
         "max_consecutive_quote_failures": _Number(integer=True, low=0, note=" (0 turns the gate off)"),

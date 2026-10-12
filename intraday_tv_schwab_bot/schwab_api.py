@@ -405,12 +405,15 @@ class PooledSchwabClient(SchwabClient):
 
     While the last request to finish failed systemically (it answered 401,
     429 or a 5xx, or raised a transport failure or a timeout:
-    ``schwab_failure_is_systemic``), the requests go one at a time, as
-    schwabdev's client sends them, until one is answered otherwise, so a
-    rate limit or an outage meets no more requests at once than it did
-    (a 429 window over the 09:15 prewarm, replayed through a loopback
+    ``schwab_failure_is_systemic``), the requests that start go one at a
+    time, as schwabdev's client sends them, until any request is answered
+    otherwise. That holds past the requests already in flight when the
+    failure came, which meet it together (up to the fetch pool's width,
+    each with its own retries), and only until the next answer: a limit
+    that answers some requests meets the full width again after each
+    answer. A 429 window over the 09:15 prewarm, replayed through a loopback
     Schwab, drew 246 requests a minute through the pool without this, 80
-    with it, and 62 through schwabdev's client).
+    with it, and 62 through schwabdev's client.
 
     The access-token refresh stays serialized (``_refresh_token_serialized``,
     then schwabdev's own lock), and a token another path refreshed reaches
