@@ -9,6 +9,132 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **top_tier judges its break-even and profit-lock stops and its peak
+  giveback floors on the bid (a LONG) or the ask (a SHORT) instead of the
+  mark (`protective_exits_on_executable_side`, true in the shipped preset,
+  false in the manifests); the SESSION REPORT counts the trades that
+  reached their target and still closed at a loss; small_cap_squeeze's
+  preset turns on the entry spread guard at top_tier's thresholds.**
+  *2026-10-12* — judged on the mark, a break-even exit fills on the bid,
+  half a spread or more under the break-even. On H:'s dry run 09-29..10-09
+  the 11 exits on a level at or past the entry that still lost money (9
+  break-even stops, a giveback floor, a target) lost -73.13: the spread
+  between the mark and the fill cost -76.39 and the gap between passes
+  -38.67, while the levels themselves stood +41.93 over the entry. Walked
+  pass by pass through the bot's own level check, judging these levels on
+  the bid / ask changes 35 of the 167 trades' exits, +70.86 (23 better, 6
+  worse, 6 at the same fill a pass earlier), and the 11 go to -43.53; 10
+  of them still lose, -43.53 together, which is the gap between passes
+  (2.3-8 s) that no rule on a pass removes, and no other protective exit
+  loses. Raising the break-even by the spread instead was rejected: it
+  stopped out winners that dipped back to the entry (-84 to -107).
+  - The rule (`trade_management.protective_read`, judged in
+    `TradeManager.update_position`): with the strategy's knob on, a stop
+    at or past the entry (the break-even, the profit lock, and a trail or
+    a promoted rung once past the entry) and the peak giveback floors'
+    current R are judged on the executable side of the pass's management
+    snapshot, the quote the exit order is priced from: its bid or ask,
+    positive as the order reads it, and finite. Never on a price past the
+    mark (a bid above the mark judges on the mark): such an exit fires on
+    the same pass as on the mark or an earlier one, never later. The
+    levels, the peak and every ratchet's arming, the initial stop, the
+    target, the time stop, the shared exits and force flatten stay on the
+    mark, and the exit order and its price are unchanged. Dry run and live
+    read the same snapshot, so they take the same decision; a working
+    exit's remainder check gets the pass's read too. `update_position`'s
+    read (`protective`) has no default: every caller names it, and None
+    judges every level on the mark.
+  - The abnormal-book guard: the mark judges when the snapshot is not a
+    quote (a bar close, the account's price), a side is missing, zero,
+    not finite or crossed, the position's window holds fewer than 5
+    spreads, or the pass's spread is at least 2x the window's median (6
+    decimals). The window is the position's last 128 spreads, at least
+    128 passes (about 5 minutes at the 2.4 s cadence, longer when the
+    book repeats). A pass's spread joins it only when the book moved
+    since the position's previous readable pass, one with both sides (its
+    bid, its ask or the mark differs), and is not zero (a locked book, so
+    a median is never zero), and, once the window holds 5, only when it
+    is under 2x the median (the pass that brings it to 5 joins even when
+    wide); any other pass is read against the window as it stands. So a
+    book that stays wide is judged on the mark for as long as it lasts,
+    against the spreads the position had before it widened, and a frozen
+    quote, a halted symbol's, adds at most one spread: frozen on a
+    position's first passes, or still frozen after a restart, it leaves
+    the window short of 5, and the mark judges for as long as it stays
+    frozen. On H:'s passes 3,023 of 21,664 (14%) repeat the book of the
+    pass before, at most 10 passes of one book in a row (CRM 10-09,
+    22 s); the rule moves no exit there. The limits: a book wide but
+    moving on a position's first passes, or on the first after a restart,
+    fills the window and sets its median (on the archive only TSLA 10-09,
+    a first median of 0.17 against its 0.08, and no exit moved); a frozen
+    book of normal width is read on the book once the window holds 5,
+    until halt handling ships. The window is kept per position by the
+    position manager, in memory, and starts again after a restart. On the
+    archive the guard keeps two exits on the mark (without it 37 change,
+    +69.91): ORCL 10-07, a book at 2x its median that would have let the
+    break-even fire on the bid for -1.04 against +3.12, and NOW 10-07, a
+    3x book (+3.21 forgone). Windows of 64 spreads or more give the same
+    result.
+  - The record: a protective exit's EXIT_CONTEXT names the read,
+    `protective_side` (`bid`, `ask`, `mark`), `protective_price`,
+    `protective_basis` (`executable`, or why the mark judged it:
+    `no_quote`, `book_unreadable`, `few_spreads`, `abnormal_book`,
+    `book_past_mark`), `protective_spread` and `protective_spread_median`
+    (each left out when the read had none) and `protective_mark_through`,
+    whether the mark itself was at or through the exit's level. False does
+    not prove the mark would have exited later: on the pass where the mark
+    reaches the target, the mark rule takes the target on that same pass
+    (ANET 10-08, a short, takes its low-tier floor on the ask there, at the
+    same fill). A floor exit's existing `peak_giveback_current_r` is the
+    read's current R, at `protective_price`. With the knob off nothing is
+    added, and that R is the mark's.
+  - The knob is checked at load (`TopTierAdaptiveStrategy.normalize_params`)
+    and at the build: true or false, else the load refuses naming the key.
+    A preset that leaves it out takes the manifest's false; params that
+    reach the build without it are refused. small_cap_squeeze keeps the
+    mark until halt handling ships: the load and the build refuse true
+    there, since a halted symbol's quote can move while its last trade is
+    frozen and an exit started on it cancels the broker's disaster stop.
+    The hook is `BaseStrategy.protective_exits_on_executable_side`, which
+    answers False; no other strategy overrides it.
+  - The count (`session_report._target_reached_losses`): the day's trades
+    whose mark reached their target and that closed at a loss, whatever
+    exit closed them, so a rule that moved such a loss to a stop or a
+    floor could not hide it. A position records the first management pass
+    whose mark was at or through the target as the pass's risk check
+    starts (`diag_target_reached_price`, `diag_target_reached_ts`): the
+    stamp runs ahead of the level check, so a runner extension that moves
+    the target on that pass does not hide it, and a target moved later
+    does not reset it. The trade record and trades.csv carry it with the
+    trade's best mark (`target_reached_price`, `best_mark_price`), so the
+    count is whole across a restart. The line reads
+    `target_reached_losses=N` after `avg_trade=`, then one line per such
+    trade (`  target reached, closed at a loss: <symbol> <side> entry=...
+    target=... best_mark=... reason=... pnl=...`), and the JSON has
+    `target_reached_losses` and `target_reached_loss_trades` (symbol,
+    side, entry time and price, target, best mark, exit reason, P&L).
+    `target_reached_losses=` holds `losses=`, so a grep for the day's
+    losses anchors the space (` losses=`). The two new trades.csv columns
+    rotate an older file once, at its next append; a row written before
+    has neither and does not count.
+  - small_cap_squeeze's preset sets `max_entry_spread_r: 0.33` and
+    `max_entry_spread_target_frac: 0.5` (its manifest keeps 0): small-cap
+    stops are wide, so it rarely binds; on the 55 small-cap entries of
+    06-01..06-03 it would have skipped 3 (HKIT, ZJYL x2), which lost
+    -44.95. It changes no exit.
+  - Decisions: the user's, 2026-10-12: judge the protective exits on the
+    executable side with the fallback to the mark on a book at least 2x
+    its rolling median, top_tier only, behind a knob; no cushion on the
+    levels; the target rule is not built, and the report's count shows
+    whether a target-reached loss still happens with the guard on; the
+    entry spread guard on for small_cap_squeeze.
+  - Behaviour: on the top_tier preset, about 4-5 protective exits a day
+    fire a pass or more earlier, at the price the bid or ask first reached
+    the level. Every other preset's exits are unchanged. Off: the knob
+    false. Docs: the top_tier README (section 12 and the knob), the
+    strategy contract, small_cap_squeeze's README, the README (the knob,
+    the session report and trades.csv) and both presets' comments.
+
 - **top_tier skips an entry whose quote is wide against its risk or its
   target (`max_entry_spread_r` / `max_entry_spread_target_frac`, 0.33 and
   0.5 in the shipped preset, 0 in the manifests), and keeps a refused
