@@ -29,11 +29,14 @@
           <div class="label">Status</div>
           <div class="value" id="status-badge-wrap"><span class="status-chip status-idle">Starting</span></div>
         </div>
-        <div class="metric-pill"><div class="label">Day PnL</div><div class="value" id="metric-daypnl">—</div></div>
-        <div class="metric-pill"><div class="label">Profit Factor</div><div class="value" id="metric-pf">—</div></div>
-        <div class="metric-pill"><div class="label">Total Trades</div><div class="value" id="metric-trades">—</div></div>
-        <div class="metric-pill"><div class="label">Wins / Losses</div><div class="value" id="metric-wl">—</div></div>
-        <div class="metric-pill"><div class="label">Win Rate</div><div class="value" id="metric-winrate">—</div></div>
+        <!-- The day's figures (performance.day); data-day-tag names the day
+             when it is not today, and what a partial day's figures lack
+             (helpers.js applyDayTags). -->
+        <div class="metric-pill" title="The ET trading day&#39;s, across a restart"><div class="label">Day PnL<span class="day-tag" data-day-tag></span></div><div class="value" id="metric-daypnl">—</div></div>
+        <div class="metric-pill" title="The ET trading day&#39;s, across a restart"><div class="label">Profit Factor<span class="day-tag" data-day-tag></span></div><div class="value" id="metric-pf">—</div></div>
+        <div class="metric-pill" title="The ET trading day&#39;s, across a restart"><div class="label">Total Trades<span class="day-tag" data-day-tag></span></div><div class="value" id="metric-trades">—</div></div>
+        <div class="metric-pill" title="The ET trading day&#39;s, across a restart"><div class="label">Wins / Losses<span class="day-tag" data-day-tag></span></div><div class="value" id="metric-wl">—</div></div>
+        <div class="metric-pill" title="The ET trading day&#39;s, across a restart"><div class="label">Win Rate<span class="day-tag" data-day-tag></span></div><div class="value" id="metric-winrate">—</div></div>
         <div class="metric-pill"><div class="label">Ready</div><div class="value" id="metric-warmup">—</div></div>
       </div>
       <div class="toolbar">
@@ -225,12 +228,12 @@
               <div class="kpi-hero-value" id="kpi-netliq">—</div>
               <div class="kpi-hero-chg neutral" id="kpi-day-chg"><span class="arrow">—</span><span id="kpi-day-chg-text">—</span></div>
             </div>
-            <div class="kpi-spark" id="kpi-spark" aria-label="Equity curve"></div>
+            <div class="kpi-spark" id="kpi-spark" aria-label="The day's equity curve"></div>
             <div class="kpi-grid">
-              <div class="kpi-tile"><div class="tiny-label">Realized</div><div class="value-main" id="kpi-realized">—</div></div>
+              <div class="kpi-tile" title="Since this bot process started"><div class="tiny-label">Realized</div><div class="value-main" id="kpi-realized">—</div></div>
               <div class="kpi-tile"><div class="tiny-label">Unrealized</div><div class="value-main" id="kpi-unrealized">—</div></div>
-              <div class="kpi-tile"><div class="tiny-label">Drawdown</div><div class="value-main" id="kpi-drawdown">—</div></div>
-              <div class="kpi-tile"><div class="tiny-label">Win Rate</div><div class="value-main" id="kpi-winrate">—</div></div>
+              <div class="kpi-tile" title="Since this bot process started"><div class="tiny-label">Drawdown</div><div class="value-main" id="kpi-drawdown">—</div></div>
+              <div class="kpi-tile" title="Since this bot process started"><div class="tiny-label">Win Rate</div><div class="value-main" id="kpi-winrate">—</div></div>
             </div>
           </div>
         </section>
@@ -250,7 +253,7 @@
                 <div class="gauge-value" id="gauge-win-value">—</div>
               </div>
               <div class="gauge-card">
-                <div class="tiny-label" style="text-align:center;">Max DD</div>
+                <div class="tiny-label" style="text-align:center;" title="Since this bot process started, in % of its peak equity">Max DD</div>
                 <div class="gauge-ring warn" id="gauge-dd-ring"><span id="gauge-dd-text">—</span></div>
                 <div class="gauge-value" id="gauge-dd-value">—</div>
               </div>

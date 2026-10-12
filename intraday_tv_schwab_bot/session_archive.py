@@ -836,11 +836,15 @@ def _archive_symbols(
     strategy: Any,
     last_candidates: Iterable[Any] | None,
     positions: dict[str, Position],
-    account: Any,
+    traded: Iterable[str | None],
 ) -> set[str]:
     """The symbols to export bars for: the active watchlist, the underlying of
-    every open position, and every symbol in the account's trades, so a
-    symbol that left the watchlist after it traded still gets its bars."""
+    every open position, and every symbol traded on the day (``traded``: the
+    underlying, else the symbol, of each of its trades), so a symbol that
+    left the watchlist after it traded still gets its bars. Until 2026-10-12
+    the traded symbols came from the exporting process's last
+    ``paper.max_trade_history`` exit slices: a restart, or more slices than
+    that in a day, left out the day's earlier ones."""
     symbols: set[str] = set()
     watch = strategy.active_watchlist(list(last_candidates or []), positions or {})
     for sym in watch or set():
@@ -851,11 +855,10 @@ def _archive_symbols(
         underlying = str((pos.metadata or {}).get("underlying") or pos.symbol or "").upper().strip()
         if underlying:
             symbols.add(underlying)
-    if account is not None:
-        for trade in list(getattr(account, "trades", []) or []):
-            ticker = str(getattr(trade, "underlying", None) or getattr(trade, "symbol", "") or "").upper().strip()
-            if ticker:
-                symbols.add(ticker)
+    for ticker in traded:
+        key = str(ticker or "").upper().strip()
+        if key:
+            symbols.add(key)
     return symbols
 
 
@@ -1032,10 +1035,26 @@ def _copy_daily_log(log_src: Path, log_dst: Path) -> bool:
         return False
 
 
-def _export_trades(account: Any, trades_src: Path, trades_dst: Path,
-                   session_date: date, strategy_name: str) -> tuple[int, float | None, str | None]:
+def _read_day_rows(trades_src: Path, session_date: date,
+                   strategy_name: str) -> tuple[list[dict[str, str]] | None, str | None]:
+    """The day's rows of the persistent trades.csv (``trades_src``) that
+    ``strategy_name`` wrote, and None; ``(None, the error)`` when the file
+    cannot be read, logged with the error's type."""
+    try:
+        rows = [row for row in read_trade_rows(trades_src, session_date.isoformat())
+                if row.get("strategy") == strategy_name]
+    except Exception as exc:
+        LOG.warning("Could not read the day's trades from %s: %s: %s",
+                    trades_src, type(exc).__name__, exc, exc_info=True)
+        return None, f"{type(exc).__name__}: {exc}"
+    return rows, None
+
+
+def _export_trades(account: Any, rows: list[dict[str, str]] | None, read_error: str | None, trades_src: Path,
+                   trades_dst: Path, session_date: date, strategy_name: str) -> tuple[int, float | None, str | None]:
     """Write the day's rows of the persistent trades.csv (``trades_src``)
-    that ``strategy_name`` wrote to ``trades_dst``.
+    that ``strategy_name`` wrote (``rows``, read by ``_read_day_rows``; None
+    with its ``read_error`` when they could not be) to ``trades_dst``.
 
     Returns ``(trades_today, realized_pnl, trades_export_error)``.
 
@@ -1062,8 +1081,12 @@ def _export_trades(account: Any, trades_src: Path, trades_dst: Path,
     snapshot are not the session's.
 
     ``account`` (the exporting process's) is checked against the file: a
-    trade of the day and the strategy that it holds and the file does not
-    (an append that failed) is an error, not a quietly shorter day.
+    trade of the day and the strategy in its outbox (``trades_outbox``: the
+    trades no append has written yet) that the file does not hold (an
+    append that failed) is an error, not a quietly shorter day. Until
+    2026-10-12 the check read the account's last ``paper.max_trade_history``
+    exit slices, the history the append had read, so a day of more slices
+    than that lost the oldest from the file and from the check alike.
 
     Today's realized PnL is summed from the SAME rows that produce trades.csv
     and trades_today. The manifest used to report `account.realized_pnl`, a
@@ -1075,8 +1098,11 @@ def _export_trades(account: Any, trades_src: Path, trades_dst: Path,
     `manifest.realized_pnl == sum(trades.csv.realized_pnl)` holds exactly.
     """
     session_date_str = session_date.isoformat()
+    if rows is None:
+        # Report UNKNOWN, not flat: a wrong-but-plausible zero is worse than
+        # an absent value, since nobody investigates a zero.
+        return 0, None, read_error
     try:
-        rows = [row for row in read_trade_rows(trades_src, session_date_str) if row.get("strategy") == strategy_name]
         with open(trades_dst, "w", newline="", encoding="utf-8") as dst_fh:
             writer = csv.DictWriter(dst_fh, fieldnames=TRADE_CSV_COLUMNS, extrasaction="raise")
             writer.writeheader()
@@ -1085,14 +1111,12 @@ def _export_trades(account: Any, trades_src: Path, trades_dst: Path,
     except Exception as exc:
         LOG.warning("Could not write the day's trades CSV from %s: %s: %s",
                     trades_src, type(exc).__name__, exc, exc_info=True)
-        # Report UNKNOWN, not flat: a wrong-but-plausible zero is worse than
-        # an absent value, since nobody investigates a zero.
         return 0, None, f"{type(exc).__name__}: {exc}"
     if account is None:
         return len(rows), realized_pnl_today, None
     try:
         held = {trade_csv_key(trade_csv_row(trade, session_date_str))
-                for trade in trades_closed_on(getattr(account, "trades", []) or [], session_date)
+                for trade in trades_closed_on(account.trades_outbox, session_date)
                 if trade.strategy == strategy_name}
     except Exception as exc:
         # A record the row cannot be built from (one missing a TradeRecord
@@ -1125,19 +1149,27 @@ def _write_config_snapshot(config: Any | None, archive_root: Path) -> bool:
         return False
 
 
-def _write_account_snapshot(account: Any, positions: dict[str, Position], archive_root: Path) -> bool:
-    """Write account_snapshot.json: equity, realized PnL, per-symbol PnL,
-    equity curve — everything the PaperAccount knows at the moment of
-    export; whether it was written."""
+def _write_account_snapshot(account: Any, positions: dict[str, Position], archive_root: Path,
+                            session_date: date) -> bool:
+    """Write account_snapshot.json at the moment of export: the run's
+    figures (``scope: run``: the exporting process's, since its
+    ``run_started_at``: equity, its peak, drawdown and curve, realized PnL,
+    the closed trades' statistics, the open positions) and
+    the archived day's (``day``: ``PaperAccount.day_figures``, the day's
+    P&L, realized P&L, trade statistics, max drawdown and curve, across a
+    restart; None when the account does not hold the day). Until 2026-10-12
+    the file held the run's figures alone, unnamed, in the day's folder.
+    Whether it was written."""
     if account is None:
         return False
     try:
         snapshot = account.capture_snapshot(positions or {})
+        record = {"scope": "run", **snapshot, "day": account.day_figures(session_date)}
         # capture_snapshot returns a dict; serialize via json (default=str
         # to handle datetimes inside equity curve points).
         atomic_write_text(
             archive_root / "account_snapshot.json",
-            json.dumps(snapshot, indent=2, default=str),
+            json.dumps(record, indent=2, default=str),
         )
         return True
     except Exception as exc:
@@ -1310,11 +1342,13 @@ def export_session_archive(
     - ``config_snapshot.yaml`` — the resolved BotConfig (with secrets
       redacted) so future audits can reproduce decisions even if
       config.yaml has been edited since.
-    - ``account_snapshot.json`` — full PaperAccount snapshot at the
-      moment of export (end-of-day daily fire or shutdown): equity
-      curve, realized PnL by symbol, open positions, etc., with each held
-      equity valued at the account's mark (the manifest's
-      ``equity_mark_basis``).
+    - ``account_snapshot.json`` — the PaperAccount at the moment of
+      export (end-of-day daily fire or shutdown): the exporting process's
+      run figures (``scope: run``, since ``run_started_at``: equity
+      curve, realized PnL, open positions, etc.) and the
+      archived day's (``day``), with each held equity valued at the
+      account's mark (the manifest's ``equity_mark_basis``)
+      (``_write_account_snapshot``).
     - ``events.jsonl`` — structured events (ENTRY_CONTEXT, EXIT_CONTEXT,
       TRADE_SUMMARY, SKIP_SUMMARY, the engine's CYCLE_TIMING, the position
       manager's POSITION_MARK, ...: ``_STRUCTURED_PREFIXES``) extracted
@@ -1363,9 +1397,10 @@ def export_session_archive(
         ``data.get_htf_frame(...)`` for the stored HTF frame (a read, never
         a Schwab fetch).
     account
-        PaperAccount (or live account tracker). Its ``account.trades`` add
-        the closed-position symbols to the bars even if they left the
-        watchlist, and are checked against the day's trades.csv rows.
+        PaperAccount (or live account tracker). Its trades not appended
+        yet (``trades_outbox``) add their symbols to the bars, as the day's
+        trades.csv rows do, even if they left the watchlist, and are
+        checked against those rows.
     positions
         Currently-open positions at the moment of export. On the
         end-of-day daily fire (8pm ET) this is whatever the bot is
@@ -1401,7 +1436,15 @@ def export_session_archive(
     bars_dir = archive_root / "bars"
     bars_dir.mkdir(parents=True, exist_ok=True)
 
-    symbols = _archive_symbols(strategy, last_candidates, positions, account)
+    trades_src = log_dir_path / "trades.csv"
+    day_rows, day_rows_error = _read_day_rows(trades_src, session_date, str(strategy_name))
+    traded = [row.get("underlying") or row.get("symbol") for row in day_rows or []]
+    if account is not None:
+        # A record that cannot be read as a trade (no symbol, say) adds no
+        # symbol here; the trades check names it in the manifest.
+        traded += [getattr(trade, "underlying", None) or getattr(trade, "symbol", None)
+                   for trade in trades_closed_on(account.trades_outbox, session_date)]
+    symbols = _archive_symbols(strategy, last_candidates, positions, traded)
     timeframes_sorted, bars_written_by_tf, bars_skipped_by_tf = _export_bars(data, symbols, strategy, bars_dir)
     # Aggregate counts for the manifest summary.
     bars_written = sum(bars_written_by_tf.values())
@@ -1411,9 +1454,9 @@ def export_session_archive(
     log_dst = archive_root / f"bot_{session_date.isoformat()}.log"
     log_copied = _copy_daily_log(log_src, log_dst)
     trades_today, realized_pnl_today, trades_export_error = _export_trades(
-        account, log_dir_path / "trades.csv", archive_root / "trades.csv", session_date, str(strategy_name))
+        account, day_rows, day_rows_error, trades_src, archive_root / "trades.csv", session_date, str(strategy_name))
     config_snapshot_written = _write_config_snapshot(config, archive_root)
-    account_snapshot_written = _write_account_snapshot(account, positions, archive_root)
+    account_snapshot_written = _write_account_snapshot(account, positions, archive_root, session_date)
 
     # events.jsonl and decisions.csv are read from the COPIED log (log_dst)
     # when it exists, so they and bot_*.log in the archive reference the

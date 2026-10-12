@@ -145,6 +145,17 @@ body {
   flex: 0 0 auto;
 }
 
+/* A day figure's tag (helpers.js applyDayTags) goes on a line of its own
+   under the label: inline, the nowrap label would squeeze the value out of
+   its 1/3-width cell. */
+.topbar.m-topbar.m-topbar-compact .metric-pill .label .day-tag:not(:empty) {
+  display: block;
+}
+
+.topbar.m-topbar.m-topbar-compact .metric-pill .label .day-tag:not(:empty)::before {
+  content: none;
+}
+
 .topbar.m-topbar.m-topbar-compact .metric-pill .value {
   font-size: 12px;
   font-weight: 700;
@@ -264,9 +275,9 @@ body {
      happens to neutralize this for mobile, but make the override
      explicit so the panel positioning doesn't depend on a brittle
      breakpoint contract.
-   - `panel-meta` ("Day PnL ${...} · cash ${...}", mobile.js:178) can
-     produce 50+ char strings with 7-figure values. Allow wrapping
-     instead of forcing single-line truncation. */
+   - `panel-meta` ("Day PnL ${...} · realized ${...} · cash ${...}",
+     helpers.js kpiMetaText) can produce 60+ char strings with 7-figure
+     values. Allow wrapping instead of forcing single-line truncation. */
 .m-shell .position-card {
   cursor: default;
   -webkit-tap-highlight-color: transparent;

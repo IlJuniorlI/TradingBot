@@ -34,14 +34,16 @@
         </div>
         <!-- Rows 2-3: 6 metric pills (3-col grid). Day PnL moved into
              the last cell of row 3 so the "Updated" full-width footer
-             can sit at the bottom on its own. PnL label trimmed from
-             "Day PnL" to just "PnL" for cell-width parity. -->
-        <div class="metric-pill"><div class="label">PF</div><div class="value" id="metric-pf">—</div></div>
-        <div class="metric-pill"><div class="label">Trades</div><div class="value" id="metric-trades">—</div></div>
-        <div class="metric-pill"><div class="label">W / L</div><div class="value" id="metric-wl">—</div></div>
+             can sit at the bottom on its own. PF, Trades, W / L and Day
+             PnL are the day's (performance.day), as the desktop's;
+             data-day-tag names the day when it is not today, and what a
+             partial day's figures lack (helpers.js applyDayTags). -->
+        <div class="metric-pill"><div class="label">PF<span class="day-tag" data-day-tag></span></div><div class="value" id="metric-pf">—</div></div>
+        <div class="metric-pill"><div class="label">Trades<span class="day-tag" data-day-tag></span></div><div class="value" id="metric-trades">—</div></div>
+        <div class="metric-pill"><div class="label">W / L<span class="day-tag" data-day-tag></span></div><div class="value" id="metric-wl">—</div></div>
         <div class="metric-pill"><div class="label">Ready</div><div class="value" id="metric-warmup">—</div></div>
         <div class="metric-pill"><div class="label">API/min</div><div class="value" id="metric-api-cpm">—</div></div>
-        <div class="metric-pill"><div class="label">PnL</div><div class="value" id="metric-daypnl">—</div></div>
+        <div class="metric-pill"><div class="label">Day PnL<span class="day-tag" data-day-tag></span></div><div class="value" id="metric-daypnl">—</div></div>
         <!-- Footer row: Updated timestamp, full width, with date -->
         <div class="metric-pill updated-metric"><div class="label">Updated</div><div class="value" id="metric-updated">—</div></div>
       </div>
@@ -56,7 +58,7 @@
           <div class="kpi-hero-value" id="kpi-netliq">—</div>
           <div class="kpi-hero-chg neutral" id="kpi-day-chg"><span class="arrow">—</span><span id="kpi-day-chg-text">—</span></div>
         </div>
-        <div class="kpi-spark" id="kpi-spark" aria-label="Equity curve"></div>
+        <div class="kpi-spark" id="kpi-spark" aria-label="The day's equity curve"></div>
         <div class="kpi-grid">
           <div class="kpi-tile"><div class="tiny-label">Realized</div><div class="value-main" id="kpi-realized">—</div></div>
           <div class="kpi-tile"><div class="tiny-label">Unrealized</div><div class="value-main" id="kpi-unrealized">—</div></div>

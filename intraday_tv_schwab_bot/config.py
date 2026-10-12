@@ -593,16 +593,27 @@ class RuntimeConfig:
 @dataclass(slots=True)
 class PaperConfig:
     starting_equity: float = 25_000.0
+    # The run's equity curve (this process's): its last this many points, in
+    # the archive's account_snapshot.json (the dashboard state carries no run
+    # curve: no page draws it). The day's curve, the pages' sparkline, is the
+    # account's day ledger's, a point a minute, whatever this says
+    # (2026-10-12).
     max_equity_points: int = 2000
-    # The equity curve gets a point at most this often (seconds). The engine
-    # samples the account every pass and the peak and the max drawdown
-    # follow every sample, but the curve gets a point only once its last one
-    # is this old (the session report's and the archive's capture always
-    # adds one). At 15, the 2,000 points of max_equity_points span at least
-    # 8.3 hours of ~2.5 s RTH passes, so the dashboard's curve and the 20:00
-    # archive's hold the whole session; one a pass would hold its last 80-90
-    # minutes. 0 adds a point on every sample (2026-10-05).
+    # The run's equity curve gets a point at most this often (seconds). The
+    # engine samples the account every pass and the peak and the max
+    # drawdown follow every sample, but the curve gets a point only once its
+    # last one is this old (the session report's and the archive's capture
+    # always adds one). At 15, the 2,000 points of max_equity_points span at
+    # least 8.3 hours of ~2.5 s RTH passes; one a pass would hold its last
+    # 80-90 minutes. 0 adds a point on every sample (2026-10-05).
     equity_point_seconds: float = 15.0
+    # The account keeps its last this many exit slices (the chart's trade
+    # markers, the recent exit events) and its last this many closed trades
+    # (the trades table); the dashboard adds the day's trades a process
+    # before a restart appended to trades.csv. Nothing else reads them: the
+    # run's trade statistics are running sums and trades.csv is appended
+    # from an uncapped outbox, so no number of trades loses one (until
+    # 2026-10-12 both were folded from these slices).
     max_trade_history: int = 200
 
 

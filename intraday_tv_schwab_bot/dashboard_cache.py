@@ -27,7 +27,7 @@ from __future__ import annotations
 import copy
 import logging
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from threading import RLock
 from typing import TYPE_CHECKING, Any
@@ -40,6 +40,7 @@ from .config import BotConfig, DashboardChartConfig
 from .dashboard_payloads import (
     bars_from_frame,
     cache_json_signature,
+    dashboard_performance,
     frame_signature,
     fvg_anchor_abs_index,
     fvg_payload,
@@ -49,6 +50,7 @@ from .dashboard_payloads import (
     recent_trade_markers,
     symbol_trade_signature,
     technical_line_payload,
+    trade_rows,
 )
 from .dashboard_zones import build_level_zones, level_anchors
 from .htf_levels import HTFContext
@@ -67,7 +69,7 @@ from .levels_shared import collapse_price_ladder, effective_side_tolerance
 if TYPE_CHECKING:
     from ._strategies.strategy_base import BaseStrategy
     from .data_feed import MarketDataStore
-    from .paper_account import PaperAccount
+    from .paper_account import PaperAccount, TradeRecord
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -93,6 +95,13 @@ class DashboardCache:
     ``strategy_level_zones``, ``chart_payload``), and the small
     config-reading helpers that resolve chart profile / max-bars /
     candidate-limit from ``config.dashboard`` and ``config.tradingview``.
+
+    ``earlier_trades`` are the day's closed trades a process before this
+    one appended to trades.csv (``IntradayBot._earlier_day_trades``, read
+    once at the start): the trades table, the events' trades and the
+    chart's markers show them beside the account's own, so a restart keeps
+    the day's trades on the page. ``earlier_trades_error`` names what they
+    lack of the day's rows and why (None when nothing).
     """
 
     def __init__(
@@ -102,11 +111,17 @@ class DashboardCache:
         data: MarketDataStore,
         strategy: BaseStrategy,
         account: PaperAccount,
+        earlier_trades: Sequence[TradeRecord] = (),
+        earlier_trades_error: str | None = None,
     ) -> None:
         self.config = config
         self.data = data
         self.strategy = strategy
         self.account = account
+        self.earlier_trades = tuple(earlier_trades)
+        # As the trades table holds them, converted once.
+        self._earlier_trade_rows = trade_rows(self.earlier_trades)
+        self.earlier_trades_error = earlier_trades_error
         self.snapshot_cache: dict[str, dict[str, Any]] = {}
         self.chart_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
         # symbol -> (key, bars, ema spans): the snapshot bars of the last
@@ -275,8 +290,12 @@ class DashboardCache:
         refreshes them before the publish (``IntradayBot._refresh_htf_frames``;
         until 2026-09-28 these reads fetched while the gate refreshed market
         context, one symbol at a time). Until 2026-09-27 this was the
-        engine's ``_dashboard_state`` (refactor cut C40)."""
-        performance = self.account.snapshot_copy(positions)
+        engine's ``_dashboard_state`` (refactor cut C40). The performance is
+        the account's snapshot with the figures the pages show
+        (``dashboard_performance``), its trades table with the day's
+        ``earlier_trades``."""
+        performance = dashboard_performance(self.account.snapshot_copy(positions), self._earlier_trade_rows,
+                                            self.earlier_trades_error, sessions.now_et())
         candidates = []
         entry_decision_by_symbol = {str(symbol or '').upper().strip(): copy.deepcopy(payload) for symbol, payload in entry_decisions.items() if str(symbol or '').upper().strip()}
         candidate_limit = self.candidate_limit()
@@ -605,7 +624,7 @@ class DashboardCache:
             },
             "technicals": technical_payload,
             "position_markers": position_markers,
-            "recent_trades": recent_trade_markers(self.account, symbol),
+            "recent_trades": recent_trade_markers(self.account, symbol, self.earlier_trades),
             # Spans of the snapshot bars' ema9 / ema20, for labelling them
             # before (or without) a chart payload.
             "ema_fast_span": snapshot_ema_spans[0],

@@ -20,12 +20,14 @@ and inside the SESSION_REPORT structured JSON payload (under top-level keys
 ``per_hour``, ``mae_mfe``, ``post_stop_continuation``, ``filter_rejections``) so
 downstream tooling can parse them without re-scraping.
 
-The persistent trades.csv is ``append_trades_csv``'s: every closed trade the
-process holds, once, under its exit's ET date, each read and write of it
-under its lock (``trades.csv.lock`` beside it). The per-day archive under
-``{log_dir}/sessions/`` (bars, decisions, the manifest's regime-call outcomes
-and gate attribution) is ``session_archive``'s; its trades.csv is the day's
-rows of the persistent trades.csv, the exporting strategy's.
+The persistent trades.csv is ``append_trades_csv``'s: every trade the
+process closed, once, under its exit's ET date, each read and write of it
+under its lock (``trades.csv.lock`` beside it). A day's report reads the
+day's rows of it, every process's, with the process's trades not appended
+yet. The per-day archive under ``{log_dir}/sessions/`` (bars, decisions, the
+manifest's regime-call outcomes and gate attribution) is
+``session_archive``'s; its trades.csv is the day's rows of the persistent
+trades.csv, the exporting strategy's.
 """
 from __future__ import annotations
 
@@ -40,7 +42,7 @@ import shutil
 import time
 from collections import defaultdict
 from contextlib import ExitStack, contextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -152,6 +154,72 @@ def read_trade_rows(csv_path: Path, session_date: str) -> list[dict[str, str]]:
     return rows
 
 
+def _row_flag(value: str) -> bool:
+    if value not in ("True", "False"):
+        raise ValueError(f"{value!r} is not True or False")
+    return value == "True"
+
+
+def _row_time(value: str) -> datetime:
+    stamp = datetime.fromisoformat(value)
+    if stamp.tzinfo is None:
+        raise ValueError(f"{value!r} has no UTC offset")
+    return stamp
+
+
+# How ``trade_record_from_row`` reads each ``TradeRecord`` field's column,
+# by the field's annotation: the inverse of ``trade_csv_row`` (csv writes None
+# as "" and a bool as True / False).
+_ROW_READERS = {
+    "str": str,
+    "int": int,
+    "float": float,
+    "bool": _row_flag,
+    "datetime": _row_time,
+    "str | None": lambda value: value or None,
+    "float | None": lambda value: float(value) if value != "" else None,
+    "tuple[str, ...]": lambda value: tuple(value.split("|")) if value else (),
+}
+
+
+def trade_record_from_row(row: dict[str, str | None]) -> TradeRecord:
+    """The closed trade a trades.csv row holds (``trade_csv_row`` read back
+    as text), at the row's rounding. KeyError or ValueError on a row that
+    does not read as one (a value missing from a short line included)."""
+    values: dict[str, Any] = {}
+    for field in dataclasses.fields(TradeRecord):
+        text = row[field.name]
+        if text is None:
+            raise ValueError(f"the row has no {field.name}")
+        values[field.name] = _ROW_READERS[field.type](text)
+    return TradeRecord(**values)
+
+
+# What ``read_trade_rows`` raises on a file it cannot read.
+TRADES_CSV_READ_ERRORS = (OSError, ValueError, csv.Error, UnicodeDecodeError)
+
+
+def day_trade_records(log_dir: str, session_date: date,
+                      strategy: str | None) -> tuple[list[TradeRecord], set[tuple[str, ...]], list[str]]:
+    """The rows of the persistent trades.csv dated ``session_date``
+    (``read_trade_rows``), ``strategy``'s, or every strategy's with None:
+    the closed trades they hold (``trade_record_from_row``), in file order;
+    the ``TRADE_CSV_KEY`` of each row, one that does not read included; and
+    the error of each row that does not read, with the error's type.
+    Raises what ``read_trade_rows`` raises (``TRADES_CSV_READ_ERRORS``)."""
+    rows = read_trade_rows(Path(log_dir) / "trades.csv", session_date.isoformat())
+    if strategy is not None:
+        rows = [row for row in rows if row.get("strategy") == strategy]
+    trades: list[TradeRecord] = []
+    unreadable: list[str] = []
+    for row in rows:
+        try:
+            trades.append(trade_record_from_row(row))
+        except (KeyError, ValueError) as exc:
+            unreadable.append(f"{type(exc).__name__}: {exc}")
+    return trades, {trade_csv_key(row) for row in rows}, unreadable
+
+
 def _exit_date(trade: TradeRecord) -> date | None:
     """``trade``'s exit ET date; None, with a WARNING, when its exit
     timestamp cannot be read.
@@ -195,30 +263,32 @@ def _safe_pct(wins: int, total: int) -> float | None:
     return (wins / total) if total > 0 else None
 
 
-def _summarize_group(trades: list[TradeRecord]) -> dict[str, Any]:
+def _summarize_group(pnls: list[float]) -> dict[str, Any]:
     """Compute the shared (count, wins, losses, net_pnl, avg_pnl, win_rate,
-    best, worst) summary for any slice of trades."""
-    if not trades:
+    best, worst) summary for the P&L of any slice of trades."""
+    if not pnls:
         return {
             "count": 0, "wins": 0, "losses": 0,
             "net_pnl": 0.0, "avg_pnl": None, "win_rate": None,
             "best": None, "worst": None,
         }
-    wins = sum(1 for t in trades if t.realized_pnl > 0)
-    losses = sum(1 for t in trades if t.realized_pnl < 0)
-    total_pnl = sum(t.realized_pnl for t in trades)
-    best_trade = max(trades, key=lambda t: t.realized_pnl)
-    worst_trade = min(trades, key=lambda t: t.realized_pnl)
+    wins = sum(1 for pnl in pnls if pnl > 0)
+    losses = sum(1 for pnl in pnls if pnl < 0)
+    total_pnl = sum(pnls)
     return {
-        "count": len(trades),
+        "count": len(pnls),
         "wins": wins,
         "losses": losses,
         "net_pnl": round(total_pnl, 2),
-        "avg_pnl": round(total_pnl / len(trades), 2),
-        "win_rate": _safe_pct(wins, len(trades)),
-        "best": round(best_trade.realized_pnl, 2),
-        "worst": round(worst_trade.realized_pnl, 2),
+        "avg_pnl": round(total_pnl / len(pnls), 2),
+        "win_rate": _safe_pct(wins, len(pnls)),
+        "best": round(max(pnls), 2),
+        "worst": round(min(pnls), 2),
     }
+
+
+def _summaries(groups: dict[str, list[TradeRecord]]) -> dict[str, dict[str, Any]]:
+    return {key: _summarize_group([t.realized_pnl for t in group]) for key, group in groups.items()}
 
 
 def _group_by(trades: Iterable[TradeRecord], key_fn) -> dict[str, list[TradeRecord]]:
@@ -232,7 +302,7 @@ def _group_by(trades: Iterable[TradeRecord], key_fn) -> dict[str, list[TradeReco
 
 
 def _per_regime(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
-    return {regime: _summarize_group(group) for regime, group in _group_by(trades, lambda t: t.regime or "unknown").items()}
+    return _summaries(_group_by(trades, lambda t: t.regime or "unknown"))
 
 
 def _per_entry_path(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
@@ -256,26 +326,27 @@ def _per_entry_path(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
             return "market_fallback"
         return "immediate"
 
-    return {key: _summarize_group(group)
-            for key, group in sorted(_group_by(trades, _bucket).items())}
+    return _summaries(dict(sorted(_group_by(trades, _bucket).items())))
 
 
 def _per_symbol(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
-    return {symbol: _summarize_group(group) for symbol, group in _group_by(trades, lambda t: t.symbol).items()}
+    return _summaries(_group_by(trades, lambda t: t.symbol))
 
 
 def _per_exit_reason(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
     """Closed trades by the reason of their FINAL exit."""
-    return {reason: _summarize_group(group) for reason, group in _group_by(trades, lambda t: exit_reason_code(t.reason) or "unknown").items()}
+    return _summaries(_group_by(trades, lambda t: exit_reason_code(t.reason) or "unknown"))
 
 
-def _per_partial_exit_reason(slices: list[TradeRecord]) -> dict[str, dict[str, Any]]:
-    """Partial-exit SLICES by their own reason: what each scale-out (and each
-    broker partial fill) booked. A folded trade reports only its final
-    reason, so without this a divergence scale-out never appeared in the
-    exit tables at all (2026-09-24)."""
-    partials = [t for t in slices if bool(t.partial_exit)]
-    return {reason: _summarize_group(group) for reason, group in _group_by(partials, lambda t: exit_reason_code(t.reason) or "unknown").items()}
+def _per_partial_exit_reason(slices: list[tuple[str, float]]) -> dict[str, dict[str, Any]]:
+    """Partial-exit SLICES (each a reason and its P&L) by their own reason:
+    what each scale-out (and each broker partial fill) booked. A folded
+    trade reports only its final reason, so without this a divergence
+    scale-out never appeared in the exit tables at all (2026-09-24)."""
+    groups: dict[str, list[float]] = defaultdict(list)
+    for reason, pnl in slices:
+        groups[exit_reason_code(reason) or "unknown"].append(pnl)
+    return {reason: _summarize_group(pnls) for reason, pnls in groups.items()}
 
 
 def _per_hour(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
@@ -285,7 +356,7 @@ def _per_hour(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
         # can drift long after entry.
         return f"{t.entry_time.hour:02d}:00"
 
-    return {hour: _summarize_group(group) for hour, group in _group_by(trades, _hour_bucket).items()}
+    return _summaries(_group_by(trades, _hour_bucket))
 
 
 def _mae_mfe_summary(trades: list[TradeRecord]) -> dict[str, Any]:
@@ -848,6 +919,32 @@ def _log_filter_rejections(summary: dict[str, Any]) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _day_trades(account: PaperAccount, log_dir: str, session_date: date,
+                strategy: str) -> tuple[list[TradeRecord], str | None]:
+    """The trades of ``strategy`` that closed on ``session_date``, one record
+    each, oldest exit first: the day's rows of the persistent trades.csv
+    (every process's that appended them, as the archive's manifest counts
+    them) and the account's closed trades no append has written yet
+    (``PaperAccount.trades_outbox``) that the file lacks. With the file
+    unreadable, the outbox's alone; a row that does not read is left out.
+    The second item names what was left out, with the error's type (None
+    when nothing was)."""
+    day = session_date.isoformat()
+    pending = [trade for trade in trades_closed_on(account.trades_outbox, session_date) if trade.strategy == strategy]
+    try:
+        trades, held, unreadable = day_trade_records(log_dir, session_date, strategy)
+    except TRADES_CSV_READ_ERRORS as exc:
+        error = f"the day's trades.csv rows could not be read ({type(exc).__name__}: {exc})"
+        LOG.warning("Session report %s: %s, so it covers only this process's trades not appended yet", day, error)
+        return sorted(pending, key=lambda trade: trade.exit_time), error
+    trades += [trade for trade in pending if trade_csv_key(trade_csv_row(trade, day)) not in held]
+    error = None
+    if unreadable:
+        error = f"{len(unreadable)} of the day's trades.csv rows could not be read (the first: {unreadable[0]})"
+        LOG.warning("Session report %s: %s, so it leaves them out", day, error)
+    return sorted(trades, key=lambda trade: trade.exit_time), error
+
+
 def write_session_report(
     account: PaperAccount,
     positions: dict[str, Position],
@@ -855,6 +952,7 @@ def write_session_report(
     session_date: date,
     strategy: str,
     dry_run: bool,
+    log_dir: str,
     structured_logger: Any | None = None,
     skip_counts: dict[str, int] | None = None,
     bars_for: Any | None = None,
@@ -866,31 +964,50 @@ def write_session_report(
     per-symbol / per-exit-reason / per-hour breakdowns, MAE/MFE aggregates,
     and the filter-rejection tally.
 
-    The session is the ET date ``session_date``: the trades in ``account``
-    that closed on it. The engine writes it once a day, when a trading day's
-    stream window closes (20:00 ET) or at a shutdown before then
-    (``IntradayBot._close_session_day``), and appends the trades to the
-    persistent trades.csv after it (``append_trades_csv``). A failure is
-    logged with its type and never raised: the summary is a log record.
+    The session is the ET date ``session_date``: the trades of ``strategy``
+    that closed on it (``_day_trades``), every process's that appended them
+    to ``{log_dir}/trades.csv`` and this one's not appended yet, so a day a
+    restart split reports whole once its last process reports it, as its
+    archive's manifest counts it. A trade is one record, its partial exits
+    folded in, on its final exit's date. The engine writes it once a day,
+    when a trading day's stream window closes (20:00 ET) or at a shutdown
+    before then (``IntradayBot._close_session_day``), and appends the
+    trades to the persistent trades.csv after it (``append_trades_csv``). A
+    failure is logged with its type and never raised: the summary is a log
+    record.
 
-    The max drawdown is the account's (``capture_snapshot``), which values a
-    held equity at its mark; the line and the payload name the mark's basis,
+    The max drawdown is the day's (``PaperAccount.day_figures``: from the
+    day's opening equity, across a restart; ``day_since``, ``day_gaps`` and
+    ``day_partial`` say when its figures start and what they lack), with
+    the run's beside it
+    (``run_max_drawdown``, this process's, from ``capture_snapshot``); n/a
+    (None) for a day the account does not hold, as a shutdown on a weekend
+    or a holiday. Until 2026-10-12 ``max_drawdown`` was the run's, under the
+    day's report. The partial-exit table is the day's slices
+    (``PaperAccount.day_partial_exits``). Both value a held equity at its
+    mark; the line and the payload name the mark's basis,
     ``equity_mark_basis`` (``position_manager.EQUITY_MARK_BASIS``). A report
     without it was written by an earlier version, which marked every held
-    equity at its 1m close.
+    equity at its 1m close. ``day_ledger_trades`` is the day's trades as
+    the account's day ledger counts them, every process's and strategy's,
+    on the line when it is not the report's count (a process killed before
+    its append, say, whose trades only the ledger's row kept).
 
     Parameters
     ----------
     account : PaperAccount
-        The paper/live account tracker with trade history.
+        The paper/live account tracker: its outbox, its day figures and the
+        run's max drawdown.
     positions : dict[str, Position]
         Currently open positions (should be empty at session end).
     session_date : date
         The ET trading day reported.
     strategy : str
-        Active strategy name.
+        Active strategy name; the trades.csv rows reported are its.
     dry_run : bool
         Whether the bot ran in dry-run mode.
+    log_dir : str
+        The log directory holding the persistent trades.csv.
     structured_logger : callable, optional
         A ``(prefix, payload)`` callable for structured JSON logging
         (e.g., ``engine._log_structured``).
@@ -903,26 +1020,19 @@ def write_session_report(
     session_date_str = session_date.isoformat()
     try:
         performance = account.capture_snapshot(positions)
-        trades = list(account.trades)
+        day = account.day_figures(session_date)
 
-        # Scoped to the SESSION, not the account. `account.realized_pnl` is a
-        # lifetime accumulator -- set to 0.0 once in `PaperAccount.__init__`,
-        # only ever incremented, never reset per day -- and every headline
-        # number below used to come from it while `trades` counted the list
-        # beside it. Two scopes in one line, with the wrong one as the
-        # headline. `manifest.realized_pnl` was fixed for exactly this on
-        # 2026-09-19; this is the call site that fix missed.
-        #
-        # The date filter matters for the same reason it does in
-        # `session_archive.export_session_archive`: a bot that runs across
-        # midnight without restarting keeps the prior day's records in
-        # `account.trades`, so without it the headline mixes days.
-        # `trades_closed_on` folds a trade's partial exits into it and drops
-        # a trade whose exit timestamp cannot be read (`_exited_on`).
-        closed = trades_closed_on(trades, session_date)
+        # Scoped to the SESSION, not the account or the process. Every
+        # headline number below once came from `account.realized_pnl`, a
+        # lifetime accumulator, while `trades` counted the list beside it:
+        # two scopes in one line, with the wrong one as the headline. Until
+        # 2026-10-12 the trades were this process's, from its capped exit
+        # history: a restart split the day's report, and more than
+        # `paper.max_trade_history` exit slices in a day dropped the oldest.
+        closed, trades_source_error = _day_trades(account, log_dir, session_date, strategy)
         # The slices that closed part of a trade that day, whether or not
         # the rest of it has closed yet: their P&L is realized that day.
-        partial_slices = [t for t in trades if bool(t.partial_exit) and _exited_on(t, session_date)]
+        partial_slices = account.day_partial_exits(session_date) or []
 
         # --- Log summary ---
         wins = sum(1 for t in closed if t.realized_pnl > 0)
@@ -936,17 +1046,28 @@ def write_session_report(
         gross_loss = abs(sum(t.realized_pnl for t in closed if t.realized_pnl < 0))
         profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
         avg_trade = (total_pnl / len(closed)) if closed else None
-        # Drawdown stays account-derived: it is an equity-curve metric, not a
-        # per-trade aggregate, and has no meaningful session-only form here.
-        max_dd = float(performance.get("max_drawdown", 0.0) or 0.0)
+        # The day's peak-to-trough from its opening equity, the run's beside
+        # it: an equity-curve metric, read from the account's samples.
+        max_dd = None if day is None else float(day["max_drawdown"])
+        run_max_dd = float(performance["max_drawdown"])
+        # The day ledger's count of the day's trades, when it is not the
+        # report's: every process's trades (a process killed before its
+        # append left its trades in the day's row only), every strategy's
+        # (the row is one per sqlite file).
+        ledger_trades = None if day is None else int(day["trades"])
         LOG.info(
             "SESSION REPORT %s: strategy=%s pnl=%.2f trades=%d wins=%d losses=%d win_rate=%s pf=%s avg_trade=%s "
-            "max_drawdown=%.2f equity_mark_basis=%s",
+            "max_drawdown=%s run_max_drawdown=%.2f equity_mark_basis=%s%s%s%s%s",
             session_date_str, strategy, total_pnl, len(closed), wins, losses,
             f"{win_rate:.1%}" if win_rate is not None else "n/a",
             f"{profit_factor:.2f}" if profit_factor is not None else "n/a",
             f"${avg_trade:.2f}" if avg_trade is not None else "n/a",
-            max_dd, EQUITY_MARK_BASIS,
+            f"{max_dd:.2f}" if max_dd is not None else "n/a", run_max_dd, EQUITY_MARK_BASIS,
+            f" day_since={day['since']}" if day is not None and day["late_start"] else "",
+            "" if day is None or not day["gaps"] else
+            " day_gaps=" + ",".join(f"{gap['from']}/{gap['to']}" for gap in day["gaps"]),
+            f" day_ledger_trades={ledger_trades}" if ledger_trades is not None and ledger_trades != len(closed) else "",
+            " trades_source_error=yes" if trades_source_error is not None else "",
         )
         for trade in closed:
             LOG.info(
@@ -996,7 +1117,13 @@ def write_session_report(
             "win_rate": round(win_rate, 4) if win_rate is not None else None,
             "profit_factor": round(profit_factor, 4) if profit_factor is not None else None,
             "average_trade": round(avg_trade, 2) if avg_trade is not None else None,
-            "max_drawdown": round(max_dd, 2),
+            "max_drawdown": round(max_dd, 2) if max_dd is not None else None,
+            "run_max_drawdown": round(run_max_dd, 2),
+            "day_since": day["since"] if day is not None else None,
+            "day_partial": day["partial"] if day is not None else None,
+            "day_gaps": [[gap["from"], gap["to"]] for gap in day["gaps"]] if day is not None else None,
+            "day_ledger_trades": ledger_trades,
+            "trades_source_error": trades_source_error,
             "equity_mark_basis": EQUITY_MARK_BASIS,
             "per_regime": per_regime,
             "per_entry_path": per_entry_path,
@@ -1023,14 +1150,18 @@ def append_trades_csv(trades: Iterable[TradeRecord], *, log_dir: str, session_da
     that the file lacks, each under its exit's ET date; True when the file
     then holds every one of them.
 
-    The engine calls it at each day close and at shutdown with every trade
-    the process holds, whatever its exit date: one an earlier append
-    failed to write goes in the next time. A row already in the file (the
-    same date and ``TRADE_CSV_KEY``) is not written again, so a repeat, a
-    shutdown after the 20:00 close, or a second process holding the same
-    trade adds nothing. A trade still open (a partial exit without its
-    final slice) waits for its close: ``closed_trade_lifecycles`` folds
-    its slices into one row then.
+    The engine calls it at each day close and at shutdown with the
+    account's outbox (``PaperAccount.trades_outbox``: every trade the
+    process closed that no append has written yet, uncapped, whatever its
+    exit date), and clears what an append that returns True wrote, so one
+    an earlier append failed to write goes in the next time, and no number
+    of exit slices between two appends loses one. A row already in the file
+    (the same date and ``TRADE_CSV_KEY``) is not written again, so a
+    repeat, a shutdown after the 20:00 close, or a second process holding
+    the same trade adds nothing. Exit slices are folded per trade
+    (``closed_trade_lifecycles``): a trade still open (a partial exit
+    without its final slice) waits for its close, and the outbox's trades
+    are folded already.
 
     The read, the check against the file and the write (or the rotation)
     run under the file's lock (``_trades_csv_lock``), so processes sharing

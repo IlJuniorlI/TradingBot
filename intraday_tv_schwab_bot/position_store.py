@@ -13,6 +13,12 @@ from .models import Position, Side
 
 LOG = logging.getLogger(__name__)
 
+# How long a connection of the day ledger's store waits for a lock another
+# connection holds before it fails (``DayLedgerStore``; sqlite's default, 5 s,
+# for the other stores). The day's row is display and records: a write that
+# fails is retried a minute later, never at the cost of an engine pass.
+DAY_LEDGER_BUSY_SECONDS = 0.25
+
 
 class ReconcileMetadataStore:
     def __init__(self, path: str | Path):
@@ -332,3 +338,93 @@ class SessionRiskStateStore:
         except Exception as exc:
             LOG.warning("Could not load session risk state from %s: %s", self.path, exc)
             return None
+
+
+class DayLedgerStore:
+    """The paper account's day ledger across a restart
+    (``PaperAccount``'s day figures: the day's Day PnL, realized P&L, trade
+    statistics, peak, max drawdown and curve), one row per ET trading day.
+
+    Stored in the same sqlite file as ``session_risk_state``, in a table of
+    its own (``account_day_ledger``) that an older version never reads. The
+    row's figures are one JSON document, ``PaperAccount`` its only writer and
+    reader. Unlike the risk store this one raises: the account logs each
+    failure with its type and carries on, since its figures are display and
+    records and never gate an order. For the same reason every connection
+    waits at most ``DAY_LEDGER_BUSY_SECONDS`` for a lock another connection
+    holds (sqlite's default is 5 s), so a busy file costs the engine's pass
+    that much at most.
+    """
+
+    # What a read or a write raises when the file cannot be used now (a lock
+    # held past the busy wait, an I/O error, a file that cannot be opened):
+    # any other row's write would meet it too.
+    UNAVAILABLE = (sqlite3.OperationalError,)
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path).expanduser()
+        self._initialized = False
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.path, timeout=DAY_LEDGER_BUSY_SECONDS)
+
+    def _ensure_ready(self) -> None:
+        if self._initialized:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS account_day_ledger (
+                    session_date TEXT PRIMARY KEY,
+                    ledger_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self._initialized = True
+
+    def save(self, session_date: str, ledger: dict[str, Any], updated_at: datetime) -> None:
+        """Write ``session_date``'s row over any earlier one, stamped with
+        the account's clock (``updated_at``)."""
+        self._ensure_ready()
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO account_day_ledger (session_date, ledger_json, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(session_date) DO UPDATE SET
+                    ledger_json=excluded.ledger_json,
+                    updated_at=excluded.updated_at
+                """,
+                (str(session_date), json.dumps(ledger, separators=(",", ":"), allow_nan=False),
+                 updated_at.isoformat()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def read_day(self, session_date: str) -> tuple[tuple[str, str] | None, list[str]]:
+        """``session_date``'s row as stored, ``(ledger_json, updated_at)``
+        (None when the file or the table holds none), and the dates of the
+        rows dated after it (a clock once set ahead), oldest first. The text
+        is the row's: the account parses it."""
+        if not self.path.exists():
+            return None, []
+        self._ensure_ready()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT ledger_json, updated_at FROM account_day_ledger WHERE session_date = ?", (str(session_date),)
+            ).fetchone()
+            later = conn.execute(
+                "SELECT session_date FROM account_day_ledger WHERE session_date > ? ORDER BY session_date",
+                (str(session_date),),
+            ).fetchall()
+        finally:
+            conn.close()
+        return (None if row is None else (str(row[0]), str(row[1]))), [str(day) for (day,) in later]

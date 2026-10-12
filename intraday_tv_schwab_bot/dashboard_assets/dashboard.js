@@ -1708,8 +1708,13 @@ function renderCandidates() {
   target.querySelectorAll('.candidate-tile[data-symbol]').forEach(card => card.addEventListener('click', () => setSelectedSymbol(card.dataset.symbol)));
 }
 
+// The top bar's Day PnL, Profit Factor, Total Trades, Wins / Losses and Win
+// Rate are the day's (``performance.day``), each label tagged with the day
+// on another day; the KPI card's Realized, Drawdown and Win Rate are the
+// run's.
 function renderTopbar(data) {
   const perf = data?.performance || {};
+  const day = perf.day || {};
   const rawStatus = String(data?.status || 'idle').toLowerCase();
   const botActive = !!(data?.management_active || data?.screening_active || data?.streaming_active || data?.position_monitoring_active);
   const status = rawStatus === 'running' && !botActive ? 'idle' : rawStatus;
@@ -1726,13 +1731,12 @@ function renderTopbar(data) {
   const sublineEl = document.getElementById('top-subline');
   if (statusWrap) statusWrap.innerHTML = `${statusBadge(status)}${modeBadge(!!data?.dry_run)}`;
   if (netLiqLabelEl) netLiqLabelEl.textContent = safe(data?.tracked_capital_label) || (data?.dry_run ? 'Net Liq' : 'Allocated Capital');
-  if (dayPnlEl) dayPnlEl.innerHTML = `<span class="${pnlClass((perf.total_equity || 0) - (perf.starting_equity || 0))}">${fmtMoney((perf.total_equity || 0) - (perf.starting_equity || 0))}</span>`;
-  if (pfEl) pfEl.textContent = fmtNum(perf.profit_factor, 2);
-  const openPositions = Array.isArray(perf.positions) ? perf.positions.length : (Number(perf.open_positions) || 0);
-  const totalTrades = Number(perf.total_trades);
-  if (tradesEl) tradesEl.textContent = fmtInteger(Number.isFinite(totalTrades) ? totalTrades : ((Number(perf.closed_trades) || 0) + openPositions));
-  if (wlEl) wlEl.textContent = `${fmtInteger(perf.wins ?? 0)} / ${fmtInteger(perf.losses ?? 0)}`;
-  if (winRateEl) winRateEl.textContent = perf.win_rate == null ? '—' : fmtPctFromRatio(perf.win_rate);
+  applyDayTags(day);
+  if (dayPnlEl) dayPnlEl.innerHTML = `<span class="${pnlClass(day.pnl)}">${fmtMoney(day.pnl)}</span>`;
+  if (pfEl) pfEl.textContent = fmtNum(day.profit_factor, 2);
+  if (tradesEl) tradesEl.textContent = fmtInteger(day.total_trades);
+  if (wlEl) wlEl.textContent = `${fmtInteger(day.wins)} / ${fmtInteger(day.losses)}`;
+  if (winRateEl) winRateEl.textContent = fmtPctFromRatio(day.win_rate);
   if (apiCpmEl) apiCpmEl.textContent = fmtNum(data?.api_usage?.calls_per_minute_5m, 1);
   if (updatedEl) updatedEl.textContent = safe(data?.last_update).replace('T', ' ').slice(0, 19);
   const warmup = data?.warmup || {};
@@ -1746,9 +1750,9 @@ function renderTopbar(data) {
 
 function renderKpiAndGauges(data) {
   const perf = data?.performance || {};
+  const day = perf.day || {};
   const positions = Array.isArray(perf.positions) ? perf.positions : [];
   const totalEquity = numOrNull(perf.total_equity) || 0;
-  const starting = numOrNull(perf.starting_equity) || 0;
   const grossExposure = numOrNull(perf.gross_market_value) ?? positions.reduce((acc, pos) => acc + Math.abs(numOrNull(pos?.market_value) || 0), 0);
   const grossMaxRisk = numOrNull(perf.gross_max_risk) ?? positions.reduce((acc, pos) => acc + Math.abs(numOrNull(pos?.max_risk) || 0), 0);
   // ``Pct`` (clamped 0-100) drives the ring's visual fill; ``PctTrue``
@@ -1758,11 +1762,11 @@ function renderKpiAndGauges(data) {
   // up as an alert.
   const exposurePctTrue = totalEquity > 0 ? (grossExposure / totalEquity) * 100 : 0;
   const riskPctTrue = totalEquity > 0 ? (grossMaxRisk / totalEquity) * 100 : 0;
-  const ddPctTrue = totalEquity > 0 ? ((numOrNull(perf.max_drawdown) || numOrNull(perf.drawdown) || 0) / totalEquity) * 100 : 0;
+  // The run's max drawdown in % of the run's peak equity (the payload's).
+  const ddPctTrue = numOrNull(perf.max_drawdown_pct);
   const exposurePct = clamp(exposurePctTrue, 0, 100);
   const riskPct = clamp(riskPctTrue, 0, 100);
-  const ddPct = clamp(ddPctTrue, 0, 100);
-  const dayPnl = totalEquity - starting;
+  const ddPct = clamp(ddPctTrue ?? 0, 0, 100);
 
   document.getElementById('kpi-netliq').textContent = fmtMoney(totalEquity);
   document.getElementById('kpi-realized').innerHTML = `<span class="${pnlClass(perf.realized_pnl)}">${fmtMoney(perf.realized_pnl)}</span>`;
@@ -1771,13 +1775,14 @@ function renderKpiAndGauges(data) {
   document.getElementById('kpi-drawdown').innerHTML = `<span class="${drawdownTone}">${fmtMoney(perf.drawdown)}</span>`;
   const winrateEl = document.getElementById('kpi-winrate');
   if (winrateEl) winrateEl.textContent = perf.win_rate == null ? '—' : fmtPctFromRatio(perf.win_rate);
-  document.getElementById('kpi-meta').textContent = `Day PnL ${fmtMoney(dayPnl)} · cash ${fmtMoney(perf.cash)}`;
+  document.getElementById('kpi-meta').textContent = kpiMetaText(day, perf.cash);
 
-  // Day change pill: percent change from starting equity, color-coded.
+  // Day change pill: the day's P&L in % of the day's opening equity,
+  // color-coded, labelled with the day.
   const chgEl = document.getElementById('kpi-day-chg');
   const chgText = document.getElementById('kpi-day-chg-text');
   if (chgEl && chgText) {
-    const dayPct = starting > 0 ? (dayPnl / starting) * 100 : 0;
+    const dayPnl = numOrNull(day.pnl) ?? 0;
     const tone = dayPnl > 0 ? 'good' : (dayPnl < 0 ? 'bad' : 'neutral');
     const arrow = dayPnl > 0 ? '▲' : (dayPnl < 0 ? '▼' : '—');
     chgEl.className = `kpi-hero-chg ${tone}`;
@@ -1787,16 +1792,18 @@ function renderKpiAndGauges(data) {
     // Mirrors mobile.js's pattern (mobile.js:142-143).
     const arrowEl = chgEl.querySelector('.arrow');
     if (arrowEl) arrowEl.textContent = arrow;
-    chgText.textContent = starting > 0 ? `${fmtPct(dayPct, 2)} today` : '— today';
+    chgText.textContent = dayChangeText(day);
   }
 
+  // The day's equity curve (a point a minute from the day's opening; on a
+  // weekend or a holiday the last trading day's).
   const kpiSpark = document.getElementById('kpi-spark');
   if (kpiSpark) {
-    const equityValues = (Array.isArray(perf.equity_curve) ? perf.equity_curve : [])
+    const equityValues = (Array.isArray(day.curve) ? day.curve : [])
       .map(point => numOrNull(point?.equity))
       .filter(v => v !== null);
     if (equityValues.length < 2) {
-      // Bot just started or no equity points yet — let :empty CSS rule collapse the strip.
+      // The day just opened or no day yet — let :empty CSS rule collapse the strip.
       kpiSpark.innerHTML = '';
     } else {
       const first = equityValues[0];
@@ -1834,10 +1841,9 @@ function renderKpiAndGauges(data) {
     if (n === null) return '—';
     return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n);
   };
-  const ddDollars = numOrNull(perf.max_drawdown) || numOrNull(perf.drawdown) || 0;
   document.getElementById('gauge-exposure-value').textContent = fmtGauge(grossExposure);
   document.getElementById('gauge-win-value').textContent = fmtGauge(grossMaxRisk);
-  document.getElementById('gauge-dd-value').textContent = fmtGauge(ddDollars);
+  document.getElementById('gauge-dd-value').textContent = fmtGauge(perf.max_drawdown);
 }
 
 function renderPositions(data) {
@@ -4192,7 +4198,12 @@ function renderEventsAndDock() {
   `).join('') : `<div class="empty-state">No event context available yet.</div>`;
 
   const trades = data?.performance?.recent_trades || [];
-  const tradesHtml = trades.length ? trades.map(trade => `
+  // The day's trades of an earlier process that trades.csv could not give.
+  const tradesError = data?.performance?.recent_trades_error;
+  const tradesNote = tradesError
+    ? `<tr><td colspan="11"><div class="empty-state">Earlier trades of the day left out: ${escapeHtml(tradesError)}</div></td></tr>`
+    : '';
+  const tradesHtml = (trades.length ? trades.map(trade => `
     <tr>
       <td>${escapeHtml(safe(trade.exit_time).replace('T',' ').slice(0,16))}</td>
       <td>${tradeSymbolCell(trade, snapshots)}</td>
@@ -4206,7 +4217,7 @@ function renderEventsAndDock() {
       <td>${fmtNum(trade.hold_minutes, 1)}</td>
       <td>${escapeHtml(safe(trade.reason))}</td>
     </tr>
-  `).join('') : `<tr><td colspan="11"><div class="empty-state" style="min-height:96px;">No closed trades yet.</div></td></tr>`;
+  `).join('') : `<tr><td colspan="11"><div class="empty-state" style="min-height:96px;">No closed trades yet.</div></td></tr>`) + tradesNote;
   // Rewritten only when a row changes: a rewrite on every poll replaced the
   // symbol buttons under a click in progress, which lost the click, and
   // dropped their keyboard focus.
@@ -4236,10 +4247,11 @@ function renderEventsAndDock() {
     ['Schwabdev Calls / Min (5m)', fmtNum(data?.api_usage?.calls_per_minute_5m, 1)],
     ['Schwabdev Calls Total', safe(data?.api_usage?.total_calls)],
     ['Last Schwabdev Call', safe(data?.api_usage?.last_call_at).replace('T', ' ').slice(0, 19)],
-    ['Closed Trades', safe(perf.closed_trades)],
-    ['Wins / Losses', `${safe(perf.wins)} / ${safe(perf.losses)}`],
-    ['Average Trade', fmtMoney(perf.average_trade)],
-    ['Max Drawdown', fmtMoney(perf.max_drawdown)],
+    // The run's, as the KPI card's: the top bar's are the day's.
+    ['Closed Trades (run)', safe(perf.closed_trades)],
+    ['Wins / Losses (run)', `${safe(perf.wins)} / ${safe(perf.losses)}`],
+    ['Average Trade (run)', fmtMoney(perf.average_trade)],
+    ['Max Drawdown (run)', fmtMoney(perf.max_drawdown)],
   ];
   document.getElementById('diagnostics-grid').innerHTML = diag.map(([k, v]) => `
     <div class="detail-card">

@@ -40,8 +40,13 @@
 
   // ---- renderers (mirror dashboard.js but only for mobile DOM) ----
 
+  // The top bar's PF, Trades, W / L and Day PnL are the day's
+  // (``performance.day``), each label tagged with the day on another day;
+  // the KPI card's Realized, Drawdown and Win Rate are the run's (as the
+  // desktop's).
   function renderTopbar(data) {
     const perf = data?.performance || {};
+    const day = perf.day || {};
     const rawStatus = String(data?.status || 'idle').toLowerCase();
     const botActive = !!(data?.management_active || data?.screening_active || data?.streaming_active || data?.position_monitoring_active);
     const status = rawStatus === 'running' && !botActive ? 'idle' : rawStatus;
@@ -60,14 +65,11 @@
     if (statusWrap) statusWrap.innerHTML = `${statusBadge(status)}${modeBadge(!!data?.dry_run)}`;
     if (netLiqLabelEl) netLiqLabelEl.textContent = safe(data?.tracked_capital_label) || (data?.dry_run ? 'Net Liq' : 'Allocated Capital');
 
-    const dayPnl = (perf.total_equity || 0) - (perf.starting_equity || 0);
-    if (dayPnlEl) dayPnlEl.innerHTML = `<span class="${pnlClass(dayPnl)}">${fmtMoney(dayPnl)}</span>`;
-    if (pfEl) pfEl.textContent = fmtNum(perf.profit_factor, 2);
-
-    const openPositions = Array.isArray(perf.positions) ? perf.positions.length : (Number(perf.open_positions) || 0);
-    const totalTrades = Number(perf.total_trades);
-    if (tradesEl) tradesEl.textContent = fmtInteger(Number.isFinite(totalTrades) ? totalTrades : ((Number(perf.closed_trades) || 0) + openPositions));
-    if (wlEl) wlEl.textContent = `${fmtInteger(perf.wins ?? 0)} / ${fmtInteger(perf.losses ?? 0)}`;
+    applyDayTags(day);
+    if (dayPnlEl) dayPnlEl.innerHTML = `<span class="${pnlClass(day.pnl)}">${fmtMoney(day.pnl)}</span>`;
+    if (pfEl) pfEl.textContent = fmtNum(day.profit_factor, 2);
+    if (tradesEl) tradesEl.textContent = fmtInteger(day.total_trades);
+    if (wlEl) wlEl.textContent = `${fmtInteger(day.wins)} / ${fmtInteger(day.losses)}`;
 
     const warmup = data?.warmup || {};
     if (warmupEl) warmupEl.textContent = warmup.total ? `${fmtInteger(warmup.ready_count || 0)} / ${fmtInteger(warmup.total || 0)}` : '—';
@@ -100,9 +102,9 @@
 
   function renderKpiAndGauges(data) {
     const perf = data?.performance || {};
+    const day = perf.day || {};
     const positions = Array.isArray(perf.positions) ? perf.positions : [];
     const totalEquity = numOrNull(perf.total_equity) || 0;
-    const starting = numOrNull(perf.starting_equity) || 0;
     const grossExposure = numOrNull(perf.gross_market_value) ??
       positions.reduce((acc, pos) => acc + Math.abs(numOrNull(pos?.market_value) || 0), 0);
     const grossMaxRisk = numOrNull(perf.gross_max_risk) ??
@@ -113,12 +115,11 @@
     // ratio > 100% — same pattern as the desktop gauge.
     const exposurePctTrue = totalEquity > 0 ? (grossExposure / totalEquity) * 100 : 0;
     const riskPctTrue = totalEquity > 0 ? (grossMaxRisk / totalEquity) * 100 : 0;
-    const ddValue = numOrNull(perf.max_drawdown) || numOrNull(perf.drawdown) || 0;
-    const ddPctTrue = totalEquity > 0 ? (ddValue / totalEquity) * 100 : 0;
+    // The run's max drawdown in % of the run's peak equity (the payload's).
+    const ddPctTrue = numOrNull(perf.max_drawdown_pct);
     const exposurePct = clamp(exposurePctTrue, 0, 100);
     const riskPct = clamp(riskPctTrue, 0, 100);
-    const ddPct = clamp(ddPctTrue, 0, 100);
-    const dayPnl = totalEquity - starting;
+    const ddPct = clamp(ddPctTrue ?? 0, 0, 100);
 
     const kpiNet = document.getElementById('kpi-netliq');
     const kpiReal = document.getElementById('kpi-realized');
@@ -135,26 +136,29 @@
     }
     const kpiWinrate = document.getElementById('kpi-winrate');
     if (kpiWinrate) kpiWinrate.textContent = perf.win_rate == null ? '—' : fmtPctFromRatio(perf.win_rate);
-    if (kpiMeta) kpiMeta.textContent = `Day PnL ${fmtMoney(dayPnl)} · cash ${fmtMoney(perf.cash)}`;
+    if (kpiMeta) kpiMeta.textContent = kpiMetaText(day, perf.cash);
 
-    // Day change pill: percent change from starting equity, color-coded.
+    // Day change pill: the day's P&L in % of the day's opening equity,
+    // color-coded, labelled with the day.
     const chgEl = document.getElementById('kpi-day-chg');
     const chgText = document.getElementById('kpi-day-chg-text');
     if (chgEl && chgText) {
-      const dayPct = starting > 0 ? (dayPnl / starting) * 100 : 0;
+      const dayPnl = numOrNull(day.pnl) ?? 0;
       const tone = dayPnl > 0 ? 'good' : (dayPnl < 0 ? 'bad' : 'neutral');
       const arrow = dayPnl > 0 ? '▲' : (dayPnl < 0 ? '▼' : '—');
       chgEl.className = `kpi-hero-chg ${tone}`;
       const arrowEl = chgEl.querySelector('.arrow');
       if (arrowEl) arrowEl.textContent = arrow;
-      chgText.textContent = starting > 0 ? `${fmtPct(dayPct, 2)} today` : '— today';
+      chgText.textContent = dayChangeText(day);
     }
 
-    // Equity curve sparkline: green/red based on net direction; empty wrapper
-    // (CSS :empty rule) collapses the strip until we have ≥2 points.
+    // The day's equity curve (a point a minute from the day's opening; on a
+    // weekend or a holiday the last trading day's): green/red based on net
+    // direction; empty wrapper (CSS :empty rule) collapses the strip until
+    // we have ≥2 points.
     const kpiSpark = document.getElementById('kpi-spark');
     if (kpiSpark) {
-      const equityValues = (Array.isArray(perf.equity_curve) ? perf.equity_curve : [])
+      const equityValues = (Array.isArray(day.curve) ? day.curve : [])
         .map(point => numOrNull(point?.equity))
         .filter(v => v !== null);
       if (equityValues.length < 2) {
@@ -199,7 +203,7 @@
     const ddValueEl = document.getElementById('gauge-dd-value');
     if (expValue) expValue.textContent = fmtGauge(grossExposure);
     if (winValue) winValue.textContent = fmtGauge(grossMaxRisk);
-    if (ddValueEl) ddValueEl.textContent = fmtGauge(ddValue);
+    if (ddValueEl) ddValueEl.textContent = fmtGauge(perf.max_drawdown);
   }
 
   function positionRangeMarkup(pos) {
@@ -322,31 +326,41 @@
   function renderTrades(data) {
     // Compact mobile completed-trades list: one row per recent close.
     // Top line: symbol + side + realized P&L (with % in muted sub-span).
-    // Bottom line: exit time (HH:MM) + strategy + exit reason (truncated).
-    // Pulls from ``performance.recent_trades`` — the same shape the
-    // desktop dock-trades table renders, so payload parity is automatic.
-    const trades = data?.performance?.recent_trades || [];
+    // Bottom line: exit time (HH:MM, MM-DD HH:MM when not today) + exit
+    // reason (truncated). Pulls from ``performance.recent_trades`` — the
+    // same shape the desktop dock-trades table renders (the last 20 closed
+    // trades, the day's from before a restart among them), so payload
+    // parity is automatic. The meta says what the list holds (the last N)
+    // and the day's count of closed trades, tagged as the day's figures are
+    // (``dayTag``: a partial day's says what it lacks).
+    const perf = data?.performance || {};
+    const day = perf.day || {};
+    const trades = perf.recent_trades || [];
     const meta = document.getElementById('m-trades-meta');
     const target = document.getElementById('m-trade-list');
-    if (meta) meta.textContent = trades.length ? `${trades.length} closed` : 'No closed trades';
+    const leftOut = perf.recent_trades_error ? ' · earlier trades of the day left out' : '';
+    if (meta) {
+      meta.textContent = trades.length
+        ? `last ${fmtInteger(trades.length)} · ${fmtInteger(day.trades)} ${day.label || 'today'}${day.partial_label ? ` · ${day.partial_label}` : ''}${leftOut}`
+        : `No closed trades${leftOut}`;
+    }
     if (!target) return;
     if (!trades.length) {
       target.innerHTML = `<div class="empty-state">No closed trades yet.</div>`;
       return;
     }
-    // Reverse-chronological so the latest close sits at the top — recent
-    // trades from the bot are typically appended in entry order, not exit
-    // order. Sort on exit_time (ISO string, lexicographic sort works).
-    const sorted = [...trades].sort((a, b) => String(b.exit_time || '').localeCompare(String(a.exit_time || '')));
-    target.innerHTML = sorted.map(t => {
+    // Newest exit first, as the payload orders them.
+    target.innerHTML = trades.map(t => {
       const side = String(t.side || '').toUpperCase();
       const tone = side === 'SHORT' ? 'tone-short' : 'tone-long';
-      // Exit time HH:MM (no date, no seconds). Bottom-meta is just
+      // Exit time HH:MM (no seconds), with its MM-DD when the exit was
+      // not today (``exit_today``, the payload's). Bottom-meta is just
       // exit-time + reason — strategy name dropped (every trade on
       // this dashboard runs the same active strategy, so listing it
       // per-row is noise) and return-% dropped from the top-right
       // (realized $ alone is the signal that matters on a phone).
-      const exitTime = String(t.exit_time || '').slice(11, 16);
+      const exitStamp = String(t.exit_time || '');
+      const exitTime = t.exit_today ? exitStamp.slice(11, 16) : `${exitStamp.slice(5, 10)} ${exitStamp.slice(11, 16)}`.trim();
       const reason = String(t.reason || '').slice(0, 36);
       const metaParts = [exitTime, reason].filter(Boolean);
       return `<div class="m-trade-row ${tone}">

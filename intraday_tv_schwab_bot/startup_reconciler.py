@@ -932,9 +932,13 @@ class StartupReconciler:
             self._reprotect_restored_position(position, working_orders)
             self.positions[symbol] = position
             try:
-                self.account.record_entry(position, float(position.entry_price))
+                # Booked at the broker's average price; the account's day
+                # figures count its move from the mark the day's row valued
+                # it at, or else from its first mark, never from its entry
+                # again (PaperAccount.record_restored_entry).
+                self.account.record_restored_entry(position, float(position.entry_price))
             except Exception as exc:
-                LOG.warning("Could not materialize restored paper entry for %s: %s", symbol, exc)
+                LOG.warning("Could not materialize restored paper entry for %s: %s: %s", symbol, type(exc).__name__, exc)
             restored += 1
         if use_metadata and not unusable:
             try:

@@ -30,9 +30,9 @@ from .models import (
     asset_type_of,
     is_option_asset,
 )
-from .paper_account import PaperAccount
+from .paper_account import PaperAccount, TradeRecord
 from .position_manager import PositionManager
-from .position_store import ReconcileMetadataStore, SessionRiskStateStore
+from .position_store import DayLedgerStore, ReconcileMetadataStore, SessionRiskStateStore
 from .risk import RiskManager
 from .screener_client import TradingViewScreenerClient
 from .startup_reconciler import StartupReconciler
@@ -45,7 +45,13 @@ from .session_archive import (
     session_archive_manifest_path,
     session_archive_owed_path,
 )
-from .session_report import append_trades_csv, check_trades_csv_lock, write_session_report
+from .session_report import (
+    TRADES_CSV_READ_ERRORS,
+    append_trades_csv,
+    check_trades_csv_lock,
+    day_trade_records,
+    write_session_report,
+)
 from .schwab_api import (
     PooledSchwabClient,
     SchwabdevApiUsageTracker,
@@ -325,14 +331,28 @@ class IntradayBot:
         self.session_risk_state_store = SessionRiskStateStore(config.runtime.startup_reconcile_metadata_db_path)
         self.risk = RiskManager(config, state_store=self.session_risk_state_store)
         self.strategy: BaseStrategy = build_strategy(config)
+        # The account's day figures (its day ledger) persist in the same
+        # file too, in a table of their own: a restart carries on the day's
+        # P&L, realized P&L, trade statistics, drawdown and curve, checked
+        # against the day's trades.csv rows. Read and shown only: nothing
+        # that gates or sizes an order reads them.
+        self._day_trades_read: dict[date, tuple[list[TradeRecord], str | None, bool]] = {}
         self.account = PaperAccount(
             starting_equity=self._tracked_capital_baseline(),
             max_equity_points=config.paper.max_equity_points,
             max_trade_history=config.paper.max_trade_history,
             equity_point_seconds=config.paper.equity_point_seconds,
+            day_store=DayLedgerStore(config.runtime.startup_reconcile_metadata_db_path),
+            day_trades_exit=self._day_trades_exit,
         )
+        # The day's trades an earlier process closed are in trades.csv only
+        # (a shutdown appends them): read once, they keep the dashboard's
+        # trades table and chart markers whole across a restart.
+        earlier_trades, earlier_trades_error = self._earlier_day_trades() if config.dashboard.enabled else ([], None)
+        self._day_trades_read.clear()
         self.dashboard_cache = DashboardCache(
             config, data=self.data, strategy=self.strategy, account=self.account,
+            earlier_trades=earlier_trades, earlier_trades_error=earlier_trades_error,
         )
         self.dashboard = (
             DashboardServer(
@@ -544,6 +564,48 @@ class IntradayBot:
 
     def _tracked_capital_label(self) -> str:
         return "Net Liq" if self.config.schwab.dry_run else "Allocated Capital"
+
+    def _read_day_trades(self, day: date) -> tuple[list[TradeRecord], str | None, bool]:
+        """The closed trades of ``day`` in trades.csv when this process
+        starts, every strategy's, as the day ledger counts every process's
+        (``session_report.day_trade_records``), read once at the start for
+        both readers (``_day_trades_exit``, ``_earlier_day_trades``). The
+        second item names what was left out and why (None when nothing
+        was), with the error's type; the third is whether that is the whole
+        file."""
+        cached = self._day_trades_read.get(day)
+        if cached is not None:
+            return cached
+        try:
+            trades, _keys, unreadable = day_trade_records(self.config.runtime.log_dir, day, None)
+        except TRADES_CSV_READ_ERRORS as exc:
+            cached = ([], f"the {day} trades.csv rows could not be read ({type(exc).__name__}: {exc})", True)
+        else:
+            error = None if not unreadable else (
+                f"{len(unreadable)} of the {day} trades.csv rows could not be read (the first: {unreadable[0]})")
+            cached = (trades, error, False)
+        self._day_trades_read[day] = cached
+        return cached
+
+    def _day_trades_exit(self, day: date) -> tuple[datetime | None, str | None]:
+        """The latest exit of ``day``'s trades in trades.csv, and what could
+        not be read (``_read_day_trades``): what the account checks the
+        day's carried row against (``PaperAccount``'s ``day_trades_exit``)."""
+        trades, error, _whole_file = self._read_day_trades(day)
+        return max((trade.exit_time for trade in trades), default=None), error
+
+    def _earlier_day_trades(self) -> tuple[list[TradeRecord], str | None]:
+        """The closed trades of the account's day (``PaperAccount.day``) in
+        trades.csv when this process starts (``_read_day_trades``): what the
+        processes before this one closed and appended. The second item names
+        what was left out and why (None when nothing was): the whole file
+        when it cannot be read, else the rows that do not read; either is a
+        WARNING, with the error's type, and the dashboard shows the rest."""
+        trades, error, whole_file = self._read_day_trades(self.account.day.date)
+        if error is not None:
+            LOG.warning("Dashboard: %s, so its trades %s", error,
+                        "show this process's only" if whole_file else "leave them out")
+        return trades, error
 
 
     def _save_reconcile_metadata(self) -> None:
@@ -976,6 +1038,10 @@ class IntradayBot:
             self._last_reconcile_session_date = session_date
             self._reconcile_failures = 0
             self._settle_hold_failures = 0
+            # The day's row's positions this reconcile did not restore leave
+            # the row, each logged with the move it leaves in the day's P&L
+            # (after the first success, there are none).
+            self.account.drop_unrestored_positions()
             # A full replace, even when the positions are unchanged: saves
             # before the first success only upserted, so stale rows remain
             # (the store never skips a replace that follows an upsert).
@@ -1155,9 +1221,10 @@ class IntradayBot:
     def _close_session_day(self, day: date, *, final: bool, now: datetime, archive_due: bool,
                            wait_for_lock: bool) -> bool:
         """Write what this process owes ``day`` (``_day_closes``): the
-        summary, then the append of every trade it holds that trades.csv
-        lacks, then, when ``archive_due``, the archive. True, and the day is
-        no longer owed, when all three are done.
+        summary, then the append of every trade it closed that no append has
+        written yet (``_append_trades_csv``), then, when ``archive_due``, the
+        archive. True, and the day is no longer owed, when all three are
+        done.
 
         The summary is written once: it is marked done before the append, so
         one that raises is logged and not repeated, and a stop signal (or any
@@ -1214,16 +1281,26 @@ class IntradayBot:
         return True
 
     def _append_trades_csv(self, day: date, *, wait_for_lock: bool) -> bool:
-        """Append every trade this process holds that trades.csv lacks; True
-        when the file holds them all. An error is logged with its type:
-        False then (the append logs its own I/O errors). ``wait_for_lock``
-        False tries the file's lock once instead of waiting for it."""
+        """Append every trade this process closed that no append has written
+        yet (``PaperAccount.trades_outbox``, uncapped) and clear them from
+        the outbox; True when the file holds them all. Until 2026-10-12 it
+        appended from the account's last ``paper.max_trade_history`` exit
+        slices, so more than that many slices between two appends lost the
+        oldest from trades.csv, the archive and the manifest, silently. An
+        error is logged with its type: False then (the append logs its own
+        I/O errors), and the trades stay in the outbox for the next append.
+        ``wait_for_lock`` False tries the file's lock once instead of
+        waiting for it."""
+        outbox = list(self.account.trades_outbox)
         try:
-            return append_trades_csv(self.account.trades, log_dir=self.config.runtime.log_dir, session_date=day,
-                                     wait_for_lock=wait_for_lock)
+            appended = append_trades_csv(outbox, log_dir=self.config.runtime.log_dir, session_date=day,
+                                         wait_for_lock=wait_for_lock)
         except Exception as exc:
             LOG.exception("trades.csv append for %s failed: %s", day, type(exc).__name__)
             return False
+        if appended:
+            self.account.clear_appended(outbox)
+        return appended
 
     def _maybe_prune_inactive_symbols(self) -> None:
         """Evict per-symbol state for symbols no longer in the active set.
@@ -1364,9 +1441,14 @@ class IntradayBot:
             if not self._append_trades_csv(today, wait_for_lock=True):
                 LOG.error("Shutdown: the trades.csv append failed, so the trades it could not write are only in "
                           "this process's log")
+            self.account.save_day_ledger()
             return
         for day in sorted(self._day_closes):
             self._close_session_day(day, final=True, now=now, archive_due=False, wait_for_lock=True)
+        # The day's row as of the summaries' samples, before the exports
+        # (seconds, and a kill can cut them off): the next start carries the
+        # day on from it.
+        self.account.save_day_ledger()
         self._shutdown_exports()
 
     def _shutdown_exports(self) -> None:
@@ -1463,6 +1545,7 @@ class IntradayBot:
             session_date=day,
             strategy=self.config.strategy,
             dry_run=self.config.schwab.dry_run,
+            log_dir=self.config.runtime.log_dir,
             structured_logger=self.audit.log_structured,
             skip_counts=dict(skip_counts),
             # Post-stop continuation needs bars AFTER each stop-out. Passed as
@@ -2205,7 +2288,8 @@ class IntradayBot:
         (KeyboardInterrupt) is not an Exception and reaches the shutdown.
 
         Every pass samples the paper account's equity first (its peak, max
-        drawdown and curve, which the session report and archive read),
+        drawdown and curve, which the session report and archive read, and
+        its day ledger's, which rolls at a new trading day's first sample),
         watched or not. The state itself is built only when someone or
         something reads it (``_dashboard_build_due``), and on the error path
         (``always``) whatever the demand.

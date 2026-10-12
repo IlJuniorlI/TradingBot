@@ -504,7 +504,8 @@ evening. No cron needed. Each archive contains:
 - `bot_YYYY-MM-DD.log` — copy of the daily log
 - `events.jsonl` — structured events extracted from the log
 - `decisions.csv` — every entry decision as queryable rows
-- `account_snapshot.json` — equity curve, realized PnL, etc.
+- `account_snapshot.json` — the exporting process's run figures
+  (`scope: run`: equity curve, realized PnL, etc.) and the day's (`day`)
 - `config_snapshot.yaml` — resolved config (secrets redacted)
 - `manifest.json` — strategy + summary stats
 
@@ -520,11 +521,15 @@ exit status is 1.
 
 After a restart on the same day, `trades.csv`, `trades_today` and
 `realized_pnl` cover every process of the strategy that appended its
-trades, but the manifest's `session_skip_counts` and
-`account_snapshot.json` are the last process's alone. A process killed
+trades, as does `account_snapshot.json`'s `day`, but the manifest's
+`session_skip_counts` and `account_snapshot.json`'s run figures are the
+last process's alone. A process killed
 before it appended (`kill -9`, an OOM kill, systemd's SIGKILL after
 `TimeoutStopSec`, a crash before 8pm) leaves its trades out of
-`.logs/trades.csv` and every archive. `trades.csv` has no mode column:
+`.logs/trades.csv`, the archive's `trades.csv` and its manifest. The
+account's day ledger, whose row is written at each exit, still counts
+them: `account_snapshot.json`'s `day`, the dashboard's day figures and
+the SESSION REPORT's `day_ledger_trades=` hold them. `trades.csv` has no mode column:
 a dry-run and a live process of one strategy that share `.logs` on one
 day archive each other's rows, under the exporting process's `dry_run`.
 Processes sharing `.logs` take turns at `trades.csv` through an advisory
@@ -659,8 +664,14 @@ systemctl --user restart intraday-bot
 
 The clean-shutdown path runs first (writes session report + archive
 unless it wrote them at 8pm ET, and appends its trades to trades.csv),
-then the new code starts. Any open positions are preserved via the
-reconcile metadata SQLite store.
+then the new code starts. In live mode the open positions are restored
+from the broker at the start, their levels from the reconcile metadata
+SQLite store. A dry run's paper positions are not restored: each one open
+at the restart is dropped, logged when the start-up reconcile ends
+(`Day ledger: <symbol> <side> <qty>, open in the <day> row, was not
+restored: its move up to the restart, <amount>, stays in the day's P&L,
+never realized and in no trade`), and that move stays in the day's P&L.
+Restart a dry run flat (top_tier is flat from 15:50).
 
 ---
 

@@ -4,7 +4,8 @@
 ``DashboardCache`` builds the snapshot and chart payloads from these:
 exchange names (``normalize_exchange``, ``quote_exchange``), the chart's bar
 rows (``bars_from_frame``) and the HTF chart's frame (``htf_chart_frame``),
-the FVG / order-block and trendline payloads, today's trade markers, and
+the FVG / order-block and trendline payloads, today's trade markers, the
+account's figures as the pages read them (``dashboard_performance``), and
 the signatures the snapshot and chart caches key on. Until 2026-09-27 they
 were ``dashboard_cache`` module functions named with a ``dashboard_`` prefix
 (refactor cut C40).
@@ -13,9 +14,9 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
-from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from collections.abc import Mapping, Sequence
+from datetime import date, datetime, timezone
+from typing import Any
 
 import pandas as pd
 
@@ -23,9 +24,8 @@ from . import sessions
 from .bars import equity_stream_window_bars, last_bucket_forming, resample_bars, session_bucket_ends
 from .indicators import ensure_standard_indicator_frame
 from .numeric import safe_float
-
-if TYPE_CHECKING:
-    from .paper_account import PaperAccount
+from .paper_account import PaperAccount, TradeRecord
+from .session_report import trade_csv_key
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 
@@ -203,9 +203,26 @@ def frame_signature(frame: pd.DataFrame | None) -> tuple[Any, ...]:
     )
 
 
-def recent_trade_markers(account: PaperAccount, symbol: str) -> list[dict[str, Any]]:
-    """Return up to 12 dashboard-shaped trade rows for ``symbol`` from
-    today's ``account.trades`` (filtered by current ET session date).
+# The chart's trade markers for a symbol, at most.
+TRADE_MARKERS_SHOWN = 12
+
+
+def _lifecycle(trade: TradeRecord) -> tuple[Any, ...]:
+    """The trade an exit slice or a closed trade belongs to: its lifecycle
+    (position key and entry time), else its symbol and entry time."""
+    return (trade.lifecycle_id,) if trade.lifecycle_id else (trade.symbol, trade.entry_time)
+
+
+def recent_trade_markers(account: PaperAccount, symbol: str,
+                         earlier: Sequence[TradeRecord]) -> list[dict[str, Any]]:
+    """Up to ``TRADE_MARKERS_SHOWN`` dashboard-shaped trade rows for
+    ``symbol`` from today's trades, newest exit first: the account's exit
+    slices (``account.trades``) and the closed trades of ``earlier`` (the
+    day's trades.csv rows a process before this one appended,
+    ``DashboardCache.earlier_trades``) whose trade the account holds no
+    slice of, each once, so a restart keeps the day's markers and draws
+    none twice. A closed trade from the file is one marker, at its
+    quantity-weighted exit price and its final exit's time.
 
     Two correctness fixes vs. the original Phase-5 extraction:
     1. The symbol filter runs BEFORE the slice. The trades deque is
@@ -218,12 +235,18 @@ def recent_trade_markers(account: PaperAccount, symbol: str) -> list[dict[str, A
        on the current ET trading date (or, for still-open positions
        that emit a marker, ``entry_time``).
     """
-    out: list[dict[str, Any]] = []
     key = str(symbol or "").upper().strip()
     if not key:
-        return out
+        return []
     today = sessions.now_et().date()
-    for trade in list(account.trades):
+    merged = list(account.trades)
+    held = {_lifecycle(trade) for trade in merged}
+    for trade in earlier:
+        if _lifecycle(trade) not in held:
+            held.add(_lifecycle(trade))
+            merged.append(trade)
+    shown: list[TradeRecord] = []
+    for trade in merged:
         if str(getattr(trade, "symbol", "") or "").upper().strip() != key:
             continue
         # Today-filter: a trade belongs to today's chart if either side
@@ -235,6 +258,13 @@ def recent_trade_markers(account: PaperAccount, symbol: str) -> list[dict[str, A
         ref_time = exit_time if exit_time is not None else entry_time
         if ref_time is None or ref_time.date() != today:
             continue
+        shown.append(trade)
+    # Newest exit first; the account's own before the file's on a tie.
+    shown.sort(key=lambda trade: _exit_moment(trade.exit_time), reverse=True)
+    out: list[dict[str, Any]] = []
+    for trade in shown[:TRADE_MARKERS_SHOWN]:
+        exit_time = getattr(trade, "exit_time", None)
+        entry_time = getattr(trade, "entry_time", None)
         out.append({
             "symbol": key,
             "side": str(getattr(trade, "side", "") or ""),
@@ -247,9 +277,92 @@ def recent_trade_markers(account: PaperAccount, symbol: str) -> list[dict[str, A
             "return_pct": safe_float(getattr(trade, "return_pct", None)),
             "reason": str(getattr(trade, "reason", "") or ""),
         })
-        if len(out) >= 12:
-            break
     return out
+
+
+_NO_EXIT_TIME = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _exit_moment(exit_time: datetime | str | None) -> datetime:
+    """An exit time (a datetime or its ISO text) to sort and date by; one
+    that is missing or unreadable, or has no UTC offset, is the earliest
+    moment (last when sorted newest first, never today)."""
+    if isinstance(exit_time, str):
+        try:
+            exit_time = datetime.fromisoformat(exit_time)
+        except ValueError:
+            return _NO_EXIT_TIME
+    if not isinstance(exit_time, datetime) or exit_time.tzinfo is None:
+        return _NO_EXIT_TIME
+    return exit_time
+
+
+def trade_rows(trades: Sequence[TradeRecord]) -> tuple[dict[str, Any], ...]:
+    """``trades`` as the state's ``recent_trades`` holds a closed trade
+    (``PaperAccount._trade_to_dict``): ``dashboard_performance``'s
+    ``earlier``, converted once, not on every build."""
+    return tuple(PaperAccount._trade_to_dict(trade) for trade in trades)
+
+
+# The trades table's closed trades, at most: as many as
+# ``PaperAccount.snapshot``'s ``recent_trades`` hold of the run's.
+RECENT_TRADES_SHOWN = 20
+
+
+def dashboard_performance(performance: dict[str, Any], earlier: Sequence[Mapping[str, Any]],
+                          earlier_error: str | None, now: datetime) -> dict[str, Any]:
+    """``performance`` (``PaperAccount.snapshot``) with what the pages show
+    and do not compute themselves, since 2026-10-12:
+
+    * ``max_drawdown_pct``: the run's max drawdown in % of the run's peak
+      equity (the Max DD gauge; the page divided it by the equity now);
+    * ``day.total_trades``: the day's closed trades, with the open
+      positions while the day is today (the top bar's Total Trades, as the
+      run's ``total_trades`` counts them; a weekend's or a holiday's day is
+      the last trading day's, which the positions open now are not);
+    * ``day.partial_label``: what a ``partial`` day's figures lack, the
+      tag the pages put on each day figure: ``since HH:MM`` when they start
+      after the day did, ``gap HH:MM-HH:MM`` for each span a start found
+      missing from the day's row (``MM-DD HH:MM`` on a date other than the
+      day's); None for a whole day;
+    * ``recent_trades``: the run's last closed trades with ``earlier``'s
+      (the day's closed trades a process before this one appended to
+      trades.csv, as ``trade_rows`` gives them), each once
+      (``TRADE_CSV_KEY``), newest exit first, the last
+      ``RECENT_TRADES_SHOWN``, each with ``exit_today``, whether its exit's
+      ET date is ``now``'s (the phone dates the others);
+    * ``recent_trades_error``: what ``earlier`` lacks of the day's rows and
+      why (``earlier_error``; None when it lacks none)."""
+    peak = performance["peak_equity"]
+    performance["max_drawdown_pct"] = performance["max_drawdown"] / peak * 100.0 if peak > 0 else None
+    day = performance["day"]
+    day["total_trades"] = day["trades"] + (performance["open_positions"] if day["is_today"] else 0)
+    day["partial_label"] = _partial_label(day)
+    trades = list(performance["recent_trades"])
+    held = {trade_csv_key(trade) for trade in trades}
+    for row in earlier:
+        if trade_csv_key(row) not in held:
+            held.add(trade_csv_key(row))
+            trades.append(dict(row))
+    # Newest exit first; this process's before the file's on a tie.
+    trades.sort(key=lambda trade: _exit_moment(trade["exit_time"]), reverse=True)
+    today = now.date()
+    for trade in trades[:RECENT_TRADES_SHOWN]:
+        trade["exit_today"] = _exit_moment(trade["exit_time"]).date() == today
+    performance["recent_trades"] = trades[:RECENT_TRADES_SHOWN]
+    performance["recent_trades_error"] = earlier_error
+    return performance
+
+
+def _partial_label(day: dict[str, Any]) -> str | None:
+    on = date.fromisoformat(day["date"])
+
+    def clock(text: str) -> str:
+        stamp = datetime.fromisoformat(text)
+        return f"{stamp:%H:%M}" if stamp.date() == on else f"{stamp:%m-%d %H:%M}"
+    parts = [f"since {clock(day['since'])}"] if day["late_start"] else []
+    parts += [f"gap {clock(gap['from'])}-{clock(gap['to'])}" for gap in day["gaps"]]
+    return ", ".join(parts) or None
 
 
 def symbol_trade_signature(account: PaperAccount, symbol: str) -> tuple[Any, ...]:

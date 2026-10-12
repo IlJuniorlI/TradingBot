@@ -25,13 +25,15 @@
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const state = await resp.json();
 
-      // Top bar
+      // Top bar: the account's day (performance.day: its P&L and closed
+      // trades; on a weekend or a holiday the last trading day's, which
+      // its label names).
       setText('status', state.status || '—');
-      const dayPnl = state.day_pnl ?? state.day_realized_pnl ?? null;
-      setText('daypnl', fmtMoney(dayPnl));
+      const day = state.performance?.day;
+      const dayPnl = day ? day.pnl : null;
+      setText('daypnl', day && !day.is_today ? `${fmtMoney(dayPnl)} ${day.label}` : fmtMoney(dayPnl));
       setClass('daypnl', dayPnl == null ? '' : (dayPnl >= 0 ? 'pos' : 'neg'));
-      const trades = state.trade_count ?? (state.trades?.length ?? '—');
-      setText('trades', trades);
+      setText('trades', day ? day.trades : '—');
       setText('updated', state.last_update ? `Updated ${state.last_update}` : 'Live');
 
       // Watchlist dump — trim down to show it's live

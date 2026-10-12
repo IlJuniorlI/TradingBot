@@ -111,6 +111,39 @@ function fmtInteger(value) {
   return n !== null ? new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(n) : '—';
 }
 
+// The account's day (``performance.day``, the day ledger's figures, which
+// the payload computes): the day's label when they are not today's ("Fri
+// 10-09": a weekend or a holiday shows the last trading day's), so a figure
+// of another day never reads as today's, and what a partial day's figures
+// lack (``partial_label``: "since 22:00", "gap 11:02-13:40"); '' for
+// today's whole day.
+function dayTag(day) {
+  const label = day && day.is_today === false ? String(day.label || '') : '';
+  return [label, day?.partial_label || ''].filter(Boolean).join(' · ');
+}
+
+// Every element marked ``data-day-tag`` (a span in a day figure's label)
+// shows the day's tag.
+function applyDayTags(day) {
+  const tag = dayTag(day);
+  document.querySelectorAll('[data-day-tag]').forEach(el => { el.textContent = tag; });
+}
+
+// The KPI card's meta line: the day's P&L and realized P&L, then the cash
+// now; led by the day's tag (``dayTag``).
+function kpiMetaText(day, cash) {
+  const scope = dayTag(day);
+  return `${scope ? `${scope} · ` : ''}Day PnL ${fmtMoney(day?.pnl)} · realized ${fmtMoney(day?.realized)} · cash ${fmtMoney(cash)}`;
+}
+
+// The "% today" pill's text: the day's P&L in % of its opening equity, the
+// day's label ("today", or the day's date on another day) and what a
+// partial day's figures lack (``partial_label``), as every day figure's tag.
+function dayChangeText(day) {
+  const partial = day?.partial_label ? ` · ${day.partial_label}` : '';
+  return `${fmtPct(day?.pnl_pct, 2)} ${day?.label || 'today'}${partial}`;
+}
+
 function pnlClass(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n === 0) return '';

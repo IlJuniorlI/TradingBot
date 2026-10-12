@@ -130,6 +130,9 @@
     .status-strip .metric-pill.status-metric { min-width: 0; }
     .metric-pill .label,
     .tiny-label { color: var(--soft); font-size: 10px; text-transform: uppercase; letter-spacing: .1em; }
+    /* A day figure's label names its day when that is not today, and what
+       a partial day's figures lack (helpers.js applyDayTags). */
+    .metric-pill .label .day-tag:not(:empty)::before { content: ' · '; }
     .metric-pill .value {
       font-size: 16px;
       font-weight: 600;
