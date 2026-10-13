@@ -1798,6 +1798,320 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **top_tier sets every regime up on closed 5m buckets and times its entries
+  on closed 1m bars: no setup qualifies before 09:45, the knobs tuned on the
+  1m bars' ATR keep their price distances, the reclaim's dip and its reclaim
+  read one session VWAP and the volume baselines the session's volume, an
+  entry that reads a missing or stale HTF frame is refused, and a stale peer
+  or sector ETF no longer confirms or judges one.** *2026-10-13* — from
+  2026-05-29 the strategy set up on 1m bars with every indicator stretched
+  x5 (`ltf_indicator_span_scale: 5`, EMAs 45 / 100) to keep the 5m
+  calibration, and the calibration did not hold: over 14 archived days
+  (09-18..10-09, 25 names, 94,810 symbol-minutes) the stretched 1m ATR read
+  a median 0.429 of a 5m ATR14, so every ATR multiple tuned on 5m bars sat
+  at less than half its price distance, and the ADX cleared `min_adx14` on
+  about 12% of minutes against about 73% on 5m bars. The range, vol_squeeze,
+  momentum and vwap_reclaim windows counted 1m bars: a 20-minute range, a
+  12-minute squeeze box, a 6-minute breakout or dip.
+  - The LTF (`ltf_minutes` 1 to 5, `ltf_indicator_span_scale` 5 to 1,
+    `ltf_ema_fast_span` / `ltf_ema_slow_span` 45 / 100 to 9 / 20,
+    `min_ltf_bars` 120 to 30, an ADX-14 warm-up in 5m buckets) is resampled
+    from the step frame's closed 1m bars, its last row the bucket the last
+    1m bar is in. One flag says whether that bucket is still trading
+    (`_CandidateRead.ltf_forming`, read once a pass), and no setup reads it:
+    ATR14, ADX14, EMA9 / EMA20, ret5 / ret15, the pullback's close position
+    and volume, the side vote's last three bars and the pullback leg are the
+    last closed bucket's (`closed_ltf`); a window (the trend and momentum
+    breakout reference, the pullback touch, the range zone, the squeeze box)
+    is made of today's buckets before the current one (`setup_window`), and
+    the reclaim's dip of the session's (`session_window`), so a breakout
+    never has to clear a high its own bucket set. The scale stays as an
+    opt-in for a 1m LTF.
+  - Price and timing: the trigger close is the step frame's last 1m close
+    and VWAP the step frame's session VWAP, on the LTF too (each bucket's
+    `vwap` is the step frame's at the bucket's last minute,
+    `vwap_at_bucket_close`; a resample rebuilt VWAP from its own typical
+    prices). Entries are timed on closed 1m bars: the entry pass leaves out
+    a last 1m bar whose minute is still trading by the clock, once, before
+    the LTF is resampled (`_read_candidate`, through `last_closed_bars`),
+    with a WARNING (`<symbol>: the step frame's last 1m bar <time> has not
+    closed at <now>; its 1m bar <time> is left out as forming`), so the
+    close, the trigger bar's wick, close position and volume, range's
+    previous bar, vol_squeeze's breakout bar, vwap_reclaim's volume pop, the
+    armed retest's touch, reclaim and bar shape and the confirmation bar
+    (Fix B) read closed bars, and a forming bar never confirms. A step frame
+    normally holds closed bars only (the history without the minute still
+    trading, the stream's bars once their minute closed), and then nothing
+    is left out. Exits read as they did (management's price and the step
+    frame's last bar), and `_finalize_signal` and the shared entry stage
+    keep the 1m frame.
+  - The opening: no setup qualifies until today's session holds three closed
+    buckets, 09:45 on the RTH indicator window (`ltf_warmup(<n>/3)` in the
+    skip line): the first buckets would otherwise vote, trend and break out
+    on one or two buckets and on session-reset EMAs that had not yet
+    separated. The count is of buckets that printed: a name whose first bars
+    come late waits for its third. Position management is not touched.
+  - The windows count today's buckets from midnight, premarket included, as
+    the 1m windows did (`today_bars`), and so do the pullback's leg and
+    swing target and the reclaim's HOD / LOD target; the prior session's
+    bars never. A window read against VWAP counts the session's buckets
+    alone (`session_window`, from 09:30): a premarket bucket carries the
+    step frame's all-hours VWAP, which the session VWAP replaces at the
+    open, so vwap_reclaim's dip and its reclaim read one session VWAP, a
+    premarket bucket is no dip and the six-bucket dip window is whole from
+    10:00, and range's VWAP flips count the zone's session buckets. The
+    pullback's VWAP touch compares its window's low (high) with the session
+    VWAP's current value, one VWAP, and keeps today's window. Counting
+    today's buckets for the dip, a premarket bucket's close through its
+    all-hours VWAP read as a dip from 09:45: on five replayed mornings
+    (09:40-11:30) that reading took 15 vwap_reclaim entries between 09:46
+    and 09:59, 8 of them with no dip in the session at all.
+  - The volume baselines count the session's bars alone, like the session
+    VWAP: the pullback's last closed bucket against the mean of the up to
+    five session buckets before it, vol_squeeze's breakout bar against the
+    median of the box's session minutes (a box of premarket minutes alone
+    has no baseline and refuses), and vwap_reclaim's pop against the dip
+    window's minutes, which are the session's already. A premarket bucket or
+    minute trades a fraction of a session one, so in the first hour, while
+    the windows still held premarket bars, it pulled the baseline down and a
+    session bar read as a volume expansion.
+  - The knobs moved with the LTF. Those tuned on the 1m bars' ATR after
+    2026-05-29 keep their tested price distances, multiplied by 0.435:
+    `armed_retest_zone_atr` 0.35 to 0.15, `armed_retest_invalidation_atr`
+    0.75 to 0.33, `sr_scalp_min_stop_atr_mult` 0.5 to 0.22, and the ORB's
+    `orb_breakout_buffer_atr_mult` 0.05 to 0.022, `orb_min_range_atr_mult`
+    0.5 to 0.22 and `orb_max_range_atr_mult` 4.0 to 1.74 (ORB is off; the
+    converted opening-range band is unmeasured on the 5m ATR). The bar
+    counts that predate 2026-05-29 return to their 5m meaning:
+    `pullback_lookback_bars` 25 to 5 and
+    `side_decision_recent_lookback_bars` 30 to 6; the ATR buffers, touch and
+    zone multiples and `min_adx14` read the 5m ATR and ADX they were tuned
+    on. `trailing_bias_lookback` 10 to 2 keeps the ten minutes its memory
+    was tested on, two buckets, and its floors, which made a two-bucket
+    window a three-bar one with all three directional, are gone: half the
+    window, rounded up, must be directional. The range, vol_squeeze,
+    momentum and vwap_reclaim windows count closed 5m buckets (20, 12, 6 and
+    6: 100, 60, 30 and 30 minutes). `vol_squeeze_max_range_atr` 2.8 to 3.0
+    keeps the squeeze's selectivity on the 5m box (2.8 passed 51.5% of
+    minutes on the 1m bars, 3.0 passes 50.9% on 5m; the matching cap ran
+    2.84-3.16 by day), and its backstop `vol_squeeze_max_range_pct` 0.012 to
+    0.025 (at 0.012 the 5m box refused 10.6% of minutes on its own).
+    vol_squeeze's stop buffer, max(0.12 x ATR, 0.10% of the close, a box
+    term), had a 0.22 x box term tested on the 12-minute box; it is a knob
+    now, `vol_squeeze_stop_box_mult`, 0.088 on the 60-minute box, the same
+    price distance (0.22 x 0.401, the median per-minute ratio of the
+    12-minute box's height to the 60-minute box's over the same 94,810
+    symbol-minutes, 0.085-0.091 by day; at 0.22 the buffer was a median
+    1.68x the 1m box's and the box term set it on 87% of minutes, where it
+    had on 28.5%). The code defaults follow the manifest, so no default
+    brings back a 1m value.
+  - The side vote: its recent-return arm reads the latest 1m close against
+    the close six buckets before the current one (25-30 minutes, as
+    designed); the VWAP arm's leg anchor is measured on the 1m step frame,
+    the frame the peers' confirmation measures it on, so the vote and the
+    gate read one reference on one `leg_anchor_min_age_bars` horizon (on the
+    LTF the vote would have needed 100 minutes of leg age where the gate
+    needs 20); the EMA arm reads the last closed bucket's EMAs, and the
+    three-bar arm the last three closed buckets, 15 minutes as designed (on
+    1m bars it read three minutes), a bar that does not read leaving it out.
+    The trailing-bias memory starts each session empty before it is read:
+    the day's first pass read the prior session's memory and cleared it
+    after, so a flat open could inherit yesterday's closing bias for one
+    pass.
+  - The regimes: trend's and momentum's breakout reference is the window's
+    extreme (5 and 6 closed buckets; momentum scores a whole window only),
+    and the armed retest's zone and invalidation band are measured against
+    the 5m ATR, its touch, reclaim and bar shape on 1m bars. pullback's
+    close position and volume are the last closed bucket's (a forming
+    bucket's partial volume passed its test 0.5% of the time in its first
+    minute and 25.8% in its last). vol_squeeze's box is the last 12 closed
+    buckets, whole; its Bollinger compression term reads the 1m step frame's
+    bands (20 one-minute bars, beside the 60-minute box); the break is the
+    1m trigger bar, and it enters on the first 1m bar of its bucket to close
+    through the box's buffered edge only
+    (`<side>_vol_squeeze_not_first_break(first=HH:MM,required=...)`): the
+    box stays the same for the whole bucket, so a later minute enters past a
+    break that has happened (over 15 archived days 59% of the minutes a box
+    broke were later minutes of their bucket, and those closed a median 0.31
+    x the 5m ATR past the edge against 0.13 for a first minute), and the
+    next bucket's box holds the break. vwap_reclaim's volume pop is the
+    trigger bar's volume against the dip window's mean 1m volume. sr_scalp's
+    zone, distance and proximity multiples read the 5m ATR; its noise
+    lookback stays 20 one-minute bars. Every stop anchored on a window
+    (sr_scalp's and orb's anchor on their levels and range) also clears the
+    current bucket's 1m bars, the trigger bar's included (`stop_anchor`), so
+    no stop sits where price traded after the window closed.
+  - range, off in the shipped preset (`disable_range_regime: true`) until it
+    shows an edge, is correct on 5m: its zone is the last 20 closed buckets;
+    a close past the range's edge has broken it and is refused
+    (`below_range_low(...)` / `above_range_high(...)`); its stop is at least
+    `range_min_stop_atr_mult` (0.5, new) x the 5m ATR from the close, where
+    a close at the edge put it one buffer away (0.5 binds on 5.7% of in-zone
+    minutes; the `default_stop_pct` floor would have bound on 99.7%, with a
+    reward under the risk on 71.6%); and
+    `range_require_prev_bar_confirmation: true`, on closed bars, asks the
+    last two closed 1m bars to sit in the fade zone (`false` asks the last
+    closed bar alone: the 2026-04-23 reading, written against a forming
+    bar), a previous bar that does not read refusing (it passed until now).
+  - An entry that reads the stored HTF frame is refused while the frame is
+    missing (`<regime>_htf_frame_missing(tf=15m)`) or, in RTH, stale: its
+    newest completed bar ended more than two of its bars ago, 30 minutes on
+    the 15m frame (60 on a 30m one, 120 on a 60m one), so one refresh may
+    miss (`<regime>_htf_frame_stale(age=..m>30m,last=HH:MM)`); outside RTH
+    only a missing frame refuses. The readers are the HTF structure gate,
+    the HTF EMA gate on the sides it names, the HTF EMA score term (all
+    three lifted by the ORB-window HTF bypass) and, with
+    `support_resistance` on and a data feed, the S/R levels the shared S/R
+    veto, broken-level guard and refinement read: every entry in both
+    shipped presets. A symbol's state is logged when it changes (`<symbol>:
+    the entries that read its HTF frame are refused: ...`, `<symbol>: its
+    15m HTF frame reads again (was stale)`). Until now an entry that read no
+    frame saw no levels, a neutral structure and a neutral trend and passed,
+    and a frozen frame kept deciding at the live price. Every HTF refusal
+    names its regime (`<regime>_htf_bias_...`, `<regime>_htf_pivot_...`,
+    `<regime>_htf_ema_trend_...`), and the session archive's gate
+    attribution counts each reason under the regime it names.
+  - The index confirmation reads fresh frames only: a peer or sector ETF
+    whose newest 1m bar closed more than 3 minutes ago, or that has no bars,
+    is left out (over 8 archived days the longest RTH gap between one name's
+    bars was 2 minutes), and fewer than `index_breadth_min_peers` readable
+    peers is no confirmation
+    (`index_not_confirmed(breadth_unreadable(readable=..,stale=..,missing=..,min_peers=..))`),
+    where it fell back to the ETF and a stale peer voted the posture it
+    froze at. Each refusal says why (`breadth(agree=a/r<frac)`,
+    `etf(fresh=f/n,agree=0)`). range's index-neutral term needs every ETF to
+    read fresh, with a close and a positive VWAP, and a symbol with no ETF
+    is not neutral; both read neutral until now.
+  - The relative-strength gate reads its sector on a fresh frame too: the
+    first of the symbol's sector ETFs whose newest 1m bar closed within 3
+    minutes, with a positive close and a session open (a NaN close read as 0
+    until now); when none reads the gate cannot judge either side and
+    refuses the candidate, naming each ETF's state
+    (`relative_strength_sector_unreadable(SMH=stale)`, `missing`,
+    `unreadable`), where a frame of any age set the residual and no frame
+    skipped the gate. Without the symbol's beta the gate is skipped, as
+    designed, and the decision now says so: a skip lists
+    `relative_strength_skipped(no_daily_stats|no_sector_beta)` after its own
+    reasons (`no_day_strength` when the candidate's own session open does
+    not read) and a signal carries it as `gate_relative_strength_skipped`. A
+    side the gate drops while the other stays is recorded too: a skip lists
+    `<side>_relative_strength_<lagging|leading>_sector(resid=..,sym=..,sec=..,beta=..,threshold=..)`
+    after its own reasons, and a signal carries it as
+    `gate_relative_strength_drop`, which its ENTRY_CONTEXT and an engine
+    refusal's SKIP_SUMMARY keep. The drop, on about half of all candidate
+    rows, left no trace.
+  - The HTF, index, leg-anchor, trailing-bias and LTF knobs, the range floor
+    and the squeeze stop's box term are checked at load and when the
+    strategy is built, and a refusal names the key: `true` or `false` (a
+    quoted `"false"` is refused, not read as true), a finite number in its
+    bounds (`htf_ema_alignment_score`, `range_min_stop_atr_mult` and
+    `vol_squeeze_stop_box_mult` 0 or more, bar counts whole and at least 1,
+    `index_breadth_min_agree_frac` in (0, 1],
+    `trailing_bias_majority_threshold` in (0.5, 1]), present in the params.
+    Both manifests declare them, and small_cap_squeeze's preset adds
+    `range_min_stop_atr_mult` and `vol_squeeze_stop_box_mult`.
+  - With the 5m LTF the LTF FVG and order-block contexts read 5m bars, the
+    forming bucket's included, and take `_score_fvg_context`'s HTF branch,
+    as before 2026-05-29: `ltf_fvg_entry_weight`, the FVG continuation and
+    reversal bias, the runner flag and the FVG retest plans read 5m gaps.
+    The session archive keeps the 5m bars the setups read
+    (`bars/5m_from_1m`; their `vwap` is the resample's own, while the setups
+    read the 1m bars' session VWAP at each bucket's last minute). On the
+    dashboard the compact chart draws 5m candles and the key-level zones are
+    sized with the 5m ATR14 as sr_scalp's zones are (the newest bucket's),
+    though the 0.15% `zone_pct` floor sets their half-width on about 99%
+    of minutes, so they barely moved; the
+    technicals overlay (fibs, AVWAP, Bollinger, channels, trendlines,
+    divergence lines) stays on the 1m step frame the strategy's
+    `technical_levels` context reads (`technical_context_minutes`, a
+    strategy's own, its LTF unless it says otherwise: on the 5m buckets the
+    `technical_levels` lookbacks, which are in 1m bars, would count
+    buckets), each line and divergence pivot placed on the 5m chart's bars.
+  - small_cap_squeeze runs the same engine on its own preset and keeps its
+    1m LTF, so its windows, ATR and zones read 1m bars as before, and they
+    start where its frames do, at its 07:00 extended session; its index
+    confirmation and relative-strength gate are off. What reaches it: the
+    forming-bar drop (nothing to drop on closed frames), the confirmation
+    bar on the step frame (the same bars on a 1m LTF), the stop anchor (on a
+    1m LTF the trigger bar's own extreme), the knob checks, the warm-up
+    (three 1m bars of its session, counted in bars: a name whose first
+    prints come late waits for its third, where it built from its first),
+    and the HTF frame refusal: its S/R levels read the stored frame, so its
+    trend, momentum and vwap_reclaim entries are refused while the frame is
+    missing, or stale in RTH. Its volume baselines count its session's bars,
+    from 07:00, where its frames start, and its squeeze stop keeps the 0.22
+    box term (vol_squeeze is off in its preset). Its replay is in the
+    Measured line.
+  - Decisions: the user's. 2026-10-12: every regime sets up on 5m bars and
+    entries and exits stay on 1m; the knobs tuned on the 1m bars' ATR after
+    2026-05-29 keep their tested price distances and the older ones return
+    to their 5m meaning; a 5m setup qualifies only after three closed
+    buckets, position management unaffected; range stays off in the preset
+    until it shows an edge, its code made correct for 5m. 2026-10-13: every
+    stop anchored on a window clears the current bucket's 1m bars; the
+    windows keep the premarket bars they always read; vol_squeeze enters on
+    the first break of its bucket only; vwap_reclaim stays on; range keeps
+    the two-bar reading of its previous-bar test (a replay A/B of 10-07 and
+    10-08 rested on one stop, not enough to choose between them); the 5m
+    re-derivations of `vol_squeeze_max_range_pct` and of the range stop's
+    floor stand; and the reclaim's dip and its reclaim read one session
+    VWAP, so a premarket bucket is no dip, every other read of bars against
+    VWAP held to the same (range's flips; the pullback's touch reads one
+    VWAP already).
+  - Measured: stepped replays of H:'s archive (the top_tier preset,
+    09:40-11:30 and 13:00-15:00 at 60 s, on 10-07, 10-08, 10-09, 10-01 and
+    09-25) against the previous version. No entry before 09:45, where the
+    previous version took 11. 103 signals and 56 fills against 140 and 85,
+    of which the previous version's range, on in its preset, had 82 and 52;
+    vwap_reclaim 64 signals against 45, sr_scalp 32 against 7. The median
+    stop is 47.4 bps of the entry, 0.96 x the 5m ATR (the previous version's
+    21.9 bps, and 63.3 without range), and the shared clamp's floor of 1.5 x
+    the 1m ATR sets 30 of the 103. Realized P&L at the harness's fills
+    -1,142.56 against -1,996.16; with each symbol's median spread and 1 bp a
+    trade, -1,683.56 against -2,684.60, and +114.53 against -15.52 open at
+    the windows' ends; both lose on every day. vwap_reclaim lost -972.71 at
+    those costs on 33 exits, against -1,415.75 on 26. The mornings alone:
+    -1,049.86 (-1,471.51 at cost), vwap_reclaim's first entry at 10:02 or
+    later each day; with the dip window counting today's premarket buckets
+    they were -1,355.21 (-1,776.00) with 15 vwap_reclaim entries between
+    09:46 and 09:59. Counting the volume baselines on the session's bars
+    moved one window of the ten: on 10-08's morning a pullback short no
+    longer qualified at 09:53, and the slot went to other entries (-1,024.84
+    and -1,405.62 for the mornings with the baselines counting the
+    premarket); every other window took the same entries. The harness steps
+    once a minute and fills at 1-10 cent quotes, so these understate costs,
+    and five days is a small sample. small_cap_squeeze replayed on
+    2026-06-03 (09:30-11:30 at 20 s) is identical to the previous version in
+    every recorded category: 4 trades, +105.12.
+  - Left as is, for later calls: the shared S/R clamp's floor stays 1.5 x
+    the 1m ATR14, and on the 5m stops it binds on about 3 in 10 signals;
+    whether the HTF structure gate should judge the fade regimes, and how
+    the opening window reads the HTF, are open; peer and ETF frames are read
+    as stored, so a forming last bar there would vote its posture; with S/R
+    off, the shared HTF divergence and FVG score terms read the HTF frame
+    unchecked; `range_max_intraday_range_pct` and `range_min_flip_count`
+    were tuned on the 20-minute zone; the entry spread guard's calibration
+    (2026-10-12) was measured mostly on range entries, which are off now.
+  - Docs: the strategy README (*Timeframes*, the regimes, the gates, the
+    index confirmation, the relative-strength gate, the knob reference and
+    its defaults, sections 17, 18, 23 and 24), small_cap_squeeze's README
+    (what it inherits), the top_tier preset's comments, the dashboard's
+    comments, and the README (the LTF knobs, the index confirmation, the HTF
+    refusals, the relative-strength sector read, the score weight's bound).
+  - Tests: a new module for the 5m setups and what came with them (the reads
+    and the forming-bar drop, the warm-up, the side vote and the trailing
+    memory's new day, each regime's window, trigger, volume baseline and
+    stop, the session VWAP reads, today's bars and not the prior session's,
+    the first break, the HTF bound on 15m, 30m and 60m frames, the index and
+    sector freshness, the knob checks, the relative-strength records, the
+    shipped values), the existing modules moved to the new contracts and run
+    on closed bars (the armed retest's harness on fresh peers), the
+    strategy's freshness read of the data feed's own stored frame, the
+    dashboard's technicals on the strategy's bars and placed on the 5m
+    chart, and the archive's gate attribution. 204 mutants: 202 killed; one
+    equivalent (the day's bars counted from 04:00 rather than midnight) and
+    one test-harness clock mutant survive.
+
 - **The REST shadow drops a lagging stream quote book only when it may have
   stopped receiving with a price apart from REST's, or a side apart from
   REST's is stale, cannot be dated, or was kept as the race at the check
