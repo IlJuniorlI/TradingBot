@@ -1651,6 +1651,17 @@ class EntryGatekeeper:
                 LOG.log(TRADEFLOW_LEVEL, "Skipping %s %s: %s", signal.symbol, signal.reason, reason)
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, reason], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, entry_price, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)}, market_side=signal_market_side)
                 continue
+            # The daily-loss check again, now the entry's size and limit are
+            # known: its own risk to its stop at them (can_open read it at
+            # the signal's entry, before the quote; 2026-10-12).
+            reason = self.risk.daily_loss_refusal(
+                self.positions, self.risk.entry_risk_to_stop(qty, entry_price, signal.stop_price),
+                label=f"{signal.symbol} {signal.side.value} qty={qty} at {entry_price:.4f}",
+            )
+            if reason is not None:
+                LOG.log(TRADEFLOW_LEVEL, "Skipping %s %s: %s", signal.symbol, signal.reason, reason)
+                self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, reason], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty, entry_price, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent), **self._risk_snapshot(signal, entry_price, qty)}, market_side=signal_market_side)
+                continue
             # side/stop/target are what turn this into a broker-side bracket:
             # when execution.bracket_orders_enabled is false the executor
             # ignores them and submits today's plain repriced limit.

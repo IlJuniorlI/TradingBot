@@ -2707,6 +2707,20 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
             "but options.underlyings is empty. Add at least one underlying symbol "
             "(e.g. SPY, QQQ) under the options section."
         )
+    # The day is over once its realized P&L leaves no room for one full
+    # trade's risk under max_daily_loss (RiskManager.trade_risk_budget, the
+    # same figure): a limit at or under one trade's risk would end every day
+    # at its first close that is not a profit larger than the difference.
+    if is_option_strategy(strategy):
+        trade_risk, trade_risk_from = options_cfg.max_loss_per_trade, "options.max_loss_per_trade"
+    else:
+        trade_risk = risk_cfg.max_notional_per_trade * risk_cfg.risk_per_trade_frac_of_notional
+        trade_risk_from = "risk.max_notional_per_trade x risk.risk_per_trade_frac_of_notional"
+    if not risk_cfg.max_daily_loss > trade_risk:
+        raise ValueError(
+            f"{config_path}: risk.max_daily_loss ({risk_cfg.max_daily_loss:g}) must be above one trade's risk "
+            f"({trade_risk:g}, {trade_risk_from}): the day ends once less than one trade's risk is left under it."
+        )
 
     support_resistance_cfg = SupportResistanceConfig(**support_resistance_raw)
     _validate_support_resistance_config(support_resistance_cfg, config_path)

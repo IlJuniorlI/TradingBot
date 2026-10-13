@@ -39,7 +39,7 @@ risk:
   risk_per_trade_frac_of_notional: 0.004
   max_notional_per_trade: 16000.0
   max_total_notional: 48000.0
-  max_daily_loss: 2000.0  # 4% daily stop on $50K equity; accommodates ~4 full-loss trades at the $500 per-trade cap below
+  max_daily_loss: 2000.0  # 4% daily stop on $50K equity; entries end for the day after 3 full-loss trades at the $500 per-trade cap below (at -1500, when less than one trade's risk is left under it)
   default_stop_pct: 0.018
   default_target_pct: 0.038
   trailing_stop_pct: 0.014

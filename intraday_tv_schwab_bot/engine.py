@@ -33,7 +33,7 @@ from .models import (
 from .paper_account import PaperAccount, TradeRecord
 from .position_manager import PositionManager
 from .position_store import DayLedgerStore, ReconcileMetadataStore, SessionRiskStateStore
-from .risk import RiskManager
+from .risk import DAILY_LOSS_REACHED, RISK_STATE_UNREADABLE, RiskManager
 from .screener_client import TradingViewScreenerClient
 from .startup_reconciler import StartupReconciler
 from .warmup_tracker import WarmupTracker
@@ -50,6 +50,7 @@ from .session_report import (
     append_trades_csv,
     check_trades_csv_lock,
     day_trade_records,
+    trades_closed_on,
     write_session_report,
 )
 from .schwab_api import (
@@ -398,6 +399,15 @@ class IntradayBot:
         # and _cycle_sleep_seconds reads them.
         self._cycle_idle = False
         self._cycle_idle_wake_at: datetime | None = None
+        # Whether the last pass's gate was in the day-over idle (the daily
+        # loss latch set and nothing held, CycleGateState.day_over_idle), for
+        # the one INFO line where it starts and where it ends
+        # (_note_day_over_idle).
+        self._day_over_idle = False
+        # The 1m bars a day's day-over idle stopped building: by ET day, when
+        # its idle first started and the watchlist then. The day's close
+        # fetches them for its report and archive (_complete_idle_bars).
+        self._idle_bars_owed: dict[date, tuple[datetime, set[str]]] = {}
         # The last dashboard build: its time.monotonic() and the status it
         # showed (message, no error), None before the first; see
         # _dashboard_build_due.
@@ -545,6 +555,8 @@ class IntradayBot:
             positions=self.positions,
             executor=self.executor,
             startup_reconciler=self.startup_reconciler,
+            risk=self.risk,
+            day_held_open=self._day_held_open,
         )
         self.warmup_tracker = WarmupTracker(
             config,
@@ -1246,6 +1258,7 @@ class IntradayBot:
         later trading day's stream window).
         """
         owed = self._day_closes[day]
+        self._complete_idle_bars(day, now)
         if owed.summary:
             try:
                 self._write_session_report(day, owed.skip_counts)
@@ -1548,6 +1561,7 @@ class IntradayBot:
             log_dir=self.config.runtime.log_dir,
             structured_logger=self.audit.log_structured,
             skip_counts=dict(skip_counts),
+            daily_loss_limit=self.risk.daily_loss_limit_report(day),
             # Post-stop continuation needs bars AFTER each stop-out. Passed as
             # a callable so session_report stays a pure aggregator over
             # TradeRecords and doesn't take a DataFeed dependency.
@@ -1576,6 +1590,134 @@ class IntradayBot:
             exporter_ran_session=owed.ran_session,
         )
 
+    def _complete_idle_bars(self, day: date, now: datetime) -> None:
+        """Fetch the 1m bars ``day``'s day-over idle did not build, once,
+        before the day's report and archive read them (``_close_session_day``:
+        the 20:00 close, or a shutdown's). The idle builds no frame, so
+        without this the report's post-stop windows and the archive's
+        ``bars/1m`` and ``bars/{N}m_from_1m`` ended where it began.
+
+        One price_history request per symbol (``MarketDataStore.
+        fetch_history``, merged into its history): from the idle's start for
+        a symbol on the watchlist when it began, whose frame ran to there;
+        and from ``runtime.history_lookback_minutes`` before it, as a late
+        start's warm-up, for the rest of the symbols the archive exports
+        bars for (``_day_bar_symbols``), whose frame this process did not
+        build to there, or at all: a process that started into the idle
+        builds no watchlist. The stored HTF frames (``bars/{N}m_schwab_htf``)
+        are not fetched. The bars are merged without raising the depth the
+        symbols' frames retain (``fetch_history(set_depth=False)``), so an
+        always-on run's later sessions keep the frames a fresh start would.
+
+        Not after a stop signal (``_since_stop_signal``): that shutdown's
+        exports run on the stop's clock (``TimeoutStopSec``). The auto-exit's
+        shutdown, and one an error ended, fetch them. A request that fails
+        ends the rest with a WARNING, so an outage costs one request's
+        retries; other symbols that cannot be read (``_day_bar_symbols``
+        raising) leave the watchlist's, with a WARNING."""
+        owed = self._idle_bars_owed.pop(day, None)
+        for earlier in [noted for noted in self._idle_bars_owed if noted < day]:
+            del self._idle_bars_owed[earlier]      # an idle noted after its day's close: nothing reads it
+        if owed is None:
+            return          # no day-over idle that day
+        started, watched = owed
+        if self._since_stop_signal() is not None:
+            LOG.info("The %s day-over idle's 1m bars from %s are not fetched after a stop signal: the report and "
+                     "archive read the bars to the idle's start", day, f"{started:%H:%M:%S}")
+            return
+        try:
+            others = self._day_bar_symbols(day)
+        except Exception as exc:
+            # The close runs in the loop's housekeeping, which has no catch.
+            LOG.warning("The %s day-over idle's 1m bars: the archive's other symbols could not be read (%s: %s), so "
+                        "only the %d on its watchlist then are fetched", day, type(exc).__name__, exc, len(watched))
+            others = set()
+        ordered = sorted(watched | others)
+        idle_minutes = int((now - started).total_seconds() // 60) + 2
+        warm_minutes = int(self.config.runtime.history_lookback_minutes)
+        for done, symbol in enumerate(ordered):
+            lookback = idle_minutes if symbol in watched else idle_minutes + warm_minutes
+            try:
+                self.data.fetch_history(symbol, lookback_minutes=lookback, set_depth=False)
+            except Exception as exc:
+                LOG.warning("The %s day-over idle's 1m bars from %s: %s's price_history failed (%s: %s), so it and "
+                            "%d more symbol(s) keep the bars they had in the report and archive", day,
+                            f"{started:%H:%M:%S}", symbol, type(exc).__name__, exc, len(ordered) - done - 1)
+                return
+        LOG.info("Fetched the %s day-over idle's 1m bars from %s for the report and archive: %d symbol(s), one "
+                 "price_history request each; %d not on its watchlist then, from %d minutes before it", day,
+                 f"{started:%H:%M:%S}", len(ordered), len(set(ordered) - watched), warm_minutes)
+
+    def _day_bar_symbols(self, day: date) -> set[str]:
+        """The symbols ``day``'s archive exports bars for
+        (``session_archive._archive_symbols``), as this process knows them
+        before the close's append: the strategy's watchlist for the last
+        candidates and the open positions, the positions' underlyings, and
+        the symbols the day traded, each by its underlying, else its symbol:
+        this strategy's rows trades.csv holds at the close, before this
+        process's append (``_read_day_trades``; the processes before it), and
+        its own trades of the day not appended yet
+        (``PaperAccount.trades_outbox``)."""
+        symbols = set(self.strategy.active_watchlist(list(self.last_candidates), self.positions))
+        symbols |= {position.metadata.get("underlying") or position.symbol for position in self.positions.values()}
+        earlier_trades, _error, _whole_file = self._read_day_trades(day)
+        traded = [trade for trade in earlier_trades if trade.strategy == self.config.strategy]
+        traded += trades_closed_on(self.account.trades_outbox, day)
+        symbols |= {trade.underlying or trade.symbol for trade in traded}
+        return {key for key in (str(symbol or "").upper().strip() for symbol in symbols) if key}
+
+    def _day_held_open(self) -> list[str]:
+        """What keeps the cycle gate out of the day-over idle once the
+        session's daily loss latch is set (``CycleGate.evaluate``), empty
+        when nothing does: an open position (an equity or an option, a
+        restored one included), a working entry order not yet settled, a
+        closed position's exit orders still to sweep, and, live with the
+        broker reconcile on, a broker account the last reconcile did not
+        settle (one still being retried, or one holding a position or a
+        working order the bot does not own: its block). Each of these needs
+        the management passes, or the account read, that the idle would
+        stop. The start-up's reconcile has run before the first pass, so
+        an account never reconciled is one being retried."""
+        held: list[str] = []
+        if self.positions:
+            held.append(f"{len(self.positions)} open position(s)")
+        if self.entry_gatekeeper.unsettled_entry_orders:
+            held.append(f"working entry order(s) in {','.join(sorted(self.entry_gatekeeper.unsettled_entry_orders))}")
+        sweeps = self.position_manager.exit_sweep_symbols()
+        if sweeps:
+            held.append(f"exit orders left to sweep in {','.join(sweeps)}")
+        runtime = self.config.runtime
+        if (not self.config.schwab.dry_run and runtime.reconcile_on_startup
+                and runtime.startup_reconcile_mode != "ignore"
+                and (self._reconcile_failures or self.startup_reconciler.trading_blocked_reason)):
+            held.append("a broker account not reconciled to hold nothing")
+        return held
+
+    def _note_day_over_idle(self, gate_state: CycleGateState, now: datetime) -> None:
+        """One INFO line where the day-over idle (``CycleGateState.
+        day_over_idle``) starts, and one where it ends: at a new session, or
+        when something is held again. Where it starts, the day's
+        ``_idle_bars_owed`` notes the watchlist it stops building (the last
+        pass's: none in a process that starts into it) and, the first time
+        that day, the time; a second idle that day adds its watchlist and
+        keeps the first one's time (``_complete_idle_bars``)."""
+        if gate_state.day_over_idle == self._day_over_idle:
+            return
+        self._day_over_idle = gate_state.day_over_idle
+        if gate_state.day_over_idle:
+            started, symbols = self._idle_bars_owed.get(now.date(), (now, set()))
+            self._idle_bars_owed[now.date()] = (started, symbols | set(self.last_watchlist))
+        if gate_state.daily_loss_latch is None:
+            LOG.info("The day-over idle ended: a new session")
+        elif gate_state.day_over_idle:
+            LOG.info("Idle until next session: %s, and nothing is held. No screening, watchlist, frames, quotes or "
+                     "stream until then; the day close (its report and archive, with the 1m bars the idle does not "
+                     "build fetched once), the dashboard and the reconcile still run.",
+                     self.cycle_gate.daily_loss_text(gate_state.daily_loss_latch))
+        else:
+            LOG.info("The day-over idle ended: holding %s; entries stay ended for the day",
+                     "; ".join(self._day_held_open()))
+
     def step(self) -> None:
         # The phases CYCLE_TIMING reports (_log_cycle_timing).
         timer = self._cycle_timer
@@ -1586,7 +1728,9 @@ class IntradayBot:
             schedule = self.config.active_strategy.schedule()
             gate_state = self.cycle_gate.evaluate(now, schedule)
             self._cycle_idle = gate_state.idle_closed_market
-            self._cycle_idle_wake_at = self.cycle_gate.idle_wake_at(now, schedule) if self._cycle_idle else None
+            self._cycle_idle_wake_at = self.cycle_gate.idle_wake_at(
+                now, schedule, day_over=gate_state.day_over_idle) if self._cycle_idle else None
+            self._note_day_over_idle(gate_state, now)
             if gate_state.screening_active:
                 self.last_candidates = self.screener.get_candidates(self.config.strategy)
                 candidate_symbols = [c.symbol for c in self.last_candidates]
@@ -1607,7 +1751,9 @@ class IntradayBot:
                 self.last_watchlist = []
             else:
                 self.last_watchlist = sorted(_unique_symbol_keys(watchlist))
-            if gate_state.idle_closed_market:
+            if gate_state.day_over_idle:
+                pass      # its start and end are logged once (_note_day_over_idle)
+            elif gate_state.idle_closed_market:
                 self.audit.log_cycle(
                     f"watchlist_idle:{self.config.strategy}",
                     "idle_no_window_or_position",
@@ -1722,9 +1868,18 @@ class IntradayBot:
             timer.enter("htf_refresh")
             self._refresh_htf_frames(gate_state, htf_cycle, where="before entries", bars=bars)
             timer.enter("entries")
-            if self.startup_reconciler.trading_blocked_reason:
+            # The startup reconcile's block, the unread risk state, then the
+            # daily loss latch: no entry runs. The day-over idle holds the
+            # decisions without a line (its start and end have theirs).
+            blocked = [part for part in str(self.startup_reconciler.trading_blocked_reason or "").split(",") if part]
+            if gate_state.risk_state_unread:
+                blocked.append(RISK_STATE_UNREADABLE)
+            if gate_state.daily_loss_latch is not None:
+                blocked.append(DAILY_LOSS_REACHED)
+            if gate_state.day_over_idle:
+                self.entry_gatekeeper.hold_entry_decisions(blocked)
+            elif self.startup_reconciler.trading_blocked_reason or blocked:
                 candidate_symbols = [c.symbol for c in self.last_candidates]
-                blocked = [part for part in str(self.startup_reconciler.trading_blocked_reason).split(",") if part]
                 reasons: list[str] = []
                 if not candidate_symbols:
                     reasons.append("no_candidates")
@@ -1785,12 +1940,17 @@ class IntradayBot:
             # mark_prices call above. Skipping _extract_last_prices here avoids iterating
             # the full bars dict a second time per tick.
             self.account.mark_prices(self._extract_position_marks())
+            # The latch and the risk state as they stand now: an exit this
+            # pass may have set the latch.
             message = self.cycle_gate.runtime_status_message(
                 screening_active=gate_state.screening_active,
                 management_active=gate_state.management_active,
                 streaming_active=gate_state.streaming_active,
                 context_refresh_active=gate_state.context_refresh_active,
                 position_monitoring_active=gate_state.position_monitoring_active,
+                daily_loss_latch=self.risk.daily_loss_latch(),
+                day_over_idle=gate_state.day_over_idle,
+                risk_state_error=self.risk.risk_state_error,
             )
             # Last, and inside the cycle, so it reads the frames the cycle
             # cached. It cannot fail the cycle: a failure is the dashboard's
@@ -2387,7 +2547,8 @@ class IntradayBot:
             "started_at": self.started_at.isoformat(),
             "screening_active": screening_active,
             "streaming_active": streaming_active,
-            "trading_blocked_reason": self.startup_reconciler.trading_blocked_reason,
+            "trading_blocked_reason": self.cycle_gate.trading_blocked_reason(self.risk.daily_loss_latch(),
+                                                                             self.risk.risk_state_error),
             "startup_reconcile": self.startup_reconciler.result,
             "active_watchlist": self.last_watchlist,
             "quote_watchlist": self.last_quote_watchlist,

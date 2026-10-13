@@ -1779,6 +1779,13 @@ class PositionManager:
         wanted = str(symbol).upper().strip()
         return any(str(owed["symbol"]).upper().strip() == wanted for owed in self._sweeps_owed.values())
 
+    def exit_sweep_symbols(self) -> list[str]:
+        """The symbols whose closed positions still owe their post-close
+        sweep (``_sweep_exit_orders``): exit orders may still work there, so
+        the engine holds the day open for them (``IntradayBot._day_held_open``)
+        and management keeps running the sweep."""
+        return sorted({str(owed["symbol"]).upper().strip() for owed in self._sweeps_owed.values()})
+
     def _sweep_exit_orders(self, key: str, position: Position) -> None:
         """After a full close of a position that had live broker protection,
         cancel the exit orders that may still work on its symbol for its side

@@ -1628,13 +1628,19 @@ class MarketDataStore:
             return True
         return False
 
-    def fetch_history(self, symbol: str, lookback_minutes: int | None = None) -> pd.DataFrame:
+    def fetch_history(self, symbol: str, lookback_minutes: int | None = None, *,
+                      set_depth: bool = True) -> pd.DataFrame:
         """``symbol``'s 1m price_history cut at the clock, merged into its
         history frame. A request that raises is noted for the stream
         backfill's back-off (``_history_fetch_failed``) and raises on to the
         caller; one that answers ends a run of failures
         (``_history_fetch_answered``). Either outcome is the quote
-        blacklist's evidence too (``_note_rest_outcome``)."""
+        blacklist's evidence too (``_note_rest_outcome``).
+
+        ``set_depth`` False merges the bars without raising the depth the
+        symbol's frames retain (``_history_window_rows``, the depth a fresh
+        start would fetch): the day-over idle's fetch at the close is for the
+        report and the archive, and must not deepen later sessions' frames."""
         cache_key = self._symbol_key(symbol)
         lookback = lookback_minutes or self.config.runtime.history_lookback_minutes
         end = sessions.now_et()
@@ -1669,7 +1675,7 @@ class MarketDataStore:
             if self.is_regular_session(fetched_at) and latest_bar_age_seconds >= float(self._stream_stale_after_seconds()):
                 self._log_stream_health(symbol, f"price_history latest 1m bar stale for {latest_bar_age_seconds:.0f}s after repair fetch", level=logging.INFO)
         with self._lock:
-            if not df.empty:
+            if not df.empty and set_depth:
                 self._history_window_rows[cache_key] = max(len(df), self._history_window_rows.get(cache_key, 0))
             keep_rows = self._history_window_rows.get(cache_key)
             self.history[cache_key] = self._retain_window(self._merge_frames(self.history.get(cache_key), df), keep_rows)

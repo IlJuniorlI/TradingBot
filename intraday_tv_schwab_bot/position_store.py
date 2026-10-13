@@ -18,6 +18,10 @@ LOG = logging.getLogger(__name__)
 # for the other stores). The day's row is display and records: a write that
 # fails is retried a minute later, never at the cost of an engine pass.
 DAY_LEDGER_BUSY_SECONDS = 0.25
+# sqlite3.connect's own wait for a lock another connection holds: the other
+# stores' connections keep it, unless a caller passes its own (the risk
+# state's retry read, ``risk.RISK_STATE_RETRY_BUSY_SECONDS``).
+SQLITE_BUSY_SECONDS = 5.0
 
 
 class ReconcileMetadataStore:
@@ -245,17 +249,32 @@ class SessionRiskStateStore:
     path, one lifecycle and one backup. A single row keyed by ET session date;
     a row from an earlier date is ignored, which gives the daily reset for
     free.
+
+    The row also holds the session's daily loss latch (``risk.DailyLossLatch``,
+    2026-10-12): when its realized P&L first left no room for one full
+    trade's risk under ``max_daily_loss``, that P&L, and the limit and the
+    one trade's risk it set under, all NULL until then; and the day's
+    latches a start cleared (``risk.ClearedDailyLossLatch``), a JSON list,
+    NULL while there are none. A file an earlier version created gets the
+    five columns when this store first opens it (``ALTER TABLE``); its rows
+    read as not latched, and the risk manager latches a restored tally that
+    leaves no such room itself.
     """
+
+    # The latch's columns, added to a table an earlier version created.
+    _LATCH_COLUMNS = (("daily_loss_latched_at", "TEXT"), ("daily_loss_latched_pnl", "REAL"),
+                      ("daily_loss_latched_limit", "REAL"), ("daily_loss_latched_trade_risk", "REAL"),
+                      ("daily_loss_cleared_json", "TEXT"))
 
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser()
         self._initialized = False
 
-    def _ensure_ready(self) -> None:
+    def _ensure_ready(self, busy_seconds: float) -> None:
         if self._initialized:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=busy_seconds)
         try:
             conn.execute(
                 """
@@ -264,34 +283,56 @@ class SessionRiskStateStore:
                     realized_pnl REAL NOT NULL,
                     cooldowns_json TEXT NOT NULL,
                     recent_exits_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    daily_loss_latched_at TEXT,
+                    daily_loss_latched_pnl REAL,
+                    daily_loss_latched_limit REAL,
+                    daily_loss_latched_trade_risk REAL,
+                    daily_loss_cleared_json TEXT
                 )
                 """
             )
+            present = {row[1] for row in conn.execute("PRAGMA table_info(session_risk_state)")}
+            for name, kind in self._LATCH_COLUMNS:
+                if name not in present:
+                    conn.execute(f"ALTER TABLE session_risk_state ADD COLUMN {name} {kind}")
             conn.commit()
         finally:
             conn.close()
         self._initialized = True
 
     def save(self, session_date: str, realized_pnl: float,
-             cooldowns: list[dict[str, Any]], recent_exits: list[dict[str, Any]]) -> None:
-        """Upsert today's tallies. Never raises — a persistence failure must
-        not take down a running bot, but it is logged at WARNING because the
-        restart guarantee is gone until it succeeds again."""
+             cooldowns: list[dict[str, Any]], recent_exits: list[dict[str, Any]],
+             daily_loss_latch: dict[str, Any] | None, daily_loss_cleared: list[dict[str, Any]]) -> None:
+        """Upsert today's tallies, its daily loss latch (``{"at": ISO
+        time, "realized_pnl": P&L, "limit": max_daily_loss, "trade_risk": one
+        trade's risk}``, None while not latched) and the latches a start
+        cleared (each a latch's fields and, under ``cleared``, the clear's
+        ``at``, ``limit``, ``trade_risk`` and ``realized_pnl``). Never raises —
+        a persistence failure must not take down a running bot, but it is
+        logged at WARNING because the restart guarantee is gone until it
+        succeeds again."""
         try:
-            self._ensure_ready()
+            self._ensure_ready(SQLITE_BUSY_SECONDS)
             conn = sqlite3.connect(self.path)
             try:
                 conn.execute(
                     """
                     INSERT INTO session_risk_state
-                        (session_date, realized_pnl, cooldowns_json, recent_exits_json, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
+                        (session_date, realized_pnl, cooldowns_json, recent_exits_json, updated_at,
+                         daily_loss_latched_at, daily_loss_latched_pnl, daily_loss_latched_limit,
+                         daily_loss_latched_trade_risk, daily_loss_cleared_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_date) DO UPDATE SET
                         realized_pnl=excluded.realized_pnl,
                         cooldowns_json=excluded.cooldowns_json,
                         recent_exits_json=excluded.recent_exits_json,
-                        updated_at=excluded.updated_at
+                        updated_at=excluded.updated_at,
+                        daily_loss_latched_at=excluded.daily_loss_latched_at,
+                        daily_loss_latched_pnl=excluded.daily_loss_latched_pnl,
+                        daily_loss_latched_limit=excluded.daily_loss_latched_limit,
+                        daily_loss_latched_trade_risk=excluded.daily_loss_latched_trade_risk,
+                        daily_loss_cleared_json=excluded.daily_loss_cleared_json
                     """,
                     (
                         str(session_date),
@@ -299,16 +340,34 @@ class SessionRiskStateStore:
                         json.dumps(json_safe(cooldowns, non_finite="keep"), separators=(",", ":")),
                         json.dumps(json_safe(recent_exits, non_finite="keep"), separators=(",", ":")),
                         datetime.now(timezone.utc).isoformat(),
+                        None if daily_loss_latch is None else str(daily_loss_latch["at"]),
+                        None if daily_loss_latch is None else float(daily_loss_latch["realized_pnl"]),
+                        None if daily_loss_latch is None else float(daily_loss_latch["limit"]),
+                        None if daily_loss_latch is None else float(daily_loss_latch["trade_risk"]),
+                        None if not daily_loss_cleared else json.dumps(
+                            json_safe(daily_loss_cleared, non_finite="keep"), separators=(",", ":")),
                     ),
                 )
                 conn.commit()
             finally:
                 conn.close()
         except Exception as exc:
-            LOG.warning("Could not persist session risk state to %s: %s", self.path, exc)
+            LOG.warning("Could not persist session risk state to %s: %s: %s", self.path, type(exc).__name__, exc)
 
-    def load(self, session_date: str) -> dict[str, Any] | None:
-        """Return the stored tallies for *session_date*, or ``None``.
+    def load(self, session_date: str, *, busy_seconds: float = SQLITE_BUSY_SECONDS) -> dict[str, Any] | None:
+        """Return the stored tallies for *session_date*, or ``None`` when the
+        file or the row is not there. The latch (``daily_loss_latch``) is
+        ``{"at", "realized_pnl", "limit", "trade_risk"}`` as stored, None
+        when the row holds none; ``daily_loss_cleared`` the list of the
+        latches a start cleared, as ``save`` took them (empty when none).
+        ``busy_seconds``: how long the read waits for a lock another
+        connection holds.
+
+        A read that fails raises (a locked or corrupt file, a column it
+        cannot add, a row it cannot parse): the risk manager then blocks new
+        entries until a read succeeds (``RiskManager.risk_state_unread``).
+        Until 2026-10-12 it logged and returned None, which read as a flat
+        day.
 
         A row from any other date is deliberately not returned: the daily
         reset is the absence of a match, so a stale row can never resurrect
@@ -316,28 +375,32 @@ class SessionRiskStateStore:
         """
         if not self.path.exists():
             return None
+        self._ensure_ready(busy_seconds)
+        conn = sqlite3.connect(self.path, timeout=busy_seconds)
         try:
-            self._ensure_ready()
-            conn = sqlite3.connect(self.path)
-            try:
-                conn.row_factory = sqlite3.Row
-                row = conn.execute(
-                    "SELECT * FROM session_risk_state WHERE session_date = ?",
-                    (str(session_date),),
-                ).fetchone()
-            finally:
-                conn.close()
-            if row is None:
-                return None
-            return {
-                "session_date": row["session_date"],
-                "realized_pnl": float(row["realized_pnl"]),
-                "cooldowns": json.loads(row["cooldowns_json"] or "[]"),
-                "recent_exits": json.loads(row["recent_exits_json"] or "[]"),
-            }
-        except Exception as exc:
-            LOG.warning("Could not load session risk state from %s: %s", self.path, exc)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM session_risk_state WHERE session_date = ?",
+                (str(session_date),),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
             return None
+        latched_at = row["daily_loss_latched_at"]
+        cleared = json.loads(row["daily_loss_cleared_json"] or "[]")
+        if not isinstance(cleared, list):
+            raise ValueError(f"daily_loss_cleared_json is not a list: {cleared!r}")
+        return {
+            "session_date": row["session_date"],
+            "realized_pnl": float(row["realized_pnl"]),
+            "cooldowns": json.loads(row["cooldowns_json"] or "[]"),
+            "recent_exits": json.loads(row["recent_exits_json"] or "[]"),
+            "daily_loss_latch": None if latched_at is None else {
+                "at": latched_at, "realized_pnl": row["daily_loss_latched_pnl"],
+                "limit": row["daily_loss_latched_limit"], "trade_risk": row["daily_loss_latched_trade_risk"]},
+            "daily_loss_cleared": cleared,
+        }
 
 
 class DayLedgerStore:

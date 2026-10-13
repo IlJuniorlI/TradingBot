@@ -468,6 +468,12 @@ def _post_stop_continuation(
     ``bars_for`` is a ``symbol -> DataFrame`` callable (the engine passes a
     thin wrapper over the data feed). Passing None disables the section, which
     is what the pure-aggregate tests do.
+
+    A stop whose frame ends before its window does is not evaluated: its
+    window is not all there, and the part that is would read as a stop that
+    was right. Until 2026-10-12 it was scored on the bars there were before
+    the gate idled at 15:55, or at a day-over idle (one or two for a stop
+    just before it).
     """
     stop_exits = [
         t for t in trades
@@ -507,6 +513,8 @@ def _post_stop_continuation(
             continue
         try:
             window_end = trade.exit_time + timedelta(minutes=int(window_minutes))
+            if frame.index.max() < window_end:
+                continue
             after = frame[(frame.index > trade.exit_time) & (frame.index <= window_end)]
             if after.empty:
                 continue
@@ -594,6 +602,9 @@ def _entry_timing(
 
     ``bars_for`` is a ``symbol -> DataFrame`` callable. Passing None disables
     the section, which is what the pure-aggregate tests do.
+
+    A window the frame ends before is not measured, for a trade or a
+    baseline sample alike, as in ``_post_stop_continuation`` (2026-10-12).
     """
     summary: dict[str, Any] = {
         "window_minutes": int(window_minutes),
@@ -623,8 +634,12 @@ def _entry_timing(
         return (ordered[mid - 1] + ordered[mid]) / 2.0
 
     def _retrace_r(frame, at, is_long: bool, entry: float, risk: float) -> float | None:
-        """Deepest move AGAINST *entry* in the window after *at*, in R."""
-        window = frame[(frame.index > at) & (frame.index <= at + timedelta(minutes=int(window_minutes)))]
+        """Deepest move AGAINST *entry* in the window after *at*, in R; None
+        when the frame ends before the window does."""
+        window_end = at + timedelta(minutes=int(window_minutes))
+        if frame.index.max() < window_end:
+            return None
+        window = frame[(frame.index > at) & (frame.index <= window_end)]
         if window.empty:
             return None
         worst = float(window["low"].min()) if is_long else float(window["high"].max())
@@ -867,7 +882,7 @@ def _log_post_stop_continuation(summary: dict[str, Any]) -> None:
     LOG.info("--- Post-stop continuation (%d min window) ---", summary.get("window_minutes", 0))
     evaluated = int(summary.get("evaluated") or 0)
     LOG.info(
-        "  stop exits=%d  evaluated=%d  (unevaluated=%d: no initial risk or no bars)",
+        "  stop exits=%d  evaluated=%d  (unevaluated=%d: no initial risk, or no bars to the window's end)",
         int(summary.get("stop_exits") or 0), evaluated,
         int(summary.get("not_evaluated") or 0),
     )
@@ -979,6 +994,35 @@ def _day_trades(account: PaperAccount, log_dir: str, session_date: date,
     return sorted(trades, key=lambda trade: trade.exit_time), error
 
 
+def _daily_loss_limit_text(daily_loss_limit: dict[str, Any]) -> str:
+    """The SESSION REPORT line's ``daily_loss_limit_reached`` value: ``no``,
+    ``unknown``, or the latest latch's ET time and the realized P&L then
+    (``10:06:43 daily_loss_limit_pnl=-415.87``); ``yes`` for a latch whose
+    time cannot be read, and ``unknown`` for a P&L that cannot. Then, when
+    a start cleared that latch, ``daily_loss_limit_cleared=`` and when
+    (``11:06:41``), and when the day had earlier latches, each one a start
+    cleared, ``daily_loss_limit_earlier=`` and each one's time and its
+    clear's (``10:06:41/11:06:41``, comma-separated)."""
+    reached = daily_loss_limit["reached"]
+    if reached is None:
+        return "unknown"
+    if not reached:
+        return "no"
+    at = daily_loss_limit["at"]
+    pnl = daily_loss_limit["realized_pnl"]
+    when = "yes" if at is None else f"{datetime.fromisoformat(str(at)):%H:%M:%S}"
+    text = f"{when} daily_loss_limit_pnl={'unknown' if pnl is None else f'{float(pnl):.2f}'}"
+    cleared = daily_loss_limit["cleared"]
+    if cleared is not None:
+        text += f" daily_loss_limit_cleared={datetime.fromisoformat(str(cleared['at'])):%H:%M:%S}"
+    if daily_loss_limit["earlier"]:
+        text += " daily_loss_limit_earlier=" + ",".join(
+            f"{datetime.fromisoformat(str(latch['at'])):%H:%M:%S}/"
+            f"{datetime.fromisoformat(str(latch['cleared']['at'])):%H:%M:%S}"
+            for latch in daily_loss_limit["earlier"])
+    return text
+
+
 def write_session_report(
     account: PaperAccount,
     positions: dict[str, Position],
@@ -989,6 +1033,7 @@ def write_session_report(
     log_dir: str,
     structured_logger: Any | None = None,
     skip_counts: dict[str, int] | None = None,
+    daily_loss_limit: dict[str, Any],
     bars_for: Any | None = None,
     post_stop_window_minutes: int = 30,
     entry_timing_window_minutes: int = 15,
@@ -1031,7 +1076,17 @@ def write_session_report(
     (``_target_reached_losses``), on the line, then one line per such
     trade, and in the JSON with each trade (``target_reached_loss_trades``:
     symbol, side, entry, target, best mark, exit reason, P&L); whole across
-    a restart, as the day's trades are.
+    a restart, as the day's trades are. ``daily_loss_limit`` is the day's
+    daily loss latch (``RiskManager.daily_loss_limit_report``: ``limit``,
+    ``trade_risk``, ``reached``, ``at``, ``realized_pnl``, ``cleared``,
+    ``earlier``): whether the day's realized P&L left no room for one full
+    trade's risk under ``-max_daily_loss``, when (ET) and at what P&L its
+    latest latch set, which ended its entries, whether and when a start
+    cleared it, and the day's earlier latches a start cleared; on the line
+    as ``daily_loss_limit_reached=no``, or the time (``yes`` when it cannot
+    be read) and ``daily_loss_limit_pnl``, then ``daily_loss_limit_cleared``
+    and ``daily_loss_limit_earlier`` when there are, or ``unknown``
+    (2026-10-12).
 
     Parameters
     ----------
@@ -1056,6 +1111,8 @@ def write_session_report(
         ``engine.session_skip_counts``, in symbol-minutes (a signal an engine
         gate refused counts under that gate alone). Used to emit the
         filter-rejection summary.
+    daily_loss_limit : dict
+        The day's daily loss latch (``RiskManager.daily_loss_limit_report``).
     """
     session_date_str = session_date.isoformat()
     try:
@@ -1099,13 +1156,15 @@ def write_session_report(
         target_reached_losses = _target_reached_losses(closed)
         LOG.info(
             "SESSION REPORT %s: strategy=%s pnl=%.2f trades=%d wins=%d losses=%d win_rate=%s pf=%s avg_trade=%s "
-            "target_reached_losses=%d max_drawdown=%s run_max_drawdown=%.2f equity_mark_basis=%s%s%s%s%s",
+            "target_reached_losses=%d max_drawdown=%s run_max_drawdown=%.2f equity_mark_basis=%s "
+            "daily_loss_limit_reached=%s%s%s%s%s",
             session_date_str, strategy, total_pnl, len(closed), wins, losses,
             f"{win_rate:.1%}" if win_rate is not None else "n/a",
             f"{profit_factor:.2f}" if profit_factor is not None else "n/a",
             f"${avg_trade:.2f}" if avg_trade is not None else "n/a",
             len(target_reached_losses),
             f"{max_dd:.2f}" if max_dd is not None else "n/a", run_max_dd, EQUITY_MARK_BASIS,
+            _daily_loss_limit_text(daily_loss_limit),
             f" day_since={day['since']}" if day is not None and day["late_start"] else "",
             "" if day is None or not day["gaps"] else
             " day_gaps=" + ",".join(f"{gap['from']}/{gap['to']}" for gap in day["gaps"]),
@@ -1175,6 +1234,7 @@ def write_session_report(
             "day_ledger_trades": ledger_trades,
             "trades_source_error": trades_source_error,
             "equity_mark_basis": EQUITY_MARK_BASIS,
+            "daily_loss_limit": dict(daily_loss_limit),
             "target_reached_losses": len(target_reached_losses),
             "target_reached_loss_trades": target_reached_losses,
             "per_regime": per_regime,
