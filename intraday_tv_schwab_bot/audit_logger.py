@@ -130,6 +130,11 @@ def structured_metadata_snapshot(meta: Mapping[str, Any] | None) -> dict[str, An
         return {}
     include_keys = {
         'benchmark', 'zscore', 'side_preference', 'runner_target_applied', 'qualifying_target_count',
+        # peer_confirmed_key_levels' trigger gate: ltf_score_required is
+        # min_ltf_score, the requirement on ltf_base_score (the 4-part base
+        # trigger, the gate's input since 2026-10-13), not on its ltf_score
+        # (the base plus the ranking bonus).
+        'ltf_base_score',
         'ltf_score_required', 'min_peer_score_required', 'strong_setup_ltf_score_required', 'strong_setup_peer_score_required',
         'or_high', 'or_low', 'pullback_high', 'pullback_low', 'trigger_high', 'trigger_low',
         'support_low', 'resistance_high', 'extension_from_vwap_pct', 'peer_details', 'macro_details',

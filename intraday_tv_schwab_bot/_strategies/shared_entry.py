@@ -111,7 +111,105 @@ DIVERGENCE_INELIGIBLE_REASONS: frozenset[str] = frozenset({
     "event_blackout", "earnings_blackout",
     "shorts_disabled",
     "relative_strength_lagging_sector", "relative_strength_leading_sector",
+    # key_levels (2026-10-13): a setup it already signalled on the trigger
+    # bucket it judges once (its entry pass judges each completed LTF bucket
+    # once and repeats that verdict until the next completes), a bucket
+    # first seen too late to judge, a bucket whose 1m backfill is still
+    # owed, and a candidate whose judgement raised. The peer_confirmed
+    # family records every side past its entry cutoff as
+    # ``after_entry_cutoff`` (above); one side past is skipped through
+    # ``closed_entry_sides``.
+    "ltf_bucket_signalled", "ltf_bucket_missed", "ltf_bucket_backfill_pending", "entry_pass_error",
 })
+
+
+# ---------------------------------------------------------------------------
+# The entry spread guard (the entry stage's hook,
+# ``BaseStrategy.entry_spread_refusal``)
+# ---------------------------------------------------------------------------
+
+# The guard's knobs, in the order ``entry_spread_limits`` returns them: the
+# largest spread an entry may be quoted at, as a multiple of its risk
+# |limit - stop| and of its target distance |target - limit|. 0 turns a test
+# off. A strategy that declares both in its manifest answers its
+# ``entry_spread_refusal`` with ``entry_spread_guard``: the peer_confirmed
+# family since 2026-10-13. top_tier_adaptive (and small_cap_squeeze, which
+# runs its engine) keeps its own copy of these two functions until the cut
+# that moves it onto them.
+ENTRY_SPREAD_KNOBS = ("max_entry_spread_r", "max_entry_spread_target_frac")
+
+
+def entry_spread_limits(params: Mapping[str, Any], strategy_name: str) -> tuple[float, float]:
+    """The entry spread guard's limits in ``params``, ``(max_entry_spread_r,
+    max_entry_spread_target_frac)``: each a finite number >= 0, else a
+    ValueError naming the key (a NaN, an infinity, a negative, a bool, a
+    quoted number or a null), and a ValueError for a knob the params do not
+    carry. A strategy runs it at load (``normalize_params``) and again when
+    it is built; its manifest declares both knobs, so a loaded config always
+    carries them."""
+    limits: list[float] = []
+    for key in ENTRY_SPREAD_KNOBS:
+        if key not in params:
+            raise ValueError(f"strategies.{strategy_name}.params.{key} is missing: the strategy's manifest declares "
+                             f"it (0 turns the test off)")
+        value = params[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"strategies.{strategy_name}.params.{key} must be a finite number >= 0 "
+                f"(a multiple of the entry's distance from its limit; 0 turns the test off), got {value!r}"
+            )
+        limits.append(float(value))
+    return limits[0], limits[1]
+
+
+def entry_spread_guard(bid: Any, ask: Any, limit_price: float, stop_price: float, target_price: float | None,
+                       *, max_spread_r: float, max_spread_target_frac: float) -> str | None:
+    """Why the entry spread guard refuses an entry priced at the marketable
+    limit ``limit_price`` on the quote ``bid`` / ``ask``, or None:
+
+    - ``entry_spread_too_wide(...)``: the spread ``ask - bid`` is at least
+      ``max_spread_r`` x the risk ``|limit - stop|``, or at least
+      ``max_spread_target_frac`` x the target distance ``|target - limit|``.
+      The detail carries the spread, both distances, both ratios and both
+      limits (``off`` for a test at 0); a target-less runner's target terms
+      read ``na``, and only the risk test applies to it.
+    - ``entry_spread_unreadable(bid=...,ask=...)``: a test applies, but the
+      quote has no positive, finite bid or ask, or is crossed (ask below
+      bid). The guard fails closed.
+
+    No test applies, and the quote is not read, with both limits 0, or with
+    only the target test on and no target. Each ratio is rounded to 6
+    decimals before it is compared, so float noise in ``ask - bid``
+    (100.33 - 100.00 = 0.3299999999999983) cannot carry a quote that sits at
+    a limit to the side below it. The entry stage checks the levels before
+    it asks the guard (``EntryGatekeeper._entry_levels_valid``); a risk or a
+    target distance of 0 raises ValueError."""
+    target_test = max_spread_target_frac > 0 and target_price is not None
+    if max_spread_r <= 0 and not target_test:
+        return None
+    bid_price = safe_float(bid, None, finite=True)
+    ask_price = safe_float(ask, None, finite=True)
+    if bid_price is None or ask_price is None or bid_price <= 0 or ask_price < bid_price:
+        return f"entry_spread_unreadable({detail_fields(bid=bid_price, ask=ask_price)})"
+    spread = ask_price - bid_price
+    risk = abs(float(limit_price) - float(stop_price))
+    target_distance = None if target_price is None else abs(float(target_price) - float(limit_price))
+    if risk <= 0 or target_distance == 0:
+        raise ValueError(f"entry spread guard on unchecked levels: limit={limit_price!r} stop={stop_price!r} "
+                         f"target={target_price!r}")
+    spread_r = round(spread / risk, 6)
+    spread_target = None if target_distance is None else round(spread / target_distance, 6)
+    too_wide_r = max_spread_r > 0 and spread_r >= max_spread_r
+    too_wide_target = (max_spread_target_frac > 0 and spread_target is not None
+                       and spread_target >= max_spread_target_frac)
+    if not (too_wide_r or too_wide_target):
+        return None
+    detail = detail_fields(
+        spread=spread, risk=risk, spread_r=spread_r, max_spread_r=max_spread_r if max_spread_r > 0 else "off",
+        target_distance=target_distance, spread_target=spread_target,
+        max_spread_target=max_spread_target_frac if max_spread_target_frac > 0 else "off",
+    )
+    return f"entry_spread_too_wide({detail})"
 
 
 def _disabled_fvg_score() -> dict[str, Any]:
@@ -969,14 +1067,18 @@ class SharedEntryPolicy:
         symbol, outside its window, a blackout, not enough data, every side
         it trades switched off...). A side is skipped
         when the candidate's directional bias or ``risk.allow_short`` blocks
-        it, and the better-scoring remaining side is proposed. Refusals are
-        added to the symbol's recorded decision as
-        ``divergence_entry_blockers``.
+        it, or when the strategy opens no position on it now
+        (``closed_entry_sides``: the peer_confirmed family's sides past
+        their entry cutoff, ``entry_cutoff_lead_minutes`` before their
+        force-flatten cutoff, since 2026-10-13), and the
+        better-scoring remaining side is proposed. Refusals are added to the
+        symbol's recorded decision as ``divergence_entry_blockers``.
         """
         if not self.config.shared_entry.use_divergence_entry_signal or not self._divergence_entry_capable:
             return []
         signalled = {signal.symbol for signal in primaries}
         allow_short = bool(self.config.risk.allow_short)
+        closed = self.strategy.closed_entry_sides(sessions.now_et())
         out: list[Signal] = []
         for candidate in candidates:
             symbol = candidate.symbol
@@ -988,6 +1090,7 @@ class SharedEntryPolicy:
             takeable = [
                 found for side, found in self._divergence_candidates(symbol, frame, data).items()
                 if found is not None
+                and side not in closed
                 and (side == Side.LONG or allow_short)
                 and (candidate.directional_bias is None or candidate.directional_bias == side)
             ]

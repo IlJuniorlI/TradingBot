@@ -1570,6 +1570,23 @@ class MarketDataStore:
             "last_stream_bar_age_seconds": age_seconds,
         }
 
+    def pending_stream_backfill(self, symbol: str) -> pd.Timestamp | None:
+        """The CHART_EQUITY bar ``symbol``'s owed first-bar backfill reaches
+        up to, or None when none is owed: its price_history was cut before
+        its first stream bar since the stream (re)started, the symbol was
+        (re)subscribed, or a reconnect missed bars
+        (``_stream_first_bar_time``), so the bars before that one are not
+        all in its 1m frame yet. ``should_backfill_stream_symbol`` fetches
+        them once the fetch is due. Read only: peer_confirmed_key_levels'
+        entry pass judges no trigger bucket while one is owed (2026-10-13)."""
+        key = self._symbol_key(symbol)
+        with self._lock:
+            first_bar = self._stream_first_bar_time.get(key)
+            last_history = self.last_history_refresh.get(key)
+        if first_bar is None or (last_history is not None and pd.Timestamp(last_history) >= first_bar):
+            return None
+        return first_bar
+
     def should_backfill_stream_symbol(self, symbol: str) -> bool:
         """Return True when a streamable symbol needs a history repair/backfill."""
         if not is_streamable_equity(symbol):
@@ -1609,9 +1626,8 @@ class MarketDataStore:
         # (fetch_history stamps ``end``) then passes this check for good
         # (2026-09-23). A reconnect that missed bars re-arms it with its
         # first bar after the reconnect (_merge_chart_equity, 2026-10-06).
-        first_bar = self._stream_first_bar_time.get(cache_key)
-        last_history = self.last_history_refresh.get(cache_key)
-        if first_bar is not None and history_due and (last_history is None or pd.Timestamp(last_history) < first_bar):
+        first_bar = self.pending_stream_backfill(symbol)
+        if first_bar is not None and history_due:
             self._log_stream_health(symbol, f"price_history predates the first CHART_EQUITY bar {first_bar:%H:%M}; backfilling the gap", level=logging.INFO)
             return True
 

@@ -53,7 +53,7 @@ This is the key balance of the strategy: **aggressive enough to join continuatio
 
 ### 5. Shared vetoes still matter
 
-Even with a good trend and a good pullback, the trade can still be blocked by its own anti-chase / extension, score and peer rules — and, since 2026-09-24, by the shared entry stage (`shared_entry.SharedEntryPolicy`) every strategy's setup goes through. It refuses on the strategy's own blockers and on every `shared_entry` veto the YAML switches on in one pass — structure (`use_structure_filter`), S/R (`use_sr_filter`, which replaced this strategy's `use_sr_veto` param), chart, candle, dual divergence, broken level — and records every blocker under the side's key with the gate snapshots and the near-miss payload. The vetoes and the structure / technical / chart / candle contexts read the 5m trigger frame; S/R is built on the 1m frame. So the refinement's stop floor (`shared_entry.min_stop_atr_mult`) is in 5m ATR, while the broken-level guard's `broken_level_min_clearance_atr` and the divergence entry candidates read the 1m S/R frame, the frame top_tier's thresholds were set on (a 1m ATR is roughly half a 5m one).
+Even with a good trend and a good pullback, the trade can still be blocked by its own anti-chase / extension, score and peer rules — and, since 2026-09-24, by the shared entry stage (`shared_entry.SharedEntryPolicy`) every strategy's setup goes through. It refuses on the strategy's own blockers and on every `shared_entry` veto the YAML switches on in one pass — structure (`use_structure_filter`), S/R (`use_sr_filter`, which replaced this strategy's `use_sr_veto` param), chart, candle, dual divergence, broken level — and records every blocker under the side's key with the gate snapshots and the near-miss payload. The vetoes and the structure / technical / chart / candle contexts read the 5m trigger frame; S/R is built on the 1m frame. So the refinement's stop floor (`shared_entry.min_stop_atr_mult`) is in 5m ATR, while the broken-level guard's `broken_level_min_clearance_atr` and the divergence entry candidates read the 1m S/R frame, the frame top_tier's thresholds were set on (a 1m ATR is about 0.4 of a 5m one on the family's large caps: 2.56x in RTH, measured 2026-10-13).
 
 So the strategy is continuation-first, but still disciplined about not entering at the worst possible location.
 
@@ -106,8 +106,10 @@ Strategy-specific knobs:
   - past `max_extension_from_*_atr` the score pays `extension_penalty_per_atr` per ATR; past that times `extension_hard_cap_mult` the side is refused as `too_extended_hard_cap_vwap_atr` / `too_extended_hard_cap_ema9_atr` (before 2026-09-26 it reused the base exhaustion filter's `too_extended_from_*_atr`, which `max_entry_*_extension_atr` still drives)
   - both read the close's absolute distance from VWAP / EMA9 in ATR, so a close that far on the wrong side of the line (a LONG below it, a SHORT above) pays the same penalty and is refused too, as `wrong_side_hard_cap_vwap_atr` / `wrong_side_hard_cap_ema9_atr` (before 2026-09-26 under the `too_extended_hard_cap_*` tokens); the base exhaustion filter measures only the side's own direction
 - Peer and macro confirmation:
-  - `min_peer_agreement`, `min_peer_score`
-  - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`
+  - `min_peer_agreement`, `min_peer_score`, `peer_max_age_minutes`
+  - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`, `macro_max_age_minutes`
+- The order and the exits (the family's, below):
+  - `max_entry_spread_r`, `max_entry_spread_target_frac`, `protective_exits_on_executable_side`, `force_flatten`, `entry_cutoff_lead_minutes`
 - R:R and adaptive management:
   - `min_rr`, `target_rr`, `stop_buffer_atr_mult`
   - `strong_setup_runner_enabled`, `adaptive_breakeven_rr`, `adaptive_profit_lock_rr`, `adaptive_profit_lock_stop_rr`, `adaptive_runner_trigger_rr`
@@ -120,6 +122,15 @@ Also uses these shared stock groups:
 - force-flatten
 - stock FVG confluence
 - adaptive stock trade management
+
+**The family's engine (2026-10-13).** This strategy subclasses `peer_confirmed_key_levels` and runs its peer and macro votes, its entry spread guard, its protective exits and its knob checks (base README, sections 5-7):
+
+- a peer whose newest 1m bar started more than `peer_max_age_minutes` (3) ago, or a macro symbol more than `macro_max_age_minutes` (20) ago, is `stale` in `peer_details` / `macro_details` (one with no frame `missing`): it never agrees, and a peer counts against the side in its directional score, the worst case (2026-10-13; while stale peers only abstained, a stale peer that would have opposed the trade raised the score). So stale or missing data can only count against an entry here: fewer agreeing peers (`weak_peer_agreement`), a lower score (no peer bonus, `weak_peer_score`) or no macro alignment (the macro miss). Unlike key_levels it refuses no side on too few fresh votes (no `peers_stale` / `macro_stale`);
+- the entry spread guard (`max_entry_spread_r` / `max_entry_spread_target_frac`, manifest `0`, off; the shipped preset `0.33` / `0.5`) skips an entry whose quote's spread is too wide against its risk or target distance, or cannot be read;
+- `protective_exits_on_executable_side` (manifest `false`, the preset `true`) judges a stop at or past the entry and the peak giveback floors on the bid / ask instead of the mark;
+- the family's knobs are checked at load and at the build (the HTF map, the trigger frame, peers, macro, the ages, the spread guard, the protective exits, `force_flatten`, `force_flatten_buffer_minutes` and `entry_cutoff_lead_minutes`, with the bounds against the windows and the macro poll at the build, the shared management, ladder and FVG knobs, among them the base strategy's own reads: `adaptive_breakeven_offset_r`, the partial breakeven and the runner's target and trail, `ladder_min_target_rr` / `ladder_zone_atr_mult` / `ladder_max_rungs`, each declared in the manifest at what the base read without it); this strategy's own knobs are not checked yet.
+
+The shipped preset flattens both sides from 15:53 ET (the management window's 15:58 end less `force_flatten_buffer_minutes`, 5; 12:55 on an early-close day) since 2026-10-13, the flatten retrying in the post-market to 20:00; until then it held both sides overnight. Its entry pass opens no side within `entry_cutoff_lead_minutes` (10) of that cutoff, the check key_levels' makes (`after_entry_cutoff(cutoff=15:43,flatten=15:53)` for the symbol when every side it trades is past it, `<side>.after_entry_cutoff(…)` after a refused side's blockers otherwise): from 15:43, after its 15:40 entry window ends, and from 12:45 on an early-close day, before its 12:55 afternoon window opens. A divergence-only entry skips such a side too. A position still open at 20:00 is carried overnight and flattened at the next session's first management pass, with a WARNING naming it, as key_levels' (base README, section 7); the preset's `startup_reconcile_mode: ignore` does not restore one across a restart. Unlike key_levels, its trigger still reads the forming 5m bucket.
 
 Current package defaults:
 
@@ -146,6 +157,11 @@ Current package defaults:
 | `dollar_symbol`                   | `NYICDX`                                  |
 | `bond_symbol`                     | `TLT`                                     |
 | `volatility_symbol`               | `VIX`                                     |
+| `peer_max_age_minutes`            | `3`                                       |
+| `macro_max_age_minutes`           | `20`                                      |
+| `max_entry_spread_r`              | `0.0` (off; the preset `0.33`)            |
+| `max_entry_spread_target_frac`    | `0.0` (off; the preset `0.5`)             |
+| `protective_exits_on_executable_side` | `false` (the preset `true`)          |
 | `min_total_score`                 | `5.5`                                     |
 | `min_ltf_score`               | `2.5`                                     |
 | `min_adx14`                       | `13.5`                                    |
@@ -177,8 +193,14 @@ Current package defaults:
 | `extension_penalty_per_atr`       | `0.72`                                    |
 | `extension_hard_cap_mult`         | `1.45`                                    |
 | `force_flatten`                   | `{'long': True, 'short': True}`           |
+| `force_flatten_buffer_minutes`    | `5`                                       |
+| `entry_cutoff_lead_minutes`       | `10`                                      |
+| `adaptive_breakeven_offset_r`     | `0.05`                                    |
+| `adaptive_partial_breakeven_rr` / `_offset_r` | `null` (off) / `0.0`          |
+| `adaptive_runner_target_rr` / `adaptive_runner_trail_pct` | `null` / `null` (derived) |
+| `ladder_min_target_rr` / `ladder_zone_atr_mult` / `ladder_max_rungs` | `1.2` / `0.5` / `4` (a divergence-only entry's ladder) |
 
-`force_flatten` is the default end-of-window flatten policy — both directions auto-flatten when the management window closes.
+`force_flatten` is the default end-of-window flatten policy — both directions auto-flatten at the management window's end less `force_flatten_buffer_minutes` (5), and no side opens within `entry_cutoff_lead_minutes` (10) of that cutoff; the shipped preset keeps both on since 2026-10-13 (it flattened neither before).
 
 ## Files in this folder
 

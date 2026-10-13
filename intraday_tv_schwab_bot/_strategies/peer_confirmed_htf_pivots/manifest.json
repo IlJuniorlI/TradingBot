@@ -64,11 +64,13 @@
     "min_total_score": 5,
     "min_peer_agreement": 2,
     "min_peer_score": 2,
+    "peer_max_age_minutes": 3,
     "enable_macro_confirmation": true,
     "require_macro_agreement_count": 1,
     "dollar_symbol": "NYICDX",
     "bond_symbol": "TLT",
     "volatility_symbol": "VIX",
+    "macro_max_age_minutes": 20,
     "pivot_zone_atr_mult": 0.24,
     "pivot_zone_pct": 0.0018,
     "pivot_battleground_max_distance_atr": 1.1,
@@ -104,6 +106,14 @@
     "adaptive_profit_lock_rr": 1.18,
     "adaptive_profit_lock_stop_rr": 0.32,
     "adaptive_runner_trigger_rr": 1.1,
+    "adaptive_breakeven_offset_r": 0.02,
+    "adaptive_partial_breakeven_rr": null,
+    "adaptive_partial_breakeven_offset_r": 0.0,
+    "adaptive_runner_target_rr": null,
+    "adaptive_runner_trail_pct": null,
+    "ladder_min_target_rr": 1.2,
+    "ladder_zone_atr_mult": 0.5,
+    "ladder_max_rungs": 4,
     "htf_fvg_entry_weight": 0.28,
     "ltf_fvg_entry_weight": 0.14,
     "pivot_reclaim_family_bonus": 0.25,
@@ -124,10 +134,15 @@
     "activity_score_weight": 0.1,
     "macro_bonus": 0.75,
     "macro_miss_penalty": 0.28,
+    "max_entry_spread_r": 0.0,
+    "max_entry_spread_target_frac": 0.0,
+    "protective_exits_on_executable_side": false,
     "force_flatten": {
       "long": true,
       "short": true
-    }
+    },
+    "force_flatten_buffer_minutes": 5,
+    "entry_cutoff_lead_minutes": 10
   },
   "capabilities": {
     "dashboard": {

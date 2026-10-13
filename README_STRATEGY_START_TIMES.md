@@ -9,7 +9,7 @@ Times are **America/New_York (ET)**, the bot's only clock.
 - Start the bot **5-15 minutes before the earliest screener or entry window you care about**.
 - You do **not** need to launch the bot hours early just to seed indicators. The bot backfills history on startup.
 - If you only care about a later window, it is usually fine to start later.
-- For stock strategies, `params.force_flatten.long` / `params.force_flatten.short` control whether long and short positions are flattened at the end of the final management window.
+- For stock strategies, `params.force_flatten.long` / `params.force_flatten.short` control whether long and short positions are flattened at the force-flatten cutoff: the end of the final management window less `force_flatten_buffer_minutes` (default 5), or, on an early-close day, the early close less the same buffer when that is sooner. The `peer_confirmed_*` strategies also open no side within `entry_cutoff_lead_minutes` (10) of that cutoff, and flatten a position carried past a session at the next session's first management pass (2026-10-13).
 - For option strategies, flattening is controlled by `options.force_flatten_time`.
 
 ## At-a-glance schedule table

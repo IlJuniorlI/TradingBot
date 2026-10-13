@@ -1287,7 +1287,7 @@ Behavior:
 
 - Every weight and threshold is read directly and None-aware: a configured `0` is `0`, and only `null` falls back where a fallback exists. Until 2026-09-24 the score weights were read as `float(x or default)`, so a `0` meant the default. `small_cap_squeeze`'s three zeroed extension penalties (`technical_levels.atr_stretch_penalty`, `bollinger_entry_penalty_outer_band`, `entry_penalty_near_extension`) were therefore inert and still docked up to 0.75 from a stretched entry. They take effect now.
 - `use_fvg_context` (score term, retest) controls three things. The first is the FVG score term `fvg_entry_adjustment`, weighted by the strategy's `htf_fvg_entry_weight` / `ltf_fvg_entry_weight` / `opposing_fvg_entry_penalty_mult` params. The second is the FVG retest plan of the retest admission. The third is the FVG continuation / reversal bias the strategies read for their runner and management. The bias is 0 when the knob is off, so off also means no FVG-driven runner. zero_dte's regime FVG scores read it through `SharedEntryPolicy.fvg_regime_scores`.
-- `use_structure_filter` (veto) refuses an entry against the LTF market structure on the gate frame: a fresh opposing CHoCH, or an opposing bias without a fresh same-side BoS (`market_structure_bearish(...)` / `market_structure_bullish(...)`). It only runs while `support_resistance.structure_enabled` is on. top_tier and small_cap_squeeze read it on the 1m frame resampled to `structure_ltf_timeframe_minutes` (5 in their presets), and the peer strategies on their 5m LTF. Both 5m frames end in the still-forming bucket, which since 2026-09-25 confirms no swing pivot (a pivot confirmed by the first minutes of a bucket could be gone at its close); its close and any BoS / CHoCH break on it still count at once. The same-side-BoS escape can only apply on an inverted reference pair (reference low above reference high, which a gap leaves) with the close through both references: the bias is the later of the two breaks, and the earlier one can still be fresh. Until 2026-09-25 the resolver tested the high side first, so every such close read bullish, a gap up that broke its first swing low included, and only a SHORT could use the escape. On the archive the case is rare: 21 of 67,891 5m bars, none at a top_tier entry. Since 2026-09-25 (a user decision) both the top_tier and small_cap_squeeze manifests exempt their `range`, `pullback` and `sr_scalp` regimes from the veto. Those regimes enter against the short-term swing by design, and the 5m bias the veto reads is mostly a location reading: the resolver checks the midpoint of the last swing before the swing labels, so an HH / HL uptrend that pulls back into the lower half of its last swing reads bearish. Over 162 archived top_tier entries the veto had blocked 20, averaging +0.41R against -0.14R for the entries it kept. With the exemption it blocks 7 of them; about +2.1R of what it releases is not also refused by the S/R or chart veto. `trend`, `momentum`, `vol_squeeze` and `vwap_reclaim` keep it.
+- `use_structure_filter` (veto) refuses an entry against the LTF market structure on the gate frame: a fresh opposing CHoCH, or an opposing bias without a fresh same-side BoS (`market_structure_bearish(...)` / `market_structure_bullish(...)`). It only runs while `support_resistance.structure_enabled` is on. top_tier and small_cap_squeeze read it on the 1m frame resampled to `structure_ltf_timeframe_minutes` (5 in their presets), and the peer strategies on their 5m LTF. top_tier's, small_cap_squeeze's, htf_pivots' and trend_continuation's 5m frames end in the still-forming bucket, which since 2026-09-25 confirms no swing pivot (a pivot confirmed by the first minutes of a bucket could be gone at its close); its close and any BoS / CHoCH break on it still count at once. peer_confirmed_key_levels' gate frame ends at its last completed bucket since 2026-10-13, the bucket its entry pass judges once (its 1m variant's frame of 1m bars always was complete). The same-side-BoS escape can only apply on an inverted reference pair (reference low above reference high, which a gap leaves) with the close through both references: the bias is the later of the two breaks, and the earlier one can still be fresh. Until 2026-09-25 the resolver tested the high side first, so every such close read bullish, a gap up that broke its first swing low included, and only a SHORT could use the escape. On the archive the case is rare: 21 of 67,891 5m bars, none at a top_tier entry. Since 2026-09-25 (a user decision) both the top_tier and small_cap_squeeze manifests exempt their `range`, `pullback` and `sr_scalp` regimes from the veto. Those regimes enter against the short-term swing by design, and the 5m bias the veto reads is mostly a location reading: the resolver checks the midpoint of the last swing before the swing labels, so an HH / HL uptrend that pulls back into the lower half of its last swing reads bearish. Over 162 archived top_tier entries the veto had blocked 20, averaging +0.41R against -0.14R for the entries it kept. With the exemption it blocks 7 of them; about +2.1R of what it releases is not also refused by the S/R or chart veto. `trend`, `momentum`, `vol_squeeze` and `vwap_reclaim` keep it.
 - `use_sr_filter` (veto) refuses an entry that crowds the HTF level ahead of it: inside `support_resistance.entry_min_clearance_pct` OR `entry_min_clearance_atr` of the resistance over a LONG or the support under a SHORT. A pending, unconfirmed-broken level counts as the nearest one and is always too close. Otherwise the level is the nearest one playing the role (`support_resistance.role_level`, since 2026-10-07): a lost support (`broken_support`) between price and `nearest_resistance` is the resistance over a LONG, a reclaimed resistance (`broken_resistance`) between `nearest_support` and price the support under a SHORT; a refusal measured to such a flip ends with it (`too_close_to_htf_resistance(...,broken_support=485.4198)`). It also refuses an entry through a broken level when no level stands on its own side. The tokens are `too_close_to_htf_resistance(...)`, `too_close_to_htf_support(...)`, `htf_breakdown_below_support(...)` and `htf_breakout_above_resistance(...)`. It only runs while `support_resistance.enabled` is on. It replaced `use_sr_veto` (htf_pivots, trend_continuation) and zero_dte_etf_long_options' `orb_apply_sr_veto`. `peer_confirmed_key_levels` keeps its own AND peer-target clearance as the strategy param `require_peer_target_clearance`. Since 2026-09-25 (a user decision) top_tier's manifest exempts its `vwap_reclaim` regime from this veto, and small_cap_squeeze's does not. vwap_reclaim enters on the bar that closes back across VWAP, which on a large cap sits right next to an HTF level: the veto refused 15 of top_tier's 16 vwap_reclaim entries on 09-21..09-24 (11 winners, 4 losers, +6.74R), and the live bot, which never ran this veto state, traded all 16 for +6.94R. In small_cap_squeeze it refused only losers (3 vwap_reclaim entries in June, -2.45R). The S/R stop / target refinement and the ladder still read the levels for vwap_reclaim.
 - `use_broken_level_guard` (veto, off in every preset) refuses an entry within `broken_level_min_clearance_pct` (times the proposal's volatility scale; top_tier passes its own) OR `broken_level_min_clearance_atr` ATR (the S/R frame's) of a confirmed BROKEN level beyond it: `long_near_broken_support(...)` / `short_near_broken_resistance(...)`. It moved out of top_tier's `reject_entry_near_broken_level` on 2026-09-24. It existed to keep an entry clear of the S/R-loss exit's trigger, and that exit ships off. Over 09-17..09-23 it blocked about 3.5 setups per session. Across all 139 archived episodes (04-24..09-23), on a +2R / -1R bracket, the blocked setups made -0.09R against -0.04R for top_tier fills (difference CI [-0.37, +0.30]); the 57 it alone blocked made +0.18R. 110 of 138 closed back through the level within 30 minutes. The top_tier and small_cap_squeeze presets carry their old thresholds (0.0035 / 0.90 and 0.0025 / 0.72) in case it is switched on.
 - `use_opposing_chart_filter` (veto) refuses an entry against an opposing chart pattern (`chart_pattern_opposed`). It now also meets retest-admitted entries; it used to run only while no other reason was pending.
@@ -1304,7 +1304,7 @@ Behavior:
   - **The candidate.** Once per symbol per cycle the stage reads a divergence candidate for each side on the proposal's S/R frame (the canonical frame for a divergence-only entry). It is the first of the regular, then the hidden, RSI then OBV divergence whose age is inside [`divergence_entry_min_age_bars`, `technical_levels.divergence_max_age_bars`] and whose latest pivot is in the reader's current session; yesterday's pivots are refused, not rescaled across the gap. A hidden one also needs the HTF EMAs aligned. With `divergence_entry_require_sr_confluence`, the pivot must sit within the S/R level buffer of a level on its side.
   - **Score, stop and target.** Score = indicator strength (the delta over twice the indicator's minimum delta, capped at 1) + recency (1 - age / max age) + 0.5 regular / 0.3 hidden + 0.5 confluence; it must reach `divergence_entry_score_floor`. The stop is the pivot minus (plus) `support_resistance.stop_buffer_atr_mult` ATR. The target is `min_target_rr` x risk, capped at the opposing S/R level; a capped target must still clear `min_target_rr`, so a wall inside that room refuses the candidate. With `min_target_rr` off the target is the opposing level, or none (a runner).
   - **Confirmation.** Every strategy proposal is checked against the candidates. One on the proposal's own side adds `divergence_entry_score_bump` to its shared score (`divergence_entry_confirmed`). One only on the other side is stamped as a conflict (`divergence_entry_conflict`) and changes nothing.
-  - **Divergence-only entries.** After `entry_signals`, a symbol the strategy produced no signal for may enter on its better takeable side, as far as the candidate's directional bias and `risk.allow_short` allow. It enters as a proposal of style `divergence_regular` (family `reversal`) or `divergence_hidden` (`continuation`), so every veto, the refinement, the score floor, the ladder and the adaptive management apply, and it always ranks behind every strategy signal. A symbol that is held, that the strategy signalled, or that the strategy skipped before evaluating a setup is never entered this way. The last group is `shared_entry.DIVERGENCE_INELIGIBLE_REASONS`: not its symbol, outside its window, not enough data, a macro or earnings blackout, every side it trades switched off, plus any `insufficient_*` token. A refusal is added to the symbol's decision as `divergence_entry_blockers`. `pairs_residual` and both 0DTE strategies opt out in their manifests.
+  - **Divergence-only entries.** After `entry_signals`, a symbol the strategy produced no signal for may enter on its better takeable side, as far as the candidate's directional bias, `risk.allow_short` and the strategy's closed sides allow (`closed_entry_sides`: the `peer_confirmed_*` family names the sides past their entry cutoff, `entry_cutoff_lead_minutes` before their force-flatten cutoff, since 2026-10-13). It enters as a proposal of style `divergence_regular` (family `reversal`) or `divergence_hidden` (`continuation`), so every veto, the refinement, the score floor, the ladder and the adaptive management apply, and it always ranks behind every strategy signal. A symbol that is held, that the strategy signalled, or that the strategy skipped before evaluating a setup is never entered this way. The last group is `shared_entry.DIVERGENCE_INELIGIBLE_REASONS`: not its symbol, outside its window or past its entry cutoff (`after_entry_cutoff`), not enough data, a macro or earnings blackout, every side it trades switched off, and, for `peer_confirmed_key_levels` (2026-10-13), a trigger bucket whose setup already signalled (`ltf_bucket_signalled`), one first seen too late to judge (`ltf_bucket_missed`), one whose 1m backfill is still owed (`ltf_bucket_backfill_pending`) and a candidate whose judgement raised (`entry_pass_error`), plus any `insufficient_*` token. A refusal is added to the symbol's decision as `divergence_entry_blockers`. `pairs_residual` and both 0DTE strategies opt out in their manifests.
   - Until 2026-09-24 no strategy called the old helper, so the knob did nothing. The helper also read its stop buffer from a key that did not exist, divided recency by 8 whatever the max age, never read OBV, and kept only the better-scoring side, so a SHORT the strategy could not take hid a valid LONG.
 
 **Ranking.** The gatekeeper sorts signals, descending, with `SharedEntryPolicy.rank_key`, built from the strategy manifest's `capabilities.signal_priority`:
@@ -1631,8 +1631,9 @@ These groups are reused across several stock strategies.
 - `force_flatten.long`
 - `force_flatten.short`
 - Valid values: `true` or `false` for each side
-- When a side is `true`, the bot auto-flattens open stock positions on that side at the end of the final `management_windows` block for that strategy.
+- When a side is `true`, the bot auto-flattens open stock positions on that side at the force-flatten cutoff: the end of the final `management_windows` block for that strategy less `force_flatten_buffer_minutes` (default `5`), or, on an early-close day, the early close less the same buffer when that is sooner.
 - When a side is `false`, that side may hold overnight.
+- The `peer_confirmed_*` family declares `force_flatten_buffer_minutes` and `entry_cutoff_lead_minutes` in its manifests and checks them (whole numbers >= 0, together shorter than the last management window). Neither its entry passes nor a divergence-only entry open a side within `entry_cutoff_lead_minutes` (10) of its cutoff, and a position still open past its session (its flatten unfilled before the post-market closed, an outage, a restart across the cutoff) is flattened at the next session's first management pass, with a WARNING naming it (2026-10-13).
 
 ### Anti-chase / exhaustion filter
 
@@ -1703,6 +1704,7 @@ Behavior:
 - `adaptive_profit_lock_stop_rr`: how much profit is locked once the previous threshold is met.
 - `adaptive_runner_trigger_rr`: progress threshold that can activate runner behavior.
 - Lower thresholds protect faster; higher thresholds give trades more room.
+- The base strategy also reads `adaptive_breakeven_offset_r` (where the breakeven moves the stop, in R past the entry: 0.05 for trend-like styles, 0.02 otherwise), `adaptive_partial_breakeven_rr` / `adaptive_partial_breakeven_offset_r` (an earlier, smaller stop move; off unless set) and `adaptive_runner_target_rr` / `adaptive_runner_trail_pct` (the runner's target and trail; derived unless set). The `peer_confirmed_*` family declares them in its manifests at those defaults and checks them at load, each stop move under the peak R that arms it (2026-10-13).
 
 ## Strategy-by-strategy reference
 
@@ -2154,8 +2156,11 @@ Strategy-specific knobs:
   - past `max_extension_from_*_atr` the score pays `extension_penalty_per_atr` per ATR; past that times `extension_hard_cap_mult` the side is refused as `too_extended_hard_cap_vwap_atr` / `too_extended_hard_cap_ema9_atr` (before 2026-09-26 it reused the base exhaustion filter's `too_extended_from_*_atr`, which `max_entry_*_extension_atr` still drives)
   - both read the close's absolute distance from VWAP / EMA9 in ATR, so a close that far on the wrong side of the line (a LONG below it, a SHORT above) pays the same penalty and is refused too, as `wrong_side_hard_cap_vwap_atr` / `wrong_side_hard_cap_ema9_atr` (before 2026-09-26 under the `too_extended_hard_cap_*` tokens); the base exhaustion filter measures only the side's own direction
 - Peer and macro confirmation:
-  - `min_peer_agreement`, `min_peer_score`
-  - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`
+  - `min_peer_agreement`, `min_peer_score`, `peer_max_age_minutes`
+  - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`, `macro_max_age_minutes`
+  - a stale or missing peer never agrees and counts against the side in its directional score (2026-10-13; `peer_confirmed_key_levels`)
+- The order and the exits (the family's; `peer_confirmed_key_levels`):
+  - `max_entry_spread_r`, `max_entry_spread_target_frac`, `protective_exits_on_executable_side`, `force_flatten`, `force_flatten_buffer_minutes`, `entry_cutoff_lead_minutes`
 - R:R and adaptive management:
   - `min_rr`, `target_rr`, `stop_buffer_atr_mult`
   - `strong_setup_runner_enabled`, `adaptive_breakeven_rr`, `adaptive_profit_lock_rr`, `adaptive_profit_lock_stop_rr`, `adaptive_runner_trigger_rr`
@@ -2194,6 +2199,11 @@ Current package defaults:
 | `dollar_symbol`                   | `'NYICDX'`                                |
 | `bond_symbol`                     | `'TLT'`                                   |
 | `volatility_symbol`               | `'VIX'`                                   |
+| `peer_max_age_minutes`            | `3`                                       |
+| `macro_max_age_minutes`           | `20`                                      |
+| `max_entry_spread_r`              | `0.0` (preset `0.33`)                     |
+| `max_entry_spread_target_frac`    | `0.0` (preset `0.5`)                      |
+| `protective_exits_on_executable_side` | `false` (preset `true`)               |
 | `min_total_score`                 | `5.5`                                     |
 | `min_ltf_score`               | `2.5`                                     |
 | `min_adx14`                       | `13.5`                                    |
@@ -2224,7 +2234,13 @@ Current package defaults:
 | `macro_miss_penalty`              | `0.3`                                     |
 | `extension_penalty_per_atr`       | `0.72`                                    |
 | `extension_hard_cap_mult`         | `1.45`                                    |
-| `force_flatten`                   | `{long: true, short: true}` (preset: both `false`) |
+| `force_flatten`                   | `{long: true, short: true}` (preset: both since 2026-10-13, from 15:53 ET; both `false` before) |
+| `force_flatten_buffer_minutes`    | `5`                                       |
+| `entry_cutoff_lead_minutes`       | `10` (no side opens from 15:43, 12:45 on an early-close day) |
+| `adaptive_breakeven_offset_r`     | `0.05`                                    |
+| `adaptive_partial_breakeven_rr` / `_offset_r` | `null` (off) / `0.0`          |
+| `adaptive_runner_target_rr` / `adaptive_runner_trail_pct` | `null` / `null` (derived) |
+| `ladder_min_target_rr` / `ladder_zone_atr_mult` / `ladder_max_rungs` | `1.2` / `0.5` / `4` (a divergence-only entry's ladder) |
 
 ### `peer_confirmed_key_levels`
 
@@ -2245,13 +2261,24 @@ Strategy-specific knobs:
   - `ltf_minutes`, `min_bars`, `min_ltf_bars`
   - Stronger signals are prioritized lexicographically by trigger quality, level quality, peer confirmation, vote edge, and clearance before smaller additive bonuses are allowed to break ties.
 - Zone, score, and R:R:
-  - `zone_atr_mult`, `zone_pct`, `min_level_score`, `min_ltf_score`, `min_rr`, `stop_buffer_atr_mult`
-  - `require_peer_target_clearance` (default `True`): the nearest HTF key level in the trade's direction must clear BOTH `support_resistance.entry_min_clearance_pct` and `_atr`, else `too_close_to_overhead_resistance` / `too_close_to_nearby_support`. It rode on `shared_entry.use_sr_filter` until 2026-09-24; that knob is the shared S/R veto now
+  - `zone_atr_mult`, `zone_pct`, `min_level_score`, `level_score_raw_htf_weight`, `min_ltf_score`, `min_rr`, `stop_buffer_atr_mult`
+  - `min_ltf_score` gates the 4-part base trigger (a CHoCH, a volume spike, the candle model, and a sweep-reclaim / sweep-reject that counts only when a low traded below the level, a high above it for a SHORT, and the trigger bucket closed back at or across it); the capped quality bonus only ranks (`ltf_score`). A signal records the gate's input as `ltf_base_score` and `min_ltf_score` as `ltf_score_required`, the requirement on it; ENTRY_CONTEXT logs both. The trigger reads completed 5m buckets only, and the entry pass judges each completed bucket once, repeating its verdict until the next completes, and only while the step frame ends within one 1m step of the bucket's end: a bucket first seen later (the symbol held back by a cooldown, an open position, a restart or a stream-inactive spell) is skipped as `ltf_bucket_missed(bucket=HH:MM,late=Xm)`, and one whose 1m backfill is still owed after the stream (re)started or reconnected waits (`ltf_bucket_backfill_pending(...)`) until the backfill is in, or is missed once late. A candidate whose judgement raises is skipped alone as `entry_pass_error(error=<type>)`, its bucket keeping no verdict, and the other candidates' signals go on (2026-10-13; until then a touch inside the zone scored the sweep on every setup, the bonus counted toward the gate, and the trigger read the forming bucket)
+  - `require_peer_target_clearance` (default `True`): the side is refused as `too_close_to_overhead_resistance` / `too_close_to_nearby_support` when the nearest HTF key level in the trade's direction is inside BOTH `support_resistance.entry_min_clearance_pct` and `_atr`; clearing either passes. It rode on `shared_entry.use_sr_filter` until 2026-09-24; that knob is the shared S/R veto now, which refuses inside EITHER
   - `ltf_quality_bonus_enabled`, `ltf_quality_max_bonus`, `ltf_reclaim_quality_bonus_cap`, `ltf_zone_interaction_bonus_cap`, `ltf_candle_quality_bonus_cap`, `ltf_volume_quality_bonus_cap`, `ltf_range_expansion_bonus_cap`
+- HTF bias:
+  - `require_htf_bias_alignment` (default `True`): a side not aligned with the HTF bias is refused
 - Peer confirmation:
   - `min_peer_agreement`, `min_peer_score`
+  - `peer_max_age_minutes` (default `3`, at least `2`): a peer whose newest 1m bar started longer ago, or that has no bars, never agrees and counts against the side in its peer score (the fresh peers agreeing less those disagreeing, less every peer with no fresh vote); fewer fresh peers than `min_peer_agreement` refuses the side as `peers_stale(...)`, with the ages (2026-10-13; until then a stale peer voted as if current)
 - Macro confirmation:
-  - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`
+  - `enable_macro_confirmation`, `require_macro_agreement_count`, `require_macro_net_bias`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`
+  - `macro_max_age_minutes` (default `20`, at least `2`, and at least `runtime.history_poll_seconds` / 60 + 2, checked at the build): the same for the macro symbols (VIX and $NYICDX are polled every `history_poll_seconds`, 300 s, and print nothing after about 16:15 / 17:00). A stale or missing one never agrees and counts against the side in the net bias (`require_macro_net_bias`), so once both index symbols are stale (from about 16:20: their live 1m series ended at 15:59 on the archived days) no side clears it on TLT alone; fewer fresh ones than `require_macro_agreement_count` refuses as `macro_stale(...)` while macro confirmation is on (2026-10-13)
+- The order and the exits (2026-10-13; the strategy README, sections 6 and 7):
+  - `max_entry_spread_r` / `max_entry_spread_target_frac` (default `0`, off; `0.33` / `0.5` in every peer preset): the entry spread guard, top_tier's rule through the strategy-neutral `shared_entry.entry_spread_guard`. At the order, skip an entry whose quote's spread is at least this many × its risk |limit − stop| / its target distance |target − limit|; an unreadable quote is skipped too
+  - `protective_exits_on_executable_side` (default `false`; `true` in every peer preset): a stop at or past the entry and the peak giveback floors are judged on the bid (LONG) / ask (SHORT), as top_tier's
+  - `force_flatten`: every peer preset flattens both sides from its cutoff (key_levels from 19:50 ET, 12:55 on an early-close day, while the post-market takes orders, to 20:00); a position still open at 20:00 is carried overnight and flattened at the next session's first management pass (07:00 ET), with a WARNING naming it. Until 2026-10-13 three peer presets held longs overnight and trend_continuation both sides
+  - `entry_cutoff_lead_minutes` (default `10`): no peer entry pass, nor a divergence-only entry, opens a side within this many minutes of its force-flatten cutoff (key_levels from 19:40, 12:45 on an early-close day; `after_entry_cutoff(cutoff=19:40,flatten=19:50)`), which a flatten would close minutes later (2026-10-13)
+  - Every knob is checked at load and at the build (type, range, strict bools; `ltf_minutes` one of 1, 2, 3, 5, 6, 10, 15, 30; the peer and macro counts reachable; the age limits at least 2 minutes; each adaptive stop move under the peak R that arms it), the base strategy's reads of these params among them (`force_flatten_buffer_minutes`, `adaptive_breakeven_offset_r`, the partial breakeven, the runner's target and trail, a divergence-only entry's `ladder_*`), which the manifest declares at the base's defaults. The bounds against the rest of the config are checked at the build: `force_flatten_buffer_minutes`, and with `entry_cutoff_lead_minutes` added, shorter than the last management window, and `macro_max_age_minutes` at least the macro poll plus 2 minutes. A misspelled params key still loads unread
 - Level scoring detail:
   - `level_round_number_tolerance_pct`
 - Strong-setup runner / ladder logic:
@@ -2303,6 +2330,8 @@ Current package defaults:
 | `dollar_symbol`                      | `'NYICDX'`                                |
 | `bond_symbol`                        | `'TLT'`                                   |
 | `volatility_symbol`                  | `'VIX'`                                   |
+| `peer_max_age_minutes`               | `3`                                       |
+| `macro_max_age_minutes`              | `20`                                      |
 | `level_round_number_tolerance_pct`   | `0.002`                                   |
 | `strong_setup_runner_enabled`        | `True`                                    |
 | `strong_setup_min_ltf_score`     | `3.2`                                     |
@@ -2319,7 +2348,16 @@ Current package defaults:
 | `adaptive_profit_lock_rr`            | `1.25`                                    |
 | `adaptive_profit_lock_stop_rr`       | `0.32`                                    |
 | `adaptive_runner_trigger_rr`         | `1.12`                                    |
-| `force_flatten`                      | `{long: true, short: true}` (preset: long `false`, short `true`) |
+| `max_entry_spread_r`                 | `0.0` (preset `0.33`)                     |
+| `max_entry_spread_target_frac`       | `0.0` (preset `0.5`)                      |
+| `protective_exits_on_executable_side` | `false` (preset `true`)                  |
+| `force_flatten`                      | `{long: true, short: true}` (preset: both since 2026-10-13) |
+| `force_flatten_buffer_minutes`       | `5`                                       |
+| `entry_cutoff_lead_minutes`          | `10`                                      |
+| `adaptive_breakeven_offset_r`        | `0.05`                                    |
+| `adaptive_partial_breakeven_rr` / `_offset_r` | `null` (off) / `0.0`             |
+| `adaptive_runner_target_rr` / `adaptive_runner_trail_pct` | `null` / `null` (derived) |
+| `ladder_min_target_rr` / `ladder_zone_atr_mult` / `ladder_max_rungs` | `1.2` / `0.5` / `4` (a divergence-only entry's ladder) |
 
 ### `peer_confirmed_key_levels_1m`
 
@@ -2335,7 +2373,7 @@ Key differences vs the 5-minute base strategy:
 
 - `ltf_minutes: 1`
 - deeper LTF warmup with `min_bars: 90` and `min_ltf_bars: 45`
-- compromise 1-minute LTF gates that are still faster than the 5-minute base but no longer use the older aggressive thresholds: `min_level_score: 2.5`, `min_rr: 1.6`, `min_peer_agreement: 2`, `min_peer_score: 2`
+- compromise 1-minute LTF gates that are still faster than the 5-minute base but no longer use the older aggressive thresholds: `min_level_score: 2.5`, `min_rr: 1.6`; the peer gate is the base's (`min_peer_agreement: 2`, `min_peer_score: 2` in both manifests, `min_peer_agreement: 3` in both shipped presets)
 - tighter LTF zone sizing and slightly faster adaptive management to suit 1-minute execution while keeping confirmation more balanced
 - heavier weighting on LTF FVG participation while still retaining the HTF map and macro confirmation checks
 - inherits the base strategy's capped LTF-quality bonus layer so clean 1-minute reclaims / rejects can outrank weaker touches without raising `min_ltf_score`
@@ -2397,7 +2435,12 @@ Current package defaults:
 | `adaptive_profit_lock_rr`            | `1.08`                                    |
 | `adaptive_profit_lock_stop_rr`       | `0.28`                                    |
 | `adaptive_runner_trigger_rr`         | `1.02`                                    |
-| `force_flatten`                      | `{long: true, short: true}` (preset: long `false`, short `true`) |
+| `peer_max_age_minutes` / `macro_max_age_minutes` | `3` / `20`                     |
+| `max_entry_spread_r` / `max_entry_spread_target_frac` | `0.0` / `0.0` (preset `0.33` / `0.5`) |
+| `protective_exits_on_executable_side` | `false` (preset `true`)                  |
+| `force_flatten`                      | `{long: true, short: true}` (preset: both since 2026-10-13, from 15:50 ET) |
+| `entry_cutoff_lead_minutes`          | `10` (no entry from 15:40 in the preset, after its window) |
+| `force_flatten_buffer_minutes`, the adaptive management's and the ladder's reads | as `peer_confirmed_key_levels` |
 
 ### `peer_confirmed_htf_pivots`
 
@@ -2419,8 +2462,9 @@ Strategy-specific knobs:
 - Entry-family selection:
   - `entry_family` with `auto`, `pivot_reclaim`, `pivot_rejection`, and `pivot_continuation`
 - Regime / trigger scoring:
-  - `min_regime_score`, `min_ltf_score`, `min_total_score`, `min_peer_agreement`, `min_peer_score`
-  - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`
+  - `min_regime_score`, `min_ltf_score`, `min_total_score`, `min_peer_agreement`, `min_peer_score`, `peer_max_age_minutes`
+  - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`, `macro_max_age_minutes`
+  - a stale or missing peer never agrees and counts against the side in its directional score (2026-10-13; `peer_confirmed_key_levels`)
 - Pivot-zone sizing and family detail:
   - `pivot_zone_atr_mult`, `pivot_zone_pct`
   - `pivot_reclaim_buffer_pct`, `pivot_reclaim_zone_frac`
@@ -2431,6 +2475,8 @@ Strategy-specific knobs:
   - `max_reclaim_distance_from_pivot_atr`, `max_rejection_distance_from_pivot_atr`, `max_continuation_distance_from_pivot_atr`
   - `entry_exhaustion_filter_enabled`, `max_entry_vwap_extension_atr`, `max_entry_ema9_extension_atr`, `max_entry_bar_range_atr`, `max_entry_upper_wick_frac`, `max_entry_lower_wick_frac`
   - the S/R veto is `shared_entry.use_sr_filter` (off in the preset, so the strategy stays anchored to the HTF pivot model); `use_sr_veto` was retired on 2026-09-24 and a preset still carrying it fails at load. The structure veto (`shared_entry.use_structure_filter`) exempts `pivot_rejection` through the manifest's `capabilities.shared_entry.exemptions`
+- The order and the exits (the family's; `peer_confirmed_key_levels`):
+  - `max_entry_spread_r`, `max_entry_spread_target_frac`, `protective_exits_on_executable_side`, `force_flatten`, `force_flatten_buffer_minutes`, `entry_cutoff_lead_minutes`
 - R:R and adaptive management:
   - `min_rr`, `target_rr`, `stop_buffer_atr_mult`
   - `strong_setup_runner_enabled`, `adaptive_breakeven_rr`, `adaptive_profit_lock_rr`, `adaptive_profit_lock_stop_rr`, `adaptive_runner_trigger_rr`
@@ -2472,6 +2518,11 @@ Current package defaults:
 | `dollar_symbol`                                | `'NYICDX'`                                      |
 | `bond_symbol`                                  | `'TLT'`                                         |
 | `volatility_symbol`                            | `'VIX'`                                         |
+| `peer_max_age_minutes`                         | `3`                                             |
+| `macro_max_age_minutes`                        | `20`                                            |
+| `max_entry_spread_r`                           | `0.0` (preset `0.33`)                           |
+| `max_entry_spread_target_frac`                 | `0.0` (preset `0.5`)                            |
+| `protective_exits_on_executable_side`          | `false` (preset `true`)                         |
 | `pivot_zone_atr_mult`                          | `0.24`                                          |
 | `pivot_zone_pct`                               | `0.0018`                                        |
 | `pivot_reclaim_buffer_pct`                     | `0.00045`                                       |
@@ -2508,7 +2559,13 @@ Current package defaults:
 | `activity_score_weight`                        | `0.1`                                           |
 | `macro_bonus`                                  | `0.75`                                          |
 | `macro_miss_penalty`                           | `0.28`                                          |
-| `force_flatten`                                | `{'long': True, 'short': True}`                 |
+| `force_flatten`                                | `{'long': True, 'short': True}` (preset: both since 2026-10-13, from 15:50 ET) |
+| `force_flatten_buffer_minutes`                 | `5`                                             |
+| `entry_cutoff_lead_minutes`                    | `10` (no side opens from 15:40, 12:45 on an early-close day) |
+| `adaptive_breakeven_offset_r`                  | `0.02` (the base's default for its `pivot` management style) |
+| `adaptive_partial_breakeven_rr` / `_offset_r`  | `null` (off) / `0.0`                            |
+| `adaptive_runner_target_rr` / `adaptive_runner_trail_pct` | `null` / `null` (derived)            |
+| `ladder_min_target_rr` / `ladder_zone_atr_mult` / `ladder_max_rungs` | `1.2` / `0.5` / `4` (a divergence-only entry's ladder) |
 
 ### `top_tier_adaptive`
 

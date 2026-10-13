@@ -492,9 +492,39 @@ strategies:
       enable_macro_confirmation: true
       entry_exhaustion_filter_enabled: true
       entry_family: auto
+      # What is guaranteed (2026-10-13): both sides are flattened from the
+      # management window's 15:55 end less force_flatten_buffer_minutes (5),
+      # 15:50 ET (12:55 on an early-close day), and the flatten keeps trying
+      # in the post-market, to 20:00. No side opens within
+      # entry_cutoff_lead_minutes of that cutoff: from 15:40, inside the
+      # 13:00-15:45 window (12:45 on an early-close day). A position still
+      # open at 20:00 stays tracked while the bot runs
+      # (auto_exit_after_session waits for it) and is flattened at the next
+      # session's first management pass, 07:00 ET, with a WARNING naming it; a
+      # restart drops its tracking (startup_reconcile_mode: ignore). Until
+      # then longs were held overnight (shorts were flattened), an early-close
+      # day's 13:00 window's longs among them.
       force_flatten:
-        long: false
+        long: true
         short: true
+      entry_cutoff_lead_minutes: 10
+      # A peer whose newest 1m bar started more than peer_max_age_minutes ago,
+      # or a macro symbol more than macro_max_age_minutes ago (VIX and $NYICDX
+      # are polled every history_poll_seconds, 300 s), or one with no bars,
+      # never agrees and counts against the side in the peer score
+      # (2026-10-13). Both limits are at least 2; the macro one at least
+      # history_poll_seconds / 60 + 2.
+      macro_max_age_minutes: 20
+      peer_max_age_minutes: 3
+      # The entry spread guard (peer_confirmed_key_levels README, section 6),
+      # at top_tier's values: skip an entry whose quote's spread is at least
+      # 0.33 x its risk |limit - stop| or 0.5 x its target distance; an
+      # unreadable quote is skipped.
+      max_entry_spread_r: 0.33
+      max_entry_spread_target_frac: 0.5
+      # Judge a stop at or past the entry and the peak giveback floors on the
+      # bid (LONG) / ask (SHORT) instead of the mark.
+      protective_exits_on_executable_side: true
       fvg_runner_rr_bonus: 0.1
       htf_atr_tolerance_mult: 0.35
       htf_ema_fast_span: 34

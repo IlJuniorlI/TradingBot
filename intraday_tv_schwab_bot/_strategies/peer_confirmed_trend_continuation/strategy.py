@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-from typing import Any
+from typing import Any, ClassVar
 
 import pandas as pd
 
@@ -9,12 +9,16 @@ from ...numeric import safe_float
 from ...reasons import insufficient_bars_reason, reason_with_values
 from ...bars import bar_close_position
 from ...indicators import last_bar_atr
-from ..peer_confirmed_key_levels.strategy import PeerConfirmedKeyLevelsStrategy, _gate_snapshot, _score_threshold
+from ..peer_confirmed_key_levels.strategy import FAMILY_KNOBS, Knob, PeerConfirmedKeyLevelsStrategy, _gate_snapshot, _score_threshold
 from ..shared_entry import EntryContexts, EntryProposal
 
 
 class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
     strategy_name = 'peer_confirmed_trend_continuation'
+    # The family's knobs, checked at load and at the build
+    # (``PeerConfirmedKeyLevelsStrategy.check_knobs``); this strategy's own
+    # trend / pullback knobs are not checked yet.
+    KNOBS: ClassVar[dict[str, Knob]] = dict(FAMILY_KNOBS)
 
     def dashboard_overlay_candidates(self, side: Side, close: float, ltf: pd.DataFrame, htf: HTFContext) -> list[dict[str, Any]] | None:
         if ltf is None or ltf.empty:
@@ -285,7 +289,9 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
         total_score = float(trend.get("score", 0.0) or 0.0)
         total_score += float(trigger.get("score", 0.0) or 0.0)
         peer_score = int(peer_ctx.get("score", 0) or 0)
-        directional_peer_score = peer_score if side == Side.LONG else -peer_score
+        # Every peer with no fresh vote counts against the side (the family's
+        # ``_directional_peer_score``, 2026-10-13).
+        directional_peer_score = self._directional_peer_score(side, peer_ctx)
         # Parenthesize the side-selection so the `or 0` fallback applies to BOTH
         # branches (the ternary + `or 0` was an operator-precedence gotcha: the
         # LONG branch was using `int(bullish)` with no fallback while the SHORT
@@ -490,18 +496,32 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
         )
 
     def entry_signals(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], client=None, data=None) -> list[Signal]:
+        """Each candidate's continuation setup on the preferred sides it may
+        open: none past its entry cutoff, ``entry_cutoff_lead_minutes`` (10)
+        before its force-flatten cutoff (``_entry_sides_now``, the check
+        key_levels' pass makes; with every side past it the symbol is
+        skipped as ``after_entry_cutoff(cutoff=HH:MM,flatten=HH:MM)``, and a
+        refusal ends with ``<side>.after_entry_cutoff(...)`` for a side past
+        it): 15:43 in the preset, after its 15:40 window ends, and 12:45 on
+        an early-close day, before its 12:55 afternoon window opens. Until
+        2026-10-13 the preset flattened neither side, so such an entry was
+        held overnight."""
         self._reset_entry_decisions()
         out: list[Signal] = []
         history_bars = self.required_history_bars()
         ltf_min = max(1, int(self.params.get("ltf_minutes", 5)))
         macro_ctx = self._macro_signal(bars, data)
         tradable_symbols = set(self._tradable_symbols())
+        open_sides, cutoffs_passed = self._entry_sides_now()
+        closed_side_reasons = self._closed_side_reasons(cutoffs_passed)
         for c in candidates:
             if self._skip_untradable(c.symbol, tradable_symbols):
                 continue
             frame = bars.get(c.symbol)
             if c.symbol in positions:
                 self._record_entry_decision(c.symbol, "skipped", ["already_in_position"])
+                continue
+            if self._skip_past_cutoff(c.symbol, open_sides, cutoffs_passed):
                 continue
             if frame is None or len(frame) < history_bars:
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), history_bars)])
@@ -515,7 +535,8 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             if preferred_sides is None:
                 self._record_entry_decision(c.symbol, "skipped", ["shorts_disabled"])
                 continue
-            side_order, evaluated_sides = self._entry_side_context(preferred_sides)
+            side_order, evaluated_sides = self._entry_side_context(
+                [side for side in preferred_sides if side in open_sides])
             # Build side-agnostic contexts ONCE per candidate; pass them into each
             # per-side builder so we don't recompute market-structure / technical
             # contexts twice when both LONG and SHORT are evaluated.
@@ -533,7 +554,7 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
                 signal_details = {"side_eval": sides.side_eval or meta.get("side_eval"), "peer_universe": meta.get("peer_universe"), "evaluated_sides": evaluated_sides}
                 self._record_entry_decision(c.symbol, "signal", [signal.reason], details=signal_details)
             else:
-                fail_reasons = sides.fail_reasons
+                fail_reasons = sides.fail_reasons + closed_side_reasons
                 skip_details = {"side_eval": sides.side_eval, "peer_universe": list(peer_ctx.get("universe", [])), "peer_details": dict(peer_ctx.get("details", {})), "evaluated_sides": evaluated_sides, "primary_blocker": fail_reasons[0] if fail_reasons else None, "all_blockers": list(fail_reasons), "near_miss_blockers": sides.near_miss_blockers}
                 self._record_entry_decision(c.symbol, "skipped", fail_reasons or ["no_setup"], details=skip_details)
         return out

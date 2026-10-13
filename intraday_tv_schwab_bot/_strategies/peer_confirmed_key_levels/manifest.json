@@ -66,6 +66,7 @@
     "stop_buffer_atr_mult": 0.68,
     "min_peer_agreement": 2,
     "min_peer_score": 2,
+    "peer_max_age_minutes": 3,
     "enable_macro_confirmation": true,
     "require_macro_agreement_count": 1,
     "require_macro_net_bias": true,
@@ -74,6 +75,7 @@
     "dollar_symbol": "NYICDX",
     "bond_symbol": "TLT",
     "volatility_symbol": "VIX",
+    "macro_max_age_minutes": 20,
     "level_round_number_tolerance_pct": 0.002,
     "strong_setup_runner_enabled": true,
     "strong_setup_min_ltf_score": 3.2,
@@ -96,10 +98,23 @@
     "adaptive_profit_lock_rr": 1.25,
     "adaptive_profit_lock_stop_rr": 0.32,
     "adaptive_runner_trigger_rr": 1.12,
+    "adaptive_breakeven_offset_r": 0.05,
+    "adaptive_partial_breakeven_rr": null,
+    "adaptive_partial_breakeven_offset_r": 0.0,
+    "adaptive_runner_target_rr": null,
+    "adaptive_runner_trail_pct": null,
+    "ladder_min_target_rr": 1.2,
+    "ladder_zone_atr_mult": 0.5,
+    "ladder_max_rungs": 4,
+    "max_entry_spread_r": 0.0,
+    "max_entry_spread_target_frac": 0.0,
+    "protective_exits_on_executable_side": false,
     "force_flatten": {
       "long": true,
       "short": true
-    }
+    },
+    "force_flatten_buffer_minutes": 5,
+    "entry_cutoff_lead_minutes": 10
   },
   "capabilities": {
     "dashboard": {

@@ -75,7 +75,7 @@ Even after the family is chosen, the trade can still be blocked by its own gates
 - pivot-distance and zone-flip rules
 - exhaustion / extension checks
 
-Since 2026-09-24 those blockers go, with the proposed stop and target, to the shared entry stage (`shared_entry.SharedEntryPolicy`), like every strategy's setup. It refuses on them and on every `shared_entry` veto the YAML switches on in one pass — structure (`use_structure_filter`; the manifest exempts `pivot_rejection`, `capabilities.shared_entry.exemptions`), S/R (`use_sr_filter`, which replaced this strategy's `use_sr_veto` param), chart, candle, dual divergence, broken level — and records every blocker under the side's key with the gate snapshots and the near-miss payload. The vetoes and the structure / technical / chart / candle contexts read the 5m trigger frame; S/R is built on the 1m frame. So the refinement's stop floor (`shared_entry.min_stop_atr_mult`) is in 5m ATR, while the broken-level guard's `broken_level_min_clearance_atr` and the divergence entry candidates read the 1m S/R frame, the frame top_tier's thresholds were set on (a 1m ATR is roughly half a 5m one).
+Since 2026-09-24 those blockers go, with the proposed stop and target, to the shared entry stage (`shared_entry.SharedEntryPolicy`), like every strategy's setup. It refuses on them and on every `shared_entry` veto the YAML switches on in one pass — structure (`use_structure_filter`; the manifest exempts `pivot_rejection`, `capabilities.shared_entry.exemptions`), S/R (`use_sr_filter`, which replaced this strategy's `use_sr_veto` param), chart, candle, dual divergence, broken level — and records every blocker under the side's key with the gate snapshots and the near-miss payload. The vetoes and the structure / technical / chart / candle contexts read the 5m trigger frame; S/R is built on the 1m frame. So the refinement's stop floor (`shared_entry.min_stop_atr_mult`) is in 5m ATR, while the broken-level guard's `broken_level_min_clearance_atr` and the divergence entry candidates read the 1m S/R frame, the frame top_tier's thresholds were set on (a 1m ATR is about 0.4 of a 5m one on the family's large caps: 2.56x in RTH, measured 2026-10-13).
 
 That is why this strategy can be aggressive around pivots without turning into a blind breakout-chase system.
 
@@ -123,8 +123,10 @@ Strategy-specific knobs:
   - `entry_family` with `auto`, `pivot_reclaim`, `pivot_rejection`, and `pivot_continuation`
   - `pivot_reclaim_family_bonus`, `pivot_rejection_family_bonus`, `pivot_continuation_family_bonus` for `auto` family weighting
 - Regime / trigger scoring:
-  - `min_regime_score`, `min_ltf_score`, `min_total_score`, `min_peer_agreement`, `min_peer_score`
-  - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`
+  - `min_regime_score`, `min_ltf_score`, `min_total_score`, `min_peer_agreement`, `min_peer_score`, `peer_max_age_minutes`
+  - `enable_macro_confirmation`, `require_macro_agreement_count`, `dollar_symbol`, `bond_symbol`, `volatility_symbol`, `macro_max_age_minutes`
+- The order and the exits (the family's, below):
+  - `max_entry_spread_r`, `max_entry_spread_target_frac`, `protective_exits_on_executable_side`, `force_flatten`, `entry_cutoff_lead_minutes`
 - Pivot-zone sizing and family detail:
   - `pivot_zone_atr_mult`, `pivot_zone_pct`
   - `pivot_confirmed_flip_zone_bonus`, `pivot_original_zone_hold_bonus`, `pivot_pending_flip_zone_penalty`, `pivot_invalidated_zone_penalty`
@@ -156,6 +158,15 @@ Also uses these shared stock groups:
 - stock FVG confluence
 - adaptive stock trade management
 
+**The family's engine (2026-10-13).** This strategy subclasses `peer_confirmed_key_levels` and runs its peer and macro votes, its entry spread guard, its protective exits and its knob checks (base README, sections 5-7):
+
+- a peer whose newest 1m bar started more than `peer_max_age_minutes` (3) ago, or a macro symbol more than `macro_max_age_minutes` (20) ago, is `stale` in `peer_details` / `macro_details` (one with no frame `missing`): it never agrees, and a peer counts against the side in its directional score, the worst case (2026-10-13; while stale peers only abstained, three fresh bullish peers and three stale ones scored +3 and passed `min_peer_score`, where the same votes scored 0 when current). So stale or missing data can only count against an entry here: fewer agreeing peers (`weak_peer_agreement`), a lower score (`weak_peer_score`) or no macro alignment (the macro miss, or `macro_not_aligned` for `pivot_continuation`). Unlike key_levels it refuses no side on too few fresh votes (no `peers_stale` / `macro_stale`);
+- the entry spread guard (`max_entry_spread_r` / `max_entry_spread_target_frac`, manifest `0`, off; the shipped preset `0.33` / `0.5`) skips an entry whose quote's spread is too wide against its risk or target distance, or cannot be read;
+- `protective_exits_on_executable_side` (manifest `false`, the preset `true`) judges a stop at or past the entry and the peak giveback floors on the bid / ask instead of the mark;
+- the family's knobs are checked at load and at the build (the HTF map, the trigger frame, peers, macro, the ages, the spread guard, the protective exits, `force_flatten`, `force_flatten_buffer_minutes` and `entry_cutoff_lead_minutes`, with the bounds against the windows and the macro poll at the build, the shared management, ladder and FVG knobs, among them the base strategy's own reads: `adaptive_breakeven_offset_r`, the partial breakeven and the runner's target and trail, `ladder_min_target_rr` / `ladder_zone_atr_mult` / `ladder_max_rungs`, each declared in the manifest at what the base read without it); this strategy's own knobs are not checked yet.
+
+The shipped preset flattens both sides from 15:50 ET (the management window's 15:55 end less `force_flatten_buffer_minutes`, 5; 12:55 on an early-close day) since 2026-10-13, the flatten retrying in the post-market to 20:00; until then it held longs overnight. Its entry pass opens no side within `entry_cutoff_lead_minutes` (10) of that cutoff, the check key_levels' makes (`after_entry_cutoff(cutoff=15:40,flatten=15:50)` for the symbol when every side it trades is past it, `<side>.after_entry_cutoff(…)` after a refused side's blockers otherwise): from 15:40, inside its 13:00-15:45 entry window, and from 12:45 on an early-close day, before that window opens. A divergence-only entry skips such a side too. A position still open at 20:00 is carried overnight and flattened at the next session's first management pass, with a WARNING naming it, as key_levels' (base README, section 7); the preset's `startup_reconcile_mode: ignore` does not restore one across a restart. Unlike key_levels, its families still read the forming 5m bucket.
+
 Current package defaults:
 
 | Option                                         | Current package default                         |
@@ -185,6 +196,11 @@ Current package defaults:
 | `dollar_symbol`                                | `NYICDX`                                        |
 | `bond_symbol`                                  | `TLT`                                           |
 | `volatility_symbol`                            | `VIX`                                           |
+| `peer_max_age_minutes`                         | `3`                                             |
+| `macro_max_age_minutes`                        | `20`                                            |
+| `max_entry_spread_r`                           | `0.0` (off; the preset `0.33`)                  |
+| `max_entry_spread_target_frac`                 | `0.0` (off; the preset `0.5`)                   |
+| `protective_exits_on_executable_side`          | `false` (the preset `true`)                     |
 | `pivot_zone_atr_mult`                          | `0.24`                                          |
 | `pivot_zone_pct`                               | `0.0018`                                        |
 | `pivot_battleground_max_distance_atr`          | `1.1`                                           |
@@ -234,7 +250,14 @@ Current package defaults:
 | `activity_score_weight`                        | `0.1`                                           |
 | `macro_bonus`                                  | `0.75`                                          |
 | `macro_miss_penalty`                           | `0.28`                                          |
-| `force_flatten`                                | `{'long': True, 'short': True}`                 |
+| `force_flatten`                                | `{'long': True, 'short': True}` (the preset: both since 2026-10-13) |
+| `force_flatten_buffer_minutes`                 | `5`                                             |
+| `entry_cutoff_lead_minutes`                    | `10`                                            |
+| `adaptive_breakeven_offset_r`                  | `0.02` (the base's default for its `pivot` management style) |
+| `adaptive_partial_breakeven_rr` / `_offset_r`  | `null` (off) / `0.0`                            |
+| `adaptive_runner_target_rr` / `adaptive_runner_trail_pct` | `null` / `null` (derived)            |
+| `ladder_min_target_rr` / `ladder_zone_atr_mult` / `ladder_max_rungs` | `1.2` / `0.5` / `4` (a divergence-only entry's ladder) |
+
 ## Files in this folder
 
 - `manifest.json` defines the plugin registration metadata.

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import time
+from datetime import datetime, time
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import pandas as pd
@@ -614,30 +614,40 @@ class BaseStrategy(ContextBuildersMixin):
             return None
         return max(window.end for window in windows)
 
-    def _configurable_stock_force_flatten(self, position: Position, default_enabled: bool = True) -> bool:
+    def _force_flatten_cutoff(self, side: Side, now_dt: datetime, default_enabled: bool = True) -> time | None:
+        """The time a ``side`` position is force-flattened at on ``now_dt``'s
+        day, or None when that side is not flattened (its ``force_flatten``
+        setting off; ``default_enabled`` when the params do not set it) or
+        the strategy has no management window. It is the management
+        windows' last end less ``force_flatten_buffer_minutes`` (5 by
+        default), so the flatten fires before the window closes and its
+        order has time to fill; on an early-close day the early close less
+        the same buffer, when that is sooner, rather than hours after the
+        market has closed. ``_configurable_stock_force_flatten`` flattens a
+        position at it. The peer_confirmed family reads it too (2026-10-13):
+        its flatten (``should_force_flatten``), and its entry cutoff,
+        ``entry_cutoff_lead_minutes`` before it, which its four entry passes
+        and its ``closed_entry_sides`` read, so no side opens that a flatten
+        would close within minutes."""
         settings = self._force_flatten_settings()
-        side_key = "long" if position.side == Side.LONG else "short"
-        enabled = bool(settings.get(side_key, default_enabled))
-        if not enabled:
-            return False
-        cutoff = self._management_window_end_time()
-        if cutoff is None:
-            return False
-        # Apply a configurable buffer so the flatten fires *before* the
-        # management window closes, giving the order time to fill before
-        # the real market close.  Default 5 minutes.
+        side_key = "long" if side == Side.LONG else "short"
+        if not bool(settings.get(side_key, default_enabled)):
+            return None
+        window_end = self._management_window_end_time()
+        if window_end is None:
+            return None
         buffer = max(0, int(self.params.get("force_flatten_buffer_minutes", 5) or 0))
-        cutoff_minutes = cutoff.hour * 60 + cutoff.minute
-        adjusted_minutes = max(0, cutoff_minutes - buffer)
-        # On early-close days, clamp the flatten time so it fires before the
-        # early close rather than hours after the market has already closed.
-        now_dt = sessions.now_et()
+        adjusted_minutes = max(0, window_end.hour * 60 + window_end.minute - buffer)
         state = equity_session_state(now_dt)
         if state.early_close:
             early_m = state.rth_close_time.hour * 60 + state.rth_close_time.minute - buffer
             adjusted_minutes = min(adjusted_minutes, max(0, early_m))
-        adjusted_cutoff = time(adjusted_minutes // 60, adjusted_minutes % 60)
-        return now_dt.time() >= adjusted_cutoff
+        return time(adjusted_minutes // 60, adjusted_minutes % 60)
+
+    def _configurable_stock_force_flatten(self, position: Position, default_enabled: bool = True) -> bool:
+        now_dt = sessions.now_et()
+        cutoff = self._force_flatten_cutoff(position.side, now_dt, default_enabled)
+        return cutoff is not None and now_dt.time() >= cutoff
 
     def _reset_entry_decisions(self) -> None:
         # Per-cycle decision tracking. Called at the start of every strategy's
@@ -1136,6 +1146,17 @@ class BaseStrategy(ContextBuildersMixin):
     def should_force_flatten(self, position: Position) -> bool:
         return False
 
+    def closed_entry_sides(self, now_dt: datetime) -> frozenset[Side]:
+        """The sides on which no new position may open at ``now_dt``, a moment
+        on the ET clock: the shared stage's divergence-only entries
+        (``SharedEntryPolicy.divergence_entries``) propose neither, as the
+        strategy's own entry pass opens neither. None here. The
+        peer_confirmed family names the sides past their entry cutoff,
+        ``entry_cutoff_lead_minutes`` before their force-flatten cutoff
+        (``_force_flatten_cutoff``): a position opened there would be
+        flattened within minutes (2026-10-13)."""
+        return frozenset()
+
     def entry_spread_refusal(self, signal: Signal, bid: Any, ask: Any, limit_price: float) -> str | None:
         """The strategy's entry spread guard: why ``signal``, a stock entry
         priced at the marketable limit ``limit_price`` on the quote ``bid`` /
@@ -1147,7 +1168,9 @@ class BaseStrategy(ContextBuildersMixin):
         guard only refuses, so it never moves, prices or sizes the signal.
         None here: a strategy without a guard refuses nothing.
         top_tier_adaptive declares one (its strategy README, section 6g), and
-        so small_cap_squeeze, which runs its engine, has it too."""
+        so small_cap_squeeze, which runs its engine, has it too; the
+        peer_confirmed family answers it with the strategy-neutral
+        ``shared_entry.entry_spread_guard`` (2026-10-13)."""
         return None
 
     def protective_exits_on_executable_side(self) -> bool:
@@ -1159,7 +1182,8 @@ class BaseStrategy(ContextBuildersMixin):
         every level. top_tier_adaptive reads its
         ``protective_exits_on_executable_side`` knob (its strategy README,
         section 12); small_cap_squeeze, which runs its engine, keeps it
-        off."""
+        off; the peer_confirmed family reads a knob of the same name
+        (2026-10-13)."""
         return False
 
     def position_mark_price(self, position: Position, data) -> float | None:
