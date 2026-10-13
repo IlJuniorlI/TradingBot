@@ -250,7 +250,10 @@ class PositionManager:
         only when an aged cached quote is still stale after that, and with no
         cached quote and no fresh book the price is the bar close, as before.
         The snapshot's bid, ask and last are what an exit it decides is priced
-        from (``SchwabExecutor.submit_equity_exit``)."""
+        from (``SchwabExecutor.submit_equity_exit``). A stream book's quote
+        also names the book's last item time and its quote time
+        (``stream_item_at``, ``stream_quote_time_ms``; None for a REST quote):
+        diagnostics for POSITION_MARK, which no decision reads."""
         mark = self.strategy.position_mark_price(position, self.data)
         if mark is not None:
             price = float(mark)
@@ -283,6 +286,8 @@ class PositionManager:
                         "source": "quote",
                         "decision_price": price,
                         "price_at": quote.get("fetched_at"),
+                        "stream_item_at": quote.get("stream_item_at"),
+                        "stream_quote_time_ms": quote.get("stream_quote_time_ms"),
                     }
                     return price, market_snapshot
         frame = bars.get(position.symbol)
@@ -789,7 +794,11 @@ class PositionManager:
         pass before (``gap_s``), the stop and target coming into the pass (a
         ratchet this pass moves them: POSITION_ADJUSTMENT), and the quote the
         mark came from, its ``source`` and its ``price_at`` (absent for a
-        strategy's own mark, the 0DTE strategies')."""
+        strategy's own mark, the 0DTE strategies'). A stream book's quote
+        adds the book's own times (since 2026-10-13): ``stream_item_at``, the
+        receipt of its last item, and ``stream_quote_time_ms``, its quote time
+        (field 34, Schwab's epoch ms), so a mark says how old its own book was
+        (``price_at`` is the stream's last packet, any symbol's)."""
         snapshot = market_snapshot if isinstance(market_snapshot, dict) else {}
         payload = {
             'symbol': key,
@@ -804,6 +813,8 @@ class PositionManager:
             'last': safe_float(snapshot.get('last'), None),
             'source': snapshot.get('source'),
             'price_at': snapshot.get('price_at'),
+            'stream_item_at': snapshot.get('stream_item_at'),
+            'stream_quote_time_ms': snapshot.get('stream_quote_time_ms'),
         }
         self.audit.log_structured("POSITION_MARK", {k: v for k, v in payload.items() if v is not None},
                                   level=logging.DEBUG)

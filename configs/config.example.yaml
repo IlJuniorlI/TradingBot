@@ -146,9 +146,15 @@ runtime:
   # The stream quotes' REST shadow: every N-th publication, after management
   # and the entries, the served symbols' books are compared with one REST
   # batch; a book whose quote time lags REST's by more than
-  # quote_cache_seconds is dropped. After a REST quote request in trouble it
-  # waits 60 s, doubling to 15 minutes while its own checks fail. 0 turns it
-  # off.
+  # quote_cache_seconds is dropped when its last item is older than
+  # quote_cache_seconds with any price apart from REST's, or a side that
+  # differs from REST's is stale (REST held it 2 s or more), cannot be
+  # dated, or it was kept for one check at the check before; it is kept when
+  # its prices equal REST's, its bid and ask do while it receives items (for
+  # one check when its last or mark is apart), or each differing side
+  # changed at REST within 2 s (for one check).
+  # After a REST quote request in trouble it waits 60 s, doubling to 15
+  # minutes while its own checks fail. 0 turns it off.
   stream_quote_shadow_every: 20
   quote_batch_size: 50
   history_lookback_minutes: 780

@@ -478,10 +478,19 @@ class RuntimeConfig:
     # and the entries ran, the symbols the stream served since the last check
     # are fetched by REST in uncached `quotes` batches (one per quote_batch_size
     # chunk, no other request form, stopping at the first chunk in trouble) and
-    # compared with their books; a book whose
-    # quote time lags REST's by more than quote_cache_seconds is dropped and
-    # REST's quote cached in its place. After a REST quote request that failed
-    # or took longer than 2 s it waits 60 s, doubling with each further check
+    # compared with their books; a book whose quote time lags REST's by more
+    # than quote_cache_seconds is dropped and REST's quote cached in its place
+    # when its last item is older than quote_cache_seconds with any of its
+    # bid, ask, last and mark apart from REST's, or a side that differs from
+    # REST's is stale (REST held it 2 s or more at the check's read of the
+    # books, in Schwab's clock), cannot be dated, or it was kept for one check
+    # at the check before; it is kept otherwise (its four prices equal REST's;
+    # its bid and ask do while it receives items, for one check when its last
+    # or mark is apart; or each differing side changed at REST within 2 s, for
+    # one check: the stream trails REST by up to about a second;
+    # data_feed.STREAM_QUOTE_STALE_SIDE_SECONDS, since 2026-10-13). After a
+    # REST quote request that failed or took longer than 2 s it waits 60 s,
+    # doubling with each further check
     # of its own in trouble, at most 15 minutes, until a request answers. A
     # check that meets a REST outage holds the loop for its request's retry
     # chain (about 31 s when reads time out at timeout: 10, longer for connect
@@ -581,8 +590,9 @@ class RuntimeConfig:
     export_session_archive: bool = True
     # One POSITION_MARK record per held position per management pass, at
     # DEBUG (the log file, not the console): the mark the pass read, its
-    # bid / ask and when the quote was fetched, the stop and target coming
-    # into the pass, and the seconds since the pass before
+    # bid / ask and when the quote was fetched (for a stream book's quote,
+    # also the book's last item time and its quote time), the stop and
+    # target coming into the pass, and the seconds since the pass before
     # (PositionManager._log_position_mark). About 325 bytes a line: a median
     # 0.1 MB a day on the archived top_tier days (up to 1.3 MB), up to 2 MB
     # on a 0DTE day (2026-09-28). EXIT_CONTEXT and POSITION_ADJUSTMENT carry

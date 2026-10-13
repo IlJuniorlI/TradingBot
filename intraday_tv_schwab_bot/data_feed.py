@@ -137,6 +137,53 @@ STREAM_QUOTE_SHADOW_BACKOFF_SECONDS = 60.0
 STREAM_QUOTE_SHADOW_BACKOFF_MAX_SECONDS = 900.0
 STREAM_QUOTE_SHADOW_SLOW_SECONDS = 2.0
 
+# The REST shadow's drop rule (MarketDataStore._check_stream_quotes_against_rest,
+# _shadow_lag_verdict; since 2026-10-13). Only a book whose quote time (field
+# 34) lags REST's quoteTime by more than _quote_ttl is judged, in this order:
+# - A book whose last item is older than _quote_ttl, or unknown, may have
+#   stopped receiving: it is dropped when any of its bid, ask, last and mark
+#   differs from REST's, and kept when all four equal REST's (a quiet book).
+# - A book receiving items is kept when its bid and ask both equal REST's (a
+#   current book whose quote time alone stood still); when its last or mark
+#   differs from REST's, for one check only, as the race below (management
+#   prices from the mark, so a mark that stays apart is not kept for good).
+# - Otherwise each side that differs from REST's is judged by REST's own time
+#   for it (bidTime, askTime) against the check's read of the books, in
+#   Schwab's clock. A side REST had held STREAM_QUOTE_STALE_SIDE_SECONDS or
+#   more drops the book: the stream, which trails REST by up to about a
+#   second (one packet a second), would have delivered it. So, as before the
+#   rule, does a side time that is missing, unreadable or later than its
+#   answer's newest time (another unit or clock), and an answer that holds
+#   no other quote with a time: a quote cannot date its own sides, since its
+#   own quote time may be the very change judged. Where the answer's other
+#   quotes are all quiet, their newest time trails the read, and it is the
+#   stream packet's bound below that dates the sides. When every differing side
+#   changed at REST within the limit (the race: REST answered a change the
+#   stream had not yet delivered), the book is kept, for one check only: a
+#   book kept on either one-check ground and kept on one again at the next
+#   check that judges it, in the same epoch, is dropped
+#   (MarketDataStore._stream_quote_race_kept).
+#   So a book whose bid and ask stopped while its prints flow, which REST's
+#   moving sides on a busy name would otherwise keep for good, serves at
+#   most one shadow interval.
+# The read is a lower bound of Schwab's clock when the books were read, the
+# later of two: the answer's newest quoteTime or tradeTime plus our time from
+# that answer's arrival to the read, and the stream's last packet's Schwab
+# timestamp plus our time from its receipt to the read (our clock minus that
+# packet's lag). Each adds our clock's time to Schwab's, never our clock's
+# instant, so a skew between the two clocks moves no age. An age reads
+# short: by the packet's latency under the packet's bound (about 0.2 s on
+# H:), and under the answer's by as long as the answer stood still before
+# REST read it plus REST's time from its read to its answer. The packet's
+# bound can only lengthen an age, so should Schwab's stream timestamps run
+# ahead of its quote times it drops more, as before the rule; it never dates
+# a side that its answer cannot.
+STREAM_QUOTE_STALE_SIDE_SECONDS = 2.0
+
+# The prices the REST shadow sets side by side: (the name in a normalized
+# quote, the book's L1 field id).
+_SHADOW_PRICES = (("bid", "1"), ("ask", "2"), ("last", "3"), ("mark", "33"))
+
 # Two waits space out the REST requests that would otherwise go out pass after
 # pass while they fail, so neither an outage nor Schwab refusing a symbol
 # holds every pass for a request's retry chain (about 3 s under a 429 or a
@@ -202,6 +249,109 @@ def _quote_time(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
     return int(value)
+
+
+def _rest_number(value: Any) -> str:
+    """A REST quote's time or size on a stream quote line: the number, or
+    ``na`` when ``value`` is not a finite one (a bool is not)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return "na"
+    return repr(value)
+
+
+def _quote_section(payload: Any) -> Mapping:
+    """A REST quote payload's ``quote`` section, or ``{}``."""
+    section = payload.get("quote") if isinstance(payload, Mapping) else None
+    return section if isinstance(section, Mapping) else {}
+
+
+def _answer_times(extracted: Mapping[str, Any]) -> dict[str, int | None]:
+    """For each quote of one REST ``quotes`` answer (``extracted``: symbol to
+    payload), the answer's newest ``quoteTime`` or ``tradeTime`` (Schwab's
+    epoch ms, which every time in the answer is at or before), or None when
+    no other quote in the answer carries one: a quote cannot date its own
+    sides, since its own quote time may be the very change judged. Where the
+    other quotes are all quiet this time trails the read, and the stream
+    packet's bound dates the sides (``STREAM_QUOTE_STALE_SIDE_SECONDS``'
+    comment)."""
+    newest: dict[str, int] = {}
+    for symbol, payload in extracted.items():
+        section = _quote_section(payload)
+        times = [moment for moment in (_quote_time(section.get("quoteTime")), _quote_time(section.get("tradeTime")))
+                 if moment is not None]
+        if times:
+            newest[symbol] = max(times)
+    if not newest:
+        return {symbol: None for symbol in extracted}
+    answer_ms = max(newest.values())
+    return {symbol: answer_ms if any(other != symbol for other in newest) else None for symbol in extracted}
+
+
+def _joined(names: list[str]) -> str:
+    """``bid``, ``bid and ask``, ``bid, last and mark``."""
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+@dataclass(frozen=True, slots=True)
+class _ShadowVerdict:
+    """What the REST shadow does with a lagging book (``_shadow_lag_verdict``):
+    ``drop`` it or not, ``why``, and ``race`` whether it is kept on a ground
+    that holds for one check only: the race (each differing side changed at
+    REST within the limit), or its last or mark alone apart from REST's while
+    its bid and ask equal them."""
+
+    drop: bool
+    why: str
+    race: bool = False
+
+
+def _shadow_lag_verdict(values: Mapping[str, Any], normalized: Mapping[str, Any], section: Mapping,
+                        answer_ms: int | None, read_ms: int | None, item_age: float | None, ttl: float,
+                        race_before: bool) -> _ShadowVerdict:
+    """The REST shadow's verdict on a book whose quote time lags REST's by
+    more than ``ttl`` (``STREAM_QUOTE_STALE_SIDE_SECONDS``' comment has the
+    rule): ``values`` the book's fields, ``normalized`` and ``section`` REST's
+    quote and its ``quote`` section, ``answer_ms`` its answer's newest time
+    (``_answer_times``; None when no other quote dates it), ``read_ms`` the
+    check's read of the books in Schwab's clock (None with ``answer_ms``),
+    ``item_age`` the seconds from the book's last item to the check (None
+    when unknown), ``race_before`` whether the check before that judged it
+    kept it on a one-check ground (``_ShadowVerdict.race``)."""
+    apart = [name for name, fid in _SHADOW_PRICES if float(values[fid]) != float(normalized[name])]
+    if item_age is None or item_age > ttl:
+        stopped = ("its last item's time is unknown" if item_age is None
+                   else "its last item is older than the limit")
+        if apart:
+            return _ShadowVerdict(True, f"{stopped}, with its {_joined(apart)} apart from REST's"
+                                        + ("" if item_age is None else ": a book that stopped receiving"))
+        return _ShadowVerdict(False, f"{stopped}, but its bid, ask, last and mark equal REST's")
+    sides = [(name, key) for name, key in (("bid", "bidTime"), ("ask", "askTime")) if name in apart]
+    if not sides:
+        if not apart:
+            return _ShadowVerdict(False, "bid and ask equal REST's")
+        held = f"its bid and ask equal REST's, but its {_joined(apart)} differ{'s' if len(apart) == 1 else ''}"
+        if race_before:
+            return _ShadowVerdict(True, f"{held}, and its book was kept for one check at the check before")
+        return _ShadowVerdict(False, f"{held}: kept for one check", race=True)
+    differ = f"its {_joined([name for name, _key in sides])} differ{'s' if len(sides) == 1 else ''} from REST's"
+    if answer_ms is None or read_ms is None:
+        return _ShadowVerdict(True, f"{differ}, and REST's answer holds no other quote with a time to date its sides "
+                                    "by")
+    limit_ms = STREAM_QUOTE_STALE_SIDE_SECONDS * 1000.0
+    for name, key in sides:
+        side_ms = _quote_time(section.get(key))
+        if side_ms is None:
+            return _ShadowVerdict(True, f"{differ}, and REST's {key} is unreadable")
+        if side_ms > answer_ms:
+            return _ShadowVerdict(True, f"{differ}, and REST's {key} is after its answer's newest time")
+        if read_ms - side_ms >= limit_ms:
+            return _ShadowVerdict(True, f"{differ}, and REST's {name} had stood {(read_ms - side_ms) / 1000.0:.1f} s "
+                                        f"at the read, at least {STREAM_QUOTE_STALE_SIDE_SECONDS:.0f} s")
+    race = f"REST's changed less than {STREAM_QUOTE_STALE_SIDE_SECONDS:.0f} s before the read"
+    if race_before:
+        return _ShadowVerdict(True, f"{differ}, and {race}, but its book was kept for one check at the check "
+                                    "before: the race keeps a book for one check")
+    return _ShadowVerdict(False, f"{differ}, but {race}: the stream trails REST by up to about a second", race=True)
 
 
 def _stream_log_text(value: Any) -> str:
@@ -277,6 +427,32 @@ class _QuoteOutcome:
     what: str
     trouble: str | None
     seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ShadowLag:
+    """A book the REST shadow found lagging REST by more than the limit
+    (``MarketDataStore._check_stream_quotes_against_rest``): the lag and
+    the two quote times (epoch ms), REST's quote (``_normalize_quote``'s)
+    and its ``quote`` section, the book's fields, its REST answer's newest
+    time (``_answer_times``; None when no other quote dates it), the
+    stream's last packet's Schwab timestamp (None without one), the check's
+    read of the books in Schwab's clock (None without the answer's time),
+    the seconds from the book's last item to the check (None when unknown),
+    and the verdict (``_shadow_lag_verdict``)."""
+
+    symbol: str
+    lag: int
+    stream_time: int
+    rest_time: int
+    normalized: dict
+    section: Mapping
+    values: dict
+    answer_ms: int | None
+    stamp_ms: int | None
+    read_ms: int | None
+    item_age: float | None
+    verdict: _ShadowVerdict
 
 
 @dataclass(slots=True)
@@ -456,6 +632,11 @@ class MarketDataStore:
         self._rest_quote_trouble: tuple[datetime, str] | None = None
         self._stream_quote_shadow_doublings = 0
         self._stream_quote_shadow_skipping = False
+        # The symbols whose books the last check that judged them kept on the
+        # race's ground, with that check's epoch: the race keeps a book for one
+        # check (STREAM_QUOTE_STALE_SIDE_SECONDS' comment). A check replaces
+        # the entry of each symbol it judges; a reset of the books clears them.
+        self._stream_quote_race_kept: dict[str, int] = {}
         self._lock = RLock()
         self.started_at = sessions.now_et()
         self._forced_premarket_history_refresh_date: dict[str, date] = {}
@@ -2930,10 +3111,15 @@ class MarketDataStore:
         fresh now, one INFO line setting the two side by side: ``Stream quote
         check symbol=... source=... epoch=... stream_age_s=... bid=REST/stream
         ask=... last=... mark=... d_bid=... d_ask=... d_last=... d_mark=...
-        quote_time_lag_ms=... exchange=REST/stream`` (``d_`` is stream minus
-        REST; the lag is REST's ``quoteTime`` minus the book's field 34; the
-        exchanges are the two raw names). It never fails the fetch: an error
-        is logged with its type."""
+        quote_time_lag_ms=... rest_bid_time=... rest_ask_time=...
+        rest_bid_size=... rest_ask_size=... rest_quote_age_ms=...
+        exchange=REST/stream`` (``d_`` is stream minus REST; the lag is REST's
+        ``quoteTime`` minus the book's field 34; REST's ``bidTime`` and
+        ``askTime`` in epoch ms, its ``bidSize`` and ``askSize``, and its
+        quote's age when it answered, by our clock, so a skew between
+        Schwab's clock and ours reads in it, since 2026-10-13; ``na`` for one
+        it lacks; the exchanges are the two raw names). It never fails the
+        fetch: an error is logged with its type."""
         if not symbols or not self.config.runtime.stream_quotes:
             return
         now = sessions.now_et()
@@ -2959,13 +3145,20 @@ class MarketDataStore:
                 stream_time = values.get("34")
                 lag = (str(int(rest_time) - int(stream_time)) if isinstance(rest_time, (int, float))
                        and not isinstance(rest_time, bool) and stream_time is not None else "na")
+                section = _quote_section(raw)
+                fetched_at = rest.get("fetched_at")
+                quote_ms = _quote_time(section.get("quoteTime"))
+                quote_age = ("na" if quote_ms is None or not isinstance(fetched_at, datetime)
+                             else str(round(fetched_at.timestamp() * 1000.0) - quote_ms))
                 reference = raw.get("reference") if isinstance(raw.get("reference"), dict) else {}
                 LOG.info("Stream quote check symbol=%s source=%s epoch=%d stream_age_s=%.2f %s %s "
-                         "quote_time_lag_ms=%s exchange=%s/%s", symbol, str(source or "unspecified"), read.epoch,
+                         "quote_time_lag_ms=%s rest_bid_time=%s rest_ask_time=%s rest_bid_size=%s rest_ask_size=%s "
+                         "rest_quote_age_ms=%s exchange=%s/%s", symbol, str(source or "unspecified"), read.epoch,
                          max(0.0, (now - read.at).total_seconds()),
                          " ".join(f"{name}={_check_text(r)}/{_check_text(s)}" for name, r, s in pairs),
                          " ".join(f"d_{name}={_check_delta(r, s)}" for name, r, s in pairs), lag,
-                         reference.get("exchangeName"), values.get("25"))
+                         *(_rest_number(section.get(key)) for key in ("bidTime", "askTime", "bidSize", "askSize")),
+                         quote_age, reference.get("exchangeName"), values.get("25"))
             except Exception as exc:
                 LOG.error("Stream quotes: the forced-fetch check of %s failed (%s: %s)", symbol, type(exc).__name__,
                           exc)
@@ -3030,20 +3223,39 @@ class MarketDataStore:
         the back-off doubled when REST already was. Otherwise, for each symbol
         with both, the four prices' differences (stream minus REST) and the
         quote-time lag (REST's ``quoteTime`` minus the book's field 34, when
-        both carry one). A book that lags by more than ``_quote_ttl`` is
-        dropped before it is served again and REST's quote is cached in its
-        place (WARNING each): a frozen book is then neither published nor
+        both carry one). A book that lags by more than ``_quote_ttl`` gets
+        one line naming the lag, its last item's age, its prices against
+        REST's, REST's ``bidTime``, ``askTime``, ``bidSize`` and ``askSize``,
+        its answer's newest time (``_answer_times``, per answer), the
+        stream's last packet's Schwab timestamp, the check's read of the
+        books in Schwab's clock with each side's age at it, and REST's quote
+        age at the check by our clock. It is dropped
+        (``_shadow_lag_verdict``; ``STREAM_QUOTE_STALE_SIDE_SECONDS``' comment
+        has the rule, since 2026-10-13) when it may have stopped receiving
+        with a price apart from REST's, or a side that differs from REST's
+        is stale, cannot be dated, or was kept on the race's ground at the
+        check before, before it is served again, and REST's quote is cached
+        in its place (WARNING): a frozen book is then neither published nor
         served from the cache, and serves again once its bid, ask, last and
-        mark arrive again. One INFO line per check, ``Stream quote shadow:
-        checked=... lagging=... rest_missing=... not_fresh=... differ=...
-        max_abs_d_bid=... max_abs_d_ask=... max_abs_d_last=...
-        max_abs_d_mark=... max_lag_ms=... rest_s=...`` (each largest
-        difference with its symbol when it is not zero)."""
+        mark arrive again. Otherwise it is kept and serves on (INFO): its
+        four prices equal REST's, its bid and ask do while it receives items,
+        or each side that differs changed at REST within the limit before
+        the read (for one check). One INFO line per check,
+        ``Stream quote shadow: checked=... lagging=... dropped=...
+        rest_missing=... not_fresh=... differ=... max_abs_d_bid=...
+        max_abs_d_ask=... max_abs_d_last=... max_abs_d_mark=...
+        max_lag_ms=... rest_s=...`` (each largest difference with its symbol
+        when it is not zero)."""
         ttl = self._quote_ttl()
         was_in_trouble = self._rest_quote_trouble is not None
         started = time.monotonic()
         outcomes: list[_QuoteOutcome] = []
         rest: dict[str, dict] = {}
+        # Each symbol's answer's newest time (None when no other quote in the
+        # answer dates it) and when that answer arrived, by our clock: each
+        # answer is its own, since a later chunk's would age an earlier one's
+        # sides by the time between them.
+        answers: dict[str, tuple[int | None, datetime]] = {}
         for chunk in self._quote_batch_chunks(symbols):
             what = f"the shadow's quotes of {len(chunk)}"
             try:
@@ -3057,6 +3269,7 @@ class MarketDataStore:
                 if schwab_failure_is_systemic(exc):
                     self._note_rest_outcome(None, QUOTE_REQUEST, systemic_failure=True)
                 break                          # its outcome says why
+            answered_at = sessions.now_et()
             self._note_rest_outcome(None, QUOTE_REQUEST, systemic_failure=schwab_status_is_systemic(
                 getattr(response, "status_code", None)))
             if outcomes[-1].trouble is not None:
@@ -3071,6 +3284,7 @@ class MarketDataStore:
             for symbol in extracted:
                 self._note_quote_answered(symbol)
             rest.update(extracted)
+            answers.update((symbol, (answer_ms, answered_at)) for symbol, answer_ms in _answer_times(extracted).items())
         rest_seconds = time.monotonic() - started
         self._note_rest_quote_outcomes(outcomes)
         trouble = next((outcome for outcome in outcomes if outcome.trouble is not None), None)
@@ -3084,10 +3298,16 @@ class MarketDataStore:
             return
         now = sessions.now_et()
         read = self.stream_quotes.read(symbols, now, ttl)
+        # Schwab's clock at this read by the stream: its last packet's
+        # timestamp plus our time since its receipt (our clock minus that
+        # packet's lag), a lower bound short by the packet's latency.
+        packet_ms = (None if read.stamp_ms is None or read.at is None
+                     else read.stamp_ms + round((now - read.at).total_seconds() * 1000.0))
         largest: dict[str, tuple[float, str]] = {}
         max_lag: tuple[int, str] | None = None
-        lagging: list[tuple[str, int, int, int, dict, dict, datetime | None]] = []
+        lagging: list[_ShadowLag] = []
         checked = rest_missing = not_fresh = differ = 0
+        judged: list[str] = []
         for symbol in symbols:
             payload = rest.get(symbol)
             values = read.books.get(symbol)
@@ -3098,58 +3318,73 @@ class MarketDataStore:
                 not_fresh += 1
                 continue
             checked += 1
+            judged.append(symbol)
             normalized = self._normalize_quote(symbol, payload)
             differs = False
-            for name, fid in (("bid", "1"), ("ask", "2"), ("last", "3"), ("mark", "33")):
+            for name, fid in _SHADOW_PRICES:
                 delta = abs(float(values[fid]) - float(normalized[name]))
                 differs = differs or delta != 0.0
                 if name not in largest or delta > largest[name][0]:
                     largest[name] = (delta, symbol)
             if differs:
                 differ += 1
-            section = payload.get("quote") if isinstance(payload.get("quote"), Mapping) else {}
+            section = _quote_section(payload)
             rest_time, stream_time = _quote_time(section.get("quoteTime")), values.get("34")
             if rest_time is not None and stream_time is not None:
                 lag = rest_time - int(stream_time)
                 if max_lag is None or lag > max_lag[0]:
                     max_lag = (lag, symbol)
                 if lag > ttl * 1000.0:
-                    # .get: a served book always has its time, and the
-                    # warning's diagnosis must never stand in the drop's way.
-                    lagging.append((symbol, lag, int(stream_time), rest_time, normalized, values,
-                                    read.item_at.get(symbol)))
-        if lagging:
+                    # The book's last item and its own prices against REST's
+                    # tell a book that stopped receiving items (an old item,
+                    # prices apart) from a current one whose quote time alone
+                    # stood still (prices equal). An item merged between this
+                    # check's now and its read reads 0.0 s; a book without its
+                    # item time (a served book always has it) is judged as one
+                    # that may have stopped.
+                    item_at = read.item_at.get(symbol)
+                    item_age = None if item_at is None else max(0.0, (now - item_at).total_seconds())
+                    answer_ms, answered_at = answers[symbol]
+                    read_ms = None
+                    if answer_ms is not None:
+                        read_ms = answer_ms + max(0, round((now - answered_at).total_seconds() * 1000.0))
+                        if packet_ms is not None:
+                            read_ms = max(read_ms, packet_ms)
+                    verdict = _shadow_lag_verdict(values, normalized, section, answer_ms, read_ms, item_age, ttl,
+                                                  self._stream_quote_race_kept.get(symbol) == read.epoch)
+                    lagging.append(_ShadowLag(symbol, lag, int(stream_time), rest_time, normalized, section, values,
+                                              answer_ms, read.stamp_ms, read_ms, item_age, verdict))
+        dropping = [entry for entry in lagging if entry.verdict.drop]
+        for entry in lagging:
+            if not entry.verdict.drop:
+                LOG.info("Stream quote shadow: %s; its book is kept (%s)", self._shadow_lag_text(entry, ttl, now),
+                         entry.verdict.why)
+        if dropping:
             # REST's quotes first: a lock timeout on the drop (which replaces
             # the books) leaves the cache holding them all the same.
-            for symbol, _lag, _stream_time, _rest_time, normalized, _values, _item_at in lagging:
-                self._store_rest_quote(symbol, normalized, now)
+            for entry in dropping:
+                self._store_rest_quote(entry.symbol, entry.normalized, now)
 
-            def _warn_lagging() -> None:
-                # The book's last item and its own prices against REST's tell
-                # a book that stopped receiving items (an old item, prices
-                # apart) from a current one whose quote time alone stood
-                # still (prices equal): the dry-run question of 2026-10-06.
-                # An item merged between this check's now and its read reads
-                # 0.0 s.
-                for symbol, lag, stream_time, rest_time, normalized, values, item_at in lagging:
-                    item_age = (f"{max(0.0, (now - item_at).total_seconds()):.1f} s" if item_at is not None
-                                else "na")
-                    gaps = " ".join(f"{name} {float(values[fid]) - float(normalized[name]):+.4f}"
-                                    for name, fid in (("bid", "1"), ("ask", "2"), ("last", "3"), ("mark", "33")))
-                    LOG.warning("Stream quote shadow: %s lags REST by %d ms (quote time %d against REST's %d, limit "
-                                "%.0f s; its last item %s before this check; stream minus REST: %s); its book is "
-                                "dropped and REST's quote cached in its place, and it serves again once its bid, ask, "
-                                "last and mark arrive again", symbol, lag, stream_time, rest_time, ttl, item_age, gaps)
+            def _warn_dropped() -> None:
+                for entry in dropping:
+                    LOG.warning("Stream quote shadow: %s; its book is dropped (%s) and REST's quote cached in its "
+                                "place, and it serves again once its bid, ask, last and mark arrive again",
+                                self._shadow_lag_text(entry, ttl, now), entry.verdict.why)
 
             try:
-                self.stream_quotes.drop([entry[0] for entry in lagging])
+                self.stream_quotes.drop([entry.symbol for entry in dropping])
             except StreamQuoteLockTimeout:
                 # The reset that follows replaces every book, so each is
                 # dropped all the same: the lines a stuck stream thread's day
                 # needs most.
-                _warn_lagging()
+                _warn_dropped()
                 raise
-            _warn_lagging()
+            _warn_dropped()
+        # After the drop: one that raised leaves the one-check keeps of the
+        # check before, so a book due its drop is dropped at the next check.
+        for symbol in judged:
+            self._stream_quote_race_kept.pop(symbol, None)
+        self._stream_quote_race_kept.update((entry.symbol, read.epoch) for entry in lagging if entry.verdict.race)
 
         def _largest(name: str) -> str:
             if name not in largest:
@@ -3157,11 +3392,45 @@ class MarketDataStore:
             delta, which = largest[name]
             return f"{delta:.4f}@{which}" if delta > 0 else f"{delta:.4f}"
 
-        LOG.info("Stream quote shadow: checked=%d of %d served symbols (epoch %d) lagging=%d rest_missing=%d "
-                 "not_fresh=%d differ=%d max_abs_d_bid=%s max_abs_d_ask=%s max_abs_d_last=%s max_abs_d_mark=%s "
-                 "max_lag_ms=%s rest_s=%.2f", checked, len(symbols), read.epoch, len(lagging), rest_missing, not_fresh,
-                 differ, _largest("bid"), _largest("ask"), _largest("last"), _largest("mark"),
-                 "na" if max_lag is None else f"{max_lag[0]}@{max_lag[1]}", rest_seconds)
+        LOG.info("Stream quote shadow: checked=%d of %d served symbols (epoch %d) lagging=%d dropped=%d "
+                 "rest_missing=%d not_fresh=%d differ=%d max_abs_d_bid=%s max_abs_d_ask=%s max_abs_d_last=%s "
+                 "max_abs_d_mark=%s max_lag_ms=%s rest_s=%.2f", checked, len(symbols), read.epoch, len(lagging),
+                 len(dropping), rest_missing, not_fresh, differ, _largest("bid"), _largest("ask"), _largest("last"),
+                 _largest("mark"), "na" if max_lag is None else f"{max_lag[0]}@{max_lag[1]}", rest_seconds)
+
+    @staticmethod
+    def _shadow_lag_text(entry: _ShadowLag, ttl: float, now: datetime) -> str:
+        """What the REST shadow's line says of a lagging book, before its
+        verdict: ``SYM lags REST by N ms (quote time ... against REST's ...,
+        limit N s; its last item N s before this check; stream minus REST:
+        bid ... ask ... last ... mark ...; REST bid_time=... ask_time=...
+        bid_size=... ask_size=... answer_time=... packet_time=... read_time=...
+        bid_age_ms=... ask_age_ms=... quote_age_ms=...)``. REST's times are
+        its epoch ms; ``answer_time`` its answer's newest quote or trade time
+        (``_answer_times``), ``packet_time`` the stream's last packet's
+        Schwab timestamp, ``read_time`` the check's read of the books in
+        Schwab's clock (``STREAM_QUOTE_STALE_SIDE_SECONDS``' comment) and
+        each side's age at it, the ages the drop rule judges;
+        ``quote_age_ms`` REST's quote's age at this check by our clock, so a
+        skew between Schwab's clock and ours reads in it; ``na`` for what is
+        missing (a read without its answer's time)."""
+        section = entry.section
+        gaps = " ".join(f"{name} {float(entry.values[fid]) - float(entry.normalized[name]):+.4f}"
+                        for name, fid in _SHADOW_PRICES)
+        ages = []
+        for key in ("bidTime", "askTime"):
+            side_ms = _quote_time(section.get(key))
+            ages.append("na" if side_ms is None or entry.read_ms is None else str(entry.read_ms - side_ms))
+        item_age = "na" if entry.item_age is None else f"{entry.item_age:.1f} s"
+        answer_time, packet_time, read_time = ("na" if moment is None else str(moment)
+                                               for moment in (entry.answer_ms, entry.stamp_ms, entry.read_ms))
+        return (f"{entry.symbol} lags REST by {entry.lag} ms (quote time {entry.stream_time} against REST's "
+                f"{entry.rest_time}, limit {ttl:.0f} s; its last item {item_age} before this check; stream minus REST: "
+                f"{gaps}; REST bid_time={_rest_number(section.get('bidTime'))} "
+                f"ask_time={_rest_number(section.get('askTime'))} bid_size={_rest_number(section.get('bidSize'))} "
+                f"ask_size={_rest_number(section.get('askSize'))} "
+                f"answer_time={answer_time} packet_time={packet_time} read_time={read_time} bid_age_ms={ages[0]} "
+                f"ask_age_ms={ages[1]} quote_age_ms={round(now.timestamp() * 1000.0) - entry.rest_time})")
 
     def _log_stream_quote_transition(self, read: StreamQuoteRead, now: datetime, ttl: float, requested: int) -> None:
         """Log the stream quotes going silent (no LEVELONE_EQUITIES data
@@ -3202,7 +3471,7 @@ class MarketDataStore:
         if values is None or read.at is None:
             return None
         try:
-            return self._publish_stream_quote(symbol, values, read.at)
+            return self._publish_stream_quote(symbol, values, read.at, read.item_at.get(symbol))
         except Exception as exc:
             LOG.error("Stream quotes: publishing %s failed (%s: %s); its book is dropped and REST serves it", symbol,
                       type(exc).__name__, exc)
@@ -3212,7 +3481,8 @@ class MarketDataStore:
                 self._reset_stream_quotes("the book drop", again)
             return None
 
-    def _publish_stream_quote(self, symbol: str, values: Mapping[str, Any], at: datetime) -> dict | None:
+    def _publish_stream_quote(self, symbol: str, values: Mapping[str, Any], at: datetime,
+                              item_at: datetime | None) -> dict | None:
         """Cache ``symbol``'s stream book as its quote, through
         ``_normalize_quote`` like a REST quote (the book in Schwab's REST
         names, ``stream_quotes.rest_payload``, a display field it lacks
@@ -3220,10 +3490,16 @@ class MarketDataStore:
         stamped ``fetched_at`` and ``last_quote_refresh`` with ``at`` (the
         receipt of the stream's last LEVELONE_EQUITIES data message, so the
         quote's age is honest and never more than ``_quote_ttl``) and
-        ``quote_source`` "stream". Never over a newer quote: when the cached
-        one's ``last_quote_refresh`` is later than ``at`` (a forced REST
-        fetch after the stream's last message) nothing is written and None
-        is returned; the symbol then takes the TTL path, which serves it."""
+        ``quote_source`` "stream". Since 2026-10-13 it also carries the
+        book's own times, as diagnostics that no decision reads (POSITION_MARK
+        logs them): ``stream_item_at``, the receipt of the last item merged
+        into the book (``StreamQuoteRead.item_at``), and
+        ``stream_quote_time_ms``, the book's quote time (field 34, Schwab's
+        epoch ms; None when the book has none). Never over a newer quote:
+        when the cached one's ``last_quote_refresh`` is later than ``at`` (a
+        forced REST fetch after the stream's last message) nothing is written
+        and None is returned; the symbol then takes the TTL path, which
+        serves it."""
         with self._lock:
             cached = self.quote_cache.get(symbol)
             last = self.last_quote_refresh.get(symbol)
@@ -3233,6 +3509,8 @@ class MarketDataStore:
                                                                 (cached or {}).get("raw")))
         normalized["fetched_at"] = at
         normalized["quote_source"] = "stream"
+        normalized["stream_item_at"] = item_at
+        normalized["stream_quote_time_ms"] = values.get("34")
         with self._lock:
             last = self.last_quote_refresh.get(symbol)
             if last is not None and last > at:
@@ -3659,8 +3937,10 @@ class MarketDataStore:
         holds it. Replace the books with an empty state (nothing subscribed,
         no book; the epoch count kept: ``StreamQuoteState.successor``), so no
         later pass waits on that lock: every quote is REST until the next pass
-        subscribes afresh (SUBS) and Schwab's snapshot fills the books."""
+        subscribes afresh (SUBS) and Schwab's snapshot fills the books, which
+        the REST shadow judges afresh (no race keep carries over)."""
         self.stream_quotes = self.stream_quotes.successor()
+        self._stream_quote_race_kept.clear()
         LOG.error("Stream quotes: %s failed (%s: %s); the books are replaced by empty ones, and the next pass "
                   "subscribes afresh", what, type(exc).__name__, exc)
 

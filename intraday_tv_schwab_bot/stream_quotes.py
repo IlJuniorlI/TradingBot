@@ -180,9 +180,10 @@ class StreamQuoteBook:
     ``values`` holds the kept fields by L1 id; ``delayed`` the last
     ``"delayed"`` flag seen (None before any); ``announced`` whether the
     first-complete line was logged; ``item_at`` the receipt time of the last
-    item merged into it (a drop keeps it), which the REST shadow's lag
-    warning names, so the log tells a book that stopped receiving items from
-    one whose quote time alone stood still."""
+    item merged into it (a drop keeps it), which the REST shadow's lag line
+    names and its drop rule reads (a book whose last item is older than the
+    limit stopped receiving items; a current one's quote time alone may stand
+    still), and each publication of the book carries, for POSITION_MARK."""
 
     values: dict[str, Any] = field(default_factory=dict)
     delayed: bool | None = None
@@ -268,9 +269,12 @@ class StreamQuoteRead:
     requested symbol that is fresh, and ``item_at`` the receipt time of the
     last item merged into each of those books (``StreamQuoteBook.item_at``);
     ``at`` is the receipt time of the last LEVELONE_EQUITIES data message of
-    this epoch (None before any); ``live`` whether that is within the read's
-    limit; ``epoch`` the LOGIN responses seen; ``subscribed`` how many
-    symbols are subscribed."""
+    this epoch (None before any) and ``stamp_ms`` that message's Schwab
+    timestamp (epoch ms; None when it carried none that is a positive
+    integer), so ``at`` minus it is the message's lag behind Schwab's clock,
+    which the REST shadow's drop rule reads (since 2026-10-13); ``live``
+    whether ``at`` is within the read's limit; ``epoch`` the LOGIN responses
+    seen; ``subscribed`` how many symbols are subscribed."""
 
     books: dict[str, dict[str, Any]]
     at: datetime | None
@@ -278,6 +282,7 @@ class StreamQuoteRead:
     epoch: int
     subscribed: int
     item_at: dict[str, datetime] = field(default_factory=dict)
+    stamp_ms: int | None = None
 
 
 class StreamQuoteState:
@@ -291,7 +296,10 @@ class StreamQuoteState:
         self._symbols: frozenset[str] = frozenset()
         self._books: dict[str, StreamQuoteBook] = {}
         self._epoch = epoch
+        # The receipt of this epoch's last LEVELONE_EQUITIES data message and
+        # its Schwab timestamp (StreamQuoteRead's at and stamp_ms).
         self._last_data_at: datetime | None = None
+        self._last_data_stamp_ms: int | None = None
         self._warned: set[tuple[str, str]] = set()
         self._first_item_logged = False
         # The health line: the period's counters, when the last line was
@@ -357,6 +365,7 @@ class StreamQuoteState:
             self._symbols = frozenset()
             self._books = {}
             self._last_data_at = None
+            self._last_data_stamp_ms = None
             self._last_data_received_at = None
             self._last_heartbeat_at = None
             self._last_message_at = None
@@ -449,7 +458,7 @@ class StreamQuoteState:
                         if book.item_at is not None:      # always, on a complete book: for the type
                             item_at[symbol] = book.item_at
             return StreamQuoteRead(books=books, at=at, live=live, epoch=self._epoch, subscribed=len(self._symbols),
-                                   item_at=item_at)
+                                   item_at=item_at, stamp_ms=self._last_data_stamp_ms)
 
     # ------------------------------------------------------------ stream thread
     def on_message(self, payload: Any, now: datetime) -> None:
@@ -558,6 +567,9 @@ class StreamQuoteState:
             if isinstance(stamp, int) and not isinstance(stamp, bool) and stamp > 0:
                 lag = now.timestamp() * 1000.0 - stamp
                 period.max_lag_ms = lag if period.max_lag_ms is None else max(period.max_lag_ms, lag)
+                self._last_data_stamp_ms = stamp
+            else:
+                self._last_data_stamp_ms = None
             for item in content:
                 self._on_item_locked(item, now, lines)
 
@@ -604,6 +616,7 @@ class StreamQuoteState:
         self._epoch += 1
         self._books = {symbol: StreamQuoteBook() for symbol in self._symbols}
         self._last_data_at = None
+        self._last_data_stamp_ms = None
         self._warned.clear()
         self._first_item_logged = False
 
