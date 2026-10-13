@@ -30,10 +30,10 @@ from typing import Any
 
 import pandas as pd
 
-from ...bars import same_day_mask
-from ...indicators import get_session_indicator_window, last_bar_atr, ltf_ema_spans
+from ...bars import session_bucket_ends
+from ...indicators import get_session_indicator_window, htf_ema_spans, last_bar_atr, ltf_ema_spans
 from ...models import Candidate, Position, Side, Signal
-from ...sessions import EQUITY_RTH_OPEN, equity_session_state, parse_hhmm
+from ...sessions import EQUITY_RTH_OPEN, equity_session_state, is_regular_equity_session, parse_hhmm
 from ...numeric import safe_float
 from ...reasons import detail_fields, insufficient_bars_reason, reason_gate
 from ...support_resistance import role_levels
@@ -42,7 +42,7 @@ from ..shared_entry import EntryContexts, EntryProposal
 from ..strategy_base import BaseStrategy
 from ...daily_stats import SymbolDailyStats
 from .armed_retest import ARMED_RETEST_REGIMES, ArmedRetestMixin
-from .confirmation import ConfirmationMixin, last_closed_bars
+from .confirmation import ConfirmationMixin, closed_ltf, last_closed_bars, session_bars, setup_window, vwap_at_bucket_close
 from .regimes.momentum import MomentumRegimeMixin
 from .regimes.orb import OrbRegimeMixin
 from .regimes.pullback import PullbackRegimeMixin
@@ -202,6 +202,97 @@ def protective_exits_knob(params: Mapping[str, Any], strategy_name: str, *, allo
     return value
 
 
+# A setup qualifies only once today's session holds this many CLOSED LTF
+# buckets (user decision 3, 2026-10-12): three 5m buckets, from 09:45 on the
+# RTH session. Until then every candidate is skipped as ltf_warmup(<n>/3);
+# position management does not read it. On a 1m LTF it is three minutes.
+LTF_WARMUP_CLOSED_BUCKETS = 3
+
+# The stored HTF frame's freshness bound (2026-10-13), in bars of the frame
+# (``htf_minutes``): in RTH a stored HTF frame whose newest completed bar
+# ended more than this many of its bars ago is stale, and an entry that
+# reads it (``_htf_frame_readers``: the HTF gates and score term, the S/R
+# levels) is refused. A frame refreshed on schedule is at most one bar plus
+# the refresh settle old (seconds past 15 minutes on the 15m frame), so two
+# bars (30 minutes on the 15m frame, 60 on a 30m one, 120 on a 60m one) let
+# one refresh miss, and the frame reads stale once the bar after it has
+# ended too.
+HTF_FRAME_MAX_AGE_BARS = 2
+
+# Knobs checked at load (2026-10-13): each must be in the params (both
+# manifests that run this engine declare it) and of its kind, else the load
+# refuses, naming the key. A quoted "false" is a string, not false.
+STRICT_BOOL_KNOBS = (
+    "require_htf_bias_alignment",
+    "require_htf_pivot_alignment_trend",
+    "orb_bypass_htf_bias",
+    "require_index_confirmation",
+    "leg_anchored_confirmation",
+    "trailing_bias_enabled",
+)
+# (key, whole number, lowest, lowest allowed, highest, highest allowed).
+# htf_ema_alignment_score is a weight: 0 turns the term off, and a negative
+# one would add to the side the HTF trend opposes (bounded 2026-10-13).
+NUMBER_KNOBS = (
+    ("htf_ema_alignment_score", False, 0.0, True, None, True),
+    ("index_breadth_min_peers", True, 1, True, None, True),
+    ("index_breadth_min_agree_frac", False, 0.0, False, 1.0, True),
+    ("leg_anchor_min_age_bars", True, 1, True, None, True),
+    ("leg_anchor_min_impulse_pct", False, 0.0, True, None, True),
+    ("trailing_bias_lookback", True, 1, True, None, True),
+    ("trailing_bias_majority_threshold", False, 0.5, False, 1.0, True),
+    ("ltf_minutes", True, 1, True, None, True),
+    ("ltf_indicator_span_scale", False, 0.0, False, None, True),
+    ("min_ltf_bars", True, 1, True, None, True),
+    ("range_min_stop_atr_mult", False, 0.0, True, None, True),
+    ("vol_squeeze_stop_box_mult", False, 0.0, True, None, True),
+)
+
+
+def checked_knobs(params: Mapping[str, Any], strategy_name: str) -> None:
+    """Refuse, with a ValueError naming the key, a knob of
+    ``STRICT_BOOL_KNOBS`` that is not true or false, one of ``NUMBER_KNOBS``
+    that is not a finite number in its bounds (a whole number where it
+    counts bars), a missing one of either, and a bad
+    ``require_htf_ema_alignment`` mode or LTF / HTF EMA span pair. The load
+    runs it on the params of every strategy a config sets
+    (``normalize_params``), and the strategy again when it is built."""
+    for key in STRICT_BOOL_KNOBS:
+        if key not in params:
+            raise ValueError(f"strategies.{strategy_name}.params.{key} is missing: the strategy's manifest declares it")
+        if not isinstance(params[key], bool):
+            raise ValueError(f"strategies.{strategy_name}.params.{key} must be true or false, got {params[key]!r}")
+    for key, whole, low, low_ok, high, high_ok in NUMBER_KNOBS:
+        if key not in params:
+            raise ValueError(f"strategies.{strategy_name}.params.{key} is missing: the strategy's manifest declares it")
+        value = params[key]
+        bad = isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+        if not bad and whole and float(value) != int(value):
+            bad = True
+        if not bad and low is not None and (value < low or (value == low and not low_ok)):
+            bad = True
+        if not bad and high is not None and (value > high or (value == high and not high_ok)):
+            bad = True
+        if bad:
+            kind = "a whole number" if whole else "a finite number"
+            bounds = []
+            if low is not None:
+                bounds.append(f"{'>=' if low_ok else '>'} {low}")
+            if high is not None:
+                bounds.append(f"{'<=' if high_ok else '<'} {high}")
+            raise ValueError(f"strategies.{strategy_name}.params.{key} must be {kind}"
+                             f"{' ' + ' and '.join(bounds) if bounds else ''}, got {value!r}")
+    if "require_htf_ema_alignment" not in params:
+        raise ValueError(f"strategies.{strategy_name}.params.require_htf_ema_alignment is missing: the strategy's "
+                         "manifest declares it")
+    try:
+        TopTierAdaptiveStrategy._htf_ema_alignment_sides(params["require_htf_ema_alignment"])
+        ltf_ema_spans(params)
+        htf_ema_spans(params)
+    except ValueError as exc:
+        raise ValueError(f"strategies.{strategy_name}.params: {exc}") from exc
+
+
 @dataclass
 class _EntryCycle:
     """What ``entry_signals`` reads once per cycle for every candidate."""
@@ -223,11 +314,22 @@ class _EntryCycle:
 @dataclass
 class _CandidateRead:
     """One candidate's reads for this cycle (``_read_candidate``): what the
-    scoring pass and the builds share."""
+    scoring pass and the builds share.
+
+    ``frame`` is the step frame's closed 1m bars (a last bar whose minute is
+    still trading by the clock left out: ``last_closed_bars``, so every 1m
+    trigger read is a closed bar's) and ``ltf`` its resample to
+    ``ltf_min`` minutes with the step frame's session VWAP, the current
+    bucket last; ``ltf_forming`` says whether that bucket is still forming
+    (the one flag every setup read keys on: ``confirmation.closed_ltf``).
+    ``close`` and ``vwap`` are the step frame's last close and session VWAP;
+    ``ema9`` / ``ema20`` / ``adx`` / ``ret5`` / ``ret15`` / ``atr`` the last
+    closed LTF bucket's."""
     c: Candidate
     frame: pd.DataFrame
     ltf: pd.DataFrame
     ltf_min: int
+    ltf_forming: bool
     close: float
     vwap: float
     ema9: float
@@ -238,12 +340,15 @@ class _CandidateRead:
     atr: float
     vol_scale: float
     index_ok_by_side: dict[Side, bool]
+    index_detail_by_side: dict[Side, str]
     htf_ema_read: tuple[str, int, int]
     idx_neutral: bool
     day_strength: float | None
     effective_bias: Side | None
     respect_bias: bool
     preferred_sides: list[Side]
+    relative_strength_drop: str | None
+    relative_strength_skipped: str | None
     explicit_side_decided: bool
     decided_side: Side | None
     side_vote_note: str
@@ -265,26 +370,33 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
 
     @classmethod
     def normalize_params(cls, params: dict[str, Any]) -> dict[str, Any]:
-        """Checks the entry spread guard's knobs (``entry_spread_limits``)
-        and the protective exits' knob (``protective_exits_knob``) at load
+        """Checks the entry spread guard's knobs (``entry_spread_limits``),
+        the protective exits' knob (``protective_exits_knob``) and the HTF,
+        index, leg, trailing-bias and LTF knobs (``checked_knobs``) at load
         (``load_config`` runs this on every ``strategies.<name>.params`` a
         config sets), so a bad value refuses to start before the Schwab
         client is built."""
         out = super().normalize_params(params)
         entry_spread_limits(out, cls.strategy_name)
         protective_exits_knob(out, cls.strategy_name, allowed=cls.protective_exits_on_book_allowed)
+        checked_knobs(out, cls.strategy_name)
         return out
 
     def __init__(self, config):
         super().__init__(config)
-        # The entry spread guard's limits (``entry_spread_refusal``) and the
-        # protective exits' knob, checked again here: params the load did
-        # not normalize (a config with no params block for this strategy, or
-        # params set after the load) reach the strategy only through its
-        # build.
+        # The entry spread guard's limits (``entry_spread_refusal``), the
+        # protective exits' knob and the knobs of ``checked_knobs``, checked
+        # again here: params the load did not normalize (a config with no
+        # params block for this strategy, or params set after the load) reach
+        # the strategy only through its build.
         self._entry_spread_limits = entry_spread_limits(self.params, self.strategy_name)
         self._protective_exits_on_executable_side = protective_exits_knob(
             self.params, self.strategy_name, allowed=self.protective_exits_on_book_allowed)
+        checked_knobs(self.params, self.strategy_name)
+        # Per symbol, the state of its stored HTF frame the gates last read
+        # (``_htf_frame_refusal``: fresh, stale or missing), so a change is
+        # logged once rather than every pass.
+        self._htf_frame_states: dict[str, str] = {}
         # Per-symbol rolling window of recent LIVE directional bias
         # observations (output of ``_compute_live_directional_bias``).
         # Trailing-bias memory for Fix A (2026-04-23): when the current
@@ -324,11 +436,6 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # that has since been swept is worse than re-deriving it.
         self._armed_retests: dict[str, dict[str, Any]] = {}
         self._validate_orb_window()
-        # A bad ltf_ema_fast_span / ltf_ema_slow_span or
-        # require_htf_ema_alignment fails here, naming the key, rather than on
-        # the first entry cycle.
-        ltf_ema_spans(self.params)
-        self._htf_ema_gated_sides()
 
     def _htf_ema_gated_sides(self) -> frozenset[Side]:
         return self._htf_ema_alignment_sides(self.params.get("require_htf_ema_alignment", "disabled"))
@@ -345,6 +452,101 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         if (side == Side.LONG and bias == "bearish") or (side == Side.SHORT and bias == "bullish"):
             return -weight
         return 0.0
+
+    def _htf_frame_readers(self, side: Side, orb_htf_bypass: bool, data) -> tuple[str, ...]:
+        """What reads the candidate's stored HTF frame on an entry on *side*:
+        ``_finalize_signal`` then needs the frame there and fresh
+        (``_htf_frame_refusal``; 2026-10-13). Empty when nothing does.
+
+        - ``htf_bias``: the structure gate (``require_htf_bias_alignment``);
+        - ``htf_ema_gate``: the EMA gate on *side* (``require_htf_ema_alignment``);
+        - ``htf_ema_score``: the EMA score term (``htf_ema_alignment_score``),
+          which moved the regime scores before the build, so a stale frame's
+          trend can have qualified the regime;
+        - ``sr``: the S/R context, built on the stored frame when
+          ``support_resistance`` is on and a data feed holds the frames
+          (``_sr_context``). Every entry hands it to the shared stage, whose
+          S/R veto, broken-level guard, S/R stop / target refinement and S/R
+          score terms read it, and top_tier's own S/R reads use it too: Fix
+          G, the ladder's rungs, the ORB opposing-level block, sr_scalp's
+          levels and vol_squeeze's S/R alignment.
+
+        The shared stage's HTF score terms (the HTF divergence and FVG terms)
+        read the HTF context too; which of them run is the shared stage's
+        to read (``config.shared_entry`` belongs to ``SharedEntryPolicy``),
+        and they score rather than gate. With the S/R levels on, as in both
+        presets, every entry asks for the frame anyway.
+
+        The ORB-window HTF bypass (``orb_htf_bypass``) lifts the three HTF
+        reads only; the S/R context is read in the window too. With no data
+        feed there are no stored frames and no S/R context to read (it is
+        the empty one), and only the HTF gates and score term ask for the
+        frame, which then reads as missing."""
+        readers: list[str] = []
+        if not orb_htf_bypass:
+            if bool(self.params.get("require_htf_bias_alignment", True)):
+                readers.append("htf_bias")
+            if side in self._htf_ema_gated_sides():
+                readers.append("htf_ema_gate")
+            if float(self.params.get("htf_ema_alignment_score", 0.0)):
+                readers.append("htf_ema_score")
+        if data is not None and bool(self._support_resistance_setting("enabled", True)):
+            readers.append("sr")
+        return tuple(readers)
+
+    def _htf_frame_refusal(self, symbol: str, data) -> str | None:
+        """Why an entry cannot read *symbol*'s stored HTF frame
+        (``htf_minutes``), or None when it can (2026-10-13):
+
+        - ``htf_frame_missing(tf=<N>m)``: no frame is stored (before the
+          first refresh, a fetch that keeps failing, no data feed);
+        - ``htf_frame_stale(age=<M>m><bound>m,last=HH:MM)``: in RTH, the
+          frame's newest completed bar ended more than
+          ``HTF_FRAME_MAX_AGE_BARS`` of its bars ago (30 minutes on the 15m
+          frame): its refreshes stopped (an outage keeps the stored bars).
+          Outside RTH a thin name can print no bar in a bucket, so only a
+          missing frame refuses there.
+
+        Until then a gate reading no frame saw no levels, a neutral
+        structure and a neutral EMA trend and passed the entry, and a frozen
+        frame kept deciding at the live price. ``_finalize_signal`` asks it
+        whenever the entry reads the frame (``_htf_frame_readers``). A
+        symbol's state (fresh, stale or missing) is logged when it changes,
+        not on every pass. The stored frame's index is tz-aware ET: the data
+        feed builds it from the broker's epoch times
+        (``MarketDataStore._refresh_htf_frame``)."""
+        timeframe = self.htf_minutes()
+        stored = (data.get_htf_frame(symbol, timeframe_minutes=timeframe)
+                  if data is not None and hasattr(data, "get_htf_frame") else None)
+        now = sessions.now_et()
+        if stored is None or stored.empty:
+            state, refusal = "missing", f"htf_frame_missing(tf={timeframe}m)"
+        else:
+            label = pd.Timestamp(stored.index[-1])
+            end = session_bucket_ends(pd.DatetimeIndex([label]), timeframe)[0]
+            age = (pd.Timestamp(now) - end).total_seconds() / 60.0
+            bound = HTF_FRAME_MAX_AGE_BARS * timeframe
+            if is_regular_equity_session(now) and age > bound:
+                state = "stale"
+                refusal = f"htf_frame_stale(age={age:.0f}m>{bound}m,last={label:%H:%M})"
+            else:
+                state, refusal = "fresh", None
+        previous = self._htf_frame_states.get(symbol)
+        if state != previous:
+            self._htf_frame_states[symbol] = state
+            if refusal is not None:
+                LOG.warning("%s: the entries that read its HTF frame are refused: %s", symbol, refusal)
+            elif previous is not None:
+                LOG.warning("%s: its %dm HTF frame reads again (was %s)", symbol, timeframe, previous)
+        return refusal
+
+    def technical_context_minutes(self) -> int:
+        """1: the technical-levels context this strategy reads is the step
+        frame's, its 1m bars, whatever the LTF its setups use
+        (``_finalize_signal``'s gates and the shared entry stage, the
+        candidate's stop widening, vol_squeeze's Bollinger compression), and
+        the dashboard's technicals overlay is built on the same bars."""
+        return 1
 
     def dashboard_htf_trend(self, symbol: str, data, price: float) -> dict[str, str] | None:
         """The HTF EMA trend the gate and score read, off the same context
@@ -409,7 +611,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         return max(0, int(self.params.get("min_bars", 60) or 60))
 
     def _breakout_reference(
-        self, regime: str, side: Side, ltf: pd.DataFrame, frame: pd.DataFrame,
+        self, regime: str, side: Side, ltf: pd.DataFrame,
     ) -> tuple[pd.DataFrame | None, float | None]:
         """The N-bar extreme a breakout regime has to clear, and the window it
         came from.
@@ -420,22 +622,25 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         the moment either lookback was retuned, and the failure would be
         silent — the bot would arm on one level and enter against another.
 
-        ``trend`` reads the LTF (25 bars at ``ltf_minutes: 1``); ``momentum``
-        reads the base 1m frame (6 bars), matching the standalone
-        momentum_close strategy it was generalised from. Both are scoped to
-        today's session, because the resampled LTF crosses the session
-        boundary during early RTH.
+        Both read the LTF's setup window (``setup_window``): the last N of
+        today's buckets before the current one (premarket included, as the
+        1m windows were), all closed —
+        ``pullback_lookback_bars`` for ``trend`` and
+        ``momentum_breakout_lookback_bars`` for ``momentum``, 5 and 6 closed
+        5m buckets on the shipped preset (2026-10-13). Until then ``trend``
+        read 25 bars of the 1m LTF and ``momentum`` 6 bars of the base 1m
+        frame, the bar before the current one last. The close that has to
+        clear the level is the step frame's latest 1m close.
         """
         if regime == "trend":
-            source, lookback = ltf, max(3, int(self.params.get("pullback_lookback_bars", 5)))
+            lookback = max(3, int(self.params.get("pullback_lookback_bars", 5)))
         elif regime == "momentum":
-            source, lookback = frame, max(3, int(self.params.get("momentum_breakout_lookback_bars", 6)))
+            lookback = max(3, int(self.params.get("momentum_breakout_lookback_bars", 6)))
         else:
             return None, None
-        if source is None or source.empty:
+        if ltf is None or ltf.empty:
             return None, None
-        session = source[same_day_mask(source, sessions.now_et().date())]
-        recent = session.tail(lookback + 1).iloc[:-1] if len(session) > lookback else session.iloc[:-1]
+        recent = setup_window(ltf, lookback)
         if recent.empty:
             return None, None
         if side == Side.LONG:
@@ -622,15 +827,20 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # context (usually 15m) is attached to sr_ctx.market_structure.
         # Two layers:
         #   1. Explicit bias: block if mshtf_bias is opposed to the trade
-        #      direction (e.g. LONG vs bearish). This catches confirmed
-        #      trend opposition.
-        #   2. Pivot pattern: `mshtf_bias` is labeled "bearish" only after
-        #      an active BOS/CHoCH, so a stock forming LL/LH pivots may
-        #      still read "neutral" while being structurally bearish.
-        #      Extend the filter to pullback entries so the AMZN 2026-04-15
-        #      pattern is caught (LL pivots, screener bias SHORT, bot
-        #      took 3 range/pullback LONGs and lost on all three).
-        #   3. Neutral/aligned bias still passes.
+        #      direction (e.g. LONG vs bearish). The bias is the first rule of
+        #      _resolve_structure_bias that applies -- a 15m breakout, the
+        #      close's half of the last swing (the midpoint, tested before
+        #      the labels), a recent BoS, the swing labels -- so it is
+        #      largely a location reading, and it applies to every regime.
+        #   2. Pivot pattern (pullback, and trend under
+        #      require_htf_pivot_alignment_trend): the swing labels against
+        #      the trade (LH with LL / EQL for a LONG). LH + LL never resolves
+        #      to a neutral bias, so this layer refuses a trade layer 1 has
+        #      passed as aligned: the AMZN 2026-04-15 and INTC 2026-04-20
+        #      pattern, a bias that read the trade's way while the swings
+        #      still leaned against it.
+        #   3. A neutral bias passes layer 1; at layer 2 only LH + EQL /
+        #      EQH + HL, whose pivot_bias reads neutral, can still refuse.
         #
         # ORB-window bypass: during the opening window (through orb_end),
         # the 15-min chart has zero or one completed bars from today — the
@@ -639,7 +849,9 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # its own directional proof. Blocking on stale HTF bias here
         # killed the TSLA 2026-04-15 open-dip-then-run ($362→$394).
         # After the ORB window, 2-3 closed 15-min bars exist and the
-        # filter becomes meaningful again.
+        # filter becomes meaningful again. With disable_orb_regime (the
+        # shipped preset) there is no ORB window and the bypass never
+        # applies: the HTF gates run from the first entry.
         # (orb_end / in_orb_window now computed once at the top of this
         # function so Fix D gates share the same reading; see comment there.)
         # ORB follow-through gate: during the ORB window, require the most
@@ -691,6 +903,23 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                         self._set_build_failure(c.symbol, regime, f"short_orb_5m_not_bearish(open={bar_open:.4f},close={bar_close:.4f})")
                         return None
         orb_htf_bypass = bool(self.params.get("orb_bypass_htf_bias", True)) and in_orb_window
+        # The stored HTF frame must be there and, in RTH, fresh
+        # (2026-10-13: ``_htf_frame_refusal``) whenever this entry
+        # reads it (``_htf_frame_readers``): the HTF gates below, the HTF EMA
+        # score term that moved the regime scores, and the S/R context the
+        # shared stage and top_tier's own S/R gates read. A gate
+        # reading no frame saw no levels, a neutral structure and a neutral
+        # EMA trend and passed every entry, and a frame an outage froze kept
+        # deciding at the live price. Checked once, before any of them.
+        if self._htf_frame_readers(side, orb_htf_bypass, data):
+            htf_refusal = self._htf_frame_refusal(c.symbol, data)
+            if htf_refusal is not None:
+                self._set_build_failure(c.symbol, regime, f"{regime}_{htf_refusal}")
+                return None
+        # Every HTF refusal names its regime (2026-10-13), as the
+        # queue loop's own gates do: ``<side>_build_failed_<regime>_htf_...``.
+        # A side that tries three regimes logged three identical strings
+        # before, and only the primary's family told them apart.
         if bool(self.params.get("require_htf_bias_alignment", True)) and not orb_htf_bypass:
             mshtf_ctx = getattr(sr_ctx, "market_structure", None)
             if mshtf_ctx is not None:
@@ -706,24 +935,31 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 if side == Side.LONG and htf_bias == "bearish":
                     self._set_build_failure(
                         c.symbol, regime,
-                        f"htf_bias_bearish(source={bias_source},"
+                        f"{regime}_htf_bias_bearish(source={bias_source},"
                         f"last_high={last_high or 'na'},last_low={last_low or 'na'})",
                     )
                     return None
                 if side == Side.SHORT and htf_bias == "bullish":
                     self._set_build_failure(
                         c.symbol, regime,
-                        f"htf_bias_bullish(source={bias_source},"
+                        f"{regime}_htf_bias_bullish(source={bias_source},"
                         f"last_high={last_high or 'na'},last_low={last_low or 'na'})",
                     )
                     return None
-                # Layer 2 — pullback + trend regimes: block when the HTF
-                # pivot pattern itself leans against the trade even though
-                # bias is labeled neutral. Extended to trend as Fix E after
-                # top_tier INTC 2026-04-20 (-$29) showed mshtf_bias=bullish
-                # but mshtf_pivot_bias=bearish let a doomed trend long through.
-                # Range regime still skips this — range thesis doesn't
-                # presume trend direction.
+                # Layer 2 — pullback + trend regimes: block when the 15m
+                # swing labels form the opposing pattern: LH with LL or EQL
+                # against a LONG, HL with HH or EQH against a SHORT. It keys
+                # on the labels, not on pivot_bias (LH with EQL reads neutral)
+                # and not on the bias: layer 1 has already refused an opposed
+                # bias, and LH + LL can never resolve to a neutral one, so
+                # this layer refuses only trades whose 15m bias reads ALIGNED
+                # (a 15m breakout, the close's half of the swing, a recent
+                # BoS) while the swing pattern still leans the other way. The
+                # pivot_bias test below is implied by the labels it follows.
+                # Extended to trend as Fix E after top_tier INTC 2026-04-20
+                # (-$29): mshtf_bias=bullish but mshtf_pivot_bias=bearish let a
+                # doomed trend long through. Range regime still skips this —
+                # range thesis doesn't presume trend direction.
                 # Disable via ``require_htf_pivot_alignment_trend: false``.
                 pivot_regimes = {"pullback"}
                 if bool(self.params.get("require_htf_pivot_alignment_trend", True)):
@@ -732,14 +968,14 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                     if side == Side.LONG and last_high == "LH" and last_low in {"LL", "EQL"} and pivot_bias != "bullish":
                         self._set_build_failure(
                             c.symbol, regime,
-                            f"htf_pivot_bearish(last_high={last_high},last_low={last_low},"
+                            f"{regime}_htf_pivot_bearish(last_high={last_high},last_low={last_low},"
                             f"pivot_bias={pivot_bias})",
                         )
                         return None
                     if side == Side.SHORT and last_low == "HL" and last_high in {"HH", "EQH"} and pivot_bias != "bearish":
                         self._set_build_failure(
                             c.symbol, regime,
-                            f"htf_pivot_bullish(last_high={last_high},last_low={last_low},"
+                            f"{regime}_htf_pivot_bullish(last_high={last_high},last_low={last_low},"
                             f"pivot_bias={pivot_bias})",
                         )
                         return None
@@ -762,7 +998,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         if side in self._htf_ema_gated_sides() and htf_ema_opposed and not orb_htf_bypass:
             self._set_build_failure(
                 c.symbol, regime,
-                f"htf_ema_trend_{htf_ema_bias}(votes={htf_ema_bull}v{htf_ema_bear})",
+                f"{regime}_htf_ema_trend_{htf_ema_bias}(votes={htf_ema_bull}v{htf_ema_bear})",
             )
             return None
         htf_ema_bonus = self._htf_ema_score_term(side, htf_ema_bias, in_orb_window)
@@ -1082,18 +1318,20 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         self._prune_armed_retests()
         out: list[Signal] = []
         min_bars = int(self.params.get("min_bars", 60) or 60)
-        ltf_min = max(1, int(self.params.get("ltf_minutes", 5)))
-        # Indicator-span stretch for the LTF frame. With a 1m LTF, span_scale=5
-        # makes atr14/adx14/rsi14/ret5/ret15 behave like the old 5m frame
-        # (atr14->70, ...) so entry scoring keeps its 5m wall-clock horizons
-        # while acting on finer 1m bars/closes. Default 1.0 leaves the
-        # canonical spans untouched. The LTF EMAs are set on their own by
-        # ltf_ema_fast_span / ltf_ema_slow_span (default: 9 / 20 x span_scale).
+        # The LTF every regime sets up on (5m in the shipped preset since
+        # 2026-10-13; 1m with its indicators stretched x5 from 2026-05-29).
+        ltf_min = int(self.params.get("ltf_minutes", 5))
+        # Indicator-span stretch for the LTF frame: 1.0 (the shipped preset)
+        # keeps the canonical spans; on a 1m LTF, 5 made atr14 / adx14 / rsi14
+        # / ret5 / ret15 behave like a 5m frame's (atr14 -> 70 bars, ...), an
+        # opt-in kept for that use (the ATR it gives is ~0.43x a 5m ATR14, not
+        # equal to it). The LTF EMAs are set on their own by
+        # ltf_ema_fast_span / ltf_ema_slow_span (9 / 20 on the shipped 5m LTF).
         # Exits and the ema9-extension gate read the base 1m frame's native
         # EMA9 / EMA20, not these.
         ltf_span_scale = float(self.params.get("ltf_indicator_span_scale", 1.0))
         ltf_ema_pair = ltf_ema_spans(self.params)
-        min_ltf_bars = int(self.params.get("min_ltf_bars", 15))
+        min_ltf_bars = int(self.params.get("min_ltf_bars", 30))
         allow_short = bool(self.config.risk.allow_short)
         now_t = sessions.now_et().time()
         allowed_regimes = self._allowed_regimes(now_t)
@@ -1167,6 +1405,23 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                                    winning_norm)
         return out
 
+    @staticmethod
+    def _trailing_bias_side(recent: list[Side | None], lookback: int, threshold: float) -> Side | None:
+        """The side the trailing-bias memory infers from *recent* (its last
+        ``lookback`` LTF bars' live bias reads): at least half the window,
+        rounded up, must be directional, and *threshold* of those one side.
+        None when neither holds."""
+        long_count = sum(1 for b in recent if b == Side.LONG)
+        short_count = sum(1 for b in recent if b == Side.SHORT)
+        total_directional = long_count + short_count
+        if total_directional < (lookback + 1) // 2:
+            return None
+        if short_count / total_directional >= threshold:
+            return Side.SHORT
+        if long_count / total_directional >= threshold:
+            return Side.LONG
+        return None
+
     def _read_candidate(self, cycle: _EntryCycle, c: Candidate, bars: dict[str, pd.DataFrame],
                         positions: dict[str, Position], data) -> _CandidateRead | None:
         """Everything the scoring pass and the builds read for *c* this cycle,
@@ -1205,40 +1460,92 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             self._record_entry_decision(c.symbol, "skipped", ["extended_hours_not_eligible"])
             return None
         frame = bars.get(c.symbol)
+        # The step frame holds closed 1m bars: the minute history without the
+        # minute still trading and the stream's bars, each sent once its
+        # minute closed. A last bar whose minute is still trading by the
+        # clock (a partial minute from the stream, a history path that kept
+        # it) is dropped here, once a pass, and logged (``last_closed_bars``),
+        # so the price and every 1m trigger read of this candidate -- the
+        # trigger close, range's wick and previous close, vol_squeeze's
+        # breakout bar, vwap_reclaim's volume pop and wick, the armed
+        # retest's touch, reclaim and bar shape, Fix B's two bars -- read
+        # closed bars: a forming bar never confirms (2026-10-13). The LTF is
+        # resampled from the same bars.
+        if frame is not None:
+            frame = last_closed_bars(c.symbol, frame, 1, frame)
         if frame is None or len(frame) < min_bars:
             self._record_entry_decision(c.symbol, "skipped", [
                 insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), min_bars)])
             return None
 
+        # The LTF (``ltf_minutes``), resampled from the step frame: every
+        # regime's setup is measured on its closed buckets (2026-10-13; see
+        # confirmation.py, "The LTF setup reads"). Its last row is the current
+        # bucket, which holds the step frame's last 1m bar; ``ltf_forming``
+        # says whether that bucket is still trading (``last_closed_bars``,
+        # read here once a pass: the earlier of the step frame's end and the
+        # clock).
         ltf = self._resampled_frame(frame, ltf_min, span_scale=ltf_span_scale,
                                     ema_spans=ltf_ema_pair)
-        if ltf is None or ltf.empty or len(ltf) < min_ltf_bars:
+        if ltf is None or ltf.empty or "vwap" not in frame.columns:
             self._record_entry_decision(c.symbol, "skipped", ["missing_ltf_context"])
             return None
+        ltf_forming = len(last_closed_bars(c.symbol, ltf, ltf_min, frame)) < len(ltf)
+        if len(closed_ltf(ltf, ltf_forming)) < min_ltf_bars:
+            self._record_entry_decision(c.symbol, "skipped", ["missing_ltf_context"])
+            return None
+        # A setup qualifies only once today's session holds
+        # LTF_WARMUP_CLOSED_BUCKETS closed LTF buckets (user decision 3,
+        # 2026-10-12): from 09:45 on the 5m LTF, whose first buckets would
+        # otherwise vote, trend and break out on one or two session buckets
+        # and session-reset EMAs that have not separated. It counts the
+        # indicator session's buckets (``session_bars``: from 09:30 on the
+        # "rth" window); the setup windows count today's, premarket included
+        # (``today_bars``, user decision 2026-10-13).
+        session_closed = len(session_bars(closed_ltf(ltf, ltf_forming)))
+        if session_closed < LTF_WARMUP_CLOSED_BUCKETS:
+            self._record_entry_decision(c.symbol, "skipped", [
+                f"ltf_warmup({session_closed}/{LTF_WARMUP_CLOSED_BUCKETS})"])
+            return None
+        # One VWAP reference: the step frame's session VWAP, on the LTF too
+        # (``vwap_at_bucket_close``), the VWAP the peers, the reclaim and the
+        # vote read. A resample rebuilds VWAP from its own typical prices. A
+        # premarket bucket carries the step frame's all-hours VWAP, so the
+        # reads of buckets against VWAP keep to the session's
+        # (``session_window``).
+        ltf = ltf.assign(vwap=vwap_at_bucket_close(ltf, frame))
+        closed = closed_ltf(ltf, ltf_forming)
 
         # Per-candidate index lookup — uses ``sector_index_map`` to route
         # AAPL → XLK, XOM → XLE, FCX → XLB, etc. Falls back to
         # ``index_symbols`` when no sector mapping exists for the symbol.
-        index_ok_by_side = {side: self._index_confirms(side, c.symbol, bars, data) for side in sides_to_evaluate}
-        # The HTF EMA trend, read once per candidate for the score term
-        # (``_score_sides``; the gate reads the same context in
-        # _finalize_signal).
-        ltf_close = safe_float(ltf.iloc[-1]["close"], 0.0)
-        htf_ema_read = (
-            self._htf_bias(self._default_htf_context_for_score(c.symbol, data, ltf_close), ltf_close)
-            if float(self.params.get("htf_ema_alignment_score", 0.0)) else ("neutral", 0, 0)
-        )
-        idx_neutral = self._index_neutral(c.symbol, bars)
+        # Each side's read carries the refusal detail the build queue logs.
+        index_reads = {side: self._index_confirms(side, c.symbol, bars) for side in sides_to_evaluate}
+        index_ok_by_side = {side: ok for side, (ok, _detail) in index_reads.items()}
+        index_detail_by_side = {side: detail for side, (_ok, detail) in index_reads.items()}
 
-        last = ltf.iloc[-1]
-        close = safe_float(last["close"], 0.0)
-        vwap = safe_float(last.get("vwap"), close)
+        # Price is the step frame's: its last close, the bar the entry is
+        # built at, and its session VWAP. The setup values are the last
+        # CLOSED LTF bucket's: a forming bucket's ATR, ADX, EMAs and returns
+        # move with its partial bar.
+        close = safe_float(frame.iloc[-1]["close"], 0.0)
+        vwap = safe_float(frame.iloc[-1].get("vwap"), close)
+        last = closed.iloc[-1]
         ema9 = safe_float(last.get("ema9"), close)
         ema20 = safe_float(last.get("ema20"), close)
         adx = safe_float(last.get("adx14"), 0.0)
         ret5 = safe_float(last.get("ret5"), 0.0)
         ret15 = safe_float(last.get("ret15"), 0.0)
-        atr = last_bar_atr(ltf, close, floor_pct=0.0005)
+        atr = last_bar_atr(closed, close, floor_pct=0.0005)
+        # The HTF EMA trend, read once per candidate for the score term
+        # (``_score_sides``; the gate reads the same context in
+        # _finalize_signal), at the latest close: the HTF context's primed
+        # price.
+        htf_ema_read = (
+            self._htf_bias(self._default_htf_context_for_score(c.symbol, data, close), close)
+            if float(self.params.get("htf_ema_alignment_score", 0.0)) else ("neutral", 0, 0)
+        )
+        idx_neutral = self._index_neutral(c.symbol, bars)
 
         # Per-symbol volatility scale: this symbol's 20-day ADR relative
         # to ``reference_adr_pct``, the ADR the percent-of-price params
@@ -1293,21 +1600,32 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # that bias for the penalty calculation. Addresses the
         # 2026-04-23 GOOG 12:51 pullback_long case (current bias None
         # after 10 SHORT-biased bars, lost $22 to counter-trend).
+        #
+        # The window is ``trailing_bias_lookback`` LTF bars (checked at load,
+        # >= 1): 2 on the shipped 5m LTF, the 10 minutes it was tested on
+        # (10 on the 1m LTF); ``_trailing_bias_side`` reads it. Until
+        # 2026-10-13 the window had a floor of 3 bars and the directional
+        # count a floor of 3, which made a 2-bar window a 3-bar one that
+        # needed all three directional.
         trailing_enabled = bool(self.params.get("trailing_bias_enabled", True))
-        trailing_lookback = max(3, int(self.params.get("trailing_bias_lookback", 10)))
+        trailing_lookback = int(self.params.get("trailing_bias_lookback", 2))
         trailing_threshold = float(self.params.get("trailing_bias_majority_threshold", 0.7))
+        hist = self._recent_directional_bias.get(c.symbol)
+        if hist is None or hist.maxlen != trailing_lookback:
+            existing = list(hist) if hist is not None else []
+            hist = deque(existing[-trailing_lookback:], maxlen=trailing_lookback)
+            self._recent_directional_bias[c.symbol] = hist
+        # A new session starts the memory empty, before it is read:
+        # yesterday's closing read says nothing about this morning's open.
+        # Until 2026-10-13 the day's first pass read it first and cleared it
+        # after, so a flat open inherited the prior session's last bias.
+        bar_ts = pd.Timestamp(ltf.index[-1])
+        last_bar = self._recent_directional_bias_bar.get(c.symbol)
+        if last_bar is not None and last_bar.date() != bar_ts.date():
+            hist.clear()
         effective_bias = live_bias
         if effective_bias is None and trailing_enabled and respect_bias:
-            recent = list(self._recent_directional_bias.get(c.symbol, ()))
-            long_count = sum(1 for b in recent if b == Side.LONG)
-            short_count = sum(1 for b in recent if b == Side.SHORT)
-            total_directional = long_count + short_count
-            min_directional = max(3, trailing_lookback // 2)
-            if total_directional >= min_directional:
-                if short_count / total_directional >= trailing_threshold:
-                    effective_bias = Side.SHORT
-                elif long_count / total_directional >= trailing_threshold:
-                    effective_bias = Side.LONG
+            effective_bias = self._trailing_bias_side(list(hist), trailing_lookback, trailing_threshold)
         # Record the raw live bias (not the trailing-inferred fallback)
         # so the trailing memory reflects what the LIVE day_strength
         # has actually been doing across recent BARS.
@@ -1318,17 +1636,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # iterations -- 20-30 seconds at a 2s loop, varying with cycle
         # time -- and the memory the knob was written for (the GOOG
         # 2026-04-23 LONG into ten SHORT-biased bars) had faded long
-        # before it mattered. A new session starts it empty: yesterday's
-        # closing read says nothing about this morning's open.
-        hist = self._recent_directional_bias.get(c.symbol)
-        if hist is None or hist.maxlen != trailing_lookback:
-            existing = list(hist) if hist is not None else []
-            hist = deque(existing[-trailing_lookback:], maxlen=trailing_lookback)
-            self._recent_directional_bias[c.symbol] = hist
-        bar_ts = pd.Timestamp(ltf.index[-1])
-        last_bar = self._recent_directional_bias_bar.get(c.symbol)
-        if last_bar is not None and last_bar.date() != bar_ts.date():
-            hist.clear()
+        # before it mattered.
         if last_bar == bar_ts and hist:
             hist[-1] = live_bias
         else:
@@ -1379,7 +1687,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         decided_side: Side | None = None
         side_vote_note = ""
         if bool(self.params.get("require_explicit_side_decision", True)) and not side_decision_orb_bypass:
-            decided_side, votes = self._decide_side(ltf, close, vwap, ema9, ema20)
+            decided_side, votes = self._decide_side(ltf, closed, frame, close, vwap, ema9, ema20)
             side_vote_note = (
                 f"long={votes['long']},short={votes['short']},"
                 f"votes=[{','.join(votes['breakdown'])}]"
@@ -1407,17 +1715,52 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # Beta comes from ``_symbol_daily_stats``. When it is unavailable
         # the gate is SKIPPED for that symbol and the reason is recorded —
         # falling back to beta 1.0 would reintroduce the exact bug.
+        # ``relative_strength_skipped`` holds it,
+        # ``relative_strength_skipped(no_daily_stats|no_sector_beta)`` (and
+        # ``no_day_strength`` for a candidate whose own session open does
+        # not read), which a skip lists after its own reasons and a signal
+        # carries as ``gate_relative_strength_skipped`` (2026-10-13; until
+        # then this comment said so and nothing recorded it).
+        #
+        # The sector strength is the first of the symbol's sector ETFs that
+        # reads on a fresh frame (``_sector_day_strength``, the index
+        # confirmation's bound). None reading -- a missing, stale or
+        # unreadable ETF -- refuses the candidate, both sides being the
+        # gate's (``relative_strength_sector_unreadable(SMH=stale)``),
+        # since 2026-10-13: until then a frame of any age set the residual
+        # (a stream that stopped 30 minutes back could drop a side on its
+        # old reading) and no frame skipped the gate.
+        #
         # When the rel-strength conflicts with a side, that side is
         # removed from ``preferred_sides``; if no sides remain the
         # candidate is skipped. ORB window is bypassed (the opening
         # window is too noisy for a stock-vs-sector divergence read).
+        #
+        # A side dropped while the other remains is recorded too
+        # (2026-10-13): ``relative_strength_drop`` holds its reason,
+        # ``<side>_relative_strength_<lagging|leading>_sector(...)``, which a
+        # skip lists after its own reasons (``_record_candidate``) and a
+        # signal carries in its metadata (``gate_relative_strength_drop``).
+        # Until then the drop, about half of all candidate rows, left no
+        # trace in the decision row.
+        relative_strength_drop: str | None = None
+        relative_strength_skipped: str | None = None
         rs_threshold = self._pct_param("relative_strength_block_threshold_pct", 0.5, vol_scale)
         rs_orb_bypass = bool(self.params.get("orb_bypass_relative_strength", True)) and in_orb_window
-        if rs_threshold > 0.0 and not rs_orb_bypass and day_strength is not None:
-            sector_ds = self._sector_day_strength(c.symbol, bars)
+        if rs_threshold > 0.0 and not rs_orb_bypass:
             stats = self._symbol_daily_stats(c.symbol, data)
             beta = stats.beta if (stats is not None and stats.has_beta) else None
-            if sector_ds is not None and beta is not None:
+            if day_strength is None:
+                relative_strength_skipped = "relative_strength_skipped(no_day_strength)"
+            elif beta is None:
+                relative_strength_skipped = (
+                    f"relative_strength_skipped({'no_daily_stats' if stats is None else 'no_sector_beta'})")
+            else:
+                sector_ds, sector_why = self._sector_day_strength(c.symbol, bars)
+                if sector_ds is None:
+                    self._record_entry_decision(c.symbol, "skipped", [
+                        f"relative_strength_sector_unreadable({sector_why})"])
+                    return None
                 rel_strength = day_strength - (beta * sector_ds)
                 blocked_long = rel_strength <= -rs_threshold and Side.LONG in preferred_sides
                 blocked_short = rel_strength >= rs_threshold and Side.SHORT in preferred_sides
@@ -1425,14 +1768,15 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                     preferred_sides = [s for s in preferred_sides if s != Side.LONG]
                 if blocked_short:
                     preferred_sides = [s for s in preferred_sides if s != Side.SHORT]
+                direction = "lagging" if blocked_long else "leading"
+                rs_detail = (f"relative_strength_{direction}_sector(resid={rel_strength:+.2f}%,"
+                             f"sym={day_strength:+.2f}%,sec={sector_ds:+.2f}%,beta={beta:.2f},"
+                             f"threshold={rs_threshold:.2f}%)")
                 if not preferred_sides:
-                    direction = "lagging" if blocked_long else "leading"
-                    self._record_entry_decision(c.symbol, "skipped", [
-                        f"relative_strength_{direction}_sector(resid={rel_strength:+.2f}%,"
-                        f"sym={day_strength:+.2f}%,sec={sector_ds:+.2f}%,beta={beta:.2f},"
-                        f"threshold={rs_threshold:.2f}%)"
-                    ])
+                    self._record_entry_decision(c.symbol, "skipped", [rs_detail])
                     return None
+                if blocked_long or blocked_short:
+                    relative_strength_drop = f"{'long' if blocked_long else 'short'}_{rs_detail}"
 
         # Score thresholds — read once, used for both sides' qualifier
         # filtering.
@@ -1468,10 +1812,12 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         vol_widening = self._volatility_widening_factor(tech_ctx_for_candidate, current_time=now_t)
 
         return _CandidateRead(
-            c=c, frame=frame, ltf=ltf, ltf_min=cycle.ltf_min, close=close, vwap=vwap, ema9=ema9, ema20=ema20,
-            adx=adx, ret5=ret5, ret15=ret15, atr=atr, vol_scale=vol_scale, index_ok_by_side=index_ok_by_side,
+            c=c, frame=frame, ltf=ltf, ltf_min=cycle.ltf_min, ltf_forming=ltf_forming, close=close, vwap=vwap,
+            ema9=ema9, ema20=ema20, adx=adx, ret5=ret5, ret15=ret15, atr=atr, vol_scale=vol_scale,
+            index_ok_by_side=index_ok_by_side, index_detail_by_side=index_detail_by_side,
             htf_ema_read=htf_ema_read, idx_neutral=idx_neutral, day_strength=day_strength,
             effective_bias=effective_bias, respect_bias=respect_bias, preferred_sides=preferred_sides,
+            relative_strength_drop=relative_strength_drop, relative_strength_skipped=relative_strength_skipped,
             explicit_side_decided=explicit_side_decided, decided_side=decided_side,
             side_vote_note=side_vote_note, thresholds=thresholds,
             tech_ctx_for_candidate=tech_ctx_for_candidate, vol_widening=vol_widening,
@@ -1507,25 +1853,27 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             # (e.g. ORB window is trend-only → skip pullback + range).
             trend_score = self._score_trend(side, close, vwap, ema9, ema20, adx, ret5, ret15, index_ok)
             pullback_score = (
-                self._score_pullback(side, close, vwap, ema9, ema20, adx, atr, trend_score, ltf)
+                self._score_pullback(side, close, vwap, ema9, ema20, adx, atr, trend_score, ltf, read.ltf_forming)
                 if "pullback" in allowed_regimes else 0.0
             )
             range_score = (
-                self._score_range(side, close, ema9, ema20, frame,
+                self._score_range(side, close, ema9, ema20, ltf, frame,
                                   tech_ctx_for_candidate, idx_neutral, vol_scale)
                 if "range" in allowed_regimes else 0.0
             )
-            # vol_squeeze and momentum: scoring methods read live frame
-            # data — vol_squeeze derives compression from session bars +
-            # BB-width; momentum derives day_strength from the session
+            # vol_squeeze and momentum: their setups (the box, the breakout
+            # window) are LTF buckets, their trigger the step frame's last
+            # 1m bar; vol_squeeze's Bollinger compression is the step
+            # frame's (tech_ctx), momentum's day_strength reads the session
             # open. ``momentum`` was renamed from ``momentum_close`` and
             # widened from afternoon-only to post-ORB through close.
             vol_squeeze_score = (
-                self._score_vol_squeeze(side, close, vwap, ema9, ema20, atr, frame, tech_ctx_for_candidate, vol_scale)
+                self._score_vol_squeeze(side, close, vwap, ema9, ema20, atr, ltf, frame, tech_ctx_for_candidate,
+                                        vol_scale)
                 if "vol_squeeze" in allowed_regimes else 0.0
             )
             momentum_score = (
-                self._score_momentum(side, close, vwap, ema9, ema20, ret15, frame, vol_scale)
+                self._score_momentum(side, close, vwap, ema9, ema20, ret15, ltf, frame, vol_scale)
                 if "momentum" in allowed_regimes else 0.0
             )
             # sr_scalp: level-aware scoring (2026-05-29). Scores the
@@ -1546,10 +1894,11 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 if "orb" in allowed_regimes else 0.0
             )
             # vwap_reclaim (2026-05-30): a VWAP-reclaim momentum
-            # re-entry — dipped below session VWAP then reclaimed it on a
-            # volume pop. Reads the base 1m frame (VWAP is session-cumulative).
+            # re-entry — closed LTF buckets dipped below session VWAP, and
+            # the latest 1m close reclaimed it on a volume pop. One VWAP: the
+            # step frame's session VWAP, on the LTF's buckets too.
             vwap_reclaim_score = (
-                self._score_vwap_reclaim(side, close, vwap, ema9, ema20, atr, frame, vol_scale)
+                self._score_vwap_reclaim(side, close, vwap, ema9, ema20, atr, ltf, frame, vol_scale)
                 if "vwap_reclaim" in allowed_regimes else 0.0
             )
 
@@ -1841,21 +2190,24 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             # rotation between levels." The orb regime is also exempt (not
             # in the set) — its range-break is the directional proof. Index
             # failure on one regime falls through to the next in the queue.
+            # The refusal carries why (``_index_confirms``: the breadth
+            # tally, the peers that did not read, or the ETF path).
             if not pre_validated and regime_name in INDEX_CONFIRMED_REGIMES and not index_ok:
                 fail_reasons.append(
                     f"{side.value.lower()}_build_failed_{regime_name}_index_not_confirmed"
+                    f"({read.index_detail_by_side.get(side, '')})"
                 )
                 continue
 
             # Confirmation-bar trigger (Fix B, 2026-05-27). For
             # direction-following regimes, require the LAST FULLY
-            # CLOSED LTF bar to confirm direction before we call the
-            # build method, which enters at that bar's close: green and
-            # through the close before it (``_entry_bar_confirms``; the
-            # step frame holds closed bars only, so on a 1m LTF that is
-            # its last row). Catches single-bar fakeouts where a bar
-            # tipped a score threshold but did not close the trade's
-            # way. Range and
+            # CLOSED 1m bar of the step frame to confirm direction before
+            # we call the build method, which enters at that bar's close:
+            # green and through the close before it
+            # (``_entry_bar_confirms``). It is entry timing, so it reads the
+            # 1m bar whatever the LTF the setup is measured on. Catches
+            # single-bar fakeouts where a bar tipped a score threshold but
+            # did not close the trade's way. Range and
             # sr_scalp are exempt — both are mean-reversion theses
             # where the LAST CLOSED bar moves AGAINST the entry
             # direction by design. vwap_reclaim is also exempt — its prior
@@ -1866,7 +2218,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             if not pre_validated and (
                 regime_name in CONFIRMATION_BAR_REGIMES
                 and bool(self.params.get("require_entry_confirmation_bar", True))
-                and not self._entry_bar_confirms(c.symbol, side, ltf, read.ltf_min, frame)
+                and not self._entry_bar_confirms(c.symbol, side, frame)
             ):
                 fail_reasons.append(
                     f"{side.value.lower()}_build_failed_{regime_name}_no_confirmation_bar"
@@ -1948,19 +2300,19 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             if regime_name == "trend":
                 sig = self._build_trend_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale, breakout_confirmed=breakout_confirmed)
             elif regime_name == "pullback":
-                sig = self._build_pullback_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
+                sig = self._build_pullback_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale, ltf_forming=read.ltf_forming)
             elif regime_name == "range":
-                sig = self._build_range_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
+                sig = self._build_range_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
             elif regime_name == "vol_squeeze":
-                sig = self._build_vol_squeeze_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
+                sig = self._build_vol_squeeze_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
             elif regime_name == "momentum":
-                sig = self._build_momentum_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale, breakout_confirmed=breakout_confirmed)
+                sig = self._build_momentum_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale, breakout_confirmed=breakout_confirmed)
             elif regime_name == "sr_scalp":
                 sig = self._build_sr_scalp_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
             elif regime_name == "orb":
                 sig = self._build_orb_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
             elif regime_name == "vwap_reclaim":
-                sig = self._build_vwap_reclaim_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
+                sig = self._build_vwap_reclaim_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
 
             if sig is not None:
                 # How this entry was reached: on the retest the regime
@@ -1982,6 +2334,16 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 # watch) loses them (README section 24).
                 if refused_arms:
                     sig.metadata["armed_retest_refused"] = list(refused_arms)
+                # The side the relative-strength filter dropped this cycle
+                # (``_read_candidate``): the signal's decision row replaces
+                # the strategy's, which would have listed it. Under a
+                # ``gate_`` key, a prefix the entry and skip records keep
+                # (``audit_logger.structured_metadata_snapshot``).
+                if read.relative_strength_drop is not None and isinstance(sig.metadata, dict):
+                    sig.metadata["gate_relative_strength_drop"] = read.relative_strength_drop
+                # Likewise the gate's skip when the symbol had no beta.
+                if read.relative_strength_skipped is not None and isinstance(sig.metadata, dict):
+                    sig.metadata["gate_relative_strength_skipped"] = read.relative_strength_skipped
                 # Tier 3b: on high-conviction days, loosen the
                 # peak-giveback threshold so a 2R+ runner doesn't get
                 # cut by a normal 50% retracement. Override is stamped
@@ -2109,9 +2471,9 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             # `family` column in decisions.csv is "none" on every skipped
             # row, so a post-mortem can establish that ~20% of decisions
             # die on `no_fresh_breakout` but not whether that is `trend`
-            # or `momentum` — two regimes with very different lookbacks
-            # (25 bars on the LTF vs 6 on the base frame) and very
-            # different trade counts. The success path above already
+            # or `momentum` — two regimes with their own lookbacks
+            # (`pullback_lookback_bars`, `momentum_breakout_lookback_bars`)
+            # and very different trade counts. The success path above already
             # stamps `regime`; this is the same information on the path
             # that produces almost every row.
             #
@@ -2142,8 +2504,16 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 # different failure from "a builder rejected it", and the
                 # two are worth telling apart in the histogram.
                 skip_details["entry_family"] = "none_qualified"
+            # The side the relative-strength filter dropped, or why it was
+            # skipped, after the reasons of the side(s) it left, so the
+            # primary reason stays theirs (2026-10-13).
+            reasons = fail_reasons or ["no_setup"]
+            if read.relative_strength_drop is not None:
+                reasons = [*reasons, read.relative_strength_drop]
+            if read.relative_strength_skipped is not None:
+                reasons = [*reasons, read.relative_strength_skipped]
             self._record_entry_decision(
-                c.symbol, "skipped", fail_reasons or ["no_setup"],
+                c.symbol, "skipped", reasons,
                 details=skip_details,
             )
 

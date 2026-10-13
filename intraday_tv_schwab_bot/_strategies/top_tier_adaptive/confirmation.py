@@ -2,18 +2,21 @@
 """Confirmation and context reads for the regime engine.
 
 What the entry loop and the regimes read besides the bars themselves: the
-sector confirmation (index ETFs and peer breadth, the leg-anchored VWAP), the
-per-symbol daily statistics and volatility scale, the regime score
-normalisation (``REGIME_SCORE_CEILINGS``), the side asymmetry multipliers,
-the side vote and confirmation bar, and the live directional bias, stop
-widening and soft-bias penalty.
+LTF setup reads (``today_bars``, ``session_bars``, ``setup_window``,
+``session_window``, ``closed_ltf``, ``current_bucket_extreme``,
+``vwap_at_bucket_close``), the sector confirmation (index ETFs and peer
+breadth, the leg-anchored VWAP), the per-symbol daily statistics and
+volatility scale, the regime score normalisation
+(``REGIME_SCORE_CEILINGS``), the side asymmetry multipliers, the side vote
+and confirmation bar, and the live directional bias, stop widening and
+soft-bias penalty.
 """
 from __future__ import annotations
 
 import logging
 import math
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from typing import Any
 
 import pandas as pd
@@ -27,6 +30,14 @@ from ... import sessions
 from ...daily_stats import SymbolDailyStats, build_symbol_stats, volatility_scale
 
 LOG = logging.getLogger(__name__)
+
+# The index confirmation's freshness bound (2026-10-13): a peer or
+# sector ETF frame whose newest 1m bar closed more than this many minutes ago
+# does not vote. The frames are the step frames: a stream bar lands seconds
+# after its minute closes, and over 8 archived days the longest RTH gap was 2
+# minutes, so 3 tolerates a gap and the minute turn while an outage or a
+# halted peer drops out within minutes instead of voting its old posture.
+INDEX_FRAME_MAX_AGE_MINUTES = 3.0
 
 # Per-regime score ceilings — the maximum each _score_* method can return.
 # Used to normalise scores onto a common 0..1 scale before the build-order
@@ -75,6 +86,180 @@ def last_closed_bars(symbol: str, bars: pd.DataFrame, bar_minutes: int, frame: p
                     symbol, frame.index[-1], now.isoformat(timespec="seconds"), bar_minutes, bars.index[-1])
         return bars.iloc[:-1]
     return bars
+
+
+# ---------------------------------------------------------------------------
+# The LTF setup reads (2026-10-13)
+#
+# Every regime sets up on the strategy's LTF (``ltf_minutes``, 5 in the
+# shipped preset), resampled from the step frame's closed 1m bars, and times
+# its entry on the step frame itself. The step frame an entry pass reads has
+# closed bars only: ``_read_candidate`` drops a last 1m bar whose minute is
+# still trading by the clock (``last_closed_bars``), so the trigger bar, the
+# bar before it and the close every regime reads are closed bars'. The LTF's
+# last row is the CURRENT bucket, the one the step frame's last 1m bar (the
+# trigger bar) is in. It is still forming until the step frame holds its
+# last minute (``last_closed_bars``); ``_CandidateRead.ltf_forming`` is the
+# one flag that says so, read once a pass. A setup reads closed buckets only:
+#   * values (ATR14, ADX14, EMA9 / EMA20, ret5 / ret15, the pullback's close
+#     position and volume, the vote's last three bars, the pullback leg):
+#     the closed buckets (``closed_ltf``), so the last value is the last
+#     closed bucket's;
+#   * windows (the trend and momentum reference extreme, the pullback touch,
+#     the range zone, the squeeze box): today's buckets before the current
+#     one (``setup_window``), all closed; the reclaim's dip: the session's
+#     buckets before the current one (``session_window``, below). The
+#     current bucket is no part of its own setup: a breakout cannot clear a
+#     high its own bucket set, at the minute a bucket closes as much as
+#     within it.
+# Windows, targets and the pullback leg count today's bars from midnight
+# (``today_bars``), premarket included, as they did on 1m bars (user
+# decision, 2026-10-13); the 09:45 warm-up counts the session's own buckets
+# (``session_bars``), and so do the volume baselines (pullback's,
+# vol_squeeze's), the session's volume like the session VWAP. The LTF FVG
+# and order-block contexts read the LTF as resampled, its forming bucket
+# included (an accepted side effect).
+# Price stays the step frame's: the close is its last 1m close and VWAP its
+# session VWAP, on the LTF too (``vwap_at_bucket_close``). That VWAP resets
+# at the session's start (09:30 on the "rth" window), and a premarket bucket
+# carries the all-hours VWAP instead, so a read of buckets AGAINST VWAP --
+# the reclaim's dip, range's flips -- counts the session's buckets alone
+# (``session_window``, ``session_bars``): the dip and the reclaim read one
+# session VWAP, and a premarket bucket is no dip and no flip (user decision,
+# 2026-10-13). The pullback's touch reads a window's lows / highs against
+# the session VWAP's current value, one VWAP, and keeps today's window.
+# A stop anchored on a window also clears the current bucket's 1m bars
+# (``current_bucket_extreme``; kept by the user, 2026-10-13).
+# ---------------------------------------------------------------------------
+
+def _day_slice(frame: pd.DataFrame, start: time) -> pd.DataFrame:
+    """``frame``'s bars from ``start`` today to the day's end, today being
+    ``sessions.now_et()``'s date, read on the index's own clock (tz-aware or
+    ET wall time alike). Taken by position on the time-ordered index, as
+    ``_leg_anchor_vwap`` scans."""
+    index = frame.index
+    today = sessions.now_et().date()
+    first = pd.Timestamp(datetime.combine(today, start), tz=index.tz)
+    end = pd.Timestamp(datetime.combine(today + timedelta(days=1), time()), tz=index.tz)
+    return frame.iloc[index.searchsorted(first):index.searchsorted(end)]
+
+
+def today_bars(frame: pd.DataFrame) -> pd.DataFrame:
+    """``frame``'s bars of today's calendar day, premarket included: the
+    bars ``same_day_mask`` selects on a time-ordered frame. Every setup
+    window, the pullback's leg and swing target, the reclaim's HOD / LOD
+    target and range's previous 1m bar count these, as they did on 1m bars
+    until 2026-10-13 (user decision, 2026-10-13: the setups keep the
+    premarket bars they always read). The step frame also holds the prior
+    session; nothing is measured on it."""
+    if frame is None or frame.empty:
+        return frame
+    return _day_slice(frame, time())
+
+
+def session_bars(frame: pd.DataFrame) -> pd.DataFrame:
+    """``frame``'s bars of today's indicator session: from where the session
+    VWAP / EMA reset starts (``indicator_session_start``: the 09:30 open under
+    the "rth" window, the 07:00 stream open under "extended") to the day's
+    end. The opening warm-up counts its closed buckets
+    (``LTF_WARMUP_CLOSED_BUCKETS``: no setup before 09:45 on the "rth"
+    window), and so do a read of buckets against the session VWAP
+    (``session_window``, range's flips) and the volume baselines (the
+    pullback's buckets, vol_squeeze's box minutes: the session's volume,
+    like the session VWAP, 2026-10-13); other windows count
+    ``today_bars``."""
+    if frame is None or frame.empty:
+        return frame
+    return _day_slice(frame, indicator_session_start())
+
+
+def setup_window(ltf: pd.DataFrame, bars: int) -> pd.DataFrame:
+    """The last ``bars`` of today's buckets before the current one (``ltf``'s
+    last row; ``today_bars``, premarket included): the window a regime
+    measures its setup on. All of them have closed. Fewer when the day holds
+    fewer; empty when it holds none before the current bucket."""
+    day = today_bars(ltf)
+    if day is None or day.empty:
+        return ltf.iloc[0:0]
+    return day.iloc[:-1].tail(max(0, int(bars)))
+
+
+def session_window(ltf: pd.DataFrame, bars: int) -> pd.DataFrame:
+    """The last ``bars`` of today's SESSION buckets before the current one
+    (``ltf``'s last row; ``session_bars``: from the indicator session's
+    start, 09:30 on the "rth" window): the window a setup read against VWAP
+    measures on. Each of its buckets' ``vwap`` (``vwap_at_bucket_close``)
+    is the session VWAP the latest close is read against; a premarket
+    bucket's is the all-hours VWAP, which the session VWAP replaces at the
+    open, so it has no place here (user decision, 2026-10-13: the reclaim's
+    dip and its reclaim read the same session VWAP). All of them have
+    closed. Fewer when the session holds fewer before the current one (it
+    holds six 5m buckets from 10:00 on the "rth" window); empty when it
+    holds none."""
+    return session_bars(ltf.iloc[:-1]).tail(max(0, int(bars)))
+
+
+def closed_ltf(ltf: pd.DataFrame, forming: bool) -> pd.DataFrame:
+    """``ltf`` without its last bucket when ``forming`` (the pass's
+    ``ltf_forming`` flag) says it is still trading: the buckets a setup's
+    values are read from, the last closed one last."""
+    return ltf.iloc[:-1] if forming else ltf
+
+
+def current_bucket_extreme(frame: pd.DataFrame, ltf: pd.DataFrame, side: Side) -> float | None:
+    """The lowest low (``side`` LONG) or highest high (SHORT) of the step
+    frame's 1m bars in the current LTF bucket, the trigger bar (the frame's
+    last) included; None when none reads. They traded after the setup
+    window closed and before the entry, so a stop anchored on the window
+    clears them too: a stop inside them sits where price has just been. On a
+    1m LTF the current bucket is the trigger bar alone."""
+    if frame is None or frame.empty or ltf is None or ltf.empty:
+        return None
+    bucket = frame.iloc[frame.index.searchsorted(ltf.index[-1]):]
+    if bucket.empty:
+        return None
+    return safe_float(bucket["low"].min() if side == Side.LONG else bucket["high"].max())
+
+
+def stop_anchor(side: Side, window: pd.DataFrame, frame: pd.DataFrame, ltf: pd.DataFrame, fallback: float) -> float:
+    """The level a builder puts its stop beyond: the setup window's lowest
+    low (``side`` LONG) or highest high (SHORT), ``fallback`` when that does
+    not read, and past that every 1m bar of the current bucket
+    (``current_bucket_extreme``)."""
+    if side == Side.LONG:
+        level = safe_float(window["low"].min(), fallback)
+        extreme = current_bucket_extreme(frame, ltf, side)
+        return level if extreme is None else min(level, extreme)
+    level = safe_float(window["high"].max(), fallback)
+    extreme = current_bucket_extreme(frame, ltf, side)
+    return level if extreme is None else max(level, extreme)
+
+
+def vwap_at_bucket_close(ltf: pd.DataFrame, frame: pd.DataFrame) -> pd.Series:
+    """The step frame's session VWAP at each LTF bucket's last 1m bar, on
+    ``ltf``'s index (``ltf`` is resampled from ``frame``): the one VWAP
+    reference. A resample rebuilds VWAP from its own typical prices, which
+    drifts from the 1m session VWAP that the peers, the reclaim and the vote
+    read; the LTF's ``vwap`` is replaced by this. The current bucket's is
+    the frame's last VWAP. A bucket's last 1m bar is the frame's last bar
+    before the next bucket's label. A premarket bucket's is the step
+    frame's all-hours VWAP (the session VWAP starts at the open), so a read
+    of buckets against VWAP keeps to the session's (``session_window``)."""
+    if ltf.empty:
+        return pd.Series([], index=ltf.index, dtype=float)
+    positions = [*(frame.index.searchsorted(ltf.index[1:], side="left") - 1), len(frame) - 1]
+    return pd.Series(frame["vwap"].to_numpy(dtype=float)[positions], index=ltf.index, dtype=float)
+
+
+def frame_age_minutes(frame: pd.DataFrame, now: datetime) -> float:
+    """Minutes from the close of ``frame``'s newest 1m bar (its label plus a
+    minute) to ``now``; negative when that bar has not closed yet. A
+    tz-naive index is ET wall time."""
+    last = pd.Timestamp(frame.index[-1])
+    moment = pd.Timestamp(now)
+    if last.tzinfo is None and moment.tzinfo is not None:
+        moment = moment.tz_convert(sessions.EXCHANGE_TZ).tz_localize(None)
+    return (moment - (last + pd.Timedelta(minutes=1))).total_seconds() / 60.0
 
 
 class ConfirmationMixin:
@@ -144,9 +329,10 @@ class ConfirmationMixin:
 
         Empty when there are no index symbols (``index_symbols: []`` and no
         mapping for the symbol): the ETF path of ``_index_confirms`` then
-        has nothing to agree, ``_index_neutral`` reads neutral, the
-        relative-strength gate and the sector beta have no benchmark, and
-        the signal's ``confirmation_indices`` stamp is empty.
+        has nothing to agree, ``_index_neutral`` reads not neutral (since
+        2026-10-13; it read neutral until then), the relative-strength gate
+        and the sector beta have no benchmark, and the signal's
+        ``confirmation_indices`` stamp is empty.
         """
         fallback = self._index_symbols()
         sector_groups = self.params.get("sector_groups") or {}
@@ -193,6 +379,12 @@ class ConfirmationMixin:
         Returns ``None`` when there is no established leg, in which case the
         caller uses session VWAP — the correct reference when the session has
         not yet turned.
+
+        Both guards and the 5-bar session floor count *frame*'s bars, and
+        every caller hands it a 1m step frame (each peer's in
+        ``_frame_posture``, the candidate's in ``_decide_side``, both through
+        ``_leg_anchor_read``), so they are minutes: one reference with one
+        horizon for the vote and the gate.
         """
         if frame is None or frame.empty or "volume" not in frame.columns:
             return None
@@ -236,6 +428,18 @@ class ConfirmationMixin:
                    + leg["close"].to_numpy(dtype=float)) / 3.0
         return float((typical * volume).sum() / total)
 
+    def _leg_anchor_read(self, frame: pd.DataFrame) -> float | None:
+        """``_leg_anchor_vwap(frame)``, scanned once per frame in an entry
+        pass (``_pass_memo_read``): a candidate's side vote reads its step
+        frame's leg, and the breadth gate reads the same frame again as a
+        peer of each other candidate of its sector. Keyed also on what the
+        scan reads: the clock's date, the session start and the two leg
+        params."""
+        inputs = (sessions.now_et().date(), indicator_session_start(),
+                  int(self.params.get("leg_anchor_min_age_bars", 20)),
+                  float(self.params.get("leg_anchor_min_impulse_pct", 0.005)))
+        return self._pass_memo_read("leg_anchor", frame, inputs, lambda: self._leg_anchor_vwap(frame))
+
     def _frame_agrees(self, side: Side, frame: pd.DataFrame | None) -> bool | None:
         """Does *frame*'s latest bar lean *side*? ``None`` when unreadable.
 
@@ -265,7 +469,7 @@ class ConfirmationMixin:
         leg_anchored = bool(self.params.get("leg_anchored_confirmation", False))
 
         def read() -> Side | None:
-            reference = self._leg_anchor_vwap(frame) if leg_anchored else None
+            reference = self._leg_anchor_read(frame) if leg_anchored else None
             return bar_posture(frame.iloc[-1], reference)
 
         inputs = (sessions.now_et().date(), indicator_session_start(), leg_anchored,
@@ -273,21 +477,31 @@ class ConfirmationMixin:
                   float(self.params.get("leg_anchor_min_impulse_pct", 0.005)))
         return self._pass_memo_read("posture", frame, inputs, read)
 
-    def _index_confirms(self, side: Side, symbol: str, bars: dict[str, pd.DataFrame], _data=None) -> bool:
-        """Return True when *symbol*'s sector tape agrees with *side*.
+    def _index_confirms(self, side: Side, symbol: str, bars: dict[str, pd.DataFrame]) -> tuple[bool, str]:
+        """``(confirmed, why_not)``: does *symbol*'s sector tape agree with
+        *side*? ``why_not`` is the refusal's detail (``""`` when confirmed),
+        which the build queue puts in ``<side>_build_failed_<regime>_
+        index_not_confirmed(<why_not>)``.
 
         Two paths, chosen by how much of the sector the symbol itself is:
 
         **Breadth** (preferred). Counts how many of the symbol's OTHER
         ``sector_groups`` members lean *side*, and requires at least
-        ``index_breadth_min_agree_frac`` of them. Used whenever at least
-        ``index_breadth_min_peers`` peers have readable bars.
+        ``index_breadth_min_agree_frac`` of the readable ones. Used whenever
+        the symbol has at least ``index_breadth_min_peers`` peers. A peer
+        reads only with a fresh frame: one whose newest 1m bar closed more
+        than ``INDEX_FRAME_MAX_AGE_MINUTES`` ago (a halted peer, an outage)
+        is left out, and so is a missing one. Fewer than
+        ``index_breadth_min_peers`` readable peers is no confirmation
+        (``breadth_unreadable(...)``): the tape cannot be read, so it does
+        not agree (2026-10-13). Until then a stale peer voted its
+        old posture, and too few readable peers fell back to the ETF.
 
-        **Sector ETF** (fallback). The original check — at least one mapped
-        ETF leaning *side*. Used when the symbol has too few mapped peers to
-        measure breadth (single-member sectors like healthcare/staples here).
-        A symbol with no index ETFs (``_indices_for_symbol`` empty) has
-        nothing to agree on this path, so it is not confirmed.
+        **Sector ETF**. The original check — at least one mapped ETF leaning
+        *side*, on a fresh frame. Used when the symbol has fewer mapped peers
+        than ``index_breadth_min_peers``. A symbol with no index ETFs
+        (``_indices_for_symbol`` empty), or none fresh, has nothing to agree
+        on this path, so it is not confirmed.
 
         Breadth exists because the ETF test is close to circular on a mega-cap
         universe: AAPL+MSFT+NVDA+AVGO are roughly 45% of XLK, GOOG+META about
@@ -298,61 +512,95 @@ class ConfirmationMixin:
         confirm a move with that move.
         """
         if not bool(self.params.get("require_index_confirmation", True)):
-            return True
+            return True, ""
+        now = sessions.now_et()
         peers = self._sector_peers(symbol)
-        min_peers = max(1, int(self.params.get("index_breadth_min_peers", 3)))
+        min_peers = int(self.params.get("index_breadth_min_peers", 3))
         if len(peers) >= min_peers:
-            agree = 0
-            readable = 0
+            agree = readable = stale = missing = 0
             for peer in peers:
-                verdict = self._frame_agrees(side, bars.get(peer))
-                if verdict is None:
+                frame = bars.get(peer)
+                if frame is None or frame.empty:
+                    missing += 1
+                    continue
+                if frame_age_minutes(frame, now) > INDEX_FRAME_MAX_AGE_MINUTES:
+                    stale += 1
                     continue
                 readable += 1
-                if verdict:
+                if self._frame_agrees(side, frame):
                     agree += 1
-            if readable >= min_peers:
-                min_frac = float(self.params.get("index_breadth_min_agree_frac", 0.5))
-                return (agree / readable) >= min_frac
-        for sym in self._indices_for_symbol(symbol):
-            if self._frame_agrees(side, bars.get(sym)) is True:
-                return True
-        return False
+            if readable < min_peers:
+                return False, (f"breadth_unreadable(readable={readable},stale={stale},missing={missing},"
+                               f"min_peers={min_peers})")
+            min_frac = float(self.params.get("index_breadth_min_agree_frac", 0.5))
+            if agree / readable >= min_frac:
+                return True, ""
+            return False, f"breadth(agree={agree}/{readable}<{min_frac:.2f})"
+        etfs = self._indices_for_symbol(symbol)
+        fresh = [sym for sym in etfs if bars.get(sym) is not None and not bars[sym].empty
+                 and frame_age_minutes(bars[sym], now) <= INDEX_FRAME_MAX_AGE_MINUTES]
+        for sym in fresh:
+            if self._frame_agrees(side, bars[sym]):
+                return True, ""
+        return False, f"etf(fresh={len(fresh)}/{len(etfs)},agree=0)"
 
     def _index_neutral(self, symbol: str, bars: dict[str, pd.DataFrame]) -> bool:
-        """Return True if the per-symbol indices (see ``_indices_for_symbol``)
-        are not strongly directional — i.e. all are within 0.25% of their
-        own VWAP. Used by the range regime's scoring bonus."""
+        """Whether every index ETF of *symbol* (``_indices_for_symbol``) sits
+        within 0.25% of its own VWAP: not directional. The range regime's
+        +0.5 reads it. Each ETF must read, on a fresh frame
+        (``INDEX_FRAME_MAX_AGE_MINUTES``) with a close and a positive VWAP,
+        and a symbol must have one: an ETF that does not read is no
+        evidence the tape is neutral (2026-10-13; until then a
+        missing frame was skipped and a missing VWAP read as the close, both
+        "neutral", and so was a symbol with no ETF)."""
         index_symbols = self._indices_for_symbol(symbol)
+        if not index_symbols:
+            return False
+        now = sessions.now_et()
         for sym in index_symbols:
             frame = bars.get(sym)
-            if frame is None or frame.empty:
-                continue
+            if frame is None or frame.empty or frame_age_minutes(frame, now) > INDEX_FRAME_MAX_AGE_MINUTES:
+                return False
             last = frame.iloc[-1]
-            close = safe_float(last["close"], 0.0)
-            vwap = safe_float(last.get("vwap"), close)
-            if vwap > 0 and abs((close - vwap) / vwap) >= 0.0025:
+            close = safe_float(last.get("close"))
+            vwap = safe_float(last.get("vwap"))
+            if close is None or vwap is None or vwap <= 0:
+                return False
+            if abs((close - vwap) / vwap) >= 0.0025:
                 return False
         return True
 
-    def _sector_day_strength(self, symbol: str, bars: dict[str, pd.DataFrame]) -> float | None:
-        """Return the first available sector ETF's day_strength (close vs
-        session_open, in percent) for *symbol*. Used by the relative-strength
-        gate in ``_read_candidate`` to compute how much the candidate is
-        leading/lagging its sector. Returns ``None`` when no sector ETF
-        bars are loaded or all session-open lookups fail. A frame that does
-        not read raises: the gate skips on ``None``, so until 2026-09-26,
-        when an error here was skipped as a missing frame, it let the entry
-        through."""
+    def _sector_day_strength(self, symbol: str, bars: dict[str, pd.DataFrame]) -> tuple[float | None, str]:
+        """``(day_strength, why_not)``: the first of *symbol*'s sector ETFs
+        (``_indices_for_symbol``) that reads, its day strength (close vs
+        session open, in percent), for the relative-strength gate in
+        ``_read_candidate``. An ETF reads on a fresh frame only
+        (``INDEX_FRAME_MAX_AGE_MINUTES``, the index confirmation's bound),
+        with a positive close and a session open. ``(None, why_not)`` when
+        none reads, ``why_not`` naming each ETF's state, ``SMH=stale`` /
+        ``missing`` / ``unreadable`` (``etfs=none`` with no ETF): the gate
+        then refuses the candidate (2026-10-13; until then it read a frame
+        of any age, a NaN close as 0, and skipped on no frame). A frame that
+        raises propagates: until 2026-09-26 an error here was skipped as a
+        missing frame, which let the entry through."""
+        states: list[str] = []
+        now = sessions.now_et()
         for sym in self._indices_for_symbol(symbol):
             frame = bars.get(sym)
             if frame is None or frame.empty:
+                states.append(f"{sym}=missing")
                 continue
-            close = safe_float(frame.iloc[-1]["close"], 0.0)
-            _, ds = self._compute_live_bias_and_day_strength(frame, close)
-            if ds is not None:
-                return ds
-        return None
+            if frame_age_minutes(frame, now) > INDEX_FRAME_MAX_AGE_MINUTES:
+                states.append(f"{sym}=stale")
+                continue
+            close = safe_float(frame.iloc[-1].get("close"))
+            ds = (None if close is None or close <= 0
+                  else self._compute_live_bias_and_day_strength(frame, close)[1])
+            if ds is None:
+                states.append(f"{sym}=unreadable")
+                continue
+            return ds, ""
+        return None, ",".join(states) or "etfs=none"
 
     # ------------------------------------------------------------------
     # Daily statistics — per-symbol volatility scale + sector beta
@@ -522,8 +770,8 @@ class ConfirmationMixin:
     def _sector_peers(self, symbol: str) -> list[str]:
         """Other members of *symbol*'s ``sector_groups`` entry.
 
-        Feeds the breadth confirmation in ``_index_breadth_confirms``. Returns
-        an empty list when the symbol is unmapped or alone in its sector.
+        Feeds the breadth confirmation in ``_index_confirms``. Returns an
+        empty list when the symbol is unmapped or alone in its sector.
         """
         symbol_upper = str(symbol).upper().strip()
         for members in (self.params.get("sector_groups") or {}).values():
@@ -535,9 +783,14 @@ class ConfirmationMixin:
         return []
 
     @staticmethod
-    def _recent_momentum_pct(ltf: pd.DataFrame, lookback_bars: int) -> float | None:
-        """Return the percent change over the last ``lookback_bars`` of the
-        LTF frame: ``(last_close - close_lookback_bars_ago) / close_ago * 100``.
+    def _recent_momentum_pct(ltf: pd.DataFrame, lookback_bars: int, close: float) -> float | None:
+        """The percent change from the close ``lookback_bars`` LTF bars
+        before the current one (``ltf``'s last row, the bucket the step
+        frame's last 1m bar is in) to ``close``, the latest 1m close:
+        ``(close - close_ago) / close_ago * 100``. The bar it reads has
+        closed; on the 5m LTF and the shipped 6 bars the span is 25-30
+        minutes, as it was on the 5m LTF before 2026-05-29 (the current
+        bucket's close was the latest close then too).
 
         Its reader is ``_decide_side``: the side vote's first signal, the
         LOCAL trend (last N bars). On a stock that has reversed intraday,
@@ -545,21 +798,19 @@ class ConfirmationMixin:
         direction while recent price action has flipped.
 
         Returns ``None`` when there aren't enough bars or the prior close
-        is non-positive (defensive against bad data)."""
+        does not read or is non-positive."""
         if ltf is None or len(ltf) < lookback_bars + 1:
             return None
-        try:
-            last_close = float(ltf.iloc[-1]["close"])
-            prior_close = float(ltf.iloc[-(lookback_bars + 1)]["close"])
-        except (KeyError, ValueError, TypeError, IndexError):
+        prior_close = safe_float(ltf.iloc[-(lookback_bars + 1)].get("close"))
+        if prior_close is None or prior_close <= 0:
             return None
-        if prior_close <= 0:
-            return None
-        return (last_close - prior_close) / prior_close * 100.0
+        return (float(close) - prior_close) / prior_close * 100.0
 
     def _decide_side(
         self,
         ltf: pd.DataFrame,
+        closed: pd.DataFrame,
+        frame: pd.DataFrame,
         close: float,
         vwap: float,
         ema9: float,
@@ -567,12 +818,24 @@ class ConfirmationMixin:
     ) -> tuple[Side | None, dict[str, Any]]:
         """Pick the trade side from current price action (Fix A, 2026-05-27).
 
+        ``ltf`` is the LTF, its current bucket last; ``closed`` its closed
+        buckets (``closed_ltf``); ``frame`` the step frame; ``close`` and
+        ``vwap`` the step frame's last close and session VWAP; ``ema9`` /
+        ``ema20`` the last closed bucket's.
+
         Counts LONG and SHORT votes across four current-action signals:
-          1. Recent return over the last N LTF bars (default 30 = 30 min at 1m)
+          1. Recent return: ``close`` against the close
+             ``side_decision_recent_lookback_bars`` LTF bars before the
+             current one (``_recent_momentum_pct``; the shipped 6 on the 5m
+             LTF = 25-30 minutes, the window Fix A was designed on)
           2. Close vs VWAP — the current leg's anchored VWAP under
-             ``leg_anchored_confirmation``, session VWAP otherwise
-          3. EMA9 vs EMA20
-          4. Last 3 LTF bars' net direction (green-count vs red-count)
+             ``leg_anchored_confirmation``, measured on the step frame (the
+             1m frame the peers' confirmation measures it on, so the vote and
+             the gate read one reference with one ``leg_anchor_min_age_bars``
+             horizon), session VWAP otherwise
+          3. EMA9 vs EMA20, of the last closed LTF bucket
+          4. The last 3 CLOSED LTF bars' net direction (green-count vs
+             red-count): three 5m buckets, 15 minutes, as Fix A designed it
 
         Each signal contributes one LONG or one SHORT vote, or abstains
         when its read is genuinely neutral (recent return inside the noise
@@ -598,7 +861,7 @@ class ConfirmationMixin:
 
         recent_lookback = max(1, int(self.params.get("side_decision_recent_lookback_bars", 6)))
         recent_threshold = float(self.params.get("side_decision_recent_threshold_pct", 0.1))
-        recent_pct = self._recent_momentum_pct(ltf, recent_lookback)
+        recent_pct = self._recent_momentum_pct(ltf, recent_lookback, close)
         if recent_pct is not None:
             if recent_pct >= recent_threshold:
                 long_votes += 1
@@ -625,10 +888,17 @@ class ConfirmationMixin:
         # Leaving the layers on different references was also incoherent: the
         # vote and the confirmation gate disagreed about what "reclaimed VWAP"
         # meant for the same symbol on the same bar.
+        #
+        # The anchor is measured on the step frame, the 1m bars the peers'
+        # anchor is measured on (2026-10-13): ``leg_anchor_min_age_bars`` and
+        # the 5-bar session floor count that frame's bars, so on the 5m LTF
+        # the vote would have needed 100 minutes of leg age where the gate
+        # needs 20, and read session VWAP on most of the minutes the gate
+        # reads the leg (the incoherence 2026-09-19 removed).
         vwap_buffer = float(self.params.get("side_decision_vwap_buffer_pct", 0.0005))
         vwap_reference = None
         if bool(self.params.get("leg_anchored_confirmation", False)):
-            vwap_reference = self._leg_anchor_vwap(ltf)
+            vwap_reference = self._leg_anchor_read(frame)
         # Label the breakdown so an operator reading a `side_undecided(...)`
         # line can tell which reference produced the vote.
         vwap_label = "legvwap" if vwap_reference is not None else "vwap"
@@ -660,15 +930,20 @@ class ConfirmationMixin:
         # rows on 2026-07-28/29 it split 1,021 LONG / 1,053 SHORT: a coin
         # flip. Three consecutive same-colour bars is a real read; 2-of-3 is
         # not, so mixed counts now abstain like the other two signals.
-        if ltf is not None and len(ltf) >= 3:
-            try:
-                last_3 = ltf.iloc[-3:]
-                greens = sum(
-                    1 for _, b in last_3.iterrows()
-                    if float(b.get("close", 0)) > float(b.get("open", 0))
-                )
-            except (KeyError, ValueError, TypeError):
+        #
+        # The three are the last CLOSED LTF bars (2026-10-13): three 5m
+        # buckets, the 15 minutes Fix A designed it on, read on the 1m LTF
+        # as three minutes from 2026-05-29. A forming bucket's partial bar
+        # does not vote. A bar whose open or close does not read leaves the
+        # arm out.
+        if closed is not None and len(closed) >= 3:
+            last_3 = closed.iloc[-3:]
+            opens = [safe_float(value) for value in last_3["open"]]
+            closes = [safe_float(value) for value in last_3["close"]]
+            if any(value is None for value in (*opens, *closes)):
                 greens = -1
+            else:
+                greens = sum(1 for o, c in zip(opens, closes) if c > o)
             if greens == 3:
                 long_votes += 1
                 breakdown.append(f"3b:{greens}G>L")
@@ -711,32 +986,33 @@ class ConfirmationMixin:
         return None, vote_info
 
     @staticmethod
-    def _entry_bar_confirms(symbol: str, side: Side, ltf: pd.DataFrame, ltf_minutes: int,
-                            frame: pd.DataFrame) -> bool:
+    def _entry_bar_confirms(symbol: str, side: Side, frame: pd.DataFrame) -> bool:
         """Confirmation-bar trigger (Fix B, 2026-05-27): the most recent
-        FULLY CLOSED LTF bar must confirm direction before we enter.
+        FULLY CLOSED 1m bar of *symbol*'s step frame ``frame`` must confirm
+        direction before we enter.
 
         For LONG: ``last_closed.close > last_closed.open`` (green bar) AND
         ``last_closed.close > prev_closed.close`` (higher-high tape).
-        Mirror for SHORT. ``ltf`` is the ``ltf_minutes`` frame resampled from
-        *symbol*'s step frame ``frame``, and its closed bars are
-        ``last_closed_bars``': at ``ltf_minutes: 1`` (both shipped presets)
-        every row, so the last closed bar is ``iloc[-1]``; a last bar or
-        bucket still trading by the step frame's end or the clock is left
-        out, so a forming bar never confirms. Until 2026-10-12
-        this read ``iloc[-2]`` on the premise that ``iloc[-1]`` was the bar
-        in progress, which a step frame has seldom held (none from 2026-09-24
-        on, in H:'s archive): the gate judged the bar before the last closed
-        one, so a setup confirmed one bar late, and an armed retest needed
-        its reclaim bar and then one more. Returns
-        ``True`` when not enough bars (don't block on thin early-session
-        data — other gates handle that case), and ``False`` when a bar does
-        not read: it confirms nothing. Until 2026-09-26 a read that raised
-        returned ``True`` and a missing column read as 0, which a LONG's
-        close always beat."""
-        if ltf is None:
+        Mirror for SHORT. The bar is entry timing, so it is a 1m bar whatever
+        the LTF the setup is measured on (2026-10-13): the step frame's own
+        bars, the bar the entry is built at last. The step frame holds closed
+        bars only, so the last closed bar is its last row, unless that bar's
+        minute is still trading by the clock (``last_closed_bars``: it is
+        left out and logged), so a forming bar never confirms. Until
+        2026-10-12 this read ``iloc[-2]`` on the premise that ``iloc[-1]`` was
+        the bar in progress, which a step frame has seldom held (none from
+        2026-09-24 on, in H:'s archive): the gate judged the bar before the
+        last closed one, so a setup confirmed one bar late, and an armed
+        retest needed its reclaim bar and then one more. From 2026-10-12 to
+        2026-10-13 it read the LTF's last closed bar, the same bars while
+        the LTF was 1m. Returns ``True`` when not enough bars (don't block on
+        thin early-session data — other gates handle that case), and
+        ``False`` when a bar does not read: it confirms nothing. Until
+        2026-09-26 a read that raised returned ``True`` and a missing column
+        read as 0, which a LONG's close always beat."""
+        if frame is None:
             return True
-        closed = last_closed_bars(symbol, ltf, ltf_minutes, frame)
+        closed = last_closed_bars(symbol, frame, 1, frame)
         if len(closed) < 2:
             return True
         last_closed = closed.iloc[-1]

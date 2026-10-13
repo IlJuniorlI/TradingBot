@@ -6,23 +6,70 @@ from typing import Any
 
 import pandas as pd
 
-from ....bars import bar_close_position, same_day_mask
+from ....bars import bar_close_position
 from ....indicators import bar_posture
 from ....models import Candidate, Side, Signal
 from ....numeric import safe_float
-from .... import sessions
+from ..confirmation import session_bars, setup_window, stop_anchor
+
+
+def box_minute_bars(frame: pd.DataFrame, ltf: pd.DataFrame, box: pd.DataFrame) -> pd.DataFrame:
+    """The step frame's 1m bars of the squeeze box that traded in today's
+    session (``session_bars``: from 09:30 on the "rth" window): from the
+    box's first bucket to the current one (``ltf``'s last row), which is
+    where the box ends, its premarket minutes left out. The breakout's
+    volume is weighed against them, the session's volume like the session
+    VWAP (2026-10-13): a premarket minute trades a fraction of a session
+    minute, so until 10:30, while the box still held premarket buckets,
+    their minutes pulled the median down and a session bar cleared it more
+    easily. Empty when the box holds no session minute."""
+    if box.empty:
+        return frame.iloc[0:0]
+    return session_bars(frame.iloc[frame.index.searchsorted(box.index[0]):frame.index.searchsorted(ltf.index[-1])])
+
+
+def bucket_minute_bars(frame: pd.DataFrame, ltf: pd.DataFrame) -> pd.DataFrame:
+    """The step frame's 1m bars of the current LTF bucket (``ltf``'s last
+    row) before the trigger bar, the frame's last: the minutes of the bucket
+    that traded before it. Empty on a 1m LTF, whose bucket is the trigger
+    bar alone."""
+    return frame.iloc[frame.index.searchsorted(ltf.index[-1]):len(frame) - 1]
 
 
 class VolSqueezeRegimeMixin:
     """Volatility squeeze: a compressed box breaking out. Mixed into
     ``TopTierAdaptiveStrategy`` (``strategy.py``), whose ``BaseStrategy``
-    supplies ``params``, ``config`` and the contexts."""
+    supplies ``params``, ``config`` and the contexts.
 
-    def _vol_squeeze_breakout_quality(self, side: Side, session_frame: pd.DataFrame,
-                                      box: pd.DataFrame, box_high: float, box_low: float,
+    The box is set up on the LTF (2026-10-13): the last
+    ``vol_squeeze_lookback_bars`` of today's closed buckets before the
+    current one (``setup_window``; 12 x 5m = 60 minutes on the shipped
+    preset), its height measured against the LTF ATR. The breakout is the
+    step frame's last 1m bar, a closed bar (``_read_candidate`` drops one
+    still trading): its close through the box edge, its volume against the
+    median volume of the box's session minutes, its close position. It
+    enters on the first
+    1m bar of its bucket to close through the edge only (user decision,
+    2026-10-13): the box stays the same for the whole bucket, so a later
+    minute of it would enter past a break that has already happened, and it
+    waits for the next bucket's box, which holds this bucket. Until then the
+    box was the last 12 one-minute bars, and the break joined it a minute
+    later."""
+
+    def _vol_squeeze_breakout_quality(self, side: Side, frame: pd.DataFrame,
+                                      box_minutes: pd.DataFrame, bucket_minutes: pd.DataFrame,
+                                      box_high: float, box_low: float,
                                       close: float, vol_scale: float = 1.0) -> dict[str, Any]:
         """The three breakout conditions ``_build_vol_squeeze_signal`` hard-gates
-        on, derived once and read by both it and ``_score_vol_squeeze``.
+        on, derived once and read by both it and ``_score_vol_squeeze``, on
+        the breakout bar: the step frame's last 1m bar (``frame``), its
+        volume against the median of the box's session 1m bars
+        (``box_minutes``, ``box_minute_bars``), a minute's volume against a
+        minute's. Also
+        ``earlier_break``, the first of the current bucket's earlier minutes
+        (``bucket_minutes``, ``bucket_minute_bars``) to close through the
+        same buffered edge, or None: the builder enters on the bucket's first
+        break only (2026-10-13).
 
         They used to be derived twice, and the two copies disagreed about what
         they were FOR. The 2026-05-14 change is recorded in the preset as
@@ -39,7 +86,7 @@ class VolSqueezeRegimeMixin:
         reasons quote, and the two DECISIVE variants the scorer pays a bonus
         for now that clearing the gate is table stakes.
         """
-        last = session_frame.iloc[-1]
+        last = frame.iloc[-1]
         last_close = safe_float(last.get("close"), close)
         buffer_pct = self._pct_param("vol_squeeze_breakout_buffer_pct", 0.0008, vol_scale)
         if side == Side.LONG:
@@ -53,15 +100,18 @@ class VolSqueezeRegimeMixin:
         # A box volume that does not read fails the volume gate. Until
         # 2026-09-26 an error here, and a NaN median (max(1.0, nan) is 1.0),
         # made the baseline 1 share, which any bar's volume cleared.
-        vol_median = safe_float(box["volume"].median())
+        vol_median = safe_float(box_minutes["volume"].median())
         cur_vol = safe_float(last.get("volume"), 0.0)
         vol_ratio = cur_vol / max(1.0, vol_median) if vol_median is not None else 0.0
         min_vol_ratio = float(self.params.get("vol_squeeze_min_breakout_volume_ratio", 1.12))
-        close_pos = bar_close_position(session_frame)
+        close_pos = bar_close_position(frame)
         min_close_pos = float(self.params.get("vol_squeeze_min_bar_close_position", 0.63))
+        earlier_closes = bucket_minutes["close"].astype(float)
+        through = earlier_closes >= required if side == Side.LONG else earlier_closes <= required
         return {
             "close": last_close,
             "broke_out": broke_out,
+            "earlier_break": bucket_minutes.index[through.to_numpy()][0] if bool(through.any()) else None,
             "decisive_break": decisive_break,
             "required_clearance": required,
             "volume_ok": vol_ratio >= min_vol_ratio,
@@ -75,7 +125,7 @@ class VolSqueezeRegimeMixin:
         }
 
     def _score_vol_squeeze(self, side: Side, close: float, vwap: float, ema9: float,
-                           ema20: float, atr: float, frame: pd.DataFrame, tech_ctx,
+                           ema20: float, atr: float, ltf: pd.DataFrame, frame: pd.DataFrame, tech_ctx,
                            vol_scale: float = 1.0) -> float:
         """Score the Bollinger-squeeze breakout setup: compressed-range
         consolidation followed by a directional break out of the box.
@@ -109,15 +159,14 @@ class VolSqueezeRegimeMixin:
 
         With ``vol_squeeze_hard_breakout_gates: false`` the builder reverts to
         scoring-only on those three, so this reverts with it -- the two must
-        agree under either setting, which is the whole point."""
+        agree under either setting, which is the whole point. The builder's
+        first-break rule (``earlier_break``) is its own, like its S/R and
+        pct_b gates: a later minute of the bucket qualifies here and is
+        refused there, by name."""
         lookback = max(6, int(self.params.get("vol_squeeze_lookback_bars", 12)))
-        session_frame = frame[same_day_mask(frame, sessions.now_et().date())]
-        if len(session_frame) < lookback + 2:
-            return 0.0
-        # Look at the box (last lookback bars BEFORE the current one). The
+        # The box: the last lookback LTF buckets before the current one. The
         # breakout bar itself is read inside `_vol_squeeze_breakout_quality`.
-        prior = session_frame.iloc[:-1]
-        box = prior.tail(lookback)
+        box = setup_window(ltf, lookback)
         if len(box) < lookback:
             return 0.0
         box_high = safe_float(box["high"].max(), close)
@@ -125,8 +174,8 @@ class VolSqueezeRegimeMixin:
         box_range = max(0.0, box_high - box_low)
         box_range_pct = (box_range / close) if close > 0 else 0.0
         box_range_atr = (box_range / atr) if atr > 0 else float("inf")
-        max_range_pct = self._pct_param("vol_squeeze_max_range_pct", 0.012, vol_scale)
-        max_range_atr = float(self.params.get("vol_squeeze_max_range_atr", 1.8))
+        max_range_pct = self._pct_param("vol_squeeze_max_range_pct", 0.025, vol_scale)
+        max_range_atr = float(self.params.get("vol_squeeze_max_range_atr", 3.0))
         compression_box_ok = box_range_pct <= max_range_pct and box_range_atr <= max_range_atr
         bb_squeeze_flag = bool(getattr(tech_ctx, "bollinger_squeeze", False))
         bb_width_pct = safe_float(getattr(tech_ctx, "bollinger_width_pct", None), 0.0)
@@ -143,8 +192,9 @@ class VolSqueezeRegimeMixin:
             score += 0.5
 
         # The builder's three hard gates, from the one derivation both read.
-        q = self._vol_squeeze_breakout_quality(side, session_frame, box, box_high,
-                                               box_low, close, vol_scale)
+        q = self._vol_squeeze_breakout_quality(side, frame, box_minute_bars(frame, ltf, box),
+                                               bucket_minute_bars(frame, ltf), box_high, box_low, close,
+                                               vol_scale)
         if bool(self.params.get("vol_squeeze_hard_breakout_gates", True)):
             # All three or nothing, exactly as `_build_vol_squeeze_signal`
             # enforces them. Compression alone caps at 3.5, below the floor.
@@ -173,20 +223,18 @@ class VolSqueezeRegimeMixin:
         return score
 
     def _build_vol_squeeze_signal(self, c: Candidate, side: Side, close: float, atr: float,
-                                  frame: pd.DataFrame, regime_score: float,
+                                  ltf: pd.DataFrame, frame: pd.DataFrame, regime_score: float,
                                   data=None, vol_widening: float = 1.0, vol_scale: float = 1.0) -> Signal | None:
-        """Build a Bollinger-squeeze breakout signal. Stops sit just outside
+        """Build a Bollinger-squeeze breakout signal on the first 1m bar of
+        its bucket to break the box (``long_vol_squeeze_not_first_break`` /
+        ``short_...`` refuses a later one). Stops sit just outside
         the squeeze box (below box_low for LONG / above box_high for SHORT),
-        with an ATR-floored buffer to absorb noise around the breakout. Target
+        and beyond every 1m bar since it (``stop_anchor``), with an
+        ATR-floored buffer to absorb noise around the breakout. Target
         is the standard RR multiple. Shared filters (HTF bias, stretched-entry,
         SR/structure, FVG retest, etc.) run inside ``_finalize_signal``."""
         lookback = max(6, int(self.params.get("vol_squeeze_lookback_bars", 12)))
-        session_frame = frame[same_day_mask(frame, sessions.now_et().date())]
-        if len(session_frame) < lookback + 2:
-            self._set_build_failure(c.symbol, "vol_squeeze", "insufficient_session_bars")
-            return None
-        prior = session_frame.iloc[:-1]
-        box = prior.tail(lookback)
+        box = setup_window(ltf, lookback)
         if len(box) < lookback:
             self._set_build_failure(c.symbol, "vol_squeeze", "insufficient_box_bars")
             return None
@@ -223,11 +271,13 @@ class VolSqueezeRegimeMixin:
         # scoring-only behavior on the volume / close_pos / buffer gates.
         # The SR-alignment and pct_b gates can be disabled independently
         # via their own threshold params (set to 0.0 to disable).
+        #
+        # Via `_vol_squeeze_breakout_quality`, the same call `_score_vol_squeeze`
+        # makes -- the scorer must not qualify what the hard gates reject.
+        q = self._vol_squeeze_breakout_quality(side, frame, box_minute_bars(frame, ltf, box),
+                                               bucket_minute_bars(frame, ltf), box_high, box_low, close,
+                                               vol_scale)
         if bool(self.params.get("vol_squeeze_hard_breakout_gates", True)):
-            # Via `_vol_squeeze_breakout_quality`, the same call `_score_vol_squeeze`
-            # makes -- the scorer must not qualify what this rejects.
-            q = self._vol_squeeze_breakout_quality(side, session_frame, box, box_high,
-                                                   box_low, close, vol_scale)
             if not q["broke_out"]:
                 op = "<" if side == Side.LONG else ">"
                 self._set_build_failure(
@@ -251,6 +301,25 @@ class VolSqueezeRegimeMixin:
                     f"pos={q['close_pos']:.2f}{op}{bound:.2f})",
                 )
                 return None
+
+        # The bucket's first break only (user decision, 2026-10-13). The box
+        # is the same for every minute of the current bucket, so once one of
+        # its minutes has closed through the edge, a later one enters past a
+        # break that already happened: over 15 archived days 59% of the
+        # minutes a box broke were later minutes of their bucket, closing a
+        # median 0.31 x ATR5 past the edge against 0.13 for a first minute.
+        # It waits for the next bucket's box, which holds this bucket. On a
+        # 1m LTF the bucket is the trigger bar alone and this never refuses.
+        # Like the two setup-quality gates below it is not mirrored in the
+        # scorer: the refusal falls through to the next qualifying regime,
+        # and the skip line names it.
+        if q["earlier_break"] is not None:
+            self._set_build_failure(
+                c.symbol, "vol_squeeze",
+                f"{'long' if side == Side.LONG else 'short'}_vol_squeeze_not_first_break("
+                f"first={q['earlier_break']:%H:%M},required={q['required_clearance']:.4f})",
+            )
+            return None
 
         # Setup-quality gates that proved to separate winners from losers
         # in the 2026-05-14 session. Independent of hard_breakout_gates
@@ -292,17 +361,25 @@ class VolSqueezeRegimeMixin:
         # Stop buffer scales with box range so tighter squeezes don't get
         # over-wide ATR-based stops. Mirrors source strategy logic.
         # vol_widening (Tier 2a) applies on top of the max() so all three
-        # buffer floors expand together in trend-day regimes.
-        stop_buffer = max(atr * 0.12, close * 0.0010, box_range * 0.22) * vol_widening * self._side_stop_buffer_mult(side)
+        # buffer floors expand together in trend-day regimes. The box term
+        # is ``vol_squeeze_stop_box_mult`` x the box (2026-10-13): 0.22 was
+        # tested on the box of the 12 one-minute bars before the trigger, and
+        # on the 5m LTF's box of 12 closed buckets, 60 minutes, 0.088 keeps
+        # that price distance (0.22 x 0.401, the median per-minute ratio of
+        # the 12-minute box's height to the 60-minute box's; the preset says
+        # how it was measured). A 1m LTF's box is the 12-minute one: 0.22.
+        box_mult = float(self.params.get("vol_squeeze_stop_box_mult", 0.088))
+        stop_buffer = (max(atr * 0.12, close * 0.0010, box_range * box_mult)
+                       * vol_widening * self._side_stop_buffer_mult(side))
         effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening * vol_scale
 
         if side == Side.LONG:
-            stop = box_low - stop_buffer
+            stop = stop_anchor(side, box, frame, ltf, box_low) - stop_buffer
             stop = min(stop, close * (1.0 - effective_default_stop_pct))
             risk = max(0.01, close - stop)
             target = close + risk * target_rr
         else:
-            stop = box_high + stop_buffer
+            stop = stop_anchor(side, box, frame, ltf, box_high) + stop_buffer
             stop = max(stop, close * (1.0 + effective_default_stop_pct))
             risk = max(0.01, stop - close)
             target = max(0.01, close - risk * target_rr)

@@ -319,6 +319,13 @@ class ContextBuildersMixin:
         uses 5-min trigger candles). Otherwise defaults to 1-minute streamed bars."""
         return int(self.params.get("ltf_minutes", 1))
 
+    def technical_context_minutes(self) -> int:
+        """The timeframe of the bars the strategy's technical-levels context
+        (``_technical_context``) is built on: the LTF (``ltf_minutes``)
+        unless the strategy reads it on other bars. The dashboard builds
+        its technicals overlay on the same bars (2026-10-13)."""
+        return self.ltf_minutes()
+
     def _is_ltf_token(self, token: str) -> bool:
         """Whether ``token`` refers to the strategy's LTF timeframe.
 
@@ -813,8 +820,9 @@ class ContextBuildersMixin:
         does not.
 
         span_scale stretches every indicator lookback so a fine timeframe can
-        carry a coarser timeframe's wall-clock horizon (top_tier's 1m LTF uses
-        span_scale=5); ema_spans sets the ema9 / ema20 spans on their own
+        carry a coarser timeframe's wall-clock horizon (an opt-in: top_tier's
+        1m LTF used span_scale=5 from 2026-05-29 to 2026-10-13); ema_spans
+        sets the ema9 / ema20 spans on their own
         (ltf_ema_fast_span / ltf_ema_slow_span). Defaults = canonical spans,
         unchanged for every other caller.
 
@@ -827,17 +835,17 @@ class ContextBuildersMixin:
         (``context_memo``). Any other frame is built on every call and
         carries no version: a frame without one, a written step frame, a
         hand-out of another timeframe, and a 1m hand-out with other
-        indicators (top_tier's LTF), whose columns a canonical 1m request
-        would keep as they are.
+        indicators (a stretched 1m LTF, as top_tier's was to 2026-10-13),
+        whose columns a canonical 1m request would keep as they are.
 
         Until 2026-10-07 a caller that passed the data feed got the store's
         frame of the timeframe instead (``get_merged``), read when the
         strategy asked: a stream bar that landed after the engine built the
         step frame reached that frame but not the step frame, nor the S/R
         context the engine built on it (``_prime_cycle_support_cache``). On
-        top_tier, whose signal is its LTF's last bar, the S/R context a
-        signal read was then one bar older than the signal (10 of the 88
-        entries archived 2026-09-29 .. 10-06).
+        top_tier, whose signal was its 1m LTF's last bar then, the S/R
+        context a signal read was one bar older than the signal (10 of the
+        88 entries archived 2026-09-29 .. 10-06).
         """
         if frame is None or frame.empty:
             return None

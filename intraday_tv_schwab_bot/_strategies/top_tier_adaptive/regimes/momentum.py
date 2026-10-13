@@ -4,19 +4,24 @@ from __future__ import annotations
 
 import pandas as pd
 
-from ....bars import same_day_mask
 from ....models import Candidate, Side, Signal
 from ....numeric import safe_float
-from .... import sessions
+from ..confirmation import setup_window, stop_anchor
 
 
 class MomentumRegimeMixin:
     """Momentum from the open: day strength plus a fresh N-bar extreme.
     Mixed into ``TopTierAdaptiveStrategy`` (``strategy.py``), whose
-    ``BaseStrategy`` supplies ``params``, ``config`` and the contexts."""
+    ``BaseStrategy`` supplies ``params``, ``config`` and the contexts.
+
+    The breakout window is the LTF's (2026-10-13): the last
+    ``momentum_breakout_lookback_bars`` of today's closed buckets before the
+    current one (6 x 5m = 30 minutes on the shipped preset; 6 one-minute
+    bars until then), which the latest 1m close must clear; day strength
+    reads the step frame's session open."""
 
     def _score_momentum(self, side: Side, close: float, vwap: float, ema9: float,
-                        ema20: float, ret15: float, frame: pd.DataFrame,
+                        ema20: float, ret15: float, ltf: pd.DataFrame, frame: pd.DataFrame,
                         vol_scale: float = 1.0) -> float:
         """Score the momentum-from-open setup. The thesis is a stock with
         strong day-direction (live ``day_strength`` from session open) that's
@@ -41,13 +46,12 @@ class MomentumRegimeMixin:
         if side == Side.SHORT and day_strength > -min_day:
             return 0.0
 
-        # N-bar breakout (use today's bars only)
+        # N-bar breakout: today's LTF buckets before the current one, all of
+        # them (``setup_window``, the window ``_breakout_reference`` reads for
+        # the builder); fewer than the lookback is no breakout to score.
         lookback = max(3, int(self.params.get("momentum_breakout_lookback_bars", 6)))
-        session_frame = frame[same_day_mask(frame, sessions.now_et().date())]
-        if len(session_frame) < lookback + 1:
-            return 0.0
-        recent = session_frame.tail(lookback + 1).iloc[:-1]
-        if recent.empty:
+        recent = setup_window(ltf, lookback)
+        if len(recent) < lookback:
             return 0.0
 
         score = 0.0
@@ -84,7 +88,7 @@ class MomentumRegimeMixin:
         return score
 
     def _build_momentum_signal(self, c: Candidate, side: Side, close: float, atr: float,
-                               frame: pd.DataFrame,
+                               ltf: pd.DataFrame, frame: pd.DataFrame,
                                regime_score: float, data=None,
                                vol_widening: float = 1.0, vol_scale: float = 1.0,
                                breakout_confirmed: bool = False) -> Signal | None:
@@ -94,9 +98,10 @@ class MomentumRegimeMixin:
         or afternoon thin liquidity) don't trigger the stop. Target uses
         ``momentum_target_rr``.
 
-        Uses the 1m ``frame`` for the N-bar breakout check so it stays
-        consistent with ``_score_momentum`` and with the source standalone
-        momentum_close strategy. Renamed from ``_build_momentum_close_signal``
+        Reads the LTF's setup window for the N-bar breakout check
+        (``_breakout_reference``), the window ``_score_momentum`` reads; the
+        stop's swing anchor also clears every 1m bar since it
+        (``stop_anchor``). Renamed from ``_build_momentum_close_signal``
         2026-05-12 when the regime was generalized from afternoon-only to
         post-ORB through close.
 
@@ -105,7 +110,7 @@ class MomentumRegimeMixin:
         already established and the fresh-breakout gate would reject the fill
         by definition. See ``_build_trend_signal``.
         """
-        recent, trigger_level = self._breakout_reference("momentum", side, frame, frame)
+        recent, trigger_level = self._breakout_reference("momentum", side, ltf)
         if recent is None or recent.empty:
             self._set_build_failure(c.symbol, "momentum", "insufficient_session_history")
             return None
@@ -135,12 +140,12 @@ class MomentumRegimeMixin:
         # get knocked out by expanded per-bar noise.
         effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening * vol_scale
         if side == Side.LONG:
-            swing = safe_float(recent["low"].min(), close) - (atr * 0.08 * vol_widening * self._side_stop_buffer_mult(side))
+            swing = stop_anchor(side, recent, frame, ltf, close) - (atr * 0.08 * vol_widening * self._side_stop_buffer_mult(side))
             stop = max(close * (1.0 - effective_default_stop_pct), swing)
             risk = max(0.01, close - stop)
             target = close + risk * target_rr
         else:
-            swing = safe_float(recent["high"].max(), close) + (atr * 0.08 * vol_widening * self._side_stop_buffer_mult(side))
+            swing = stop_anchor(side, recent, frame, ltf, close) + (atr * 0.08 * vol_widening * self._side_stop_buffer_mult(side))
             stop = min(close * (1.0 + effective_default_stop_pct), swing)
             risk = max(0.01, stop - close)
             target = max(0.01, close - risk * target_rr)

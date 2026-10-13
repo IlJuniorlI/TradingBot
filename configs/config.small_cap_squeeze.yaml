@@ -802,6 +802,7 @@ strategies:
       range_max_ema_gap_pct: 0.0008
       range_max_intraday_range_pct: 0.012
       range_min_flip_count: 3
+      range_min_stop_atr_mult: 0.5
       range_require_prev_bar_confirmation: true
       sr_scalp_max_distance_from_zone_atr: 0.5
       sr_scalp_min_distance_atr: 2.5
@@ -817,6 +818,7 @@ strategies:
       vol_squeeze_min_breakout_volume_ratio: 1.12
       vol_squeeze_min_pct_b_directional: 0.5
       vol_squeeze_min_sr_bias_alignment: 0.2
+      vol_squeeze_stop_box_mult: 0.22   # its 1m LTF's box is the 12-minute one the stop buffer's box term was tested on
 
 
       force_flatten:

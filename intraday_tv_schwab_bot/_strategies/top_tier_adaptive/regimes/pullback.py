@@ -4,30 +4,55 @@ from __future__ import annotations
 
 import pandas as pd
 
-from ....bars import bar_close_position, same_day_mask
+from ....bars import bar_close_position
 from ....models import Candidate, Side, Signal
 from ....numeric import safe_float
-from .... import sessions
+from ..confirmation import closed_ltf, session_bars, setup_window, stop_anchor, today_bars
 
 
 class PullbackRegimeMixin:
     """Pullback: a trend retracing to EMA20 / VWAP on a young, real leg.
     Mixed into ``TopTierAdaptiveStrategy`` (``strategy.py``), whose
-    ``BaseStrategy`` supplies ``params``, ``config`` and the contexts."""
+    ``BaseStrategy`` supplies ``params``, ``config`` and the contexts.
+
+    Set up on the LTF's closed buckets: the touch / hold window is the last
+    ``pullback_lookback_bars`` of today's buckets before the current one, and
+    the close position and volume are the last CLOSED bucket's. Today's
+    buckets count from midnight, premarket included (``today_bars``), as the
+    1m LTF's bars did; the volume is weighed against the session's buckets
+    alone (``session_bars``), like the session VWAP."""
 
     def _score_pullback(self, side: Side, close: float, vwap: float, ema9: float, ema20: float,
-                        adx: float, atr: float, trend_score: float, ltf: pd.DataFrame) -> float:
+                        adx: float, atr: float, trend_score: float, ltf: pd.DataFrame,
+                        ltf_forming: bool) -> float:
+        """Components (max 5.0): +1.5 the window touched EMA20 / VWAP
+        (within ``pullback_ema_touch_atr_mult`` x ATR), +1.0 it held above
+        EMA20 less ``pullback_hold_atr_mult`` x ATR (mirror for a SHORT),
+        +1.0 the close is through EMA9, +0.5 the last closed bucket closed in
+        its top 40% (bottom for a SHORT), +0.5 its volume was at least 1.10x
+        the mean of the up to ``pullback_lookback_bars`` session buckets
+        before it, +0.5 ADX at ``min_adx14``. The close position and the
+        volume read the last CLOSED bucket (2026-10-13): on the 5m LTF a
+        forming bucket's partial volume passed the volume test 0.5% of the
+        time in its first minute and 25.8% in its last. The baseline counts
+        the session's buckets only (``session_bars``: from 09:30 on the "rth"
+        window), as the session VWAP does (2026-10-13): a premarket bucket
+        trades a fraction of a session one, so in the first half hour it
+        pulled the mean down and the session's first buckets read as volume
+        expansions."""
         min_trend = float(self.params.get("min_pullback_trend_score", 3.0))
         if trend_score < min_trend:
             return 0.0
-        session_ltf = ltf[same_day_mask(ltf, sessions.now_et().date())]
         score = 0.0
         touch_mult = float(self.params.get("pullback_ema_touch_atr_mult", 0.35))
         touch_dist = atr * touch_mult
         lookback = max(2, int(self.params.get("pullback_lookback_bars", 5)))
-        recent = session_ltf.tail(lookback + 1).iloc[:-1] if len(session_ltf) > lookback else session_ltf.iloc[:-1]
+        recent = setup_window(ltf, lookback)
         if recent.empty:
             return 0.0
+        # The closed buckets; the window above holds one of today's at least,
+        # so the last of them is today's.
+        closed = closed_ltf(ltf, ltf_forming)
 
         if side == Side.LONG:
             recent_low = safe_float(recent["low"].min(), close)
@@ -40,8 +65,7 @@ class PullbackRegimeMixin:
                 score += 1.0
             if close > ema9:
                 score += 1.0
-            close_pos = bar_close_position(session_ltf if not session_ltf.empty else ltf)
-            if close_pos >= 0.60:
+            if bar_close_position(closed) >= 0.60:
                 score += 0.5
         else:
             recent_high = safe_float(recent["high"].max(), close)
@@ -54,14 +78,14 @@ class PullbackRegimeMixin:
                 score += 1.0
             if close < ema9:
                 score += 1.0
-            close_pos = bar_close_position(session_ltf if not session_ltf.empty else ltf)
-            if close_pos <= 0.40:
+            if bar_close_position(closed) <= 0.40:
                 score += 0.5
 
-        # Volume expansion on current bar
-        vol_src = session_ltf if not session_ltf.empty else ltf
-        vol = safe_float(vol_src.iloc[-1].get("volume"), 0.0)
-        vol_mean = safe_float(recent["volume"].mean(), 1.0)
+        # Volume expansion on the last closed bucket, against the mean of
+        # the lookback session buckets before it.
+        vol = safe_float(closed.iloc[-1].get("volume"), 0.0)
+        prior = session_bars(closed.iloc[:-1]).tail(lookback)
+        vol_mean = safe_float(prior["volume"].mean(), 0.0) if not prior.empty else 0.0
         if vol_mean > 0 and vol / vol_mean >= 1.10:
             score += 0.5
         if adx >= float(self.params.get("min_adx14", 15.0)):
@@ -120,13 +144,21 @@ class PullbackRegimeMixin:
 
     def _build_pullback_signal(self, c: Candidate, side: Side, close: float, atr: float,
                                ltf: pd.DataFrame, frame: pd.DataFrame, regime_score: float,
-                               data=None, vol_widening: float = 1.0, vol_scale: float = 1.0) -> Signal | None:
+                               data=None, vol_widening: float = 1.0, vol_scale: float = 1.0, *,
+                               ltf_forming: bool) -> Signal | None:
+        """The stop goes beyond the last ``pullback_lookback_bars`` closed
+        LTF buckets' low (LONG) by ``stop_buffer_atr_mult`` x the LTF ATR and
+        beyond every 1m bar since them (``stop_anchor``), floored at
+        ``default_stop_pct``; the target is the R:R multiple or today's
+        swing high over ~100 minutes of buckets, whichever is further. The
+        leg (``_pullback_leg_context``) is read on today's closed buckets,
+        premarket included (``today_bars``).
+        ``ltf_forming`` is the pass's flag (``_CandidateRead.ltf_forming``)."""
         lookback = max(3, int(self.params.get("pullback_lookback_bars", 5)))
-        # ltf is resampled from the full multi-day history frame, so tail(N)
-        # crosses session boundary during early RTH. Scope swing/stop lookups
-        # to today's session bars only.
-        session_ltf = ltf[same_day_mask(ltf, sessions.now_et().date())]
-        recent = session_ltf.tail(lookback + 1).iloc[:-1] if len(session_ltf) > lookback else session_ltf.iloc[:-1]
+        # Today's buckets only (premarket included): the LTF is resampled
+        # from the multi-day step frame (``today_bars``, ``setup_window``).
+        session_ltf = today_bars(ltf)
+        recent = setup_window(ltf, lookback)
         if recent.empty:
             self._set_build_failure(c.symbol, "pullback", "insufficient_ltf_history")
             return None
@@ -150,7 +182,8 @@ class PullbackRegimeMixin:
         # no swing extreme exists yet (early session, insufficient bars);
         # both checks short-circuit in that case.
         ltf_min = max(1, int(self.params.get("ltf_minutes", 5)))
-        minutes_since, retrace_pct = self._pullback_leg_context(side, session_ltf, close, ltf_min)
+        minutes_since, retrace_pct = self._pullback_leg_context(
+            side, today_bars(closed_ltf(ltf, ltf_forming)), close, ltf_min)
 
         if bool(self.params.get("pullback_require_fresh_leg", True)):
             max_minutes = float(self.params.get("pullback_max_minutes_since_session_extreme", 45.0))
@@ -210,13 +243,13 @@ class PullbackRegimeMixin:
         swing_bars = max(8, round(100 / ltf_min))
 
         if side == Side.LONG:
-            stop = safe_float(recent["low"].min(), close) - buffer
+            stop = stop_anchor(side, recent, frame, ltf, close) - buffer
             stop = min(stop, close * (1.0 - effective_default_stop_pct))
             risk = max(0.01, close - stop)
             swing_high = safe_float(session_ltf.tail(swing_bars)["high"].max(), close + risk * target_rr)
             target = max(close + risk * target_rr, swing_high)
         else:
-            stop = safe_float(recent["high"].max(), close) + buffer
+            stop = stop_anchor(side, recent, frame, ltf, close) + buffer
             stop = max(stop, close * (1.0 + effective_default_stop_pct))
             risk = max(0.01, stop - close)
             swing_low = safe_float(session_ltf.tail(swing_bars)["low"].min(), close - risk * target_rr)

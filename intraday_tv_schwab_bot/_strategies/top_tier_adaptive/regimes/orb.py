@@ -64,7 +64,7 @@ class OrbRegimeMixin:
             return 0.5
         or_high, or_low, _ = opening
         score = 0.5
-        buffer = float(self.params.get("orb_breakout_buffer_atr_mult", 0.05)) * atr
+        buffer = float(self.params.get("orb_breakout_buffer_atr_mult", 0.022)) * atr
         broke = (close > or_high + buffer if side == Side.LONG
                  else close < or_low - buffer)
         if not broke:
@@ -75,8 +75,8 @@ class OrbRegimeMixin:
         if decisive:
             score += 1.0
         range_height = or_high - or_low
-        min_range = float(self.params.get("orb_min_range_atr_mult", 0.5)) * atr
-        max_range_mult = float(self.params.get("orb_max_range_atr_mult", 4.0))
+        min_range = float(self.params.get("orb_min_range_atr_mult", 0.22)) * atr
+        max_range_mult = float(self.params.get("orb_max_range_atr_mult", 1.74))
         max_range = max_range_mult * atr if max_range_mult > 0 else float("inf")
         if min_range <= range_height <= max_range:
             score += 1.0
@@ -104,8 +104,8 @@ class OrbRegimeMixin:
             return None
         or_high, or_low, _ = opening
         range_height = or_high - or_low
-        min_range = float(self.params.get("orb_min_range_atr_mult", 0.5)) * atr
-        max_range_mult = float(self.params.get("orb_max_range_atr_mult", 4.0))
+        min_range = float(self.params.get("orb_min_range_atr_mult", 0.22)) * atr
+        max_range_mult = float(self.params.get("orb_max_range_atr_mult", 1.74))
         if range_height < min_range:
             self._set_build_failure(
                 c.symbol, "orb",
@@ -118,7 +118,7 @@ class OrbRegimeMixin:
                 f"orb_range_too_wide(height={range_height:.4f}>{max_range_mult * atr:.4f})",
             )
             return None
-        breakout_buffer = float(self.params.get("orb_breakout_buffer_atr_mult", 0.05)) * atr
+        breakout_buffer = float(self.params.get("orb_breakout_buffer_atr_mult", 0.022)) * atr
         stop_buffer = atr * float(self.params.get("stop_buffer_atr_mult", 0.25)) * vol_widening * self._side_stop_buffer_mult(side)
         target_mult = float(self.params.get("orb_target_range_mult", 1.5))
         if side == Side.LONG:

@@ -6,13 +6,18 @@ import pandas as pd
 
 from ....models import Candidate, Side, Signal
 from ....numeric import safe_float
+from ..confirmation import stop_anchor
 
 
 class TrendRegimeMixin:
     """Trend: VWAP / EMA posture with ADX and index agreement; enters a
     fresh N-bar extreme. Mixed into ``TopTierAdaptiveStrategy``
     (``strategy.py``), whose ``BaseStrategy`` supplies ``params``,
-    ``config`` and the contexts."""
+    ``config`` and the contexts.
+
+    The scorer reads the latest 1m close and session VWAP against the last
+    closed LTF bucket's EMA9 / EMA20, ADX14 and returns; the builder's
+    reference is the LTF setup window (``_breakout_reference``)."""
 
     def _score_trend(self, side: Side, close: float, vwap: float, ema9: float, ema20: float,
                      adx: float, ret5: float, ret15: float, index_ok: bool) -> float:
@@ -49,7 +54,13 @@ class TrendRegimeMixin:
                             ltf: pd.DataFrame, frame: pd.DataFrame, regime_score: float,
                             data=None, vol_widening: float = 1.0, vol_scale: float = 1.0,
                             breakout_confirmed: bool = False) -> Signal | None:
-        """``breakout_confirmed`` is set by an armed retest: a CONFIRMED retest,
+        """The latest 1m close must clear the last ``pullback_lookback_bars``
+        closed LTF buckets' high (LONG; low for a SHORT,
+        ``_breakout_reference``). The stop goes beyond those buckets' low by
+        ``stop_buffer_atr_mult`` x the LTF ATR, and beyond every 1m bar since
+        them (``current_bucket_extreme``), floored at ``default_stop_pct``.
+
+        ``breakout_confirmed`` is set by an armed retest: a CONFIRMED retest,
         or an expired arm whose breakout still holds (the market fallback).
 
         The fresh-breakout gate below asks "is close above the last N bars'
@@ -61,7 +72,7 @@ class TrendRegimeMixin:
         close back above that level, so the condition is satisfied by
         construction here rather than skipped.
         """
-        recent, trigger_level = self._breakout_reference("trend", side, ltf, frame)
+        recent, trigger_level = self._breakout_reference("trend", side, ltf)
         if recent is None or recent.empty:
             self._set_build_failure(c.symbol, "trend", "insufficient_ltf_history")
             return None
@@ -80,7 +91,7 @@ class TrendRegimeMixin:
                     f"no_fresh_breakout(close={close:.4f}<=recent_high={trigger_high:.4f})",
                 )
                 return None
-            stop = safe_float(recent["low"].min(), close) - buffer
+            stop = stop_anchor(side, recent, frame, ltf, close) - buffer
             stop = min(stop, close * (1.0 - effective_default_stop_pct))
             risk = max(0.01, close - stop)
             target = close + risk * target_rr
@@ -92,7 +103,7 @@ class TrendRegimeMixin:
                     f"no_fresh_breakdown(close={close:.4f}>=recent_low={trigger_low:.4f})",
                 )
                 return None
-            stop = safe_float(recent["high"].max(), close) + buffer
+            stop = stop_anchor(side, recent, frame, ltf, close) + buffer
             stop = max(stop, close * (1.0 + effective_default_stop_pct))
             risk = max(0.01, stop - close)
             target = max(0.01, close - risk * target_rr)

@@ -94,27 +94,88 @@ def quote_exchange(quote: Mapping[str, Any] | None) -> str | None:
     return None
 
 
-def technical_line_payload(line: Any) -> dict[str, Any] | None:
+class ChartPositions:
+    """Where the bars of an overlay's frame (``source``: the bars a context
+    was built on, e.g. top_tier's 1m technicals) sit on a chart drawn at a
+    coarser timeframe from the same bars (``chart``: e.g. its 5m LTF chart):
+    each source bar in the chart bar that holds it, the last one labelled at
+    or before it (a bar is labelled at its start)."""
+
+    def __init__(self, source: pd.DatetimeIndex, chart: pd.DatetimeIndex):
+        if len(source) == 0 or len(chart) == 0:
+            raise ValueError("chart positions need bars on both frames")
+        self.source = source
+        self.chart = chart
+
+    def at(self, pos: int) -> int:
+        """The chart position of the source bar at ``pos``."""
+        stamp = self.source[min(max(int(pos), 0), len(self.source) - 1)]
+        return max(0, int(self.chart.searchsorted(stamp, side="right")) - 1)
+
+    def label(self, pos: int) -> pd.Timestamp:
+        """The label of the chart bar that holds the source bar at ``pos``."""
+        return self.chart[self.at(pos)]
+
+    @property
+    def newest_source(self) -> int:
+        return len(self.source) - 1
+
+
+def technical_line_payload(line: Any, positions: ChartPositions | None = None) -> dict[str, Any] | None:
     """A trendline / channel edge for the chart. Its positions (start_pos,
     end_pos, and the intercept at position 0) are in the coordinate space of
     the frame handed to ``build_technical_levels_context`` -- the dashboard
-    hands it the chart's own frame, so they are the chart bars' abs_index
-    and ``slope * abs_index + intercept`` at the newest bar is
-    ``current_value``. Until 2026-09-23 they were positions in the builder's
-    internal 120-280 bar tail, and every line drew as a zero-length stub at
-    the chart's left edge."""
+    hands it the bars the strategy's technical context reads, so they are
+    that frame's positions and ``slope * position + intercept`` at its newest
+    bar is ``current_value``. The LTF chart draws a line at its own bars'
+    abs_index, so on a chart of other bars (``positions``: top_tier's 1m
+    technicals on its 5m LTF chart, since 2026-10-13) the line is
+    re-expressed in the chart's positions: through its value at its first
+    pivot's chart bar and ``current_value`` at the chart's newest bar, the
+    pivots' positions moved to the chart bars that hold them. Until
+    2026-09-23 they were positions in the builder's internal 120-280 bar
+    tail, and every line drew as a zero-length stub at the chart's left
+    edge."""
     if line is None:
         return None
+    slope = float(getattr(line, "slope", 0.0) or 0.0)
+    intercept = float(getattr(line, "intercept", 0.0) or 0.0)
+    start_pos = int(getattr(line, "start_pos", 0) or 0)
+    end_pos = int(getattr(line, "end_pos", 0) or 0)
+    current_value = float(getattr(line, "current_value", 0.0) or 0.0)
+    if positions is not None:
+        start, newest = positions.at(start_pos), positions.at(positions.newest_source)
+        start_value = slope * start_pos + intercept
+        slope = (current_value - start_value) / (newest - start) if newest > start else 0.0
+        intercept = current_value - slope * newest
+        start_pos, end_pos = start, positions.at(end_pos)
     return {
         "kind": str(getattr(line, "kind", "line") or "line"),
-        "slope": float(getattr(line, "slope", 0.0) or 0.0),
-        "intercept": float(getattr(line, "intercept", 0.0) or 0.0),
+        "slope": slope,
+        "intercept": intercept,
         "touches": int(getattr(line, "touches", 0) or 0),
-        "start_pos": int(getattr(line, "start_pos", 0) or 0),
-        "end_pos": int(getattr(line, "end_pos", 0) or 0),
-        "current_value": float(getattr(line, "current_value", 0.0) or 0.0),
+        "start_pos": start_pos,
+        "end_pos": end_pos,
+        "current_value": current_value,
         "direction": str(getattr(line, "direction", "neutral") or "neutral"),
     }
+
+
+def divergence_line_payload(match: Any, positions: ChartPositions | None = None) -> dict[str, Any]:
+    """A divergence line for the chart (``DivergenceMatch.to_payload``). The
+    chart places each pivot at the first of its bars at or after the
+    pivot's time, and an off-window pivot by the bar gap between the two
+    pivots' positions; on a chart of other bars than the context's
+    (``positions``) both pivots move to the chart bars that hold them, the
+    bar's label and position, at the pivot bar's own price."""
+    payload = match.to_payload()
+    if positions is not None:
+        for key in ("pivot_a", "pivot_b"):
+            pivot = dict(payload[key])
+            pivot["ts"] = str(positions.label(pivot["pos"]))
+            pivot["pos"] = positions.at(pivot["pos"])
+            payload[key] = pivot
+    return payload
 
 
 def fvg_payload(gap: Any) -> dict[str, Any] | None:

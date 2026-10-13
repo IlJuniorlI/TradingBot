@@ -2027,9 +2027,11 @@ function renderSelectedSymbol() {
   // (appState.expandedChart / compactChart, captured when /api/chart payloads
   // arrive): the strategy's HTF EMAs in HTF mode (e.g. 34/200 for
   // peer_confirmed_key_levels), its own LTF EMAs in LTF mode
-  // (scaled_span(9 / 20, ltf_indicator_span_scale), e.g. 45/100 for
-  // top_tier). Until a payload lands the bars are the snapshot's, whose
-  // spans travel on snapshot.chart.ema_fast_span / ema_slow_span.
+  // (scaled_span(9 / 20, ltf_indicator_span_scale), or its declared
+  // ltf_ema_fast_span / ltf_ema_slow_span: 9/20 on top_tier's 5m LTF, 45/100
+  // on its 1m LTF from 2026-05-29 to 2026-10-13). Until a payload lands the
+  // bars are the snapshot's, whose spans travel on
+  // snapshot.chart.ema_fast_span / ema_slow_span.
   const activeEmaSource = appState.mainPanelExpanded ? appState.expandedChart : appState.compactChart;
   const emaFastSpan = Math.max(1, Number(activeEmaSource?.emaFastSpan) || Number(snapshot?.chart?.ema_fast_span) || 9);
   const emaSlowSpan = Math.max(1, Number(activeEmaSource?.emaSlowSpan) || Number(snapshot?.chart?.ema_slow_span) || 20);
@@ -2546,10 +2548,12 @@ function drawSelectedChart(snapshot) {
       if (v !== null) horizontalLines.push({ value: v, label: item.label, shortLabel: item.shortLabel, color: item.color, dash: [3, 6], labelMode: 'inline' });
     });
   }
-  // Channels and trendlines are computed against the LTF frame in
-  // dashboard_cache.py (build_technical_levels_context fed by tech_frame
-  // at strategy.ltf_minutes()), and their start_pos / end_pos / intercept are
-  // positions in that frame: the LTF chart bars' abs_index. On the HTF chart
+  // Channels and trendlines are computed in dashboard_cache.py
+  // (build_technical_levels_context fed by tech_frame, the bars the
+  // strategy's technical context reads), and their start_pos / end_pos /
+  // intercept are positions in the LTF chart's bars: tech_frame's own when
+  // it is the LTF, else re-expressed in them (top_tier's 1m technicals on
+  // its 5m LTF chart, ChartPositions). On the HTF chart
   // the bars carry HTF abs_index values, so lineValueAt(line, bars[i].abs_index)
   // projects to garbage prices — the line ends up "in empty space" detached
   // from the bars. Gate the rendering to LTF-only (mirrors the

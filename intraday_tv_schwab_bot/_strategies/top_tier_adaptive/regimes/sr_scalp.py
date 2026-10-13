@@ -14,7 +14,13 @@ from .... import sessions
 class SrScalpRegimeMixin:
     """S/R scalp: a holding level or a confirmed flip, riding to the next
     rung. Mixed into ``TopTierAdaptiveStrategy`` (``strategy.py``), whose
-    ``BaseStrategy`` supplies ``params``, ``config`` and the contexts."""
+    ``BaseStrategy`` supplies ``params``, ``config`` and the contexts.
+
+    The levels are the HTF S/R context's; every ATR multiple here is of the
+    LTF ATR (``atr``: the last closed 5m bucket's ATR14 on the shipped
+    preset since 2026-10-13). The rejection wick and the noise window
+    (``sr_scalp_noise_lookback_bars``) read the step frame's 1m bars: entry
+    timing."""
 
     def _score_sr_scalp(self, side: Side, close: float, atr: float,
                         frame: pd.DataFrame, sr_ctx, vol_scale: float = 1.0) -> float:
@@ -244,9 +250,13 @@ class SrScalpRegimeMixin:
         psup_px = float(getattr(psup, "price", 0.0) or 0.0) if psup is not None else 0.0
         pres_px = float(getattr(pres, "price", 0.0) or 0.0) if pres is not None else 0.0
 
-        # Zone band half-width — bot's existing zone construction (same
-        # formula as the dashboard's key_level_zones via
-        # dashboard_level_context_spec). Reads ``zone_atr_mult`` / ``zone_pct``.
+        # Zone band half-width: ``zone_atr_mult`` x the LTF ATR (``atr``, the
+        # last closed 5m bucket's ATR14 on the shipped preset since
+        # 2026-10-13) or ``zone_pct`` x the close, the wider. The dashboard's
+        # key_level_zones read the same knobs against the 5m ATR14 too (the
+        # newest bucket's), so their bands are these (until 2026-10-13 they
+        # read the 1m frame's ATR14). The zone_pct floor sets the half-width
+        # on about 99% of minutes, so neither moved much with the ATR.
         zone_half_width = max(
             float(self.params.get("zone_atr_mult", 0.20)) * atr,
             close * float(self.params.get("zone_pct", 0.0015)),
@@ -395,7 +405,7 @@ class SrScalpRegimeMixin:
         noise_lookback = max(2, int(self.params.get("sr_scalp_noise_lookback_bars", 20)))
         noise_frame = frame[same_day_mask(frame, sessions.now_et().date())].tail(noise_lookback)
         pierce = self._level_pierce(side, noise_frame, entry_level)
-        min_stop_atr = float(self.params.get("sr_scalp_min_stop_atr_mult", 0.5))
+        min_stop_atr = float(self.params.get("sr_scalp_min_stop_atr_mult", 0.22))
         atr_floor = min_stop_atr * atr if (min_stop_atr > 0 and atr > 0) else 0.0
         if side == Side.LONG:
             pierce_stop = entry_level - pierce - level_buffer

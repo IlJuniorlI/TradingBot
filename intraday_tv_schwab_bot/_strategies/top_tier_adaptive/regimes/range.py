@@ -4,16 +4,29 @@ from __future__ import annotations
 
 import pandas as pd
 
-from ....bars import bar_wick_fractions, same_day_mask
+from ....bars import bar_wick_fractions
 from ....models import Candidate, Side, Signal
 from ....numeric import safe_float
-from .... import sessions
+from ..confirmation import session_bars, setup_window, stop_anchor, today_bars
+
+# The fewest buckets a range is measured on (the zone, ``setup_window``):
+# 40 minutes of 5m buckets.
+RANGE_MIN_ZONE_BARS = 8
 
 
 class RangeRegimeMixin:
     """Range: fade the edge of the lookback range. Mixed into
     ``TopTierAdaptiveStrategy`` (``strategy.py``), whose ``BaseStrategy``
-    supplies ``params``, ``config`` and the contexts."""
+    supplies ``params``, ``config`` and the contexts.
+
+    The range is set up on the LTF (2026-10-13): the zone is the last
+    ``range_lookback_bars`` of today's closed buckets before the current one
+    (``setup_window``; 20 x 5m = 100 minutes on the shipped preset). The
+    entry is timed on the step frame's closed 1m bars (``_read_candidate``
+    drops one still trading): the latest 1m close must be in the fade zone,
+    the bar before it too under ``range_require_prev_bar_confirmation``,
+    and the rejection wick is the last 1m bar's. Until then the zone was the
+    last 20 one-minute bars, the current bar among them."""
 
     def _range_entry_zone(self, side: Side, recent: pd.DataFrame,
                           close: float) -> tuple[bool, float, float, float]:
@@ -26,6 +39,12 @@ class RangeRegimeMixin:
         above. Extracted for the same reason as ``_breakout_reference``: a
         scorer and a builder that derive the same geometry separately drift,
         and here they had drifted all the way apart (see ``_score_range``).
+
+        The zone ends at the range's own edge (2026-10-13): a close below
+        ``range_low`` (LONG; above ``range_high`` for a SHORT) has broken the
+        range rather than reached its edge, and is no fade. With the range
+        measured on the buckets before the current one, the close can lie
+        outside it; while the range held the current bar it could not.
         """
         range_high = safe_float(recent["high"].max(), close)
         range_low = safe_float(recent["low"].min(), close)
@@ -33,12 +52,31 @@ class RangeRegimeMixin:
         frac = float(self.params.get("range_entry_zone_frac", 0.35))
         if side == Side.LONG:
             threshold = range_low + span * frac
-            return close <= threshold, range_low, range_high, threshold
+            return range_low <= close <= threshold, range_low, range_high, threshold
         threshold = range_high - span * frac
-        return close >= threshold, range_low, range_high, threshold
+        return threshold <= close <= range_high, range_low, range_high, threshold
+
+    def _range_prev_close(self, frame: pd.DataFrame) -> float | None:
+        """The close of the 1m bar before the trigger bar (today's bars,
+        ``today_bars``), which ``range_require_prev_bar_confirmation`` asks to
+        sit in the fade zone too; None when there is none or it does not read.
+
+        The pass's step frame holds closed bars only (``_read_candidate``
+        drops a last bar still trading), so its last bar is the last closed
+        one and this is the one before it: the reading asks for the last TWO
+        closed 1m bars in the zone. The 2026-04-23 design wrote it against a
+        forming last bar, where it asked for the last closed bar alone, the
+        one the zone test already reads; that reading is
+        ``range_require_prev_bar_confirmation: false``. The default keeps the
+        two-bar reading (the user's call, 2026-10-13: a replay A/B of 10-07
+        and 10-08 rested on one stop, not enough to choose between them)."""
+        day = today_bars(frame)
+        if day is None or len(day) < 2:
+            return None
+        return safe_float(day.iloc[-2].get("close"))
 
     def _score_range(self, side: Side, close: float, ema9: float, ema20: float,
-                     frame: pd.DataFrame, tech_ctx, index_neutral: bool,
+                     ltf: pd.DataFrame, frame: pd.DataFrame, tech_ctx, index_neutral: bool,
                      vol_scale: float = 1.0) -> float:
         """Score the range fade on the geometry ``_build_range_signal`` gates
         on: price sitting in the fade zone at the range edge this side trades.
@@ -76,33 +114,39 @@ class RangeRegimeMixin:
                   win the auction and die on ``range_bollinger_squeeze``.
           * +2.0  close is in the fade zone at THIS side's edge AND, when
                   ``range_require_prev_bar_confirmation`` is on, so is the
-                  last COMPLETED bar -- both of the builder's entry gates,
-                  enforced together. Either missing => base only, which
-                  cannot reach ``min_range_score``. The prev-bar half used to
+                  1m bar before it (``_range_prev_close``) -- both of the
+                  builder's entry gates, enforced together. Either missing
+                  => base only, which cannot reach ``min_range_score``. The
+                  close must also be inside the range (a close past its edge
+                  has broken it, ``_range_entry_zone``). The prev-bar half used to
                   be an optional +0.5 while the builder demanded it, so a
                   single-bar poke into the zone scored 3.5, cleared the floor,
                   won its place in the build queue and then died on
                   ``not_near_range_low_prev_bar``: a guaranteed-fail path, not
                   an optimistic one. ORB had the same shape, fixed the same
                   way two days ago.
-          * +1.0  the bar rejected the edge (LONG: lower wick >= 0.30 of bar
-                  range; SHORT: upper wick >= 0.30).
+          * +1.0  the last 1m bar rejected the edge (LONG: lower wick >= 0.30
+                  of bar range; SHORT: upper wick >= 0.30).
           * +0.5  the fade is DEEP rather than marginal -- close is in the
                   inner half of the zone, nearer the extreme than the
                   threshold.
           * +0.5  the tape is two-sided: at least ``range_min_flip_count``
-                  VWAP crosses in the lookback AND the lookback range is
-                  within ``range_max_intraday_range_pct``.
+                  closes across VWAP (each bucket's close against the step
+                  frame's session VWAP at it) in the zone's session buckets
+                  (``session_bars``: a premarket bucket's VWAP is the
+                  all-hours one, so its close is no flip, and neither is
+                  the switch to the session VWAP at the open; 2026-10-13)
+                  AND the zone's range is within
+                  ``range_max_intraday_range_pct``.
           * +0.5  nothing is trending against the fade: the per-symbol indices
                   are VWAP-neutral AND ema9/ema20 are within
                   ``range_max_ema_gap_pct``.
         """
-        lookback = max(8, int(self.params.get("range_lookback_bars", 20)))
-        session_frame = frame[same_day_mask(frame, sessions.now_et().date())]
-        recent = session_frame.tail(lookback)
+        lookback = max(RANGE_MIN_ZONE_BARS, int(self.params.get("range_lookback_bars", 20)))
+        recent = setup_window(ltf, lookback)
         # Same floor the builder rejects on (`insufficient_range_bars`), so a
         # frame too short to define a range cannot qualify here either.
-        if len(recent) < 8:
+        if len(recent) < RANGE_MIN_ZONE_BARS:
             return 0.0
 
         score = 0.5
@@ -117,14 +161,13 @@ class RangeRegimeMixin:
         if not in_zone:
             return score
         if bool(self.params.get("range_require_prev_bar_confirmation", True)):
-            # `recent` is at least 8 bars by the guard above, so iloc[-2] exists.
-            prev_close = safe_float(recent.iloc[-2].get("close"))
+            prev_close = self._range_prev_close(frame)
             if prev_close is None or not (
                     prev_close <= threshold if side == Side.LONG else prev_close >= threshold):
                 return score
         score += 2.0
 
-        upper_wick, lower_wick, _body, bar_range = bar_wick_fractions(recent)
+        upper_wick, lower_wick, _body, bar_range = bar_wick_fractions(frame)
         if bar_range > 0:
             wick = lower_wick if side == Side.LONG else upper_wick
             if wick >= 0.30:
@@ -138,7 +181,8 @@ class RangeRegimeMixin:
 
         flips = -1
         if "vwap" in recent.columns:
-            above = recent["close"].astype(float) > recent["vwap"].astype(float)
+            session = session_bars(recent)
+            above = session["close"].astype(float) > session["vwap"].astype(float)
             flips = int((above != above.shift()).sum()) - 1
         range_pct = (range_high - range_low) / max(close, 1.0)
         if (flips >= int(self.params.get("range_min_flip_count", 3))
@@ -152,15 +196,25 @@ class RangeRegimeMixin:
         return score
 
     def _build_range_signal(self, c: Candidate, side: Side, close: float, atr: float,
-                            frame: pd.DataFrame, regime_score: float, data=None,
+                            ltf: pd.DataFrame, frame: pd.DataFrame, regime_score: float, data=None,
                             vol_widening: float = 1.0, vol_scale: float = 1.0) -> Signal | None:
-        lookback = max(8, int(self.params.get("range_lookback_bars", 20)))
-        # Scope to today's session so range_high/range_low are not polluted
-        # by prior-session bars during early RTH.
-        session_frame = frame[same_day_mask(frame, sessions.now_et().date())]
-        recent = session_frame.tail(lookback)
-        if len(recent) < 8:
-            self._set_build_failure(c.symbol, "range", f"insufficient_range_bars({len(recent)}<8)")
+        """Fade the range edge: LONG in the bottom ``range_entry_zone_frac``
+        of the zone (``setup_window`` of ``range_lookback_bars`` of today's
+        LTF buckets), SHORT in the top. The stop goes beyond the range edge by
+        ``stop_buffer_atr_mult`` x the LTF ATR, and beyond every 1m bar of
+        the current bucket (``stop_anchor``: a spring through the edge that
+        closed back inside is under it), and at least
+        ``range_min_stop_atr_mult`` x the LTF ATR from the close: no
+        floorless stop (2026-10-13; the stop sat range_low - buffer, which a
+        close at the edge put a buffer away). The target is the far edge less
+        the buffer."""
+        lookback = max(RANGE_MIN_ZONE_BARS, int(self.params.get("range_lookback_bars", 20)))
+        # Today's buckets only, so range_high/range_low are not polluted by
+        # prior-session bars during early RTH.
+        recent = setup_window(ltf, lookback)
+        if len(recent) < RANGE_MIN_ZONE_BARS:
+            self._set_build_failure(c.symbol, "range",
+                                    f"insufficient_range_bars({len(recent)}<{RANGE_MIN_ZONE_BARS})")
             return None
         # Reject range entries during a Bollinger squeeze. Squeeze = compressed
         # volatility, typically resolves via breakout — the opposite of what
@@ -189,46 +243,60 @@ class RangeRegimeMixin:
         # V 14:14 SHORT) all fired on an in-progress bar whose live tick
         # happened to cross the range-edge threshold, but the bar itself
         # closed at a mid-range value and the next bar moved adversely.
-        # When enabled, require the last COMPLETED bar's close (iloc[-2])
-        # to also sit in the entry zone — filters single-tick whipsaws.
+        # When enabled, the 1m bar before the trigger bar must also close in
+        # the entry zone (``_range_prev_close``: on closed bars that asks for
+        # two closed bars).
         require_prev_bar = bool(self.params.get("range_require_prev_bar_confirmation", True))
-        prev_close = None
-        if require_prev_bar and len(recent) >= 2:
-            prev_close = safe_float(recent.iloc[-2].get("close"))
+        prev_close = self._range_prev_close(frame) if require_prev_bar else None
+        prev_text = "na" if prev_close is None else f"{prev_close:.4f}"
+        # A floor on the stop's distance from the close, in LTF ATR.
+        min_stop = float(self.params.get("range_min_stop_atr_mult", 0.5)) * atr
 
         if side == Side.LONG:
-            # Enter near range low
+            # Enter near range low; a close under it has broken the range.
+            if close < range_low:
+                self._set_build_failure(
+                    c.symbol, "range",
+                    f"below_range_low(close={close:.4f}<{range_low:.4f},range={range_low:.2f}-{range_high:.2f})",
+                )
+                return None
             if not in_zone:
                 self._set_build_failure(
                     c.symbol, "range",
                     f"not_near_range_low(close={close:.4f}>{threshold:.4f},range={range_low:.2f}-{range_high:.2f})",
                 )
                 return None
-            if require_prev_bar and prev_close is not None and prev_close > threshold:
+            if require_prev_bar and (prev_close is None or prev_close > threshold):
                 self._set_build_failure(
                     c.symbol, "range",
-                    f"not_near_range_low_prev_bar(prev_close={prev_close:.4f}>{threshold:.4f},"
+                    f"not_near_range_low_prev_bar(prev_close={prev_text}>{threshold:.4f},"
                     f"range={range_low:.2f}-{range_high:.2f})",
                 )
                 return None
-            stop = range_low - buffer
+            stop = min(stop_anchor(side, recent, frame, ltf, close) - buffer, close - min_stop)
             target = range_high - buffer
         else:
-            # Enter near range high
+            # Enter near range high; a close over it has broken the range.
+            if close > range_high:
+                self._set_build_failure(
+                    c.symbol, "range",
+                    f"above_range_high(close={close:.4f}>{range_high:.4f},range={range_low:.2f}-{range_high:.2f})",
+                )
+                return None
             if not in_zone:
                 self._set_build_failure(
                     c.symbol, "range",
                     f"not_near_range_high(close={close:.4f}<{threshold:.4f},range={range_low:.2f}-{range_high:.2f})",
                 )
                 return None
-            if require_prev_bar and prev_close is not None and prev_close < threshold:
+            if require_prev_bar and (prev_close is None or prev_close < threshold):
                 self._set_build_failure(
                     c.symbol, "range",
-                    f"not_near_range_high_prev_bar(prev_close={prev_close:.4f}<{threshold:.4f},"
+                    f"not_near_range_high_prev_bar(prev_close={prev_text}<{threshold:.4f},"
                     f"range={range_low:.2f}-{range_high:.2f})",
                 )
                 return None
-            stop = range_high + buffer
+            stop = max(stop_anchor(side, recent, frame, ltf, close) + buffer, close + min_stop)
             target = max(0.01, range_low + buffer)
 
         return self._finalize_signal(c, side, close, stop, target, "range", regime_score, frame, data, vol_scale=vol_scale)

@@ -4224,8 +4224,9 @@ class MarketDataStore:
         # Base (OHLCV-only) cache is span-independent and stays shared. The
         # enriched cache is keyed by span_scale and the resolved EMA spans so a
         # caller asking for stretched indicators or its own EMAs (the
-        # dashboard's chart of top_tier's 1m LTF: span_scale 5,
-        # ltf_ema_*_span) gets its own entry without clobbering the canonical
+        # dashboard's chart of a strategy's LTF at its ltf_ema_*_span, or of
+        # a stretched 1m LTF: top_tier's at span_scale 5 from 2026-05-29 to
+        # 2026-10-13) gets its own entry without clobbering the canonical
         # frame (the engine's step frames, which the strategies read, and the
         # dashboard's). Resolving None keeps an explicit canonical request
         # (9/20 at scale 1) on that same entry.

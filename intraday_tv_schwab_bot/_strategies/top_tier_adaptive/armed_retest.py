@@ -23,10 +23,12 @@ from ...models import Side
 from ... import sessions
 
 # Regimes that ARM instead of entering the moment they qualify. Both can only
-# fill at an N-bar extreme -- `close > max(high of the previous N bars)` -- so
-# the fill sits at the highest price in 25 (trend) or 6 (momentum) minutes by
-# construction, and the stop then lands inside the ordinary retrace band. The
-# other four are excluded on their own evidence:
+# fill at an N-bar extreme -- the latest 1m close above the high of the last N
+# closed LTF buckets (``_breakout_reference``) -- so the fill sits at the
+# highest price of the last 5 (trend) or 6 (momentum) closed 5m buckets by
+# construction (25 and 6 one-minute bars until 2026-10-13), and the stop then
+# lands inside the ordinary retrace band. The other four are excluded on their
+# own evidence:
 #   * `pullback` already requires a 25-50% leg retracement before it fires.
 #   * `vwap_reclaim` already requires a flush THROUGH session VWAP and a
 #     reclaim back across it within `vwap_reclaim_lookback_bars` -- it cannot
@@ -194,9 +196,17 @@ class ArmedRetestMixin:
                    level and waits like a first arm. The cycle skips; other
                    regimes in the build queue are unaffected, so arming trend
                    does not stop a pullback firing on the same symbol.
-        ``enter``  price returned to within ``armed_retest_zone_atr`` of the
-                   level and closed back through it on a bar with the right
-                   shape. This is the entry the regime was waiting for.
+        ``enter``  price returned to within ``armed_retest_zone_atr`` x the LTF
+                   ATR of the level and closed back through it on a 1m bar
+                   with the right shape. This is the entry the regime was
+                   waiting for. The zone and the invalidation are multiples
+                   of the LTF ATR (``atr``, a 5m ATR14 on the shipped preset;
+                   0.15 / 0.33 there keep the price distances 0.35 / 0.75 were
+                   tested at on the 1m LTF's ~0.435x smaller ATR); the touch,
+                   the reclaim and the bar shape read the step frame's
+                   closed 1m bars (``frame``, the pass's: ``_read_candidate``
+                   leaves out a last bar still trading, so a partial bar's
+                   touch or shape never confirms).
 
         EXPIRY IS NOT HANDLED HERE. It lives in ``_expired_armed_retests``,
         which runs before the build queue, because this method is only reached
@@ -223,15 +233,15 @@ class ArmedRetestMixin:
         # retest window after it; without them there is nothing to arm on.
         if frame is None or frame.empty:
             return out
-        _recent, trigger_level = self._breakout_reference(regime, side, ltf, frame)
+        _recent, trigger_level = self._breakout_reference(regime, side, ltf)
         if trigger_level is None or not math.isfinite(trigger_level) or trigger_level <= 0:
             return out
 
         now = sessions.now_et()
         key = f"{symbol}|{side.value}|{regime}"
         arm = self._armed_retests.get(key)
-        zone_atr = max(0.0, float(self.params.get("armed_retest_zone_atr", 0.35)))
-        invalidation_atr = max(0.0, float(self.params.get("armed_retest_invalidation_atr", 0.75)))
+        zone_atr = max(0.0, float(self.params.get("armed_retest_zone_atr", 0.15)))
+        invalidation_atr = max(0.0, float(self.params.get("armed_retest_invalidation_atr", 0.33)))
         max_minutes = float(self.params.get("armed_retest_max_minutes", 12.0))
 
         # A close well back through the armed level means the breakout

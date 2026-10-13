@@ -125,7 +125,8 @@ runtime:
   # entry fallthrough in _allowed_regimes is disabled (it is gated on
   # "extended"). With disable_orb_regime: true there is no opening-range
   # carve-out: the first entry comes from the normal regime mix once
-  # entry_windows opens (09:35); sr_scalp still waits for orb_end_time. Set "extended" to
+  # entry_windows opens (09:35) and three 5m buckets of the session have
+  # closed (09:45, the LTF warm-up); sr_scalp still waits for orb_end_time. Set "extended" to
   # anchor the reset to the 07:00-20:00 equity stream and enable pre/post-market
   # trading (also widen the entry/management/screener windows + populate
   # extended_hours_tradable).
@@ -245,6 +246,8 @@ dashboard:
   ssl_certfile: ""
   ssl_keyfile: ""
   charting:
+    # ltf = the strategy's ltf_minutes: 5m candles since 2026-10-13, so
+    # the compact chart's 90 bars span 7.5 hours.
     compact_chart_timeframe: ltf
     compact:
       max_bars: 90
@@ -397,11 +400,13 @@ support_resistance:
   structure_exit_require_bos_confirmation: true
 
 # Technical indicator-derived levels and overlay settings.
-# NOTE (1m-LTF retune, 2026-05-29): this whole section is computed on the BASE
-# 1-minute frame (build_technical_levels_context is fed the base frame via
-# _technical_context, NOT the strategy's resampled LTF). The base frame was
-# already 1m before the LTF switch, so these bar-count lookbacks are UNCHANGED —
-# only the strategy's trend/pullback LTF (and its span_scale'd indicators) moved.
+# NOTE: this whole section is computed on the BASE 1-minute frame
+# (build_technical_levels_context is fed the base frame via _technical_context,
+# NOT the strategy's resampled LTF), so its bar-count lookbacks are 1m bars
+# through every LTF change (the 1m LTF of 2026-05-29, the 5m setups of
+# 2026-10-13). The dashboard's technicals overlay is built on the same 1m bars
+# (top_tier's technical_context_minutes), its lines placed on the 5m LTF
+# chart.
 technical_levels:
   enabled: true
   fib_enabled: true
@@ -605,9 +610,11 @@ strategies:
   top_tier_adaptive:
     # RTH-only windows. Entries open at 09:35 (2026-09-23; was 09:45). With
     # disable_orb_regime true there is no opening-range carve-out, so the
-    # regime mix is live from 09:30 and this window is the only thing holding
-    # entries back; 09:35 skips the first five minutes of the open. There is
-    # no pre-market trading in rth indicator mode.
+    # regime mix is live from 09:30; since 2026-10-13 a setup also needs
+    # three closed 5m buckets of the session (params ltf_minutes, the
+    # LTF warm-up), so the first entry can come at 09:45 and the 09:35-09:44
+    # passes log ltf_warmup(<n>/3). There is no pre-market trading in rth
+    # indicator mode.
     # If you turn the ORB regime back on, 09:30 -> 09:30 + orb_range_minutes
     # (09:45) is a no-entry zone again regardless of this window, so an
     # earlier start here is harmless but inert until range-end. Entries stop
@@ -670,21 +677,36 @@ strategies:
       #   SMH — semis / AI hardware
       #   IGV — enterprise + application software
       #   XLK — broad tech, for the platform block
-      # These are only the FALLBACK path: every group below has >= 5 members,
-      # so `_index_confirms` uses peer breadth and consults the ETF only when
-      # peer bars are missing (see index_breadth_* below).
+      # Every group below has >= 5 members, so `_index_confirms` uses peer
+      # breadth and these confirm nothing in it (since 2026-10-13 too few
+      # fresh peers is no confirmation, where it fell back to the ETF; see
+      # index_breadth_* below). They are the relative-strength benchmark, the
+      # range regime's neutral read, and the ETF path for a symbol with fewer
+      # peers.
       index_symbols: [SMH, IGV, XLK]
       require_index_confirmation: true
 
-      # Reject LONGs when HTF (15m) structure is bearish (mirror for SHORT).
-      # Neutral HTF bias never blocks. Prevents counter-trend entries when
-      # a symbol's HTF structure is pinned against the trade direction.
+      # Reject LONGs when HTF (15m) structure is bearish (mirror for SHORT):
+      # layer 1, every regime. Layer 2 (pullback, and trend under
+      # require_htf_pivot_alignment_trend) also refuses the opposing swing
+      # pattern (LH with LL / EQL against a LONG), which can refuse a trade
+      # whose bias reads neutral (LH + EQL) or aligned. The bias is largely a
+      # location reading (the midpoint of the last 15m swing is tested before
+      # the labels). Every HTF refusal names its regime
+      # (<side>_build_failed_<regime>_htf_...). An entry that reads the
+      # stored 15m frame -- these gates, the HTF EMA gate and score term
+      # below, and the S/R levels the shared S/R veto and refinement read --
+      # is refused while the frame is missing, or in RTH stale (newest
+      # completed bar ended over 30 minutes ago): <regime>_htf_frame_missing
+      # / _stale (2026-10-13; they passed every entry until then). Checked at
+      # load (true or false), as are require_htf_pivot_alignment_trend and
+      # orb_bypass_htf_bias.
       require_htf_bias_alignment: true
       # HTF EMA trend (htf_ema_fast_span / htf_ema_slow_span below): the peer
       # strategies' 2-of-3 vote -- close vs the fast EMA, fast vs slow, the
       # HTF context's trend bias, on the strategy's own HTF (htf_minutes).
       # require_htf_ema_alignment blocks an entry against it
-      # (htf_ema_trend_<bias>) on the sides it names: enabled / true (both),
+      # (<regime>_htf_ema_trend_<bias>) on the sides it names: enabled / true (both),
       # long_only, short_only, or disabled / false (neither).
       # htf_ema_alignment_score adds (aligned) or subtracts (opposed) that
       # much to every scored regime of the side before it has to clear its
@@ -707,34 +729,56 @@ strategies:
       orb_bypass_htf_bias: true
       orb_bypass_exhaustion: true
 
-      # Bar requirements. 1m-LTF retune (2026-05-29): the strategy now trades on
-      # a 1-minute LTF (was 5m) for finer entries/exits and to kill the "wait for
-      # the 5m bar to close" entry lag. To keep the SAME wall-clock behavior, the
-      # LTF indicators are stretched ×5 via ltf_indicator_span_scale (ema9→45,
-      # ema20→100, atr14→70, adx14→70, rsi14→70, bb→100, ret5→25, ret15→75) so
-      # ATR-based stops/buffers and every score threshold keep their 5m calibration
-      # untouched — only the bar granularity changed. Warmup gates bumped so the
-      # long (100-bar / 70-period) indicators are fully warm before entries.
+      # Timeframes (2026-10-13; user decisions 2026-10-12 and -13). Every
+      # regime SETS UP on 5m bars: the LTF below, resampled from the 1m step
+      # frame, its closed buckets only (zones, lookback extremes, ATR14,
+      # ADX14, EMA9 / EMA20, returns); the windows count today's buckets from
+      # midnight, premarket included, as the 1m windows did, except where a
+      # window is read against VWAP (vwap_reclaim's dip, range's flips): that
+      # counts the session's buckets only, since a premarket bucket carries
+      # the all-hours VWAP and the session VWAP the reclaim reads starts at
+      # 09:30, and so do the volume baselines (pullback's, vol_squeeze's), the
+      # session's volume like the session VWAP. Entries are TIMED on 1m closed
+      # bars (the entry pass leaves out
+      # a 1m bar still trading: it never confirms): the latest 1m close and
+      # the session VWAP of the step frame, the confirmation bar (Fix B), the
+      # trigger bars' wick / close position / volume, the armed retest's
+      # touch. Exits stay on 1m as before (management's price, the step
+      # frame's last bar); the drop is the entry pass's alone. A setup
+      # qualifies only once 3 closed 5m buckets of today's session exist
+      # (09:45; logged ltf_warmup(<n>/3)).
+      # From 2026-05-29 to 2026-10-13 the LTF was 1m with its indicators
+      # stretched x5 (ltf_indicator_span_scale 5, EMAs 45 / 100), meant to keep
+      # the 5m calibration; it did not: its ATR read ~0.435x a 5m ATR14 and its
+      # ADX cleared min_adx14 on ~12% of minutes against ~73% on 5m. The ATR
+      # knobs tuned after 05-29 are scaled x0.435 below to keep their tested
+      # price distances (each says what it was); the bar counts that predate
+      # 05-29 return to their 5m meaning, trailing_bias_lookback keeps its
+      # tested ten minutes (two buckets), and the range / vol_squeeze /
+      # momentum / vwap_reclaim windows, which counted 1m bars, count 5m
+      # buckets.
       min_bars: 150
-      ltf_minutes: 1
+      ltf_minutes: 5                       # was 1 (2026-05-29 to 2026-10-13)
       htf_minutes: 15
-      min_ltf_bars: 120
-      # LTF indicator-span stretch. 5 = preserve the old 5m horizons on 1m bars.
-      # Set 1 to run true-native 1m indicators (much faster/noisier). Drives
-      # add_indicators(span_scale=) for the strategy's private 1m LTF frame; the
-      # shared 1m frame the engine/other strategies/dashboard read stays at 1.
-      ltf_indicator_span_scale: 5
+      # Closed 5m buckets the LTF must hold (ADX-14 warm-up; the step frame
+      # carries the prior session). Was 120 one-minute bars (2026-05-29 to
+      # 2026-10-13), 15 5m buckets before.
+      min_ltf_bars: 30
+      # LTF indicator-span stretch: 1 = native spans on the 5m bars. Kept as an
+      # opt-in: on a 1m LTF, 5 stretches ATR / ADX / RSI / Bollinger / returns
+      # to 5m-ish wall-clock horizons (was 5, 2026-05-29 to 2026-10-13). The
+      # shared 1m frame the engine / other strategies / dashboard read stays
+      # at 1.
+      ltf_indicator_span_scale: 1
       # The LTF fast / slow EMAs the entry scoring reads (the side-decision
       # EMA vote and the trend / pullback / range / vol_squeeze / momentum /
       # vwap_reclaim scores), set on their own: changing them moves nothing
-      # else, while ltf_indicator_span_scale above still moves ATR / ADX / RSI
-      # / Bollinger / returns and no longer these EMAs. 45 / 100 = the 5m
-      # EMA9 / EMA20 horizon on 1m bars. Session-reset like every LTF EMA; the
-      # compact chart draws these same lines. Exits and the ema9-extension gate
-      # read the base 1m frame's native EMA9 / EMA20, not these. (Until
-      # 2026-09-23 knobs of these names existed but only the chart read them.)
-      ltf_ema_fast_span: 45
-      ltf_ema_slow_span: 100
+      # else. 9 / 20 on the 5m LTF (was 45 / 100 on the 1m LTF, the 5m
+      # horizon on 1m bars). Session-reset like every LTF EMA; the compact
+      # chart draws these same lines. Exits and the ema9-extension gate read
+      # the base 1m frame's native EMA9 / EMA20, not these.
+      ltf_ema_fast_span: 9
+      ltf_ema_slow_span: 20
       # HTF EMA spans (15m bars): the HTF context's fast / slow EMA, and so
       # the HTF EMA trend below, plus the lines the HTF chart and the sidebar
       # trend show. Until 2026-09-24 the bot hard-coded 50/200 and read no
@@ -792,12 +836,23 @@ strategies:
       # setups on 09-21 and 2 on 09-18 — the dead-regime state this rewrite
       # exists to fix. Mid-range still cannot reach any of these.
       min_range_score: 4.0
-      min_adx14: 18.0          # HIGH_VOL: was 16.0 — ADX naturally higher in high vol; demand stronger trend
+      # HIGH_VOL: was 16.0 — ADX naturally higher in high vol; demand stronger
+      # trend. Set 2026-05-13 on the 5m LTF's ADX-14. On the 1m LTF's ADX-70
+      # (2026-05-29 to 2026-10-13) it cleared on ~12% of minutes, so trend's
+      # +1.0 and pullback's +0.5 ADX points were mostly off while
+      # min_trend_score was retuned (07-29); on 5m it clears on ~73%, so
+      # trend qualifies more often: the 2026-10-13 replays re-checked the floor.
+      min_adx14: 18.0
 
-      # Pullback detection
-      pullback_ema_touch_atr_mult: 0.45    # HIGH_VOL: was 0.35 — pullbacks noisier; allow further from EMA
-      pullback_hold_atr_mult: 0.50         # HIGH_VOL: was 0.40 — same logic
-      pullback_lookback_bars: 25           # 1m-LTF: ×5 (was 5 at 5m) = 25 min recent-leg window
+      # Pullback detection. The touch / hold window is the last
+      # pullback_lookback_bars closed 5m buckets; the close position and the
+      # volume read the last CLOSED bucket; the ATR is the 5m ATR14.
+      pullback_ema_touch_atr_mult: 0.45    # HIGH_VOL: was 0.35 — pullbacks noisier; allow further from EMA (2026-05-13, 5m ATR)
+      pullback_hold_atr_mult: 0.50         # HIGH_VOL: was 0.40 — same logic (2026-05-13, 5m ATR)
+      # Also trend's breakout window (the high to clear, the low the stop
+      # goes under). Was 25 one-minute bars (2026-05-29 to 2026-10-13), 5 x
+      # 5m before.
+      pullback_lookback_bars: 5
       # Pullback maturity check (2026-05-27): reject pullback when BOTH
       # the session extreme is older than max_minutes_since AND price has
       # retraced more than max_leg_retrace_pct of the leg. AND-logic on
@@ -824,15 +879,29 @@ strategies:
       # `range_entry_zone_frac`. Over 10,162 real 1m bars the old scorer
       # correlated -0.17 with distance from mid-range and blocked 6,485 of the
       # 7,477 bars that were actually at an edge.
+      #
+      # Since 2026-10-13 the zone is the last range_lookback_bars of today's
+      # closed 5m buckets (100 minutes; it was 20 one-minute bars, the current
+      # bar among them, in both earlier eras), the entry the latest 1m close
+      # inside the range and in the fade zone (a close past the edge has
+      # broken the range), the prev-bar check and the wick the 1m trigger
+      # bars'. The stop clears the zone edge and every 1m bar of the current
+      # bucket by stop_buffer_atr_mult x the 5m ATR, at least
+      # range_min_stop_atr_mult x it from the close. range ships OFF
+      # (disable_range_regime below) until it shows an edge on this geometry;
+      # range_max_intraday_range_pct and range_min_flip_count were tuned on
+      # the 20-minute zone and are not re-derived for the 100-minute one; the
+      # flips count the zone's session buckets only (a premarket bucket's
+      # close is against the all-hours VWAP).
       range_entry_zone_frac: 0.35   # fade zone = outer 35% of the lookback range; scorer and builder both read it
       range_max_ema_gap_pct: 0.0008
       range_min_flip_count: 3
-      range_lookback_bars: 20              # base-1m frame (unchanged by LTF switch — _score_range/_build_range_signal index `frame`, not `ltf`)
+      range_lookback_bars: 20              # closed 5m buckets (since 2026-10-13; 1m bars before)
 
       # Target R:R by regime (range targets range_high, not an R multiple)
       trend_target_rr: 2.0
       pullback_target_rr: 2.0
-      stop_buffer_atr_mult: 0.30          # HIGH_VOL: was 0.25 — wider base buffer (Tier 2a scales this further when ATR expands)
+      stop_buffer_atr_mult: 0.30          # HIGH_VOL: was 0.25 — wider base buffer (Tier 2a scales this further when ATR expands); 2026-05-13, x the 5m ATR
 
       # Time-of-day regime windows.
       # NOTE: orb_end_time and the orb_* block below are INERT while
@@ -854,12 +923,17 @@ strategies:
       # break of that range — stop at the OPPOSITE range edge, target a
       # measured move (range height x orb_target_range_mult).
       # disable_orb_window: true skips the whole open and starts trading at
-      # orb_end_time instead.
+      # orb_end_time instead. The three *_atr_mult knobs below were set on
+      # 2026-05-29 against the 1m LTF's ATR (~0.435x a 5m ATR14); since
+      # 2026-10-13 they are scaled x0.435 (was 0.05 / 0.5 / 4.0) to keep their
+      # price distances
+      # against the 5m ATR (orb_opposing_sr_atr_mult reads the base 1m ATR14
+      # and is unchanged).
       orb_range_minutes: 15                 # when enabled, OR would form 09:30-09:45
-      orb_breakout_buffer_atr_mult: 0.05    # break must clear the edge by this x ATR (not a 1-tick poke)
+      orb_breakout_buffer_atr_mult: 0.022   # break must clear the edge by this x ATR (not a 1-tick poke); was 0.05
       orb_target_range_mult: 1.5            # measured-move target = range height x this
-      orb_min_range_atr_mult: 0.5           # reject ranges tighter than this x ATR (noise breaks)
-      orb_max_range_atr_mult: 4.0           # reject ranges wider than this x ATR (untradeable); 0 disables the cap
+      orb_min_range_atr_mult: 0.22          # reject ranges tighter than this x ATR (noise breaks); was 0.5
+      orb_max_range_atr_mult: 1.74          # reject ranges wider than this x ATR (untradeable); 0 disables the cap; was 4.0
       min_orb_score: 3.5                    # regime-score floor (base 0.5 + break 2.5 + conviction/range bonuses)
 
       # Entry quality gates. Each `orb_bypass_*` companion relaxes the
@@ -876,13 +950,23 @@ strategies:
       respect_screener_bias: true
       orb_bypass_screener_bias: true           # gap-reversal LONGs need fallthrough during ORB
 
-      # Relative-strength gate (2026-05-26): filter preferred_sides based
-      # on (candidate.day_strength − sector_ETF.day_strength). When stock
-      # lags its sector by ≥ threshold, LONG is removed; outperforms by
-      # ≥ threshold, SHORT is removed. If preferred_sides empty → skip.
-      # Catches the "drifting at 0% on a +1% sector day" pattern (INTC
-      # 5/26 at +0.21% vs XLK +1.27%, rel −1.06%). Set threshold to 0 to
-      # disable.
+      # Relative-strength gate (2026-05-26; beta residual 2026-09-18): filter
+      # preferred_sides on the residual day_strength − beta x sector ETF
+      # day_strength (beta from the daily history; the gate is skipped when
+      # it is unavailable, and a skip or signal records it as
+      # relative_strength_skipped(...), 2026-10-13), the sector ETF read on a
+      # fresh frame only (the index confirmation's 3-minute bound, with a
+      # close and a session open: a missing, stale or unreadable ETF refuses
+      # the candidate, relative_strength_sector_unreadable(SMH=stale),
+      # 2026-10-13), against this threshold scaled by the symbol's ADR
+      # (vol_scale). When the stock lags its sector by ≥ threshold, LONG is
+      # removed; outperforms by ≥ threshold, SHORT is removed. If
+      # preferred_sides is empty → skip; a side dropped while the other
+      # remains is listed after the skip's reasons
+      # (<side>_relative_strength_<lagging|leading>_sector(...), 2026-10-13),
+      # and a signal carries it as gate_relative_strength_drop. Catches the
+      # "drifting at 0% on a +1% sector day" pattern (INTC 5/26 at +0.21% vs
+      # XLK +1.27%, rel −1.06%). Set threshold to 0 to disable.
       relative_strength_block_threshold_pct: 0.5
 
       # --- Long/short asymmetry (2026-09-18) ----------------------------
@@ -920,14 +1004,19 @@ strategies:
       # Explicit side decision (2026-05-27, Fix A). Replaces the implicit
       # "evaluate both sides per regime, pick highest-scoring" with an
       # evidence-based vote across current price-action signals: recent
-      # return, close-vs-VWAP, ema9-vs-ema20, last 3 bars' direction.
-      # Each signal contributes one LONG or SHORT vote (or abstains).
-      # Side wins when its votes ≥ min_votes AND opposing ≤ max_opposing.
-      # Mixed reads → skip the candidate. The wrong side is never
-      # evaluated, so all downstream regime/bias filtering only sees the
-      # decided side.
+      # return (the latest 1m close against the close 6 LTF buckets back),
+      # close vs VWAP (the current leg's anchored VWAP on the 1m step frame,
+      # the reference the peers' confirmation reads, else session VWAP),
+      # EMA9 vs EMA20 (the last closed 5m bucket's), the last 3 CLOSED 5m
+      # buckets' colour (unanimous only). Each signal contributes one LONG
+      # or SHORT vote (or abstains); a side wins on a majority of the votes
+      # cast with at most side_decision_max_opposing against (below). The
+      # vote gates the direction-following regimes (trend / pullback /
+      # vol_squeeze / momentum / vwap_reclaim) per (side, regime): an
+      # undecided or opposed vote refuses them, while range and sr_scalp,
+      # which fade the move, build on either side.
       require_explicit_side_decision: true
-      side_decision_recent_lookback_bars: 30    # 1m-LTF: ×5 (was 6 at 5m) = 30 min recent-return window
+      side_decision_recent_lookback_bars: 6     # 5m buckets = 25-30 min (was 30 one-minute bars, 2026-05-29 to 2026-10-13; 6 on 5m before)
       side_decision_recent_threshold_pct: 0.1   # threshold for recent-return vote (above typical noise)
       side_decision_vwap_buffer_pct: 0.0005     # 0.05% dead-band around VWAP — within = neutral vote
       # Threshold is a MAJORITY OF THE SIGNALS THAT VOTED, not an absolute
@@ -949,11 +1038,13 @@ strategies:
 
       # Confirmation-bar trigger (2026-05-27, Fix B). For direction-
       # following regimes (trend/pullback/momentum/vol_squeeze), the LAST
-      # FULLY CLOSED LTF bar must confirm direction: green AND > prior
-      # close for LONG, red AND < prior close for SHORT. Catches single-
-      # bar fakeouts where the in-progress bar tipped a score threshold
-      # but the move didn't carry. Range and sr_scalp are EXEMPT (mean-
-      # reversion theses where the last bar moves against entry by design).
+      # CLOSED 1m bar (entry timing: the step frame's last bar, the bar the
+      # entry is built at) must confirm direction: green AND > prior close
+      # for LONG, red AND < prior close for SHORT. Catches single-bar
+      # fakeouts where a bar tipped a score threshold but did not close the
+      # trade's way. Range and sr_scalp are EXEMPT (mean-reversion theses
+      # where the last bar moves against entry by design), and so is
+      # vwap_reclaim (its prior closed bar is the flush).
       require_entry_confirmation_bar: true
 
       # ===== declared 2026-09-20: previously code-default only =====
@@ -967,16 +1058,26 @@ strategies:
       zone_pct: 0.0015                          # SR zone half-width as a fraction of price
       zone_atr_mult: 0.20                       # ...and as a multiple of ATR; the wider of the two wins
       range_max_intraday_range_pct: 0.012       # range regime: session range ceiling (ADR-scaled)
-      range_require_prev_bar_confirmation: true # range regime: prior bar must confirm the fade
+      # range regime: the 1m bar before the trigger bar must also close in the
+      # fade zone. On closed 1m bars that asks for the last TWO closed bars in
+      # the zone; false is the 2026-04-23 reading (the last closed bar alone,
+      # which the zone test already reads). Kept true (the user's call,
+      # 2026-10-13: a replay A/B of 10-07 and 10-08 rested on one stop, not
+      # enough to choose between them); range ships off.
+      range_require_prev_bar_confirmation: true
       trailing_bias_enabled: true               # Fix A: infer side from recent bias when today's is neutral
-      trailing_bias_lookback: 10
+      # One read per LTF bar: 2 x 5m = the 10 minutes the memory was tested on
+      # (was 10 one-minute bars, to 2026-10-13). At least half the window,
+      # rounded up, must be directional, and this share of those one side.
+      trailing_bias_lookback: 2
       trailing_bias_majority_threshold: 0.7
       extended_hours_tradable_all: false        # RTH-only; true would make every symbol pre/post eligible
 
       # ===== armed retest (added 2026-09-20) =====
       # `trend` and `momentum` no longer enter on the cycle they qualify.
-      # Both trigger on `close > max(high of the previous N bars)`, so the fill
-      # is the highest price in 25 / 6 minutes BY CONSTRUCTION and the stop
+      # Both trigger on the latest close above the high of the last N closed
+      # 5m buckets (5 / 6), so the fill is the highest price in 25 / 30
+      # minutes BY CONSTRUCTION and the stop
       # then sits inside the retrace that normally follows. Measured on the
       # archived sessions via the new `entry_timing` report block: a trend fill
       # was followed by a retrace covering 85% of the way to its stop, against
@@ -990,11 +1091,16 @@ strategies:
       # The market fallback is deliberate: a strong trend day never offers the
       # retest, and forfeiting those would deepen "some days it doesn't trade
       # at all" rather than fix the entry.
+      # The zone and the invalidation are multiples of the LTF ATR (the 5m
+      # ATR14). Set 2026-09-20 against the 1m LTF's ATR (~0.435x a 5m ATR14),
+      # they are scaled x0.435 to keep the price distances they were tested
+      # at (was 0.35 / 0.75, to 2026-10-13). The touch, the reclaim and the
+      # bar shape read the 1m step frame.
       armed_retest_enabled: true
       armed_retest_max_minutes: 12.0        # how long to wait before entering at market anyway
-      armed_retest_zone_atr: 0.35           # price must come back within this x ATR of the cleared level
+      armed_retest_zone_atr: 0.15           # price must come back within this x ATR of the cleared level
       armed_retest_min_close_position: 0.60 # reclaim bar must close in the top 40% of its range (mirror for SHORT)
-      armed_retest_invalidation_atr: 0.75   # a close this far back through the level kills the arm
+      armed_retest_invalidation_atr: 0.33   # a close this far back through the level kills the arm
 
       # Stretched entry filter: reject LONG at pct_b ≥ threshold AND
       # atr_stretch ≥ threshold (mirror for SHORT at pct_b ≤ 1-threshold).
@@ -1006,7 +1112,8 @@ strategies:
       # Bar-size gate (2026-05-14) — reject entries when the latest 1m entry
       # bar's range or body is far above its recent ATR (a violent expansion
       # bar fills you near its high/low on an already-done move). Measured on
-      # the base 1m frame, so unchanged by the 1m-LTF switch.
+      # the base 1m frame, so unchanged by the LTF switches (the 1m LTF of
+      # 2026-05-29, the 5m setups of 2026-10-13).
       # Applies to trend / pullback / sr_scalp (regimes that need clean
       # entries); range / vol_squeeze / momentum / orb are exempt (big bars
       # ARE the setup for those, and the ORB regime isn't in this gate's set).
@@ -1053,7 +1160,10 @@ strategies:
       # |target - limit| (a target-less runner checks the risk alone). A quote
       # whose spread cannot be read is skipped too. On the dry run 09-21..10-09
       # it skips 54 of 231 entries, which lost -777.51 / -35.74 R; the 177 kept
-      # averaged -0.078 R a trade against -0.214 R for all. After a refusal the
+      # averaged -0.078 R a trade against -0.214 R for all. 154 of the 231
+      # were range entries, off since 2026-10-13: re-counted on each entry's
+      # decision quote, the guard skips 5 of the other 77 (about 6%), so
+      # re-measure it on the 5m setups' dry-run days. After a refusal the
       # signal is judged on the symbol's stream quote book with no REST quote
       # request until the book passes, or is not fresh; then the REST quote
       # decides, as before, asked again at most once each 10 s while it still
@@ -1179,17 +1289,44 @@ strategies:
       #           wrong side of mid for the trade direction.
       #       Set either threshold to 0.0 to disable that gate.
       min_vol_squeeze_score: 4.0
-      vol_squeeze_lookback_bars: 12          # base-1m frame (unchanged — _score/_build_vol_squeeze index `frame`, not `ltf`)
-      # Compression. These two are an AND, and only the second one binds.
+      # Since 2026-10-13 the box is the last 12 closed 5m buckets (60 min),
+      # the breakout the latest 1m bar (its close through the box edge, its
+      # volume against the median volume of the box's session minutes, its
+      # close position). The Bollinger compression term reads the 1m step
+      # frame's bands (the technical_levels context: 20 one-minute bars, beside
+      # the 60-minute box). The stop buffer's box term is 0.088 x the box
+      # (0.22 x the 12-minute box until then: the same price distance at the
+      # median).
+      # Only the first 1m bar of its bucket to close through the edge enters
+      # (user decision 2026-10-13): a later minute of the same bucket is
+      # refused as <side>_vol_squeeze_not_first_break(first=HH:MM,...) and
+      # waits for the next bucket's box. Until then the box was the last 12
+      # one-minute bars.
+      vol_squeeze_lookback_bars: 12
+      # Compression. These two are an AND, and the second one decides.
       #
-      # `vol_squeeze_max_range_pct` admits 95.59% of bars at 0.012 (the box
-      # height is p50 0.33% of price, p95 1.15%). It is kept as the absolute
-      # backstop for a name whose atr14 is unusually small relative to its
-      # price, where the ATR test below could pass on a box that is large in
-      # percentage terms. It is not the selectivity gate and should not be
-      # read as one.
+      # `vol_squeeze_max_range_pct` (ADR-scaled) is the absolute backstop for
+      # a name whose ATR is unusually small relative to its price, where the
+      # ATR test below could pass on a box that is large in percentage terms.
+      # It is not the selectivity gate. 0.025 since 2026-10-13, was 0.012. On
+      # the 12-minute 1m box 0.012 sat above the box's p95 (as a % of price,
+      # unscaled); the 60-minute 5m box runs p50 0.82% / p75 1.24% / p95
+      # 2.36%, where 0.012 would bind alone on a quarter of minutes. 0.025 is
+      # above the new p95 again (it admits 95.9% unscaled, 99.4% ADR-scaled;
+      # 10:30-15:00, 14 archived days 09-18..10-09, 25 names). Jointly with
+      # the ATR test the two values differ on 0.2% of minutes.
       #
-      # `vol_squeeze_max_range_atr` is the gate that decides. 2026-09-22: was
+      # `vol_squeeze_max_range_atr` is the gate that decides. 3.0 since
+      # 2026-10-13, was 2.8. The box is now 12 closed 5m buckets against the
+      # last closed bucket's ATR14 (a 5m ATR); 2.8 was set against 12
+      # one-minute bars and the 1m LTF's ATR (an ATR-70, ~0.43x a 5m ATR14),
+      # where it admitted 51.5% of minutes over the same 14 days. 3.0 admits
+      # 50.9% of the 5m box/ATR distribution (the per-day match runs
+      # 2.84-3.16): the tested selectivity, kept. (The 2026-09-22 note below
+      # measured the box against the base frame's 1-bar ATR14, not the ATR
+      # the code read, so "the p25" there was nearer the median as run.)
+      #
+      # 2026-09-22: was
       # 1.8, which compares a TWELVE-bar box against a ONE-bar atr14 — the
       # same units mismatch as `orb_max_range_atr_mult`, and worse here.
       # Measured over 167,447 RTH 1m bars across 18 archived sessions
@@ -1210,8 +1347,19 @@ strategies:
       # gates. The breakout buffer is deliberately NOT touched in the same
       # change: this regime has 11 archived trades for +$9.58 that turn into
       # -$120 without one TSLA winner, so it gets one variable at a time.
-      vol_squeeze_max_range_pct: 0.012        # absolute backstop; does not bind
-      vol_squeeze_max_range_atr: 2.8          # box height vs 1-bar ATR — the binding gate
+      vol_squeeze_max_range_pct: 0.025        # absolute backstop, ADR-scaled (was 0.012, to 2026-10-13)
+      vol_squeeze_max_range_atr: 3.0          # 5m box height vs the 5m ATR14 — the binding gate (was 2.8, to 2026-10-13)
+      # The stop buffer's box term: the stop sits max(0.12 x ATR, 0.10% of
+      # the close, this x the box's height) past the box (2026-10-13; a code
+      # constant of 0.22 until then). 0.22 was tested on the 12-minute box of
+      # 1m bars; on the 60-minute box of 5m buckets 0.088 keeps that price
+      # distance: 0.22 x 0.401, the median per-minute ratio of the 12-minute
+      # box's height to the 60-minute box's (94,810 symbol-minutes, 14
+      # archived days 09-18..10-09, 25 names, 10:30-15:00; 0.085-0.091 by
+      # day; the measurement the x0.435 knobs took their ratio from). At 0.22
+      # the 60-minute box made the buffer a median 1.68x the 12-minute box's
+      # and set it on 87% of those minutes against 28.5% (29.7% at 0.088).
+      vol_squeeze_stop_box_mult: 0.088
       # 2026-09-22: was 0.05 — same units error as bollinger_squeeze_width_pct
       # above, in the OR-branch of the same test
       # (`bb_squeeze_flag or 0 < bb_width_pct <= this`). At 0.05 the branch was
@@ -1288,7 +1436,7 @@ strategies:
       # change_from_open field), so the threshold applies to the bot's actual
       # perceived intraday move. Set `disable_momentum_regime: true` to opt out.
       min_momentum_score: 4.0
-      momentum_breakout_lookback_bars: 6     # base-1m frame (unchanged — _score/_build_momentum index `frame`, not `ltf`)
+      momentum_breakout_lookback_bars: 6     # closed 5m buckets = 30 min (since 2026-10-13; 6 one-minute bars before)
       # 2026-09-18: 2.0 -> 1.8 for the Tech/AI retarget. This is now scaled
       # per symbol by vol_scale (see reference_adr_pct), so the written value
       # is what a MEDIAN-volatility name in this universe must move, not a
@@ -1306,10 +1454,17 @@ strategies:
       # own levels — it uses sr_ctx the same way _refine_*_sr_levels and
       # the dashboard's key_level_zones do:
       #   * Level prices come from sr_ctx.nearest_support / nearest_resistance
-      #   * Zone bands use zone_atr_mult * atr (or zone_pct * close, max)
-      #     — same formula as dashboard's key_level_zones
+      #   * Zone bands use zone_atr_mult * atr (or zone_pct * close, max);
+      #     the dashboard's key_level_zones read the same knobs against the
+      #     5m ATR14 too (its newest bucket's) since 2026-10-13; the
+      #     zone_pct floor sets the half-width on ~99% of minutes, so
+      #     the drawn bands barely moved from the 1m ATR14 ones
       #   * Stop nudge uses sr_ctx.level_buffer — same buffer
       #     _refine_*_sr_levels uses
+      # Every `atr` here is the LTF ATR, the last closed 5m bucket's ATR14
+      # (since 2026-10-13). zone_atr_mult 0.20, the 0.4 proximity and the 2.0
+      # gap floor were set on the 5m LTF (2026-05-13 / 05-14) and read it
+      # again; the rejection wick and the noise window stay on 1m bars.
       #
       # Distance gate: the INNER gap between zones (HR_zone_lower −
       # HS_zone_upper) must clear BOTH floors (max wins):
@@ -1362,8 +1517,11 @@ strategies:
       # the R:R check rejects the setup. That is the META case, rejected for the
       # right reason. What remains below is a small absolute backstop for a
       # level nothing has touched.
-      sr_scalp_noise_lookback_bars: 20         # bars used to measure how far the level has been pierced
-      sr_scalp_min_stop_atr_mult: 0.5          # was 2.5 — now a backstop, not the binding floor
+      sr_scalp_noise_lookback_bars: 20         # 1m bars used to measure how far the level has been pierced (entry timing)
+      # was 2.5 — now a backstop, not the binding floor. Set 2026-09-22 against
+      # the 1m LTF's ATR; since 2026-10-13 it is scaled x0.435 (was 0.5) to
+      # keep its price distance against the 5m ATR14.
+      sr_scalp_min_stop_atr_mult: 0.22
       # sr_scalp ON (re-enabled 2026-09-23). The geometry that made it
       # unbuildable was fixed on 2026-09-22 (see the stop-floor note above):
       # the two knobs no longer fight, and a setup at the documented
@@ -1380,7 +1538,20 @@ strategies:
       # ``afternoon_include_range`` still works for window-specific exclusion.
       disable_trend_regime: false
       disable_pullback_regime: false
-      disable_range_regime: false
+      # range OFF (2026-10-13; user decision 4) until it shows an edge on the
+      # 5m geometry: a 100-minute zone of 5m buckets, entries on the 1m
+      # trigger bars. Its code reads that geometry correctly; the replay A/B of
+      # range_require_prev_bar_confirmation ran with it on.
+      disable_range_regime: true
+      # The range stop's floor (2026-10-13): at least this many x the 5m
+      # ATR14 from the close. The geometric stop (the zone edge less 0.30 ATR)
+      # was floorless: a close on the edge put it a buffer away. Measured on
+      # the 5m geometry (14 days, 25 names, the minutes in a fade zone): the
+      # raw risk runs p5 0.49 / p10 0.57 / median 1.08 ATR (30 bps); 0.5 binds
+      # on ~6% (that tail) and leaves every R:R >= 1, where the
+      # default_stop_pct floor the other regimes carry would bind on 99.7% and
+      # put 72% under 1R (a range's target is its far edge, not an R multiple).
+      range_min_stop_atr_mult: 0.5
 
       # Whole-window opt-out for the opening (range-formation + ORB) window
       # through orb_end_time. When
@@ -1431,7 +1602,7 @@ strategies:
       # VWAP by a small-cap margin.
       disable_vwap_reclaim_regime: false
       min_vwap_reclaim_score: 3.5   # ceiling 5.0; a bare reclaim scores 2.5, so this needs a second component. SHORTs clear 4.0 via short_min_score_premium
-      vwap_reclaim_lookback_bars: 6 # the dip below VWAP must be within the last ~6 min
+      vwap_reclaim_lookback_bars: 6 # a close below the session VWAP among the session's last 6 closed 5m buckets (30 min, so from 10:00; a premarket bucket is no dip; 6 one-minute bars until 2026-10-13)
       vwap_reclaim_min_volume_ratio: 1.5
       vwap_reclaim_buffer_pct: 0.0015
       vwap_reclaim_target_rr: 2.0   # matches trend/pullback/momentum; a ladder rung replaces it when one qualifies
@@ -1605,15 +1776,20 @@ strategies:
       beta_lookback_days: 60       # daily regression window for the sector-beta residual
 
       # --- Sector-breadth index confirmation (2026-09-18) ----------------
-      # `_index_confirms` prefers peer breadth over the sector ETF whenever
-      # the symbol has at least `index_breadth_min_peers` readable peers in
-      # its `sector_groups` entry. The ETF test is close to circular on this
-      # universe — AAPL+MSFT+NVDA+AVGO are ~45% of XLK, GOOG+META ~45% of
-      # XLC, AMZN+TSLA ~40% of XLY — so asking XLK to confirm AAPL largely
-      # asks AAPL about AAPL, and it fails in the one case that matters: the
-      # mega cap moving against the rest of its sector. Breadth excludes the
-      # symbol itself. Single-member sectors (healthcare, staples) have no
-      # peers and fall back to the ETF check.
+      # `_index_confirms` reads peer breadth whenever the symbol has at least
+      # `index_breadth_min_peers` peers in its `sector_groups` entry (every
+      # group here): at least `index_breadth_min_agree_frac` of the readable
+      # peers must lean the trade's way (close vs the reference VWAP, EMA9
+      # vs EMA20 on each peer's 1m step frame). The ETF test is close to
+      # circular on this universe — AAPL+MSFT+NVDA+AVGO are ~45% of XLK,
+      # GOOG+META ~45% of XLC, AMZN+TSLA ~40% of XLY — so asking XLK to
+      # confirm AAPL largely asks AAPL about AAPL, and it fails in the one
+      # case that matters: the mega cap moving against the rest of its
+      # sector. Breadth excludes the symbol itself. A peer reads only on a
+      # fresh frame (its newest 1m bar closed within 3 minutes; 2026-10-13),
+      # and fewer than `index_breadth_min_peers` readable peers is
+      # no confirmation; the ETF is consulted only for a group too small for
+      # breadth. Both knobs are checked at load.
       index_breadth_min_peers: 3
       index_breadth_min_agree_frac: 0.5
 
@@ -1633,10 +1809,13 @@ strategies:
       # deltas vs session VWAP across synthetic tapes (count of confirmed
       # bars): pure trend up/down 0, grind-with-pullbacks 0, chop +1,
       # V-reversal LONG +22, inverted-V SHORT +22. It changes the answer
-      # only where the session has actually turned.
+      # only where the session has actually turned. The side vote's VWAP arm
+      # reads the same anchor, on the candidate's own 1m step frame.
       leg_anchored_confirmation: true
       # The anchor is today's more recent extreme. These two guards stop it
-      # chasing a pullback and confirming the wrong side.
+      # chasing a pullback and confirming the wrong side. Both are measured
+      # on 1m step frames (the peers' and, for the vote, the candidate's), so
+      # min_age_bars counts minutes on every reader, the 5m LTF included.
       # min_age_bars is the one that does the work: at 15 an ordinary
       # grind-with-pullbacks produced 12 spurious counter-trend
       # confirmations, at 20 it produced none. Raising it trades reversal

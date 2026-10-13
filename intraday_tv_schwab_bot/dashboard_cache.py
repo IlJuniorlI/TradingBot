@@ -38,9 +38,11 @@ from .candles import detect_candle_context, detect_per_bar_candle_patterns
 from .chart_patterns import analyze_chart_pattern_context
 from .config import BotConfig, DashboardChartConfig
 from .dashboard_payloads import (
+    ChartPositions,
     bars_from_frame,
     cache_json_signature,
     dashboard_performance,
+    divergence_line_payload,
     frame_signature,
     fvg_anchor_abs_index,
     fvg_payload,
@@ -240,9 +242,10 @@ class DashboardCache:
         read and this one are one build a bar (``bars.derived_frame``; until
         2026-10-07 this asked ``get_merged``, which built it a second time);
         a coarser chart frame asks ``get_merged`` for the variant of its own
-        bars. On top_tier's 1m LTF that is a 45/100-bar EMA (its
-        ltf_ema_fast_span / ltf_ema_slow_span) that restarts on each session's
-        first RTH bar. Until 2026-09-23 the chart drew a continuous 45/100 EWM across the
+        bars. On top_tier's 5m LTF that is its EMA 9 / 20 (ltf_ema_fast_span
+        / ltf_ema_slow_span, since 2026-10-13; a 45/100-bar EMA on its 1m
+        LTF from 2026-05-29), restarting on each session's first RTH bar.
+        Until 2026-09-23 the chart drew a continuous 45/100 EWM across the
         prior day and premarket instead (the opposite stack to the bot's on 93
         of 480 bars between 09:30 and 10:30 across 8 symbols on 2026-09-22),
         and the snapshot bars, merged over the chart's newest 48, carried the
@@ -552,7 +555,7 @@ class DashboardCache:
             quote, quote_is_fresh, frame, bars, candidate_row, sr_row,
         )
         ladder = self._snapshot_ladder(sr_row, current_price)
-        tech_ctx, technical_payload = self._snapshot_technicals(symbol, frame, current_price)
+        tech_ctx, technical_payload, tech_positions = self._snapshot_technicals(symbol, frame, current_price)
         position_markers = self._position_markers(position_row)
 
         nearest_support = ladder["nearest_support"]
@@ -598,6 +601,7 @@ class DashboardCache:
         )
         ltf_divergence_lines, htf_divergence_lines = self._snapshot_divergence_lines(
             symbol, tech_ctx, htf_ctx, compact_chart_profile, expanded_chart_profile, chart_wants_rsi_div,
+            tech_positions,
         )
 
         chart_payload = {
@@ -906,27 +910,42 @@ class DashboardCache:
 
     def _snapshot_technicals(
         self, symbol: str, frame: pd.DataFrame | None, current_price: float | None,
-    ) -> tuple[TechnicalLevelsContext | None, dict[str, Any]]:
-        """The technical levels built on the strategy's LTF frame, and the
-        chart's ``technicals`` payload of them. A failed build is logged
+    ) -> tuple[TechnicalLevelsContext | None, dict[str, Any], ChartPositions | None]:
+        """The technical levels built on the bars the strategy's technical
+        context reads, the chart's ``technicals`` payload of them, and where
+        those bars sit on the LTF chart (``ChartPositions``; None when they
+        are the chart's own bars). A failed build is logged
         (``technical_overlay``) and gives no context and an empty payload."""
         technical_payload: dict[str, Any] = {}
         # Build technical levels (fib extensions/retracements, AVWAP,
-        # Bollinger, ADX, channels, trendlines, etc.) on the strategy's LTF
-        # frame so all overlays render at LTF-derived prices. Strategies
-        # with default LTF=1 keep using the 1m streamed frame; strategies
-        # with non-1m LTF (e.g. peer_confirmed_key_levels at LTF=5m) get
-        # 5m-derived fibs/AVWAP/etc. matching the LTF chart bars.
-        ltf_min_for_tech = self.strategy.ltf_minutes()
-        tech_frame = self._overlay_frame(frame, ltf_min_for_tech)
+        # Bollinger, ADX, channels, trendlines, etc.) on the bars the
+        # strategy's own technical-levels context reads
+        # (``technical_context_minutes``), so the panel and the overlays
+        # show what its gates judge: the LTF for most strategies (e.g.
+        # peer_confirmed_key_levels' 5m, the LTF chart's bars), top_tier's
+        # 1m step frame whatever its LTF (2026-10-13: following its 5m LTF,
+        # the overlay would count the technical_levels lookbacks, which are
+        # in 1m bars, in 5m buckets).
+        tech_minutes = max(1, self.strategy.technical_context_minutes())
+        tech_frame = self._overlay_frame(frame, tech_minutes)
         tech_ctx = None  # Stays None when tech_frame is empty (warmup path) or build_technical_levels_context raises; downstream readers (technical_payload, divergence_lines) all guard on `tech_ctx is not None`.
+        # The lines come back positioned in tech_frame, and the LTF chart
+        # draws them at its own bars' abs_index: on an LTF chart of other
+        # bars they are re-expressed in its positions.
+        chart_minutes = max(1, self.strategy.ltf_minutes())
+        positions = None
+        if tech_frame is not None and not tech_frame.empty and chart_minutes != tech_minutes:
+            chart_frame = self._overlay_frame(frame, chart_minutes)
+            if chart_frame is not None and not chart_frame.empty:
+                positions = ChartPositions(tech_frame.index, chart_frame.index)
         if tech_frame is not None and not tech_frame.empty:
             tl_cfg = self.config.technical_levels
             sr_cfg = self.config.support_resistance
             try:
                 # tech_frame itself, not a filtered copy: the lines come back
-                # positioned in the frame passed, and tech_frame is the frame
-                # the LTF chart's bars (and their abs_index) are cut from.
+                # positioned in the frame passed, the frame the chart's bars
+                # (and their abs_index) are cut from, or placed on them
+                # (``positions``).
                 tech_ctx = build_technical_levels_context(
                     tech_frame,
                     current_price=current_price,
@@ -1037,18 +1056,21 @@ class DashboardCache:
                         "upper": safe_float(getattr(getattr(tech_ctx, "channel", None), "upper", None)),
                         "mid": safe_float(getattr(getattr(tech_ctx, "channel", None), "mid", None)),
                         "position_pct": safe_float(getattr(getattr(tech_ctx, "channel", None), "position_pct", None)),
-                        "lower_line": technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "lower_line", None)),
-                        "upper_line": technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "upper_line", None)),
-                        "mid_line": technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "mid_line", None)),
+                        "lower_line": technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "lower_line", None),
+                                                             positions),
+                        "upper_line": technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "upper_line", None),
+                                                             positions),
+                        "mid_line": technical_line_payload(getattr(getattr(tech_ctx, "channel", None), "mid_line", None),
+                                                           positions),
                     },
-                    "support_trendline": technical_line_payload(getattr(tech_ctx, "support_trendline", None)),
-                    "resistance_trendline": technical_line_payload(getattr(tech_ctx, "resistance_trendline", None)),
+                    "support_trendline": technical_line_payload(getattr(tech_ctx, "support_trendline", None), positions),
+                    "resistance_trendline": technical_line_payload(getattr(tech_ctx, "resistance_trendline", None), positions),
                     "trendline_break_up": bool(getattr(tech_ctx, "trendline_break_up", False)),
                     "trendline_break_down": bool(getattr(tech_ctx, "trendline_break_down", False)),
                     "support_respected": bool(getattr(tech_ctx, "support_respected", False)),
                     "resistance_respected": bool(getattr(tech_ctx, "resistance_respected", False)),
                 }
-        return tech_ctx, technical_payload
+        return tech_ctx, technical_payload, positions
 
     @staticmethod
     def _position_markers(position_row: dict[str, Any] | None) -> dict[str, Any]:
@@ -1280,16 +1302,20 @@ class DashboardCache:
         compact_chart_profile: DashboardChartConfig,
         expanded_chart_profile: DashboardChartConfig,
         chart_wants_rsi_div: bool,
+        tech_positions: ChartPositions | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """The chart's divergence lines: the LTF ones from ``tech_ctx`` (RSI and
-        OBV, as the profiles draw them) and the HTF RSI ones from ``htf_ctx``.
+        OBV, as the profiles draw them), placed on the LTF chart's bars by
+        ``tech_positions`` when its bars are not the context's
+        (``_snapshot_technicals``), and the HTF RSI ones from ``htf_ctx``.
         A failure is logged (``divergence_lines_collect``) and gives no lines
         on either side."""
         # Divergence trendlines (RSI / OBV, regular / hidden, bullish / bearish)
-        # for the price chart. LTF divergences come from tech_ctx (built off
-        # the strategy's primary frame), HTF divergences come from htf_ctx
-        # (read once by _snapshot_htf_overlays, when divergence or FVG rendering
-        # is enabled). Each entry is a DivergenceMatch.to_payload() dict —
+        # for the price chart. LTF divergences come from tech_ctx (built on
+        # the bars the strategy's technical context reads), HTF divergences
+        # come from htf_ctx (read once by _snapshot_htf_overlays, when
+        # divergence or FVG rendering is enabled). Each entry is a
+        # DivergenceMatch.to_payload() dict —
         # frontend draws a line connecting the two pivot points and color-
         # codes by direction (green=bullish/red=bearish), kind (solid=regular,
         # dashed=hidden), indicator (RSI heavier stroke than OBV).
@@ -1312,7 +1338,7 @@ class DashboardCache:
                         continue
                     if indicator == "obv" and not chart_wants_obv_div:
                         continue
-                    line = match.to_payload()
+                    line = divergence_line_payload(match, tech_positions)
                     line["timeframe"] = "ltf"
                     ltf_divergence_lines.append(line)
             # HTF divergence lines — only RSI is computed at HTF level
@@ -2011,8 +2037,9 @@ class DashboardCache:
             except Exception:
                 LOG.debug("Failed to compute HTF strategy EMAs for %s; chart falls back to default ema9/ema20.", symbol_key, exc_info=True)
         # In LTF mode, draw the EMAs the strategy reads off its LTF frame (for
-        # top_tier_adaptive's 1m LTF at ltf_indicator_span_scale 5, the
-        # session-reset EMA45 / EMA100), exactly as the snapshot bars merged
+        # top_tier_adaptive's 5m LTF its session-reset EMA9 / EMA20, since
+        # 2026-10-13; on its 1m LTF at ltf_indicator_span_scale 5 from
+        # 2026-05-29, EMA45 / EMA100), exactly as the snapshot bars merged
         # over these carry them.
         elif resolved_mode == "ltf" and bars:
             (ema_fast_span, ema_slow_span), _source = self._apply_strategy_ltf_emas(

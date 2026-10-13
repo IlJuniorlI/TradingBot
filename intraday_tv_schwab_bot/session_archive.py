@@ -403,9 +403,13 @@ def _gate_attribution(
     fragments `session_skip_counts` into hundreds of near-duplicates rolls up
     (until 2026-09-26 only the ``(`` detail was cut, and the peer family's
     ``long.x`` / ``short.x`` were two gates). The side each block was scored
-    on is kept per gate in ``sides``. Decisions are deduped by (symbol,
-    minute, gate, side) because one decision is logged repeatedly across a
-    cycle.
+    on is kept per gate in ``sides``, and the regime each was counted under
+    in ``regimes`` (``_reason_regimes``: a top_tier build reason's own regime,
+    since 2026-10-13; until then every reason on a row took the row's
+    ``family``, the regime of its first build, so a gate that stopped a
+    later regime was counted under the first). Decisions are deduped by
+    (symbol, minute, gate, side) because one decision is logged repeatedly
+    across a cycle.
 
     Returns {} on any I/O or parse failure — never crashes the archive write.
     """
@@ -485,7 +489,8 @@ def _gate_attribution(
                 family = str(row.get("family", "") or "none").strip() or "none"
                 excursion: tuple[float, float, float] | None = None
                 excursion_read = False
-                for token in gates:
+                regimes = _reason_regimes(gates, family)
+                for token, regime in zip(gates, regimes):
                     # ``reasons.blocked_side``: the rule above, which the
                     # session's skip tally keys its minutes on too.
                     side = blocked_side(token, market_side=market_side, side_pref=side_pref)
@@ -501,7 +506,7 @@ def _gate_attribution(
 
                     blocked[reason] += 1
                     sides[reason][side] += 1
-                    families[reason][family] += 1
+                    families[reason][regime] += 1
 
                     if not excursion_read:
                         excursion = _forward_excursion_atr(rows, ts, window_minutes)
@@ -634,6 +639,36 @@ _QUALIFIED_REGIME_NAMES = ("vwap_reclaim", "vol_squeeze", "sr_scalp", "pullback"
 _BUILD_FAILED_SIDE_RE = re.compile(
     r"^(?:(?P<side_a>long|short)_build_failed_|build_failed_(?P<side_b>long|short)_)(?P<rest>.*)$"
 )
+
+
+def _named_regime(rest: str) -> str | None:
+    """The regime a top_tier build reason's text after its side names
+    first (``trend_index_not_confirmed`` -> ``trend``), or None."""
+    return next((name for name in _QUALIFIED_REGIME_NAMES if rest.startswith(name + "_") or rest == name), None)
+
+
+def _reason_regimes(tokens: list[str], family: str) -> list[str]:
+    """The regime gate attribution counts each of a row's scored reasons
+    under, in order (2026-10-13). A top_tier build reason
+    (``<side>_build_failed_<regime>_...``, ``build_failed_<side>_...``)
+    counts under the regime it names; one that names none (a builder's or a
+    finalize gate's own tag, ``long_build_failed_no_fresh_breakout``) under
+    the row's ``family`` when it is the row's first build reason, the one
+    the family names (``_qualified_regime_calls`` reads them the same way),
+    and under ``unattributed`` after it. Any other reason (an unqualified
+    side, an engine gate, another strategy's) counts under the row's
+    ``family``, as every reason did until then."""
+    out: list[str] = []
+    first_build = True
+    for token in tokens:
+        match = _BUILD_FAILED_SIDE_RE.match(str(token).strip().lower())
+        if match is None:
+            out.append(family)
+            continue
+        named = _named_regime(match.group("rest"))
+        out.append(named if named is not None else (family if first_build else "unattributed"))
+        first_build = False
+    return out
 # The reason of a signal top_tier built (and small_cap_squeeze, which
 # inherits the builder): `top_tier_{regime}_{side}`, whole.
 _TOP_TIER_SIGNAL_RE = re.compile(
@@ -685,8 +720,7 @@ def _qualified_regime_calls(row: dict[str, Any]) -> list[tuple[str, int]]:
         if not m:
             continue
         side = m.group("side_a") or m.group("side_b")
-        rest = m.group("rest")
-        regime = next((name for name in _QUALIFIED_REGIME_NAMES if rest.startswith(name + "_") or rest == name), None)
+        regime = _named_regime(m.group("rest"))
         if regime is None and first_build and family in _QUALIFIED_REGIME_NAMES:
             regime = family
         first_build = False
@@ -1315,8 +1349,9 @@ def export_session_archive(
     - ``bars/{N}m_from_1m/{SYMBOL}.csv`` — that merged 1m frame resampled
       to ``ltf_minutes`` and ``htf_minutes`` when they're set and > 1,
       with the indicators run on the resample. For top_tier_adaptive
-      (ltf 1, htf 15) that's ``bars/15m_from_1m/``. It is what LTF
-      triggers and the resample-based LTF contexts read; it is NOT the
+      (ltf 5, htf 15; ltf 1 until 2026-10-13) that's ``bars/5m_from_1m/``
+      and ``bars/15m_from_1m/``. It is what the LTF setups and the
+      resample-based LTF contexts read; it is NOT the
       frame the HTF levels are built from (it only spans the days the 1m
       history covers).
     - ``bars/{N}m_schwab_htf/{SYMBOL}.csv`` — the stored HTF frame

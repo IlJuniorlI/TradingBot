@@ -880,8 +880,9 @@ def _populate_adx_context(
     ``adx_length`` is NOMINAL — it counts bars of the notional timeframe, the
     same unit the shared ``adx14`` column is named in. The fallback therefore
     computes at ``adx_length x span_scale`` so both branches mean the same
-    horizon: on top_tier's span_scale=5 LTF, ``adx14`` holds a 70-bar ADX, and
-    asking for 15 must give a 75-bar ADX rather than a native 15-bar one.
+    horizon: on a span_scale=5 frame (top_tier's 1m LTF from 2026-05-29 to
+    2026-10-13), ``adx14`` holds a 70-bar ADX, and asking for 15 must give a
+    75-bar ADX rather than a native 15-bar one.
     """
     adx_nominal = max(5, int(adx_length))
     adx_period = scaled_span(adx_nominal, span_scale)

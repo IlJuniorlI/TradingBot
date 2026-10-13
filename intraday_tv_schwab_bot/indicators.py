@@ -574,9 +574,11 @@ def add_indicators(
     # ``span_scale`` stretches every bar-count lookback so a finer timeframe can
     # preserve a coarser timeframe's wall-clock horizon. Default 1.0 = the
     # canonical 9/20/14/5/15-bar spans (byte-for-byte unchanged for every
-    # existing caller). top_tier_adaptive's 1m LTF passes span_scale=5 so its
-    # indicators behave like the old 5m frame (ema9->45, ema20->100, atr14->70,
-    # rsi14->70, bb20->100, ret5->25, ret15->75). The column NAMES keep their
+    # existing caller). top_tier_adaptive's 1m LTF passed span_scale=5 from
+    # 2026-05-29 to 2026-10-13 so its indicators would behave like a 5m
+    # frame's (ema9->45, ema20->100, atr14->70, rsi14->70, bb20->100,
+    # ret5->25, ret15->75; its ATR read ~0.43x a 5m ATR14, so they did not);
+    # its LTF is 5m bars at scale 1 since. The column NAMES keep their
     # nominal numeric suffix; the EFFECTIVE span is suffix x span_scale.
     # ``ema_spans`` sets the ema9 / ema20 spans on their own (a strategy's
     # ltf_ema_fast_span / ltf_ema_slow_span); nothing else follows it, and
