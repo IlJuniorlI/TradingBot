@@ -1657,6 +1657,79 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The REST shadow drops a lagging stream quote book only when it may have
+  stopped receiving with a price apart from REST's, or a side apart from
+  REST's is stale, cannot be dated, or was kept as the race at the check
+  before; its lag line names REST's side times, sizes, read and quote age,
+  as does the forced fetch's check line, and each published stream quote
+  and POSITION_MARK name the book's own item time and quote time.**
+  *2026-10-13* — on H:'s dry runs of 2026-10-07..10-09 the shadow dropped
+  201 books in 172 checks (a `Stream quote shadow: SYM lags REST by N ms`
+  warning each), and none was a book that stopped receiving: 95 had bid
+  and ask equal to REST's, and 106 had a side apart while REST's
+  quote was at most 1.07 s old (REST answering a quote change the stream
+  had not yet delivered). The drops cost 83, 50 and 135 REST quotes a day,
+  and on 10-08 a held QCOM was marked from a REST snapshot up to 4.9 s old;
+  10-12 had 65 more in 57 checks (73 REST quotes), one of them a held VRT.
+  - The rule (`_shadow_lag_verdict`, `STREAM_QUOTE_STALE_SIDE_SECONDS` in
+    `data_feed.py`) judges only a book whose quote time lags REST's by more
+    than `quote_cache_seconds`, as before, in this order. A book whose last
+    item is older than `quote_cache_seconds` (or unknown) may have stopped
+    receiving: it is dropped, and REST's quote cached in its place, when any
+    of its bid, ask, last and mark differs from REST's, and kept when all
+    four are equal. A book receiving items is kept when its bid and ask
+    equal REST's; with its last or mark apart, for one check only, since
+    management prices from the mark. Otherwise each side that differs is
+    judged by REST's own time for it (`bidTime`, `askTime`): a side REST had
+    held 2 s or more at the check's read of the books drops the book, as do
+    a side time that is missing, unreadable or later than its answer's
+    newest time, and an answer that holds no other quote with a quote or
+    trade time (a quote cannot date its own sides; where the answer's other
+    quotes are all quiet, the stream packet's bound dates them). When every
+    differing side changed at REST less than 2 s before the read (the race),
+    the book is kept, for one check: kept on either one-check ground again
+    at the next check that judges it, in the same epoch, it is dropped, so a
+    book whose bid and ask stopped while its prints flow serves at most one
+    shadow interval. Every drop the rule makes, the old one made. On the
+    four days' 266 lines, 129 are kept for sure, bid and ask equal or a
+    quiet book (106 of 229 drops gone, 194 of 341 REST quotes saved, QCOM's
+    held drop among them), and one is dropped for sure (10-09 ADBE, its last
+    and mark half a cent apart at two checks running) and none had stopped
+    receiving; the other 136 turn on REST's side times, which the old line
+    did not carry (if all were the race, 135 are kept).
+  - The read is Schwab's clock when the books were read, as the later of
+    two lower bounds: the answer's newest `quoteTime` or `tradeTime` plus
+    the bot's time since that answer arrived, and the stream's last
+    packet's timestamp plus the bot's time since its receipt
+    (`StreamQuoteRead.stamp_ms`). Each adds the bot's elapsed time to a
+    Schwab time, so a skew between the clocks moves no age; an age reads
+    short by the packet's latency, or by as long as the answer stood still
+    plus REST's latency.
+  - The lag line: `Stream quote shadow: SYM lags REST by N ms (quote time
+    ... against REST's ..., limit N s; its last item N s before this check;
+    stream minus REST: bid ... ask ... last ... mark ...; REST bid_time=...
+    ask_time=... bid_size=... ask_size=... answer_time=... packet_time=...
+    read_time=... bid_age_ms=... ask_age_ms=... quote_age_ms=...); its book
+    is dropped (why) and REST's quote cached in its place, ...` at WARNING,
+    or `...; its book is kept (why)` at INFO. `quote_age_ms` is REST's
+    quote's age at the check by the bot's clock (a skew reads in it); `na`
+    for what is missing. The check's line adds `dropped=N` after
+    `lagging=N`.
+  - The forced fetch's `Stream quote check` line adds `rest_bid_time=...
+    rest_ask_time=... rest_bid_size=... rest_ask_size=...
+    rest_quote_age_ms=...` before `exchange=`, which stays last.
+  - Each published stream quote carries `stream_item_at` (the receipt of
+    the book's own last item) and `stream_quote_time_ms` (its field 34),
+    and the management snapshot and POSITION_MARK carry both for a mark
+    priced from a book: diagnostics that no decision reads (a REST quote
+    has neither). A mark's `price_at` stays the stream's last packet, any
+    symbol's.
+  - README now says that the book trails REST by up to about a second
+    (about one packet a second): at 28 of 79 entries on 10-07..10-09 its
+    bid or ask differed from the REST quote the entry had just fetched (8
+    by more than 0.05), so an exit priced from the book can be a tick or a
+    few behind REST's at that instant. Exit pricing is unchanged.
+
 - **The session archive's bars folders say what they hold:
   `bars/{N}m_from_1m/` is the merged 1m frame resampled to N minutes and
   `bars/{N}m_schwab_htf/` the stored HTF frame; `bars/1m/` stays.**
