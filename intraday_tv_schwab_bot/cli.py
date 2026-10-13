@@ -33,8 +33,9 @@ _DEFAULT_CONFIG_CANDIDATES = (
 )
 
 
-def _default_config_path() -> str:
-    """The first default config that exists under the working directory."""
+def default_config_path() -> str:
+    """The first default config that exists under the working directory: the
+    ``--config`` default, here and in scripts/renew_schwab_token.py."""
     for candidate in _DEFAULT_CONFIG_CANDIDATES:
         if candidate.exists():
             return str(candidate)
@@ -50,7 +51,11 @@ def _exit_on_error(what: str, exc: Exception) -> NoReturn:
     raise SystemExit(1)
 
 
-def main() -> None:
+def argument_parser() -> argparse.ArgumentParser:
+    """The bot's command line: ``main`` parses it, and
+    scripts/renew_schwab_token.py reads a running bot's ``--config`` and
+    ``--env`` with it, so both read them the same way (the last one given
+    wins; an unambiguous prefix such as ``--conf`` counts)."""
     parser = argparse.ArgumentParser(
         description="TradingView + Schwabdev intraday bot"
     )
@@ -61,7 +66,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--config",
-        default=_default_config_path(),
+        default=default_config_path(),
         help="Path to the YAML config file.",
     )
     parser.add_argument(
@@ -79,7 +84,11 @@ def main() -> None:
             "outside the repo."
         ),
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = argument_parser().parse_args()
 
     try:
         config = load_config(args.config, strategy_override=args.strategy, env_path=args.env)

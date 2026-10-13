@@ -191,6 +191,9 @@ def _refresh_token_serialized(client: Any) -> None:
 # 14:08:26 on 2026-09-25, a minute after the first EOFError.
 SCHWABDEV_REFRESH_TOKEN_LIFETIME = timedelta(days=7)
 SCHWABDEV_LOGIN_LEAD = timedelta(seconds=3630)
+# ``Tokens.update_tokens`` refreshes the 30-minute access token once less
+# than 61 s of it is left (its ``access_threshold``).
+SCHWABDEV_ACCESS_REFRESH_LEAD = timedelta(seconds=61)
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,25 +211,78 @@ class RefreshTokenWindow:
         return self.expires_at - SCHWABDEV_LOGIN_LEAD
 
 
+def token_store_path(tokens_db: str) -> Path:
+    """The token store's file (``schwab.tokens_db``): the path expanded as
+    schwabdev's ``Tokens`` expands it, against the working directory."""
+    return Path(os.path.expanduser(tokens_db)).absolute()
+
+
+def stored_time(value: Any) -> datetime:
+    """An issue time as schwabdev stores it (ISO 8601), read as schwabdev
+    reads it (``Tokens._parse_dt``): a naive one is UTC. ``ValueError``
+    when it does not parse."""
+    moment = datetime.fromisoformat(str(value))
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
 def read_refresh_token_window(tokens_db: str) -> RefreshTokenWindow:
     """The refresh token's window, read from schwabdev's token store
-    (``schwab.tokens_db``, the sqlite file its ``Tokens`` keeps; the path
-    expanded as schwabdev expands it) opened read-only: no request, no
-    authorization flow, nothing written or created. The issue time is stored
-    in clear even when the tokens are encrypted; a naive one is UTC, as
-    schwabdev reads it.
+    (``schwab.tokens_db``, the sqlite file its ``Tokens`` keeps:
+    ``token_store_path``) opened read-only: no request, no authorization
+    flow, nothing written or created. The issue time is stored in clear
+    even when the tokens are encrypted.
 
     Raises ``sqlite3.Error`` for a store it cannot open or read (a missing
     file, no ``schwabdev`` table, a lock held past the 1 s timeout while
     schwabdev renews the tokens) and ``ValueError`` for one holding no token
     or an issue time that does not parse."""
-    uri = Path(os.path.expanduser(tokens_db)).absolute().as_uri() + "?mode=ro"
+    uri = token_store_path(tokens_db).as_uri() + "?mode=ro"
     with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
         row = conn.execute("SELECT refresh_token_issued FROM schwabdev LIMIT 1").fetchone()
     if row is None:
         raise ValueError("the store holds no token")
-    issued = datetime.fromisoformat(str(row[0]))
-    return RefreshTokenWindow(issued if issued.tzinfo is not None else issued.replace(tzinfo=timezone.utc))
+    return RefreshTokenWindow(stored_time(row[0]))
+
+
+def _store_signature(path: Path) -> tuple[tuple[int, int, int, int] | None, ...]:
+    """What a write to the token store changes, read with ``os.stat`` alone:
+    the device, inode, size and modification time of the store and of its
+    -wal and -journal files (None for one that does not exist). Never a
+    descriptor of the store opened outside sqlite: POSIX record locks belong
+    to the process, and closing any descriptor of the file drops every lock
+    the process holds on it, schwabdev's over its refresh POST included: a
+    request's check during the bot's own refresh would let another process
+    (a renewal) write inside the bot's transaction, and the bot's commit
+    would undo that write, its refresh token lost. sqlite's own connections
+    keep the process's locks across each other (the read here goes through
+    one). Two writes within one tick of the file system's clock that leave
+    the size as it was look alike: the second is taken at the next write,
+    or by schwabdev's own reload at the bot's next refresh point.
+    ``OSError`` when the store itself cannot be read so."""
+    def _seen(status: os.stat_result) -> tuple[int, int, int, int]:
+        return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns
+
+    signature: list[tuple[int, int, int, int] | None] = [_seen(os.stat(path))]
+    for suffix in ("-wal", "-journal"):
+        try:
+            signature.append(_seen(os.stat(f"{path}{suffix}")))
+        except FileNotFoundError:
+            signature.append(None)
+    return tuple(signature)
+
+
+def _read_stored_tokens(path: Path) -> tuple[Any, ...]:
+    """The token store's row: the access and refresh tokens' issue times,
+    then the access, refresh and id tokens as stored (encrypted or not),
+    over a read-only connection that does not wait for a lock
+    (``sqlite3.OperationalError``, "database is locked", while another
+    process writes). ``ValueError`` when it holds no token."""
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0)) as conn:
+        row = conn.execute("SELECT access_token_issued, refresh_token_issued, access_token, refresh_token, id_token "
+                           "FROM schwabdev LIMIT 1").fetchone()
+    if row is None:
+        raise ValueError("the store holds no token")
+    return row
 
 
 def call_schwab_client(client: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
@@ -416,23 +472,33 @@ class PooledSchwabClient(SchwabClient):
     with it, and 62 through schwabdev's client.
 
     The access-token refresh stays serialized (``_refresh_token_serialized``,
-    then schwabdev's own lock), and a token another path refreshed reaches
-    the next request: the stream's (re)connect refreshes through
-    ``client.tokens`` (``ClientBase._get_streamer_info``), which leaves
-    schwabdev's session header on the old token.
+    then schwabdev's own lock), the stream's (re)connect's included
+    (``_get_streamer_info``), and a token another path refreshed reaches the
+    next request: each request is stamped with ``tokens.access_token`` as it
+    goes out. Tokens another process wrote to the token store (a login
+    renewed by scripts/renew_schwab_token.py) are taken at the next call
+    (``_take_store_write``).
 
-    It overrides a private method of a pinned dependency:
+    It overrides private methods of a pinned dependency:
     tests/foundation/test_pooled_schwab_client.py pins the source of the
-    schwabdev code it replaces (``Client._request``) and builds on
-    (``Client.__init__``, ``update_tokens``, ``close``), so a schwabdev
-    upgrade fails there first.
+    schwabdev code it replaces (``Client._request``,
+    ``ClientBase._get_streamer_info``), wraps (``Client.update_tokens``) and
+    builds on (``Client.__init__``, ``close``, and the ``Tokens`` code that
+    reads, refreshes and writes the tokens), so a schwabdev upgrade fails
+    there first.
     """
 
-    def __init__(self, *args: Any, pool_size: int, **kwargs: Any) -> None:
+    def __init__(self, *, pool_size: int, tokens_db: str, **kwargs: Any) -> None:
         # Checked before schwabdev's __init__ reads (or asks for) a token.
         if isinstance(pool_size, bool) or not isinstance(pool_size, int) or pool_size < 1:
             raise ValueError(f"pool_size must be an integer >= 1, got {pool_size!r}")
-        super().__init__(*args, **kwargs)
+        # The token store's file, as schwabdev opens it, what the last read
+        # of it saw, and the trouble last logged reading it
+        # (``_take_store_write``).
+        self._tokens_path = token_store_path(tokens_db)
+        self._store_seen: tuple[tuple[int, int, int, int] | None, ...] | None = None
+        self._store_trouble: str | None = None
+        super().__init__(tokens_db=tokens_db, **kwargs)
         self._pooled_sessions: list[requests.Session] = []
         self._idle_sessions: queue.LifoQueue[requests.Session] = queue.LifoQueue()
         self._failing = False
@@ -443,6 +509,162 @@ class PooledSchwabClient(SchwabClient):
                 session.mount(prefix, adapter)
             self._pooled_sessions.append(session)
             self._idle_sessions.put(session)
+
+    def update_tokens(self, force_access_token: bool = False, force_refresh_token: bool = False) -> bool:
+        """schwabdev's ``Client.update_tokens``, after taking the tokens
+        another process wrote to the token store since the last call
+        (``_take_store_write``), and with an access token schwabdev itself
+        took from another process checked before it is sent.
+
+        schwabdev 4.0.0 reloads the store before it refreshes a token, and
+        when another process wrote newer tokens there it takes them instead
+        ("Access token updated elsewhere" in ``Tokens._update_access_token``,
+        "Refresh token updated elsewhere" in ``_update_refresh_token``)
+        without checking that the access token is still live. A login
+        renewed from a second terminal (scripts/renew_schwab_token.py)
+        writes both, and the bot makes no Schwab call between sessions: a
+        renewal at 00:10 (H:, 2026-10-13) met the 09:15 prewarm as an access
+        token expired since 00:40. The check before each call
+        (``_refresh_token_serialized``) took it, and only the request's own
+        check replaced it, outside that check's lock: calls made together
+        each refreshed it (the race of 2026-09-22), and a request checked
+        once sent it, a 401: the stream's (re)connect, or a schwabdev
+        endpoint called directly. ``_take_store_write`` now takes such
+        tokens first, and schwabdev's check refreshes a lapsed one; its own
+        reload still takes another process's write when the store could not
+        be read at the take (a lock held by that write).
+
+        A token schwabdev took so with less than
+        ``SCHWABDEV_ACCESS_REFRESH_LEAD`` left (schwabdev's own refresh
+        point) is refreshed at once, in the check that took it, with the
+        refresh token taken with it. A refresh that fails leaves it, as
+        schwabdev leaves a token whose refresh failed: schwabdev logs why,
+        and the requests carry it until a refresh succeeds. Returns whether
+        the tokens changed."""
+        taken = self._take_store_write()
+        if not super().update_tokens(force_access_token, force_refresh_token):
+            return taken
+        tokens = self.tokens
+        now = sessions.now_et()
+        issued_at = tokens._access_token_issued
+        expires_at = issued_at + timedelta(seconds=tokens._access_token_timeout)
+        if expires_at - now >= SCHWABDEV_ACCESS_REFRESH_LEAD:
+            return True
+        stamp = "%Y-%m-%d %H:%M:%S %Z"
+        LOG.info("Schwab access token taken from the token store (issued %s) %s %s: refreshing it before a "
+                 "request carries it", f"{issued_at.astimezone(sessions.EXCHANGE_TZ):{stamp}}",
+                 "expired" if expires_at <= now else "expires",
+                 f"{expires_at.astimezone(sessions.EXCHANGE_TZ):{stamp}}")
+        if not super().update_tokens(force_access_token=True):
+            LOG.warning("Schwab access token taken from the token store could not be refreshed (schwabdev logs why): "
+                        "the requests carry it until a refresh succeeds")
+        return True
+
+    def _take_store_write(self) -> bool:
+        """Take, at this call, the tokens another process wrote to the token
+        store: the access, refresh and id tokens and both issue times, as
+        schwabdev's own reload (``Tokens._load_tokens_from_db``) takes them,
+        when either issue time is newer than the bot's (the bot's own writes
+        are not). schwabdev reloads the store only when it refreshes a
+        token, so until 2026-10-13 a login renewed while a session ran
+        reached the bot only at its own access-token refresh, up to 29
+        minutes on: had Schwab revoked the old tokens at the new login, that
+        was up to 29 minutes of 401s.
+
+        One ``os.stat`` of the store and of its -wal and -journal files per
+        call (``_store_signature``: no descriptor of the store outside
+        sqlite, which would drop schwabdev's lock); the store is read only
+        when that changed, through sqlite, over a read-only connection that
+        does not wait for a lock. It fails closed: a store that cannot be
+        read (a lock the other process's write holds, a missing file) or
+        whose tokens the bot's key does not decrypt (written under another
+        key) leaves the bot the tokens it holds, logged once until a read
+        succeeds, and the next call tries again. Only a writer other than
+        scripts/renew_schwab_token.py (which refuses a key that does not
+        read the store) can store tokens under a key the bot lacks; the
+        bot keeps its own tokens only until its next refresh point, where
+        schwabdev's own reload takes that write's issue times without its
+        tokens. A store replaced by a rename while the bot runs is not the
+        file schwabdev keeps open: what is taken from it is undone at the
+        bot's next refresh point (README_LINUX_DEPLOY.md: never replace the
+        store while the bot runs). Returns whether it took tokens."""
+        tokens = self.tokens
+        try:
+            seen = _store_signature(self._tokens_path)
+        except OSError as exc:
+            with tokens._update_lock:
+                self._store_trouble_once(logging.WARNING, "could not be checked", exc)
+            return False
+        if seen == self._store_seen:
+            return False
+        with tokens._update_lock:
+            try:
+                row = _read_stored_tokens(self._tokens_path)
+                access_issued, refresh_issued = stored_time(row[0]), stored_time(row[1])
+            except (sqlite3.Error, ValueError) as exc:
+                self._store_trouble_once(logging.WARNING, "changed but could not be read", exc)
+                return False
+            if access_issued <= tokens._access_token_issued and refresh_issued <= tokens._refresh_token_issued:
+                self._store_seen, self._store_trouble = seen, None
+                return False
+            try:
+                access_token, refresh_token, id_token = (tokens._dec(value) for value in row[2:])
+            # schwabdev's ``_dec`` raises a bare Exception with no key, and
+            # cryptography's InvalidToken with another key.
+            except Exception as exc:
+                self._store_trouble_once(logging.ERROR, "holds tokens another process wrote that this bot's key "
+                                                        "(schwab.encryption) does not decrypt", exc)
+                return False
+            tokens.access_token, tokens.refresh_token, tokens.id_token = access_token, refresh_token, id_token
+            tokens._access_token_issued, tokens._refresh_token_issued = access_issued, refresh_issued
+            self._store_seen, self._store_trouble = seen, None
+        stamp = "%Y-%m-%d %H:%M:%S %Z"
+        LOG.info("Schwab tokens taken from the token store %s, which another process wrote: access token issued %s, "
+                 "refresh token issued %s", self._tokens_path,
+                 f"{access_issued.astimezone(sessions.EXCHANGE_TZ):{stamp}}",
+                 f"{refresh_issued.astimezone(sessions.EXCHANGE_TZ):{stamp}}")
+        return True
+
+    def _store_trouble_once(self, level: int, what: str, exc: Exception) -> None:
+        """Log ``what`` happened to the token store, with the error and its
+        type, unless the same trouble was the last logged; called under
+        ``tokens._update_lock``."""
+        trouble = f"{what}: {type(exc).__name__}"
+        if trouble == self._store_trouble:
+            return
+        self._store_trouble = trouble
+        LOG.log(level, "Schwab token store %s %s (%s: %s): the requests carry the tokens the bot holds, and the "
+                "next call tries again", self._tokens_path, what, type(exc).__name__, exc)
+
+    def _get_streamer_info(self) -> Any:
+        """schwabdev's ``ClientBase._get_streamer_info`` (the stream's
+        (re)connect: the streamer info, and the token the stream's login
+        carries), with the token check the requests make
+        (``_refresh_token_serialized``) in place of schwabdev's own
+        (``self.tokens.update_tokens()``). That one is unserialized: it
+        refreshed the token again behind a call refreshing it, skipped the
+        store check (``_take_store_write``) and, kept after the serialized
+        one, ran schwabdev's login flow a second time per (re)connect once
+        the refresh token is in its last hour. The rest is schwabdev's (the
+        request, its timeout, a failure returned as None after an ERROR
+        line), but its lines go to this module's logger, not schwabdev's,
+        and the network error's type is added."""
+        _refresh_token_serialized(self)
+        try:
+            response = requests.get(f"{self._base_api_url}/trader/v1/userPreference",
+                                    headers={"Authorization": f"Bearer {self.tokens.access_token}"},
+                                    timeout=self.timeout)
+        except requests.RequestException as exc:
+            LOG.error("Could not get streamerInfo (network error: %s: %s)", type(exc).__name__, exc)
+            return None
+        if not response.ok:
+            LOG.error("Could not get streamerInfo (HTTP %s)", response.status_code)
+            return None
+        info = response.json().get("streamerInfo") or []
+        if not info:
+            LOG.error("streamerInfo missing from userPreference response.")
+            return None
+        return info[0]
 
     def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
         self.update_tokens()

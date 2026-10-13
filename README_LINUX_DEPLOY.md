@@ -177,16 +177,21 @@ cd ~/TradingBot
 # Browser opens, you log in, paste the redirected URL back, tokens.db is written.
 # Ctrl+C once tokens are saved.
 
-# Then SCP to the server:
+# Then SCP to the server, with the bot there stopped (never over the store
+# of a running bot: see "Renewing the Schwab login without a restart"):
 scp .schwabdev/tokens.db <user>@<server>:~/TradingBot/.schwabdev/
 
 # Important: the SCHWAB_ENCRYPTION_KEY values must MATCH between machines.
 # Copy the same value into ~/TradingBot/.env on the server.
 ```
 
-If you really need to do auth from the server itself, see the
-"Troubleshooting" section below for SSH X11 forwarding and pure-terminal
-paste flows.
+To log in from the server itself instead, set
+`schwab.open_browser_for_auth: false` and start the bot by hand in a
+terminal: schwabdev prints `[Schwabdev] Open to authenticate: <URL>` and
+waits for you to paste the address-bar URL the login lands on (open the URL
+in any browser; paste within about 30 seconds). The weekly renewal after
+that needs neither a desktop nor a restart: see "Renewing the Schwab login
+without a restart" below.
 
 ---
 
@@ -567,7 +572,9 @@ waits on `input()` for the redirected URL.
 - **On a terminal** (the bot started by hand, or in tmux), the engine waits
   at that prompt, mid-session if that is when the hour starts, and every
   other caller waits behind it. Paste the URL within 30 seconds of logging
-  in and the bot carries on with a new 7-day token.
+  in and the bot carries on with a new 7-day token. While it waits there
+  it holds `tokens.db` locked, so `scripts/renew_schwab_token.py` refuses
+  to run: paste at the bot's prompt.
 - **Under systemd** there is no stdin, so `input()` raises `EOFError`, and
   schwabdev logs `WARNING Schwabdev The refresh token is expiring soon
   (<60min)!` and `ERROR Schwabdev [Schwabdev] Could not update refresh
@@ -575,9 +582,11 @@ waits on `input()` for the redirected URL.
   2026-09-25). That check comes before the access token's, so schwabdev
   stops renewing the access token too: every call fails with `401
   Unauthorized` once the current one lapses (at most 30 minutes; at
-  14:08:26 that day), until the tokens are renewed and the bot is
-  restarted. Meanwhile the engine can neither read a quote nor send an
-  order; only orders already resting at Schwab protect a position.
+  14:08:26 that day), until the login is renewed with
+  `scripts/renew_schwab_token.py` (below): the bot's next call takes the
+  new tokens, no restart. Meanwhile the engine can neither read a quote
+  nor send an order; only orders already resting at Schwab protect a
+  position.
 
 The bot logs the token's window at start-up and on the first pass of each
 trading day, from `tokens.db`, read-only:
@@ -594,20 +603,32 @@ is today's while it lasts, else the next trading day's, and a session ends
 at the regular close (13:00 on an early-close day) or the strategy's last
 window, whichever is later; weekends and exchange holidays hold none. The
 WARNING comes a trading day ahead because a bot that exits after each
-session (`auto_exit_after_session`, on in all but one shipped preset) logs this
-once a day, at start-up, and the next day's start-up may meet schwabdev's
-prompt inside the client's own start, before the bot logs anything: the day
-before is the last warning you can act on outside a session. The line above
-was logged on Thu 2026-10-08; the same token logs INFO through Fri 10-09,
-then `before the session after the coming one ends (2026-10-13 16:00:00
-EDT)` on Mon 10-12 and `before the coming session ends (2026-10-13
-16:00:00 EDT)` on Tue 10-13. Once the login time has passed (a bot started
-after it, or after the token expired), the WARNING says so: `..., expires
-(or expired) ...; schwabdev has asked for a new login since ...: log in
-again now. ...`. A `tokens.db` it cannot read is a
-WARNING naming the error's type (`Schwab refresh token: could not read
-schwabdev's token store ...`). Neither blocks entries. Watch for them in
-the day's log, or in the journal:
+session (`auto_exit_after_session`, on in all but one shipped preset) logs
+this once a day, at start-up, and the next day's start-up may meet
+schwabdev's prompt inside the client's own start, before the bot logs
+anything: the day before is the last warning you can act on outside a
+session. The line above was logged on Thu 2026-10-08; the same token logs
+INFO through Fri 10-09, then `before the session after the coming one ends
+(2026-10-13 16:00:00 EDT)` on Mon 10-12 and `before the coming session ends
+(2026-10-13 16:00:00 EDT)` on Tue 10-13. Once the login time has passed (a
+bot started after it, or after the token expired), the WARNING says so:
+`..., expires (or expired) ...; schwabdev has asked for a new login since
+...: log in again now (or paste at the bot's own prompt if it waits at
+one). ...`. Both WARNINGs end with the command that renews the login from
+a terminal while the bot runs (below): to the bot's working folder, then
+the script by its full path, with the `--config` (and `--env`, when it was
+given one) the bot was started with:
+
+```
+... To log in again from a terminal while the bot runs (no restart needed): cd /home/<user>/TradingBot && .venv/bin/python /home/<user>/TradingBot/scripts/renew_schwab_token.py --config configs/config.yaml
+```
+
+(An installed package, with no scripts folder beside it, says to run the
+script from a source checkout of that version instead.)
+
+A `tokens.db` it cannot read is a WARNING naming the error's type (`Schwab
+refresh token: could not read schwabdev's token store ...`). Neither
+blocks entries. Watch for them in the day's log, or in the journal:
 
 ```bash
 grep 'Schwab refresh token' ~/TradingBot/.logs/bot_$(TZ=America/New_York date +%F).log
@@ -618,24 +639,224 @@ Not `journalctl -p warning`: the bot writes its lines to stdout as plain
 text, so the journal files every one of them at priority `info`, its
 WARNINGs included, and a priority filter drops them all.
 
-To renew ahead of time, outside the session:
+### Renewing the Schwab login without a restart
 
-1. Stop the bot.
-2. On the machine you log in from (the desktop of "First-time Schwab
-   OAuth" above, or the server if you log in there), move
-   `.schwabdev/tokens.db` aside. schwabdev starts its login only for an
-   empty store or one in its last hour (the 3630 s above): over a store
-   with more left, the run just renews the access token, and the
-   `tokens.db` you copy back holds the old refresh token, which still
-   expires when it did.
-3. Redo that flow there. From a desktop, SCP the new `tokens.db` over the
-   server's (move the server's aside first to keep a copy).
-4. Start the bot and check that its `Schwab refresh token issued ...` line
-   shows the time of the new login. The old issue time means the old token
-   came back: start again from step 2.
+`scripts/renew_schwab_token.py` renews the login beside the running bot,
+from any terminal on the machine the bot runs on (an SSH session will do);
+the bot keeps running. Run it as the user that runs the bot (from the
+bot's folder, for the case where the bot is stopped). It needs no flags:
 
-The new token is good for 7 days from that login. A bot stopped for more
-than 7 days needs the same.
+```bash
+cd ~/TradingBot
+.venv/bin/python scripts/renew_schwab_token.py --status   # the checks and the window only
+.venv/bin/python scripts/renew_schwab_token.py            # renew
+```
+
+**Which settings: the running bot's.** It finds the bot of its checkout
+in /proc: a process of your user running the checkout's `main.py` (from
+any working folder), or the `intraday-tv-schwab-bot` console script
+working in the checkout. It takes that bot's `--config` and `--env`, read
+as the bot read them, and reads them, the `.env` and a relative
+`schwab.tokens_db` in the bot's working folder, as the bot did; it says so
+first: `The bot of /home/<user>/TradingBot running: pid 1234, working in
+/home/<user>/TradingBot (--config configs/config.yaml, no --env).` The app
+key, the app secret and the key are the bot's too: the environment the
+bot was started with (a systemd unit's `Environment=`, say) wins over its
+`.env`, as the bot's loader let it, and your shell's own `SCHWAB_*`
+variables are never used while a bot runs (a shell exporting another app's
+key would otherwise log in as that app, whose tokens the bot cannot
+refresh). The summary says where each came from, never the value; a bot
+whose environment cannot be read is refused.
+
+**What the bot loaded.** /proc keeps the environment the bot started with,
+but not its config and `.env`: the script reads those as they are now. So
+it refuses when the bot's config or its `.env` (the ones it finds for the
+bot) changed after the bot started, naming the file (`Refused:
+/home/<user>/TradingBot/.env changed at ..., after the running bot, pid
+1234, started (...)`): a `.env` given another app for the next restart, or
+a preset a pull changed, would otherwise renew an app or a store the bot
+does not run with. Restart the bot (it then reads the file as it is; past
+the store's login time a starting bot meets schwabdev's prompt, so stop
+it, renew with the bot's `--config` while it is stopped, then start it). A
+file put back with its old modification time (`mv`, `cp -p`, `rsync -a`)
+still counts as changed: its status-change time, which nothing sets back,
+is new, and so is that of a file whose mode or owner changed. And the
+store it renews must be the file the running bot holds open (the same
+device and inode, from `/proc/<pid>/fd`; schwabdev keeps the store open):
+a store replaced by a copy or a rename while the bot runs, or one found
+elsewhere (a preset changed with its time kept, another `--config`, a `~/`
+path read with another home folder), is refused, naming that store and the
+sqlite files the bot holds open (`... (deleted)` for a replaced one).
+
+`--config` and `--env` (relative to the folder you run it from) are
+checked against the running bot, each config loaded as the bot loads it
+(the bot's environment over that config's `.env`): one that names another
+token store (both are named), or gives other credentials (an `--env` with
+another app's key and secret, say), is refused: the renewal would not
+reach the bot. With no bot running they are used, read in the folder
+you run it from (with your shell's `SCHWAB_*` over the `.env`, as a bot
+started there would take them), and the summary says the bot reads the
+store at its next start. With no bot running and no `--config` it stops,
+lists the presets in `configs/` and asks for `--config` (and `--env`, if
+the bot was given one); it never falls back to a default config. Several
+bots running are refused: it renews one bot's login. A bot of another
+user is named, with that user to run it as. A bot of the checkout whose
+command line the bot's parser no longer reads (a `--strategy` the pulled
+code dropped) is still the running bot (its environment, the store it
+holds open), but its `--config` cannot be told: refused, saying why,
+unless `--config` is given, which is used only if it names the store that
+bot holds open. The bot's day-ahead WARNING ends with the exact command,
+flags included.
+
+**The checks, before the login.** On a copy of `tokens.db` (in memory) it
+proves the settings fit the store: the configured key must read the stored
+tokens. Refused, naming where the key came from: tokens stored in clear
+while this run has a key (the bot runs without one; with no bot running,
+a `SCHWAB_ENCRYPTION_KEY` your shell exports wins over the `.env`: unset
+it), encrypted tokens and no key, and another key. A
+`tokens.db` (or its folder) your user cannot write is refused too: Schwab
+takes the code before the store is written, so a write that fails would
+spend the login. So are a store that is missing (with no bot running: a
+first login is the bot's own first start) or locked (the bot writing its
+tokens: try again; or a bot waiting at schwabdev's own prompt: paste there
+instead). Then it shows what it will renew and asks:
+
+```
+The bot of /home/<user>/TradingBot running: pid 1234, working in /home/<user>/TradingBot (--config configs/config.yaml, no --env).
+  config      /home/<user>/TradingBot/configs/config.yaml (the --config of the running bot, pid 1234)
+  .env        /home/<user>/TradingBot/.env (found as the bot finds it: the running bot has no --env)
+  app key     SCHWAB_APP_KEY in /home/<user>/TradingBot/.env
+  app secret  SCHWAB_APP_SECRET in /home/<user>/TradingBot/.env
+  key         SCHWAB_ENCRYPTION_KEY in /home/<user>/TradingBot/.env
+  tokens      encrypted (this run's key reads them)
+  bot         pid 1234, working in /home/<user>/TradingBot: it takes the new tokens from the store at its next Schwab call
+The Schwab refresh token in /home/<user>/TradingBot/.schwabdev/tokens.db:
+  issued   2026-10-06 14:48:37 EDT
+  expires  2026-10-13 14:48:37 EDT
+  schwabdev asks for a new login from 2026-10-13 13:48:07 EDT
+Renew it? [y/N]:
+```
+
+**The login.** Confirmed, it starts schwabdev's client on `tokens.db`
+first (after an evening's idle, that start refreshes the lapsed access
+token, before the URL is shown, so none of the code's life goes to it),
+prints Schwab's login URL for your app key and callback URL, and waits:
+
+1. Open the URL in a browser, on any machine, and log in to Schwab.
+2. The login lands on your callback URL (`https://127.0.0.1/?code=...`), a
+   page that does not load. Copy the whole address-bar URL and paste it at
+   the prompt within about 30 seconds: the code in it expires.
+
+It then trades the code for new tokens and prints the new window:
+
+```
+Renewed.
+The Schwab refresh token in /home/<user>/TradingBot/.schwabdev/tokens.db:
+  issued   2026-10-13 00:10:00 EDT
+  expires  2026-10-20 00:10:00 EDT
+  schwabdev asks for a new login from 2026-10-19 23:09:30 EDT
+The running bot, pid 1234, takes the new tokens from the store at its next Schwab call, no restart (its log: "Schwab tokens taken from the token store").
+Renew before then: by the close of the last session ahead of it (2026-10-19 16:00:00 EDT), or after that close while the bot idles.
+```
+
+A bot that started before `intraday_tv_schwab_bot/schwab_api.py` last
+changed (one running from before a pull) may run the code before this,
+which takes a renewal only at its next access-token refresh. The summary
+and the last lines say so for it: `pid 1234, working in
+/home/<user>/TradingBot, started before
+/home/<user>/TradingBot/intraday_tv_schwab_bot/schwab_api.py changed: it
+takes the new tokens from the store at its next access-token refresh
+(within 30 minutes during a session; after an idle stretch, at its first
+call)`.
+
+Run it in a terminal: a here-document (`python - <<'PY' ... PY`) or a pipe
+leaves its prompts nothing to read, so it refuses to start. A pasted URL
+that holds no code is refused before the code is sent (the client's start
+before it may have refreshed a lapsed access token; the refresh token is as
+it was). A failed exchange is
+reported with schwabdev's reason; a code lasts about 30 seconds, so run it
+again and paste the new URL at once. If schwabdev's client cannot start
+because another process held `tokens.db`'s lock for more than 5 seconds
+(the bot writing its tokens), it says so before the URL is shown, and no
+code was sent: run it again. It prints neither the app secret, nor a
+token, nor the pasted URL, and warns when `tokens.db` can be read or
+written by its group or others (fix: `chmod 600 .schwabdev/tokens.db`).
+Exit status: 0 renewed (with `--status`: the summary printed), 1 not
+renewed, 2 refused before the login (the login is as it was).
+
+**Where.** On the machine the bot runs on, with `tokens.db` on that
+machine's own disk. From another host over a shared folder (the checkout's
+SMB share, WSL, NFS) two things go wrong. The issue times are stamped by
+that host's clock, and the bot trusts them: a clock 10 minutes ahead makes
+the bot send a dead access token for 10 minutes, and ask for its next login
+10 minutes after its refresh token died. And sqlite's locking is not
+reliable over SMB or NFS, so the renewal and the bot can write over each
+other.
+
+Never replace `tokens.db` by a copy or a rename while the bot runs
+(`cp` or `rsync` over it, `mv`, an editor's save): the bot keeps the file
+it opened. A renewed copy renamed over it is taken at the bot's next call,
+then undone at its next refresh, when schwabdev refreshes from the file it
+still holds (unlinked) with the old refresh token; the path then shows the
+renewal while the bot runs on the old login until it expires (the script
+refuses such a store: the bot does not hold it open). A copy written over
+the open file bypasses sqlite's locks. The script writes the store in
+place, through sqlite.
+
+**What a held lock costs.** While the script trades the code (usually under
+a second; schwabdev waits up to 30 s for Schwab's answer) it holds
+`tokens.db`'s lock, and so does the client's start while it refreshes a
+lapsed access token. A bot that reaches its own access-token refresh
+meanwhile waits for that lock, and every Schwab call of the bot waits
+behind it: no quote and no order for that long, 30 s at most. Past that its
+refresh fails and the call carries its own token (one 401 at worst, if that
+token lapsed meanwhile). After the close, while the bot idles, it costs
+nothing.
+
+**When.** Once a week, before the login time the bot's `Schwab refresh
+token` line names (its WARNING, a trading day ahead, ends with the
+command). The bot makes no Schwab call between sessions, so renew by the
+close of the last session before that time, or in the idle hours after it,
+as the script's last line says: a renewal during a session reaches the bot
+at its next call, but risks the lock's cost above. A renewal in the evening
+puts the next login time in an evening too, a week on.
+
+**What the bot logs after.** At its next Schwab call it takes the new
+tokens from `tokens.db`: `INFO intraday_tv_schwab_bot.schwab_api Schwab
+tokens taken from the token store /home/<user>/TradingBot/.schwabdev/tokens.db,
+which another process wrote: access token issued 2026-10-13 00:10:00 EDT,
+refresh token issued 2026-10-13 00:10:00 EDT`. After an evening renewal
+that access token has lapsed by the next session (it lives 30 minutes), so
+schwabdev refreshes it in the same check, before a request carries it:
+`INFO Schwabdev Access token updated at ...`. A store the bot cannot read at
+that call (another process writing it) leaves it its tokens, with one
+`WARNING ... Schwab token store ... changed but could not be read (...)`,
+and the next call tries again. Tokens written under a key the bot does not
+have are an ERROR, `Schwab token store ... holds tokens another process
+wrote that this bot's key (schwab.encryption) does not decrypt (...)`. Only
+another writer can store them (the script refuses a key that does not
+read the store, and takes the bot's own), and the bot keeps its own tokens
+only until its next refresh point: there schwabdev's own reload takes that
+write's issue times but not its tokens, so the bot sends its own access
+token past its expiry (401s), then refreshes with its old refresh token and
+writes it back, as it keeps its tokens, under that write's issue time: a
+window `--status` and the WARNING show but its refresh token does not
+have. Until that write-back the script refuses the store (its tokens do
+not read with the bot's key): renew with it, no flags, once it no longer
+refuses (within 30 minutes), or restart the bot with the key that wrote
+the store. The next trading day's `Schwab refresh token issued ...` line
+shows the renewal's time; `--status` shows it at once.
+
+**The deadline.** The refresh token expires 7 days after the login that
+issued it, and schwabdev asks for a new login once less than 3630 s of it
+is left. Past that time, a bot under systemd fails every call (above) until
+the login is renewed; run the script then too, and the bot recovers at its
+next call, no restart. A bot stopped for more than 7 days needs the
+renewal before it starts again: the script works with the bot stopped
+too, given the bot's `--config` (and `--env`), since there is no running
+bot to find them on; run it from the bot's working folder (where a
+relative `tokens_db` and the `.env` are read), with the shell
+environment the bot starts with.
 
 ### TradingView session expiry
 
@@ -721,8 +942,10 @@ unit runs is listed too; `ps -o pid,tty,args -p <pid>` tells them apart
 (the unit's has no terminal: `?`).
 
 **Don't fight this — sidestep it.** Auth on a machine that has a
-browser, SCP the `tokens.db` over (see "First-time Schwab OAuth"
-above). The encryption key in `.env` must match between machines.
+browser, SCP the `tokens.db` over with the bot stopped (see "First-time
+Schwab OAuth" above), or set `schwab.open_browser_for_auth: false` so no browser is
+spawned. The encryption key in `.env` must match between machines. The
+weekly renewal, `scripts/renew_schwab_token.py`, never opens a browser.
 
 ### Bot starts in shell but fails under systemd
 

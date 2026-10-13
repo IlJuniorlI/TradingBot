@@ -55,38 +55,15 @@ _SECRET_PLACEHOLDERS: frozenset[str] = frozenset({
 _LOADED_DOTENV_PATHS: set[Path] = set()
 
 
-def _load_dotenv(config_path: Path, explicit_env_path: Path | None = None) -> None:
-    """Populate os.environ from a .env file if one exists.
-
-    If ``explicit_env_path`` is provided (e.g. via the ``--env`` CLI flag),
-    that file is loaded with priority. If it's set but missing, a hard
-    error is raised — the user explicitly asked for it, so silently
-    falling back would hide the typo.
-
-    Otherwise, searches the config file's parent directory, (if under
-    ``configs/``) the repo root, and finally the current working
-    directory. Only sets keys that aren't already present in the
-    environment — process env always wins over file values, so a .env
-    never silently overrides something the user set explicitly. Each
-    resolved path is parsed at most once per process.
-    """
+def dotenv_path(config_path: Path, explicit_env_path: Path | None = None) -> Path | None:
+    """The .env file ``load_config`` reads for ``config_path``:
+    ``explicit_env_path`` (the ``--env`` CLI flag) as given, else the first
+    that exists of the config's folder's, (for a config under ``configs/``)
+    the folder above's and the working directory's; None when none exists.
+    scripts/renew_schwab_token.py names it as where a credential came
+    from."""
     if explicit_env_path is not None:
-        path = Path(explicit_env_path).expanduser()
-        if not path.is_file():
-            raise FileNotFoundError(
-                f".env file not found: {path}. Pass --env with a valid path or omit it to auto-discover."
-            )
-        resolved = path.resolve()
-        if resolved in _LOADED_DOTENV_PATHS:
-            return
-        _LOADED_DOTENV_PATHS.add(resolved)
-        try:
-            _parse_dotenv_into_environ(path)
-            LOG.info("Loaded .env from %s (explicit --env)", path)
-        except OSError as exc:
-            LOG.warning("Failed to read .env at %s: %s", path, exc)
-        return
-
+        return Path(explicit_env_path).expanduser()
     candidates: list[Path] = []
     config_parent = config_path.resolve().parent
     candidates.append(config_parent / ".env")
@@ -96,21 +73,44 @@ def _load_dotenv(config_path: Path, explicit_env_path: Path | None = None) -> No
     cwd_env = Path.cwd() / ".env"
     if cwd_env not in candidates:
         candidates.append(cwd_env)
+    return next((path for path in candidates if path.is_file()), None)
 
-    for path in candidates:
-        if not path.is_file():
-            continue
-        resolved = path.resolve()
-        if resolved in _LOADED_DOTENV_PATHS:
-            return  # already processed this .env in a prior call
-        # Mark as loaded before parsing so a malformed file isn't retried.
-        _LOADED_DOTENV_PATHS.add(resolved)
-        try:
-            _parse_dotenv_into_environ(path)
-            LOG.debug("Loaded .env from %s", path)
-        except OSError as exc:
-            LOG.warning("Failed to read .env at %s: %s", path, exc)
+
+def _load_dotenv(config_path: Path, explicit_env_path: Path | None = None) -> None:
+    """Populate os.environ from the .env file ``dotenv_path`` names, if one
+    exists.
+
+    If ``explicit_env_path`` is provided (e.g. via the ``--env`` CLI flag),
+    that file is loaded with priority. If it's set but missing, a hard
+    error is raised — the user explicitly asked for it, so silently
+    falling back would hide the typo.
+
+    Only sets keys that aren't already present in the environment — process
+    env always wins over file values, so a .env never silently overrides
+    something the user set explicitly. Each resolved path is parsed at most
+    once per process.
+    """
+    path = dotenv_path(config_path, explicit_env_path)
+    if explicit_env_path is not None and not path.is_file():
+        raise FileNotFoundError(
+            f".env file not found: {path}. Pass --env with a valid path or omit it to auto-discover."
+        )
+    if path is None:
         return
+    resolved = path.resolve()
+    if resolved in _LOADED_DOTENV_PATHS:
+        return  # already processed this .env in a prior call
+    # Mark as loaded before parsing so a malformed file isn't retried.
+    _LOADED_DOTENV_PATHS.add(resolved)
+    try:
+        _parse_dotenv_into_environ(path)
+    except OSError as exc:
+        LOG.warning("Failed to read .env at %s (%s: %s)", path, type(exc).__name__, exc)
+        return
+    if explicit_env_path is not None:
+        LOG.info("Loaded .env from %s (explicit --env)", path)
+    else:
+        LOG.debug("Loaded .env from %s", path)
 
 
 def _parse_dotenv_into_environ(path: Path) -> None:
@@ -1564,6 +1564,12 @@ class BotConfig:
     technical_levels: TechnicalLevelsConfig
     options: ZeroDteOptionsConfig
     strategies: dict[str, StrategyConfig]
+    # The ``--config`` and ``--env`` paths as the bot was given them
+    # (``load_config``'s ``path`` and ``env_path``; ``env_path`` None when
+    # the .env is found the usual way): the refresh token's WARNING names
+    # the renewal command with them.
+    config_path: str
+    env_path: str | None
     events: EventsConfig = field(default_factory=EventsConfig)
     shared_entry: SharedEntryLogicConfig = field(default_factory=SharedEntryLogicConfig)
     shared_exit: SharedExitLogicConfig = field(default_factory=SharedExitLogicConfig)
@@ -2766,5 +2772,7 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
         shared_exit=shared_exit_cfg,
         options=options_cfg,
         strategies=strategies,
+        config_path=str(path),
+        env_path=str(env_path) if env_path else None,
         pairs=pairs,
     )

@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import signal
 import sqlite3
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dt_time, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
 import pandas as pd
@@ -296,6 +300,59 @@ class _HtfCycle:
     probed: bool = False
     probed_failing: bool = False
     held_back: bool = False
+
+
+# The script that renews the Schwab login from a terminal while the bot runs
+# (the bot takes the new tokens from the token store at its next Schwab call:
+# ``PooledSchwabClient._take_store_write``).
+RENEW_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "renew_schwab_token.py"
+
+
+def renewal_command(config: BotConfig, *, cwd: Path, python: str, windows: bool) -> str:
+    """The command that renews the Schwab login of the bot running on
+    ``config`` in ``cwd`` with the interpreter ``python``: ``cd`` to that
+    folder, then ``RENEW_SCRIPT`` by its full path with the ``--config``
+    (and ``--env``, when the bot was given one) the bot was started with
+    (``BotConfig.config_path``, ``env_path``), as it was given them. The
+    script reads them, and the token store, in the folder of the bot it
+    finds running (or, with none running, the folder it is run from), as
+    the bot does. The interpreter, when under the folder, is given
+    relative to it. Quoted for a POSIX shell, or for cmd.exe when
+    ``windows``."""
+    words = [str(Path(python).relative_to(cwd)) if Path(python).is_relative_to(cwd) else python, str(RENEW_SCRIPT),
+             "--config", config.config_path]
+    if config.env_path is not None:
+        words += ["--env", config.env_path]
+    if windows:
+        return f"cd /d {subprocess.list2cmdline([str(cwd)])} && {subprocess.list2cmdline(words)}"
+    return f"cd {shlex.quote(str(cwd))} && {shlex.join(words)}"
+
+
+def session_end_time(config: BotConfig, session: EquitySessionState) -> dt_time:
+    """When the bot's trading day ``session`` ends on ``config``: the latest
+    of the regular close (13:00 on an early-close day) and the strategy's
+    management, entry and screener windows' ends, so a post-market window
+    counts. The auto-exit stops after it."""
+    schedule = config.active_strategy.schedule()
+    ends = [session.rth_close_time]
+    for window in schedule.management_windows + schedule.entry_windows + schedule.screener_windows:
+        ends.append(window.end)
+    return max(ends)
+
+
+def session_ends_after(config: BotConfig, now: datetime) -> Iterator[datetime]:
+    """The ends (``session_end_time``) of the sessions to come, in order,
+    the first the coming session's: today's while ``now`` is a trading day
+    before it ends, else the next trading day's. Weekends and exchange
+    holidays hold no session."""
+    day = now.date()
+    while True:
+        session = equity_session_state(datetime.combine(day, dt_time(12, 0), tzinfo=EXCHANGE_TZ))
+        if session.is_trading_day:
+            end = datetime.combine(day, session_end_time(config, session), tzinfo=EXCHANGE_TZ)
+            if end > now:
+                yield end
+        day += timedelta(days=1)
 
 
 class IntradayBot:
@@ -810,7 +867,7 @@ class IntradayBot:
                         # Non-trading day (weekend/holiday) — exit immediately
                         LOG.info("Auto-exit: non-trading day, no open positions — shutting down")
                         return
-                    exit_after = self._session_end_time(session)
+                    exit_after = session_end_time(self.config, session)
                     if now_t > exit_after:
                         LOG.info("Auto-exit: all windows closed at %s, no open positions — shutting down", exit_after.strftime("%H:%M"))
                         return
@@ -878,48 +935,28 @@ class IntradayBot:
             f"Last error: {first_line}"
         )
 
-    def _session_end_time(self, session: EquitySessionState) -> dt_time:
-        """When this bot's trading day ``session`` ends: the latest of the
-        regular close (13:00 on an early-close day) and the strategy's
-        management, entry and screener windows' ends, so a post-market window
-        counts. The auto-exit stops after it."""
-        schedule = self.config.active_strategy.schedule()
-        ends = [session.rth_close_time]
-        for window in schedule.management_windows + schedule.entry_windows + schedule.screener_windows:
-            ends.append(window.end)
-        return max(ends)
-
-    def _session_ends_after(self, now: datetime) -> Iterator[datetime]:
-        """The ends (``_session_end_time``) of the sessions to come, in
-        order, the first the coming session's: today's while ``now`` is a
-        trading day before it ends, else the next trading day's. Weekends and
-        exchange holidays hold no session."""
-        day = now.date()
-        while True:
-            session = equity_session_state(datetime.combine(day, dt_time(12, 0), tzinfo=EXCHANGE_TZ))
-            if session.is_trading_day:
-                end = datetime.combine(day, self._session_end_time(session), tzinfo=EXCHANGE_TZ)
-                if end > now:
-                    yield end
-            day += timedelta(days=1)
-
     def _log_refresh_token_window(self) -> None:
         """Log when the Schwab refresh token was issued, when it expires and
         when schwabdev will ask for a new login (``schwab_api.RefreshTokenWindow``),
         read from its token store with no request and no login flow. INFO,
         or WARNING when that login falls before the session after the coming
-        one ends (``_session_ends_after``), or has already passed (the line
+        one ends (``session_ends_after``), or has already passed (the line
         then says so and to log in now): an interactive run then waits at
         schwabdev's prompt inside an API call, and a systemd run's prompt
         fails (EOFError) on every call, which fail (401) once the access
-        token lapses (``schwab_api.SCHWABDEV_LOGIN_LEAD``). A day ahead, not
-        only on the day: a bot started each day (``auto_exit_after_session``)
-        logs this once, at start-up, and the next day's start-up may already
-        meet the prompt inside the client's own start, before it logs
-        anything. A store that cannot be read is a WARNING naming the error's
-        type. Entries are not blocked. Called at start-up and on the first
-        pass of each trading day (``_maybe_log_refresh_token_window``); both
-        stamp the day."""
+        token lapses (``schwab_api.SCHWABDEV_LOGIN_LEAD``). Both WARNINGs
+        end with the command that renews the login from a terminal while
+        the bot runs (``renewal_command``: scripts/renew_schwab_token.py
+        with this bot's ``--config`` and ``--env``); the bot takes the new
+        tokens from the store at its next Schwab call
+        (``PooledSchwabClient._take_store_write``). A day ahead, not only on
+        the day: a bot started each day (``auto_exit_after_session``) logs
+        this once, at start-up, and the next day's start-up may already meet
+        the prompt inside the client's own start, before it logs anything. A
+        store that cannot be read is a WARNING naming the error's type.
+        Entries are not blocked. Called at start-up and on the first pass of
+        each trading day (``_maybe_log_refresh_token_window``); both stamp
+        the day."""
         now = sessions.now_et()
         self._refresh_token_logged_date = now.date()
         tokens_db = self.config.schwab.tokens_db
@@ -940,11 +977,12 @@ class IntradayBot:
             # the same way.
             expiry = "expired" if now > expires_at else "expires"
             LOG.warning("Schwab refresh token %s, %s %s; schwabdev has asked for a new login since %s: log in "
-                        "again now. Until then an API call on a terminal waits at schwabdev's prompt; under systemd "
-                        "the prompt fails (EOFError) and the calls fail (401) once the access token lapses.",
-                        issued, expiry, f"{expires_at:{stamp}}", f"{login_at:{stamp}}")
+                        "again now (or paste at the bot's own prompt if it waits at one). Until then an API call on "
+                        "a terminal waits at schwabdev's prompt; under systemd the prompt fails (EOFError) and the "
+                        "calls fail (401) once the access token lapses. %s",
+                        issued, expiry, f"{expires_at:{stamp}}", f"{login_at:{stamp}}", self._renew_with())
             return
-        ends = self._session_ends_after(now)
+        ends = session_ends_after(self.config, now)
         coming_end, following_end = next(ends), next(ends)
         times = (f"{issued}, expires {expires_at:{stamp}}; "
                  f"schwabdev asks for a new login from {login_at:{stamp}}")
@@ -952,12 +990,23 @@ class IntradayBot:
             which, end = ("the coming session", coming_end) if login_at < coming_end else \
                 ("the session after the coming one", following_end)
             LOG.warning("Schwab refresh token %s, before %s ends (%s): log in again before then. From then an API "
-                        "call on a terminal waits at schwabdev's prompt; under systemd the prompt fails (EOFError) "
-                        "and the calls fail (401) once the access token lapses.",
-                        times, which, f"{end:{stamp}}")
+                        "call on a terminal waits at schwabdev's prompt; under systemd the prompt fails (EOFError) and "
+                        "the calls fail (401) once the access token lapses. %s",
+                        times, which, f"{end:{stamp}}", self._renew_with())
         else:
             LOG.info("Schwab refresh token %s, after the session after the coming one ends (%s).",
                      times, f"{following_end:{stamp}}")
+
+    def _renew_with(self) -> str:
+        """The refresh token WARNINGs' last sentence: how to log in again
+        from a terminal while this bot runs (``renewal_command``), or, for
+        an installed package (no scripts folder beside it), where the
+        script is not."""
+        if not RENEW_SCRIPT.is_file():
+            return (f"To log in again while the bot runs, run scripts/renew_schwab_token.py from a source checkout "
+                    f"of this version: this install has no {RENEW_SCRIPT}.")
+        command = renewal_command(self.config, cwd=Path.cwd(), python=sys.executable, windows=os.name == "nt")
+        return f"To log in again from a terminal while the bot runs (no restart needed): {command}"
 
     def _maybe_log_refresh_token_window(self) -> None:
         """``_log_refresh_token_window`` on the first pass of each trading
