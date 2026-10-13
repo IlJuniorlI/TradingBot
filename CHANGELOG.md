@@ -9,6 +9,187 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The day ends when no full trade fits under the daily loss limit: the
+  first time the session's realized P&L leaves no room for one trade's risk
+  under `max_daily_loss`, new entries end until the next session, a restart
+  keeps that unless its configuration leaves room for a full trade, and
+  once nothing is held the bot idles until the next session as it idles
+  overnight; before that, the daily-loss check counts the entry's own risk
+  to its stop; a stored risk state the start cannot read blocks entries
+  until it is read; the dashboard says the day is over and the SESSION
+  REPORT says when it ended.** *2026-10-12* — on H: 10-12 (`max_daily_loss`
+  500, 120 a trade) AVGO's stop at 10:06:43 took the day to -415.87, which
+  left 84.13 under the limit, less than one trade's risk. The bot took four
+  more entries; the last, VRT LONG at 10:54:53, stopped at 11:19:03 for
+  -63.86, the day at -521.46. Flat from then on, it ran 1,441 more entry
+  cycles with no signal by 12:19, and the dashboard read "Running" with no
+  blocked reason.
+  - The latch (`RiskManager.daily_loss_latch`, `DailyLossLatch`): the first
+    booking (an exit, a partial one, a close the reconcile books) that takes
+    the realized tally to `-(max_daily_loss - one trade's risk)` or past it
+    sets it, with one WARNING (`Daily loss limit reached: realized P&L
+    -415.87 leaves 84.13 under max_daily_loss 500.00, no room for one
+    trade's risk of 120.00. ...`). From then on `can_open` refuses every
+    entry (`daily_loss_limit_reached`) until the tally resets at the next ET
+    date, even if a position still open then closes at a profit. One
+    trade's risk (`RiskManager.trade_risk_budget`) is the most the strategy
+    sizes an entry to risk: an equity strategy's per-trade budget,
+    `max_notional_per_trade × risk_per_trade_frac_of_notional` (H: 15,000 ×
+    0.008 = 120, so the day ends at -380), and an option strategy's
+    `options.max_loss_per_trade`; a run enters one kind. The config load
+    refuses a `max_daily_loss` at or under one trade's risk; every preset
+    passes. The 0DTE presets' comments now say their days end after three
+    full-loss trades (at -1500 of 2000, and -750 of 1000), not four.
+  - Across a restart: the latch is stored with the tally in
+    `session_risk_state`, with the limit and the one trade's risk it set
+    under, so a restart that day keeps it. A start whose configuration
+    leaves room for a full trade at the lower of the latch's realized P&L
+    and the day's (a raised `max_daily_loss`, a smaller trade) clears it
+    with a WARNING naming both limits (`The daily loss latch set at ... is
+    cleared: ...`), and the day keeps it as cleared, with when the start
+    cleared it, the limits it started with and the day's P&L then; any
+    other start keeps it, so neither a restart alone nor a profit after the
+    latch lifts it. A later loss past the new line sets it again. A stored
+    latch that cannot be read is kept, and a tally an earlier version
+    stored that leaves no room latches when it is restored. The table gets
+    five new columns (`daily_loss_latched_at`, `_pnl`, `_limit`,
+    `_trade_risk` and `daily_loss_cleared_json`), added to an existing file
+    when the store first opens it.
+  - The entry's own risk, before the latch (`RiskManager.candidate_risk`,
+    `daily_loss_refusal`): the day's worst case with the entry is its
+    realized P&L, less the open positions' risk to their current stops when
+    `daily_loss_includes_open_risk` is on (its meaning is unchanged), less
+    the entry's own risk to its stop at the size it would take. At or past
+    `-max_daily_loss` the entry is refused (`daily_loss_limit`, a WARNING
+    naming the own risk). An option's own risk is its max loss per contract
+    times the contracts it would buy; an equity's is its stop distance
+    times the shares it would buy at the signal's entry price before its
+    quote, and the entry gatekeeper checks again at the quote's limit and
+    size before the order. The per-trade budget stands in when the signal
+    names no entry price, and a risk that cannot be read refuses the entry
+    (`daily_loss_risk_unreadable`).
+  - The idle (`CycleGate.evaluate`, `CycleGateState.day_over_idle`):
+    latched with nothing held (no position, equity or option, no entry
+    order still working, no closed position's exit orders still to sweep,
+    and live with the reconcile on, a last broker reconcile that succeeded
+    with no block: `IntradayBot._day_held_open`), the gate idles until the
+    next session: no screening, watchlist, frames, S/R, contexts, quotes or
+    stream, at the idle cadence, waking for the next session's prewarm
+    (today's later windows and their prewarm included). The 20:00 report
+    and archive, the dashboard, the refresh-token check and the broker
+    reconcile still run. One INFO line where it starts (`Idle until next
+    session: ...`) and one where it ends (`The day-over idle ended: ...`, a
+    new session or something held again). Latched with something still
+    held, management runs as usual and the entry pass does not.
+  - The day's close fetches the 1m bars the idle did not build, once,
+    before the report and the archive read them
+    (`IntradayBot._complete_idle_bars`): one `price_history` request per
+    symbol, from the idle's start for a symbol on the watchlist when it
+    began, and from `runtime.history_lookback_minutes` before it, as a late
+    start's warm-up, for the archive's other symbols (the strategy's
+    watchlist for its last candidates, and every symbol the day traded), so
+    a restart into a latched day, whose idle builds no watchlist, still
+    reports and archives the day's bars. The close is the 20:00 one or, for
+    a bot that stops before then, the shutdown's: the auto-exit's (every
+    preset but `peer_confirmed_key_levels` turns it on) and one an error
+    ended fetch them, a shutdown a stop signal started does not (its
+    exports run on the stop's clock). A request that fails ends the rest
+    with a WARNING, and the stored HTF frames are not fetched: those bars
+    then end at the idle's start. The bars are merged without raising the
+    depth the symbols' frames retain
+    (`MarketDataStore.fetch_history(set_depth=False)`), so an always-on
+    run's later sessions keep the frames a fresh start would.
+  - A stored risk state the start cannot read (a locked or corrupt file, a
+    column it cannot add) blocks new entries (`risk_state_unreadable`) until
+    a read, tried again every 60 s, succeeds, with one WARNING (`Could not
+    read the session risk state for <day> (<error>): ...`); exits,
+    management and disaster stops run as usual. What the day books
+    meanwhile is not written over the row and sets no latch on its own:
+    the read that succeeds adds it to the row and decides the latch on the
+    whole tally. The retry waits at most 0.25 s for a lock, since it runs on
+    the engine's pass ahead of management. A lock clears by itself; a
+    corrupt file blocks entries every session until it is repaired or moved
+    aside and the bot restarted (the README says how).
+    `SessionRiskStateStore.load` now raises on a read error: until now it
+    logged and returned nothing, which started the day flat, its realized
+    P&L read as 0, so a restart after a losing day reopened entries.
+  - The dashboard: its status reads `Idle until next session: daily loss
+    limit reached at 10:06:43 (realized -415.87, limit 500, one trade's risk
+    120)` in the idle and `Entries ended for the day: ...` while a position
+    is still managed, after the startup reconcile's block, and `Entries
+    blocked: the session risk state could not be read (...)` while it is
+    unread; `trading_blocked_reason` adds `risk_state_unreadable` and
+    `daily_loss_limit`. The phone page shows the same status.
+  - The SESSION REPORT: `daily_loss_limit_reached=no`, or the latch's time
+    and `daily_loss_limit_pnl`, on its line, then `daily_loss_limit_cleared`
+    when a start cleared that latch and `daily_loss_limit_earlier` for the
+    day's earlier latches a start cleared (`unknown` while the risk state is
+    unread, `yes` for a stored latch whose time cannot be read), and
+    `daily_loss_limit` (`limit`, `trade_risk`, `reached`, `at`,
+    `realized_pnl`, `cleared`, `earlier`) in its JSON, read from the day's
+    stored row for a day closed after midnight. Its post-stop continuation
+    and entry timing no longer score a window the symbol's frame ends
+    inside: until now a stop within 30 minutes of the 15:55 idle (and so of
+    a day-over idle) was scored on the bars its frame had, one or two for a
+    stop just before it, and counted as evaluated; the line now reads
+    `unevaluated=N: no initial risk, or no bars to the window's end`.
+  - Docs: the README (`max_daily_loss`, the unread state and its remedy,
+    the idle, the dashboard's status, the report's post-stop continuation
+    and entry timing).
+  - Decisions: the user's, 2026-10-12: the latch until the session resets
+    and kept across a restart; the day over when no full trade fits, at
+    one trade's risk under the limit; a raised limit clears it at a start;
+    the entry's own risk at its size before that, the per-trade budget
+    where the size is not known, refused when unreadable; the idle until
+    the next session once nothing is held, its status and one line where
+    it starts and ends. A close the session reconcile books at the start of
+    a trading day counts toward that day's tally and can end its entries
+    before its first window, by design.
+  - Measured: stepped replays of H:'s archive (the top_tier preset,
+    09:00-16:00 at 20 s) against the previous version. 09-30, a day whose
+    realized P&L never went below 0: identical in every recorded category,
+    its 22 trades and +116.70 the same. 10-07 (the shipped preset: 500,
+    128 a trade, so the day ends at -372): identical to 09:47:40, where AMD
+    LONG's stop takes the day to -425.22 and the latch sets; flat, the bot
+    idles from 09:48:00. From there to 16:00 (1,117 passes) the previous
+    version built 30,856 frames, ran 154,956 map calls and sent 1,102
+    batched quote requests and 672 HTF fetches; the new one none, and logs
+    two lines. The previous version took 17 more trades that day, down to
+    -487.34 at 11:05:40 and back to -306.97; the new one ends at -425.22
+    over 8. 10-12 (H:'s 120 a trade, so the day ends at -380; the
+    replay's fills differ from H:'s live run): identical to 09:55:00,
+    where ANET SHORT's stop takes the day to -383.23 (116.77 left) and the
+    latch sets with AVGO LONG still open. MSFT LONG at 09:56:20 is
+    refused (the previous version took it and lost 49.95); AVGO's stop at
+    10:06:40 ends the day at -484.09 against -534.04, and the bot idles from
+    10:07:00. From there to 16:00 the previous version built 29,260 frames
+    and sent 1,045 batched quote requests and 644 HTF fetches, and it logged
+    38 daily-loss WARNINGs refusing entries (48 over the day, the first at
+    09:56:40); the new one none, two log lines. H:'s own log puts the latch
+    at 10:06:43 (AVGO's stop, -415.87) with GOOG and TSM open; the four
+    entries after it would have been refused, and the day would have ended
+    near -413.20 instead of -521.46.
+  - Tests: test_day_over_idle.py (through the real engine step, gate, loop
+    and close: the latch at 10-12's numbers with another position open,
+    which then closes at a profit with entries still ended; the idle once
+    flat, its cadence, wake, lines, the decisions it holds and the spread
+    watch it ends; no idle while a position, a working entry order, an exit
+    sweep or a live unreconciled or blocked account is held; the close's
+    bars fetch, once, without it, at the auto-exit's shutdown and not after
+    a stop signal, for a second idle the same day, for a symbol the day
+    traded off the watchlist and after a restart into the idle; a restart
+    with a raised limit and the report that keeps the cleared latch; an
+    unreadable risk state, and a stop while it is unread; the next session;
+    the dashboard status; the report fields), test_daily_loss_latch.py (the
+    line at one trade's risk, options, the store and restore, a raised
+    limit and the cleared latch it keeps, a later latch, the unread state,
+    no latch while unread, the retry's lock wait, the own risk, the
+    gatekeeper's check at the quote's size, the report field and line),
+    test_cycle_gate.py, test_post_stop_continuation.py and
+    test_entry_timing.py (a window the frame ends inside) and
+    test_config_validation.py (the limit above one trade's risk). 136
+    mutants, all killed.
+
 - **top_tier judges its break-even and profit-lock stops and its peak
   giveback floors on the bid (a LONG) or the ask (a SHORT) instead of the
   mark (`protective_exits_on_executable_side`, true in the shipped preset,
@@ -5842,6 +6023,108 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `levels_shared.find_divergence` a required `bar_clock`.
 
 ### Fixed
+
+- **top_tier's armed retest counts the bar right after the breakout as
+  part of its retest window, its confirmation bar (Fix B) and its ORB 5m
+  follow-through judge the last closed bar, and an armed retest that
+  resolved and was then refused by an entry gate leaves a record, on its
+  decision or on a signal built for the same symbol after it in the same
+  cycle.** *2026-10-12*
+  — the study of why the armed retest never became an entry found that it
+  does confirm, and that top_tier's own entry gates refuse the
+  confirmations (the stretched gate first, then S/R clearance). It also
+  found three defects, and these are fixed here. Loosening the gates is a
+  separate study.
+  - The touch window (`armed_retest.py`). `touched` read the bars
+    labelled after the arm's clock. Bars are labelled at their start, and
+    an arm is made seconds into the minute after its breakout bar, so the
+    first bar after the breakout was never in the window: that bar was
+    still trading when the arm was made, and it is the first bar of any
+    pullback. The arm now records its breakout bar (the base frame's last
+    bar, `breakout_bar`), and the window is every bar after it. With no
+    base frame the verdict does not arm.
+  - The confirmation bar (`confirmation.py`, `_entry_bar_confirms`). It
+    read `iloc[-2]` as the last closed LTF bar, on the premise that
+    `iloc[-1]` was still forming. The step frame holds closed bars only:
+    the minute history drops the minute still trading, and the stream
+    sends each bar once its minute has closed. So the gate judged the bar
+    before the last closed one: every trend, pullback, vol_squeeze and
+    momentum entry it judged (and small_cap_squeeze's) confirmed one bar
+    late, but the few whose step frame held a forming bar (in H:'s archive
+    140 decision events on 8 days up to 09-23, none from 09-24 on), and an
+    armed retest needed its reclaim bar and then one more. The gate now
+    judges the last closed bar. A coarser LTF's last bucket counts as
+    closed once the step frame holds its last minute (`last_closed_bars`).
+    The data end is the earlier of the step frame's end and the clock, so
+    a last bar whose minute is still trading by the clock (a partial
+    minute from the stream, or a history path that kept it) is left out,
+    at 1m too, and never confirms; the drop is logged with the symbol and
+    the bar.
+  - The ORB 5m follow-through gate made the same assumption. It now judges
+    the day's last closed 5m bar (`last_closed_bars`, the clock included),
+    from the first bar of the day on. A 5m bar that does not read, its
+    open or its close, now refuses the entry
+    (`<side>_orb_5m_unreadable`); before, it skipped the gate. ORB is
+    disabled in both shipped presets.
+  - The record (`strategy.py`). The verdict or the expiry sweep consumes
+    the arm before the build, and the signal is stamped with
+    `armed_retest_status` only when it is built. So a confirmed retest or a
+    held expiry that a gate refused left only the gate's untagged refusal.
+    The retest then read as never confirming: on H:, 10-07..10-09, 158 of
+    the 400 arms confirmed and were refused untagged. A check that passed
+    left no row beside the wait rows, and README section 24's A/B could not
+    see the arm. The decision row now carries
+    `<side>_build_failed_<regime>_armed_retest_refused(status=...,gate=...,level=...,waited=...m)`
+    after the gate's own refusal, which stays the row's reason. When another
+    regime builds a signal for the same symbol in the same cycle, the engine
+    writes that signal's own decision row in place of the strategy's, so the
+    symbol's records of that cycle ride on the signal as
+    `armed_retest_refused`, in its `ENTRY_CONTEXT` or the `SKIP_SUMMARY` of
+    an engine gate's refusal, and so does a faded expiry's row
+    (`armed_retest_faded`), which was lost the same way. On the replays
+    below records rode on four signals (one refused retest and four faded
+    expiries, on 09-24 and 09-25). The gatekeeper writes that `SKIP_SUMMARY`
+    only for the signal's first engine refusal on its bar: a repeat of the
+    same decision on the bar is deduped, and a skip while the stream book's
+    spread watch holds the signal writes none, so the records of such a
+    cycle are written nowhere (once on the replays below: ADBE's faded
+    expiry on 09-25). That is the gatekeeper's to fix
+    (`entry_gatekeeper.py`, not changed here); README section 24 lists it,
+    with the expiries that leave no row at all (outside the regime's time
+    window, or reaped by the prune). A built armed signal that an engine
+    gate refuses already carried `armed_retest_status` in its
+    `SKIP_SUMMARY`.
+  - Replays: stepped, the top_tier preset, synthetic L1, on 10-07, 10-08,
+    10-09, 09-24 and 09-25.
+    - The window alone: the arms that confirmed went from 231 to 399, and
+      no entry changed.
+    - The confirmation bar alone: they went to 397. The bar's refusals fell
+      by a third for pullback and by more than half for momentum. Four
+      entries changed: NFLX short pullback in on 10-07 (+9.28), DELL long
+      pullback in on 10-08 (-78.03), ADBE long pullback a bar earlier on
+      10-09, and ANET long trend on 10-08, an armed retest built and
+      stopped (-83.62).
+    - Both fixes: 606 confirmations, 605 of them refused (the stretched
+      gate and its cooldown 71%, S/R clearance 12%), plus 110 refused held
+      expiries.
+    - Realized P&L went from -1,023.95 to -1,363.41. Of the difference,
+      -151.72 comes from those entries and -187.74 is knock-on. On 10-07
+      the extra NFLX win let a losing ADBE sr_scalp past the daily loss
+      limit, which counts open risk, and the limit then refused 10 later
+      entries (the 9 that closed had netted +130.50). On 10-08 the DELL
+      pullback took the slot of a DELL range trade (+13.77). 09-24 and
+      09-25 changed nothing.
+    - With the record and without it, every trade is identical on every
+      day, and so is every decision, position and signal once the record
+      is removed.
+    - small_cap_squeeze on 06-02 and 06-03 (confirmation bar): ZJYL's trend
+      long on 06-02 came 19 minutes earlier (+23.40 where the later one
+      lost -44.22), and 06-03 is unchanged.
+    - ORB switched on for 09:30-10:10 of the five days: the 5m gate refused
+      other minutes, and no ORB entry changed.
+  - The preset's comment on `armed_retest_min_close_position` and the
+    README said the reclaim bar must close in the top 60% of its range. At
+    0.60 the code requires the top 40%. The texts now say so.
 
 - **The account's money figures say whose they are: the run's trade
   statistics cover every trade the process closed, a day ledger keeps each
