@@ -9,6 +9,147 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`scripts/renew_schwab_token.py` renews the Schwab login from a terminal
+  while the bot runs, with no flags: it finds the running bot, reads its
+  settings, `.env` and token store in the bot's working folder and its
+  credentials from the bot's environment, proves they fit the token store
+  before the login and asks to confirm; the bot takes a renewal at its next
+  Schwab call; the refresh token's WARNING ends with the renewal command for
+  that bot.**
+  *2026-10-13* — schwabdev's refresh token lives 7 days and only a browser
+  login renews it. On H: the night of 10-12 the user renewed it from a
+  second terminal with schwabdev's own client
+  (`update_tokens(force_refresh_token=True)`) while the bot ran; a
+  here-document form of the same failed at once, its prompt reading an
+  exhausted stdin (EOFError), and nothing told which config, `.env` and
+  token file the running bot used.
+  - Which bot: the script finds the bot of its checkout in /proc (a
+    process of this user running the checkout's `main.py` from any working
+    folder, or the `intraday-tv-schwab-bot` console script working in the
+    checkout) and says so (`The bot of /my-files/TradingBot running: pid
+    ..., working in /my-files/TradingBot (--config
+    configs/config.top_tier_adaptive.yaml, no --env).`). It takes its
+    `--config` and `--env`, read with the bot's own parser
+    (`cli.argument_parser`), and reads them, the `.env` and a relative
+    `schwab.tokens_db` in the bot's working folder, as the bot did.
+  - Which credentials: the app key, the app secret and the key are the
+    bot's: the environment it was started with (`/proc/<pid>/environ`) over
+    the `.env` it read, as the bot's loader let it, never this shell's
+    while a bot runs (a shell exporting another Schwab app's key would log
+    in as that app, whose tokens the bot cannot refresh). The summary says
+    where each came from, never the value; a bot whose environment cannot
+    be read is refused.
+  - What the bot loaded: /proc keeps the bot's environment as it started,
+    not its config and `.env`, which the script reads as they are now. A
+    config or `.env` it reads for the bot that changed after the bot
+    started (`/proc/<pid>/stat`; a symbolic link re-pointed counts) is
+    refused, naming it (`Refused: <file> changed at ..., after the running
+    bot, pid ..., started (...)`): a `.env` given another app for the next
+    restart, or a preset a pull changed, would otherwise renew an app or a
+    store the bot does not run with. Restart the bot: a file put back with
+    its old modification time (mv, cp -p, rsync -a), or whose mode
+    changed, still counts, by its status-change time. The store renewed
+    must be the file the bot holds open (`/proc/<pid>/fd`, by device and
+    inode; schwabdev keeps it open): a store replaced by a copy or a
+    rename while the bot runs, or one found elsewhere (a preset changed
+    with its time kept, another `--config`, a `~/` path read with another
+    home folder), is refused, naming it and the sqlite files the bot holds
+    open (`... (deleted)` for a replaced one).
+  - `--config` and `--env` given with a bot running are checked against
+    its own, each loaded as the bot loads it (its environment over that
+    config's `.env`): another token store (both are named) or other
+    credentials (an `--env` with another app's key and secret) are
+    refused: the renewal would not reach the bot. With no bot running they
+    are used, read in the folder the script is run from, and the summary
+    says the bot reads the store at its next start. With no bot running
+    and no `--config`, or several bots, it stops (the presets listed); it
+    never falls back to a default config. A bot of another user is named,
+    with that user. A bot whose command line the bot's parser no longer
+    reads (a `--strategy` the pulled code dropped) is still the running
+    bot, its environment and the store it holds open included, but its
+    `--config` cannot be told: refused, saying why (argparse's own lines
+    not printed), unless `--config` is given, which is used only if it
+    names that store.
+  - The checks, before the login: on a copy of `tokens.db` in memory, the
+    configured key must read the stored tokens. Refused, naming where the
+    key came from: tokens in clear with a key configured (the renewal
+    would store them encrypted, which the keyless bot cannot read),
+    encrypted tokens with none, another key, a key that is not a Fernet
+    key, and a store or folder this user cannot write (Schwab takes the
+    code before the write). Also refused: a stdin that is not a terminal,
+    a missing or locked store (the bot writing its tokens, or a bot waiting
+    at schwabdev's own prompt) and a pasted URL with no code, before the
+    code is sent. It then shows the config, the `.env`, the credentials'
+    sources, the store's path, its refresh token's issue, expiry and login
+    time in ET, how its tokens are kept and the bot that takes them and
+    when (at its next Schwab call; a bot that started before
+    `intraday_tv_schwab_bot/schwab_api.py` last changed, at its next
+    access-token refresh), and asks `Renew it? [y/N]`.
+  - The login: schwabdev's client starts on the store first (after an
+    evening's idle that start refreshes the lapsed access token), then the
+    login URL is shown and the address-bar URL read, so the code's ~30 s
+    cover the exchange alone; the client is handed the pasted URL only once
+    there is one. It prints the new window, which bot takes it and when,
+    and when to renew next, or why it failed (schwabdev's reason, or the
+    error with its type). `--status` makes the same checks and prints the
+    summary, read-only. Neither prints the app secret, a token or the
+    pasted URL; both warn when `tokens.db` can be read or written by its
+    group or others. Exit status: 0 renewed, 1 not renewed, 2 refused
+    before the login.
+  - The bot (`PooledSchwabClient._take_store_write`) takes the tokens
+    another process wrote to the store at its next Schwab call: `INFO
+    Schwab tokens taken from the token store ..., which another process
+    wrote: access token issued ..., refresh token issued ...`. schwabdev
+    reloads the store only when it refreshes a token, so a renewal made
+    during a session reached the bot up to 29 minutes later. The check
+    stats the store and its `-wal` and `-journal` files once per call
+    (device, inode, size and modification time: a copy renamed over the
+    store with its size and time is seen by its inode) and opens no
+    descriptor of the store outside sqlite: POSIX locks belong to
+    the process, and closing one drops schwabdev's lock over its refresh,
+    which would let a renewal be written inside the bot's transaction and
+    undone by its commit. It reads the store, through sqlite, read-only and
+    without waiting for a lock, only when that changed. A store it cannot
+    read keeps the bot's tokens, with one WARNING, and the next call tries
+    again; tokens its key does not decrypt keep them too, with one ERROR,
+    until the bot's next refresh point, where schwabdev's own reload takes
+    that write's issue times but not its tokens and the bot writes its old
+    refresh token back under them (only another writer than the script can
+    store such tokens; README_LINUX_DEPLOY.md says how to recover). A token
+    schwabdev's own reload takes past its refresh point (when the bot's
+    read met a lock) is refreshed at once, with an INFO line; until now the
+    check before each call took such a token and only each request's own
+    check refreshed it, so calls made together each refreshed it and the
+    stream's (re)connect sent it. The stream's (re)connect makes that
+    serialized check alone: schwabdev's own, unserialized, refreshed again
+    behind a call that was refreshing, and ran the login flow a second time
+    per reconnect. tests/foundation/test_pooled_schwab_client.py pins the
+    schwabdev code the bot and the script rely on (`Tokens` reload,
+    refresh, login and write, `ClientBase.__init__` and
+    `_get_streamer_info`).
+  - The refresh token's WARNINGs (at start-up and on each trading day's
+    first pass) end with the command that renews the login from a terminal
+    while the bot runs: to the bot's working folder, then the script by its
+    full path with the `--config` and `--env` the bot was started with
+    (`BotConfig.config_path`, `env_path`, kept by `load_config` as given):
+    `To log in again from a terminal while the bot runs (no restart
+    needed): cd /my-files/TradingBot && .venv/bin/python
+    /my-files/TradingBot/scripts/renew_schwab_token.py --config
+    configs/config.top_tier_adaptive.yaml`. An installed package, with no
+    scripts folder, says to run the script from a source checkout instead.
+    README_LINUX_DEPLOY.md: "Renewing the Schwab login without a restart"
+    (which settings and credentials, what the bot loaded, the checks, the
+    login, where to run it: on the bot's machine with `tokens.db` on its
+    own disk, never replacing `tokens.db` by a copy or a rename while the
+    bot runs, what a held lock costs the bot, what the bot logs after, the
+    deadline) replaces the stop-and-copy steps.
+  - `config.dotenv_path` names the `.env` `load_config` reads (a missing
+    `--env` is an error naming it, an unreadable `.env` a WARNING naming
+    the error's type: both pinned by tests);
+    `engine.session_end_time` and `engine.session_ends_after` are module
+    functions, and `cli.default_config_path` and `cli.argument_parser` are
+    public (the script uses them).
+
 - **The day ends when no full trade fits under the daily loss limit: the
   first time the session's realized P&L leaves no room for one trade's risk
   under `max_daily_loss`, new entries end until the next session, a restart
