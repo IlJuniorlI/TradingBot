@@ -6024,6 +6024,146 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **peer_confirmed_key_levels: the trigger's sweep is a real sweep and
+  min_ltf_score gates the base score; the trigger reads completed 5m
+  buckets, each judged once; stale or missing peer and macro votes count
+  against the side; the entry spread guard and the protective exits on the
+  bid / ask; both sides flattened, a carried position flattened at the next
+  session's first pass, and no entry in the 10 minutes before the flatten;
+  every knob checked at load.** *2026-10-13* — a study of the strategy on
+  8c40c29 found the strategy's trigger gate mostly free and its
+  extended-hours trading unguarded.
+  - The sweep-reclaim / sweep-reject term (+1) counts only when, within the
+    4-bucket trigger window, a low traded below the level (a high above it,
+    a SHORT) and the trigger bucket closed back at or across it. Until now a
+    low inside the zone ABOVE the level counted: the very touch that selects
+    the level, on a level that sits on the trade's side of the close since
+    the HTF context is built at the reader's price (8b1c0bf) -- so every
+    selected setup scored it. `min_ltf_score` now gates the 4-part base
+    score (`ltf_base_score_below_min:<base><<min>`, replacing
+    `ltf_score_below_min`); the capped quality bonus only ranks
+    (`ltf_score`, the selection preview, the strong-setup bar), as the
+    README always said. The bonus's terms and the 1-bar candle tier need a
+    real context term again. On the 7 archived key_levels entries (05-04,
+    05-05), rebuilt from the archive's 1m bars, the new trigger on the
+    completed bucket before each signal and the one after it reaches a best
+    base of 1.0-2.35 per entry: none passes 2.5. 8c40c29's trigger, on the
+    same bars, passes 3 of the 7 at the signal bar and 5 within the next 5
+    minutes (the May code and frames differed, so this is a proxy).
+  - The trigger, the level touch, the trigger ATR and the swing stop read
+    COMPLETED trigger buckets only: a bucket is complete once the step frame
+    holds a bar ending at its end, so a bucket whose last minute has not
+    arrived is not read as complete on the clock alone. Each completed
+    bucket is judged once: the first pass that sees it complete evaluates
+    the setup, and an entry can fire on that pass; later passes repeat its
+    verdict (`ltf_bucket_repeat` in the details; a signalled bucket reads
+    `ltf_bucket_signalled(bucket=HH:MM)`) until the next completes. A bucket
+    is judged only while the step frame ends within one 1m step of its end
+    (a thin name's next print still qualifies); one first seen later -- a
+    cooldown, an open position, a restart or a stream-inactive spell held
+    the symbol back -- is skipped as
+    `ltf_bucket_missed(bucket=HH:MM,late=Xm)` and the pass waits for the
+    next bucket. Nor is a bucket judged while the symbol's 1m backfill is
+    owed after the stream (re)started or reconnected having missed bars
+    (`MarketDataStore.pending_stream_backfill`, a new read-only accessor):
+    `ltf_bucket_backfill_pending(bucket=HH:MM,first_bar=HH:MM)`, no verdict
+    kept, judged once the backfill is in or missed once late. A candidate
+    whose judgement raises is skipped alone as
+    `entry_pass_error(error=<type>)`, logged with its type (the traceback on
+    the first failure of a run and every 10th), its bucket keeping no
+    verdict, and the pass goes on: until now the raise ended the pass, and a
+    bucket judged earlier in it read as signalled for a signal the entry
+    stage never saw. The four new tokens are divergence-ineligible. The 1m
+    variant judges each closed bar once. Until now the trigger read the
+    forming bucket, 1-5 minutes of a 5m candle against full ones (82% of the
+    time), up to five looks a bucket.
+  - A peer whose newest 1m bar started more than `peer_max_age_minutes` (3)
+    ago, or a macro symbol more than `macro_max_age_minutes` (20) ago, or
+    one with no bars, never agrees, and counts AGAINST the side (fail
+    closed): in the peer score (the fresh peers agreeing less those
+    disagreeing, less every peer with no fresh vote; htf_pivots and
+    trend_continuation read the same score) and in key_levels' macro net
+    bias. Fewer fresh peers than `min_peer_agreement` refuses the side as
+    `peers_stale(...)`, fewer fresh macro symbols than
+    `require_macro_agreement_count` (macro on) as `macro_stale(...)`, the
+    ages in the detail. VIX and $NYICDX print nothing after about 16:15 /
+    17:00, and their 15:5x bucket voted to 19:55; while stale votes only
+    abstained, 3 fresh bullish peers and 3 stale ones read +3 where the same
+    votes read 0 when current. What it costs: with `require_macro_net_bias`
+    on (the preset), once both index symbols are stale (from about 16:20: on
+    the archived days their live 1m series ended at 15:59) no side clears
+    the net bias on TLT alone, so key_levels opens nothing from then to its
+    19:40 entry cutoff. Both limits are at least 2 minutes; the macro one at
+    least `runtime.history_poll_seconds` / 60 + 2 (checked at the build).
+  - The entry spread guard (top_tier's rule, now strategy-neutral in
+    `shared_entry.entry_spread_limits` / `entry_spread_guard`; the four peer
+    manifests declare `max_entry_spread_r` / `max_entry_spread_target_frac`
+    at 0 and every peer preset sets 0.33 / 0.5), and
+    `protective_exits_on_executable_side` (manifests false, the four presets
+    true). key_levels' preset traded 07:00-19:55 on 5m-ATR stops with
+    neither: the median post-market R is about 14 bps (spread / R 0.15+
+    against 0.07 in RTH). top_tier keeps its own copy of the two guard
+    functions until a later change moves it onto the shared ones and deletes
+    the copy. config.example.yaml (htf_pivots) sets neither and runs on the
+    manifests' off / mark.
+  - Every peer preset flattens both sides (`force_flatten`): key_levels from
+    19:50 ET, key_levels_1m and htf_pivots from 15:50, trend_continuation
+    from 15:53 (12:55 on an early-close day). Until now key_levels,
+    key_levels_1m and htf_pivots held longs overnight (they flattened
+    shorts) and trend_continuation both sides: the median 19:55-07:00 gap
+    was 1.8x the RTH-median R, 71% of nights past 1R. A position still open
+    past its session (its flatten unfilled by 20:00, an outage, a restart
+    across the cutoff) is flattened at the next session's first management
+    pass (07:00 ET), with a WARNING naming it; until now it was managed as a
+    new one all the next session (the family's `should_force_flatten`). No
+    peer entry pass opens a side within `entry_cutoff_lead_minutes` (10, a
+    new knob) of its cutoff -- key_levels from 19:40, htf_pivots from 15:40,
+    inside its 13:00-15:45 window, 12:45 on an early-close day -- recorded
+    as `after_entry_cutoff(cutoff=HH:MM,flatten=HH:MM)` (the standard
+    token), or `<side>.after_entry_cutoff(...)` while the other side stays
+    open; until now a key_levels SHORT could enter 19:50-19:55, and its
+    19:40 bucket, judged at 19:45, open a position the 19:50 flatten closed.
+    A divergence-only entry opens no such side either
+    (`BaseStrategy.closed_entry_sides`, a new hook the shared stage asks);
+    `BaseStrategy._force_flatten_cutoff` is the one cutoff they and the
+    flatten read.
+  - Every knob the family reads is checked at load (`normalize_params`) and
+    at the build: present, typed (strict bools, whole numbers, symbols), in
+    range, `ltf_minutes` one of 1, 2, 3, 5, 6, 10, 15, 30, the peer and
+    macro counts reachable, the HTF longer than the LTF, the profit lock's
+    stop under its arm. min_rr -3, `min_peer_agreement: banana`,
+    `require_macro_agreement_count: 7` and `ltf_minutes: 7` loaded until
+    now. BaseStrategy's reads of the family's params are declared in the
+    four manifests at the base's defaults (htf_pivots' breakeven offset
+    0.02, its `pivot` style's) and checked with them:
+    `force_flatten_buffer_minutes` (`abc` raised in the flatten check, at
+    the first management pass of a position held on a flattened side; 5.9
+    was cut to 5 and -5 clamped to 0), `adaptive_breakeven_offset_r`, the
+    partial breakeven, the runner's target and trail (a non-number trail
+    read as unset), and a divergence-only entry's `ladder_*`
+    (`ladder_max_rungs: 0` read as 4), each adaptive stop move under the
+    peak R that arms it. The bounds against the rest of the config are
+    checked at the build: the buffer, and with the lead, shorter than the
+    last management window (a buffer of 1500 loaded and clamped the cutoff
+    to 00:00), and the macro age limit above the macro poll. htf_pivots and
+    trend_continuation check the family's knobs, not yet their own. A
+    misspelled params key still loads unread (no strategy-params schema
+    yet).
+  - The signal records `ltf_base_score` as read (a base of 0, possible at
+    `min_ltf_score: 0`, read as `ltf_score`), and ENTRY_CONTEXT logs it
+    beside `ltf_score_required`, the requirement on it.
+  - Divergence-only entries (off in every shipped preset) read the declared
+    `adaptive_breakeven_offset_r` instead of their style's default: reversal
+    entries of key_levels, key_levels_1m and trend_continuation move the
+    breakeven 0.02 -> 0.05 R, htf_pivots continuation entries 0.05 -> 0.02
+    R.
+  - Docs: the key_levels README's level-score inputs (no peer data; the
+    weight is in [0, 1], no 0.60 floor), windows, clearance rule (refused
+    only inside BOTH clearances), gate order and inert ladder knobs; the
+    variant READMEs; the presets' comments (each states exactly what its
+    flatten guarantees); README_STRATEGY_START_TIMES.md's force-flatten
+    rule.
+
 - **top_tier's armed retest counts the bar right after the breakout as
   part of its retest window, its confirmation bar (Fix B) and its ORB 5m
   follow-through judge the last closed bar, and an armed retest that
