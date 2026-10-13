@@ -160,7 +160,7 @@ Post-mortem on 2026-05-26 (7 LONGs on a +1.2% XLK day, 1W/6L, -$177.66) surfaced
 - **`stretched_cooldown_minutes`** (default `3.0`). Hysteresis on `reject_stretched_entries` (section 6a, Fix D#1). The `stretched_percent_b_max` / `stretched_atr_mult_max` thresholds are crisp — a single tick across relaxes them while the structural condition (price stretched above EMA20 / pinned to upper Bollinger band) is still active. AMZN on 5/26 was rejected at 10:11:41 with `pct_b=0.851` then entered 46 s later as the close ticked back across, losing $28. The cooldown stamps the failure timestamp and rejects subsequent stretched checks within the window. Per-symbol regardless of side. Disable with `stretched_cooldown_minutes: 0`.
 - **`pullback_require_fresh_leg`** (default `true`; 2026-05-27 addition). Pullback works when the prior leg is YOUNG and the retracement shallow; it fails when the trend is stale and price has given back most of the move. Reject pullback when BOTH `(bars_since_session_extreme * ltf_minutes) > pullback_max_minutes_since_session_extreme` (default `45`) AND `retracement_from_extreme_pct > pullback_max_leg_retrace_pct` (default `50`). AND-logic on purpose — fresh-but-deep retracements and old-but-shallow ones still trade. NEM on 5/27 LONG at 14:48 was 400 min past session high with 140% retracement (price had fallen below the anchor low) — exactly the "multi-hour rollover dressed as a pullback" pattern this gate catches. Implemented via `_pullback_leg_context` which estimates `minutes_since_extreme` from bar count × ltf_minutes (avoids per-bar timestamp arithmetic) and computes the retracement against the lowest-low-at-or-before the high bar (mirror for SHORT). Disable with `pullback_require_fresh_leg: false`.
 - **`require_explicit_side_decision`** (default `true`; 2026-05-27 addition — **Fix A**). Replaces the implicit "evaluate both sides per regime, pick the highest-scoring (side, regime) pair" with an evidence-based side decision computed BEFORE regime scoring. The old approach could pick SHORT just because the SHORT regime score was 0.5 higher even when every meaningful current-action signal said LONG. The new flow: `_decide_side` votes across four CURRENT price-action signals and either filters `preferred_sides` to a single decided side OR skips the candidate when signals are mixed. The wrong side is never evaluated. Votes contributed by: (1) recent return over `side_decision_recent_lookback_bars` (default `6` = 30 min at 5m), threshold `side_decision_recent_threshold_pct` (default `0.1`); (2) close vs session VWAP with `side_decision_vwap_buffer_pct` dead-band (default `0.0005` = 0.05%); (3) EMA9 vs EMA20 on the LTF; (4) last 3 LTF bars' green-count — **unanimous only** (3 green = LONG, 0 green = SHORT, mixed abstains; 2026-07-29, previously ≥2/≤1 which meant it always voted and let bounce bars out-vote the trend). Decision: a side wins when its votes ≥ `max(side_decision_min_agreeing, ceil(participating × side_decision_majority_frac))` AND opposing ≤ `side_decision_max_opposing` (default `1`). The threshold scales with the number of signals that actually voted — `recent` and `vwap` abstain ~35% of the time, and the previous absolute floor of 3 rejected unanimous 2-0 reads outright. Companion `orb_bypass_side_decision` (default `true`) skips the gate during the ORB window (through `orb_end_time`) (early-session signals are gap-dominated). 5/27 dry-run: NVDA SHORT (1-2 votes — mixed) and NEM LONG (2-2 tied) skipped, saved $114 net. Reuses `_recent_momentum_pct` for vote #1.
-- **`require_entry_confirmation_bar`** (default `true`; 2026-05-27 addition — **Fix B**). Companion to Fix A. For direction-following regimes (trend / pullback / momentum / vol_squeeze), the LAST FULLY CLOSED LTF bar must confirm direction before `_build_<regime>_signal` is called: `last_closed.close > last_closed.open` AND `last_closed.close > prev_closed.close` for LONG (mirror for SHORT). Catches single-bar fakeouts where the in-progress bar tipped a score threshold but the actual completed bar didn't carry. Range and sr_scalp are EXEMPT — both are mean-reversion theses where the last closed bar moves AGAINST the entry direction by design. Implemented via `_entry_bar_confirms`. The ORB regime is also exempt (not in the confirmation-bar regime set) — its range-break is the confirmation.
+- **`require_entry_confirmation_bar`** (default `true`; 2026-05-27 addition — **Fix B**). Companion to Fix A. For direction-following regimes (trend / pullback / momentum / vol_squeeze), the LAST FULLY CLOSED LTF bar must confirm direction before `_build_<regime>_signal` is called: `last_closed.close > last_closed.open` AND `last_closed.close > prev_closed.close` for LONG (mirror for SHORT). Catches single-bar fakeouts where the in-progress bar tipped a score threshold but the actual completed bar didn't carry. Range and sr_scalp are EXEMPT — both are mean-reversion theses where the last closed bar moves AGAINST the entry direction by design. Implemented via `_entry_bar_confirms`. The ORB regime is also exempt (not in the confirmation-bar regime set) — its range-break is the confirmation. **The bar judged is the last closed one itself** (2026-10-12): the step frame holds closed bars only (the minute history without the minute still trading, and the stream's bars, each sent once its minute closed), so on the 1m LTF the last closed bar is the LTF's last row, the bar whose close the entry is built at; a coarser LTF's last bucket counts once the step frame holds its last minute (`last_closed_bars`). Its data end is the earlier of the step frame's end and the clock, so a last bar whose minute is still trading by the clock (a partial minute from the stream, or a history path that kept it) is left out, at 1m too, and never confirms; the drop is logged with the symbol and the bar. Until then the gate read the row before the last (`iloc[-2]`) on the premise that the last row was still forming, which a step frame has seldom held: of H:'s archived decision events (`SKIP_SUMMARY`, `ENTRY_DECISION`) since 05-27, 140 read a forming last bar, on 8 days up to 09-23 (the most, 62 of 4,316 on 09-18; none on 07-28..07-31), and none from 09-24 on; since 2026-09-25 the minute history drops the minute still trading (`MarketDataStore._completed_bars`). So every trend, pullback, vol_squeeze and momentum entry the gate judged (small_cap_squeeze's too; a held expiry's market entry skips it), but those few, confirmed one bar late, and an armed retest needed its reclaim bar and then one more (section 24). On stepped replays of 10-07, 10-08, 10-09, 09-24 and 09-25 (the preset, synthetic quotes) the gate's refusals fell by a third for pullback (2,501 to 1,679 symbol-minutes) and by more than half for momentum (307 to 135; vol_squeeze 12 to 0), trend's hardly moved (6,613 to 6,487), and four entries changed: three pullbacks (NFLX short let in on 10-07, +9.28; DELL long on 10-08, -78.03; ADBE long on 10-09 a bar earlier) and an armed trend retest (ANET long on 10-08, -83.62, section 24). Most bars that now pass it are refused by the stretched, S/R and exhaustion gates after it. On small_cap_squeeze's 06-02 replay it took a ZJYL trend entry 19 minutes earlier (+23.40, where the later one lost -44.22).
 - **Low-tier peak-giveback** — exit-side fix in `RiskConfig` (not strategy-side; see section 14). Catches 0.7-1.0R MFE trades that round-trip to BE before the main tier's `peak_giveback_min_r: 1.0` arms.
 
 All gates are independently toggleable via the manifest (or `params` in `configs/config.top_tier_adaptive.yaml`). The relative-strength gate has its own `relative_strength_block_threshold_pct: 0.0` off-switch. The pullback maturity check disables via `pullback_require_fresh_leg: false`. Fix A/B disable via `require_explicit_side_decision: false` / `require_entry_confirmation_bar: false`.
@@ -727,6 +727,19 @@ the moment the cap was corrected.
    the range over one span and opening the window against another;
    `_breakout_reference` was extracted for exactly this on 2026-09-20.
 
+**The 5m follow-through gate reads the last closed 5m bar** (2026-10-12). In
+the ORB window `orb_require_5m_followthrough` refuses an entry whose last
+closed 5m bar of the day leans against it. That 5m frame is resampled from the
+step frame's closed 1m bars, so its last bucket has closed once the step frame
+holds its last minute and the clock has passed it (`last_closed_bars`); the
+gate always read the bucket before the last, as though the last were still
+forming, and so judged a bar 5 minutes stale whenever the last bucket had
+closed. A 5m bar that does not read now refuses the entry
+(`<side>_orb_5m_unreadable`) instead of skipping the gate. On replays of
+09:30-10:10 of 10-07, 10-08, 10-09, 09-24 and 09-25 with ORB switched on
+(`disable_orb_regime: false`, `orb_max_range_atr_mult: 8.0`) the gate refused
+other minutes (10-07: 4 symbol-minutes against 13) and no ORB entry changed.
+
 Two things worth knowing that were **not** changed. ORB's achievable R:R is
 capped below its own `orb_target_range_mult: 1.5` — the stop is the *opposite*
 range edge plus a buffer while the target is measured from the *broken* edge,
@@ -762,18 +775,20 @@ against 21% from an arbitrary moment in the same session.
 records the level it cleared and waits (`_armed_retest_verdict`). Four
 outcomes:
 
-- `none` — feature off, no usable trigger level, or no live arm (none yet, or
-  the one there was just invalidated) and the close has not crossed the
-  current level. The builder decides, as before; on an uncrossed
+- `none` — feature off, no base frame, no usable trigger level, or no live arm
+  (none yet, or the one there was just invalidated) and the close has not
+  crossed the current level. The builder decides, as before; on an uncrossed
   close its fresh-breakout check refuses the cycle with `no_fresh_breakout` /
   `no_fresh_breakdown`.
 - `wait` — armed, retest not confirmed. The cycle records
   `<side>_build_failed_<regime>_armed_awaiting_retest(...)` and skips. Other
   regimes in the build queue are unaffected, so arming `trend` does not stop
   `pullback` firing on the same symbol in the same cycle.
-- `enter` — price returned to within `armed_retest_zone_atr` (0.35) ATR of the
-  level and closed back through it on a bar closing in the top
-  `armed_retest_min_close_position` (60%) of its range.
+- `enter` — on a bar after the breakout bar price returned to within
+  `armed_retest_zone_atr` (0.35) ATR of the level, and it closed back through
+  the level on a bar closing in the top 40% of its range (a close position of
+  at least `armed_retest_min_close_position`, 0.60; mirror for SHORT). Until
+  2026-10-12 this read "the top 60%", and so did the preset's comment.
 - `expired` — no retest inside `armed_retest_max_minutes` (12). **Enters at
   market**, which is the pre-2026-09-20 behaviour. Handled by
   `_expired_armed_retests`, which runs BEFORE the build queue and **skips the
@@ -790,6 +805,21 @@ side, and across 09-29 to 10-02 394 of the 737 arm creations logged in
 `decisions.csv` (every reason on a row, not only the primary) had the close
 at or on the wrong side of the level. An existing arm is unaffected: a close
 back under its level is the retest in progress.
+
+**The retest window starts right after the breakout bar** (2026-10-12). The
+arm records the base frame's last bar, whose close crossed the level
+(`breakout_bar`), and `touched` reads every bar after it. Until then it read
+the bars labelled after the arm's clock: bars are labelled at their start and
+an arm is made seconds into the minute after its breakout bar, so the first
+bar after the breakout, still trading when the arm was made and the first bar
+of any pullback, was never in the window (on the 10-08 replay of the study
+that found it, it was the only touch of 25 of the 166 arms). The breakout bar
+itself stays out: its low is the level it crossed, not a return to it.
+On stepped replays of 10-07, 10-08, 10-09, 09-24 and 09-25 the window alone
+took the arms that confirmed from 231 to 399 (160 to 256 on 10-07..10-09) and
+changed no entry: the gates refuse the confirmations, as before. With the
+confirmation bar fixed as well (section 6f) they were 606, and one was built
+and filled (ANET long trend, 10-08 14:29, stopped, -83.62).
 
 **An invalidated arm is replaced, not skipped.** A close more than
 `armed_retest_invalidation_atr` ATR back through the armed level drops the
@@ -876,6 +906,66 @@ Signals carry `armed_retest_status` (`retest_confirmed` / `expired_market_entry`
 `armed_retest_level` and `armed_retest_waited_minutes`, which is what lets the
 session report tell the two populations apart. Turn the whole mechanism off
 with `armed_retest_enabled: false` — that is the A/B.
+
+**A resolved arm the gates refuse leaves its record** (2026-10-12). A confirmed
+retest or a held expiry consumes its arm before the build, and the stretched,
+S/R, HTF, exhaustion and other gates of `_finalize_signal` and the shared entry
+stage refuse most of them. The decision row then carries, after the gate's own
+refusal (which stays the row's reason),
+`<side>_build_failed_<regime>_armed_retest_refused(status=<retest_confirmed|expired_market_entry>,gate=<the gate>,level=...,waited=...m)`.
+When another regime then builds a signal for the same symbol in the same cycle,
+the engine writes that signal's own decision row (its reason, then the refusal
+of an engine gate that refuses it) in place of the strategy's, so the symbol's
+records of that cycle ride on the signal: `armed_retest_refused`, the list of
+them in queue order, in its `ENTRY_CONTEXT`, or in the `SKIP_SUMMARY` of an
+engine gate's refusal, as every `armed_retest_*` key does. A faded expiry's row
+(`<side>_build_failed_<regime>_armed_retest_faded(level=...,close=...)`: the
+held breakout no longer holds) is lost the same way, so it rides in the same
+list. On the five replays above records rode on four signals: on 09-24 MSFT's
+at 10:20:20 (a trend retest the stretched gate refused, then a range short that
+entered) and TSM's at 10:00:00 (a faded trend expiry, then a range long that
+entered), on 09-25 MSFT's at 10:05:20 (a trend and a momentum expiry, both
+faded, then a range long the daily loss limit refused) and ADBE's at 10:04:40
+(a faded trend expiry, then a range long the daily loss limit refused a second
+time on its bar, so the record was written nowhere: the first case below).
+Where the records are not written:
+
+- The gatekeeper writes no `SKIP_SUMMARY` and no `Decision` line for a repeat
+  of a decision it logged in the last 120 s for the same bar (the same action
+  and reasons; the records are not among them), and no `SKIP_SUMMARY` for a
+  skip while the stream book's spread watch holds the signal (section 6g). So
+  a signal's records are written with its first engine refusal on its bar only:
+  when the engine refuses it the same way again on that bar (max positions,
+  the daily loss limit, the cooldown, the correlation cap), or the spread watch
+  skips it again, the records of that cycle are written nowhere. The fix
+  belongs to the gatekeeper, which is not changed here.
+- With `shared_entry.use_divergence_entry_signal` on (off in every preset), a
+  divergence entry built for the symbol after the strategy skipped it takes the
+  strategy's row, records included, and does not carry them.
+- An expiry whose regime the time window no longer offers (a trend arm that
+  expires at midday) is dropped by `_expired_armed_retests` with no row at all,
+  and so is an arm that is never swept and that the prune reaps at twice its
+  wait; both as before.
+
+A built armed signal that an engine gate refuses (max positions, the daily
+loss limit) carries `armed_retest_status` in its `SKIP_SUMMARY` the same way.
+Until 2026-10-12 a refused confirmation left only the gate's untagged
+refusal: the armed retest read as never confirming (on H: 10-07..10-09, 158 of
+the 400 arms confirmed and were refused, untagged), and the wait rows were
+censored, since a check that passed left no row: every `touched=1,reclaimed=1`
+wait row has failed the bar test by construction. With the record the arm's
+A/B reads from the logs, short of the cases above: entries per path from
+`trades.csv` (`retest` / `market_fallback` / `immediate`, the session report's
+per-entry-path table), and the arms that resolved and were refused, per status
+and gate, from `decisions.csv`, with the few on a signal from its
+`ENTRY_CONTEXT` or `SKIP_SUMMARY` in `events.jsonl`. It is a record, not a
+gate: the session's skip tally and the gate attribution also list a decision
+row's record, as a row of its own under
+`<side>_build_failed_<regime>_armed_retest_refused`, beside the gate that
+refused; a record on a signal is in neither. On the five replays above the
+records named 605 refused confirmations (the stretched gate 52%, its cooldown
+20%, S/R clearance 12%, the oversized bar 7%) and 110 refused held expiries
+(S/R clearance 43%, the VWAP extension 21%).
 
 `_breakout_reference` is the single source for both the builder's own
 fresh-breakout check and the armed level. Two copies would drift the moment

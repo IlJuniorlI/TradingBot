@@ -993,7 +993,7 @@ strategies:
       armed_retest_enabled: true
       armed_retest_max_minutes: 12.0        # how long to wait before entering at market anyway
       armed_retest_zone_atr: 0.35           # price must come back within this x ATR of the cleared level
-      armed_retest_min_close_position: 0.60 # reclaim bar must close in the upper 60% of its range (mirror for SHORT)
+      armed_retest_min_close_position: 0.60 # reclaim bar must close in the top 40% of its range (mirror for SHORT)
       armed_retest_invalidation_atr: 0.75   # a close this far back through the level kills the arm
 
       # Stretched entry filter: reject LONG at pct_b ≥ threshold AND

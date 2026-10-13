@@ -35,14 +35,14 @@ from ...indicators import get_session_indicator_window, last_bar_atr, ltf_ema_sp
 from ...models import Candidate, Position, Side, Signal
 from ...sessions import EQUITY_RTH_OPEN, equity_session_state, parse_hhmm
 from ...numeric import safe_float
-from ...reasons import detail_fields, insufficient_bars_reason
+from ...reasons import detail_fields, insufficient_bars_reason, reason_gate
 from ...support_resistance import role_levels
 from ... import sessions
 from ..shared_entry import EntryContexts, EntryProposal
 from ..strategy_base import BaseStrategy
 from ...daily_stats import SymbolDailyStats
 from .armed_retest import ARMED_RETEST_REGIMES, ArmedRetestMixin
-from .confirmation import ConfirmationMixin
+from .confirmation import ConfirmationMixin, last_closed_bars
 from .regimes.momentum import MomentumRegimeMixin
 from .regimes.orb import OrbRegimeMixin
 from .regimes.pullback import PullbackRegimeMixin
@@ -227,6 +227,7 @@ class _CandidateRead:
     c: Candidate
     frame: pd.DataFrame
     ltf: pd.DataFrame
+    ltf_min: int
     close: float
     vwap: float
     ema9: float
@@ -647,10 +648,8 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # filters the "poke above range then reverse" false breakouts that
         # dominated 2026-04-17's ORB book (AAPL LONG @269.61 rejected at
         # 268.54 resistance; NFLX SHORT @95.26 squeezed back to 96.82, both
-        # within minutes). The gate only engages when ≥2 today's 5m bars
-        # exist, so the first 5 minutes of the session (before any 5m bar
-        # has closed) remain unconstrained — ORB is allowed to fire at 09:36
-        # if momentum is obvious, but must survive the 09:40 5m close.
+        # within minutes). The gate only engages once one of today's 5m bars
+        # has closed, so the session's first 5 minutes remain unconstrained.
         if in_orb_window and bool(self.params.get("orb_require_5m_followthrough", True)):
             # A 5m frame that cannot be built is a gate that cannot pass.
             # Until 2026-09-26 an error here set the frame to None, which
@@ -668,19 +667,29 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 now_dt = sessions.now_et()
                 session_start = now_dt.replace(hour=EQUITY_RTH_OPEN.hour, minute=EQUITY_RTH_OPEN.minute, second=0, microsecond=0)
                 today_bars = frame_5m[frame_5m.index >= session_start]
-                # Use iloc[-2] (previous completed bar) when ≥2 exist.
-                # iloc[-1] is the currently-forming bar.
-                if len(today_bars) >= 2:
-                    last_closed = today_bars.iloc[-2]
+                # The 5m frame is resampled from the step frame's closed 1m
+                # bars, so its last bucket is still forming only until the
+                # step frame holds that bucket's last minute and the clock
+                # has passed it (``last_closed_bars``). Until 2026-10-12 this
+                # always read iloc[-2] as though iloc[-1] were forming, which
+                # judged a bar 5 minutes stale whenever the last bucket had
+                # closed.
+                closed_today = last_closed_bars(c.symbol, today_bars, 5, frame)
+                if not closed_today.empty:
+                    last_closed = closed_today.iloc[-1]
                     bar_open = safe_float(last_closed.get("open"))
                     bar_close = safe_float(last_closed.get("close"))
-                    if bar_open is not None and bar_close is not None:
-                        if side == Side.LONG and bar_close <= bar_open:
-                            self._set_build_failure(c.symbol, regime, f"long_orb_5m_not_bullish(open={bar_open:.4f},close={bar_close:.4f})")
-                            return None
-                        if side == Side.SHORT and bar_close >= bar_open:
-                            self._set_build_failure(c.symbol, regime, f"short_orb_5m_not_bearish(open={bar_open:.4f},close={bar_close:.4f})")
-                            return None
+                    # A bar that does not read leans no way: it confirms
+                    # nothing (until 2026-10-12 it skipped the gate).
+                    if bar_open is None or bar_close is None:
+                        self._set_build_failure(c.symbol, regime, f"{side.value.lower()}_orb_5m_unreadable")
+                        return None
+                    if side == Side.LONG and bar_close <= bar_open:
+                        self._set_build_failure(c.symbol, regime, f"long_orb_5m_not_bullish(open={bar_open:.4f},close={bar_close:.4f})")
+                        return None
+                    if side == Side.SHORT and bar_close >= bar_open:
+                        self._set_build_failure(c.symbol, regime, f"short_orb_5m_not_bearish(open={bar_open:.4f},close={bar_close:.4f})")
+                        return None
         orb_htf_bypass = bool(self.params.get("orb_bypass_htf_bias", True)) and in_orb_window
         if bool(self.params.get("require_htf_bias_alignment", True)) and not orb_htf_bypass:
             mshtf_ctx = getattr(sr_ctx, "market_structure", None)
@@ -1459,8 +1468,8 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         vol_widening = self._volatility_widening_factor(tech_ctx_for_candidate, current_time=now_t)
 
         return _CandidateRead(
-            c=c, frame=frame, ltf=ltf, close=close, vwap=vwap, ema9=ema9, ema20=ema20, adx=adx, ret5=ret5,
-            ret15=ret15, atr=atr, vol_scale=vol_scale, index_ok_by_side=index_ok_by_side,
+            c=c, frame=frame, ltf=ltf, ltf_min=cycle.ltf_min, close=close, vwap=vwap, ema9=ema9, ema20=ema20,
+            adx=adx, ret5=ret5, ret15=ret15, atr=atr, vol_scale=vol_scale, index_ok_by_side=index_ok_by_side,
             htf_ema_read=htf_ema_read, idx_neutral=idx_neutral, day_strength=day_strength,
             effective_bias=effective_bias, respect_bias=respect_bias, preferred_sides=preferred_sides,
             explicit_side_decided=explicit_side_decided, decided_side=decided_side,
@@ -1784,6 +1793,11 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         winning_decision: dict[str, Any] | None = None
         winning_regime: str | None = None
         winning_norm: float = 0.0
+        # The records of this candidate's resolved arms that the cycle did
+        # not build, so far: a faded expiry, or a gate's refusal (below). A
+        # signal built after them carries them, because the engine logs a
+        # signal's decision itself and drops the strategy's.
+        refused_arms: list[str] = []
         for pre_validated, side, regime_name, regime_score, regime_norm, decision in queue:
             index_ok = decision["index_ok"]
 
@@ -1836,10 +1850,12 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             # Confirmation-bar trigger (Fix B, 2026-05-27). For
             # direction-following regimes, require the LAST FULLY
             # CLOSED LTF bar to confirm direction before we call the
-            # build method (which would otherwise enter at current
-            # close on the same bar that scored the regime). Catches
-            # single-bar fakeouts where the in-progress bar tipped a
-            # score threshold but the move didn't carry. Range and
+            # build method, which enters at that bar's close: green and
+            # through the close before it (``_entry_bar_confirms``; the
+            # step frame holds closed bars only, so on a 1m LTF that is
+            # its last row). Catches single-bar fakeouts where a bar
+            # tipped a score threshold but did not close the trade's
+            # way. Range and
             # sr_scalp are exempt — both are mean-reversion theses
             # where the LAST CLOSED bar moves AGAINST the entry
             # direction by design. vwap_reclaim is also exempt — its prior
@@ -1850,7 +1866,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             if not pre_validated and (
                 regime_name in CONFIRMATION_BAR_REGIMES
                 and bool(self.params.get("require_entry_confirmation_bar", True))
-                and not self._entry_bar_confirms(side, ltf)
+                and not self._entry_bar_confirms(c.symbol, side, ltf, read.ltf_min, frame)
             ):
                 fail_reasons.append(
                     f"{side.value.lower()}_build_failed_{regime_name}_no_confirmation_bar"
@@ -1872,10 +1888,11 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             # ``require_entry_confirmation_bar`` rejects and the verdict is
             # never consulted -- which is correct: there is nothing to
             # decide mid-pullback. The first cycle that reaches the verdict
-            # again is the one AFTER a bar closed back the trade's way,
-            # which is exactly the reclaim the retest is waiting for. Move
-            # this above the confirmation gate and entries would fire
-            # partway down the retrace.
+            # again is the one whose last closed bar closed back the
+            # trade's way, which is exactly the reclaim the retest is
+            # waiting for, and the verdict judges that same bar. Move this
+            # above the confirmation gate and entries would fire partway
+            # down the retrace.
             retest_meta: dict[str, Any] = {}
             breakout_confirmed = False
             if pre_validated:
@@ -1904,10 +1921,12 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 # The fallback only ever fired by coincidence.
                 held = close > armed_level if side == Side.LONG else close < armed_level
                 if not held:
-                    fail_reasons.append(
+                    faded = (
                         f"{side.value.lower()}_build_failed_{regime_name}_armed_retest_faded("
                         f"level={armed_level:.4f},close={close:.4f})"
                     )
+                    fail_reasons.append(faded)
+                    refused_arms.append(faded)
                     continue
                 breakout_confirmed = True
             elif regime_name in ARMED_RETEST_REGIMES:
@@ -1949,6 +1968,20 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 # the session report to tell the two populations apart.
                 if retest_meta and isinstance(sig.metadata, dict):
                     sig.metadata.update(retest_meta)
+                # The symbol's resolved arms that faded or that the gates
+                # refused earlier in this cycle. The engine logs this
+                # signal's decision row ([its reason], then an engine gate's
+                # refusal) in place of the strategy's row, which held their
+                # records, so the records ride on the signal: in its
+                # ENTRY_CONTEXT, or the SKIP_SUMMARY of an engine gate's
+                # refusal, as every ``armed_retest_*`` key (the 09-24
+                # replay, MSFT at 10:20:20: a refused trend retest, then a
+                # range short that entered). An engine refusal that the
+                # gatekeeper writes no SKIP_SUMMARY for (a repeat of the
+                # same decision on the same bar, a skip of the spread
+                # watch) loses them (README section 24).
+                if refused_arms:
+                    sig.metadata["armed_retest_refused"] = list(refused_arms)
                 # Tier 3b: on high-conviction days, loosen the
                 # peak-giveback threshold so a 2R+ runner doesn't get
                 # cut by a normal 50% retracement. Override is stamped
@@ -2020,6 +2053,25 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 fail_reasons.append(f"build_failed_{failure}")
             else:
                 fail_reasons.append(f"{side_tag}_build_failed_{failure}")
+            # A resolved arm, a confirmed retest or a held expiry, that the
+            # gates refused: the arm is gone (consumed by the verdict or the
+            # expiry sweep), and the refusal above does not say an arm
+            # reached it. This reason is its record, after the refusal so the
+            # gate stays the decision's own reason; a signal built for the
+            # symbol later in the cycle carries it (``refused_arms``). Until
+            # 2026-10-12 nothing recorded one: the armed retest read as never
+            # confirming, and README section 24's A/B could not see it
+            # (10-07..10-09 on H:, 158 of 400 arms confirmed and were
+            # refused, untagged).
+            if retest_meta:
+                record = (
+                    f"{side_tag}_build_failed_{regime_name}_armed_retest_refused("
+                    f"status={retest_meta['armed_retest_status']},gate={reason_gate(failure)},"
+                    f"level={retest_meta['armed_retest_level']:.4f},"
+                    f"waited={retest_meta['armed_retest_waited_minutes']:.1f}m)"
+                )
+                fail_reasons.append(record)
+                refused_arms.append(record)
 
         return best_signal, winning_decision, winning_regime, winning_norm
 

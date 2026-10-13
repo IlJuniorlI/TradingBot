@@ -184,10 +184,11 @@ class ArmedRetestMixin:
         So qualification no longer means "enter". It means "remember the level
         that was cleared and wait for price to come back to it". Three outcomes:
 
-        ``none``   feature off, no usable trigger level, or no live arm (none
-                   yet, or the one there was just invalidated) and the close
-                   has not crossed the current level -- the builder decides,
-                   and its fresh-breakout check rejects the cycle.
+        ``none``   feature off, no base frame (nothing to arm on), no usable
+                   trigger level, or no live arm (none yet, or the one there
+                   was just invalidated) and the close has not crossed the
+                   current level -- the builder decides, and its
+                   fresh-breakout check rejects the cycle.
         ``wait``   armed, retest not yet confirmed; a close through the
                    current level after an invalidation arms anew on that
                    level and waits like a first arm. The cycle skips; other
@@ -217,6 +218,10 @@ class ArmedRetestMixin:
         if not bool(self.params.get("armed_retest_enabled", True)):
             return out
         if not math.isfinite(close) or close <= 0 or not math.isfinite(atr) or atr <= 0:
+            return out
+        # The base frame's bars are the breakout bar an arm records and the
+        # retest window after it; without them there is nothing to arm on.
+        if frame is None or frame.empty:
             return out
         _recent, trigger_level = self._breakout_reference(regime, side, ltf, frame)
         if trigger_level is None or not math.isfinite(trigger_level) or trigger_level <= 0:
@@ -276,6 +281,9 @@ class ArmedRetestMixin:
                 return out
             self._armed_retests[key] = {
                 "armed_at": now,
+                # The base frame's last bar, whose close crossed the level:
+                # the retest window is every bar after it (below).
+                "breakout_bar": frame.index[-1],
                 "session_date": now.date(),
                 "trigger_level": float(trigger_level),
                 # Carried so the expiry sweep can build the signal from the
@@ -298,14 +306,19 @@ class ArmedRetestMixin:
 
         # Did price come back to the level while we waited? Measured on the
         # base 1m frame regardless of the regime's own timeframe -- the finest
-        # resolution gives the truest extreme for the window.
+        # resolution gives the truest extreme for the window -- over every bar
+        # after the breakout bar the arm recorded. Bars are labelled at their
+        # start and an arm is made seconds into the minute after its breakout
+        # bar, so until 2026-10-12 the window (the bars labelled after the
+        # arm's clock) left out the first bar after the breakout, the one
+        # still trading when the arm was made: on the 10-08 replay 25 of 166
+        # arms were checked with that bar their only touch.
         touched = False
         extreme: float | None = None
-        if frame is not None and not frame.empty:
-            since = frame[frame.index > armed_at]
-            if not since.empty:
-                extreme = (float(since["low"].min()) if side == Side.LONG
-                           else float(since["high"].max()))
+        since = frame[frame.index > arm["breakout_bar"]]
+        if not since.empty:
+            extreme = (float(since["low"].min()) if side == Side.LONG
+                       else float(since["high"].max()))
         if extreme is not None and math.isfinite(extreme):
             if side == Side.LONG:
                 touched = extreme <= level + zone_atr * atr

@@ -10,6 +10,7 @@ widening and soft-bias penalty.
 """
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable
 from datetime import datetime
@@ -17,13 +18,15 @@ from typing import Any
 
 import pandas as pd
 
-from ...bars import session_open_price
+from ...bars import last_bucket_forming, session_open_price
 from ...indicators import bar_posture, indicator_session_start
 from ...models import Side
 from ...sessions import parse_hhmm
 from ...numeric import safe_float
 from ... import sessions
 from ...daily_stats import SymbolDailyStats, build_symbol_stats, volatility_scale
+
+LOG = logging.getLogger(__name__)
 
 # Per-regime score ceilings — the maximum each _score_* method can return.
 # Used to normalise scores onto a common 0..1 scale before the build-order
@@ -43,6 +46,35 @@ REGIME_SCORE_CEILINGS = {
     "orb": 5.0,
     "vwap_reclaim": 5.0,
 }
+
+
+def last_closed_bars(symbol: str, bars: pd.DataFrame, bar_minutes: int, frame: pd.DataFrame) -> pd.DataFrame:
+    """``bars``, a ``bar_minutes`` frame resampled from *symbol*'s step frame
+    ``frame``, without a last bucket that has not closed yet.
+
+    The step frame holds closed 1m bars only: the minute history without the
+    minute still trading (``MarketDataStore._completed_bars``) and the
+    stream's bars, each sent once its minute closed. Its data therefore ends
+    when its last bar closed, and a coarser bucket that ends after that is
+    still forming: its close is not the bar's close yet. The data end is the
+    earlier of the step frame's end and the clock. The step frame's end,
+    because for a moment after a bucket ends the clock has passed it while
+    its last 1m bar may not be in. The clock, so that a forming bar never
+    counts: a last 1m bar whose minute is still trading (a partial minute
+    from the stream, or a history path that kept it) is left out with its
+    bucket, at 1m too, and the drop is logged. A 1m frame of closed bars is
+    returned whole."""
+    if bars is None or bars.empty or frame is None or frame.empty:
+        return bars
+    data_end = pd.Timestamp(frame.index[-1]) + pd.Timedelta(minutes=1)
+    if last_bucket_forming(bars.index, bar_minutes, data_end):
+        return bars.iloc[:-1]
+    now = sessions.now_et()
+    if last_bucket_forming(bars.index, bar_minutes, now):
+        LOG.warning("%s: the step frame's last 1m bar %s has not closed at %s; its %dm bar %s is left out as forming",
+                    symbol, frame.index[-1], now.isoformat(timespec="seconds"), bar_minutes, bars.index[-1])
+        return bars.iloc[:-1]
+    return bars
 
 
 class ConfirmationMixin:
@@ -679,23 +711,36 @@ class ConfirmationMixin:
         return None, vote_info
 
     @staticmethod
-    def _entry_bar_confirms(side: Side, ltf: pd.DataFrame) -> bool:
+    def _entry_bar_confirms(symbol: str, side: Side, ltf: pd.DataFrame, ltf_minutes: int,
+                            frame: pd.DataFrame) -> bool:
         """Confirmation-bar trigger (Fix B, 2026-05-27): the most recent
         FULLY CLOSED LTF bar must confirm direction before we enter.
 
         For LONG: ``last_closed.close > last_closed.open`` (green bar) AND
         ``last_closed.close > prev_closed.close`` (higher-high tape).
-        Mirror for SHORT. Uses ``iloc[-2]`` for the last closed bar (since
-        ``iloc[-1]`` is the in-progress bar) and ``iloc[-3]`` for the prior
-        closed bar. Returns ``True`` when not enough bars (don't block on
-        thin early-session data — other gates handle that case), and
-        ``False`` when a bar does not read: it confirms nothing. Until
-        2026-09-26 a read that raised returned ``True`` and a missing column
-        read as 0, which a LONG's close always beat."""
-        if ltf is None or len(ltf) < 3:
+        Mirror for SHORT. ``ltf`` is the ``ltf_minutes`` frame resampled from
+        *symbol*'s step frame ``frame``, and its closed bars are
+        ``last_closed_bars``': at ``ltf_minutes: 1`` (both shipped presets)
+        every row, so the last closed bar is ``iloc[-1]``; a last bar or
+        bucket still trading by the step frame's end or the clock is left
+        out, so a forming bar never confirms. Until 2026-10-12
+        this read ``iloc[-2]`` on the premise that ``iloc[-1]`` was the bar
+        in progress, which a step frame has seldom held (none from 2026-09-24
+        on, in H:'s archive): the gate judged the bar before the last closed
+        one, so a setup confirmed one bar late, and an armed retest needed
+        its reclaim bar and then one more. Returns
+        ``True`` when not enough bars (don't block on thin early-session
+        data — other gates handle that case), and ``False`` when a bar does
+        not read: it confirms nothing. Until 2026-09-26 a read that raised
+        returned ``True`` and a missing column read as 0, which a LONG's
+        close always beat."""
+        if ltf is None:
             return True
-        last_closed = ltf.iloc[-2]
-        prev_closed = ltf.iloc[-3]
+        closed = last_closed_bars(symbol, ltf, ltf_minutes, frame)
+        if len(closed) < 2:
+            return True
+        last_closed = closed.iloc[-1]
+        prev_closed = closed.iloc[-2]
         last_open = safe_float(last_closed.get("open"))
         last_close = safe_float(last_closed.get("close"))
         prev_close = safe_float(prev_closed.get("close"))
