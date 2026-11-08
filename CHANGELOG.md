@@ -9,6 +9,44 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A stock entry's target must pay at least `risk.entry_min_target_rr_at_limit`
+  times its risk from the marketable limit the order goes out at
+  (`entry_target_rr_below_floor(...)`), 1.0 in the shipped presets; and
+  `adaptive_breakeven_rr: null` turns the breakeven tier off.**
+  *2026-11-07* — the strategy builds the stop and the target against the bar
+  close it signalled on, and the ladder keeps its first rung at
+  `ladder_min_target_rr` (1.2) from that close; the order is priced on a
+  later quote, past the close by the move since and the spread, and the stop
+  does not move with it. On H: 2026-10-14..11-06, 36 of 124 top_tier entries
+  went out with under 1.5R from the fill to the first rung and 5 with the
+  target nearer than the stop (NVDA 10-16: filled 216.67 against a 217.20
+  target and a 215.94 stop, 0.73R, and "hit target"); nothing judged the
+  reward after the quote (`ladder_target_rung_rr_from_fill` was recorded for
+  the archive only).
+  - The check (`EntryGatekeeper._entry_target_rr_refusal`) runs on the stock
+    path once the quote is read and the levels hold, before the entry spread
+    guard is asked or anything is sized; the refusal is the decision's
+    second reason, counted under its own gate. A refusal starts the
+    signal's stream book watch as the guard's does, and the book's limit is
+    judged on the floor too, so a standing refused signal asks REST at most
+    every 10 s instead of a forced quote every pass.
+    A signal with no target (a trail runner) and an option entry (premium
+    levels) are not judged. 0 or null turns it off; the knob is checked at
+    load. Those under 1R lost and those between 1R and 1.5R were net
+    winners on the replay, so the floor is 1.0 and no higher.
+  - `adaptive_breakeven_rr: null`: `BaseStrategy._adaptive_management_components`
+    read the knob with `float()`, so null failed at the signal; it now stamps
+    None, which `TradeManager.update_position` already skips, as it does the
+    partial tier's. The peer_confirmed family's load check takes null too
+    (its arm / stop cross-check already skipped a tier that is off), and
+    top_tier checks the knob at load (`NULLABLE_NUMBER_KNOBS`: null or a
+    finite number above 0): until now a bad value raised at the first
+    signal, mid-session, and a 0 armed the tier on any peak.
+  - The floor is a `risk` default, so every stock preset runs it, those
+    that do not declare the knob included (the peer family,
+    small_cap_squeeze); `configs/config.example.yaml` and the top_tier
+    preset declare it.
+
 - **`scripts/renew_schwab_token.py` renews the Schwab login from a terminal
   while the bot runs, with no flags: it finds the running bot, reads its
   settings, `.env` and token store in the bot's working folder and its
@@ -1797,6 +1835,35 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gates ran, which were exempt and what the shared score was.
 
 ### Changed
+
+- **The top_tier preset's exits: no breakeven move, the profit lock at 1.20R
+  to +0.50R, the low-tier peak giveback off and the main giveback floor from
+  1.25R.**
+  *2026-11-07* — H:'s dry run 2026-10-14..11-06 (124 trades on the 5m
+  setups, -$225) cashed 0.4-0.9R winners against full 1R losers: realized
+  winners averaged 0.77R and initial stops -1.07R at a 53% win rate. The
+  breakeven at 0.60R scratched 10 trades of a 0.66R mean peak, 7 of which
+  then ran 1R or more; the low tier fired 15 times, 11 minutes in on
+  average, on a 0.3R wiggle after a 0.85R mean peak and kept 0.41R; across
+  the 44 giveback exits price went past the pre-exit peak later in 93% and
+  to the initial target without the initial stop in 59%.
+  - Replayed on the trades' 1m bars with the same entries, stops and sizes
+    (the simulator reproduces the actual exits at 0.93 correlation): the
+    shipped knobs +$360; the low tier off, no breakeven move, the lock at
+    1.20R to +0.50R and the floor from 1.25R +$990; a breakeven move at 1.0R
+    under that lock cost $245; the raw bracket, no management, +$1,675.
+    Every knob set in the grid did better without the low tier (+$330 mean).
+    About 45% of any variant's gain sat in its five best trades, and the
+    retune gained in October's trending sessions (+$944) while giving back
+    in November's chop (-$318).
+  - `configs/config.top_tier_adaptive.yaml`: `adaptive_breakeven_rr: null`
+    (was 0.60), `adaptive_profit_lock_rr: 1.20` (was 0.85),
+    `adaptive_profit_lock_stop_rr: 0.50` (was 0.45),
+    `risk.peak_giveback_low_tier_enabled: false`, `risk.peak_giveback_min_r:
+    1.25` (was 1.0); the low tier's two knobs stay for turning it back on.
+    H:'s own `config.yaml` is the user's to update. Pinned in
+    tests/guards/test_preset_parity.py and
+    tests/strategies/top_tier_adaptive/test_bug_regressions.py.
 
 - **top_tier sets every regime up on closed 5m buckets and times its entries
   on closed 1m bars: no setup qualifies before 09:45, the knobs tuned on the
