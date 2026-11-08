@@ -247,25 +247,37 @@ NUMBER_KNOBS = (
     ("range_min_stop_atr_mult", False, 0.0, True, None, True),
     ("vol_squeeze_stop_box_mult", False, 0.0, True, None, True),
 )
+# As NUMBER_KNOBS, and null is allowed too: the breakeven tier's arm, which
+# null turns off (2026-11-07; BaseStrategy._adaptive_management_components
+# stamps None and TradeManager skips the tier). Read with float() at the
+# signal until then, so a bad value raised mid-session and a 0 armed the
+# tier on any peak.
+NULLABLE_NUMBER_KNOBS = (
+    ("adaptive_breakeven_rr", False, 0.0, False, None, True),
+)
 
 
 def checked_knobs(params: Mapping[str, Any], strategy_name: str) -> None:
     """Refuse, with a ValueError naming the key, a knob of
     ``STRICT_BOOL_KNOBS`` that is not true or false, one of ``NUMBER_KNOBS``
     that is not a finite number in its bounds (a whole number where it
-    counts bars), a missing one of either, and a bad
-    ``require_htf_ema_alignment`` mode or LTF / HTF EMA span pair. The load
-    runs it on the params of every strategy a config sets
-    (``normalize_params``), and the strategy again when it is built."""
+    counts bars; one of ``NULLABLE_NUMBER_KNOBS`` may be null too), a
+    missing one of any, and a bad ``require_htf_ema_alignment`` mode or
+    LTF / HTF EMA span pair. The load runs it on the params of every
+    strategy a config sets (``normalize_params``), and the strategy again
+    when it is built."""
     for key in STRICT_BOOL_KNOBS:
         if key not in params:
             raise ValueError(f"strategies.{strategy_name}.params.{key} is missing: the strategy's manifest declares it")
         if not isinstance(params[key], bool):
             raise ValueError(f"strategies.{strategy_name}.params.{key} must be true or false, got {params[key]!r}")
-    for key, whole, low, low_ok, high, high_ok in NUMBER_KNOBS:
+    numbers = [(knob, False) for knob in NUMBER_KNOBS] + [(knob, True) for knob in NULLABLE_NUMBER_KNOBS]
+    for (key, whole, low, low_ok, high, high_ok), nullable in numbers:
         if key not in params:
             raise ValueError(f"strategies.{strategy_name}.params.{key} is missing: the strategy's manifest declares it")
         value = params[key]
+        if value is None and nullable:
+            continue
         bad = isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
         if not bad and whole and float(value) != int(value):
             bad = True
@@ -274,7 +286,7 @@ def checked_knobs(params: Mapping[str, Any], strategy_name: str) -> None:
         if not bad and high is not None and (value > high or (value == high and not high_ok)):
             bad = True
         if bad:
-            kind = "a whole number" if whole else "a finite number"
+            kind = ("null or " if nullable else "") + ("a whole number" if whole else "a finite number")
             bounds = []
             if low is not None:
                 bounds.append(f"{'>=' if low_ok else '>'} {low}")

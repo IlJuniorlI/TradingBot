@@ -254,7 +254,9 @@ FAMILY_KNOBS: dict[str, Knob] = {
     "stop_buffer_atr_mult": Knob("number", low=0),
     "strong_setup_runner_enabled": Knob("bool"),
     "activity_score_weight": Knob("number", low=0),
-    "adaptive_breakeven_rr": Knob("number", low=0, low_open=True),
+    # null turns the breakeven tier off (2026-11-07), as BaseStrategy stamps
+    # it; the arm / stop cross-check below skips a tier that is off.
+    "adaptive_breakeven_rr": Knob("number", low=0, low_open=True, nullable=True),
     "adaptive_profit_lock_rr": Knob("number", low=0, low_open=True),
     "adaptive_profit_lock_stop_rr": Knob("number", low=0),
     "adaptive_runner_trigger_rr": Knob("number", low=0, low_open=True),

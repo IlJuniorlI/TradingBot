@@ -83,6 +83,15 @@ risk:
   # time_stop_min_return_pct are scratched to free a slot. 0 = disabled.
   time_stop_minutes: 0  # parity: the peer exit path never ran it before 2026-09-24
   time_stop_min_return_pct: 0.003
+  # The target's reward at the entry's limit (2026-11-07): a stock entry
+  # whose target, from the marketable limit the order goes out at, pays
+  # under this multiple of the risk to its stop from that limit is refused
+  # (entry_target_rr_below_floor). The strategy built both levels against
+  # the bar close it signalled on; the limit sits past that close by the
+  # move since and the spread, and the stop stays. 1.0 = never a target
+  # nearer than the stop. 0 or null turns the check off. Option entries,
+  # whose stop and target are premiums, are not judged by it.
+  entry_min_target_rr_at_limit: 1.0
   # Peak-giveback floor: once max_favorable_r since entry crosses
   # peak_giveback_min_r (default 1.0), exit when current_r retraces below
   # a tiered fraction of the peak (the peak_giveback_retain_* keys below).

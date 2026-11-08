@@ -871,7 +871,12 @@ class BaseStrategy(ContextBuildersMixin):
         profit_lock_rr_default = 1.35 if trend_like else 0.95
         profit_lock_stop_default = 0.40 if trend_like else 0.20
         runner_trigger_default = 1.15 if trend_like else 1.00
-        breakeven_rr = float(self.params.get("adaptive_breakeven_rr", breakeven_rr_default))
+        # null turns the breakeven tier off (2026-11-07): no stop move at
+        # that peak, the profit lock and the peak giveback floors alone
+        # protect the trade, as the partial tier below reads its null.
+        # TradeManager.update_position skips a tier whose RR is None.
+        breakeven_rr_raw = self.params.get("adaptive_breakeven_rr", breakeven_rr_default)
+        breakeven_rr = None if breakeven_rr_raw is None else float(breakeven_rr_raw)
         breakeven_offset_r = float(self.params.get("adaptive_breakeven_offset_r", breakeven_offset_default))
         profit_lock_rr = float(self.params.get("adaptive_profit_lock_rr", profit_lock_rr_default))
         profit_lock_stop_r = float(self.params.get("adaptive_profit_lock_stop_rr", profit_lock_stop_default))
@@ -903,7 +908,7 @@ class BaseStrategy(ContextBuildersMixin):
         return {
             "adaptive_management_enabled": True,
             "adaptive_management_style": style_token,
-            "adaptive_breakeven_rr": round(breakeven_rr, 4),
+            "adaptive_breakeven_rr": (None if breakeven_rr is None else round(breakeven_rr, 4)),
             "adaptive_breakeven_offset_r": round(breakeven_offset_r, 4),
             "adaptive_partial_breakeven_rr": (None if partial_breakeven_rr is None else round(partial_breakeven_rr, 4)),
             "adaptive_partial_breakeven_offset_r": round(partial_breakeven_offset_r, 4),

@@ -107,7 +107,8 @@ SPREAD_WATCH_REST_RETRY_SECONDS = 10.0
 @dataclass
 class _SpreadWatch:
     """The entry spread watch on one signal, a symbol and a side, that the
-    strategy's entry spread guard refused on its REST quote
+    strategy's entry spread guard, or the target's reward floor
+    (``risk.entry_min_target_rr_at_limit``), refused on its REST quote
     (``EntryGatekeeper._spread_watches``): when it started, the refusal that
     started it, the passes it skipped on the symbol's fresh stream book (no
     REST request), the REST quotes it let the entry ask since (each on a
@@ -313,6 +314,32 @@ class EntryGatekeeper:
             if target is not None and target >= entry:
                 return False, "target_not_below_entry"
         return True, None
+
+    def _entry_target_rr_refusal(self, side: Side, limit_price: float, stop_price: float,
+                                 target_price: float | None) -> str | None:
+        """Why a stock entry's target is refused at the marketable limit the
+        order would go out at (None when it is not): the target's reward
+        from that limit under ``risk.entry_min_target_rr_at_limit`` times
+        the risk to the stop from it. The strategy built both levels
+        against the bar close it signalled on, and the ladder kept its first
+        rung at ``ladder_min_target_rr`` from that close; the limit sits
+        past the close by the move since and the spread while the stop stays,
+        so the reward the order actually buys is smaller (on H: 2026-10-14..
+        11-06, 5 of 124 top_tier entries went out with the target nearer
+        than the stop). Called after ``_entry_levels_valid`` passed, so the
+        stop and the target are finite and on their sides of the limit. A
+        signal with no target (a trail runner) and a floor of 0 or null pass."""
+        floor = self.config.risk.entry_min_target_rr_at_limit
+        if floor is None or floor <= 0 or target_price is None:
+            return None
+        direction = 1.0 if side == Side.LONG else -1.0
+        risk = direction * (float(limit_price) - float(stop_price))
+        reward = direction * (float(target_price) - float(limit_price))
+        rr = reward / risk
+        if rr >= floor:
+            return None
+        return (f"entry_target_rr_below_floor(rr={rr:.2f}<{floor:.2f},limit={float(limit_price):.4f},"
+                f"stop={float(stop_price):.4f},target={float(target_price):.4f})")
 
     def _post_fill_levels(self, side: Side, stop_price: float, target_price: float | None,
                           fill_price: float) -> tuple[float, float | None, str | None]:
@@ -1052,7 +1079,8 @@ class EntryGatekeeper:
         book, or a REST quote newer than the stream's last message. On it the
         entry is priced with no request (``SchwabExecutor.preview_equity_entry``,
         ``refresh_quotes=False``) and judged as on the REST quote: this pass's
-        signal's levels from that limit, then the strategy's guard. A fresh
+        signal's levels from that limit, then the target's reward floor
+        (``_entry_target_rr_refusal``), then the strategy's guard. A fresh
         book that prices no limit (no fresh cached quote, or no touch to
         price one from) refuses the entry:
         ``book_unreadable(bid=...,ask=...,last=...)``, the cached quote's.
@@ -1073,6 +1101,8 @@ class EntryGatekeeper:
                 levels_ok, levels_reason = self._entry_levels_valid(signal.side, limit, signal.stop_price,
                                                                     signal.target_price)
                 refusal = None if levels_ok else (levels_reason or "invalid_levels")
+                if refusal is None:
+                    refusal = self._entry_target_rr_refusal(signal.side, limit, signal.stop_price, signal.target_price)
                 if refusal is None:
                     refusal = self.strategy.entry_spread_refusal(signal, bid, ask, limit)
             quote = {"bid": bid, "ask": ask, "last": last, "source": f"spread_watch:{cached.get('quote_source')}"}
@@ -1117,8 +1147,9 @@ class EntryGatekeeper:
         return f"{SPREAD_WATCH_GATE}:rest_unanswered({detail})", None, None
 
     def _judge_spread_watch(self, key: tuple[str, Side], refusal: str | None) -> None:
-        """After the strategy's guard judged ``key``'s signal on its REST
-        quote: a refusal starts the signal's watch, with one TRADEFLOW line,
+        """After the target's reward floor and the strategy's guard judged
+        ``key``'s signal on its REST quote: a refusal starts the signal's
+        watch, with one TRADEFLOW line,
         unless one holds; a pass ends the one that holds
         (``rest_quote_passes``)."""
         if refusal is None:
@@ -1621,7 +1652,16 @@ class EntryGatekeeper:
                 levels_ok, levels_reason = self._entry_levels_valid(signal.side, entry_price, signal.stop_price, signal.target_price)
                 refusal = None if levels_ok else (levels_reason or "invalid_levels")
                 if refusal is None:
-                    refusal = self.strategy.entry_spread_refusal(signal, preview.get("bid"), preview.get("ask"), entry_price)
+                    # The target's reward at this limit (2026-11-07), then
+                    # the guard. A refusal by either starts the signal's
+                    # watch, or holds the one that stands, and a pass by
+                    # both ends it (the floor since 2026-11-08: before, a
+                    # standing floor-refused signal asked a forced REST
+                    # quote every pass, the rate the watch exists to cap;
+                    # the book's limit is judged on the floor too).
+                    refusal = self._entry_target_rr_refusal(signal.side, entry_price, signal.stop_price, signal.target_price)
+                    if refusal is None:
+                        refusal = self.strategy.entry_spread_refusal(signal, preview.get("bid"), preview.get("ask"), entry_price)
                     self._judge_spread_watch(watch_key, refusal)
             else:
                 refusal, entry_price, market_snapshot = watch_skip

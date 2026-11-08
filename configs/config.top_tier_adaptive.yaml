@@ -76,19 +76,40 @@ risk:
   # time_stop_min_return_pct are scratched to free a slot. 0 = disabled.
   time_stop_minutes: 45
   time_stop_min_return_pct: 0.003
+  # The target's reward at the entry's limit (2026-11-07): a stock entry
+  # whose target, from the marketable limit the order goes out at, pays
+  # under this multiple of the risk to its stop from that limit is refused
+  # (entry_target_rr_below_floor). The ladder keeps its first rung at
+  # ladder_min_target_rr (1.2) from the signal's close; the limit sits
+  # past that close and the stop stays, so on H: 2026-10-14..11-06, 5 of
+  # 124 entries went out with the target nearer than the stop (NVDA 10-16:
+  # 0.73R). 1.0 refuses those and no more: the 31 entries between 1R and
+  # 1.5R were net winners. 0 or null turns the check off.
+  entry_min_target_rr_at_limit: 1.0
   # Peak-giveback floor: once max_favorable_r since entry crosses
-  # peak_giveback_min_r (default 1.0), exit when current_r retraces to a
-  # floor that keeps a tiered fraction of the peak: the
-  # peak_giveback_retain_* fractions below (65% of a 1R-2R peak, 72% of
-  # 2R-3R, 78% of 3R+). peak_giveback_enabled: false turns it off.
+  # peak_giveback_min_r, exit when current_r retraces to a floor that
+  # keeps a tiered fraction of the peak: the peak_giveback_retain_*
+  # fractions below (65% of a 1R-2R peak, 72% of 2R-3R, 78% of 3R+).
+  # peak_giveback_enabled: false turns it off.
+  # 2026-11-07: 1.25, was 1.0. H: 2026-10-14..11-06 (124 trades): the 44
+  # giveback exits kept 0.77R of a 1.28R mean peak, and price went past the
+  # peak later in 93% of them, to the initial target without the initial
+  # stop in 59%; the exits sat in 1m noise. Replayed on the 1m bars with the
+  # profit lock at 1.20R (below) and no breakeven move, arming the floor at
+  # 1.25R made +$930 against +$360 at the shipped knobs; 1.5R made +$1,070
+  # on fewer, bigger trades. 1.25R, a floor at 0.81R, keeps the lock's
+  # +0.50R under it.
   peak_giveback_enabled: true
-  peak_giveback_min_r: 1.0
+  peak_giveback_min_r: 1.25
   # Low-tier peak-giveback (2026-05-26): catches 0.7-1.0R MFE trades
-  # that round-trip to BE before the main tier (peak_giveback_min_r=1.0)
-  # arms. 0.7 giveback_frac = floor at 30% of peak (e.g., 0.9R peak →
-  # exits when current_r ≤ 0.27R). Skipped when the high-conviction
-  # per-trade override is active.
-  peak_giveback_low_tier_enabled: true
+  # that round-trip to BE before the main tier arms. Skipped when the
+  # high-conviction per-trade override is active.
+  # OFF 2026-11-07. On H: 2026-10-14..11-06 it fired 15 times, 11 minutes
+  # in on average, on a 0.3R wiggle after a 0.85R mean peak, and kept
+  # 0.41R; price later went past the peak in 93% of them (median 3.9R from
+  # entry). Every replayed knob set did better without it (+$330 mean
+  # across the grid). Its two knobs below are kept for turning it back on.
+  peak_giveback_low_tier_enabled: false
   peak_giveback_low_tier_min_r: 0.7
   # 2026-07-31: was 0.7 (retain only 30% of peak). With the partial-
   # breakeven tier disabled this became the EARLIEST ratchet, and it was
@@ -1193,13 +1214,24 @@ strategies:
       # -0.02R). Excursion measured in ATR is MFE p25 0.43 / median 1.55 /
       # p75 3.05, and a typical stop is ~3 ATR, so the median trade peaks
       # near 0.5R. Triggers moved onto that distribution: breakeven arms on
-      # roughly half of trades instead of a fifth. Ordering is deliberate —
-      # discretionary_exit_min_r (0.50) < breakeven (0.60) <
-      # peak_giveback_low_tier_min_r (0.70) < profit-lock (0.85) < runner
-      # (0.90) < peak_giveback_min_r (1.00).
-      adaptive_breakeven_rr: 0.60              # was 1.00 — armed on only ~21% of trades
-      adaptive_profit_lock_rr: 0.85            # was 1.20
-      adaptive_profit_lock_stop_rr: 0.45       # unchanged — locks +0.45R once the 0.85R trigger arms
+      # roughly half of trades instead of a fifth.
+      # 2026-11-07 retune, on H: 2026-10-14..11-06 (124 trades, the 5m
+      # setups). The 07-27 triggers cashed 0.4-0.9R winners against full
+      # 1R losers: the breakeven at 0.60R scratched 10 trades of a 0.66R
+      # mean peak, 7 of which then ran 1R or more; the lock at 0.85R and
+      # the low tier at 0.70R (risk block) took the rest of the winners
+      # near 0.8R. Replayed on the 1m bars with the same entries: the
+      # shipped knobs +$360, no breakeven move and the lock at 1.20R to
+      # +0.50R with the giveback floor from 1.25R +$990, the raw bracket
+      # +$1,675; a breakeven move at 1.0R under the 1.20R lock cost $245.
+      # Ordering is deliberate — profit-lock (1.20) < peak_giveback_min_r
+      # (1.25, risk block). The runner trigger (0.90) stays where it was:
+      # a laddered trade never extends (TradeManager reads the ladder's
+      # flag), and a rung-less runner (a range setup, or no rung) extends
+      # its target and trails from 0.90R as before.
+      adaptive_breakeven_rr: null              # 2026-11-07: off, was 0.60 (1.00 before 07-27); null = no breakeven move
+      adaptive_profit_lock_rr: 1.20            # 2026-11-07: was 0.85 (1.20 before 07-27)
+      adaptive_profit_lock_stop_rr: 0.50       # 2026-11-07: was 0.45 — locks +0.50R once the 1.20R trigger arms
       # Partial-breakeven tier DISABLED 2026-07-29 (null = off; see
       # TradeManager.update_position, which skips the tier when the value
       # is None).

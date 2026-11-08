@@ -381,6 +381,22 @@ class RiskConfig:
     # capital blocking a slot. 0 = disabled.
     time_stop_minutes: int = 45
     time_stop_min_return_pct: float = 0.003
+    # --- The target's reward at the entry's limit (2026-11-07) ---
+    # A stock entry is refused when its target's reward from the marketable
+    # limit the order would go out at is under this multiple of its risk to
+    # the stop from that limit (``entry_target_rr_below_floor(...)``). The
+    # strategy built the target against the bar close it signalled on; the
+    # order is priced on a later quote, past that close by the move since
+    # and the spread, and the stop does not move with it. On H:
+    # 2026-10-14..11-06, 36 of 124 top_tier entries went out with under 1.5R
+    # from the fill to the ladder's first rung (kept at ladder_min_target_rr
+    # 1.2 from the close) and 5 with under 1R: NVDA 10-16 filled 216.67
+    # against a 217.20 target and a 215.94 stop, 0.73R, and "hit target".
+    # Those under 1R lost; those between 1R and 1.5R were net winners, so
+    # the floor ships at 1.0, never a target nearer than the stop. 0 or
+    # null turns the check off. An option entry, whose stop and target are
+    # premiums, is not judged by it.
+    entry_min_target_rr_at_limit: float | None = 1.0
     # Peak-giveback floor: once the trade's max_favorable_r (peak R since
     # entry) crosses peak_giveback_min_r, force an exit when current_r
     # retraces to the floor, a tiered fraction of the peak it keeps: the
@@ -1876,6 +1892,8 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         "trailing_stop_pct": _Number(low=0, nullable=True, note=" (0 or null turns the trail off)"),
         "time_stop_minutes": _Number(integer=True, low=0, note=" (0 turns the time stop off)"),
         "time_stop_min_return_pct": _AT_LEAST_ZERO,
+        # Read at every stock entry (EntryGatekeeper._entry_target_rr_refusal).
+        "entry_min_target_rr_at_limit": _Number(low=0, nullable=True, note=" (0 or null turns the check off)"),
         "peak_giveback_min_r": _Number(
             low=0, low_open=True, note=" (peak_giveback_enabled: false turns the giveback off)",
         ),
