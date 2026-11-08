@@ -9,6 +9,85 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The orders the bot sent are never left untracked across a cancel, a
+  replacement, a restart or a poll (the whole-bot review's live-order
+  safety set, 2026-11-08).**
+  - *Unsettled entry orders are saved* (`ReconcileMetadataStore`, table
+    `unsettled_entry_orders`) on every change and loaded before the startup
+    reconcile, which settles them against the account read (the fills
+    adopted as positions, capped at what the account holds; a working
+    remainder cancelled), so a restart no longer leaves a remainder to fill
+    untracked. A live stock entry order is recorded the moment the broker
+    accepts it, before its poll (`SchwabExecutor.submit_equity_entry`'s
+    `on_order_sent`, as an exit's), so a stop signal in the poll leaves it
+    recorded. A record the broker cannot show, or a REPLACED order whose
+    replacement is never found, is dropped at ERROR once it is from an
+    earlier day (a DAY order can fill nothing then); a dry run tracks no
+    saved record. What a tracked order may still fill counts as a slot,
+    stock notional and open risk (`EntryGatekeeper._positions_with_unsettled`).
+  - *An entry order REPLACED at the broker is followed to its replacement*
+    (`_follow_replaced_entry`: the id its payload names, else the one later
+    entry order on the symbol for the side among the day's orders,
+    `broker_payloads.replacement_order(..., entry=True)`), with the
+    replacement's fills counted from zero; while none is found the record is
+    held, the symbol closed to entries, ERROR each pass and `ORDER REPLACED
+    UNTRACKED` at CRITICAL every `disaster_stop_escalation_attempts`-th.
+    Until now a REPLACED entry read as settled: the record was dropped, the
+    symbol reopened to a second entry and the replacement filled untracked.
+    An option partial fill whose result names a replacement books nothing
+    against the new id (the fills were the original's).
+  - *The post-close sweep keeps its key until the cancel confirms*
+    (`PositionManager._run_exit_sweep`): a leftover exit order whose cancel
+    the broker does not confirm is re-cancelled each pass, entries in the
+    symbol and the day hold wait, ERROR each pass and `EXIT ORDERS LEFT` at
+    CRITICAL every `disaster_stop_escalation_attempts`-th failed pass; a
+    leftover that sold shares is CRITICAL once per share sold. Until now the
+    key was dropped before the cancel was sent.
+  - *A saved position the broker no longer holds is booked from its stop's
+    fill* (`StartupReconciler._book_positions_closed_while_down`): its
+    disaster stop filled while the process was down, so the fill goes into
+    trades.csv, the day's figures and `risk.register_realized_pnl` (the
+    daily-loss latch), once, for the filled shares, and the row is deleted.
+    A fill from an earlier day, an unreadable or unfilled stop, or a
+    remainder the fill does not cover is reported at ERROR, unbooked. Until
+    now the row was pruned unread and `max_daily_loss` had the loss's room.
+  - *A live entry's re-sends are judged at their new limit*
+    (`submit_equity_entry`'s `reprice_guard`, `EntryGatekeeper._relimit_refusal`):
+    the levels, the target's reward floor and the entry spread guard at the
+    re-priced limit, before it goes out; a refusal ends the entry
+    (`live_reprice_refused:<refusal>`) with the order before it cancelled.
+    Until now the re-sends chased the ask unjudged, so an entry refused at
+    its limit could fill at a worse one.
+  - *An expired Schwab login is escalated every pass*
+    (`IntradayBot._check_schwab_login`): past schwabdev's login time,
+    `SCHWAB LOGIN EXPIRED` at CRITICAL once, ERROR every 15 minutes, the
+    dashboard's `trading_blocked_reason` `schwab_login_expired`, status
+    `error` and a message naming it, until the token store shows a renewed
+    login (re-read once a minute). Until now the lapse was one WARNING at
+    the day's first pass and the bot showed "Running" through whole days of
+    401s (H: 10-20, 10-28, 10-29).
+
+### Fixed
+
+- **An unreadable reconcile metadata store is never read as empty**
+  (`ReconcileMetadataStore.load_positions` raises). The reconcile restores
+  what the broker's rows give (a position restored from its row alone is
+  tracked and managed, not left untracked), prunes and saves nothing over
+  the saved rows (the engine saves no metadata while the last attempt's
+  read failed, `StartupReconciler.metadata_read_error`), and fails the
+  attempt, so entries stay blocked and the retry reads the store again.
+  Until now a store locked past sqlite's wait or corrupt read as "no saved
+  rows": under `restore_hybrid` every held position restored basic with
+  default levels and the save overwrote the saved rows for good. The
+  store's per-row parse skip and its failed-save warning name the error's
+  type.
+- **The cycle gate fails closed when the positions' session check raises**
+  (`CycleGate._positions_management_actionable`): management stays on and
+  the error is logged at WARNING with its type, once a minute while it
+  persists; the executor judges the session again before any order. Until
+  now it turned management off for every position, at DEBUG (no production
+  input reached it).
+
 - **A stock entry's target must pay at least `risk.entry_min_target_rr_at_limit`
   times its risk from the marketable limit the order goes out at
   (`entry_target_rr_below_floor(...)`), 1.0 in the shipped presets; and
