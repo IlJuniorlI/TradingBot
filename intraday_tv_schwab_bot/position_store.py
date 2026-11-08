@@ -58,6 +58,19 @@ class ReconcileMetadataStore:
                 )
                 """
             )
+            # The entry orders the gatekeeper could not settle, as it tracks
+            # them (``EntryGatekeeper.unsettled_entry_orders``, serialised by
+            # it), so a restart settles them instead of leaving a working
+            # remainder to fill untracked (2026-11-08).
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS unsettled_entry_orders (
+                    position_key TEXT PRIMARY KEY,
+                    record_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             conn.commit()
         finally:
             conn.close()
@@ -145,7 +158,7 @@ class ReconcileMetadataStore:
             else:
                 self.upsert_positions(positions)
         except Exception as exc:
-            LOG.warning("Could not save startup reconcile metadata: %s", exc)
+            LOG.warning("Could not save startup reconcile metadata (%s: %s)", type(exc).__name__, exc)
             return False
         self._last_saved = (signature, replace_all)
         return True
@@ -184,7 +197,51 @@ class ReconcileMetadataStore:
         finally:
             conn.close()
 
+    def save_unsettled_entries(self, records: dict[str, dict[str, Any]]) -> None:
+        """Replace every stored unsettled entry row with *records* (the
+        gatekeeper's, already serialisable): the table holds exactly what
+        the gatekeeper tracks, so an empty dict clears it. Raises on a store
+        that cannot be written; the caller logs it."""
+        self._ensure_ready()
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [{"position_key": str(key), "record_json": json.dumps(json_safe(record, non_finite="keep"), sort_keys=True),
+                 "updated_at": now} for key, record in records.items()]
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.execute("DELETE FROM unsettled_entry_orders")
+            if rows:
+                conn.executemany(
+                    "INSERT INTO unsettled_entry_orders (position_key, record_json, updated_at) "
+                    "VALUES (:position_key, :record_json, :updated_at)", rows)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def load_unsettled_entries(self) -> dict[str, dict[str, Any]]:
+        """The stored unsettled entry rows, by position key, as saved. A
+        store that cannot be read raises: it is never read as empty (the
+        caller decides what an unknown record means)."""
+        if not self.path.exists():
+            return {}
+        self._ensure_ready()
+        conn = sqlite3.connect(self.path)
+        try:
+            rows = conn.execute(
+                "SELECT position_key, record_json FROM unsettled_entry_orders ORDER BY position_key").fetchall()
+        finally:
+            conn.close()
+        return {str(key): json.loads(raw) for key, raw in rows}
+
     def load_positions(self) -> dict[str, Position]:
+        """The saved rows as positions, by position key. A missing file is
+        an empty store. A store that cannot be read (locked past sqlite's
+        wait, corrupt, an I/O error) raises: it is never read as empty
+        (2026-11-08; until then the read's failure returned {} at WARNING,
+        the hybrid restore then rebuilt every held position with default
+        levels and its save overwrote the saved rows, the whole-bot
+        review's R-002). A row that is there but does not parse is skipped
+        with its error's type, as decided 2026-09-26: the other rows still
+        restore."""
         if not self.path.exists():
             return {}
         self._ensure_ready()
@@ -192,9 +249,6 @@ class ReconcileMetadataStore:
         try:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("SELECT * FROM open_position_metadata ORDER BY position_key").fetchall()
-        except Exception as exc:
-            LOG.warning("Could not load startup reconcile metadata from %s: %s", self.path, exc)
-            return {}
         finally:
             conn.close()
         out: dict[str, Position] = {}
@@ -206,8 +260,29 @@ class ReconcileMetadataStore:
                     continue
                 out[key] = self._deserialize(record)
             except Exception as exc:
-                LOG.warning("Skipping startup reconcile metadata row due to parse error: %s", exc)
+                LOG.warning("Skipping startup reconcile metadata row due to parse error (%s: %s)",
+                            type(exc).__name__, exc)
         return out
+
+    def delete_positions(self, position_keys: set[str]) -> int:
+        """Delete the rows of *position_keys*; the number removed. For a row
+        whose position is settled outside the restore (a stop fill booked
+        while the bot was down, ``StartupReconciler._book_positions_closed_while_down``,
+        2026-11-08): an upsert keeps every other row, so the booked row must
+        go at once or the next attempt books it again."""
+        keys = {str(key).strip() for key in position_keys if str(key).strip()}
+        if not keys or not self.path.exists():
+            return 0
+        self._ensure_ready()
+        conn = sqlite3.connect(self.path)
+        try:
+            placeholders = ",".join("?" for _ in keys)
+            cur = conn.execute(f"DELETE FROM open_position_metadata WHERE position_key IN ({placeholders})",
+                               tuple(sorted(keys)))
+            conn.commit()
+            return int(cur.rowcount or 0)
+        finally:
+            conn.close()
 
     def delete_unmatched_positions(self, keep_position_keys: set[str]) -> int:
         if not self.path.exists():

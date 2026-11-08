@@ -20,7 +20,7 @@ import pandas as pd
 from .audit_logger import AuditLogger
 from .dashboard_cache import DashboardCache
 from .config import BotConfig
-from .cycle_gate import CycleGate, CycleGateState
+from .cycle_gate import CycleGate, CycleGateState, SCHWAB_LOGIN_EXPIRED
 from .dashboard import DashboardServer
 from .data_feed import MarketDataStore
 from .entry_gatekeeper import EntryGatekeeper
@@ -59,6 +59,7 @@ from .session_report import (
 )
 from .schwab_api import (
     PooledSchwabClient,
+    RefreshTokenWindow,
     SchwabdevApiUsageTracker,
     read_refresh_token_window,
     register_schwab_api_tracker,
@@ -355,6 +356,11 @@ def session_ends_after(config: BotConfig, now: datetime) -> Iterator[datetime]:
         day += timedelta(days=1)
 
 
+# While the Schwab login is expired (``IntradayBot._check_schwab_login``):
+# the CRITICAL when the state starts, then an ERROR this often.
+SCHWAB_LOGIN_ERROR_SECONDS = 900.0
+
+
 class IntradayBot:
     def __init__(self, config: BotConfig):
         self.config = config
@@ -564,6 +570,18 @@ class IntradayBot:
         # (`_log_refresh_token_window`): at start-up, then on the first pass
         # of each trading day.
         self._refresh_token_logged_date: date | None = None
+        # The refresh token's window as last read (``_log_refresh_token_window``),
+        # when schwabdev's login time in it has passed (``_check_schwab_login``:
+        # the login is expired, every API call fails once the access token
+        # lapses) and when the store is next re-read for a renewal.
+        self._schwab_login_window: RefreshTokenWindow | None = None
+        self._schwab_login_expired_since: datetime | None = None
+        self._schwab_login_recheck_at: datetime | None = None
+        # When the expired state last logged (the CRITICAL, then an ERROR
+        # every SCHWAB_LOGIN_ERROR_SECONDS).
+        self._schwab_login_logged_at: datetime | None = None
+        # Every position key this process has tracked (``_save_reconcile_metadata``).
+        self._tracked_position_keys: set[str] = set()
         self.entry_gatekeeper = EntryGatekeeper(
             config,
             client=self.client,
@@ -575,6 +593,7 @@ class IntradayBot:
             strategy=self.strategy,
             positions=self.positions,
             position_manager=None,  # set below once PositionManager exists
+            reconcile_metadata_store=self.reconcile_metadata_store,
             save_reconcile_metadata=self._save_reconcile_metadata,
             is_startup_reconcile_entry_blocked=lambda symbol: self.startup_reconciler.is_entry_blocked(symbol),
         )
@@ -607,6 +626,9 @@ class IntradayBot:
         # (for initialize_position_diagnostics + underlying_price_for_position
         # + SR-timeframe accessors used by _candidate_snapshot).
         self.entry_gatekeeper.position_manager = self.position_manager
+        # The entry orders the last run left unsettled: tracked before the
+        # startup reconcile, which settles them (2026-11-08).
+        self.entry_gatekeeper.load_unsettled_entry_orders()
         self.cycle_gate = CycleGate(
             config,
             positions=self.positions,
@@ -684,9 +706,25 @@ class IntradayBot:
         # retry restores from (the first management cycle did it); write what
         # is tracked over them instead and delete none. `_reconcile_broker`
         # replaces them all on success.
-        self.reconcile_metadata_store.save_if_changed(
-            self.positions, replace_all=self._last_reconcile_session_date is not None,
-        )
+        if self.startup_reconciler.metadata_read_error is not None:
+            # The last attempt could not read the store: the positions it
+            # restored carry default levels, which a save would write over
+            # the saved rows (2026-11-08, R-002). The retry reads it again.
+            return
+        replace_all = self._last_reconcile_session_date is not None
+        # A row of a position this process tracked and has since closed goes
+        # with the upsert too (2026-11-08): the close is booked here, and a
+        # row left behind read, at the next restart, as a position closed
+        # while the bot was down, booked a second time.
+        self._tracked_position_keys |= set(self.positions)
+        closed_here = self._tracked_position_keys - set(self.positions)
+        if closed_here and not replace_all:
+            try:
+                self.reconcile_metadata_store.delete_positions(closed_here)
+            except Exception as exc:
+                LOG.warning("Could not delete the startup reconcile metadata rows of %s (%s: %s)",
+                            ",".join(sorted(closed_here)), type(exc).__name__, exc)
+        self.reconcile_metadata_store.save_if_changed(self.positions, replace_all=replace_all)
 
     def _trade_management_mode(self) -> str:
         return self.config.risk.trade_management_mode
@@ -820,6 +858,7 @@ class IntradayBot:
                     # dropped them (2026-09-25).
                     timer.enter("reconcile")
                     self._maybe_log_refresh_token_window()
+                    self._check_schwab_login(sessions.now_et())
                     self._maybe_session_reconcile()
                     self.step()
                     self.last_error = None
@@ -964,9 +1003,11 @@ class IntradayBot:
             window = read_refresh_token_window(tokens_db)
         except (sqlite3.Error, ValueError) as exc:
             LOG.warning("Schwab refresh token: could not read schwabdev's token store %s (%s: %s); "
-                        "when schwabdev will ask for a new login is unknown",
-                        tokens_db, type(exc).__name__, exc)
+                        "when schwabdev will ask for a new login is unknown%s",
+                        tokens_db, type(exc).__name__, exc,
+                        "" if self._schwab_login_window is None else "; the window last read stands")
             return
+        self._schwab_login_window = window
         login_at = window.login_at.astimezone(EXCHANGE_TZ)
         expires_at = window.expires_at.astimezone(EXCHANGE_TZ)
         stamp = "%Y-%m-%d %H:%M:%S %Z"
@@ -1007,6 +1048,76 @@ class IntradayBot:
                     f"of this version: this install has no {RENEW_SCRIPT}.")
         command = renewal_command(self.config, cwd=Path.cwd(), python=sys.executable, windows=os.name == "nt")
         return f"To log in again from a terminal while the bot runs (no restart needed): {command}"
+
+    def _entry_block_reasons(self, gate_state: CycleGateState) -> list[str]:
+        """Why no entry runs this pass, in the order the dashboard's
+        ``trading_blocked_reason`` lists them: the startup reconcile's
+        block, an expired Schwab login (``_check_schwab_login``, 2026-11-08:
+        the dashboard named the block and the step did not apply it), the
+        unread risk state, then the daily loss latch. Empty when entries
+        may run."""
+        blocked = [part for part in str(self.startup_reconciler.trading_blocked_reason or "").split(",") if part]
+        if self._schwab_login_expired_since is not None:
+            blocked.append(SCHWAB_LOGIN_EXPIRED)
+        if gate_state.risk_state_unread:
+            blocked.append(RISK_STATE_UNREADABLE)
+        if gate_state.daily_loss_latch is not None:
+            blocked.append(DAILY_LOSS_REACHED)
+        return blocked
+
+    def _check_schwab_login(self, now: datetime) -> None:
+        """Every pass (2026-11-08): while schwabdev's login time
+        (``RefreshTokenWindow.login_at``, from the window the daily line
+        read) has passed, the login is expired: once the access token
+        lapses every Schwab call fails (401), no bar or quote arrives, no
+        entry is sent and a held position's exits fail. That state is
+        logged ``SCHWAB LOGIN EXPIRED`` at CRITICAL when it starts, at
+        ERROR every ``SCHWAB_LOGIN_ERROR_SECONDS`` after, shown on the
+        dashboard (``trading_blocked_reason`` ``schwab_login_expired``,
+        status ``error``, the message naming it) and blocks entries
+        (``_entry_block_reasons``), until the store shows a renewed login,
+        re-read at most once a minute while expired (the renew script
+        writes it while the bot runs); a daily read that fails keeps the
+        window last read, so the state is never cleared by an unreadable
+        store. Until then the lapse was one
+        WARNING at the day's first pass, and the bot showed "Running" for
+        whole days of 401s (H: 10-20, 10-28, 10-29; the whole-bot review's
+        R-036)."""
+        window = self._schwab_login_window
+        if window is None or now <= window.login_at:
+            self._schwab_login_expired_since = None
+            return
+        if self._schwab_login_recheck_at is None or now >= self._schwab_login_recheck_at:
+            self._schwab_login_recheck_at = now + timedelta(seconds=60)
+            try:
+                fresh = read_refresh_token_window(self.config.schwab.tokens_db)
+            except (sqlite3.Error, ValueError) as exc:
+                self.audit.log_cycle("schwab_login_store", "unreadable",
+                                     f"Schwab login: the token store could not be re-read ({type(exc).__name__}: {exc})",
+                                     interval=900.0, level=logging.WARNING)
+                fresh = None
+            if fresh is not None and fresh.login_at != window.login_at:
+                self._schwab_login_window = window = fresh
+                if now <= window.login_at:
+                    LOG.warning("Schwab login renewed: the token store now holds a refresh token issued %s; "
+                                "schwabdev asks for the next login from %s",
+                                f"{window.issued_at.astimezone(EXCHANGE_TZ):%Y-%m-%d %H:%M:%S %Z}",
+                                f"{window.login_at.astimezone(EXCHANGE_TZ):%Y-%m-%d %H:%M:%S %Z}")
+                    self._schwab_login_expired_since = None
+                    return
+        login_at = window.login_at.astimezone(EXCHANGE_TZ)
+        if self._schwab_login_expired_since is None:
+            self._schwab_login_expired_since = login_at
+            self._schwab_login_logged_at = now
+            LOG.critical("SCHWAB LOGIN EXPIRED — schwabdev has asked for a new login since %s; once the access token "
+                         "lapses every Schwab call fails (401): no bars or quotes, no entries, and a held position's "
+                         "exits fail. %s", f"{login_at:%Y-%m-%d %H:%M:%S %Z}", self._renew_with())
+            return
+        if (self._schwab_login_logged_at is None
+                or (now - self._schwab_login_logged_at).total_seconds() >= SCHWAB_LOGIN_ERROR_SECONDS):
+            self._schwab_login_logged_at = now
+            LOG.error("Schwab login expired: schwabdev has asked for a new login since %s; API calls fail until it is "
+                      "renewed. %s", f"{login_at:%Y-%m-%d %H:%M:%S %Z}", self._renew_with())
 
     def _maybe_log_refresh_token_window(self) -> None:
         """``_log_refresh_token_window`` on the first pass of each trading
@@ -1920,11 +2031,7 @@ class IntradayBot:
             # The startup reconcile's block, the unread risk state, then the
             # daily loss latch: no entry runs. The day-over idle holds the
             # decisions without a line (its start and end have theirs).
-            blocked = [part for part in str(self.startup_reconciler.trading_blocked_reason or "").split(",") if part]
-            if gate_state.risk_state_unread:
-                blocked.append(RISK_STATE_UNREADABLE)
-            if gate_state.daily_loss_latch is not None:
-                blocked.append(DAILY_LOSS_REACHED)
+            blocked = self._entry_block_reasons(gate_state)
             if gate_state.day_over_idle:
                 self.entry_gatekeeper.hold_entry_decisions(blocked)
             elif self.startup_reconciler.trading_blocked_reason or blocked:
@@ -2000,6 +2107,7 @@ class IntradayBot:
                 daily_loss_latch=self.risk.daily_loss_latch(),
                 day_over_idle=gate_state.day_over_idle,
                 risk_state_error=self.risk.risk_state_error,
+                schwab_login_expired_since=self._schwab_login_expired_since,
             )
             # Last, and inside the cycle, so it reads the frames the cycle
             # cached. It cannot fail the cycle: a failure is the dashboard's
@@ -2584,7 +2692,7 @@ class IntradayBot:
             warmup_summary=warmup_summary,
         )
         return {
-            "status": "running" if self.last_error is None else "error",
+            "status": "running" if self.last_error is None and self._schwab_login_expired_since is None else "error",
             "entry_window_active": gate_state.entry_actionable,
             "management_window_active": gate_state.intraday_session_day and gate_state.management_window_open,
             "management_active": management_active,
@@ -2596,8 +2704,9 @@ class IntradayBot:
             "started_at": self.started_at.isoformat(),
             "screening_active": screening_active,
             "streaming_active": streaming_active,
-            "trading_blocked_reason": self.cycle_gate.trading_blocked_reason(self.risk.daily_loss_latch(),
-                                                                             self.risk.risk_state_error),
+            "trading_blocked_reason": self.cycle_gate.trading_blocked_reason(
+                self.risk.daily_loss_latch(), self.risk.risk_state_error,
+                schwab_login_expired=self._schwab_login_expired_since is not None),
             "startup_reconcile": self.startup_reconciler.result,
             "active_watchlist": self.last_watchlist,
             "quote_watchlist": self.last_quote_watchlist,

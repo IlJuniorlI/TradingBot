@@ -79,6 +79,9 @@ LIVE_UNFILLED_EXPIRED = "live_unfilled_expired"
 # is the original's, whose state reads REPLACED, and the caller looks the
 # replacement up from there.
 LIVE_ORDER_REPLACED = "live_order_replaced"
+# A re-priced entry the caller's guard refused at its new limit
+# (``submit_equity_entry``'s ``reprice_guard``): nothing was sent for it.
+LIVE_REPRICE_REFUSED = "live_reprice_refused"
 REPLACEMENT_UNNAMED = "unknown"
 _LIVE_UNFILLED_BY_STATUS = {
     "CANCELED": LIVE_UNFILLED_CANCELED,
@@ -375,10 +378,13 @@ class SchwabExecutor:
         ok, msg, _payload = self._cancel_live_equity_order(str(order_id))
         return ok, msg
 
-    def _build_repriced_equity_request(self, request: OrderRequest, data, buffer_mult: float) -> OrderRequest | None:
-        """``request`` at a limit priced off a fresh quote, its spread buffer
+    def _build_repriced_equity_request(self, request: OrderRequest, data, buffer_mult: float,
+                                       market: tuple[float, float, float] | None = None) -> OrderRequest | None:
+        """``request`` at a limit priced off a fresh quote (``market``, the
+        caller's bid, ask and last when it read one), its spread buffer
         ``buffer_mult`` times the first's; None without a fresh, usable quote."""
-        market = self._equity_market(request.symbol, data, refresh_quotes=True)
+        if market is None:
+            market = self._equity_market(request.symbol, data, refresh_quotes=True)
         if market is None:
             return None
         bid, ask, last = market
@@ -545,7 +551,10 @@ class SchwabExecutor:
                       leg.get("quantity"), dead_status)
         return OrderResult(ok=False, order_id=order_id, raw=latest_payload or spec, message=message, simulated=False)
 
-    def _submit_live_equity_entry_with_reprice(self, initial_request: OrderRequest, data=None) -> OrderResult:
+    def _submit_live_equity_entry_with_reprice(self, initial_request: OrderRequest, data=None, *,
+                                               on_order_sent: Callable[[str], None] | None = None,
+                                               reprice_guard: Callable[[float | None, float | None, float], str | None] | None = None,
+                                               ) -> OrderResult:
         timeout_seconds = max(0.5, float(self.config.execution.entry_live_fill_timeout_seconds))
         poll_seconds = max(0.1, float(self.config.execution.entry_live_poll_seconds))
         reprice_attempts = max(0, int(self.config.execution.entry_live_reprice_attempts))
@@ -558,6 +567,8 @@ class SchwabExecutor:
             order_id = self._response_order_id(response)
             if not order_id:
                 return OrderResult(ok=False, order_id=None, raw=getattr(response, 'text', current_spec), message="live_missing_order_id", simulated=False)
+            if on_order_sent is not None:
+                on_order_sent(order_id)
             payload, _ = self._poll_equity_order(order_id, timeout_seconds, poll_seconds)
             if order_is_filled(payload):
                 return self._finalize_live_equity_entry_result(current_request, current_spec, payload, order_id, f"live_fill_attempt_{attempt}", data=data)
@@ -599,10 +610,20 @@ class SchwabExecutor:
                 return OrderResult(ok=False, order_id=order_id, raw=latest_payload or current_spec, message=f"live_reprice_cancel_failed:{cancel_msg}", simulated=False,
                                    may_still_be_working=True)
             step_frac = max(0.05, float(self.config.execution.entry_live_reprice_step_frac))
-            next_request = self._build_repriced_equity_request(current_request, data,
-                                                               buffer_mult=1.0 + (attempt + 1) * step_frac)
+            market = self._equity_market(current_request.symbol, data, refresh_quotes=True)
+            next_request = (None if market is None else
+                            self._build_repriced_equity_request(current_request, data,
+                                                                buffer_mult=1.0 + (attempt + 1) * step_frac,
+                                                                market=market))
             if next_request is None:
                 return OrderResult(ok=False, order_id=order_id, raw=payload or current_spec, message="live_reprice_missing_or_stale_quotes", simulated=False)
+            if reprice_guard is not None:
+                refusal = reprice_guard(market[0], market[1], float(next_request.price))
+                if refusal is not None:
+                    LOG.log(TRADEFLOW_LEVEL, "Entry %s re-price to %.4f refused (%s); the order before it was "
+                            "cancelled, nothing is sent", current_request.symbol, float(next_request.price), refusal)
+                    return OrderResult(ok=False, order_id=None, raw=payload or current_spec,
+                                       message=f"{LIVE_REPRICE_REFUSED}:{refusal}", simulated=False)
             current_request = next_request
             current_spec = self._build_order(current_request)
         return OrderResult(ok=False, order_id=None, raw=current_spec, message="live_reprice_exhausted", simulated=False)
@@ -753,9 +774,31 @@ class SchwabExecutor:
     def submit_equity_entry(self, symbol: str, qty: int, intent: OrderIntent, data=None, market_snapshot: Any | None = None,
                             side: Side | None = None, stop_price: float | None = None,
                             target_price: float | None = None,
-                            post_fill_levels: PostFillLevels | None = None) -> OrderResult:
+                            post_fill_levels: PostFillLevels | None = None,
+                            on_order_sent: Callable[[str], None] | None = None,
+                            reprice_guard: Callable[[float | None, float | None, float], str | None] | None = None,
+                            ) -> OrderResult:
         """Send an equity entry: a marketable limit, or in bracket mode (with
         ``side`` and ``stop_price``) the entry with its resting protection.
+
+        Each live order's id goes to ``on_order_sent`` before the order is
+        polled, as an exit's does (``_submit_live_single_order_with_poll``):
+        the caller records it as working first, so a stop signal during the
+        poll leaves it recorded and a restart settles it (2026-11-08; until
+        then an entry passed none, and a working entry order was recorded
+        nowhere across the poll). The dry run calls it for nothing: its fill
+        is settled in the call.
+
+        ``reprice_guard`` judges each re-priced limit before it is sent
+        (``_submit_live_equity_entry_with_reprice``): called with the fresh
+        quote's bid and ask (either None when the quote has no such side)
+        and the limit the re-send would go out at, it
+        returns a refusal (the caller's levels, target-reward floor or
+        spread guard at that limit) or None. A refusal ends the entry with
+        ``live_reprice_refused:<refusal>`` and no order (the order before
+        was cancelled first). Until 2026-11-08 the re-sends chased the ask
+        with no judgement, so an entry the gatekeeper refused at its limit
+        could fill at a worse one (the whole-bot review's R-042).
 
         A bracketed entry needs ``post_fill_levels``, the caller's rule for
         the stop and target a fill leaves the trade with
@@ -821,8 +864,10 @@ class SchwabExecutor:
         if bracketed:
             assert side is not None and stop_price is not None and post_fill_levels is not None
             return self._submit_live_bracket_entry(request, side=side, stop_price=stop_price, target_price=target_price,
-                                                   post_fill_levels=post_fill_levels, data=data)
-        return self._submit_live_equity_entry_with_reprice(request, data=data)
+                                                   post_fill_levels=post_fill_levels, data=data,
+                                                   on_order_sent=on_order_sent)
+        return self._submit_live_equity_entry_with_reprice(request, data=data, on_order_sent=on_order_sent,
+                                                           reprice_guard=reprice_guard)
 
     def submit_equity_exit(self, symbol: str, qty: int, intent: OrderIntent, data=None, market_snapshot: Any | None = None,
                            *, reprice_deadline: float, on_order_sent: Callable[[str], None]) -> OrderResult:
@@ -1845,7 +1890,7 @@ class SchwabExecutor:
 
     def _submit_live_bracket_entry(self, request: OrderRequest, *, side: Side, stop_price: float,
                                    target_price: float | None, post_fill_levels: PostFillLevels,
-                                   data=None) -> OrderResult:
+                                   data=None, on_order_sent: Callable[[str], None] | None = None) -> OrderResult:
         """Submit the one-order bracket and reconcile the resting protection.
 
         No reprice loop: cancel/replace churn on a TRIGGER parent with live
@@ -1864,6 +1909,8 @@ class SchwabExecutor:
         if not order_id:
             return OrderResult(ok=False, order_id=None, raw=getattr(response, "text", spec),
                                message="bracket_missing_order_id", simulated=False)
+        if on_order_sent is not None:
+            on_order_sent(order_id)
         payload, status = self._poll_equity_order(order_id, timeout_seconds, poll_seconds)
         if payload is not None and order_is_filled(payload):
             result = self._finalize_live_equity_entry_result(request, spec, payload, order_id, f"live_bracket_fill:{status}", data=data)

@@ -40,10 +40,11 @@ from typing import TYPE_CHECKING, Any, Callable
 from schwabdev import Client
 
 from .audit_logger import AuditLogger, structured_metadata_snapshot
-from .broker_payloads import active_broker_bracket, is_disaster_stop, order_result_needs_broker_recheck
+from .broker_payloads import (ORDER_REPLACED, active_broker_bracket, is_disaster_stop, order_result_needs_broker_recheck,
+                              order_status_class, replacement_order)
 from .config import BotConfig
 from .data_feed import MarketDataStore
-from .execution import SchwabExecutor
+from .execution import SchwabExecutor, order_result_names_replacement
 from .models import (
     ASSET_TYPE_EQUITY,
     ASSET_TYPE_OPTION_SINGLE,
@@ -51,12 +52,14 @@ from .models import (
     Candidate,
     Position,
     Side,
+    Signal,
     asset_type_of,
     is_option_asset,
 )
 from .options_mode import realized_max_loss_per_contract
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
+from .position_store import ReconcileMetadataStore
 from .position_metrics import entry_slippage, initial_risk_per_unit
 from .numeric import safe_float
 from .reasons import blocked_side, detail_fields, reason_gate
@@ -141,6 +144,7 @@ class EntryGatekeeper:
         strategy: BaseStrategy,
         positions: dict[str, Position],
         position_manager: PositionManager | None,
+        reconcile_metadata_store: ReconcileMetadataStore | None,
         save_reconcile_metadata: Callable[[], None],
         is_startup_reconcile_entry_blocked: Callable[[str], bool],
     ) -> None:
@@ -154,6 +158,10 @@ class EntryGatekeeper:
         self.strategy = strategy
         self.positions = positions
         self.position_manager = position_manager
+        # Where the unsettled entry orders are saved across restarts
+        # (``_save_unsettled_entries``); None only in tests of the stages
+        # that never send an order.
+        self.reconcile_metadata_store = reconcile_metadata_store
         self._save_reconcile_metadata = save_reconcile_metadata
         self._is_startup_reconcile_entry_blocked = is_startup_reconcile_entry_blocked
         # Per-session state (was on IntradayBot before Phase 5 Step 10).
@@ -178,7 +186,9 @@ class EntryGatekeeper:
         # runs.
         self._spread_watches: dict[tuple[str, Side], _SpreadWatch] = {}
         # Entry orders whose outcome the submit call could not settle, keyed
-        # by position key. See settle_unsettled_entry_orders.
+        # by position key. See settle_unsettled_entry_orders. Saved to the
+        # reconcile metadata store on every change and loaded at startup
+        # (``load_unsettled_entry_orders``), so a restart settles them.
         self.unsettled_entry_orders: dict[str, dict[str, Any]] = {}
 
     @staticmethod
@@ -314,6 +324,25 @@ class EntryGatekeeper:
             if target is not None and target >= entry:
                 return False, "target_not_below_entry"
         return True, None
+
+    def _relimit_refusal(self, signal, bid: float | None, ask: float | None, limit_price: float) -> str | None:
+        """The executor's ``reprice_guard`` (2026-11-08): a live entry's
+        re-send at ``limit_price``, priced off the fresh quote ``bid`` /
+        ``ask`` (either None when the quote has no such side, which the
+        guard refuses as unreadable), is judged as the first order was at
+        its limit, in the same order: the levels from that limit
+        (``_entry_levels_valid``), the target's reward floor
+        (``_entry_target_rr_refusal``), then the strategy's entry spread
+        guard. The refusal, or None to send it. Until then the re-sends
+        chased the ask unjudged (R-042)."""
+        levels_ok, levels_reason = self._entry_levels_valid(signal.side, limit_price, signal.stop_price,
+                                                            signal.target_price)
+        if not levels_ok:
+            return levels_reason or "invalid_levels"
+        refusal = self._entry_target_rr_refusal(signal.side, limit_price, signal.stop_price, signal.target_price)
+        if refusal is not None:
+            return refusal
+        return self.strategy.entry_spread_refusal(signal, bid, ask, limit_price)
 
     def _entry_target_rr_refusal(self, side: Side, limit_price: float, stop_price: float,
                                  target_price: float | None) -> str | None:
@@ -699,7 +728,9 @@ class EntryGatekeeper:
     # no management. The order is recorded here and settled from its OWN fill
     # record (account_orders) each cycle: fills are adopted as a position, or
     # grow the position a partial fill already opened, and no new entry is
-    # sent for the symbol while the order may still be live.
+    # sent for the symbol while the order may still be live. An order
+    # REPLACED at the broker is followed to its replacement
+    # (``_follow_replaced_entry``, 2026-11-08).
     #
     # This replaced a recovery that read broker POSITIONS through a snapshot
     # cached once per cycle: every recovery after the cycle's first read a
@@ -708,17 +739,22 @@ class EntryGatekeeper:
     # ------------------------------------------------------------------
 
     def _track_unsettled_entry(self, signal, result, *, position_key: str, asset_type: str,
-                               preview_entry_price: float, booked_qty: int, touch_price: float | None) -> None:
+                               preview_entry_price: float, booked_qty: int, touch_price: float | None,
+                               requested_qty: int) -> None:
         """Track an entry order the submit call could not settle.
         *touch_price* is a stock entry's touch (``_entry_touch``), what its
         late fills' slippage is measured from; None for an option entry and
-        for a quote with no touch on the entry's side."""
+        for a quote with no touch on the entry's side. *requested_qty* is
+        what the order asked for: what it may still fill counts as a slot,
+        stock notional and open risk until it settles
+        (``_positions_with_unsettled``, 2026-11-08)."""
         self.unsettled_entry_orders[position_key] = {
             "order_id": str(result.order_id),
             "symbol": str(signal.symbol),
             "signal": signal,
             "asset_type": asset_type,
             "preview_entry_price": float(preview_entry_price),
+            "requested_qty": int(requested_qty),
             "booked_qty": int(booked_qty),
             # Read as the booking read it (2026-09-26): an infinite fill
             # priced the late slice at 0.0001 or at inf.
@@ -729,11 +765,172 @@ class EntryGatekeeper:
             "booked_price_estimated": bool(result.fill_price_estimated),
             "touch_price": touch_price,
             "message": str(result.message),
+            "tracked_at": sessions.now_et().isoformat(),
         }
         LOG.warning(
             "Entry order %s for %s unsettled (%s); tracking it until the broker reports it terminal",
             result.order_id, position_key, result.message,
         )
+        self._save_unsettled_entries()
+
+    ENTRY_ORDER_SENT = "entry_order_sent"
+
+    @staticmethod
+    def _booked_qty_for_tracking(result, booked_qty: int) -> int:
+        """What a partial fill's record books against ``result.order_id``:
+        *booked_qty*, or 0 when the result's order was REPLACED at the
+        broker and names the replacement
+        (``execution.order_result_names_replacement``), which has filled
+        nothing of its own; the booked contracts are the original's. Until
+        2026-11-08 the original's fills were booked against the new id, so
+        the settle took them off the replacement's own and left the
+        difference untracked (the R-038 verifier's probe: 5 held, 3
+        booked)."""
+        return 0 if order_result_names_replacement(result.message) else int(booked_qty)
+
+    def _note_entry_order_sent(self, signal, order_id: str, *, position_key: str, preview_entry_price: float,
+                               touch_price: float | None, requested_qty: int) -> None:
+        """The executor's ``on_order_sent``: a live stock entry order was
+        accepted and is about to be polled. Record it as unsettled, with
+        nothing booked, and save, so a stop signal in the poll (not an
+        Exception; the submit call never returns) leaves the order recorded
+        and the restart settles it (``load_unsettled_entry_orders``). The
+        submit's result then replaces the record (``_track_unsettled_entry``)
+        or clears it (``_clear_entry_order_sent``). A re-priced send names
+        the new order; the one before it was cancelled first."""
+        self.unsettled_entry_orders[position_key] = {
+            "order_id": str(order_id),
+            "symbol": str(signal.symbol),
+            "signal": signal,
+            "asset_type": ASSET_TYPE_EQUITY,
+            "preview_entry_price": float(preview_entry_price),
+            "requested_qty": int(requested_qty),
+            "booked_qty": 0,
+            "booked_price": None,
+            "booked_price_estimated": False,
+            "touch_price": touch_price,
+            "message": self.ENTRY_ORDER_SENT,
+            "tracked_at": sessions.now_et().isoformat(),
+        }
+        self._save_unsettled_entries()
+
+    def _clear_entry_order_sent(self, position_key: str) -> None:
+        """The submit call returned: the record ``_note_entry_order_sent``
+        wrote is settled by its result, which re-tracks what still works."""
+        record = self.unsettled_entry_orders.get(position_key)
+        if record is not None and record.get("message") == self.ENTRY_ORDER_SENT:
+            del self.unsettled_entry_orders[position_key]
+            self._save_unsettled_entries()
+
+    def _save_unsettled_entries(self) -> None:
+        """Save ``unsettled_entry_orders`` as they stand (every row
+        replaced). A save that fails is logged with its type and the next
+        change tries again: the entry and settle flows must not fail on it,
+        and the startup reconcile's broker reads still catch a working order
+        or its fill."""
+        if self.reconcile_metadata_store is None:
+            return
+        try:
+            self.reconcile_metadata_store.save_unsettled_entries(
+                {key: self._serialize_unsettled_record(record) for key, record in self.unsettled_entry_orders.items()})
+        except Exception as exc:
+            LOG.error("Could not save the %d unsettled entry order record(s) (%s: %s); a restart before the next "
+                      "save would not know of them", len(self.unsettled_entry_orders), type(exc).__name__, exc)
+
+    @staticmethod
+    def _serialize_unsettled_record(record: dict[str, Any]) -> dict[str, Any]:
+        return {**record, "signal": record["signal"].to_record()}
+
+    @staticmethod
+    def _deserialize_unsettled_record(raw: dict[str, Any]) -> dict[str, Any]:
+        return {**raw, "signal": Signal.from_record(raw["signal"]), "requested_qty": int(raw.get("requested_qty") or 0),
+                "booked_qty": int(raw.get("booked_qty") or 0)}
+
+    def load_unsettled_entry_orders(self) -> None:
+        """At startup: track the entry orders the last run left unsettled
+        (saved by ``_save_unsettled_entries``), so the startup reconcile's
+        settle books their fills as positions and cancels what still works,
+        instead of a working remainder filling untracked and unprotected
+        (2026-11-08). A store that cannot be read tracks none, at ERROR with
+        the type: the reconcile's broker reads still see a working order or
+        a position the bot does not hold, and block entries until a human
+        clears them."""
+        if self.reconcile_metadata_store is None:
+            return
+        try:
+            rows = self.reconcile_metadata_store.load_unsettled_entries()
+        except Exception as exc:
+            LOG.error("Could not read the unsettled entry orders saved by the last run (%s: %s); none is tracked. "
+                      "A working entry order or its fill is still caught by the startup reconcile's broker "
+                      "reads, which block entries until it is cleared", type(exc).__name__, exc)
+            return
+        if rows and self.config.schwab.dry_run:
+            # A dry run places no order and cannot settle one: the records
+            # are a live run's (the store is shared) and stay for it.
+            LOG.warning("%d unsettled entry order record(s) saved by a live run (%s) are not tracked by this dry run, "
+                        "which cannot settle them; they stay in the store for the next live run",
+                        len(rows), ", ".join(sorted(rows)))
+            return
+        for key, raw in rows.items():
+            try:
+                record = self._deserialize_unsettled_record(raw)
+            except Exception as exc:
+                LOG.error("Unsettled entry order record for %s saved by the last run cannot be read (%s: %s); "
+                          "it is not tracked", key, type(exc).__name__, exc)
+                continue
+            if self._unsettled_record_is_stale(record):
+                # A DAY order from an earlier day: what it filled is in the
+                # account, which the startup reconcile reads (a restore mode
+                # restores it, block mode blocks); nothing more fills.
+                LOG.error("Entry order %s for %s saved by a run on an earlier day (%s) is not tracked: a DAY order "
+                          "that can fill nothing now; what it filled is in the account the startup reconcile reads",
+                          record["order_id"], key, record.get("tracked_at"))
+                continue
+            # The slice the last run booked is in no position this run holds
+            # yet: the broker holds it with whatever filled since, and the
+            # settle adopts the order's whole fill as the position, capped at
+            # what the account holds (``settle_unsettled_entry_orders`` with
+            # ``held``; the restore then skips the tracked symbol). Counted as
+            # booked, the settle adopted only the fills since, short by the
+            # slice.
+            record.update({"booked_qty": 0, "booked_price": None, "booked_price_estimated": False, "loaded": True})
+            self.unsettled_entry_orders[str(key)] = record
+            LOG.warning("Entry order %s for %s was left unsettled by the last run (%s); tracking it until the "
+                        "broker reports it terminal, its fill adopted against the account", record["order_id"], key,
+                        record["message"])
+        if rows and set(rows) != set(self.unsettled_entry_orders):
+            self._save_unsettled_entries()
+
+    def _positions_with_unsettled(self) -> dict[str, Position]:
+        """The open positions plus what each unsettled entry order may
+        still fill (its requested quantity less what is booked, at the limit
+        it was priced at, with its signal's levels), for the risk reads that
+        count slots, stock notional and open risk (``RiskManager.can_open``,
+        ``can_add_stock_notional``, ``daily_loss_refusal``): a tracked
+        remainder is a position the account may hold by the next pass
+        (2026-11-08; until then it counted as nothing, R-122)."""
+        view = dict(self.positions)
+        for key, record in self.unsettled_entry_orders.items():
+            signal = record["signal"]
+            qty = max(0, int(record.get("requested_qty") or 0) - int(record.get("booked_qty") or 0))
+            if qty <= 0:
+                continue
+            price = float(record["preview_entry_price"])
+            if key in view:
+                # A partial fill's position stands; its unfilled remainder
+                # counts beside it.
+                grown = copy.copy(view[key])
+                grown.qty = int(view[key].qty) + qty
+                view[key] = grown
+                continue
+            view[key] = Position(
+                symbol=str(key), strategy=signal.strategy, side=signal.side, qty=qty, entry_price=price,
+                entry_time=sessions.now_et(), stop_price=float(signal.stop_price), target_price=signal.target_price,
+                highest_price=price, lowest_price=price, pair_id=signal.pair_id,
+                reference_symbol=signal.reference_symbol,
+                metadata={**dict(signal.metadata or {}), "unsettled_entry_order": str(record["order_id"])},
+            )
+        return view
 
     def unsettled_entry_order_ids(self) -> dict[str, str]:
         """Position key -> order id of every entry order still settling.
@@ -752,8 +949,18 @@ class EntryGatekeeper:
         return any(str(record.get("symbol") or "").upper().strip() == wanted
                    for record in self.unsettled_entry_orders.values())
 
-    def settle_unsettled_entry_orders(self) -> None:
-        """Adopt whatever the tracked entry orders filled; drop the terminal ones."""
+    def settle_unsettled_entry_orders(self, held: dict[str, int] | None = None) -> None:
+        """Adopt whatever the tracked entry orders filled; drop the terminal
+        ones. A record loaded from the store at startup (``loaded``) is
+        settled only when the caller passes what the broker holds, *held*
+        (shares by symbol, the startup reconcile's account read): the slice
+        the last run booked is in no position this run holds, so the whole
+        fill is adopted, capped at what the account holds in the symbol
+        beyond what is tracked; fills the account no longer holds (a stop
+        sold them while the bot was down) are logged at ERROR, unbooked
+        (2026-11-08; adopting the order's whole fill tracked more than the
+        account held). Without *held* such a record is skipped: the
+        management pass before the reconcile has no account read."""
         if not self.unsettled_entry_orders:
             return
         states = self.executor.fetch_order_states()
@@ -763,8 +970,26 @@ class EntryGatekeeper:
             return
         for position_key, record in list(self.unsettled_entry_orders.items()):
             order_id = str(record["order_id"])
+            if record.get("loaded") and held is None:
+                self.audit.log_cycle(
+                    f"entry_unsettled:{position_key}", "awaiting_account_read",
+                    f"Entry order {order_id} for {position_key} from the last run settles against the startup "
+                    "reconcile's account read; holding",
+                    interval=60.0, level=TRADEFLOW_LEVEL,
+                )
+                continue
             state = states.get(order_id) or self.executor.order_state(order_id)
             if state is None:
+                if self._unsettled_record_is_stale(record):
+                    # A DAY order from an earlier day can fill nothing now;
+                    # a record the broker will never show would otherwise
+                    # hold the symbol, and every restart's reconcile, for
+                    # good (2026-11-08).
+                    LOG.error("Entry order %s for %s, tracked %s, is not listed by the broker and is from an earlier "
+                              "day: a DAY order that can fill nothing now. Dropped; the day's orders at the broker "
+                              "have what it did", order_id, position_key, record.get("tracked_at"))
+                    del self.unsettled_entry_orders[position_key]
+                    continue
                 self.audit.log_cycle(
                     f"entry_unsettled:{position_key}", "state_unavailable",
                     f"Entry order {order_id} for {position_key} not listed by the broker yet; holding",
@@ -773,6 +998,17 @@ class EntryGatekeeper:
                 continue
             filled = int(state.get("filled_qty") or 0)
             booked = int(record["booked_qty"])
+            if record.get("loaded") and held is not None and not is_option_asset(record):
+                symbol = str(record["symbol"]).upper().strip()
+                tracked = sum(int(p.qty) for k, p in self.positions.items()
+                              if str(p.symbol).upper().strip() == symbol and k != position_key)
+                room = max(0, int(held.get(symbol, 0)) - tracked)
+                if filled > room:
+                    LOG.error("Entry order %s for %s filled %d while the bot was down and the account holds %d of them "
+                              "beyond what is tracked: %d are not held (sold while down) and are not booked; check "
+                              "the account for their close", order_id, position_key, filled, room, filled - room)
+                    filled = room
+                record.pop("loaded", None)
             if filled > booked:
                 scale = 100.0 if is_option_asset(record) else 1.0
                 average = safe_float(state.get("fill_price"), None)
@@ -802,6 +1038,11 @@ class EntryGatekeeper:
                 if average is not None:
                     record["booked_price"] = average
                     record["booked_price_estimated"] = average_estimated
+            if order_status_class(state.get("status")) == ORDER_REPLACED:
+                # Ahead of the fill check: a REPLACED order may read filled
+                # (nothing remaining) while its replacement still works.
+                self._follow_replaced_entry(position_key, record, state)
+                continue
             if state.get("is_filled") or state.get("is_terminal_failure"):
                 del self.unsettled_entry_orders[position_key]
                 continue
@@ -809,6 +1050,75 @@ class EntryGatekeeper:
             if not cancel_ok:
                 LOG.warning("Unsettled entry order %s for %s still live; cancel unconfirmed (%s)",
                             order_id, position_key, cancel_msg)
+        self._save_unsettled_entries()
+
+    def _follow_replaced_entry(self, position_key: str, record: dict[str, Any], state: dict[str, Any]) -> None:
+        """A tracked entry order the broker lists REPLACED (changed in the
+        app), its own fills booked: its shares live on in the replacement,
+        which is tracked in its place from here, with its own fills counted
+        from zero. That is the order its payload names (``replaced_by``),
+        or else the one found among the day's orders
+        (``broker_payloads.replacement_order`` with ``entry=True``: the one
+        entry order on the symbol for the side, entered no earlier than it
+        and not dead), as the exit side does. While none is found the
+        record is held as it is: the symbol stays closed to entries, nothing
+        is cancelled (the original is dead), every pass logs at ERROR and
+        every ``execution.disaster_stop_escalation_attempts``-th pass logs
+        ``ORDER REPLACED UNTRACKED`` at CRITICAL, until the orders show it
+        or a human cancels it at the broker (the record survives a restart).
+        Until 2026-11-08 a REPLACED entry read as settled: the record was
+        dropped, the symbol reopened to a second entry, and the replacement
+        filled untracked and unprotected (the whole-bot review's R-038)."""
+        order_id = str(record["order_id"])
+        replacement_id = state.get("replaced_by")
+        if replacement_id is None and not is_option_asset(record):
+            # A stock entry's replacement is a stock entry order on the
+            # symbol; an option record's symbol is its underlying, whose
+            # stock orders are not the replacement: held until named.
+            orders = self.executor.todays_orders()
+            original = next((order for order in orders or [] if str(order.get("orderId")) == order_id), None)
+            found = (replacement_order(orders, original, record["symbol"], record["signal"].side, entry=True)
+                     if orders is not None and original is not None else None)
+            replacement_id = str(found["orderId"]) if found is not None else None
+        if replacement_id is None:
+            if self._unsettled_record_is_stale(record):
+                LOG.error("Entry order %s for %s was REPLACED at the broker, its replacement was never found, and the "
+                          "record is from an earlier day: a DAY order that can fill nothing now. Dropped; the day's "
+                          "orders at the broker have what it did", order_id, position_key)
+                del self.unsettled_entry_orders[position_key]
+                return
+            misses = int(record.get("replacement_misses") or 0) + 1
+            record["replacement_misses"] = misses
+            detail = (f"entry order {order_id} for {position_key} was REPLACED at the broker and its replacement is "
+                      f"not named by its payload nor found among the day's orders ({misses} consecutive pass(es))")
+            LOG.error("%s; the record is held: %s stays closed to entries, and a restart's reconcile waits on it, "
+                      "until the orders show the replacement or the day ends", detail, record.get("symbol"))
+            if misses % int(self.config.execution.disaster_stop_escalation_attempts) == 0:
+                LOG.critical("ORDER REPLACED UNTRACKED — %s; the replacement may fill untracked and unprotected. "
+                             "Check the account.", detail)
+            return
+        LOG.error("Entry order %s for %s was REPLACED at the broker by order %s, which is tracked in its place",
+                  order_id, position_key, replacement_id)
+        record.pop("replacement_misses", None)
+        record.update({"order_id": str(replacement_id), "booked_qty": 0, "booked_price": None,
+                       "booked_price_estimated": False})
+
+    @staticmethod
+    def _unsettled_record_is_stale(record: dict[str, Any]) -> bool:
+        """True when the record was tracked on an earlier ET day than today:
+        the bot's entry orders are DAY orders, so one the broker cannot show
+        by then can fill nothing more (``settle_unsettled_entry_orders``,
+        2026-11-08). A record with no ``tracked_at`` (saved before it was
+        stamped) is not stale."""
+        stamp = record.get("tracked_at")
+        if not stamp:
+            return False
+        try:
+            tracked = datetime.fromisoformat(str(stamp))
+        except ValueError:
+            return False
+        now = sessions.now_et()
+        return tracked.astimezone(now.tzinfo).date() < now.date()
 
     def _grow_position(self, position_key: str, extra_qty: int, extra_price: float | None,
                        record: dict[str, Any], *, extra_price_estimated: bool) -> None:
@@ -1467,7 +1777,7 @@ class EntryGatekeeper:
                 # hold unbooked fills; a second one could double the position.
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "entry_order_unsettled"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
                 continue
-            allowed, reason = self.risk.can_open(signal, self.positions)
+            allowed, reason = self.risk.can_open(signal, self._positions_with_unsettled())
             if not allowed:
                 LOG.log(TRADEFLOW_LEVEL, "Skipping %s %s: %s", signal.symbol, signal.reason, reason)
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, reason], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, None)}, market_side=signal_market_side)
@@ -1519,7 +1829,7 @@ class EntryGatekeeper:
                             signal, result,
                             position_key=str(signal.metadata.get("position_key") or signal.symbol),
                             asset_type=asset_type, preview_entry_price=preview_entry_price, booked_qty=0,
-                            touch_price=None,
+                            touch_price=None, requested_qty=qty,
                         )
                         self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_unsettled:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, preview_entry_price, result.message)}, market_side=signal_market_side)
                         continue
@@ -1598,9 +1908,16 @@ class EntryGatekeeper:
                 if result.may_still_be_working:
                     # Partial fill whose cancel never confirmed: the rest of
                     # the order may still fill and must grow this position.
+                    # A result whose order was REPLACED at the broker names
+                    # the replacement, which has filled nothing of its own:
+                    # the booked contracts are the original's, so the
+                    # record books none against the new id (2026-11-08; as
+                    # the exit side's record does).
                     self._track_unsettled_entry(
                         signal, result, position_key=position_key, asset_type=asset_type,
-                        preview_entry_price=preview_entry_price, booked_qty=qty_for_position, touch_price=None,
+                        preview_entry_price=preview_entry_price,
+                        booked_qty=self._booked_qty_for_tracking(result, qty_for_position),
+                        touch_price=None, requested_qty=qty,
                     )
                 self._save_reconcile_metadata()
                 self._log_entry_decision(signal.strategy, signal.symbol, "entered", [signal.reason], market_side=signal_market_side)
@@ -1678,7 +1995,8 @@ class EntryGatekeeper:
             qty = self.risk.size_position(
                 entry_price, signal.stop_price, slippage_allowance=slippage_allowance,
             )
-            remaining_notional = self.risk.remaining_stock_notional_capacity(self.positions)
+            counted = self._positions_with_unsettled()
+            remaining_notional = self.risk.remaining_stock_notional_capacity(counted)
             if entry_price > 0:
                 qty = min(qty, self.risk.floor_discrete_units(remaining_notional, entry_price))
             if qty <= 0:
@@ -1686,7 +2004,7 @@ class EntryGatekeeper:
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "qty_zero_or_notional_limit"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty, entry_price, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent), **self._risk_snapshot(signal, entry_price, qty)}, market_side=signal_market_side)
                 continue
             proposed_notional = entry_price * qty
-            allowed, reason = self.risk.can_add_stock_notional(self.positions, proposed_notional)
+            allowed, reason = self.risk.can_add_stock_notional(counted, proposed_notional)
             if not allowed:
                 LOG.log(TRADEFLOW_LEVEL, "Skipping %s %s: %s", signal.symbol, signal.reason, reason)
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, reason], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, None, entry_price, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)}, market_side=signal_market_side)
@@ -1695,7 +2013,7 @@ class EntryGatekeeper:
             # known: its own risk to its stop at them (can_open read it at
             # the signal's entry, before the quote; 2026-10-12).
             reason = self.risk.daily_loss_refusal(
-                self.positions, self.risk.entry_risk_to_stop(qty, entry_price, signal.stop_price),
+                counted, self.risk.entry_risk_to_stop(qty, entry_price, signal.stop_price),
                 label=f"{signal.symbol} {signal.side.value} qty={qty} at {entry_price:.4f}",
             )
             if reason is not None:
@@ -1713,10 +2031,14 @@ class EntryGatekeeper:
                 stop_price=signal.stop_price,
                 target_price=signal.target_price,
                 post_fill_levels=partial(self._post_fill_levels, signal.side, signal.stop_price, signal.target_price),
+                on_order_sent=partial(self._note_entry_order_sent, signal, position_key=signal.symbol,
+                                      preview_entry_price=entry_price, touch_price=entry_touch, requested_qty=qty),
+                reprice_guard=partial(self._relimit_refusal, signal),
             )
             filled_qty = int(result.filled_qty or 0) if result.ok else 0
             if result.ok and filled_qty <= 0:
                 LOG.warning("Entry %s ok=True but filled_qty=%s — treating as unfilled", signal.symbol, result.filled_qty)
+                self._clear_entry_order_sent(signal.symbol)
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, "filled_qty_zero"], market_side=signal_market_side)
                 continue
             qty_for_position = filled_qty if filled_qty > 0 else qty
@@ -1728,12 +2050,17 @@ class EntryGatekeeper:
             self.audit.log_structured("ENTRY_CONTEXT", entry_context_payload)
             if not result.ok:
                 if result.order_id and (result.may_still_be_working or order_result_needs_broker_recheck(result.message)):
+                    # Over the provisional record, which the clear below
+                    # then leaves (2026-11-08: cleared first, a stop signal
+                    # in between lost the order).
                     self._track_unsettled_entry(
                         signal, result, position_key=signal.symbol, asset_type=ASSET_TYPE_EQUITY,
-                        preview_entry_price=entry_price, booked_qty=0, touch_price=entry_touch,
+                        preview_entry_price=entry_price, booked_qty=0, touch_price=entry_touch, requested_qty=qty,
                     )
+                    self._clear_entry_order_sent(signal.symbol)
                     self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_unsettled:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, entry_price, result_message=result.message, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent)}, market_side=signal_market_side)
                     continue
+                self._clear_entry_order_sent(signal.symbol)
                 self._log_entry_decision(signal.strategy, signal.symbol, "skipped", [signal.reason, f"order_failed:{result.message}"], context={**self._candidate_snapshot(candidate_by_symbol.get(signal.symbol), bars), **self._signal_snapshot(signal, qty_for_position, entry_price, result_message=result.message, market_snapshot=preview.get('market_snapshot') if isinstance(preview, dict) else None, order_intent=intent), **self._risk_snapshot(signal, entry_price, qty_for_position)}, market_side=signal_market_side)
                 continue
             limit_price = float(entry_price)  # the marketable limit the order went out at
@@ -1836,7 +2163,9 @@ class EntryGatekeeper:
                 self._track_unsettled_entry(
                     signal, result, position_key=signal.symbol, asset_type=ASSET_TYPE_EQUITY,
                     preview_entry_price=limit_price, booked_qty=qty_for_position, touch_price=entry_touch,
+                    requested_qty=qty,
                 )
+            self._clear_entry_order_sent(signal.symbol)
             self._save_reconcile_metadata()
             # The disaster stop goes out once the position is tracked and
             # saved, so a submit that raises cannot lose the position; the

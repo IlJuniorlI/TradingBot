@@ -223,7 +223,8 @@ class PositionManager:
         # _take_look.
         self._looks: dict[str, _Look] = {}
         # Position key -> the post-close sweep still owed for a closed
-        # position whose orders could not be read; see _sweep_exit_orders.
+        # position whose orders could not be read, or whose leftover exit
+        # orders' cancel is not confirmed; see _sweep_exit_orders.
         self._sweeps_owed: dict[str, dict[str, Any]] = {}
         # Position key -> its recent spreads, the abnormal-book guard of a
         # strategy that judges its protective exits on the executable side;
@@ -1792,7 +1793,8 @@ class PositionManager:
 
     def exit_sweep_symbols(self) -> list[str]:
         """The symbols whose closed positions still owe their post-close
-        sweep (``_sweep_exit_orders``): exit orders may still work there, so
+        sweep (``_sweep_exit_orders``; its orders could not be read, or a leftover's cancel
+        is not confirmed): exit orders may still work there, so
         the engine holds the day open for them (``IntradayBot._day_held_open``)
         and management keeps running the sweep."""
         return sorted({str(owed["symbol"]).upper().strip() for owed in self._sweeps_owed.values()})
@@ -1842,11 +1844,19 @@ class PositionManager:
 
     def _run_exit_sweep(self, key: str) -> None:
         """Run *key*'s owed post-close sweep (``_sweep_exit_orders``). One
-        whose read fails stays owed, logged at ERROR, and every
-        ``execution.disaster_stop_escalation_attempts``-th consecutive
-        failure logs ``EXIT ORDERS LEFT`` at CRITICAL. One that reads stays
-        owed while the stop an unconfirmed record sent may still be listed
-        late (until ``sent_at`` + ``DISASTER_STOP_RETRY_SECONDS``). That stop
+        whose read fails, or whose leftover orders' cancel the broker does
+        not confirm, stays owed and is tried again next pass, logged at
+        ERROR, and every ``execution.disaster_stop_escalation_attempts``-th
+        consecutive failure logs ``EXIT ORDERS LEFT`` at CRITICAL; a
+        leftover that sold shares before its cancel is CRITICAL at once. The
+        sweep is done, and the key dropped, only once the symbol lists no
+        live untracked exit order for the side, or the cancel confirmed
+        (until 2026-11-08 the key was dropped before the cancel was sent, so
+        an unconfirmed cancel was never retried and the symbol reopened to
+        entries beside the resting order; the whole-bot review's R-047).
+        One that reads stays owed while the stop an unconfirmed record sent
+        may still be listed late (until ``sent_at`` +
+        ``DISASTER_STOP_RETRY_SECONDS``). That stop
         is looked for among the orders entered from a minute before its
         submit, as the lookup does, so an earlier stop at the same price and
         size is never taken for it; each order's unbooked fills are reported
@@ -1873,9 +1883,8 @@ class PositionManager:
                              "consecutive times to cancel the exit orders it may have left working. Check the "
                              "account; entries in %s wait until they are read.", key, symbol, owed["misses"], symbol)
             return
-        owed["misses"] = 0
-        if sent is None or sessions.now_et() >= sent["sent_at"] + timedelta(seconds=DISASTER_STOP_RETRY_SECONDS):
-            del self._sweeps_owed[key]
+        settled = (sent is None
+                   or sessions.now_et() >= sent["sent_at"] + timedelta(seconds=DISASTER_STOP_RETRY_SECONDS))
         if sent is not None:
             self._report_sent_stop_fills(key, owed, sent_orders)
         tracked = self._tracked_order_ids()
@@ -1883,19 +1892,39 @@ class PositionManager:
                                                symbol, side)
                 if str(order["orderId"]) not in tracked]
         if not left:
+            owed["misses"] = 0
+            if settled:
+                del self._sweeps_owed[key]
             return
         ids = [str(order["orderId"]) for order in left]
         LOG.warning("%s closed with exit order(s) %s still working on %s; cancelling them", key, ", ".join(
             f"{order['orderId']} ({order.get('orderType')} {order.get('quantity')} at "
             f"{order.get('stopPrice')}, {order.get('status') or 'no status'})" for order in left), symbol)
         cancel = self.executor.cancel_bracket({"child_order_ids": ids})
-        if not cancel.ok or cancel.filled_qty > 0:
+        if cancel.filled_qty > int(owed.get("fills_logged") or 0):
+            # Once per share sold: a retried cancel reads the same
+            # cumulative fill again.
+            owed["fills_logged"] = int(cancel.filled_qty)
             LOG.critical(
-                "EXIT ORDERS LEFT — %s closed, and its leftover exit order(s) %s on %s %s: %s. Check the account "
-                "for a position the bot does not track.", key, ", ".join(ids), symbol,
-                f"filled {cancel.filled_qty} share(s) before the cancel" if cancel.filled_qty > 0
-                else "could not be confirmed cancelled", cancel.message,
+                "EXIT ORDERS LEFT — %s closed, and its leftover exit order(s) %s on %s filled %d share(s) before "
+                "the cancel: %s. Check the account for a position the bot does not track.",
+                key, ", ".join(ids), symbol, cancel.filled_qty, cancel.message,
             )
+        if not cancel.ok:
+            owed["misses"] += 1
+            LOG.error("%s closed, and its leftover exit order(s) %s on %s could not be confirmed cancelled (%s; the "
+                      "sweep's %d consecutive failed pass(es)). Retried next pass; entries in %s wait until they are",
+                      key, ", ".join(ids), symbol, cancel.message, owed["misses"], symbol)
+            if owed["misses"] % int(self.config.execution.disaster_stop_escalation_attempts) == 0:
+                LOG.critical("EXIT ORDERS LEFT — %s closed, and its leftover exit order(s) %s on %s could not be "
+                             "confirmed cancelled (%s) after the sweep's %d consecutive failed pass(es). Check the "
+                             "account for an order that would open a position the bot does not track; entries in "
+                             "%s wait until it is gone.", key, ", ".join(ids), symbol, cancel.message, owed["misses"],
+                             symbol)
+            return
+        owed["misses"] = 0
+        if settled:
+            del self._sweeps_owed[key]
 
     def _tracked_order_ids(self) -> set[str]:
         """Every order id an open position tracks: its broker protection's
@@ -2212,7 +2241,8 @@ class PositionManager:
         positions that miss together (2026-09-28).
 
         A post-close sweep a closed position still owes (its orders could
-        not be read, ``_sweep_exit_orders``) is tried again first.
+        not be read, or a leftover's cancel is not confirmed,
+        ``_sweep_exit_orders``) is tried again first.
         """
         reprice_deadline = self.executor.exit_reprice_deadline()
         for key in list(self._sweeps_owed):

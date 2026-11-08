@@ -33,7 +33,8 @@ Design notes:
   as callables (live on EntryGatekeeper). The account holds an unsettled
   entry order's fills before the gatekeeper books them, so the reconcile
   settles those orders first and leaves the positions of any still unsettled
-  to the gatekeeper (2026-09-25). Empty at startup.
+  to the gatekeeper (2026-09-25). The gatekeeper loads the orders the last
+  run left unsettled before the reconcile runs (2026-11-08).
 - ``book_bracket_cancel_fills`` injected as callable (lives on
   PositionManager): what a cancelled bracket's children filled is booked at
   the broker's price with the risk manager's registration, as the manager
@@ -74,7 +75,8 @@ from .broker_payloads import (
 )
 from .config import BotConfig
 from .data_feed import MANAGEMENT_PRICE_KEYS, MarketDataStore
-from .models import ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side, asset_type_of
+from .models import (ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side, asset_type_of,
+                     is_option_asset)
 from .paper_account import PaperAccount
 from .numeric import first_float, safe_float
 from .position_metrics import initial_risk_per_unit
@@ -124,7 +126,7 @@ class StartupReconciler:
         reconcile_metadata_store: ReconcileMetadataStore,
         save_reconcile_metadata: Callable[[], None],
         book_bracket_cancel_fills: Callable[..., None],
-        settle_unsettled_entry_orders: Callable[[], None],
+        settle_unsettled_entry_orders: Callable[..., None],
         unsettled_entry_order_ids: Callable[[], dict[str, str]],
     ) -> None:
         self.config = config
@@ -139,6 +141,15 @@ class StartupReconciler:
         self._book_bracket_cancel_fills = book_bracket_cancel_fills
         self._settle_unsettled_entry_orders = settle_unsettled_entry_orders
         self._unsettled_entry_order_ids = unsettled_entry_order_ids
+        # The error of the attempt's read of the reconcile metadata store,
+        # when it failed (``metadata_read_error``): the broker's positions
+        # are restored from their rows alone, nothing is pruned or saved
+        # over the rows, and the attempt fails so the retry reads it again.
+        self._metadata_read_error: str | None = None
+        # A saved position's stop that could not be read when its close
+        # while the bot was down was to be booked: the attempt fails so the
+        # retry reads it (``_book_positions_closed_while_down``).
+        self._close_booking_error: str | None = None
         # State set by reconcile() and read by engine + entry gate.
         self.trading_blocked_reason: str | None = None
         self.trading_blocked_message: str | None = None
@@ -247,12 +258,32 @@ class StartupReconciler:
     # Restore path — materialize broker positions into self.positions.
     # ------------------------------------------------------------------
 
+    @property
+    def metadata_read_error(self) -> str | None:
+        """The last attempt's reconcile metadata read error (type and
+        message), or None when it read. While set, the engine saves no
+        metadata: a save would write the positions restored from the
+        broker's rows alone over the saved rows (``IntradayBot._save_reconcile_metadata``)."""
+        return self._metadata_read_error
+
     def _load_reconcile_metadata(self) -> dict[str, Position]:
-        try:
-            return self.reconcile_metadata_store.load_positions()
-        except Exception as exc:
-            LOG.warning("Could not load startup reconcile metadata: %s", exc)
-            return {}
+        """The saved rows (``ReconcileMetadataStore.load_positions``). A
+        store that cannot be read raises; the callers note the error
+        (``_metadata_read_error``), go on with what the broker's rows give
+        (a position restored basic is managed and protected rather than
+        left untracked), prune and save nothing over the rows, and the
+        attempt fails at its end so entries stay blocked and the retry reads
+        the store again. Until 2026-11-08 the failure read as no saved rows:
+        the hybrid restore rebuilt every held position with default levels
+        and its save overwrote the saved rows for good (R-002)."""
+        return self.reconcile_metadata_store.load_positions()
+
+    def _note_metadata_read_error(self, exc: Exception, where: str) -> None:
+        self._metadata_read_error = f"{type(exc).__name__}: {exc}"
+        LOG.error("The startup reconcile metadata store could not be read for %s (%s): the broker's positions are "
+                  "restored from their rows alone (default levels), nothing is pruned or saved over the rows, and "
+                  "the attempt fails so entries stay blocked and the retry reads the store again",
+                  where, self._metadata_read_error)
 
     def _restore_levels_for_stock_position(self, side: Side, entry_price: float, current_price: float | None = None, metadata: dict[str, Any] | None = None) -> tuple[float, float | None, float | None, float | None, float | None]:
         """A restored stock position's levels without saved ones: the
@@ -528,6 +559,130 @@ class StartupReconciler:
             return outstanding
         return max(0, int(state.get("filled_qty") or 0) - int(record.get("booked_qty") or 0))
 
+    @staticmethod
+    def _held_shares_by_symbol(raw_positions: list[dict[str, Any]]) -> dict[str, int]:
+        """Net shares the account holds by symbol (long less short), from the
+        broker's position rows, for the entry orders settling against it."""
+        held: dict[str, int] = {}
+        for row in raw_positions:
+            symbol = str(row.get("symbol") or "").upper().strip()
+            if not symbol:
+                continue
+            try:
+                long_qty = int(float(row.get("longQuantity") or 0))
+                short_qty = int(float(row.get("shortQuantity") or 0))
+            except (TypeError, ValueError):
+                continue
+            held[symbol] = held.get(symbol, 0) + abs(long_qty - short_qty)
+        return held
+
+    def _book_positions_closed_while_down(self, raw_positions: list[dict[str, Any]]) -> None:
+        """A position the last run saved (its row in the reconcile metadata
+        store) that the broker no longer holds closed while the bot was
+        down: by its disaster stop, or in the app. Book it before any prune
+        reads the row as stale (2026-11-08; until then the row was pruned
+        unread and the close was in no trade, no report and not in the risk
+        manager's realized P&L, so ``max_daily_loss`` had the loss's room
+        left: the whole-bot review's R-053).
+
+        The booking is the saved stop's fill (``bracket.stop_order_id``, the
+        disaster stop or the bracket's stop) as the broker reports it
+        (``executor.order_state``): its quantity and price, reason ``stop``,
+        broker-recovered, into the account (trades.csv, the day's figures)
+        and ``risk.register_realized_pnl``, gain or loss, since the price is
+        an execution's. The entry is booked for the filled shares only; a
+        remainder the broker holds none of went some other way and is
+        logged at ERROR, unbooked. The row is deleted once booked: a save
+        before the first successful reconcile is an upsert that keeps it,
+        and a retry or a restart booked the fill again (the verifier's
+        probes); the row of a position this process closed itself goes at
+        the engine's next metadata save (``IntradayBot._save_reconcile_metadata``),
+        so a stop the manager booked is not booked here after a restart. A
+        stop that filled on an earlier day
+        (the position was entered before today; a DAY stop fills the day
+        it is entered) is that day's P&L: reported at ERROR, not booked
+        into today's figures, its row deleted. A row whose stop is not
+        saved, cannot be read, or did not fill (closed in the app, or the
+        save raced the exit) is logged at ERROR with what is known: its
+        P&L is unknown and not in the tally, and the row is pruned as
+        before.
+
+        Not judged: a dry run (paper positions never reach the broker), a
+        key still tracked (the settle's), a symbol the broker still holds
+        (the restore's quantity gap), and an option row (no broker stop;
+        its exits are the engine's, F-0063's family)."""
+        if self.config.schwab.dry_run:
+            return
+        try:
+            saved = self._load_reconcile_metadata()
+        except Exception as exc:
+            self._note_metadata_read_error(exc, "the positions closed while the bot was down")
+            return
+        if not saved:
+            return
+        held = {str(row.get("symbol") or "").upper().strip() for row in raw_positions}
+        now = sessions.now_et()
+        for key, position in saved.items():
+            symbol = str(position.symbol or key).upper().strip()
+            if key in self.positions or str(key).upper().strip() in held or symbol in held:
+                continue
+            metadata = position.metadata if isinstance(position.metadata, dict) else {}
+            if is_option_asset(metadata):
+                LOG.warning("%s: an option position saved by the last run is not held by the broker; its close "
+                            "while the bot was down is not booked (option exits are the engine's)", key)
+                continue
+            entered_day = position.entry_time.astimezone(now.tzinfo).date()
+            bracket = metadata.get("bracket") if isinstance(metadata.get("bracket"), dict) else {}
+            stop_id = bracket.get("stop_order_id")
+            if entered_day < now.date():
+                LOG.error("%s: %s %d at %.4f entered %s and saved by the last run is not held by the broker; its "
+                          "close (stop %s) belongs to that day and is not booked into today's figures: the broker "
+                          "statement has it", key, position.side.value, int(position.qty), float(position.entry_price),
+                          entered_day, stop_id or "none saved")
+                self._delete_reconcile_metadata_row(key)
+                continue
+            state = self.executor.order_state(str(stop_id)) if stop_id else None
+            filled = int((state or {}).get("filled_qty") or 0)
+            price = safe_float((state or {}).get("fill_price"), None, finite=True)
+            if stop_id and state is None:
+                # The stop could not be read: the row stays for the retry,
+                # and the attempt fails at its end so one runs.
+                self._close_booking_error = f"{key}: stop {stop_id} could not be read"
+            if state is None or filled <= 0 or price is None or price <= 0:
+                LOG.error("%s: %s %d at %.4f saved by the last run is not held by the broker; its close while the bot "
+                          "was down is not booked (%s). The day's loss tally does not count it: check the account",
+                          key, position.side.value, int(position.qty), float(position.entry_price),
+                          "no stop order saved" if not stop_id
+                          else f"stop {stop_id} could not be read" if state is None
+                          else f"stop {stop_id} reads {state.get('status')} with {filled} filled")
+                continue
+            qty = min(int(position.qty), filled)
+            closed = copy.copy(position)
+            closed.qty = qty
+            self.account.record_restored_entry(closed, float(position.entry_price))
+            realized = self.account.record_exit(
+                closed, float(price), "stop", final_exit=True, remaining_qty_after_exit=0,
+                fill_price_estimated=state.get("fill_price_estimated") is not False, broker_recovered=True,
+            )
+            self.risk.register_realized_pnl(float(realized))
+            LOG.warning("%s: closed while the bot was down: its stop %s filled %d of %d at %.4f (realized %.2f); "
+                        "booked and counted in the day's loss tally", key, stop_id, qty, int(position.qty),
+                        float(price), float(realized))
+            if qty < int(position.qty):
+                LOG.error("%s: %d of its %d shares are not in the stop's fill and the broker holds none; how they "
+                          "closed is unknown and not booked: check the account", key, int(position.qty) - qty,
+                          int(position.qty))
+            self._delete_reconcile_metadata_row(key)
+
+    def _delete_reconcile_metadata_row(self, key: str) -> None:
+        """Delete *key*'s saved row once its position is settled here, so no
+        later attempt reads it again; a delete that fails is logged with its
+        type (the prune on a successful attempt is the second chance)."""
+        try:
+            self.reconcile_metadata_store.delete_positions({str(key)})
+        except Exception as exc:
+            LOG.warning("%s: could not delete its startup reconcile metadata row (%s: %s)", key, type(exc).__name__, exc)
+
     def _settle_positions_closed_at_broker(self, raw_positions: list[dict[str, Any]],
                                            working_orders: list[dict[str, Any]] | None,
                                            unsettled: set[str]) -> bool:
@@ -788,7 +943,12 @@ class StartupReconciler:
         if self.config.active_is_option:
             LOG.warning("startup_reconcile_mode=%s does not restore option strategies; leaving options handling unchanged", self.config.runtime.startup_reconcile_mode)
             return 0, len(positions), []
-        metadata_positions = self._load_reconcile_metadata() if use_metadata else {}
+        metadata_positions: dict[str, Position] = {}
+        if use_metadata:
+            try:
+                metadata_positions = self._load_reconcile_metadata()
+            except Exception as exc:
+                self._note_metadata_read_error(exc, "the hybrid restore")
         matched_metadata_keys: set[str] = set()
         restored = 0
         skipped = 0
@@ -940,7 +1100,7 @@ class StartupReconciler:
             except Exception as exc:
                 LOG.warning("Could not materialize restored paper entry for %s: %s: %s", symbol, type(exc).__name__, exc)
             restored += 1
-        if use_metadata and not unusable:
+        if use_metadata and not unusable and self._metadata_read_error is None and self._close_booking_error is None:
             try:
                 # A position already tracked keeps its row. The loop skips it,
                 # so it never matches, and the engine's save skips an unchanged
@@ -953,7 +1113,7 @@ class StartupReconciler:
                     LOG.info("Pruned %s stale startup reconcile metadata row(s) after hybrid restore", removed)
             except Exception as exc:
                 LOG.warning("Could not prune stale startup reconcile metadata after hybrid restore: %s", exc)
-        if restored or use_metadata:
+        if (restored or use_metadata) and self._metadata_read_error is None:
             self._save_reconcile_metadata()
         return restored, skipped, unusable
 
@@ -985,6 +1145,8 @@ class StartupReconciler:
             return True
         account_read = False
         unsettled: dict[str, str] = {}
+        self._metadata_read_error = None
+        self._close_booking_error = None
         try:
             # Entry orders an earlier cycle left unsettled are booked first,
             # from their own fill records: the account read below already
@@ -1013,6 +1175,16 @@ class StartupReconciler:
             if raw_positions is None:
                 raise RuntimeError("the broker account read failed")
             account_read = True
+            # The entry orders the last run left unsettled settle against
+            # what the account holds (2026-11-08): their fills are adopted
+            # capped at the account's shares, so a stop that sold part while
+            # the bot was down is not tracked as held.
+            self._settle_unsettled_entry_orders(held=self._held_shares_by_symbol(raw_positions))
+            unsettled = self._unsettled_entry_order_ids()
+            # A saved position the account no longer holds closed while the
+            # bot was down: booked from its stop's fill before any prune
+            # reads its row as stale.
+            self._book_positions_closed_while_down(raw_positions)
             working_orders = None if raw_orders is None else self._filter_reconcile_orders(raw_orders)
             # The settle needs the order list only to re-protect a bracketed
             # position, and waits for it there.
@@ -1118,7 +1290,7 @@ class StartupReconciler:
             else:
                 self.trading_blocked_reason = None
                 self.trading_blocked_message = None
-                if mode == "restore_hybrid":
+                if mode == "restore_hybrid" and self._metadata_read_error is None and self._close_booking_error is None:
                     try:
                         # A position the settle left tracked keeps its row.
                         removed = self.reconcile_metadata_store.delete_unmatched_positions(set(self.positions))
@@ -1134,6 +1306,16 @@ class StartupReconciler:
                     )
                 else:
                     LOG.info("Startup reconciliation found no broker positions or working orders")
+            if self._metadata_read_error is not None:
+                # After the restore, so what the broker holds is tracked and
+                # managed; the attempt still fails (entries blocked, retried)
+                # until the store reads.
+                raise RuntimeError(f"the startup reconcile metadata store could not be read "
+                                   f"({self._metadata_read_error}); the broker's positions were restored from "
+                                   f"their rows alone")
+            if self._close_booking_error is not None:
+                raise RuntimeError(f"a position closed while the bot was down could not be booked "
+                                   f"({self._close_booking_error}); retried")
         except Exception as exc:
             LOG.exception("Startup reconciliation failed: %s", exc)
             if not account_read:
@@ -1154,7 +1336,8 @@ class StartupReconciler:
                 waiting = ", ".join(f"{order_id} ({key})" for key, order_id in sorted(unsettled.items()))
                 self.trading_blocked_message = (
                     f"Startup reconciliation is waiting on entry order(s) {waiting} to settle; retrying "
-                    "(a restart clears an order that never does, and the restore then adopts its fills)"
+                    "(the record survives a restart; an order that never settles keeps its symbol closed to "
+                    "entries until it is cancelled at the broker, and its fills are adopted as they show)"
                 )
             else:
                 self.trading_blocked_message = (

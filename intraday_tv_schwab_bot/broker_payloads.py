@@ -629,6 +629,22 @@ def exit_orders(orders: list[dict[str, Any]], symbol: Any, side: Side, *,
     ]
 
 
+def entry_orders(orders: list[dict[str, Any]], symbol: Any, side: Side) -> list[dict[str, Any]]:
+    """The ``extract_orders`` rows among *orders* (whatever their status) on
+    *symbol* alone whose one leg opens a *side* position (a BUY for a LONG,
+    a SELL_SHORT for a SHORT), in the order listed. The entry side of
+    ``exit_orders`` (2026-11-08): what the gatekeeper's settle looks a
+    REPLACED entry's unnamed replacement up among."""
+    entry_instruction = "BUY" if side == Side.LONG else "SELL_SHORT"
+    wanted = str(symbol).upper().strip()
+    return [
+        order for order in orders
+        if order.get("orderId") is not None
+        and [str(s).upper().strip() for s in order.get("symbols") or []] == [wanted]
+        and list(order.get("instructions") or []) == [entry_instruction]
+    ]
+
+
 def listed_stop(order: dict[str, Any]) -> dict[str, Any]:
     """A bracket stub of the stop an ``extract_orders`` row lists as one
     that may still work, adopted as that row lists it
@@ -712,18 +728,20 @@ def order_row_filled_qty(order: dict[str, Any]) -> int:
 
 
 def replacement_order(orders: list[dict[str, Any]], replaced: dict[str, Any], symbol: Any,
-                      side: Side) -> dict[str, Any] | None:
+                      side: Side, *, entry: bool = False) -> dict[str, Any] | None:
     """The ``extract_orders`` row among *orders* of the order that REPLACED
     *replaced* (a row) at the broker, whatever its status since, or None.
 
     The one *replaced* names (``replacementId``) when it is listed. When it
     names none: the one exit order on *symbol* for a *side* position
-    (``exit_orders``) of its kind (a stop for a stop, any other type for any
-    other), entered no earlier than it and not dead (``order_status_class``),
-    other than itself. None when that is not exactly one, or when the time
-    *replaced* was entered cannot be read: the caller holds rather than
-    guess (2026-09-29). A candidate whose entry time cannot be read counts,
-    so it makes the match ambiguous rather than being missed."""
+    (``exit_orders``; with *entry*, the one entry order for it,
+    ``entry_orders``, 2026-11-08) of its kind (a stop for a stop, any other
+    type for any other), entered no earlier than it and not dead
+    (``order_status_class``), other than itself. None when that is not
+    exactly one, or when the time *replaced* was entered cannot be read:
+    the caller holds rather than guess (2026-09-29). A candidate whose
+    entry time cannot be read counts, so it makes the match ambiguous
+    rather than being missed."""
     named = replaced.get("replacementId")
     if named is not None:
         return next((order for order in orders if str(order.get("orderId")) == str(named)), None)
@@ -731,8 +749,9 @@ def replacement_order(orders: list[dict[str, Any]], replaced: dict[str, Any], sy
     if entered is None:
         return None
     is_stop = replaced.get("orderType") in STOP_ORDER_TYPES
+    rows = entry_orders(orders, symbol, side) if entry else exit_orders(orders, symbol, side)
     candidates = [
-        order for order in exit_orders(orders, symbol, side)
+        order for order in rows
         if str(order["orderId"]) != str(replaced.get("orderId"))
         and (order.get("orderType") in STOP_ORDER_TYPES) is is_stop
         and order_status_class(order.get("status")) != ORDER_DEAD

@@ -27,6 +27,7 @@ Design notes:
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -35,6 +36,10 @@ from typing import Any
 from .config import BotConfig
 from .models import Position
 from .risk import DAILY_LOSS_PROJECTED, RISK_STATE_UNREADABLE, DailyLossLatch, RiskManager
+
+# ``trading_blocked_reason`` while schwabdev's login time has passed
+# (``IntradayBot._check_schwab_login``, 2026-11-08).
+SCHWAB_LOGIN_EXPIRED = "schwab_login_expired"
 from .sessions import equity_session_state, is_weekday_session_day
 
 LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
@@ -86,6 +91,9 @@ class CycleGate:
         self.startup_reconciler = startup_reconciler
         self.risk = risk
         self.day_held_open = day_held_open
+        # When the positions' session check last logged its failure
+        # (``_positions_management_actionable``).
+        self._session_check_warned_at: float | None = None
 
     @staticmethod
     def _next_schedule_window_start(now: datetime, schedule: Any) -> datetime | None:
@@ -132,9 +140,20 @@ class CycleGate:
             return False
         try:
             return any(bool(self.executor.can_close_position_now(position, now)) for position in self.positions.values())
-        except Exception:
-            LOG.debug("Could not evaluate position management session state; falling back to monitor-only mode.", exc_info=True)
-            return False
+        except Exception as exc:
+            # Fail closed: a held position is managed, and the executor
+            # judges the session again before any order goes out
+            # (``SchwabExecutor.can_close_position_now`` in
+            # ``PositionManager``). Until 2026-11-08 this returned False at
+            # DEBUG: management off for every position, the wrong direction
+            # (no production input reaches it; R-001). Logged once a minute
+            # while it persists, with the type.
+            mono = time.monotonic()
+            if self._session_check_warned_at is None or mono - self._session_check_warned_at >= 60.0:
+                self._session_check_warned_at = mono
+                LOG.warning("Could not evaluate the positions' session state (%s: %s); managing them, and the "
+                            "executor judges the session again before any order", type(exc).__name__, exc)
+            return True
 
     def _entries_actionable(self, session_state: Any) -> bool:
         if not bool(getattr(session_state, "is_trading_day", False)):
@@ -255,13 +274,18 @@ class CycleGate:
         )
 
     def trading_blocked_reason(self, daily_loss_latch: DailyLossLatch | None,
-                               risk_state_error: str | None) -> str | None:
+                               risk_state_error: str | None, *, schwab_login_expired: bool = False) -> str | None:
         """The dashboard's ``trading_blocked_reason``: the startup
-        reconcile's block, then ``risk_state_unreadable`` while the
-        session's stored risk state is unread (``risk_state_error``, its
-        read's error), then ``daily_loss_limit`` while the session's daily
-        loss latch is set; None when none blocks."""
+        reconcile's block, then ``schwab_login_expired`` while schwabdev's
+        login time has passed (the engine's ``_check_schwab_login``,
+        2026-11-08: every Schwab call fails once the access token lapses),
+        then ``risk_state_unreadable`` while the session's stored risk state
+        is unread (``risk_state_error``, its read's error), then
+        ``daily_loss_limit`` while the session's daily loss latch is set;
+        None when none blocks."""
         reasons = [part for part in str(self.startup_reconciler.trading_blocked_reason or "").split(",") if part]
+        if schwab_login_expired:
+            reasons.append(SCHWAB_LOGIN_EXPIRED)
         if risk_state_error is not None:
             reasons.append(RISK_STATE_UNREADABLE)
         if daily_loss_latch is not None:
@@ -291,6 +315,7 @@ class CycleGate:
         daily_loss_latch: DailyLossLatch | None,
         day_over_idle: bool,
         risk_state_error: str | None,
+        schwab_login_expired_since: datetime | None = None,
     ) -> str:
         """The dashboard's status message. An idle gate (no position,
         screener, management, stream or prewarm) reads "Idle until next
@@ -310,6 +335,10 @@ class CycleGate:
             return str(self.startup_reconciler.trading_blocked_message)
         if self.startup_reconciler.trading_blocked_reason:
             return str(self.startup_reconciler.trading_blocked_reason)
+        if schwab_login_expired_since is not None:
+            return (f"Schwab login expired: schwabdev has asked for a new login since "
+                    f"{schwab_login_expired_since:%H:%M:%S}; API calls fail until it is renewed "
+                    f"(scripts/renew_schwab_token.py)")
         if daily_loss_latch is not None:
             prefix = "Idle until next session" if day_over_idle else "Entries ended for the day"
             return f"{prefix}: {self.daily_loss_text(daily_loss_latch)}"

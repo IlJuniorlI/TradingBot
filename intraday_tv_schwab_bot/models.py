@@ -138,6 +138,26 @@ class Signal:
     pair_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def to_record(self) -> dict[str, Any]:
+        """The signal as JSON-able fields (``side`` by its value), for the
+        unsettled entry orders saved across a restart
+        (``EntryGatekeeper._save_unsettled_entries``, 2026-11-08)."""
+        return {"symbol": self.symbol, "strategy": self.strategy, "side": self.side.value, "reason": self.reason,
+                "stop_price": self.stop_price, "target_price": self.target_price,
+                "reference_symbol": self.reference_symbol, "pair_id": self.pair_id,
+                "metadata": dict(self.metadata or {})}
+
+    @classmethod
+    def from_record(cls, data: Mapping[str, Any]) -> "Signal":
+        """The signal ``to_record`` wrote, read back. Not a new signal: the
+        entry policy built it in the run that saved it (shared_entry.py is
+        the one builder of signals, tests/guards/test_shared_knob_contract.py)."""
+        return cls(symbol=str(data["symbol"]), strategy=str(data["strategy"]), side=Side(str(data["side"])),
+                   reason=str(data["reason"]), stop_price=float(data["stop_price"]),
+                   target_price=None if data.get("target_price") is None else float(data["target_price"]),
+                   reference_symbol=data.get("reference_symbol"), pair_id=data.get("pair_id"),
+                   metadata=dict(data.get("metadata") or {}))
+
 
 @dataclass(frozen=True, slots=True)
 class ExitDecision:

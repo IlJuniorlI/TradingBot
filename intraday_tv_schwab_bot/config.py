@@ -834,7 +834,8 @@ class EquityExecutionConfig:
     # or not looked up; one that went down, or rests more than is held; a
     # cancel before an exit not confirmed, which defers the exit) log a
     # CRITICAL naming it, and so does every this-many consecutive failed
-    # read of a closed position's post-close sweep. Each attempt also logs
+    # pass of a closed position's post-close sweep (its orders not read, or
+    # a leftover exit order's cancel not confirmed). Each attempt also logs
     # on its own.
     disaster_stop_escalation_attempts: int = 3
 
