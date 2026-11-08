@@ -68,8 +68,10 @@ class VwapReclaimRegimeMixin:
                   review's R-021: on H: 10-14..11-06 any bucket under VWAP
                   in the window was the dip and a 30-minute-old one still
                   counted, 94 of 124 entries at 0.00R); top_tier's preset
-                  sets 2 buckets and the round trip, small_cap_squeeze
-                  keeps the old reading.
+                  sets 2 buckets and leaves the held bucket off (user
+                  decision 2026-11-08: with it the regime kept 8 of the 94
+                  archived entries at +0.07R, without it 15 at +3.98R),
+                  small_cap_squeeze keeps the old reading.
           * +1.0  volume pop on the reclaim bar (the last 1m bar's volume >=
                   the dip window's mean 1m volume x ratio)
           * +0.7  trend intact — close > ema9

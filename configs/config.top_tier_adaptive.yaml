@@ -1648,16 +1648,19 @@ strategies:
       vwap_reclaim_lookback_bars: 6 # the round trip's window: the session's last 6 closed 5m buckets (30 min, so from 10:00; a premarket bucket is no dip; 6 one-minute bars until 2026-10-13)
       # 2026-11-08 (the whole-bot review): the flush's last bucket must be
       # among the last this-many closed buckets (2 = the dip ended within 10
-      # minutes; the code default, the window, restricts nothing), and with
-      # the round trip below a bucket of the window must have closed ABOVE
-      # VWAP before the one that closed below it (the name held VWAP, then
-      # flushed). Until then any bucket under VWAP in the window was the dip:
-      # a name under VWAP all morning "reclaimed" a level it never held and
-      # a 30-minute-old dip still counted (94 of 124 dry-run entries at
-      # 0.00R, 10-14..11-06). false admits the session-reversal shape again
-      # (under VWAP all morning, one close back over it).
+      # minutes; the manifest's 6, the window, restricts nothing). Until then
+      # any bucket under VWAP in the window was the dip: a name under VWAP
+      # all morning "reclaimed" a level it never held and a 30-minute-old
+      # dip still counted (94 of 124 dry-run entries at 0.00R, 10-14..11-06).
+      # The held bucket (true: the bucket before the flush must have closed
+      # over VWAP, a round trip) is OFF here (user decision 2026-11-08): on
+      # the 94 archived entries replayed on their trigger bar, Fix B + this
+      # age cap + the S/R veto kept 15 entries at +3.98R; the held rule on
+      # top kept 8 at +0.07R (none distinguishable from chance), and the
+      # goal is to take the trades with the side right, not to filter the
+      # regime down to a few a month.
       vwap_reclaim_max_dip_age_bars: 2
-      vwap_reclaim_require_held_bucket: true
+      vwap_reclaim_require_held_bucket: false
       vwap_reclaim_min_volume_ratio: 1.5
       vwap_reclaim_buffer_pct: 0.0015
       vwap_reclaim_target_rr: 2.0   # matches trend/pullback/momentum; a ladder rung replaces it when one qualifies

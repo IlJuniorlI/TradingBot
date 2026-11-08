@@ -599,7 +599,7 @@ strategies:
       min_vwap_reclaim_score: 3.5
       vwap_reclaim_lookback_bars: 6        # the round trip's window, in closed LTF buckets
       vwap_reclaim_max_dip_age_bars: 6     # 2026-11-08 knobs, set to the old reading here: any dip in the window ...
-      vwap_reclaim_require_held_bucket: false  # ... with no held bucket required (top_tier sets 2 and true)
+      vwap_reclaim_require_held_bucket: false  # ... with no held bucket required (top_tier sets 2 and false too)
       # 2026-06-02: tightened the reclaim confirmation. On the 06-02 fady tape
       # vwap_reclaim over-fired on FALSE reclaims (tiny VWAP pokes that failed
       # back, exiting anchored_vwap_loss — ABTS alone took 4 such losers), and the
