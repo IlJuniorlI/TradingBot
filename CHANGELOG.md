@@ -69,6 +69,21 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Regime-call outcomes read against each side's own baseline** (the
+  whole-bot review's R-051, 2026-11-08; `session_archive._regime_call_outcomes`):
+  a call is right when the close 30 minutes on is its way (until now the
+  two excursions were compared with a 1-ATR floor, which reclassified 0.17%
+  of calls, and the net move was dropped); every `right_pct` comes with its
+  `edge_pct`, the points over the tape's own rate of moving that way over
+  the calls' span (`baseline.up_pct` for LONG, `baseline.short_up_pct` for
+  SHORT; a regime's or an hour's edge weighs its calls' sides), and the
+  payload names its unit: one regime qualification per symbol-minute per
+  side, not the side the vote chose and not an entry. Until now the
+  LONG-view `up_pct` sat alone beside per-side `right_pct`: on the
+  down-drifting 2026-10-14..11-06 window SHORT read 10 points better than
+  LONG (55.9 against 46.1) when, against each side's own baseline, both
+  were below it and SHORT further below (-3.9 against -2.0 points).
+
 - **What loses money on H: now: the whole-bot review's queue section B
   (2026-11-08).** Each item names its finding.
   - *The time stop judges in R and spares a protected trade* (R-017,
