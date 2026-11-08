@@ -76,6 +76,11 @@ risk:
   # time_stop_min_return_pct are scratched to free a slot. 0 = disabled.
   time_stop_minutes: 45
   time_stop_min_return_pct: 0.003
+  # 2026-11-08: gone nowhere in R. The 0.3% band was 0.43R at the median stop
+  # on H: (10-14..11-06) and over 0.8R on a tight one: GOOG 10-26 was scratched
+  # at +1.10R with its lock armed, then ran to 3.73R. A stock is now judged on
+  # |close - entry| / initial risk < 0.3R, never while its stop protects it.
+  time_stop_min_r: 0.3
   # The target's reward at the entry's limit (2026-11-07): a stock entry
   # whose target, from the marketable limit the order goes out at, pays
   # under this multiple of the risk to its stop from that limit is refused
@@ -569,7 +574,8 @@ shared_entry:
   # got 0.11% vs the 1.0% default_stop_pct backstop) tighter than the
   # builder floor — parking the stop on the one price most likely to be
   # swept. 1.5 ATR only refuses to tighten; a builder that deliberately
-  # chose a tighter stop (range / sr_scalp / momentum) keeps it.
+  # chose a tighter stop (range / sr_scalp) keeps it (momentum's
+  # default_stop_pct was a cap until 2026-11-08; it is the floor now).
   min_stop_atr_mult: 1.5
 
 # Shared exit-side toggles — tape-confirmation thresholds and exit gates.
@@ -1064,8 +1070,11 @@ strategies:
       # for LONG, red AND < prior close for SHORT. Catches single-bar
       # fakeouts where a bar tipped a score threshold but did not close the
       # trade's way. Range and sr_scalp are EXEMPT (mean-reversion theses
-      # where the last bar moves against entry by design), and so is
-      # vwap_reclaim (its prior closed bar is the flush).
+      # where the last bar moves against entry by design). vwap_reclaim is
+      # judged too since 2026-11-08 (its reclaim bar is the last closed one;
+      # the flush is a closed 5m bucket before it): on H: 10-14..11-06 the
+      # exemption let 43 of its 94 entries in on a bar that closed against
+      # the trade, -$745, against +$400 kept by the other 51.
       require_entry_confirmation_bar: true
 
       # ===== declared 2026-09-20: previously code-default only =====
@@ -1119,7 +1128,7 @@ strategies:
       # bar shape read the 1m step frame.
       armed_retest_enabled: true
       armed_retest_max_minutes: 12.0        # how long to wait before entering at market anyway
-      armed_retest_zone_atr: 0.15           # price must come back within this x ATR of the cleared level
+      armed_retest_zone_atr: 0.15           # price must come back within this x ATR of the cleared level, and this far under the breakout bar's close (2026-11-08)
       armed_retest_min_close_position: 0.60 # reclaim bar must close in the top 40% of its range (mirror for SHORT)
       armed_retest_invalidation_atr: 0.33   # a close this far back through the level kills the arm
 
@@ -1228,7 +1237,9 @@ strategies:
       # (1.25, risk block). The runner trigger (0.90) stays where it was:
       # a laddered trade never extends (TradeManager reads the ladder's
       # flag), and a rung-less runner (a range setup, or no rung) extends
-      # its target and trails from 0.90R as before.
+      # its target at 0.90R; its 1.2% trail arms at a 0.5R peak
+      # (risk.trail_activation_r, the code's default; "trails from 0.90R"
+      # here was wrong until 2026-11-08, R-152).
       adaptive_breakeven_rr: null              # 2026-11-07: off, was 0.60 (1.00 before 07-27); null = no breakeven move
       adaptive_profit_lock_rr: 1.20            # 2026-11-07: was 0.85 (1.20 before 07-27)
       adaptive_profit_lock_stop_rr: 0.50       # 2026-11-07: was 0.45 — locks +0.50R once the 1.20R trigger arms
@@ -1634,7 +1645,19 @@ strategies:
       # VWAP by a small-cap margin.
       disable_vwap_reclaim_regime: false
       min_vwap_reclaim_score: 3.5   # ceiling 5.0; a bare reclaim scores 2.5, so this needs a second component. SHORTs clear 4.0 via short_min_score_premium
-      vwap_reclaim_lookback_bars: 6 # a close below the session VWAP among the session's last 6 closed 5m buckets (30 min, so from 10:00; a premarket bucket is no dip; 6 one-minute bars until 2026-10-13)
+      vwap_reclaim_lookback_bars: 6 # the round trip's window: the session's last 6 closed 5m buckets (30 min, so from 10:00; a premarket bucket is no dip; 6 one-minute bars until 2026-10-13)
+      # 2026-11-08 (the whole-bot review): the flush's last bucket must be
+      # among the last this-many closed buckets (2 = the dip ended within 10
+      # minutes; the code default, the window, restricts nothing), and with
+      # the round trip below a bucket of the window must have closed ABOVE
+      # VWAP before the one that closed below it (the name held VWAP, then
+      # flushed). Until then any bucket under VWAP in the window was the dip:
+      # a name under VWAP all morning "reclaimed" a level it never held and
+      # a 30-minute-old dip still counted (94 of 124 dry-run entries at
+      # 0.00R, 10-14..11-06). false admits the session-reversal shape again
+      # (under VWAP all morning, one close back over it).
+      vwap_reclaim_max_dip_age_bars: 2
+      vwap_reclaim_require_held_bucket: true
       vwap_reclaim_min_volume_ratio: 1.5
       vwap_reclaim_buffer_pct: 0.0015
       vwap_reclaim_target_rr: 2.0   # matches trend/pullback/momentum; a ladder rung replaces it when one qualifies
@@ -1729,7 +1752,7 @@ strategies:
       # to recover and extend. The risk_manager reads the override from
       # position.metadata; falls back to the global default for trades
       # without the stamp (other strategies, non-conviction trades).
-      peak_giveback_high_conviction_day_strength_pct: 2.5  # HIGH_VOL: was 2.0 — 2% is common in high vol; require 2.5% for true trend-day conviction
+      peak_giveback_high_conviction_day_strength_pct: 2.5  # HIGH_VOL: was 2.0 — 2% is common in high vol; require 2.5% for true trend-day conviction; read toward the trade since 2026-11-08 (a counter-day entry gets the default)
       peak_giveback_high_conviction_min_r: 2.5             # HIGH_VOL: was 2.0 — let conviction trades retrace from 2.5R peak (more runway)
 
       # Confirmation groups (the concentration guard reads correlation_groups

@@ -66,10 +66,13 @@ LOG = logging.getLogger(__name__)
 MEAN_REVERSION_REGIMES = frozenset({"range", "sr_scalp"})
 # Need a market-aligned tape.
 INDEX_CONFIRMED_REGIMES = frozenset({"trend", "pullback", "vol_squeeze", "momentum", "vwap_reclaim"})
-# Need the last CLOSED bar to point the trade's way. vwap_reclaim is excluded
-# because its prior closed bar is the flush; orb because its range-break is
-# the confirmation.
-CONFIRMATION_BAR_REGIMES = frozenset({"trend", "pullback", "vol_squeeze", "momentum"})
+# Need the last CLOSED bar to point the trade's way. orb is excluded because
+# its range-break is the confirmation. vwap_reclaim joined 2026-11-08: its
+# reclaim bar is the last closed one and must close the trade's way (the
+# flush is a closed 5m bucket before it); on H: 10-14..11-06 the exemption
+# let 43 of its 94 entries in on a bar that closed against the trade, for
+# -$745, against +$400 kept by the rest (the whole-bot review's R-022).
+CONFIRMATION_BAR_REGIMES = frozenset({"trend", "pullback", "vol_squeeze", "momentum", "vwap_reclaim"})
 # Regimes whose side must match the _decide_side vote. Everything except the
 # mean-reversion pair and orb (which carries its own bypass because the
 # opening tape is gap-dominated).
@@ -229,6 +232,7 @@ STRICT_BOOL_KNOBS = (
     "require_index_confirmation",
     "leg_anchored_confirmation",
     "trailing_bias_enabled",
+    "vwap_reclaim_require_held_bucket",
 )
 # (key, whole number, lowest, lowest allowed, highest, highest allowed).
 # htf_ema_alignment_score is a weight: 0 turns the term off, and a negative
@@ -246,6 +250,7 @@ NUMBER_KNOBS = (
     ("min_ltf_bars", True, 1, True, None, True),
     ("range_min_stop_atr_mult", False, 0.0, True, None, True),
     ("vol_squeeze_stop_box_mult", False, 0.0, True, None, True),
+    ("vwap_reclaim_max_dip_age_bars", True, 1, True, None, True),
 )
 # As NUMBER_KNOBS, and null is allowed too: the breakeven tier's arm, which
 # null turns off (2026-11-07; BaseStrategy._adaptive_management_components
@@ -567,6 +572,23 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             return None
         return self._htf_trend_row(*self._htf_bias(self._default_htf_context_for_score(symbol, data, float(price)), float(price)))
 
+    def _reads_daily_stats(self) -> bool:
+        """Whether an entry reads ``_symbol_daily_stats``: the ADR scale
+        (``volatility_scaled_thresholds``) or the relative-strength gate
+        (``relative_strength_block_threshold_pct`` above 0)."""
+        return bool(self.params.get("volatility_scaled_thresholds", True)) or \
+            float(self.params.get("relative_strength_block_threshold_pct", 0.5)) > 0.0
+
+    def _daily_history_unreadable(self, symbol: str, data) -> str | None:
+        """The symbol, or its benchmark ETF, whose daily fetch failed today
+        (``MarketDataStore.daily_history_failed``); None when neither did."""
+        key = str(symbol).upper().strip()
+        indices = self._indices_for_symbol(key)
+        for read in [key] + ([indices[0]] if indices else []):
+            if data.daily_history_failed(read):
+                return read
+        return None
+
     def daily_history_symbols(self, watchlist: list[str]) -> list[str]:
         """The symbols ``_symbol_daily_stats`` reads the daily history of,
         for a candidate from ``watchlist``: the symbol itself and its
@@ -718,10 +740,22 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # for those. ORB-bypassed by default — opening flush bars are
         # always huge and other ORB-stretch gates already handle that
         # window.
+        # A gate whose read is missing refuses (2026-11-08, R-093): until
+        # then a None atr14 / %B / stretch (technical_levels or its ATR or
+        # Bollinger sub-feature off, or a frame too short for them) skipped
+        # the gate silently, so switching the context off switched the
+        # anti-chase gates off with it.
+        side_prefix = "long" if side == Side.LONG else "short"
         if regime in {"trend", "pullback", "sr_scalp"}:
             if bool(self.params.get("reject_oversized_entry_bar", True)):
                 atr14 = safe_float(getattr(tech_ctx, "atr14", None))
-                if frame is not None and not frame.empty and atr14 is not None and atr14 > 0.0:
+                if frame is None or frame.empty or atr14 is None or atr14 <= 0.0:
+                    self._set_build_failure(
+                        c.symbol, regime,
+                        f"{side_prefix}_oversized_entry_bar_unreadable(atr14={atr14})",
+                    )
+                    return None
+                else:
                     last_bar = frame.iloc[-1]
                     bar_high = safe_float(last_bar.get("high"))
                     bar_low = safe_float(last_bar.get("low"))
@@ -742,7 +776,6 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                     range_violated = range_atr >= range_max
                     body_violated = body_atr >= body_max
                     if range_violated or body_violated:
-                        side_prefix = "long" if side == Side.LONG else "short"
                         self._set_build_failure(
                             c.symbol, regime,
                             f"{side_prefix}_oversized_entry_bar(range={range_atr:.2f}>={range_max:.2f},body={body_atr:.2f}>={body_max:.2f})",
@@ -779,7 +812,6 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                     if last_fail is not None:
                         elapsed_min = (sessions.now_et() - last_fail).total_seconds() / 60.0
                         if elapsed_min < cooldown_min:
-                            side_prefix = "long" if side == Side.LONG else "short"
                             self._set_build_failure(
                                 c.symbol, regime,
                                 f"{side_prefix}_stretched_cooldown("
@@ -790,9 +822,14 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 atr_stretch = safe_float(getattr(tech_ctx, "atr_stretch_ema20_mult", None))
                 pct_b_max = float(self.params.get("stretched_percent_b_max", 0.80))
                 stretch_max = float(self.params.get("stretched_atr_mult_max", 1.1))
+                if pct_b is None or atr_stretch is None:
+                    self._set_build_failure(
+                        c.symbol, regime,
+                        f"{side_prefix}_stretched_unreadable(pct_b={pct_b},stretch={atr_stretch})",
+                    )
+                    return None
                 if (
                     side == Side.LONG
-                    and pct_b is not None and atr_stretch is not None
                     and pct_b >= pct_b_max and atr_stretch >= stretch_max
                 ):
                     self._stretched_failure_time[c.symbol] = sessions.now_et()
@@ -803,7 +840,6 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                     return None
                 if (
                     side == Side.SHORT
-                    and pct_b is not None and atr_stretch is not None
                     and pct_b <= (1.0 - pct_b_max) and atr_stretch >= stretch_max
                 ):
                     # atr_stretch_ema20_mult is abs(close-ema20)/atr14 — always
@@ -1069,8 +1105,9 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # evaluated, so the refusal payload lists every blocker, of which the
         # queue loop's decision log keeps the primary; the manifest exempts
         # orb from the first two, and since 2026-09-25 range / pullback /
-        # sr_scalp from the structure veto and -- top_tier's manifest only --
-        # vwap_reclaim from the S/R veto), the S/R then technical stop / target
+        # sr_scalp from the structure veto; top_tier's manifest exempted
+        # vwap_reclaim from the S/R veto from 2026-09-25 to 2026-11-08), the
+        # S/R then technical stop / target
         # refinement, and the entry-context / FVG score terms. It reuses the
         # contexts the gates above read, on the same 1m frame.
         admitted = self.entry_policy.admit(EntryProposal(
@@ -1458,15 +1495,17 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             self._drop_armed_retests(c.symbol)
             self._record_entry_decision(c.symbol, "skipped", ["already_in_position"])
             return None
-        # Per-symbol earnings blackout. An earnings print resets the
-        # symbol's volatility regime, so the ATR-derived stops and the
-        # session-open-anchored day_strength this strategy relies on are
-        # both calibrated to a distribution that no longer holds. Across
-        # 23 mega caps that is roughly 92 scheduled events a year,
-        # clustered into three weeks a quarter.
-        earnings_block = self._event_calendar.earnings_block_reason(c.symbol)
-        if earnings_block is not None:
-            self._record_entry_decision(c.symbol, "skipped", [earnings_block])
+        # Per-symbol blackouts: a macro window scoped to the symbol
+        # (2026-11-08, R-124: the cycle's read above passes no symbol, so a
+        # scoped row never matched) and the earnings blackout. An earnings
+        # print resets the symbol's volatility regime, so the ATR-derived
+        # stops and the session-open-anchored day_strength this strategy
+        # relies on are both calibrated to a distribution that no longer
+        # holds. Across 23 mega caps that is roughly 92 scheduled events a
+        # year, clustered into three weeks a quarter.
+        symbol_block = self._event_calendar.entry_block_record(c.symbol)
+        if symbol_block is not None:
+            self._record_entry_decision(c.symbol, "skipped", [symbol_block])
             return None
         if ext_hours_now and not ext_all and c.symbol.upper().strip() not in ext_allowed:
             self._record_entry_decision(c.symbol, "skipped", ["extended_hours_not_eligible"])
@@ -1566,7 +1605,19 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # ADR spans roughly 0.9% (COST/V/TMUS) to 3%+ (NVDA/TSLA/AMD).
         # Orthogonal to ``vol_widening``: that reacts to TODAY's ATR
         # expansion, this encodes how volatile the name normally is.
-        # 1.0 when the daily feed has no stats for the symbol.
+        # 1.0 when the daily feed has no stats for the symbol: a name with
+        # no completed session. A symbol whose daily fetch FAILED today, or
+        # whose benchmark ETF's did (the beta), is refused instead (fail
+        # closed, 2026-11-08; R-114): its scale would be the reference one
+        # and its relative-strength gate skipped, until the feed's retry
+        # answers. Only where the strategy reads the daily stats at all
+        # (``_reads_daily_stats``): small_cap_squeeze scales nothing and
+        # runs no relative-strength gate, so a failed fetch costs it nothing.
+        if data is not None and self._reads_daily_stats():
+            unreadable = self._daily_history_unreadable(c.symbol, data)
+            if unreadable is not None:
+                self._record_entry_decision(c.symbol, "skipped", [f"daily_history_unreadable(symbol={unreadable})"])
+                return None
         vol_scale = self._vol_scale(c.symbol, data)
 
         # Soft-bias gating (Fix A, refactored 2026-05-12). The original
@@ -2222,11 +2273,13 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             # did not close the trade's way. Range and
             # sr_scalp are exempt — both are mean-reversion theses
             # where the LAST CLOSED bar moves AGAINST the entry
-            # direction by design. vwap_reclaim is also exempt — its prior
-            # closed bar is the flush (red, below VWAP) and would fail the
-            # green-bar check; the reclaim's own VWAP-buffer + volume
-            # confirmation stands in. The orb regime is also exempt (not in
-            # the set) — its range-break is the confirmation.
+            # direction by design. vwap_reclaim is judged since 2026-11-08
+            # (R-022): its reclaim bar is the last closed 1m bar and the
+            # flush a closed 5m bucket before it, so a fresh reclaim bar
+            # passes by construction; it was exempt while the gate read the
+            # bar before the trigger bar (until 2026-10-12). The orb regime
+            # is exempt (not in the set) — its range-break is the
+            # confirmation.
             if not pre_validated and (
                 regime_name in CONFIRMATION_BAR_REGIMES
                 and bool(self.params.get("require_entry_confirmation_bar", True))
@@ -2332,6 +2385,12 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 # the session report to tell the two populations apart.
                 if retest_meta and isinstance(sig.metadata, dict):
                     sig.metadata.update(retest_meta)
+                # The arm a confirmed retest entered on is consumed here,
+                # on the emitted signal, so a confirmation the gates refuse
+                # keeps it (2026-11-08, R-019; an expiry's arm is popped by
+                # the sweep).
+                if retest_meta.get("armed_retest_status") == "retest_confirmed":
+                    self._consume_armed_retest(c.symbol, side, regime_name)
                 # The symbol's resolved arms that faded or that the gates
                 # refused earlier in this cycle. The engine logs this
                 # signal's decision row ([its reason], then an engine gate's
@@ -2363,9 +2422,14 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 # manager (TradeManager._peak_giveback_triggered) reads
                 # it from position.metadata at management time. Falls
                 # back to the global config default when not set.
+                # The day strength is read toward the trade (2026-11-08,
+                # R-097): a LONG on a -3% day is a counter-day entry, not a
+                # high-conviction one, and keeps the default management; until
+                # then |day_strength| gave it the loosest.
                 if day_strength is not None:
                     conv_threshold = float(self.params.get("peak_giveback_high_conviction_day_strength_pct", 2.0))
-                    if abs(day_strength) >= conv_threshold:
+                    toward_trade = float(day_strength) if side == Side.LONG else -float(day_strength)
+                    if toward_trade >= conv_threshold:
                         override_r = float(self.params.get("peak_giveback_high_conviction_min_r", 2.0))
                         if isinstance(sig.metadata, dict):
                             sig.metadata["peak_giveback_min_r_override"] = override_r
@@ -2428,9 +2492,11 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             else:
                 fail_reasons.append(f"{side_tag}_build_failed_{failure}")
             # A resolved arm, a confirmed retest or a held expiry, that the
-            # gates refused: the arm is gone (consumed by the verdict or the
-            # expiry sweep), and the refusal above does not say an arm
-            # reached it. This reason is its record, after the refusal so the
+            # gates refused: the refusal above does not say an arm reached
+            # it. A confirmed retest's arm is kept, with its level and
+            # clock, for a later retest or the expiry (2026-11-08); a held
+            # expiry's is gone (popped by the sweep). This reason is its
+            # record, after the refusal so the
             # gate stays the decision's own reason; a signal built for the
             # symbol later in the cycle carries it (``refused_arms``). Until
             # 2026-10-12 nothing recorded one: the armed retest read as never
@@ -2438,6 +2504,8 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             # (10-07..10-09 on H:, 158 of 400 arms confirmed and were
             # refused, untagged).
             if retest_meta:
+                if retest_meta.get("armed_retest_status") == "retest_confirmed":
+                    self._restart_armed_retest_window(c.symbol, side, regime_name, frame.index[-1])
                 record = (
                     f"{side_tag}_build_failed_{regime_name}_armed_retest_refused("
                     f"status={retest_meta['armed_retest_status']},gate={reason_gate(failure)},"

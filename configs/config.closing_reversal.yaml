@@ -61,6 +61,7 @@ risk:
   # time_stop_min_return_pct are scratched to free a slot. 0 = disabled.
   time_stop_minutes: 45
   time_stop_min_return_pct: 0.003
+  time_stop_min_r: 0            # the default: price band only, as this preset was tuned (2026-11-08; top_tier judges in R)
   # Peak-giveback floor: once max_favorable_r since entry crosses
   # peak_giveback_min_r (default 1.0), exit when current_r retraces to a
   # floor that keeps a tiered fraction of the peak: 65% of a 1R-2R peak, 72%

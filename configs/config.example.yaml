@@ -83,6 +83,11 @@ risk:
   # time_stop_min_return_pct are scratched to free a slot. 0 = disabled.
   time_stop_minutes: 0  # parity: the peer exit path never ran it before 2026-09-24
   time_stop_min_return_pct: 0.003
+  # Gone nowhere in R (2026-11-08): a stock position with a known initial stop
+  # is scratched only when its move is under this many R; never while its stop
+  # is at or past the entry. The price band above stays for options and for a
+  # position with no initial stop; 0 (the default) judges in price % only.
+  time_stop_min_r: 0.3
   # The target's reward at the entry's limit (2026-11-07): a stock entry
   # whose target, from the marketable limit the order goes out at, pays
   # under this multiple of the risk to its stop from that limit is refused

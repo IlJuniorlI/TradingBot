@@ -169,8 +169,10 @@ class BaseStrategy(ContextBuildersMixin):
                 )
         self._manifest = get_plugin(config.strategy)
         # Scheduled-event calendar (macro windows + per-symbol earnings),
-        # shared by every strategy. Lazily re-reads its YAML sources when
-        # their mtime changes, so it is safe to build once here.
+        # built for every strategy and consulted by the ones that read it
+        # (top_tier_adaptive, small_cap_squeeze, the two 0DTE strategies;
+        # event_blackouts' module docstring). Lazily re-reads its YAML
+        # sources when their mtime changes, so it is safe to build once here.
         self._event_calendar = EventBlackoutCalendar(config)
         self._entry_decisions: dict[str, dict[str, Any]] = {}
         self._build_failures: dict[tuple[str, str], dict[str, Any]] = {}

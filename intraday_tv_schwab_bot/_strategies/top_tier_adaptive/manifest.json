@@ -141,6 +141,13 @@
     "disable_range_regime": false,
     "disable_vol_squeeze_regime": false,
     "disable_vwap_reclaim_regime": false,
+    "min_vwap_reclaim_score": 3.5,
+    "vwap_reclaim_lookback_bars": 6,
+    "vwap_reclaim_max_dip_age_bars": 6,
+    "vwap_reclaim_require_held_bucket": false,
+    "vwap_reclaim_min_volume_ratio": 1.2,
+    "vwap_reclaim_buffer_pct": 0.0005,
+    "vwap_reclaim_target_rr": 2.0,
     "disable_momentum_regime": false,
     "stop_buffer_atr_mult": 0.25,
     "require_index_confirmation": true,
@@ -336,9 +343,6 @@
         ],
         "sr_scalp": [
           "structure"
-        ],
-        "vwap_reclaim": [
-          "sr"
         ]
       }
     },

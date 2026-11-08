@@ -1955,6 +1955,18 @@ class MarketDataStore:
             failed_at = self.daily_history_failed_at.get(key)
         return retry_failed and failed_at is not None and (now - failed_at).total_seconds() >= DAILY_HISTORY_RETRY_SECONDS
 
+    def daily_history_failed(self, symbol: str) -> bool:
+        """True while today's daily history fetch for ``symbol`` raised and
+        nothing has answered since (``fetch_daily_history``'s failure
+        branch): the strategy's reads of its stats would fall back to no
+        stats, so an entry in it is refused instead (fail closed,
+        2026-11-08; the whole-bot review's R-114). An answer with no
+        completed session is not a failure: the symbol has no stats to
+        give."""
+        key = self._symbol_key(symbol)
+        with self._lock:
+            return self.last_daily_refresh.get(key) == sessions.now_et().date() and key in self.daily_history_failed_at
+
     def get_daily_history(self, symbol: str, calendar_days: int = 180) -> pd.DataFrame | None:
         """Daily OHLC bars for *symbol*: what ``fetch_daily_history`` stored
         for today's ET date (in memory; a new date fetches again), fetched
@@ -2018,14 +2030,22 @@ class MarketDataStore:
             )
             frame = self._history_candles_to_frame(payload.get("candles", []))
         except Exception as exc:
-            LOG.warning("Daily price_history fetch failed for %s: %s: %s; no daily stats for it until a fetch succeeds.",
-                        symbol, type(exc).__name__, exc)
             with self._lock:
+                repeat = self.last_daily_refresh.get(key) == today and key in self.daily_history_failed_at
                 self.daily_history[key] = None
                 self.last_daily_refresh[key] = today
                 self.daily_history_failed_at[key] = now
-            self._note_rest_outcome(key, PRICE_HISTORY_REQUEST,
-                                    systemic_failure=schwab_failure_is_systemic(exc))
+            # The day's first failure for the symbol at WARNING, the retries
+            # (one a minute all day, 2026-11-08) at DEBUG.
+            LOG.log(logging.DEBUG if repeat else logging.WARNING,
+                    "Daily price_history fetch failed for %s: %s: %s; no daily stats for it until a fetch succeeds"
+                    "%s.", symbol, type(exc).__name__, exc, " (retried a minute apart)" if repeat else "")
+            systemic = schwab_failure_is_systemic(exc)
+            if systemic:
+                # The engine's prefetch holds every daily fetch while the
+                # back-off waits (``IntradayBot._prefetch_daily_history``).
+                self._note_rest_backoff_failure(f"the daily history fetch of {key} ({type(exc).__name__}: {exc})")
+            self._note_rest_outcome(key, PRICE_HISTORY_REQUEST, systemic_failure=systemic)
             return None
         self._note_rest_outcome(key, PRICE_HISTORY_REQUEST, systemic_failure=False)
         if not frame.empty:

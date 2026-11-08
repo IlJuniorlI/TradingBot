@@ -581,11 +581,10 @@ class RiskManager:
 
         With ``cooldown_direction_aware: true`` (the shipped default), the
         write side only stamps the direction that just exited, so reads
-        should pass the candidate's intended ``side`` when known to avoid
-        blocking the opposite direction. When ``side`` is None — strategies
-        whose screener doesn't pre-classify direction (e.g.
-        peer_confirmed_key_levels) or test fixtures — this returns True if
-        EITHER direction is on cooldown, the conservative fallback.
+        pass the ``side`` they ask about. With no ``side`` this says whether
+        EITHER direction is cooling: the held decisions' information
+        (``EntryGatekeeper.hold_entry_decisions``). The candidate stage's
+        gate is ``candidate_on_cooldown``.
         """
         key = self._symbol_key(symbol)
         now = sessions.now_et()
@@ -596,6 +595,31 @@ class RiskManager:
             if stored_key == key and until and now < until:
                 return True
         return False
+
+    def candidate_on_cooldown(self, symbol: str, bias: "Side | None") -> bool:
+        """Whether the candidate stage holds ``symbol`` back for its cooldown
+        before the strategy sees it. With the screener's ``bias`` that side's
+        cooldown. With none (peer_confirmed_key_levels always, top_tier on
+        a flat day; the strategies evaluate both sides whatever it says)
+        only when EVERY side the config lets it trade is cooling: LONG, and
+        SHORT when ``risk.allow_short``, so the opposite-side flip reaches
+        the strategy and ``can_open`` judges the signal's own side. Until
+        2026-11-08 (R-048) either side cooling dropped the candidate, so the
+        flip the presets promise was never evaluated for ``cooldown_minutes``
+        (H: 10-12..11-06: unreachable in 125 of 167 exit windows). With
+        ``cooldown_direction_aware`` off the exit stamps both sides, so the
+        read is unchanged. An option strategy keeps the either-side reading:
+        its cooldown is keyed by the ORDER side (a bull put credit spread is
+        a SHORT order and a bullish trade), its screener bias is None and
+        both order sides are allowed, so the flip reading would let a credit
+        spread follow a debit spread's exit on the same underlying inside the
+        cooldown (B7's verification)."""
+        if self.config.active_is_option:
+            return self.is_symbol_on_cooldown(symbol)
+        if bias is not None:
+            return self.is_symbol_on_cooldown(symbol, bias)
+        sides = [Side.LONG] + ([Side.SHORT] if bool(self.config.risk.allow_short) else [])
+        return all(self.is_symbol_on_cooldown(symbol, side) for side in sides)
 
     def _reset_if_new_session(self) -> None:
         """Reset per-day realized P&L, and the daily loss latch and the

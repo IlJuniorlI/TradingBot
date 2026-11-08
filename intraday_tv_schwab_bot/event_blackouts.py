@@ -15,7 +15,11 @@ This machinery previously lived inside the 0DTE options strategy, which made
 it unavailable to every equity strategy — top_tier trades 23 mega caps with
 roughly 92 scheduled earnings a year between them and had no event awareness
 at all. It now lives here and is driven by the top-level ``events:`` config
-section, so options and equity strategies share one calendar.
+section: one calendar, built for every strategy and CONSULTED by the ones
+that read it, top_tier_adaptive and small_cap_squeeze (entries) and the two
+0DTE strategies (entries and the ``force_flatten`` rows); the peer_confirmed
+family and the other stock plugins never ask it (2026-11-08, R-018: the
+docs said every strategy did).
 
 The files are re-read when their mtime changes, so a blackout can be added to
 a running bot without a restart. A file that cannot be read, is not YAML, has
@@ -270,6 +274,9 @@ class EventBlackoutCalendar:
         # 0DTE strategies the force-flatten check.
         self._refresh_macro(startup=True)
         self._refresh_earnings(startup=True)
+        # The date the expiry WARNING was last given on (``_check_expiry``).
+        self._expiry_warned_on: date | None = None
+        self._log_state("built")
 
     # ------------------------------------------------------------------
     # Loading
@@ -316,28 +323,99 @@ class EventBlackoutCalendar:
         """
         cfg = self._events_cfg
         inline = [dict(row) for row in (cfg.blackouts or [])]
+        reread = False
         if not cfg.blackout_file:
             self._macro_file_events = []
         else:
             rows = self._reload_file("blackout_file", _blackout_file_rows, startup=startup)
             if rows is not None:
                 self._macro_file_events = rows
+                reread = not startup
         self._macro_events = inline + self._macro_file_events
+        if reread:
+            self._log_state("blackout file re-read")
 
     def _refresh_earnings(self, *, startup: bool = False) -> None:
         """Recompose ``_earnings`` from the inline map plus the file, same
         separation as ``_refresh_macro``."""
         cfg = self._events_cfg
+        reread = False
         if not cfg.earnings_file:
             self._earnings_file = {}
         else:
             dates = self._reload_file("earnings_file", _earnings_file_dates, startup=startup)
             if dates is not None:
                 self._earnings_file = dates
+                reread = not startup
         merged: dict[str, set[date]] = {sym: set(dates) for sym, dates in self._earnings_file.items()}
         for sym, dates in _earnings_map(cfg.earnings).items():
             merged.setdefault(sym, set()).update(dates)
         self._earnings = merged
+        if reread:
+            self._log_state("earnings file re-read")
+
+    # ------------------------------------------------------------------
+    # What the calendar holds
+    # ------------------------------------------------------------------
+    def status(self, today: date | None = None) -> dict[str, Any]:
+        """What the calendar holds: the macro rows (the file's and the
+        inline ones), the newest dated macro row, how many dated rows are
+        today or later, and the earnings symbols with a date today or later
+        (2026-11-08, R-030: H: ran 25 sessions on a macro file that ended
+        2026-08-13 and an empty earnings map, and nothing said so)."""
+        today = today or sessions_today()
+        dated = [d for d in (_row_date(row) for row in self._macro_events) if d is not None]
+        upcoming_earnings = sorted(sym for sym, dates in self._earnings.items() if any(d >= today for d in dates))
+        return {
+            "enabled": bool(self._events_cfg.enabled),
+            "macro_rows": len(self._macro_events),
+            "macro_file_rows": len(self._macro_file_events),
+            "macro_undated_rows": sum(1 for row in self._macro_events if _row_date(row) is None),
+            "macro_newest_date": max(dated).isoformat() if dated else None,
+            "macro_upcoming_rows": sum(1 for d in dated if d >= today),
+            "earnings_symbols": len(self._earnings),
+            "earnings_upcoming_symbols": upcoming_earnings,
+        }
+
+    def _log_state(self, when: str) -> None:
+        """One INFO line with what the calendar holds, at build (every
+        strategy builds one) and on each file re-read. The WARNING for a
+        calendar that holds nothing upcoming comes from the entry path
+        (``_check_expiry``), so only a strategy that consults the calendar
+        gives it."""
+        state = self.status()
+        if not state["enabled"]:
+            LOG.info("Event calendar %s: disabled (events.enabled false)", when)
+            return
+        LOG.info("Event calendar %s: %d macro row(s) (%d from %s, newest dated %s, %d dated today or later, "
+                 "%d undated), %d earnings symbol(s) (%d with a date today or later)",
+                 when, state["macro_rows"], state["macro_file_rows"], self._events_cfg.blackout_file or "no file",
+                 state["macro_newest_date"] or "none", state["macro_upcoming_rows"], state["macro_undated_rows"],
+                 state["earnings_symbols"], len(state["earnings_upcoming_symbols"]))
+
+    def _warn_if_empty(self, state: dict[str, Any]) -> None:
+        if state["macro_upcoming_rows"] == 0 and state["macro_undated_rows"] == 0:
+            LOG.warning("Event calendar: no macro blackout dated today or later (newest %s): the macro windows block "
+                        "nothing; run scripts/sync_macro_events.py (events.blackout_file %s)",
+                        state["macro_newest_date"] or "none", self._events_cfg.blackout_file or "unset")
+        if not state["earnings_upcoming_symbols"]:
+            LOG.warning("Event calendar: no earnings date today or later (%d symbol(s) listed): the earnings blackouts "
+                        "block nothing; fill events.earnings_file (%s) or events.earnings",
+                        state["earnings_symbols"], self._events_cfg.earnings_file or "unset")
+
+    def _check_expiry(self, today: date) -> None:
+        """Once a day, from the entry path (the first read of a macro
+        window that day): the WARNING of ``_warn_if_empty`` when the
+        calendar holds no macro row dated today or later (an expired or
+        empty file) or no upcoming earnings date. From the entry path, so a
+        strategy that never consults the calendar (the peer family) is not
+        told to fill it."""
+        if self._expiry_warned_on == today or not self._events_cfg.enabled:
+            return
+        self._expiry_warned_on = today
+        # The earnings file is otherwise re-read on its own read, after this.
+        self._refresh_earnings()
+        self._warn_if_empty(self.status(today))
 
     # ------------------------------------------------------------------
     # Evaluation
@@ -357,6 +435,7 @@ class EventBlackoutCalendar:
         # compared as a date: compared as text with today's ISO string, a
         # YAML datetime never matched, and the window blocked nothing
         # (2026-09-26).
+        self._check_expiry(today)
         for event in self._macro_events:
             if not event.get("enabled", True):
                 continue
@@ -398,6 +477,20 @@ class EventBlackoutCalendar:
                 return f"earnings_blackout({key} {event_date.isoformat()},{when},offset={offset:+d}session)"
         return None
 
+    def entry_block_record(self, symbol: str, now_dt: datetime | None = None) -> str | None:
+        """The decision reason a strategy records for *symbol* right now, or
+        None: ``event_blackout(<label>)`` for a macro window (the unscoped
+        ones and those scoped to the symbol) or the earnings reason. One
+        read per candidate, with the symbol (2026-11-08, R-124: every
+        caller read the macro windows once a cycle with no symbol, so a row
+        scoped to symbols matched nothing, anywhere)."""
+        if not self._events_cfg.enabled:
+            return None
+        event = self.matching_macro_event(symbol=symbol, now_dt=now_dt)
+        if event is not None and event.get("block_new_entries", True):
+            return f"event_blackout({event.get('label') or 'event_blackout'})"
+        return self.earnings_block_reason(symbol, now_dt=now_dt)
+
     def entry_block_reason(self, symbol: str | None = None, now_dt: datetime | None = None) -> str | None:
         """Combined gate: the reason new entries are blocked right now, or
         ``None``. Macro windows are checked first, then earnings."""
@@ -418,6 +511,18 @@ class EventBlackoutCalendar:
         if event is not None and event.get("force_flatten", False):
             return event
         return None
+
+
+def _row_date(row: dict[str, Any]) -> date | None:
+    """A macro row's date, None for a weekday or every-day row (the rows
+    were checked at load, so a dated one parses)."""
+    value = row.get("date")
+    return None if value is None else _parse_date(value)
+
+
+def sessions_today() -> date:
+    from . import sessions
+    return sessions.now_et().date()
 
 
 def _parse_date(value: Any) -> date:

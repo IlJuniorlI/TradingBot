@@ -50,11 +50,26 @@ class VwapReclaimRegimeMixin:
 
         Components (max ~5.0):
           * +0.5  base
-          * +2.0  reclaim confirmed — a bucket closed below VWAP within the
-                  last ``vwap_reclaim_lookback_bars`` of the session's LTF
-                  buckets (``session_window``: the window must be whole)
-                  AND the latest close is back above VWAP by a small
-                  buffer. No reclaim => 0 (regime sits out).
+          * +2.0  reclaim confirmed — a dip through VWAP in the last
+                  ``vwap_reclaim_lookback_bars`` of the session's LTF
+                  buckets (``session_window``: the window must be whole): a
+                  bucket closed BELOW VWAP (the flush), its last such bucket
+                  among the last ``vwap_reclaim_max_dip_age_bars`` closed
+                  ones (fresh; the manifest's 6, the window's size,
+                  restricts nothing), with
+                  ``vwap_reclaim_require_held_bucket`` a bucket of the
+                  window closed ABOVE VWAP right before the flush, the
+                  final run of buckets under it (the name held it: a round
+                  trip, not a session under VWAP reclaiming a level it never
+                  held; an older dip before the held buckets is no bar to
+                  it), AND the latest close is back above
+                  VWAP by a small buffer. No reclaim => 0 (regime sits
+                  out). Both knobs date from 2026-11-08 (the whole-bot
+                  review's R-021: on H: 10-14..11-06 any bucket under VWAP
+                  in the window was the dip and a 30-minute-old one still
+                  counted, 94 of 124 entries at 0.00R); top_tier's preset
+                  sets 2 buckets and the round trip, small_cap_squeeze
+                  keeps the old reading.
           * +1.0  volume pop on the reclaim bar (the last 1m bar's volume >=
                   the dip window's mean 1m volume x ratio)
           * +0.7  trend intact — close > ema9
@@ -76,12 +91,26 @@ class VwapReclaimRegimeMixin:
         recent_close = recent["close"].astype(float)
         recent_vwap = recent["vwap"].astype(float)
         if side == Side.LONG:
-            dipped = bool((recent_close < recent_vwap).any())
+            under = (recent_close < recent_vwap).to_numpy()
             reclaimed = close > vwap + buffer
         else:
-            dipped = bool((recent_close > recent_vwap).any())
+            under = (recent_close > recent_vwap).to_numpy()
             reclaimed = close < vwap - buffer
-        if not (dipped and reclaimed):
+        if not reclaimed or not under.any():
+            return 0.0
+        dips = [i for i, flag in enumerate(under) if flag]
+        if bool(self.params.get("vwap_reclaim_require_held_bucket", False)):
+            # The flush is the final run of dip buckets; the bucket before
+            # it must have held. (Until 2026-11-08's verification the test
+            # read the window's OLDEST bucket, so an old dip at the window's
+            # edge refused a textbook round trip for one bucket.)
+            flush_start = dips[-1]
+            while flush_start > 0 and under[flush_start - 1]:
+                flush_start -= 1
+            if flush_start == 0:
+                return 0.0
+        max_age = max(1, int(self.params.get("vwap_reclaim_max_dip_age_bars", 6)))
+        if (len(under) - 1 - dips[-1]) >= max_age:
             return 0.0
         score = 0.5 + 2.0
         cur_vol = safe_float(frame.iloc[-1].get("volume"), 0.0)

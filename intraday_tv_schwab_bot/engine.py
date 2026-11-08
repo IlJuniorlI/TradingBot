@@ -2486,19 +2486,29 @@ class IntradayBot:
         meanwhile. Only while the gate refreshes market context.
 
         A fetch that raised is fetched again, ``DAILY_HISTORY_RETRY_SECONDS``
-        apart, until the day's first entry window opens
-        (``StrategySchedule.before_first_entry``); from then on it stays
-        cached for the day, as a read keeps it. On the top_tier preset the
-        prewarm starts 20 minutes before that window (09:15, 09:35), room for
-        a transient failure to clear; until then a failure was cached for the
-        day at the first fetch."""
+        apart, all day (2026-11-08): until then only until the day's first
+        entry window opened, after which a transient failure (or a restart
+        after 09:35 whose first fetch failed) left the symbol with no stats
+        for the day, its relative-strength gate skipped and its scaled
+        knobs at the reference volatility; the entry pass now refuses such
+        a symbol until a fetch answers (``MarketDataStore.daily_history_failed``,
+        the whole-bot review's R-114). An answer with no completed session
+        stays cached for the day. One request a minute per failed symbol at
+        most, and none while the REST back-off waits
+        (``MarketDataStore.rest_backoff_waiting``: a daily fetch that failed
+        systemically starts or extends it, like the HTF probe's), so an
+        outage does not add a round of failing requests a minute, before
+        management, to the one it already holds."""
         if not gate_state.context_refresh_active:
             return
-        retry_failed = schedule.before_first_entry(now.time())
         due = [symbol for symbol in self.strategy.daily_history_symbols(self.last_watchlist)
-               if self.data.daily_history_due(symbol, retry_failed=retry_failed)]
-        if due:
-            self._fetch_symbol_map(due, self.data.fetch_daily_history, label="Daily history fetch")
+               if self.data.daily_history_due(symbol, retry_failed=True)]
+        if not due:
+            return
+        if self.data.rest_backoff_waiting():
+            LOG.debug("Daily history fetch: %d due (%s) wait for the REST back-off", len(due), ", ".join(due))
+            return
+        self._fetch_symbol_map(due, self.data.fetch_daily_history, label="Daily history fetch")
 
     def _prime_cycle_support_cache(self, bars: dict[str, pd.DataFrame]) -> None:
         sr_cfg = getattr(self.config, "support_resistance", None)

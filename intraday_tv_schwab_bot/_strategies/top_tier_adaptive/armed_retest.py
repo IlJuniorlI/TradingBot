@@ -82,6 +82,22 @@ class ArmedRetestMixin:
             if (now - armed_at).total_seconds() / 60.0 >= stale_after:
                 del self._armed_retests[key]
 
+    def _consume_armed_retest(self, symbol: str, side: Side, regime: str) -> None:
+        """Drop the arm a confirmed retest entered on. Called by the queue
+        loop once the signal is emitted, not by the verdict: a confirmation
+        the gates refuse keeps its arm (2026-11-08, R-019)."""
+        self._armed_retests.pop(f"{symbol}|{side.value}|{regime}", None)
+
+    def _restart_armed_retest_window(self, symbol: str, side: Side, regime: str, bar: Any) -> None:
+        """A confirmation the gates refused on ``bar`` (the step frame's
+        last bar): the arm keeps its level and clock, and its touch window
+        restarts after that bar, so the next confirmation needs a retest
+        after the refusal (2026-11-08; a kept touch let any later green bar
+        over the level, a fresh high included, enter as the retest)."""
+        arm = self._armed_retests.get(f"{symbol}|{side.value}|{regime}")
+        if arm is not None:
+            arm["window_from"] = bar
+
     def _drop_armed_retests(self, symbol: str) -> None:
         """Forget every arm on *symbol*, both sides and both regimes."""
         if not self._armed_retests:
@@ -197,9 +213,25 @@ class ArmedRetestMixin:
                    regimes in the build queue are unaffected, so arming trend
                    does not stop a pullback firing on the same symbol.
         ``enter``  price returned to within ``armed_retest_zone_atr`` x the LTF
-                   ATR of the level and closed back through it on a 1m bar
-                   with the right shape. This is the entry the regime was
-                   waiting for. The zone and the invalidation are multiples
+                   ATR of the level AND at least that zone width under the
+                   breakout bar's close (a retrace, not a tick: 2026-11-08,
+                   R-019 / R-081: a breakout that closed inside the zone
+                   confirmed on its next bar at the extreme, 38-43% of arms,
+                   and the stretched gate refused 72% of those; a one-tick
+                   dip under the close still "touched" on the next bar in
+                   51 of 51 such arms on 11-06), and closed back through it
+                   on a 1m bar with the right shape. This is the entry the
+                   regime was waiting for. The arm stays until a signal is
+                   EMITTED for it (``_consume_armed_retest``): a confirmation
+                   the gates refuse keeps its level and clock, and its touch
+                   window restarts after the refused bar
+                   (``_restart_armed_retest_window``), so the next
+                   confirmation needs a new retest (until 2026-11-08 the
+                   verdict consumed the arm, and the symbol was re-armed with
+                   a fresh clock inside the breakout bucket or lost once it
+                   closed; a kept touch would have let a later fresh high
+                   enter as the "retest"). The zone and the invalidation are
+                   multiples
                    of the LTF ATR (``atr``, a 5m ATR14 on the shipped preset;
                    0.15 / 0.33 there keep the price distances 0.35 / 0.75 were
                    tested at on the 1m LTF's ~0.435x smaller ATR); the touch,
@@ -292,8 +324,13 @@ class ArmedRetestMixin:
             self._armed_retests[key] = {
                 "armed_at": now,
                 # The base frame's last bar, whose close crossed the level:
-                # the retest window is every bar after it (below).
+                # the retest window is every bar after it (below), and a
+                # touch has to retrace a zone width under (over) its close.
                 "breakout_bar": frame.index[-1],
+                "breakout_close": float(close),
+                # The bar the touch window starts after: the breakout bar,
+                # then the bar of a confirmation the gates refused.
+                "window_from": frame.index[-1],
                 "session_date": now.date(),
                 "trigger_level": float(trigger_level),
                 # Carried so the expiry sweep can build the signal from the
@@ -323,17 +360,25 @@ class ArmedRetestMixin:
         # arm's clock) left out the first bar after the breakout, the one
         # still trading when the arm was made: on the 10-08 replay 25 of 166
         # arms were checked with that bar their only touch.
+        # A touch is a RETRACE: into the zone and at least a zone width
+        # past the breakout bar's close. A breakout bar closing inside the
+        # zone put its next bar's low in the zone unless price gapped away,
+        # so a green continuation bar confirmed the "retest" with no return
+        # to the level; a dip of a tick under the close did the same. The
+        # window starts after the breakout bar, or after the bar of a
+        # confirmation the gates refused (``_restart_armed_retest_window``).
         touched = False
         extreme: float | None = None
-        since = frame[frame.index > arm["breakout_bar"]]
+        breakout_close = float(arm["breakout_close"])
+        since = frame[frame.index > arm["window_from"]]
         if not since.empty:
             extreme = (float(since["low"].min()) if side == Side.LONG
                        else float(since["high"].max()))
         if extreme is not None and math.isfinite(extreme):
             if side == Side.LONG:
-                touched = extreme <= level + zone_atr * atr
+                touched = extreme <= min(level + zone_atr * atr, breakout_close - zone_atr * atr)
             else:
-                touched = extreme >= level - zone_atr * atr
+                touched = extreme >= max(level - zone_atr * atr, breakout_close + zone_atr * atr)
 
         reclaimed = close > level if side == Side.LONG else close < level
         min_close_pos = min(0.95, max(0.05, float(
@@ -351,7 +396,7 @@ class ArmedRetestMixin:
         }
 
         if touched and reclaimed and bar_ok:
-            self._armed_retests.pop(key, None)
+            # Kept: the queue loop consumes it once a signal is emitted.
             out.update({
                 "status": "enter",
                 "metadata": {**base_meta, "armed_retest_status": "retest_confirmed"},

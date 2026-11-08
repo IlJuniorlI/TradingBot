@@ -622,7 +622,9 @@ class TradeManager:
         if initial_stop is None:
             initial_stop = float(position.stop_price)
         initial_risk = max(0.0, abs(float(position.entry_price) - initial_stop))
-        trail_activation_mult = 0.5
+        # The peak in R that arms the trail (risk.trail_activation_r; 0.5
+        # hard-coded until 2026-11-08, R-152).
+        trail_activation_mult = float(self.config.risk.trail_activation_r)
         options_position = is_option_asset(meta)
 
         # Peak-giveback floor — fires *before* normal stop/target/trail logic

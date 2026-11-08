@@ -31,14 +31,18 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Mapping
 
+import logging
+
 import pandas as pd
 
-from ..models import ExitDecision, Position
+from ..log_setup import TRADEFLOW_LEVEL
+from ..models import ExitDecision, Position, is_option_asset
 from ..bars import CANDLE_PATTERN_WINDOW_BARS, bar_closed_after, bars_have_range
 from ..indicators import get_runtime_indicator_mode, last_bar_atr
 from .. import sessions
 from ..numeric import safe_float
-from ..position_metrics import position_r_multiple, underlying_entry_price, underlying_extremes
+from ..position_metrics import (favorable_move, initial_risk_per_unit, position_r_multiple, underlying_entry_price,
+                                underlying_extremes)
 
 if TYPE_CHECKING:
     from ..config import BotConfig
@@ -48,6 +52,9 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # The gate table
 # ---------------------------------------------------------------------------
+
+
+LOG = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class FamilyGates:
@@ -433,12 +440,21 @@ class SharedExitPolicy:
 
     def _time_stop(self, position: Position, frame: pd.DataFrame | None) -> ExitDecision | None:
         """Scratch a trade held ``risk.time_stop_minutes`` that has gone
-        nowhere (``|return| < risk.time_stop_min_return_pct``) to free the
-        slot. 2026-04-17 META held 223 min for +$0.16.
+        nowhere, to free the slot. 2026-04-17 META held 223 min for +$0.16.
 
-        "Gone nowhere" is judged on the frame's own instrument: for an
-        option, the underlying since entry -- its premium against the
-        underlying's close was never under the threshold.
+        "Gone nowhere" (2026-11-08): for a stock position with a known
+        initial stop, a move since entry under ``risk.time_stop_min_r`` of
+        that risk (|close - entry| / |entry - initial stop|); never while
+        its stop is at or past the entry (``favorable_move`` of the stop,
+        a break-even, lock or trail: the position protects itself). For an
+        option (judged on its underlying since entry, the instrument this
+        frame holds), a position with no initial stop, or ``time_stop_min_r``
+        0, the price band ``|return| < risk.time_stop_min_return_pct`` as
+        before. Until then the band judged every stock in price %: 0.43R at
+        the median stop on H:, over 0.8R on a tight one, so GOOG 2026-10-26
+        was scratched at +1.10R with its lock armed (the whole-bot review's
+        R-017). The judged close and threshold are logged at TRADEFLOW with
+        the decision.
         """
         time_stop_minutes = self.config.risk.time_stop_minutes
         if time_stop_minutes <= 0:
@@ -452,8 +468,22 @@ class SharedExitPolicy:
         last_close = safe_float(frame["close"].iloc[-1])
         if last_close is None:
             return None
+        if favorable_move(position.side, float(position.entry_price), float(position.stop_price)) >= 0.0:
+            return None
+        min_r = float(self.config.risk.time_stop_min_r)
+        risk = None if is_option_asset(position.metadata) else initial_risk_per_unit(position)
+        if risk is not None and min_r > 0:
+            moved_r = abs(last_close - entry) / risk
+            if moved_r >= min_r:
+                return None
+            LOG.log(TRADEFLOW_LEVEL, "Time stop %s: held %dm, close %.4f is %.2fR from the entry %.4f (under %.2fR)",
+                    position.symbol, int(held_minutes), last_close, moved_r, entry, min_r)
+            return ExitDecision(f"time_stop:{int(held_minutes)}m", "time_stop")
         min_return_pct = self.config.risk.time_stop_min_return_pct
-        if abs((last_close - entry) / entry) < min_return_pct:
+        moved_pct = abs((last_close - entry) / entry)
+        if moved_pct < min_return_pct:
+            LOG.log(TRADEFLOW_LEVEL, "Time stop %s: held %dm, close %.4f is %.3f%% from the entry %.4f (under %.3f%%)",
+                    position.symbol, int(held_minutes), last_close, moved_pct * 100.0, entry, min_return_pct * 100.0)
             return ExitDecision(f"time_stop:{int(held_minutes)}m", "time_stop")
         return None
 

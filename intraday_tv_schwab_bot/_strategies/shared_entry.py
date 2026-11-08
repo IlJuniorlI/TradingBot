@@ -1382,8 +1382,8 @@ class SharedEntryPolicy:
 
         The clamp never WIDENS past the incoming stop. A builder that
         deliberately chose a stop tighter than the floor (range / sr_scalp
-        anchor to level geometry, momentum caps at ``default_stop_pct``)
-        keeps it exactly. Both callers pass a ``proposed_stop`` already on
+        anchor to level geometry; momentum capped at ``default_stop_pct``
+        until 2026-11-08) keeps it exactly. Both callers pass a ``proposed_stop`` already on
         the tightening side of ``incoming_stop``, so its sign relative to
         ``close`` identifies the trade direction. The retest stop anchor is
         bounded the same way since 2026-09-24 (see ``admit``); it used to be

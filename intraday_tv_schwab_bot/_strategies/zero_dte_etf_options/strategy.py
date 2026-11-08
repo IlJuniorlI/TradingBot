@@ -227,8 +227,10 @@ class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
         allowed = {str(s).strip() for s in (self.optcfg.styles or []) if str(s).strip()}
         return style in allowed
 
-    def _option_entry_block_reason(self, now_dt=None) -> str | None:
-        return self._event_calendar.entry_block_reason(now_dt=now_dt)
+    def _option_entry_block_reason(self, now_dt=None, symbol: str | None = None) -> str | None:
+        """The macro blackout right now: the cycle's, or with ``symbol`` the
+        candidate's (a row scoped to its underlying; 2026-11-08, R-124)."""
+        return self._event_calendar.entry_block_reason(symbol=symbol, now_dt=now_dt)
 
     @classmethod
     def _underlying_already_open(cls, symbol: str, positions: dict[str, Position]) -> bool:
@@ -953,6 +955,10 @@ class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
             for c in candidates:
                 self._record_entry_decision(c.symbol, "skipped", [blackout_reason])
             return out
+        scoped_out = [c for c in candidates if self._option_entry_block_reason(now_dt, c.symbol)]
+        for c in scoped_out:
+            self._record_entry_decision(c.symbol, "skipped", [self._option_entry_block_reason(now_dt, c.symbol)])
+        candidates = [c for c in candidates if c not in scoped_out]
         now_t = now_dt.time()
         if now_t > parse_hhmm(self.params.get("no_new_entries_after", "13:30")):
             for c in candidates:
@@ -1079,7 +1085,10 @@ class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
         return out
 
     def should_force_flatten(self, position: Position) -> bool:
-        if self._event_calendar.force_flatten_event(now_dt=sessions.now_et()) is not None:
+        # With the underlying's symbol (the position's own is its option
+        # label): a flatten row scoped to it counts (2026-11-08, R-124).
+        underlying = str(position.metadata.get("underlying") or position.symbol)
+        if self._event_calendar.force_flatten_event(symbol=underlying, now_dt=sessions.now_et()) is not None:
             return True
         now_dt = sessions.now_et()
         flat_time = self.force_flat_time

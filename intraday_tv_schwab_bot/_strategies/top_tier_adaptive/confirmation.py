@@ -622,10 +622,14 @@ class ConfirmationMixin:
         fetch failed — callers must gate on that explicitly instead of
         assuming a default ADR or a beta of 1.0. The feed reports a failed
         fetch as ``None`` (logged; a read never fetches it again that day,
-        and the engine's prefetch retries it until the first entry window,
-        ``MarketDataStore.daily_history_due``); anything it
+        and the engine's prefetch retries it a minute apart all day,
+        ``MarketDataStore.daily_history_due``; the entry pass refuses the
+        symbol meanwhile, ``_read_candidate``); anything it
         raises is not a failed fetch and propagates. Until 2026-09-26 it was
         read as one, which skipped the relative-strength gate in silence.
+        Stats built while the benchmark's fetch had failed are not cached
+        (2026-11-08): the beta read None for the day otherwise, after the
+        ETF's retry had answered.
         """
         if data is None or not hasattr(data, "get_daily_history"):
             return None
@@ -643,11 +647,13 @@ class ConfirmationMixin:
         benchmark = None
         benchmark_daily = None
         indices = self._indices_for_symbol(key)
+        benchmark_failed = False
         if indices:
             benchmark = indices[0]
             benchmark_daily = data.get_daily_history(benchmark)
             if benchmark_daily is None or benchmark_daily.empty:
                 benchmark_daily = None
+                benchmark_failed = bool(data.daily_history_failed(benchmark))
         stats = build_symbol_stats(
             key,
             symbol_daily,
@@ -656,7 +662,8 @@ class ConfirmationMixin:
             adr_lookback_days=int(self.params.get("adr_lookback_days", 20)),
             beta_lookback_days=int(self.params.get("beta_lookback_days", 60)),
         )
-        self._daily_stats[key] = stats
+        if not benchmark_failed:
+            self._daily_stats[key] = stats
         return stats
 
     def _vol_scale(self, symbol: str, data=None) -> float:

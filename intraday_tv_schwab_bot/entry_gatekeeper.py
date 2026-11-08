@@ -1722,11 +1722,13 @@ class EntryGatekeeper:
             # pairs_residual, top_tier_adaptive, microcap_*, zero_dte_*) so a
             # LONG cooldown does not block a candidate the screener has
             # already pre-classified as SHORT (and vice-versa) under
-            # cooldown_direction_aware: true. Strategies that defer the
-            # direction decision until entry_signals (peer_confirmed_key_levels)
-            # pass directional_bias=None and fall through to the conservative
-            # "any direction blocked" branch in is_symbol_on_cooldown.
-            if self.risk.is_symbol_on_cooldown(candidate.symbol, candidate.directional_bias):
+            # cooldown_direction_aware: true. A candidate with no bias
+            # (peer_confirmed_key_levels always; top_tier on a flat day) is
+            # dropped only when every side it may trade is cooling, so the
+            # opposite-side flip reaches the strategy and ``can_open`` judges
+            # the signal's own side (2026-11-08, R-048; until then either
+            # side cooling dropped it).
+            if self.risk.candidate_on_cooldown(candidate.symbol, candidate.directional_bias):
                 self._log_entry_decision(self.config.strategy, candidate.symbol, "skipped", ["cooldown"], context=candidate_context)
                 continue
             live_entry_status = self.data.live_entry_bar_status(candidate.symbol)

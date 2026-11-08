@@ -134,19 +134,22 @@ class MomentumRegimeMixin:
                 return None
 
         target_rr = float(self.params.get("momentum_target_rr", 2.0)) * self._side_target_rr_mult(side)
-        # ATR-cushioned swing anchor (mirrors standalone momentum_close/strategy.py:76-79).
-        # vol_widening (Tier 2a) widens the ATR cushion AND the
-        # default_stop_pct floor so momentum trades on trend days don't
+        # ATR-cushioned swing anchor, floored at default_stop_pct like every
+        # other regime's (2026-11-08, R-020: until then this builder kept the
+        # NEARER of the two, a cap, the one place the knob read that way,
+        # against the preset's and the README's "floor"; the standalone
+        # momentum_close keeps its cap). vol_widening (Tier 2a) widens the
+        # ATR cushion AND the floor so momentum trades on trend days don't
         # get knocked out by expanded per-bar noise.
         effective_default_stop_pct = self.config.risk.default_stop_pct * vol_widening * vol_scale
         if side == Side.LONG:
             swing = stop_anchor(side, recent, frame, ltf, close) - (atr * 0.08 * vol_widening * self._side_stop_buffer_mult(side))
-            stop = max(close * (1.0 - effective_default_stop_pct), swing)
+            stop = min(close * (1.0 - effective_default_stop_pct), swing)
             risk = max(0.01, close - stop)
             target = close + risk * target_rr
         else:
             swing = stop_anchor(side, recent, frame, ltf, close) + (atr * 0.08 * vol_widening * self._side_stop_buffer_mult(side))
-            stop = min(close * (1.0 + effective_default_stop_pct), swing)
+            stop = max(close * (1.0 + effective_default_stop_pct), swing)
             risk = max(0.01, stop - close)
             target = max(0.01, close - risk * target_rr)
 

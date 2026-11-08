@@ -317,6 +317,12 @@ class RiskConfig:
     default_stop_pct: float = 0.018
     default_target_pct: float = 0.038
     trailing_stop_pct: float = 0.014
+    # The peak, in R from the entry, that arms the trail (TradeManager): the
+    # stop then follows the extreme by trailing_stop_pct. 0.5 was hard-coded
+    # until 2026-11-08 (R-152): in R the 1.2% trail from a 0.5R peak is a
+    # breakeven only on stops of about 2.4% of price or more and inert on
+    # tighter ones. 0 arms it at the entry.
+    trail_activation_r: float = 0.5
     trade_management_mode: str = "adaptive_ladder"
     allow_short: bool = False
     cooldown_minutes: int = 20
@@ -381,6 +387,17 @@ class RiskConfig:
     # capital blocking a slot. 0 = disabled.
     time_stop_minutes: int = 45
     time_stop_min_return_pct: float = 0.003
+    # "Gone nowhere" in R (2026-11-08): a stock position with a known initial
+    # stop is judged on its move in units of that risk, |close - entry| /
+    # |entry - initial stop| < time_stop_min_r, and never while its stop is
+    # at or past the entry (a break-even, lock or trail already protects it).
+    # The price-% band above stays for an option (judged on its underlying)
+    # and a position with no initial stop, or with this at 0. On H: the 0.3%
+    # band was 0.43R at the median stop and over 0.8R on a tight one: GOOG
+    # 2026-10-26 was scratched at +1.10R with its lock armed. Off by
+    # default: a preset tuned on the price band keeps it unless it opts in
+    # (top_tier's sets 0.3).
+    time_stop_min_r: float = 0.0
     # --- The target's reward at the entry's limit (2026-11-07) ---
     # A stock entry is refused when its target's reward from the marketable
     # limit the order would go out at is under this multiple of its risk to
@@ -1404,7 +1421,9 @@ class SharedExitLogicConfig:
 
 @dataclass(slots=True)
 class EventsConfig:
-    """Scheduled-event blackouts shared by every strategy.
+    """Scheduled-event blackouts: one calendar, consulted by the strategies
+    that read it (top_tier_adaptive, small_cap_squeeze and the two 0DTE
+    strategies; the force_flatten rows by the 0DTE strategies).
 
     Lifted out of ``ZeroDteOptionsConfig`` (2026-09-18) — the blackout
     calendar was reachable only from the 0DTE options strategy, so equity
@@ -1891,8 +1910,10 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         # where an unreadable value switched the trail off without a word
         # until 2026-09-26, and so did a negative one.
         "trailing_stop_pct": _Number(low=0, nullable=True, note=" (0 or null turns the trail off)"),
+        "trail_activation_r": _Number(low=0, note=" (the peak in R that arms the trail; 0 arms it at the entry)"),
         "time_stop_minutes": _Number(integer=True, low=0, note=" (0 turns the time stop off)"),
         "time_stop_min_return_pct": _AT_LEAST_ZERO,
+        "time_stop_min_r": _Number(low=0, note=" (0 judges in price % only)"),
         # Read at every stock entry (EntryGatekeeper._entry_target_rr_refusal).
         "entry_min_target_rr_at_limit": _Number(low=0, nullable=True, note=" (0 or null turns the check off)"),
         "peak_giveback_min_r": _Number(
