@@ -750,15 +750,30 @@ def _regime_call_outcomes(archive_root: Path) -> dict[str, Any]:
         calls: a measurement that could not see the strategy, not a
         strategy that made no calls.
 
-    Classifier per call (excursions from ``_forward_excursion_atr``):
-      * ``right`` -- price moved >= 1 ATR in the call's direction within
-        the next 30 minutes, and further that way than the other.
-      * ``wrong`` -- the opposite excursion was larger.
-      * ``flat`` -- neither of the above, or a non-directional call.
+    Classifier per call (the net move from ``_forward_excursion_atr``,
+    2026-11-08; until then the two excursions were compared, with a 1-ATR
+    floor that reclassified 0.17% of calls, and the net move was read and
+    dropped):
+      * ``right`` -- the close 30 minutes on is the call's way.
+      * ``wrong`` -- it is the other way.
+      * ``flat`` -- unchanged, or a non-directional call.
       * ``unclear`` -- insufficient forward bars or missing ATR.
 
-    Read ``by_side`` against the day: on a trend day most of one side is
-    "right" whatever the regimes did.
+    What a call is: a regime QUALIFICATION on a side, one per symbol-minute
+    per regime per side (``unit`` in the payload), not the side the vote
+    chose and not an entry: both sides of a symbol-minute can count, and
+    about a thousand calls stand behind each entry. The decided side is
+    not recorded in decisions.csv, so this block cannot measure the side
+    vote's accuracy (the whole-bot review's R-051).
+
+    Every ``right_pct`` comes with its ``edge_pct``: the points over the
+    tape's own rate of moving that way over the same span (``baseline``:
+    ``up_pct`` for LONG calls, ``short_up_pct``, its mirror, for SHORT;
+    a regime's or an hour's edge weighs its calls' sides). Until
+    2026-11-08 the payload carried the LONG-view ``up_pct`` alone beside
+    per-side ``right_pct``: on the down-drifting 2026-10-14..11-06 window
+    SHORT read 10 points better than LONG when, against each side's own
+    baseline, both were below it and SHORT further below (R-051).
 
     Reads from the already-written ``decisions.csv`` and the per-symbol
     1m bars under ``bars/1m/`` in the same archive directory. Dedupes
@@ -812,9 +827,12 @@ def _regime_call_outcomes(archive_root: Path) -> dict[str, Any]:
             return {}
 
         def _bucket() -> dict[str, int]:
-            return {"total": 0, "right": 0, "wrong": 0, "flat": 0, "unclear": 0}
+            # The side counts carry each bucket's edge: a right LONG call is
+            # measured against up_pct, a right SHORT one against its mirror.
+            return {"total": 0, "right": 0, "wrong": 0, "flat": 0, "unclear": 0,
+                    "_long_directional": 0, "_short_directional": 0}
 
-        by_outcome = {"right": 0, "wrong": 0, "flat": 0, "unclear": 0}
+        by_outcome = _bucket()
         by_hour: dict[str, dict[str, int]] = defaultdict(_bucket)
         by_regime: dict[str, dict[str, int]] = defaultdict(_bucket)
         by_side: dict[str, dict[str, int]] = defaultdict(_bucket)
@@ -823,39 +841,57 @@ def _regime_call_outcomes(archive_root: Path) -> dict[str, Any]:
             outcome = "unclear"
             excursion = _forward_excursion_atr(bars_by_sym[call["sym"]], call["ts"], 30)
             if excursion is not None:
-                up_atr, down_atr, _net = excursion
-                favourable, adverse = (up_atr, down_atr) if call["direction"] > 0 else (down_atr, up_atr)
-                if call["direction"] == 0:
+                net_atr = excursion[2] * call["direction"]
+                if call["direction"] == 0 or net_atr == 0.0:
                     outcome = "flat"
-                elif favourable >= 1.0 and favourable > adverse:
+                elif net_atr > 0.0:
                     outcome = "right"
-                elif adverse > favourable:
-                    outcome = "wrong"
                 else:
-                    outcome = "flat"
+                    outcome = "wrong"
             side = "LONG" if call["direction"] > 0 else "SHORT" if call["direction"] < 0 else "none"
-            by_outcome[outcome] += 1
-            for bucket in (by_hour[call["ts"].strftime("%H")], by_regime[call["top"]], by_side[side]):
+            for bucket in (by_outcome, by_hour[call["ts"].strftime("%H")], by_regime[call["top"]], by_side[side]):
                 bucket["total"] += 1
                 bucket[outcome] += 1
-
-        def _right_pct(bucket: dict[str, int]) -> float | None:
-            directional = bucket["right"] + bucket["wrong"] + bucket["flat"]
-            return round(bucket["right"] / directional, 4) if directional > 0 else None
+                if outcome != "unclear" and side != "none":
+                    bucket["_long_directional" if side == "LONG" else "_short_directional"] += 1
 
         call_times = [call["ts"] for call in calls]
+        # The tape over the same span: what "right" is competing with. A 60%
+        # up_pct day makes most LONG calls right, and most SHORT calls wrong.
+        baseline = _forward_baseline(bars_by_sym, 30, start=min(call_times), end=max(call_times)) if call_times else {}
+        up_pct = baseline.get("up_pct")
+        if baseline:
+            baseline["short_up_pct"] = None if up_pct is None else round(100.0 - up_pct, 1)
+            baseline["short_median_net_atr"] = (None if baseline.get("median_net_atr") is None
+                                                else round(-baseline["median_net_atr"], 3))
+
+        def _rates(bucket: dict[str, int]) -> dict[str, Any]:
+            directional = bucket["right"] + bucket["wrong"] + bucket["flat"]
+            shown = {k: v for k, v in bucket.items() if not k.startswith("_")}
+            if directional == 0:
+                return {**shown, "right_pct": None, "edge_pct": None}
+            right_pct = bucket["right"] / directional
+            edge = None
+            if up_pct is not None:
+                # The calls the tape would have made right by itself.
+                expected = (bucket["_long_directional"] * up_pct + bucket["_short_directional"] * (100.0 - up_pct)) / 100.0
+                edge = round(100.0 * (bucket["right"] - expected) / directional, 1)
+            return {**shown, "right_pct": round(right_pct, 4), "edge_pct": edge}
+
+        overall = _rates(by_outcome)
         return {
             "total_unique_calls": len(calls),
+            "unit": ("one regime qualification per symbol-minute per regime per side (both sides of a minute can "
+                     "count; not the side the vote chose, not an entry); right = the close 30 minutes on is the "
+                     "call's way; edge_pct = right_pct in points over the same side's baseline over the calls' span"),
             "sources": dict(sources),
-            # The tape over the same span, LONG viewpoint: what "right" is
-            # competing with. A 60% up_pct day makes most LONG calls right.
-            "baseline": (_forward_baseline(bars_by_sym, 30, start=min(call_times), end=max(call_times))
-                         if call_times else {}),
-            "by_outcome": by_outcome,
-            "right_pct_of_directional": _right_pct(by_outcome),
-            "by_hour": {h: dict(d) for h, d in sorted(by_hour.items())},
-            "by_regime": {r: {**d, "right_pct": _right_pct(d)} for r, d in sorted(by_regime.items())},
-            "by_side": {s: {**d, "right_pct": _right_pct(d)} for s, d in sorted(by_side.items())},
+            "baseline": baseline,
+            "by_outcome": {k: v for k, v in by_outcome.items() if not k.startswith("_")},
+            "right_pct_of_directional": overall["right_pct"],
+            "edge_pct_of_directional": overall["edge_pct"],
+            "by_hour": {h: _rates(d) for h, d in sorted(by_hour.items())},
+            "by_regime": {r: _rates(d) for r, d in sorted(by_regime.items())},
+            "by_side": {s: _rates(d) for s, d in sorted(by_side.items())},
         }
     except Exception as exc:
         LOG.warning("Could not compute regime-call outcomes: %s", exc, exc_info=True)
