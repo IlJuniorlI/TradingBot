@@ -69,6 +69,120 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **What loses money on H: now: the whole-bot review's queue section B
+  (2026-11-08).** Each item names its finding.
+  - *The time stop judges in R and spares a protected trade* (R-017,
+    `shared_exit._time_stop`, `risk.time_stop_min_r`, default `0`: price %
+    only, as every preset but top_tier's was tuned; top_tier's sets `0.3`):
+    a position held `time_stop_minutes` is scratched when the close is
+    under `time_stop_min_r` of its initial risk from the entry, either way,
+    and never while its stop sits at or past the entry (break-even, the
+    lock). Until now it judged in price % and ignored the stop: GOOG
+    10-26 was scratched at +1.10R with its lock armed (it ran to 3.73R).
+    Options and a position with no initial stop keep the price band.
+  - *vwap_reclaim's dip is a fresh round trip* (R-021, R-022, R-016;
+    `vwap_reclaim_max_dip_age_bars`, preset 2, and
+    `vwap_reclaim_require_held_bucket`, preset true, both declared in both
+    manifests at the old reading, 6 / false): the flush's last bucket must
+    be among the last N closed buckets and the bucket right before the
+    flush must have held VWAP (an older dip at the window's edge is no
+    bar); Fix B judges its reclaim bar (a fresh cross bar passes by
+    construction) and the S/R veto holds it, the 2026-09-25 exemption
+    reversed on the four dry-run weeks (the veto's refused half lost
+    -$410 in dollars; in R the two halves are indistinguishable, and the
+    verifier's replay puts the regime at about eight entries over the 17
+    days with every filter on). Until now any of the last six buckets
+    under VWAP was the dip: 94 of the 124 dry-run entries at 0.00R.
+  - *A daily-history fetch that fails is retried all day and the symbol
+    refused meanwhile* (R-114, `MarketDataStore.daily_history_failed`,
+    `daily_history_unreadable(symbol=...)`), its benchmark ETF's failure
+    too (the beta), with the stats built meanwhile not cached; a strategy
+    that reads no daily stats (small_cap_squeeze) is not refused. The
+    retries wait for the REST back-off, which a systemic daily failure
+    now starts; the day's first failure for a symbol is a WARNING, the
+    retries DEBUG. Until now a failure before 09:35 cached "no stats" for
+    the day: the relative-strength gate skipped and every scaled knob at
+    the reference volatility.
+  - *The Fix D gates refuse on an unreadable read* (R-093,
+    `<side>_oversized_entry_bar_unreadable(atr14=...)`,
+    `<side>_stretched_unreadable(pct_b=...,stretch=...)`): until now a
+    None atr14 / %B / stretch (technical_levels or a sub-feature off, a
+    frame too short, a zero-width band) skipped the anti-chase gates
+    silently.
+  - *momentum's `default_stop_pct` is the floor every other regime
+    carries* (R-020, `regimes/momentum.py`): until now this builder kept
+    the nearer of its swing stop and the backstop, a cap, against the
+    preset's and the README's "floor" (the standalone momentum_close
+    keeps its cap).
+  - *The armed retest's touch is a retrace, and a refused confirmation
+    keeps its arm* (R-019 / R-081 with F-0154, `armed_retest.py`): the
+    low must come back into the zone AND at least a zone width under the
+    breakout bar's close (`breakout_close` on the arm; a dip of a tick
+    would still have touched on the next bar in 51 of 51 inside-zone arms
+    on 11-06); the arm is consumed when its signal is emitted
+    (`_consume_armed_retest`), not by the confirmation, and a refused
+    confirmation restarts its touch window after the refused bar
+    (`_restart_armed_retest_window`), so a confirmation the gates refuse
+    keeps its level and clock for a retest after it or the expiry, and a
+    later fresh high cannot enter as the "retest". Until now a breakout that closed inside the
+    zone (38-43% of arms) confirmed on its next bar at the extreme, the
+    stretched gate refused 72% of those, and the refusal consumed the arm,
+    re-armed with a fresh clock inside the breakout bucket (64 of 76 on
+    11-06) or lost once the bucket closed.
+  - *A candidate with no screener bias is held for its cooldown only when
+    every side it may trade is cooling* (R-048,
+    `RiskManager.candidate_on_cooldown`): the opposite-side flip the
+    presets promise reaches the strategy and `can_open` judges the
+    signal's side; an option strategy keeps the either-side reading (its
+    cooldown is keyed by the order side, which is not the trade's
+    direction). Until now either side cooling dropped the candidate,
+    so the flip waited out `cooldown_minutes` (unreachable in 125 of 167
+    H: exit windows); the held decisions' "cooldown" tag keeps its
+    either-side reading.
+  - *The high-conviction giveback override reads the day toward the trade*
+    (R-097): a LONG on a -3% day keeps the default management; until now
+    |day_strength| stamped both sides.
+  - *The event calendar says what it holds* (R-030, `EventBlackoutCalendar.status`):
+    one INFO at build and on every file re-read (macro rows, newest date,
+    earnings symbols) and a WARNING, again once a day from the entry
+    path, when it is enabled with no macro row dated today or later or no
+    upcoming earnings date. H: ran 25 sessions on a macro file that ended
+    2026-08-13 and an empty earnings map, and nothing said so.
+  - *A macro row scoped to symbols is read per candidate with its symbol*
+    (R-124, `entry_block_record`; the 0DTE strategies pass the
+    underlying, their flatten check too): until now every caller read the
+    macro windows once a cycle with no symbol, so a scoped row blocked
+    nothing anywhere.
+  - *`scripts/sync_macro_events.py` reads what the pages carry* (R-057,
+    R-157): the FOMC decision days from the meeting cells (until now the
+    Minutes release dates and the footer's date were the "decisions", and
+    no decision day was written: 2026-12-09 included); BEA's GDP estimates
+    and Personal Income and Outlays from its title / `Month D` / time
+    cells (until now nothing); next year's BLS page when the horizon
+    crosses New Year; the Census source is opt-in (`--census`), as its
+    page lists no releases. A source that fails or parses nothing is a
+    warning, and the sync keeps the file as it stands and exits 1
+    (`--write-partial` writes the rest); the file is written beside and
+    moved into place. Until now a dead source was silent and the file was
+    overwritten without its rows, exit 0.
+  - *The calendar's scope is stated* (R-018): it is built for every
+    strategy and consulted by top_tier_adaptive, small_cap_squeeze and the
+    two 0DTE strategies (the `force_flatten` rows by the 0DTE ones); the
+    README, `config.py`, `event_blackouts.py` and `strategy_base.py` said
+    every strategy.
+  - *The trail's activation is a knob* (R-152, `risk.trail_activation_r`,
+    default `0.5`, the value hard-coded until now): the peak in R that
+    arms the `trailing_stop_pct` trail; the top_tier preset's comment said
+    the runner "trails from 0.90R".
+  - *The top_tier README describes the screener as coded* (R-024, R-080,
+    R-082): the activity score is `|change_from_open| x max(0.5, volume /
+    1M)`, uncapped, every tradable is ranked and `tradingview.max_candidates`
+    caps no entry (it said `|change| x min(RVOL, 3)` capped at
+    `max_candidates`); the vwap_reclaim knobs are declared in the manifest
+    with the code's defaults. A test pins the formula.
+
+### Fixed
+
 - **An unreadable reconcile metadata store is never read as empty**
   (`ReconcileMetadataStore.load_positions` raises). The reconcile restores
   what the broker's rows give (a position restored from its row alone is
