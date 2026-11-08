@@ -82,17 +82,21 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     Options and a position with no initial stop keep the price band.
   - *vwap_reclaim's dip is a fresh round trip* (R-021, R-022, R-016;
     `vwap_reclaim_max_dip_age_bars`, preset 2, and
-    `vwap_reclaim_require_held_bucket`, preset true, both declared in both
-    manifests at the old reading, 6 / false): the flush's last bucket must
-    be among the last N closed buckets and the bucket right before the
-    flush must have held VWAP (an older dip at the window's edge is no
-    bar); Fix B judges its reclaim bar (a fresh cross bar passes by
-    construction) and the S/R veto holds it, the 2026-09-25 exemption
-    reversed on the four dry-run weeks (the veto's refused half lost
-    -$410 in dollars; in R the two halves are indistinguishable, and the
-    verifier's replay puts the regime at about eight entries over the 17
-    days with every filter on). Until now any of the last six buckets
-    under VWAP was the dip: 94 of the 124 dry-run entries at 0.00R.
+    `vwap_reclaim_require_held_bucket`, both declared in both manifests
+    at the old reading, 6 / false): the flush's last bucket must be among
+    the last N closed buckets and, with the held knob, the bucket right
+    before the flush must have held VWAP (an older dip at the window's
+    edge is no bar); Fix B judges its reclaim bar (a fresh cross bar
+    passes by construction) and the S/R veto holds it, the 2026-09-25
+    exemption reversed on the four dry-run weeks (the veto's refused half
+    lost -$410 in dollars; in R the two halves are indistinguishable). The
+    preset leaves the held knob OFF (user decision 2026-11-08): on the 94
+    archived entries replayed on their trigger bar, Fix B + the age cap +
+    the veto kept 15 at +3.98R, the held rule on top kept 8 at +0.07R,
+    and the goal is to take the trades with the side right, not to filter
+    the regime down to a few a month. Until now any of the last six
+    buckets under VWAP was the dip: 94 of the 124 dry-run entries at
+    0.00R.
   - *A daily-history fetch that fails is retried all day and the symbol
     refused meanwhile* (R-114, `MarketDataStore.daily_history_failed`,
     `daily_history_unreadable(symbol=...)`), its benchmark ETF's failure
