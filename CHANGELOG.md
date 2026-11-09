@@ -67,7 +67,102 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the day's first pass and the bot showed "Running" through whole days of
     401s (H: 10-20, 10-28, 10-29).
 
+### Added
+
+- **The side vote's outcome is recorded on every top_tier candidate
+  decision** (2026-11-08): `side_vote` in a skip's details (the
+  `SKIP_SUMMARY` record: `LONG` / `SHORT`, `undecided`, or `off` when the
+  vote did not run) and `gate_side_vote` in a signal's metadata (its
+  `ENTRY_CONTEXT`). Until now the decided side reached no record but a
+  `side_undecided` / `side_decision_opposed` refusal, so the vote's
+  accuracy could not be measured from the archive.
+
 ### Fixed
+
+- **Every number and switch of the shared entry, technical-levels, candle
+  and chart-pattern sections is checked at load** (the whole-bot review's
+  R-031, 2026-11-08; `config._NUMBER_CHECKS`, `_section_errors`): a count
+  is a whole number (at least 1 where it sizes a window), anything else a
+  finite number at least 0, the three anchored-VWAP overrides and the
+  shared stage's three floors nullable; a switch is true or false (the
+  pattern lists' tokens were checked before). Until now the four sections'
+  numbers and switches were built unchecked, so
+  `shared_entry.use_structure_filter: null` turned the veto off and
+  `min_target_rr: '1,0'` the R:R gate, silently. With them (R-105) the two
+  S/R flip-confirmation bar counts are whole numbers at least 0 (`int()`
+  read true as 1 and 1.9 as 1, and a text raised unnamed), and the S/R
+  switches are checked; and (R-104) the option multipliers are bounded by
+  their meaning (a stop fraction in (0, 1), a target or credit-stop
+  multiple above 1, the ratchet multiples in [1, 2) or (1, 2): a break-even
+  stop multiple under 1 put the "break-even" stop under the entry, and a
+  multiple of 2 or more is a threshold a SHORT can never reach, R-154; a
+  ratchet's stop multiple sits under the mark that arms it), a
+  technical-levels float whose reader turns 0 into its default is above 0,
+  and `options.styles` holds distinct tokens of `OPTION_ENTRY_STYLES` (a
+  typo'd style never traded, without a word). Not done here: top_tier's
+  other params read with `bool()` / `float()` at signal time (R-079,
+  R-092) and the unknown-key check on a strategy's params (R-106: the
+  small_cap and peer manifests declare only part of what their presets
+  set), each a unit of its own.
+
+- **The dashboard's figures say what they are** (the whole-bot review's
+  R-032, R-133, R-108, R-109; 2026-11-08). The focus card names the gate
+  that refused a built signal (`skipped: daily loss limit (top tier vwap
+  reclaim long)`; until now it showed the setup's name and the gate was
+  nowhere on the page, on 161 refusals over 14 dry-run days); the "Max
+  Risk" ring is "Initial Risk", with the sum it shows named (the open
+  positions' risk to their INITIAL stops, which a break-even or a lock
+  does not lower); the candidate card's "N shown · M ranked" reads every
+  row the screener ranked (`candidate_count`), not the shipped list twice,
+  on the phone too; and the Day % keeps the quote's prior-close basis
+  outside the regular session, computed from the prior close when the
+  quote carries no percent, the candidate row's change from the open the
+  last resort (until now the row's figure stood in after 16:00 and in the
+  premarket, so the basis flipped at the bell).
+
+- **The entry-timing baseline samples the regular session** (R-145;
+  `session_report._entry_timing`): its anchors are the trade's date AND
+  its regular session (09:30 to the calendar's close, 13:00 on an
+  early-close day). Until now the date alone bounded them, so a frame with
+  extended hours (07:00-20:00 on H:, about 42% of a day's bars) sampled
+  the premarket and the post-market in proportion.
+
+- **Gate attribution leaves the engine's and the feed's state out** (the
+  whole-bot review's R-050, 2026-11-08; `reasons.is_state_skip`,
+  `session_archive._gate_attribution`): `already_in_position` (and the
+  0DTE `underlying_already_open`), `entry_order_unsettled`,
+  `exit_orders_unswept`, `entry_retry_backoff`, the reconcile's hold, the
+  entry windows and the cutoff, the live 1m feed's states, a frame, a
+  quote or a feed not there yet, too few bars or too little history (a
+  vote short of its count, `macro_net_bias_insufficient_short`, stays a
+  gate) and a regime's missing or stale HTF frame are counted under
+  `state_skips_excluded` and never scored or ranked. Until now
+  `already_in_position`, which names no side, took the screener's bias and
+  was scored on the tape during held minutes: it headed `costliest_gates`
+  on 10-30 and 11-06 (+2.27 ATR on 209 "blocks": TSM held LONG and stopped
+  out while its rows read SHORT) and sat in the top 8 on 14 of 34 days.
+
+- **A trades.csv under an older header is read by column name** (R-037;
+  `session_report.read_trade_rows`): a column the file lacks reads as "",
+  as the rotating append carries it. Until now such a file raised, so on a
+  day a deploy changed the schema the SESSION REPORT, written before the
+  append that rotates the file, counted this process's unappended trades
+  alone (H: 10-13: `pnl=0.00 trades=0` for a 34-trade day at -234.15,
+  flagged only by `trades_source_error=yes`), and the dashboard's and the
+  day ledger's readers saw none of the file's trades all afternoon.
+
+- **A stop exit says which stop it was** (the whole-bot review's R-056,
+  2026-11-08): the exit reason is `stop:initial`, `stop:breakeven`,
+  `stop:profit_lock`, `stop:trail`, ... (`position_metrics.stop_exit_reason`,
+  from the stop's last move; the code stays `stop`), on the trade row,
+  the exit record and the decision. The session report's per-exit-reason
+  table keeps a row per kind, and its post-stop continuation scores the
+  initial stops alone, counting the moved ones apart
+  (`moved_stop_exits`): a break-even stop that then ran was a trade that
+  was right, not a shake-out. Until now one `stop` row blended them: on
+  H: 10-08..11-06, 80 initial stops at -$5,803 with 21 moved ones at
+  +$82, and the row's win rate and average loss read as the initial
+  stop's.
 
 - **Regime-call outcomes read against each side's own baseline** (the
   whole-bot review's R-051, 2026-11-08; `session_archive._regime_call_outcomes`):
