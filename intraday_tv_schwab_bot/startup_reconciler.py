@@ -61,6 +61,7 @@ from .broker_payloads import (
     ORDER_REPLACED,
     active_broker_bracket,
     booked_fills_ledger,
+    protective_stop_reason,
     bracket_order_ids,
     broker_position_side_qty,
     broker_quantity,
@@ -587,7 +588,9 @@ class StartupReconciler:
 
         The booking is the saved stop's fill (``bracket.stop_order_id``, the
         disaster stop or the bracket's stop) as the broker reports it
-        (``executor.order_state``): its quantity and price, reason ``stop``,
+        (``executor.order_state``): its quantity and price, the reason the
+        running bot books that stop's fill with (``disaster_stop`` or
+        ``broker_stop``, ``broker_payloads.protective_stop_reason``),
         broker-recovered, into the account (trades.csv, the day's figures)
         and ``risk.register_realized_pnl``, gain or loss, since the price is
         an execution's. The entry is booked for the filled shares only; a
@@ -661,7 +664,7 @@ class StartupReconciler:
             closed.qty = qty
             self.account.record_restored_entry(closed, float(position.entry_price))
             realized = self.account.record_exit(
-                closed, float(price), "stop", final_exit=True, remaining_qty_after_exit=0,
+                closed, float(price), protective_stop_reason(bracket), final_exit=True, remaining_qty_after_exit=0,
                 fill_price_estimated=state.get("fill_price_estimated") is not False, broker_recovered=True,
             )
             self.risk.register_realized_pnl(float(realized))

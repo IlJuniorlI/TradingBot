@@ -292,7 +292,8 @@
     (data?.dashboard_symbols || []).forEach(item => {
       if (item && item.symbol) snapshotsByKey.set(String(item.symbol).toUpperCase(), item);
     });
-    if (meta) meta.textContent = rows.length ? `${rows.length} ranked` : 'No candidates';
+    // ``candidate_count`` is every row the screener ranked; ``rows`` the shipped list.
+    if (meta) meta.textContent = rows.length ? `${safe(data?.candidate_count ?? rows.length)} ranked` : 'No candidates';
     if (!target) return;
     if (!rows.length) {
       target.innerHTML = `<div class="empty-state">No candidate data yet.</div>`;

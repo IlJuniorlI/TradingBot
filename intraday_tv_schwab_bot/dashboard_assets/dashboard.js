@@ -318,14 +318,34 @@ function entryDecisionForSnapshot(snapshot) {
   return direct && typeof direct === 'object' ? direct : null;
 }
 
+// The token a decision is shown by. On a decision about a signal the
+// strategy built (``market_side`` set), the reasons are the signal's own
+// name first and the engine gate that refused it second
+// (``EntryGatekeeper._log_entry_decision``): the gate is what the card
+// must say. Until 2026-11-08 both labels read the first token, so a
+// refused signal showed as its setup's name (``top tier vwap reclaim
+// long``) with the gate (``daily_loss_limit``, the R:R floor) nowhere on
+// the page (the whole-bot review's R-032: 161 such rows over 14 dry-run
+// days). Returns {head, signal}: the token to show and, for a refused
+// signal, the signal's name beside it.
+function decisionTokens(decision) {
+  const reasons = Array.isArray(decision.reasons) ? decision.reasons : [];
+  const primary = decision.primary_reason || reasons[0] || '';
+  const refusedSignal = Boolean(decision.market_side) && reasons.length > 1;
+  if (refusedSignal) return { head: decision.secondary_reason || reasons[1], signal: primary };
+  return { head: primary, signal: '' };
+}
+
 function entryDecisionLabel(decision) {
   if (!decision || typeof decision !== 'object') return '';
   const action = String(decision.action || '').trim().toLowerCase();
-  const primary = humanizeDecisionToken(decision.primary_reason || (Array.isArray(decision.reasons) ? decision.reasons[0] : ''));
+  const tokens = decisionTokens(decision);
+  const primary = humanizeDecisionToken(tokens.head);
   if (!action && !primary) return '';
   if (!primary || primary === '—') return action || '';
   if (!action || action === 'signal') return primary;
-  return `${action}: ${primary}`;
+  const signal = tokens.signal ? ` (${humanizeDecisionToken(tokens.signal)})` : '';
+  return `${action}: ${primary}${signal}`;
 }
 
 // Compact variant for tight UI surfaces. Same shape as
@@ -339,7 +359,7 @@ function entryDecisionLabel(decision) {
 function entryDecisionLabelCompact(decision) {
   if (!decision || typeof decision !== 'object') return '';
   const action = String(decision.action || '').trim().toLowerCase();
-  const primary = humanizeDecisionTokenCompact(decision.primary_reason || (Array.isArray(decision.reasons) ? decision.reasons[0] : ''));
+  const primary = humanizeDecisionTokenCompact(decisionTokens(decision).head);
   if (!action && !primary) return '';
   if (!primary || primary === '—') return action || '';
   return primary;
@@ -1657,7 +1677,10 @@ function renderCandidates() {
   const data = appState.data;
   const snapshots = buildSnapshotMap(data);
   const rows = data?.candidates || [];
-  document.getElementById('candidate-meta').textContent = `${rows.length} shown · ${safe(data?.candidates?.length || 0)} ranked`;
+  // ``candidate_count`` is every row the screener ranked; ``candidates``
+  // holds the first ``candidate_limit`` of them (until 2026-11-08 both
+  // numbers read the shipped list, so "ranked" could never differ).
+  document.getElementById('candidate-meta').textContent = `${rows.length} shown · ${safe(data?.candidate_count ?? rows.length)} ranked`;
   const html = rows.length ? rows.map(row => {
     const snap = snapshots.get(String(row.symbol || '').toUpperCase());
     const values = (snap?.bars || []).map(bar => numOrNull(bar.close)).filter(v => v !== null);

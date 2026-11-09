@@ -40,7 +40,7 @@ import yaml
 from .models import Position
 from . import sessions
 from .position_manager import EQUITY_MARK_BASIS
-from .reasons import SKIP_COUNT_UNIT, blocked_side, reason_gate, split_side_prefix
+from .reasons import SKIP_COUNT_UNIT, blocked_side, is_state_skip, reason_gate, split_side_prefix
 from .serialization import atomic_write_text
 from .session_report import (
     TRADE_CSV_COLUMNS,
@@ -397,6 +397,15 @@ def _gate_attribution(
     recognised, so every other strategy's refused signal was scored under
     its own name, on the screener's side, and the gate never was.
 
+    An engine-state or feed-state skip is not scored (``reasons.is_state_skip``,
+    2026-11-08, R-050): ``already_in_position`` has no side of its own, so
+    ``blocked_side`` gave it the screener's bias and the move that followed
+    was the tape during a held minute (TSM held LONG 11:39-12:36 on 11-06,
+    stopped out, its 58 rows carrying side_pref=SHORT, scored a +3.03 ATR
+    "edge" for a SHORT block); it headed ``costliest_gates`` on 10-30 and
+    11-06 and sat in the top 8 on 14 of 34 days. Such skips are counted
+    under ``state_skips_excluded`` instead.
+
     Each reason is bucketed under its gate, ``reasons.reason_gate``: the key
     the filter rejections and the entry cycle summary use, with no side
     prefix and no ``(...)`` or ``:...`` detail, so the numeric detail that
@@ -426,6 +435,7 @@ def _gate_attribution(
         families: dict[str, Counter] = defaultdict(Counter)
         sides: dict[str, Counter] = defaultdict(Counter)
         blocked = Counter()
+        state_skips: Counter = Counter()
         unevaluated = Counter()
         seen: set[tuple[str, datetime, str, str]] = set()
         # (reason, side, excursion) -- scored after the baseline, which needs
@@ -491,6 +501,10 @@ def _gate_attribution(
                 excursion_read = False
                 regimes = _reason_regimes(gates, family)
                 for token, regime in zip(gates, regimes):
+                    reason = reason_gate(token)
+                    if is_state_skip(reason):
+                        state_skips[reason] += 1
+                        continue
                     # ``reasons.blocked_side``: the rule above, which the
                     # session's skip tally keys its minutes on too.
                     side = blocked_side(token, market_side=market_side, side_pref=side_pref)
@@ -498,7 +512,6 @@ def _gate_attribution(
                         continue
                     # One gate can stop both sides on a row (the peer
                     # family's `long.x` and `short.x` are gate `x`): two blocks.
-                    reason = reason_gate(token)
                     key = (symbol, ts.replace(second=0), reason, side)
                     if key in seen:
                         continue
@@ -619,6 +632,8 @@ def _gate_attribution(
                 "span": [first_ts.isoformat() if first_ts else None,
                          last_ts.isoformat() if last_ts else None],
             },
+            # Engine- and feed-state skips, not gates, left out of the scoring.
+            "state_skips_excluded": dict(sorted(state_skips.items())),
             "costliest_gates": [
                 {
                     "gate": name,

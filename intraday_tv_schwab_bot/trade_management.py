@@ -56,6 +56,7 @@ from .position_metrics import (
     TARGET_HOLD_TIMEOUT,
     TARGET_WEAK_CLOSE,
     append_management_adjustment,
+    stop_exit_reason,
     favorable_move,
 )
 from .reasons import exit_reason_code
@@ -843,7 +844,7 @@ class TradeManager:
                     if isinstance(meta, dict) and candidate_stop > prior_stop + 1e-12:
                         append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "trail", "from": prior_stop, "to": float(candidate_stop)})
             if (protective_price if protective_stop(position) else last_price) <= position.stop_price:
-                return True, "stop"
+                return True, stop_exit_reason(meta)
             if position.target_price is not None and last_price >= position.target_price and not touch_hold and not broker_owns_target:
                 return True, "target"
         else:
@@ -921,7 +922,7 @@ class TradeManager:
                     if isinstance(meta, dict) and candidate_stop < prior_stop - 1e-12:
                         append_management_adjustment(meta,{"manager": "adaptive", "kind": "stop", "reason": "trail", "from": prior_stop, "to": float(candidate_stop)})
             if (protective_price if protective_stop(position) else last_price) >= position.stop_price:
-                return True, "stop"
+                return True, stop_exit_reason(meta)
             if position.target_price is not None and last_price <= position.target_price and not touch_hold and not broker_owns_target:
                 return True, "target"
         return False, "hold"

@@ -2523,8 +2523,17 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                           winning_decision: dict[str, Any] | None, winning_regime: str | None,
                           winning_norm: float) -> None:
         """Record the candidate's decision: the signal with its regime and
-        score, or the skip with the regime that came closest."""
+        score, or the skip with the regime that came closest. Both carry the
+        side vote's outcome (``side_vote``: LONG / SHORT, ``undecided``, or
+        ``off`` when the vote did not run, the knob off or the ORB bypass),
+        the skip in its details (the SKIP_SUMMARY record) and the signal in
+        its metadata too (``gate_side_vote``, the ENTRY_CONTEXT record):
+        until 2026-11-08 the decided side reached no record but a
+        ``side_undecided`` / ``side_decision_opposed`` refusal, so the
+        vote's accuracy could not be measured (the regime scorecard)."""
         c = read.c
+        side_vote = (read.decided_side.value if read.decided_side is not None
+                     else "undecided" if read.side_vote_note else "off")
         if best_signal is not None:
             # Stamp the soft-bias penalty value on the success path too
             # so post-mortem can see whether a winner was nearly killed
@@ -2542,9 +2551,12 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                     scores_dict = winning_decision.get("scores") or {}
                     detail_payload["score"] = round(float(scores_dict.get(winning_regime, 0.0)), 4)
                     detail_payload["score_norm"] = round(float(winning_norm), 4)
+            detail_payload["side_vote"] = side_vote
+            if isinstance(best_signal.metadata, dict):
+                best_signal.metadata["gate_side_vote"] = side_vote
             self._record_entry_decision(
                 c.symbol, "signal", [best_signal.reason],
-                details=detail_payload or None,
+                details=detail_payload,
             )
         else:
             # Stamp WHICH regime the skip came from. Without this the
@@ -2584,6 +2596,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 # different failure from "a builder rejected it", and the
                 # two are worth telling apart in the histogram.
                 skip_details["entry_family"] = "none_qualified"
+            skip_details["side_vote"] = side_vote
             # The side the relative-strength filter dropped, or why it was
             # skipped, after the reasons of the side(s) it left, so the
             # primary reason stays theirs (2026-10-13).

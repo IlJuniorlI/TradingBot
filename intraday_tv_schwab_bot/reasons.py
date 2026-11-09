@@ -14,6 +14,7 @@ format them here, and the report and the entry stage read them back through
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pandas as pd
@@ -194,6 +195,43 @@ def reason_gate(reason: Any) -> str:
 
 
 _BLOCKED_SIDES = frozenset(side.value for side in Side)
+
+# Skip reasons that are the engine's or the feed's state, not a gate that
+# judged a setup: a held position, an unsettled order, a sweep owed, a
+# retry back-off, the reconcile's hold, the entry windows, a frame or a
+# feed not there yet. Each is counted in the skip tallies, but none can be
+# scored by the move that followed it: there was no setup to refuse, and
+# the move was the tape during a held or a dark minute (2026-11-08, the
+# whole-bot review's R-050: `already_in_position`, scored on the screener's
+# bias, headed `costliest_gates` on 10-30 and 11-06).
+STATE_SKIP_GATES = frozenset({
+    "already_in_position", "underlying_already_open", "entry_order_unsettled", "exit_orders_unswept",
+    "entry_retry_backoff", "startup_reconcile_ignored_open_position", "outside_entry_window", "non_trading_day",
+    "after_entry_cutoff", "live_1m_not_subscribed", "live_1m_stream_inactive", "awaiting_first_live_1m_bar",
+    "live_1m_bar_stale", "live_1m_entry_not_ready", "ltf_warmup", "missing_ltf_context",
+    "entry_frame_unavailable", "entry_quote_unavailable", "daily_history_unreadable",
+})
+_STATE_SKIP_SUFFIXES = ("_htf_frame_missing", "_htf_frame_stale", "_unreadable")
+# Too few bars or too little history for a read, inside a build reason too
+# (``long_build_failed_insufficient_session_history``, ``insufficient_bars``,
+# ``insufficient_htf_bars``). Not a vote that fell short of its count
+# (``macro_net_bias_insufficient_short``, ``peer_confirmation_insufficient_long``):
+# that is a gate on the setup.
+_STATE_SKIP_HISTORY = re.compile(r"insufficient_(?:[a-z]+_)*(?:bars|history)\b")
+
+
+def is_state_skip(gate: Any) -> bool:
+    """Whether ``gate`` (a ``reason_gate``) is engine or feed state rather
+    than a gate on a setup: one of ``STATE_SKIP_GATES``, a regime's missing /
+    stale HTF frame or unreadable read (``trend_htf_frame_missing``,
+    ``relative_strength_sector_unreadable``, ``breadth_unreadable``), or
+    too few bars or too little history for a read
+    (``insufficient_session_history``, ``insufficient_bars``). A vote that
+    fell short of its count (``macro_net_bias_insufficient_short``) is a
+    gate."""
+    name = str(gate or "")
+    return (name in STATE_SKIP_GATES or name.endswith(_STATE_SKIP_SUFFIXES)
+            or _STATE_SKIP_HISTORY.search(name) is not None)
 
 
 def blocked_side(reason: Any, *, market_side: Any = None, side_pref: Any = None) -> str | None:

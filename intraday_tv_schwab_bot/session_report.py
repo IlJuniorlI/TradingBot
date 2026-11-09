@@ -53,6 +53,7 @@ from .paper_account import PaperAccount, TradeRecord, closed_trade_lifecycles
 from .models import Position
 from .position_manager import EQUITY_MARK_BASIS
 from .reasons import SKIP_COUNT_UNIT, exit_reason_code, reason_gate
+from .sessions import EXCHANGE_TZ, session_mask
 
 # trades.csv's lock (``_trades_csv_lock``) is flock on POSIX and a byte-range
 # lock on Windows, where the bot also runs (start_trading_bot.bat).
@@ -125,6 +126,9 @@ def trade_csv_row(trade: TradeRecord, session_date: str) -> dict[str, Any]:
 # its shutdown, or two processes, can each hold a trade; its row is written
 # once.
 TRADE_CSV_KEY = ("lifecycle_id", "symbol", "entry_time", "exit_time")
+# The columns every reader of trades.csv keys on: a file under an older
+# header is read by column name only when it has them (``read_trade_rows``).
+TRADE_CSV_CORE = ("date", "strategy", "side", "qty", "realized_pnl", *TRADE_CSV_KEY)
 
 
 def trade_csv_key(row: dict[str, Any]) -> tuple[str, ...]:
@@ -139,12 +143,22 @@ def read_trade_rows(csv_path: Path, session_date: str) -> list[dict[str, str]]:
     (``_trades_csv_lock``), so another process's append or rotation is never
     seen half-written.
 
+    A file under another header (one an older version wrote, which the
+    next append rotates) is read by column name, as the rotation carries
+    its rows: a column the file lacks reads as "" (what the rotation
+    writes), a column the current schema lacks is dropped (2026-11-08, the
+    whole-bot review's R-037). Until then such a file raised ValueError, so
+    on a day a deploy changed the schema the SESSION REPORT, which runs
+    before the append that rotates the file, counted this process's
+    unappended trades alone (H: 10-13: `pnl=0.00 trades=0` for a day of 34
+    trades, -234.15), and the dashboard's and the day ledger's readers saw
+    none of the file's trades all afternoon. A header without the columns
+    every reader keys on (``TRADE_CSV_CORE``) is no trades.csv of this
+    bot's: ValueError, as before.
+
     Raises OSError, csv.Error or UnicodeDecodeError on a file it cannot read
     (TimeoutError, an OSError, on a lock it could not take), and ValueError
-    when a row of that day sits under a header other than
-    ``TRADE_CSV_COLUMNS`` (a file an older version wrote, which the next
-    append rotates, carrying the rows of the day it closes, unless the
-    rotation failed): those rows cannot be read as the current columns.
+    on a header without the core columns.
     """
     if not csv_path.exists():
         return []
@@ -153,9 +167,14 @@ def read_trade_rows(csv_path: Path, session_date: str) -> list[dict[str, str]]:
         rows = [row for row in reader if row.get("date") == session_date]
         header = reader.fieldnames
     if rows and header != TRADE_CSV_COLUMNS:
-        raise ValueError(
-            f"{csv_path} holds {len(rows)} rows of {session_date} under a header of "
-            f"{len(header or [])} columns, not the current {len(TRADE_CSV_COLUMNS)}")
+        missing = [name for name in TRADE_CSV_CORE if name not in (header or [])]
+        if missing:
+            raise ValueError(
+                f"{csv_path} holds {len(rows)} rows of {session_date} under a header of {len(header or [])} "
+                f"columns without {', '.join(missing)}: not a trades.csv this bot can read")
+        LOG.info("%s holds %d rows of %s under a header of %d columns, not the current %d: read by column name",
+                 csv_path, len(rows), session_date, len(header or []), len(TRADE_CSV_COLUMNS))
+        rows = [{name: row.get(name) or "" for name in TRADE_CSV_COLUMNS} for row in rows]
     return rows
 
 
@@ -338,9 +357,29 @@ def _per_symbol(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
     return _summaries(_group_by(trades, lambda t: t.symbol))
 
 
+def _exit_reason_bucket(reason: Any) -> str:
+    """The per-exit-reason table's key: the reason's code, except a stop,
+    which keeps its kind (``stop:initial``, ``stop:breakeven``,
+    ``stop:profit_lock``, ``stop:trail``, ...; a bare ``stop`` from a row
+    written before 2026-11-08 is ``stop:initial``, what 80 of 101 were).
+    One ``stop`` row blended -1R initial stops with break-even scratches
+    and profit-lock exits, and the table is what the exit tuning is read
+    from (the whole-bot review's R-056)."""
+    code = exit_reason_code(reason) or "unknown"
+    if code != "stop":
+        return code
+    text = str(reason or "")
+    detail = text.split(":", 1)[1].strip() if ":" in text else ""
+    return f"stop:{detail or 'initial'}"
+
+
+def _is_initial_stop(reason: Any) -> bool:
+    return _exit_reason_bucket(reason) == "stop:initial"
+
+
 def _per_exit_reason(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
-    """Closed trades by the reason of their FINAL exit."""
-    return _summaries(_group_by(trades, lambda t: exit_reason_code(t.reason) or "unknown"))
+    """Closed trades by the reason of their FINAL exit, a stop by its kind."""
+    return _summaries(_group_by(trades, lambda t: _exit_reason_bucket(t.reason)))
 
 
 def _per_partial_exit_reason(slices: list[tuple[str, float]]) -> dict[str, dict[str, Any]]:
@@ -474,14 +513,20 @@ def _post_stop_continuation(
     was right. Until 2026-10-12 it was scored on the bars there were before
     the gate idled at 15:55, or at a day-over idle (one or two for a stop
     just before it).
+
+    INITIAL stops only (2026-11-08, R-056): a break-even or profit-lock stop
+    that then ran is a trade that was right and kept what it locked, not a
+    shake-out, and with them in the figure could not answer its question
+    (H: 10-08..11-06: 21 of 101 stop exits were moved stops). They are
+    counted in ``moved_stop_exits``; a bare ``stop`` from a row written
+    before the kind was recorded counts as initial.
     """
-    stop_exits = [
-        t for t in trades
-        if (exit_reason_code(t.reason) or "").lower() == "stop"
-    ]
+    all_stops = [t for t in trades if (exit_reason_code(t.reason) or "").lower() == "stop"]
+    stop_exits = [t for t in all_stops if _is_initial_stop(t.reason)]
     summary: dict[str, Any] = {
         "window_minutes": int(window_minutes),
         "stop_exits": len(stop_exits),
+        "moved_stop_exits": len(all_stops) - len(stop_exits),
         "evaluated": 0,
         "not_evaluated": len(stop_exits),
         "reached_1r": 0,
@@ -695,14 +740,21 @@ def _entry_timing(
         # symbol's session, anchored on each sampled bar's own close and
         # carrying THIS trade's risk distance.
         #
-        # Scoped to the TRADE'S OWN SESSION DATE. `bars_for` hands back the
-        # multi-day history frame, and sampling all of it would fold a quiet
-        # overnight stretch into the baseline, depress it, and inflate every
-        # edge above it -- while the docstring claimed a same-session
-        # comparison. The whole metric is the gap between observed and
-        # baseline, so a baseline drawn from a different tape measures nothing.
-        session_mask = frame.index.date == trade.entry_time.date()
-        session = frame[session_mask]
+        # Scoped to the TRADE'S OWN SESSION DATE and its regular session
+        # (09:30-16:00 ET). `bars_for` hands back the multi-day history
+        # frame, and sampling all of it would fold a quiet overnight stretch
+        # into the baseline, depress it, and inflate every edge above it --
+        # while the docstring claimed a same-session comparison. The whole
+        # metric is the gap between observed and baseline, so a baseline
+        # drawn from a different tape measures nothing. Until 2026-11-08 the
+        # date was the only bound, so the extended-hours bars of a frame
+        # with them (07:00-20:00 on H:, about 42% of a day's bars) were
+        # sampled in proportion (the whole-bot review's R-145). The regular
+        # session is the calendar's (``sessions.session_mask``: 16:00, or
+        # 13:00 on an early-close day).
+        index_et = frame.index.tz_convert(EXCHANGE_TZ) if frame.index.tz is not None else frame.index
+        in_session = (index_et.date == trade.entry_time.date()) & session_mask(frame.index, "rth")
+        session = frame[in_session]
         rows = (session.iloc[::max(1, int(baseline_stride))]
                 if not session.empty else None)
         if rows is not None:
@@ -877,14 +929,15 @@ def _log_mae_mfe(summary: dict[str, Any]) -> None:
 def _log_post_stop_continuation(summary: dict[str, Any]) -> None:
     """Only logged when there were stop exits — silence is the common case
     early in a session and an empty table is noise."""
-    if not summary.get("stop_exits"):
+    if not summary.get("stop_exits") and not summary.get("moved_stop_exits"):
         return
-    LOG.info("--- Post-stop continuation (%d min window) ---", summary.get("window_minutes", 0))
+    LOG.info("--- Post-stop continuation (%d min window; initial stops) ---", summary.get("window_minutes", 0))
     evaluated = int(summary.get("evaluated") or 0)
     LOG.info(
-        "  stop exits=%d  evaluated=%d  (unevaluated=%d: no initial risk, or no bars to the window's end)",
+        "  initial stop exits=%d  evaluated=%d  (unevaluated=%d: no initial risk, or no bars to the window's end)"
+        "  moved stops left out=%d",
         int(summary.get("stop_exits") or 0), evaluated,
-        int(summary.get("not_evaluated") or 0),
+        int(summary.get("not_evaluated") or 0), int(summary.get("moved_stop_exits") or 0),
     )
     if not evaluated:
         return

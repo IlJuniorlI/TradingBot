@@ -10,6 +10,7 @@ keeps its own answer for degenerate input (a zero entry, no price).
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from .models import ExitDecision, Position, Side, is_option_asset
@@ -248,6 +249,22 @@ STOP_SOURCE_KEY = "stop_source"
 DISASTER_STOP_PRICE_KEY = "disaster_stop_price"
 
 
+def stop_exit_reason(meta: Mapping[str, Any] | None) -> str:
+    """The exit reason of a stop exit, ``stop:<kind>``: the kind the
+    stop's last move left under ``STOP_SOURCE_KEY`` (``breakeven``,
+    ``profit_lock``, ``trail``, ``touch_promoted``, ...), or ``initial`` for
+    the stop the position opened or was restored with. The code stays
+    ``stop`` (``reasons.exit_reason_code``); the kind lets the session
+    report's per-exit-reason table and its post-stop continuation tell a
+    -1R initial stop from a moved one (2026-11-08, the whole-bot review's
+    R-056: on H: 10-08..11-06 one ``stop`` row blended 80 initial stops at
+    -$5,803 with 21 moved ones at +$82)."""
+    source = meta.get(STOP_SOURCE_KEY) if isinstance(meta, Mapping) else None
+    if not source:
+        return "stop:initial"
+    return "stop:" + str(source).split(":", 1)[-1]
+
+
 def append_management_adjustment(meta: dict, entry: dict) -> None:
     """Append a management adjustment to position metadata with a size cap,
     and record a stop move's manager and reason under ``STOP_SOURCE_KEY``.
@@ -255,7 +272,11 @@ def append_management_adjustment(meta: dict, entry: dict) -> None:
     Keeps the most recent ``_MAX_MANAGEMENT_ADJUSTMENTS`` entries so the list
     doesn't grow without bound on very active trades.
     """
-    if entry.get("kind") == "stop":
+    # A bracket sync (manager ``bracket_sync``) mirrors the engine's stop at
+    # the broker; it moves no level of its own, so it leaves the source the
+    # move that set the level wrote (2026-11-08: it overwrote it, and a
+    # moved stop's exit then read ``stop:replace_child``).
+    if entry.get("kind") == "stop" and entry.get("manager") != "bracket_sync":
         meta[STOP_SOURCE_KEY] = f"{entry.get('manager')}:{entry.get('reason')}"
     adjustments = meta.setdefault("management_adjustments", [])
     adjustments.append(entry)

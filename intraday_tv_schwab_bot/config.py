@@ -1444,13 +1444,20 @@ class EventsConfig:
     earnings_block_sessions_after: int = 1
 
 
+# The entry styles the two 0DTE strategies offer, the tokens ``options.styles``
+# switches on (``ZeroDteEtfOptionsStrategy._entry_styles`` and the long
+# options strategy's); checked at load (``_validate_options_config``).
+OPTION_ENTRY_STYLES = ("orb_debit_spread", "trend_debit_spread", "midday_credit_spread", "orb_long_option",
+                       "trend_long_option")
+
+
 @dataclass(slots=True)
 class ZeroDteOptionsConfig:
     enabled: bool = True
     underlyings: list[str] = field(default_factory=lambda: ["SPY", "QQQ"])
     confirmation_symbols: dict[str, str] = field(default_factory=lambda: {"SPY": "$SPX", "QQQ": "$COMPX", "IWM": "$RUT"})
     volatility_symbol: str = "VIX"
-    styles: list[str] = field(default_factory=lambda: ["orb_debit_spread", "trend_debit_spread", "midday_credit_spread", "orb_long_option", "trend_long_option"])
+    styles: list[str] = field(default_factory=lambda: list(OPTION_ENTRY_STYLES))
     min_underlying_price: float = 100.0
     min_option_volume: int = 300
     min_open_interest: int = 600
@@ -1798,6 +1805,7 @@ class _Number:
     low: float | None = None
     low_open: bool = False
     high: float | None = None
+    high_open: bool = False
     nullable: bool = False
     note: str = ""
 
@@ -1817,7 +1825,7 @@ class _Number:
             and not isinstance(value, bool)
             and (isinstance(value, int) or math.isfinite(value))
             and (self.low is None or (value > self.low if self.low_open else value >= self.low))
-            and (self.high is None or value <= self.high)
+            and (self.high is None or (value < self.high if self.high_open else value <= self.high))
         )
 
     def _text_hint(self, value: Any) -> str:
@@ -1861,7 +1869,7 @@ class _Number:
             return ""
         if self.high is None:
             return f" {'>' if self.low_open else '>='} {self.low:g}"
-        return f" in {'(' if self.low_open else '['}{self.low:g}, {self.high:g}]"
+        return f" in {'(' if self.low_open else '['}{self.low:g}, {self.high:g}{')' if self.high_open else ']'}"
 
 
 _ABOVE_ZERO = _Number(low=0, low_open=True)
@@ -2000,6 +2008,12 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         "pct_tolerance": _ABOVE_ZERO,
         "same_side_min_gap_atr_mult": _ABOVE_ZERO,
         "same_side_min_gap_pct": _ABOVE_ZERO,
+        # The flip-confirmation bar counts (2026-11-08, R-105): whole numbers
+        # >= 0, and not both 0 (``_validate_support_resistance_config``);
+        # until then ``int()`` read true as 1 and 1.9 as 1, and a text raised
+        # unnamed.
+        "trading_flip_confirmation_1m_bars": _COUNT_OR_ZERO,
+        "trading_flip_confirmation_5m_bars": _COUNT_OR_ZERO,
     },
     # The trade manager's adaptive ladder touch hold (2026-09-27): a 0
     # would time every hold out on its first cycle, before any bar could be
@@ -2048,19 +2062,104 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         "max_quote_age_seconds": _AT_LEAST_ZERO,
         "dry_run_replace_attempts": _COUNT_OR_ZERO,
         "dry_run_step_frac": _AT_LEAST_ZERO,
-        "debit_stop_frac": _ABOVE_ZERO,
-        "debit_target_mult": _ABOVE_ZERO,
-        "credit_stop_mult": _ABOVE_ZERO,
-        "credit_target_frac": _ABOVE_ZERO,
-        "single_stop_frac": _ABOVE_ZERO,
-        "single_target_mult": _ABOVE_ZERO,
+        "debit_stop_frac": _Number(low=0, low_open=True, high=1, high_open=True, note=" (a fraction of the entry)"),
+        "debit_target_mult": _Number(low=1, low_open=True, note=" (a multiple of the entry above it)"),
+        "credit_stop_mult": _Number(low=1, low_open=True, note=" (a multiple of the credit above it)"),
+        "credit_target_frac": _Number(low=0, low_open=True, high=1, high_open=True, note=" (a fraction of the credit)"),
+        "single_stop_frac": _Number(low=0, low_open=True, high=1, high_open=True, note=" (a fraction of the entry)"),
+        "single_target_mult": _Number(low=1, low_open=True, note=" (a multiple of the entry above it)"),
         "debit_stop_time_decay_widen_factor": _AT_LEAST_ZERO,
-        "options_breakeven_mark_mult": _ABOVE_ZERO,
-        "options_breakeven_stop_mult": _ABOVE_ZERO,
-        "options_profit_lock_mark_mult": _ABOVE_ZERO,
-        "options_profit_lock_stop_mult": _ABOVE_ZERO,
+        "options_breakeven_mark_mult": _Number(low=1, low_open=True, high=2, high_open=True, note=" (a SHORT's threshold is the entry x (2 - mult))"),
+        "options_breakeven_stop_mult": _Number(low=1, high=2, high_open=True, note=" (1 is the entry; a SHORT's level is the entry x (2 - mult))"),
+        "options_profit_lock_mark_mult": _Number(low=1, low_open=True, high=2, high_open=True, note=" (a SHORT's threshold is the entry x (2 - mult))"),
+        "options_profit_lock_stop_mult": _Number(low=1, high=2, high_open=True, note=" (1 is the entry; a SHORT's level is the entry x (2 - mult))"),
         "vix_spike_pct": _Number(low=0, low_open=True, high=1, note=" (a fraction: 0.10 is a 10% VIX day change)"),
         "max_vix_quote_age_seconds": _ABOVE_ZERO,
+    },
+    # The shared entry stage's, the technical context's, the candle and the
+    # chart-pattern sections (2026-11-08, the whole-bot review's R-031): until
+    # then these four were built with no check at all, so a quoted number, a
+    # null or a "false" switch loaded and read mid-session as off, as 0 or
+    # as a raise (``use_structure_filter: null`` turned the veto off;
+    # ``min_target_rr: '1,0'`` turned the R:R gate off). Every number the
+    # sections hold is checked: a count is a whole number (>= 1 where it
+    # sizes a window, >= 0 otherwise), anything else a finite number >= 0,
+    # the three anchored-VWAP overrides and the shared stage's three floors
+    # nullable, as their readers take a null for "off" or "default"; a
+    # technical-levels float whose reader turns 0 into its default (the
+    # ``or default`` reads of contexts.ContextBuildersMixin) is above 0. (The
+    # pattern lists' tokens were checked before: ``_validate_pattern_config``.)
+    "shared_entry": {
+        "divergence_entry_min_age_bars": _COUNT_OR_ZERO,
+        "divergence_entry_score_floor": _AT_LEAST_ZERO,
+        "divergence_entry_score_bump": _AT_LEAST_ZERO,
+        "broken_level_min_clearance_pct": _AT_LEAST_ZERO,
+        "broken_level_min_clearance_atr": _AT_LEAST_ZERO,
+        "min_target_rr": _Number(low=0, nullable=True),
+        "min_stop_atr_mult": _Number(low=0, nullable=True),
+        "min_shared_context_score": _Number(low=0, nullable=True),
+    },
+    "technical_levels": {
+        "fib_lookback_bars": _COUNT,
+        "fib_min_impulse_atr": _ABOVE_ZERO,
+        "fib_near_extension_pct": _AT_LEAST_ZERO,
+        "anchored_vwap_impulse_lookback_bars": _Number(integer=True, low=1, nullable=True),
+        "anchored_vwap_min_impulse_atr": _Number(low=0, nullable=True),
+        "anchored_vwap_pivot_span": _Number(integer=True, low=1, nullable=True),
+        "channel_lookback_bars": _COUNT,
+        "channel_min_touches": _COUNT,
+        "channel_atr_tolerance_mult": _ABOVE_ZERO,
+        "channel_parallel_slope_frac": _ABOVE_ZERO,
+        "channel_min_gap_atr_mult": _ABOVE_ZERO,
+        "channel_min_gap_pct": _ABOVE_ZERO,
+        "channel_near_edge_pct": _AT_LEAST_ZERO,
+        "trendline_lookback_bars": _COUNT,
+        "trendline_min_touches": _COUNT,
+        "trendline_atr_tolerance_mult": _ABOVE_ZERO,
+        "trendline_breakout_buffer_atr_mult": _AT_LEAST_ZERO,
+        "adx_length": _COUNT,
+        "adx_min_strength": _AT_LEAST_ZERO,
+        "adx_entry_bonus": _AT_LEAST_ZERO,
+        "adx_rising_bonus": _AT_LEAST_ZERO,
+        "adx_weak_penalty": _AT_LEAST_ZERO,
+        "anchored_vwap_entry_bonus": _AT_LEAST_ZERO,
+        "anchored_vwap_entry_penalty": _AT_LEAST_ZERO,
+        "atr_expansion_lookback": _COUNT,
+        "atr_expansion_min_mult": _AT_LEAST_ZERO,
+        "atr_expansion_bonus": _AT_LEAST_ZERO,
+        "atr_stretch_penalty_mult": _AT_LEAST_ZERO,
+        "atr_stretch_penalty": _AT_LEAST_ZERO,
+        "obv_ema_length": _COUNT,
+        "obv_entry_bonus": _AT_LEAST_ZERO,
+        "obv_entry_penalty": _AT_LEAST_ZERO,
+        "divergence_rsi_length": _COUNT,
+        "divergence_rsi_min_delta": _AT_LEAST_ZERO,
+        "divergence_obv_min_volume_frac": _AT_LEAST_ZERO,
+        "divergence_counter_rsi_penalty": _AT_LEAST_ZERO,
+        "divergence_counter_obv_penalty": _AT_LEAST_ZERO,
+        "divergence_pivot_lookback": _COUNT,
+        "divergence_max_age_bars": _COUNT_OR_ZERO,
+        "htf_divergence_max_age_bars": _COUNT_OR_ZERO,
+        "divergence_min_price_move_pct": _AT_LEAST_ZERO,
+        "divergence_hidden_bonus_rsi": _AT_LEAST_ZERO,
+        "divergence_hidden_bonus_obv": _AT_LEAST_ZERO,
+        "htf_divergence_aligned_bonus_rsi": _AT_LEAST_ZERO,
+        "htf_divergence_counter_penalty_rsi": _AT_LEAST_ZERO,
+        "htf_divergence_hidden_bonus_rsi": _AT_LEAST_ZERO,
+        "bollinger_length": _COUNT,
+        "bollinger_std_mult": _ABOVE_ZERO,
+        "bollinger_squeeze_width_pct": _AT_LEAST_ZERO,
+        "bollinger_entry_bonus_midband": _AT_LEAST_ZERO,
+        "bollinger_entry_penalty_outer_band": _AT_LEAST_ZERO,
+        "entry_bonus_channel_alignment": _AT_LEAST_ZERO,
+        "entry_bonus_trendline_respect": _AT_LEAST_ZERO,
+        "entry_penalty_near_extension": _AT_LEAST_ZERO,
+    },
+    "candles": {
+        "opposing_net_score_threshold": _AT_LEAST_ZERO,
+    },
+    "chart_patterns": {
+        "lookback_bars": _COUNT,
     },
 }
 
@@ -2214,13 +2313,10 @@ def _validate_support_resistance_config(sr: SupportResistanceConfig, config_path
     ladder, until 2026-09-27 ``_sr_ladder``, now
     ``levels_shared.effective_side_tolerance``) read it as the default. ``order_block_mode`` is
     ``loose`` or ``strict`` (``_CHOICES``)."""
-    errors = _number_errors("support_resistance", sr) + _choice_errors("support_resistance", sr)
+    errors = _section_errors("support_resistance", sr)
     names = ("trading_flip_confirmation_1m_bars", "trading_flip_confirmation_5m_bars")
-    for name in names:
-        value = getattr(sr, name)
-        if int(value) < 0:
-            errors.append(f"support_resistance.{name} must be >= 0, got {value}")
-    if all(int(getattr(sr, name)) == 0 for name in names):
+    counts = [getattr(sr, name) for name in names]
+    if all(isinstance(value, int) and not isinstance(value, bool) for value in counts) and all(v == 0 for v in counts):
         errors.append("support_resistance: at least one of trading_flip_confirmation_1m_bars / _5m_bars must be > 0")
     if errors:
         raise ValueError(f"{config_path}: invalid support_resistance configuration:\n  " + "\n  ".join(errors))
@@ -2382,6 +2478,28 @@ def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path)
         value = getattr(options, name)
         if not is_hhmm(value):
             errors.append(f"options.{name} must be an HH:MM time, got {value!r}")
+    # The entry styles the two 0DTE strategies offer (2026-11-08, R-104): a
+    # token outside the set matched no style, so a typo switched a style off
+    # without a word.
+    styles = options.styles
+    if not isinstance(styles, list):
+        errors.append(f"options.styles must be a list of styles ({', '.join(OPTION_ENTRY_STYLES)}), got {styles!r}")
+    else:
+        errors += [f"options.styles[{index}] must be one of {', '.join(OPTION_ENTRY_STYLES)}, got {style!r}"
+                   for index, style in enumerate(styles) if not isinstance(style, str) or style not in OPTION_ENTRY_STYLES]
+        named = [style for style in styles if isinstance(style, str)]
+        if len(set(named)) != len(named):
+            errors.append(f"options.styles lists a style twice: {styles!r}")
+    # A ratchet's stop multiple sits under its threshold multiple: the stop
+    # a break-even or a lock moves to is below the mark that arms it (R-104).
+    for mark, stop in (("options_breakeven_mark_mult", "options_breakeven_stop_mult"),
+                       ("options_profit_lock_mark_mult", "options_profit_lock_stop_mult")):
+        mark_value, stop_value = getattr(options, mark), getattr(options, stop)
+        if (isinstance(mark_value, (int, float)) and isinstance(stop_value, (int, float))
+                and not isinstance(mark_value, bool) and not isinstance(stop_value, bool)
+                and stop_value >= mark_value):
+            errors.append(f"options.{stop} ({stop_value!r}) must be below options.{mark} ({mark_value!r}): the stop a "
+                          f"ratchet moves to sits under the mark that arms it")
     _raise_section_errors("options", errors, config_path)
 
 
@@ -2780,6 +2898,16 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
 
     support_resistance_cfg = SupportResistanceConfig(**support_resistance_raw)
     _validate_support_resistance_config(support_resistance_cfg, config_path)
+    # The four sections that were built unchecked until 2026-11-08 (R-031):
+    # their numbers and switches (the pattern lists' tokens: _validate_pattern_config).
+    candles_cfg = CandlesConfig(**candles_raw)
+    _raise_section_errors("candles", _section_errors("candles", candles_cfg), config_path)
+    chart_patterns_cfg = ChartPatternsConfig(**chart_patterns_raw)
+    _raise_section_errors("chart_patterns", _section_errors("chart_patterns", chart_patterns_cfg), config_path)
+    technical_levels_cfg = TechnicalLevelsConfig(**technical_levels_raw)
+    _raise_section_errors("technical_levels", _section_errors("technical_levels", technical_levels_cfg), config_path)
+    shared_entry_cfg = SharedEntryLogicConfig(**shared_entry_raw)
+    _raise_section_errors("shared_entry", _section_errors("shared_entry", shared_entry_cfg), config_path)
 
     events_cfg = EventsConfig(**events_raw)
     _validate_events_config(events_cfg, config_path)
@@ -2803,12 +2931,12 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
         paper=paper_cfg,
         dashboard=dashboard_cfg,
         execution=execution_cfg,
-        candles=CandlesConfig(**candles_raw),
-        chart_patterns=ChartPatternsConfig(**chart_patterns_raw),
+        candles=candles_cfg,
+        chart_patterns=chart_patterns_cfg,
         support_resistance=support_resistance_cfg,
-        technical_levels=TechnicalLevelsConfig(**technical_levels_raw),
+        technical_levels=technical_levels_cfg,
         events=events_cfg,
-        shared_entry=SharedEntryLogicConfig(**shared_entry_raw),
+        shared_entry=shared_entry_cfg,
         shared_exit=shared_exit_cfg,
         options=options_cfg,
         strategies=strategies,

@@ -497,6 +497,9 @@ class DashboardCache:
             },
             "performance": performance,
             "candidates": candidates,
+            # Every row the screener ranked; ``candidates`` is the first
+            # ``candidate_limit`` of them (the card's "N shown · M ranked").
+            "candidate_count": len(all_candidate_rows),
             "symbol_exchanges": symbol_exchanges,
             "dashboard_charting": self.charting_settings(),
             "dashboard_symbols": dashboard_symbols,
@@ -791,29 +794,30 @@ class DashboardCache:
         cached_net_change = safe_float(quote.get("net_change"))
         candidate_percent_change = safe_float((candidate_row or {}).get("change_from_open"))
         candidate_close = safe_float((candidate_row or {}).get("close"))
-        regular_session_active = self.data.is_regular_session(sessions.now_et())
         display_total_volume = quote_total_volume
         if display_total_volume is None:
             display_total_volume = session_total_volume
         last_price = quote_last
         if last_price is None:
             last_price = safe_float(latest_bar.get("close"))
+        # The quote's prior close and its change since it, whatever the
+        # session (R-109, 2026-11-08): until then outside RTH the candidate
+        # row's last print and change-from-open stood in for them when the
+        # row was there, so the Day % flipped its basis at 16:00 and in the
+        # premarket. Without the quote's percent the change is computed from
+        # its prior close; the candidate's change from the open is the last
+        # resort, with no prior close to read.
         display_close = quote_close
-        if not regular_session_active and candidate_close is not None:
-            display_close = candidate_close
         if display_close is None and candidate_close is not None:
             display_close = candidate_close
         if display_close is None and len(bars) >= 2:
             display_close = safe_float(bars[-2].get("close"))
         session_reference_close = quote_close
-        if not regular_session_active and candidate_percent_change is not None:
-            percent_change = candidate_percent_change
-        else:
-            percent_change = cached_percent_change
-        if percent_change is None:
-            percent_change = candidate_percent_change
+        percent_change = cached_percent_change
         if percent_change is None and last_price not in (None, 0.0) and session_reference_close not in (None, 0.0):
             percent_change = ((last_price - session_reference_close) / session_reference_close) * 100.0
+        if percent_change is None:
+            percent_change = candidate_percent_change
         net_change = cached_net_change
         if net_change is None and last_price is not None and session_reference_close not in (None, 0.0):
             net_change = last_price - session_reference_close
