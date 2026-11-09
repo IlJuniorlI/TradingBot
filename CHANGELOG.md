@@ -67,8 +67,6 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the day's first pass and the bot showed "Running" through whole days of
     401s (H: 10-20, 10-28, 10-29).
 
-### Added
-
 - **The side vote's outcome is recorded on every top_tier candidate
   decision** (2026-11-08): `side_vote` in a skip's details (the
   `SKIP_SUMMARY` record: `LONG` / `SHORT`, `undecided`, or `off` when the
@@ -77,7 +75,223 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `side_undecided` / `side_decision_opposed` refusal, so the vote's
   accuracy could not be measured from the archive.
 
+- **key_levels bounds the entry's distance from the level it defends**
+  (`max_entry_distance_from_level_atr`, in trigger-frame ATRs; the 5m
+  preset 1.0, the 1m variant 3.0 (its ATR is a third of the 5m's: medians
+  0.10% / 0.31% of price on H:), `null` no bound; `too_far_from_level_atr:<distance>><max>`; the
+  whole-bot review's R-067, 2026-11-08). The touch and the sweep may be up
+  to 4 completed buckets old and the CHoCH enters at the bounce's extreme,
+  while the stop hangs from the level, so R grew with the chase and the
+  first rung (`min_rr` x R) moved out with it. Checked at load.
+
+### Changed
+
+- **The peer strategies' stop floor** (`risk.default_stop_pct`, the whole-bot
+  review's R-008, 2026-11-08): 0.005 in the htf_pivots and
+  trend_continuation presets. 0.018 was the dataclass default, never tuned
+  for them: 2.6-6.8 five-minute ATRs on the presets' names (median 4.8),
+  against structural stops of at most about 1.6 ATR, so it set about 95%
+  of the stops, sized every position off a stop 3-7 ATR away and keyed
+  every R-based target and stop move to a 1.2-3.7% move. Measured on H:'s
+  5m bars (10-20..11-06): on trend_continuation the 0.5% floor sets about
+  a fifth of the stops (the structural stop's median 0.75% of price, 2.2
+  ATR); on htf_pivots it still sets most on AAPL, GOOG and AMZN (1.5-1.9
+  ATR there, the structural stop 0.36-0.6%) and few on AMD and INTC. A
+  lower value, or an ATR-scaled floor, is the user's call.
+
+- **htf_pivots' `pivot_continuation_max_distance_atr` is removed**
+  (R-064): the continuation's base around the pivot is a condition of its
+  own (`pivot_not_interacted`), and the distance from the pivot is gated
+  by `max_continuation_distance_from_pivot_atr` alone. A config that still
+  sets the removed knob refuses to load, naming the gate.
+
 ### Fixed
+
+- **mean_reversion's and closing_reversal's stops keep the
+  `risk.default_stop_pct` floor** (the whole-bot review's R-003,
+  2026-11-08), as every other stock builder's does: the 3-bar low, at least
+  that fraction under the close. Until now the raw 3-bar low was the stop,
+  so a quiet trigger bar on a $2-20 name gave a 2-3c stop, the position was
+  sized to it (40-65% of the notional cap at $8, the cap from about $13
+  up), and a stop-out across the spread lost 1.2-1.3x the dollar budget.
+
+- **rth_trend_pullback wants a pullback** (R-014): the pullback slice's low
+  must have come within `support_hold_pct` above min(VWAP, EMA20)
+  (`no_pullback_to_support`; a short mirrors it on max(VWAP, EMA20),
+  `no_bounce_to_resistance`), beside the hold it already tested. Until now
+  the hold was one-sided, so a tape whose low never came near the support
+  read as a pullback that held, and the entry was a new 4-bar high near
+  VWAP; the shared exhaustion gates confined it, the strategy's own gates
+  did not.
+
+- **volatility_squeeze_breakout's stop floor** (`risk.default_stop_pct`,
+  R-027): 0.006 in the preset. The box stop (the box plus a
+  compression-scaled buffer) spans 0.6-1.8% of price over the 1m ATR's
+  range on the preset's names, and 0.018, the dataclass default, set every
+  stop, so the documented "beyond the far side of the box" never did.
+
+- **The 0DTE stop widens under the time decay, and a single option's
+  position is booked on the decayed levels** (the whole-bot review's R-029,
+  R-028, 2026-11-08; `options_mode.decayed_premium_levels`, one formula for
+  the debit and single builders and the gatekeeper's post-fill rebuild):
+  the stop fraction, the floor under the entry premium, shrinks by the
+  widen factor x the target's shrink, as the knob and the README say. Until
+  now all four sites multiplied it by `1 + (1 - scale) x widen`, raising
+  the floor and tightening the stop by up to 9% of itself (0.45 -> 0.4905
+  at the preset's 14:00). And the long-options builder now stamps
+  `time_decay_scale` on the signal, as the debit builder did: until now
+  the single's position was booked on the undecayed 0.38 / 1.50 of the fill
+  while ENTRY_CONTEXT showed the decayed levels.
+
+- **The premium ratchets arm under the decayed target** (R-153;
+  `TradeManager.update_position`): a bought premium's break-even and lock
+  marks and stops scale their excess over the entry with the position's
+  `time_decay_scale`. Until now a debit entered after 11:48 (scale under
+  0.889) had a target under 1.40x the entry, so the 1.40x lock could arm
+  only on a mark past the target, which exits first. At load (R-154) an
+  enabled ratchet's mark multiple must sit below `debit_target_mult` and
+  `single_target_mult`, and below `2 - credit_target_frac`: a credit
+  spread's threshold is the entry x (2 - mult), and a multiple of 1.68 or
+  more put it at or under the 0.32x target.
+
+- **A chain with no greeks picks no contract** (R-131;
+  `options_mode.choose_by_delta`): a contract with no delta, or Schwab's
+  -999 sentinel for a missing greek, is no candidate, and with none left
+  the builder refuses `no_contract_near_target_delta`. Until now a missing
+  delta scored as 99, so a chain with no greeks picked its lowest strike,
+  the deepest ITM call or the deepest OTM put.
+
+- **The 0DTE session clock reads early-close days** (R-101;
+  `_configured_time`): on a 13:00 close a configured time after noon is
+  read 3 hours earlier, the hours the session loses, but never before
+  noon, so `no_new_entries_after`, the trend and credit windows and the
+  time-decay window end by 12:00, ahead of the 12:48 flatten, instead of
+  after the close (the presets' 13:30 / 13:45 cutoffs, the 13:40 trend
+  end, the 13:45 credit end and the 14:00 / 13:30 decay ends all read
+  12:00). Until now they stood on a 13:00 close: entries fired until the
+  clamped flatten and the decay never reached its floor.
+
+- **htf_pivots and trend_continuation judge the last completed trigger
+  bucket, once** (R-009; `entry_signals` of both), key_levels' rule since
+  2026-10-13: the trigger frame drops its forming bucket, a bucket is
+  judged on the first pass that sees it complete and its verdict repeated
+  until the next one completes, a bucket first seen more than a minute
+  past its end is missed unjudged, a symbol owing a backfill waits. The
+  regime, the family trigger, the volume ratio, the structure and
+  technical contexts read that frame, and the battleground's zone flip is
+  confirmed on the 1m step frame, the frame the S/R context classified
+  the same level on. A candidate whose judgement raises is skipped alone
+  (`entry_pass_error(...)`, no verdict kept) and the pass goes on,
+  key_levels' rule since 2026-10-13: until now the raise ended the pass,
+  so a signal built earlier in it never reached the entry stage while its
+  bucket read `ltf_bucket_signalled`. trend_continuation's dashboard
+  overlay reads the completed buckets too. Until now every trigger term
+  of both read the forming bucket (1-4 minutes of a 5m candle against full
+  ones, up to five looks a bucket; the volume ratio selected 1m bursts),
+  the pivot map was built on it, and the 5m frame's buckets counted as 1m
+  flip-confirmation bars.
+
+- **trend_continuation measures a pullback** (R-013, R-069;
+  `_pullback_trigger_signal`): the impulse's extreme is the highest high
+  among the last `max_pullback_bars` + 2 completed buckets, the buckets
+  after it are the pullback (`min_pullback_bars` to `max_pullback_bars`;
+  fewer is `no_pullback`, an extreme on the window's first bucket is a
+  decline longer than the knob, `pullback_too_long`: either scores 0, so
+  `weak_ltf_score` refuses), its depth within [`min_pullback_depth_atr`
+  (new), `max_pullback_depth_atr`], the re-expansion a close over the
+  pullback's highs, the stop anchor the pullback's low, and the
+  countertrend ratio the pullback's mean volume over the impulse's (the
+  same count of buckets ending at the extreme). The band is re-derived on
+  the new definition from H:'s 5m bars (10-20..11-06, five names, 4,755
+  detected pullbacks: depth p10 1.2, median 2.0, p90 3.4 ATR): 1.0 to 3.0
+  in the manifest and the preset; the old 1.05, the old arithmetic's
+  bound, would have withheld the depth point on 95% of them. On those
+  bars the old detector scored 2.5 or more on a re-expanded trigger in
+  8.1% of evaluations; the new one, with the new band and the duration
+  bound, on 2.4% (a quarter of the evaluations are declines longer than
+  `max_pullback_bars`, which the old window read as 6-bar pullbacks from
+  inside; the knob is the lever if more are wanted).
+  Until now the "pullback" was the last 6 buckets' low against a 3-bucket
+  high with no swing and no count, so a 6-bucket grind to new highs scored
+  the full pullback and a fast impulse-then-pullback read as too deep with
+  the stop at the impulse's origin; and the countertrend ratio was a
+  6-bucket mean over a 7-bucket mean containing it (at most 1.17), so the
+  1.28 knob never fired and its half point was a constant. The detector's
+  knobs are checked at load, the bounds ordered.
+
+- **trend_continuation's extension penalty is live** (R-070): the base
+  exhaustion filter's `entry_exhaustion_filter_enabled`,
+  `max_entry_vwap_extension_atr` and `max_entry_ema9_extension_atr` are
+  declared in the manifest and preset at the band's hard cap (1.5225 /
+  1.276) and checked at load to be no tighter than
+  `max_extension_from_*_atr`. Until now they were the undeclared defaults
+  0.95 / 0.75, under the band's 1.05 / 0.88, so the filter refused
+  `too_extended_from_*_atr` before the penalty or the hard cap could
+  count, and the four documented anti-chase knobs changed no decision on
+  the chase side. The filter's `expansion_bar_too_large` is coupled to the
+  same thresholds (it needs the extension past 0.75 x them), so it now
+  fires from 1.14 / 0.96 ATR instead of 0.71 / 0.56.
+
+- **htf_pivots' sweep is an event** (R-063; `pivot_sweep_lookback_bars`,
+  new, 4): the reclaim's sweep and the rejection's touch are read within
+  the last 4 completed buckets, and the stop anchors on that window's low.
+  Until now the whole 19-bucket context (95 minutes) counted, so a dip 90
+  minutes old kept every later bullish bar near the pivot qualifying as a
+  "reclaim" and anchored the stop.
+
+- **key_levels' trigger reads its own session** (the whole-bot review's
+  R-012, 2026-11-08; `_trigger_session_rows`): the prior 20 buckets' mean
+  volume and bodies, the prior 3 buckets' extreme and the 4-bucket sweep
+  window are the trigger bucket's own session segment's (the premarket,
+  the regular session, the post-market) on its own date; the CHoCH needs
+  the 3 buckets before it, the volume baseline 5. Until now they ran across
+  the open: the 09:30 bucket's volume was 21-107x the premarket's mean (a
+  "spike" on 90 of 90 first-five RTH buckets on H:, 11-04..11-06, against
+  10% of the buckets from 10:00) and its close above the premarket's thin
+  highs a CHoCH on 11 of 18 symbol-days, two of the four trigger points
+  for the session transition alone, and the quality bonus's volume and
+  range terms with them. What that does to the morning (H: 10-20..11-06,
+  10 names): the first bucket that can trigger is 09:45 (09:30 and 09:35
+  top out at 2.0 under the 2.5 gate), and the volume point, whose baseline
+  now holds the open's own heavy buckets, is nearly off until about 11:15
+  (a "spike" on 0.0% / 0.3% / 1.2% of the 09:30-09:55 / 09:55-10:30 /
+  10:30-11:15 buckets against 99.6% / 43.9% / 4.1% before; 11.2% from
+  11:15 on, unchanged), so until then the gate needs the CHoCH, a real
+  sweep and a 2- or 3-bar candle. The candle patterns and the level
+  touch's window still read across the open.
+
+- **key_levels selects the level among those that can pass** (R-011;
+  `_select_level`, the dashboard with it): the touched levels that meet
+  `min_level_score` are ranked first; with none, the first-ranked touched
+  level names the refusal. Until now every touched level was ranked
+  together and only the winner met the gate, so a level that could never
+  pass (an HTF FVG tops out at 2.80 under the 5m preset's 2.9, a
+  single-touch pivot at 1.5) won on the trigger preview's zone-interaction
+  geometry, which favours the level nearest the sweep's extreme, and the
+  side was refused for the bucket while a passing level with the same
+  trigger was never judged.
+
+- **The peer family's peer and macro votes read the last completed
+  bucket** (R-066; key_levels' `_peer_signal` and `_macro_signal`, which
+  htf_pivots and trend_continuation inherit), as key_levels' trigger has
+  since 2026-10-13. Until now they read the resample's last bucket, still
+  forming: 1-4 minutes of it when the pass caught the minute's bars
+  between the candidate's and the peer's, one minute of every peer's when
+  a thin candidate's bucket was judged a step late, 1-5 minutes of a polled
+  VIX / $NYICDX bucket at any pass; a vote the partial bucket flipped
+  refused the side for the whole once-judged bucket.
+
+- **key_levels' ladder defence can fire before the stop** (R-065;
+  `_ladder_defense_buffer`): the defended zone is lost at a quarter of the
+  zone (at least 0.05% of price) through its far edge, at most half the
+  room between the edge and the position's stop, so a confirmed flip
+  exits before the stop whenever the stop sits beyond the edge (with the
+  stop inside the zone, the stop is the defence). The entry's stop is
+  unchanged. Until now the 60m S/R context's `level_buffer` (0.25 x the
+  60m ATR, about 0.36% on H:'s names) was a third term of the exit's
+  depth, about 0.52% under the level against a stop 0.19% under it, so
+  the documented exit could fire only after a sweep deeper than 1.5 x the
+  5m ATR.
 
 - **Every number and switch of the shared entry, technical-levels, candle
   and chart-pattern sections is checked at load** (the whole-bot review's
