@@ -306,7 +306,19 @@
     "armed_retest_max_minutes": 12.0,
     "armed_retest_zone_atr": 0.15,
     "armed_retest_min_close_position": 0.6,
-    "armed_retest_invalidation_atr": 0.33
+    "armed_retest_invalidation_atr": 0.33,
+    "activity_score_weight": 0.12,
+    "extended_hours_tradable": [],
+    "extended_hours_tradable_all": false,
+    "ladder_max_rungs": 4,
+    "ladder_min_target_rr": 1.2,
+    "ladder_zone_atr_mult": 0.5,
+    "pullback_min_leg_retrace_pct": 25.0,
+    "pullback_require_real_dip": true,
+    "range_max_intraday_range_pct": 0.012,
+    "range_require_prev_bar_confirmation": true,
+    "zone_atr_mult": 0.2,
+    "zone_pct": 0.0015
   },
   "capabilities": {
     "dashboard": {

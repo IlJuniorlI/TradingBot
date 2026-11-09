@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 from copy import deepcopy
+import difflib
 import logging
 import math
 import os
@@ -35,6 +36,7 @@ from ._strategies.catalogue import (
     plugin_names,
 )
 from ._strategies.factory import normalize_strategy_params
+from ._strategies.plugin_api import FRAMEWORK_PARAMS
 from .indicators import set_runtime_indicator_mode, set_session_indicator_window
 from .sessions import is_hhmm, parse_hhmm
 from .symbols import normalize_symbol_list, ticker_quote_hint
@@ -1712,9 +1714,21 @@ _RETIRED_STRATEGY_PARAMS: dict[str, dict[str, str]] = {
     },
     # The switch that kept the shared S/R veto off for these two; the veto is
     # the global shared_entry.use_sr_filter now.
-    **{name: {
+    "peer_confirmed_trend_continuation": {
         "use_sr_veto": "replaced by shared_entry.use_sr_filter (2026-09-24)",
-    } for name in ("peer_confirmed_htf_pivots", "peer_confirmed_trend_continuation")},
+    },
+    "peer_confirmed_htf_pivots": {
+        "use_sr_veto": "replaced by shared_entry.use_sr_filter (2026-09-24)",
+        # The continuation's base became a real condition (the review's
+        # R-063): its distance from the pivot is gated by
+        # max_continuation_distance_from_pivot_atr alone, and its
+        # interaction test reads pivot_continuation_interaction_lookback_bars.
+        "pivot_continuation_max_distance_atr": (
+            "removed on 2026-11-08: the continuation's distance from the pivot is gated by "
+            "max_continuation_distance_from_pivot_atr alone, and its interaction test reads "
+            "pivot_continuation_interaction_lookback_bars"
+        ),
+    },
 }
 
 
@@ -1722,6 +1736,31 @@ def _reject_retired_keys(config_path: Path, section: str, raw: Mapping[str, Any]
     stale = [f"{section}.{key}: {hint}" for key, hint in retired.items() if key in raw]
     if stale:
         raise ValueError(f"{config_path}: retired config keys -- " + "; ".join(stale))
+
+
+def _reject_unknown_params(config_path: Path, name: str, raw: Mapping[str, Any], declared: Mapping[str, Any]) -> None:
+    """A ``strategies.<name>.params`` key neither the strategy's manifest nor
+    the shared framework (``plugin_api.FRAMEWORK_PARAMS``) declares refuses
+    the load, naming the key and the nearest declared one (the whole-bot
+    review's R-106, 2026-11-08). The manifest declares every knob the
+    strategy's own code reads, at the value the code takes when the key is
+    absent, and the framework set the knobs the base and the shared policies
+    read for any strategy; an unknown key is a misspelling (or a knob of
+    another strategy): until now it loaded unread and the code used its
+    default, so a retune the operator thought made never happened. The
+    retired keys are refused apart, with their replacement
+    (``_reject_retired_keys``)."""
+    known = set(map(str, declared)) | FRAMEWORK_PARAMS
+    unknown = sorted(str(key) for key in raw if str(key) not in known)
+    if not unknown:
+        return
+    parts = []
+    for key in unknown:
+        close = difflib.get_close_matches(key, sorted(known), n=1, cutoff=0.6)
+        parts.append(f"{key!r}" + (f" (did you mean {close[0]!r}?)" if close else ""))
+    raise ValueError(f"{config_path}: strategies.{name}.params has keys neither the strategy's manifest nor the shared "
+                     f"framework declares: {', '.join(parts)}; the manifest declares every knob the strategy's own code "
+                     f"reads, plugin_api.FRAMEWORK_PARAMS the knobs the shared code reads for any strategy")
 
 
 def _normalize_tv_percent_param(value: Any) -> float:
@@ -2846,6 +2885,7 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
         _reject_retired_keys(config_path, f"strategies.{name}.params", params_raw,
                              _RETIRED_STRATEGY_PARAMS.get(name, {}))
         base = strategies[name]
+        _reject_unknown_params(config_path, name, params_raw, base.params)
         merged_params = deepcopy(base.params)
         merged_params.update(deepcopy(params_raw))
         strategies[name] = StrategyConfig(

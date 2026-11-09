@@ -575,28 +575,14 @@ strategies:
         - INTC
       ltf_minutes: 5
       volatility_symbol: VIX
-      # ===== inherited peer_confirmed_key_levels params, at their code defaults (2026-09-22) =====
-      # Read by the shared peer_confirmed engine but never declared for this
-      # preset, so each ran on the default inside its `self.params.get(...)`.
-      # Values are unchanged; declared so they are visible and tunable here.
+      # ===== the inherited peer_confirmed_key_levels params this strategy reaches =====
+      # The dashboard's level spec and the zone width read them (2026-09-22,
+      # at their code defaults but zone_atr_mult). The key_levels entry-pass
+      # knobs (strong_setup_*, require_*, the LTF quality bonus) this
+      # strategy never reads were dropped on 2026-11-08 (R-106).
       level_round_number_tolerance_pct: 0.002
-      level_score_raw_htf_weight: 0.65
-      ltf_candle_quality_bonus_cap: 0.5
-      ltf_quality_bonus_enabled: true
-      ltf_quality_max_bonus: 2.0
-      ltf_range_expansion_bonus_cap: 0.4
-      ltf_reclaim_quality_bonus_cap: 0.8
-      ltf_volume_quality_bonus_cap: 0.4
-      ltf_zone_interaction_bonus_cap: 0.5
       min_level_score: 2.9
-      require_macro_net_bias: true
-      strong_setup_min_htf_vote_edge: 1
-      strong_setup_min_level_score: 3.4
-      strong_setup_min_ltf_score: 3.2
-      strong_setup_min_peer_score: 2
-      strong_setup_target_level_offset: 1
       zone_atr_mult: 0.21
       zone_pct: 0.0015
-
 # Pair definitions used by the pairs_residual strategy.
 pairs: []

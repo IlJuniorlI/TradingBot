@@ -668,8 +668,6 @@ strategies:
       trend_vwap_distance_pct: 0.0014
       trend_vwap_lookback: 10
       use_htf_trend_confirmation: true
-      rvol_gate_multiplier_benchmark: 0.08
-      rvol_gate_floor_benchmark: 0.10
 
 # Pair definitions used by the pairs_residual strategy.
 pairs: []

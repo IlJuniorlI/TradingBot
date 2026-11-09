@@ -35,16 +35,6 @@ HTF_PIVOTS_KNOBS: dict[str, Knob] = {
 
 class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
 
-    @classmethod
-    def _own_knob_errors(cls, params) -> list[str]:
-        name = cls.strategy_name
-        errors: list[str] = []
-        if "pivot_continuation_max_distance_atr" in params:
-            errors.append(f"strategies.{name}.params.pivot_continuation_max_distance_atr was removed on 2026-11-08: the "
-                          f"continuation's distance from the pivot is gated by max_continuation_distance_from_pivot_atr "
-                          f"alone, and its interaction test reads pivot_continuation_interaction_lookback_bars")
-        return errors
-
     strategy_name = 'peer_confirmed_htf_pivots'
     # The family's knobs, checked at load and at the build
     # (``PeerConfirmedKeyLevelsStrategy.check_knobs``); this strategy's own

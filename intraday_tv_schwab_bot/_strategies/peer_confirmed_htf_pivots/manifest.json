@@ -142,7 +142,8 @@
       "short": true
     },
     "force_flatten_buffer_minutes": 5,
-    "entry_cutoff_lead_minutes": 10
+    "entry_cutoff_lead_minutes": 10,
+    "level_score_raw_htf_weight": 0.65
   },
   "capabilities": {
     "dashboard": {

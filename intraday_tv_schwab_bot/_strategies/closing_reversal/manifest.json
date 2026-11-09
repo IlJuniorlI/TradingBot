@@ -47,6 +47,7 @@
     "force_flatten": {
       "long": true,
       "short": true
-    }
+    },
+    "screener_min_pullback_from_high": 0.003
   }
 }

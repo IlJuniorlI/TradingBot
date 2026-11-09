@@ -97,6 +97,10 @@ def _option_manifest_params() -> dict[str, Any]:
         # not from params.symbols. The screener synthesizes candidates from
         # that list directly (no TradingView call).
         "min_bars": 40,
+        # The trend style's thresholds the generated entry pass reads
+        # (R-106: the load refuses a params key the manifest does not declare).
+        "trend_vwap_distance_pct": 0.0016,
+        "trend_ema_gap_pct": 0.00075,
         **_FVG_PARAMS,
     }
 

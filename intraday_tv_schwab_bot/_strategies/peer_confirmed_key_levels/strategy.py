@@ -470,9 +470,10 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         under the peak R that arms it. A ValueError names the key. Until
         2026-10-13 min_rr -3, a min_peer_agreement of 'banana' (raised
         inside the entry pass), a require_macro_agreement_count of 7 (never
-        traded) and an ltf_minutes of 7 all loaded. A params key no check
-        knows (a typo) is not refused: the framework has no strategy-params
-        schema yet."""
+        traded) and an ltf_minutes of 7 all loaded. A params key neither
+        the manifest nor ``plugin_api.FRAMEWORK_PARAMS`` declares (a typo)
+        is refused by the load itself (``config._reject_unknown_params``,
+        2026-11-08)."""
         name = cls.strategy_name
         errors: list[str] = []
         for key, knob in cls.KNOBS.items():
@@ -519,8 +520,8 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
     @classmethod
     def _own_knob_errors(cls, params: Mapping[str, Any]) -> list[str]:
         """A subclass's checks between its own knobs, run by ``check_knobs``
-        after every knob in ``KNOBS`` passed on its own (htf_pivots' and
-        trend_continuation's, 2026-11-08). Each string names the key."""
+        after every knob in ``KNOBS`` passed on its own
+        (trend_continuation's, 2026-11-08). Each string names the key."""
         return []
 
     def _check_build_knobs(self) -> None:
