@@ -480,6 +480,11 @@ class RuntimeConfig:
     # backoff, 10 cycles is roughly 10 minutes of no management.
     # Set to 0 to disable the escalation (the backoff is unaffected).
     error_escalation_cycles: int = 10
+    # The dashboard's header warns this many hours ahead of schwabdev's login
+    # time (RefreshTokenWindow.login_at, the one the daily line reads), in
+    # amber, and in red once it has passed (IntradayBot._schwab_login_notice,
+    # 2026-11-09). A number above 0; the daily WARNING is unchanged.
+    schwab_login_warning_hours: float = 24.0
     # When the bot is in "deep idle" (always-on mode with
     # auto_exit_after_session=false, outside the 7am–8pm ET equity stream
     # session, and no open positions), the main loop sleeps this long
@@ -2000,6 +2005,7 @@ _NUMBER_CHECKS: dict[str, dict[str, _Number]] = {
         # and on every failed cycle by the engine's. A null used to turn the
         # engine's off, and a typo raised out of its error path (2026-09-26).
         "error_escalation_cycles": _Number(integer=True, low=0, note=" (0 turns the escalation off)"),
+        "schwab_login_warning_hours": _ABOVE_ZERO,
         # Sizes the engine's fetch pool, the quote fallbacks' pool and the
         # Schwab client's sessions (one more than it, the requests in flight
         # at most): at most 9, so the sessions stay within the 10 connections

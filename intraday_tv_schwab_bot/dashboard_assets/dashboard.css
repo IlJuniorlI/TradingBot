@@ -27,7 +27,8 @@
     }
     .app-shell {
       display: grid;
-      grid-template-rows: var(--top-h) minmax(0, 1fr);
+      /* The header grows for the Schwab login band under its row. */
+      grid-template-rows: minmax(var(--top-h), auto) minmax(0, 1fr);
       height: 100vh;
       padding: 14px;
       gap: var(--gap);
@@ -1559,3 +1560,29 @@
   font-size: 11px;
   opacity: 0.72;
 }
+
+    /* The header's Schwab login band (helpers.js renderLoginNotice):
+       amber while the login is due, red once it has expired; the whole
+       header's width. */
+    .login-notice {
+      grid-column: 1 / -1;
+      position: relative;
+      z-index: 1;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: 12px;
+      border: 1px solid transparent;
+      font-size: 13px;
+      line-height: 1.35;
+      min-width: 0;
+    }
+    .login-notice[hidden] { display: none; }
+    .login-notice.warn {
+      color: var(--warn);
+      border-color: color-mix(in oklab, var(--warn) 40%, transparent);
+      background: color-mix(in oklab, var(--warn) 14%, transparent);
+    }
+    .login-notice.error { color: var(--bad); border-color: rgba(255,107,130,.35); background: rgba(255,107,130,.10); }
+    .login-notice code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }

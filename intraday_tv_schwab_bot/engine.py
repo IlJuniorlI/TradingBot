@@ -1044,11 +1044,47 @@ class IntradayBot:
         from a terminal while this bot runs (``renewal_command``), or, for
         an installed package (no scripts folder beside it), where the
         script is not."""
-        if not RENEW_SCRIPT.is_file():
+        command = self._renewal_command()
+        if command is None:
             return (f"To log in again while the bot runs, run scripts/renew_schwab_token.py from a source checkout "
                     f"of this version: this install has no {RENEW_SCRIPT}.")
-        command = renewal_command(self.config, cwd=Path.cwd(), python=sys.executable, windows=os.name == "nt")
         return f"To log in again from a terminal while the bot runs (no restart needed): {command}"
+
+    def _renewal_command(self) -> str | None:
+        """The renew script's command line for this bot (``renewal_command``),
+        or None for an installed package without the scripts folder."""
+        if not RENEW_SCRIPT.is_file():
+            return None
+        return renewal_command(self.config, cwd=Path.cwd(), python=sys.executable, windows=os.name == "nt")
+
+    def _schwab_login_notice(self, now: datetime) -> dict[str, Any] | None:
+        """The dashboard header's Schwab login band (2026-11-09): ``due``
+        within ``runtime.schwab_login_warning_hours`` of schwabdev's login
+        time (``RefreshTokenWindow.login_at``, from the window the daily line
+        read), ``expired`` once it has passed (``_check_schwab_login``'s
+        state, or the time itself), else None and no band. It carries the
+        login time in ET, the seconds left and the renew script's command
+        (``renew_note`` where the install has no script). Until then the
+        only notice ahead of the expiry was the daily WARNING in the log."""
+        window = self._schwab_login_window
+        if window is None:
+            return None
+        login_at = window.login_at.astimezone(EXCHANGE_TZ)
+        left = login_at - now
+        if self._schwab_login_expired_since is not None or left < timedelta(0):
+            state = "expired"
+        elif left <= timedelta(hours=float(self.config.runtime.schwab_login_warning_hours)):
+            state = "due"
+        else:
+            return None
+        command = self._renewal_command()
+        return {
+            "state": state,
+            "login_at": login_at.isoformat(),
+            "seconds_left": max(0, int(left.total_seconds())),
+            "renew_command": command,
+            "renew_note": None if command is not None else self._renew_with(),
+        }
 
     def _entry_block_reasons(self, gate_state: CycleGateState) -> list[str]:
         """Why no entry runs this pass, in the order the dashboard's
@@ -1077,7 +1113,9 @@ class IntradayBot:
         dashboard (``trading_blocked_reason`` ``schwab_login_expired``,
         status ``error``, the message naming it) and blocks entries
         (``_entry_block_reasons``), until the store shows a renewed login,
-        re-read at most once a minute while expired (the renew script
+        re-read at most once a minute from the dashboard band's warning
+        window on (``runtime.schwab_login_warning_hours`` ahead of the login
+        time; 2026-11-09) and while expired (the renew script
         writes it while the bot runs); a daily read that fails keeps the
         window last read, so the state is never cleared by an unreadable
         store. Until then the lapse was one
@@ -1085,10 +1123,15 @@ class IntradayBot:
         whole days of 401s (H: 10-20, 10-28, 10-29; the whole-bot review's
         R-036)."""
         window = self._schwab_login_window
-        if window is None or now <= window.login_at:
+        if window is None:
             self._schwab_login_expired_since = None
             return
-        if self._schwab_login_recheck_at is None or now >= self._schwab_login_recheck_at:
+        # The store is re-read at most once a minute from the dashboard
+        # band's warning window on (2026-11-09: a renewal made while the band
+        # was amber kept the band, counting down to the old time, until the
+        # next day's read), not only once expired.
+        due_from = window.login_at - timedelta(hours=float(self.config.runtime.schwab_login_warning_hours))
+        if now >= due_from and (self._schwab_login_recheck_at is None or now >= self._schwab_login_recheck_at):
             self._schwab_login_recheck_at = now + timedelta(seconds=60)
             try:
                 fresh = read_refresh_token_window(self.config.schwab.tokens_db)
@@ -1104,8 +1147,9 @@ class IntradayBot:
                                 "schwabdev asks for the next login from %s",
                                 f"{window.issued_at.astimezone(EXCHANGE_TZ):%Y-%m-%d %H:%M:%S %Z}",
                                 f"{window.login_at.astimezone(EXCHANGE_TZ):%Y-%m-%d %H:%M:%S %Z}")
-                    self._schwab_login_expired_since = None
-                    return
+        if now <= window.login_at:
+            self._schwab_login_expired_since = None
+            return
         login_at = window.login_at.astimezone(EXCHANGE_TZ)
         if self._schwab_login_expired_since is None:
             self._schwab_login_expired_since = login_at
@@ -2745,6 +2789,7 @@ class IntradayBot:
                 self.risk.daily_loss_latch(), self.risk.risk_state_error,
                 schwab_login_expired=self._schwab_login_expired_since is not None),
             "startup_reconcile": self.startup_reconciler.result,
+            "schwab_login": self._schwab_login_notice(now),
             "active_watchlist": self.last_watchlist,
             "quote_watchlist": self.last_quote_watchlist,
             "data": symbol_state["data"],

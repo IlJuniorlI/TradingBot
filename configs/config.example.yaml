@@ -150,6 +150,9 @@ runtime:
   # naming the open positions and the dashboard shows an alarm (the backoff
   # itself never gives up). 0 = no escalation.
   error_escalation_cycles: 10
+  # The dashboard's header warns this many hours ahead of schwabdev's login
+  # time (amber; red once it has passed), with the renew script's command.
+  schwab_login_warning_hours: 24
   history_poll_seconds: 300
   quote_poll_seconds: 6
   quote_cache_seconds: 6

@@ -63,6 +63,7 @@
     const netLiqLabelEl = document.getElementById('kpi-netliq-label');
 
     if (statusWrap) statusWrap.innerHTML = `${statusBadge(status)}${modeBadge(!!data?.dry_run)}`;
+    renderLoginNotice(data);
     if (netLiqLabelEl) netLiqLabelEl.textContent = safe(data?.tracked_capital_label) || (data?.dry_run ? 'Net Liq' : 'Allocated Capital');
 
     applyDayTags(day);

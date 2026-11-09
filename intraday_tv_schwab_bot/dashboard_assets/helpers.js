@@ -170,6 +170,40 @@ function modeBadge(isDryRun) {
   return `<span class="mode-pill inline-mode ${tone}">${escapeHtml(label)}</span>`;
 }
 
+// The header's Schwab login band (``data.schwab_login``, the engine's
+// ``_schwab_login_notice``; 2026-11-09): ``due`` within
+// runtime.schwab_login_warning_hours of schwabdev's login time reads amber
+// with the time left and the login time in ET; ``expired`` reads red; no
+// notice hides the band. Both end with the renew script's command (or the
+// engine's note where the install has no script).
+function renderLoginNotice(data) {
+  const el = document.getElementById('login-notice');
+  if (!el) return;
+  const notice = data?.schwab_login;
+  if (!notice || !notice.state) {
+    el.hidden = true;
+    el.className = 'login-notice';
+    el.innerHTML = '';
+    return;
+  }
+  const at = String(notice.login_at || '').replace('T', ' ').slice(0, 16);
+  const renew = notice.renew_command
+    ? `<code>${escapeHtml(notice.renew_command)}</code>`
+    : escapeHtml(notice.renew_note || '');
+  let text;
+  if (notice.state === 'expired') {
+    text = `<strong>Schwab login expired</strong> at ${escapeHtml(at)} ET; bars, quotes, entries and exits fail until it is renewed: ${renew}`;
+  } else {
+    const seconds = Math.max(0, Number(notice.seconds_left || 0));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    text = `<strong>Schwab login expires in ${hours}h ${String(minutes).padStart(2, '0')}m</strong> (${escapeHtml(at)} ET). Log in again before then from a terminal while the bot runs: ${renew}`;
+  }
+  el.className = `login-notice ${notice.state === 'expired' ? 'error' : 'warn'}`;
+  el.innerHTML = text;
+  el.hidden = false;
+}
+
 // Module-scoped counter for unique gradient IDs. Multiple sparklines render
 // on the same page (KPI equity curve, watchlist rows, etc.) so each needs a
 // distinct linearGradient id — otherwise stops collide and every spark picks

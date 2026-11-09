@@ -1753,6 +1753,7 @@ function renderTopbar(data) {
   const warmupEl = document.getElementById('metric-warmup');
   const sublineEl = document.getElementById('top-subline');
   if (statusWrap) statusWrap.innerHTML = `${statusBadge(status)}${modeBadge(!!data?.dry_run)}`;
+  renderLoginNotice(data);
   if (netLiqLabelEl) netLiqLabelEl.textContent = safe(data?.tracked_capital_label) || (data?.dry_run ? 'Net Liq' : 'Allocated Capital');
   applyDayTags(day);
   if (dayPnlEl) dayPnlEl.innerHTML = `<span class="${pnlClass(day.pnl)}">${fmtMoney(day.pnl)}</span>`;
