@@ -9,6 +9,18 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The dashboard's header warns ahead of the Schwab login's expiry
+  (2026-11-09).** A band under the top bar, on both pages, turns amber
+  within `runtime.schwab_login_warning_hours` (24) of schwabdev's login
+  time (the token store's refresh token expiry less its login lead, the
+  time the daily `Schwab refresh token` line names), with the time left,
+  the login time in ET and the renew script's command
+  (`scripts/renew_schwab_token.py`), and red once it has passed, beside the
+  Error status and the trading block of 2026-11-08's R-036. The state
+  carries it as `schwab_login` (`state`, `login_at`, `seconds_left`,
+  `renew_command`). Until now the only notice ahead of the expiry was the
+  daily WARNING in the log.
+
 - **A key a settings section does not take refuses the load, naming the
   section, the key and the nearest setting (2026-11-09).**
   `risk.max_position: 2` refuses with `risk.max_position is not a setting
@@ -128,6 +140,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first rung (`min_rr` x R) moved out with it. Checked at load.
 
 ### Changed
+
+- **The quote blacklist's WARNING names the probe (2026-11-09).** `Blacklisting SYM
+  from quote refresh after N consecutive failures of its own (...); probed
+  again at the stream quotes' checks while the stream serves it, else on
+  bot restart`, as the R-117 probe works; it said "will retry on bot
+  restart". The README's structure-gate note names htf_pivots and
+  trend_continuation among the strategies whose gate frame ends at the
+  last completed bucket (section D), and the peer READMEs and the
+  strategies' comments name their own knobs as checked.
 
 - **The peer strategies' stop floor** (`risk.default_stop_pct`, the whole-bot
   review's R-008, 2026-11-08): 0.005 in the htf_pivots and

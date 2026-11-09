@@ -71,9 +71,9 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
         return errors
 
     strategy_name = 'peer_confirmed_trend_continuation'
-    # The family's knobs, checked at load and at the build
-    # (``PeerConfirmedKeyLevelsStrategy.check_knobs``); this strategy's own
-    # trend / pullback knobs are not checked yet.
+    # The family's knobs and this strategy's own (``TREND_CONTINUATION_KNOBS``,
+    # with ``_own_knob_errors`` for the bounds between them, 2026-11-08),
+    # checked at load and at the build (``PeerConfirmedKeyLevelsStrategy.check_knobs``).
     KNOBS: ClassVar[dict[str, Knob]] = {**FAMILY_KNOBS, **TREND_CONTINUATION_KNOBS}
 
     def dashboard_overlay_candidates(self, side: Side, close: float, ltf: pd.DataFrame, htf: HTFContext) -> list[dict[str, Any]] | None:

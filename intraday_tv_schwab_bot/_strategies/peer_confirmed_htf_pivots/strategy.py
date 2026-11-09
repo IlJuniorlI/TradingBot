@@ -36,9 +36,9 @@ HTF_PIVOTS_KNOBS: dict[str, Knob] = {
 class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
 
     strategy_name = 'peer_confirmed_htf_pivots'
-    # The family's knobs, checked at load and at the build
-    # (``PeerConfirmedKeyLevelsStrategy.check_knobs``); this strategy's own
-    # pivot / regime knobs are not checked yet.
+    # The family's knobs and this strategy's own (``HTF_PIVOTS_KNOBS``: the
+    # sweep window, 2026-11-08), checked at load and at the build
+    # (``PeerConfirmedKeyLevelsStrategy.check_knobs``).
     KNOBS: ClassVar[dict[str, Knob]] = {**FAMILY_KNOBS, **HTF_PIVOTS_KNOBS}
     _ENTRY_FAMILY_ALIASES = {
         "auto": "auto",

@@ -2597,7 +2597,7 @@ class MarketDataStore:
             return
         if blacklisted:
             LOG.warning("Blacklisting %s from quote refresh after %d consecutive failures of its own (last: %s: %s); "
-                        "will retry on bot restart", symbol, blacklisted, type(error).__name__, error)
+                        "probed again at the stream quotes' checks while the stream serves it, else on bot restart", symbol, blacklisted, type(error).__name__, error)
         if not own:
             self._note_rest_backoff_failure(f"quote {symbol} ({type(error).__name__}: {error})")
 
