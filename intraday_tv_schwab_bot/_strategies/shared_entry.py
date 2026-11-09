@@ -994,8 +994,8 @@ class SharedEntryPolicy:
         if not self.config.shared_entry.use_fvg_context:
             return _disabled_fvg_score(), _disabled_fvg_score()
         return (
-            self._score_fvg_context(close, htf_ctx, timeframe_minutes=getattr(htf_ctx, "timeframe_minutes", self.strategy.htf_minutes())),
-            self._score_fvg_context(close, ltf_ctx, timeframe_minutes=self.strategy.ltf_minutes()),
+            self._score_fvg_context(close, htf_ctx, timeframe_minutes=getattr(htf_ctx, "timeframe_minutes", self.strategy.htf_minutes()), role="htf"),
+            self._score_fvg_context(close, ltf_ctx, timeframe_minutes=self.strategy.ltf_minutes(), role="ltf"),
         )
 
     # -- divergence ----------------------------------------------------------
@@ -1350,7 +1350,9 @@ class SharedEntryPolicy:
         min_rr = safe_float(self.config.shared_entry.min_target_rr)
         if min_rr is None or min_rr <= 0:
             return True
-        return (reward / risk) >= min_rr
+        # A target set AT the floor (close + risk x min_rr) reads back a ulp
+        # under it about half the time (R-074, 2026-11-08).
+        return (reward / risk) >= min_rr - 1e-9
 
     def _clamp_refined_stop(self, close: float, incoming_stop: float,
                             proposed_stop: float, atr: float) -> float:
@@ -2360,10 +2362,19 @@ class SharedEntryPolicy:
             "distance_pct": float(distance / max(abs(close), 1e-9)) if close else None,
         }
 
-    def _score_fvg_context(self, current_price: float, ctx: Any, *, timeframe_minutes: int) -> dict[str, Any]:
+    def _score_fvg_context(self, current_price: float, ctx: Any, *, timeframe_minutes: int, role: str) -> dict[str, Any]:
+        """The FVG term's score for one context: ``role`` ``"htf"`` (the
+        strategy's HTF gaps: wider proximity floor, heavier bases) or
+        ``"ltf"`` (its LTF gaps). ``timeframe_minutes`` ages the gaps in
+        bars. Until 2026-11-08 the role was read off the timeframe (over a
+        minute = HTF), so a strategy whose LTF is 5m (key_levels) had its
+        LTF gaps scored and weighted as HTF ones (the whole-bot review's
+        R-076)."""
+        if role not in ("htf", "ltf"):
+            raise ValueError(f"FVG score role must be 'htf' or 'ltf', got {role!r}")
         close = float(current_price or 0.0)
         tf = max(1, int(timeframe_minutes or 1))
-        is_htf = tf > 1
+        is_htf = role == "htf"
         valid_base = 0.37 if is_htf else 0.22
         active_base = 0.24 if is_htf else 0.15
         invalid_base = 0.42 if is_htf else 0.26
@@ -2476,8 +2487,8 @@ class SharedEntryPolicy:
         # never reads the EMAs, so no FVG or FVG score changed with them.
         htf_ctx = self.strategy._htf_context(symbol, data, current_price=close, **self.strategy._default_htf_request())
         fvg_ltf_ctx = self.strategy._ltf_fvg_context(symbol, frame, data)
-        htf_score = self._score_fvg_context(close, htf_ctx, timeframe_minutes=getattr(htf_ctx, "timeframe_minutes", self.strategy.htf_minutes()))
-        fvg_ltf_score = self._score_fvg_context(close, fvg_ltf_ctx, timeframe_minutes=self.strategy.ltf_minutes())
+        htf_score = self._score_fvg_context(close, htf_ctx, timeframe_minutes=getattr(htf_ctx, "timeframe_minutes", self.strategy.htf_minutes()), role="htf")
+        fvg_ltf_score = self._score_fvg_context(close, fvg_ltf_ctx, timeframe_minutes=self.strategy.ltf_minutes(), role="ltf")
         htf_weight = max(0.0, float(self.params.get("htf_fvg_entry_weight", 0.55)))
         ltf_fvg_weight = max(0.0, float(self.params.get("ltf_fvg_entry_weight", 0.35)))
         opposing_mult = max(0.50, float(self.params.get("opposing_fvg_entry_penalty_mult", 1.00)))

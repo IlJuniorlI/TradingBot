@@ -593,12 +593,25 @@ def _reconcile_flipped_levels(
 
 
 
+def _minute_cutoff() -> pd.Timestamp:
+    """The current minute's start on the ET clock, floored on UTC
+    (``flip_frame_clock_key`` floors so too): a floor on the ET wall clock
+    raises on the fall-back hour's ambiguous times (01:00-02:00 on the
+    first Sunday of November), which failed every S/R build the dashboard
+    asked for then (the whole-bot review's R-150, 2026-11-08; 120 failures
+    on 2026-11-01)."""
+    moment = pd.Timestamp(sessions.now_et())
+    if moment.tzinfo is None:
+        return moment.floor("1min")
+    return moment.tz_convert("UTC").floor("1min").tz_convert(moment.tzinfo)
+
+
 def _completed_1m_bars(flip_frame: pd.DataFrame | None) -> pd.DataFrame:
     """The flip frame's 1m bars that have completed at ``sessions.now_et()``."""
     base = ensure_ohlcv_frame(flip_frame if flip_frame is not None else pd.DataFrame())
     if base.empty:
         return base
-    return base[base.index < pd.Timestamp(sessions.now_et()).floor("1min")]
+    return base[base.index < _minute_cutoff()]
 
 
 def _minutes_since_level_touch(completed_1m: pd.DataFrame, level: float, *, price_above: bool) -> float | None:
@@ -641,7 +654,7 @@ def _completed_flip_frames(flip_frame: pd.DataFrame | None) -> tuple[pd.DataFram
     completed_1m = _completed_1m_bars(flip_frame)
     if completed_1m.empty:
         return completed_1m, pd.DataFrame(columns=completed_1m.columns)
-    one_min_cutoff = pd.Timestamp(sessions.now_et()).floor("1min")
+    one_min_cutoff = _minute_cutoff()
     completed_5m = resample_bars(completed_1m, "5min")
     if not completed_5m.empty:
         # A 5m bar labelled T holds the 1m bars starting T .. T+4 (see
@@ -686,13 +699,29 @@ def _flip_checker(
         for field_name in ("low", "high")
         for frame_key, frame, count in (("1m", completed_1m, bars_1m), ("5m", completed_5m, bars_5m))
     }
+    # The completed 1m bars since the last completed 5m bucket ended (the
+    # bucket still filling): a 5m confirmation holds only while they hold
+    # too (R-054 / R-130, 2026-11-08). The newest completed 5m bucket is
+    # 1-4 closed 1m bars old on every minute off the 5m grid, so until now
+    # the 5m path confirmed a reclaim the two newest 1m bars had given back
+    # (NVDA 11-06 12:33: the 12:25 bucket above 187.75, 12:31 and 12:32
+    # back under it), which took the level off the resistance list for the
+    # LONG's clearance and put it under the SHORT as pending support.
+    since_bucket = completed_1m.iloc[0:0]
+    if not completed_5m.empty:
+        since_bucket = completed_1m[completed_1m.index >= completed_5m.index[-1] + pd.Timedelta(minutes=5)]
+    since = {
+        field_name: (since_bucket[field_name].to_numpy(dtype=np.float64)
+                     if not since_bucket.empty and field_name in since_bucket.columns else None)
+        for field_name in ("low", "high")
+    }
 
     def check(level_price: float, direction: str) -> bool:
         field_name, comparator = ("low", "above") if direction == "reclaim" else ("high", "below")
-        if (
-            confirm_by_values(tails[(field_name, "1m")], comparator, level_price, tol)
-            or confirm_by_values(tails[(field_name, "5m")], comparator, level_price, tol)
-        ):
+        if confirm_by_values(tails[(field_name, "1m")], comparator, level_price, tol):
+            return True
+        if confirm_by_values(tails[(field_name, "5m")], comparator, level_price, tol) and (
+                since[field_name] is None or confirm_by_values(since[field_name], comparator, level_price, tol)):
             return True
         if overlay_requested or fallback_bar is None:
             return False

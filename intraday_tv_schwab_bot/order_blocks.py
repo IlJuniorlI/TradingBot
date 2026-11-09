@@ -33,7 +33,7 @@ import pandas as pd
 
 from .levels_shared import pivot_points
 from .sessions import session_segment_ids
-from .bars import ensure_ohlcv_frame
+from .bars import completed_bars, ensure_ohlcv_frame
 from .indicators import atr_with_floor, ensure_standard_indicator_frame
 from .zones import zone_distance, zone_filled_pct, zone_sizing
 
@@ -547,7 +547,12 @@ def build_order_block_context(
             timeframe_minutes=timeframe_minutes,
             mode=mode,
         )
-    base = ensure_standard_indicator_frame(ensure_ohlcv_frame(frame))
+    # Completed buckets only (``bars.completed_bars``, as the fair value gaps
+    # since 2026-09-25): the last bucket's partial close fed the breakout
+    # test and the fill measure and repainted at the bucket's close until
+    # 2026-11-08 (the whole-bot review's R-132; the HTF order blocks are
+    # off in every preset).
+    base = ensure_standard_indicator_frame(ensure_ohlcv_frame(completed_bars(frame, timeframe_minutes)))
     if base.empty or len(base) < 5:
         return empty_order_block_context(
             float(current_price or 0.0),

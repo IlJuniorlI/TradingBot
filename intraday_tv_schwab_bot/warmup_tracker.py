@@ -144,7 +144,8 @@ class WarmupTracker:
             # Below required bars — retry aggressively (every 10s) instead of
             # waiting the full history_poll_seconds (90s) so warmup completes
             # before the entry window opens.
-            last_refresh = self.data.last_history_refresh.get(str(symbol).upper().strip())
+            # Paced from the last answer, with bars or empty (R-113, 2026-11-08).
+            last_refresh = self.data.history_pace_time(symbol)
             if last_refresh is None:
                 should_fetch = True
             else:
@@ -177,7 +178,18 @@ class WarmupTracker:
         data_state: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         key = str(symbol or '').upper().strip()
-        merged_frame = frame if frame is not None else (self.data.get_merged(key, with_indicators=False) if key else None)
+        merged_frame = frame
+        frame_error: str | None = None
+        if frame is None and key:
+            # The read is the summary's own, outside the engine's per-symbol
+            # isolation (R-120, 2026-11-08): a frame whose merge raises reads
+            # as no frame here, named, instead of failing the whole step.
+            try:
+                merged_frame = self.data.get_merged(key, with_indicators=False)
+            except Exception as exc:
+                frame_error = f"{type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}".rstrip(": ")
+                LOG.warning("Warm-up summary: %s's frame could not be read (%s); it counts as no frame", key, frame_error)
+                merged_frame = None
         merged_rows = 0 if merged_frame is None else len(merged_frame)
         required_bars = max(0, int(self._required_history_bars(key) or 0))
         ready = required_bars <= 0 or merged_rows >= required_bars
@@ -189,12 +201,13 @@ class WarmupTracker:
         stream_last = state.get("last_stream_update")
         next_retry_due = None
         retry_delay_seconds = None
-        if not ready and history_last is not None:
+        paced_from = history_last if empty_last is None or (history_last is not None and empty_last <= history_last) else empty_last
+        if not ready and paced_from is not None:
             interval = float(self.config.runtime.history_poll_seconds)
-            if empty_last is not None and empty_last == history_last and not self.data.is_regular_session(sessions.now_et()):
+            if empty_last is not None and empty_last == paced_from and not self.data.is_regular_session(sessions.now_et()):
                 interval = max(interval, 900.0)
-            retry_delay_seconds = max(0.0, interval - max(0.0, (sessions.now_et() - history_last).total_seconds()))
-            next_retry_due = history_last + timedelta(seconds=max(interval, 0.0))
+            retry_delay_seconds = max(0.0, interval - max(0.0, (sessions.now_et() - paced_from).total_seconds()))
+            next_retry_due = paced_from + timedelta(seconds=max(interval, 0.0))
         blocking_reason = None if ready else insufficient_bars_reason("insufficient_bars", merged_rows, required_bars)
         live_entry_state = dict(state.get("live_entry_bar_status") or {})
         return {

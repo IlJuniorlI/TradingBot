@@ -718,9 +718,29 @@ class MarketDataStore:
             return True
         interval = float(self.config.runtime.history_poll_seconds)
         last_empty = self.last_empty_history_refresh.get(key)
+        last = self._history_pace_time(key, last)
         if last_empty is not None and last_empty == last and not self.is_regular_session(now):
             interval = max(interval, 900.0)
         return (now - last).total_seconds() >= interval
+
+    def _history_pace_time(self, key: str, last: datetime | None = None) -> datetime | None:
+        """When ``key``'s next price_history request is paced from: the
+        later of its last answer with bars (``last_history_refresh``) and
+        its last empty answer (``last_empty_history_refresh``). An empty
+        answer paces the next request but covers no bars (R-113,
+        2026-11-08), so every reader that paces requests reads this, and
+        every reader that asks what the frame covers reads
+        ``last_history_refresh`` alone (``pending_stream_backfill``)."""
+        if last is None:
+            last = self.last_history_refresh.get(key)
+        last_empty = self.last_empty_history_refresh.get(key)
+        if last is None:
+            return last_empty
+        return last if last_empty is None or last_empty <= last else last_empty
+
+    def history_pace_time(self, symbol: str) -> datetime | None:
+        """``_history_pace_time`` for the warm-up tracker's retry."""
+        return self._history_pace_time(self._symbol_key(symbol))
 
     def _quote_ttl(self) -> float:
         """The quote cache's TTL: ``runtime.quote_cache_seconds``, at least
@@ -1574,7 +1594,15 @@ class MarketDataStore:
         if version is None:
             ctx = build()
         else:
-            ctx = self._level_memo.serve(("ob", *cache_key), (version,), indicator_clock_key, lambda _clock: build())
+            # Keyed on the forming bucket's positions as the FVG memo is: the
+            # build reads completed buckets (R-132), so a bucket completing
+            # between two reads of one frame version rebuilds it.
+            ctx = self._level_memo.serve(
+                ("ob", *cache_key),
+                (version,),
+                lambda: (forming_positions(bars.index, tf, sessions.now_et()), indicator_clock_key()),
+                lambda _clock: build(),
+            )
         with self._lock:
             if self._cycle_active:
                 self._cycle_ob_cache[cycle_key] = (frame, ctx)
@@ -1635,7 +1663,7 @@ class MarketDataStore:
         failure = self._history_fetch_failures.get(key)
         if failure is not None and (now - failure[0]).total_seconds() < _backfill_retry_seconds(failure[1]):
             return False
-        last = self.last_history_refresh.get(key)
+        last = self._history_pace_time(key)
         if last is None:
             return True
         interval = max(10, int(self.config.runtime.stream_fallback_poll_seconds))
@@ -1883,11 +1911,18 @@ class MarketDataStore:
             # boundary the cut did not: a poll requested at 11:04:59.5 and
             # answered at 11:05:00.7 holds bars through 11:03, and stamped
             # 11:05:00.7 it satisfied the first-bar backfill check for an
-            # 11:05 first stream bar, so 11:04 was never fetched.
-            self.last_history_refresh[cache_key] = end
+            # 11:05 first stream bar, so 11:04 was never fetched. An answer
+            # with no candles covers nothing (R-113, 2026-11-08): it is
+            # stamped apart (``last_empty_history_refresh``, which paces the
+            # next request) and leaves an owed stream backfill owed; until
+            # then it stamped the cut time and the backfill read as done,
+            # leaving the hole before the stream's first bar for good.
             if df.empty:
                 self.last_empty_history_refresh[cache_key] = end
+                if self.last_history_refresh.get(cache_key) is None:
+                    self.last_history_refresh[cache_key] = end
             else:
+                self.last_history_refresh[cache_key] = end
                 self.last_empty_history_refresh.pop(cache_key, None)
             self.merge_stats[cache_key].history_rows = len(self.history[cache_key])
         self._invalidate_cycle_symbol(symbol)
@@ -2462,6 +2497,16 @@ class MarketDataStore:
             self._unconfirmed_quote_failures.pop(symbol, None)
             self._quote_failing_symbols.pop(symbol, None)
             held_failure = self._held_quote_failures.pop(symbol, None)
+            # An answer ends the blacklist too (R-117, 2026-11-08): the
+            # stream-quote shadow keeps requesting a blacklisted symbol's
+            # REST quote at its cadence, so a symbol Schwab answers again
+            # comes back to the refresh, and its stream book is checked
+            # against REST again. Until then only a restart cleared it, and
+            # on the always-on bot its book served entries unchecked.
+            blacklisted_at = self._quote_blacklist.pop(symbol, None)
+        if blacklisted_at is not None:
+            LOG.info("REST quote of %s answered again, blacklisted since %s: back on the quote refresh and the shadow",
+                     symbol, f"{blacklisted_at:%H:%M:%S}")
         if held_failure is not None:
             LOG.info("REST quote of held %s answered again after %d failure(s) in a row", symbol, held_failure[1])
 
@@ -2649,8 +2694,15 @@ class MarketDataStore:
                     raise
                 extracted = self._extract_quote_payloads(payload, [request_symbol, symbol])
                 quote_payload = extracted.get(symbol) or extracted.get(request_symbol)
-                if quote_payload is None and isinstance(payload, dict):
-                    quote_payload = payload
+                if quote_payload is None:
+                    # A 2xx body with no section for the symbol (an error
+                    # body, an empty one) is no quote: until 2026-11-08 the
+                    # whole body stood in and normalized to a zero-price
+                    # quote, stored fresh and counted as answered (R-116).
+                    keys = sorted(payload)[:6] if isinstance(payload, dict) else type(payload).__name__
+                    outcomes[-1] = _QuoteOutcome(what, f"answered a body with no quote for {request_symbol} ({keys})",
+                                                 outcomes[-1].seconds)
+                    raise ValueError(f"quote body for {request_symbol} holds no quote section: {keys}")
                 normalized = self._normalize_quote(symbol, quote_payload)
                 normalized["source_symbol"] = request_symbol
                 if request_symbol != str(symbol):
@@ -3220,8 +3272,10 @@ class MarketDataStore:
                 return
         self._stream_quote_shadow_skipping = False
         # A blacklisted symbol rides no batch: Schwab may refuse the whole
-        # batch for it.
-        symbols = sorted(symbol for symbol in self._stream_quote_served if not self._quote_blacklisted(symbol))
+        # batch for it. It is probed alone instead (``_probe_blacklisted_quote``).
+        served = sorted(self._stream_quote_served)
+        symbols = [symbol for symbol in served if not self._quote_blacklisted(symbol)]
+        probes = [symbol for symbol in served if self._quote_blacklisted(symbol)]
         self._stream_quote_publications = 0
         self._stream_quote_served = set()
         try:
@@ -3230,6 +3284,30 @@ class MarketDataStore:
             self._reset_stream_quotes("the REST shadow", exc)
         except Exception as exc:
             LOG.error("Stream quote shadow: the check failed (%s: %s)", type(exc).__name__, exc)
+        if probes and self._rest_quote_trouble is None:
+            self._probe_blacklisted_quote(min(probes, key=lambda symbol: self._quote_blacklist.get(symbol, now)))
+
+    def _probe_blacklisted_quote(self, symbol: str) -> None:
+        """One single REST quote request for a blacklisted symbol the stream
+        served, the shadow's recovery probe (R-117, 2026-11-08): an answer
+        ends the blacklist (``_note_quote_answered``) and caches the quote,
+        so the symbol is back on the refresh and its book is compared with
+        REST at the next check; a failure is logged at INFO and counts
+        toward nothing (the symbol is blacklisted already, and a probe is
+        no evidence of an outage). One probe per check, the longest
+        blacklisted first, and none while REST is in trouble. Until then
+        only a restart cleared the blacklist, and on the always-on bot a
+        blacklisted symbol's book served entries without ever being compared
+        with REST again."""
+        outcomes: list[_QuoteOutcome] = []
+        try:
+            normalized = self._fetch_single_quote_with_aliases(symbol, outcomes)
+        except Exception as exc:
+            LOG.info("Stream quote shadow: the probe of blacklisted %s failed (%s: %s); it stays blacklisted",
+                     symbol, type(exc).__name__, exc)
+            return
+        self._note_quote_answered(symbol)
+        self._store_rest_quote(symbol, normalized, sessions.now_et())
 
     def _check_stream_quotes_against_rest(self, symbols: list[str]) -> None:
         """The shadow's check of ``symbols`` (the stream served each since the

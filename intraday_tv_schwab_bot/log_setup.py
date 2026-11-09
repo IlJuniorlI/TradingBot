@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime
 import sys
 import time
 from pathlib import Path
@@ -175,6 +176,13 @@ class _ETDailyFileHandler(logging.FileHandler):
         super().emit(record)
 
 
+def et_time_tuple(seconds: float | None = None) -> time.struct_time:
+    """``time.localtime`` on the exchange clock: the log formatter's
+    ``converter`` (``setup_logging``)."""
+    moment = datetime.fromtimestamp(time.time() if seconds is None else seconds, sessions.EXCHANGE_TZ)
+    return moment.timetuple()
+
+
 def setup_logging(log_dir: str | Path) -> None:
     path = Path(log_dir)
     path.mkdir(parents=True, exist_ok=True)
@@ -184,6 +192,11 @@ def setup_logging(log_dir: str | Path) -> None:
     root.handlers.clear()
 
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    # The timestamps in ET whatever the host's zone (R-144, 2026-11-08): the
+    # session archive reads decisions.csv's and events.jsonl's stamps as
+    # naive ET against the bars' ET index, and the daily file rotates on
+    # the ET date; on a non-ET host every window shifted by the difference.
+    formatter.converter = et_time_tuple
 
     stream = sys.stdout
     if hasattr(stream, "reconfigure"):
@@ -204,7 +217,9 @@ def setup_logging(log_dir: str | Path) -> None:
     console_handler.setLevel(logging.INFO)
     _enable_windows_ansi()
     if _console_supports_color(stream):
-        console_handler.setFormatter(ColorConsoleFormatter())
+        color_formatter = ColorConsoleFormatter()
+        color_formatter.converter = et_time_tuple
+        console_handler.setFormatter(color_formatter)
     else:
         console_handler.setFormatter(formatter)
 

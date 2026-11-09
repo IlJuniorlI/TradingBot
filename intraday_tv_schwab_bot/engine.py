@@ -471,6 +471,7 @@ class IntradayBot:
         # its idle first started and the watchlist then. The day's close
         # fetches them for its report and archive (_complete_idle_bars).
         self._idle_bars_owed: dict[date, tuple[datetime, set[str]]] = {}
+        self._closed_market_idle = False
         # The last dashboard build: its time.monotonic() and the status it
         # showed (message, no error), None before the first; see
         # _dashboard_build_due.
@@ -1751,7 +1752,8 @@ class IntradayBot:
         )
 
     def _complete_idle_bars(self, day: date, now: datetime) -> None:
-        """Fetch the 1m bars ``day``'s day-over idle did not build, once,
+        """Fetch the 1m bars ``day``'s idle (the day-over idle, or the regular
+        closed-market idle after the last window, 2026-11-08) did not build, once,
         before the day's report and archive read them (``_close_session_day``:
         the 20:00 close, or a shutdown's). The idle builds no frame, so
         without this the report's post-stop windows and the archive's
@@ -1779,17 +1781,17 @@ class IntradayBot:
         for earlier in [noted for noted in self._idle_bars_owed if noted < day]:
             del self._idle_bars_owed[earlier]      # an idle noted after its day's close: nothing reads it
         if owed is None:
-            return          # no day-over idle that day
+            return          # no idle noted that day
         started, watched = owed
         if self._since_stop_signal() is not None:
-            LOG.info("The %s day-over idle's 1m bars from %s are not fetched after a stop signal: the report and "
+            LOG.info("The %s idle's 1m bars from %s are not fetched after a stop signal: the report and "
                      "archive read the bars to the idle's start", day, f"{started:%H:%M:%S}")
             return
         try:
             others = self._day_bar_symbols(day)
         except Exception as exc:
             # The close runs in the loop's housekeeping, which has no catch.
-            LOG.warning("The %s day-over idle's 1m bars: the archive's other symbols could not be read (%s: %s), so "
+            LOG.warning("The %s idle's 1m bars: the archive's other symbols could not be read (%s: %s), so "
                         "only the %d on its watchlist then are fetched", day, type(exc).__name__, exc, len(watched))
             others = set()
         ordered = sorted(watched | others)
@@ -1800,11 +1802,11 @@ class IntradayBot:
             try:
                 self.data.fetch_history(symbol, lookback_minutes=lookback, set_depth=False)
             except Exception as exc:
-                LOG.warning("The %s day-over idle's 1m bars from %s: %s's price_history failed (%s: %s), so it and "
+                LOG.warning("The %s idle's 1m bars from %s: %s's price_history failed (%s: %s), so it and "
                             "%d more symbol(s) keep the bars they had in the report and archive", day,
                             f"{started:%H:%M:%S}", symbol, type(exc).__name__, exc, len(ordered) - done - 1)
                 return
-        LOG.info("Fetched the %s day-over idle's 1m bars from %s for the report and archive: %d symbol(s), one "
+        LOG.info("Fetched the %s idle's 1m bars from %s for the report and archive: %d symbol(s), one "
                  "price_history request each; %d not on its watchlist then, from %d minutes before it", day,
                  f"{started:%H:%M:%S}", len(ordered), len(set(ordered) - watched), warm_minutes)
 
@@ -1853,6 +1855,30 @@ class IntradayBot:
             held.append("a broker account not reconciled to hold nothing")
         return held
 
+    def _note_closed_market_idle(self, gate_state: CycleGateState, now: datetime) -> None:
+        """Where the regular closed-market idle starts (``CycleGateState.
+        idle_closed_market`` with no day-over latch: the last window ended
+        and nothing is held), the day's ``_idle_bars_owed`` notes the
+        watchlist it stops building, as the day-over idle's does
+        (``_note_day_over_idle``), so the day close fetches the 1m bars from
+        there (``_complete_idle_bars``) and the report and the archive run
+        to the session's close. Until 2026-11-08 (the whole-bot review's
+        R-107) only the day-over idle noted it: the 15:54 bar closes at
+        15:55:00 and arrives after the pass that went idle at 15:55:01, so
+        every archived 1m frame ended at 15:53 on a regular day (H: 10-30,
+        11-03, 11-04) and the post-stop windows of the day's last trades
+        were left unscored. An idle with no watchlist (a start into it, a
+        morning before the first window) notes nothing."""
+        idle = bool(gate_state.idle_closed_market and not gate_state.day_over_idle)
+        if idle == self._closed_market_idle:
+            return
+        self._closed_market_idle = idle
+        if idle and self.last_watchlist:
+            started, symbols = self._idle_bars_owed.get(now.date(), (now, set()))
+            self._idle_bars_owed[now.date()] = (started, symbols | set(self.last_watchlist))
+            LOG.info("Idle after the last window: the %d watched symbols' 1m bars from %s are fetched at the day close "
+                     "for its report and archive", len(self.last_watchlist), f"{now:%H:%M:%S}")
+
     def _note_day_over_idle(self, gate_state: CycleGateState, now: datetime) -> None:
         """One INFO line where the day-over idle (``CycleGateState.
         day_over_idle``) starts, and one where it ends: at a new session, or
@@ -1891,6 +1917,7 @@ class IntradayBot:
             self._cycle_idle_wake_at = self.cycle_gate.idle_wake_at(
                 now, schedule, day_over=gate_state.day_over_idle) if self._cycle_idle else None
             self._note_day_over_idle(gate_state, now)
+            self._note_closed_market_idle(gate_state, now)
             if gate_state.screening_active:
                 self.last_candidates = self.screener.get_candidates(self.config.strategy)
                 candidate_symbols = [c.symbol for c in self.last_candidates]

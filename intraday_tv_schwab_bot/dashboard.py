@@ -335,7 +335,7 @@ class DashboardServer:
             self.thread.join(timeout=2.0)
         self.thread = None
 
-    def publish(self, payload: dict[str, Any]) -> None:
+    def publish(self, payload: dict[str, Any], *, headline: tuple[Any, Any] | None = None) -> None:
         # Guard the whole body: an exception here (exotic payload, disk write
         # failure) would propagate into the engine thread and kill the cycle.
         try:
@@ -345,7 +345,8 @@ class DashboardServer:
             if not self.state_path:
                 return
             now = time.monotonic()
-            headline = (safe_payload.get("status"), safe_payload.get("message"))
+            if headline is None:
+                headline = (safe_payload.get("status"), safe_payload.get("message"))
             if (self._last_state_write is not None and now - self._last_state_write < self.state_write_seconds
                     and headline == self._last_written_headline):
                 self._unwritten_state = serialized
@@ -383,7 +384,11 @@ class DashboardServer:
         state = self.state.get()
         state["status"] = status
         state["message"] = message
-        self.publish(state)
+        # The headline the write throttle compares is the status alone: the
+        # message names the failure count and time, which change every
+        # pass, so until 2026-11-08 every stale pass rewrote the state file
+        # (R-121). The first stale publish still writes at once.
+        self.publish(state, headline=(status, "stale"))
 
     def _make_handler(self) -> type[BaseHTTPRequestHandler]:
         dashboard_server = self
