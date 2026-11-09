@@ -9,6 +9,22 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A key a settings section does not take refuses the load, naming the
+  section, the key and the nearest setting (2026-11-09).**
+  `risk.max_position: 2` refuses with `risk.max_position is not a setting
+  of risk (did you mean risk.max_positions?)`, every section's bad keys in
+  one message; until now the section's dataclass raised a bare
+  `RiskConfig.__init__() got an unexpected keyword argument 'max_position'`,
+  naming neither the file nor the section; a `strategies.<name>` key other
+  than the three windows and `params` (`entry_window:`, no s) is refused
+  the same way, where it loaded without a word and the strategy kept its
+  manifest's windows. The two TradingView keys of the
+  browser-cookie login the screener client no longer has
+  (`cookies_from_browser`, `browser`) are retired keys, refused with the
+  hint, where the load dropped them without a word. `config.example.yaml`
+  carries `risk.trail_activation_r` (0.5, the peak in R that arms the
+  trail, 2026-11-08's knob) so the example shows every risk setting.
+
 - **A strategy's params key nothing declares refuses the load (the
   whole-bot review's R-106, 2026-11-08).** `load_config` accepts a
   `strategies.<name>.params` key the strategy's manifest declares or
