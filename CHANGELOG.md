@@ -107,6 +107,89 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A 5m flip confirmation holds only to the newest closed 1m bar** (the
+  whole-bot review's R-054 and R-130, 2026-11-08; `support_resistance.
+  _flip_checker`): the 5m path confirms a reclaim (a loss) only while the
+  completed 1m bars since the last completed 5m bucket ended hold above
+  (below) the level too. Until now the newest completed bucket, 1-4 closed
+  1m bars old on every minute off the 5m grid, confirmed on its own, so a
+  reclaim the two newest bars had given back (NVDA 11-06 12:33) took the
+  level off the resistance list the LONG's clearance measured to and put
+  it under the SHORT as pending support, and the verdict flapped with the
+  5m grid.
+
+- **The S/R build's minute cutoff floors on UTC** (R-150;
+  `support_resistance._minute_cutoff`): a floor on the ET wall clock raised
+  on the fall-back hour's ambiguous times (01:00-02:00 on the first Sunday
+  of November), which failed every S/R build the dashboard asked for then
+  (120 failures on 2026-11-01).
+
+- **Order blocks are built on completed buckets** (R-132;
+  `order_blocks.build_order_block_context`, `bars.completed_bars`, as the
+  fair value gaps since 2026-09-25): the forming bucket's partial close fed
+  the breakout test and the fill measure and repainted at the bucket's
+  close. The HTF order blocks are off in every preset.
+
+- **The FVG score term reads its role, not the timeframe** (R-076;
+  `SharedEntryPolicy._score_fvg_context(role=)`): a strategy whose LTF is 5m
+  (key_levels) had its LTF gaps scored and weighted as HTF ones. And the
+  R:R floor tolerates a ulp (R-074; `_target_meets_min_rr`): a target set
+  at close + risk x `min_target_rr` read back under the floor about half
+  the time.
+
+- **The regular closed-market idle notes the bars it stops building**
+  (R-107; `IntradayBot._note_closed_market_idle`), as the day-over idle
+  did, so the day close fetches the 1m bars from the idle's start and the
+  report and archive run to the session's close. Until now the 15:54 bar,
+  closing at 15:55:00, arrived after the pass that went idle at 15:55:01,
+  so every archived 1m frame ended at 15:53 on a regular day (H: 10-30,
+  11-03, 11-04) and the day's last stops had no post-stop window.
+
+- **An empty price_history answer leaves the stream backfill owed**
+  (R-113; `MarketDataStore.fetch_history`, `should_refresh_history`): an
+  answer with no candles is stamped apart (`last_empty_history_refresh`)
+  and no longer as the cut time, which read the backfill as done and left
+  the hole before the stream's first bar for good. Every reader that paces
+  requests (`should_refresh_history`, the stream fallback's
+  `_stream_history_due`, the warm-up tracker's retry and its
+  `next_retry_due`) paces from the later of the two stamps
+  (`history_pace_time`), so an empty answer is not re-requested every
+  pass.
+
+- **A quote body without the symbol's quote is a failure, not a zero
+  quote** (R-116; `_fetch_single_quote_with_aliases`): a 2xx body with no
+  section for the symbol (an error body, an empty one) normalized to a
+  zero-price quote, stored fresh and counted as answered; it now fails the
+  request as the symbol's own, naming the body's keys.
+
+- **The quote blacklist ends on an answer** (R-117; `_note_quote_answered`,
+  `_probe_blacklisted_quote`): at each stream-quote shadow check one
+  blacklisted symbol the stream served (the longest blacklisted) is probed
+  by a single REST request, kept out of the shadow's batch (Schwab may
+  refuse a whole batch for one symbol) and out of the REST trouble
+  accounting; an answer takes the symbol off the blacklist and caches the
+  quote. Until now only a restart cleared it, so on the
+  always-on bot a blacklisted symbol's stream book served entries without
+  ever being compared with REST again.
+
+- **The warm-up summary's frame read is isolated** (R-120;
+  `WarmupTracker._symbol_warmup_snapshot`): a frame whose merge raises
+  reads as no frame, named at WARNING, instead of failing the engine's
+  step outside the per-symbol isolation.
+
+- **The stale dashboard state is written at most every
+  `state_write_seconds`** (R-121; `DashboardServer.publish_stale`): the
+  stale message names the failure count and time, which change every pass,
+  so every stale pass rewrote the state file (1.3 MB on H:); the write
+  throttle now compares the status alone, the first stale publish still
+  written at once.
+
+- **The log timestamps are Eastern on any host** (R-144;
+  `log_setup.et_time_tuple`, the formatter's converter): the session
+  archive reads decisions.csv's and events.jsonl's stamps as naive ET
+  against the bars' ET index, and the daily file rotates on the ET date;
+  on a non-ET host every window shifted by the difference.
+
 - **mean_reversion's and closing_reversal's stops keep the
   `risk.default_stop_pct` floor** (the whole-bot review's R-003,
   2026-11-08), as every other stock builder's does: the 3-bar low, at least
