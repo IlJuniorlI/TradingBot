@@ -1662,6 +1662,12 @@ _PERCENT_PARAM_NAMES = {
 # swallowed, silently doing nothing): the knob's old behaviour no longer
 # exists, so running on it would trade a config the operator never wrote.
 _RETIRED_SECTION_KEYS: dict[str, dict[str, str]] = {
+    # The browser-cookie login the TradingView screener client no longer
+    # has; the load dropped both without a word until 2026-11-09.
+    "tradingview": {
+        "cookies_from_browser": "removed; the TradingView session is tradingview.sessionid (or TRADINGVIEW_SESSIONID) alone",
+        "browser": "removed; the TradingView session is tradingview.sessionid (or TRADINGVIEW_SESSIONID) alone",
+    },
     "shared_entry": {
         "use_divergence_filter": "renamed to shared_entry.use_dual_divergence_veto (2026-09-24)",
         "use_htf_divergence_filter": "renamed to shared_entry.use_htf_divergence_score (2026-09-24)",
@@ -2727,6 +2733,67 @@ _MAPPING_SECTIONS = ("schwab", "tradingview", "risk", "runtime", "paper", "dashb
                      "shared_exit", "options", "strategies")
 
 
+# Each settings section and the dataclass that takes it (a strategy block's
+# keys are ``_reject_unknown_strategy_keys``', its params
+# ``_reject_unknown_params``', ``pairs`` ``_normalize_pairs_config``'s and
+# ``dashboard.charting`` ``_charting_key_errors``').
+_SECTION_TYPES: dict[str, type] = {
+    "schwab": SchwabConfig, "tradingview": TradingViewConfig, "paper": PaperConfig, "runtime": RuntimeConfig,
+    "risk": RiskConfig, "shared_entry": SharedEntryLogicConfig, "shared_exit": SharedExitLogicConfig,
+    "execution": EquityExecutionConfig, "options": ZeroDteOptionsConfig, "support_resistance": SupportResistanceConfig,
+    "candles": CandlesConfig, "chart_patterns": ChartPatternsConfig, "technical_levels": TechnicalLevelsConfig,
+    "events": EventsConfig, "dashboard": DashboardConfig,
+}
+
+
+def _reject_unknown_section_keys(config_path: Path, raw: Mapping[str, Any]) -> None:
+    """A key a settings section does not take refuses the load, naming the
+    file, the section, the key and the nearest setting (2026-11-09, the
+    config sweep after R-106). Until then the section's dataclass raised a
+    bare ``SchwabConfig.__init__() got an unexpected keyword argument
+    'zzz'``, naming neither the file nor the section, and without the
+    setting it meant. Every section is checked at once, so one load names
+    every bad key. A retired key (``_RETIRED_SECTION_KEYS``) is refused
+    first, with its replacement."""
+    for section, retired in _RETIRED_SECTION_KEYS.items():
+        block = raw.get(section)
+        if isinstance(block, dict):
+            _reject_retired_keys(config_path, section, block, retired)
+    errors: list[str] = []
+    for section, cls in _SECTION_TYPES.items():
+        block = raw.get(section)
+        if not isinstance(block, dict):
+            continue
+        taken = sorted(spec.name for spec in fields(cls))
+        for key in sorted(str(key) for key in block if str(key) not in taken):
+            close = difflib.get_close_matches(key, taken, n=1, cutoff=0.6)
+            errors.append(f"{section}.{key} is not a setting of {section}"
+                          + (f" (did you mean {section}.{close[0]}?)" if close else ""))
+    if errors:
+        raise ValueError(f"{config_path}: unknown config keys -- " + "; ".join(errors))
+
+
+# What a ``strategies.<name>`` block takes.
+_STRATEGY_BLOCK_KEYS: tuple[str, ...] = ("entry_windows", "management_windows", "screener_windows", "params")
+
+
+def _reject_unknown_strategy_keys(config_path: Path, name: str, block: Mapping[str, Any]) -> None:
+    """A ``strategies.<name>`` key other than the three windows and
+    ``params`` refuses the load, naming it and the nearest (2026-11-09).
+    Until then ``entry_window:`` (no s) loaded without a word and the
+    strategy kept its manifest's windows."""
+    unknown = sorted(str(key) for key in block if str(key) not in _STRATEGY_BLOCK_KEYS)
+    if not unknown:
+        return
+    parts = []
+    for key in unknown:
+        close = difflib.get_close_matches(key, _STRATEGY_BLOCK_KEYS, n=1, cutoff=0.6)
+        parts.append(f"strategies.{name}.{key} is not a setting of a strategy block"
+                     + (f" (did you mean strategies.{name}.{close[0]}?)" if close else "")
+                     + f"; it takes {', '.join(_STRATEGY_BLOCK_KEYS)}")
+    raise ValueError(f"{config_path}: unknown config keys -- " + "; ".join(parts))
+
+
 def _section_shape_errors(raw: Mapping[str, Any]) -> list[str]:
     """One message per section, ``dashboard.charting`` or chart profile,
     strategy entry or its ``params`` that is not a mapping (a null one is
@@ -2803,6 +2870,7 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     shape_errors = _section_shape_errors(raw)
     if shape_errors:
         raise ValueError(f"{config_path}: invalid config sections:\n  " + "\n  ".join(shape_errors))
+    _reject_unknown_section_keys(config_path, raw)
 
     # Load .env (if present) before resolving secrets. Process env always
     # wins; .env only fills in keys that aren't already set. If env_path
@@ -2815,8 +2883,6 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     raw["strategy"] = strategy
     schwab_raw = _settings(raw, "schwab")
     tv_raw = _settings(raw, "tradingview")
-    tv_raw.pop("cookies_from_browser", None)
-    tv_raw.pop("browser", None)
 
     # Resolve secrets: yaml real value wins, env is the fallback. Missing
     # Schwab credentials are a hard error; sessionid is optional.
@@ -2870,9 +2936,6 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     events_raw = _settings(raw, "events")
     shared_entry_raw = _settings(raw, "shared_entry")
     shared_exit_raw = _settings(raw, "shared_exit")
-    for section, section_raw in (("shared_entry", shared_entry_raw), ("technical_levels", technical_levels_raw),
-                                 ("runtime", runtime_raw)):
-        _reject_retired_keys(config_path, section, section_raw, _RETIRED_SECTION_KEYS[section])
     options_raw = _normalize_options_config(_settings(raw, "options"))
 
     strategies = _strategy_defaults()
@@ -2881,6 +2944,7 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
     for key in strategies_raw:
         name = normalize_strategy_name(key)
         value = _settings(strategies_raw, key)
+        _reject_unknown_strategy_keys(config_path, name, value)
         params_raw = _settings(value, "params")
         _reject_retired_keys(config_path, f"strategies.{name}.params", params_raw,
                              _RETIRED_STRATEGY_PARAMS.get(name, {}))
