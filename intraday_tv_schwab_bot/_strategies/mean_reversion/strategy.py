@@ -81,7 +81,11 @@ class MeanReversionStrategy(BaseStrategy):
                 style="reversal",
                 style_family="reversal",
                 close=last_close,
-                stop=float(recent3["low"].min()),
+                # The 3-bar low, at least default_stop_pct under the close, the
+                # floor every other stock builder applies (R-003, 2026-11-08):
+                # until then a quiet trigger bar on a $2-20 name gave a 2-3c
+                # stop, and the position was sized to it.
+                stop=min(float(recent3["low"].min()), last_close * (1.0 - self.config.risk.default_stop_pct)),
                 target=max(float(high20), last_close * (1.0 + self.config.risk.default_target_pct)),
                 gate_frame=frame,
                 sr_frame=frame,

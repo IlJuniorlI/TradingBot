@@ -19,9 +19,10 @@ from ...options_mode import (
     net_credit_dollars,
     net_debit_dollars,
     vertical_limit_price,
+    decayed_premium_levels,
 )
 from ...bars import opening_range, rth_open_plus, session_open_price
-from ...sessions import EQUITY_RTH_OPEN, equity_session_state, is_time_in_window, parse_hhmm
+from ...sessions import EQUITY_RTH_CLOSE, EQUITY_RTH_OPEN, equity_session_state, is_time_in_window, parse_hhmm
 from ...numeric import first_float, safe_float
 from ...reasons import (
     bool_token,
@@ -247,9 +248,10 @@ class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
         stop multipliers as theta decay accelerates through the 0DTE session."""
         if not self.optcfg.debit_target_time_decay_enabled:
             return 1.0
-        now_t = sessions.now_et().time()
-        start = parse_hhmm(self.optcfg.debit_target_time_decay_start)
-        end = parse_hhmm(self.optcfg.debit_target_time_decay_end)
+        now_dt = sessions.now_et()
+        now_t = now_dt.time()
+        start = self._configured_time(self.optcfg.debit_target_time_decay_start, now_dt)
+        end = self._configured_time(self.optcfg.debit_target_time_decay_end, now_dt)
         min_scale = max(0.10, float(getattr(self.optcfg, "debit_target_time_decay_min_scale", 0.70)))
         if now_t <= start:
             return 1.0
@@ -576,13 +578,10 @@ class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
                                            spread_side=Side.LONG, opening=True)
         entry_value = entry_limit * 100.0
         # Guard: debit stop must be below entry, target must be above entry
-        debit_stop_frac = max(0.01, min(0.99, float(self.optcfg.debit_stop_frac)))
-        debit_target_mult = max(1.01, float(self.optcfg.debit_target_mult))
         time_decay_scale = self._compute_time_decay_scale()
-        if time_decay_scale < 1.0:
-            debit_target_mult = max(1.01, 1.0 + (debit_target_mult - 1.0) * time_decay_scale)
-            widen = self.optcfg.debit_stop_time_decay_widen_factor
-            debit_stop_frac = max(0.01, min(0.99, debit_stop_frac * (1.0 + (1.0 - time_decay_scale) * widen)))
+        debit_stop_frac, debit_target_mult = decayed_premium_levels(
+            self.optcfg.debit_stop_frac, self.optcfg.debit_target_mult, time_decay_scale,
+            self.optcfg.debit_stop_time_decay_widen_factor)
         stop = entry_value * debit_stop_frac
         target = entry_value * debit_target_mult
         stop, target = clamp_long_premium_levels(entry_value, stop, target)
@@ -890,15 +889,39 @@ class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
             _EntryStyle("midday_credit_spread", "credit", self._build_credit_spread_signal),
         )
 
-    def _style_window(self, kind: str, now_t: time) -> bool:
+    @staticmethod
+    def _configured_time(value: Any, now_dt: datetime | None = None) -> time:
+        """A configured HH:MM read on ``now_dt``'s session (R-101,
+        2026-11-08): on an early-close day (13:00 ET: the day before
+        Independence Day when it is a session, Black Friday, Christmas Eve)
+        a time after noon is moved earlier by the hours the session loses
+        (3), but never before noon, so the entry cutoff, the style windows
+        and the decay window end by 12:00, ahead of the 12:48 flatten,
+        instead of after the close; a time at or before noon is kept. Until
+        then every one of them stood on a 13:00 close: the 13:30 / 13:45
+        cutoff and the 13:40 trend window let entries fire until the
+        clamped flatten and the 14:00 decay end never reached its floor."""
+        configured = parse_hhmm(value)
+        noon = time(12, 0)
+        state = equity_session_state(now_dt if now_dt is not None else sessions.now_et())
+        if not state.early_close or configured <= noon:
+            return configured
+        lost = ((EQUITY_RTH_CLOSE.hour * 60 + EQUITY_RTH_CLOSE.minute)
+                - (state.rth_close_time.hour * 60 + state.rth_close_time.minute))
+        minutes = max(noon.hour * 60 + noon.minute, configured.hour * 60 + configured.minute - lost)
+        return time(minutes // 60, minutes % 60)
+
+    def _style_window(self, kind: str, now_t: time, now_dt: datetime | None = None) -> bool:
         """Is ``now_t`` inside the ``kind`` style's entry window (both ends
-        inclusive)?"""
+        inclusive), the ends read on the session (``_configured_time``)?"""
         p = self.params
         if kind == "orb":
-            return is_time_in_window(now_t, p.get("orb_start_time", rth_open_plus(5)), p.get("orb_end_time", "10:05"))
-        if kind == "trend":
-            return is_time_in_window(now_t, p.get("trend_start_time", "10:05"), p.get("trend_end_time", "13:40"))
-        return is_time_in_window(now_t, p.get("credit_start_time", "11:05"), p.get("credit_end_time", "13:45"))
+            start, end = p.get("orb_start_time", rth_open_plus(5)), p.get("orb_end_time", "10:05")
+        elif kind == "trend":
+            start, end = p.get("trend_start_time", "10:05"), p.get("trend_end_time", "13:40")
+        else:
+            start, end = p.get("credit_start_time", "11:05"), p.get("credit_end_time", "13:45")
+        return is_time_in_window(now_t, self._configured_time(start, now_dt), self._configured_time(end, now_dt))
 
     def _opening_window(self) -> tuple[time, int]:
         """The opening range's start and its length in minutes.
@@ -960,7 +983,7 @@ class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
             self._record_entry_decision(c.symbol, "skipped", [self._option_entry_block_reason(now_dt, c.symbol)])
         candidates = [c for c in candidates if c not in scoped_out]
         now_t = now_dt.time()
-        if now_t > parse_hhmm(self.params.get("no_new_entries_after", "13:30")):
+        if now_t > self._configured_time(self.params.get("no_new_entries_after", "13:30"), now_dt):
             for c in candidates:
                 self._record_entry_decision(c.symbol, "skipped", ["after_entry_cutoff"])
             return out
@@ -984,7 +1007,7 @@ class ZeroDteEtfOptionsStrategy(OptionChainMixin, RegimeMixin, BaseStrategy):
                 self._prefetch_option_chains(prefetch_symbols, client)
         styles = self._entry_styles()
         enabled = {style.kind: self._style_enabled(style.name) for style in styles}
-        in_window = {style.kind: self._style_window(style.kind, now_t) for style in styles}
+        in_window = {style.kind: self._style_window(style.kind, now_t, now_dt) for style in styles}
         buffer_pct = float(self.params.get("orb_breakout_buffer_pct", 0.0008))
         trend_min_ret5 = float(self.params.get("trend_min_ret5", 0.0007))
         for c in candidates:

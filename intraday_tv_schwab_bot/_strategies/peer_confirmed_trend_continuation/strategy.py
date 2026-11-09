@@ -9,18 +9,79 @@ from ...numeric import safe_float
 from ...reasons import insufficient_bars_reason, reason_with_values
 from ...bars import bar_close_position
 from ...indicators import last_bar_atr
-from ..peer_confirmed_key_levels.strategy import FAMILY_KNOBS, Knob, PeerConfirmedKeyLevelsStrategy, _gate_snapshot, _score_threshold
+from ..peer_confirmed_key_levels.strategy import (
+    FAMILY_KNOBS,
+    LTF_BUCKET_MAX_LATE,
+    Knob,
+    PeerConfirmedKeyLevelsStrategy,
+    _BucketVerdict,
+    _gate_snapshot,
+    _score_threshold,
+)
 from ..shared_entry import EntryContexts, EntryProposal
+from ... import sessions
+
+
+# trend_continuation's own knobs checked at load (2026-11-08: the pullback
+# detector's and the extension band's; the rest of its own knobs are still
+# read unchecked, the whole-bot review's R-079).
+TREND_CONTINUATION_KNOBS: dict[str, Knob] = {
+    "min_pullback_bars": Knob("count", low=1),
+    "max_pullback_bars": Knob("count", low=1),
+    "min_pullback_depth_atr": Knob("number", low=0),
+    "max_pullback_depth_atr": Knob("number", low=0, low_open=True),
+    "pullback_hold_atr": Knob("number", low=0),
+    "max_countertrend_volume_ratio": Knob("number", low=0, low_open=True),
+    "max_extension_from_vwap_atr": Knob("number", low=0, low_open=True),
+    "max_extension_from_ema9_atr": Knob("number", low=0, low_open=True),
+    "extension_penalty_per_atr": Knob("number", low=0),
+    "extension_hard_cap_mult": Knob("number", low=1),
+    # The base exhaustion filter's reads (``BaseStrategy._entry_exhaustion_reasons``),
+    # declared so the band's penalty is live (R-070).
+    "entry_exhaustion_filter_enabled": Knob("bool"),
+    "max_entry_vwap_extension_atr": Knob("number", low=0, low_open=True),
+    "max_entry_ema9_extension_atr": Knob("number", low=0, low_open=True),
+}
 
 
 class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
+
+    @classmethod
+    def _own_knob_errors(cls, params) -> list[str]:
+        """The pullback's bounds ordered, and the base exhaustion filter no
+        tighter than the strategy's extension band: the filter refuses
+        ``too_extended_from_*_atr`` at its own threshold, so with it under
+        the band the penalty between the band and the hard cap never
+        reached a decision (R-070, 2026-11-08: the undeclared defaults 0.95 /
+        0.75 sat under the band's 1.05 / 0.88)."""
+        name = cls.strategy_name
+        errors: list[str] = []
+        if params["max_pullback_bars"] < params["min_pullback_bars"]:
+            errors.append(f"strategies.{name}.params.max_pullback_bars ({params['max_pullback_bars']}) must be at least "
+                          f"min_pullback_bars ({params['min_pullback_bars']})")
+        if params["max_pullback_depth_atr"] <= params["min_pullback_depth_atr"]:
+            errors.append(f"strategies.{name}.params.max_pullback_depth_atr ({params['max_pullback_depth_atr']}) must be "
+                          f"above min_pullback_depth_atr ({params['min_pullback_depth_atr']})")
+        for base_key, band_key in (("max_entry_vwap_extension_atr", "max_extension_from_vwap_atr"),
+                                   ("max_entry_ema9_extension_atr", "max_extension_from_ema9_atr")):
+            if params["entry_exhaustion_filter_enabled"] and params[base_key] < params[band_key]:
+                errors.append(f"strategies.{name}.params.{base_key} ({params[base_key]}) must be at least {band_key} "
+                              f"({params[band_key]}): the base exhaustion filter would refuse before the extension "
+                              f"penalty could count")
+        return errors
+
     strategy_name = 'peer_confirmed_trend_continuation'
     # The family's knobs, checked at load and at the build
     # (``PeerConfirmedKeyLevelsStrategy.check_knobs``); this strategy's own
     # trend / pullback knobs are not checked yet.
-    KNOBS: ClassVar[dict[str, Knob]] = dict(FAMILY_KNOBS)
+    KNOBS: ClassVar[dict[str, Knob]] = {**FAMILY_KNOBS, **TREND_CONTINUATION_KNOBS}
 
     def dashboard_overlay_candidates(self, side: Side, close: float, ltf: pd.DataFrame, htf: HTFContext) -> list[dict[str, Any]] | None:
+        """The trigger and the pullback anchor the entry pass would read, on
+        the dashboard's LTF cut to its completed buckets (``_completed_ltf``
+        on the ET clock, as key_levels' ``dashboard_select_level``; the
+        dashboard hands no step frame). None drawn without a pullback."""
+        ltf = self._completed_ltf(ltf, int(self.params.get("ltf_minutes", 5)), sessions.now_et())
         if ltf is None or ltf.empty:
             return []
         trend = self._trend_signal(side, ltf, htf)
@@ -155,103 +216,138 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
         }
 
     def _pullback_trigger_signal(self, side: Side, ltf: pd.DataFrame, *, close: float, ema9: float, ema20: float, atr: float) -> dict[str, Any]:
-        max_pullback_bars = max(2, int(self.params.get("max_pullback_bars", 5)))
-        min_pullback_bars = max(1, int(self.params.get("min_pullback_bars", 2)))
+        """The pullback and its re-expansion on ``ltf``'s last bar (the entry
+        pass hands the completed buckets), for a LONG (a SHORT mirrored):
+
+        - the impulse's extreme is the highest high among the last
+          ``max_pullback_bars`` + 1 completed bars before the trigger bar;
+          the bars after it are the pullback, ``min_pullback_bars`` to
+          ``max_pullback_bars`` of them -- fewer, and there is no pullback
+          (``no_pullback``: score 0, so ``weak_ltf_score`` refuses the
+          side; a straight grind to new highs puts the extreme on the last
+          bar);
+        - its depth, the extreme less the pullback's low in ATR, within
+          [``min_pullback_depth_atr``, ``max_pullback_depth_atr``] +1
+          (``pullback_too_shallow_atr`` / ``pullback_too_deep_atr`` withhold
+          the point); the low holding EMA20 less ``pullback_hold_atr`` ATR
+          +1; the trigger bar closing over the pullback's highs by
+          ``breakout_buffer_pct`` +1 (``no_reexpansion_trigger``);
+        - the bar's own quality: EMA9 reclaimed 0.75, a bullish body 0.5,
+          the close position 0.5, the candle model's tier up to 0.6, the
+          trigger's volume over the prior bars' mean 0.5, and the
+          pullback's mean volume no more than ``max_countertrend_volume_ratio``
+          x the impulse's (the same count of bars ending at the extreme)
+          0.5 (``heavy_countertrend_volume``).
+
+        The stop anchor is the pullback's low. Until 2026-11-08 (the
+        whole-bot review's R-013, R-069) the "pullback" was the last
+        ``max_pullback_bars`` bars' low against a 3-bar high, with no swing
+        and no bar count, so a 6-bar grind to new highs scored the full
+        pullback and a fast impulse-then-pullback read as too deep with the
+        stop at the impulse's origin; and the countertrend ratio was a
+        6-bar mean over a 7-bar mean containing it, at most 1.17, so the
+        1.28 knob never fired and its 0.5 was a constant."""
+        max_pullback_bars = int(self.params["max_pullback_bars"])
+        min_pullback_bars = int(self.params["min_pullback_bars"])
         ltf_window = max(2, int(self.params.get("min_ltf_bars", 18)))
         breakout_buffer_pct = max(0.0, float(self.params.get("breakout_buffer_pct", 0.0008)))
         min_close_pos = min(0.95, max(0.05, float(self.params.get("min_ltf_close_position", 0.58))))
         min_trigger_vol = max(0.1, float(self.params.get("min_ltf_volume_ratio", 1.02)))
-        max_countertrend_vol = max(0.5, float(self.params.get("max_countertrend_volume_ratio", 1.28)))
-        max_pullback_depth_atr = max(0.1, float(self.params.get("max_pullback_depth_atr", 1.05)))
-        pullback_hold_atr = max(0.0, float(self.params.get("pullback_hold_atr", 0.38)))
+        max_countertrend_vol = float(self.params["max_countertrend_volume_ratio"])
+        min_pullback_depth_atr = float(self.params["min_pullback_depth_atr"])
+        max_pullback_depth_atr = float(self.params["max_pullback_depth_atr"])
+        pullback_hold_atr = float(self.params["pullback_hold_atr"])
+        long = side == Side.LONG
 
-        recent = ltf.tail(max(ltf_window, max_pullback_bars + 6))
+        def _refused(reason: str) -> dict[str, Any]:
+            # No pullback: no trigger level and no extreme to draw (the
+            # dashboard overlay leaves them out); the stop anchor falls back
+            # to the close, which the builder never reaches (score 0).
+            return {"score": 0.0, "reasons": [reason], "trigger_level": None, "pullback_extreme": None,
+                    "pullback_depth_atr": 0.0, "pullback_bars": 0, "close_position": 0.0, "trigger_volume_ratio": 0.0,
+                    "countertrend_volume_ratio": 0.0, "stop_anchor": float(close)}
+
+        recent = ltf.tail(max(ltf_window, max_pullback_bars * 2 + 2))
         prior = recent.iloc[:-1]
-        if prior.empty:
-            return {"score": 0.0, "reasons": ["no_pullback_context"]}
-        pullback = prior.tail(max_pullback_bars)
-        trigger_ref = prior.tail(max(min_pullback_bars + 1, 2))
+        if len(prior) <= min_pullback_bars:
+            return _refused("no_pullback_context")
+        # The search holds one bar more than the longest pullback: an extreme
+        # on its first bar means the pullback runs longer than
+        # max_pullback_bars (or the swing lies farther back still), so the
+        # duration is bounded both ways (R-013's verifier, 2026-11-08: with
+        # a window of max + 1 bars, 24% of the detected pullbacks on H: were
+        # a longer decline read from inside).
+        search = prior.tail(max_pullback_bars + 2)
+        extreme_values = search["high" if long else "low"].to_numpy(dtype=float)
+        swing_pos = int(extreme_values.argmax() if long else extreme_values.argmin())
+        swing_extreme = float(extreme_values[swing_pos])
+        pullback = search.iloc[swing_pos + 1:]
+        pullback_bars = len(pullback)
+        if len(search) > max_pullback_bars + 1 and swing_pos == 0:
+            return _refused(reason_with_values("pullback_too_long", current=pullback_bars, required=max_pullback_bars, op="<=", digits=0))
+        if pullback_bars < min_pullback_bars:
+            return _refused(reason_with_values("no_pullback", current=pullback_bars, required=min_pullback_bars, op=">=", digits=0))
+        # The impulse: the same count of bars, ending at the extreme.
+        impulse = prior.iloc[:len(prior) - pullback_bars].tail(max(1, pullback_bars))
         close_pos = bar_close_position(ltf)
         last_vol = safe_float(ltf.iloc[-1].get("volume"), 0.0)
         avg_vol = max(safe_float(prior["volume"].tail(max(3, max_pullback_bars)).mean(), 0.0), 1.0)
         volume_ratio = last_vol / avg_vol if avg_vol > 0 else 0.0
-        pullback_countertrend_volume_ratio = max(safe_float(pullback["volume"].mean(), 0.0), 0.0) / max(safe_float(prior["volume"].tail(max(6, max_pullback_bars + 1)).mean(), 0.0), 1.0)
+        pullback_countertrend_volume_ratio = (max(safe_float(pullback["volume"].mean(), 0.0), 0.0)
+                                              / max(safe_float(impulse["volume"].mean(), 0.0), 1.0))
         score = 0.0
         reasons: list[str] = []
-        if side == Side.LONG:
-            trigger_level = safe_float(trigger_ref["high"].max(), close)
+        if long:
+            trigger_level = safe_float(pullback["high"].max(), close)
             pullback_extreme = safe_float(pullback["low"].min(), close)
-            pullback_depth_atr = max(0.0, trigger_level - pullback_extreme) / atr if atr > 0 else 0.0
-            if pullback_depth_atr <= max_pullback_depth_atr:
-                score += 1.0
-            else:
-                reasons.append(reason_with_values("pullback_too_deep_atr", current=pullback_depth_atr, required=max_pullback_depth_atr, op="<=", digits=4))
-            if pullback_extreme >= (ema20 - (atr * pullback_hold_atr)):
-                score += 1.0
-            else:
-                reasons.append(reason_with_values("pullback_lost_ema20", current=pullback_extreme, required=ema20 - (atr * pullback_hold_atr), op=">=", digits=4))
-            if close > trigger_level * (1.0 + breakout_buffer_pct):
-                score += 1.0
-            else:
-                reasons.append(reason_with_values("no_reexpansion_trigger", current=close, required=trigger_level * (1.0 + breakout_buffer_pct), op=">", digits=4))
-            if close >= ema9:
-                score += 0.75
-            else:
-                reasons.append(reason_with_values("failed_ema9_reclaim", current=close, required=ema9, op=">=", digits=4))
-            if safe_float(ltf.iloc[-1].get("close"), close) >= safe_float(ltf.iloc[-1].get("open"), close):
-                score += 0.5
-            else:
-                reasons.append("trigger_bar_not_bullish")
-            if close_pos >= min_close_pos:
-                score += 0.5
-            else:
-                reasons.append(reason_with_values("weak_bar_close", current=close_pos, required=min_close_pos, op=">=", digits=4))
-            candle_summary = self._configured_ltf_candle_summary(side, ltf)
-            candle_tier = str(candle_summary.get("confirm_tier", "none") or "none")
-            candle_bonus = {
-                "strong_3c": 0.60,
-                "solid_2c": 0.40,
-                "weak_1c": 0.20,
-            }.get(candle_tier, 0.0)
-            score += candle_bonus
-            stop_anchor = pullback_extreme
+            pullback_depth_atr = max(0.0, swing_extreme - pullback_extreme) / atr if atr > 0 else 0.0
+            held = pullback_extreme >= (ema20 - (atr * pullback_hold_atr))
+            hold_level = ema20 - (atr * pullback_hold_atr)
+            reexpanded = close > trigger_level * (1.0 + breakout_buffer_pct)
+            reexpansion_level = trigger_level * (1.0 + breakout_buffer_pct)
+            ema9_ok, ema9_reason = close >= ema9, "failed_ema9_reclaim"
+            body_ok, body_reason = safe_float(ltf.iloc[-1].get("close"), close) >= safe_float(ltf.iloc[-1].get("open"), close), "trigger_bar_not_bullish"
+            close_ok = close_pos >= min_close_pos
         else:
-            trigger_level = safe_float(trigger_ref["low"].min(), close)
+            trigger_level = safe_float(pullback["low"].min(), close)
             pullback_extreme = safe_float(pullback["high"].max(), close)
-            pullback_depth_atr = max(0.0, pullback_extreme - trigger_level) / atr if atr > 0 else 0.0
-            if pullback_depth_atr <= max_pullback_depth_atr:
-                score += 1.0
-            else:
-                reasons.append(reason_with_values("pullback_too_deep_atr", current=pullback_depth_atr, required=max_pullback_depth_atr, op="<=", digits=4))
-            if pullback_extreme <= (ema20 + (atr * pullback_hold_atr)):
-                score += 1.0
-            else:
-                reasons.append(reason_with_values("pullback_lost_ema20", current=pullback_extreme, required=ema20 + (atr * pullback_hold_atr), op="<=", digits=4))
-            if close < trigger_level * (1.0 - breakout_buffer_pct):
-                score += 1.0
-            else:
-                reasons.append(reason_with_values("no_reexpansion_trigger", current=close, required=trigger_level * (1.0 - breakout_buffer_pct), op="<", digits=4))
-            if close <= ema9:
-                score += 0.75
-            else:
-                reasons.append(reason_with_values("failed_ema9_reject", current=close, required=ema9, op="<=", digits=4))
-            if safe_float(ltf.iloc[-1].get("close"), close) <= safe_float(ltf.iloc[-1].get("open"), close):
-                score += 0.5
-            else:
-                reasons.append("trigger_bar_not_bearish")
-            if close_pos <= (1.0 - min_close_pos):
-                score += 0.5
-            else:
-                reasons.append(reason_with_values("weak_bar_close", current=close_pos, required=1.0 - min_close_pos, op="<=", digits=4))
-            candle_summary = self._configured_ltf_candle_summary(side, ltf)
-            candle_tier = str(candle_summary.get("confirm_tier", "none") or "none")
-            candle_bonus = {
-                "strong_3c": 0.60,
-                "solid_2c": 0.40,
-                "weak_1c": 0.20,
-            }.get(candle_tier, 0.0)
-            score += candle_bonus
-            stop_anchor = pullback_extreme
+            pullback_depth_atr = max(0.0, pullback_extreme - swing_extreme) / atr if atr > 0 else 0.0
+            held = pullback_extreme <= (ema20 + (atr * pullback_hold_atr))
+            hold_level = ema20 + (atr * pullback_hold_atr)
+            reexpanded = close < trigger_level * (1.0 - breakout_buffer_pct)
+            reexpansion_level = trigger_level * (1.0 - breakout_buffer_pct)
+            ema9_ok, ema9_reason = close <= ema9, "failed_ema9_reject"
+            body_ok, body_reason = safe_float(ltf.iloc[-1].get("close"), close) <= safe_float(ltf.iloc[-1].get("open"), close), "trigger_bar_not_bearish"
+            close_ok = close_pos <= (1.0 - min_close_pos)
+        if pullback_depth_atr < min_pullback_depth_atr:
+            reasons.append(reason_with_values("pullback_too_shallow_atr", current=pullback_depth_atr, required=min_pullback_depth_atr, op=">=", digits=4))
+        elif pullback_depth_atr > max_pullback_depth_atr:
+            reasons.append(reason_with_values("pullback_too_deep_atr", current=pullback_depth_atr, required=max_pullback_depth_atr, op="<=", digits=4))
+        else:
+            score += 1.0
+        if held:
+            score += 1.0
+        else:
+            reasons.append(reason_with_values("pullback_lost_ema20", current=pullback_extreme, required=hold_level, op=">=" if long else "<=", digits=4))
+        if reexpanded:
+            score += 1.0
+        else:
+            reasons.append(reason_with_values("no_reexpansion_trigger", current=close, required=reexpansion_level, op=">" if long else "<", digits=4))
+        if ema9_ok:
+            score += 0.75
+        else:
+            reasons.append(reason_with_values(ema9_reason, current=close, required=ema9, op=">=" if long else "<=", digits=4))
+        if body_ok:
+            score += 0.5
+        else:
+            reasons.append(body_reason)
+        if close_ok:
+            score += 0.5
+        else:
+            reasons.append(reason_with_values("weak_bar_close", current=close_pos, required=min_close_pos if long else 1.0 - min_close_pos, op=">=" if long else "<=", digits=4))
+        candle_summary = self._configured_ltf_candle_summary(side, ltf)
+        candle_tier = str(candle_summary.get("confirm_tier", "none") or "none")
+        score += {"strong_3c": 0.60, "solid_2c": 0.40, "weak_1c": 0.20}.get(candle_tier, 0.0)
         if volume_ratio >= min_trigger_vol:
             score += 0.5
         else:
@@ -266,10 +362,12 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             "trigger_level": float(trigger_level),
             "pullback_extreme": float(pullback_extreme),
             "pullback_depth_atr": float(pullback_depth_atr),
+            "pullback_bars": int(pullback_bars),
+            "swing_extreme": float(swing_extreme),
             "close_position": float(close_pos),
             "trigger_volume_ratio": float(volume_ratio),
             "countertrend_volume_ratio": float(pullback_countertrend_volume_ratio),
-            "stop_anchor": float(stop_anchor),
+            "stop_anchor": float(pullback_extreme),
         }
 
     def _build_continuation_signal(self, c: Candidate, frame: pd.DataFrame, ltf: pd.DataFrame, side: Side, peer_ctx: dict[str, Any], macro_ctx: dict[str, Any], data=None, *, sr_ctx=None, ms_ctx=None, tech_ctx=None) -> Signal | None:
@@ -514,27 +612,56 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
         tradable_symbols = set(self._tradable_symbols())
         open_sides, cutoffs_passed = self._entry_sides_now()
         closed_side_reasons = self._closed_side_reasons(cutoffs_passed)
-        for c in candidates:
+        def judge(c: Candidate) -> Signal | None:
+            """One candidate's judgement; a raise is its own (``_entry_pass_failed``)."""
             if self._skip_untradable(c.symbol, tradable_symbols):
-                continue
+                return None
             frame = bars.get(c.symbol)
             if c.symbol in positions:
                 self._record_entry_decision(c.symbol, "skipped", ["already_in_position"])
-                continue
+                return None
             if self._skip_past_cutoff(c.symbol, open_sides, cutoffs_passed):
-                continue
+                return None
             if frame is None or len(frame) < history_bars:
                 self._record_entry_decision(c.symbol, "skipped", [insufficient_bars_reason("insufficient_bars", 0 if frame is None else len(frame), history_bars)])
-                continue
-            ltf = self._resampled_frame(frame, ltf_min)
+                return None
+            data_clock = self._step_frame_end(frame)
+            ltf = self._completed_ltf(self._resampled_frame(frame, ltf_min), ltf_min, data_clock)
             if ltf is None or ltf.empty or len(ltf) < max(10, int(self.params.get("min_ltf_bars", 18)) + 4):
                 self._record_entry_decision(c.symbol, "skipped", ["missing_ltf_context"])
-                continue
+                return None
+            # The setup is judged on the last COMPLETED trigger bucket, once
+            # (the family's rule, key_levels since 2026-10-13, this strategy
+            # since 2026-11-08, the whole-bot review's R-009): the first pass
+            # that sees a bucket complete judges it, every later pass repeats
+            # its verdict until the next bucket completes, and a bucket first
+            # seen more than LTF_BUCKET_MAX_LATE past its end is missed
+            # unjudged. Until then every trigger term read the forming
+            # bucket, 1-4 minutes of a 5m candle against full ones, up to
+            # five looks a bucket.
+            bucket = pd.Timestamp(ltf.index[-1])
+            judged = self._judged_buckets.get(c.symbol)
+            if judged is not None and judged.bucket == bucket:
+                self._repeat_bucket_verdict(c.symbol, judged)
+                return None
+            late = self._bucket_lateness(ltf, ltf_min, data_clock)
+            if late > LTF_BUCKET_MAX_LATE:
+                self._miss_bucket(c.symbol, bucket, late)
+                return None
+            bucket_details = {"ltf_bucket": bucket.isoformat()}
+            if data is not None:
+                owed = data.pending_stream_backfill(c.symbol)
+                if owed is not None:
+                    self._record_entry_decision(
+                        c.symbol, "skipped",
+                        [f"ltf_bucket_backfill_pending(bucket={bucket:%H:%M},first_bar={pd.Timestamp(owed):%H:%M})"],
+                        details=dict(bucket_details))
+                    return None
             peer_ctx = self._peer_signal(c.symbol, bars, data)
             preferred_sides = self._preferred_sides(c)
             if preferred_sides is None:
                 self._record_entry_decision(c.symbol, "skipped", ["shorts_disabled"])
-                continue
+                return None
             side_order, evaluated_sides = self._entry_side_context(
                 [side for side in preferred_sides if side in open_sides])
             # Build side-agnostic contexts ONCE per candidate; pass them into each
@@ -549,12 +676,30 @@ class PeerConfirmedTrendContinuationStrategy(PeerConfirmedKeyLevelsStrategy):
             ))
             if sides.signals:
                 signal = self._pick_side_signal(sides.signals, c)
-                out.append(signal)
                 meta = signal.metadata if isinstance(signal.metadata, dict) else {}
-                signal_details = {"side_eval": sides.side_eval or meta.get("side_eval"), "peer_universe": meta.get("peer_universe"), "evaluated_sides": evaluated_sides}
+                signal_details = {"side_eval": sides.side_eval or meta.get("side_eval"), "peer_universe": meta.get("peer_universe"), "evaluated_sides": evaluated_sides, **bucket_details}
                 self._record_entry_decision(c.symbol, "signal", [signal.reason], details=signal_details)
+                self._judged_buckets[c.symbol] = _BucketVerdict(bucket, True, [signal.reason], signal_details)
+                return signal
             else:
                 fail_reasons = sides.fail_reasons + closed_side_reasons
-                skip_details = {"side_eval": sides.side_eval, "peer_universe": list(peer_ctx.get("universe", [])), "peer_details": dict(peer_ctx.get("details", {})), "evaluated_sides": evaluated_sides, "primary_blocker": fail_reasons[0] if fail_reasons else None, "all_blockers": list(fail_reasons), "near_miss_blockers": sides.near_miss_blockers}
+                skip_details = {"side_eval": sides.side_eval, "peer_universe": list(peer_ctx.get("universe", [])), "peer_details": dict(peer_ctx.get("details", {})), "evaluated_sides": evaluated_sides, "primary_blocker": fail_reasons[0] if fail_reasons else None, "all_blockers": list(fail_reasons), "near_miss_blockers": sides.near_miss_blockers, **bucket_details}
                 self._record_entry_decision(c.symbol, "skipped", fail_reasons or ["no_setup"], details=skip_details)
+                self._judged_buckets[c.symbol] = _BucketVerdict(bucket, False, list(fail_reasons or ["no_setup"]), skip_details)
+                return None
+
+        # A candidate whose judgement raises is skipped alone, fail closed,
+        # and the pass goes on (key_levels' rule since 2026-10-13, this
+        # strategy's since 2026-11-08): until then the raise ended the pass,
+        # so a signal built earlier in it never reached the entry stage while
+        # its bucket's verdict read ltf_bucket_signalled.
+        for c in candidates:
+            try:
+                signal = judge(c)
+            except Exception as exc:
+                self._entry_pass_failed(c.symbol, exc)
+                continue
+            self._entry_error_streaks.pop(c.symbol, None)
+            if signal is not None:
+                out.append(signal)
         return out

@@ -40,7 +40,13 @@ risk:
   max_notional_per_trade: 16000.0
   max_total_notional: 48000.0
   max_daily_loss: 500.0
-  default_stop_pct: 0.018
+  # The stop's distance floor, in fraction of price (2026-11-08, R-008). 0.018
+  # was the dataclass default, 2.6-6.8 five-minute ATRs on these names, and set
+  # about 95% of the stops. 0.005 is 1.5-1.9 ATR on AAPL / GOOG / AMZN, where
+  # the structural stop (the pivot zone plus the 0.5 ATR buffer, 0.36-0.6% of
+  # price) still sits inside it on most bars, and 0.7-0.8 ATR on AMD / INTC,
+  # where the structure sets the stop.
+  default_stop_pct: 0.005
   default_target_pct: 0.038
   trailing_stop_pct: 0.012
   trade_management_mode: adaptive
@@ -564,7 +570,8 @@ strategies:
       pivot_continuation_breakout_buffer_pct: 0.0009
       pivot_continuation_family_bonus: -0.12
       pivot_continuation_interaction_lookback_bars: 9
-      pivot_continuation_max_distance_atr: 1.45
+      # The reclaim's sweep and the rejection's touch within this many completed 5m buckets.
+      pivot_sweep_lookback_bars: 4
       pivot_invalidated_zone_penalty: 1.0
       pivot_original_zone_hold_bonus: 0.18
       pivot_pending_flip_zone_penalty: 0.5

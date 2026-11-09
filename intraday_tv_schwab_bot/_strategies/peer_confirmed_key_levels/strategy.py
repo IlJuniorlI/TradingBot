@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from typing import Any, ClassVar
 
+import numpy as np
 import pandas as pd
 
 from ...htf_levels import HTFContext
@@ -150,6 +151,11 @@ VOTE_AGE_FLOOR_MINUTES = 2
 # ENTRY_ERROR_TRACEBACK_EVERY-th after, a one-line WARNING in between (the
 # engine's per-symbol map failures, ``_symbol_map_failed``, do the same).
 ENTRY_ERROR_TRACEBACK_EVERY = 10
+
+# The trigger's volume and body baselines need this many completed buckets
+# of the trigger bucket's own session segment (``_trigger_session_rows``);
+# its CHoCH needs the full 3 before it.
+LTF_BASELINE_MIN_BUCKETS = 5
 
 
 @dataclass(frozen=True)
@@ -308,6 +314,10 @@ KEY_LEVELS_KNOBS: dict[str, Knob] = {
     "zone_atr_mult": Knob("number", low=0),
     "zone_pct": Knob("number", low=0, low_open=True, high=1),
     "min_level_score": Knob("number", low=0),
+    # The entry's distance from the level it defends, in trigger-frame ATRs
+    # (5m in the preset, 1m in the _1m variant); null is no bound
+    # (``_build_equity_signal``, ``too_far_from_level_atr``).
+    "max_entry_distance_from_level_atr": Knob("number", low=0, low_open=True, nullable=True),
     "level_score_raw_htf_weight": Knob("number", low=0, high=1),
     "level_round_number_tolerance_pct": Knob("number", low=0, high=1),
     "min_ltf_score": Knob("number", low=0, high=LTF_BASE_SCORE_MAX),
@@ -502,8 +512,16 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             if params[arm_key] is not None and params[stop_key] >= params[arm_key]:
                 errors.append(f"strategies.{name}.params.{stop_key} ({params[stop_key]}) must be under {arm_key} "
                               f"({params[arm_key]}): the {move} moves the stop below the price it arms at")
+        errors.extend(cls._own_knob_errors(params))
         if errors:
             raise ValueError("; ".join(errors))
+
+    @classmethod
+    def _own_knob_errors(cls, params: Mapping[str, Any]) -> list[str]:
+        """A subclass's checks between its own knobs, run by ``check_knobs``
+        after every knob in ``KNOBS`` passed on its own (htf_pivots' and
+        trend_continuation's, 2026-11-08). Each string names the key."""
+        return []
 
     def _check_build_knobs(self) -> None:
         """The bounds a knob has against the rest of the config, which the
@@ -627,6 +645,24 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         width = max(float(zone_width or 0.0), 0.0)
         return float(price) - width, float(price) + width
 
+    @staticmethod
+    def _ladder_defense_buffer(zone_width: float, close: float, room_to_stop: float | None = None) -> float:
+        """How far through the defended zone's edge the close must be for
+        the zone to count as lost (``_ladder_exit_signal``): a quarter of
+        the zone, at least 0.05% of price, and at most half the room between
+        the edge and the position's stop (``room_to_stop``), so a confirmed
+        flip exits before the stop is hit whenever the stop sits beyond the
+        edge; with the stop inside the zone, the stop is the defence. Until
+        2026-11-08 the 60m S/R context's ``level_buffer`` (0.25 x the 60m
+        ATR, about 0.36% on H:'s names) was a third term: the exit sat
+        about 0.52% under the level while the stop sat 0.19% under it, so
+        the defence could fire only after a sweep deeper than 1.5 x the 5m
+        ATR (the whole-bot review's R-065)."""
+        buffer = max(max(float(zone_width or 0.0), 0.0) * 0.25, float(close) * 0.0005)
+        if room_to_stop is not None:
+            buffer = min(buffer, max(0.0, float(room_to_stop)) * 0.5)
+        return buffer
+
     def _ladder_exit_signal(self, position: Position, frame: pd.DataFrame, tape: ExitTape, data=None) -> ExitDecision | None:
         """The adaptive-ladder defence: the defended zone flipped, or HTF
         structure broke against the trade with price through its EMA / VWAP
@@ -676,16 +712,14 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 use_prior_day_high_low=bool(self._support_resistance_setting("use_prior_day_high_low", True)),
                 use_prior_week_high_low=bool(self._support_resistance_setting("use_prior_week_high_low", True)),
             )
-        buffer = max(
-            defense_zone_width * 0.25,
-            float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0),
-            close * 0.0005,
-        )
+        lower, upper = self._ladder_bounds(defense_price, defense_zone_width)
+        stop_price = safe_float(position.stop_price)
+        room_to_stop = None if stop_price is None else ((lower - stop_price) if position.side == Side.LONG else (stop_price - upper))
+        buffer = self._ladder_defense_buffer(defense_zone_width, close, room_to_stop)
         eps = max(float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0) * 0.15, close * 0.0001, 1e-6)
         # Through the shared reader: `int(value or 2)` turned a configured 0
         # (that frame's gate off) back into the default (2026-09-23).
         confirm_1m, confirm_5m = self.config.support_resistance.flip_confirmation_bars()
-        lower, upper = self._ladder_bounds(defense_price, defense_zone_width)
         ms = getattr(sr_ctx, "market_structure", None)
 
         def _broke_after_entry(direction: str) -> bool:
@@ -813,7 +847,13 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 continue
             fresh += 1
             close = safe_float(frame.iloc[-1]["close"], 0.0)
-            ltf = self._resampled_frame(frame, int(self.params.get("ltf_minutes", 5)))
+            ltf_min = int(self.params.get("ltf_minutes", 5))
+            # The posture reads the peer's last COMPLETED bucket (R-066,
+            # 2026-11-08): the resample keeps the bucket still forming, 1-4
+            # minutes of it when the pass catches the minute's bars between
+            # the candidate's and the peer's, one minute of every peer's
+            # when a thin candidate's bucket is judged a step late.
+            ltf = self._completed_ltf(self._resampled_frame(frame, ltf_min), ltf_min, self._step_frame_end(frame))
             htf = self._htf_context(peer, data, current_price=close, **htf_request)
             bull_votes = 0
             bear_votes = 0
@@ -882,7 +922,10 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 details[key] = "stale"
                 stale[symbol] = age
                 continue
-            macro = self._resampled_frame(frame, ltf_min)
+            # The vote reads the symbol's last COMPLETED bucket (R-066,
+            # 2026-11-08): a polled symbol's (VIX, $NYICDX, every 300 s)
+            # newest bucket holds 1-5 minutes at any pass.
+            macro = self._completed_ltf(self._resampled_frame(frame, ltf_min), ltf_min, self._step_frame_end(frame))
             if macro is None or macro.empty:
                 details[key] = "missing"
                 continue
@@ -1231,11 +1274,25 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         return self._select_level(side, close, completed, htf)
 
     def _select_level(self, side: Side, close: float, ltf: pd.DataFrame, htf: HTFContext) -> dict[str, Any] | None:
+        """The level ``side`` defends: of the levels touched within the last
+        4 completed buckets, the one ranked first
+        (``_level_selection_priority_key``) among those that meet
+        ``min_level_score``; with none meeting it, the first-ranked touched
+        level, so the refusal (``<side>_level_score_below_min``,
+        ``_judge_candidate``) names a level and its score. Until 2026-11-08
+        every touched level was ranked together and only the winner met the
+        gate, so a level that could never pass (an HTF FVG tops out at 2.80
+        under the 5m preset's 2.9; a single-touch pivot at 1.5) won on the
+        trigger preview's zone-interaction geometry, which favours the level
+        nearest the sweep's extreme, and the side was refused for the bucket
+        while a passing level with the same trigger was never judged (the
+        whole-bot review's R-011)."""
         if ltf is None or ltf.empty:
             return None
         atr = last_bar_atr(ltf, close, fallback_atr=getattr(htf, "atr14", None))
         recent = ltf.tail(4)
-        best: dict[str, Any] | None = None
+        min_level_score = float(self.params["min_level_score"])
+        touched_levels: list[dict[str, Any]] = []
         for candidate in self._candidate_levels(close, htf, side):
             price = float(candidate["price"])
             zone = self._zone_width_for_level(side, close, atr, price, htf, candidate)
@@ -1251,13 +1308,11 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             distance = abs(close - price)
             payload = {**candidate, "zone_width": zone, "distance": distance}
             payload.update(self._peer_level_selection_details(side, payload, ltf, close, atr))
-            if best is None:
-                best = payload
-                continue
-
-            if self._level_selection_priority_key(payload) > self._level_selection_priority_key(best):
-                best = payload
-        return best
+            touched_levels.append(payload)
+        if not touched_levels:
+            return None
+        passing = [payload for payload in touched_levels if float(payload["level_score"]) >= min_level_score]
+        return max(passing or touched_levels, key=self._level_selection_priority_key)
 
     def _configured_ltf_candle_summary(self, side: Side, ltf: pd.DataFrame) -> dict[str, Any]:
         # _directional_candle_signal slices internally to CANDLE_CONTEXT_BARS
@@ -1382,9 +1437,38 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             "quality_breakdown": rounded_breakdown,
         }
 
+    @staticmethod
+    def _trigger_session_rows(ltf: pd.DataFrame) -> pd.DataFrame:
+        """``ltf``'s buckets on the trigger bucket's (its last row's) ET
+        session date and in its segment of the day: the premarket, the
+        regular session (09:30 to the calendar's close) or the post-market.
+        The trigger's baselines and windows are drawn from them alone (the
+        whole-bot review's R-012, 2026-11-08): until then the prior 20
+        buckets' mean volume, the prior 20 bodies, the prior 3 buckets'
+        extreme and the 4-bucket sweep window were read across the open, so
+        the 09:30 bucket's volume was 21-107x the premarket's mean (a
+        "spike" on 90 of 90 first-five RTH buckets on H:, 11-04..11-06, 10%
+        of the buckets from 10:00) and its close above the premarket's
+        thin highs a CHoCH on 11 of 18 symbol-days: two of the four trigger
+        points for the session transition alone."""
+        if ltf is None or ltf.empty:
+            return ltf
+        wall = sessions.session_datetime_index(ltf.index)
+        days = wall.normalize().to_numpy()
+        minute = (wall.hour * 60 + wall.minute).to_numpy()
+        rth = sessions.session_mask(ltf.index, "rth")
+        segment = np.where(rth, 1, np.where(minute < 9 * 60 + 30, 0, 2))
+        same = (days == days[-1]) & (segment == segment[-1])
+        return ltf[same]
+
     def _ltf_score(self, side: Side, ltf: pd.DataFrame, level_price: float, zone_width: float) -> dict[str, Any]:
         """The trigger on ``ltf``'s last bar (the entry pass hands it the
         completed buckets, ``_completed_ltf``) at the level ``level_price``.
+        Its baselines and windows are the trigger bucket's own session
+        segment's (``_trigger_session_rows``): the CHoCH needs the 3 buckets
+        before it, the volume and body baselines ``LTF_BASELINE_MIN_BUCKETS``,
+        and the sweep window holds the segment's last 4 buckets; with fewer,
+        the term does not score.
 
         ``base_score`` is the 4-part trigger: a CHoCH (the close beyond the
         prior 3 bars' extreme) 1, a volume spike (over 1.5x the prior 20
@@ -1401,12 +1485,14 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         ``min_ltf_score``, reads ``base_score`` alone."""
         if ltf is None or len(ltf) < 5:
             return {"score": 0.0, "base_score": 0.0, "quality_bonus": 0.0, "reasons": [], "quality_reasons": [], "quality_breakdown": {}}
+        session = self._trigger_session_rows(ltf)
         last = ltf.iloc[-1]
-        prior = ltf.iloc[:-1]
-        prev3 = prior.tail(3)
+        prior = session.iloc[:-1]
+        prev3 = prior.tail(3) if len(prior) >= 3 else prior.iloc[0:0]
         body = abs(float(last["close"]) - float(last["open"]))
-        avg_body = abs(prior["close"] - prior["open"]).tail(20).mean() if len(prior) >= 2 else body
-        avg_vol_raw = prior["volume"].tail(20).mean() if "volume" in prior.columns and len(prior) >= 2 else float(last.get("volume", 0.0))
+        baseline_ready = len(prior) >= LTF_BASELINE_MIN_BUCKETS
+        avg_body = abs(prior["close"] - prior["open"]).tail(20).mean() if baseline_ready else body
+        avg_vol_raw = prior["volume"].tail(20).mean() if baseline_ready and "volume" in prior.columns else float("nan")
         last_vol = float(last.get("volume", 0.0))
         if avg_vol_raw == avg_vol_raw and float(avg_vol_raw) > 0:
             avg_vol_valid = float(avg_vol_raw)
@@ -1418,7 +1504,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
         strong_body = body > max(0.01, float(avg_body) * 1.2)
         reasons: list[str] = []
         base_score = 0.0
-        ltf_sweep_window = ltf.tail(4)
+        ltf_sweep_window = session.tail(4)
         pattern_summary = self._configured_ltf_candle_summary(side, ltf)
         candle_score = float(pattern_summary.get("score", 0.0) or 0.0)
         candle_net_score = float(pattern_summary.get("net_score", 0.0) or 0.0)
@@ -1477,7 +1563,7 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
                 reasons.append("sweep_reject")
         quality = self._ltf_quality_bonus(
             side,
-            ltf,
+            session,
             level_price=float(level_price),
             zone_width=float(zone_width),
             choch=bool(choch),
@@ -1691,6 +1777,18 @@ class PeerConfirmedKeyLevelsStrategy(BaseStrategy):
             clearance_atr_blocked = clearance_atr <= min_clearance_atr
             if clearance_pct_blocked and clearance_atr_blocked:
                 self._set_build_failure(c.symbol, failure_style, "too_close_to_overhead_resistance" if side == Side.LONG else "too_close_to_nearby_support")
+                return None
+        # The entry's distance from the level it defends (R-067, 2026-11-08):
+        # the touch and the sweep may be up to 4 completed buckets old and
+        # the CHoCH enters at the bounce's extreme, while the stop hangs from
+        # the level, so R grew with the chase and the first rung (min_rr x R)
+        # moved out with it. Null: no bound.
+        max_distance_atr = self.params.get("max_entry_distance_from_level_atr")
+        if max_distance_atr is not None:
+            distance_atr = abs(close - float(level["price"])) / max(float(atr), 1e-9)
+            if distance_atr > float(max_distance_atr):
+                self._set_build_failure(c.symbol, failure_style,
+                                        f"too_far_from_level_atr:{distance_atr:.2f}>{float(max_distance_atr):.2f}")
                 return None
         swing_window = ltf.tail(5)
         buffer = max(atr * float(self.params.get("stop_buffer_atr_mult", 0.68)), float(level["zone_width"]) * 0.35)

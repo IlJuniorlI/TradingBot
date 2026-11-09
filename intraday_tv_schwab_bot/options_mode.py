@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
+
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -106,14 +109,58 @@ def filter_contracts(
     return sorted(out, key=lambda c: (c.expiration, c.strike))
 
 
+def decayed_premium_levels(stop_frac: float, target_mult: float, time_decay_scale: float, widen_factor: float) -> tuple[float, float]:
+    """A bought premium's stop fraction and target multiple under the time
+    decay ``time_decay_scale`` (1.0 before the window, the floor at its
+    end): the target's excess over the entry shrinks with the scale, and
+    the stop fraction, the floor under the entry premium, shrinks by
+    ``widen_factor`` x the target's shrink, so the stop WIDENS as theta
+    accelerates (a lower floor is a wider stop). One formula for the two
+    builders and the gatekeeper's post-fill rebuild (2026-11-08, the
+    whole-bot review's R-029): until then all four sites multiplied the
+    fraction by ``1 + (1 - scale) x widen``, which raised the floor and
+    tightened the stop by up to 9% of itself, against the knob's and the
+    README's word."""
+    scale = min(1.0, max(0.0, float(time_decay_scale)))
+    stop = max(0.01, min(0.99, float(stop_frac)))
+    target = max(1.01, float(target_mult))
+    if scale < 1.0:
+        target = max(1.01, 1.0 + (target - 1.0) * scale)
+        stop = max(0.01, min(0.99, stop * (1.0 - (1.0 - scale) * max(0.0, float(widen_factor)))))
+    return stop, target
+
+
+def time_decay_scale_of(metadata: Mapping[str, Any] | None) -> float:
+    """The time-decay scale a signal's builder stamped on ``metadata``
+    (``time_decay_scale``), 1.0 when there is none or it is not a number in
+    (0, 1]: the one reader for the gatekeeper's post-fill levels and the
+    premium ratchets (2026-11-08), so a corrupt stamp reads as no decay
+    everywhere rather than as full decay in one place and none in another."""
+    if not isinstance(metadata, Mapping):
+        return 1.0
+    value = metadata.get("time_decay_scale")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return 1.0
+    return float(value) if 0.0 < float(value) <= 1.0 else 1.0
+
+
 def choose_by_delta(contracts: Iterable[OptionContract], target_abs_delta: float, above_strike: float | None = None, below_strike: float | None = None) -> OptionContract | None:
+    """The contract whose |delta| is nearest ``target_abs_delta`` among those
+    past the strike bounds. A contract with no delta, or Schwab's -999
+    sentinel for a missing greek (any |delta| over 1), is not a candidate:
+    with none left the answer is None and the caller refuses
+    (``no_contract_near_target_delta``). Until 2026-11-08 (R-131) a missing
+    delta scored as 99, so a chain with no greeks picked its lowest strike,
+    the deepest ITM call or the deepest OTM put."""
     best: tuple[float, OptionContract] | None = None
     for c in contracts:
         if above_strike is not None and c.strike <= above_strike:
             continue
         if below_strike is not None and c.strike >= below_strike:
             continue
-        abs_delta = abs(c.delta) if c.delta is not None else 99.0
+        if c.delta is None or not math.isfinite(c.delta) or abs(c.delta) > 1.0:
+            continue
+        abs_delta = abs(c.delta)
         score = abs(abs_delta - abs(target_abs_delta))
         if best is None or score < best[0]:
             best = (score, c)

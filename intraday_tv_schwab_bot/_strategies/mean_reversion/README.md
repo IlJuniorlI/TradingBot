@@ -52,7 +52,7 @@ That helps keep the strategy from buying strong names that are technically rebou
 
 ### 5. How the trade is framed
 
-The initial stop starts under the last three bars' low. The first target points back toward the recent high area (at least `risk.default_target_pct` away). The shared stage refines both sides as above; the strategy then adds adaptive management in the `reversal` style (no runner, leaning on the FVG reversal bias).
+The initial stop starts under the last three bars' low, at least `risk.default_stop_pct` under the close (2026-11-08, R-003: until then the raw 3-bar low, a 2-3c stop on a quiet trigger bar of a $2-20 name, sized the position to the notional cap). The first target points back toward the recent high area (at least `risk.default_target_pct` away). The shared stage refines both sides as above; the strategy then adds adaptive management in the `reversal` style (no runner, leaning on the FVG reversal bias).
 
 Its own priority (`strategy_priority_score`) is built from the screener strength, the shallowness of the pullback and pattern quality. The shared context terms are added on top (`shared_context_score`), and their sum is the `final_priority_score` the gatekeeper ranks on. The signal is stamped `entry_style_family: reversal`.
 

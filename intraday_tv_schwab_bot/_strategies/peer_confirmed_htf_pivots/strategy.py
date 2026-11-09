@@ -11,17 +11,45 @@ from ...numeric import safe_float
 from ...reasons import insufficient_bars_reason, reason_with_values
 from ...bars import bar_close_position, bar_wick_fractions
 from ...indicators import last_bar_atr
-from ..peer_confirmed_key_levels.strategy import FAMILY_KNOBS, Knob, PeerConfirmedKeyLevelsStrategy, _gate_snapshot, _score_threshold
+from ..peer_confirmed_key_levels.strategy import (
+    FAMILY_KNOBS,
+    LTF_BUCKET_MAX_LATE,
+    Knob,
+    PeerConfirmedKeyLevelsStrategy,
+    _BucketVerdict,
+    _gate_snapshot,
+    _score_threshold,
+)
 from ..shared_entry import EntryContexts, EntryProposal
 from ...support_resistance import zone_flip_confirmed
 
 
+# htf_pivots' own knobs checked at load (2026-11-08; the rest of its own
+# knobs are still read unchecked, the whole-bot review's R-079).
+HTF_PIVOTS_KNOBS: dict[str, Knob] = {
+    # The reclaim's sweep and the rejection's touch within this many completed
+    # trigger buckets (``_pivot_reclaim_signal``, ``_pivot_rejection_signal``).
+    "pivot_sweep_lookback_bars": Knob("count", low=1),
+}
+
+
 class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
+
+    @classmethod
+    def _own_knob_errors(cls, params) -> list[str]:
+        name = cls.strategy_name
+        errors: list[str] = []
+        if "pivot_continuation_max_distance_atr" in params:
+            errors.append(f"strategies.{name}.params.pivot_continuation_max_distance_atr was removed on 2026-11-08: the "
+                          f"continuation's distance from the pivot is gated by max_continuation_distance_from_pivot_atr "
+                          f"alone, and its interaction test reads pivot_continuation_interaction_lookback_bars")
+        return errors
+
     strategy_name = 'peer_confirmed_htf_pivots'
     # The family's knobs, checked at load and at the build
     # (``PeerConfirmedKeyLevelsStrategy.check_knobs``); this strategy's own
     # pivot / regime knobs are not checked yet.
-    KNOBS: ClassVar[dict[str, Knob]] = dict(FAMILY_KNOBS)
+    KNOBS: ClassVar[dict[str, Knob]] = {**FAMILY_KNOBS, **HTF_PIVOTS_KNOBS}
     _ENTRY_FAMILY_ALIASES = {
         "auto": "auto",
         "pivot_reclaim": "pivot_reclaim",
@@ -425,7 +453,14 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         )
         return max(float(atr) * atr_mult, float(close) * pct, 0.01)
 
-    def _regime_signal(self, side: Side, ltf: pd.DataFrame, sr_ctx) -> dict[str, Any]:
+    def _regime_signal(self, side: Side, ltf: pd.DataFrame, sr_ctx, flip_frame: pd.DataFrame | None = None) -> dict[str, Any]:
+        """The HTF regime around the pivot, read on ``ltf``'s last bar (the
+        entry pass hands the completed buckets). The battleground's zone
+        flip is confirmed on ``flip_frame``, the 1m step frame the S/R
+        context classified the same level on (2026-11-08, R-009): until
+        then the 5m frame stood in, so its buckets were counted as 1m
+        confirmation bars and the build and the S/R context could disagree
+        on one level's flip."""
         last = ltf.iloc[-1]
         close = safe_float(last.get("close"), 0.0)
         vwap = safe_float(last.get("vwap"), close)
@@ -439,7 +474,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         score = 0.0
         reasons: list[str] = []
         min_adx = float(self.params.get("min_adx14", 12.5))
-        battleground = self._sr_battleground(side, sr_ctx, close, atr, ltf)
+        battleground = self._sr_battleground(side, sr_ctx, close, atr, flip_frame if flip_frame is not None else ltf)
         target_level = self._sr_opposing_target(side, sr_ctx, close)
         zone_width = max(self._pivot_zone_width(close, atr), float(getattr(sr_ctx, "level_buffer", 0.0) or 0.0))
         proximity_limit = max(0.1, float(self.params.get("pivot_battleground_max_distance_atr", 1.10)))
@@ -621,6 +656,13 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         prior = recent.iloc[:-1]
         if prior.empty:
             return {"family": "pivot_reclaim", "score": 0.0, "reasons": ["no_reclaim_context"]}
+        # The sweep is an event (R-063, 2026-11-08): the low under the pivot
+        # (the high over it) within the last ``pivot_sweep_lookback_bars``
+        # completed buckets, 4 in the presets, as key_levels' sweep window.
+        # Until then the whole 19-bucket context (95 minutes) counted, so a
+        # dip 90 minutes old kept every later bullish bar near the pivot
+        # qualifying as a "reclaim", and anchored the stop.
+        sweep_window = prior.tail(int(self.params["pivot_sweep_lookback_bars"]))
         close_pos = bar_close_position(ltf)
         min_close_pos = min(0.95, max(0.05, float(self.params.get("min_ltf_close_position", 0.60))))
         reclaim_buffer_pct = max(0.0, float(self.params.get("pivot_reclaim_buffer_pct", 0.0005)))
@@ -631,8 +673,8 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         reasons: list[str] = []
         score = 0.0
         if side == Side.LONG:
-            touched = safe_float(prior["low"].min(), close) <= (pivot + zone_width)
-            swept = safe_float(prior["low"].min(), close) <= pivot
+            touched = safe_float(sweep_window["low"].min(), close) <= (pivot + zone_width)
+            swept = safe_float(sweep_window["low"].min(), close) <= pivot
             reclaimed = close >= (pivot + reclaim_offset)
             if touched:
                 score += 1.0
@@ -658,10 +700,10 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                 score += 0.25
             if close >= vwap:
                 score += 0.25
-            stop_anchor = min(pivot, safe_float(prior["low"].min(), pivot))
+            stop_anchor = min(pivot, safe_float(sweep_window["low"].min(), pivot))
         else:
-            touched = safe_float(prior["high"].max(), close) >= (pivot - zone_width)
-            swept = safe_float(prior["high"].max(), close) >= pivot
+            touched = safe_float(sweep_window["high"].max(), close) >= (pivot - zone_width)
+            swept = safe_float(sweep_window["high"].max(), close) >= pivot
             reclaimed = close <= (pivot - reclaim_offset)
             if touched:
                 score += 1.0
@@ -687,7 +729,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                 score += 0.25
             if close <= vwap:
                 score += 0.25
-            stop_anchor = max(pivot, safe_float(prior["high"].max(), pivot))
+            stop_anchor = max(pivot, safe_float(sweep_window["high"].max(), pivot))
         if close_pos >= min_close_pos if side == Side.LONG else close_pos <= (1.0 - min_close_pos):
             score += 0.5
         else:
@@ -720,6 +762,8 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         prior = recent.iloc[:-1]
         if prior.empty:
             return {"family": "pivot_rejection", "score": 0.0, "reasons": ["no_rejection_context"]}
+        # The touch within the sweep window, as the reclaim's (R-063).
+        sweep_window = prior.tail(int(self.params["pivot_sweep_lookback_bars"]))
         close_pos = bar_close_position(ltf)
         min_close_pos = min(0.95, max(0.05, float(self.params.get("min_ltf_close_position", 0.60))))
         min_wick_frac = min(0.95, max(0.05, float(self.params.get("pivot_rejection_min_wick_frac", 0.24))))
@@ -730,7 +774,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         reasons: list[str] = []
         score = 0.0
         if side == Side.LONG:
-            touched = safe_float(prior["low"].min(), close) <= (pivot + zone_width)
+            touched = safe_float(sweep_window["low"].min(), close) <= (pivot + zone_width)
             held = close >= pivot
             reversal_candle = lower_wick_frac >= min_wick_frac or self._configured_ltf_candle_match(side, ltf)
             if touched:
@@ -753,9 +797,9 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                 reasons.append("ltf_structure_not_supportive")
             if close >= ema9:
                 score += 0.25
-            stop_anchor = min(pivot, safe_float(prior["low"].min(), pivot))
+            stop_anchor = min(pivot, safe_float(sweep_window["low"].min(), pivot))
         else:
-            touched = safe_float(prior["high"].max(), close) >= (pivot - zone_width)
+            touched = safe_float(sweep_window["high"].max(), close) >= (pivot - zone_width)
             held = close <= pivot
             reversal_candle = upper_wick_frac >= min_wick_frac or self._configured_ltf_candle_match(side, ltf)
             if touched:
@@ -778,7 +822,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                 reasons.append("ltf_structure_not_supportive")
             if close <= ema9:
                 score += 0.25
-            stop_anchor = max(pivot, safe_float(prior["high"].max(), pivot))
+            stop_anchor = max(pivot, safe_float(sweep_window["high"].max(), pivot))
         if close_pos >= min_close_pos if side == Side.LONG else close_pos <= (1.0 - min_close_pos):
             score += 0.5
         else:
@@ -820,7 +864,6 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         close_pos = bar_close_position(ltf)
         min_close_pos = min(0.95, max(0.05, float(self.params.get("min_ltf_close_position", 0.60))))
         breakout_buffer_pct = max(0.0, float(self.params.get("pivot_continuation_breakout_buffer_pct", 0.0009)))
-        max_distance_atr = max(0.1, float(self.params.get("pivot_continuation_max_distance_atr", 1.45)))
         volume_ratio = self._volume_ratio(ltf)
         min_volume_ratio = max(0.1, float(self.params.get("min_ltf_volume_ratio", 1.0)))
         reasons: list[str] = []
@@ -831,10 +874,14 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
             interacted = safe_float(interaction_slice["low"].min(), close) <= (pivot + (zone_width * 1.25))
             pivot_held = safe_float(prior["low"].min(), close) >= (pivot - zone_width)
             trigger_broke = close >= (trigger_level * (1.0 + breakout_buffer_pct))
-            if interacted or self._pivot_distance_atr(side, close, pivot, atr) <= max_distance_atr:
+            # The base around the pivot is a condition of its own (R-064,
+            # 2026-11-08): until then `interacted or distance <= 1.45 ATR`
+            # was always true past the 1.35 ATR gate, so the point was a
+            # constant and README's "bases around the pivot" unenforced.
+            if interacted:
                 score += 1.0
             else:
-                reasons.append(reason_with_values("too_far_from_pivot_atr", current=self._pivot_distance_atr(side, close, pivot, atr), required=max_distance_atr, op="<=", digits=4))
+                reasons.append("pivot_not_interacted")
             if pivot_held:
                 score += 1.0
             else:
@@ -857,10 +904,10 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
             interacted = safe_float(interaction_slice["high"].max(), close) >= (pivot - (zone_width * 1.25))
             pivot_held = safe_float(prior["high"].max(), close) <= (pivot + zone_width)
             trigger_broke = close <= (trigger_level * (1.0 - breakout_buffer_pct))
-            if interacted or self._pivot_distance_atr(side, close, pivot, atr) <= max_distance_atr:
+            if interacted:
                 score += 1.0
             else:
-                reasons.append(reason_with_values("too_far_from_pivot_atr", current=self._pivot_distance_atr(side, close, pivot, atr), required=max_distance_atr, op="<=", digits=4))
+                reasons.append("pivot_not_interacted")
             if pivot_held:
                 score += 1.0
             else:
@@ -1006,7 +1053,7 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         # Where every failure of this side is recorded -- its own gates' and
         # the shared entry stage's -- and where entry_signals consumes them.
         failure_key = self._failure_style_name(side)
-        regime = self._regime_signal(side, ltf, sr_ctx)
+        regime = self._regime_signal(side, ltf, sr_ctx, frame)
         pivot_price = safe_float(regime.get("pivot_price"))
         if pivot_price is None or pivot_price <= 0:
             self._set_build_failure(
@@ -1361,15 +1408,16 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
         tradable_symbols = set(self._tradable_symbols())
         open_sides, cutoffs_passed = self._entry_sides_now()
         closed_side_reasons = self._closed_side_reasons(cutoffs_passed)
-        for candidate in candidates:
+        def judge(candidate: Candidate) -> Signal | None:
+            """One candidate's judgement; a raise is its own (``_entry_pass_failed``)."""
             if self._skip_untradable(candidate.symbol, tradable_symbols):
-                continue
+                return None
             frame = bars.get(candidate.symbol)
             if candidate.symbol in positions:
                 self._record_entry_decision(candidate.symbol, "skipped", ["already_in_position"])
-                continue
+                return None
             if self._skip_past_cutoff(candidate.symbol, open_sides, cutoffs_passed):
-                continue
+                return None
             if frame is None or len(frame) < history_bars:
                 self._record_entry_decision(
                     candidate.symbol,
@@ -1382,16 +1430,44 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                         )
                     ],
                 )
-                continue
-            ltf = self._resampled_frame(frame, ltf_min)
+                return None
+            data_clock = self._step_frame_end(frame)
+            ltf = self._completed_ltf(self._resampled_frame(frame, ltf_min), ltf_min, data_clock)
             if ltf is None or ltf.empty or len(ltf) < max(10, int(self.params.get("min_ltf_bars", 20)) + 3):
                 self._record_entry_decision(candidate.symbol, "skipped", ["missing_ltf_context"])
-                continue
+                return None
+            # The setup is judged on the last COMPLETED trigger bucket, once
+            # (the family's rule, key_levels since 2026-10-13, this strategy
+            # since 2026-11-08, the whole-bot review's R-009): the first pass
+            # that sees a bucket complete judges it, every later pass repeats
+            # its verdict until the next bucket completes, and a bucket first
+            # seen more than LTF_BUCKET_MAX_LATE past its end is missed
+            # unjudged. Until then every trigger term read the forming
+            # bucket, 1-4 minutes of a 5m candle against full ones, up to
+            # five looks a bucket.
+            bucket = pd.Timestamp(ltf.index[-1])
+            judged = self._judged_buckets.get(candidate.symbol)
+            if judged is not None and judged.bucket == bucket:
+                self._repeat_bucket_verdict(candidate.symbol, judged)
+                return None
+            late = self._bucket_lateness(ltf, ltf_min, data_clock)
+            if late > LTF_BUCKET_MAX_LATE:
+                self._miss_bucket(candidate.symbol, bucket, late)
+                return None
+            bucket_details = {"ltf_bucket": bucket.isoformat()}
+            if data is not None:
+                owed = data.pending_stream_backfill(candidate.symbol)
+                if owed is not None:
+                    self._record_entry_decision(
+                        candidate.symbol, "skipped",
+                        [f"ltf_bucket_backfill_pending(bucket={bucket:%H:%M},first_bar={pd.Timestamp(owed):%H:%M})"],
+                        details=dict(bucket_details))
+                    return None
             peer_ctx = self._peer_signal(candidate.symbol, bars, data)
             preferred_sides = self._preferred_sides(candidate)
             if preferred_sides is None:
                 self._record_entry_decision(candidate.symbol, "skipped", ["shorts_disabled"])
-                continue
+                return None
             side_order, evaluated_sides = self._entry_side_context(
                 [side for side in preferred_sides if side in open_sides])
             # Build side-agnostic contexts ONCE per candidate; passed into each
@@ -1407,27 +1483,21 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
             family_eval = sides.extra["family_eval"]
             if sides.signals:
                 signal = self._pick_side_signal(sides.signals, candidate)
-                out.append(signal)
                 meta = signal.metadata if isinstance(signal.metadata, dict) else {}
-                self._record_entry_decision(
-                    candidate.symbol,
-                    "signal",
-                    [signal.reason],
-                    details={
-                        "entry_family": meta.get("entry_family"),
-                        "peer_universe": meta.get("peer_universe"),
-                        "side_eval": sides.side_eval or meta.get("side_eval"),
-                        "family_eval": family_eval or meta.get("family_eval"),
-                        "evaluated_sides": evaluated_sides,
-                    },
-                )
+                signal_details = {
+                    "entry_family": meta.get("entry_family"),
+                    "peer_universe": meta.get("peer_universe"),
+                    "side_eval": sides.side_eval or meta.get("side_eval"),
+                    "family_eval": family_eval or meta.get("family_eval"),
+                    "evaluated_sides": evaluated_sides,
+                    **bucket_details,
+                }
+                self._record_entry_decision(candidate.symbol, "signal", [signal.reason], details=signal_details)
+                self._judged_buckets[candidate.symbol] = _BucketVerdict(bucket, True, [signal.reason], signal_details)
+                return signal
             else:
                 fail_reasons = sides.fail_reasons + closed_side_reasons
-                self._record_entry_decision(
-                    candidate.symbol,
-                    "skipped",
-                    fail_reasons or ["no_setup"],
-                    details={
+                skip_details = {
                         "peer_universe": list(peer_ctx.get("universe", [])),
                         "peer_details": dict(peer_ctx.get("details", {})),
                         "side_eval": sides.side_eval,
@@ -1440,6 +1510,24 @@ class PeerConfirmedHTFPivotsStrategy(PeerConfirmedKeyLevelsStrategy):
                             "primary_blocker": fail_reasons[0] if fail_reasons else None,
                             "evaluated_sides": evaluated_sides,
                         },
-                    },
-                )
+                        **bucket_details,
+                }
+                self._record_entry_decision(candidate.symbol, "skipped", fail_reasons or ["no_setup"], details=skip_details)
+                self._judged_buckets[candidate.symbol] = _BucketVerdict(bucket, False, list(fail_reasons or ["no_setup"]), skip_details)
+                return None
+
+        # A candidate whose judgement raises is skipped alone, fail closed,
+        # and the pass goes on (key_levels' rule since 2026-10-13, this
+        # strategy's since 2026-11-08): until then the raise ended the pass,
+        # so a signal built earlier in it never reached the entry stage while
+        # its bucket's verdict read ltf_bucket_signalled.
+        for candidate in candidates:
+            try:
+                signal = judge(candidate)
+            except Exception as exc:
+                self._entry_pass_failed(candidate.symbol, exc)
+                continue
+            self._entry_error_streaks.pop(candidate.symbol, None)
+            if signal is not None:
+                out.append(signal)
         return out

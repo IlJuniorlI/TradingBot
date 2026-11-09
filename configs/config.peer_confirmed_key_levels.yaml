@@ -610,6 +610,8 @@ strategies:
       min_peer_agreement: 3
       min_peer_score: 2
       min_rr: 1.75
+      # The entry at most this many trigger-frame (5m) ATRs from the level it defends (null: no bound).
+      max_entry_distance_from_level_atr: 1.0
       min_ltf_bars: 18
       # The 4-part base trigger (CHoCH, volume spike, candle, a real sweep of
       # the level) must reach it; the quality bonus only ranks (2026-10-13).

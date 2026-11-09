@@ -39,7 +39,7 @@ For longs, it wants things like:
 - EMA9 above EMA20
 - minimum recent return thresholds
 - limited extension from VWAP
-- the pullback low to keep holding relative support
+- the pullback low to have come to the relative support and held it: within `support_hold_pct` above min(VWAP, EMA20) and no more than `support_hold_pct` under it (`no_pullback_to_support` / `pullback_lost_support`; a short mirrors them on max(VWAP, EMA20), `no_bounce_to_resistance` / `bounce_lost_resistance`). Until 2026-11-08 only the hold was tested, so a tape whose low never came near the support read as a pullback that held (the whole-bot review's R-014)
 - a fresh re-expansion trigger
 - a strong close on the trigger bar
 

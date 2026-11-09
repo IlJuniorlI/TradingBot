@@ -85,7 +85,7 @@
     "pivot_rejection_allows_neutral_ltf_structure": true,
     "pivot_continuation_breakout_buffer_pct": 0.0009,
     "pivot_continuation_interaction_lookback_bars": 9,
-    "pivot_continuation_max_distance_atr": 1.45,
+    "pivot_sweep_lookback_bars": 4,
     "min_ltf_close_position": 0.6,
     "min_ltf_volume_ratio": 1.0,
     "min_adx14": 12.5,

@@ -56,7 +56,7 @@ from .models import (
     asset_type_of,
     is_option_asset,
 )
-from .options_mode import realized_max_loss_per_contract
+from .options_mode import decayed_premium_levels, realized_max_loss_per_contract, time_decay_scale_of
 from .paper_account import PaperAccount
 from .position_manager import PositionManager
 from .position_store import ReconcileMetadataStore
@@ -252,14 +252,12 @@ class EntryGatekeeper:
         asset_type = asset_type_of(metadata)
         entry_value = max(0.01, float(entry_price))
         if asset_type == ASSET_TYPE_OPTION_VERTICAL and signal.side.value == "LONG":
-            debit_stop_frac = float(self.config.options.debit_stop_frac)
-            debit_target_mult = float(self.config.options.debit_target_mult)
-            # Apply time-decay scaling if the signal builder stored it.
-            tds = safe_float(metadata.get("time_decay_scale"), 1.0) or 1.0
-            if tds < 1.0:
-                debit_target_mult = max(1.01, 1.0 + (debit_target_mult - 1.0) * tds)
-                widen = self.config.options.debit_stop_time_decay_widen_factor
-                debit_stop_frac = max(0.01, min(0.99, debit_stop_frac * (1.0 + (1.0 - tds) * widen)))
+            # The time-decay scale the builder stamped (both builders since
+            # 2026-11-08, R-028), through the one formula (R-029).
+            tds = time_decay_scale_of(metadata)
+            debit_stop_frac, debit_target_mult = decayed_premium_levels(
+                self.config.options.debit_stop_frac, self.config.options.debit_target_mult, tds,
+                self.config.options.debit_stop_time_decay_widen_factor)
             stop = entry_value * debit_stop_frac
             target = entry_value * debit_target_mult
             stop = max(0.01, min(stop, entry_value - 0.01))
@@ -283,13 +281,10 @@ class EntryGatekeeper:
             metadata["max_profit_per_contract"] = max(0.0, entry_value)
             return stop, target, metadata
         if asset_type == ASSET_TYPE_OPTION_SINGLE:
-            single_stop_frac = float(self.config.options.single_stop_frac)
-            single_target_mult = float(self.config.options.single_target_mult)
-            tds = safe_float(metadata.get("time_decay_scale"), 1.0) or 1.0
-            if tds < 1.0:
-                single_target_mult = max(1.01, 1.0 + (single_target_mult - 1.0) * tds)
-                widen = self.config.options.debit_stop_time_decay_widen_factor
-                single_stop_frac = max(0.01, min(0.99, single_stop_frac * (1.0 + (1.0 - tds) * widen)))
+            tds = time_decay_scale_of(metadata)
+            single_stop_frac, single_target_mult = decayed_premium_levels(
+                self.config.options.single_stop_frac, self.config.options.single_target_mult, tds,
+                self.config.options.debit_stop_time_decay_widen_factor)
             stop = entry_value * single_stop_frac
             target = entry_value * single_target_mult
             stop = max(0.01, min(stop, entry_value - 0.01))

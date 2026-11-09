@@ -1042,7 +1042,7 @@ strategies:
       pivot_continuation_breakout_buffer_pct: 0.0009
       pivot_continuation_family_bonus: -0.12
       pivot_continuation_interaction_lookback_bars: 9
-      pivot_continuation_max_distance_atr: 1.45
+      pivot_sweep_lookback_bars: 4
       pivot_invalidated_zone_penalty: 1.0
       pivot_original_zone_hold_bonus: 0.18
       pivot_pending_flip_zone_penalty: 0.5

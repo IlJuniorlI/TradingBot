@@ -35,10 +35,12 @@ The setup has two main components:
 
 For a good continuation trade, the strategy wants the pullback to be:
 
-- controlled in depth
-- limited in duration
-- not dominated by aggressive countertrend volume
-- still above support / below resistance in a trend-respecting way
+- a pullback at all: the impulse's extreme is the highest high (lowest low, for a short) among the last `max_pullback_bars` + 2 completed trigger buckets, and the buckets after it are the pullback, `min_pullback_bars` to `max_pullback_bars` of them — fewer, and the trigger scores 0 (`no_pullback`); an extreme on the window's first bucket is a decline longer than the knob (`pullback_too_long`, score 0 too); either way `weak_ltf_score` refuses the side. A straight grind to new highs puts the extreme on the last bucket
+- controlled in depth: the extreme less the pullback's low, in 5m ATRs, within [`min_pullback_depth_atr`, `max_pullback_depth_atr`] (`pullback_too_shallow_atr` / `pullback_too_deep_atr` withhold the point). The preset's 1.0-3.0 is derived from H:'s 5m bars (10-20..11-06: the detected pullbacks' depth p10 1.2, median 2.0, p90 3.4 ATR); the old 1.05 was the old arithmetic's bound
+- holding EMA20 less `pullback_hold_atr` ATR (`pullback_lost_ema20`)
+- not dominated by aggressive countertrend volume: the pullback's mean volume at most `max_countertrend_volume_ratio` × the impulse's, the same count of buckets ending at the extreme (`heavy_countertrend_volume`)
+
+Until 2026-11-08 (the whole-bot review's R-013, R-069) the "pullback" was the last `max_pullback_bars` buckets' low against a 3-bucket high, with no swing and no bucket count, so a 6-bucket grind to new highs scored the full pullback and a fast impulse-then-pullback read as too deep with the stop at the impulse's origin; and the countertrend ratio was a 6-bucket mean over a 7-bucket mean containing it, at most 1.17, so the 1.28 knob never fired and its half point was a constant.
 
 ### 4. Then it wants a fresh re-expansion trigger
 
@@ -59,7 +61,9 @@ So the strategy is continuation-first, but still disciplined about not entering 
 
 ### 6. Stops, targets, and management
 
-The stop is anchored to the pullback structure with ATR buffering. The target starts from reward-to-risk logic and can extend for stronger continuation setups. The shared entry stage can refine both (`shared_entry.use_sr_stop_target_refinement` / `use_technical_stop_target_refinement`), and shared adaptive management — on the refined levels and the FVG term's continuation bias — can then give the stronger trends more room when the context supports it.
+**The setup is judged on the last completed trigger bucket, once (2026-11-08, R-009).** The trigger frame is the 1m step frame resampled to `ltf_minutes` without its forming bucket (key_levels' rule since 2026-10-13, base README section 4): the first pass that sees a bucket complete judges it and an entry can fire on that pass; every later pass repeats its verdict (`ltf_bucket_repeat`, `ltf_bucket_signalled(bucket=HH:MM)`) until the next bucket completes; a bucket first seen more than a minute past its end is missed unjudged (`ltf_bucket_missed(...)`), and one whose symbol owes a stream backfill waits (`ltf_bucket_backfill_pending(...)`). Until then every trigger term read the forming bucket, 1-4 minutes of a 5m candle against full ones, up to five looks a bucket.
+
+The stop is anchored to the pullback's low with ATR buffering, and `risk.default_stop_pct` floors its distance: 0.005 in the shipped preset since 2026-11-08 (0.018 before, the dataclass default, 2.6-6.8 five-minute ATRs on the preset's names, which set about 95% of the stops and sized every position and every R-keyed target and stop move off it, R-008). The target starts from reward-to-risk logic and can extend for stronger continuation setups. The shared entry stage can refine both (`shared_entry.use_sr_stop_target_refinement` / `use_technical_stop_target_refinement`), and shared adaptive management — on the refined levels and the FVG term's continuation bias — can then give the stronger trends more room when the context supports it.
 
 The signal carries `regime: trend_continuation`, `entry_style_family: continuation`, the structure fields as `msltf_*` (`ms_ltf_*` until 2026-09-24), `strategy_priority_score` (the total score plus the activity term), `shared_context_score` (the entry-context and FVG terms — its `execution_quality_score` — with the HTF divergence term on this strategy's own HTF context) and `final_priority_score` = the two added, the same total as before (this strategy always summed the entry-context terms). `selection_quality_score` equals `final_priority_score`; the gatekeeper ranks on `ltf_score + 0.5 × shared_context_score` (manifest `signal_priority.shared_score_weight`, user decision 3), then the manifest's tail.
 
@@ -98,12 +102,12 @@ Strategy-specific knobs:
   - `ltf_minutes`, `min_bars`, `min_ltf_bars`
 - Continuation scoring and pullback quality:
   - `min_total_score`, `min_ltf_score`, `min_adx14`
-  - `min_pullback_bars`, `max_pullback_bars`, `max_pullback_depth_atr`, `pullback_hold_atr`, `max_countertrend_volume_ratio`
+  - `min_pullback_bars`, `max_pullback_bars`, `min_pullback_depth_atr`, `max_pullback_depth_atr`, `pullback_hold_atr`, `max_countertrend_volume_ratio` (each checked at load since 2026-11-08, the bounds ordered)
 - Re-expansion trigger detail:
   - `breakout_buffer_pct`, `min_ltf_close_position`, `min_ltf_volume_ratio`
 - Anti-chase / extension controls:
   - `max_extension_from_vwap_atr`, `max_extension_from_ema9_atr`, `extension_penalty_per_atr`, `extension_hard_cap_mult`
-  - past `max_extension_from_*_atr` the score pays `extension_penalty_per_atr` per ATR; past that times `extension_hard_cap_mult` the side is refused as `too_extended_hard_cap_vwap_atr` / `too_extended_hard_cap_ema9_atr` (before 2026-09-26 it reused the base exhaustion filter's `too_extended_from_*_atr`, which `max_entry_*_extension_atr` still drives)
+  - past `max_extension_from_*_atr` the score pays `extension_penalty_per_atr` per ATR; past that times `extension_hard_cap_mult` the side is refused as `too_extended_hard_cap_vwap_atr` / `too_extended_hard_cap_ema9_atr` (before 2026-09-26 it reused the base exhaustion filter's `too_extended_from_*_atr`, which `max_entry_*_extension_atr` still drives). The base filter's own thresholds, `entry_exhaustion_filter_enabled`, `max_entry_vwap_extension_atr` and `max_entry_ema9_extension_atr`, are declared since 2026-11-08 at the band's hard cap (1.5225 / 1.276) and checked at load to be no tighter than the band: until then they were the undeclared defaults 0.95 / 0.75, under the band's 1.05 / 0.88, so the filter refused before the penalty could count and the four documented knobs changed no decision on the chase side (R-070)
   - both read the close's absolute distance from VWAP / EMA9 in ATR, so a close that far on the wrong side of the line (a LONG below it, a SHORT above) pays the same penalty and is refused too, as `wrong_side_hard_cap_vwap_atr` / `wrong_side_hard_cap_ema9_atr` (before 2026-09-26 under the `too_extended_hard_cap_*` tokens); the base exhaustion filter measures only the side's own direction
 - Peer and macro confirmation:
   - `min_peer_agreement`, `min_peer_score`, `peer_max_age_minutes`
@@ -167,7 +171,8 @@ Current package defaults:
 | `min_adx14`                       | `13.5`                                    |
 | `max_pullback_bars`               | `6`                                       |
 | `min_pullback_bars`               | `2`                                       |
-| `max_pullback_depth_atr`          | `1.05`                                    |
+| `min_pullback_depth_atr`          | `1.0`                                     |
+| `max_pullback_depth_atr`          | `3.0`                                     |
 | `pullback_hold_atr`               | `0.38`                                    |
 | `max_countertrend_volume_ratio`   | `1.28`                                    |
 | `breakout_buffer_pct`             | `0.0007`                                  |
@@ -192,6 +197,9 @@ Current package defaults:
 | `macro_miss_penalty`              | `0.3`                                     |
 | `extension_penalty_per_atr`       | `0.72`                                    |
 | `extension_hard_cap_mult`         | `1.45`                                    |
+| `entry_exhaustion_filter_enabled` | `true`                                    |
+| `max_entry_vwap_extension_atr`    | `1.5225`                                  |
+| `max_entry_ema9_extension_atr`    | `1.276`                                   |
 | `force_flatten`                   | `{'long': True, 'short': True}`           |
 | `force_flatten_buffer_minutes`    | `5`                                       |
 | `entry_cutoff_lead_minutes`       | `10`                                      |

@@ -50,9 +50,9 @@ That means a level can no longer look good on price alone while its matching non
 
 The actual trigger can come from one of three families:
 
-- **pivot reclaim**: price sweeps or trades into the pivot zone and then reclaims it
-- **pivot rejection**: price tests the pivot zone and visibly rejects it
-- **pivot continuation**: price bases around the pivot and then continues away from it in the expected direction
+- **pivot reclaim**: price sweeps or trades into the pivot zone within the last `pivot_sweep_lookback_bars` completed trigger buckets (4 in the preset, 20 minutes) and the trigger bucket reclaims it; the stop anchors on that window's low. The sweep is still a state over those 4 buckets, not a first-reclaim event: up to 4 consecutive buckets can each signal, bounded by the cooldown and the same-level block. Until 2026-11-08 the whole trigger context counted (19 buckets, 95 minutes), so a dip 90 minutes old kept every later bullish bar near the pivot qualifying as a "reclaim" (the whole-bot review's R-063)
+- **pivot rejection**: price tests the pivot zone (within the same window) and visibly rejects it
+- **pivot continuation**: price bases around the pivot (a low within 1.25 zones of it inside `pivot_continuation_interaction_lookback_bars`, `pivot_not_interacted` otherwise; the pivot held, no low under `pivot - zone`, over the whole 19-bucket context) and then continues away from it in the expected direction. Until 2026-11-08 the base was `interacted or distance <= 1.45 ATR`, always true past the 1.35 ATR gate (`max_continuation_distance_from_pivot_atr`), so the point was a constant; `pivot_continuation_max_distance_atr` is gone, and a config that still sets it refuses to load (R-064)
 
 When `entry_family=auto`, the strategy evaluates all three, slightly **prefers reclaim first, then rejection, then continuation** when raw scores are close, and otherwise falls back to the best weighted fit. That means `auto` is still a structured best-fit selector, but it is now intentionally tuned toward S/R reactions before breakout continuation.
 
@@ -81,7 +81,9 @@ That is why this strategy can be aggressive around pivots without turning into a
 
 ### 7. How the trade is framed
 
-The stop is anchored to the chosen support / resistance battleground with ATR buffering. The first target now starts from the **next opposing S/R level** when that gives enough room, and only falls back to reward-to-risk expansion logic when needed. The shared entry stage can then refine both (`shared_entry.use_sr_stop_target_refinement` / `use_technical_stop_target_refinement`), and the management reads the refined levels and the FVG term's continuation bias; the runner still keys on the strategy's own total score.
+**The setup is judged on the last completed trigger bucket, once (2026-11-08, R-009).** The trigger frame is the 1m step frame resampled to `ltf_minutes` without its forming bucket (key_levels' rule since 2026-10-13, base README section 4): the first pass that sees a bucket complete judges it and an entry can fire on that pass; every later pass repeats its verdict (`ltf_bucket_repeat`, `ltf_bucket_signalled(bucket=HH:MM)`) until the next bucket completes; a bucket first seen more than a minute past its end is missed unjudged (`ltf_bucket_missed(...)`), and one whose symbol owes a stream backfill waits (`ltf_bucket_backfill_pending(...)`). The regime, the family trigger, the volume ratio, the structure and technical contexts all read that frame; the battleground's zone flip is confirmed on the 1m step frame, the frame the S/R context classified the same level on. Until then every trigger term read the forming bucket, 1-4 minutes of a 5m candle against full ones, up to five looks a bucket, the 5m frame's buckets were counted as 1m flip-confirmation bars, and the pivot map was built on the forming bucket too.
+
+The stop is anchored to the chosen support / resistance battleground with ATR buffering, and `risk.default_stop_pct` floors its distance: 0.005 in the shipped preset since 2026-11-08 (0.018 before, the dataclass default, 2.6-6.8 five-minute ATRs on the preset's names, which set about 95% of the stops and sized every position and every R-keyed target and stop move off it, R-008). The first target now starts from the **next opposing S/R level** when that gives enough room, and only falls back to reward-to-risk expansion logic when needed. The shared entry stage can then refine both (`shared_entry.use_sr_stop_target_refinement` / `use_technical_stop_target_refinement`), and the management reads the refined levels and the FVG term's continuation bias; the runner still keys on the strategy's own total score.
 
 The signal carries `regime` = the pivot family (`pivot_reclaim` / `pivot_rejection` / `pivot_continuation`), `entry_style_family: pivot`, the structure fields as `msltf_*` (`ms_ltf_*` until 2026-09-24), `strategy_priority_score` (the total score plus the activity term), `shared_context_score` (the FVG and HTF divergence terms — the latter on this family's 60m context — plus any entry-context term the YAML switches on) and `final_priority_score` = the two added. `selection_quality_score` equals `final_priority_score`, as before; the gatekeeper ranks on `ltf_score + 0.5 × shared_context_score` (manifest `signal_priority.shared_score_weight`, user decision 3), then the manifest's tail.
 
@@ -132,7 +134,7 @@ Strategy-specific knobs:
   - `pivot_confirmed_flip_zone_bonus`, `pivot_original_zone_hold_bonus`, `pivot_pending_flip_zone_penalty`, `pivot_invalidated_zone_penalty`
   - `pivot_reclaim_buffer_pct`, `pivot_reclaim_zone_frac`
   - `pivot_rejection_min_wick_frac`, `pivot_rejection_allows_neutral_ltf_structure`
-  - `pivot_continuation_breakout_buffer_pct`, `pivot_continuation_interaction_lookback_bars`, `pivot_continuation_max_distance_atr`
+  - `pivot_continuation_breakout_buffer_pct`, `pivot_continuation_interaction_lookback_bars`, `pivot_sweep_lookback_bars` (checked at load: a whole number at least 1)
 - Trigger quality and anti-chase:
   - `min_ltf_close_position`, `min_ltf_volume_ratio`, `min_adx14`
   - `max_reclaim_distance_from_pivot_atr`, `max_rejection_distance_from_pivot_atr`, `max_continuation_distance_from_pivot_atr`
@@ -215,7 +217,7 @@ Current package defaults:
 | `pivot_rejection_allows_neutral_ltf_structure` | `true`                                          |
 | `pivot_continuation_breakout_buffer_pct`       | `0.0009`                                        |
 | `pivot_continuation_interaction_lookback_bars` | `9`                                             |
-| `pivot_continuation_max_distance_atr`          | `1.45`                                          |
+| `pivot_sweep_lookback_bars`                    | `4`                                             |
 | `min_ltf_close_position`                   | `0.6`                                           |
 | `min_ltf_volume_ratio`                     | `1.0`                                           |
 | `min_adx14`                                    | `12.5`                                          |

@@ -52,7 +52,7 @@ That is why a name can look visually interesting but still be skipped: the strat
 
 ### 5. Stop, target, and management
 
-The initial stop starts under the recent three-bar low. The first target points back toward the session-high area, capped at `min(2%, risk.default_target_pct)` above the close. The shared stage refines both sides as above; the strategy then adds adaptive management in the `reversal` style.
+The initial stop starts under the recent three-bar low, at least `risk.default_stop_pct` under the close (2026-11-08, R-003). The first target points back toward the session-high area, capped at `min(2%, risk.default_target_pct)` above the close. The shared stage refines both sides as above; the strategy then adds adaptive management in the `reversal` style.
 
 Because this is a **reversal-style** setup, the strategy does not automatically treat it like a full continuation runner: the runner stays off and the management leans on the FVG reversal bias. It is more conservative than a trend-following breakout system. Its own priority (`strategy_priority_score`: screener strength, the bounce, pattern quality) plus the shared context terms (`shared_context_score`) is the `final_priority_score` the gatekeeper ranks on, and the signal is stamped `entry_style_family: reversal`.
 

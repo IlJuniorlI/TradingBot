@@ -46,6 +46,7 @@ from .data_feed import MarketDataStore
 from .levels_shared import effective_side_tolerance, select_next_distinct_level
 from .models import ExitDecision, Position, Side, is_option_asset
 from .numeric import first_float, safe_float
+from .options_mode import time_decay_scale_of
 from .position_metrics import (
     LADDER_TOUCH_HOLD_KEY,
     PEAK_GIVEBACK,
@@ -693,9 +694,18 @@ class TradeManager:
             opt_entry = max(0.01, float(position.entry_price))
             if position.side == Side.LONG:
                 opt_peak = float(position.highest_price) if position.highest_price is not None else float(last_price)
+                # The marks and the stops scale with the position's decayed
+                # target (``time_decay_scale``, the builder's stamp; R-153,
+                # 2026-11-08): a debit entered after 11:48 on the preset
+                # had a target under 1.40x the entry, so the 1.40x lock
+                # could arm only on a mark past the target, which exits
+                # first. The multiples' excess over the entry shrinks as
+                # the target's does, so the order mark < target holds at
+                # every scale (checked at load against the target multiples).
+                tds = time_decay_scale_of(meta)
                 if opt_cfg.options_breakeven_enabled:
-                    be_thresh = opt_entry * opt_cfg.options_breakeven_mark_mult
-                    be_stop = opt_entry * opt_cfg.options_breakeven_stop_mult
+                    be_thresh = opt_entry * (1.0 + (opt_cfg.options_breakeven_mark_mult - 1.0) * tds)
+                    be_stop = opt_entry * (1.0 + (opt_cfg.options_breakeven_stop_mult - 1.0) * tds)
                     if opt_peak >= be_thresh and be_stop > float(position.stop_price):
                         prior = float(position.stop_price)
                         position.stop_price = float(be_stop)
@@ -703,8 +713,8 @@ class TradeManager:
                             append_management_adjustment(meta,{"manager": "options_ratchet", "kind": "stop", "reason": "breakeven", "from": prior, "to": float(be_stop)})
                             meta["options_breakeven_armed"] = True
                 if opt_cfg.options_profit_lock_enabled:
-                    pl_thresh = opt_entry * opt_cfg.options_profit_lock_mark_mult
-                    pl_stop = opt_entry * opt_cfg.options_profit_lock_stop_mult
+                    pl_thresh = opt_entry * (1.0 + (opt_cfg.options_profit_lock_mark_mult - 1.0) * tds)
+                    pl_stop = opt_entry * (1.0 + (opt_cfg.options_profit_lock_stop_mult - 1.0) * tds)
                     if opt_peak >= pl_thresh and pl_stop > float(position.stop_price):
                         prior = float(position.stop_price)
                         position.stop_price = float(pl_stop)

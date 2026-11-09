@@ -11,6 +11,7 @@ from ...options_mode import (
     clamp_long_premium_levels,
     choose_by_delta,
     single_option_limit_price,
+    decayed_premium_levels,
 )
 from ...numeric import first_float, safe_float
 from ...reasons import reason_with_values
@@ -141,13 +142,10 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
         nat_bid, nat_ask, quoted_mid = market
         entry_limit = single_option_limit_price(contract, mode=self.optcfg.option_limit_mode, opening=True)
         entry_value = entry_limit * 100.0
-        single_stop_frac = max(0.01, min(0.99, float(self.optcfg.single_stop_frac)))
-        single_target_mult = max(1.01, float(self.optcfg.single_target_mult))
         time_decay_scale = self._compute_time_decay_scale()
-        if time_decay_scale < 1.0:
-            single_target_mult = max(1.01, 1.0 + (single_target_mult - 1.0) * time_decay_scale)
-            widen = self.optcfg.debit_stop_time_decay_widen_factor
-            single_stop_frac = max(0.01, min(0.99, single_stop_frac * (1.0 + (1.0 - time_decay_scale) * widen)))
+        single_stop_frac, single_target_mult = decayed_premium_levels(
+            self.optcfg.single_stop_frac, self.optcfg.single_target_mult, time_decay_scale,
+            self.optcfg.debit_stop_time_decay_widen_factor)
         stop = entry_value * single_stop_frac
         target = entry_value * single_target_mult
         stop, target = clamp_long_premium_levels(entry_value, stop, target)
@@ -165,6 +163,11 @@ class ZeroDteEtfLongOptionsStrategy(ZeroDteEtfOptionsStrategy):
             "direction": "bullish" if bullish else "bearish",
             "option_type": put_call,
             "entry_price": entry_value,
+            # The gatekeeper rebuilds the levels from the fill with this
+            # scale (R-028, 2026-11-08): until then the single's metadata
+            # carried none, so the position was booked on the undecayed
+            # 0.38 / 1.50 while ENTRY_CONTEXT showed the decayed levels.
+            "time_decay_scale": round(time_decay_scale, 4),
             "mark_price_hint": quoted_mid * 100.0,
             "max_loss_per_contract": entry_value,
             "max_profit_per_contract": None,

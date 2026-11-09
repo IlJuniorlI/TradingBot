@@ -84,7 +84,8 @@ class ClosingReversalStrategy(BaseStrategy):
                 style="reversal",
                 style_family="reversal",
                 close=last_close,
-                stop=float(last3["low"].min()),
+                # The 3-bar low, at least default_stop_pct under the close (R-003, 2026-11-08).
+                stop=min(float(last3["low"].min()), last_close * (1.0 - self.config.risk.default_stop_pct)),
                 target=min(session_high, default_target) if session_high > last_close * 1.003 else default_target,
                 gate_frame=frame,
                 sr_frame=frame,

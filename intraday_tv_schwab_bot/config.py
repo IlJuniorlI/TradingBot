@@ -2500,6 +2500,28 @@ def _validate_options_config(options: "ZeroDteOptionsConfig", config_path: Path)
                 and stop_value >= mark_value):
             errors.append(f"options.{stop} ({stop_value!r}) must be below options.{mark} ({mark_value!r}): the stop a "
                           f"ratchet moves to sits under the mark that arms it")
+    # An enabled ratchet's mark sits under the targets, so it can arm before
+    # the target exits (R-153, R-154, 2026-11-08): a bought premium's mark
+    # multiple under the debit and single target multiples (the three scale
+    # alike under the time decay), and a credit spread's threshold, the
+    # entry x (2 - mult), above its target, the entry x credit_target_frac.
+    def _number(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    for mark, enabled in (("options_breakeven_mark_mult", "options_breakeven_enabled"),
+                          ("options_profit_lock_mark_mult", "options_profit_lock_enabled")):
+        mark_value = getattr(options, mark)
+        if getattr(options, enabled) is not True or not _number(mark_value):
+            continue
+        for target_key in ("debit_target_mult", "single_target_mult"):
+            target = getattr(options, target_key)
+            if _number(target) and mark_value >= target:
+                errors.append(f"options.{mark} ({mark_value!r}) must be below options.{target_key} ({target!r}): the "
+                              f"target exits before the ratchet could arm")
+        frac = options.credit_target_frac
+        if _number(frac) and (2.0 - mark_value) <= frac:
+            errors.append(f"options.{mark} ({mark_value!r}) must be below 2 - options.credit_target_frac ({2.0 - frac:g}): "
+                          f"a credit spread's threshold, the entry x (2 - mult), sits at or under its target, which "
+                          f"exits first")
     _raise_section_errors("options", errors, config_path)
 
 

@@ -63,6 +63,7 @@
     "ltf_volume_quality_bonus_cap": 0.4,
     "ltf_range_expansion_bonus_cap": 0.4,
     "min_rr": 1.6,
+    "max_entry_distance_from_level_atr": 3.0,
     "stop_buffer_atr_mult": 0.56,
     "min_peer_agreement": 2,
     "min_peer_score": 2,

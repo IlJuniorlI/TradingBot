@@ -538,6 +538,9 @@ strategies:
       min_peer_agreement: 3
       min_peer_score: 2
       min_rr: 1.6
+      # The entry at most this many 1m ATRs from the level it defends (null: no bound):
+      # the 1m ATR is about a third of the 5m one, so 3.0 is the 5m preset's 1.0.
+      max_entry_distance_from_level_atr: 3.0
       min_ltf_bars: 55
       # The 4-part base trigger (CHoCH, volume spike, candle, a real sweep of
       # the level) must reach it; the quality bonus only ranks (2026-10-13).

@@ -1581,8 +1581,9 @@ Behavior and valid values:
 - Premium ratchet (post-entry stop management). All four premium-ratchet families are off by default; enable the ones you want active.
   - `options_breakeven_enabled` / `options_breakeven_mark_mult` / `options_breakeven_stop_mult`: when the option mark crosses `entry × options_breakeven_mark_mult`, ratchet the stop up to `entry × options_breakeven_stop_mult`. Locks a small protective gain on debit trades that go through their first push.
   - `options_profit_lock_enabled` / `options_profit_lock_mark_mult` / `options_profit_lock_stop_mult`: a second, looser ratchet that activates at a higher mark multiple and locks a larger fraction of the move. Stacks with `options_breakeven_*`.
+  - On a bought premium the marks' and stops' excess over the entry scales with the position's `time_decay_scale` (2026-11-08): a debit entered at scale 0.7 targets 1.315x, and the 1.40x lock arms at 1.28x instead of past the target. An enabled ratchet's mark multiple is checked at load to sit below `debit_target_mult` and `single_target_mult` (the three scale alike) and below `2 - credit_target_frac` (a credit spread's threshold is the entry x (2 - mult); at or under its target, the target exits first).
 - Time-decay-aware stop/target scaling for debit trades:
-  - `debit_target_time_decay_enabled`: master toggle. When `true`, the debit target shrinks linearly between `debit_target_time_decay_start` and `debit_target_time_decay_end` (HH:MM ET), and the debit stop widens proportionally so theta-decayed trades aren't stopped on noise.
+  - `debit_target_time_decay_enabled`: master toggle. When `true`, the debit target shrinks linearly between `debit_target_time_decay_start` and `debit_target_time_decay_end` (HH:MM ET), and the debit stop widens proportionally so theta-decayed trades aren't stopped on noise (one formula for the two builders and the post-fill rebuild, `options_mode.decayed_premium_levels`; until 2026-11-08 the four sites multiplied the stop fraction by `1 + (1 - scale) x widen`, raising the floor and tightening the stop by up to 9% of itself). Both builders stamp `time_decay_scale` on the signal, so the position is booked on the decayed levels (the single option's lacked it until 2026-11-08), and the premium ratchets' marks and stops scale with it (below).
   - `debit_target_time_decay_start` / `debit_target_time_decay_end`: scaling window. Outside this window, the standard `debit_target_mult` and `debit_stop_frac` apply unchanged.
   - `debit_target_time_decay_min_scale`: lower bound on the target scale at the end of the window (e.g. `0.70` = target collapses to 70% of `debit_target_mult` by `debit_target_time_decay_end`).
   - `debit_stop_time_decay_widen_factor`: how much the stop widens at the end of the window relative to the target shrink (e.g. `0.30` = stop loosens by 30% × the target shrink).
@@ -2153,7 +2154,7 @@ Strategy-specific knobs:
   - `ltf_minutes`, `min_bars`, `min_ltf_bars`
 - Continuation scoring and pullback quality:
   - `min_total_score`, `min_ltf_score`, `min_adx14`
-  - `min_pullback_bars`, `max_pullback_bars`, `max_pullback_depth_atr`, `pullback_hold_atr`, `max_countertrend_volume_ratio`
+  - `min_pullback_bars`, `max_pullback_bars`, `min_pullback_depth_atr`, `max_pullback_depth_atr`, `pullback_hold_atr`, `max_countertrend_volume_ratio`; the base exhaustion filter's `entry_exhaustion_filter_enabled`, `max_entry_vwap_extension_atr`, `max_entry_ema9_extension_atr` (declared at the extension band's hard cap since 2026-11-08)
 - Re-expansion trigger detail:
   - `breakout_buffer_pct`, `min_ltf_close_position`, `min_ltf_volume_ratio`
 - Anti-chase / extension controls:
@@ -2214,7 +2215,8 @@ Current package defaults:
 | `min_adx14`                       | `13.5`                                    |
 | `max_pullback_bars`               | `6`                                       |
 | `min_pullback_bars`               | `2`                                       |
-| `max_pullback_depth_atr`          | `1.05`                                    |
+| `min_pullback_depth_atr`          | `1.0`                                     |
+| `max_pullback_depth_atr`          | `3.0`                                     |
 | `pullback_hold_atr`               | `0.38`                                    |
 | `max_countertrend_volume_ratio`   | `1.28`                                    |
 | `breakout_buffer_pct`             | `0.0007`                                  |
@@ -2474,7 +2476,7 @@ Strategy-specific knobs:
   - `pivot_zone_atr_mult`, `pivot_zone_pct`
   - `pivot_reclaim_buffer_pct`, `pivot_reclaim_zone_frac`
   - `pivot_rejection_min_wick_frac`, `pivot_rejection_allows_neutral_ltf_structure`
-  - `pivot_continuation_breakout_buffer_pct`, `pivot_continuation_interaction_lookback_bars`, `pivot_continuation_max_distance_atr`
+  - `pivot_continuation_breakout_buffer_pct`, `pivot_continuation_interaction_lookback_bars`, `pivot_sweep_lookback_bars`
 - Trigger quality and anti-chase:
   - `min_ltf_close_position`, `min_ltf_volume_ratio`, `min_adx14`
   - `max_reclaim_distance_from_pivot_atr`, `max_rejection_distance_from_pivot_atr`, `max_continuation_distance_from_pivot_atr`
@@ -2536,7 +2538,7 @@ Current package defaults:
 | `pivot_rejection_allows_neutral_ltf_structure` | `True`                                          |
 | `pivot_continuation_breakout_buffer_pct`       | `0.0009`                                        |
 | `pivot_continuation_interaction_lookback_bars` | `9`                                             |
-| `pivot_continuation_max_distance_atr`          | `1.45`                                          |
+| `pivot_sweep_lookback_bars`                    | `4`                                             |
 | `min_ltf_close_position`                   | `0.6`                                           |
 | `min_ltf_volume_ratio`                     | `1.0`                                           |
 | `min_adx14`                                    | `12.5`                                          |

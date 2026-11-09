@@ -40,7 +40,12 @@ risk:
   max_notional_per_trade: 16000.0
   max_total_notional: 48000.0
   max_daily_loss: 400.0
-  default_stop_pct: 0.018
+  # The stop's distance floor, in fraction of price (2026-11-08, R-008). 0.018
+  # was the dataclass default, 2.6-6.8 five-minute ATRs on these names, and set
+  # about 95% of the stops. At 0.005 the structural stop (the pullback's low
+  # less the 0.5 ATR buffer; median 0.75% of price, 2.2 ATR, on H: 10-20..11-06)
+  # sets about four stops in five and the floor the rest.
+  default_stop_pct: 0.005
   default_target_pct: 0.038
   trailing_stop_pct: 0.014
   trade_management_mode: adaptive
@@ -533,8 +538,17 @@ strategies:
       max_countertrend_volume_ratio: 1.28
       max_extension_from_ema9_atr: 0.88
       max_extension_from_vwap_atr: 1.05
+      # The base exhaustion filter's thresholds, at the band's hard cap (the band x
+      # extension_hard_cap_mult), so the extension penalty is live between them.
+      entry_exhaustion_filter_enabled: true
+      max_entry_vwap_extension_atr: 1.5225
+      max_entry_ema9_extension_atr: 1.276
       max_pullback_bars: 6
-      max_pullback_depth_atr: 1.05
+      # The pullback's depth from the impulse's extreme to its low, in 5m ATRs
+      # (2026-11-08, measured on H: 10-20..11-06: p10 1.2, median 2.0, p90 3.4;
+      # 1.05 was the old arithmetic's bound and would withhold the point on 95%).
+      max_pullback_depth_atr: 3.0
+      min_pullback_depth_atr: 1.0
       min_adx14: 13.5
       min_bars: 85
       min_peer_agreement: 2

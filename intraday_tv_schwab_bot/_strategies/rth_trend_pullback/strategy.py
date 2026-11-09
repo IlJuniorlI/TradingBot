@@ -104,6 +104,11 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                 trigger_level = trigger_high
                 trigger_fired = bool(self._structure_event_recent(getattr(ms_ctx, "bos_up_age_bars", None)) and getattr(ms_ctx, "bos_up", False)) or last_close > trigger_high
                 pullback_hold_ok = pullback_low >= (support_ref * (1.0 - support_hold_pct)) if support_ref > 0 else True
+                # A pullback came TO the support (R-014, 2026-11-08): the slice's
+                # low within support_hold_pct above min(VWAP, EMA20). Until then
+                # the hold was one-sided, so a tape whose low never came near
+                # the support passed as a pullback that held.
+                pullback_touched = pullback_low <= (support_ref * (1.0 + support_hold_pct)) if support_ref > 0 else True
                 if day_strength < min_change:
                     reasons.append(reason_with_values("weak_day_strength", current=day_strength, required=min_change, op=">=", digits=4))
                 if last_close <= last_vwap:
@@ -118,6 +123,8 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                     reasons.append(reason_with_values("too_extended_from_vwap", current=extension_pct, required=max_extension, op="<=", digits=4))
                 if not pullback_hold_ok:
                     reasons.append(reason_with_values("pullback_lost_support", current=pullback_low, required=support_ref * (1.0 - support_hold_pct), op=">=", digits=4))
+                elif not pullback_touched:
+                    reasons.append(reason_with_values("no_pullback_to_support", current=pullback_low, required=support_ref * (1.0 + support_hold_pct), op="<=", digits=4))
                 if not trigger_fired:
                     reasons.append(reason_with_values("no_reexpansion_trigger", current=last_close, required=trigger_high, op=">", digits=4))
                 if close_pos < min_bar_close_position:
@@ -135,6 +142,7 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                 trigger_level = trigger_low
                 trigger_fired = bool(self._structure_event_recent(getattr(ms_ctx, "bos_down_age_bars", None)) and getattr(ms_ctx, "bos_down", False)) or last_close < trigger_low
                 pullback_hold_ok = pullback_high <= (support_ref * (1.0 + support_hold_pct)) if support_ref > 0 else True
+                pullback_touched = pullback_high >= (support_ref * (1.0 - support_hold_pct)) if support_ref > 0 else True
                 if day_strength > -min_change:
                     reasons.append(reason_with_values("weak_day_weakness", current=day_strength, required=-min_change, op="<=", digits=4))
                 if last_close >= last_vwap:
@@ -149,6 +157,8 @@ class RTHTrendPullbackStrategy(BaseStrategy):
                     reasons.append(reason_with_values("too_extended_from_vwap", current=extension_pct, required=max_extension, op="<=", digits=4))
                 if not pullback_hold_ok:
                     reasons.append(reason_with_values("bounce_lost_resistance", current=pullback_high, required=support_ref * (1.0 + support_hold_pct), op="<=", digits=4))
+                elif not pullback_touched:
+                    reasons.append(reason_with_values("no_bounce_to_resistance", current=pullback_high, required=support_ref * (1.0 - support_hold_pct), op=">=", digits=4))
                 if not trigger_fired:
                     reasons.append(reason_with_values("no_reexpansion_trigger", current=last_close, required=trigger_low, op="<", digits=4))
                 if close_pos > (1.0 - min_bar_close_position):

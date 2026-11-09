@@ -52,7 +52,10 @@ risk:
   max_notional_per_trade: 4500.0
   max_total_notional: 9000.0
   max_daily_loss: 400.0
-  default_stop_pct: 0.018
+  # The stop's distance floor (2026-11-08, R-027): the box stop (the box plus a
+  # compression-scaled buffer) is 0.6-1.8% of price over the 1m ATR's range on
+  # the preset's names; 0.018, the dataclass default, set every stop.
+  default_stop_pct: 0.006
   default_target_pct: 0.038
   trailing_stop_pct: 0.014
   trade_management_mode: adaptive
