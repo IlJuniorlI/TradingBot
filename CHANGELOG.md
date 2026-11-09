@@ -9,6 +9,33 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A strategy's params key nothing declares refuses the load (the
+  whole-bot review's R-106, 2026-11-08).** `load_config` accepts a
+  `strategies.<name>.params` key the strategy's manifest declares or
+  `plugin_api.FRAMEWORK_PARAMS` names (the knobs the base strategy, the
+  shared entry policy, the rvol module, the indicators, the risk manager
+  and the dashboard's level spec read from any strategy's block, each with
+  its reader's own default), and refuses any other, naming the key and the nearest declared
+  one (`'pivot_sweep_lookback_bar' (did you mean 'pivot_sweep_lookback_bars'?)`);
+  until now such a key loaded unread and the code took its default, so a
+  retune the operator thought made never happened. The manifests declare
+  every knob the strategy's own code reads, at the value the code took
+  without them (small_cap_squeeze 76 keys of the top_tier engine it runs,
+  top_tier_adaptive 12, mean_reversion's and closing_reversal's screener
+  pullback, htf_pivots' HTF weight), so a preset can set what its strategy
+  reads; the guard
+  `tests/guards/test_plugin_contract.py` holds each manifest to its code's
+  literal reads and the framework set to the shared modules'. The
+  htf_pivots and trend_continuation presets drop the 13 key_levels keys
+  their strategies never reach (the strong-setup, LTF quality bonus and
+  `require_*` knobs of key_levels' own entry pass, which both replace); the
+  level-context keys they keep (`min_level_score`, `zone_atr_mult` 0.21,
+  `zone_pct`, `level_round_number_tolerance_pct`) are read by the
+  dashboard's level spec and the zone width; the 0DTE presets drop the two
+  benchmark rvol gate knobs their screeners never read. The removed
+  `pivot_continuation_max_distance_atr` is refused as a retired key, with
+  its replacement, rather than by the strategy's own check.
+
 - **The orders the bot sent are never left untracked across a cancel, a
   replacement, a restart or a poll (the whole-bot review's live-order
   safety set, 2026-11-08).**
@@ -398,9 +425,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `options.styles` holds distinct tokens of `OPTION_ENTRY_STYLES` (a
   typo'd style never traded, without a word). Not done here: top_tier's
   other params read with `bool()` / `float()` at signal time (R-079,
-  R-092) and the unknown-key check on a strategy's params (R-106: the
-  small_cap and peer manifests declare only part of what their presets
-  set), each a unit of its own.
+  R-092), a unit of its own; the unknown-key check on a strategy's params
+  (R-106) is the entry at the head of this section.
 
 - **The dashboard's figures say what they are** (the whole-bot review's
   R-032, R-133, R-108, R-109; 2026-11-08). The focus card names the gate
