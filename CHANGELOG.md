@@ -178,6 +178,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The key_levels preset's entry gates are retuned (2026-11-10).**
+  `configs/config.peer_confirmed_key_levels.yaml`: `min_level_score` 2.9 to
+  2.0, `min_peer_agreement` 3 to 2, `min_peer_score` 2 to 1, `min_ltf_score`
+  2.5 to 2.0, `require_htf_bias_alignment` true to false (a bias against the
+  side still refuses). Replays of the real code on 31 archived regular
+  sessions (09-18..11-09, macro votes from recorded VIX / TLT / dollar bars):
+  the old values opened 3 trades, all losers; with every gate loose (335
+  trades, +0.01R a trade) none of these four gates separated winners from
+  losers; the new values opened 44 (61% winners, +12.3R net of spreads,
+  positive in both halves of the days and on both sides). The values were
+  chosen on those days: in sample, for the dry run to judge. The manifest's
+  defaults and the 1-minute variant's preset are unchanged. Strategy README,
+  "Shipped reference".
+
 - **The top_tier preset stops entries at 13:00 (2026-11-10; 15:00 until
   then).** `entry_windows` ends at `13:00` and `no_new_entries_after` is
   `13:00`. On 31 replayed days (23 from 10-01..11-09, 8 held-out September
