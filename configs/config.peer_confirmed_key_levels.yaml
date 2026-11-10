@@ -606,21 +606,32 @@ strategies:
       level_round_number_tolerance_pct: 0.002
       level_score_raw_htf_weight: 0.65
       min_bars: 80
-      min_level_score: 2.9
-      min_peer_agreement: 3
-      min_peer_score: 2
+      # 2026-11-10 retune (min_level_score, the two peer knobs, min_ltf_score
+      # and require_htf_bias_alignment below). At 2.9 / 3 / 2 / 2.5 with the
+      # HTF alignment required, the real code opened 3 trades in 31 replayed
+      # regular sessions (09-18 .. 11-09, all losers). With every gate loose
+      # (335 trades) none of these four separated winners from losers, so each
+      # now asks for a real setup without starving the entry. Replayed with
+      # the macro gate on: 44 trades, 61% winners, +12.3R net of spreads. The
+      # values were chosen on those days, so the dry run is the test.
+      min_level_score: 2.0
+      min_peer_agreement: 2
+      min_peer_score: 1
       min_rr: 1.75
       # The entry at most this many trigger-frame (5m) ATRs from the level it defends (null: no bound).
       max_entry_distance_from_level_atr: 1.0
       min_ltf_bars: 18
       # The 4-part base trigger (CHoCH, volume spike, candle, a real sweep of
       # the level) must reach it; the quality bonus only ranks (2026-10-13).
-      min_ltf_score: 2.5
+      # 2.5 until 2026-11-10 (the retune note at min_level_score).
+      min_ltf_score: 2.0
       ltf_fvg_entry_weight: 0.2
       opposing_fvg_entry_penalty_mult: 1.0
       require_macro_agreement_count: 1
       require_macro_net_bias: true
-      require_htf_bias_alignment: true
+      # false since 2026-11-10 (the retune note at min_level_score): a neutral
+      # HTF bias no longer refuses the side; a bias AGAINST it still does.
+      require_htf_bias_alignment: false
       # key_levels' own S/R check: refuse when the peer target level ahead is
       # inside BOTH support_resistance.entry_min_clearance_pct AND _atr
       # (clearing either passes). It ran under shared_entry.use_sr_filter until

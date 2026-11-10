@@ -119,6 +119,14 @@ In plain English:
 
 Purpose: trade around hourly key levels/zones only when a tradable symbol, its peer basket, and optional macro symbols agree strongly enough, then take profit at the targeted rung of the cleaned S/R ladder, exiting early if price loses the level the entry defends (with `shared_exit.adaptive_ladder_touch_hold` on, a strong close at a rung moves the target to the next rung and the defended level to that rung).
 
+**The shipped preset's entry gates (2026-11-10 retune).** `configs/config.peer_confirmed_key_levels.yaml` sets `min_level_score: 2.0`, `min_peer_agreement: 2`, `min_peer_score: 1`, `min_ltf_score: 2.0` and `require_htf_bias_alignment: false` (2.9 / 3 / 2 / 2.5 / `true` until then; the tables below are the manifest's defaults, unchanged). Measured on replays of the real code over 31 archived regular sessions (2026-09-18 .. 11-09; macro votes from recorded VIX, TLT and dollar-index bars; costs = each name's quoted spread + 1 bp):
+
+- with the old values the preset opened 3 trades in the 31 sessions, all losers (-2.1R);
+- with every gate loose (level 1.5, no HTF alignment, peers 0 / 0, trigger 1.0, no distance cap, structure filter off) it opened 335, at +0.01R a trade, and none of the level score, the HTF alignment, the peer gate or the trigger score separated winners from losers; the macro gate did on the 14 days it was first read on (+0.45R against -0.20R) and did not on the 17 it was then tested on (+0.02R against -0.04R);
+- with the new values, the macro gate and the structure filter as shipped: 44 trades (24 of the 31 sessions), 61% winners, mean winner 0.90R, mean loser -0.71R, +12.3R; positive in both halves of the days (+2.8R, +9.5R) and on both sides (21 longs +6.3R, 23 shorts +6.0R).
+
+The new values were chosen after reading those same days, so that result is in sample and a dry run is its test. With macro confirmation on, VIX and $NYICDX print in the regular session only, so the preset opens nothing outside it (section 5, Age); the replays measured the regular session. The 1-minute variant's preset is unchanged and unmeasured.
+
 Default windows (the manifest's; the shipped preset runs all three 07:00-19:55):
 
 - `entry_windows`: `[['07:10', '15:15']]`
