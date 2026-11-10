@@ -225,6 +225,34 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The rest of top_tier's knobs are checked at load (2026-11-10; the
+  whole-bot review's R-092 and R-079, deferred on 2026-11-08).** 32
+  switches were read with `bool()`, so a quoted `"false"` read as true and
+  silently flipped a gate (`reject_*`, `require_*`), an ORB bypass, a regime
+  (`disable_*_regime`) or the armed retest; 29 numbers were read with
+  `float()` / `int()` at the first signal, so a quoted or null value raised
+  inside the entry pass mid-session and a 0 or a negative passed without a
+  word (a `min_*_score` of 0 qualified every regime on every bar; an
+  `armed_retest_max_minutes` of 0 pruned every arm, so trend and momentum
+  never entered; `adaptive_profit_lock_rr` 0 exited every trade at once).
+  All 61 are in `checked_knobs`' tables now, for both strategies that run
+  this engine: refused when the config loads and again when the strategy is
+  built, the key named. That is every switch the engine reads; about 60
+  other numbers are still read where they are used. `adaptive_profit_lock_stop_rr`
+  must be under `adaptive_profit_lock_rr`, and
+  `peak_giveback_high_conviction_min_r` at least `risk.peak_giveback_min_r`.
+  `armed_retest_min_close_position` is held to 0.05..0.95 and its silent
+  clamp is gone. Every shipped preset loads unchanged; a config
+  of your own that holds such a value now refuses to start. The strategy
+  README, section 26.
+
+- **A damaged giveback override stamp is reported once (2026-11-10).** A
+  position's `peak_giveback_min_r_override` that is not a finite number
+  above 0 (a restored position's damaged record) was logged at WARNING on
+  every management pass, and a NaN read as an override that armed the main
+  tier at any peak. It is logged once with its type and dropped from the
+  position, and the default arming holds.
+
 - **A 5m flip confirmation holds only to the newest closed 1m bar** (the
   whole-bot review's R-054 and R-130, 2026-11-08; `support_resistance.
   _flip_checker`): the 5m path confirms a reclaim (a loss) only while the
