@@ -9,6 +9,43 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **top_tier's trend-day pass (2026-11-10).** On a morning the symbol's
+  sector ETF already runs the trade's way by `trend_day_pass_sector_pct`
+  percent from its open, before `trend_day_pass_until`, a `trend` or
+  `momentum` entry whose armed retest has resolved (the confirmed retest, or
+  the held expiry's market entry) is no longer refused by three anti-chase
+  gates: the stretched check and its cooldown, the S/R veto's HTF clearance
+  (`too_close_to_htf_resistance` / `_support`; the shared stage's new
+  `EntryProposal.waive_sr_clearance`) and the exhaustion check's VWAP
+  extension. Every other gate judges the entry as ever: a missing stretched
+  read refuses, a breakout / breakdown flag's S/R block stays, the other
+  exhaustion checks stay, and a waived stretched read still starts the
+  symbol's cooldown for the builds that carry no pass. The entry records the
+  pass (`gate_trend_day_pass`) and each refusal it waived
+  (`gate_trend_day_pass_waived`, `shared_entry_gates_waived`). Both knobs
+  are checked at load; the manifests declare the pass off (`0.0`, `"11:00"`)
+  and the top_tier preset sets `1.5` and `"11:00"`. From an offline study of
+  18 candidate changes on 23 archived days (10-01..11-09) and 8 held-out
+  September days: before 11:00 the pass admitted 33 entries, 18 winners,
+  +11.69R; from 11:00 on, 83 entries at -6.75R, hence the clock. The
+  held-out support is thin (8 entries, the gain on one day). The strategy
+  README, section 25.
+
+- **The high-conviction override's bridge (2026-11-10).** The override
+  (`peak_giveback_min_r_override`, 2.5R on the top_tier preset) left a
+  trade that peaked between `risk.peak_giveback_min_r` and the override
+  with no giveback floor at all: it fell back to the profit lock. A
+  position stamped with `peak_giveback_bridge_retain` beside the override
+  (top_tier's new `peak_giveback_high_conviction_bridge_retain`, at least 0
+  and under 1, checked at load) exits once the trade is back to that
+  fraction of such a peak, as `peak_giveback_bridge:peakXR_floorYR_minRZ`,
+  a protective exit judged like the other floors, its record marked
+  `peak_giveback_bridge_active`. A stamp that is not such a number is
+  logged once with its type, dropped, and bridges nothing. The manifests
+  declare `0.0` (no stamp); the top_tier preset sets `0.5`. On the 23
+  replayed days it moved 4 exits from 0.33R-0.50R to 0.78R-1.08R and
+  worsened none.
+
 - **The dashboard's header warns ahead of the Schwab login's expiry
   (2026-11-09).** A band under the top bar, on both pages, turns amber
   within `runtime.schwab_login_warning_hours` (24) of schwabdev's login
@@ -140,6 +177,23 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first rung (`min_rr` x R) moved out with it. Checked at load.
 
 ### Changed
+
+- **The top_tier preset stops entries at 13:00 (2026-11-10; 15:00 until
+  then).** `entry_windows` ends at `13:00` and `no_new_entries_after` is
+  `13:00`. On 31 replayed days (23 from 10-01..11-09, 8 held-out September
+  days) the 13 entries from 13:00 on had 2 winners and lost 7.89R, in every
+  sample; it is a filter, and why afternoon entries fail is not known. Open
+  positions are managed to 15:55 as before and the screener still runs to
+  15:00, so the afternoon's watchlist bars are archived for a re-test. The
+  manifest keeps 15:00. With the pass and the bridge above, replayed as one
+  run on the 31 days: 120 trades, 53.3% winners, +29.20R, against 100
+  trades, 48.0%, +7.72R before (the 8 held-out days alone: 30 trades at
+  +4.67R against 25 at +1.18R). Mostly in-sample: both clocks were chosen
+  on the 23 days, and the dry run is the test. The preset's `orb_*` comments no
+  longer say that `disable_orb_regime: false` restores a tuned regime: as
+  set the regime takes no trade (`orb_max_range_atr_mult`, the strategy
+  README's section 23), and replayed with that cap off it lost 12.51R on
+  118 trades. Those values are unchanged.
 
 - **The quote blacklist's WARNING names the probe (2026-11-09).** `Blacklisting SYM
   from quote refresh after N consecutive failures of its own (...); probed
